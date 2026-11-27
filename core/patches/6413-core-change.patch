@@ -1,0 +1,110 @@
+From 376265cd5651e8655d7cc9989984aa06c51be6fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:18:26 +0000
+Subject: [PATCH 6413] Bounded private code-provenance diagnostic snapshots
+
+Public mirror of source commit 376265cd5651e8655d7cc9989984aa06c51be6fd.
+
+---
+diff --git a/gateway/code_provenance_control.py b/gateway/code_provenance_control.py
+index cba8240ff90..f619e6290d9 100644
+--- a/gateway/code_provenance_control.py
++++ b/gateway/code_provenance_control.py
+@@ -122,6 +122,10 @@
+                 # Fixed/class-only errors, never exception text containing paths/secrets.
+                 box['error'] = str(exc) if type(exc) is ValueError and str(exc) in {
+                     'entry_too_large', 'snapshot_too_large'} else type(exc).__name__
++            except Exception:  # health: allow BLE001 -- settle private worker failures without logging arbitrary secret-bearing exception text
++                # Do not expose arbitrary exception messages or custom class names.
++                # BaseException remains outside this ordinary-failure contract.
++                box['error'] = 'capture_failed'
+             finally:
+                 with custody:
+                     done.set()
+diff --git a/tests/gateway/test_code_provenance_control.py b/tests/gateway/test_code_provenance_control.py
+index 5872e177636..effd449909f 100644
+--- a/tests/gateway/test_code_provenance_control.py
++++ b/tests/gateway/test_code_provenance_control.py
+@@ -142,6 +142,79 @@
+     asyncio.run(scenario())
+ 
+ 
++@pytest.mark.parametrize('failure', [KeyError, ZeroDivisionError])
++def test_unexpected_inventory_failure_is_sanitized_and_recoverable(runtime, monkeypatch, failure):
++    hooks, workers = [], []
++    monkeypatch.setattr(threading, 'excepthook', hooks.append)
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            summary = (await ask(runtime, params))['result']
++            original = runtime[2]._inventory_modules
++            def broken(**kwargs):
++                workers.append(threading.current_thread())
++                raise failure('PRIVATE_INVENTORY_EXCEPTION_SENTINEL')
++            monkeypatch.setattr(runtime[2], '_inventory_modules', broken)
++            raw = json.dumps({'protocol': 1, 'verb': 'code-provenance',
++                              'id': 1, 'params': params}).encode() + b'\n'
++            reply = json.loads(await asyncio.to_thread(private_control_query, runtime[0], raw))
++            assert len(workers) == 1
++            await asyncio.to_thread(workers[0].join, 2)
++            assert not workers[0].is_alive()
++            assert reply == {'protocol': 1, 'id': 1, 'ok': True,
++                             'result': pc._error('capture_failed')}
++            assert 'snapshot_id' not in reply['result']
++            assert not hooks
++            assert 'PRIVATE_INVENTORY_EXCEPTION_SENTINEL' not in json.dumps(reply)
++            assert next(iter(control._snapshots.values()))['token'] == summary['snapshot_id']
++            page = (await ask(runtime, page_params(summary)))['result']
++            assert page['complete'] and page['snapshot_id'] == summary['snapshot_id']
++            assert not pc._FLIGHT.locked()
++            monkeypatch.setattr(runtime[2], '_inventory_modules', original)
++            fresh = (await ask(runtime, params))['result']
++            assert fresh['complete'] and fresh['snapshot_id'] != summary['snapshot_id']
++            assert not hooks
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_late_unexpected_failure_keeps_flight_until_worker_exit(runtime, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    hooks, workers = [], []
++    monkeypatch.setattr(threading, 'excepthook', hooks.append)
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            summary = (await ask(runtime, params))['result']
++            original = runtime[2]._inventory_modules
++            def blocked(**kwargs):
++                workers.append(threading.current_thread())
++                entered.set()
++                assert release.wait(8)
++                raise KeyError('PRIVATE_LATE_EXCEPTION_SENTINEL')
++            monkeypatch.setattr(runtime[2], '_inventory_modules', blocked)
++            pending = asyncio.create_task(ask(runtime, params))
++            assert await asyncio.to_thread(entered.wait, 2)
++            assert (await pending)['result'] == pc._error('capture_timeout')
++            assert (await ask(runtime, params))['result'] == pc._error('capture_busy')
++            assert (await ask(runtime, page_params(summary)))['result']['complete']
++            assert pc._FLIGHT.locked()
++            release.set()
++            await asyncio.to_thread(workers[0].join, 2)
++            assert not workers[0].is_alive() and not hooks
++            assert not pc._FLIGHT.locked()
++            assert next(iter(control._snapshots.values()))['token'] == summary['snapshot_id']
++            monkeypatch.setattr(runtime[2], '_inventory_modules', original)
++            assert (await ask(runtime, params))['result']['complete']
++        finally:
++            release.set()
++            for worker in workers:
++                await asyncio.to_thread(worker.join, 2)
++            await server.stop()
++    asyncio.run(scenario())
++
++
+ def test_missing_ledger_is_error_and_never_installs(runtime, monkeypatch):
+     monkeypatch.setattr(ca, '_installed', None)
+     async def scenario():
+-- 
+2.43.0
+

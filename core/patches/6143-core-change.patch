@@ -1,0 +1,133 @@
+From 58fb5c730dc3e9ca2af73ccc867e0ffbc86e269c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 10:31:49 +0000
+Subject: [PATCH 6143] Kanban canonical home, execution separation and explicit-home readers
+
+Public mirror of source commit 58fb5c730dc3e9ca2af73ccc867e0ffbc86e269c.
+
+---
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 43f4745fa96..732eb274b7b 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -202,13 +202,16 @@
+     return verified, legacy, terminal
+ 
+ 
+-def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> dict:
++def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float,
++                       local_only: bool = False) -> dict:
+     """Attach owner evidence during the collector's existing read transaction.
+ 
+     The collector must call this on the owner, never on a replica. A completion
+     event is evidence of the core lifecycle gate; status alone (including an
+     archive) is not. Goal-mode also requires a current, completion-bound
+     judge-success receipt; unavailable judges never supply release evidence.
++    Explicit-home callers set local_only: upstream presentation is confined to
++    this connection, never an implicitly discovered process-home shadow.
+     """
+     if not conn.in_transaction:
+         raise ValueError('origin_observation_snapshot_required')
+@@ -247,7 +250,10 @@
+     payload = {k: v for k, v in task.items()
+                if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients', 'ask_notice')}
+     from hermes_cli.kanban_session_activity_card_details import _add_blocked_upstream
+-    _add_blocked_upstream(conn, {task['id']: payload})
++    if local_only:
++        _add_blocked_upstream(conn, {task['id']: payload}, replica=None)
++    else:
++        _add_blocked_upstream(conn, {task['id']: payload})
+     from hermes_cli.kanban_remote_ask import publish as publish_ask
+     if (ask := publish_ask(conn, task)) is not None:
+         payload['ask_notice'] = ask
+diff --git a/hermes_cli/kanban_origin_local.py b/hermes_cli/kanban_origin_local.py
+index 209fda0ce9c..19046162ab0 100644
+--- a/hermes_cli/kanban_origin_local.py
++++ b/hermes_cli/kanban_origin_local.py
+@@ -43,6 +43,6 @@
+             if marker not in markers:
+                 return None
+             task = {**dict(row), **owner, 'id': owner['task_id'], 'origin_bindings': markers}
+-            return observe_owner_task(conn, task, now=now)
++            return observe_owner_task(conn, task, now=now, local_only=explicit)
+     except (OSError, sqlite3.Error, ValueError, TypeError):
+         return None
+diff --git a/hermes_cli/kanban_replica_upstream.py b/hermes_cli/kanban_replica_upstream.py
+index 606a336ea0f..1f4bc8c8651 100644
+--- a/hermes_cli/kanban_replica_upstream.py
++++ b/hermes_cli/kanban_replica_upstream.py
+@@ -17,7 +17,9 @@
+ 
+     # Card ids can occur once per linked chat. Compute once, then fan out to all links.
+     cards = {r["id"]: {"status": r["status"]} for r in rows}
+-    _add_blocked_upstream(conn, cards)
++    # This connection is already the selected replica snapshot. A process-home
++    # shadow cannot supply evidence for its graph (and may belong to another home).
++    _add_blocked_upstream(conn, cards, replica=None)
+     for row in rows:
+         stamp = _decoded_request(row.get("blocked_upstream"))
+         row.pop("blocked_upstream", None)
+diff --git a/tests/hermes_cli/test_replica_explicit_acquisition.py b/tests/hermes_cli/test_replica_explicit_acquisition.py
+index 160623f2602..f3af13ec8de 100644
+--- a/tests/hermes_cli/test_replica_explicit_acquisition.py
++++ b/tests/hermes_cli/test_replica_explicit_acquisition.py
+@@ -64,6 +64,19 @@
+     assert got[0]["synced_at"] == 950
+ 
+ 
++def test_populated_explicit_replica_graph_never_discovers_second_shadow(tmp_path, monkeypatch):
++    rep = tmp_path / 'selected.db'
++    _replica(rep, [('t_scoped', 'SCOPED', 'running', OTHER)], [('t_scoped', ME, 's1', 'created', 0)])
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('selected replica graph discovered a process-home shadow')
++
++    monkeypatch.setattr('hermes_cli.kanban_sync_client.shadow_path', forbidden)
++    got = links.replica_cards(['s1'], ME, replicas=[('default', rep)], profile='default',
++                              origin_cards=[_ledger_row('t_scoped', 's1')])
++    assert len(got) == 1 and got[0]['title'] == 'SCOPED'
++
++
+ def test_omitted_profile_preserves_legacy_policy_and_ledger(monkeypatch):
+     calls = []
+     monkeypatch.setattr(sync, "sync_config", lambda: calls.append("config") or {})
+diff --git a/tests/hermes_cli/test_review_explicit_local_deep.py b/tests/hermes_cli/test_review_explicit_local_deep.py
+new file mode 100644
+index 00000000000..f03460b4d23
+--- /dev/null
++++ b/tests/hermes_cli/test_review_explicit_local_deep.py
+@@ -0,0 +1,31 @@
++"""Reviewer probe: real owner observation beneath explicit local binding."""
++import json
++import pytest
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin_local as local
++
++@pytest.mark.parametrize('local_only_control', [False, True])
++@pytest.mark.parametrize('status', ['ready', 'running', 'scheduled', 'blocked'])
++def test_explicit_local_binding_never_discovers_shadow(tmp_path, monkeypatch, status, local_only_control):
++    home = tmp_path / 'authorized'
++    home.mkdir()
++    with kbc.connect_closing(home / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='Bound observation', assignee='default', completion_contract='local-only')
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++        binding = {'binding_id': 'review-binding', 'version': 1,
++            'owner': {'gateway': 'owner', 'profile': 'default', 'board': 'default', 'task_id': tid},
++            'origin': {'gateway': 'owner', 'profile': 'default', 'session': 'chat'},
++            'task_record_key': 'default/default/' + tid}
++        conn.execute('CREATE TABLE origin_creation_intents (task_id TEXT, binding_json TEXT)')
++        conn.execute('INSERT INTO origin_creation_intents VALUES (?, ?)', (tid, json.dumps(binding)))
++    if local_only_control:
++        from hermes_cli import kanban_session_activity_card_details as details
++        original = details._add_blocked_upstream
++        monkeypatch.setattr(details, '_add_blocked_upstream',
++                            lambda conn, rows, **kw: original(conn, rows, replica=None))
++    def forbidden(*a, **kw):
++        pytest.fail('explicit owner observation reached ambient shadow_path')
++    monkeypatch.setattr('hermes_cli.kanban_sync_client.shadow_path', forbidden)
++    row = local.observe_local_binding(binding, profile='default', now=100, home=home)
++    assert row is not None
++    assert row['status'] == status
+-- 
+2.43.0
+

@@ -1,0 +1,257 @@
+From 21f37f294297a30c7ce5049fa41afc64a011a878 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:36:22 +0000
+Subject: [PATCH 6328] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 21f37f294297a30c7ce5049fa41afc64a011a878.
+
+---
+diff --git a/hermes_cli/kanban_annotation_lineage.py b/hermes_cli/kanban_annotation_lineage.py
+new file mode 100644
+index 00000000000..8b4b8bc8878
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_lineage.py
+@@ -0,0 +1,46 @@
++"""Semantic state.db input of the annotation COUNTS part. [daveey]
++
++Only session existence and canonical continuation edges can change the aliases
++selected by the origin projector. Transcript content, token counts and turn
++leases are not inputs. Use the canonical SQL rather than duplicating its branch,
++delegate/reset, source, ended-state, message recency and started-at ordering.
++An unreadable/missing/unknown schema raises: the holder must read afresh.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++
++def key(path: Path) -> tuple:
++    from hermes_cli.kanban_session_activity import cached_ro
++    from hermes_state_compression import _CHAIN_CAP, _CHAIN_STEP_SQL
++
++    with cached_ro(path, busy_budget=0) as conn:
++        conn.execute('BEGIN')
++        try:
++            # Compile every canonical dependency even with no compressed rows;
++            # an incomplete schema must not certify a reusable empty graph.
++            conn.execute(_CHAIN_STEP_SQL, (None,)).fetchone()
++            sessions = tuple(conn.execute('SELECT id, end_reason FROM sessions ORDER BY id'))
++            edges = {}
++            for sid, reason in sessions:
++                if reason == 'compression':
++                    row = conn.execute(_CHAIN_STEP_SQL, (sid,)).fetchone()
++                    if row is not None:
++                        edges[sid] = row[0]
++            # Unknown lineage is not an unchanged successful projection. Match
++            # the resolver's cycle/cap refusal, including a tail at the cap.
++            for root in edges:
++                sid, seen = root, {root}
++                for _ in range(_CHAIN_CAP):
++                    if sid not in edges:
++                        break
++                    sid = edges[sid]
++                    if sid in seen:
++                        raise ValueError('origin_lineage_invalid')
++                    seen.add(sid)
++                else:
++                    raise ValueError('origin_lineage_invalid')
++            return tuple(sid for sid, _ in sessions), tuple(sorted(edges.items()))
++        finally:
++            conn.rollback()
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index 7a51a8f4c19..a02be0db767 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -90,15 +90,20 @@
+     return watch.signature(scope, [p for p in paths if p not in plain], plain)
+ 
+ 
+-def _plain_key(scope: tuple[str, ...]) -> str:
+-    """Every watched input of ``scope`` that no content revision covers."""
++def _plain_key(scope: tuple[str, ...]) -> object:
++    """Non-board inputs, with state.db narrowed to canonical continuation edges."""
+     from hermes_cli import kanban_annotation_host as host
+     from hermes_cli import kanban_session_activity as ksa
+ 
+     dbs, files = host._watch_paths(scope)
+     discovery, _dirs = host._discovery_paths()
+     keyed = {str(p) for p in ksa._board_db_paths()} | {str(p) for p in ksa._replica_paths()}
+-    return _signature(scope, {*dbs, *files, *(str(p) for p in discovery)} - keyed)
++    from hermes_cli import kanban_annotation_lineage as lineage
++    from hermes_constants import get_hermes_home
++
++    state = get_hermes_home() / 'state.db'
++    return (_signature(scope, {*dbs, *files, *(str(p) for p in discovery)} - keyed - {str(state)}),
++            lineage.key(state))
+ 
+ 
+ def _replica_dir() -> str | None:
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index d06c5ac9e71..14015265ae8 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -31,9 +31,12 @@
+     """One board, one plain input (state.db's stand-in) and a done check with one declared file."""
+     board = tmp_path / 'kanban.db'
+     conn = helpers._board(board, [('t1', 'running', 's1')])
++    from hermes_state import SessionDB
+     plain, declared = tmp_path / 'state.db', tmp_path / 'done-check.json'
+-    plain.write_text('0')
++    state = SessionDB(db_path=plain)
++    state.create_session('ordinary', 'cli')
+     declared.write_text('0')
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+     monkeypatch.setattr(disk, 'FORCE', True)
+     monkeypatch.setattr(ksa, '_origin_scope', lambda: SCOPE)
+@@ -46,7 +49,7 @@
+     monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
+     monkeypatch.setattr(host, 'SETTLE_S', ())
+     seen = SimpleNamespace(counts=0, links=0, checks=0, flagged=True, conn=conn, board=board, plain=plain,
+-                           declared=declared, deadline=None)
++                           declared=declared, deadline=None, state=state)
+     recompute = ksa._recompute_all_counts
+ 
+     def counting(*a, **kw):
+@@ -70,6 +73,7 @@
+     monkeypatch.setattr(host, '_known', {SCOPE: contextvars.copy_context()})
+     disk.touch_demand(SCOPE)
+     yield seen
++    state.close()
+     conn.close()
+     ksa._reset_cache_for_tests()
+ 
+@@ -117,8 +121,8 @@
+     _refresh()
+     assert _reads(world) == before, 'a bookkeeping write reread a part'
+ 
+-    # the plain input (state.db, config): the counts read it; the links cache bounds it by its TTL, not a key
+-    world.plain.write_text('moved')
++    # Relevant lineage membership changes still force counts, not links.
++    world.state.create_session('new-lineage', 'cli')
+     _refresh()
+     assert _reads(world) == (before[0] + 1, before[1], before[2]), 'a plain input forced the links projection'
+ 
+@@ -197,7 +201,7 @@
+ def test_every_gated_refresh_publishes_what_a_cold_full_read_would(world):
+     steps = [
+         lambda: None,
+-        lambda: world.plain.write_text('one'),
++        lambda: world.state.create_session('one', 'cli'),
+         lambda: world.declared.write_text('one'),
+         lambda: world.conn.execute("INSERT INTO tasks VALUES ('t2', 'running', 's2')"),
+         lambda: setattr(world, 'flagged', False) or world.declared.write_text('two'),
+@@ -546,7 +550,7 @@
+     _refresh()
+     links = world.links
+     for i in range(5):  # state.db churn: chats writing, sync stamps
+-        world.plain.write_text(f'churn {i}')
++        world.state.append_message('ordinary', 'user', f'churn {i}')
+         _refresh()
+     assert world.links == links, 'plain-input churn re-projected the links'
+ 
+diff --git a/tests/hermes_cli/test_kanban_annotation_state_key.py b/tests/hermes_cli/test_kanban_annotation_state_key.py
+new file mode 100644
+index 00000000000..6859fc7c86f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_state_key.py
+@@ -0,0 +1,96 @@
++"""The COUNTS state input is canonical compression lineage, not transcript bytes."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_annotation_lineage as lineage
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli.kanban_origin_adapter import _resolve_session
++from hermes_state import SessionDB
++from tests.hermes_cli import test_kanban_annotation_parts as helpers
++
++world = helpers.world
++
++
++def test_transcript_only_write_does_not_force_counts(world, monkeypatch):
++    # Use a real state DB rather than the old raw-file stand-in. The message is
++    # not a continuation candidate, so its text/activity cannot change an alias.
++    db = world.state
++    monkeypatch.setenv('HERMES_HOME', str(world.plain.parent))
++    from hermes_cli import kanban_annotation_disk as disk
++    disk.touch_demand(helpers.SCOPE)
++    helpers._refresh()
++    before = helpers._reads(world)
++    assert before[0] > 0, 'the real holder must have read counts before the storm'
++    db.append_message('ordinary', 'user', 'not a lineage input')
++    helpers._refresh()
++    assert helpers._reads(world) == before
++
++
++@pytest.mark.parametrize('change', [
++    "UPDATE sessions SET model_config='{\"_branched_from\":\"root\"}' WHERE id='b'",
++    "UPDATE sessions SET model_config='{\"_delegate_from\":\"root\"}' WHERE id='b'",
++    "UPDATE sessions SET model_config='{\"_reset_from\":\"root\"}' WHERE id='b'",
++    "UPDATE sessions SET source='tool' WHERE id='b'",
++    "UPDATE sessions SET ended_at=1700000020 WHERE id='b'",
++    "UPDATE sessions SET last_activity_at=1700000020 WHERE id='a'",
++    "UPDATE sessions SET started_at=1700000002 WHERE id='a'",
++    "UPDATE sessions SET end_reason='normal' WHERE id='root'",
++    "DELETE FROM sessions WHERE id='b'",
++])
++def test_every_canonical_tip_selection_change_moves_key(tmp_path, change):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    db.create_session('root', 'cli')
++    db.end_session('root', 'compression')
++    db.create_session('a', 'cli', parent_session_id='root')
++    db.create_session('b', 'cli', parent_session_id='root')
++    db.close()
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE sessions SET started_at=1700000000, last_activity_at=1700000010')
++        conn.execute("UPDATE sessions SET started_at=1700000001 WHERE id='b'")
++    assert _resolve_session(path, 'root') == 'b'
++    before = lineage.key(path)
++    with sqlite3.connect(path) as conn:
++        conn.execute(change)
++    assert _resolve_session(path, 'root') != 'b'
++    assert lineage.key(path) != before
++
++
++@pytest.mark.parametrize('damage', ['cycle', 'cap'])
++def test_unknown_lineage_is_not_certified(tmp_path, monkeypatch, damage):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    db.create_session('root', 'cli')
++    db.end_session('root', 'compression')
++    db.create_session('a', 'cli', parent_session_id='root')
++    db.close()
++    if damage == 'cycle':
++        with sqlite3.connect(path) as conn:
++            conn.execute("UPDATE sessions SET parent_session_id='a' WHERE id='root'")
++            conn.execute("UPDATE sessions SET end_reason='compression' WHERE id='a'")
++    else:
++        monkeypatch.setattr('hermes_state_compression._CHAIN_CAP', 1)
++    with pytest.raises(ValueError, match='origin_lineage_invalid'):
++        lineage.key(path)
++
++
++def test_unknown_lineage_schema_is_not_an_empty_certificate(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    db.create_session('ordinary', 'cli')
++    db.close()
++    with sqlite3.connect(path) as conn:
++        conn.execute('DROP TABLE messages')
++    with pytest.raises(sqlite3.Error):
++        lineage.key(path)
++
++
++def test_unknown_state_is_never_certified(world, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(world.plain.parent / 'absent'))
++    # No state store may be turned into a reusable empty lineage certificate.
++    forced, now = parts.plan(helpers.SCOPE, clock=False)
++    assert forced == parts.ALL and now is None
++    parts.done(helpers.SCOPE, now)
++    forced, now = parts.plan(helpers.SCOPE, clock=False)
++    assert forced == parts.ALL and now is None
+-- 
+2.43.0
+

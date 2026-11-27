@@ -1,0 +1,209 @@
+From 451f9fcb9dcf00d567c1a1eda0fa557a23b6a8ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:13:51 +0000
+Subject: [PATCH 6388] Private-hold diagnostic: released capability stops and stacked historical releases
+
+Public mirror of source commit 451f9fcb9dcf00d567c1a1eda0fa557a23b6a8ed.
+
+---
+diff --git a/hermes_cli/kanban_actionability_observation.py b/hermes_cli/kanban_actionability_observation.py
+index abb43f5c0f0..4d81dccee77 100644
+--- a/hermes_cli/kanban_actionability_observation.py
++++ b/hermes_cli/kanban_actionability_observation.py
+@@ -47,7 +47,11 @@
+             raise _invalid()
+         uids.add(event['uid'])
+         orders.add(event['ord'])
+-    reason = held(task['status'], data['events'])
++    # Release provenance is the Board-stamped envelope of the card's home gateway, never payload actor text.
++    releases = frozenset(e['uid'] for e in data['events'] if e['kind'] == 'stop_released'
++                         and isinstance(task['created_on'], str) and task['created_on']
++                         and e.get('origin_gateway') == task['created_on'])
++    reason = held(task['status'], data['events'], verified_releases=releases)
+     if reason is not None:
+         raise PrivateHold(task_id, reason)
+     return data
+diff --git a/hermes_cli/kanban_actionability_private.py b/hermes_cli/kanban_actionability_private.py
+index 7f7d9317d75..af8dbaf67e7 100644
+--- a/hermes_cli/kanban_actionability_private.py
++++ b/hermes_cli/kanban_actionability_private.py
+@@ -10,6 +10,8 @@
+ * a scope stop needs a later renewal that froze its uid AND a caller-verified mandate digest
+   (``verified_cover``). Event bytes alone cannot re-read the mandate comment, so an unverified
+   renewal stays ``mandate_unverifiable``;
++* a capability stop needs a caller-authenticated exact-episode ``stop_released`` followed by
++  a decision; payload actor labels are not authentication (``verified_releases``);
+ * anything unparseable or unattributable stays held.
+ """
+ from __future__ import annotations
+@@ -18,7 +20,8 @@
+ 
+ STOPS = frozenset({'spend_budget_triaged', 'decision_hold_restricted'})
+ RENEWAL = 'scope_renewed'
+-PRIVATE = STOPS | {RENEWAL}
++RELEASE = 'stop_released'
++PRIVATE = STOPS | {RENEWAL, RELEASE}
+ DECISIONS = frozenset({'promoted_manual', 'archived'})
+ 
+ 
+@@ -40,7 +43,7 @@
+     return raw if isinstance(raw, dict) else None
+ 
+ 
+-def held(status, events, *, verified_cover=frozenset()):
++def held(status, events, *, verified_cover=frozenset(), verified_releases=frozenset()):
+     """Reason the private history still holds, or ``None`` when there is none or all of it is resolved."""
+     private = [e for e in events if e['kind'] in PRIVATE]
+     if not private:
+@@ -77,6 +80,15 @@
+             if event['uid'] not in cover:
+                 return 'mandate_unverifiable'
+             floor = min(after)
++        elif cause == 'capability_unavailable' and event['kind'] == 'spend_budget_triaged':
++            after = [r['ord'] for r in private if r['kind'] == RELEASE
++                     and r['uid'] in verified_releases and r['ord'] > floor
++                     and type(payloads[r['uid']].get('version')) is int
++                     and payloads[r['uid']]['version'] == 1
++                     and payloads[r['uid']].get('episode') == event['uid']]
++            if not after:
++                return 'restriction_unattributable'
++            floor = min(after)
+         elif cause is not None or event['kind'] != 'spend_budget_triaged':
+             return 'restriction_unattributable'
+         if not any(o > floor for o in decisions):
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 5db7d7ace5c..8039329923d 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -274,7 +274,13 @@
+         verified = covered(Rows(conn), task['id'])
+     except EVIDENCE_ERRORS:
+         verified = frozenset()  # Missing mandate evidence cannot resolve a scope hold.
+-    return held(task['status'], events, verified_cover=verified)
++    # Synced provenance is the Board-stamped envelope, never actor text in the payload.
++    # An unsynced board's own release writer is local; foreign envelopes are not local writes.
++    releases = frozenset(key(row) for row in rows if row['kind'] == 'stop_released' and (
++        (reader.synced and isinstance(task.get('created_on'), str) and task['created_on']
++         and row.get('origin_gateway') == task['created_on'])
++        or (not reader.synced and not row.get('origin_gateway'))))
++    return held(task['status'], events, verified_cover=verified, verified_releases=releases)
+ 
+ 
+ def _lane_gate_at(conn, tid, reader) -> int | None:
+diff --git a/tests/hermes_cli/test_kanban_actionability_private.py b/tests/hermes_cli/test_kanban_actionability_private.py
+index a0d14cabc71..d31318c5cf3 100644
+--- a/tests/hermes_cli/test_kanban_actionability_private.py
++++ b/tests/hermes_cli/test_kanban_actionability_private.py
+@@ -143,6 +143,87 @@
+         assert sources._private_reason(conn, {'id': tid, 'status': 'ready'}, sources.Reader(conn)) is None
+ 
+ 
++def test_verified_capability_release_requires_exact_episode_and_later_decision():
++    stop = ev('capability', 2, 'spend_budget_triaged', cause='capability_unavailable')
++    release = ev('released', 3, 'stop_released', version=1, episode='capability')
++    go = ev('go', 4, 'promoted_manual')
++    verified = frozenset({'released'})
++    assert held('ready', [stop, release, go], verified_releases=verified) is None
++    assert held('ready', [stop, release, go]) == 'restriction_unattributable'
++    assert held('triage', [stop, release, go], verified_releases=verified) == 'card_in_triage'
++    for bad in (dict(release, ord=1),
++                ev('released', 3, 'stop_released', version=1, episode='other'),
++                ev('released', 3, 'stop_released', version=True, episode='capability')):
++        assert held('ready', [stop, bad, go], verified_releases=verified) == 'restriction_unattributable'
++    assert held('ready', [stop, release, dict(go, ord=2)], verified_releases=verified) == 'stop_undecided'
++    for cause in ('safety_refusal', 'unknown', 'decision_pending', 'scope_stopped'):
++        other = ev('capability', 2, 'spend_budget_triaged', cause=cause)
++        assert held('ready', [other, release, go], verified_releases=verified) is not None
++    annotation = ev('annotation', 5, 'decision_hold_restricted', cause='capability_unavailable')
++    assert held('ready', [stop, release, go, annotation], verified_releases=verified) == 'restriction_unattributable'
++    # Only a spend stop is releasable this way: a restriction annotation named by a verified release stays held.
++    restricted = ev('capability', 2, 'decision_hold_restricted', cause='capability_unavailable')
++    assert held('ready', [restricted, release, go], verified_releases=verified) == 'restriction_unattributable'
++
++
++def test_capability_release_then_scope_renewal_history_keeps_each_stop_on_its_own_proof():
++    """Capability stop -> release -> scope stop -> renewal -> release -> capability stop -> release."""
++    events = [
++        ev('cap1', 2, 'spend_budget_triaged', cause='capability_unavailable'),
++        ev('rel1', 3, 'stop_released', version=1, episode='cap1'), ev('go1', 4, 'promoted_manual'),
++        ev('scope', 5, 'spend_budget_triaged', cause='scope_stopped'),
++        ev('renew', 6, 'scope_renewed', episode='scope', covered_restriction_uids=['scope']),
++        ev('rel2', 7, 'stop_released', version=1, episode='scope'), ev('go2', 8, 'promoted_manual'),
++        ev('cap2', 9, 'spend_budget_triaged', cause='capability_unavailable')]
++    releases, cover = frozenset({'rel1', 'rel2', 'rel3'}), frozenset({'scope'})
++    assert held('ready', events[:3], verified_releases=releases) is None
++    assert held('ready', events[:7], verified_cover=cover, verified_releases=releases) is None
++    # A release never substitutes for the scope stop's own mandate digest.
++    assert held('ready', events[:7], verified_releases=releases) == 'mandate_unverifiable'
++    assert held('triage', events, verified_cover=cover, verified_releases=releases) == 'card_in_triage'
++    # The first episode's release does not release a later capability stop.
++    assert held('ready', events + [ev('go3', 10, 'promoted_manual')], verified_cover=cover,
++                verified_releases=releases) == 'restriction_unattributable'
++    done = events + [ev('rel3', 10, 'stop_released', version=1, episode='cap2'), ev('go3', 11, 'promoted_manual')]
++    assert held('ready', done, verified_cover=cover, verified_releases=releases) is None
++    assert held('ready', done, verified_cover=cover, verified_releases=releases - {'rel3'}) == 'restriction_unattributable'
++
++
++@pytest.mark.parametrize('origin', ['home', 'foreign', None, ''])
++def test_local_synced_capability_release_requires_home_envelope(tmp_path, origin):
++    from hermes_cli import kanban_actionability_sources as sources
++    with connect(tmp_path / 'kanban.db') as conn:
++        from hermes_cli.kanban_db_sync import apply_sync_schema_steps
++        apply_sync_schema_steps(conn)
++        tid = kb.create_task(conn, title='Synced capability stop', assignee='default')
++        kb._append_event(conn, tid, 'spend_budget_triaged', {'cause': 'capability_unavailable'})
++        conn.execute("UPDATE task_events SET uid='capability' WHERE task_id=? AND kind='spend_budget_triaged'", (tid,))
++        stop = conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'", (tid,)).fetchone()[0]
++        kb._append_event(conn, tid, 'stop_released', {'version': 1, 'episode': stop})
++        conn.execute("UPDATE task_events SET uid='released',origin_gateway=? WHERE task_id=? AND kind='stop_released'", (origin, tid))
++        kb._append_event(conn, tid, 'promoted_manual', {})
++        reader = sources.Reader(conn)
++        reader.synced = True
++        task = {'id': tid, 'status': 'ready', 'created_on': 'home'}
++        reason = sources._private_reason(conn, task, reader)
++        assert reason == (None if origin == 'home' else 'restriction_unattributable')
++
++
++@pytest.mark.parametrize('origin', ['home', 'foreign', None, ''])
++def test_board_capability_release_uses_attested_home_not_actor(origin):
++    hub = Hub()
++    hub.data['t_root']['events'] += [
++        ev('capability', 2, 'spend_budget_triaged', cause='capability_unavailable'),
++        dict(ev('released', 3, 'stop_released', version=1, episode='capability',
++                authority_kind='human', actor_kind='human'), origin_gateway=origin),
++        ev('go', 4, 'promoted_manual')]
++    if origin == 'home':
++        assert source.observe(hub, 'default', 't_root')['facts']['status'] == 'ready'
++    else:
++        with pytest.raises(PrivateHold, match='restriction_unattributable'):
++            source.observe(hub, 'default', 't_root')
++
++
+ def test_lane_gated_triage_is_lane_capacity_not_an_owner_decision(tmp_path):
+     now = 1_700_000_000
+     with connect(tmp_path / 'kanban.db') as conn:
+diff --git a/tests/hermes_cli/test_kanban_release.py b/tests/hermes_cli/test_kanban_release.py
+index 11c1e33b8df..c7cbb7f30b1 100644
+--- a/tests/hermes_cli/test_kanban_release.py
++++ b/tests/hermes_cli/test_kanban_release.py
+@@ -88,6 +88,17 @@
+     return card
+ 
+ 
++def test_capability_release_clears_private_diagnostic_through_supported_writer(board):
++    from hermes_cli.kanban_actionability_sources import describe
++    tid = kb.create_task(board, title='Capability stop', assignee='default')
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(board, tid, decision.EVENT, {'cause': 'capability_unavailable'})
++    assert run(board, tid)['outcome'] == 'released'
++    assert not decision.pending(board, tid)
++    assert 'private_hold' not in describe(board, tid)['violations']
++
++
+ def test_ordinary_spend_stop_released(board):
+     tid = spend_stopped(board)
+     out = run(board, tid, note='Desktop Unblock, operation op-1')
+-- 
+2.43.0
+

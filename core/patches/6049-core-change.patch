@@ -1,0 +1,299 @@
+From cda43dc91cc6c8943f47e59a4da2e09988156017 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:34:34 +0000
+Subject: [PATCH 6049] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit cda43dc91cc6c8943f47e59a4da2e09988156017.
+
+---
+diff --git a/hermes_cli/fact_content_owner.py b/hermes_cli/fact_content_owner.py
+index 0de934e2cfd..fd0a9997bb8 100644
+--- a/hermes_cli/fact_content_owner.py
++++ b/hermes_cli/fact_content_owner.py
+@@ -18,9 +18,27 @@
+ 
+ @dataclass(frozen=True)
+ class ContentBinding:
++    """*clock_only*: publish only the source's SourceState (its cursor), never rows or membership. [daveey]
++
++    For consumers using a content source as an invalidation clock.
++    Board and project-tree owners bound kanban.db and state.db only for
++    SourceState, but published every row into the shared process store.
++    Publications exceeded the fact budget, repeatedly rebuilding both sources.
++    """
+     source: object
+     path: object
+     hydrate: object = None
++    clock_only: bool = False
++
++
++def _ids_only(conn, ids):
++    """Clock-only hydration: the cursor alone is published, so rows carry nothing but their id.
++    Same input contract as the scalar row hydrators (capture transaction, <= 500 string ids)."""
++    if not conn.in_transaction:
++        raise ValueError('content hydration requires capture transaction')
++    if len(ids) > 500 or any(type(identity) is not str for identity in ids):
++        raise ValueError('invalid hydration id batch')
++    return ({'id': identity} for identity in ids)
+ 
+ 
+ class ContentStartupError(RuntimeError):
+@@ -54,8 +72,11 @@
+                 adapter_type, kind, rows = SessionContentSource, 'SessionContentInput', session_rows
+             else:
+                 raise ValueError('unsupported content source kind')
+-            adapter = adapter_type(source, binding.path, rows if binding.hydrate is None else binding.hydrate)
+-            publisher = SourcePublisher(engines[source.scope], source, kind)
++            if binding.clock_only and binding.hydrate is not None:
++                raise ValueError('clock-only binding takes no hydrate')
++            hydrate = _ids_only if binding.clock_only else rows if binding.hydrate is None else binding.hydrate
++            adapter = adapter_type(source, binding.path, hydrate)
++            publisher = SourcePublisher(engines[source.scope], source, kind, clock_only=binding.clock_only)
+             self._publishers[adapter] = publisher
+             self._by_source[source] = publisher
+         for adapter in operational:
+diff --git a/hermes_cli/fact_source_commit.py b/hermes_cli/fact_source_commit.py
+index fa07bd09245..6667602dfea 100644
+--- a/hermes_cli/fact_source_commit.py
++++ b/hermes_cli/fact_source_commit.py
+@@ -21,12 +21,13 @@
+     owns the engine and must not register duplicate source identities. Source key
+     prefixes prevent local and shadow rows with identical ids colliding.
+     """
+-    def __init__(self, engine, source, kind):
++    def __init__(self, engine, source, kind, *, clock_only=False):
+         if source.scope != engine.scope:
+             raise ValueError('source scope mismatch')
+         if kind in ('SourceState', 'SourceMembership') or kind in engine._specs:
+             raise ValueError('source kind reserved or derived')
+         self.engine, self.source, self.kind = engine, source, kind
++        self.clock_only = clock_only  # publish SourceState only (see ContentBinding.clock_only)
+         self.cursor = None
+         self._members = set()
+         self._failed = False
+@@ -55,6 +56,13 @@
+             raise ValueError('source cursor mismatch')
+         if capture.after is None:
+             raise ValueError('source cursor coverage missing')
++        if self.clock_only:
++            cursor = asdict(capture.after)
++            snapshot = self.engine.store.snapshot(self.source.scope)
++            revision = self.engine.publish([self._state(cursor, snapshot, capture, ((self.source, cursor),))],
++                                           now=time.time())
++            self.cursor, self._failed = capture.after, False
++            return revision
+         records = {}
+         ids = set(capture.ids)
+         for row in capture.records:
+@@ -88,19 +96,23 @@
+                 facts.append(evolve(old, health='fresh', error_code=None))
+         if membership_changed or previous_membership is None or previous_membership.health != 'fresh':
+             facts.append(self._fact(self.membership_key, membership_value, snapshot, capture, vector))
+-        facts.append(self._fact(self.state_key, {'source_kind': self.source.kind,
+-                     'origin_id': self.source.origin_id, 'cursor_state': cursor,
+-                     'revision_token': json.dumps(cursor, sort_keys=True, separators=(',', ':'))},
+-                     snapshot, capture, vector))
++        facts.append(self._state(cursor, snapshot, capture, vector))
+         revision = self.engine.publish(facts, deleted_keys=(self.key(i) for i in removed),
+                                        now=time.time())
+         self.cursor, self._members, self._failed = capture.after, members, False
+         return revision
+ 
++    def _state(self, cursor, snapshot, capture, vector):
++        return self._fact(self.state_key, {'source_kind': self.source.kind,
++                          'origin_id': self.source.origin_id, 'cursor_state': cursor,
++                          'revision_token': json.dumps(cursor, sort_keys=True, separators=(',', ':'))},
++                          snapshot, capture, vector)
++
+     def failure(self):
+         """Sanitized last-good health; never publish exception text or deletions."""
+         snapshot = self.engine.store.snapshot(self.source.scope)
+-        keys = [self.key(i) for i in self._members] + [self.membership_key, self.state_key]
++        keys = ([self.state_key] if self.clock_only else
++                [self.key(i) for i in self._members] + [self.membership_key, self.state_key])
+         facts = []
+         for key in keys:
+             old = snapshot.get(key)
+diff --git a/hermes_cli/fact_view_owner.py b/hermes_cli/fact_view_owner.py
+index 798f394f8fe..428ffadcb08 100644
+--- a/hermes_cli/fact_view_owner.py
++++ b/hermes_cli/fact_view_owner.py
+@@ -4,6 +4,8 @@
+ functions. Demands only enqueue; no request discovery, source access or reducer
+ execution occurs here. This is an in-process transport, not a dedicated host.
+ """
++from dataclasses import replace
++
+ from hermes_cli.fact_board_inputs import BoardInputSource
+ from hermes_cli.fact_capture import CaptureBudget
+ from hermes_cli.fact_content_owner import ContentOwner
+@@ -22,7 +24,9 @@
+         self.source = BoardInputSource(engine, SourceId(scope, 'board.input', 'native'), capture, paths=paths)
+         self.owner = self.transport = self.handle = None
+         self.lifecycle = IncrementalLifecycle({(scope, consumer)})
+-        self._bindings = tuple(bindings)
++        # Views depend only on each binding's SourceState (an invalidation clock), never its rows, so the
++        # bindings are clock-only: whole kanban.db/state.db row sets overflowed the shared store. [daveey]
++        self._bindings = tuple(replace(binding, clock_only=True) for binding in bindings)
+         self._states = []
+ 
+         def projection(view):
+diff --git a/tests/hermes_cli/test_fact_clock_only.py b/tests/hermes_cli/test_fact_clock_only.py
+new file mode 100644
+index 00000000000..c8c746baacc
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_clock_only.py
+@@ -0,0 +1,150 @@
++"""Clock-only content bindings publish their cursor, never rows. [daveey]
++
++Representative observation: board/project-tree owners bound kanban.db and state.db
++only for SourceState. Published rows overflowed the shared
++store, failed fact_budget_exceeded and caused repeated source rebuilds.
++"""
++from dataclasses import dataclass
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_content_owner import ContentBinding, ContentOwner
++from hermes_cli.fact_contract import Fact, Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_source_commit import SourcePublisher
++from hermes_cli.fact_store import FactStore
++from hermes_cli.fact_view_owner import ViewOwner
++from tests.hermes_cli import test_fact_session_source as sessions
++from tests.hermes_cli import test_fact_task_source as tasks
++from tests.waiting import wait_until
++
++home, board = tasks.home, tasks.board
++store = sessions.store
++SCOPE = Scope("install", "profile", "board")
++
++
++@dataclass(frozen=True)
++class _Cursor:
++    n: int
++
++
++def _capture(before, after, n_rows, pad):
++    records = [{"id": str(i), "body": "x" * pad} for i in range(n_rows)]
++    return SimpleNamespace(before=before, after=after, ids=[r["id"] for r in records], records=records,
++                           full=True, observed_at=float(after.n))
++
++
++def _publisher(store, clock_only):
++    return SourcePublisher(ReducerEngine(store, SCOPE), SourceId(SCOPE, "tasks.content", "local"),
++                           "TaskContentInput", clock_only=clock_only)
++
++
++def test_clock_only_publishes_only_source_state_and_fits_where_rows_do_not():
++    rows_mode = _publisher(FactStore(fact_bytes=256 * 1024), clock_only=False)
++    with pytest.raises(ValueError, match="fact_budget_exceeded"):
++        rows_mode.commit(_capture(None, _Cursor(1), 200, 4096))  # ~800 KiB of rows
++
++    store = FactStore(fact_bytes=256 * 1024)
++    clock = _publisher(store, clock_only=True)
++    clock.commit(_capture(None, _Cursor(1), 200, 4096))
++    snapshot = store.snapshot(SCOPE)
++    assert set(store._facts) == {clock.state_key}
++    first = snapshot.get(clock.state_key)
++    assert first.value["cursor_state"] == {"n": 1} and first.health == "fresh"
++
++    clock.commit(_capture(_Cursor(1), _Cursor(2), 200, 4096))
++    second = store.snapshot(SCOPE).get(clock.state_key)
++    assert second.value["cursor_state"] == {"n": 2} and second.rev > first.rev
++    with pytest.raises(ValueError, match="cursor mismatch"):
++        clock.commit(_capture(_Cursor(1), _Cursor(3), 1, 1))
++
++    clock.failure()
++    failed = store.snapshot(SCOPE)
++    assert set(store._facts) == {clock.state_key}
++    assert failed.get(clock.state_key).health == "stale"
++    assert failed.get(clock.state_key).error_code == "source_unavailable"
++
++    clock.commit(_capture(_Cursor(2), _Cursor(3), 200, 4096))  # recovery
++    recovered = store.snapshot(SCOPE).get(clock.state_key)
++    assert recovered.health == "fresh" and recovered.error_code is None
++    assert recovered.value["cursor_state"] == {"n": 3} and set(store._facts) == {clock.state_key}
++
++
++def test_clock_only_binding_rejects_a_custom_hydrate():
++    scope = Scope("install", "profile")
++    engine = ReducerEngine(FactStore(), scope)
++    with pytest.raises(ValueError, match="clock-only"):
++        ContentOwner({scope: engine}, [ContentBinding(SourceId(scope, "tasks.content", "b"), "/nonexistent",
++                                                      hydrate=lambda conn, ids: (), clock_only=True)])
++
++
++@pytest.mark.platforms("linux")
++def test_clock_only_owner_advances_state_without_rows(board):
++    first = tasks.kb.create_task(board, title="a", assignee="w")
++    tasks.kb.create_task(board, title="b", assignee="w")
++    path = next(r[2] for r in board.execute("PRAGMA database_list") if r[1] == "main")
++    scope = Scope("install", "profile")
++    source = SourceId(scope, "tasks.content", "board")
++    store = FactStore()
++    engine = ReducerEngine(store, scope)
++    owner = ContentOwner({scope: engine}, [ContentBinding(source, path, clock_only=True)],
++                         budget=CaptureBudget(max_seconds=2, max_keys=1))  # max_keys=1 forces paged bootstrap
++    try:
++        state_key = owner.publisher(source).state_key
++        assert wait_until(lambda: store.snapshot(scope).get(state_key) is not None, timeout=10)
++        before = store.snapshot(scope).get(state_key)
++        with tasks.kbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='a2' WHERE id=?", (first,))
++        assert wait_until(lambda: store.snapshot(scope).get(state_key).rev > before.rev, timeout=10)
++        kinds = {key.kind for key in store._facts}
++        assert kinds == {"SourceState"}, kinds
++    finally:
++        owner.close()
++
++
++def test_view_owner_binds_content_sources_clock_only():
++    scope = Scope("install", "profile", "board")
++    binding = ContentBinding(SourceId(scope, "tasks.content", "local"), "/nonexistent/kanban.db")
++    owner = ViewOwner(scope, lambda *args: None, lambda *args: None, ("board",), bindings=[binding])
++    assert [b.clock_only for b in owner._bindings] == [True]
++    assert owner._bindings[0].source == binding.source and owner._bindings[0].path == binding.path
++
++
++@pytest.mark.platforms("linux")
++def test_clock_only_session_owner_advances_state_without_rows(store):
++    db, _reader, path = store
++    db.create_session("a", "cli")
++    db.create_session("b", "cli")
++    scope = Scope("install", "profile")
++    source = SourceId(scope, "sessions.content", "local")
++    facts = FactStore()
++    owner = ContentOwner({scope: ReducerEngine(facts, scope)}, [ContentBinding(source, path, clock_only=True)],
++                         budget=CaptureBudget(max_seconds=2, max_keys=1))  # max_keys=1 forces paged bootstrap
++    try:
++        state_key = owner.publisher(source).state_key
++        assert wait_until(lambda: facts.snapshot(scope).get(state_key) is not None, timeout=10)
++        before = facts.snapshot(scope).get(state_key)
++        db._execute_write(lambda conn: conn.execute("UPDATE sessions SET input_tokens=37 WHERE id='a'"))
++        assert wait_until(lambda: facts.snapshot(scope).get(state_key).rev > before.rev, timeout=10)
++        db.create_session("c", "cli")
++        mid = facts.snapshot(scope).get(state_key)
++        assert wait_until(lambda: facts.snapshot(scope).get(state_key).rev > mid.rev, timeout=10)
++        assert {key.kind for key in facts._facts} == {"SourceState"}
++    finally:
++        owner.close()
++
++
++def test_ids_only_hydration_keeps_the_row_hydrator_contract():
++    import sqlite3
++    from hermes_cli.fact_content_owner import _ids_only
++    conn = sqlite3.connect(":memory:", isolation_level=None)
++    with pytest.raises(ValueError, match="transaction"):
++        list(_ids_only(conn, ["a"]))
++    conn.execute("BEGIN")
++    assert list(_ids_only(conn, ["a", "b"])) == [{"id": "a"}, {"id": "b"}]
++    with pytest.raises(ValueError, match="id batch"):
++        _ids_only(conn, [1])
++    with pytest.raises(ValueError, match="id batch"):
++        _ids_only(conn, ["x"] * 501)
+-- 
+2.43.0
+

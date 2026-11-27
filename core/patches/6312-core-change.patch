@@ -1,0 +1,219 @@
+From 90d93e573065c34d7bbacab5c2facba75534626e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:12:58 +0000
+Subject: [PATCH 6312] Conditional terminal-run reservation and indexed wait history
+
+Public mirror of source commit 90d93e573065c34d7bbacab5c2facba75534626e.
+
+---
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 648e595e556..bdf6bd2c9e6 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -997,13 +997,13 @@
+ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_events_kind_task_id   ON task_events(kind, task_id, id);
++CREATE INDEX IF NOT EXISTS idx_events_park_history ON task_events(id) WHERE kind IN ('scheduled','continued') AND typeof(kind)='text';
+ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
+ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+ CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+ """
+ 
+-
+ # --- ID generation ---
+ 
+ def _new_task_id() -> str:
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index a2d71e72d5e..e03899647b7 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1277,6 +1277,7 @@
+     # Same ordering rule as the ``tasks`` indexes above: index after column.
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind_task_id ON task_events(kind, task_id, id)")
++    conn.execute(_EVENT_PARK_HISTORY_INDEX.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1))
+     conn.execute(_EVENT_BLOCKER_ASSERT_INDEX.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1))
+ 
+     if _table_exists(conn, "kanban_notify_subs"):
+@@ -1484,6 +1485,12 @@
+         conn.execute(ddl.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1))
+ 
+ 
++_EVENT_PARK_HISTORY_INDEX = (
++    "CREATE INDEX idx_events_park_history ON task_events(id) "
++    "WHERE kind IN ('scheduled','continued') AND typeof(kind)='text'"
++)
++
++
+ _REBUILD_SPECS = {
+     "task_events": (
+         "CREATE TABLE task_events ("
+@@ -1494,6 +1501,7 @@
+             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
+             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+             "CREATE INDEX idx_events_kind_task_id ON task_events(kind, task_id, id)",
++            _EVENT_PARK_HISTORY_INDEX,
+             _EVENT_BLOCKER_ASSERT_INDEX,
+         ),
+     ),
+diff --git a/hermes_cli/kanban_wait_history_batch.py b/hermes_cli/kanban_wait_history_batch.py
+index 48277783ff2..579133593e4 100644
+--- a/hermes_cli/kanban_wait_history_batch.py
++++ b/hermes_cli/kanban_wait_history_batch.py
+@@ -20,9 +20,16 @@
+     probes = ' UNION ALL '.join(
+         'SELECT MIN(n.id) AS next_id FROM task_events n '
+         'WHERE n.kind=? AND n.task_id=p.task_id AND n.id>p.id' for _ in END_EVENTS)
++    # Explicit opt-in keeps this partial index unavailable to existing readers
++    # whose unspecified traversal order must not change after installation.
++    indexed = conn.execute(
++        "SELECT 1 FROM sqlite_schema WHERE type='index' AND name='idx_events_park_history'"
++    ).fetchone() is not None
++    source = 'task_events INDEXED BY idx_events_park_history' if indexed else 'task_events'
++    opt_in = " AND typeof(kind)='text'" if indexed else ''
+     sql = (
+-        "WITH parks AS MATERIALIZED (SELECT id,task_id,payload,created_at FROM task_events "
+-        "WHERE kind IN ('scheduled','continued') AND json_extract(payload,'$.awaiting.kind')=? "
++        f"WITH parks AS MATERIALIZED (SELECT id,task_id,payload,created_at FROM {source} "
++        "WHERE kind IN ('scheduled','continued')" + opt_in + " AND json_extract(payload,'$.awaiting.kind')=? "
+         "ORDER BY id DESC LIMIT ?), ended AS ("
+         f"SELECT p.*, (SELECT MIN(next_id) FROM ({probes})) AS end_id FROM parks p) "
+         "SELECT json_group_array(json_array(CASE WHEN typeof(payload)='blob' THEN hex(payload) ELSE payload END,created_at,"
+diff --git a/tests/hermes_cli/test_kanban_wait_history_index.py b/tests/hermes_cli/test_kanban_wait_history_index.py
+new file mode 100644
+index 00000000000..df4aeada7c9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_history_index.py
+@@ -0,0 +1,127 @@
++"""Park-history capture must not sort the complete park inventory. [daveey]"""
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_wait_history_batch as batch
++from tests.hermes_cli import test_kanban_wait_history_batch as helpers
++from tests.hermes_cli import test_kanban_wait_eta as eta_helpers
++
++
++DDL = ("CREATE INDEX idx_events_park_history ON task_events(id) "
++       "WHERE kind IN ('scheduled','continued') AND typeof(kind)='text'")
++
++
++@pytest.mark.parametrize('analyze', [False, True])
++@pytest.mark.parametrize('reverse', [False, True])
++def test_capture_vm_work_is_bounded_by_recent_matching_parks(analyze, reverse):
++    with closing(sqlite3.connect(':memory:')) as conn:
++        helpers.seed(conn, 1)
++        # Older matching parks dwarf the bounded recent capture. Each has a
++        # distinct task so the old kind/task/id index cannot satisfy id order.
++        conn.executemany(
++            "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'scheduled',?,1)",
++            [(f'old{i}', '{"awaiting":{"kind":"ci","ref":"https://github.com/acme/old/actions/runs/1"}}')
++             for i in range(20_000)])
++        for i in range(650):
++            eta_helpers._finished(conn, f'recent{i}', 'ci',
++                'https://github.com/acme/recent/actions/runs/1', 900)
++        conn.execute(DDL)
++        if analyze:
++            conn.execute('ANALYZE')
++        conn.execute(f'PRAGMA reverse_unordered_selects={int(reverse)}')
++        expected = {'acme/recent': [900.0] * 20}
++        steps = [0]
++        def progress():
++            steps[0] += 100
++            return 0
++        conn.set_progress_handler(progress, 100)
++        actual = batch.capture(conn, 'ci')
++        conn.set_progress_handler(None, 0)
++        assert actual == expected
++        assert steps[0] < 150_000, steps[0]
++        print(f'capture analyze={analyze} reverse={reverse}: {steps[0]} VM steps')
++
++
++@pytest.mark.parametrize('blob', [False, True])
++def test_indexed_capture_matches_legacy_and_next_call_mutation(blob):
++    with closing(sqlite3.connect(':memory:')) as conn:
++        helpers.seed(conn, 40)
++        if blob:
++            conn.execute('UPDATE task_events SET payload=CAST(payload AS BLOB)')
++        expected = batch.capture(conn, 'ci')
++        conn.execute(DDL)
++        assert batch.capture(conn, 'ci') == expected
++        conn.execute("UPDATE task_events SET created_at=created_at+7 WHERE kind='condition_met'")
++        changed = batch.capture(conn, 'ci')
++        assert changed != expected
++        conn.execute('DROP INDEX idx_events_park_history')
++        assert batch.capture(conn, 'ci') == changed
++
++
++def test_index_is_not_eligible_for_existing_event_queries():
++    with closing(sqlite3.connect(':memory:')) as conn:
++        helpers.seed(conn, 1)
++        conn.execute(DDL)
++        conn.execute('ANALYZE')
++        # Explicit typeof is an opt-in, not an index every existing consumer
++        # can silently choose (and thereby change unspecified traversal order).
++        with pytest.raises(sqlite3.OperationalError, match='no query solution'):
++            conn.execute("SELECT id FROM task_events INDEXED BY idx_events_park_history "
++                         "WHERE kind IN ('scheduled','continued')").fetchall()
++
++
++def test_fresh_upgrade_rebuild_and_settled_schema_match():
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with closing(sqlite3.connect(':memory:', isolation_level=None)) as conn:
++        conn.row_factory = sqlite3.Row
++        conn.executescript(kb.SCHEMA_SQL)
++        def index_sql():
++            return conn.execute("SELECT sql FROM sqlite_schema WHERE name='idx_events_park_history'").fetchone()[0]
++        fresh = index_sql()
++        conn.execute('DROP INDEX idx_events_park_history')
++        kbc._migrate_add_optional_columns(conn)
++        assert index_sql() == fresh
++        cookie = conn.execute('PRAGMA schema_version').fetchone()[0]
++        kbc._migrate_add_optional_columns(conn)
++        assert conn.execute('PRAGMA schema_version').fetchone()[0] == cookie
++        conn.execute('DROP TABLE task_events')
++        table, indexes = kbc._REBUILD_SPECS['task_events']
++        conn.execute(table)
++        for ddl in indexes:
++            conn.execute(ddl)
++        assert index_sql() == fresh
++
++
++@pytest.mark.parametrize('kind', ['ci', 'deploy'])
++@pytest.mark.parametrize('reverse', [False, True])
++def test_indexed_cap_first_end_and_mutations_match_literal(kind, reverse):
++    from hermes_cli import kanban_wait_history as history
++    with closing(sqlite3.connect(':memory:')) as conn:
++        helpers.seed(conn, 1)
++        for i in range(history.SCAN_CAP + 20):
++            eta_helpers._finished(conn, f'x{i}', kind,
++                'https://github.com/acme/widgets/actions/runs/1' if kind == 'ci' else 'hub/core#1',
++                600 if i < 20 else 900, start_kind='continued' if i % 2 else 'scheduled')
++        # Later end has an earlier timestamp: select first id, not MIN(time).
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('x619','claimed','{}',1)")
++        conn.execute(f'PRAGMA reverse_unordered_selects={int(reverse)}')
++        literal = batch.capture(conn, kind)
++        conn.execute(DDL)
++        assert batch.capture(conn, kind) == literal
++        conn.execute("UPDATE task_events SET created_at=created_at+7 WHERE kind='condition_met'")
++        changed = batch.capture(conn, kind)
++        assert changed != literal
++        conn.execute('DROP INDEX idx_events_park_history')
++        assert batch.capture(conn, kind) == changed
++
++
++def test_indexed_capture_retains_malformed_recent_payload_failure():
++    with closing(sqlite3.connect(':memory:')) as conn:
++        helpers.seed(conn, 1)
++        conn.execute(DDL)
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('bad','scheduled','{',1)")
++        with pytest.raises(sqlite3.OperationalError, match='malformed JSON'):
++            batch.capture(conn, 'ci')
+-- 
+2.43.0
+

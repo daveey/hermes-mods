@@ -1,0 +1,116 @@
+From 9dc5cffe1853a12cb6129ca6d01e41f67cf8cd44 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:57:24 +0000
+Subject: [PATCH 6392] Run-route provenance labels and subscription-class judge routing
+
+Public mirror of source commit 9dc5cffe1853a12cb6129ca6d01e41f67cf8cd44.
+
+---
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index d61dbc73dd6..282903f4820 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -277,6 +277,28 @@
+     return model, provider, "profile_default" if model else "unknown"
+ 
+ 
++def _stored_selector(conn: sqlite3.Connection, task: Any) -> tuple[str, str]:
++    """``(model_override, provider_override)`` on the card row; the claimed ``Task`` carries the per-run route."""
++    row = conn.execute("SELECT model_override, provider_override FROM tasks WHERE id=?", (task.id,)).fetchone()
++    if row is None:
++        raise LookupError(task.id)  # no row to compare with: the caller keeps the in-memory label
++    return _str(row[0]), _str(row[1])
++
++
++def _stored_source(stored: tuple[str, str], source: str) -> str:
++    """Receipt ``source`` for a concrete per-run route: a pin only when the card row itself stores that selector.
++
++    ``apply_model_tier`` allocates on the claimed ``Task``, so an unpinned card's concrete route used to read as
++    ``pin`` despite a NULL selector and ``tier_reason: review_unpinned`` in a representative review run."""
++    from agent.model_routing import is_class_selector
++    model, provider = stored
++    if not model:
++        return "dynamic" + source[len("pin"):]
++    if is_class_selector(model) or provider.lower() == "auto":
++        return "class"
++    return source
++
++
+ def record_run_route(conn: sqlite3.Connection, task: Any, *, lane: str, reason: str) -> None:
+     """Admission receipt (``run_route`` event on this run) for every spawn, tier on or off. [daveey]
+ 
+@@ -291,6 +313,12 @@
+         logger.debug("kanban model tier: route resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+                      exc_info=True)
+         model, provider, source = None, None, "unknown"
++    if source in ("pin", "pin_provider_unknown"):
++        try:
++            source = _stored_source(_stored_selector(conn, task), source)
++        except Exception as exc:  # the receipt still gets written, with the in-memory label
++            logger.debug("kanban model tier: stored selector read failed for %s (%s)", getattr(task, "id", "?"), exc,
++                         exc_info=True)
+     payload = {"model": model, "provider": provider, "lane": lane, "source": source, "tier_reason": reason}
+     if picked := _ratio_receipt(conn, task, reason):
+         payload["ratio"] = picked
+diff --git a/tests/hermes_cli/test_kanban_run_route_source.py b/tests/hermes_cli/test_kanban_run_route_source.py
+new file mode 100644
+index 00000000000..a8f105faf84
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_run_route_source.py
+@@ -0,0 +1,53 @@
++"""``run_route`` receipts name where the route came from: the stored card row, not the per-run allocation.
++
++Representative observation: a review card held no selector and the tier reason was ``review_unpinned``,
++yet the receipt said ``source: "pin"``. ``apply_model_tier`` sets the concrete route on the claimed ``Task`` object
++only, and ``effective_route`` labelled any concrete in-memory route a pin.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_model_tier as tier
++from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++
++MODEL, PROVIDER = "claude-opus-5-5", "anthropic"
++
++
++def _receipt(conn, stored, allocated, reason):
++    """Claim a card whose row holds ``stored``, give the claimed Task ``allocated``, return its ``run_route``."""
++    tid = kb.create_task(conn, title="route", assignee="a")
++    if stored != (None, None):  # a legacy or synced row: creation no longer accepts a concrete selector
++        conn.execute("UPDATE tasks SET model_override=?, provider_override=? WHERE id=?", (*stored, tid))
++        conn.commit()
++    task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert task is not None
++    task.model_override, task.provider_override = allocated
++    tier.record_run_route(conn, task, lane="ready", reason=reason)
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='run_route' ORDER BY id DESC LIMIT 1",
++                       (tid,)).fetchone()
++    return kb._json_dict(row[0])
++
++
++@pytest.mark.parametrize("stored, allocated, reason, source", [
++    ((None, None), (MODEL, PROVIDER), "review_unpinned", "dynamic"),
++    ((None, None), (MODEL, None), "review_unpinned", "dynamic_provider_unknown"),
++    (("class:deep", "auto"), (MODEL, PROVIDER), "default", "class"),
++    (("class:deep", "auto"), ("class:deep", "auto"), "default", "class"),
++    ((MODEL, PROVIDER), (MODEL, PROVIDER), "legacy_receipt", "pin"),
++    ((MODEL, None), (MODEL, None), "legacy_receipt", "pin_provider_unknown"),
++])
++def test_receipt_source_follows_the_stored_card_row(board, stored, allocated, reason, source):
++    with kbc.connect() as conn:
++        receipt = _receipt(conn, stored, allocated, reason)
++    assert receipt["source"] == source
++    assert (receipt["model"], receipt["tier_reason"]) == (allocated[0], reason)  # the route itself is untouched
++
++
++def test_unreadable_card_row_keeps_the_in_memory_label_and_still_writes_the_receipt(board, monkeypatch):
++    def unreadable(_conn, _task):
++        raise RuntimeError("row read failed")
++    monkeypatch.setattr(tier, "_stored_selector", unreadable)
++    with kbc.connect() as conn:
++        receipt = _receipt(conn, (None, None), (MODEL, PROVIDER), "review_unpinned")
++    assert receipt["source"] == "pin" and receipt["model"] == MODEL
+-- 
+2.43.0
+

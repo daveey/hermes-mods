@@ -1,0 +1,251 @@
+From 94dd417a5c25aea24df76a44ada0d933723f35c2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:09:38 +0000
+Subject: [PATCH 6039] Kanban source-custody base (stage A, inert)
+
+Public mirror of source commit 94dd417a5c25aea24df76a44ada0d933723f35c2.
+
+---
+diff --git a/hermes_cli/kanban_source_publication.py b/hermes_cli/kanban_source_publication.py
+index 6a7d0f07f55..64b3e415f81 100644
+--- a/hermes_cli/kanban_source_publication.py
++++ b/hermes_cli/kanban_source_publication.py
+@@ -46,11 +46,23 @@
+     return result["stdout"].rstrip("\n") if result["rc"] == 0 else ""
+ 
+ 
+-def _default_target(repo: Path, config: list[str], budget=None) -> str | None:
+-    branch = refs.run_git(repo, [*config, "symbolic-ref", "--quiet", "--short", "HEAD"], budget=budget)
++def _branch_name(repo: Path, config: list[str], budget=None) -> str | None:
++    """Full refs avoid tag collisions; empty means detached, None means unknown."""
++    branch = refs.run_git(repo, [*config, "symbolic-ref", "--quiet", "HEAD"], budget=budget)
+     if branch["status"] != "ok" or branch["rc"] not in (0, 1):
+         return None
+-    name = branch["stdout"].strip()
++    if branch["rc"] == 1:
++        return ""
++    ref = branch["stdout"].strip()
++    if not ref.startswith("refs/heads/") or not ref.removeprefix("refs/heads/"):
++        return None
++    return ref.removeprefix("refs/heads/")
++
++
++def _default_target(repo: Path, config: list[str], budget=None) -> str | None:
++    name = _branch_name(repo, config, budget)
++    if name is None:
++        return None
+     keys = ([f"branch.{name}.pushRemote"] if name else []) + ["remote.pushDefault"]
+     if name:
+         keys.append(f"branch.{name}.remote")
+@@ -94,6 +106,31 @@
+     return None
+ 
+ 
++def _reject_implicit_push(repo: Path, config: list[str]) -> str | None:
++    """Check implicit destinations using the push's own configuration overrides."""
++    mode = _config(repo, config, "--get", "push.default")
++    if mode is None:
++        return "unknown"
++    mode = mode or "simple"
++    if mode == "matching":
++        return "broad"
++    if mode not in {"nothing", "current", "upstream", "tracking", "simple"}:
++        return "unknown"
++    name = _branch_name(repo, config)
++    if name is None:
++        return "unknown"
++    if not name:
++        return None
++    merges = _config(repo, config, "--get-all", f"branch.{name}.merge")
++    if merges is None:
++        return "unknown"
++    if mode in {"upstream", "tracking", "simple"}:
++        for spec in merges.splitlines():
++            if refused := reject_refspec(spec):
++                return refused
++    return None
++
++
+ def reject_publish_argv(argv: list[str], *, repo: Path | None = None,
+                         remote: str | None = None) -> str | None:
+     """Parse once: globals, options, target, then refspecs. No data is a config key."""
+@@ -114,7 +151,9 @@
+     if repo is not None:
+         if target is None:
+             return "unknown"
+-        return reject_configured_push(repo, remote=target, config=push.config)
++        if refused := reject_configured_push(repo, remote=target, config=push.config):
++            return refused
++        return _reject_implicit_push(repo, push.config) if not push.specs else None
+     # Lexical callers have no repo: only explicitly supplied target config applies.
+     if push.config:
+         if not target:
+@@ -125,7 +164,7 @@
+                 return "unknown"
+             if mirror == "true":
+                 return "mirror"
+-    return None
++    return "unknown" if not push.specs else None
+ 
+ 
+ def remote_transport(url: str) -> str:
+diff --git a/scripts/ci/upstream_sync_push_argv.py b/scripts/ci/upstream_sync_push_argv.py
+index d31139c4046..088f2223359 100644
+--- a/scripts/ci/upstream_sync_push_argv.py
++++ b/scripts/ci/upstream_sync_push_argv.py
+@@ -96,7 +96,9 @@
+         else:
+             positional.append(arg)
+     if repo_option is not None:
+-        result.target, result.specs = repo_option, positional
++        if positional:
++            result.refusal = "unknown"
++        result.target = repo_option
+     elif positional:
+         result.target, result.specs = positional[0], positional[1:]
+     return result
+diff --git a/tests/hermes_cli/test_source_custody_publication.py b/tests/hermes_cli/test_source_custody_publication.py
+index b7525219f13..13c60996479 100644
+--- a/tests/hermes_cli/test_source_custody_publication.py
++++ b/tests/hermes_cli/test_source_custody_publication.py
+@@ -177,3 +177,137 @@
+     colon_path = pub.prove(src, oid)
+     assert colon_path["status"] == "not_published"
+     assert colon_path["reason"] == "local_remote"
++
++
++@pytest.fixture
++def push_pair(tmp_path, monkeypatch):
++    """Review reproductions use only real Git and disposable local bare remotes."""
++    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
++    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
++    src, bare = _pair(tmp_path)
++    _git(src, "branch", "-M", "main")
++    _git(src, "config", "branch.main.remote", "origin")
++    _git(src, "config", "branch.main.merge", "refs/heads/main")
++    return src, bare
++
++
++def _guard_reason(src, argv):
++    from hermes_cli.kanban_source_removal import PublishRefused, guard_publish
++    try:
++        guard_publish(src, argv)
++    except PublishRefused as exc:
++        return exc.reason
++    return None
++
++
++@pytest.mark.parametrize("option", [["--repo=safe"], ["--repo", "safe"]])
++def test_push_repo_option_with_positional_refuses(push_pair, tmp_path, option):
++    src, bare = push_pair
++    safe = tmp_path / "safe.git"
++    _git(src, "init", "--bare", str(safe))
++    _git(src, "remote", "add", "safe", str(safe))
++    _git(src, "config", "remote.origin.mirror", "true")
++    custody = "refs/hermes-source-custody/fixture"
++    _git(src, "update-ref", custody, "HEAD")
++    argv = ["push", *option, "origin"]
++    reason = _guard_reason(src, argv)
++    # Counterfactual oracle: bypassing the guard leaks into this LOCAL fixture.
++    _git(src, *argv)
++    assert custody in _git(bare, "for-each-ref", "--format=%(refname)").stdout.splitlines()
++    assert reason == "unknown"
++
++
++@pytest.mark.parametrize("mode,override,tag", [
++    ("upstream", None, False), ("tracking", None, False),
++    ("current", "default", False), ("upstream", "merge", False),
++    ("upstream", None, True),
++])
++def test_push_implicit_custody_destination_refuses(push_pair, mode, override, tag):
++    src, bare = push_pair
++    custody = "refs/hermes-source-custody/fixture"
++    _git(src, "config", "push.default", mode)
++    if override == "merge":
++        # branch.merge is multivalued: -c adds, rather than replaces, its value.
++        _git(src, "config", "--unset", "branch.main.merge")
++    else:
++        _git(src, "config", "branch.main.merge", custody)
++    config = []
++    if override == "default":
++        config = ["-c", "push.default=upstream"]
++    elif override == "merge":
++        config = ["-c", f"branch.main.merge={custody}"]
++    if tag:
++        _git(src, "tag", "main")
++    argv = [*config, "push"]
++    reason = _guard_reason(src, argv)
++    _git(src, *argv)
++    assert custody in _git(bare, "for-each-ref", "--format=%(refname)").stdout.splitlines()
++    assert reason == "custody_namespace"
++
++
++def test_push_tag_collision_preserves_pushremote_check(push_pair, tmp_path):
++    src, _ = push_pair
++    mirror = tmp_path / "mirror.git"
++    _git(src, "init", "--bare", str(mirror))
++    _git(src, "remote", "add", "backup", str(mirror))
++    _git(src, "config", "remote.backup.mirror", "true")
++    _git(src, "config", "branch.main.pushRemote", "backup")
++    _git(src, "tag", "main")
++    assert _guard_reason(src, ["push"]) == "mirror"
++
++
++@pytest.mark.parametrize("mode,argv", [
++    (None, ["push", "origin", "HEAD:refs/heads/main"]),
++    ("upstream", ["push"]), (None, ["push"]),
++    (None, ["push", "--repo=safe"]),
++])
++def test_push_ordinary_real_remote_controls(push_pair, mode, argv):
++    src, bare = push_pair
++    if mode:
++        _git(src, "config", "push.default", mode)
++    _git(src, "remote", "add", "safe", str(bare))
++    assert _guard_reason(src, argv) is None
++    _git(src, *argv)
++    assert _git(bare, "for-each-ref", "--format=%(refname)").stdout.splitlines() == ["refs/heads/main"]
++
++
++@pytest.mark.parametrize("mode,expected", [("invalid-mode", "unknown"), ("matching", "broad")])
++def test_push_default_unknown_and_matching_refuse(push_pair, mode, expected):
++    src, _ = push_pair
++    _git(src, "config", "push.default", mode)
++    assert _guard_reason(src, ["push"]) == expected
++
++
++@pytest.mark.parametrize("argv", [["push"], ["push", "origin"], ["push", "--repo=safe"]])
++def test_push_lexical_implicit_destination_unknown(argv):
++    assert pub.reject_publish_argv(argv) == "unknown"
++
++
++@pytest.mark.parametrize("mode", [None, "simple", "upstream", "tracking"])
++def test_push_checks_all_merge_values_and_path_target(push_pair, mode):
++    src, bare = push_pair
++    if mode:
++        _git(src, "config", "push.default", mode)
++    _git(src, "config", "--add", "branch.main.merge", "refs/hermes-source-custody/second")
++    assert _guard_reason(src, ["push", str(bare)]) == "custody_namespace"
++
++
++@pytest.mark.parametrize("mode", ["nothing", "current"])
++def test_push_non_upstream_modes_allow_custody_merge(push_pair, mode):
++    src, _ = push_pair
++    _git(src, "config", "branch.main.merge", "refs/hermes-source-custody/unused")
++    _git(src, "config", "push.default", mode)
++    assert _guard_reason(src, ["push"]) is None
++
++
++def test_push_detached_head_has_no_branch_check(push_pair):
++    src, _ = push_pair
++    _git(src, "checkout", "--detach")
++    assert _guard_reason(src, ["push", "origin"]) is None
++
++
++def test_push_non_head_symbolic_ref_unknown(push_pair):
++    src, _ = push_pair
++    _git(src, "update-ref", "refs/other/fixture", "HEAD")
++    _git(src, "symbolic-ref", "HEAD", "refs/other/fixture")
++    assert _guard_reason(src, ["push", "origin"]) == "unknown"
+-- 
+2.43.0
+

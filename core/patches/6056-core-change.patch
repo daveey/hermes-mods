@@ -1,0 +1,164 @@
+From 7f57cdca198091f7d59b7dfeaef754780ba69265 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:37:22 +0000
+Subject: [PATCH 6056] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit 7f57cdca198091f7d59b7dfeaef754780ba69265.
+
+---
+diff --git a/hermes_cli/serve_producer_process.py b/hermes_cli/serve_producer_process.py
+index a354f76b389..d1667637314 100644
+--- a/hermes_cli/serve_producer_process.py
++++ b/hermes_cli/serve_producer_process.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import array
++import errno
+ import hashlib
+ import hmac
+ import importlib.util
+@@ -109,6 +110,15 @@
+     return Channel(socket.socket(fileno=fds[0]))
+ 
+ 
++def shutdown_channel(channel):
++    """Both broker threads may drain a channel already closed after child exit."""
++    try:
++        channel.sock.shutdown(socket.SHUT_RDWR)
++    except OSError as exc:
++        if exc.errno not in (errno.EBADF, errno.ENOTCONN):
++            raise
++
++
+ def broker(channel, config):
+     from hermes_cli._startup_fast import project_root_str
+     from hermes_cli.serve_producer_enrollment import BrokerEnrollment
+@@ -160,7 +170,7 @@
+             data_error.append(type(exc).__name__)
+             stop.set()
+         finally:
+-            data.sock.shutdown(socket.SHUT_RDWR)
++            shutdown_channel(data)
+             data.close()
+             child.wait()
+ 
+@@ -190,7 +200,7 @@
+         stop.set()
+         # EOF requests child shutdown when it finishes its current call. An
+         # unresponsive child keeps the inherited family fence, even if we exit.
+-        data.sock.shutdown(socket.SHUT_RDWR)
++        shutdown_channel(data)
+         channel.sock.shutdown(socket.SHUT_RDWR)
+         channel.close()
+         control.close()
+diff --git a/hermes_cli/serve_producer_runtime.py b/hermes_cli/serve_producer_runtime.py
+index 717666e25d7..ea2d163e401 100644
+--- a/hermes_cli/serve_producer_runtime.py
++++ b/hermes_cli/serve_producer_runtime.py
+@@ -245,13 +245,17 @@
+         self._wake.set()
+         with self._lock:
+             self._outputs.clear()
+-        if self._control is not None:
+-            with self._control_lock:
+-                self._control.send(self._envelope('STOP'), secrets.token_hex(8))
+-                self._control.close()
+-                self._control = None
+-        elif self._channel is not None:
+-            self._channel.close()
++        with self._control_lock:
++            if self._control is not None:
++                try:
++                    self._control.send(self._envelope('STOP'), secrets.token_hex(8))
++                except (BrokenPipeError, ConnectionResetError):
++                    pass  # peer already drained; waitpid below still proves exit
++                finally:
++                    self._control.close()
++                    self._control = None
++            elif self._channel is not None:
++                self._channel.close()
+         if self._process is not None:
+             try:
+                 self._process.wait(timeout=timeout)
+diff --git a/tests/hermes_cli/test_serve_producer_runtime.py b/tests/hermes_cli/test_serve_producer_runtime.py
+index d1b2de78bcf..19aa0a6775a 100644
+--- a/tests/hermes_cli/test_serve_producer_runtime.py
++++ b/tests/hermes_cli/test_serve_producer_runtime.py
+@@ -109,7 +109,7 @@
+ 
+ 
+ @pytest.mark.platforms('posix')
+-def test_actual_crash_restarts_child_before_acknowledging(tmp_path):
++def test_actual_crash_restarts_child_before_acknowledging(tmp_path, capfd):
+     from hermes_cli.serve_producer_runtime import ProjectionRelay
+ 
+     path = tmp_path / 'crash.py'
+@@ -131,6 +131,7 @@
+         assert relay.ping()['child_pid'] != old
+     finally:
+         assert relay.close()
++    assert 'Traceback' not in capfd.readouterr().err
+ 
+ 
+ def test_mailbox_has_hard_count_bound_and_no_partial_overload(tmp_path):
+diff --git a/tests/hermes_cli/test_serve_producer_teardown.py b/tests/hermes_cli/test_serve_producer_teardown.py
+new file mode 100644
+index 00000000000..f40abdb888c
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_teardown.py
+@@ -0,0 +1,51 @@
++"""Broker cleanup must reap failed producers without a second cleanup failure."""
++import hashlib
++
++import pytest
++
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('posix')
++def test_exhausted_restart_closes_cleanly(tmp_path, capfd):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    provider = tmp_path / 'crash.py'
++    provider.write_text('import os\ndef produce(payload):\n    os._exit(7)\n', encoding='utf-8')
++    relay = ProjectionRelay(
++        {'path': str(provider), 'sha256': hashlib.sha256(provider.read_bytes()).hexdigest()},
++        home=tmp_path, runtime=tmp_path / 'runtime', generation='g')
++    try:
++        relay.start_for_fixture()
++        relay.submit({'value': 'crash'})
++        wait_until(lambda: relay.error is not None, timeout=20)
++    finally:
++        assert relay.close(timeout=10)
++    assert 'Traceback' not in capfd.readouterr().err
++    assert not relay.is_alive()
++    from hermes_cli.serve_producer_custody import FamilyCustody
++    successor = FamilyCustody.acquire(tmp_path / 'runtime', 'panel')
++    successor.close()
++
++
++@pytest.mark.parametrize('error', [None, 'EBADF', 'ENOTCONN', 'EIO'])
++def test_shutdown_only_tolerates_completed_channel_teardown(error):
++    import errno
++    import socket
++    from types import SimpleNamespace
++    from hermes_cli.serve_producer_process import shutdown_channel
++
++    calls = []
++
++    def shutdown(how):
++        calls.append(how)
++        if error is not None:
++            raise OSError(getattr(errno, error), error)
++
++    channel = SimpleNamespace(sock=SimpleNamespace(shutdown=shutdown))
++    if error == 'EIO':
++        with pytest.raises(OSError, match='EIO'):
++            shutdown_channel(channel)
++    else:
++        shutdown_channel(channel)
++    assert calls == [socket.SHUT_RDWR]
+-- 
+2.43.0
+

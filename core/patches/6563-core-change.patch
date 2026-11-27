@@ -1,0 +1,221 @@
+From 84eba2b9afad81f522019ade299128a818da0034 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:31:04 +0000
+Subject: [PATCH 6563] Kanban sync refusal audits and diagnostic drift supersession
+
+Public mirror of source commit 84eba2b9afad81f522019ade299128a818da0034.
+
+---
+diff --git a/hermes_cli/kanban_sync_actionability_drift.py b/hermes_cli/kanban_sync_actionability_drift.py
+index 452b482412a..baf1b8d9839 100644
+--- a/hermes_cli/kanban_sync_actionability_drift.py
++++ b/hermes_cli/kanban_sync_actionability_drift.py
+@@ -30,7 +30,22 @@
+             and [d['id'] for d in deps] == sorted({d['id'] for d in deps}))
+ 
+ 
+-def _source(conn, task_id):
++def _foreign_parent(shadow, parent_id, gateway):
++    """Only a fresh report cut may supply an intentionally unimported parent."""
++    if shadow is None or not isinstance(gateway, str) or not gateway:
++        return None
++    row = shadow.execute('SELECT * FROM tasks WHERE id=?', (parent_id,)).fetchone()
++    if row is None:
++        return None
++    parent = dict(row)
++    owner, version = parent.get('created_on'), parent.get('sync_version')
++    if (not isinstance(owner, str) or not owner or owner == gateway
++            or parent.get('deleted_at') is not None or type(version) is not int or version <= 0):
++        return None
++    return parent['status'], parent['containment_episode']
++
++
++def _source(conn, task_id, *, parent_shadow=None, gateway=None):
+     from hermes_cli.kanban_actionability_selection import select
+ 
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+@@ -58,6 +73,8 @@
+     deps = []
+     for (pid,) in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,)):
+         parent = conn.execute('SELECT status,containment_episode FROM tasks WHERE id=?', (pid,)).fetchone()
++        if parent is None:
++            parent = _foreign_parent(parent_shadow, pid, gateway)
+         if parent is None:
+             return None
+         status = 'triage' if parent[0] in ('done', 'archived') and parent[1] else parent[0]
+@@ -67,7 +84,7 @@
+             'source_uids': [{'uid': event['uid']}], 'dependencies': deps}
+ 
+ 
+-def audited_rejection(live, shadow, op):
++def audited_rejection(live, shadow, op, *, fresh_gateway=None):
+     """Require intact rejected command custody and agreeing, changed source facts."""
+     if (op.get('op') != transport.KIND or op.get('table_name') != 'tasks'
+             or op.get('state') != 'rejected' or op.get('last_error') != 'actionability_source_changed'):
+@@ -102,7 +119,11 @@
+             from hermes_cli.kanban_sync_actionability_terminal import superseded
+             return superseded(live, shadow, wire['task'], frozen['source_uids'][0]['uid'])
+         comparable = {**frozen, 'source_uids': [{'uid': s['uid']} for s in frozen['source_uids']]}
+-        current, replica = _source(live, wire['task']), _source(shadow, wire['task'])
++        # fresh_gateway is supplied only under the refusal report's authenticated
++        # empty-feed/generation cut. Direct diff/retirement callers get no fallback.
++        current = _source(live, wire['task'], parent_shadow=shadow if fresh_gateway else None,
++                          gateway=fresh_gateway)
++        replica = _source(shadow, wire['task'])
+         return _valid_facts(current, portable_only=True) and current == replica and current != comparable
+     except (ValueError, TypeError, KeyError, sqlite3.Error):
+         return False  # Unknown schema, malformed custody or missing source stays dirty.
+diff --git a/hermes_cli/kanban_sync_refusal_audit.py b/hermes_cli/kanban_sync_refusal_audit.py
+index d1e3edd8e2d..c61f7f6528d 100644
+--- a/hermes_cli/kanban_sync_refusal_audit.py
++++ b/hermes_cli/kanban_sync_refusal_audit.py
+@@ -90,6 +90,11 @@
+         _require([_generation(c) for c in (live, shadow)] == generations and _rows(live) == rows,
+                  'local_cut_inputs_changed')
+         result = diff(live, shadow, identity[2])
++        from hermes_cli.kanban_sync_actionability_drift import audited_rejection
++
++        diagnostic_audits = [r['op_id'] for r in rows
++                             if audited_rejection(live, shadow, r, fresh_gateway=identity[2])]
++        result['audited_retain_rejections'] = sorted(set(result['audited_retain_rejections']) | set(diagnostic_audits))
+         result['audited_server_refusals'] = [p['op_id'] for p in proofs]
+         audits = set(result['audited_server_refusals']) | set(result['audited_retain_rejections'])
+         result['clean'] = not (result['missing_in_shadow'] or result['extra_in_shadow']
+diff --git a/tests/hermes_cli/test_kanban_sync_partition_audit.py b/tests/hermes_cli/test_kanban_sync_partition_audit.py
+new file mode 100644
+index 00000000000..d68c7fd79ed
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_partition_audit.py
+@@ -0,0 +1,129 @@
++"""Foreign parents are evidence only inside the authenticated fresh report cut."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_actionability_drift as diagnostic
++from hermes_cli import kanban_sync_refusal_audit as audit
++from hermes_cli.kanban_history_residue_source import Refused
++
++pytest_plugins = ['tests.hermes_cli.test_kanban_sync_actionability_drift']
++
++
++@pytest.fixture
++def partition(stores):
++    live, shadow, op = stores
++    for conn in (live, shadow):
++        conn.execute('CREATE TABLE kanban_sync_state(board_id TEXT, gateway_id TEXT, cursor INTEGER)')
++        conn.execute("INSERT INTO kanban_sync_state VALUES ('default','macbook',100)")
++        conn.execute("UPDATE tasks SET created_on='foreign' WHERE id='t_parent'")
++    live.execute("DELETE FROM tasks WHERE id='t_parent'")
++    for conn in (live, shadow):
++        conn.commit()
++    hub = SimpleNamespace(ident=SimpleNamespace(url='https://example.test', gateway='macbook', key='key'),
++                          changes=lambda *a: dict(changes=[], more=False, head=100, next=100))
++    return live, shadow, op, hub
++
++
++def test_partition_report_preserves_custody_and_plain_diff_stays_dirty(partition):
++    from hermes_cli.kanban_sync_client import diff
++
++    live, shadow, op, hub = partition
++    before = [list(c.iterdump()) for c in (live, shadow)]
++    assert diagnostic._source(live, 't_card') is None
++    assert not diagnostic.audited_rejection(live, shadow, op)
++    assert not diff(live, shadow, 'macbook')['clean']
++    result = audit.report(live, shadow, hub, 'default')
++    assert result['clean'], result
++    assert result['audited_retain_rejections'] == [op['op_id']]
++    assert result['rejected_ops'] == 1
++    assert [list(c.iterdump()) for c in (live, shadow)] == before
++
++
++@pytest.mark.parametrize('fault', [
++    'missing_parent', 'own_parent', 'unknown_owner', 'deleted_parent', 'unversioned_parent',
++    'live_disagreement', 'source_disagreement', 'missing_original', 'custody', 'returned_premise',
++    'empty_owner', 'zero_version', 'negative_version', 'text_version',
++])
++def test_partition_unknown_or_disagreeing_evidence_stays_dirty(partition, fault):
++    live, shadow, _op, hub = partition
++    statements = {
++        'missing_parent': (shadow, "DELETE FROM tasks WHERE id='t_parent'"),
++        'own_parent': (shadow, "UPDATE tasks SET created_on='macbook' WHERE id='t_parent'"),
++        'unknown_owner': (shadow, "UPDATE tasks SET created_on=NULL WHERE id='t_parent'"),
++        'deleted_parent': (shadow, "UPDATE tasks SET deleted_at=1 WHERE id='t_parent'"),
++        'unversioned_parent': (shadow, "UPDATE tasks SET sync_version=NULL WHERE id='t_parent'"),
++        'live_disagreement': (live, "INSERT INTO tasks VALUES ('t_parent',NULL,'ready','default',NULL,NULL,1,'foreign')"),
++        'source_disagreement': (shadow, "INSERT INTO task_events VALUES (2,'new','t_card','linked',124,'{}',NULL)"),
++        'missing_original': (live, "DELETE FROM task_events"),
++        'custody': (live, "UPDATE kanban_actionability_commands SET request_sha256='bad'"),
++        'empty_owner': (shadow, "UPDATE tasks SET created_on='' WHERE id='t_parent'"),
++        'zero_version': (shadow, "UPDATE tasks SET sync_version=0 WHERE id='t_parent'"),
++        'negative_version': (shadow, "UPDATE tasks SET sync_version=-1 WHERE id='t_parent'"),
++        'text_version': (shadow, "UPDATE tasks SET sync_version='unknown' WHERE id='t_parent'"),
++        'returned_premise': (shadow, "UPDATE tasks SET status='running' WHERE id='t_parent'"),
++    }
++    conn, sql = statements[fault]
++    conn.execute(sql)
++    conn.commit()
++    result = audit.report(live, shadow, hub, 'default')
++    assert not result['clean']
++    assert not result['audited_retain_rejections']
++
++
++@pytest.mark.parametrize('fault', ['cursor', 'source', 'feed'])
++def test_partition_cut_mutation_refuses_before_audit(partition, fault):
++    live, shadow, _op, hub = partition
++    calls = []
++    def changes(*args):
++        calls.append(args)
++        if len(calls) == 2:
++            if fault == 'cursor':
++                shadow.execute('UPDATE kanban_sync_state SET cursor=101')
++                shadow.commit()
++            elif fault == 'source':
++                live.execute("UPDATE task_events SET payload=?", (json.dumps({'changed': True}),))
++                live.commit()
++            else:
++                return dict(changes=[], more=False, head=101, next=101)
++        return dict(changes=[], more=False, head=100, next=100)
++    hub.changes = changes
++    with pytest.raises(Refused):
++        audit.report(live, shadow, hub, 'default')
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_partition_contained_parent_does_not_satisfy_frozen_triage(partition, status):
++    from tests.hermes_cli.test_kanban_sync_actionability_drift import _refreeze
++
++    live, shadow, op, hub = partition
++    facts = json.loads(op['fields'])['payload']['facts']
++    facts['dependencies'][0]['status'] = 'triage'
++    _refreeze(live, op, facts)
++    live.execute('UPDATE kanban_sync_outbox SET op_id=?,fields=?', (op['op_id'], op['fields']))
++    shadow.execute("UPDATE tasks SET status=?,containment_episode='held' WHERE id='t_parent'", (status,))
++    for conn in (live, shadow):
++        conn.commit()
++    result = audit.report(live, shadow, hub, 'default')
++    assert not result['clean']
++    assert not result['audited_retain_rejections']
++
++
++def test_missing_replica_parent_returns_no_evidence(partition):
++    _live, shadow, _op, _hub = partition
++    shadow.execute("DELETE FROM tasks WHERE id='t_parent'")
++    assert diagnostic._foreign_parent(shadow, 't_parent', 'macbook') is None
++
++
++def test_partition_new_source_cannot_replace_missing_original(partition):
++    live, shadow, _op, hub = partition
++    for conn in (live, shadow):
++        conn.execute("INSERT INTO task_events VALUES (2,'new-source','t_card','linked',124,'{}',NULL)")
++    live.execute("DELETE FROM task_events WHERE uid='source'")
++    for conn in (live, shadow):
++        conn.commit()
++    result = audit.report(live, shadow, hub, 'default')
++    assert not result['clean']
++    assert not result['audited_retain_rejections']
++
+-- 
+2.43.0
+

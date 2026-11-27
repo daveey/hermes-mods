@@ -1,0 +1,121 @@
+From 9a3764fc2ffa2f337eb6c226f3aaaff379019c2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:42:34 -0800
+Subject: [PATCH 6116] TUI RPC method lanes, projects tree caching and GC budget
+
+Public mirror of source commit 9a3764fc2ffa2f337eb6c226f3aaaff379019c2b.
+
+---
+diff --git a/tests/tui_gateway/test_rpc_method_lanes.py b/tests/tui_gateway/test_rpc_method_lanes.py
+index a7ecff2a651..43bc18c12d1 100644
+--- a/tests/tui_gateway/test_rpc_method_lanes.py
++++ b/tests/tui_gateway/test_rpc_method_lanes.py
+@@ -165,6 +165,67 @@
+     assert sorted(done) == [0, 1, 2]
+ 
+ 
++def test_interrupt_during_a_handoff_still_settles_the_lane_before_it_propagates():
++    """A non-Exception from ``submit`` while handing a slot over: the waiting calls keep their done
++    hooks, the lane ends empty, and the interrupt is re-raised rather than swallowed."""
++    lanes = MethodLanes(1)
++    done, seen = [], []
++
++    class Future:
++        def add_done_callback(self, fn):
++            self.fn = fn
++
++        def cancelled(self):
++            return False
++
++    first = Future()
++    submits = iter([first])
++
++    def submit(fn):
++        try:
++            return next(submits)
++        except StopIteration:
++            raise KeyboardInterrupt from None
++
++    lanes.run(submit, "slow", lambda: None, lambda: done.append(0))
++    lanes.run(submit, "slow", lambda: None, lambda: done.append(1))
++    lanes.run(submit, "slow", lambda: None, lambda: done.append(2))
++    try:
++        first.fn(first)  # call 0 finishes: handing over to 1 and then 2 is interrupted both times
++    except KeyboardInterrupt:
++        seen.append("interrupt")
++    assert done == [0, 1, 2] and seen == ["interrupt"] and lanes.snapshot() == {}
++
++
++def test_cancel_with_no_thread_available_releases_waiting_calls_unstarted(monkeypatch):
++    lanes = MethodLanes(1)
++    release, done, ran = threading.Event(), [], []
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        futures = []
++
++        def submit(fn):
++            futures.append(pool.submit(fn))
++            return futures[-1]
++
++        blocker = pool.submit(release.wait, 10)
++        try:
++            lanes.run(submit, "slow", lambda: ran.append(0), lambda: done.append(0))
++            lanes.run(submit, "slow", lambda: ran.append(1), lambda: done.append(1))
++            lanes.run(submit, "slow", lambda: ran.append(2), lambda: done.append(2))
++
++            def no_thread(*args, **kwargs):
++                raise RuntimeError("can't start new thread")
++
++            monkeypatch.setattr(threading.Thread, "start", no_thread)
++            assert futures[0].cancel()
++            monkeypatch.undo()
++            assert done == [0, 1, 2] and len(futures) == 1 and lanes.snapshot() == {}
++        finally:
++            release.set()
++        blocker.result(10)
++    assert ran == []
++
++
+ class Transport:
+     def __init__(self):
+         self.frames = queue.Queue()
+diff --git a/tui_gateway/rpc_method_lanes.py b/tui_gateway/rpc_method_lanes.py
+index b2fee137f9d..abbc5f057d8 100644
+--- a/tui_gateway/rpc_method_lanes.py
++++ b/tui_gateway/rpc_method_lanes.py
+@@ -83,13 +83,20 @@
+                 # A cancel runs this callback on the cancelling thread. ``shutdown(cancel_futures=True)``
+                 # cancels while holding the executor's own lock, and ``submit`` takes that lock: handing
+                 # the slot over inline would deadlock the shutdown. Hand over from a thread of its own.
+-                threading.Thread(  # health: allow HX012 -- hand-off only: each call runs in the context it captured at dispatch
+-                    target=self._finished, args=(method,), name="tui-rpc-lane-handoff", daemon=True).start()
++                try:
++                    threading.Thread(  # health: allow HX012 -- hand-off only: each call runs in the context it captured at dispatch
++                        target=self._finished, args=(method,), name="tui-rpc-lane-handoff", daemon=True).start()
++                except RuntimeError:  # no thread to be had (interpreter exit, thread limit): release, start nothing
++                    logger.warning("rpc pool: no hand-off thread for %s; releasing its waiting calls unstarted",
++                                   method, exc_info=True)
++                    self._finished(method, start=False)
+             else:
+                 self._finished(method)
+ 
+-    def _finished(self, method: str) -> None:
+-        """One call of *method* left the pool: hand its slot to the next waiting call, else free it."""
++    def _finished(self, method: str, start: bool = True) -> None:
++        """One call of *method* left the pool: hand its slot to the next waiting call, else free it.
++        ``start=False`` (no thread from which ``submit`` is safe): the waiting calls are released
++        unstarted, each with its done hook, and the slot is freed."""
+         interrupt: BaseException | None = None  # a non-Exception from ``submit``: re-raised once the lane is settled
+         while True:
+             with self._lock:
+@@ -107,6 +114,8 @@
+                     return
+                 submit, fn, on_done = queue.popleft()
+             try:
++                if not start:
++                    raise RuntimeError("no thread available to start a waiting call")
+                 future = submit(fn)
+             except BaseException as exc:  # the pool is shut down: the call never runs, its caller's cleanup still does
+                 logger.warning("rpc pool: could not start a waiting %s call", method, exc_info=True)
+-- 
+2.43.0
+

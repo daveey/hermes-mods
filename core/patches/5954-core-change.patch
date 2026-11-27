@@ -1,0 +1,193 @@
+From d5e6bc43397310c477282328d7bd65901f2ff9d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:11:39 +0000
+Subject: [PATCH 5954] Fact change feed: bounded failure logging and busy-open tolerance
+
+Public mirror of source commit d5e6bc43397310c477282328d7bd65901f2ff9d7.
+
+---
+diff --git a/hermes_cli/fact_feed.py b/hermes_cli/fact_feed.py
+index 1851cbf53bd..119ddc6c98a 100644
+--- a/hermes_cli/fact_feed.py
++++ b/hermes_cli/fact_feed.py
+@@ -17,6 +17,18 @@
+ 
+ log = logging.getLogger(__name__)
+ _RETRY = (0.1, 0.2, 0.4, 1.0, 2.0, 5.0)
++_REMIND_EVERY = 60  # attempts; ~5 minutes at the max backoff
++
++
++def _busy(exc):
++    try:
++        return is_busy(exc)
++    except Exception:  # health: allow BLE001 -- odd sqlite_errorcode on a foreign exception is simply not busy
++        return False
++
++
++def _visible(attempt):
++    return attempt in (1, len(_RETRY)) or attempt % _REMIND_EVERY == 0
+ 
+ 
+ 
+@@ -30,6 +42,8 @@
+     active: bool = True
+     watch: object = None
+     publication: object = field(default_factory=threading.RLock)
++    # Owner-thread only: exception types already traced in this failure streak.
++    traced: set = field(default_factory=set)
+ 
+ 
+ class Registration:
+@@ -141,6 +155,7 @@
+                     source.cursor = capture.after
+                     source.failures = 0
+                     source.retry_at = None
++                    source.traced.clear()
+                     # Deadlines use monotonic time, not observed_at's UTC clock.
+                     deadline = getattr(capture, "next_deadline", None)
+                     if deadline is not None:
+@@ -159,11 +174,13 @@
+             # One traceback per failure streak, none for an expected busy open:
+             # formatting a traceback per retry under the shared logging lock
+             # starved the gateway event loop until its watchdog exited (75).
+-            attempt, busy = source.failures + 1, is_busy(exc)
+-            if attempt == 1 and not busy:
+-                log.exception("source capture/publication failed; retaining cursor")
++            # Each new exception type in a streak still gets its traceback.
++            attempt, busy = source.failures + 1, _busy(exc)
++            if not busy and ("capture", type(exc)) not in source.traced:
++                source.traced.add(("capture", type(exc)))
++                log.exception("source capture/publication failed (attempt %d); retaining cursor", attempt)
+             else:
+-                log.log(logging.WARNING if attempt in (1, len(_RETRY)) else logging.DEBUG,
++                log.log(logging.WARNING if _visible(attempt) else logging.DEBUG,
+                         "source capture/publication failed (attempt %d%s); retaining cursor: %s",
+                         attempt, ", busy" if busy else "", exc)
+             with source.publication:
+@@ -175,8 +192,14 @@
+                     source.due = source.retry_at
+                 try:
+                     self._failure(source.adapter, exc)
+-                except Exception:
+-                    log.exception("source health publication failed; retry remains armed")
++                except Exception as health_exc:
++                    if ("health", type(health_exc)) not in source.traced:
++                        source.traced.add(("health", type(health_exc)))
++                        log.exception("source health publication failed; retry remains armed")
++                    else:
++                        log.log(logging.WARNING if _visible(attempt) else logging.DEBUG,
++                                "source health publication failed (attempt %d); retry remains armed: %s",
++                                attempt, health_exc)
+ 
+     def _run(self):
+         while (source := self._next()) is not None:
+diff --git a/tests/hermes_cli/test_fact_feed.py b/tests/hermes_cli/test_fact_feed.py
+index 5d11e348020..ad37f184d5a 100644
+--- a/tests/hermes_cli/test_fact_feed.py
++++ b/tests/hermes_cli/test_fact_feed.py
+@@ -150,37 +150,80 @@
+         feed.close()
+ 
+ 
+-def _failing_feed(error, attempts):
+-    source = Adapter()
+-    failures, done = [], threading.Event()
++
++def _sqlite_busy():
++    exc = sqlite3.OperationalError("database is locked: SQLite tracking registry is busy")
++    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
++    return exc
++
++
++def _run_failing(errors, attempts, *, failure_error=None):
++    """Drive `attempts` failed captures; errors[i] (last repeats) raises on attempt i+1."""
++    source, calls = Adapter(), []
++    done = threading.Event()
+     def capture(cursor):
+-        raise error()
++        calls.append(cursor)
++        raise errors[min(len(calls), len(errors)) - 1]()
+     source.capture_hook = capture
++    seen = []
+     def failure(adapter, exc):
+-        failures.append(exc)
+-        if len(failures) >= attempts:
++        seen.append(exc)
++        if len(seen) >= attempts:
+             done.set()
+-    return source, done, ChangeFeed(lambda *args: None, failure)
++        if failure_error is not None:
++            raise failure_error()
++    feed = ChangeFeed(lambda *args: None, failure)
++    try:
++        feed.register(source)
++        assert done.wait(10)
++    finally:
++        feed.close()
+ 
+ 
+-def _busy():
+-    exc = sqlite3.OperationalError("database is locked: SQLite tracking registry is busy")
+-    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+-    return exc
++def _feed_records(caplog, text):
++    return [r for r in caplog.records if r.name == "hermes_cli.fact_feed" and text in r.getMessage()]
++
+ 
++@pytest.fixture
++def fast_retry(monkeypatch):
++    from hermes_cli import fact_feed
++    monkeypatch.setattr(fact_feed, "_RETRY", (0.001,) * 6)
++    monkeypatch.setattr(fact_feed, "_REMIND_EVERY", 8)
++    return fact_feed
+ 
+-@pytest.mark.parametrize("error, tracebacks", [(_busy, 0), (lambda: RuntimeError("defect"), 1)])
+-def test_retry_streak_logs_at_most_one_traceback(caplog, error, tracebacks):
++
++@pytest.mark.parametrize("error, tracebacks", [(_sqlite_busy, 0), (lambda: RuntimeError("defect"), 1)])
++def test_retry_streak_logs_at_most_one_traceback(caplog, fast_retry, error, tracebacks):
+     # Each retry used to format a full traceback under the logging lock; at ~2/s
+     # across sources that stalled the gateway event loop past its watchdog.
+     caplog.set_level(logging.DEBUG, logger="hermes_cli.fact_feed")
+-    source, done, feed = _failing_feed(error, 3)
+-    try:
+-        feed.register(source)
+-        assert done.wait(5)
+-    finally:
+-        feed.close()
+-    records = [r for r in caplog.records if r.name == "hermes_cli.fact_feed"]
+-    assert len(records) >= 3
++    _run_failing([error], 8)
++    records = _feed_records(caplog, "capture/publication failed")[:8]
++    assert len(records) == 8
+     assert sum(r.exc_info is not None for r in records) == tracebacks
+-    assert sum(r.levelno >= logging.WARNING for r in records) <= 2
++    # Still visible: attempt 1, max backoff (6) and the periodic reminder (8).
++    visible = [i + 1 for i, r in enumerate(records) if r.levelno >= logging.WARNING]
++    assert visible == [1, 6, 8]
++
++
++def test_defect_after_busy_start_still_traced(caplog, fast_retry):
++    caplog.set_level(logging.DEBUG, logger="hermes_cli.fact_feed")
++    _run_failing([_sqlite_busy, lambda: RuntimeError("defect"), lambda: KeyError("other")], 5)
++    traced = [r for r in _feed_records(caplog, "capture/publication failed") if r.exc_info]
++    assert [r.exc_info[0] for r in traced] == [RuntimeError, KeyError]
++
++
++def test_failing_health_callback_traced_once(caplog, fast_retry):
++    caplog.set_level(logging.DEBUG, logger="hermes_cli.fact_feed")
++    _run_failing([_sqlite_busy], 4, failure_error=lambda: ValueError("health down"))
++    records = _feed_records(caplog, "health publication failed")
++    assert len(records) >= 4
++    assert sum(r.exc_info is not None for r in records) == 1
++
++
++def test_foreign_errorcode_is_not_busy_and_feed_survives():
++    from hermes_cli.fact_feed import _busy
++    exc = RuntimeError("x")
++    exc.sqlite_errorcode = "weird"
++    assert _busy(exc) is False
++    assert _busy(_sqlite_busy()) is True
+-- 
+2.43.0
+

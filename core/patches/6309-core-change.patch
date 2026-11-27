@@ -1,0 +1,115 @@
+From f768214229c867a97c5ba16d19dc130c3c51c7e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:34:02 +0000
+Subject: [PATCH 6309] Immutable historical rejection observations and fresh audit cuts
+
+Public mirror of source commit f768214229c867a97c5ba16d19dc130c3c51c7e9.
+
+---
+diff --git a/docs/history-residue-audit.md b/docs/history-residue-audit.md
+index 53e48858fdd..c7429d92fd6 100644
+--- a/docs/history-residue-audit.md
++++ b/docs/history-residue-audit.md
+@@ -26,7 +26,11 @@
+ The consumer matches the full exact source, local event, sealed receipt and
+ portable local/replica/canonical parent, and vetoes active workers, claims, leases,
+ new local work, tombstones, omissions and quarantine. Existing containment/spend
+-restrictions are retained, not released. All network reads occur without SQLite
++restrictions are retained, not released. Unresolved run operations or omissions
++whose run row is already absent cannot be attributed to a parent, so they veto
++this board's audit cut conservatively. Settled tombstones without unresolved
++work do not. No missing run is restored or deleted by this diagnostic.
++All network reads occur without SQLite
+ writer reservations. Final zero-wait reservations compare the original snapshots
+ and build the actual diff before releasing them. The 30-second monotonic evidence
+ budget includes refresh, local lock acquisition, HTTP and final comparisons.
+diff --git a/hermes_cli/kanban_history_residue_local.py b/hermes_cli/kanban_history_residue_local.py
+index 52f143d1757..6050e8b44ba 100644
+--- a/hermes_cli/kanban_history_residue_local.py
++++ b/hermes_cli/kanban_history_residue_local.py
+@@ -67,6 +67,15 @@
+         _require(key in task and task[key] is None, 'local_executor_active')
+     runs = _rows(conn, 'SELECT * FROM task_runs WHERE task_id=? ORDER BY id', (task_id,))
+     _require(all(r['ended_at'] is not None and r['status'] != 'running' for r in runs), 'local_running_run')
++    # A run DELETE carries fields={} after its row disappears. Its parent cannot
++    # be recovered from the remaining UID: fail closed on unresolved orphan
++    # work anywhere on this board, not on settled historical tombstones alone.
++    orphan_ops = _rows(conn, "SELECT * FROM kanban_sync_outbox o WHERE table_name='task_runs' "
++                       "AND NOT EXISTS (SELECT 1 FROM task_runs r WHERE r.uid=o.row_uid) ORDER BY op_id")
++    orphan_omissions = _rows(conn, "SELECT * FROM kanban_sync_omissions o WHERE table_name='task_runs' "
++                             "AND state!='delivered' AND NOT EXISTS "
++                             "(SELECT 1 FROM task_runs r WHERE r.uid=o.row_uid) ORDER BY row_uid,field")
++    _require(not orphan_ops and not orphan_omissions, 'unattributed_run_work')
+     events = _rows(conn, 'SELECT * FROM task_events WHERE uid=? ORDER BY id', (event,))
+     if replica:
+         _require(not events, 'replica_event_present')
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cut.py b/tests/hermes_cli/test_kanban_history_residue_cut.py
+index a09a16f56c4..6ae0b9df6e7 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_cut.py
++++ b/tests/hermes_cli/test_kanban_history_residue_cut.py
+@@ -106,6 +106,28 @@
+     assert diff(live, shadow, 'home')['rejected_ops'] == 1
+ 
+ 
++@pytest.mark.parametrize('during_http', [False, True])
++def test_absent_run_omission_cannot_clean_cut(cut_inputs, monkeypatch, during_http):
++    live, _shadow, _db, _hub, _data, _calls = cut_inputs
++
++    def insert():
++        live.execute("INSERT INTO kanban_sync_omissions VALUES ('task_runs','gone','ended_at','held')")
++
++    if during_http:
++        old = cut.transport.current
++
++        def current(*args):
++            result = old(*args)
++            insert()
++            return result
++
++        monkeypatch.setattr(cut.transport, 'current', current)
++    else:
++        insert()
++    with pytest.raises(Refused, match='unattributed_run_work'):
++        verify(cut_inputs)
++
++
+ def test_unrelated_rejection_is_not_subtracted(cut_inputs):
+     live, _shadow, _db, _hub, _data, _calls = cut_inputs
+     live.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,state) VALUES ('unknown','tasks','unrelated','rejected')")
+diff --git a/tests/hermes_cli/test_kanban_history_residue_local.py b/tests/hermes_cli/test_kanban_history_residue_local.py
+index ae869365023..be86e2fa5e0 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_local.py
++++ b/tests/hermes_cli/test_kanban_history_residue_local.py
+@@ -120,6 +120,29 @@
+     assert local.snapshot(live, raw, board='default', gateway='home', replica=False) != first
+ 
+ 
++@pytest.mark.parametrize('replica', [False, True])
++@pytest.mark.parametrize('fault', ['omission', 'op'])
++def test_absent_run_unsettled_custody_is_not_hidden(stores, replica, fault):
++    live, shadow, raw = stores
++    conn = shadow if replica else live
++    statements = {
++        'omission': "INSERT INTO kanban_sync_omissions VALUES ('task_runs','gone','ended_at','held')",
++        'op': "INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,state) VALUES ('run-delete','task_runs','gone','delete','{}','pending')",
++    }
++    conn.execute(statements[fault])
++    with pytest.raises(Refused, match='unattributed_run_work'):
++        local.snapshot(conn, raw, board='default', gateway='home', replica=replica)
++
++
++@pytest.mark.parametrize('replica', [False, True])
++def test_settled_absent_run_tombstone_is_not_unsettled_work(stores, replica):
++    live, shadow, raw = stores
++    conn = shadow if replica else live
++    conn.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_runs','gone',99)")
++    conn.execute("INSERT INTO kanban_sync_omissions VALUES ('task_runs','gone','ended_at','delivered')")
++    assert local.snapshot(conn, raw, board='default', gateway='home', replica=replica)['tombstones'] == []
++
++
+ @pytest.mark.parametrize('replica', [False, True])
+ @pytest.mark.parametrize('fault', ['tombstone','omission','op'])
+ def test_run_repair_custody_is_not_hidden_by_terminal_parent(stores, replica, fault):
+-- 
+2.43.0
+

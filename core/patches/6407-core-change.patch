@@ -1,0 +1,1646 @@
+From 3946c1fd9235ed99acf66df318c9ed897b8cac1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:42:40 +0000
+Subject: [PATCH 6407] Bounded private code-provenance diagnostic snapshots
+
+Public mirror of source commit 3946c1fd9235ed99acf66df318c9ed897b8cac1a.
+
+---
+diff --git a/gateway/code_provenance_control.py b/gateway/code_provenance_control.py
+new file mode 100644
+index 00000000000..cc52bd7a547
+--- /dev/null
++++ b/gateway/code_provenance_control.py
+@@ -0,0 +1,210 @@
++"""Private, passive, diagnostic-only provenance pages; never authorization.
++
++A timed-out filesystem operation cannot be killed safely. A single daemon worker
++retains the global flight lock until the real operation ends. Its late result is
++never published. No executor queue, retries, source reads or persistent files.
++"""
++from __future__ import annotations
++
++import json
++import os
++import secrets
++import threading
++import time
++
++from hermes_cli.code_attestation_snapshot import SECTIONS
++
++
++CAPTURE_SECONDS = 2.0
++TTL_SECONDS = 30.0
++MAX_PAGE_BYTES = 256 * 1024
++MAX_PAGE_ENTRIES = 128
++_FLIGHT = threading.Lock()
++
++
++def _error(code):
++    return {'purpose': 'diagnostic_only', 'complete': False, 'error': code}
++
++
++def _integer(value, minimum, maximum):
++    return type(value) is int and minimum <= value <= maximum
++
++
++def _expected(value):
++    return (type(value) is dict and set(value) == {'pid', 'start_time', 'instance_id'}
++            and _integer(value['pid'], 1, 2**63 - 1)
++            and _integer(value['start_time'], 1, 2**63 - 1)
++            and type(value['instance_id']) is str and 0 < len(value['instance_id']) <= 128)
++
++
++def _validate(params):
++    if type(params) is not dict or type(params.get('schema')) is not int or params['schema'] != 1:
++        raise ValueError('invalid_schema')
++    if params.get('op') == 'capture':
++        if (set(params) != {'schema', 'op', 'expected', 'refresh_inventory'}
++                or not _expected(params['expected']) or params['refresh_inventory'] is not True):
++            raise ValueError('invalid_capture')
++    elif params.get('op') == 'page':
++        if (set(params) != {'schema', 'op', 'snapshot_id', 'section', 'offset', 'limit'}
++                or type(params['snapshot_id']) is not str or len(params['snapshot_id']) != 64
++                or any(c not in '0123456789abcdef' for c in params['snapshot_id'])
++                or type(params['section']) is not str or params['section'] not in SECTIONS
++                or not _integer(params['offset'], 0, 2**63 - 1)
++                or not _integer(params['limit'], 1, MAX_PAGE_ENTRIES)):
++            raise ValueError('invalid_page')
++    else:
++        raise ValueError('invalid_operation')
++
++
++def validate_envelope(request):
++    """Bound echoed IDs so the complete page envelope remains below 256 KiB."""
++    identity = request.get('id')
++    if (type(request.get('protocol')) is not int or
++            not (identity is None or _integer(identity, -(2**63), 2**63 - 1) or
++                 (type(identity) is str and len(identity) <= 128))):
++        raise ValueError('invalid_provenance_envelope')
++
++
++class CodeProvenanceControl:
++    def __init__(self, runner):
++        from gateway.status import _get_process_start_time
++        self.runner = runner
++        self.pid = os.getpid()
++        self.start_time = _get_process_start_time(self.pid)
++        self._state = threading.Lock()
++        self._snapshots = {}
++
++    def identity(self):
++        return {'pid': os.getpid(), 'start_time': self.start_time,
++                'instance_id': self.runner.session_runtime_descriptor.get('instance_id')}
++
++    def current(self):
++        from hermes_cli import code_attestation as ca
++        ledger = ca._installed
++        # Reading the scalar never waits on an inventory lock or performs inventory.
++        return {'identity': self.identity(), 'generation': getattr(ledger, '_generation', None)}
++
++    def handle(self, params, peer):
++        if not peer:
++            raise PermissionError('authenticated_peer_required')
++        _validate(params)
++        if not _expected(self.identity()) or os.getpid() != self.pid:
++            return _error('process_identity_unavailable')
++        if params['op'] == 'capture':
++            return self.capture(params, peer)
++        return self.page(params, peer)
++
++    def capture(self, params, peer):
++        from hermes_cli import code_attestation as ca
++        identity = self.identity()
++        if params['expected'] != identity:
++            return _error('identity_mismatch')
++        if not _FLIGHT.acquire(blocking=False):
++            return _error('capture_busy')
++        done, box = threading.Event(), {}
++        custody = threading.Lock()
++        abandoned = False
++        deadline = time.monotonic() + CAPTURE_SECONDS
++
++        def work():
++            try:
++                ledger = ca._installed
++                if not isinstance(ledger, ca.Attestation):
++                    box['error'] = 'ledger_unavailable_or_unsupported'
++                    return
++                if ledger._pid != identity['pid']:
++                    box['error'] = 'ledger_process_mismatch'
++                    return
++                snapshot = ca.diagnostic_snapshot(deadline=deadline)
++                disk = dict(snapshot.disk)
++                box['value'] = (snapshot, disk, ledger)
++            except (OSError, RuntimeError, ValueError, TypeError, AttributeError, TimeoutError) as exc:
++                # Fixed/class-only errors, never exception text containing paths/secrets.
++                box['error'] = str(exc) if type(exc) is ValueError and str(exc) in {
++                    'entry_too_large', 'snapshot_too_large'} else type(exc).__name__
++            finally:
++                with custody:
++                    done.set()
++                    if abandoned:
++                        _FLIGHT.release()
++
++        worker = threading.Thread(target=work, name='gateway-code-provenance', daemon=True)
++        try:
++            worker.start()
++        except RuntimeError:
++            _FLIGHT.release()
++            return _error('worker_unavailable')
++        completed = done.wait(max(0.0, deadline - time.monotonic()))
++        with custody:
++            if not completed or time.monotonic() >= deadline:
++                abandoned = True
++                if done.is_set():
++                    _FLIGHT.release()
++                return _error('capture_timeout')
++        try:
++            if 'error' in box:
++                return _error(box['error'])
++            snapshot, disk, ledger = box['value']
++            if self.identity() != identity or ca._installed is not ledger:
++                return _error('identity_changed')
++            return self._publish(peer, identity, snapshot, disk, ledger)
++        finally:
++            _FLIGHT.release()
++
++    def _publish(self, peer, identity, snapshot, disk, ledger):
++        token = secrets.token_hex(32)
++        with self._state:
++            now = time.monotonic()
++            self._snapshots = {p: s for p, s in self._snapshots.items() if now < s['expires']}
++            stored = {'token': token, 'expires': now + TTL_SECONDS,
++                'identity': identity, 'snapshot': snapshot, 'disk': disk, 'ledger': ledger}
++            self._snapshots[peer] = stored
++        return self._summary(stored)
++
++    def _summary(self, stored):
++        snapshot = stored['snapshot']
++        return {'purpose': 'diagnostic_only', 'complete': True, 'full_provenance': False,
++            'snapshot_id': stored['token'], 'ttl_seconds': TTL_SECONDS,
++            'captured': {'identity': stored['identity'], 'generation': snapshot.generation,
++                         'begin_mono': snapshot.begin_mono, 'end_mono': snapshot.end_mono},
++            'current': self.current(), 'disk': stored['disk'],
++            'sections': {key: dict(value) for key, value in snapshot.manifest.items()},
++            'raw': dict(snapshot.manifest['unknowns']),
++            'incomplete': ['historical_unretained_provenance'],
++            'canonical_json': 'ASCII escaped; sorted keys; compact separators; no NaN; array SHA256'}
++
++    def page(self, params, peer):
++        from hermes_cli import code_attestation as ca
++        with self._state:
++            stored = self._snapshots.get(peer)
++            if stored is None or stored['token'] != params['snapshot_id']:
++                return _error('snapshot_unavailable')
++            if time.monotonic() >= stored['expires']:
++                del self._snapshots[peer]
++                return _error('snapshot_expired')
++            if self.identity() != stored['identity'] or ca._installed is not stored['ledger']:
++                del self._snapshots[peer]
++                return _error('snapshot_identity_changed')
++        rows = stored['snapshot'].sections[params['section']]
++        offset = params['offset']
++        if offset > len(rows):
++            return _error('offset_out_of_range')
++        result = self._summary(stored)
++        result.update(section=params['section'], offset=offset, entries=[], next=None)
++        for index in range(offset, min(len(rows), offset + params['limit'])):
++            result['entries'].append(json.loads(rows[index]))
++            result['next'] = index + 1 if index + 1 < len(rows) else None
++            # Match the actual transport's default json.dumps, including envelope headroom.
++            if len(json.dumps(result).encode('utf-8')) + 4096 > MAX_PAGE_BYTES:
++                result['entries'].pop()
++                result['next'] = index
++                break
++        if not result['entries'] and offset < len(rows):
++            return _error('entry_too_large')
++        return result
++
++
++def register_code_provenance_control(runner, server):
++    control = CodeProvenanceControl(runner)
++    server.private_handlers['code-provenance'] = control.handle
++    return control
+diff --git a/gateway/control_dispatch.py b/gateway/control_dispatch.py
+index 3ea1548f170..cad1157745a 100644
+--- a/gateway/control_dispatch.py
++++ b/gateway/control_dispatch.py
+@@ -12,7 +12,7 @@
+ # Read-only identity/status/list polling: passive, never reserved (and never suppressed).
+ PASSIVE_VERBS = frozenset({
+     'identify', 'status', 'profile', 'resolve-profile', 'session-ticket', 'active-work',
+-    'checkpoint-inventory',
++    'checkpoint-inventory', 'code-provenance',
+ })
+ 
+ 
+diff --git a/gateway/control_socket.py b/gateway/control_socket.py
+index d3c92011252..881dbebf254 100644
+--- a/gateway/control_socket.py
++++ b/gateway/control_socket.py
+@@ -468,6 +468,9 @@
+             request_id, verb = request.get("id"), request.get("verb")
+             handler = self._handlers.get(verb) if isinstance(verb, str) else None
+             if isinstance(verb, str) and verb in self.private_handlers:
++                if verb == 'code-provenance':
++                    from gateway.code_provenance_control import validate_envelope
++                    validate_envelope(request)
+                 if (not peer_subject or request.get("protocol") != 1
+                         or set(request) - {"protocol", "verb", "id", "params"}
+                         or not isinstance(request.get("params"), dict)):
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 16ba5d78965..72ff22fbe82 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -435,6 +435,8 @@
+         # Quiet-v3 observer handlers (private, measurement bookkeeping); refuse until attestation finalizes.
+         from gateway.quiet_control import register_quiet_control
+         register_quiet_control(runner, _control_server)
++        from gateway.code_provenance_control import register_code_provenance_control
++        register_code_provenance_control(runner, _control_server)
+         if not await _control_server.start():
+             _control_server = None
+         else:
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index c3c7ac056cb..952c0da7ced 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -21,6 +21,10 @@
+ import threading
+ import time
+ from types import CodeType, FunctionType
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from hermes_cli.code_attestation_snapshot import DiagnosticSnapshot
+ 
+ 
+ # Required in every supported route (missing => unknown). Blob-compared, never audited.
+@@ -1667,6 +1671,12 @@
+         raise TimeoutError('code attestation inventory budget exhausted')
+ 
+ 
++def diagnostic_snapshot(*, deadline: float) -> 'DiagnosticSnapshot':
++    """Bounded metadata-only read of the already installed ledger; never authorizes code."""
++    from hermes_cli.code_attestation_snapshot import snapshot
++    return snapshot(_ledger(), deadline=deadline)
++
++
+ def integrity_observation(*, deadline=None):
+     """Observe only the ledger installed at bootstrap; missing installation refuses."""
+     return _ledger().integrity_observation(deadline=deadline)
+diff --git a/hermes_cli/code_attestation_snapshot.py b/hermes_cli/code_attestation_snapshot.py
+new file mode 100644
+index 00000000000..cd98d90dd6d
+--- /dev/null
++++ b/hermes_cli/code_attestation_snapshot.py
+@@ -0,0 +1,200 @@
++"""Diagnostic metadata only. Canonical JSON: ASCII escaped, sorted keys, compact, no NaN.
++
++The digest of a section is SHA256 of its canonical JSON array (including []),
++not of a transport envelope. Entry bytes are immutable and counted while encoding.
++No source/code/locals/config/environment or arbitrary receipt fields are copied.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++import hashlib
++import json
++import time
++from types import MappingProxyType
++from typing import Mapping
++
++from hermes_cli.plugin_review_records import REGISTRY
++from hermes_cli.code_provenance_disk import disk_identity
++
++MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
++MAX_ENTRY_BYTES = 240 * 1024  # room for page/envelope metadata under 256 KiB
++SECTIONS = ('unknowns', 'quiet_blocking', 'quiet_extension', 'components',
++            'dependencies', 'executed_units', 'producers', 'metadata')
++ENCODER = json.JSONEncoder(sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
++UNIT_KEYS = ('component', 'source_sha256', 'generation', 'filename', 'generator',
++             'producer_sha256', 'producer_site', 'interpreter_sha256', 'trust', 'kind', 'sha256')
++DIST_KEYS = ('dist', 'version', 'path', 'root', 'record_sha256', 'installer_sha256', 'binary_sha256')
++SEED_KEYS = ('module', 'path', 'git_blob', 'source_sha256', 'kind', 'route', 'head_sha256', 'tail_sha256',
++             'script_sha256', 'interpreter_binary_sha256', 'relaunch_source_sha256')
++
++
++@dataclass(frozen=True)
++class DiagnosticSnapshot:
++    sections: Mapping[str, tuple[bytes, ...]]
++    manifest: Mapping[str, Mapping[str, str | int]]
++    generation: int
++    begin_mono: float
++    end_mono: float
++    disk: Mapping[str, str | None]
++    full_provenance: bool = False
++
++
++def scalars(row, keys):
++    """Explicit field and value whitelist; never repr(), default=str or recursive objects."""
++    return {key: row[key] for key in keys if key in row and
++            (row[key] is None or type(row[key]) in (str, int, bool))}
++
++
++def _preflight(row, deadline):
++    """Bound escaped scalars before JSONEncoder can allocate a whole escaped string."""
++    pending, size = [row], 0
++    while pending:
++        value = pending.pop()
++        if type(value) is dict:
++            for key, item in value.items():
++                pending.extend((key, item))
++        elif type(value) is str:
++            if len(value) > MAX_ENTRY_BYTES:
++                raise ValueError('entry_too_large')
++            for offset in range(0, len(value), 1024):
++                if time.monotonic() >= deadline:
++                    raise TimeoutError('snapshot_deadline')
++                size += len(ENCODER.encode(value[offset:offset + 1024])) - 2
++                if size > MAX_ENTRY_BYTES:
++                    raise ValueError('entry_too_large')
++        elif value is not None and type(value) not in (int, bool):
++            raise ValueError('unsupported_metadata_value')
++
++
++class _Builder:
++    def __init__(self, deadline):
++        self.deadline = deadline
++        self.total = 4096  # fixed manifest/summary budget, in addition to array separators
++        self.rows = {section: [] for section in SECTIONS}
++
++    def add(self, section, row):
++        _preflight(row, self.deadline)
++        chunks, size = [], 0
++        for chunk in ENCODER.iterencode(row):
++            if time.monotonic() >= self.deadline:
++                raise TimeoutError('snapshot_deadline')
++            # iterencode can emit one large scalar; check before retaining encoded bytes.
++            size += len(chunk)
++            if size > MAX_ENTRY_BYTES:
++                raise ValueError('entry_too_large')
++            if self.total + size + 1 > MAX_SNAPSHOT_BYTES:
++                raise ValueError('snapshot_too_large')
++            chunks.append(chunk.encode('ascii'))
++        self.total += size + 1
++        self.rows[section].append(b''.join(chunks))
++
++    def finish(self, generation, begin, disk):
++        sections, manifest = {}, {}
++        for name, rows in self.rows.items():
++            rows.sort()  # canonical entry bytes, lexicographic; duplicates are retained
++            digest = hashlib.sha256(b'[')
++            for index, row in enumerate(rows):
++                if index:
++                    digest.update(b',')
++                digest.update(row)
++            digest.update(b']')
++            sections[name] = tuple(rows)
++            manifest[name] = MappingProxyType({'count': len(rows), 'sha256': digest.hexdigest()})
++        if time.monotonic() >= self.deadline:
++            raise TimeoutError('snapshot_deadline')
++        return DiagnosticSnapshot(MappingProxyType(sections), MappingProxyType(manifest),
++                                  generation, begin, time.monotonic(), MappingProxyType(disk))
++
++
++def _metadata(ledger, builder):
++    builder.add('metadata', {'kind': 'ledger', 'core_root': str(ledger.core_root),
++        'boot_sha': ledger.boot_sha, 'route': ledger.route,
++        'boot_registry_blob': ledger._blobs.get(REGISTRY),
++        'boot_registry_status': 'recorded' if REGISTRY in ledger._blobs else 'unavailable',
++        'stub_head_digest': ledger.stub_head_digest})
++    builder.add('metadata', {'kind': 'interpreter', **scalars(ledger.interpreter_identity,
++        ('executable', 'version', 'cache_tag', 'prefix', 'base_prefix', 'binary_sha256'))})
++    for seed in ledger._seed:
++        builder.add('metadata', {'kind': 'seed', 'identity': scalars(seed, SEED_KEYS)})
++    if ledger._launcher is not None:
++        builder.add('metadata', {'kind': 'launcher', 'identity': scalars(ledger._launcher, SEED_KEYS)})
++    builder.add('metadata', {'kind': 'history', 'status': 'unavailable',
++        'reason': 'Only retained ledger metadata; historical evicted/generated output is not reconstructed.'})
++    builder.add('metadata', {'kind': 'dependency_index', 'limit_reached': ledger._deps.limit,
++        'record_is_not_receipted': True, 'native_transitive_libraries': 'unavailable'})
++
++
++def _roots(ledger, builder):
++    for component, (root, kind, digests) in ledger._components.items():
++        builder.add('components', {'kind': kind, 'component': component, 'root': str(root)})
++        for path, digest in digests.items():
++            builder.add('components', {'kind': 'reviewed_file', 'component': component,
++                                      'path': path, 'sha256': digest})
++    # The core map holds boot Git blob identities, not inferred disk SHA256 values.
++    for path, digest in ledger._blobs.items():
++        builder.add('components', {'kind': 'boot_file', 'component': 'core',
++                                  'path': path, 'git_blob': digest})
++    for root in ledger._deps.roots:
++        builder.add('dependencies', {'kind': 'registered_root', 'root': str(root)})
++    for (root, dist), receipt in ledger._deps.dists.items():
++        builder.add('dependencies', {'kind': 'installer_receipt', 'root': str(root),
++            'distribution': dist, **scalars(receipt, ('record_sha256', 'installer_sha256', 'used'))})
++
++
++def _execution(ledger, builder):
++    for unit in ledger._units:
++        row = scalars(unit, UNIT_KEYS)
++        if isinstance(unit.get('producer_distribution'), dict):
++            row['producer_distribution'] = scalars(unit['producer_distribution'], DIST_KEYS)
++        builder.add('executed_units', row)
++    for unit in ledger._dep_units.values():
++        row = scalars(unit, UNIT_KEYS)
++        if isinstance(unit.get('producer_distribution'), dict):
++            row['producer_distribution'] = scalars(unit['producer_distribution'], DIST_KEYS)
++        builder.add('executed_units', row)
++    for load in ledger._native_loads:
++        builder.add('executed_units', {'kind': 'native_load', **scalars(load, ('name', 'caller_component'))})
++    for descriptor in ledger._generators.values():
++        builder.add('producers', {'kind': 'available', 'name': descriptor.name,
++            'source_sha256': descriptor.source_sha256, 'producer_kind': descriptor.kind,
++            'distribution': scalars(descriptor.distribution, DIST_KEYS)})
++    for reason, receipts in ledger._unknown_sources.items():
++        for receipt in receipts:
++            builder.add('producers', {'kind': 'unknown_source', 'reason': reason,
++                **scalars(receipt, ('filename', 'qualname', 'component', 'source_sha256', 'trust'))})
++    for reason, producers in ledger._unknown_detail.items():
++        for producer in producers:
++            builder.add('producers', {'kind': 'unknown_producer', 'reason': reason, 'producer': producer})
++
++
++def snapshot(ledger, *, deadline: float) -> DiagnosticSnapshot:
++    """One locked view. Inventory is monotone; a filesystem syscall cannot be cancelled.
++
++    The caller owns single-flight custody until this function actually returns.
++    Unsupported launch routes remain readable (with their original sticky refusals).
++    """
++    begin = time.monotonic()
++    if begin >= deadline:
++        raise TimeoutError('snapshot_deadline')
++    disk = disk_identity(ledger.core_root, deadline)
++    if not ledger._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
++        raise TimeoutError('snapshot_lock_timeout')
++    try:
++        ledger._inventory_modules(deadline=deadline)
++        if time.monotonic() >= deadline:
++            raise TimeoutError('snapshot_deadline')
++        if getattr(ledger, '_reviewed_plugins', None):
++            from hermes_cli.plugin_review_records import verify_registered
++            verify_registered(ledger)
++        builder = _Builder(deadline)
++        for reason in ledger._unknown:
++            builder.add('unknowns', reason)
++            extension = reason in ledger._extension_unknowns and reason not in ledger._blocking_unknowns
++            builder.add('quiet_extension' if extension else 'quiet_blocking', reason)
++        _metadata(ledger, builder)
++        builder.add('metadata', {'kind': 'disk', **disk})
++        _roots(ledger, builder)
++        _execution(ledger, builder)
++        return builder.finish(ledger._generation, begin, disk)
++    finally:
++        ledger._lock.release()
+diff --git a/hermes_cli/code_provenance_client.py b/hermes_cli/code_provenance_client.py
+new file mode 100644
+index 00000000000..c2eddcd0229
+--- /dev/null
++++ b/hermes_cli/code_provenance_client.py
+@@ -0,0 +1,92 @@
++"""Supported private provenance client, with bounded authenticated reads and digest verification.
++
++Invoke only against a gateway that has the diagnostic API installed; never installs
++or changes the ledger. ``python -m hermes_cli.code_provenance_client HOME`` writes
++the verified diagnostic document to stdout, not a persistent server snapshot.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++from pathlib import Path
++import time
++
++from hermes_cli.code_attestation_snapshot import ENCODER, MAX_SNAPSHOT_BYTES, SECTIONS
++
++
++def query(home: Path, params: dict, *, timeout: float = 5) -> dict:
++    """One private request; retain the ordinary client deadline, bound actual bytes."""
++    request = json.dumps({'protocol': 1, 'id': 1, 'verb': 'code-provenance', 'params': params}).encode() + b'\n'
++    if os.name == 'nt':
++        from gateway.runtime_bootstrap_windows import query_runtime_control
++        raw = query_runtime_control(home, request, timeout)
++    else:
++        from hermes_cli.gateway_runtime_discovery import connect_private
++        deadline = time.monotonic() + timeout
++        data = bytearray()
++        with connect_private(home, timeout) as peer:
++            peer.sendall(request)
++            while b'\n' not in data:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError('provenance_response_timeout')
++                peer.settimeout(remaining)
++                chunk = peer.recv(65536)
++                if not chunk or len(data) + len(chunk) > 512 * 1024:
++                    raise ValueError('provenance_response_invalid')
++                data.extend(chunk)
++        raw = bytes(data)
++    reply = json.loads(raw)
++    if not reply.get('ok'):
++        raise ValueError('provenance_request_refused')
++    return reply['result']
++
++
++def collect(home: Path, expected: dict) -> dict:
++    """Reconstruct every section in one short-lived capture, rejecting any gap/mixup."""
++    summary = query(home, {'schema': 1, 'op': 'capture', 'expected': expected, 'refresh_inventory': True})
++    if summary.get('complete') is not True or summary.get('purpose') != 'diagnostic_only':
++        raise ValueError('provenance_capture_incomplete')
++    result, total = {}, 4096
++    for section in SECTIONS:
++        rows, offset = [], 0
++        while offset is not None:
++            page = query(home, {'schema': 1, 'op': 'page', 'snapshot_id': summary['snapshot_id'],
++                               'section': section, 'offset': offset, 'limit': 128})
++            if (page.get('complete') is not True or page.get('snapshot_id') != summary['snapshot_id']
++                    or page.get('captured') != summary['captured'] or page.get('offset') != offset
++                    or page.get('section') != section or page.get('sections') != summary['sections']):
++                raise ValueError('provenance_page_mismatch')
++            entries, next_offset = page['entries'], page['next']
++            if next_offset is not None and (not entries or type(next_offset) is not int
++                                             or next_offset != offset + len(entries)):
++                raise ValueError('provenance_cursor_invalid')
++            for entry in entries:
++                total += len(ENCODER.encode(entry)) + 1
++                if total > MAX_SNAPSHOT_BYTES:
++                    raise ValueError('provenance_snapshot_too_large')
++                rows.append(entry)
++            offset = next_offset
++        digest = hashlib.sha256(ENCODER.encode(rows).encode('ascii')).hexdigest()
++        if summary['sections'][section] != {'count': len(rows), 'sha256': digest}:
++            raise ValueError('provenance_digest_mismatch')
++        result[section] = rows
++    if summary['raw'] != summary['sections']['unknowns']:
++        raise ValueError('provenance_raw_mismatch')
++    return {'summary': summary, 'sections': result}
++
++
++def main():
++    import sys
++    from hermes_cli.gateway_client import private_control_query
++    home = Path(sys.argv[1])
++    reply = json.loads(private_control_query(home, b'{"protocol":1,"id":1,"verb":"identify"}\n'))
++    if not reply.get('ok'):
++        raise ValueError('identify_refused')
++    expected = {k: reply['result'][k] for k in ('pid', 'start_time', 'instance_id')}
++    print(ENCODER.encode(collect(home, expected)))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/hermes_cli/code_provenance_disk.py b/hermes_cli/code_provenance_disk.py
+new file mode 100644
+index 00000000000..86bdad6a9f0
+--- /dev/null
++++ b/hermes_cli/code_provenance_disk.py
+@@ -0,0 +1,71 @@
++"""Fresh, bounded Git HEAD metadata only; not a working-tree integrity check."""
++from pathlib import Path, PurePosixPath
++import re
++import time
++
++MAX_METADATA = 4096
++MAX_PACKED_REFS = 1024 * 1024
++
++
++def _check(deadline):
++    if time.monotonic() >= deadline:
++        raise TimeoutError('disk_identity_deadline')
++
++
++def _read(path, deadline):
++    _check(deadline)
++    with path.open('rb') as stream:
++        data = stream.read(MAX_METADATA + 1)
++    _check(deadline)
++    if len(data) > MAX_METADATA:
++        raise ValueError('git_metadata_too_large')
++    return data.decode('utf-8-sig').strip()
++
++
++def _head(root, deadline):
++    git_dir = root / '.git'
++    if git_dir.is_file():
++        marker = _read(git_dir, deadline)
++        if not marker.startswith('gitdir: '):
++            raise ValueError('git_dir_unavailable')
++        git_dir = root / marker[len('gitdir: '):]
++    common = git_dir
++    if (git_dir / 'commondir').exists():
++        common = git_dir / _read(git_dir / 'commondir', deadline)
++    head = _read(git_dir / 'HEAD', deadline)
++    if not head.startswith('ref: '):
++        return head
++    ref = head[len('ref: '):]
++    path = PurePosixPath(ref)
++    if not ref.startswith('refs/') or path.is_absolute() or '..' in path.parts or '\\' in ref:
++        raise ValueError('git_ref_invalid')
++    for directory in (git_dir, common):
++        if (directory / ref).is_file():
++            return _read(directory / ref, deadline)
++    total = 0
++    with (common / 'packed-refs').open('rb') as stream:
++        while True:
++            _check(deadline)
++            line = stream.readline(MAX_METADATA + 1)
++            if not line:
++                break
++            total += len(line)
++            if len(line) > MAX_METADATA or total > MAX_PACKED_REFS:
++                raise ValueError('git_metadata_too_large')
++            parts = line.decode('ascii').strip().split(' ', 1)
++            if len(parts) == 2 and parts[1] == ref:
++                return parts[0]
++    raise ValueError('git_ref_unavailable')
++
++
++def disk_identity(root: Path, deadline: float) -> dict:
++    """One blocking syscall is not cancellable; caller must retain single-flight custody."""
++    try:
++        sha = _head(root, deadline)
++        _check(deadline)
++        if re.fullmatch('[0-9a-f]{40}', sha) is None:
++            raise ValueError('git_sha_invalid')
++        return {'sha': sha, 'error': None}
++    except (OSError, ValueError) as exc:
++        # Disk paths and arbitrary exception messages never reach the response.
++        return {'sha': None, 'error': type(exc).__name__}
+diff --git a/tests/gateway/test_code_provenance_control.py b/tests/gateway/test_code_provenance_control.py
+new file mode 100644
+index 00000000000..d28f62ff114
+--- /dev/null
++++ b/tests/gateway/test_code_provenance_control.py
+@@ -0,0 +1,337 @@
++"""Actual bootstrap/dispatch and authenticated Unix control round trips."""
++import asyncio
++import hashlib
++import json
++import os
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import code_provenance_control as pc
++from gateway.control_dispatch import verb_is_work_bearing
++from gateway.run_bootstrap import _start_gateway_start_control_socket
++from hermes_cli import code_attestation as ca
++from hermes_cli.gateway_client import private_control_query
++from tests.hermes_cli import test_code_attestation_snapshot as fixture_helpers
++
++ledger = fixture_helpers.ledger
++pytestmark = pytest.mark.platforms('linux', 'macos')
++
++
++def request(home, params, verb='code-provenance'):
++    if verb == 'code-provenance':
++        from hermes_cli.code_provenance_client import query
++        try:
++            return {'ok': True, 'result': query(home, params)}
++        except ValueError as exc:
++            return {'ok': False, 'error': str(exc)}
++    raw = json.dumps({'protocol': 1, 'verb': verb, 'id': 1, 'params': params}).encode() + b'\n'
++    return json.loads(private_control_query(home, raw))
++
++
++@pytest.fixture
++def runtime(ledger, tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir(mode=0o700)
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    from gateway import webapp_listener, quiet_control
++    # Unrelated registration is inert; production bootstrap and provenance registration are real.
++    monkeypatch.setattr(webapp_listener, 'register_control_verbs', lambda *a, **kw: None)
++    monkeypatch.setattr(quiet_control, 'register_quiet_control', lambda *a: None)
++
++    runner = SimpleNamespace(session_runtime_descriptor={'instance_id': 'test-instance',
++        'state': 'ready', 'capabilities': []}, session_ticket_store=None)
++    yield home, runner, ledger
++
++
++async def start(runtime):
++    _home, runner, _ledger = runtime
++    server = await _start_gateway_start_control_socket(runner)
++    assert server is not None
++    assert 'code-provenance' in server.private_handlers
++    control = server.private_handlers['code-provenance'].__self__
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    return server, control, params
++
++
++async def ask(runtime, params, verb='code-provenance'):
++    return await asyncio.to_thread(request, runtime[0], params, verb)
++
++
++def page_params(summary, **over):
++    return {'schema': 1, 'op': 'page', 'snapshot_id': summary['snapshot_id'],
++            'section': 'unknowns', 'offset': 0, 'limit': 128, **over}
++
++
++def test_actual_bootstrap_authenticated_passive_round_trip(runtime):
++    async def scenario():
++        server, _control, params = await start(runtime)
++        try:
++            assert not verb_is_work_bearing('code-provenance')
++            assert verb_is_work_bearing('code-provenance-other')
++            before = set(runtime[2]._unknown)
++            generation = runtime[2]._generation
++            first = await ask(runtime, params)
++            assert first['ok'], first
++            summary = first['result']
++            assert summary['purpose'] == 'diagnostic_only' and summary['complete']
++            assert summary['raw']['count'] == len(before)
++            assert runtime[2]._unknown == before
++            assert runtime[2]._generation == generation
++            page = (await ask(runtime, page_params(summary)))['result']
++            assert page['entries'] == sorted(runtime[2]._unknown)
++            assert page['next'] is None
++            assert page['current']['generation'] == generation
++            assert server.ticket_store is None
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('uid', [None, -1])
++def test_transport_rejects_missing_or_foreign_peer(runtime, monkeypatch, uid):
++    from hermes_cli import gateway_runtime_discovery
++    import socket
++    original = gateway_runtime_discovery.socket_peer_uid
++    monkeypatch.setattr(gateway_runtime_discovery, 'socket_peer_uid',
++                        lambda sock: original(sock) if isinstance(sock, socket.socket) else uid)
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            reply = await ask(runtime, params)
++            assert not reply['ok']
++            assert 'provenance_request_refused' in reply['error']
++            assert not control._snapshots
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('update', [{'schema': True}, {'schema': 2}, {'extra': 1},
++    {'refresh_inventory': 1}, {'refresh_inventory': False}, {'op': 'unknown'},
++    {'expected': {'pid': True, 'start_time': 1, 'instance_id': 'x'}},
++    {'expected': {'pid': 1, 'start_time': True, 'instance_id': 'x'}},
++    {'expected': {'pid': 1, 'start_time': 1, 'instance_id': ''}},
++    {'expected': {'pid': 1, 'start_time': 1, 'instance_id': 'x', 'extra': 1}}])
++def test_capture_strict_schema(runtime, update):
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            reply = await ask(runtime, {**params, **update})
++            assert not reply['ok'], reply
++            assert not control._snapshots
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('update', [{'offset': True}, {'offset': -1}, {'offset': 1.5},
++    {'limit': True}, {'limit': 0}, {'limit': 129}, {'section': 'secrets'}, {'section': []},
++    {'snapshot_id': 'g' * 64}, {'snapshot_id': 'a'}, {'extra': 1}])
++def test_page_strict_schema(runtime, update):
++    async def scenario():
++        server, _control, params = await start(runtime)
++        try:
++            summary = (await ask(runtime, params))['result']
++            reply = await ask(runtime, page_params(summary, **update))
++            assert not reply['ok'], reply
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_missing_ledger_is_error_and_never_installs(runtime, monkeypatch):
++    monkeypatch.setattr(ca, '_installed', None)
++    async def scenario():
++        server, _control, params = await start(runtime)
++        try:
++            result = (await ask(runtime, params))['result']
++            assert result == pc._error('ledger_unavailable_or_unsupported')
++            assert ca._installed is None
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_pagination_over_transport_limit_frozen_generation_secrets(runtime, monkeypatch):
++    a = runtime[2]
++    a._unknown = {f'{i:04d}-' + 'x' * 1500 for i in range(500)}
++    monkeypatch.setenv('PROVENANCE_TEST_SECRET', 'SECRET_SENTINEL')
++    async def scenario():
++        server, _control, params = await start(runtime)
++        try:
++            summary = (await ask(runtime, params))['result']
++            assert summary['complete']
++            a.mark_unknown('later')
++            received, offset, total_bytes = [], 0, 0
++            while offset is not None:
++                reply = await ask(runtime, page_params(summary, offset=offset))
++                assert len(json.dumps(reply).encode()) < pc.MAX_PAGE_BYTES
++                assert 'SECRET_SENTINEL' not in json.dumps(reply)
++                result = reply['result']
++                total_bytes += len(json.dumps(result['entries']).encode())
++                received.extend(result['entries'])
++                assert result['current']['generation'] > result['captured']['generation']
++                offset = result['next']
++            assert total_bytes > 512 * 1024
++            assert len(received) == len(set(received)) == 500
++            assert received == sorted(a._unknown - {'later'})
++            digest = hashlib.sha256(json.dumps(received, sort_keys=True, separators=(',', ':'),
++                                               ensure_ascii=True, allow_nan=False).encode()).hexdigest()
++            assert summary['raw'] == {'count': len(received), 'sha256': digest}
++            fresh = (await ask(runtime, params))['result']
++            assert fresh['raw']['count'] == 501
++            old = (await ask(runtime, page_params(summary)))['result']
++            assert old == pc._error('snapshot_unavailable')  # exactly one snapshot per peer
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_peer_expiry_restart_and_offset_refusals(runtime, monkeypatch):
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            summary = (await ask(runtime, params))['result']
++            assert control.handle(page_params(summary), 'another-peer') == pc._error('snapshot_unavailable')
++            assert (await ask(runtime, page_params(summary, offset=4)))['result'] == pc._error('offset_out_of_range')
++            params['expected'] = {**params['expected'], 'pid': os.getpid() + 1}
++            assert (await ask(runtime, params))['result'] == pc._error('identity_mismatch')
++            stored = next(iter(control._snapshots.values()))
++            stored['expires'] = time.monotonic() - 1
++            assert (await ask(runtime, page_params(summary)))['result'] == pc._error('snapshot_expired')
++            params['expected'] = control.identity()
++            summary = (await ask(runtime, params))['result']
++            runtime[1].session_runtime_descriptor['instance_id'] = 'replacement'
++            assert (await ask(runtime, page_params(summary)))['result'] == pc._error('snapshot_identity_changed')
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('stage', ['inventory', 'disk', 'plugin'])
++def test_blocked_inventory_default_deadline_single_flight_and_responsive_pages(runtime, monkeypatch, stage):
++    entered, release, ended = threading.Event(), threading.Event(), threading.Event()
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            summary = (await ask(runtime, params))['result']
++            def blocked(**kwargs):
++                with runtime[2]._lock:
++                    entered.set()
++                    assert release.wait(8)
++                    ended.set()
++            if stage == 'inventory':
++                monkeypatch.setattr(runtime[2], '_inventory_modules', blocked)
++            elif stage == 'disk':
++                from hermes_cli import code_attestation_snapshot as projection
++                def blocked_disk(*args):
++                    blocked()
++                    return {'sha': 'b' * 40, 'error': None}
++                monkeypatch.setattr(projection, 'disk_identity', blocked_disk)
++            else:
++                from hermes_cli import plugin_review_records
++                runtime[2]._reviewed_plugins = {'test': True}
++                monkeypatch.setattr(plugin_review_records, 'verify_registered', lambda ledger: blocked())
++            pending = asyncio.create_task(ask(runtime, params))
++            assert await asyncio.to_thread(entered.wait, 2)
++            assert (await ask(runtime, params))['result'] == pc._error('capture_busy')
++            page = await asyncio.wait_for(ask(runtime, page_params(summary)), 1)
++            assert page['result']['complete']
++            identified = await asyncio.wait_for(ask(runtime, {}, 'identify'), 2)
++            assert identified['result']['pid'] == os.getpid()
++            assert identified['result']['instance_id'] == params['expected']['instance_id']
++            reply = await pending  # real client default timeout, production 2s capture budget
++            assert reply['result'] == pc._error('capture_timeout')
++            for _ in range(10):
++                assert (await ask(runtime, params))['result'] == pc._error('capture_busy')
++            workers = [t for t in threading.enumerate() if t.name == 'gateway-code-provenance']
++            assert len(workers) == 1
++            release.set()
++            assert await asyncio.to_thread(ended.wait, 2)
++            await asyncio.to_thread(workers[0].join, 2)
++            assert not workers[0].is_alive()
++            assert next(iter(control._snapshots.values()))['token'] == summary['snapshot_id']
++            monkeypatch.setattr(runtime[2], '_inventory_modules', lambda **kw: None)
++            fresh = (await ask(runtime, params))['result']
++            assert fresh['complete'] and fresh['snapshot_id'] != summary['snapshot_id']
++        finally:
++            release.set()
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_transport_envelope_id_and_protocol_are_strict(runtime):
++    from gateway.control_socket import _query_unix_socket
++    async def scenario():
++        server, _control, params = await start(runtime)
++        try:
++            for update in ({'id': True}, {'id': {}}, {'id': 'x' * 129}, {'id': 2**63}, {'protocol': True}):
++                envelope = {'protocol': 1, 'id': 1, 'verb': 'code-provenance', 'params': params, **update}
++                raw = await asyncio.to_thread(_query_unix_socket, runtime[0], json.dumps(envelope).encode() + b'\n', 5)
++                reply = json.loads(raw)
++                assert not reply['ok'], reply
++            summary = (await ask(runtime, params))['result']
++            envelope = {'protocol': 1, 'id': '\U0001f600' * 128, 'verb': 'code-provenance', 'params': page_params(summary)}
++            raw = await asyncio.to_thread(_query_unix_socket, runtime[0], json.dumps(envelope).encode() + b'\n', 5)
++            assert len(raw) < pc.MAX_PAGE_BYTES
++            assert json.loads(raw)['ok']
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_export_has_no_reservations_runner_or_file_mutations(runtime, monkeypatch):
++    async def scenario():
++        server, _control, params = await start(runtime)
++        try:
++            def forbidden(*args, **kwargs):
++                pytest.fail('passive export attempted a reservation or registration')
++            monkeypatch.setattr(server._request_dispatch, '_reserve', forbidden)
++            monkeypatch.setattr(ca, 'install', forbidden)
++            monkeypatch.setattr(ca, 'register_component_root', forbidden)
++            monkeypatch.setattr(ca, 'register_dependency_environment', forbidden)
++            from hermes_cli import plugin_review_records
++            monkeypatch.setattr(plugin_review_records, 'register_directory', forbidden)
++            before_runner = dict(vars(runtime[1]))
++            before_files = {str(p): (p.stat().st_size, p.stat().st_mtime_ns)
++                            for p in runtime[0].rglob('*')}
++            before = (set(runtime[2]._unknown), runtime[2]._generation)
++            summary = (await ask(runtime, params))['result']
++            for section in summary['sections']:
++                assert (await ask(runtime, page_params(summary, section=section)))['result']['complete']
++            assert vars(runtime[1]) == before_runner
++            assert before_files == {str(p): (p.stat().st_size, p.stat().st_mtime_ns)
++                                    for p in runtime[0].rglob('*')}
++            assert before == (runtime[2]._unknown, runtime[2]._generation)
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('mode', ['entry', 'total', 'inventory'])
++def test_wire_errors_are_explicit_incomplete_no_secret(runtime, monkeypatch, mode):
++    if mode == 'entry':
++        runtime[2]._unknown = {'x' * 300000}
++    elif mode == 'total':
++        from hermes_cli import code_attestation_snapshot as projection
++        monkeypatch.setattr(projection, 'MAX_SNAPSHOT_BYTES', 100)
++    else:
++        def fail(**kwargs):
++            runtime[2].mark_unknown('monotone-new-refusal')
++            raise OSError('SECRET_SENTINEL')
++        monkeypatch.setattr(runtime[2], '_inventory_modules', fail)
++    async def scenario():
++        server, control, params = await start(runtime)
++        try:
++            result = (await ask(runtime, params))['result']
++            assert result['complete'] is False and 'snapshot_id' not in result
++            assert result['purpose'] == 'diagnostic_only'
++            assert 'SECRET_SENTINEL' not in json.dumps(result)
++            assert result['error'] == {'entry': 'entry_too_large', 'total': 'snapshot_too_large', 'inventory': 'OSError'}[mode]
++            assert not control._snapshots
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
+diff --git a/tests/gateway/test_code_provenance_guards.py b/tests/gateway/test_code_provenance_guards.py
+new file mode 100644
+index 00000000000..3cb9202fc03
+--- /dev/null
++++ b/tests/gateway/test_code_provenance_guards.py
+@@ -0,0 +1,159 @@
++"""Unmasked validation/custody boundary controls beside real-socket integration tests."""
++import threading
++
++
++import pytest
++
++from gateway import code_provenance_control as pc
++from hermes_cli import code_attestation as ca
++from tests.gateway import test_code_provenance_control as helpers
++from tests.hermes_cli import test_code_attestation_snapshot as snapshot_helpers
++
++runtime = helpers.runtime
++ledger = snapshot_helpers.ledger
++pytestmark = pytest.mark.platforms('linux', 'macos')
++
++
++@pytest.mark.parametrize('value', [None, [], 1, {'op': 'capture'}, {'schema': None}, {'schema': '1'}])
++def test_invalid_schema_is_classified(value):
++    with pytest.raises(ValueError, match='invalid_schema'):
++        pc._validate(value)
++
++
++@pytest.mark.parametrize('key,value', [('pid', 0), ('pid', 2**63), ('pid', 1.0),
++    ('start_time', 0), ('start_time', 2**63), ('start_time', 1.0),
++    ('instance_id', None), ('instance_id', 1), ('instance_id', 'x' * 129)])
++def test_expected_fields_reject_unmasked_invalid_values(runtime, key, value):
++    control = pc.CodeProvenanceControl(runtime[1])
++    expected = {**control.identity(), key: value}
++    with pytest.raises(ValueError, match='invalid_capture'):
++        control.handle({'schema': 1, 'op': 'capture', 'expected': expected, 'refresh_inventory': True}, 'peer')
++
++
++@pytest.mark.parametrize('key,value', [('snapshot_id', None), ('snapshot_id', 1),
++    ('section', None), ('offset', 2**63), ('offset', '1'), ('limit', 1.0), ('limit', '1')])
++def test_page_invalid_values_unmasked(key, value):
++    params = {'schema': 1, 'op': 'page', 'snapshot_id': 'a' * 64,
++              'section': 'unknowns', 'offset': 0, 'limit': 1, key: value}
++    with pytest.raises(ValueError, match='invalid_page'):
++        pc._validate(params)
++
++
++def test_authentication_identity_and_ledger_process_refusals(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    with pytest.raises(PermissionError, match='authenticated_peer_required'):
++        control.handle(params, None)
++    runtime[2]._pid += 1
++    assert control.handle(params, 'peer') == pc._error('ledger_process_mismatch')
++    runtime[2]._pid -= 1
++    monkeypatch.setattr(pc.os, 'getpid', lambda: control.pid + 1)
++    assert control.handle(params, 'peer') == pc._error('process_identity_unavailable')
++
++
++def test_missing_start_identity_refuses(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    control.start_time = None
++    assert control.handle(params, 'peer') == pc._error('process_identity_unavailable')
++
++
++def test_thread_start_failure_releases_global_flight(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    original = pc.threading.Thread.start
++    def fail(thread):
++        raise RuntimeError('SECRET_SENTINEL')
++    monkeypatch.setattr(pc.threading.Thread, 'start', fail)
++    assert control.handle(params, 'peer') == pc._error('worker_unavailable')
++    assert not pc._FLIGHT.locked()
++    monkeypatch.setattr(pc.threading.Thread, 'start', original)
++    assert control.handle(params, 'peer')['complete']
++
++
++def test_replaced_ledger_during_capture_cannot_publish(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    original = ca.diagnostic_snapshot
++    def replace(**kwargs):
++        snapshot = original(**kwargs)
++        monkeypatch.setattr(ca, '_installed', None)
++        return snapshot
++    monkeypatch.setattr(ca, 'diagnostic_snapshot', replace)
++    assert control.handle(params, 'peer') == pc._error('identity_changed')
++    assert not control._snapshots
++
++
++def test_page_ledger_replacement_and_empty_exhausted_page(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    summary = control.handle(params, 'peer')
++    exhausted = control.handle(helpers.page_params(summary, offset=summary['raw']['count']), 'peer')
++    assert exhausted['entries'] == [] and exhausted['next'] is None
++    monkeypatch.setattr(ca, '_installed', None)
++    assert control.handle(helpers.page_params(summary), 'peer') == pc._error('snapshot_identity_changed')
++
++
++def test_single_flight_includes_publication(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    entered, release = threading.Event(), threading.Event()
++    original = control._publish
++    result = []
++    def blocked(*args):
++        entered.set()
++        assert release.wait(5)
++        return original(*args)
++    monkeypatch.setattr(control, '_publish', blocked)
++    worker = threading.Thread(target=lambda: result.append(control.handle(params, 'peer')))
++    worker.start()
++    assert entered.wait(2)
++    try:
++        assert control.handle(params, 'peer') == pc._error('capture_busy')
++    finally:
++        release.set()
++        worker.join(2)
++    assert not worker.is_alive() and result[0]['complete']
++
++
++def test_page_has_count_and_encoded_byte_ceiling(runtime):
++    a = runtime[2]
++    a._unknown = {f'{i:04d}' for i in range(300)}
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    summary = control.handle(params, 'peer')
++    page = control.handle(helpers.page_params(summary), 'peer')
++    assert len(page['entries']) == 128 and page['next'] == 128
++    a._unknown = {f'{i:04d}' + 'x' * 130000 for i in range(3)}
++    summary = control.handle(params, 'peer')
++    page = control.handle(helpers.page_params(summary), 'peer')
++    assert len(page['entries']) == 1 and page['next'] == 1
++
++
++def test_page_guard_cannot_truncate_an_oversized_only_entry(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    summary = control.handle(params, 'peer')
++    monkeypatch.setattr(pc, 'MAX_PAGE_BYTES', 1)
++    assert control.handle(helpers.page_params(summary), 'peer') == pc._error('entry_too_large')
++
++
++def test_completed_after_deadline_is_not_a_reusable_positive(runtime, monkeypatch):
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    original = control._publish
++    def fail_publish(*args):
++        pytest.fail('late result published')
++    monkeypatch.setattr(control, '_publish', fail_publish)
++
++    # Zero budget is only a deterministic boundary control, not a production override.
++    monkeypatch.setattr(pc, 'CAPTURE_SECONDS', 0)
++    assert control.handle(params, 'peer') == pc._error('capture_timeout')
++    # Join the actual worker before restoring mocks or starting a new request.
++    for thread in threading.enumerate():
++        if thread.name == 'gateway-code-provenance':
++            thread.join(2)
++    assert not pc._FLIGHT.locked()
++    monkeypatch.setattr(pc, 'CAPTURE_SECONDS', 2)
++    monkeypatch.setattr(control, '_publish', original)
++    assert control.handle(params, 'peer')['complete']
+diff --git a/tests/hermes_cli/test_code_attestation_snapshot.py b/tests/hermes_cli/test_code_attestation_snapshot.py
+new file mode 100644
+index 00000000000..a1f9d20727e
+--- /dev/null
++++ b/tests/hermes_cli/test_code_attestation_snapshot.py
+@@ -0,0 +1,185 @@
++"""Bounded metadata projection of an installed ledger, not a new trust source."""
++import hashlib
++import json
++from pathlib import Path
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import code_attestation as ca
++
++
++@pytest.fixture
++def ledger(monkeypatch, tmp_path):
++    a = object.__new__(ca.Attestation)
++    a.core_root, a.boot_sha = tmp_path, 'a' * 40
++    a.route, a.stub_head_digest = None, None
++    a._pid, a._lock = __import__('os').getpid(), threading.RLock()
++    a._generation = 7
++    a._unknown = {'bootstrap-provenance-pending', 'extension', 'blocking'}
++    a._extension_unknowns, a._blocking_unknowns = {'extension', 'blocking'}, {'blocking'}
++    a._components = {'plugin:x': (tmp_path / 'plugin', 'plugin', {'a.py': 'b' * 64})}
++    a._blobs = {'hermes_cli/data/plugin-review-records.json': 'c' * 40}
++    a._deps = SimpleNamespace(roots=(tmp_path / 'site-packages',), dists={
++        (tmp_path / 'site-packages', 'x-1'): {'record_sha256': 'd' * 64,
++                                             'installer_sha256': None, 'used': True,
++                                             'secret': 'SECRET_SENTINEL'}}, limit=False)
++    a._units = [{'component': 'plugin:x', 'source_sha256': 'e' * 64, 'secret': 'SECRET_SENTINEL'}]
++    a._dep_units, a._native_loads = {}, []
++    a._unknown_sources, a._unknown_detail, a._generators = {}, {}, {}
++    a._seed = [{'module': 'seed', 'source_sha256': 'f' * 64, 'secret': 'SECRET_SENTINEL'}]
++    a._launcher = {'kind': 'trusted_launcher_script', 'launch_handoff_env': 'SECRET_SENTINEL'}
++    a.interpreter_identity = {'executable': '/python', 'version': 'test', 'secret': 'SECRET_SENTINEL'}
++    monkeypatch.setattr(a, '_inventory_modules', lambda **kw: None)
++    monkeypatch.setattr(ca, '_installed', a)
++    return a
++
++
++def capture():
++    return ca.diagnostic_snapshot(deadline=time.monotonic() + 2)
++
++
++def values(snapshot, section):
++    return [json.loads(row) for row in snapshot.sections[section]]
++
++
++def test_missing_ledger_does_not_install(monkeypatch):
++    monkeypatch.setattr(ca, '_installed', None)
++    with pytest.raises(RuntimeError, match='not installed'):
++        capture()
++    assert ca._installed is None
++
++
++def test_complete_partition_roots_receipts_and_hashes(ledger):
++    snapshot = capture()
++    assert values(snapshot, 'unknowns') == sorted(ledger._unknown)
++    assert values(snapshot, 'quiet_extension') == ['extension']
++    assert values(snapshot, 'quiet_blocking') == ['blocking', 'bootstrap-provenance-pending']
++    assert {'kind': 'reviewed_file', 'component': 'plugin:x', 'path': 'a.py', 'sha256': 'b' * 64} in values(snapshot, 'components')
++    receipts = values(snapshot, 'dependencies')
++    assert any(r.get('distribution') == 'x-1' and r['root'] == str(ledger._deps.roots[0]) for r in receipts)
++    for section, rows in snapshot.sections.items():
++        encoded = b'[' + b','.join(rows) + b']'
++        assert snapshot.manifest[section] == {'count': len(rows), 'sha256': hashlib.sha256(encoded).hexdigest()}
++    assert snapshot.generation == 7
++    assert snapshot.full_provenance is False
++    assert 'SECRET_SENTINEL' not in repr(snapshot)
++
++
++def test_frozen_capture_and_no_unknown_clearing(ledger):
++    before = set(ledger._unknown)
++    first = capture()
++    ledger.mark_unknown('new-refusal')
++    second = capture()
++    assert values(first, 'unknowns') == sorted(before)
++    assert values(second, 'unknowns') == sorted(before | {'new-refusal'})
++    assert ledger._unknown == before | {'new-refusal'}
++
++
++@pytest.mark.parametrize('reason', ['unexpected-prehook:x', 'unsupported-route:other',
++    'generated-origin-unknown:x', 'plugin-review-unverified:x', 'dependency-record-skew:x',
++    'dependency-record-ambiguous:x', 'dependency-root-loss:x'])
++def test_refusals_survive_exactly(ledger, reason):
++    ledger.mark_unknown(reason)
++    assert reason in values(capture(), 'unknowns')
++    assert reason in ledger.latched_unknowns()
++
++
++def test_inventory_deadline_and_errors_are_not_partial_success(ledger, monkeypatch):
++    def fail(**kwargs):
++        ledger.mark_unknown('monotone-inventory-refusal')
++        raise OSError('SECRET_SENTINEL')
++    monkeypatch.setattr(ledger, '_inventory_modules', fail)
++    with pytest.raises(OSError):
++        capture()
++    assert 'monotone-inventory-refusal' in ledger._unknown
++    with pytest.raises(TimeoutError):
++        ca.diagnostic_snapshot(deadline=time.monotonic() - 1)
++
++
++def test_incremental_total_and_entry_caps(ledger, monkeypatch):
++    from hermes_cli import code_attestation_snapshot as projection
++    ledger._unknown = {'x' * 300000}
++    with pytest.raises(ValueError, match='entry_too_large'):
++        capture()
++    ledger._unknown = {str(i) + 'x' * 100 for i in range(100)}
++    monkeypatch.setattr(projection, 'MAX_SNAPSHOT_BYTES', 1000)
++    with pytest.raises(ValueError, match='snapshot_too_large'):
++        capture()
++
++
++def test_boot_identity_is_recorded_not_current_files(ledger):
++    snapshot = capture()
++    metadata = values(snapshot, 'metadata')
++    boot = next(r for r in metadata if r['kind'] == 'ledger')
++    assert boot['boot_sha'] == ledger.boot_sha
++    assert boot['core_root'] == str(ledger.core_root)
++    assert boot['boot_registry_blob'] == 'c' * 40
++    assert any(r['kind'] == 'history' and r['status'] == 'unavailable' for r in metadata)
++
++
++def test_lock_wait_is_bounded(ledger):
++    ready, release = threading.Event(), threading.Event()
++    def hold():
++        with ledger._lock:
++            ready.set()
++            assert release.wait(5)
++    thread = threading.Thread(target=hold)
++    thread.start()
++    assert ready.wait(2)
++    try:
++        with pytest.raises(TimeoutError):
++            ca.diagnostic_snapshot(deadline=time.monotonic() + .02)
++    finally:
++        release.set()
++        thread.join(2)
++    assert not thread.is_alive()
++
++
++def test_preflight_rejects_escaped_scalar_before_whole_encoding(ledger, monkeypatch):
++    from hermes_cli import code_attestation_snapshot as projection
++    original = projection.ENCODER.iterencode
++    def guarded(value, **kwargs):
++        assert not (type(value) is str and len(value) > 1024)
++        return original(value, **kwargs)
++    monkeypatch.setattr(projection.ENCODER, 'iterencode', guarded)
++    ledger._unknown = {'\u0000' * 50000}
++    with pytest.raises(ValueError, match='entry_too_large'):
++        capture()
++
++
++def test_root_qualified_receipts_preserve_unused_and_overlapping_names(ledger):
++    root = Path('/second/site-packages')
++    ledger._deps.roots += (root,)
++    ledger._deps.dists[(root, 'x-1')] = {'record_sha256': '2' * 64, 'used': False}
++    receipts = [r for r in values(capture(), 'dependencies') if r['kind'] == 'installer_receipt']
++    assert {(r['root'], r['record_sha256'], r['used']) for r in receipts} == {
++        (str(root), '2' * 64, False), (str(ledger._deps.roots[0]), 'd' * 64, True)}
++
++
++def test_actual_hook_cold_capture_consistent_and_never_authorizes(tmp_path):
++    from tests.hermes_cli.test_code_attestation import run_probe
++    result = run_probe(tmp_path, '''
++        from hermes_cli import code_attestation as ca
++        ca._installed = a
++        assert 'hermes_cli.code_attestation_snapshot' not in sys.modules
++        a.mark_unknown('unsupported-route:diagnostic-control')
++        s = ca.diagnostic_snapshot(deadline=time.monotonic() + 2)
++        raw = [json.loads(r) for r in s.sections['unknowns']]
++        after = sorted(a._unknown)
++        generation = a._generation
++        from gateway.capsule_contract import owner_launch_sha
++        from hermes_state_runtime import RuntimeStoreError
++        try:
++            owner_launch_sha(True)
++            allowed = True
++        except RuntimeStoreError:
++            allowed = False
++        print(json.dumps({'raw': raw, 'after': after, 'captured_generation': s.generation,
++                          'generation': generation, 'allowed': allowed}))
++    ''')
++    assert result['raw'] == result['after']
++    assert result['captured_generation'] == result['generation']
++    assert result['allowed'] is False
+diff --git a/tests/hermes_cli/test_code_provenance_client.py b/tests/hermes_cli/test_code_provenance_client.py
+new file mode 100644
+index 00000000000..bd08776e656
+--- /dev/null
++++ b/tests/hermes_cli/test_code_provenance_client.py
+@@ -0,0 +1,60 @@
++"""The diagnostic client rejects mixed/truncated/tampered page streams."""
++import copy
++import hashlib
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import code_provenance_client as client
++from hermes_cli.code_attestation_snapshot import ENCODER, SECTIONS
++
++
++@pytest.fixture
++def stream(monkeypatch):
++    data = {name: [] for name in SECTIONS}
++    data['unknowns'] = ['one', 'two']
++    manifest = {name: {'count': len(rows), 'sha256': hashlib.sha256(ENCODER.encode(rows).encode()).hexdigest()}
++                for name, rows in data.items()}
++    summary = {'complete': True, 'purpose': 'diagnostic_only', 'snapshot_id': 'a' * 64,
++               'captured': {'generation': 1}, 'sections': manifest, 'raw': manifest['unknowns']}
++    def query(home, params):
++        if params['op'] == 'capture':
++            return copy.deepcopy(summary)
++        section, offset = params['section'], params['offset']
++        rows = data[section][offset:offset + 1]
++        return {**copy.deepcopy(summary), 'section': section, 'offset': offset, 'entries': rows,
++                'next': offset + len(rows) if offset + len(rows) < len(data[section]) else None}
++    monkeypatch.setattr(client, 'query', query)
++    return query, data, summary
++
++
++def test_client_verifies_all_sections(stream):
++    assert client.collect(Path('/unused'), {})['sections'] == stream[1]
++
++
++@pytest.mark.parametrize('field,value', [('complete', False), ('snapshot_id', 'b' * 64),
++    ('captured', {'generation': 2}), ('offset', 99), ('section', 'other'),
++    ('sections', {}), ('entries', []), ('entries', ['tampered']), ('next', 99), ('next', True)])
++def test_client_refuses_altered_pages(stream, monkeypatch, field, value):
++    original = stream[0]
++    def corrupt(home, params):
++        result = original(home, params)
++        if params['op'] == 'page' and params['section'] == 'unknowns':
++            result[field] = value
++        return result
++    monkeypatch.setattr(client, 'query', corrupt)
++    with pytest.raises(ValueError):
++        client.collect(Path('/unused'), {})
++
++
++@pytest.mark.parametrize('field,value', [('complete', False), ('purpose', 'authorization'), ('raw', {})])
++def test_client_refuses_bad_capture(stream, field, value):
++    stream[2][field] = value
++    with pytest.raises(ValueError):
++        client.collect(Path('/unused'), {})
++
++
++def test_client_has_total_byte_limit(stream, monkeypatch):
++    monkeypatch.setattr(client, 'MAX_SNAPSHOT_BYTES', 4100)
++    with pytest.raises(ValueError, match='too_large'):
++        client.collect(Path('/unused'), {})
+diff --git a/tests/hermes_cli/test_code_provenance_disk.py b/tests/hermes_cli/test_code_provenance_disk.py
+new file mode 100644
+index 00000000000..05253b1a9af
+--- /dev/null
++++ b/tests/hermes_cli/test_code_provenance_disk.py
+@@ -0,0 +1,62 @@
++"""Bounded fresh disk metadata, including real worktree and packed-ref layouts."""
++import time
++
++import pytest
++
++from hermes_cli import code_provenance_disk as disk
++
++
++def test_head_loose_packed_detached_and_linked(tmp_path):
++    common = tmp_path / 'common'
++    common.mkdir()
++    work = tmp_path / 'work'
++    work.mkdir()
++    git = tmp_path / 'git'
++    git.mkdir()
++    (work / '.git').write_text('gitdir: ../git')
++    (git / 'commondir').write_text('../common')
++    (git / 'HEAD').write_text('ref: refs/heads/topic')
++    ref = common / 'refs/heads/topic'
++    ref.parent.mkdir(parents=True)
++    ref.write_text('a' * 40)
++    assert disk.disk_identity(work, time.monotonic() + 2) == {'sha': 'a' * 40, 'error': None}
++    ref.unlink()
++    (common / 'packed-refs').write_text('# comment\n' + 'b' * 40 + ' refs/heads/other\n' +
++                                      'c' * 40 + ' refs/heads/topic\n')
++    assert disk.disk_identity(work, time.monotonic() + 2) == {'sha': 'c' * 40, 'error': None}
++    (git / 'HEAD').write_text('d' * 40)
++    assert disk.disk_identity(work, time.monotonic() + 2)['sha'] == 'd' * 40
++
++
++@pytest.mark.parametrize('head', ['ref: ../outside', 'ref: /outside', 'ref: refs/../outside',
++    'ref: refs\\outside', 'g' * 40, 'a' * 39, 'ref: refs/heads/absent'])
++def test_malformed_and_missing_metadata_explicit_unavailable(tmp_path, head):
++    git = tmp_path / '.git'
++    git.mkdir()
++    (git / 'HEAD').write_text(head)
++    result = disk.disk_identity(tmp_path, time.monotonic() + 2)
++    assert result['sha'] is None and result['error'] is not None
++
++
++def test_no_git_and_bad_gitdir(tmp_path):
++    assert disk.disk_identity(tmp_path, time.monotonic() + 2)['error'] == 'FileNotFoundError'
++    (tmp_path / '.git').write_text('not a gitdir')
++    assert disk.disk_identity(tmp_path, time.monotonic() + 2)['error'] == 'ValueError'
++
++
++def test_bounds_head_line_and_packed_total(tmp_path, monkeypatch):
++    git = tmp_path / '.git'
++    git.mkdir()
++    head = git / 'HEAD'
++    head.write_text('a' * (disk.MAX_METADATA + 1))
++    assert disk.disk_identity(tmp_path, time.monotonic() + 2)['error'] == 'ValueError'
++    head.write_text('ref: refs/heads/topic')
++    packed = git / 'packed-refs'
++    packed.write_text('x' * (disk.MAX_METADATA + 1))
++    assert disk.disk_identity(tmp_path, time.monotonic() + 2)['error'] == 'ValueError'
++    packed.write_text('# comment\n' * 100)
++    monkeypatch.setattr(disk, 'MAX_PACKED_REFS', 100)
++    assert disk.disk_identity(tmp_path, time.monotonic() + 2)['error'] == 'ValueError'
++    monkeypatch.setattr(disk, 'MAX_PACKED_REFS', 10000)
++    assert disk.disk_identity(tmp_path, time.monotonic() + 2)['error'] == 'ValueError'
++    assert disk.disk_identity(tmp_path, time.monotonic() - 1) == {'sha': None, 'error': 'TimeoutError'}
+diff --git a/website/docs/developer-guide/code-provenance-control.md b/website/docs/developer-guide/code-provenance-control.md
+new file mode 100644
+index 00000000000..57ed82da359
+--- /dev/null
++++ b/website/docs/developer-guide/code-provenance-control.md
+@@ -0,0 +1,117 @@
++# Private code-provenance diagnostics
++
++`code-provenance` is a protocol-1 **private control-socket** verb. It has no HTTP
++route, session ticket right, workflow operation or authorization receipt. The
++existing transport authenticates the same-UID Unix peer (or native pipe peer).
++The caller cannot supply or override that identity. Control dispatch treats this
++one verb as passive: it does not reserve work, arm a quiet episode, acquire a
++turn lease, restore a session, enroll/reload a plugin or change an authority epoch.
++
++The installed bootstrap ledger is the only source. Missing/unsupported ledgers
++refuse; the reader never calls `install`, resets unknowns or reconstructs execution
++history from current files. Inventory may latch additional sticky refusals, exactly
++as an ordinary integrity observation can. An unsupported **launch route** remains
++readable with its original refusal; an unsupported ledger implementation does not.
++A diagnostic export cannot make capsule owner/child verification succeed.
++
++## Requests
++
++Capture, with exact keys:
++
++```json
++{"protocol":1,"id":1,"verb":"code-provenance","params":{"schema":1,"op":"capture","expected":{"pid":123,"start_time":456,"instance_id":"opaque-runtime-instance"},"refresh_inventory":true}}
++```
++
++Page, with exact keys:
++
++```json
++{"protocol":1,"id":2,"verb":"code-provenance","params":{"schema":1,"op":"page","snapshot_id":"64-lowercase-hex-characters","section":"unknowns","offset":0,"limit":128}}
++```
++
++Booleans are not integers. Unknown keys, unknown sections, malformed offsets and
++limits refuse. The echoed envelope ID is absent/null, a signed 64-bit integer, or
++a string of at most 128 characters. Protocol/schema must be integer 1. No request
++may select a different peer or disable inventory.
++
++Successful result objects always have `purpose: "diagnostic_only"`. `complete:
++true` means the retained metadata snapshot was completely encoded within bounds,
++**not full provenance or trusted/clean code**. `full_provenance` is always false;
++`incomplete` explicitly names unavailable historical provenance. Error results have
++`complete: false` and no usable snapshot token. Invalid/authentication envelopes
++are rejected by the existing outer transport error envelope.
++
++## Sections and provenance
++
++- `unknowns`: every raw sticky reason, unfiltered.
++- `quiet_blocking`, `quiet_extension`: partitions derived from that same locked view.
++- `components`: registered canonical roots, one row per reviewed relative SHA256
++  file-map entry, and core boot-tree relative Git blob identities (not disk hashes).
++- `dependencies`: every registered root and every retained installer receipt,
++  including unused receipts. Each distribution is qualified by its physical root.
++- `executed_units`: retained core/dependency execution and native-load metadata.
++- `producers`: retained available generator and unknown-producer source metadata.
++  A producer receipt does not authorize its output.
++- `metadata`: actual ledger boot SHA/root/route, recorded interpreter/trusted seed
++  identities, exact boot-registry Git blob identity or explicit unavailability,
++  fresh disk HEAD/error, index limits and explicit unavailable history.
++
++Only named metadata fields with JSON-safe scalar values are copied. Arbitrary
++receipt keys, code objects, source, constants, frame locals, environment, selected
++configuration and credentials are not exported. Root/file/receipt membership is
++not inferred from an installation census. Disk HEAD reads bounded Git metadata;
++it does not establish a clean worktree or repair boot identity. A missing field
++is never manufactured from disk. The summary includes the capture's generation,
++monotonic begin/end, process/start/instance identity, current identity/generation,
++raw count/digest and per-section counts/digests. Current generation is a lock-free
++scalar observation and can advance again immediately; it is not an integrity gate.
++
++## Bounds and consistency
++
++One immutable in-memory snapshot per authenticated peer; no persistent server
++snapshot files. New capture replaces that peer's prior token. Tokens are bound to
++peer, installed ledger and process/start/instance. They expire 30 seconds after
++publication; expiry is checked on every page and stale storage is lazily removed.
++A new live generation does not mutate old pages. Page requests never inventory or
++recapture. Restart, replacement ledger, cross-peer use and expiry refuse.
++
++Capture has a fixed two-second budget, including bounded acquisition of the existing
++ledger lock, inventory, fresh disk metadata and encoding. One capture is in flight
++globally, including publication. Capture runs off-loop on a single-flight-owned
++daemon thread, not an accumulating executor queue. Identify and already-captured
++pages do not wait for that worker or its inventory lock. Python cannot cancel one
++blocked filesystem syscall: the caller receives `capture_timeout`, but global
++custody remains held until the actual worker ends. Further captures return busy;
++late positive results are discarded. No production deadline/cap is increased.
++A root that exceeds this budget needs a measured, separately reviewed owner decision.
++
++Snapshot accounting is incremental with a 16 MiB encoded cap, including fixed
++manifest headroom. Escaped scalars are preflighted in bounded chunks before whole
++entry encoding. An entry above 240 KiB is rejected rather than split or dropped;
++this leaves envelope space below the 256 KiB full-page cap. Pages also contain at
++most 128 entries and remain below the existing 512 KiB transport response limit.
++Overflow, inventory/lock errors and oversized entries are explicit incomplete
++failures, never truncated successful captures. Empty exhausted pages have `next:
++null`; otherwise `next` is exactly the first not-yet-returned offset.
++
++## Canonical encoding and supported collector
++
++Canonical JSON uses `ensure_ascii=True`, sorted object keys, compact `,`/`:`
++separators and `allow_nan=False`. Each section is ordered lexicographically by
++canonical entry bytes; identical retained entries remain distinct. Its digest is
++SHA256 of its complete canonical JSON **array**, including `[`/`]` and separators;
++empty sections hash `[]`. Counts include every entry. `raw` equals the `unknowns`
++manifest. Hashes cover metadata, not an authorization claim.
++
++`hermes_cli.code_provenance_client.collect(home, expected)` uses authenticated
++transport, a five-second per-request deadline and a 512 KiB actual-byte read cap.
++It rejects mixed snapshots, changed manifests, cursor gaps, aggregate overflow and
++count/digest mismatches. The ordinary ticket client's smaller 64 KiB response cap
++is unchanged. To emit a verified document to stdout after normal deployment:
++
++```sh
++python -m hermes_cli.code_provenance_client /path/to/gateway/home
++```
++
++The client identifies the existing process first, then collects all sections within
++the short TTL. It never changes deadlines or retries a failed capture silently.
++Fixture success is not a production-root capture, native proof or activation.
+diff --git a/website/docs/developer-guide/gateway-internals.md b/website/docs/developer-guide/gateway-internals.md
+index 86bdfc99bff..cd081ad9d75 100644
+--- a/website/docs/developer-guide/gateway-internals.md
++++ b/website/docs/developer-guide/gateway-internals.md
+@@ -476,6 +476,9 @@
+ 
+ ## Local control socket (public client contract)
+ 
++The private, same-peer, diagnostic-only [code-provenance snapshot API](code-provenance-control.md)
++is separate from public/session authorization and never grants capsule permission.
++
+ Each gateway listens on a local control socket. It is how a client on the same machine finds the
+ gateway that serves its profile and gets a WebSocket ticket, without spawning Python. Three verbs
+ are public: `identify` (read-only), `resolve-profile` and the public form of `session-ticket`.
+-- 
+2.43.0
+

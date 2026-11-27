@@ -1,0 +1,152 @@
+From 58994863e28637a48f900d290597be3a9f96331f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:07:36 +0000
+Subject: [PATCH 6014] Isolated native sessions capture and bounded startup
+
+Public mirror of source commit 58994863e28637a48f900d290597be3a9f96331f.
+
+---
+diff --git a/tests/hermes_cli/test_annotation_prepare_lifespan.py b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+index a003047571b..99aefb82560 100644
+--- a/tests/hermes_cli/test_annotation_prepare_lifespan.py
++++ b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+@@ -65,7 +65,15 @@
+ @pytest.mark.parametrize('optional', ['healthy', 'unused-profile', 'no-pr-info'])
+ def test_real_serve_composes_annotations_outside_sessions(kanban_root, tmp_path, monkeypatch, optional):
+     from contextlib import asynccontextmanager
++    from functools import partial
++    from hermes_cli import sessions_native_startup as sessions_startup
++    from hermes_cli.sessions_capture_worker import capture
+     from fastapi.testclient import TestClient
++
++    # Preserve this composition test's explicit roster and annotation doubles;
++    # fresh-process real-home capture is covered by test_sessions_capture_process.
++    monkeypatch.setattr(sessions_startup, 'SessionsRuntime',
++                        partial(sessions_startup.SessionsRuntime, capture_reader=capture))
+     from hermes_state import SessionDB
+     from hermes_cli import profiles, web_server, web_server_app
+     from hermes_cli import kanban_session_activity as kanban
+diff --git a/tests/hermes_cli/test_sessions_capture_http.py b/tests/hermes_cli/test_sessions_capture_http.py
+new file mode 100644
+index 00000000000..2822ae1edfe
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_capture_http.py
+@@ -0,0 +1,78 @@
++"""Default isolated capture reaches mounted HTTP with real rows and activity."""
++import asyncio
++import time
++
++import httpx
++import pytest
++from fastapi import FastAPI
++
++from hermes_cli.sessions_native_startup import SessionsMiddleware, lifespan
++from hermes_cli.web_routers import profiles
++from hermes_state import SessionDB
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.asyncio
++async def test_default_lifespan_child_capture_serves_real_list_and_sidebar(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HOME', str(home))
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    (home / 'config.yaml').write_text('kanban:\n  sync:\n    enabled: false\n    gateway: capture-fixture\n')
++    db = SessionDB(db_path=home / 'state.db')
++    try:
++        db.create_session('parent', source='cli')
++        db.append_message('parent', role='user', content='real capture')
++        db.create_session('child', source='subagent', parent_session_id='parent')
++        db.touch_session_activity('child', time.time())
++    finally:
++        db.close()
++    diagnostics = tmp_path / 'capture-stderr'
++    from hermes_cli import sessions_capture_process as process
++    original_spawn = process.spawn_owned
++
++    def diagnostic_spawn(*args, **kwargs):
++        with diagnostics.open('ab') as output:
++            kwargs['stderr'] = output
++            return original_spawn(*args, **kwargs)
++
++    monkeypatch.setattr(process, 'spawn_owned', diagnostic_spawn)
++    app = FastAPI()
++    app.add_middleware(SessionsMiddleware)
++    app.include_router(profiles.sessions_router)
++    # No injected capture, parent-only roster, clock or annotation doubles.
++    async with lifespan(app):
++        runtime = app.state.sessions_facts
++        assert await asyncio.to_thread(wait_until, lambda: runtime.ready, timeout=10)
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
++            for endpoint in ('/api/profiles/sessions', '/api/profiles/sessions/sidebar'):
++                response = None
++
++                async def ready():
++                    nonlocal response
++                    response = await client.get(endpoint, params={'profile': 'default', 'recents_profile': 'default'})
++                    assert response.status_code in (200, 503), response.text
++                    if response.status_code == 503:
++                        assert response.json() == {'detail': 'sessions projection unavailable'}
++                    return response.status_code == 200
++
++                from tests.waiting import async_wait_until
++                assert await async_wait_until(ready, timeout=15), (endpoint, diagnostics.read_text())
++                # This proves real child publication and HTTP composition, not
++                # the separate unit-start five-second production acceptance.
++                started = time.monotonic()
++                response = await client.get(endpoint, params={'profile': 'default', 'recents_profile': 'default'})
++                assert response.status_code == 200, (endpoint, response.text, diagnostics.read_text())
++                assert time.monotonic() - started < 5
++                result = response.json()
++                rows = result['recents']['sessions'] if endpoint.endswith('sidebar') else result['sessions']
++                parent = next(row for row in rows if row['id'] == 'parent')
++                observations = [o for o in parent['execution_observations'] if o['source'] == 'subagent.activity']
++                assert len(observations) == 1
++                assert observations[0]['state'] == 'running'
++                assert observations[0]['identity']['work_id'] == 'child'
++        owner = runtime.capture_reader
++    assert owner._child is None and owner._closed
++    assert app.state.sessions_facts is None
+diff --git a/tests/hermes_cli/test_sessions_first_read.py b/tests/hermes_cli/test_sessions_first_read.py
+index b5baf1b77d6..66d7db18d49 100644
+--- a/tests/hermes_cli/test_sessions_first_read.py
++++ b/tests/hermes_cli/test_sessions_first_read.py
+@@ -17,6 +17,13 @@
+ 
+ @pytest.mark.asyncio
+ async def test_cold_selector_waits_for_owner_then_warm_read_has_no_capture(profiles_on_disk, monkeypatch):
++    from functools import partial
++    from hermes_cli import sessions_native_startup as startup
++    from hermes_cli.sessions_capture_worker import capture
++
++    # This holder-boundary test gates a parent-local annotator with Events.
++    # Actual fresh-process capture has separate real-store integration coverage.
++    monkeypatch.setattr(startup, 'SessionsRuntime', partial(startup.SessionsRuntime, capture_reader=capture))
+     entered, release = threading.Event(), threading.Event()
+     original = profiles.annotate_kanban_activity
+     captures = []
+diff --git a/tests/hermes_cli/test_subagent_session_activity.py b/tests/hermes_cli/test_subagent_session_activity.py
+index 1905732eb01..55dc58913be 100644
+--- a/tests/hermes_cli/test_subagent_session_activity.py
++++ b/tests/hermes_cli/test_subagent_session_activity.py
+@@ -177,7 +177,14 @@
+ 
+ @pytest.mark.parametrize("endpoint", ["/api/profiles/sessions", "/api/profiles/sessions/sidebar"])
+ def test_profile_lists_http_entry_paths(stored, monkeypatch, endpoint):
++    from functools import partial
++    from hermes_cli import sessions_native_startup as startup
++    from hermes_cli.sessions_capture_worker import capture
+     from fastapi.testclient import TestClient
++
++    # The activity clock/scope are parent-local fixture doubles, not child state.
++    # Keep the actual annotation and HTTP path; process integration is separate.
++    monkeypatch.setattr(startup, 'SessionsRuntime', partial(startup.SessionsRuntime, capture_reader=capture))
+     from hermes_cli import profiles as profile_config
+     from hermes_cli.web_routers import profiles
+     from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+-- 
+2.43.0
+

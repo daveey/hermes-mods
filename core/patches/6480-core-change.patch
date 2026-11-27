@@ -1,0 +1,510 @@
+From ddd1a22c9e16e54695c65c6bea485f2e05a289b4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:07:53 +0000
+Subject: [PATCH 6480] Annotation readers, batched revisions and settlement generations
+
+Public mirror of source commit ddd1a22c9e16e54695c65c6bea485f2e05a289b4.
+
+---
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index 5c754edc29c..de7904172c7 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -23,11 +23,12 @@
+         lock.release()
+ 
+ 
+-def cached_entry(path, busy_budget=0.5):
+-    return retry_open(lambda remaining: _cached_entry_once(path, remaining), busy_budget)
++def cached_entry(path, busy_budget=0.5, *, reader_cache=None):
++    options = {} if reader_cache is None else {'reader_cache': reader_cache}
++    return retry_open(lambda remaining: _cached_entry_once(path, remaining, **options), busy_budget)
+ 
+ 
+-def borrow_warm(path):
++def borrow_warm(path, *, reader_cache=None):
+     """Return an already-borrowed, attested live entry, or None for ordinary admission.
+ 
+     No open/close occurs here. Retained tracking custody excludes raw offline access;
+@@ -38,9 +39,10 @@
+     from hermes_cli import kanban_generation as gen, kanban_session_activity as activity
+     from hermes_cli.kanban_lockguard import shm_identity
+ 
++    cache, cache_lock = reader_cache or (activity._RO_CACHE, activity._RO_CACHE_LOCK)
+     key = str(path)
+-    with activity._RO_CACHE_LOCK:
+-        entry = activity._RO_CACHE.get(key)
++    with cache_lock:
++        entry = cache.get(key)
+     if entry is None or not entry[2].acquire(blocking=False):
+         return None
+     keep = False
+@@ -61,8 +63,8 @@
+                 or current != entry[3] or any(c._hermes_generation_shm is not None
+                     and c._hermes_generation_shm != current for c in handles)):
+             return None
+-        with activity._RO_CACHE_LOCK:
+-            keep = activity._RO_CACHE.get(key) is entry
++        with cache_lock:
++            keep = cache.get(key) is entry
+         return (key, entry) if keep else None
+     except (OSError, sqlite3.Error):
+         return None
+@@ -79,10 +81,11 @@
+         return entry is not None and entry[0] is conn
+ 
+ 
+-def _cached_entry_once(path, remaining):
++def _cached_entry_once(path, remaining, reader_cache=None):
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli.kanban_lockguard import shm_identity
+ 
++    cache, cache_lock = reader_cache or (activity._RO_CACHE, activity._RO_CACHE_LOCK)
+     key = str(path)
+     # Same-board opens/last closes are atomic; registry locks protect only map
+     # operations. Borrowers never wait for this board lock while holding the map.
+@@ -93,15 +96,15 @@
+         except OSError as exc:
+             raise sqlite3.OperationalError(f"unable to open database file {path}: {exc}") from exc
+         ident = (st.st_dev, st.st_ino)
+-        with activity._RO_CACHE_LOCK:
+-            entry = activity._RO_CACHE.get(key)
++        with cache_lock:
++            entry = cache.get(key)
+             stale = entry if entry is not None and entry[1] != ident else None
+             if stale is not None:
+                 # A borrower may need the board lock to close on a read error.
+                 # Never wait for it while holding that lock; preserve its entry.
+                 if not stale[2].acquire(blocking=False):
+                     raise DeletedWalGenerationError(f"kanban DB {path}: replaced reader is still borrowed; retry")
+-                del activity._RO_CACHE[key]
++                del cache[key]
+                 entry = None
+         if stale is not None:
+             try:
+@@ -112,6 +115,6 @@
+             conn = activity._open_ro(path, check_same_thread=False, timeout=0)
+             conn.execute(f"PRAGMA busy_timeout={int(activity._RO_BUSY_TIMEOUT_S * 1000)}")
+             entry = (conn, ident, threading.Lock(), shm_identity(path))
+-            with activity._RO_CACHE_LOCK:
+-                activity._RO_CACHE[key] = entry
++            with cache_lock:
++                cache[key] = entry
+         return key, entry
+diff --git a/hermes_cli/kanban_reader_retention.py b/hermes_cli/kanban_reader_retention.py
+index ec4d453a939..5092deb51ed 100644
+--- a/hermes_cli/kanban_reader_retention.py
++++ b/hermes_cli/kanban_reader_retention.py
+@@ -62,6 +62,8 @@
+             closed += 1
+         finally:
+             entry[2].release()
++    from hermes_cli import kanban_waiting_reader
++    closed += kanban_waiting_reader.release_gone()
+     return closed
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 1a5420f6df0..3a2836eb690 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -421,6 +421,7 @@
+ 
+ 
+ from hermes_cli.kanban_generation import open_ro as _open_ro
++from hermes_cli.kanban_waiting_reader import reading as waiting_ro, close_all as close_waiting_readers
+ 
+ 
+ # Linked-card reads run on every sidebar refresh across ~16 boards and replicas; a fresh connection pays schema
+@@ -436,7 +437,7 @@
+ 
+ 
+ @contextlib.contextmanager
+-def cached_ro(path: Path, *, busy_budget: float = 0.5) -> Iterator[sqlite3.Connection]:
++def cached_ro(path: Path, *, busy_budget: float = 0.5, reader_cache=None) -> Iterator[sqlite3.Connection]:
+     """A shared read-only connection to ``path``, held exclusively for the ``with`` body. Reopened when the file is
+     replaced (new inode: a rebuilt replica), after any sqlite error, or when its ``-shm`` generation is gone (the
+     connection is stranded on a deleted WAL index and would fail with ``disk I/O error`` or read stale rows until
+@@ -446,9 +447,11 @@
+     with "cached reader is borrowed" (hub errors.log)."""
+     from hermes_cli.kanban_reader_lifecycle import borrow_warm, cached_entry, try_borrow
+ 
++    cache, cache_lock = reader_cache or (_RO_CACHE, _RO_CACHE_LOCK)
++    options = {} if reader_cache is None else {'reader_cache': reader_cache}
+     started = time.monotonic()
+-    warm = borrow_warm(path)
+-    key, entry = warm if warm is not None else cached_entry(path, busy_budget)
++    warm = borrow_warm(path, **options)
++    key, entry = warm if warm is not None else cached_entry(path, busy_budget, **options)
+     conn, _ident, lock, _shm = entry
+     remaining = busy_budget - (time.monotonic() - started)
+     if warm is None and not try_borrow(lock, min(remaining, _RO_SHARED_WAIT_S)):
+@@ -457,8 +460,8 @@
+             yield private
+         return
+     try:
+-        with _RO_CACHE_LOCK:
+-            if _RO_CACHE.get(key) is not entry:
++        with cache_lock:
++            if cache.get(key) is not entry:
+                 from hermes_cli.kanban_generation import DeletedWalGenerationError
+                 raise DeletedWalGenerationError(f"kanban DB {path}: reader was evicted while waiting; retry")
+         conn.row_factory = None
+@@ -470,19 +473,19 @@
+         try:
+             yield conn
+         except sqlite3.Error:
+-            with _RO_CACHE_LOCK:
+-                if _RO_CACHE.get(key) is entry:
+-                    del _RO_CACHE[key]
++            with cache_lock:
++                if cache.get(key) is entry:
++                    del cache[key]
+             _close_quietly(conn)
+             raise
+         finally:
+-            if lowered and _RO_CACHE.get(key) is entry:
++            if lowered and cache.get(key) is entry:
+                 try:
+                     conn.execute(f"PRAGMA busy_timeout={int(_RO_BUSY_TIMEOUT_S * 1000)}")
+                 except sqlite3.Error:  # never keep a reader with the probe's budget
+-                    with _RO_CACHE_LOCK:
+-                        if _RO_CACHE.get(key) is entry:
+-                            del _RO_CACHE[key]
++                    with cache_lock:
++                        if cache.get(key) is entry:
++                            del cache[key]
+                     _close_quietly(conn)
+     finally:
+         lock.release()
+diff --git a/hermes_cli/kanban_waiting_reader.py b/hermes_cli/kanban_waiting_reader.py
+new file mode 100644
+index 00000000000..77ebdf6623e
+--- /dev/null
++++ b/hermes_cli/kanban_waiting_reader.py
+@@ -0,0 +1,100 @@
++"""Bounded waiting-evidence readers, independent of generic dashboard eviction.
++
++Reuse the ordinary cached_ro admission, attestation and statement budgets. Only
++retention ownership differs; no output or SQLite snapshot is cached here.
++"""
++import atexit
++import contextlib
++import threading
++from collections import OrderedDict
++from pathlib import Path
++
++from hermes_cli import kanban_generation as generation
++
++LIMIT = 32
++_cache = OrderedDict()
++_lock = threading.RLock()
++# Waiting declarations are already serialized. Preserve that custody across
++# admission and cap checks, without taking it from generation-recovery callbacks.
++_read_lock = threading.Lock()
++
++
++def _retire(key, entry, *, gone=False):
++    from hermes_cli.kanban_sync_board_watch import path_gone
++    if not entry[2].acquire(blocking=False):
++        return False
++    try:
++        with generation.lifecycle_access(key, timeout=0):
++            if gone and not path_gone(key):
++                return False
++            with generation._cache_registry_available(_lock):
++                if _cache.get(key) is not entry or entry[0].in_transaction:
++                    return False
++                del _cache[key]
++            entry[0].close()
++        return True
++    except (generation.BoardLifecycleBusy, generation.DeletedWalGenerationError):
++        return False
++    finally:
++        entry[2].release()
++
++
++def evict(path):
++    """Recovery retains exclusive borrower and actual descriptor-close custody."""
++    with generation._cache_registry_available(_lock):
++        entries = [(key, entry) for key, entry in _cache.items() if generation._resolved(key) == path]
++    for key, entry in entries:
++        if not _retire(key, entry):
++            raise generation.DeletedWalGenerationError('waiting reader is borrowed; retry recovery')
++
++
++generation.register_reader_cache(evict)
++
++
++def close_all():
++    with _lock:
++        entries = list(_cache.items())
++    for key, entry in entries:
++        _retire(key, entry)
++
++
++def release_gone():
++    from hermes_cli.kanban_sync_board_watch import path_gone
++    with _lock:
++        entries = list(_cache.items())
++    return sum(_retire(key, entry, gone=True) for key, entry in entries if path_gone(key))
++
++
++atexit.register(close_all)
++
++
++@contextlib.contextmanager
++def reading(path, *, busy_budget=0.5):
++    from hermes_cli import kanban_session_activity as activity
++    path = Path(path)
++    # No new Python wait for a speculative zero-budget caller. A concurrent or
++    # nested declaration uses unchanged private admission, not another cache slot.
++    if not _read_lock.acquire(blocking=False):
++        with activity._private_ro(path, min(busy_budget, activity._RO_BUSY_TIMEOUT_S)) as conn:
++            yield conn
++        return
++    try:
++        key = str(path)
++        with _lock:
++            candidates = list(_cache.items()) if key not in _cache and len(_cache) >= LIMIT else []
++        for old_key, entry in candidates:
++            if _retire(old_key, entry):
++                break
++        with _lock:
++            full = key not in _cache and len(_cache) >= LIMIT
++        if full:
++            with activity._private_ro(path, min(busy_budget, activity._RO_BUSY_TIMEOUT_S)) as conn:
++                yield conn
++            return
++        with activity.cached_ro(path, busy_budget=busy_budget, reader_cache=(_cache, _lock)) as conn:
++            with _lock:
++                if key in _cache:
++                    _cache.move_to_end(key)
++            yield conn
++    finally:
++        _read_lock.release()
+diff --git a/tests/hermes_cli/test_waiting_reader_domain.py b/tests/hermes_cli/test_waiting_reader_domain.py
+new file mode 100644
+index 00000000000..a751587f037
+--- /dev/null
++++ b/tests/hermes_cli/test_waiting_reader_domain.py
+@@ -0,0 +1,216 @@
++"""Unrelated generic reader retention cannot cool serialized waiting evidence."""
++import contextlib
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_generation as generation
++from hermes_cli import kanban_waiting_reader as domain
++from hermes_cli import kanban_reader_retention as retention
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import sqlite_safe_read as safe
++from tests.hermes_cli import test_cached_ro_warm_admission as warm
++
++board = warm.board
++held_elsewhere = warm.held_elsewhere
++
++
++@pytest.fixture(autouse=True)
++def domain_cleanup():
++    domain.close_all()
++    yield
++    domain.close_all()
++    assert not domain._cache
++
++
++@pytest.fixture
++def isolated_warm(monkeypatch):
++    # Reuse the exact retained-custody controls against the independent domain,
++    # without monkeypatching activity.cached_ro (the real implementation it calls).
++    monkeypatch.setattr(warm, 'activity', SimpleNamespace(
++        cached_ro=domain.reading, _RO_CACHE=domain._cache,
++        _reset_cache_for_tests=domain.close_all))
++    from hermes_cli import kanban_reader_lifecycle as readers
++    original = readers.borrow_warm
++    monkeypatch.setattr(readers, 'borrow_warm', lambda path, **kw:
++                        original(path, **(kw or {'reader_cache': (domain._cache, domain._lock)})))
++
++
++@pytest.mark.parametrize('invalid', ['poison', 'forgotten', 'tracking', 'shm'])
++def test_domain_uncertain_custody(board, monkeypatch, isolated_warm, invalid):
++    warm.test_uncertain_warm_entry_keeps_lifecycle_admission(board, monkeypatch, invalid)
++
++
++def test_domain_lifecycle_and_read_your_writes(board, isolated_warm):
++    warm.test_warm_zero_budget_read_during_other_lifecycle_transition(board)
++
++
++def test_domain_cold_lifecycle(board, isolated_warm):
++    warm.test_cold_zero_budget_read_keeps_lifecycle_admission(board)
++
++
++def test_domain_transaction(board, isolated_warm):
++    warm.test_transaction_declines_warm_admission(board)
++
++
++def test_domain_stale_sibling(board, monkeypatch, isolated_warm):
++    warm.test_stale_sibling_declines_warm_admission(board, monkeypatch)
++
++
++def test_domain_main_replacement(board, tmp_path, isolated_warm):
++    warm.test_replaced_main_file_declines_warm_admission(board, tmp_path)
++
++
++def test_domain_body_error_tracking_custody(board, isolated_warm):
++    warm.test_error_cleanup_retains_tracking_until_lifecycle_owner_releases(board)
++
++
++def test_domain_raw_exclusion(board, isolated_warm):
++    warm.test_warm_custody_excludes_raw_probe_without_acquiring_tracking_mutex(board)
++
++
++def test_domain_cap_lru_and_close_custody(board, tmp_path, monkeypatch):
++    monkeypatch.setattr(domain, 'LIMIT', 1)
++    with domain.reading(board) as original:
++        pass
++    other = tmp_path / 'other.db'
++    with contextlib.closing(sqlite3.connect(other)) as conn:
++        conn.execute('CREATE TABLE t(v)')
++    with held_elsewhere(generation.lifecycle_lock(board)):
++        with domain.reading(other) as private:
++            assert len(domain._cache) == 1
++            assert domain._cache[str(board)][0] is original
++        with pytest.raises(sqlite3.ProgrammingError):
++            private.execute('SELECT 1')
++        domain.close_all()
++        assert safe.has_live_connection(board)
++    with domain.reading(other):
++        assert len(domain._cache) == 1
++        assert str(board) not in domain._cache
++    with pytest.raises(sqlite3.ProgrammingError):
++        original.execute('SELECT 1')
++
++
++def test_domain_warm_statement_budget(board):
++    with domain.reading(board) as conn:
++        assert conn.execute('PRAGMA busy_timeout').fetchone() == (500,)
++    with domain.reading(board, busy_budget=0) as conn:
++        assert conn.execute('PRAGMA busy_timeout').fetchone() == (0,)
++    with domain.reading(board) as conn:
++        assert conn.execute('PRAGMA busy_timeout').fetchone() == (500,)
++
++
++def test_gone_domain_reader_is_swept_without_revisit(board):
++    with domain.reading(board) as conn:
++        board.unlink()
++        assert retention.release_gone() == 0  # borrowed; never force close
++        assert safe.has_live_connection(board)
++    assert retention.release_gone() == 1
++    assert not safe.has_live_connection(board)
++    with pytest.raises(sqlite3.ProgrammingError):
++        conn.execute('SELECT 1')
++
++
++def test_domain_cold_tracking_contention_is_not_bypassed(board):
++    with held_elsewhere(safe._live_lock):
++        with pytest.raises(sqlite3.OperationalError, match='tracking registry is busy'):
++            with domain.reading(board, busy_budget=0):
++                pytest.fail('cold admission bypassed tracking custody')
++    assert not domain._cache
++    with domain.reading(board) as conn:
++        assert conn.execute('SELECT v FROM t').fetchone() == (1,)
++
++
++def test_domain_nested_private_and_error_release(board):
++    with domain.reading(board) as original:
++        with domain.reading(board) as nested:
++            assert nested is not original
++            assert len(domain._cache) == 1
++        with pytest.raises(sqlite3.ProgrammingError):
++            nested.execute('SELECT 1')
++    with pytest.raises(ValueError, match='caller'):
++        with domain.reading(board):
++            raise ValueError('caller')
++    with domain.reading(board) as current:
++        assert current is original
++
++
++def test_domain_foreign_borrow_private_is_closed(board):
++    with held_elsewhere(domain._read_lock):
++        with domain.reading(board, busy_budget=0) as private:
++            assert private.execute('SELECT v FROM t').fetchone() == (1,)
++            assert not domain._cache
++        with pytest.raises(sqlite3.ProgrammingError):
++            private.execute('SELECT 1')
++    assert not safe.has_live_connection(board)
++
++
++def test_domain_recovery_refuses_borrowed_then_retires(board):
++    canonical = generation._resolved(board)
++    with domain.reading(board) as conn:
++        with pytest.raises(generation.DeletedWalGenerationError):
++            domain.evict(canonical)
++        assert safe.has_live_connection(board)
++    domain.evict(canonical)
++    assert not domain._cache
++    assert not safe.has_live_connection(board)
++    with pytest.raises(sqlite3.ProgrammingError):
++        conn.execute('SELECT 1')
++
++
++def test_domain_recovery_preserves_unfinished_transaction(board):
++    with domain.reading(board) as conn:
++        conn.execute('BEGIN')
++    try:
++        with pytest.raises(generation.DeletedWalGenerationError):
++            domain.evict(generation._resolved(board))
++        assert conn.in_transaction
++        assert safe.has_live_connection(board)
++    finally:
++        conn.rollback()
++    domain.evict(generation._resolved(board))
++    assert not domain._cache
++
++
++def test_domain_recovery_map_contention_is_nonblocking(board):
++    with domain.reading(board):
++        pass
++    with held_elsewhere(domain._lock):
++        with pytest.raises(generation.DeletedWalGenerationError, match='reader registry is busy'):
++            domain.evict(generation._resolved(board))
++    domain.evict(generation._resolved(board))
++    assert not domain._cache
++
++
++def test_domain_alias_recovery(board, tmp_path):
++    alias = tmp_path / 'alias.db'
++    alias.symlink_to(board)
++    with domain.reading(alias) as conn:
++        pass
++    domain.evict(generation._resolved(board))
++    assert not domain._cache
++    with pytest.raises(sqlite3.ProgrammingError):
++        conn.execute('SELECT 1')
++
++
++def test_generic_prune_keeps_waiting_reader_warm(board, tmp_path, monkeypatch):
++    reading = getattr(activity, 'waiting_ro', activity.cached_ro)
++    monkeypatch.setattr(retention, 'LIMIT', 1)
++    try:
++        with reading(board) as original:
++            assert original.execute('SELECT v FROM t').fetchone() == (1,)
++        for i in range(3):
++            other = tmp_path / f'other{i}.db'
++            with contextlib.closing(sqlite3.connect(other)) as conn:
++                conn.execute('CREATE TABLE t(v)')
++            with retention.reader(other):
++                pass
++        with held_elsewhere(safe._live_lock):
++            with reading(board, busy_budget=0) as current:
++                assert current is original
++                assert current.execute('SELECT v FROM t').fetchone() == (1,)
++    finally:
++        close = getattr(activity, 'close_waiting_readers', None)
++        if close is not None:
++            close()
+-- 
+2.43.0
+

@@ -1,0 +1,422 @@
+From 2241a08ea192b6c5903ece4caf6142a12e351269 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:16:37 +0000
+Subject: [PATCH 5966] Kanban scratch archive: foreign ownership, retention and promisor clones
+
+Public mirror of source commit 2241a08ea192b6c5903ece4caf6142a12e351269.
+
+---
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index d21492ee40c..504b2f69afe 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -50,8 +50,11 @@
+   tree is archived as a nested repo; a gitdir outside it gets ``tracked.diff``,
+   ``untracked.tar`` and HEAD/branch in meta.json, read through a private copy of
+   its index so git never writes to the outside gitdir;
+-* a fifo or socket: the manifest records its path, type and mode; it has no
+-  content to archive;
++* a fifo, socket or device node: the manifest records its path, type and mode
++  (a device also its ``rdev`` [major, minor]); it has no content to archive;
++* entries owned by another user (a root build under sudo): with passwordless
++  sudo they are recorded and chowned to the worker user first
++  (``kanban_scratch_archive_ownership``);
+ * refs whose tip the remote already holds (tags fetched from a promisor remote)
+   are no longer bundled, and a ref needing objects the promisor remote vouches
+   for is left to the payload (``promised_refs``).
+@@ -63,7 +66,7 @@
+ source. A workspace referencing an external gitdir cannot use that fallback.
+ 
+ Anything it cannot prove safe keeps the workspace: a ``.git`` symlink, a gitlink
+-whose gitdir is missing or empty, a device node, unpushed objects that are
++whose gitdir is missing or empty, unpushed objects that are
+ missing locally and vouched for by no promisor remote (reason
+ ``unrecoverable_objects``), any scan error, source mutation during the archive,
+ or any failed archive step. A regular ``.git`` file with no ``gitdir:`` line
+@@ -443,7 +446,7 @@
+ 
+ 
+ # Entries the manifest records (path, type, mode) with no tar member: they hold no content.
+-_CONTENTLESS = ("fifo", "socket")
++_CONTENTLESS = ("fifo", "socket", "chardev", "blockdev")
+ 
+ 
+ def _kind(mode: int) -> str:
+@@ -457,7 +460,11 @@
+         return "fifo"
+     if stat.S_ISSOCK(mode):
+         return "socket"
+-    raise ArchiveRefused("special file in workspace (device node)")
++    if stat.S_ISCHR(mode):
++        return "chardev"
++    if stat.S_ISBLK(mode):
++        return "blockdev"
++    raise ArchiveRefused("special file in workspace (unknown type)")
+ 
+ 
+ def _signature(st: os.stat_result) -> list[int]:
+@@ -610,6 +617,8 @@
+                     entries[erel] = rec
+             elif kind in _CONTENTLESS:
+                 if rec is not None:
++                    if kind in ("chardev", "blockdev"):
++                        rec["rdev"] = [os.major(st.st_rdev), os.minor(st.st_rdev)]
+                     entries[erel] = rec  # recorded, never opened: reading a fifo could block or drain it
+             elif info is not None:
+                 if omit is not None and omit(dfd, name, erel, st):
+@@ -901,6 +910,8 @@
+     no half archive that looks complete. Raises :class:`ArchiveRefused` (or
+     ``OSError``) on any failure; the caller then keeps the workspace.
+     """
++    from hermes_cli.kanban_scratch_archive_ownership import adopt
++    adopt(workspace)  # root-owned build output: record owners, then chown to the worker user (sudo only)
+     layout = _discover(workspace)
+     repos, markers = layout.repos, layout.markers
+     try:
+diff --git a/hermes_cli/kanban_scratch_archive_ownership.py b/hermes_cli/kanban_scratch_archive_ownership.py
+new file mode 100644
+index 00000000000..c14bee77f8d
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_archive_ownership.py
+@@ -0,0 +1,120 @@
++"""Adopt foreign-owned entries in a terminal scratch tree before it is archived. [daveey]
++
++Representative observation: root-filesystem builds in finished scratch were
++kept indefinitely and stopped new claims (``worker_disk_below_floor``).
++The builds ran under sudo, so the trees held root-owned files and directories:
++the unprivileged archive scan hit ``PermissionError`` on every hourly retry, and
++even a readable root-owned directory cannot be emptied by the worker user, so
++removal after a successful archive would leave a half-deleted tree.
++
++When the worker user has passwordless sudo (``sudo -n``), :func:`adopt` records
++every entry not owned by the worker user (relative path, uid, gid, mode, type)
++into :data:`RECORD_NAME` at the workspace root, then ``chown -R -P`` the tree to
++the worker user. The record is written before the chown and is archived with the
++payload, so the original ownership is restorable. Nothing else changes: the
++normal archive, verification and guarded removal run unprivileged afterwards.
++
++Refused (``ArchiveRefused``; the tree is kept): any mount point at or below the
++workspace (a chroot with a bind-mounted /dev or host directory must never be
++chowned through), a failed find/tee/chown, or an unparseable earlier record.
++Without passwordless sudo, or when already running as root, it does nothing.
++"""
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++RECORD_NAME = ".hermes-foreign-ownership-v1.json"
++_TIMEOUT = 1800
++_run = subprocess.run  # tests replace it
++
++
++def _sudo(*args: str, input: bytes | None = None, check: bool = True) -> subprocess.CompletedProcess:
++    proc = _run(["sudo", "-n", *args], input=input, capture_output=True, timeout=_TIMEOUT)
++    if check and proc.returncode != 0:
++        from hermes_cli.kanban_scratch_archive import ArchiveRefused
++        err = (proc.stderr or b"").decode("utf-8", "replace").strip()[:300]
++        raise ArchiveRefused(f"foreign ownership adoption: {args[0]} failed (rc={proc.returncode}): {err}")
++    return proc
++
++
++def _unescape_mount(field: str) -> str:
++    # /proc/self/mountinfo escapes space, tab, newline and backslash as \ooo.
++    out, i = [], 0
++    while i < len(field):
++        if field[i] == "\\" and i + 3 < len(field) and field[i + 1:i + 4].isdigit():
++            out.append(chr(int(field[i + 1:i + 4], 8)))
++            i += 4
++        else:
++            out.append(field[i])
++            i += 1
++    return "".join(out)
++
++
++def mounts_below(root: Path, mountinfo: str | None = None) -> list[str]:
++    """Mount points equal to or below *root* (from /proc/self/mountinfo)."""
++    if mountinfo is None:
++        with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as fh:
++            mountinfo = fh.read()
++    base = os.path.realpath(root)
++    found = []
++    for line in mountinfo.splitlines():
++        parts = line.split(" ")
++        if len(parts) < 5:
++            continue
++        point = _unescape_mount(parts[4])
++        if point == base or point.startswith(base.rstrip("/") + "/"):
++            found.append(point)
++    return found
++
++
++def _parse(out: bytes) -> list[dict]:
++    rows = []
++    for rec in out.split(b"\0"):
++        if not rec:
++            continue
++        uid, gid, mode, kind, rel = rec.split(b" ", 4)
++        rows.append({"path": rel.decode("utf-8", "surrogateescape") or ".", "uid": int(uid), "gid": int(gid),
++                     "mode": int(mode, 8), "type": kind.decode()})
++    return rows
++
++
++def adopt(workspace: Path) -> list[dict]:
++    """Record then chown every foreign-owned entry of *workspace*; return the new records (may be empty)."""
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    if not sys.platform.startswith("linux") or not hasattr(os, "geteuid"):
++        return []
++    uid, gid = os.geteuid(), os.getegid()  # windows-footgun: ok -- Linux-only, hasattr guard above
++    if uid == 0:
++        return []
++    try:
++        if _run(["sudo", "-n", "true"], capture_output=True, timeout=30).returncode != 0:
++            return []
++    except (OSError, subprocess.SubprocessError):
++        return []
++    root = os.path.realpath(workspace)
++    probe = _sudo("find", root, "-xdev", "!", "-uid", str(uid), "-print", "-quit")
++    if not probe.stdout.strip():
++        return []
++    mounts = mounts_below(Path(root))
++    if mounts:
++        raise ArchiveRefused(f"foreign ownership adoption: mount point(s) inside workspace: {mounts[:3]}")
++    listing = _sudo("find", root, "-xdev", "!", "-uid", str(uid), "-printf", "%U %G %m %y %P\\0")
++    rows = _parse(listing.stdout)
++    record = Path(root) / RECORD_NAME
++    earlier: list[dict] = []
++    read = _sudo("cat", "--", str(record), check=False)
++    if read.returncode == 0:
++        try:
++            earlier = json.loads(read.stdout)["entries"]
++        except (ValueError, KeyError, TypeError) as exc:
++            raise ArchiveRefused(f"foreign ownership adoption: unreadable {RECORD_NAME}: {exc!r}") from exc
++    known = {e["path"] for e in earlier}
++    merged = earlier + [r for r in rows if r["path"] not in known and r["path"] != RECORD_NAME]
++    body = json.dumps({"version": 1, "adopted_to": [uid, gid], "entries": merged}, indent=1).encode() + b"\n"
++    _sudo("tee", "--", str(record), input=body)
++    _sudo("chown", "-R", "-P", "--no-dereference", f"{uid}:{gid}", "--", root)
++    return rows
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_ownership.py b/tests/hermes_cli/test_kanban_scratch_archive_ownership.py
+new file mode 100644
+index 00000000000..58c3709d3ee
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_archive_ownership.py
+@@ -0,0 +1,167 @@
++"""Root-owned build output in finished scratch is recorded, chowned, archived and removed. [daveey]
++
++Representative observation: finished root-filesystem builds were kept indefinitely.
++Archive retries hit PermissionError or device nodes, eventually
++stopping new claims at the disk floor (``worker_disk_below_floor``).
++"""
++import json
++import os
++import shutil
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_scratch_archive as sa
++from hermes_cli import kanban_scratch_archive_ownership as own
++from tests.hermes_cli import test_kanban_scratch_gc_archive as base
++
++board = base.board
++linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="sudo adoption is Linux-only")
++
++
++class FakeSudo:
++    def __init__(self, *, sudo_ok=True, foreign=b"", listing=b"", earlier=None):
++        self.sudo_ok, self.foreign, self.listing, self.earlier = sudo_ok, foreign, listing, earlier
++        self.calls, self.written = [], None
++
++    def __call__(self, argv, input=None, capture_output=True, timeout=None):
++        self.calls.append(argv)
++        cmd = argv[2] if argv[:2] == ["sudo", "-n"] else argv[0]
++        handler = {"true": self._true, "find": self._find, "cat": self._cat, "tee": self._tee}.get(cmd)
++        rc, out = handler(argv, input) if handler else (0, b"")
++        return SimpleNamespace(returncode=rc, stdout=out, stderr=b"")
++
++    def _true(self, argv, input):
++        return (0 if self.sudo_ok else 1), b""
++
++    def _find(self, argv, input):
++        return 0, (self.foreign if "-quit" in argv else self.listing)
++
++    def _cat(self, argv, input):
++        return (0, self.earlier) if self.earlier is not None else (1, b"")
++
++    def _tee(self, argv, input):
++        self.written = json.loads(input)
++        return 0, b""
++
++    def ran(self, cmd):
++        return [c for c in self.calls if c[:3] == ["sudo", "-n", cmd]]
++
++
++@pytest.fixture
++def fake(monkeypatch, tmp_path):
++    monkeypatch.setattr(own.os, "geteuid", lambda: 1000)
++    monkeypatch.setattr(own.os, "getegid", lambda: 1000)
++    monkeypatch.setattr(own.sys, "platform", "linux")
++    monkeypatch.setattr(own, "mounts_below", lambda root: [])
++
++    def make(**kw):
++        f = FakeSudo(**kw)
++        monkeypatch.setattr(own, "_run", f)
++        return f
++    return make
++
++
++def test_nothing_foreign_changes_nothing(fake, tmp_path):
++    f = fake(foreign=b"")
++    assert own.adopt(tmp_path) == []
++    assert not f.ran("chown") and not f.ran("tee")
++
++
++def test_no_passwordless_sudo_changes_nothing(fake, tmp_path):
++    f = fake(sudo_ok=False, foreign=b"x\n")
++    assert own.adopt(tmp_path) == []
++    assert not f.ran("find") and not f.ran("chown")
++
++
++def test_foreign_entries_are_recorded_before_chown(fake, tmp_path):
++    listing = b"0 0 755 d \x000 0 644 f rootfs/etc/hosts\x000 0 4755 f rootfs/bin/su\x00"
++    f = fake(foreign=b"x\n", listing=listing)
++    rows = own.adopt(tmp_path)
++    assert [r["path"] for r in rows] == [".", "rootfs/etc/hosts", "rootfs/bin/su"]
++    assert f.written["entries"][2] == {"path": "rootfs/bin/su", "uid": 0, "gid": 0, "mode": 0o4755, "type": "f"}
++    assert f.written["adopted_to"] == [1000, 1000]
++    tee, chown = f.ran("tee"), f.ran("chown")
++    assert tee[0][-1] == os.path.join(os.path.realpath(tmp_path), own.RECORD_NAME)
++    assert chown == [["sudo", "-n", "chown", "-R", "-P", "--no-dereference", "1000:1000", "--",
++                      os.path.realpath(tmp_path)]]
++    assert f.calls.index(tee[0]) < f.calls.index(chown[0])  # the record exists before any owner changes
++    assert all("-xdev" in c for c in f.ran("find"))
++
++
++def test_earlier_record_is_merged_not_replaced(fake, tmp_path):
++    earlier = json.dumps({"version": 1, "entries": [{"path": "a", "uid": 0, "gid": 0, "mode": 0o600, "type": "f"}]})
++    f = fake(foreign=b"x\n", listing=b"0 0 644 f b\x001000 0 644 f " + own.RECORD_NAME.encode() + b"\x00",
++             earlier=earlier.encode())
++    own.adopt(tmp_path)
++    assert [e["path"] for e in f.written["entries"]] == ["a", "b"]
++
++
++def test_unreadable_earlier_record_refuses_without_chown(fake, tmp_path):
++    f = fake(foreign=b"x\n", listing=b"0 0 644 f b\x00", earlier=b"{not json")
++    with pytest.raises(sa.ArchiveRefused, match="unreadable"):
++        own.adopt(tmp_path)
++    assert not f.ran("chown")
++
++
++def test_mount_inside_workspace_refuses_without_chown(fake, monkeypatch, tmp_path):
++    f = fake(foreign=b"x\n", listing=b"0 0 644 f b\x00")
++    monkeypatch.setattr(own, "mounts_below", lambda root: [str(tmp_path / "rootfs/dev")])
++    with pytest.raises(sa.ArchiveRefused, match="mount point"):
++        own.adopt(tmp_path)
++    assert not f.ran("chown") and not f.ran("tee")
++
++
++def test_failed_chown_refuses(fake, monkeypatch, tmp_path):
++    f = fake(foreign=b"x\n", listing=b"0 0 644 f b\x00")
++    real = f.__call__
++
++    def failing(argv, **kw):
++        if argv[:3] == ["sudo", "-n", "chown"]:
++            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"Operation not permitted")
++        return real(argv, **kw)
++    monkeypatch.setattr(own, "_run", failing)
++    with pytest.raises(sa.ArchiveRefused, match="chown failed"):
++        own.adopt(tmp_path)
++
++
++def test_mounts_below_reads_mountinfo(tmp_path):
++    root = os.path.realpath(tmp_path)
++    info = (f"36 35 0:30 / {root}/rootfs/dev rw - devtmpfs udev rw\n"
++            f"37 35 0:31 / {root}x/other rw - tmpfs t rw\n"
++            f"38 35 0:32 / {root}/with\\040space rw - tmpfs t rw\n"
++            "39 35 0:33 / / rw - ext4 /dev/root rw\n")
++    assert own.mounts_below(tmp_path, info) == [f"{root}/rootfs/dev", f"{root}/with space"]
++
++
++def _sudo_ok():
++    if not sys.platform.startswith("linux") or os.geteuid() == 0 or not shutil.which("sudo"):
++        return False
++    return subprocess.run(["sudo", "-n", "true"], capture_output=True, check=False).returncode == 0
++
++
++@pytest.mark.skipif(not _sudo_ok(), reason="needs a non-root user with passwordless sudo (pool workers have it)")
++def test_root_owned_build_is_archived_and_removed_with_real_sudo(board):
++    def build(p):
++        (p / "rootfs" / "etc").mkdir(parents=True)
++        (p / "rootfs" / "etc" / "shadow").write_text("root:*:1::::::\n")
++        subprocess.run(["sudo", "-n", "chown", "-R", "0:0", str(p / "rootfs")], check=True)
++        subprocess.run(["sudo", "-n", "chmod", "0700", str(p / "rootfs" / "etc")], check=True)
++        subprocess.run(["sudo", "-n", "chmod", "0600", str(p / "rootfs" / "etc" / "shadow")], check=True)
++
++    tid, path = base._plain_task(build)
++    try:
++        assert base._gc() == 0
++        assert not path.exists()
++        members = base._members(tid)
++        assert members["rootfs/etc/shadow"][1] == b"root:*:1::::::\n"
++        record = json.loads(members[own.RECORD_NAME][1])
++        by_path = {e["path"]: e for e in record["entries"]}
++        assert by_path["rootfs/etc"]["uid"] == 0 and by_path["rootfs/etc"]["mode"] == 0o700
++        assert by_path["rootfs/etc/shadow"]["mode"] == 0o600
++        sa.verify_complete_archive(base._archive(tid))
++    finally:
++        if path.exists():
++            subprocess.run(["sudo", "-n", "rm", "-rf", "--one-file-system", str(path)], check=False)
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_shapes.py b/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+index b3682d78fa3..8efb7f0a11e 100644
+--- a/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
++++ b/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+@@ -467,10 +467,36 @@
+         sa.verify_complete_archive(_archive(tid))
+ 
+ 
+-@pytest.mark.parametrize("mode", [stat.S_IFCHR, stat.S_IFBLK])
+-def test_device_node_is_still_refused(mode):
++@pytest.mark.parametrize("mode,kind", [(stat.S_IFCHR, "chardev"), (stat.S_IFBLK, "blockdev")])
++def test_device_node_kind_is_contentless(mode, kind):
++    """Root-filesystem builds may hold /dev nodes; refusing them retains scratch indefinitely."""
+     from hermes_cli import kanban_scratch_archive as sa
+ 
+-    with pytest.raises(sa.ArchiveRefused, match="device node"):
+-        sa._kind(mode | 0o600)
++    assert sa._kind(mode | 0o600) == kind and kind in sa._CONTENTLESS
+     assert sa._kind(stat.S_IFIFO | 0o600) == "fifo" and sa._kind(stat.S_IFSOCK | 0o600) == "socket"
++
++
++def test_verify_accepts_recorded_device_without_member(board):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, _ = base._plain_task(lambda p: os.mkfifo(p / "pipe"))
++    assert _gc() == 0
++    manifest_path = _archive(tid) / PAYLOAD / "manifest.json"
++    manifest = json.loads(manifest_path.read_text())
++    manifest["entries"]["dev/null"] = {"type": "chardev", "mode": 0o666, "rdev": [1, 3]}
++    manifest_path.write_text(json.dumps(manifest))
++    sa.verify_complete_archive(_archive(tid))
++
++
++@pytest.mark.skipif(os.geteuid() != 0, reason="mknod of a device node needs root")
++def test_device_node_is_recorded_and_tree_removed(board):
++    def build(p):
++        (p / "dev").mkdir()
++        os.mknod(p / "dev" / "null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
++
++    tid, path = base._plain_task(build)
++    assert _gc() == 0
++    assert not path.exists()
++    rec = _manifest(tid)["entries"]["dev/null"]
++    assert rec["type"] == "chardev" and rec["rdev"] == [1, 3] and "sha256" not in rec
++    assert "dev/null" not in _tree(tid)
+-- 
+2.43.0
+

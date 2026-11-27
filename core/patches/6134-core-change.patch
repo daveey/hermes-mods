@@ -1,0 +1,256 @@
+From 952a5f47983f75a3bcd20728806a86300a21ab93 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:03:48 +0000
+Subject: [PATCH 6134] Kanban actionability: frozen obligations and administrative deadlines
+
+Public mirror of source commit 952a5f47983f75a3bcd20728806a86300a21ab93.
+
+---
+diff --git a/hermes_cli/kanban_actionability_materialize.py b/hermes_cli/kanban_actionability_materialize.py
+index bc1a1e2916f..213cc71fd9c 100644
+--- a/hermes_cli/kanban_actionability_materialize.py
++++ b/hermes_cli/kanban_actionability_materialize.py
+@@ -22,7 +22,8 @@
+     event, task = source['source_event'], source['source_task']
+     if not isinstance(event.get('payload'), str):
+         raise ValueError('canonical original source payload unavailable')
+-    if event['uid'] != row['event_uid'] and row['source_kind'] == 'dependency_wait':
++    if (event['uid'] != row['event_uid'] and row['source_kind'] == 'dependency_wait'
++            and task['status'] == 'todo' and event['kind'] in ('created', 'linked')):
+         raise ValueError('canonical dependency source unavailable')
+     if (task['containment_episode'] or event['uid'] != row['event_uid']
+             or event['kind'] != row['source_kind'] or event['created_at'] != row['source_at']
+@@ -64,9 +65,19 @@
+         return
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_actionability_intents'").fetchone():
+         return
++    select = ('SELECT * FROM kanban_actionability_intents '
++              "WHERE state IN ('pending','reserved') ORDER BY last_checked_at,event_uid LIMIT 8")
++    rows = [dict(r) for r in conn.execute(select)]
++    if not rows:
++        return
++    if not callable(getattr(hub, '_call', None)):
++        reason = 'canonical execution inventory transport unavailable'
++        for row in rows:
++            if row['reason'] != reason:
++                _set(conn, row, row['state'], reason)
++        return
+     with write_txn(conn):
+-        rows = [dict(r) for r in conn.execute('SELECT * FROM kanban_actionability_intents '
+-                "WHERE state IN ('pending','reserved') ORDER BY last_checked_at,event_uid LIMIT 8")]
++        rows = [dict(r) for r in conn.execute(select)]
+         conn.executemany(f'UPDATE kanban_actionability_intents SET last_checked_at={sync._NOW_MS_SQL} WHERE event_uid=?',
+                          [(r['event_uid'],) for r in rows])
+     for row in rows:
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 221c31e4b97..7123b1ea7e9 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -69,7 +69,9 @@
+     def events(self, tid: str) -> list[dict]:
+         if not self.events_complete:
+             return []
+-        order = 'created_at DESC,uid DESC' if 'uid' in self.event_columns else 'created_at DESC,id DESC'
++        # UUIDv7 random bits do not order two appends in one millisecond.
++        # Local insertion order is diagnostic only; canonical issuance uses inventory ord.
++        order = 'created_at DESC,id DESC'
+         marks = ','.join('?' for _ in KINDS)
+         live = ' AND deleted_at IS NULL' if 'deleted_at' in self.event_columns else ''
+         rows = self.rows(f'SELECT * FROM task_events WHERE task_id=? AND kind IN ({marks}){live} ORDER BY {order}',
+diff --git a/hermes_cli/kanban_db_events.py b/hermes_cli/kanban_db_events.py
+index 73211f40bdf..c4a2831ab97 100644
+--- a/hermes_cli/kanban_db_events.py
++++ b/hermes_cli/kanban_db_events.py
+@@ -42,7 +42,7 @@
+     if isinstance(payload, dict) and 'actionability_intent' in payload:
+         from hermes_cli.kanban_actionability_intents import capture
+         from hermes_cli import kanban_db_sync as sync
+-        if sync.board_mode(conn) == 'primary':
++        if sync.board_mode(conn) == 'primary' and sync.sync_state(conn) is not None:
+             event = conn.execute('SELECT uid FROM task_events WHERE id=?', (cur.lastrowid,)).fetchone()
+             capture(conn, event[0])
+     if payload is not None and "_wake_episode_v1" in payload:
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index 5547c09b211..e67898f24fc 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -435,13 +435,14 @@
+     conn.close()
+ 
+ 
+-def test_event_reader_uses_uid_tiebreak_and_excludes_deleted_rows():
++def test_event_reader_uses_append_tiebreak_and_excludes_deleted_rows():
+     from hermes_cli.kanban_actionability_sources import Reader
+     conn = complete_fixture()
+     for uid in ('z', 'a', 'deleted'):
+         event(conn, uid, 'created', {}, 100)
+     conn.execute("UPDATE task_events SET deleted_at=1 WHERE uid='deleted'")
+-    assert [e['uid'] for e in Reader(conn).events('root')] == ['z', 'a']
++    # Same-clock UUID suffixes are not causal; the later append wins, even with a lower uid.
++    assert [e['uid'] for e in Reader(conn).events('root')] == ['a', 'z']
+     conn.close()
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_actionability_materialize.py b/tests/hermes_cli/test_kanban_actionability_materialize.py
+index fb03337855f..d9fd47bf981 100644
+--- a/tests/hermes_cli/test_kanban_actionability_materialize.py
++++ b/tests/hermes_cli/test_kanban_actionability_materialize.py
+@@ -13,6 +13,37 @@
+ live = journal.live
+ 
+ 
++@pytest.mark.parametrize('status,kind,expected', [('todo', 'created', 'pending'), ('ready', 'unblocked', 'stale')])
++def test_dependency_compatibility_cannot_hide_positive_successor(live, status, kind, expected):
++    event, hub = setup(live)
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_actionability_intents SET source_kind='dependency_wait'")
++    data = hub.data[event['task_id']]
++    data['task']['status'] = status
++    data['events'][0].update(uid='different-source', kind=kind)
++    intents.materialize(live, hub, 'default')
++    assert live.execute('SELECT state FROM kanban_actionability_intents').fetchone()[0] == expected
++    assert not hub.sent
++
++
++def test_no_transport_repeated_round_has_no_writes(live, monkeypatch):
++    _, hub = setup(live)
++    monkeypatch.setattr(hub, '_call', None)
++    intents.materialize(live, hub, 'default')
++    before = live.total_changes
++    intents.materialize(live, hub, 'default')
++    assert live.total_changes == before
++
++
++def test_empty_journal_does_not_enter_writer(live, monkeypatch):
++    _, hub = setup(live)
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_actionability_intents')
++    from hermes_cli import kanban_actionability_materialize as materializer
++    monkeypatch.setattr(materializer, 'write_txn', lambda *a: pytest.fail('empty intent window entered writer'))
++    intents.materialize(live, hub, 'default')
++
++
+ def setup(conn):
+     event = dict(journal.new_park(conn))
+     tid = event['task_id']
+diff --git a/tests/hermes_cli/test_kanban_actionability_source_order.py b/tests/hermes_cli/test_kanban_actionability_source_order.py
+new file mode 100644
+index 00000000000..f838f2ec3dd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_source_order.py
+@@ -0,0 +1,79 @@
++"""Same-clock source order and compatibility regressions. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_actionability_sources as sources
++from tests.hermes_cli import test_kanban_actionability_intents as journal
++from tests.hermes_cli import test_kanban_assignment_routing as assignment
++
++live = journal.live
++assignment_board = assignment.board
++
++
++def test_assignment_freezes_real_supervisor_and_dependency(assignment_board):
++    conn, _ = assignment_board
++    tid = assignment.task_with_drift(assignment_board)
++    assert kb.block_task(conn, tid, kind='assignment', reason='Worker lacks terminal tools')
++    data = assignment.payload(conn, tid)
++    intent = data['actionability_intent']
++    assert intent['owner'] == {'kind': 'assignee', 'refs': ['supervisor']}
++    assert intent['status'] == 'todo'
++    assert intent['invalid_reason'] is None
++    assert intent['deadline_at'] == intent['first_observed'] + 86400
++    assert data['supervisor_task_id'] in data['actionability_parent_ids']
++    assert kb.get_task(conn, tid).status == 'todo'
++    assert not kb._parents_satisfied(conn, tid)
++
++
++@pytest.mark.parametrize('human', [True, False])
++def test_initial_blocked_uses_actual_blocked_event_not_created_guess(live, human):
++    request = {'action': 'Choose A or B. Unblock = implement; archive = drop.',
++               'why_human': 'Only owner chooses.', 'interaction': 'reply',
++               'scope': 'isolated fixture', 'evidence': 'Equivalent choices'} if human else None
++    tid = kb.create_task(live, title='initial blocked', assignee='default', initial_status='blocked',
++                         human_request=request, lint_blocked=human)
++    source = live.execute("SELECT * FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()
++    intent = json.loads(source['payload'])['actionability_intent']
++    assert intent['source_kind'] == 'blocked'
++    assert intent['deadline_at'] == (source['created_at'] + 86400 if human else None)
++    assert intent['invalid_reason'] == (None if human else 'trigger_missing')
++    assert kb.get_task(live, tid).status == 'blocked'
++
++
++def test_shared_blocker_uses_final_stored_wake(live):
++    tid = kb.create_task(live, title='shared outage', assignee='default')
++    assert kb.block_task(live, tid, reason='External service unavailable', kind='capability', blocker_id='fixture-outage')
++    source = live.execute("SELECT * FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
++    data = json.loads(source['payload'])
++    intent = data['actionability_intent']
++    assert intent['invalid_reason'] is None
++    assert intent['deadline_at'] == data['wake_at'] + 600
++    assert intent['wake_at'] == data['wake_at']
++    assert intent['execution_authority'] is False
++
++
++
++@pytest.mark.parametrize('created_uid,wait_uid', [('z-created', 'a-wait'), ('a-created', 'z-wait')])
++def test_same_clock_dependency_uses_append_order_not_uuid_random_bits(live, monkeypatch, created_uid, wait_uid):
++    monkeypatch.setattr('time.time', lambda: 1_800_000_000)
++    parent = kb.create_task(live, title='parent', assignee='default')
++    tid = kb.create_task(live, title='waiter', assignee='default', parents=[parent])
++    with kbc.write_txn(live):
++        live.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='created'", (created_uid, tid))
++        live.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='dependency_wait'", (wait_uid, tid))
++    source = live.execute("SELECT * FROM task_events WHERE task_id=? AND kind='dependency_wait'", (tid,)).fetchone()
++    row = sources.describe(live, tid)
++    assert row['source_refs'] == [wait_uid]
++    assert row['escalation']['at'] == json.loads(source['payload'])['actionability_intent']['deadline_at']
++    assert row['evidence_state'] == 'unknown'  # local append order is not canonical authority
++
++
++def test_material_newer_clock_wins_over_append_order(live):
++    tid = kb.create_task(live, title='source clock', assignee='default')
++    with kbc.write_txn(live):
++        kb._append_event(live, tid, 'created', {'status': 'ready'})
++        live.execute("UPDATE task_events SET created_at=1 WHERE task_id=? AND id=(SELECT MAX(id) FROM task_events)", (tid,))
++    events = sources.Reader(live).events(tid)
++    assert events[0]['created_at'] > events[1]['created_at']
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index b9474e25b69..158211134fa 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -490,14 +490,20 @@
+         assert kb.get_task(conn, worker_env).status == "scheduled"
+         run = kb.latest_run(conn, worker_env)
+         assert (run.outcome, run.summary) == ("scheduled", reason)
+-        assert any(
+-            event.kind == "scheduled" and event.payload == {
+-                "reason": reason, "wake_at": event.payload.get("wake_at"),
+-                # the declared wake reason (a scheduled wait needs one); a clock never escalates, so no premise
+-                "awaiting": {"kind": "clock", "why": "reconnect window"}}
+-            and event.payload["wake_at"]  # SCHEDULED_UNTIL= sets a real wake time
+-            for event in kb.list_events(conn, worker_env)
+-        )
++        event = next(event for event in kb.list_events(conn, worker_env) if event.kind == 'scheduled')
++        assert event.payload is not None
++        intent = event.payload['actionability_intent']
++        assert intent['version'] == 1
++        assert intent['execution_authority'] is False
++        assert intent['policy'] == 'scheduled-wake-grace-v1'
++        assert intent['deadline_at'] == (event.payload['wake_at'] + 600 if not intent['invalid_reason'] else None)
++        assert event.payload == {
++            "reason": reason, "wake_at": event.payload['wake_at'],
++            "awaiting": {"kind": "clock", "why": "reconnect window"},
++            "actionability_intent": intent, "actionability_parent_ids": [],
++            "actionability_parent_states": [], "actionability_run_uid": event.payload['actionability_run_uid'],
++        }
++        assert event.payload['wake_at']  # SCHEDULED_UNTIL= still sets a real wake time
+ 
+ 
+ def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
+-- 
+2.43.0
+

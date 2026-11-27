@@ -1,0 +1,251 @@
+From bd41954652bbaacfde65680bae15fd31c88387f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:21:58 +0000
+Subject: [PATCH 6414] Frozen administrative deadlines for parks, links, landings and review queues
+
+Public mirror of source commit bd41954652bbaacfde65680bae15fd31c88387f4.
+
+---
+diff --git a/hermes_cli/kanban_actionability_creation.py b/hermes_cli/kanban_actionability_creation.py
+index df1d71a4b94..de99e98bf4a 100644
+--- a/hermes_cli/kanban_actionability_creation.py
++++ b/hermes_cli/kanban_actionability_creation.py
+@@ -29,7 +29,11 @@
+     todo = _todo_entry(kind, payload)
+     if not timed and kind != 'blocked' and not todo:
+         return None
+-    status = 'scheduled' if timed else ('todo' if todo or payload.get('kind') == 'assignment' else 'blocked')
++    # link_tasks admits an edge on a running child only from its owning run (dependency handoff
++    # before the park): that edge is a dependency wait with its own clock, never an exemption.
++    handoff = kind in ('linked', 'unlinked') and task.get('status') == 'running'
++    status = 'scheduled' if timed else ('running' if handoff else (
++        'todo' if todo or payload.get('kind') == 'assignment' else 'blocked'))
+     if task.get('status') != status:
+         return None
+     wake = positive_time(payload.get('wake_at')) if timed else None
+@@ -71,8 +75,8 @@
+     events = [dict(r) for r in conn.execute(
+         'SELECT * FROM task_events WHERE task_id=? ORDER BY id', (task_id,))]
+     key = lambda e: (e['created_at'], e['id'])  # the census source order
+-    source = select('todo', events, order_key=key)
+-    if source is None or any(e['kind'] in EPISODE_EXITS and key(e) > key(source) for e in events):
++    source = select(task['status'], events, order_key=key)
++    if source is None or source['kind'] == 'claimed' or any(e['kind'] in EPISODE_EXITS and key(e) > key(source) for e in events):
+         return None
+     try:
+         data = json.loads(source['payload'] or 'null')
+@@ -82,7 +86,7 @@
+         return None
+     intent = validated_intent(task, {'kind': source['kind'], 'created_at': source['created_at'], 'data': data})
+     # Provenance: the synced event uid, or the local event id on an unsynced board.
+-    return (intent['deadline_at'], source.get('uid') or str(source['id'])) if intent and intent['status'] == 'todo' else None
++    return (intent['deadline_at'], source.get('uid') or str(source['id'])) if intent and intent['status'] == task['status'] else None
+ 
+ 
+ def stamp(conn, task_id, kind, payload, *, now):
+@@ -91,8 +95,10 @@
+         return payload
+     original = payload
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+-    if kind in ('linked', 'unlinked', 'unblocked') and (row is None or row['status'] != 'todo' or not isinstance(payload, dict)):
+-        return payload  # only a todo entry; every other status keeps its own source
++    handoff = row is not None and row['status'] == 'running' and kind in ('linked', 'unlinked')
++    if kind in ('linked', 'unlinked', 'unblocked') and (
++            row is None or not (row['status'] == 'todo' or handoff) or not isinstance(payload, dict)):
++        return payload  # a todo entry or the owning run's handoff edge; every other status keeps its own source
+     if isinstance(payload, dict):
+         from hermes_cli.kanban_db_sync import run_uid
+         from hermes_cli.kanban_actionability_parents import snapshot
+@@ -105,6 +111,8 @@
+         carried = _carried(conn, task_id, dict(row)) if kind in ('linked', 'unlinked') and row else None
+         if carried:
+             payload['actionability_carried_deadline'], payload['actionability_carried_from'] = carried
++        elif handoff and kind == 'unlinked':
++            return original  # unlink has no owning-run check: it keeps a handoff clock, never starts one
+     intent = intent_for(dict(row), kind, payload, now=now) if row else None
+     return {**payload, 'actionability_intent': intent} if intent is not None else original
+ 
+diff --git a/hermes_cli/kanban_actionability_selection.py b/hermes_cli/kanban_actionability_selection.py
+index 346d8fb6a2a..1a8ec67aa54 100644
+--- a/hermes_cli/kanban_actionability_selection.py
++++ b/hermes_cli/kanban_actionability_selection.py
+@@ -34,5 +34,13 @@
+         # An unblock is a todo source only when parents re-gated it there; a release to ready is not.
+         return status != 'todo' or event['kind'] != 'unblocked' or (_data(event) or {}).get('status') == 'todo'
+ 
++    if status == 'running' and not episode:
++        # The owning run's stamped dependency handoff (link before park) outranks its claim. A later
++        # claim, or a later unstamped edge change, returns the row to the claim source.
++        edges = [e for e in events if e['kind'] in ('claimed', 'linked', 'unlinked')]
++        last = max(edges, key=order_key) if edges else None
++        intent = (_data(last) or {}).get('actionability_intent') if last and last['kind'] != 'claimed' else None
++        if isinstance(intent, dict) and intent.get('status') == 'running':
++            return last
+     candidates = [e for e in events if e.get('uid') == episode] if episode else [e for e in events if matches(e)]
+     return max(candidates, key=order_key) if candidates else None
+diff --git a/tests/hermes_cli/test_kanban_actionability_running_link.py b/tests/hermes_cli/test_kanban_actionability_running_link.py
+new file mode 100644
+index 00000000000..4fc359a8b94
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_running_link.py
+@@ -0,0 +1,157 @@
++"""The owning run's link-before-park is a dependency wait with a frozen deadline. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from tests.hermes_cli.test_kanban_actionability_todo_sources import T0, _clock, _event, _ref, _refs, _rows
++
++
++def _running(conn, title='running child'):
++    tid = kb.create_task(conn, title=title, assignee='default')
++    task = kb.claim_task(conn, tid)
++    assert task is not None and task.status == 'running'
++    return tid, task.current_run_id
++
++
++def test_owning_run_link_before_park_freezes_a_deadline(tmp_path, monkeypatch):
++    """A card claimed, linked, then parked; the census runs between."""
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, run = _running(conn)
++        parent = kb.create_task(conn, title='review', assignee='default')
++        _clock(monkeypatch, T0 + 300)
++        kb.link_tasks(conn, parent, tid, expected_child_run_id=run)
++        linked, data = _event(conn, tid, 'linked')
++        intent = data['actionability_intent']
++        assert intent['status'] == 'running' and intent['deadline_at'] == T0 + 300 + 86400
++        assert intent['action'] == 'satisfy_dependency' and intent['execution_authority'] is False
++        for row in _rows(conn, tid, T0 + 400):
++            assert row['status'] == 'running' and row['action'] == 'satisfy_dependency'
++            assert row['blocker'] and row['dependencies'][0]['task_id'] == parent  # still a wait, not exempt
++            assert row['source_refs'] == _refs(linked)
++            assert row['escalation']['at'] == T0 + 300 + 86400
++            assert row['escalation']['state'] != 'not_required'
++            assert 'escalation_deadline_missing' not in row['violations']
++            assert 'creation_intent_invalid' not in row['violations']
++        for row in _rows(conn, tid, T0 + 300 + 86400):
++            assert 'escalation_overdue' in row['violations']
++
++
++def test_relink_in_the_same_run_never_renews(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, run = _running(conn)
++        first = kb.create_task(conn, title='first', assignee='default')
++        second = kb.create_task(conn, title='second', assignee='default')
++        kb.link_tasks(conn, first, tid, expected_child_run_id=run)
++        source, _ = _event(conn, tid, 'linked')
++        frozen = T0 + 86400
++        _clock(monkeypatch, frozen + 50)
++        kb.link_tasks(conn, second, tid, expected_child_run_id=run)
++        linked, data = _event(conn, tid, 'linked')
++        assert data['actionability_intent']['deadline_at'] == frozen
++        assert data['actionability_carried_from'] == _ref(source)
++        for row in _rows(conn, tid, frozen + 60):
++            assert row['source_refs'] == _refs(linked)
++            assert row['escalation']['at'] == frozen
++            assert 'escalation_overdue' in row['violations']
++        # An unlink keeps the remaining wait's clock; removing the last parent ends the wait.
++        kb.unlink_tasks(conn, first, tid)
++        _, data = _event(conn, tid, 'unlinked')
++        assert data['actionability_intent']['deadline_at'] == frozen
++        kb.unlink_tasks(conn, second, tid)
++        _, data = _event(conn, tid, 'unlinked')
++        assert 'actionability_intent' not in data
++        for row in _rows(conn, tid, frozen + 70):
++            assert row['action'] == 'execute_current_scope' and row['dependencies'] == []
++            assert row['escalation']['state'] == 'not_required'
++
++
++def test_unlink_cannot_start_a_running_clock(tmp_path, monkeypatch):
++    """unlink_tasks has no owning-run check, so it only ever preserves a handoff obligation."""
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, run = _running(conn)
++        first = kb.create_task(conn, title='first', assignee='default')
++        second = kb.create_task(conn, title='second', assignee='default')
++        for parent in (first, second):
++            kb.link_tasks(conn, parent, tid, expected_child_run_id=run)
++        conn.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND kind='linked'", (tid,))
++        kb.unlink_tasks(conn, first, tid)
++        _, data = _event(conn, tid, 'unlinked')
++        assert 'actionability_intent' not in data
++        for row in _rows(conn, tid, T0 + 10):
++            assert row['action'] == 'satisfy_dependency'
++            assert 'escalation_deadline_missing' in row['violations']
++
++
++@pytest.mark.parametrize('damage', ['parents', 'intent', 'assignee', 'human'])
++def test_damaged_or_stale_handoff_stays_a_violation(tmp_path, monkeypatch, damage):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, run = _running(conn)
++        parent = kb.create_task(conn, title='review', assignee='default')
++        other = kb.create_task(conn, title='other', assignee='default')
++        kb.link_tasks(conn, parent, tid, expected_child_run_id=run)
++        if damage == 'parents':  # an edge that arrived without its event
++            conn.execute('INSERT INTO task_links(parent_id, child_id) VALUES (?,?)', (other, tid))
++        elif damage == 'intent':
++            conn.execute("UPDATE task_events SET payload=json_set(payload,'$.actionability_intent.deadline_at',?) "
++                         "WHERE task_id=? AND kind='linked'", (T0 + 10 * 86400, tid))
++        elif damage == 'assignee':
++            conn.execute("UPDATE tasks SET assignee='someone-else' WHERE id=?", (tid,))
++        else:
++            conn.execute("UPDATE tasks SET human_request=? WHERE id=?", ('{"action": "new ask"}', tid))
++        for row in _rows(conn, tid, T0 + 10):
++            assert row['escalation']['at'] is None
++            assert row['escalation']['state'] != 'not_required'
++            assert {'creation_intent_invalid', 'escalation_deadline_missing'} & set(row['violations'])
++            assert row['action'] != 'execute_current_scope'
++
++
++def test_next_run_does_not_inherit_the_previous_runs_handoff(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, run = _running(conn)
++        parent = kb.create_task(conn, title='review', assignee='default')
++        kb.link_tasks(conn, parent, tid, expected_child_run_id=run)
++        # Replicated claim of a later run arrives while the edge is still present.
++        _clock(monkeypatch, T0 + 500)
++        kb._append_event(conn, tid, 'claimed', {'lock': 'later-run'})
++        claimed, _ = _event(conn, tid, 'claimed')
++        for row in _rows(conn, tid, T0 + 600):
++            assert row['source_refs'] == _refs(claimed)
++            assert row['escalation']['at'] is None
++            assert 'escalation_deadline_missing' in row['violations']
++        other = kb.create_task(conn, title='other', assignee='default')
++        _clock(monkeypatch, T0 + 700)
++        kb.link_tasks(conn, other, tid, expected_child_run_id=run)
++        _, data = _event(conn, tid, 'linked')
++        assert 'actionability_carried_from' not in data  # a new claim is a new episode
++        assert data['actionability_intent']['deadline_at'] == T0 + 700 + 86400
++
++
++def test_foreign_link_to_running_child_is_still_refused(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, _run = _running(conn)
++        parent = kb.create_task(conn, title='review', assignee='default')
++        with pytest.raises(ValueError):
++            kb.link_tasks(conn, parent, tid)
++        assert conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='linked'", (tid,)).fetchone() is None
++
++
++def test_park_after_handoff_uses_the_park_source(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, run = _running(conn)
++        parent = kb.create_task(conn, title='review', assignee='default')
++        kb.link_tasks(conn, parent, tid, expected_child_run_id=run)
++        _clock(monkeypatch, T0 + 60)
++        assert kb.block_task(conn, tid, reason='waiting on review', kind='dependency')
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status != 'running'
++        for row in _rows(conn, tid, T0 + 70):
++            assert row['escalation']['at'] is not None
++            assert 'escalation_deadline_missing' not in row['violations']
++            assert 'creation_intent_invalid' not in row['violations']
+-- 
+2.43.0
+

@@ -1,0 +1,339 @@
+From f6e2f9f1e54f30ec3c40fd7fdcbba19bf8c930c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:57:48 +0000
+Subject: [PATCH 5950] Advisory integrity inventory stops at its deadline
+
+Public mirror of source commit f6e2f9f1e54f30ec3c40fd7fdcbba19bf8c930c3.
+
+---
+diff --git a/gateway/capsule_contract.py b/gateway/capsule_contract.py
+index 853e46de47f..f16e1231d2f 100644
+--- a/gateway/capsule_contract.py
++++ b/gateway/capsule_contract.py
+@@ -9,7 +9,7 @@
+ CORE_ROOT = Path(project_root_str())
+ 
+ 
+-def _verified_sha(*, worker=False):
++def _verified_sha(*, worker=False, deadline=None):
+     """Require the boot-installed ledger as well as a clean, unchanged disk.
+ 
+     Never install a ledger here: late provenance cannot attest already loaded
+@@ -18,10 +18,12 @@
+     from hermes_cli.code_attestation import integrity_observation
+     from hermes_cli.git_fingerprint import capsule_code_sha
+     try:
++        if deadline is not None and time.monotonic() >= deadline:
++            return None
+         sha = capsule_code_sha(CORE_ROOT)
+         if sha is None:
+             return None
+-        observed = integrity_observation()
++        observed = integrity_observation(deadline=deadline) if deadline is not None else integrity_observation()
+         routes = ('managed-worker-stub',) if worker else (
+             'managed-stub', 'managed-stub-relaunch', 'console-main-first')
+         if (observed['core_root'] != str(CORE_ROOT.resolve())
+@@ -49,7 +51,7 @@
+ 
+     def verify():
+         try:
+-            result[0] = _verified_sha()
++            result[0] = _verified_sha(deadline=deadline)
+         except Exception:
+             # This advisory must never take legacy identify down with it.
+             import logging
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index b52556b8c80..71c9a6b76be 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -19,6 +19,7 @@
+ from collections import OrderedDict
+ from itertools import islice
+ import threading
++import time
+ from types import CodeType, FunctionType
+ 
+ 
+@@ -1013,10 +1014,11 @@
+             elif owner is None:
+                 self._extension_unknown("unrooted-module:" + name, filename)
+ 
+-    def _inventory_modules(self):
++    def _inventory_modules(self, *, deadline=None):
+         # Requested snapshots only, never idle scans. Recheck mutable __file__ even
+         # for an unchanged module object; retaining identity avoids id recycling.
+         for name, module in self._module_snapshot():
++            _check_inventory_deadline(deadline)
+             filename = getattr(module, "__file__", None)
+             self._module_file(name, filename)
+             key = (name, id(module))
+@@ -1421,20 +1423,30 @@
+             self._inventory_modules()
+             return tuple(sorted(self._unknown))
+ 
+-    def integrity_observation(self):
++    def integrity_observation(self, *, deadline=None):
+         """One locked inventory with its process-bound identity and unfiltered unknowns.
+ 
+         Consumers must reject pending/unsupported provenance, not manufacture a
+         ledger after startup or filter observational unknowns into permission.
+         """
+-        with self._lock:
+-            self._inventory_modules()
++        _check_inventory_deadline(deadline)
++        acquired = (self._lock.acquire() if deadline is None else
++                    self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())))
++        if not acquired:
++            raise TimeoutError('code attestation inventory budget exhausted')
++        try:
++            _check_inventory_deadline(deadline)
++            self._inventory_modules(deadline=deadline)
++            _check_inventory_deadline(deadline)
+             if getattr(self, '_reviewed_plugins', None):
+                 from hermes_cli.plugin_review_records import verify_registered
+                 verify_registered(self)
++            _check_inventory_deadline(deadline)
+             return {"core_root": str(self.core_root), "boot_sha": self.boot_sha,
+                     "route": self.route, "generation": self._generation,
+                     "unknowns": tuple(sorted(self._unknown))}
++        finally:
++            self._lock.release()
+ 
+     def latched_unknowns(self):
+         """The latched unknowns without a module inventory (cheap: polled while measuring)."""
+@@ -1503,9 +1515,16 @@
+     return _installed.register_dependency_environment(site_dir)
+ 
+ 
+-def integrity_observation():
++def _check_inventory_deadline(deadline):
++    # Cancellation is advisory-only; never return a partially verified positive.
++    # One filesystem operation is not interruptible, so check between modules.
++    if deadline is not None and time.monotonic() >= deadline:
++        raise TimeoutError('code attestation inventory budget exhausted')
++
++
++def integrity_observation(*, deadline=None):
+     """Observe only the ledger installed at bootstrap; missing installation refuses."""
+-    return _ledger().integrity_observation()
++    return _ledger().integrity_observation(deadline=deadline)
+ 
+ 
+ def unknowns():
+diff --git a/tests/gateway/test_capsule_contract_availability.py b/tests/gateway/test_capsule_contract_availability.py
+index 6dc0716bb7d..25cb1412617 100644
+--- a/tests/gateway/test_capsule_contract_availability.py
++++ b/tests/gateway/test_capsule_contract_availability.py
+@@ -38,7 +38,7 @@
+     # Unit control-socket boundary: the real installed-ledger subprocess is
+     # covered separately, never reconstructed in the production permission gate.
+     from gateway import capsule_contract as contract
+-    monkeypatch.setattr('hermes_cli.code_attestation.integrity_observation', lambda: {
++    monkeypatch.setattr('hermes_cli.code_attestation.integrity_observation', lambda **kwargs: {
+         'core_root': str(contract.CORE_ROOT), 'boot_sha': actual(repo),
+         'route': 'managed-stub', 'unknowns': ()})
+     monkeypatch.setattr('gateway.control_socket.build_identify_payload', lambda: {
+diff --git a/tests/gateway/test_capsule_identify_budget.py b/tests/gateway/test_capsule_identify_budget.py
+index 8da71cde317..0577cc439d4 100644
+--- a/tests/gateway/test_capsule_identify_budget.py
++++ b/tests/gateway/test_capsule_identify_budget.py
+@@ -18,7 +18,7 @@
+     monkeypatch.setenv('HERMES_HOME', str(home))
+     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+     calls = []
+-    def slow_identity():
++    def slow_identity(**kwargs):
+         calls.append(1)
+         entered.set()
+         assert release.wait(5)
+@@ -56,9 +56,9 @@
+     assert contract._advisory_lock.acquire(timeout=5)
+     contract._advisory_lock.release()
+     # Even a late success is never a cached positive on a later identify.
+-    monkeypatch.setattr(contract, '_verified_sha', lambda: None)
++    monkeypatch.setattr(contract, '_verified_sha', lambda **kwargs: None)
+     assert contract.available_capabilities([CAPABILITY, CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CAPABILITY]
+-    monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(contract, '_verified_sha', lambda **kwargs: 'a' * 40)
+     assert contract.available_capabilities([CAPABILITY, CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CAPABILITY, CONTRACT_CAPABILITY]
+     assert descriptor['capabilities'] == [CAPABILITY, CONTRACT_CAPABILITY]
+ 
+@@ -70,7 +70,7 @@
+     marker = contextvars.ContextVar('capsule-budget-fixture', default='unset')
+     token = marker.set('profile-scope')
+     seen = []
+-    def verify():
++    def verify(**kwargs):
+         seen.append(marker.get())
+         raise LookupError('fixture unexpected inventory error')
+     try:
+@@ -78,7 +78,7 @@
+         assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == []
+         assert seen == ['profile-scope']
+         assert 'Capsule identify verification failed' in caplog.text
+-        monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++        monkeypatch.setattr(contract, '_verified_sha', lambda **kwargs: 'a' * 40)
+         assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CONTRACT_CAPABILITY]
+     finally:
+         marker.reset(token)
+@@ -93,7 +93,7 @@
+     with monkeypatch.context() as scoped:
+         scoped.setattr('agent.memory_provider.spawn_context_thread', lambda *a, **k: RefusedThread())
+         assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == []
+-    monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(contract, '_verified_sha', lambda **kwargs: 'a' * 40)
+     assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CONTRACT_CAPABILITY]
+ 
+ 
+@@ -101,7 +101,7 @@
+     from gateway import capsule_contract as contract
+     clock = [10.0]
+     monkeypatch.setattr(contract.time, 'monotonic', lambda: clock[0])
+-    monkeypatch.setattr(contract, '_verified_sha', lambda: 'a' * 40)
++    monkeypatch.setattr(contract, '_verified_sha', lambda **kwargs: 'a' * 40)
+ 
+     class LateThread:
+         def __init__(self, target):
+diff --git a/tests/gateway/test_capsule_integrity_gate.py b/tests/gateway/test_capsule_integrity_gate.py
+index dfa021071c4..5321fa326af 100644
+--- a/tests/gateway/test_capsule_integrity_gate.py
++++ b/tests/gateway/test_capsule_integrity_gate.py
+@@ -14,7 +14,7 @@
+     value = {'core_root': str(contract.CORE_ROOT), 'boot_sha': sha,
+              'route': 'managed-stub', 'generation': 1, 'unknowns': ()}
+     monkeypatch.setattr(git_fingerprint, 'capsule_code_sha', lambda root: sha)
+-    monkeypatch.setattr(code_attestation, 'integrity_observation', lambda: dict(value))
++    monkeypatch.setattr(code_attestation, 'integrity_observation', lambda **kwargs: dict(value))
+     monkeypatch.setattr(contract, '_worker_expected_sha', None)
+     return value
+ 
+@@ -22,7 +22,7 @@
+ @pytest.mark.parametrize('defect', ['missing', 'root', 'sha', 'route', 'unknown', 'pending'])
+ def test_unverified_ledger_withdraws_and_refuses_owner(observation, monkeypatch, defect):
+     if defect == 'missing':
+-        def missing():
++        def missing(**kwargs):
+             raise RuntimeError('code attestation not installed')
+         monkeypatch.setattr(code_attestation, 'integrity_observation', missing)
+     else:
+@@ -58,6 +58,32 @@
+     assert contract.install_worker_contract([]) == []
+ 
+ 
++def test_advisory_forwards_deadline_but_actual_admission_is_unbounded(observation, monkeypatch):
++    seen = []
++    def observe(**kwargs):
++        seen.append(kwargs)
++        return dict(observation)
++    monkeypatch.setattr(code_attestation, 'integrity_observation', observe)
++    monkeypatch.setattr(contract.time, 'monotonic', lambda: 10.0)
++    assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == [CONTRACT_CAPABILITY]
++    assert seen == [{'deadline': 10.4}]
++    assert contract.owner_launch_sha(True) == 'a' * 40
++    assert seen[-1] == {}
++
++
++def test_advisory_expired_before_verifier_skips_inventory(observation, monkeypatch):
++    monkeypatch.setattr(contract.time, 'monotonic', lambda: 10.0)
++    monkeypatch.setattr(code_attestation, 'integrity_observation', lambda **kwargs: pytest.fail('expired scan'))
++    assert contract._verified_sha(deadline=9.0) is None
++
++
++def test_advisory_timeout_withdraws_capability(observation, monkeypatch):
++    def expired(**kwargs):
++        raise TimeoutError('inventory budget exhausted')
++    monkeypatch.setattr(code_attestation, 'integrity_observation', expired)
++    assert contract.available_capabilities([CONTRACT_CAPABILITY], advertised_sha='a' * 40) == []
++
++
+ def test_inventory_spanning_disk_update_refuses(observation, monkeypatch):
+     values = iter([observation['boot_sha'], None])
+     monkeypatch.setattr(git_fingerprint, 'capsule_code_sha', lambda root: next(values))
+diff --git a/tests/hermes_cli/test_attestation_inventory_budget.py b/tests/hermes_cli/test_attestation_inventory_budget.py
+new file mode 100644
+index 00000000000..9cff3159030
+--- /dev/null
++++ b/tests/hermes_cli/test_attestation_inventory_budget.py
+@@ -0,0 +1,79 @@
++"""Advisory inventory expiry releases the audit lock without approving partial work."""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import code_attestation as ca
++
++
++def ledger():
++    result = object.__new__(ca.Attestation)
++    result._lock = threading.RLock()
++    result._modules = {}
++    result._generation = 0
++    result._unknown = set()
++    result.core_root = '/fixture'
++    result.boot_sha = 'a' * 40
++    result.route = 'managed-stub'
++    return result
++
++
++def test_inventory_expiry_stops_scan_releases_lock_and_never_returns_positive(monkeypatch):
++    a = ledger()
++    clock = [10.0]
++    monkeypatch.setattr(ca.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(a, '_module_snapshot', lambda: [('first', SimpleNamespace(__file__='one.py')),
++                                                       ('second', SimpleNamespace(__file__='two.py'))])
++    seen = []
++    def inspect(name, filename):
++        seen.append((name, filename))
++        clock[0] += 1
++    monkeypatch.setattr(a, '_module_file', inspect)
++    with pytest.raises(TimeoutError):
++        a.integrity_observation(deadline=10.5)
++    assert seen == [('first', 'one.py')]
++    acquired = []
++    def other_thread():
++        ok = a._lock.acquire(blocking=False)
++        acquired.append(ok)
++        if ok:
++            a._lock.release()
++    t = threading.Thread(target=other_thread)
++    t.start()
++    t.join(5)
++    assert acquired == [True]
++    # Actual admission remains a complete fresh scan, including mutable paths.
++    observed = a.integrity_observation()
++    assert observed['boot_sha'] == 'a' * 40
++    assert seen == [('first', 'one.py'), ('first', 'one.py'), ('second', 'two.py')]
++
++
++def test_expired_budget_does_not_wait_on_busy_audit_lock(monkeypatch):
++    a = ledger()
++    monkeypatch.setattr(ca.time, 'monotonic', lambda: 11.0)
++    class NoAcquire:
++        def acquire(self, **kwargs):
++            pytest.fail('expired observation tried acquiring the global audit lock')
++    a._lock = NoAcquire()
++    with pytest.raises(TimeoutError):
++        a.integrity_observation(deadline=10.0)
++
++
++def test_inventory_expiry_after_final_item_refuses_partial_positive(monkeypatch):
++    a = ledger()
++    clock = [10.0]
++    monkeypatch.setattr(ca.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(a, '_module_snapshot', lambda: [('only', SimpleNamespace(__file__='one.py'))])
++    monkeypatch.setattr(a, '_module_file', lambda *args: clock.__setitem__(0, 12.0))
++    with pytest.raises(TimeoutError):
++        a.integrity_observation(deadline=11.0)
++
++
++def test_public_observation_forwards_budget(monkeypatch):
++    a = ledger()
++    monkeypatch.setattr(ca, '_installed', a)
++    seen = []
++    monkeypatch.setattr(a, 'integrity_observation', lambda **kwargs: seen.append(kwargs))
++    ca.integrity_observation(deadline=12.0)
++    assert seen == [{'deadline': 12.0}]
+-- 
+2.43.0
+

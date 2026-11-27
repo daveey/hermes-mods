@@ -1,0 +1,225 @@
+From ee553620d45a755a251de3d651d413770fe7e30f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:46:28 +0000
+Subject: [PATCH 6000] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit ee553620d45a755a251de3d651d413770fe7e30f.
+
+---
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 93def98c1c2..62d21ac3a6e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -906,9 +906,8 @@
+             if not page.get("more"):
+                 break
+             after = str(page["next"])
+-    from hermes_cli.kanban_db_connect import write_txn
+-    with write_txn(conn):
+-        conn.execute("UPDATE kanban_sync_state SET cursor = ?", (int(head or 0),))
++    from hermes_cli.kanban_sync_snapshot_tasks import finish_rebuild  # the history replay can reopen a done card
++    finish_rebuild(conn, hub, board, int(head or 0), partition=partition)
+     return count
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_snapshot_tasks.py b/hermes_cli/kanban_sync_snapshot_tasks.py
+new file mode 100644
+index 00000000000..da643e111c5
+--- /dev/null
++++ b/hermes_cli/kanban_sync_snapshot_tasks.py
+@@ -0,0 +1,67 @@
++"""After a snapshot rebuild, write each card's snapshot row again over what the history replay made of it.
++
++:func:`kanban_sync_client.resync` imports tables in ``IMPORT_ORDER``: ``tasks`` first, then the children. A
++``task_events`` page replays a card's whole containment history, and the containment projection
++(``kanban_containment_replica.restore_page``) rewrites the card's status from it: a historical ``contained`` holds
++the card (``triage``, ``completed_at`` cleared) and its later ``containment_released`` lands it on its parents'
++status (``ready``). In the live feed a newer task write follows those events and wins. In a snapshot nothing
++follows them, so the card keeps the replayed status under the Board's version of the finished card.
++
++Representative observation: workers rebuilding replicas after contained cards finished retained
++completed cards as ``ready`` at the Board's version. Lease refusals
++and repeated dispatcher retries followed; divergence repair compared only locally
++owned cards. Rebuilding a scratch replica reproduced the issue: the
++cards read ``done`` after the ``tasks`` pass and ``ready`` after ``task_events``.
++
++So the rebuild reads the ``tasks`` snapshot again and re-applies each row whose version is still the one the first
++pass wrote. A row the Board moved past in between is left for the feed, which resumes at the first pass's head and
++delivers that change in order. [daveey]
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def finish_rebuild(conn: sqlite3.Connection, hub: Any, board: str, head: int, *,
++                   partition: Optional[str] = None) -> None:
++    """The end of :func:`kanban_sync_client.resync`: re-assert the task rows, then resume the feed at ``head``."""
++    from hermes_cli.kanban_db_connect import write_txn
++    reassert(conn, hub, board, partition=partition)
++    with write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET cursor = ?", (head,))
++
++
++def reassert(conn: sqlite3.Connection, hub: Any, board: str, *, partition: Optional[str] = None) -> int:
++    """Re-apply the ``tasks`` snapshot rows still at the version the rebuild wrote; returns how many."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli.kanban_sync_quarantine import certified_page
++    from hermes_cli.kanban_sync_stop import checkpoint
++    count, after = 0, ""
++    while True:
++        checkpoint()
++        page = hub.snapshot_page(board, "tasks", after)
++        changes = [ksc._row_change("tasks", r) for r in page.get("rows", [])]
++        if partition is not None:
++            changes = ksc.own_partition(conn, changes, partition)
++        changes = _unmoved(conn, changes)
++        if changes:
++            cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++            changes = certified_page(conn, hub, board, changes)
++            sync.apply_remote_changes(conn, changes, new_cursor=cursor, board=board, observers=False,
++                                      local_pending_wins=True)
++            count += len(changes)
++        if not page.get("more"):
++            return count
++        after = str(page["next"])
++
++
++def _unmoved(conn: sqlite3.Connection, changes: list) -> list:
++    """The changes whose card holds exactly that Board version here (a newer row waits for the feed)."""
++    if not changes:
++        return []
++    ids = [ch.uid for ch in changes]
++    held = dict(conn.execute(f"SELECT id, sync_version FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids))
++    return [ch for ch in changes if ch.version and held.get(ch.uid) == ch.version]
+diff --git a/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py b/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py
+new file mode 100644
+index 00000000000..f1088bd6fa2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py
+@@ -0,0 +1,119 @@
++"""A snapshot rebuild keeps a finished card finished after replaying its containment history. [daveey]
++
++Fleet incident undated representative observation (see ``hermes_cli/kanban_sync_snapshot_tasks.py``): the ``task_events`` pass of a rebuild
++replayed a card's old ``contained`` / ``containment_released`` pair and left the done card ``ready`` at the Board's
++version, so new workers kept retrying a card the Board refused as ``not_claimable``.
++"""
++from __future__ import annotations
++
++import copy
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_snapshot_tasks as snapshot_tasks
++from tests.hermes_cli import test_kanban_containment_replica as fixture
++
++kanban_home = fixture.kanban_home
++synced_conn = fixture.synced_conn
++
++DONE_AT = 1_795_196_446
++
++
++class SnapshotHub:
++    """The containment proofs of ``fixture.scenario`` plus a Board snapshot served one row per page, as a real
++    board's history is: a card's ``contained`` and its ``containment_released`` sit pages apart, so the first page
++    holds the card and a later one releases it (on one page they cancel out and nothing is reprojected)."""
++
++    def __init__(self, proofs, tables):
++        self.proofs, self.tables, self.reads = proofs, tables, []
++
++    def row_evidence(self, board, table, uid):
++        return self.proofs.row_evidence(board, table, uid)
++
++    def snapshot_page(self, board, table, after="", limit=ksc.SNAPSHOT_PAGE):
++        assert board == "fixture"
++        self.reads.append(table)
++        rows, index = self.tables.get(table, []), int(after or 0)
++        more = index + 1 < len(rows)
++        return {"head": 50, "rows": copy.deepcopy(rows[index:index + 1]), "more": more,
++                **({"next": index + 1} if more else {})}
++
++
++def _board(conn, target, stop, release, hub, *, version=40):
++    """The Board's copy: the card finished after its containment was released."""
++    task = {"uid": target, "id": target, "status": "done", "completed_at": DONE_AT, "containment_episode": None,
++            "version": version}
++    events = [dict(hub.events[op["event_uid"]]["row"], version=i + 1) for i, op in enumerate((stop, release))]
++    return {"tasks": [task], "task_events": events}
++
++
++def _rebuild(conn, hub):
++    """``resync`` over the snapshot (the card row exists already: a snapshot task row is an upsert either way)."""
++    return ksc.resync(conn, hub, "fixture", observers=False)
++
++
++def _reopen(conn, tid):
++    """What the history replay leaves behind, written the way the replay writes it (nothing queued to send)."""
++    conn.execute("UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?", (tid,))
++    conn.commit()
++    fixture.capture._clear_outbox(conn)
++
++
++def _card(conn, tid):
++    row = conn.execute("SELECT status, completed_at, sync_version FROM tasks WHERE id = ?", (tid,)).fetchone()
++    return tuple(row) if row else None
++
++
++def test_rebuild_keeps_a_released_card_done(synced_conn, monkeypatch):
++    target, _, stop, release, proofs = fixture.scenario(synced_conn)
++    hub = SnapshotHub(proofs, _board(synced_conn, target, stop, release, proofs))
++    _rebuild(synced_conn, hub)
++    assert _card(synced_conn, target) == ("done", DONE_AT, 40)
++    assert hub.reads[-1] == "tasks"  # the re-read comes after every child table
++
++
++def test_without_the_reassert_the_history_replay_reopens_the_card(synced_conn, monkeypatch):
++    """The failure the reassert removes: the history pass alone leaves the done card ``ready`` at its version."""
++    target, _, stop, release, proofs = fixture.scenario(synced_conn)
++    hub = SnapshotHub(proofs, _board(synced_conn, target, stop, release, proofs))
++    monkeypatch.setattr(snapshot_tasks, "reassert", lambda *a, **k: 0)
++    _rebuild(synced_conn, hub)
++    assert _card(synced_conn, target) == ("ready", None, 40)
++
++
++def test_reassert_skips_a_row_the_board_moved_past(synced_conn):
++    """A card at another version than the re-read snapshot row is left for the feed."""
++    target, _, stop, release, proofs = fixture.scenario(synced_conn)
++    hub = SnapshotHub(proofs, _board(synced_conn, target, stop, release, proofs))
++    _rebuild(synced_conn, hub)
++    _reopen(synced_conn, target)
++    hub.tables["tasks"][0]["version"] = 41  # the Board wrote the card again after the first pass
++    assert snapshot_tasks.reassert(synced_conn, hub, "fixture") == 0
++    assert _card(synced_conn, target) == ("ready", None, 40)
++    hub.tables["tasks"][0]["version"] = 40
++    assert snapshot_tasks.reassert(synced_conn, hub, "fixture") == 1
++    assert _card(synced_conn, target) == ("done", DONE_AT, 40)
++
++
++def test_reassert_does_not_move_the_cursor(synced_conn):
++    target, _, stop, release, proofs = fixture.scenario(synced_conn)
++    hub = SnapshotHub(proofs, _board(synced_conn, target, stop, release, proofs))
++    _rebuild(synced_conn, hub)
++    synced_conn.execute("UPDATE kanban_sync_state SET cursor = 77")
++    _reopen(synced_conn, target)
++    assert snapshot_tasks.reassert(synced_conn, hub, "fixture") == 1
++    assert synced_conn.execute("SELECT cursor FROM kanban_sync_state").fetchone()[0] == 77
++    assert kb.get_task(synced_conn, target).status == "done"
++
++
++def test_reassert_never_adds_a_card_the_rebuild_did_not_write(synced_conn):
++    """A snapshot card missing here (another gateway's, outside a live file's partition) stays missing."""
++    target, _, stop, release, proofs = fixture.scenario(synced_conn)
++    hub = SnapshotHub(proofs, _board(synced_conn, target, stop, release, proofs))
++    _rebuild(synced_conn, hub)
++    _reopen(synced_conn, target)
++    hub.tables["tasks"].append({"uid": "t_foreign", "id": "t_foreign", "status": "done", "created_on": "elsewhere",
++                                "version": 9})
++    assert snapshot_tasks.reassert(synced_conn, hub, "fixture", partition="worker") == 1
++    assert _card(synced_conn, "t_foreign") is None
++    assert _card(synced_conn, target) == ("done", DONE_AT, 40)
+-- 
+2.43.0
+

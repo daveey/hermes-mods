@@ -1,0 +1,706 @@
+From c210804f81d7bbd09fe06646d16512306114ce2a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:26:22 +0000
+Subject: [PATCH 6125] Fact store, reducer and capture CPU reductions
+
+Public mirror of source commit c210804f81d7bbd09fe06646d16512306114ce2a.
+
+---
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+index efcd6d08b67..70a4de85b26 100644
+--- a/hermes_cli/fact_board_inputs.py
++++ b/hermes_cli/fact_board_inputs.py
+@@ -4,6 +4,23 @@
+ supplies scoped native capture functions; the engine's ordinary view reducers
+ consume their detached inputs. Request demand only edits a bounded memory queue.
+ Each worker turn captures one selector, so a slow view cannot starve its peers.
++
++Pacing: the source watch fires on board and SQLite-sidecar
++writes, and each firing re-queued every wanted selector.
++The shared ``fact-board-capture`` worker repeatedly recaptured views. A
++deadline running from submission could expire while queued,
++making evidence stale and causing ``503 dependency_unavailable`` responses.
++A selector now starts at most once per ``min_gap_seconds`` (writes inside the gap coalesce into one capture; the
++legacy board snapshot refreshes at most every 20 s), and the deadline runs from the capture's own start. A
++board capture is 0.7-0.8 s alone but 4-8 s cold and longer under the backend's GIL contention, so the owner's 10 s
++budget failed every one there (failed even when it finished: ``_build`` re-checks the time); a board capture
++now has ``max_capture_seconds`` (30 s), below the 60 s validity, so a slow capture still lands as fresh evidence.
++
++Every ``ViewOwner`` uses this source, so the project tree's views (``fact_tree_startup``) are paced and limited the
++same way. A capture queued behind a wedged shared worker reports no failure: its evidence goes stale when its 60 s
++validity expires (``fact_expiry``) instead of within the owner's 10 s budget. The next refresh is timed from the
++last evidence's observation, not its commit: one selector whose captures finish within 30 s keeps its validity;
++in a round of several views, earlier views' evidence is older by the later captures' durations.
+ """
+ from collections import deque
+ from contextvars import copy_context
+@@ -40,14 +57,19 @@
+ 
+ class BoardInputSource:
+     """One bounded round-robin evidence source per authenticated board scope."""
+-    def __init__(self, engine, source, capture, *, paths=(), max_selectors=128, refresh_seconds=30, valid_seconds=60):
++    def __init__(self, engine, source, capture, *, paths=(), max_selectors=128, refresh_seconds=30, valid_seconds=60,
++                 min_gap_seconds=5, max_capture_seconds=30):
+         if source.scope != engine.scope or source.kind != 'board.input':
+             raise ValueError('invalid board input source')
+-        if max_selectors <= 0 or not 0 < refresh_seconds < valid_seconds:
++        if (max_selectors <= 0 or not 0 < refresh_seconds < valid_seconds or not 0 <= min_gap_seconds < refresh_seconds
++                or not 0 < max_capture_seconds < valid_seconds):
+             raise ValueError('invalid board input bounds')
+         self.engine, self.source, self._capture = engine, source, capture
+         self.key = FactKey(source.scope, 'BoardInput', '')  # one operational input namespace per scope
+         self._maximum, self._refresh, self._valid = max_selectors, refresh_seconds, valid_seconds
++        self._capture_seconds = max_capture_seconds  # replaces the owner budget's max_seconds; max_bytes still applies
++        self._gap, self._last_start = min_gap_seconds, {}  # key -> monotonic start of its last capture
++        self._began = None  # monotonic start of the running capture; its deadline (self._deadline) runs from here
+         self._context = copy_context()
+         self._lock = threading.Lock()
+         self._wanted, self._pending = {}, deque()
+@@ -101,28 +123,47 @@
+             if self._closed or self._wake is None:
+                 raise RuntimeError('board source unavailable')
+             if self._result is not None:
+-                return replace(self._result, next_deadline=time.monotonic() + (0 if self._pending else self._refresh))
++                age = max(0.0, time.time() - (self._result.observed_at or time.time()))
++                return replace(self._result, next_deadline=time.monotonic() + (
++                    0 if self._pending else max(0.0, self._refresh - age)))
+             if self._worker is None or not self._worker.is_alive():
+                 if not self._pending:
+                     self._pending.extend(self._wanted)
+                 if not self._pending:
+                     return BoardCapture(after=cursor)
+-                self._active = self._pending.popleft()
+-                self._deadline = time.monotonic() + budget.max_seconds
+-                view, selector = self._wanted[self._active]
+-                key = self._active
++                now = time.monotonic()
++                key = self._next_due(now)
++                if key is None:  # every pending selector ran within the gap: its writes wait to coalesce
++                    return BoardCapture(after=cursor, next_deadline=min(
++                        self._last_start[pending] + self._gap for pending in self._pending))
++                self._active, self._last_start[key], self._began, self._deadline = key, now, None, None
++                view, selector = self._wanted[key]
+                 self._worker = submit(lambda: self._context.run(self._build, key, view, selector, budget))
+             if self._deadline is not None and time.monotonic() >= self._deadline:
+                 self._deadline = None
+                 return BoardCapture(key=self._active, after=cursor, failed=True, observed_at=time.time())
++            if self._began is None:  # queued behind other boards on the shared worker: its budget has not started
++                return BoardCapture(after=cursor, next_deadline=time.monotonic() + 1)
+             return BoardCapture(after=cursor, next_deadline=self._deadline)
+ 
++    def _next_due(self, now):
++        """Pop the first pending selector whose last capture started at least the gap ago (caller holds the lock)."""
++        for _ in range(len(self._pending)):
++            key = self._pending.popleft()
++            if now - self._last_start.get(key, float('-inf')) >= self._gap:
++                return key
++            self._pending.append(key)
++        return None
++
+     def _build(self, key, view, selector, budget):
+         started = time.monotonic()
++        with self._lock:
++            self._began, self._deadline = started, started + self._capture_seconds
++            self._last_start[key] = started  # the gap runs from the actual start, not from queueing
+         try:
+             captured = self._capture(view, selector, budget)
+             encoded = json.dumps(captured.value, separators=(',', ':'), allow_nan=False).encode()
+-            if len(encoded) > budget.max_bytes or time.monotonic() - started > budget.max_seconds:
++            if len(encoded) > budget.max_bytes or time.monotonic() - started > self._capture_seconds:
+                 raise CaptureBudgetExceeded('board evidence capture budget exceeded')
+             result = BoardCapture(key, freeze(captured.value), captured.source_vector, captured.observed_at,
+                                   hashlib.sha256(encoded).hexdigest())
+@@ -133,7 +174,9 @@
+         with self._lock:
+             if self._closed:
+                 return
+-            self._result = result
++            # Disarm with the result: the queue marks the job done only after this returns, and a capture() in
++            # between must not read this capture's deadline as still running (a stale wait, or a late failure).
++            self._result, self._began, self._deadline = result, None, None
+             wake = self._wake
+         wake()
+ 
+diff --git a/hermes_cli/fact_board_native.py b/hermes_cli/fact_board_native.py
+index 083c8e6aeca..ece1272d7c3 100644
+--- a/hermes_cli/fact_board_native.py
++++ b/hermes_cli/fact_board_native.py
+@@ -5,8 +5,11 @@
+ observations. External policy/roster/clock evidence is bounded-refresh, not a
+ claim of an atomic cross-database snapshot or instantaneous external truth.
+ """
++from collections import OrderedDict
+ from contextlib import closing
++import os
+ import sqlite3
++import threading
+ import time
+ 
+ from dataclasses import asdict
+@@ -21,11 +24,55 @@
+             'schema': conn.execute('PRAGMA schema_version').fetchone()[0]}
+ 
+ 
++# (board file, its identity, selector) -> (change cursor, rows) of the last capture: the next one reads only what
++# moved. A replaced file has a new identity, so it starts from a full read, as the legacy route's dropped observer.
++_RETAINED: OrderedDict = OrderedDict()
++_RETAINED_MAX = 8  # as board_rows.MAX_ENTRIES
++_retained_lock = threading.Lock()
++
++
++def _local(api, live, board, selector):
++    """The board's own rows, incrementally from the last capture of the same query (as ``board_rows``)."""
++    from hermes_cli import kanban_db
++    path = str(kanban_db.kanban_db_path(board=board))
++    try:
++        stat = os.stat(path)
++    except OSError:
++        key = None  # no identity to vouch for retained rows: read in full, retain nothing
++    else:
++        key = (path, stat.st_dev, stat.st_ino, tuple(sorted(selector.items())))
++    with _retained_lock:
++        hit = _RETAINED.get(key) if key is not None else None
++    try:
++        changed, cursor = changes.changed_since(live, hit[0] if hit else None)
++        local, rows = api.board_fact_capture.capture_incremental(live, hit[1] if hit else None, changed, **selector)
++    except BaseException:
++        with _retained_lock:
++            _RETAINED.pop(key, None)  # a failed read never seeds the next delta
++        raise
++    if key is None:
++        return local
++    with _retained_lock:
++        _RETAINED[key] = (cursor, rows)
++        _RETAINED.move_to_end(key)
++        while len(_RETAINED) > _RETAINED_MAX:
++            _RETAINED.popitem(last=False)
++    return local
++
++
++def retire(paths) -> None:
++    """Drop retained rows of closed board files (``BoardRuntime.close``), as ``board_rows.retire``."""
++    paths = {str(path) for path in paths}
++    with _retained_lock:
++        for key in [key for key in _RETAINED if key[0] in paths]:
++            del _RETAINED[key]
++
++
+ def _board(api, board, selector):
+     observed_at = time.time()
+     with closing(api._conn(board=board)) as live:
+         live.execute('BEGIN')
+-        local = api.board_fact_capture.capture(live, **selector)
++        local = _local(api, live, board, selector)
+         observations = {'local': _observation(live)}
+         shadow = None
+         try:
+diff --git a/hermes_cli/fact_board_startup.py b/hermes_cli/fact_board_startup.py
+index f191407981c..f0ca0a629b7 100644
+--- a/hermes_cli/fact_board_startup.py
++++ b/hermes_cli/fact_board_startup.py
+@@ -137,6 +137,8 @@
+                     failures.append(exc)
+             if failures:
+                 raise ExceptionGroup('board shutdown incomplete', failures)
++            from hermes_cli import kanban_db
++            board_native_inputs.retire(kanban_db.kanban_db_path(board=board) for board in getattr(self, 'boards', ()))
+             views = self.api.board_fact_views
+             if views._installed is not None and views._installed[1] == self.provider:
+                 views._installed = self._previous
+diff --git a/plugins/kanban/dashboard/board_fact_capture.py b/plugins/kanban/dashboard/board_fact_capture.py
+index 637d56c4dad..a4848728308 100644
+--- a/plugins/kanban/dashboard/board_fact_capture.py
++++ b/plugins/kanban/dashboard/board_fact_capture.py
+@@ -19,12 +19,27 @@
+     Call on the auxiliary capture worker, never on the shared feed. Failure
+     propagates for source health; it is not an authoritative empty board.
+     """
++    return capture_incremental(conn, None, None, tenant=tenant, include_archived=include_archived,
++                               workflow_template_id=workflow_template_id, current_step_key=current_step_key,
++                               done_limit=done_limit)[0]
++
++
++def capture_incremental(conn, prev, changed, *, tenant=None, include_archived=False, workflow_template_id=None,
++                        current_step_key=None, done_limit=80):
++    """``capture`` from the last rows of the same query: ``(captured, rows)``. [daveey]
++
++    ``prev`` and ``changed`` (task ids from ``kanban_task_change.changed_since`` in this same read transaction) take
++    ``board_read.materialize``'s delta, exactly as the legacy route's ``board_rows.incremental`` does: displayed
++    and changed cards re-read by key instead of every row of the board. Each row step releases the GIL, so in a
++    contended process (the hub dashboard backend) a full read of the hub's board took minutes; the delta reads a
++    few hundred. ``rows`` is retained by the caller for the next capture and never mutated.
++    """
+     if not conn.in_transaction:
+         raise ValueError('board capture requires a caller-owned read transaction')
+     observed_at = time.time()
+     rows = board_read.materialize(conn, tenant, include_archived, workflow_template_id,
+-                                  current_step_key, done_limit)
+-    return capture_rows(rows, include_archived=include_archived, observed_at=observed_at)
++                                  current_step_key, done_limit, prev=prev, changed=changed)
++    return capture_rows(rows, include_archived=include_archived, observed_at=observed_at), rows
+ 
+ 
+ def capture_rows(rows, *, include_archived, observed_at):
+diff --git a/plugins/kanban/dashboard/board_fact_views.py b/plugins/kanban/dashboard/board_fact_views.py
+index 137fc0954c2..4a1593496a9 100644
+--- a/plugins/kanban/dashboard/board_fact_views.py
++++ b/plugins/kanban/dashboard/board_fact_views.py
+@@ -178,7 +178,8 @@
+     v1, bound = selected
+     if bound is None:
+         return None
+-    result = bound if isinstance(bound, v1.Unavailable) else bound.read(view, selector)
++    # A scope still activating is Pending (BoardRuntime.provider): not a view, so it answers 503 like Unavailable.
++    result = bound if isinstance(bound, (v1.Unavailable, v1.Pending)) else bound.read(view, selector)
+     if result is None:
+         return None
+     if isinstance(result, v1.Ready):
+@@ -246,7 +247,7 @@
+     v1, bound = selected
+     if bound is None:
+         return nullcontext()
+-    if isinstance(bound, v1.Unavailable):
++    if isinstance(bound, (v1.Unavailable, v1.Pending)):
+         raise HTTPException(503, detail={"code": "facts_unavailable", "reason": bound.reason})
+     return bound.legacy()
+ 
+diff --git a/tests/hermes_cli/test_fact_board_inputs.py b/tests/hermes_cli/test_fact_board_inputs.py
+index 56a692bbb9e..21d9dde1feb 100644
+--- a/tests/hermes_cli/test_fact_board_inputs.py
++++ b/tests/hermes_cli/test_fact_board_inputs.py
+@@ -23,7 +23,7 @@
+         return CapturedInput({'local': {'answer': selector['n']}}, ((source_id, 'native-token'),), time.time())
+ 
+     source_id = SourceId(scope, 'board.input', 'local')
+-    adapter = BoardInputSource(engine, source_id, capture, max_selectors=2)
++    adapter = BoardInputSource(engine, source_id, capture, max_selectors=2, min_gap_seconds=0)  # pacing: own tests
+     adapter.watch(woke.set)
+     yield adapter, engine, calls, woke
+     adapter.close()
+diff --git a/tests/hermes_cli/test_fact_board_pacing.py b/tests/hermes_cli/test_fact_board_pacing.py
+new file mode 100644
+index 00000000000..47bb68ad935
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_board_pacing.py
+@@ -0,0 +1,265 @@
++"""Board evidence capture pacing and budgets (hub undated representative observation, ``hermes_cli.fact_board_inputs``). [daveey]
++
++Every write to the board file re-queued every view, the one shared capture worker never idled, and in the
++contended dashboard backend each capture overran the owner's 10 s budget (also while still queued), so the board
++route answered ``503 dependency_unavailable`` instead of the board.
++"""
++import threading
++import time
++
++import pytest
++
++from hermes_cli import fact_capture_queue
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++
++
++class _Clock:
++    """The board source's monotonic clock, advanced by the test: the delays are the behaviour under test."""
++
++    def __init__(self):
++        self.now, self.wall = 1000.0, time.time()
++
++    def monotonic(self):
++        return self.now
++
++    def advance(self, seconds):
++        self.now += seconds
++        self.wall += seconds
++
++    def time(self):
++        return self.wall
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    from hermes_cli import fact_board_inputs
++    fake = _Clock()
++    monkeypatch.setattr(fact_board_inputs, 'time', fake)
++    return fake
++
++
++def _adapter(capture, **options):
++    from hermes_cli.fact_board_inputs import BoardInputSource
++    scope = Scope('installation', 'default', 'main')
++    engine = ReducerEngine(FactStore(), scope)
++    woke = threading.Event()
++    adapter = BoardInputSource(engine, SourceId(scope, 'board.input', 'local'), capture, max_selectors=4, **options)
++    adapter.watch(woke.set)
++    return adapter, engine, woke
++
++
++def _captured(selector):
++    from hermes_cli.fact_board_inputs import CapturedInput
++    return CapturedInput({'local': {'answer': selector['n']}}, (), time.time())
++
++
++def _run_once(adapter, woke, budget):
++    """Start one capture, let it finish, commit its result; returns the capture that started it."""
++    woke.clear()
++    started = adapter.capture(None, budget)
++    assert woke.wait(5), 'capture did not finish'
++    adapter._worker.join(5)
++    adapter.commit(adapter.capture(None, budget))
++    return started
++
++
++def test_writes_inside_the_gap_coalesce_into_one_capture(clock):
++    calls = []
++
++    def capture(view, selector, budget):
++        calls.append(clock.monotonic())
++        return _captured(selector)
++
++    adapter, _engine, woke = _adapter(capture, min_gap_seconds=0.5)
++    try:
++        adapter.want('board', {'n': 1})
++        _run_once(adapter, woke, CaptureBudget(max_seconds=2))
++        assert len(calls) == 1
++        for _ in range(5):  # a burst of board writes
++            adapter._invalidate()
++        held = adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert held.key is None and held.next_deadline == calls[0] + 0.5  # due after the gap, nothing started
++        assert len(calls) == 1
++        clock.advance(0.4)
++        assert adapter.capture(None, CaptureBudget(max_seconds=2)).key is None and len(calls) == 1
++        clock.advance(0.1)
++        _run_once(adapter, woke, CaptureBudget(max_seconds=2))
++        assert len(calls) == 2 and calls[1] - calls[0] >= 0.5  # one capture for the whole burst
++        assert adapter.capture(None, CaptureBudget(max_seconds=2)).next_deadline > clock.monotonic()
++        assert len(calls) == 2
++    finally:
++        adapter.close()
++
++
++def test_a_throttled_selector_does_not_hold_back_a_due_peer(clock):
++    calls = []
++
++    def capture(view, selector, budget):
++        calls.append(selector['n'])
++        return _captured(selector)
++
++    adapter, _engine, woke = _adapter(capture, min_gap_seconds=30 - 1)
++    try:
++        adapter.want('board', {'n': 1})
++        _run_once(adapter, woke, CaptureBudget(max_seconds=2))
++        adapter.want('board', {'n': 2})  # new demand behind a just-captured selector
++        adapter._invalidate()
++        _run_once(adapter, woke, CaptureBudget(max_seconds=2))
++        assert calls == [1, 2]
++    finally:
++        adapter.close()
++
++
++def test_a_capture_queued_behind_another_board_does_not_spend_its_budget(clock):
++    """The budget runs from the capture's own start, not from submission to the shared worker."""
++    release = threading.Event()
++    blocker = fact_capture_queue.submit(lambda: release.wait(5))  # another board's capture holds the worker
++    adapter, engine, woke = _adapter(lambda view, selector, budget: _captured(selector))
++    try:
++        adapter.want('board', {'n': 1})
++        woke.clear()  # want() wakes the owner; wait for the capture's own wake below
++        budget = CaptureBudget(max_seconds=0.1)
++        adapter.capture(None, budget)
++        clock.advance(0.3)  # longer than the budget, all of it queued
++        queued = adapter.capture(None, budget)
++        assert not queued.failed and queued.key is None
++        assert queued.next_deadline == clock.monotonic() + 1  # polled again: its deadline arms when it starts
++        release.set()
++        blocker.join(5)
++        assert woke.wait(5)
++        adapter._worker.join(5)
++        result = adapter.capture(None, budget)
++        assert not result.failed
++        adapter.commit(result)
++        fact = engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1}))
++        assert fact.health == 'fresh'
++    finally:
++        release.set()
++        adapter.close()
++
++
++def test_a_capture_slower_than_the_owner_budget_still_publishes_fresh_evidence(clock):
++    """The owner's 10 s budget failed every contended board capture, even finished ones; the board has its own."""
++    def slow(view, selector, budget):
++        clock.advance(0.3)  # the capture's own duration
++        return _captured(selector)
++
++    adapter, engine, woke = _adapter(slow, max_capture_seconds=5)
++    try:
++        adapter.want('board', {'n': 1})
++        _run_once(adapter, woke, CaptureBudget(max_seconds=0.1))
++        fact = engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1}))
++        assert fact.health == 'fresh' and fact.value['local']['answer'] == 1
++    finally:
++        adapter.close()
++
++
++def test_a_capture_over_its_own_limit_still_fails_closed(clock):
++    def slow(view, selector, budget):
++        clock.advance(0.3)  # the capture's own duration
++        return _captured(selector)
++
++    adapter, engine, woke = _adapter(slow, max_capture_seconds=0.1)
++    try:
++        adapter.want('board', {'n': 1})
++        _run_once(adapter, woke, CaptureBudget(max_seconds=10))
++        fact = engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1}))
++        assert fact.error_code == 'board_capture_failed'
++    finally:
++        adapter.close()
++
++
++def test_a_capture_still_running_past_its_own_limit_is_reported_failed(clock):
++    """The deadline is armed when the capture starts: past it, the owner hears a failure while the worker runs."""
++    entered, release = threading.Event(), threading.Event()
++
++    def blocked(view, selector, budget):
++        entered.set()
++        release.wait(5)
++        return _captured(selector)
++
++    adapter, engine, _woke = _adapter(blocked, max_capture_seconds=0.2)
++    try:
++        adapter.want('board', {'n': 1})
++        adapter.capture(None, CaptureBudget(max_seconds=10))
++        assert entered.wait(5)
++        clock.advance(0.3)
++        result = adapter.capture(None, CaptureBudget(max_seconds=10))
++        assert result.failed and adapter._worker.is_alive()
++        adapter.commit(result)
++        assert engine.store.snapshot(engine.scope).get(adapter.input_key('board', {'n': 1})).error_code == \
++            'board_capture_failed'
++    finally:
++        release.set()
++        adapter.close(timeout=5)
++
++
++def test_a_finished_capture_disarms_its_deadline_with_its_result(clock):
++    """The queue marks the job done after _build returns; a capture() in between must not see a running deadline."""
++    adapter, _engine, woke = _adapter(lambda view, selector, budget: _captured(selector))
++    try:
++        adapter.want('board', {'n': 1})
++        woke.clear()
++        adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert woke.wait(5)
++        assert adapter._deadline is None and adapter._began is None
++    finally:
++        adapter.close()
++
++
++def test_the_next_refresh_is_timed_from_the_evidence_observation(clock):
++    """Slow captures: refresh by the evidence's age, so its validity cannot lapse before the next one lands."""
++    from hermes_cli.fact_board_inputs import CapturedInput
++
++    def aged(view, selector, budget):
++        return CapturedInput({'local': {'answer': 1}}, (), clock.time() - 20)  # observed 20 s before it landed
++
++    adapter, _engine, woke = _adapter(aged)
++    try:
++        adapter.want('board', {'n': 1})
++        woke.clear()
++        adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert woke.wait(5)
++        adapter._worker.join(5)
++        result = adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert result.next_deadline == pytest.approx(clock.monotonic() + 30 - 20)
++    finally:
++        adapter.close()
++
++
++def test_the_gap_runs_from_the_capture_start_not_its_queueing(clock):
++    release = threading.Event()
++    blocker = fact_capture_queue.submit(lambda: release.wait(5))
++    adapter, _engine, woke = _adapter(lambda view, selector, budget: _captured(selector), min_gap_seconds=5)
++    try:
++        adapter.want('board', {'n': 1})
++        woke.clear()
++        adapter.capture(None, CaptureBudget(max_seconds=2))
++        clock.advance(3)  # queued for 3 s
++        release.set()
++        blocker.join(5)
++        assert woke.wait(5)
++        adapter._worker.join(5)
++        adapter.commit(adapter.capture(None, CaptureBudget(max_seconds=2)))
++        adapter._invalidate()
++        assert adapter.capture(None, CaptureBudget(max_seconds=2)).next_deadline == pytest.approx(1000 + 3 + 5)
++    finally:
++        release.set()
++        adapter.close()
++
++
++def test_every_view_owner_paces_its_views():
++    """The project tree's views run on the same source as the board's."""
++    from hermes_cli.fact_view_owner import ViewOwner
++    owner = ViewOwner(Scope('installation', 'default', 'tree'), lambda *a: None, lambda *a: None, ('tree',))
++    assert owner.source._gap == 5 and owner.source._capture_seconds == 30
++
++
++@pytest.mark.parametrize('options', [{'min_gap_seconds': -1}, {'min_gap_seconds': 30}, {'max_capture_seconds': 0},
++                                     {'max_capture_seconds': 60}])
++def test_invalid_pacing_bounds_refused(options):
++    with pytest.raises(ValueError, match='bounds'):
++        _adapter(lambda *a: None, **options)
+diff --git a/tests/plugins/test_board_native_incremental.py b/tests/plugins/test_board_native_incremental.py
+new file mode 100644
+index 00000000000..d5320b82199
+--- /dev/null
++++ b/tests/plugins/test_board_native_incremental.py
+@@ -0,0 +1,109 @@
++"""Native board evidence reads incrementally, like the legacy route (``fact_board_native._local``). [daveey]
++
++A full board read releases the GIL on every row step; in the contended hub dashboard backend it took minutes.
++The capture now keeps its last rows and change cursor and takes ``board_read.materialize``'s delta.
++"""
++from contextlib import closing
++import json
++
++import pytest
++
++from hermes_cli import fact_board_native as native
++from hermes_cli import kanban_db, kanban_db_connect
++from plugins.kanban.dashboard import board_fact_views, board_read
++from tests.plugins import test_kanban_board_shadow as helpers
++
++shadow_board = helpers.shadow_board
++
++
++@pytest.fixture
++def calls(monkeypatch):
++    seen = []
++    real = board_read.materialize
++
++    def recording(conn, *args, prev=None, changed=None, **kwargs):
++        if 'sync-shadow' not in conn.execute('PRAGMA database_list').fetchone()[2]:  # the live file, not the replica
++            seen.append((prev is not None, changed))
++        return real(conn, *args, prev=prev, changed=changed, **kwargs)
++
++    monkeypatch.setattr(board_read, 'materialize', recording)
++    monkeypatch.setattr(native, '_RETAINED', type(native._RETAINED)())
++    return seen
++
++
++def _cards(api):
++    result = native.capture(api, None, 'board', board_fact_views.board_selector())
++    return json.dumps(result['value']['local']['rows']['cards'], sort_keys=True, default=str)
++
++
++def test_the_second_capture_takes_the_delta_and_matches_a_full_read(shadow_board, calls):
++    api = shadow_board['mod']
++    first = _cards(api)
++    second = _cards(api)
++    assert [prev for prev, _ in calls] == [False, True]
++    # changed_since's own answer: a change set, or FULL when it cannot vouch for one (then a correct full read)
++    native._RETAINED.clear()
++    assert _cards(api) == first == second  # a fresh full read agrees with the delta
++
++
++def test_a_card_written_between_captures_reaches_the_delta(shadow_board, calls):
++    api = shadow_board['mod']
++    _cards(api)
++    with closing(kanban_db_connect.connect(kanban_db.kanban_db_path())) as conn:
++        tid = kanban_db.create_task(conn, title='written between captures', assignee='default')
++    assert tid in _cards(api)
++    assert calls[-1][0] is True  # read from the retained rows
++    changed = calls[-1][1]
++    assert not isinstance(changed, frozenset) or tid in changed  # a delta names the card; FULL re-reads every row
++
++
++def test_a_failed_read_never_seeds_the_next_delta(shadow_board, calls, monkeypatch):
++    api = shadow_board['mod']
++    _cards(api)
++    assert len(native._RETAINED) == 1
++
++    def broken(*_a, **_k):
++        raise OSError('disk')
++
++    monkeypatch.setattr(api.board_fact_capture, 'capture_incremental', broken)
++    with pytest.raises(OSError):
++        _cards(api)
++    assert len(native._RETAINED) == 0
++
++
++def test_a_replaced_board_file_starts_from_a_full_read(shadow_board, calls, monkeypatch):
++    """Retained rows are keyed by the file's identity, like the legacy route's per-file observer."""
++    api = shadow_board['mod']
++    _cards(api)
++    real = native.os.stat
++    board = str(kanban_db.kanban_db_path())
++
++    class Replaced:  # the same path, a new file: only its inode differs
++        def __init__(self, stat):
++            self._stat = stat
++
++        def __getattr__(self, name):
++            value = getattr(self._stat, name)
++            return value + 1 if name == 'st_ino' else value
++
++    monkeypatch.setattr(native.os, 'stat',
++                        lambda path, *a, **k: Replaced(real(path, *a, **k)) if str(path) == board else real(path, *a, **k))
++    _cards(api)
++    assert [prev for prev, _ in calls] == [False, False]
++
++
++def test_closing_the_runtime_drops_its_retained_rows(shadow_board, calls):
++    from hermes_cli.fact_board_startup import BoardRuntime
++    api = shadow_board['mod']
++    _cards(api)
++    assert native._RETAINED
++    runtime = BoardRuntime(api, boards=(kanban_db.get_current_board(),)).start()
++    runtime.close()
++    assert not native._RETAINED
++
++
++def test_retained_rows_are_capped(shadow_board, calls):
++    api = shadow_board['mod']
++    for limit in range(1, native._RETAINED_MAX + 4):  # more distinct selectors than the cap
++        native.capture(api, None, 'board', board_fact_views.board_selector(done_limit=limit))
++    assert len(native._RETAINED) == native._RETAINED_MAX
+diff --git a/tests/plugins/test_board_pending_route.py b/tests/plugins/test_board_pending_route.py
+new file mode 100644
+index 00000000000..6e2839e65f9
+--- /dev/null
++++ b/tests/plugins/test_board_pending_route.py
+@@ -0,0 +1,32 @@
++"""A board scope still activating answers 503, not a 500 (``board_fact_views.response``/``legacy``). [daveey]
++
++``BoardRuntime.provider`` returns ``Pending('board_activating')`` while a scope's owner starts; the route called
++``.read()`` on it (AttributeError) because only ``Unavailable`` was handled.
++"""
++from types import SimpleNamespace
++
++import pytest
++from fastapi import HTTPException
++
++from hermes_cli.fact_contract import Pending, Ready, Unavailable
++from plugins.kanban.dashboard import board_fact_views
++
++
++@pytest.fixture
++def pending(monkeypatch):
++    v1 = SimpleNamespace(Ready=Ready, Pending=Pending, Unavailable=Unavailable)
++    monkeypatch.setattr(board_fact_views, '_installed', (v1, lambda board: Pending('board_activating')))
++    return v1
++
++
++def test_an_activating_scope_answers_503_with_its_reason(pending):
++    with pytest.raises(HTTPException) as error:
++        board_fact_views.response('board', board_fact_views.board_selector(), board='default')
++    assert error.value.status_code == 503
++    assert error.value.detail == {'code': 'facts_unavailable', 'reason': 'board_activating'}
++
++
++def test_the_legacy_guard_answers_503_too(pending):
++    with pytest.raises(HTTPException) as error:
++        board_fact_views.legacy('default')
++    assert error.value.status_code == 503 and error.value.detail['reason'] == 'board_activating'
+-- 
+2.43.0
+

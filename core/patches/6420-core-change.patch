@@ -1,0 +1,240 @@
+From 0191dec24a3fa3fa1f5491601136a8317778c33b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:29:30 +0000
+Subject: [PATCH 6420] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 0191dec24a3fa3fa1f5491601136a8317778c33b.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 7bab114fb0d..9c5b6ed1320 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -61,6 +61,7 @@
+ SETTLED = "spend_review_settled"
+ KINDS = (QUEUED, STARTED, GRANTED, ESCALATED, SETTLED)
+ AUTHOR = "kanban-spend-reviewer"
++ROUTE_CLASS = "class:standard"  # model-neutral: the managed subscription registry picks the concrete route
+ TIMEOUT = 90
+ LEASE_SECONDS = 300
+ MAX_ATTEMPTS = 2
+@@ -396,30 +397,53 @@
+ 
+ def judge(ctx: dict) -> Optional[dict]:
+     """One subscription call bounded end to end by ``TIMEOUT``, route and credential resolution included.
+-    None when it is unavailable, late, routed outside subscription billing, or not JSON."""
++
++    Model-neutral: the judge asks for ``ROUTE_CLASS`` and the managed subscription registry allocates any
++    eligible route of that class. Subscription-only holds before the paid invocation: with managed routing
++    off (``model_routing.enforce_subscription_only``) no call is made, and under it class allocation
++    (``eligible_routes``) offers only subscription routes and the auxiliary transmit fence
++    (``verify_managed_auxiliary``) refuses anything else. The answer is accepted only from a route the
++    registry still lists as an eligible subscription member of that class (``verify_selected_route``).
++    None when it is unavailable, late, routed anywhere but such a route, or not JSON."""
+     from agent import auxiliary_client as aux
++    from agent.model_routing import ModelRoutingError
++    from agent.model_routing_managed import managed_config, verify_selected_route
+     from hermes_cli.kanban_hub_admission import _bounded, _owner_scope
+     from hermes_cli.kanban_spend_caused_review import PROMPT as CAUSED_PROMPT
+     prompt = CAUSED_PROMPT if ctx.get("cause") else PROMPT
+     user = {k: v for k, v in ctx.items() if not k.startswith("_")}
+     route: dict = {}
++    managed: dict = {}
+     deadline = time.monotonic() + TIMEOUT
+ 
+     def ask():
++        config = managed_config()
++        if config is None:
++            return False  # no subscription-only fence on this host: never invoke
++        managed["config"] = config
+         with aux.aux_stream_deadline(deadline):
+             return aux.call_llm(
+-                task="kanban_spend_review", model="class:standard", timeout=TIMEOUT, max_tokens=800,
++                task="kanban_spend_review", model=ROUTE_CLASS, timeout=TIMEOUT, max_tokens=800,
+                 temperature=0, route_info=route,
+                 messages=[{"role": "system", "content": prompt.replace("CAP", str(ctx["_cap"]))},
+                           {"role": "user", "content": json.dumps(user, ensure_ascii=False)}])
+ 
+     with _owner_scope():
+         response = _bounded(ask, deadline)
++    if response is False:
++        logger.warning("kanban: spend review needs managed subscription-only routing; escalating")
++        return None
+     if response is None:
+         logger.warning("kanban: spend review judge did not answer within %ss; escalating", TIMEOUT)
+         return None
+-    if route.get("billing_group") != "subscription":
+-        logger.warning("kanban: spend review route %s is not the subscription judge; escalating", route)
++    try:
++        if (route.get("billing_group") != "subscription"
++                or route.get("requested_class") != ROUTE_CLASS.removeprefix("class:")):
++            raise ModelRoutingError("not a subscription route of the judge class")
++        verify_selected_route(route.get("model"), route.get("provider"), route, managed["config"])
++    except ModelRoutingError as exc:
++        logger.warning("kanban: spend review route %s is not an eligible subscription route (%s); escalating",
++                       route, exc)
+         return None
+     return parse(response.choices[0].message.content)
+ 
+diff --git a/tests/hermes_cli/test_kanban_spend_reviewer.py b/tests/hermes_cli/test_kanban_spend_reviewer.py
+index a1c45032de9..437c615e757 100644
+--- a/tests/hermes_cli/test_kanban_spend_reviewer.py
++++ b/tests/hermes_cli/test_kanban_spend_reviewer.py
+@@ -237,40 +237,121 @@
+         assert txns == [] and kb.get_task(conn, tid).status == "triage"
+ 
+ 
+-@pytest.mark.parametrize("route, ok", [
+-    ({"provider": "anthropic", "model": "claude-opus-5-5", "billing_group": "subscription"}, True),
+-    ({"provider": "openai-codex", "model": "gpt-6.1-sol", "billing_group": "subscription"}, True),
+-    ({"provider": "anthropic", "model": "claude-opus-5-5"}, False),  # no billing evidence
+-    ({"provider": "openai-codex", "model": "gpt-6.1-sol", "billing_group": "metered"}, False),
+-])
+-def test_the_judge_answers_only_through_the_subscription_route(monkeypatch, route, ok):
++def _routing(*routes, allow_metered=False):
++    """A managed subscription-only registry whose ``standard`` class lists ``routes``."""
++    return {"model_routing": {
++        "enabled": True, "policy_version": 1, "allow_metered": allow_metered, "enforce_subscription_only": True,
++        "routes": {"deep": [], "fast": [], "standard": [
++            {"provider": p, "model": m, "billing": b, "eligible": True, "funding_verified": True, "weight": 1,
++             "capabilities": {"context_tokens": 200000, "tools": True, "streaming": True, "json": True}}
++            for p, m, b in routes]}}}
++
++
++_REGISTRY = (("anthropic", "claude-sonnet-5-5", "subscription"), ("openai-codex", "gpt-5.5", "subscription"),
++             ("openrouter", "paid-model", "metered"))
++
++
++def _meta(provider, model, billing="subscription", level="standard"):
++    return {"provider": provider, "model": model, "requested_class": level, "selected_provider": provider,
++            "selected_model": model, "billing_group": billing, "policy_version": 1}
++
++
++def _judge_with(monkeypatch, route, config):
+     from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
++    calls = []
+ 
+     def call_llm(**kw):
+         assert kw["model"] == "class:standard" and "provider" not in kw
+         assert kw["task"] == "kanban_spend_review"
++        calls.append(kw)
+         kw["route_info"].update(route)
+         message = types.SimpleNamespace(content='{"decision": "escalate", "reason": "same wait"}')
+         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+ 
+     monkeypatch.setattr(aux, "call_llm", call_llm)
+-    verdict = reviewer.judge({"_cap": 3, "_corpus": "", "title": "t"})
+-    assert (verdict == {"decision": "escalate", "reason": "same wait"}) is ok
++    monkeypatch.setattr(managed, "managed_config", lambda config_=None: config)
++    return reviewer.judge({"_cap": 3, "_corpus": "", "title": "t"}), calls
++
++
++@pytest.mark.parametrize("route", [
++    _meta("anthropic", "claude-sonnet-5-5"),
++    _meta("openai-codex", "gpt-5.5"),  # any eligible subscription route of the class, not one concrete model
++])
++def test_the_judge_accepts_any_eligible_subscription_route_of_its_class(monkeypatch, route):
++    verdict, calls = _judge_with(monkeypatch, route, _routing(*_REGISTRY))
++    assert verdict == {"decision": "escalate", "reason": "same wait"}
++    assert [(c["model"], c.get("provider")) for c in calls] == [(reviewer.ROUTE_CLASS, None)]
++
++
++@pytest.mark.parametrize("route", [
++    {"provider": "anthropic", "model": "claude-sonnet-5-5"},  # no billing evidence
++    _meta("openrouter", "paid-model", "metered"),  # a paid route never answers
++    _meta("anthropic", "claude-sonnet-5-5", level="deep"),  # another class
++    _meta("anthropic", "unlisted-model"),  # claims subscription but is not in the registry
++    {**_meta("openai-codex", "gpt-5.5"), "selected_model": "claude-sonnet-5-5"},  # identity mismatch
++])
++def test_the_judge_refuses_a_route_that_is_not_an_eligible_subscription_member(monkeypatch, route):
++    assert _judge_with(monkeypatch, route, _routing(*_REGISTRY))[0] is None
++
++
++def test_the_judge_refuses_a_route_withdrawn_from_the_registry(monkeypatch):
++    route = _meta("openai-codex", "gpt-5.5")
++    assert _judge_with(monkeypatch, route, _routing(("anthropic", "claude-sonnet-5-5", "subscription")))[0] is None
++
++
++def test_without_subscription_only_routing_the_judge_never_invokes_a_model(monkeypatch):
++    verdict, calls = _judge_with(monkeypatch, _meta("anthropic", "claude-sonnet-5-5"), None)
++    assert verdict is None and calls == []
++
++
++def test_an_unavailable_subscription_class_escalates(monkeypatch):
++    from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
++    from agent.model_routing import ModelRoutingError
++
++    def call_llm(**kw):
++        raise ModelRoutingError("No eligible standard routes under billing/capability policy")
++
++    monkeypatch.setattr(aux, "call_llm", call_llm)
++    monkeypatch.setattr(managed, "managed_config", lambda config=None: _routing())
++    with pytest.raises(ModelRoutingError):  # review() turns any judge exception into an escalation
++        reviewer.judge({"_cap": 3, "_corpus": "", "title": "t"})
++
++
++def test_the_class_allocator_offers_only_subscription_routes_before_any_call():
++    from agent.model_routing import eligible_routes
++    policy = _routing(*_REGISTRY, allow_metered=True)["model_routing"]  # enforce_subscription_only wins
++    assert {r["billing"] for r in eligible_routes(policy, "standard")} == {"subscription"}
+ 
+ 
+ @pytest.mark.parametrize("failure", ["paid", "missing-billing", "unavailable", "timeout", "non-json"])
+ def test_real_judge_failure_escalates_without_a_grant(kanban_home, monkeypatch, failure):
+     from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
+     monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 2))
++    monkeypatch.setattr(managed, "managed_config", lambda config=None: _routing(*_REGISTRY))
++    calls, parsed = [], []
++    real_parse = reviewer.parse
++
++    def parse(content):
++        parsed.append(content)
++        return real_parse(content)
++
++    monkeypatch.setattr(reviewer, "parse", parse)
+ 
+     def call_llm(**kwargs):
++        calls.append((kwargs["task"], kwargs["model"], kwargs.get("provider")))
+         if failure == "unavailable":
+             raise RuntimeError("no eligible route")
+         if failure == "timeout":
+             raise TimeoutError("deadline")
+-        kwargs["route_info"].update(provider="openai-codex", model="gpt-6.1-sol")
+-        if failure != "missing-billing":
+-            kwargs["route_info"]["billing_group"] = "paid" if failure == "paid" else "subscription"
++        route = _meta("openai-codex", "gpt-5.5")
++        if failure == "missing-billing":
++            route.pop("billing_group")
++        elif failure == "paid":
++            route["billing_group"] = "paid"
++        kwargs["route_info"].update(route)
+         content = "not json" if failure == "non-json" else json.dumps(_grant())
+         return types.SimpleNamespace(choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=content))])
+ 
+@@ -280,6 +361,8 @@
+         with kb.write_txn(conn):
+             kb._append_event(conn, tid, reviewer.STARTED, {"episode": episode})
+         assert reviewer.review(conn, tid, episode) == "escalated"
++        assert calls == [("kanban_spend_review", reviewer.ROUTE_CLASS, None)]
++        assert parsed == (["not json"] if failure == "non-json" else [])
+         assert kb.get_task(conn, tid).status == "triage"
+         assert reviewer.GRANTED not in _kinds(conn, tid)
+         assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED
+@@ -287,9 +370,11 @@
+ 
+ def test_a_hung_judge_is_abandoned_at_the_deadline(monkeypatch):
+     from agent import auxiliary_client as aux
++    from agent import model_routing_managed as managed
+     import threading
+     release = threading.Event()
+     monkeypatch.setattr(reviewer, "TIMEOUT", 1)
++    monkeypatch.setattr(managed, "managed_config", lambda config=None: _routing(*_REGISTRY))
+     monkeypatch.setattr(aux, "call_llm", lambda **kw: release.wait(30))
+     try:
+         assert reviewer.judge({"_cap": 3, "_corpus": "", "title": "t"}) is None
+-- 
+2.43.0
+

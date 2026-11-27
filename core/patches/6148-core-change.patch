@@ -1,0 +1,143 @@
+From 5eba5368cd46a4b281fe8832f828fbc5a31bd33c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 05:46:09 +0000
+Subject: [PATCH 6148] Kanban canonical home, execution separation and explicit-home readers
+
+Public mirror of source commit 5eba5368cd46a4b281fe8832f828fbc5a31bd33c.
+
+---
+diff --git a/hermes_cli/kanban_creation_home.py b/hermes_cli/kanban_creation_home.py
+index c59c5ba056c..70d7330650f 100644
+--- a/hermes_cli/kanban_creation_home.py
++++ b/hermes_cli/kanban_creation_home.py
+@@ -6,6 +6,21 @@
+ from __future__ import annotations
+ 
+ 
++def _worker_config(cfg, gateway):
++    """Extend an opted-in hub pool to dynamic worker slots without editing config.
++
++    Production lists intake gateways (hub/Macs), not autoscaled worker names.
++    An explicit worker route still wins; an unconfigured install stays unchanged.
++    """
++    from hermes_cli import kanban_placement as placement
++    policy = placement._Cfg(cfg)
++    label = policy.queue_label('hub')
++    if (isinstance(gateway, str) and gateway.startswith('worker-')
++            and not policy.queue_label(gateway) and label):
++        return {**cfg, 'worker_queue': {**cfg['worker_queue'], gateway: label}}
++    return cfg
++
++
+ def plan(args, *, cfg, gateway, machine_ok):
+     """Return a hub-bound view/decision, or None for an ordinary non-pool gateway.
+ 
+@@ -16,6 +31,7 @@
+     from hermes_cli import kanban_placement as placement
+     from hermes_cli import kanban_worker_placement as workers
+ 
++    cfg = _worker_config(cfg, gateway)
+     queued_gateway = bool(placement._Cfg(cfg).queue_label(gateway))
+     if not queued_gateway:
+         return None  # explicit opt-in to the fork's managed worker queue policy
+@@ -60,6 +76,7 @@
+ 
+ def prepare(args, *, cfg, gateway, machine_ok):
+     from hermes_cli import kanban_placement as placement
++    cfg = _worker_config(cfg, gateway)
+     try:
+         home = plan(args, cfg=cfg, gateway=gateway, machine_ok=machine_ok)
+     except Exception as exc:  # health: allow BLE001 -- opted-in pool creates fail closed, never worker-local
+diff --git a/tests/hermes_cli/test_creation_home_transport.py b/tests/hermes_cli/test_creation_home_transport.py
+index 0f20d0eebac..5b4aea8aaae 100644
+--- a/tests/hermes_cli/test_creation_home_transport.py
++++ b/tests/hermes_cli/test_creation_home_transport.py
+@@ -6,11 +6,30 @@
+ 
+ from hermes_cli import kanban_placement as placement
+ from tests.hermes_cli import test_origin_forward_decision as origins
++from hermes_cli import kanban_creation_home as home
+ 
+ forwarding = origins.forwarding
+ authority = origins.authority
+ 
+ 
++@pytest.mark.parametrize('cfg,gateway,label', [
++    ({'worker_queue': {'hub': 'pool:worker'}}, 'worker-asg12', 'pool:worker'),
++    ({'worker_queue': {'hub': 'pool:worker', 'worker-a3': 'pool:special'}}, 'worker-a3', 'pool:special'),
++    ({}, 'worker-a3', None),
++    ({'worker_queue': []}, 'worker-a3', None),
++    ({'worker_queue': {'hub': 'machine:hub'}}, 'worker-a3', None),
++    ({'worker_queue': {'hub': 'pool:worker'}}, 'personal-linux', None),
++    ({'worker_queue': {'hub': 'pool:worker'}}, None, None),
++    ({'worker_queue': {'hub': 'pool:worker'}}, 'worker', None),
++])
++def test_dynamic_worker_policy_keeps_opt_in_and_explicit_routes(cfg, gateway, label):
++    before = copy.deepcopy(cfg)
++    effective = home._worker_config(cfg, gateway)
++    assert placement._Cfg(effective).queue_label(gateway) == label
++    assert cfg == before
++
++
++
+ @pytest.mark.parametrize('labels', [['pool:worker'], ['machine:macbook']])
+ def test_foreign_origin_authorizes_complete_home_metadata(forwarding, labels):
+     request = copy.deepcopy(forwarding[0])
+@@ -56,9 +75,9 @@
+                ('runs_on', 'parents', 'tenant', 'max_retries', 'initial_status', 'human_request'))
+ 
+ 
++@pytest.mark.parametrize('policy', ['explicit_worker', 'hub_pool'])
+ @pytest.mark.parametrize('failure', ['unclaimable', 'exception'])
+-def test_worker_planning_failure_is_typed_not_local(monkeypatch, failure):
+-    from hermes_cli import kanban_creation_home as home
++def test_worker_planning_failure_is_typed_not_local(monkeypatch, failure, policy):
+     from hermes_cli import kanban_worker_placement as workers
+ 
+     def queue(*args):
+@@ -66,8 +85,9 @@
+             raise RuntimeError('registry unavailable')
+ 
+     monkeypatch.setattr(workers, 'queue_decision', queue)
++    cfg = {'worker_queue': {'hub' if policy == 'hub_pool' else 'worker-a3': 'pool:worker'}}
+     home_plan, _, decision = home.prepare({'title': 'must not stay on worker'},
+-        cfg={'worker_queue': {'worker-a3': 'pool:worker'}}, gateway='worker-a3', machine_ok=lambda _: False)
++        cfg=cfg, gateway='worker-a3', machine_ok=lambda _: False)
+     assert home_plan is not None
+     assert decision['where'] == 'refuse'
+     assert decision['pin'] == 'hub'
+diff --git a/tests/tools/test_kanban_worker_canonical_home.py b/tests/tools/test_kanban_worker_canonical_home.py
+index 299e139f224..74946c41175 100644
+--- a/tests/tools/test_kanban_worker_canonical_home.py
++++ b/tests/tools/test_kanban_worker_canonical_home.py
+@@ -72,6 +72,7 @@
+     assert worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
+ 
+ 
++@pytest.mark.parametrize('policy', ['explicit_worker', 'hub_pool'])
+ @pytest.mark.parametrize('card,expected', [
+     ({'title': 'portable follow-up'}, ['pool:worker']),
+     ({'title': 'Inspect Desktop DOM', 'skills': ['session-status-panel', 'inspecting-hermes-desktop-dom']},
+@@ -83,13 +84,16 @@
+     ({'title': 'Explicit creator execution', 'placement': 'local'}, ['machine:worker-1']),
+     ({'title': 'Explicit creator execution by name', 'placement': 'worker-1'}, ['machine:worker-1']),
+ ])
+-def test_disposable_hub_really_owns_worker_created_card(gws, monkeypatch, card, expected):
++def test_disposable_hub_really_owns_worker_created_card(gws, monkeypatch, card, expected, policy):
+     hub, worker = gws
+     worker.enter()
+     monkeypatch.setattr(placement.reg, 'self_gateway', lambda: Path(os.environ['HERMES_HOME']).parent.name)
+     monkeypatch.setattr(placement, 'linux_pool_gateway', lambda gateway, *a, **kw: gateway == nodes.WORKER)
+-    monkeypatch.setattr(placement, 'config', lambda: {
+-        'worker_queue': {nodes.WORKER: 'pool:worker'}, 'route': {nodes.WORKER: nodes.HUB}})
++    # Production enumerates intake gateways, not dynamic/ASG worker slot names.
++    cfg = ({'worker_queue': {nodes.HUB: 'pool:worker', 'macbook': 'pool:worker'}}
++           if policy == 'hub_pool' else
++           {'worker_queue': {nodes.WORKER: 'pool:worker'}, 'route': {nodes.WORKER: nodes.HUB}})
++    monkeypatch.setattr(placement, 'config', lambda: cfg)
+     monkeypatch.setattr(placement, '_machine_picks_up', lambda labels: True)
+     received = []
+ 
+-- 
+2.43.0
+

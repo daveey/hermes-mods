@@ -1,0 +1,233 @@
+From 7a3fa09cc33c834f59906a10be638650179bfbea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:46:03 +0000
+Subject: [PATCH 5968] Kanban scratch archive: foreign ownership, retention and promisor clones
+
+Public mirror of source commit 7a3fa09cc33c834f59906a10be638650179bfbea.
+
+---
+diff --git a/hermes_cli/kanban_scratch_archive_ownership.py b/hermes_cli/kanban_scratch_archive_ownership.py
+index 058b20e55e8..6861616d022 100644
+--- a/hermes_cli/kanban_scratch_archive_ownership.py
++++ b/hermes_cli/kanban_scratch_archive_ownership.py
+@@ -24,8 +24,11 @@
+ regular file (a planted symlink must never be written through as root), an
+ unparseable earlier record, or a failed find/cat/mv. A failure after the record
+ is written leaves the tree adopted in part with its record at the root; a later
+-pass merges new entries by path. Without passwordless sudo, or as root, nothing
+-changes. ``find -xdev`` never crosses into another filesystem.
++pass merges new entries by path and re-grants owner access to every recorded
++entry (no sudo needed), so an interrupted pass cannot pin the tree. Without
++passwordless sudo, or as root, nothing changes. ``find -xdev`` never crosses into
++another filesystem. A tree refused for hard links stays kept (logged): giving it
++up would need a copy, not a chown.
+ """
+ from __future__ import annotations
+ 
+@@ -110,6 +113,33 @@
+         raise _refused(f"unreadable {RECORD_NAME}: {exc!r}") from exc
+ 
+ 
++def _recorded(root: str) -> list[dict]:
++    """The worker-owned record of an earlier pass (no sudo), or [] when there is none."""
++    try:
++        fd = os.open(os.path.join(root, RECORD_NAME), os.O_RDONLY | os.O_NOFOLLOW)
++    except OSError:
++        return []
++    with os.fdopen(fd, "rb") as fh:
++        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
++            return []
++        try:
++            return list(json.loads(fh.read())["entries"])
++        except (ValueError, KeyError, TypeError):
++            return []
++
++
++def _sweep_temp_records(root: str) -> None:
++    # A pass killed between mkstemp and the rename leaves its temp record beside the workspace.
++    prefix = f".{os.path.basename(root)}.ownership-"
++    parent = os.path.dirname(root)
++    for name in os.listdir(parent):
++        if name.startswith(prefix):
++            path = os.path.join(parent, name)
++            st = os.lstat(path)
++            if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():  # windows-footgun: ok -- Linux-only
++                os.unlink(path)
++
++
+ def _write_record(root: str, body: bytes) -> None:
+     # Written by the worker user beside the workspace, then renamed in as root: rename replaces
+     # whatever sits at the name and never writes through a link.
+@@ -128,9 +158,16 @@
+ def _grant_owner_access(root: str, rows: list[dict]) -> None:
+     # Now worker-owned, so no sudo: an entry the worker cannot read or (for a directory) empty
+     # would refuse the scan or leave a detached tree behind. Parents come first (find pre-order).
++    # Only entries the worker owns are touched (chmod by another user fails anyway).
++    uid = os.geteuid()  # windows-footgun: ok -- only reached from adopt (Linux)
+     for row in rows:
+         path = root if row["path"] == "." else os.path.join(root, row["path"])
+-        st = os.lstat(path)
++        try:
++            st = os.lstat(path)
++        except FileNotFoundError:
++            continue
++        if st.st_uid != uid:
++            continue
+         if stat.S_ISLNK(st.st_mode) or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+             continue
+         need = stat.S_IRWXU if stat.S_ISDIR(st.st_mode) else stat.S_IRUSR | stat.S_IWUSR
+@@ -151,8 +188,10 @@
+     except (OSError, subprocess.SubprocessError):
+         return []
+     root = os.path.realpath(workspace)
++    _sweep_temp_records(root)
+     foreign = ["(", "!", "-uid", str(uid), "-o", "!", "-gid", str(gid), ")"]
+     if not _sudo("find", root, "-xdev", *foreign, "-print", "-quit").stdout.strip():
++        _grant_owner_access(root, _recorded(root))  # finish a pass interrupted after its chown
+         return []
+     mounts = mounts_below(Path(root))
+     if mounts:
+@@ -161,13 +200,14 @@
+     if linked:
+         raise _refused(f"foreign-owned file with several hard links: {linked[:200]!r}")
+     earlier = _earlier(root)
+-    if owner_check is not None and not owner_check():
+-        raise _refused("the workspace owner changed since it was selected; left untouched")
+     rows = _parse(_sudo("find", root, "-xdev", *foreign, "-printf", "%U %G %m %y %P\\0").stdout)
+     known = {e["path"] for e in earlier}
+     merged = earlier + [r for r in rows if r["path"] not in known and r["path"] != RECORD_NAME]
++    # Last, right before the first change: the listing above can take minutes on a big tree.
++    if owner_check is not None and not owner_check():
++        raise _refused("the workspace owner changed since it was selected; left untouched")
+     _write_record(root, json.dumps({"version": 1, "adopted_to": [uid, gid], "entries": merged},
+                                    indent=1).encode() + b"\n")
+     _sudo("find", root, "-xdev", *foreign, "-exec", "chown", "-h", f"{uid}:{gid}", "--", "{}", "+")
+-    _grant_owner_access(root, [r for r in rows if r["path"] != RECORD_NAME])
++    _grant_owner_access(root, [r for r in merged if r["path"] != RECORD_NAME])
+     return rows
+diff --git a/hermes_cli/kanban_scratch_custody.py b/hermes_cli/kanban_scratch_custody.py
+index b5cbe31e708..1fd6b0e3ff5 100644
+--- a/hermes_cli/kanban_scratch_custody.py
++++ b/hermes_cli/kanban_scratch_custody.py
+@@ -347,8 +347,11 @@
+                 return 0
+         try:
+             def owner_unchanged():
+-                with kb.write_txn(conn):  # local pickup shares this lock
+-                    return _safe(conn, receipt, path)
++                try:
++                    with kb.write_txn(conn):  # local pickup shares this lock
++                        return _safe(conn, receipt, path)
++                except sqlite3.Error:
++                    return False  # refuse the change; the outer loop keeps going
+ 
+             archive = sa.archive_workspace(path, kb.kanban_home() / "archive" / "scratch" / board / tid,
+                                            task_id=tid, completed_at=since, owner_check=owner_unchanged)
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 701ea203a6f..ac43bec1625 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -310,8 +310,13 @@
+ 
+     def owner_unchanged():
+         # Re-checked right before the archive changes the tree (foreign ownership adoption).
+-        with kb.write_txn(conn):
+-            return guard(path)
++        # A busy/failed board read refuses the change; it must not abort the whole GC pass.
++        try:
++            with kb.write_txn(conn):
++                return guard(path)
++        except sqlite3.Error:
++            log.warning("Scratch GC: owner re-check failed for %s; not adopting", task_id, exc_info=True)
++            return False
+ 
+     archive_dir = kb.kanban_home() / "archive" / "scratch" / _board_slug(conn) / task_id
+     if refusals is not None:
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_ownership.py b/tests/hermes_cli/test_kanban_scratch_archive_ownership.py
+index ed870cf5923..5b27212b287 100644
+--- a/tests/hermes_cli/test_kanban_scratch_archive_ownership.py
++++ b/tests/hermes_cli/test_kanban_scratch_archive_ownership.py
+@@ -271,3 +271,80 @@
+         assert os.lstat(path / "r").st_uid == 0
+     finally:
+         _cleanup(path)
++
++
++def test_stale_temp_record_beside_the_workspace_is_swept(tmp_path):
++    ws = _ws(tmp_path)
++    stale = tmp_path / "workspaces" / ".t_x.ownership-abc123"
++    stale.write_text("{}")
++    other = tmp_path / "workspaces" / ".t_y.ownership-abc123"
++    other.write_text("{}")
++    own._sweep_temp_records(os.path.realpath(ws))
++    assert not stale.exists() and other.exists()
++
++
++def _root_owned_locked_tree(p):
++    (p / "rootfs" / "etc").mkdir(parents=True)
++    (p / "rootfs" / "etc" / "shadow").write_text("s")
++    _sh("chown", "-R", "0:0", str(p / "rootfs"))
++    _sh("chmod", "0000", str(p / "rootfs" / "etc" / "shadow"))
++
++
++@real_sudo
++def test_pass_interrupted_after_chown_is_finished_by_the_next_pass(board, monkeypatch):
++    tid, path = base._plain_task(_root_owned_locked_tree)
++    real = own._grant_owner_access
++    calls = []
++
++    def interrupted(root, rows):
++        calls.append(len(rows))
++        if len(calls) == 1:
++            raise OSError("killed between chown and grant")
++        return real(root, rows)
++    monkeypatch.setattr(own, "_grant_owner_access", interrupted)
++    try:
++        base._gc()
++        assert path.exists() and os.lstat(path / "rootfs" / "etc" / "shadow").st_uid == os.getuid()
++        from hermes_cli import kanban_scratch_backoff
++        monkeypatch.setattr(kanban_scratch_backoff, "skip_logged", lambda *a, **k: False)  # the retry is due
++        assert base._gc() == 0
++        assert not path.exists()  # nothing foreign left, yet the recorded entries were opened and archived
++        assert base._members(tid)["rootfs/etc/shadow"][1] == b"s"
++    finally:
++        _cleanup(path)
++
++
++@real_sudo
++def test_card_resumed_after_selection_is_left_untouched(board, monkeypatch):
++    from hermes_cli import kanban_worktree_gc as gc
++
++    _tid, path = base._plain_task(_root_owned_locked_tree)
++    monkeypatch.setattr(gc.ws, "_is_terminal_task", lambda conn, task_id: False)
++    try:
++        base._gc()
++        assert path.exists() and not (path / own.RECORD_NAME).exists()
++        assert os.lstat(path / "rootfs" / "etc" / "shadow").st_uid == 0
++    finally:
++        _cleanup(path)
++
++
++@real_sudo
++def test_busy_board_during_owner_recheck_refuses_without_aborting_gc(board, monkeypatch):
++    import inspect
++    import sqlite3
++
++    from hermes_cli import kanban_db as kb
++
++    _tid, path = base._plain_task(_root_owned_locked_tree)
++    real_txn = kb.write_txn
++
++    def txn(conn):
++        if any(f.function == "owner_unchanged" for f in inspect.stack()[1:4]):
++            raise sqlite3.OperationalError("database is locked")
++        return real_txn(conn)
++    monkeypatch.setattr(kb, "write_txn", txn)
++    try:
++        assert base._gc() == 0  # the pass completes
++        assert path.exists() and os.lstat(path / "rootfs" / "etc" / "shadow").st_uid == 0
++    finally:
++        _cleanup(path)
+-- 
+2.43.0
+

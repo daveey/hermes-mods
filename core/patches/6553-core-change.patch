@@ -1,0 +1,582 @@
+From 1150db174b9fe07f6869d68050412b8de9106ef2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 06:02:47 +0000
+Subject: [PATCH 6553] Private-hold diagnostic: released capability stops and stacked historical releases
+
+Public mirror of source commit 1150db174b9fe07f6869d68050412b8de9106ef2.
+
+---
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 46cbdc43a69..613fa567e5f 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -699,6 +699,8 @@
+         _arg("--runs", type=int, default=None,
+              help="More runs the card gets (default: kanban.release_runs, 10), on top of the runs already counted"),
+         _arg("--note", default=None, help="Text appended to the mandate comment as its own paragraph"),
++        _arg("--capability-episode", dest="capability_episodes", action="append", default=[],
++             help="Also release this exact historical capability stop with this card's pending current decision (repeatable; UID on synced boards); never scope or safety stops"),
+         _arg("--seen", dest="seen_comment_id", type=int,
+              help="Newest comment id read (one card). An agent caller needs it when a human commented or a budget "
+                   "decision was recorded after the stop"),
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 907f6da272b..277fe4281f8 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -586,8 +586,8 @@
+ 
+ 
+ def _read_first(conn: sqlite3.Connection, tid: str, stop: dict, writer: tuple, seen: Optional[int],
+-                board: Optional[str]) -> Optional[int]:
+-    return read_first(conn, tid, stop, writer, seen, board)
++                board: Optional[str], *, rerun: str = '') -> Optional[int]:
++    return read_first(conn, tid, stop, writer, seen, board, rerun=rerun)
+ 
+ 
+ def _resume(conn: sqlite3.Connection, out: dict, tid: str, by: str, recorded: dict, parents: list[str]) -> dict:
+@@ -649,6 +649,9 @@
+     from hermes_cli import kanban_spend_budget as ksb
+     kind, session = s.writer[0], s.writer[1]
+     body = mandate_text(s.runs, s.note, agent=kind != "human", budget=s.budget_text)
++    if s.capability_rows:
++        body += "\n\nMandate requests release of these explicitly selected capability episodes: " + ", ".join(
++            renewal.key(row) for row in s.capability_rows) + ". Independent scope, safety and containment holds stay."
+     done = renewal.covered(conn, s.tid)
+     evidence = ([e for e in renewal.scope_evidence(conn, s.tid, s.episode) if renewal.key(e) not in done]
+                 if s.scope else [])
+@@ -698,6 +701,7 @@
+     from hermes_cli import kanban_scope_renewal as renewal
+     from hermes_cli import kanban_spend_budget as ksb
+     from hermes_cli import kanban_spend_decision as ksd
++    from hermes_cli import kanban_release_capability as capability
+     kind, session = s.writer[0], s.writer[1]
+     row = conn.execute("SELECT * FROM task_comments WHERE id=?", (s.comment,)).fetchone()
+     record = {"version": 1, "episode": s.episode, "authority_kind": s.authority, "actor_kind": kind,
+@@ -714,14 +718,17 @@
+         now = c.execute("SELECT status FROM tasks WHERE id=?", (s.tid,)).fetchone()
+         if now is None or now[0] != s.status or not ksd.pending(c, s.tid):
+             return f"{s.tid} changed during the release"
++        if capability.selected(c, s.tid, s.capability_episodes) != s.capability_rows:
++            return f"{s.tid}'s selected capability evidence changed during the release"
+         if kind != "human":
+-            people, missing = _human_after(c, s.tid, s.stop, s.seen)
++            people, missing = _human_after(c, s.tid, s.read_stop, s.seen)
+             if people:
+                 return f"a human commented on {s.tid} during the release (comment {people[-1]})"
+             if missing:
+                 return (f"a human's comment on {s.tid} has not synced here ({', '.join(missing)}); wait for the "
+                         f"sync and rerun, or {HUMAN_ROUTE}")
+             unread.check(c, s.tid, session=session, seen=s.seen, verb="release", board=s.board)
++        capability.append(c, s.tid, s.capability_rows, s.episode, record)
+         kb._append_event(c, s.tid, RELEASED, record)
+         return None
+ 
+@@ -753,7 +760,7 @@
+ 
+ def release(conn: sqlite3.Connection, task_id: str, *, runs: Optional[int] = None, note: Optional[str] = None,
+             writer: Optional[tuple] = None, author: Optional[str] = None, board: Optional[str] = None,
+-            seen: Optional[int] = None,
++            seen: Optional[int] = None, capability_episodes: Sequence[str] = (),
+             precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
+             env: Optional[Mapping[str, str]] = None,
+             ancestry: Optional[Sequence[Mapping[str, str]]] = None) -> dict:
+@@ -766,6 +773,8 @@
+     has read (``--seen``). ``precondition(conn)`` returns a refusal or None; it is asked before anything is
+     written and again inside the transaction that records the decision (a click's ask fence).
+     ``env``/``ancestry`` are the renewal's test seams.
++    ``capability_episodes`` explicitly names additional same-card capability stops; it never implies release
++    of historical scope or safety restrictions. Every selection is rechecked in the decision transaction.
+     """
+     tid = target(conn, task_id)
+     out: dict = {"task_id": task_id, "target": tid}
+@@ -773,7 +782,7 @@
+         return _release(conn, out, SimpleNamespace(
+             tid=tid, runs=default_runs() if runs is None else runs, note=note, writer=writer, author=author,
+             board=board, seen=seen, precondition=precondition, env=os.environ if env is None else env,
+-            ancestry=ancestry))
++            ancestry=ancestry, capability_episodes=capability_episodes))
+     except _Refusal as exc:
+         from hermes_cli.kanban_stop_recovery import refusal_context
+         try:
+@@ -795,6 +804,7 @@
+ 
+ 
+ def _release(conn: sqlite3.Connection, out: dict, s) -> dict:
++    from hermes_cli import kanban_release_capability as capability
+     from hermes_cli import kanban_scope_renewal as renewal
+     from hermes_cli import kanban_spend_decision as ksd
+     from hermes_cli.kanban_comment_writer import cli_comment_writer
+@@ -803,6 +813,10 @@
+     if isinstance(s.runs, bool) or not isinstance(s.runs, int) or s.runs < 1:
+         raise _Refusal("invalid_runs", f"--runs must be a whole number of at least 1, not {s.runs!r}")
+     s.status, recorded, resume = _eligible(conn, tid)
++    s.capability_rows = capability.selected(conn, tid, s.capability_episodes)
++    if recorded is not None and (resume or s.status in _RELEASED) and s.capability_rows:
++        capability.recorded(conn, tid, s.capability_rows, recorded)
++        out['capability_episodes'] = [renewal.key(row) for row in s.capability_rows]
+     if recorded is not None and s.status in _RELEASED:
+         return {**out, "ok": True, "outcome": "already_released",
+                 "message": f"{tid} is {s.status}: already released, nothing written"}
+@@ -815,6 +829,7 @@
+         return _resume(conn, out, tid, s.by, recorded, s.parents)
+     s.stop = ksd.pending_episode(conn, tid)
+     s.episode = renewal.key(s.stop)
++    s.read_stop = capability.anchor(s.stop, s.capability_rows)
+     _current_decision_card(conn, out["task_id"], tid, s.episode)
+     s.scope = ksd.execution_restricted(conn, tid)
+     if s.scope and (s.stop["kind"] != renewal.STOP or s.status != "triage"):
+@@ -822,12 +837,15 @@
+     if s.parents and s.status != "triage":
+         raise _Refusal("scheduled_open_parent", f"{tid} is {s.status} with open parent(s) {', '.join(s.parents)}; "
+                        "it cannot wait on them from there. Release it once they finish")
+-    s.budget_seen = _read_first(conn, tid, s.stop, s.writer, s.seen, s.board)
++    s.budget_seen = _read_first(conn, tid, s.read_stop, s.writer, s.seen, s.board,
++                               rerun=capability.rerun(tid, s.capability_rows))
+     if s.precondition and (why := s.precondition(conn)):
+         raise _Refusal("ask_changed", str(why))
+     s.budget_text = _budget_plan(conn, s)[3]  # also the up-front budget_limit_in_force refusal
+     _mandate_and_budget(conn, out, s)
+     outcome = _decide(conn, s)
++    if s.capability_rows:
++        out['capability_episodes'] = [renewal.key(row) for row in s.capability_rows]
+     parents = s.parents
+     out.update(ok=True, outcome=outcome, **({"parents": parents} if parents else {}),
+                message=(f"{tid} -> todo: released with {s.runs} more runs, waiting on {', '.join(parents)}" if parents
+@@ -855,14 +873,16 @@
+     from hermes_cli import kanban_db_connect as kbc
+     ids = list(dict.fromkeys([args.task_id, *(getattr(args, "ids", None) or [])]))
+     seen = getattr(args, "seen_comment_id", None)
+-    if seen is not None and len(ids) > 1:
+-        print("kanban release: --seen belongs to one card; release each such card separately", file=sys.stderr)
++    if len(ids) > 1 and (seen is not None or getattr(args, 'capability_episodes', ())):
++        option = '--seen' if seen is not None else '--capability-episode'
++        print(f"kanban release: {option} belongs to one card; release each such card separately", file=sys.stderr)
+         return 2
+     results = []
+     with kbc.connect_closing() as conn:
+         for tid in ids:
+             try:
+                 results.append(release(conn, tid, runs=args.runs, note=args.note, seen=seen,
++                                       capability_episodes=getattr(args, 'capability_episodes', ()),
+                                        board=getattr(args, "board", None)))
+             except (ValueError, RuntimeError, sqlite3.Error) as exc:  # one card's failure never hides the others
+                 results.append(_refused({"task_id": tid, "target": tid}, "error", f"{type(exc).__name__}: {exc}"))
+diff --git a/hermes_cli/kanban_release_capability.py b/hermes_cli/kanban_release_capability.py
+new file mode 100644
+index 00000000000..5e1acda869e
+--- /dev/null
++++ b/hermes_cli/kanban_release_capability.py
+@@ -0,0 +1,77 @@
++"""Explicit historical capability selections for the guarded home release. [daveey]
++
++Never infer supersession from a newer stop. The caller names each capability episode;
++ordinary release authority, read-first, safety, scope and containment gates still apply.
++"""
++from __future__ import annotations
++
++
++def selected(conn, task, episodes):
++    """Return exact same-card capability stop rows, or reject before release writes.
++
++    Portable UIDs on synced stores; local event keys only on unsynced stores. Returned
++    row bytes are rechecked under the deciding writer reservation, not trusted across I/O.
++    """
++    from hermes_cli.kanban_release import _Refusal, _payload
++    from hermes_cli.kanban_scope_renewal import key
++    from hermes_cli.kanban_db_sync import sync_state
++
++    if not isinstance(episodes, (list, tuple)) or len(episodes) > 32:
++        raise _Refusal('invalid_capability_episode', 'name at most 32 exact capability episodes')
++    if any(not isinstance(value, str) or not value for value in episodes):
++        raise _Refusal('invalid_capability_episode', 'capability episodes must be nonempty exact event keys')
++    wanted = list(dict.fromkeys(episodes))
++    if not wanted:
++        return []
++    synced = sync_state(conn) is not None
++    rows = {key(dict(row)): dict(row) for row in conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'", (task,))}
++    out = []
++    for episode in wanted:
++        row = rows.get(episode)
++        payload = _payload(row['payload']) if row else {}
++        if (payload.get('cause') != 'capability_unavailable'
++                or payload.get('superseded_by_safety_stop') is True
++                or (synced and not row.get('uid'))):
++            raise _Refusal('invalid_capability_episode',
++                           f'{episode} is not an exact capability stop on {task}; scope and safety stops stay separate')
++        out.append(row)
++    return out
++
++
++def anchor(current, rows):
++    """Read all required evidence since the oldest selected stop, not only the newest self-stop."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    return min([current, *rows], key=_event_order)
++
++
++def append(conn, task, rows, current, record):
++    """Append one existing-format home receipt per selected historical episode in the decision transaction."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_scope_renewal import key
++
++    for row in rows:
++        episode = key(row)
++        if episode != current:
++            kb._append_event(conn, task, 'stop_released', {**record, 'episode': episode})
++
++
++def recorded(conn, task, rows, record):
++    """A no-op/resume may acknowledge selections only if that exact release already recorded them."""
++    from hermes_cli.kanban_release import _Refusal, own_events
++    from hermes_cli.kanban_scope_renewal import key
++    payload = {name: value for name, value in record.items() if name != '_id'}
++    releases = [event['payload'] for event in own_events(conn, task, ('stop_released',))]
++    if any({**payload, 'episode': key(row)} not in releases for row in rows):
++        raise _Refusal('capability_selection_not_released',
++                       'this recorded release did not cover every selected capability episode; '
++                       'no additional receipts were written. Explicit selections require a pending stopped card, '
++                       'not an already released or resuming decision')
++
++
++def rerun(task, rows):
++    """Preserve exact selections in read-before-release retry instructions."""
++    import shlex
++    from hermes_cli.kanban_scope_renewal import key
++    return shlex.join(['hermes', 'kanban', 'release', task,
++                       *(part for row in rows for part in ('--capability-episode', key(row)))])
+diff --git a/tests/hermes_cli/test_kanban_release_stacked_capability.py b/tests/hermes_cli/test_kanban_release_stacked_capability.py
+new file mode 100644
+index 00000000000..7f81c87d1f0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_stacked_capability.py
+@@ -0,0 +1,327 @@
++"""Explicit historical capability recovery must not broaden a current scope release."""
++import json
++
++import pytest
++
++from gateway.session_context import scoped_current_session_id
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_release as release
++from hermes_cli import kanban_retain as retain
++from hermes_cli.kanban_actionability_sources import describe
++from tests.hermes_cli import test_kanban_release as helpers
++from tests.hermes_cli import test_kanban_scope_renewal as scope
++
++board = scope.board
++
++
++def stacked(board, monkeypatch, cause='capability_unavailable', multiple=False, human_note=False):
++    tid, _, session = scope.support.bind(board, monkeypatch)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'spend_budget_triaged', {'cause': cause})
++        old = dict(board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'",
++                                 (tid,)).fetchone())
++        if multiple:
++            kb._append_event(board, tid, 'spend_budget_triaged', {'cause': 'capability_unavailable'})
++        kb._append_event(board, tid, 'promoted_manual', {'reason': 'legacy promotion without release receipt'})
++    if human_note:
++        kb.add_comment(board, tid, 'user', 'Preserve the independent acceptance gates.', writer_kind='human')
++    with scoped_current_session_id(session):
++        result = retain.retain(board, board='default', **scope.ARGS)
++    for name in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_SESSION_ID'):
++        monkeypatch.delenv(name, raising=False)
++    return tid, scope.renewal.key(old), result['episode_uid']
++
++
++def receipts(board, tid):
++    return [json.loads(row[0]) for row in board.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='stop_released' ORDER BY id", (tid,))]
++
++
++def test_explicit_stacked_release_clears_each_exact_episode(board, monkeypatch):
++    tid, old, current = stacked(board, monkeypatch)
++    out = helpers.run(board, tid, capability_episodes=[old])
++    assert out['outcome'] == 'released', out
++    assert [r['episode'] for r in receipts(board, tid)] == [old, current]
++    assert out['capability_episodes'] == [old]
++    assert 'private_hold' not in describe(board, tid)['violations']
++    assert not scope.decision.execution_restricted(board, tid)
++    before = helpers.written(board, tid)
++    assert helpers.run(board, tid, capability_episodes=[old])['outcome'] == 'already_released'
++    assert helpers.written(board, tid) == before
++
++
++def test_plain_release_never_infers_historical_capability_permission(board, monkeypatch):
++    tid, old, current = stacked(board, monkeypatch)
++    assert helpers.run(board, tid)['outcome'] == 'released'
++    assert [r['episode'] for r in receipts(board, tid)] == [current]
++    assert old != current
++    assert 'private_hold' in describe(board, tid)['violations']
++
++
++@pytest.mark.parametrize('status', ['ready', 'running'])
++def test_already_released_cannot_silently_acknowledge_new_selection(board, monkeypatch, status):
++    tid, old, _ = stacked(board, monkeypatch)
++    assert helpers.run(board, tid)['outcome'] == 'released'
++    board.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++    board.commit()
++    before = helpers.written(board, tid)
++    out = helpers.run(board, tid, capability_episodes=[old])
++    assert out['refusal'] == 'capability_selection_not_released', out
++    assert helpers.written(board, tid) == before
++
++
++@pytest.mark.parametrize('selection', ['same', 'subset', 'superset', 'empty'])
++def test_resume_does_not_expand_recorded_selection(board, monkeypatch, selection):
++    tid, old, _ = stacked(board, monkeypatch, multiple=True)
++    parent = kb.create_task(board, title='parent', assignee='default')
++    kb.link_tasks(board, parent, tid)
++    extra = str(board.execute("SELECT id FROM task_events WHERE task_id=? AND kind='spend_budget_triaged' "
++                              "AND json_extract(payload,'$.cause')='capability_unavailable' AND id!=?",
++                              (tid, old)).fetchone()[0])
++    # This unsynced legacy fixture mixes retain's v7 terminal uid with uid-less events.
++    # Give the new decision a later second, as real published synced history already does by v7 time.
++    after = board.execute('SELECT max(created_at)+1 FROM task_events WHERE task_id=?', (tid,)).fetchone()[0]
++    monkeypatch.setattr('time.time', lambda: after)
++    place = release._place
++    monkeypatch.setattr(release, '_place', lambda *a: ('refused', 'injected placement failure'))
++    out = helpers.run(board, tid, capability_episodes=[old, extra] if selection == 'subset' else [old])
++    assert out['refusal'] == 'dependency_wait_refused', out
++    before = receipts(board, tid)
++    recorded = release._release_event(board, tid)
++    assert recorded is not None and release._untouched_since(board, tid, recorded)
++    monkeypatch.setattr(release, '_place', place)
++    choices = {'same': [old], 'subset': [old], 'superset': [old, extra], 'empty': []}
++    out = helpers.run(board, tid, capability_episodes=choices[selection])
++    if selection == 'superset':
++        assert out['refusal'] == 'capability_selection_not_released', out
++        assert helpers.status(board, tid) == 'triage'
++    else:
++        assert out.get('resumed') and out['outcome'] == 'waiting_on_parents', out
++        if choices[selection]:
++            assert out['capability_episodes'] == choices[selection]
++    assert receipts(board, tid) == before
++
++
++@pytest.mark.parametrize('cause', ['scope_stopped', 'decision_pending', None])
++def test_noncapability_selection_refused_without_writes(board, monkeypatch, cause):
++    tid, old, _ = stacked(board, monkeypatch, cause)
++    before = helpers.written(board, tid)
++    out = helpers.run(board, tid, capability_episodes=[old])
++    assert out['refusal'] == 'invalid_capability_episode', out
++    assert helpers.written(board, tid) == before
++    assert helpers.status(board, tid) == 'triage'
++
++
++def test_foreign_or_missing_episode_does_not_write(board, monkeypatch):
++    tid, _, _ = stacked(board, monkeypatch)
++    other = helpers.spend_stopped(board)
++    foreign = scope.renewal.key(dict(board.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'", (other,)).fetchone()))
++    for bad in (foreign, 'missing', '', 42):
++        before = helpers.written(board, tid)
++        out = helpers.run(board, tid, capability_episodes=[bad])
++        assert out['refusal'] == 'invalid_capability_episode', out
++        assert helpers.written(board, tid) == before
++
++
++def test_selection_is_exact_and_deduplicated(board, monkeypatch):
++    tid, old, current = stacked(board, monkeypatch, multiple=True)
++    extra = scope.renewal.key(dict(board.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged' AND id NOT IN (?,?)",
++        (tid, old, current)).fetchone()))
++    # Select only the original capability stop; the other remains held.
++    out = helpers.run(board, tid, capability_episodes=[old, old])
++    assert out['outcome'] == 'released', out
++    assert [r['episode'] for r in receipts(board, tid)].count(old) == 1
++    assert extra not in [r['episode'] for r in receipts(board, tid)]
++    assert current != extra
++    assert 'private_hold' in describe(board, tid)['violations']
++
++
++@pytest.mark.parametrize('mode', ['unrelated', 'own_run', 'worker'])
++def test_selection_does_not_grant_release_authority(board, monkeypatch, mode):
++    tid, old, _ = stacked(board, monkeypatch)
++    session = board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='owner_admitted'",
++                            (tid,)).fetchone()
++    own = json.loads(session[0])['session_id']
++    caller = own if mode == 'own_run' else scope.CHAT
++    env = {'HERMES_SESSION_ID': caller}
++    if mode == 'worker':
++        env['HERMES_KANBAN_TASK'] = 't_another_worker'
++    before = helpers.written(board, tid)
++    out = release.release(board, tid, writer=('agent', caller, 'fixture'), env=env, ancestry=[env],
++                          capability_episodes=[old])
++    assert out['outcome'] == 'refused', out
++    assert helpers.written(board, tid) == before
++
++
++@pytest.mark.parametrize('hold', ['safety', 'containment'])
++def test_independent_holds_dominate_selection(board, monkeypatch, hold):
++    tid, old, current = stacked(board, monkeypatch)
++    if hold == 'safety':
++        kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal', 'episode': current})
++        board.commit()
++    else:
++        monkeypatch.setattr('hermes_cli.kanban_containment_guard.pending', lambda *a, **kw: True)
++    before = helpers.written(board, tid)
++    assert helpers.run(board, tid, capability_episodes=[old])['outcome'] == 'refused'
++    assert helpers.written(board, tid) == before
++
++
++def test_selected_row_race_is_revalidated_before_any_receipts(board, monkeypatch):
++    tid, old, _ = stacked(board, monkeypatch)
++    original = release._decide
++
++    def race(conn, state):
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND id=?",
++                         (json.dumps({'cause': 'capability_unavailable', 'reason': 'changed'}), tid, old))
++        return original(conn, state)
++
++    monkeypatch.setattr(release, '_decide', race)
++    out = helpers.run(board, tid, capability_episodes=[old])
++    assert out['refusal'] == 'promote_refused', out
++    assert not receipts(board, tid)
++    assert helpers.status(board, tid) == 'triage'
++
++
++def test_receipt_failure_rolls_back_every_episode_and_promotion(board, monkeypatch):
++    import sqlite3
++    tid, old, _ = stacked(board, monkeypatch)
++    original = kb._append_event
++    count = 0
++
++    def fail(conn, task, kind, *args, **kwargs):
++        nonlocal count
++        if kind == 'stop_released':
++            count += 1
++            if count == 2:
++                raise sqlite3.OperationalError('injected second receipt failure')
++        return original(conn, task, kind, *args, **kwargs)
++
++    monkeypatch.setattr(kb, '_append_event', fail)
++    with pytest.raises(sqlite3.OperationalError, match='injected'):
++        helpers.run(board, tid, capability_episodes=[old])
++    assert count == 2
++    assert not receipts(board, tid)
++    assert helpers.status(board, tid) == 'triage'
++
++
++def test_real_cli_carries_selection_and_refuses_bulk(board, monkeypatch, capsys):
++    tid, old, current = stacked(board, monkeypatch)
++    monkeypatch.setattr('hermes_cli.kanban_comment_writer.cli_comment_writer', lambda **kw: helpers.HUMAN)
++    before = helpers.written(board, tid)
++    assert helpers.argv(tid, '--ids', 't_other', '--capability-episode', old, '--json') == 2
++    assert helpers.written(board, tid) == before
++    capsys.readouterr()
++    assert helpers.argv(tid, '--capability-episode', old, '--json') == 0
++    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
++    assert out['capability_episodes'] == [old]
++    assert [r['episode'] for r in receipts(board, tid)] == [old, current]
++
++
++def test_owner_reads_historical_human_note_before_explicit_release(board, monkeypatch):
++    tid, old, _ = stacked(board, monkeypatch, human_note=True)
++    scope.link(board, tid)
++    env = {'HERMES_SESSION_ID': scope.CHAT}
++    kwargs = dict(writer=scope.AGENT, env=env, ancestry=[env], capability_episodes=[old])
++    out = release.release(board, tid, **kwargs)
++    assert out['refusal'] == 'budget_decision_unread', out
++    assert 'Preserve the independent acceptance gates.' in out['message']
++    assert f'--capability-episode {old}' in out['message']
++    assert not receipts(board, tid)
++    out = release.release(board, tid, seen=max(out['unread']), **kwargs)
++    assert out['outcome'] == 'released', out
++    assert 'private_hold' not in describe(board, tid)['violations']
++
++
++@pytest.mark.parametrize('shape', ['null', 'scalar', 'null-item', 'bool-item', 'over-bound'])
++def test_malformed_selection_container_refuses_without_writes(board, monkeypatch, shape):
++    tid, old, _ = stacked(board, monkeypatch)
++    values = {'null': None, 'scalar': old, 'null-item': [None], 'bool-item': [True], 'over-bound': [old] * 33}[shape]
++    before = helpers.written(board, tid)
++    assert helpers.run(board, tid, capability_episodes=values)['refusal'] == 'invalid_capability_episode'
++    assert helpers.written(board, tid) == before
++
++
++def test_synced_selection_requires_portable_uid_not_local_id(board, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_release_capability as capability
++    tid, old, _ = stacked(board, monkeypatch)
++    sync.apply_sync_schema_steps(board)
++    board.commit()
++
++    board.execute("INSERT INTO kanban_sync_state (board_id, gateway_id, hlc_last, mode) "
++                  "VALUES ('fixture-board', 'home', '', 'primary')")
++    board.commit()
++    assert sync.sync_state(board) is not None
++    # Published history has portable identities; schema installation alone does not backfill them.
++    published_uid = sync.uuid7()
++    board.execute('UPDATE task_events SET uid=? WHERE id=?', (published_uid, old))
++    board.commit()
++    uid = board.execute('SELECT uid FROM task_events WHERE id=?', (old,)).fetchone()[0]
++    assert uid and uid != old
++    assert capability.selected(board, tid, [uid])[0]['uid'] == uid
++    with pytest.raises(release._Refusal, match='not an exact capability'):
++        capability.selected(board, tid, [old])
++    board.execute('UPDATE task_events SET uid=NULL WHERE id=?', (old,))
++    board.commit()
++    with pytest.raises(release._Refusal, match='not an exact capability'):
++        capability.selected(board, tid, [old])
++
++
++def test_safety_superseded_capability_is_never_selected(board, monkeypatch):
++    from hermes_cli import kanban_release_capability as capability
++    tid, old, _ = stacked(board, monkeypatch)
++    board.execute('UPDATE task_events SET payload=? WHERE id=?',
++                  (json.dumps({'cause': 'capability_unavailable', 'superseded_by_safety_stop': True}), old))
++    board.commit()
++    with pytest.raises(release._Refusal, match='not an exact capability'):
++        capability.selected(board, tid, [old])
++
++
++def test_current_capability_selection_is_not_written_twice(board):
++    tid = helpers.spend_stopped(board)
++    row = dict(board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'",
++                             (tid,)).fetchone())
++    episode = scope.renewal.key(row)
++    board.execute('UPDATE task_events SET payload=? WHERE id=?',
++                  (json.dumps({'cause': 'capability_unavailable'}), row['id']))
++    board.commit()
++    assert helpers.run(board, tid, capability_episodes=[episode])['outcome'] == 'released'
++    assert [r['episode'] for r in receipts(board, tid)] == [episode]
++
++
++def test_synced_home_records_portable_historical_receipt(board):
++    from hermes_cli import kanban_db_sync as sync
++
++    sync.apply_sync_schema_steps(board)
++    board.commit()
++    home = 'fixture-home'
++
++    board.execute('INSERT INTO kanban_sync_state (board_id,gateway_id,hlc_last,mode) VALUES (?,?,?,?)',
++                  ('fixture-board', home, '', 'primary'))
++    board.commit()
++    sync.install_triggers(board)
++    board.commit()
++    tid = helpers.spend_stopped(board)
++    board.execute('UPDATE tasks SET created_on=? WHERE id=?', (home, tid))
++    board.commit()
++    row = dict(board.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'", (tid,)).fetchone())
++    old = row['uid']
++    assert old
++    board.execute('UPDATE task_events SET payload=? WHERE id=?',
++                  (json.dumps({'cause': 'capability_unavailable'}), row['id']))
++    board.commit()
++    kb._append_event(board, tid, 'spend_budget_triaged', {'reason': 'current ordinary budget stop'})
++    board.commit()
++    assert helpers.run(board, tid, capability_episodes=[old])['outcome'] == 'released'
++    historical = [r for r in receipts(board, tid) if r['episode'] == old]
++    assert len(historical) == 1 and historical[0]['mandate_comment_uid']
++    from hermes_cli.kanban_actionability_sources import Reader, _private_reason
++    reader = Reader(board)
++    assert _private_reason(board, reader.task(tid), reader) is None
++    assert 'private_hold' not in describe(board, tid)['violations']
++    before = helpers.written(board, tid)
++    assert helpers.run(board, tid, capability_episodes=[old])['outcome'] == 'already_released'
++    assert helpers.written(board, tid) == before
+-- 
+2.43.0
+

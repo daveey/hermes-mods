@@ -1,0 +1,1215 @@
+From 2044fc9b3bedbef50a4756a41d43d76f6a55c7c8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:58:09 +0000
+Subject: [PATCH 6205] Conservative sync repair, lease custody and UDF budgets
+
+Public mirror of source commit 2044fc9b3bedbef50a4756a41d43d76f6a55c7c8.
+
+---
+diff --git a/hermes_cli/kanban_sync_board_paths.py b/hermes_cli/kanban_sync_board_paths.py
+new file mode 100644
+index 00000000000..c0f678a662b
+--- /dev/null
++++ b/hermes_cli/kanban_sync_board_paths.py
+@@ -0,0 +1,30 @@
++"""Board discovery split into non-additive CPU diagnostics, without caching."""
++from hermes_cli import kanban_sync_cpu as cpu
++
++
++def board_paths(sync, board_id_re):
++    from hermes_cli import kanban_db, kanban_db_boards
++    root = kanban_db.kanban_home()
++
++    def enumerate_boards():
++        found = [("default", root / "kanban.db")] if (root / "kanban.db").exists() else []
++        # The shared enumerator excludes archived and non-slug directories.
++        return found + [(slug, p) for slug, p in kanban_db_boards.named_board_db_files() if board_id_re.match(slug)]
++
++    found = cpu.detail("enumerate", enumerate_boards)
++    local = {slug for slug, _ in found}
++
++    def linked_boards():
++        links_dir = root / "kanban" / sync.LINKS_DIR
++        if links_dir.is_dir():
++            return [(p.stem, p) for p in sorted(links_dir.glob("*.db"))
++                    if board_id_re.match(p.stem) and p.stem not in local]
++        return []
++
++    found += cpu.detail("links", linked_boards)
++
++    def selected():
++        config = sync.sync_config()  # once, not per board
++        return [(slug, path) for slug, path in found if sync.board_selected(str(path), config)]
++
++    return cpu.detail("filter", selected)
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 13d0622b05a..bc3b3228e99 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -181,7 +181,8 @@
+         after ``_conn`` accepted the file as it is, so the baseline still follows its stat."""
+         ent = self._conns.get(key)
+         if ent is not None and ent[4] != version:
+-            self._conns[key] = (*ent[:3], _wal_evidence.read(ent[5]), version, *ent[5:])
++            wal = _sync_cpu.detail("query_rebaseline", _wal_evidence.read, ent[5])
++            self._conns[key] = (*ent[:3], wal, version, *ent[5:])
+ 
+     def _drop(self, key: str) -> None:
+         self._answers.pop(key, None)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index eaf5dafeaed..f39e8f050d5 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -48,6 +48,7 @@
+ from hermes_cli.kanban_sync_backlog import BUSY_RETRY_S, PULL_PAGE_BUDGET, Pulled
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli import kanban_sync_cpu as sync_cpu
++from hermes_cli import kanban_sync_probe_diag as probe_diag, kanban_sync_sweep_cadence as sweep_cadence
+ from hermes_cli.kanban_sync_pending import (discard_replica_writes, guard_replica, pending_task_fields,
+                                            without_pending)
+ from hermes_cli import kanban_sync_refusal as refusal  # one board's ContainmentRefused ends only its round
+@@ -482,17 +483,8 @@
+ 
+ def board_paths() -> list[tuple[str, Path]]:
+     """``(slug, kanban.db)`` for every board on this host that ``kanban.sync.boards`` selects."""
+-    from hermes_cli import kanban_db, kanban_db_boards
+-    root = kanban_db.kanban_home()
+-    found = [("default", root / "kanban.db")] if (root / "kanban.db").exists() else []
+-    # The shared real-board enumerator: ``_archived/`` and other non-slug folders are not boards.
+-    found += [(slug, p) for slug, p in kanban_db_boards.named_board_db_files() if BOARD_ID_RE.match(slug)]
+-    local = {slug for slug, _ in found}
+-    links_dir = root / "kanban" / sync.LINKS_DIR
+-    if links_dir.is_dir():  # boards only another gateway has, where this gateway's chats have cards
+-        found += [(p.stem, p) for p in sorted(links_dir.glob("*.db")) if BOARD_ID_RE.match(p.stem) and p.stem not in local]
+-    config = sync.sync_config()  # [daveey] once, not per board: every Desktop session-list poll lands here
+-    return [(slug, path) for slug, path in found if sync.board_selected(str(path), config)]
++    from hermes_cli.kanban_sync_board_paths import board_paths as discover
++    return discover(sync, BOARD_ID_RE)
+ 
+ 
+ def ensure_link_boards(slugs: Iterable[str], gateway: str) -> list[str]:
+@@ -1425,6 +1417,7 @@
+     pulled_at stamp, which the scans never read. None (cannot tell) always scans. [daveey]"""
+     got = _WATCH.query(live_path, "SELECT revision, schema_version FROM kanban_repair_revision, "
+                       "pragma_schema_version WHERE id = 1")
++    probe_diag.note(live_path, got)
+     if got is None or got[1] is None:
+         return None
+     live_version = (got[0], tuple(got[1]))
+@@ -1444,6 +1437,7 @@
+     for path in paths:
+         got = _WATCH.query(path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' LIMIT 1",
+                            unchanged_ok=True)
++        probe_diag.note(path, got)
+         if got is not None and got[1]:
+             return True
+     return False
+@@ -1526,10 +1520,13 @@
+     sender = MetricsSender(metrics, board_post(ident))
+     sender.start()
+     try:
++        probe_diag.enter()
+         with sync_cpu.iterations(keep_running) as rounds:
+             for _round in rounds:
+                 boards = sync_cpu.step(board_paths)
+-                sync_cpu.step(sweep_gone_board_handles)  # close handles a removed board pins
++                probe_diag.install(boards)
++                if sweep_cadence.due(boards, time.monotonic()):
++                    sync_cpu.step(sweep_gone_board_handles)  # close handles a removed board pins
+                 for slug, _path in boards:
+                     if slug not in watchers or not watchers[slug].is_alive():
+                         watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
+@@ -1580,6 +1577,7 @@
+                     remaining = min(remaining, retry_in)
+                 sync_cpu.step(sync_timing.wait, wait_for_work, wake, [p for _, p in ready], remaining, keep_running)
+     finally:
++        probe_diag.leave()
+         links.stop()
+         _LINKS_RUNNER = None  # no stale runner for the next loop's tests to wait on
+         sender.close()
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index f50dfd46e5e..c2615818e60 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -93,10 +93,26 @@
+     return _since(min(ages), now) if ages else None
+ 
+ 
+-def _sample(path: Path) -> Optional[tuple[str, float]]:
+-    """Oldest sendable unanswered identity and wall age; unknown reads reset observation."""
++def _sample_full(path: Path) -> Optional[tuple[str, float]]:
++    """Original clock, backlog and sendability read for one board that is not structurally empty."""
+     from hermes_cli import kanban_db_connect as kbc
+     from hermes_cli import kanban_sync_backlog as backlog
++    with kbc.connect_closing(path) as conn:
++        conn.row_factory = sqlite3.Row
++        rows = [dict(r) for r in conn.execute(
++            "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' "
++            "AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at, rowid",
++            (int(time.time()),))]
++        if backlog.behind(path):
++            rows, _ = backlog.sendable_before_head(
++                conn, _NoBoardReads(), "", rows, backlog.evidence(path))
++        row = next((r for r in rows if r["retry_after"] is None), None)
++        return (row["op_id"], _since(row["created_at"])) if row else None
++
++
++def _sample(path: Path) -> Optional[tuple[str, float]]:
++    """Oldest sendable unanswered identity and wall age; unknown reads reset observation."""
++    from hermes_cli import kanban_sync_cpu as sync_cpu
+     if not Path(path).exists():
+         return None
+     try:
+@@ -107,19 +123,15 @@
+         # backlog say: a board whose pending ops are all Board-deferred skips the
+         # fresh schema open each round (Mac, t_2196e40ae28137e2: 4.4 ms a round).
+         from hermes_cli.kanban_sync_client import _WATCH
+-        empty = _WATCH.query(path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' "
+-                             "AND retry_after IS NULL LIMIT 1", unchanged_ok=True)
++
++        from hermes_cli import kanban_sync_probe_diag as probe_diag
++        empty = sync_cpu.detail("sample_query", lambda: _WATCH.query(
++            path, "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' "
++            "AND retry_after IS NULL LIMIT 1", unchanged_ok=True))
++        probe_diag.note(path, empty)
+         if empty is not None and empty[1] is None:
+-            return None
+-        with kbc.connect_closing(path) as conn:
+-            conn.row_factory = sqlite3.Row
+-            rows = [dict(r) for r in conn.execute(
+-                "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' "
+-                "AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at, rowid", (int(time.time()),))]
+-            if backlog.behind(path):
+-                rows, _ = backlog.sendable_before_head(conn, _NoBoardReads(), "", rows, backlog.evidence(path))
+-            row = next((r for r in rows if r["retry_after"] is None), None)
+-            return (row["op_id"], _since(row["created_at"])) if row else None
++            return sync_cpu.detail("sample_skip", lambda: None)
++        return sync_cpu.detail("sample_full", _sample_full, path)
+     except (sqlite3.Error, OSError, ValueError, TypeError):
+         return None
+ 
+@@ -130,12 +142,20 @@
+ 
+ 
+ def _observed(path: Path, mono, age, awake=True):
++    from hermes_cli import kanban_sync_cpu as sync_cpu
+     sample = _sample(path)
+     # Retain the age injection seam for callers suppressing outbox observations.
+     if age is not _age and age(path) is None:
+         sample = None
+     now = mono()  # sample and timestamp under the same observation lock
+-    seen = observation.observe(path, sample[0] if sample else None, now, awake=awake)
++    op_id = sample[0] if sample else None
++    seen = sync_cpu.detail(
++        "sample_observe",
++        lambda op_id, now, awake: observation.observe(path, op_id, now, awake=awake),
++        op_id,
++        now,
++        awake,
++    )
+     return seen, sample[1] if sample else None, now
+ 
+ 
+@@ -151,7 +171,8 @@
+     """Record round outcome and WARN after :data:`STALE_S` observed-awake seconds for one sendable op.
+     Returns the boards warned about. Never raises.
+ 
+-    ``sync.detail/after_round.awake`` and ``.sample`` are inclusive diagnostics of this step's parts
++    ``sync.detail/after_round.awake`` and ``.sample`` (and sample's query, skip or full,
++    and observe) are inclusive diagnostics of this step's parts
+     (``kanban_sync_cpu.detail``, ``outer=False``): never sum them with steps."""
+     from hermes_cli import kanban_sync_cpu as sync_cpu
+     awake = sync_cpu.detail("awake", replica_age.fully_awake, awake_fn)
+diff --git a/hermes_cli/kanban_sync_probe_diag.py b/hermes_cli/kanban_sync_probe_diag.py
+new file mode 100644
+index 00000000000..3048d790802
+--- /dev/null
++++ b/hermes_cli/kanban_sync_probe_diag.py
+@@ -0,0 +1,79 @@
++"""Passive loop-only probe census. Answers are observed, never reused.
++
++The first 32 valid slugs encountered in loop-list order retain their names for
++this process's lifetime. Other paths fold into ``unmapped`` (including a real
++board with that name). Wait history is
++bounded by that snapshot's paths and is cleared when the loop leaves its pool
++thread. Counters overlap all enclosing CPU scopes and carry zero CPU themselves.
++"""
++import threading
++import time
++
++from hermes_cli import kanban_sync_cpu as cpu, loop_accounting
++
++_local = threading.local()
++_names = set()  # process-lifetime series bound, including across loop tenures
++_names_lock = threading.Lock()
++
++
++def active():
++    return getattr(_local, "active", False)
++
++
++def enter():
++    _local.active = True
++    _local.paths, _local.waits = {}, {}
++
++
++def leave():
++    _local.active = False
++    _local.paths, _local.waits = {}, {}
++
++
++def install(boards):
++    """Only the loop caller installs its own board_paths result, once per round."""
++    if not active():
++        return
++    from hermes_cli.kanban_sync_client import BOARD_ID_RE
++    paths = {}
++    with _names_lock:
++        for slug, path in boards:
++            valid = isinstance(slug, str) and BOARD_ID_RE.fullmatch(slug)
++            if valid and (slug in _names or len(_names) < 32):
++                _names.add(slug)
++                paths[str(path)] = slug
++            else:
++                paths[str(path)] = "unmapped"
++    _local.paths = paths
++    _local.waits = {p: v for p, v in _local.waits.items() if p in paths}
++
++
++def _record(kind, slug, rows=0):
++    loop_accounting.record(f"sync.probe_{kind}/slug/{slug}", cpu_s=0, rows=rows, outer=False)
++
++
++def note(path, got):
++    """Observe an already-executed query; even unavailable/empty answers are negative.
++
++    Unknown paths count under unmapped but are not retained as wait history.
++    Integer-ms rows use the existing accounting truncation (sub-ms contributes 0).
++    """
++    if not active():
++        return
++    try:
++        key = str(path)
++        slug = _local.paths.get(key, "unmapped")
++        _record("count", slug)
++        step = cpu._step_name()
++        now = time.monotonic()
++        if step == "wait" and key in _local.paths:
++            _local.waits[key] = (now, bool(got is not None and got[1]))
++        elif step == "select":
++            prior = _local.waits.get(key)
++            age = max(0.0, now - prior[0]) if prior else None
++            hit = prior is not None and not prior[1] and age <= 0.5
++            _record("reuse_hit" if hit else "reuse_miss", slug)
++            if age is not None:
++                _record("wait_age_ms", slug, int(age * 1000))
++    except Exception:  # health: allow BLE001 -- passive diagnostics must not alter query behavior
++        return
+diff --git a/hermes_cli/kanban_sync_sweep_cadence.py b/hermes_cli/kanban_sync_sweep_cadence.py
+new file mode 100644
+index 00000000000..4acee26bd4e
+--- /dev/null
++++ b/hermes_cli/kanban_sync_sweep_cadence.py
+@@ -0,0 +1,23 @@
++"""Cadence at the sync-loop caller only; housekeeping's sweep stays unconditional."""
++_LAST_BOARDS = None
++_LAST_AT = 0.0
++
++
++def due(boards, now):
++    """First sweep, changed board list, or 30 seconds since the previous attempt.
++
++    Record before the sweep. A busy close retries on the timer or housekeeping,
++    not the next unchanged round. State survives loop tenures in this process.
++    """
++    global _LAST_BOARDS, _LAST_AT
++    current = tuple(sorted((slug, str(path)) for slug, path in boards))
++    if current == _LAST_BOARDS and now - _LAST_AT < 30.0:
++        return False
++    _LAST_BOARDS, _LAST_AT = current, now
++    return True
++
++
++def reset():
++    """Tests only: never reset on a production loop restart."""
++    global _LAST_BOARDS, _LAST_AT
++    _LAST_BOARDS, _LAST_AT = None, 0.0
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index a95ae28a55a..fdc5c7743b1 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -340,17 +340,32 @@
+ 
+     def report_due(self, send: Optional[Callable[[dict], Any]] = None) -> bool:
+         """The sync loop's report (through *send*, default the Reporter's own): True sent; False not due, failed, or
+-        withheld (a CPU-less report while the gate is on and a report was sent within KEEPALIVE_S)."""
+-        if not self._lock.acquire(blocking=False):
+-            return False  # the sender thread is reporting right now
+-        try:
++        withheld (a CPU-less report while the gate is on and a report was sent within KEEPALIVE_S).
++
++        ``sync.detail/<step>.due`` is this not-due decision, including a lock miss.
++        Always-on ``outer=False``; not an opt-in timing span.
++        """
++        from hermes_cli import kanban_sync_cpu as sync_cpu
++        gate = {"held": False, "now": None}
++
++        def decide() -> bool:
++            if not self._lock.acquire(blocking=False):
++                return False  # the sender thread is reporting right now
++            gate["held"] = True
+             now = self.clock()
+             if now < self.next_at:
+                 return False
+             self.next_at = now + REPORT_EVERY_S
+-            return self._report(now, send or self.send) is True
++            gate["now"] = now
++            return True
++
++        try:
++            if not sync_cpu.detail("due", decide):
++                return False
++            return self._report(gate["now"], send or self.send) is True
+         finally:
+-            self._lock.release()
++            if gate["held"]:
++                self._lock.release()
+ 
+     def report_tick(self, send: Callable[[dict], Any]) -> Optional[bool]:
+         """The anchored sender's report through its own transport *send*: True sent, False failed, None skipped.
+@@ -375,15 +390,20 @@
+             self._lock.release()
+ 
+     def _report(self, now: float, send: Callable[[dict], Any], wait: bool = False) -> Optional[bool]:
+-        """Collect, attach the CPU triple and send. None: withheld (CPU-less while the gate is on, see KEEPALIVE_S)."""
++        """Collect, attach the CPU triple and send. None: withheld (CPU-less while the gate is on, see KEEPALIVE_S).
++
++        ``sync.detail/<step>.collect`` times ``collect()`` only. ``.send`` times the
++        send callable only (each attempt). Always-on ``outer=False``, not timing.span.
++        """
+         try:
++            from hermes_cli import kanban_sync_cpu as sync_cpu
+             from hermes_cli import kanban_sync_timing as timing
+             from hermes_cli import machine_cpu_metrics as cpu
+             from hermes_cli.machine_drain_metrics import send_compatible
+             with timing.span("collect"):
+                 _REPORT.census = self.census_fn
+                 try:
+-                    sample = dict((self.collect_fn or collect)())
++                    sample = dict(sync_cpu.detail("collect", self.collect_fn or collect))
+                 finally:
+                     _REPORT.census = None
+             with timing.span("limit"):
+@@ -414,9 +434,13 @@
+ 
+             def claiming_rejected() -> None:
+                 self.claiming_off_until = now + UNSUPPORTED_RETRY_S
++
++            def send_once(payload):
++                return sync_cpu.detail("send", send, payload)
++
+             self.started_at = now
+             with timing.span("send"):  # preserve the transport's existing hard 2 s budget
+-                send_compatible(send, sample, counters_rejected, claiming_rejected)
++                send_compatible(send_once, sample, counters_rejected, claiming_rejected)
+             self.sent_at = self.clock()  # a failed send left the row as it was: it is no keepalive
+             return True
+         except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
+diff --git a/tests/hermes_cli/test_kanban_gone_board_handles.py b/tests/hermes_cli/test_kanban_gone_board_handles.py
+index af6646b48c1..3d279051f32 100644
+--- a/tests/hermes_cli/test_kanban_gone_board_handles.py
++++ b/tests/hermes_cli/test_kanban_gone_board_handles.py
+@@ -75,6 +75,8 @@
+ def test_one_sync_loop_pass_closes_the_watch_connection_of_a_removed_board(home, monkeypatch, tmp_path):
+     """The acceptance shape: query a board through ``_WATCH`` in one round, remove its directory, and the next
+     pass of the real loop (which no longer lists it) leaves no descriptor on its deleted files."""
++    from hermes_cli import kanban_sync_sweep_cadence
++    kanban_sync_sweep_cadence.reset()
+     path = _board("probe")
+     boards = [("probe", path)]
+     rounds, _waits = loop_support._fake_loop(monkeypatch, tmp_path, boards)
+@@ -426,6 +428,16 @@
+     assert activity._RO_CACHE[key] is newer
+ 
+ 
++def test_real_sweep_closes_two_successive_removed_boards(home):
++    """Parent-green control: cadence must never move inside the shared sweep."""
++    for slug in ("first", "second"):
++        path = _board(slug)
++        assert ksc._WATCH.query(path, SQL)[1] == (0,)
++        directory = _remove(path)
++        assert gone.sweep() >= 1
++        assert _fds_under(directory) == []
++
++
+ def test_gateway_housekeeping_runs_the_sweep(monkeypatch):
+     import gateway.run as gateway_run
+     from tests.gateway.test_checkpoint_prune_housekeeping import _OneTickStopEvent
+diff --git a/tests/hermes_cli/test_kanban_sync_outbox_deferred.py b/tests/hermes_cli/test_kanban_sync_outbox_deferred.py
+index de90dd34ecf..2ec6e77766c 100644
+--- a/tests/hermes_cli/test_kanban_sync_outbox_deferred.py
++++ b/tests/hermes_cli/test_kanban_sync_outbox_deferred.py
+@@ -5,7 +5,9 @@
+ answer None. The answer is always an unanswered row (``retry_after IS NULL``), so the probe now asks for that.
+ """
+ import pathlib
++import sys
+ import threading
++import types
+ from unittest.mock import Mock
+ 
+ import pytest
+@@ -20,6 +22,46 @@
+ from tests.hermes_cli import kanban_sync_support as support
+ 
+ 
++_PROBE = "hermes_cli.kanban_sync_probe_diag"
++_EMPTY_SQL = (
++    "SELECT 1 FROM kanban_sync_outbox WHERE state = 'pending' "
++    "AND retry_after IS NULL LIMIT 1"
++)
++
++
++@pytest.fixture(autouse=True)
++def probe_notes(monkeypatch):
++    """Record ``probe_diag.note`` even when the parent module is not imported yet."""
++    notes = []
++
++    def note(path, empty):
++        notes.append((path, empty))
++
++    try:
++        probe_diag = sys.modules.get(_PROBE) or __import__(_PROBE, fromlist=["note"])
++    except ImportError:
++        probe_diag = types.ModuleType(_PROBE)
++        monkeypatch.setitem(sys.modules, _PROBE, probe_diag)
++    monkeypatch.setattr(probe_diag, "note", note, raising=False)
++    return notes
++
++
++def _spy_details(monkeypatch):
++    monkeypatch.setattr(sync_cpu, "_local", threading.local())
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: False)
++    loop_accounting.reset()
++    real = loop_accounting.record
++    details = []
++
++    def record(name, **kwargs):
++        if name.startswith("sync.detail/"):
++            details.append((name, kwargs.get("outer", True)))
++        return real(name, **kwargs)
++
++    monkeypatch.setattr(loop_accounting, "record", record)
++    return details
++
++
+ @pytest.fixture
+ def board(tmp_path, monkeypatch):
+     home = support.kanban_home(tmp_path, monkeypatch)
+@@ -189,10 +231,125 @@
+         assert sync_cpu.step(age.after_round, [result], [("default", path)], awake_fn=lambda: True) == []
+         # Inclusive parts of the step: published with outer=False, so they add nothing to the thread's
+         # accounted CPU, the step or sync.cpu.total/loop (the collector's total-minus-board value).
+-        assert details == [("sync.detail/after_round.awake", False), ("sync.detail/after_round.sample", False)]
++        assert details == [
++            ("sync.detail/after_round.awake", False),
++            ("sync.detail/after_round.query_rebaseline", False),
++            ("sync.detail/after_round.sample_query", False),
++            ("sync.detail/after_round.sample_skip", False),
++            ("sync.detail/after_round.sample_observe", False),
++            ("sync.detail/after_round.sample", False),
++        ]
+         stats = loop_accounting.counters()
+         assert stats["sync.detail/after_round.awake"]["runs"] == 1
+         assert stats["sync.detail/after_round.sample"]["runs"] == 1
+         assert not [k for k in stats if k.startswith(("sync.board/", "sync.cpu."))]
+     finally:
+         loop_accounting.reset()
++
++
++def test_deferred_round_notes_empty_probe_and_skips_the_open(board, monkeypatch, probe_notes):
++    path, conn = board
++    _insert(conn, "deferred", retry=10**12)
++    monkeypatch.setattr(age.replica_age, "note_round", lambda *a, **kw: None)
++    opened = Mock(wraps=kbc.connect_closing)
++    monkeypatch.setattr(kbc, "connect_closing", opened)
++    queries = []
++    real_query = client._WATCH.query
++
++    def query(path, sql, *, unchanged_ok=False):
++        queries.append((sql, unchanged_ok))
++        return real_query(path, sql, unchanged_ok=unchanged_ok)
++
++    monkeypatch.setattr(client._WATCH, "query", query)
++    details = _spy_details(monkeypatch)
++    result = client.RoundResult(board="default", mode="primary")
++    try:
++        assert sync_cpu.step(age.after_round, [result], [("default", path)], awake_fn=lambda: True) == []
++        assert queries == [(_EMPTY_SQL, True)]
++        assert opened.call_count == 0
++        assert probe_notes and probe_notes[0][0] == path
++        assert probe_notes[0][1] is not None and probe_notes[0][1][1] is None
++        assert ("sync.detail/after_round.sample_query", False) in details
++        assert ("sync.detail/after_round.sample_skip", False) in details
++        assert ("sync.detail/after_round.sample_observe", False) in details
++        assert not [name for name, _outer in details if name.endswith(".sample_full")]
++        assert sum(loop_accounting._copy_accounted().values()) == 0
++    finally:
++        loop_accounting.reset()
++
++
++def test_unanswered_round_records_full_sample_and_awake_kw(board, monkeypatch, probe_notes):
++    path, conn = board
++    monkeypatch.setattr(age, "_since", lambda created: float(created))
++    monkeypatch.setattr(client.backlog, "behind", lambda path: False)
++    _insert(conn, "unanswered", created=1000)
++    monkeypatch.setattr(age.replica_age, "note_round", lambda *a, **kw: None)
++    opened = Mock(wraps=kbc.connect_closing)
++    monkeypatch.setattr(kbc, "connect_closing", opened)
++    observed = []
++
++    def observe(path, op_id, now, *, awake=True):
++        observed.append((op_id, awake))
++
++    monkeypatch.setattr(age.observation, "observe", observe)
++    details = _spy_details(monkeypatch)
++    result = client.RoundResult(board="default", mode="primary")
++    try:
++        assert sync_cpu.step(
++            age.after_round, [result], [("default", path)], awake_fn=lambda: False) == []
++        assert opened.call_count == 1
++        assert observed == [("unanswered", False)]
++        assert probe_notes and probe_notes[0][1] is not None
++        assert probe_notes[0][1][1] is not None
++        assert ("sync.detail/after_round.sample_query", False) in details
++        assert ("sync.detail/after_round.sample_full", False) in details
++        assert ("sync.detail/after_round.sample_observe", False) in details
++        assert not [name for name, _outer in details if name.endswith(".sample_skip")]
++    finally:
++        loop_accounting.reset()
++
++
++def test_behind_filter_stays_on_the_full_path(board, monkeypatch):
++    path, conn = board
++    monkeypatch.setattr(age, "_since", lambda created: float(created))
++    _insert(conn, "held", created=1000)
++    opened = Mock(wraps=kbc.connect_closing)
++    monkeypatch.setattr(kbc, "connect_closing", opened)
++    monkeypatch.setattr(client.backlog, "behind", lambda path: True)
++    monkeypatch.setattr(client.backlog, "evidence", lambda path: {"head": 1})
++
++    def sendable(conn, reader, ident, rows, evidence):
++        assert ident == "" and evidence == {"head": 1}
++        assert rows and rows[0]["op_id"] == "held"
++        return [], None
++
++    monkeypatch.setattr(client.backlog, "sendable_before_head", sendable)
++
++    def sample(path):
++        return age._sample(path)
++
++    details = _spy_details(monkeypatch)
++    try:
++        assert sync_cpu.step(sample, path) is None
++        assert opened.call_count == 1
++        assert ("sync.detail/sample.sample_full", False) in details
++        assert not [name for name, _outer in details if name.endswith(".sample_skip")]
++    finally:
++        loop_accounting.reset()
++
++
++def test_error_round_does_not_sample(board, monkeypatch, probe_notes):
++    path, conn = board
++    _insert(conn, "unanswered", created=1000)
++    monkeypatch.setattr(age.replica_age, "note_round", lambda *a, **kw: None)
++    details = _spy_details(monkeypatch)
++    result = client.RoundResult(board="default", mode="primary", error="down")
++    try:
++        assert sync_cpu.step(age.after_round, [result], [("default", path)], awake_fn=lambda: True) == []
++        assert probe_notes == []
++        names = [name for name, _outer in details]
++        assert "sync.detail/after_round.awake" in names
++        assert "sync.detail/after_round.sample" not in names
++        assert "sync.detail/after_round.sample_observe" not in names
++    finally:
++        loop_accounting.reset()
+diff --git a/tests/hermes_cli/test_kanban_sync_probe_diag.py b/tests/hermes_cli/test_kanban_sync_probe_diag.py
+new file mode 100644
+index 00000000000..2204375fd44
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_probe_diag.py
+@@ -0,0 +1,171 @@
++"""Passive, bounded loop-probe diagnostics must never reuse an answer."""
++from pathlib import Path
++from unittest.mock import Mock
++import threading
++
++import pytest
++
++from hermes_cli import kanban_sync_cpu as cpu, loop_accounting as la
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_sync_work import SyncWork
++
++
++@pytest.fixture
++def diag(monkeypatch):
++    from hermes_cli import kanban_sync_probe_diag as module
++    monkeypatch.setattr(module, "_names", set())
++    module.enter()
++    la.reset()
++    yield module
++    module.leave()
++    la.reset()
++
++
++def _as(step, fn, *args):
++    def call():
++        return fn(*args)
++    call.__name__ = step
++    return cpu.step(call)
++
++
++def test_count_hit_miss_and_age_are_nonadditive(diag, monkeypatch):
++    path = Path("/board")
++    diag.install([("a", path)])
++    clock = [100.0]
++    monkeypatch.setattr(diag.time, "monotonic", lambda: clock[0])
++    records = []
++    monkeypatch.setattr(la, "record", lambda name, **kw: records.append((name, kw)))
++    _as("wait", diag.note, path, (1, None))
++    clock[0] = 100.125
++    _as("select", diag.note, path, (1, (1,)))
++    clock[0] = 101
++    _as("select", diag.note, path, None)
++    probes = [(n, kw) for n, kw in records if n.startswith("sync.probe_")]
++    assert [n for n, _ in probes] == [
++        "sync.probe_count/slug/a", "sync.probe_count/slug/a",
++        "sync.probe_reuse_hit/slug/a", "sync.probe_wait_age_ms/slug/a",
++        "sync.probe_count/slug/a", "sync.probe_reuse_miss/slug/a",
++        "sync.probe_wait_age_ms/slug/a"]
++    assert all(kw["outer"] is False and kw["cpu_s"] == 0 for _, kw in probes)
++    assert [kw["rows"] for n, kw in probes if "age_ms" in n] == [125, 1000]
++
++
++@pytest.mark.parametrize("answer", [None, (1, None), (1, ())])
++def test_negative_wait_does_not_skip_pending(diag, monkeypatch, answer):
++    path = Path("/board")
++    diag.install([("a", path)])
++    monkeypatch.setattr(diag.time, "monotonic", lambda: 100.0)
++    work = SyncWork(1000)
++    boards = [("a", path)]
++    assert work.select(boards, 99, lambda paths: False) == boards
++    _as("wait", diag.note, path, answer)
++    pending = Mock(return_value=True)
++    assert _as("select", work.select, boards, 100, pending) == boards
++    pending.assert_called_once_with([path])
++
++
++def test_short_circuit_counts_only_queried_board(diag, monkeypatch):
++    a, b = Path("/a"), Path("/b")
++    diag.install([("a", a), ("b", b)])
++    query = Mock(return_value=(1, (1,)))
++    monkeypatch.setattr(client._WATCH, "query", query)
++    assert _as("wait", client.outbox_pending, [a, b])
++    query.assert_called_once()
++    counters = la.counters()
++    assert counters["sync.probe_count/slug/a"]["runs"] == 1
++    assert "sync.probe_count/slug/b" not in counters
++
++
++def test_unmapped_and_slug_cap(diag):
++    boards = [(f"b{i}", Path(f"/b{i}")) for i in range(34)]
++    diag.install(boards + [("bad/sl ug", Path("/bad"))])
++    for _, path in boards:
++        diag.note(path, None)
++    diag.note(Path("/secret/path"), None)
++    diag.note(Path("/bad"), None)
++    rows = {n: r for n, r in la.counters().items() if n.startswith("sync.probe_count/")}
++    assert len(rows) == 33
++    assert rows["sync.probe_count/slug/unmapped"]["runs"] == 4
++    assert not any("secret" in n or "bad/" in n for n in rows)
++
++
++def test_series_cap_survives_tenures_and_known_slugs_stay_named(diag):
++    diag.install([(f"b{i}", Path(f"/b{i}")) for i in range(32)])
++    diag.leave()
++    diag.enter()
++    diag.install([("new", Path("/new")), ("b0", Path("/b0"))])
++    diag.note(Path("/new"), None)
++    diag.note(Path("/b0"), None)
++    rows = la.counters()
++    assert rows["sync.probe_count/slug/unmapped"]["runs"] == 1
++    assert rows["sync.probe_count/slug/b0"]["runs"] == 1
++    assert "sync.probe_count/slug/new" not in rows
++
++
++def test_invalid_slug_rejected_before_capacity(diag):
++    diag.install([("x" * 65, Path("/long")), ("bad/name", Path("/bad"))])
++    diag.note(Path("/long"), None)
++    diag.note(Path("/bad"), None)
++    assert set(la.counters()) == {"sync.probe_count/slug/unmapped"}
++    assert la.counters()["sync.probe_count/slug/unmapped"]["runs"] == 2
++
++
++def test_other_threads_and_after_leave_do_not_count(diag):
++    path = Path("/board")
++    diag.install([("a", path)])
++    thread = threading.Thread(target=diag.note, args=(path, None))
++    thread.start()
++    thread.join(5)
++    assert not thread.is_alive()
++    diag.leave()
++    diag.note(path, None)
++    assert not any(n.startswith("sync.probe_") for n in la.counters())
++
++
++@pytest.mark.parametrize("prior,age,expected", [(True, 0.1, "miss"), (False, 0.5, "hit"), (False, 0.501, "miss")])
++def test_wait_freshness_and_positive_answer(diag, monkeypatch, prior, age, expected):
++    path = Path("/a")
++    diag.install([("a", path)])
++    clock = [100.0]
++    monkeypatch.setattr(diag.time, "monotonic", lambda: clock[0])
++    _as("wait", diag.note, path, (1, (1,) if prior else None))
++    clock[0] += age
++    _as("select", diag.note, path, (1, None))
++    assert la.counters()[f"sync.probe_reuse_{expected}/slug/a"]["runs"] == 1
++    # A select query must not replace the positive/old wait answer.
++    _as("select", diag.note, path, (1, None))
++    assert la.counters()[f"sync.probe_reuse_{expected}/slug/a"]["runs"] == 2
++
++
++def test_submillisecond_age_and_real_unmapped(diag, monkeypatch):
++    path = Path("/a")
++    diag.install([("unmapped", path)])
++    clock = [100.0]
++    monkeypatch.setattr(diag.time, "monotonic", lambda: clock[0])
++    _as("wait", diag.note, path, None)
++    clock[0] += 0.0001
++    _as("select", diag.note, path, None)
++    assert la.counters()["sync.probe_wait_age_ms/slug/unmapped"]["rows"] == 0
++    assert la.counters()["sync.probe_wait_age_ms/slug/unmapped"]["runs"] == 1
++
++
++def test_note_failure_never_changes_query_result(diag, monkeypatch):
++    path = Path("/a")
++    diag.install([("a", path)])
++    monkeypatch.setattr(client._WATCH, "query", lambda *a, **kw: (1, (1,)))
++    def unavailable(*args, **kwargs):
++        raise RuntimeError("diagnostic sink failed")
++    monkeypatch.setattr(diag, "_record", unavailable)
++    assert client.outbox_pending([path]) is True
++
++
++def test_map_replacement_discards_removed_waits(diag, monkeypatch):
++    a, b = Path("/a"), Path("/b")
++    monkeypatch.setattr(diag.time, "monotonic", lambda: 100)
++    diag.install([("a", a)])
++    _as("wait", diag.note, a, None)
++    diag.install([("b", b)])
++    _as("select", diag.note, a, None)
++    rows = la.counters()
++    assert rows["sync.probe_reuse_miss/slug/unmapped"]["runs"] == 1
++    assert "sync.probe_wait_age_ms/slug/unmapped" not in rows
+diff --git a/tests/hermes_cli/test_kanban_sync_step_accounting.py b/tests/hermes_cli/test_kanban_sync_step_accounting.py
+index 721f41cdc57..d6a3922f357 100644
+--- a/tests/hermes_cli/test_kanban_sync_step_accounting.py
++++ b/tests/hermes_cli/test_kanban_sync_step_accounting.py
+@@ -13,7 +13,8 @@
+ def test_real_loop_publishes_step_names(monkeypatch, enabled):
+     from hermes_cli import kanban_sync_links_pass, machine_metrics
+     from hermes_cli import machine_cpu_sampler, machine_metrics_sender
+-    from hermes_cli import kanban_sync_schema_alert
++    from hermes_cli import kanban_sync_schema_alert, kanban_sync_sweep_cadence
++    kanban_sync_sweep_cadence.reset()
+     la.stop()
+     la.reset()
+     monkeypatch.setattr(la, "scopes_enabled", lambda: enabled)
+diff --git a/tests/hermes_cli/test_kanban_sync_sweep_cadence.py b/tests/hermes_cli/test_kanban_sync_sweep_cadence.py
+new file mode 100644
+index 00000000000..8208ed73b1b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_sweep_cadence.py
+@@ -0,0 +1,93 @@
++"""Loop-only cadence, preserved across tenures; housekeeping remains unconditional."""
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++
++
++def _cadence():
++    from hermes_cli import kanban_sync_sweep_cadence
++    return kanban_sync_sweep_cadence
++
++
++def test_unchanged_list_waits_thirty_seconds():
++    cadence = _cadence()
++    cadence.reset()
++    boards = [("b", Path("/b")), ("a", Path("/a"))]
++    assert cadence.due(boards, 100)
++    assert not cadence.due(list(reversed(boards)), 101)
++    assert not cadence.due(boards, 129.999)
++    assert cadence.due(boards, 130)
++    assert not cadence.due(boards, 131)
++
++
++def test_list_change_sweeps_inside_window():
++    cadence = _cadence()
++    cadence.reset()
++    assert cadence.due([("a", Path("/a"))], 100)
++    assert cadence.due([], 101)
++    assert cadence.due([("a", Path("/a"))], 102)
++    assert cadence.due([("a", Path("/replacement"))], 103)
++    assert not cadence.due([("a", Path("/replacement"))], 104)
++
++
++def _loop(monkeypatch):
++    from hermes_cli import kanban_sync_schema_alert, kanban_sync_links_pass
++    from hermes_cli import machine_metrics, machine_cpu_sampler, machine_metrics_sender
++    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="test", url="unused"))
++    monkeypatch.setattr(client, "Hub", lambda ident: Mock())
++    monkeypatch.setattr(client.sync, "set_lease_client", lambda value: None)
++    monkeypatch.setattr(client, "_schema_ahead_boards", lambda boards: [])
++    monkeypatch.setattr(kanban_sync_schema_alert, "note_start", lambda: None)
++    monkeypatch.setattr(kanban_sync_links_pass, "LinksPass", lambda gateway: Mock())
++    monkeypatch.setattr(machine_metrics, "Reporter", lambda *a: Mock())
++    monkeypatch.setattr(machine_cpu_sampler, "AdvisorySampler", Mock)
++    monkeypatch.setattr(machine_metrics_sender, "MetricsSender", lambda *a: Mock())
++    monkeypatch.setattr(machine_metrics_sender, "board_post", lambda ident: None)
++    monkeypatch.setattr(client, "board_paths", list)
++    monkeypatch.setattr(client, "deferred_repairs_due", lambda *a: [])
++    monkeypatch.setattr(client.backlog, "due", lambda *a: [])
++    monkeypatch.setattr(client.outbox_age, "after_round", lambda *a: None)
++    monkeypatch.setattr(client.outbox_age, "round_started", lambda: None)
++    monkeypatch.setattr(client.sync_timing, "report", lambda *a: None)
++    monkeypatch.setattr(client.sync_timing, "wait", lambda *a: None)
++    monkeypatch.setattr(client, "next_deferred_repair", lambda *a: None)
++    monkeypatch.setattr(client, "sync_all_once", lambda *a, **kw: [])
++    monkeypatch.setattr(client.time, "monotonic", lambda: 100.0)
++
++
++def test_two_rounds_and_new_tenure_sweep_once(monkeypatch):
++    _cadence().reset()
++    _loop(monkeypatch)
++    sweep = Mock()
++    monkeypatch.setattr(client, "sweep_gone_board_handles", sweep)
++    for _ in range(2):
++        calls = iter([True, True, False])
++        client._run_forever(lambda: next(calls), 1, Mock())
++    assert sweep.call_count == 1
++
++
++@pytest.mark.parametrize("raises", [False, True])
++def test_loop_clears_diagnostic_flag_on_every_exit(monkeypatch, raises):
++    from hermes_cli import kanban_sync_probe_diag as diag
++    _cadence().reset()
++    _loop(monkeypatch)
++    monkeypatch.setattr(client, "sweep_gone_board_handles", lambda: None)
++    seen = []
++    def run(*a, **kw):
++        seen.append(diag.active())
++        if raises:
++            raise RuntimeError("round failed")
++        return []
++    monkeypatch.setattr(client, "sync_all_once", run)
++    calls = iter([True, False])
++    if raises:
++        with pytest.raises(RuntimeError, match="round failed"):
++            client._run_forever(lambda: next(calls), 1, Mock())
++    else:
++        client._run_forever(lambda: next(calls), 1, Mock())
++    assert seen == [True]
++    assert not diag.active()
+diff --git a/tests/hermes_cli/test_sync_board_paths_details.py b/tests/hermes_cli/test_sync_board_paths_details.py
+new file mode 100644
+index 00000000000..4f395366f61
+--- /dev/null
++++ b/tests/hermes_cli/test_sync_board_paths_details.py
+@@ -0,0 +1,41 @@
++"""Board discovery still returns the same paths; split details never install probe maps."""
++from hermes_cli import kanban_db, kanban_db_boards, kanban_sync_client as client
++from hermes_cli import kanban_sync_cpu as cpu, loop_accounting as la
++
++
++def test_discovery_split_and_filter_do_not_replace_loop_map(tmp_path, monkeypatch):
++    from hermes_cli import kanban_sync_probe_diag as diag
++    monkeypatch.setattr(kanban_db, "kanban_home", lambda: tmp_path)
++    default = tmp_path / "kanban.db"
++    default.touch()
++    local = tmp_path / "local.db"
++    monkeypatch.setattr(kanban_db_boards, "named_board_db_files", lambda: [("local", local)])
++    links = tmp_path / "kanban" / client.sync.LINKS_DIR
++    links.mkdir(parents=True)
++    for name in ("remote", "local", "bad name"):
++        (links / f"{name}.db").touch()
++    config = {"fixture": True}
++    calls = []
++    monkeypatch.setattr(client.sync, "sync_config", lambda: config)
++    monkeypatch.setattr(client.sync, "board_selected", lambda p, c: calls.append((p, c)) or p != str(local))
++    records = []
++    monkeypatch.setattr(la, "record", lambda name, **kw: records.append((name, kw)))
++    diag.enter()
++    try:
++        diag.install([("original", default)])
++        assert cpu.step(client.board_paths) == [("default", default), ("remote", links / "remote.db")]
++        diag.note(default, None)
++        assert [n for n, _ in records if n.startswith("sync.detail/")] == [
++            "sync.detail/board_paths.enumerate", "sync.detail/board_paths.links", "sync.detail/board_paths.filter"]
++        assert all(not kw["outer"] for n, kw in records if n.startswith("sync.detail/"))
++        assert "sync.probe_count/slug/original" in [n for n, _ in records]
++        assert len(calls) == 3 and all(c is config for _, c in calls)
++    finally:
++        diag.leave()
++
++
++def test_missing_default_and_links(tmp_path, monkeypatch):
++    monkeypatch.setattr(kanban_db, "kanban_home", lambda: tmp_path)
++    monkeypatch.setattr(kanban_db_boards, "named_board_db_files", list)
++    monkeypatch.setattr(client.sync, "sync_config", dict)
++    assert client.board_paths() == []
+diff --git a/tests/hermes_cli/test_sync_report_details.py b/tests/hermes_cli/test_sync_report_details.py
+new file mode 100644
+index 00000000000..5b72643fc8e
+--- /dev/null
++++ b/tests/hermes_cli/test_sync_report_details.py
+@@ -0,0 +1,234 @@
++"""Always-on report diagnostics, not opt-in timing spans. [daveey]
++
++``sync.detail/<step>.due`` is the not-due decision, including a lock miss.
++``collect`` times ``collect()`` only. ``send`` times the send callable only.
++All three are ``outer=False`` and must not change sender results or errors.
++"""
++import threading
++
++import pytest
++
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_cpu as sync_cpu
++from hermes_cli import kanban_sync_timing as timing
++from hermes_cli import loop_accounting
++from hermes_cli import machine_cpu_metrics as cpu
++from hermes_cli import machine_metrics as mm
++
++
++def report(reporter):
++    """Production steps ``sync_timing.report``; this name books the same step."""
++    return reporter.report_due()
++
++
++@pytest.fixture
++def accounting(monkeypatch):
++    loop_accounting.reset()
++    monkeypatch.setattr(sync_cpu, "_local", threading.local())
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: False)
++    yield
++    loop_accounting.reset()
++
++
++def _spy(monkeypatch):
++    real = loop_accounting.record
++    details = []
++
++    def record(name, **kwargs):
++        if name.startswith("sync.detail/"):
++            details.append((name, kwargs.get("outer", True)))
++        return real(name, **kwargs)
++
++    monkeypatch.setattr(loop_accounting, "record", record)
++    return details
++
++
++def _spans(monkeypatch):
++    spans = []
++    real = timing.span
++
++    def span(name):
++        spans.append(name)
++        return real(name)
++
++    monkeypatch.setattr(timing, "span", span)
++    return spans
++
++
++def test_lock_miss_records_only_due(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++    collected, sent = [], []
++    reporter = mm.Reporter(
++        lambda sample: sent.append(sample),
++        collect_fn=lambda: collected.append(1) or {"cpus": 1},
++        clock=lambda: 0.0,
++    )
++    release, held = threading.Event(), threading.Event()
++
++    def hold():
++        reporter._lock.acquire()
++        held.set()
++        release.wait(5)
++        reporter._lock.release()
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    assert held.wait(5)
++    try:
++        assert sync_cpu.step(report, reporter) is False
++    finally:
++        release.set()
++        thread.join(5)
++    assert collected == [] and sent == []
++    assert details == [("sync.detail/report.due", False)]
++    assert sum(loop_accounting._copy_accounted().values()) == 0
++
++
++def test_clock_not_due_records_only_due_and_releases_the_lock(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++    collected = []
++    reporter = mm.Reporter(
++        lambda sample: None,
++        collect_fn=lambda: collected.append(1) or {"cpus": 1},
++        clock=lambda: 1.0,
++    )
++    reporter.next_at = 100.0
++    assert sync_cpu.step(report, reporter) is False
++    assert collected == []
++    assert details == [("sync.detail/report.due", False)]
++    assert reporter._lock.acquire(blocking=False)
++    reporter._lock.release()
++
++
++def test_due_report_times_collect_and_send_only(accounting, monkeypatch):
++    now = [20.0]
++    monkeypatch.setattr(sync_cpu.time, "thread_time", lambda: now[0])
++    details = _spy(monkeypatch)
++    spans = _spans(monkeypatch)
++    sent = []
++    reporter_box = []
++
++    def collect():
++        now[0] += 0.4
++        return {"cpus": 3, "claiming": 0}
++
++    def limit():
++        now[0] += 0.9
++        return (cpu.OFF, None)
++
++    def send(sample):
++        assert not reporter_box[0]._lock.acquire(blocking=False)
++        now[0] += 0.2
++        sent.append(dict(sample))
++
++    reporter = mm.Reporter(send, collect_fn=collect, clock=lambda: 5.0, cpu_limit_fn=limit)
++    reporter_box.append(reporter)
++    assert sync_cpu.step(report, reporter) is True
++    assert sent == [{"cpus": 3, "claiming": 0}]
++    assert spans == ["collect", "limit", "send"]
++    assert "due" not in spans
++    assert details == [
++        ("sync.detail/report.due", False),
++        ("sync.detail/report.collect", False),
++        ("sync.detail/report.send", False),
++    ]
++    stats = loop_accounting.counters()
++    assert stats["sync.detail/report.collect"]["cpu_s"] == pytest.approx(0.4)
++    assert stats["sync.detail/report.send"]["cpu_s"] == pytest.approx(0.2)
++    assert stats["sync.detail/report.due"]["cpu_s"] == pytest.approx(0.0)
++    assert sum(loop_accounting._copy_accounted().values()) == 0
++    assert reporter._lock.acquire(blocking=False)
++    reporter._lock.release()
++
++
++def test_send_error_is_recorded_and_not_raised(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++
++    def send(_sample):
++        raise OSError("network down")
++
++    reporter = mm.Reporter(send, collect_fn=lambda: {"cpus": 1}, clock=lambda: 3.0)
++    assert sync_cpu.step(report, reporter) is False
++    assert reporter.next_at == 3.0 + mm.REPORT_EVERY_S
++    assert ("sync.detail/report.send", False) in details
++    assert ("sync.detail/report.collect", False) in details
++    assert reporter._lock.acquire(blocking=False)
++    reporter._lock.release()
++
++
++def test_old_board_backoff_still_records_send(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++
++    def send(_sample):
++        raise ksc.HubError(404, "not found")
++
++    reporter = mm.Reporter(send, collect_fn=lambda: {"cpus": 1}, clock=lambda: 8.0)
++    assert sync_cpu.step(report, reporter) is False
++    assert reporter.next_at == 8.0 + mm.UNSUPPORTED_RETRY_S
++    assert ("sync.detail/report.send", False) in details
++
++
++def test_collect_error_records_collect_and_skips_send(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++    sent = []
++
++    def collect():
++        raise RuntimeError("census")
++
++    reporter = mm.Reporter(lambda sample: sent.append(sample), collect_fn=collect, clock=lambda: 2.0)
++    assert sync_cpu.step(report, reporter) is False
++    assert sent == []
++    assert reporter.next_at == 2.0 + mm.REPORT_EVERY_S
++    names = [name for name, _outer in details]
++    assert names.count("sync.detail/report.collect") == 1
++    assert "sync.detail/report.send" not in names
++
++
++def test_withheld_report_collects_without_sending(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++    sent = []
++    reporter = mm.Reporter(
++        lambda sample: sent.append(sample),
++        collect_fn=lambda: {"cpus": 1},
++        clock=lambda: 100.0,
++        cpu_limit_fn=lambda: (cpu.ON, 50.0),
++        cpu_take_fn=lambda limit: None,
++    )
++    reporter.sent_at = 99.0
++    assert sync_cpu.step(report, reporter) is False
++    assert sent == [] and reporter.suppressed == 1
++    names = [name for name, _outer in details]
++    assert "sync.detail/report.due" in names
++    assert "sync.detail/report.collect" in names
++    assert "sync.detail/report.send" not in names
++
++
++def test_downgrade_retry_times_each_send_call(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++    calls = []
++
++    def send(sample):
++        calls.append("claiming" in sample)
++        if "claiming" in sample:
++            raise ksc.HubError(400, "unknown field(s): claiming")
++        return {}
++
++    reporter = mm.Reporter(
++        send,
++        collect_fn=lambda: {"cpus": 1, "claiming": 1},
++        clock=lambda: 1.0,
++        cpu_limit_fn=lambda: (cpu.OFF, None),
++    )
++    assert sync_cpu.step(report, reporter) is True
++    assert calls == [True, False]
++    sends = [item for item in details if item[0] == "sync.detail/report.send"]
++    assert sends == [("sync.detail/report.send", False), ("sync.detail/report.send", False)]
++    assert reporter.claiming_off_until == 1.0 + mm.UNSUPPORTED_RETRY_S
++
++
++def test_report_tick_skip_is_not_a_due_detail(accounting, monkeypatch):
++    details = _spy(monkeypatch)
++    reporter = mm.Reporter(lambda sample: None, collect_fn=lambda: {"cpus": 1}, clock=lambda: 0.0)
++    reporter.next_at = 1000.0
++    assert reporter.report_tick(lambda sample: None) is None
++    assert details == []
+-- 
+2.43.0
+

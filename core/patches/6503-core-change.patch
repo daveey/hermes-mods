@@ -1,0 +1,143 @@
+From d9f8bc052e551176fdfa8fd39799a89623a55bfa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:39:33 +0000
+Subject: [PATCH 6503] Session list reads, status checkpoints and early startup
+
+Public mirror of source commit d9f8bc052e551176fdfa8fd39799a89623a55bfa.
+
+---
+diff --git a/hermes_cli/web_server_sessions.py b/hermes_cli/web_server_sessions.py
+index 7cd4ae926be..a615f20a307 100644
+--- a/hermes_cli/web_server_sessions.py
++++ b/hermes_cli/web_server_sessions.py
+@@ -411,13 +411,15 @@
+     )
+ 
+     def _open_probed():
+-        identity = _file_identity(db_path)  # before connecting: a swap during the open never matches
++        identity = _file_identity(db_path)  # before connecting, and again after: a swap during the open
+         db = SessionDB(db_path=db_path, read_only=True)
+         try:
+             conn = getattr(db, "_conn", None)
+             if conn is not None:
+                 probes = _session_db_read_probe_statements()
+-                key = _probe_key(conn, identity, probes)
++                # The connection may have opened a file that replaced the stat'd one; only an identity unchanged
++                # across the connect proves which file this connection reads. Otherwise probe, as before.
++                key = _probe_key(conn, identity, probes) if _file_identity(db_path) == identity else None
+                 with _PROBED_LOCK:
+                     probed = key is not None and key in _PROBED_STORES
+                 if not probed:
+diff --git a/hermes_state_page_pack.py b/hermes_state_page_pack.py
+index ce9437acea9..ad9531214c2 100644
+--- a/hermes_state_page_pack.py
++++ b/hermes_state_page_pack.py
+@@ -50,8 +50,10 @@
+     """``conn.execute(sql, params).fetchall()`` as tuples in ONE statement and one handed-out row. [daveey]
+ 
+     For a reader whose ``width`` result columns are known: no prepare-only probe for their names, the columns are
+-    renamed by position (a wrong ``width`` fails at prepare). Same transport as ``read_page``: SQLite types, row
+-    order and binary64 values are preserved."""
++    renamed by position (a wrong ``width`` fails at prepare). Same transport as ``read_page``: SQLite types and row
++    order are preserved; REAL travels as ``printf('%!.26g')`` text, whose round trip is exact only as far as the
++    SQLite build's printf is (this runtime's is; Apple's system SQLite 3.51.0 was 1 ULP off on some doubles, and
++    -0.0 arrives as 0.0). ``test_kanban_external_read_rows`` guards this interpreter's SQLite."""
+     cols = [f"_pack_c{i}" for i in range(width)]
+     packed = conn.execute(
+         f"WITH _packed_rows({','.join(cols)}) AS MATERIALIZED ({sql}) "
+diff --git a/tests/hermes_cli/test_browse_probe_memo.py b/tests/hermes_cli/test_browse_probe_memo.py
+index 97f2b6526fb..1b057199423 100644
+--- a/tests/hermes_cli/test_browse_probe_memo.py
++++ b/tests/hermes_cli/test_browse_probe_memo.py
+@@ -118,3 +118,30 @@
+         with pytest.raises(HTTPException):
+             _browse(path)
+     assert probes.runs == 2 and not getattr(wss, "_PROBED_STORES", set())
++
++
++def test_a_store_swapped_in_during_the_open_is_probed(tmp_path, probes, monkeypatch):
++    """The stat before the connect saw the cached store; the connect opened the one that replaced it."""
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    _browse(path)
++    other = _store(tmp_path / "profiles" / "other" / "state.db")
++    with closing(sqlite3.connect(path)) as a, closing(sqlite3.connect(other)) as b:
++        cookie = a.execute("PRAGMA schema_version").fetchone()[0]
++        # Same cookie: only the identity can tell the two stores apart.
++        assert b.execute("PRAGMA schema_version").fetchone()[0] == cookie
++    real = wss._file_identity
++    calls = []
++
++    def swapping(p):
++        seen = real(p)
++        if not calls:  # the pre-connect stat: then the swap, before SessionDB connects
++            os.replace(other, path)
++            for suffix in ("-wal", "-shm"):
++                if os.path.exists(f"{path}{suffix}"):
++                    os.remove(f"{path}{suffix}")
++        calls.append(seen)
++        return seen
++
++    monkeypatch.setattr(wss, "_file_identity", swapping)
++    assert _browse(path) == ["kept"]
++    assert probes.runs == 2  # the swapped-in store was probed, not taken for the cached one
+diff --git a/tests/hermes_cli/test_kanban_external_read_rows.py b/tests/hermes_cli/test_kanban_external_read_rows.py
+index 1c2aba98b9e..491d08dee08 100644
+--- a/tests/hermes_cli/test_kanban_external_read_rows.py
++++ b/tests/hermes_cli/test_kanban_external_read_rows.py
+@@ -183,6 +183,12 @@
+     plan = " | ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params))
+     # Not idx_events_task (task_id, created_at), which walked every event of each card.
+     assert "idx_events_kind_task_id" in plan and "idx_events_task " not in plan + " ", plan
++    kph = ",".join("?" for _ in kwi.PARK_EVENT_KINDS)
++    old_plan = " | ".join(r[3] for r in conn.execute(
++        "EXPLAIN QUERY PLAN SELECT e.task_id, e.kind, e.payload, e.created_at FROM task_events e WHERE e.id IN ("
++        "SELECT MAX(id) FROM task_events WHERE task_id IN (SELECT value FROM json_each(?)) "
++        f"AND kind IN ({kph}) GROUP BY task_id)", (json.dumps(_ids(conn)), *kwi.PARK_EVENT_KINDS)))
++    assert "idx_events_task " in old_plan + " " and "idx_events_kind_task_id" not in old_plan, old_plan
+ 
+ 
+ def test_a_board_without_task_events_keeps_status_only_rows():
+@@ -252,6 +258,13 @@
+         counted = Counting(conn)
+         got = kew.card_states(counted, [a, other, "missing", b], now=time.time())
+         assert set(got) == {a, b}
++        more = [park(conn, 9110 + i) for i in range(8)]
++        tick(conn, gh, clock)
++        wide = Counting(conn)
++        got = kew.card_states(wide, [a, other, "missing", b, *more], now=time.time())
++        assert set(got) == {a, b, *more}
++        # 2 vs 10 scheduled cards: the same rows handed out (the old statuses read was one row per card).
++        assert wide.rows == counted.rows and wide.statements == counted.statements, (counted.rows, wide.rows)
+ 
+ 
+ def test_read_rows_is_fetchall_in_one_statement_and_one_row():
+@@ -273,3 +286,26 @@
+     assert read_rows(conn, "SELECT a FROM v WHERE 0", (), 1) == []
+     with pytest.raises(sqlite3.Error):
+         read_rows(conn, sql, params, 2)  # a wrong width fails at prepare, never a silent reshape
++
++
++def test_read_rows_carries_hard_doubles_bit_exactly_on_this_sqlite():
++    """``printf('%!.26g')`` is only as exact as the SQLite build's printf (Apple's 3.51.0 was 1 ULP off): fail here,
++    not as a silently drifted timestamp, if this interpreter's SQLite loses a bit."""
++    import random
++    import struct
++
++    from hermes_state_page_pack import read_rows
++
++    rng = random.Random(20261125)
++    doubles = [5e-324, 2.2250738585072014e-308, 2.225073858507201e-308, float(2**53 + 1), 2.0**53 + 2, 0.1 + 0.2,
++               1 / 3, 1.7976931348623157e308, -1e-310, 1_700_000_000.123456789, 9007199254740993.0, 1e23, 5e-310]
++    while len(doubles) < 2000:
++        (x,) = struct.unpack("<d", rng.getrandbits(64).to_bytes(8, "little"))
++        if x == x and x not in (float("inf"), float("-inf")) and not (x == 0 and str(x).startswith("-")):
++            doubles.append(x)
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE d (i INTEGER, x REAL)")
++    conn.executemany("INSERT INTO d VALUES (?, ?)", enumerate(doubles))
++    got = read_rows(conn, "SELECT x FROM d ORDER BY i", (), 1)
++    lost = [(x, y) for (y,), x in zip(got, doubles) if struct.pack("<d", x) != struct.pack("<d", y)]
++    assert not lost, (sqlite3.sqlite_version, lost[:5])
+-- 
+2.43.0
+

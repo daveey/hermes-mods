@@ -1,0 +1,920 @@
+From a9c93214ed54bc090bd18bf962bdbb7e3995cb90 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:52:39 +0000
+Subject: [PATCH 6058] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit a9c93214ed54bc090bd18bf962bdbb7e3995cb90.
+
+---
+diff --git a/hermes_cli/serve_producer_admission.py b/hermes_cli/serve_producer_admission.py
+index d042f8f13e8..f9bbbaf1432 100644
+--- a/hermes_cli/serve_producer_admission.py
++++ b/hermes_cli/serve_producer_admission.py
+@@ -15,7 +15,7 @@
+ import tempfile
+ import threading
+ import time
+-from dataclasses import asdict, dataclass
++from dataclasses import asdict, dataclass, replace
+ from pathlib import Path
+ 
+ from hermes_cli.serve_producer_census import (
+@@ -23,6 +23,7 @@
+     _bounded_names, _read_bytes, read_ledger_strict,
+ )
+ from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody, _acquire_runtime
++from hermes_cli.serve_producer_identity import ProcessKey, observation_digest, receipt_key
+ 
+ SUPPORTED_LAUNCHES = frozenset(('serve', 'dashboard', 'gateway', 'agent_startup',
+                                 'tui_gateway', 'gateway_spawner', 'plugin_host', 'producer_broker'))
+@@ -30,7 +31,8 @@
+ LAUNCH_SOURCES = ('hermes_cli/main.py', 'gateway/run.py', 'tui_gateway/entry.py',
+                   'hermes_cli/gateway_runtime_start.py', 'hermes_cli/plugin_host_child.py',
+                   'hermes_cli/serve_producer_admission.py', 'hermes_cli/serve_producer_census.py',
+-                  'hermes_cli/serve_producer_process.py', 'hermes_cli/serve_producer_enrollment.py')
++                  'hermes_cli/serve_producer_process.py', 'hermes_cli/serve_producer_enrollment.py',
++                  'hermes_cli/serve_producer_identity.py')
+ _MAX_PARTICIPANTS = 8192
+ _MAX_RECEIPTS = 8 * 1024 * 1024
+ 
+@@ -46,10 +48,9 @@
+     guarded: bool = False
+ 
+ 
+-def observation_digest(record) -> str:
+-    """Bind receipt to observed exec identity without persisting argv or environment."""
+-    return hashlib.sha256(json.dumps(asdict(record), sort_keys=True,
+-                                     ensure_ascii=True).encode('ascii')).hexdigest()
++    @property
++    def key(self) -> ProcessKey:
++        return receipt_key(self)
+ 
+ 
+ def launcher_generation(installation: Path) -> str:
+@@ -111,7 +112,7 @@
+         if not allow_foreign_namespace and any(
+                 row.identity.boot_id == boot and row.namespace != namespace for row in receipts):
+             raise CensusUnavailable('foreign pid namespace')
+-        if len({receipt.identity for receipt in receipts}) != len(receipts):
++        if len({receipt.key for receipt in receipts}) != len(receipts):
+             raise CensusUnavailable('duplicate participant incarnation')
+         if _read_bytes(path, _MAX_RECEIPTS, nofollow=True) != raw:
+             raise CensusUnavailable('participant ledger changed')
+@@ -120,20 +121,58 @@
+         raise CensusUnavailable(f'participants:{type(exc).__name__}') from exc
+ 
+ 
+-def incarnation_exited(adapter: LinuxProcessCensus, identity: Incarnation) -> bool:
+-    """Positive retirement includes PID reuse, never permission failure or a new boot."""
+-    if adapter.boot_id() != identity.boot_id:
++def incarnation_exited(adapter: LinuxProcessCensus, key: ProcessKey) -> bool:
++    """Only probe our namespace. Changed exec is uncertainty, NOT retirement."""
++    if not isinstance(key, ProcessKey):
++        raise CensusUnavailable('full launcher identity required')
++    if adapter.boot_id() != key.boot_id:
+         raise CensusUnavailable('retirement boot changed')
++    if adapter.namespace_id() != key.namespace:
++        raise CensusUnavailable('retirement foreign pid namespace')
+     try:
+-        current = adapter.identity(identity.pid, identity.boot_id)
+-    except FileNotFoundError:
+-        current = None
+-    if adapter.boot_id() != identity.boot_id:
++        current = adapter.read_process(key.pid, key.boot_id).key
++    except OSError:
++        # Missing cmdline/exe/environment is not process death. Recheck the raw
++        # kernel birth; preserve the expected launcher component, never mint one.
++        try:
++            birth = adapter.identity(key.pid, key.boot_id)
++        except FileNotFoundError:
++            current = None
++        else:
++            current = replace(key, boot_id=birth.boot_id, pid=birth.pid,
++                              start_ticks=birth.start_ticks, namespace=adapter.namespace_id())
++            if current == key:
++                raise CensusUnavailable('live launcher observation unavailable') from None
++    if adapter.boot_id() != key.boot_id:
+         raise CensusUnavailable('retirement boot changed')
+-    return current != identity
++    if adapter.namespace_id() != key.namespace:
++        raise CensusUnavailable('retirement namespace changed')
++    if current is not None and replace(current, start_ticks=key.start_ticks,
++                                       launcher_incarnation=key.launcher_incarnation) != key:
++        raise CensusUnavailable('incoherent retirement observation')
++    if current == key:
++        return False
++    if current is not None and replace(current, launcher_incarnation=key.launcher_incarnation) == key:
++        return False  # changed exec is not positive process retirement; retain old evidence
++    return True
++
++
++def _retain_receipt(adapter, row, receipt) -> bool:
++    """Launch compatibility never turns uncertain retirement into deletion."""
++    key = row.key
++    if key.namespace != receipt.key.namespace:
++        return True
++    if key.boot_id != receipt.key.boot_id or key == receipt.key:
++        return False
++    try:
++        return not incarnation_exited(adapter, key)
++    except (OSError, ValueError, IndexError, CensusUnavailable):
++        return True
+ 
+ 
+ def _write_participants(runtime: Path, receipts):
++    if len({row.key for row in receipts}) != len(receipts):
++        raise CensusUnavailable('duplicate participant incarnation')
+     raw = json.dumps([asdict(receipt) for receipt in receipts], ensure_ascii=True).encode('ascii')
+     if len(raw) > _MAX_RECEIPTS:
+         raise CensusUnavailable('participant byte budget')
+@@ -191,16 +230,13 @@
+         boot = adapter.boot_id()
+         record = adapter.read_process(os.getpid(), boot)
+         receipt = LaunchReceipt(record.identity, str(installation), launcher_generation(installation),
+-                                role, observation_digest(record), adapter.namespace_id())
+-        namespace = adapter.namespace_id()
++                                role, observation_digest(record), record.namespace)
+         # Foreign-namespace rows cannot be probed from here: keep them (never proof of absence);
+         # the census refuses them, so the cut stays INCOMPLETE until their namespace retires them.
+-        kept = [row for row in receipts if row.identity.boot_id == boot
+-                and row.identity != record.identity
+-                and (row.namespace != namespace or not incarnation_exited(adapter, row.identity))]
++        kept = [row for row in receipts if _retain_receipt(adapter, row, receipt)]
+         if len(kept) >= _MAX_PARTICIPANTS:
+             raise CensusUnavailable('participant count budget')
+-        if adapter.read_process(os.getpid(), boot) != record or adapter.boot_id() != boot:
++        if adapter.read_process(os.getpid(), boot).key != receipt.key or adapter.boot_id() != boot:
+             raise CensusUnavailable('enrolling process changed')
+         _write_participants(runtime, (*kept, receipt))
+         if receipt not in read_participants_strict(runtime, allow_foreign_namespace=True):
+@@ -322,23 +358,22 @@
+ def classify_process(record, participants: tuple[LaunchReceipt, ...], generation: str,
+                      *, installation: str, home: str = '') -> Classification:
+     """Exact enrollment is unguarded legacy; unrelated needs a path-free identity."""
+-    namespace = LinuxProcessCensus().namespace_id()
+-    matching = [row for row in participants if row.identity == record.identity and row.namespace == namespace
++    matching = [row for row in participants if row.key == record.key
+                 and row.installation == installation
+-                and row.observation == observation_digest(record) and row.generation == generation]
++                and row.generation == generation]
+     if len(matching) == 1:
+         receipt = matching[0]
+         # No broker/custody hook exists yet, even an in-memory guarded bit is not authority.
+-        return Classification(record.identity, 'legacy',
++        return Classification(record.key, 'legacy',
+                               f'enrollment:{receipt.generation}:{receipt.role}')
+     module = _module_token(record.argv)
+     if module in _KNOWN_MODULES:
+         # Explicit Hermes launcher: a separate install sharing the default home, or an
+         # editable/.pth import, leaves no path evidence, so it is never positively unrelated.
+-        return Classification(record.identity, 'legacy', f'launcher:{module}')
++        return Classification(record.key, 'legacy', f'launcher:{module}')
+     if not _record_touches(record, installation, home):
+-        return Classification(record.identity, 'unrelated', f'exe:{record.exe}')
+-    return Classification(record.identity, 'unknown', 'no exact guarded launch receipt')
++        return Classification(record.key, 'unrelated', f'exe:{record.exe}')
++    return Classification(record.key, 'unknown', 'no exact guarded launch receipt')
+ 
+ # Each collector must enumerate its exact configured scope (including disabled or
+ # empty scope receipts), distinguish errors and return positive evidence refs.
+@@ -358,7 +393,7 @@
+ 
+ @dataclass(frozen=True)
+ class Classification:
+-    identity: Incarnation
++    identity: ProcessKey
+     kind: str  # participant or positively unrelated; legacy/unknown are conflicts
+     proof: str
+ 
+@@ -371,8 +406,8 @@
+     census: ProcessCensus | None
+     collectors: tuple[tuple[str, CollectorEvidence], ...]
+     classifications: tuple[Classification, ...]
+-    legacy_candidates: tuple[Incarnation, ...]
+-    retired: tuple[Incarnation, ...]
++    legacy_candidates: tuple[ProcessKey, ...]
++    retired: tuple[ProcessKey, ...]
+     errors: tuple[str, ...]
+     _acquisition: object
+ 
+@@ -412,7 +447,7 @@
+             raise AdmissionUnavailable('launch gate must remain held by collecting process')
+ 
+     def inspect(self, *, boot_id: str, generation: str, installation: str,
+-                census, collectors: dict, classify, legacy_candidates: tuple[Incarnation, ...],
++                census, collectors: dict, classify, legacy_candidates: tuple[ProcessKey, ...],
+                 exited) -> AdmissionCut:
+         """Run strict host observations inside the gate; never from an HTTP path.
+ 
+@@ -432,6 +467,8 @@
+                 _classify(record, classify, classified, errors)
+         for identity in legacy_candidates:
+             try:
++                if not isinstance(identity, ProcessKey):
++                    raise CensusUnavailable('full launcher identity required')
+                 if exited(identity) is not True:
+                     errors.append(f'legacy:{identity.pid}:not_retired')
+                 else:
+@@ -486,7 +523,7 @@
+ def _classify(record, callback, classified, errors):
+     try:
+         result = callback(record)
+-        if not isinstance(result, Classification) or result.identity != record.identity:
++        if not isinstance(result, Classification) or result.identity != record.key:
+             errors.append(f'pid:{record.identity.pid}:classification_identity')
+             return
+         classified.append(result)
+@@ -676,7 +713,7 @@
+ 
+ 
+ def inspect_host(runtime: Path, installation: Path, *, root: Path, timeout: float = 10,
+-                  legacy_candidates: tuple[Incarnation, ...] = (), broker=None) -> AdmissionCut:
++                  legacy_candidates: tuple[ProcessKey, ...] = (), broker=None) -> AdmissionCut:
+     """Gate-held strict cut. Enrollment remains unguarded; COMPLETE stays conservative."""
+     if sys.platform != 'linux':
+         raise AdmissionUnavailable('no linux census adapter')
+diff --git a/hermes_cli/serve_producer_census.py b/hermes_cli/serve_producer_census.py
+index ac831f07154..0bf8d8d8fcd 100644
+--- a/hermes_cli/serve_producer_census.py
++++ b/hermes_cli/serve_producer_census.py
+@@ -17,6 +17,8 @@
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++from hermes_cli.serve_producer_identity import process_key
++
+ MAX_PROCESSES = 8192
+ MAX_OBSERVATION_BYTES = 32 * 1024 * 1024
+ _MAX_PROC_FILE = 1024 * 1024
+@@ -35,6 +37,7 @@
+ 
+ @dataclass(frozen=True, order=True)
+ class Incarnation:
++    """Raw kernel birth probe, NOT an admission/retirement identity."""
+     boot_id: str
+     pid: int
+     start_ticks: int
+@@ -47,6 +50,11 @@
+     cwd: str
+     argv: tuple[str, ...]
+     environment: tuple[tuple[str, str], ...]
++    namespace: str = 'pid:[0]'  # synthetic observations cannot match real enrollment
++
++    @property
++    def key(self):
++        return process_key(self)
+ 
+     @property
+     def retained_bytes(self) -> int:
+@@ -132,6 +140,8 @@
+ 
+     def namespace_id(self) -> str:
+         """PID numbers are meaningful only inside the same kernel PID namespace."""
++        if self.root == Path('/proc') and os.readlink(self.root / 'self') != str(os.getpid()):
++            raise CensusUnavailable('proc mount uses foreign pid numbering')
+         value = os.readlink(self.root / 'self/ns/pid')
+         if not value.startswith('pid:[') or not value.endswith(']') or not value[5:-1].isdecimal():
+             raise CensusUnavailable('invalid pid namespace')
+@@ -172,14 +182,16 @@
+         return exe, cwd, argv, tuple(sorted(environment))
+ 
+     def read_process(self, pid: int, boot: str) -> ProcessObservation:
++        namespace = self.namespace_id()
+         identity = self.identity(pid, boot)
+         details = self._details(pid)
+         # exec preserves startticks: compare actual executable/argv/env/cwd too.
+         # This detects observed mutation, not an atomic kernel-wide snapshot;
+         # supported launch fencing and strict classification remain mandatory.
+-        if self._details(pid) != details or self.identity(pid, boot) != identity:
++        if (self._details(pid) != details or self.identity(pid, boot) != identity
++                or self.namespace_id() != namespace):
+             raise IncarnationChanged('process changed while reading')
+-        return ProcessObservation(identity, *details)
++        return ProcessObservation(identity, *details, namespace)
+ 
+     def _observe(self, pid, boot, processes, exited, errors):
+         identity = None
+@@ -214,6 +226,7 @@
+         processes, exited, errors = [], [], []
+         try:
+             boot = self.boot_id()
++            namespace = self.namespace_id()
+             pids = self.pids()
+             if len(pids) > MAX_PROCESSES:
+                 raise CensusUnavailable('process_budget')
+@@ -230,12 +243,14 @@
+                 errors.append('census:membership_changed')
+             for record in processes:
+                 try:
+-                    if self.read_process(record.identity.pid, boot) != record:
++                    if self.read_process(record.key.pid, boot).key != record.key:
+                         errors.append(f'pid:{record.identity.pid}:final_identity_changed')
+                 except (OSError, ValueError, IndexError, CensusUnavailable) as exc:
+                     errors.append(f'pid:{record.identity.pid}:final:{type(exc).__name__}')
+             if self.boot_id() != boot:
+                 errors.append('census:boot_changed')
++            if self.namespace_id() != namespace:
++                errors.append('census:namespace_changed')
+         except CensusUnavailable as exc:
+             errors.append(f'census:{exc}')
+         except (OSError, ValueError, IndexError) as exc:
+diff --git a/hermes_cli/serve_producer_enrollment.py b/hermes_cli/serve_producer_enrollment.py
+index 68922027735..b5df3c52ef3 100644
+--- a/hermes_cli/serve_producer_enrollment.py
++++ b/hermes_cli/serve_producer_enrollment.py
+@@ -11,7 +11,7 @@
+ 
+ from hermes_cli.serve_producer_admission import (
+     AdmissionUnavailable, LaunchGate, classify_process, enroll_launch,
+-    launcher_generation, observation_digest, read_participants_strict,
++    launcher_generation, read_participants_strict,
+ )
+ from hermes_cli.serve_producer_census import LinuxProcessCensus
+ from hermes_cli.serve_producer_custody import FamilyCustody
+@@ -43,8 +43,7 @@
+             if len(record.argv) < 5 or record.argv[1:4] != ('-I', expected, 'broker'):
+                 raise AdmissionUnavailable('only exec broker can claim custody enrollment')
+             if (ticket not in read_participants_strict(runtime)
+-                    or ticket.identity != record.identity
+-                    or ticket.observation != observation_digest(record)):
++                    or ticket.key != record.key):
+                 raise AdmissionUnavailable('broker enrollment changed')
+             owner = FamilyCustody.acquire(runtime, 'panel')
+             try:
+@@ -55,11 +54,11 @@
+ 
+     def matches(self, record, *, runtime, installation, generation):
+         """Read local custody, never trust ticket.guarded or a caller readiness bit."""
+-        if (self.owner.fd is None or record.identity.pid != os.getpid()
++        if (self.owner.fd is None
+                 or Path(runtime).resolve() != self.runtime
+                 or str(self.installation) != installation
+-                or self.ticket.identity != record.identity
+-                or self.ticket.observation != observation_digest(record)
++                or self.ticket.key != record.key
++                or LinuxProcessCensus().read_process(os.getpid(), self.ticket.key.boot_id).key != self.ticket.key
+                 or self.ticket.generation != generation
+                 or launcher_generation(self.installation) != generation):
+             return False
+@@ -88,5 +87,5 @@
+     if (baseline.kind == 'legacy' and type(broker) is BrokerEnrollment
+             and broker.ticket in participants
+             and broker.matches(record, runtime=runtime, installation=installation, generation=generation)):
+-        return Classification(record.identity, 'participant', f'panel-broker-custody:{generation}')
++        return Classification(record.key, 'participant', f'panel-broker-custody:{generation}')
+     return baseline
+diff --git a/hermes_cli/serve_producer_identity.py b/hermes_cli/serve_producer_identity.py
+new file mode 100644
+index 00000000000..6c5de4cb805
+--- /dev/null
++++ b/hermes_cli/serve_producer_identity.py
+@@ -0,0 +1,37 @@
++"""One admission identity; kernel birth probes alone never authorize a launcher.
++
++Launcher incarnation is the digest of the twice-read exec observation (including
++its namespace), not the mutable on-disk source generation. A changed exec is
++uncertainty, not proof of retirement. Source generation is checked separately.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import asdict, dataclass
++
++
++@dataclass(frozen=True)
++class ProcessKey:
++    boot_id: str
++    namespace: str
++    pid: int
++    start_ticks: int
++    launcher_incarnation: str
++
++
++def observation_digest(record) -> str:
++    return hashlib.sha256(json.dumps(asdict(record), sort_keys=True,
++                                     ensure_ascii=True).encode('ascii')).hexdigest()
++
++
++def process_key(record) -> ProcessKey:
++    birth = record.identity
++    return ProcessKey(birth.boot_id, record.namespace, birth.pid, birth.start_ticks,
++                      observation_digest(record))
++
++
++def receipt_key(receipt) -> ProcessKey:
++    birth = receipt.identity
++    return ProcessKey(birth.boot_id, receipt.namespace, birth.pid, birth.start_ticks,
++                      receipt.observation)
+diff --git a/tests/hermes_cli/test_serve_producer_admission.py b/tests/hermes_cli/test_serve_producer_admission.py
+index ae653d0489d..cf604495c4b 100644
+--- a/tests/hermes_cli/test_serve_producer_admission.py
++++ b/tests/hermes_cli/test_serve_producer_admission.py
+@@ -20,7 +20,7 @@
+ 
+ 
+ def _classified(record):
+-    return admission.Classification(record.identity, 'participant', 'verified-launch-receipt')
++    return admission.Classification(record.key, 'participant', 'verified-launch-receipt')
+ 
+ 
+ def _cut(gate, **kwargs):
+@@ -84,7 +84,7 @@
+ @pytest.mark.parametrize('kind', ['legacy', 'unknown'])
+ def test_unknown_python_and_legacy_snapshots_never_admit(tmp_path, kind):
+     with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
+-        cut = _cut(gate, classify=lambda record: admission.Classification(record.identity, kind, '/snapshot'))
++        cut = _cut(gate, classify=lambda record: admission.Classification(record.key, kind, '/snapshot'))
+         assert not cut.complete
+         with pytest.raises(admission.AdmissionUnavailable, match='incomplete'):
+             gate.require(cut, boot_id='boot', generation='generation', installation='/installation')
+@@ -92,7 +92,7 @@
+ 
+ @pytest.mark.platforms('posix')
+ def test_legacy_spawner_must_be_affirmatively_retired_not_missing_from_census(tmp_path):
+-    legacy = Incarnation('boot', 456, 7)
++    legacy = ProcessObservation(Incarnation('boot', 456, 7), '/python', '/old', ('python',), ()).key
+     with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
+         assert not _cut(gate, legacy_candidates=(legacy,)).complete
+         assert _cut(gate, legacy_candidates=(legacy,), exited=lambda value: value == legacy).complete
+@@ -108,4 +108,4 @@
+         assert not cut.complete
+         assert not _cut(gate, census=lambda: replace(_processes(), boot_id='old-boot')).complete
+         assert not _cut(gate, classify=lambda record: admission.Classification(
+-            replace(record.identity, start_ticks=41), 'participant', 'wrong-incarnation')).complete
++            replace(record.key, start_ticks=41), 'participant', 'wrong-incarnation')).complete
+diff --git a/tests/hermes_cli/test_serve_producer_census.py b/tests/hermes_cli/test_serve_producer_census.py
+index 17809120efb..28069672146 100644
+--- a/tests/hermes_cli/test_serve_producer_census.py
++++ b/tests/hermes_cli/test_serve_producer_census.py
+@@ -24,6 +24,8 @@
+ def _reader(tmp_path):
+     (tmp_path / 'sys/kernel/random').mkdir(parents=True)
+     (tmp_path / 'sys/kernel/random/boot_id').write_text('test-boot\n')
++    (tmp_path / 'self/ns').mkdir(parents=True)
++    (tmp_path / 'self/ns/pid').symlink_to('pid:[42]')
+     return census.LinuxProcessCensus(tmp_path)
+ 
+ 
+diff --git a/tests/hermes_cli/test_serve_producer_collectors.py b/tests/hermes_cli/test_serve_producer_collectors.py
+index 64e39ae9c59..c111ee55d4d 100644
+--- a/tests/hermes_cli/test_serve_producer_collectors.py
++++ b/tests/hermes_cli/test_serve_producer_collectors.py
+@@ -102,7 +102,7 @@
+         cut = gate.inspect(
+             boot_id='boot', generation='generation', installation=str(installation),
+             census=lambda: census, collectors=admission.host_collectors(root, installation),
+-            classify=lambda record: admission.Classification(record.identity, 'unrelated', 'exe'),
++            classify=lambda record: admission.Classification(record.key, 'unrelated', 'exe'),
+             legacy_candidates=(), exited=lambda identity: False)
+         assert cut.complete
+         gate.require(cut, boot_id='boot', generation='generation', installation=str(installation))
+diff --git a/tests/hermes_cli/test_serve_producer_enrollment.py b/tests/hermes_cli/test_serve_producer_enrollment.py
+index 3e789e77832..3a66aa17ce1 100644
+--- a/tests/hermes_cli/test_serve_producer_enrollment.py
++++ b/tests/hermes_cli/test_serve_producer_enrollment.py
+@@ -69,8 +69,8 @@
+         with admission.LaunchGate.acquire(runtime) as gate:
+             assert not cut(gate, guarded=False).complete
+             assert cut(gate, guarded=True).complete
+-            assert not cut(gate, guarded=True, legacy=(unrelated.identity,)).complete
+-            assert cut(gate, guarded=True, legacy=(unrelated.identity,), exited=lambda _: True).complete
++            assert not cut(gate, guarded=True, legacy=(unrelated.key,)).complete
++            assert cut(gate, guarded=True, legacy=(unrelated.key,), exited=lambda _: True).complete
+             broker.close()
+             assert not cut(gate, guarded=True).complete
+     finally:
+diff --git a/tests/hermes_cli/test_serve_producer_identity.py b/tests/hermes_cli/test_serve_producer_identity.py
+new file mode 100644
+index 00000000000..f5f54dead2d
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_identity.py
+@@ -0,0 +1,196 @@
++"""Admission identity matrix: namespace/exec changes never become absence evidence."""
++import json
++import os
++from dataclasses import asdict, replace
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++from hermes_cli.serve_producer_census import CensusUnavailable, LinuxProcessCensus
++
++pytestmark = pytest.mark.platforms('linux')
++ROOT = Path(__file__).parents[2]
++
++
++@pytest.mark.parametrize('field,value', [
++    ('boot_id', 'another-boot'), ('namespace', 'pid:[1]'), ('pid', 987654),
++    ('start_ticks', 1), ('launcher_incarnation', 'a' * 64),
++])
++def test_each_component_changes_identity_and_cannot_reuse_enrollment(tmp_path, field, value):
++    receipt = admission.enroll_launch(tmp_path / 'runtime', 'serve', installation=ROOT)
++    adapter = LinuxProcessCensus()
++    record = adapter.read_process(os.getpid(), adapter.boot_id())
++    assert receipt.key == record.key
++    changed = replace(record.key, **{field: value})
++    assert changed != record.key
++    assert len({changed, record.key}) == 2
++    if field == 'namespace':
++        foreign = replace(receipt, namespace=value)
++    elif field == 'launcher_incarnation':
++        foreign = replace(receipt, observation=value)
++    else:
++        foreign = replace(receipt, identity=replace(receipt.identity, **{field: value}))
++    result = admission.classify_process(record, (foreign,), receipt.generation, installation=str(ROOT))
++    assert not result.proof.startswith('enrollment:')
++    assert result.identity == record.key
++
++
++@pytest.mark.parametrize('change,duplicate', [
++    ({}, True), ({'namespace': 'pid:[1]'}, False),
++    ({'identity': {'start_ticks': 1}}, False),
++    ({'identity': {'boot_id': 'previous-boot'}}, False),
++    ({'observation': 'a' * 64}, False),
++    ({'role': 'gateway'}, True), ({'generation': 'a' * 64}, True),
++])
++def test_duplicate_detection_uses_exact_key_not_role_or_source_version(tmp_path, change, duplicate):
++    runtime = tmp_path / 'runtime'
++    local = admission.enroll_launch(runtime, 'serve', installation=ROOT)
++    change = dict(change)
++    if 'identity' in change:
++        change['identity'] = replace(local.identity, **change['identity'])
++    other = replace(local, **change)
++    (runtime / 'participants.json').write_text(json.dumps([asdict(local), asdict(other)]))
++    if duplicate:
++        with pytest.raises(CensusUnavailable, match='duplicate'):
++            admission.read_participants_strict(runtime, allow_foreign_namespace=True)
++    else:
++        assert admission.read_participants_strict(runtime, allow_foreign_namespace=True) == (local, other)
++
++
++@pytest.mark.parametrize('collision', ['same', 'reused', 'other-pid', 'previous-boot'])
++def test_foreign_receipt_survives_repeated_shared_home_launch_without_liveness_probe(tmp_path, monkeypatch, collision):
++    runtime = tmp_path / 'runtime'
++    local = admission.enroll_launch(runtime, 'serve', installation=ROOT)
++    identity = local.identity
++    if collision == 'reused':
++        identity = replace(identity, start_ticks=1)
++    elif collision == 'other-pid':
++        identity = replace(identity, pid=987654)
++    elif collision == 'previous-boot':
++        identity = replace(identity, boot_id='previous-boot')
++    foreign = replace(local, namespace='pid:[1]', identity=identity)
++    (runtime / 'participants.json').write_text(json.dumps([asdict(foreign)]))
++    def forbidden(*_):
++        pytest.fail('foreign namespace must never be probed/retired')
++    monkeypatch.setattr(admission, 'incarnation_exited', forbidden)
++    for _ in range(3):
++        fresh = admission.enroll_launch(runtime, 'serve', installation=ROOT)
++        assert admission.read_participants_strict(runtime, allow_foreign_namespace=True) == (foreign, fresh)
++    if collision != 'previous-boot':
++        with pytest.raises(CensusUnavailable, match='namespace'):
++            admission.read_participants_strict(runtime)
++
++
++@pytest.mark.parametrize('field,value,outcome', [
++    (None, None, False), ('start_ticks', 1, True),
++    ('launcher_incarnation', 'a' * 64, False),
++    ('boot_id', 'previous-boot', 'boot'), ('namespace', 'pid:[1]', 'namespace'),
++])
++def test_retirement_uses_same_key_and_only_positive_kernel_reuse(field, value, outcome):
++    adapter = LinuxProcessCensus()
++    key = adapter.read_process(os.getpid(), adapter.boot_id()).key
++    expected = key if field is None else replace(key, **{field: value})
++    if isinstance(outcome, str):
++        with pytest.raises(CensusUnavailable, match=outcome):
++            admission.incarnation_exited(adapter, expected)
++    else:
++        assert admission.incarnation_exited(adapter, expected) is outcome
++
++
++@pytest.mark.parametrize('failure', [FileNotFoundError, PermissionError])
++def test_missing_live_exec_details_do_not_prove_retirement(monkeypatch, failure):
++    adapter = LinuxProcessCensus()
++    key = adapter.read_process(os.getpid(), adapter.boot_id()).key
++    def denied(*_):
++        raise failure('not process death')
++    monkeypatch.setattr(adapter, 'read_process', denied)
++    with pytest.raises((CensusUnavailable, PermissionError)):
++        admission.incarnation_exited(adapter, key)
++
++
++def test_rechecked_absence_can_retire_exact_launcher(monkeypatch):
++    adapter = LinuxProcessCensus()
++    key = adapter.read_process(os.getpid(), adapter.boot_id()).key
++    def gone(*_):
++        raise FileNotFoundError('positive rechecked exit')
++    monkeypatch.setattr(adapter, 'read_process', gone)
++    monkeypatch.setattr(adapter, 'identity', gone)
++    assert admission.incarnation_exited(adapter, key)
++
++
++@pytest.mark.parametrize('field,value', [('namespace', 'pid:[1]'), ('boot_id', 'wrong-boot'), ('pid', 987654)])
++def test_incoherent_census_result_is_not_retirement(monkeypatch, field, value):
++    adapter = LinuxProcessCensus()
++    record = adapter.read_process(os.getpid(), adapter.boot_id())
++    if field == 'namespace':
++        changed = replace(record, namespace=value)
++    else:
++        changed = replace(record, identity=replace(record.identity, **{field: value}))
++    monkeypatch.setattr(adapter, 'read_process', lambda *_: changed)
++    with pytest.raises(CensusUnavailable, match='incoherent'):
++        admission.incarnation_exited(adapter, record.key)
++
++
++@pytest.mark.parametrize('failure', [PermissionError, FileNotFoundError, IndexError, CensusUnavailable])
++def test_uncertain_own_namespace_receipt_does_not_brick_ordinary_launch(tmp_path, monkeypatch, failure):
++    runtime = tmp_path / 'runtime'
++    local = admission.enroll_launch(runtime, 'serve', installation=ROOT)
++    old = replace(local, identity=replace(local.identity, pid=987654))
++    (runtime / 'participants.json').write_text(json.dumps([asdict(old)]))
++    def uncertain(*_):
++        raise failure('unreadable/zombie/incomplete process observation')
++    monkeypatch.setattr(admission, 'incarnation_exited', uncertain)
++    fresh = admission.enroll_launch(runtime, 'serve', installation=ROOT)
++    assert admission.read_participants_strict(runtime) == (old, fresh)
++
++
++def test_reused_pid_can_retire_even_when_new_owners_exec_is_unreadable(monkeypatch):
++    adapter = LinuxProcessCensus()
++    record = adapter.read_process(os.getpid(), adapter.boot_id())
++    def denied(*_):
++        raise PermissionError('different UID on reused pid')
++    monkeypatch.setattr(adapter, 'read_process', denied)
++    assert admission.incarnation_exited(adapter, replace(record.key, start_ticks=1))
++
++
++def test_raw_birth_probe_cannot_authorize_legacy_retirement(tmp_path):
++    adapter = LinuxProcessCensus()
++    raw = adapter.identity(os.getpid(), adapter.boot_id())
++    with pytest.raises(CensusUnavailable, match='full launcher'):
++        admission.incarnation_exited(adapter, raw)
++
++
++def test_foreign_proc_mount_numbering_cannot_mint_namespace_identity(monkeypatch):
++    original = os.readlink
++    def foreign(path):
++        if Path(path) == Path('/proc/self'):
++            return str(os.getpid() + 1)
++        return original(path)
++    monkeypatch.setattr(os, 'readlink', foreign)
++    with pytest.raises(CensusUnavailable, match='numbering'):
++        LinuxProcessCensus().namespace_id()
++
++
++def test_duplicate_write_refuses_before_replacing_existing_evidence(tmp_path):
++    runtime = tmp_path / 'runtime'
++    local = admission.enroll_launch(runtime, 'serve', installation=ROOT)
++    ledger = runtime / 'participants.json'
++    before = ledger.read_bytes()
++    with pytest.raises(CensusUnavailable, match='duplicate'):
++        admission._write_participants(runtime, (local, replace(local, role='gateway')))
++    assert ledger.read_bytes() == before
++
++
++def test_empty_census_cannot_hide_namespace_change(monkeypatch):
++    adapter = LinuxProcessCensus()
++    calls = 0
++    def namespace():
++        nonlocal calls
++        calls += 1
++        return 'pid:[10]' if calls == 1 else 'pid:[11]'
++    monkeypatch.setattr(adapter, 'pids', lambda: ())
++    monkeypatch.setattr(adapter, 'namespace_id', namespace)
++    observed = adapter.collect()
++    assert not observed.complete
++    assert 'census:namespace_changed' in observed.errors
+diff --git a/tests/hermes_cli/test_serve_producer_launch.py b/tests/hermes_cli/test_serve_producer_launch.py
+index 79268e6ca0a..8da14069485 100644
+--- a/tests/hermes_cli/test_serve_producer_launch.py
++++ b/tests/hermes_cli/test_serve_producer_launch.py
+@@ -108,7 +108,7 @@
+ 
+ def test_retirement_requires_exact_incarnation_and_same_boot():
+     adapter = LinuxProcessCensus()
+-    current = adapter.identity(os.getpid(), adapter.boot_id())
++    current = adapter.read_process(os.getpid(), adapter.boot_id()).key
+     assert admission.incarnation_exited(adapter, current) is False
+     assert admission.incarnation_exited(adapter, replace(current, start_ticks=current.start_ticks + 1)) is True
+     with pytest.raises(CensusUnavailable, match='boot'):
+diff --git a/tests/hermes_cli/test_serve_producer_review_boundaries.py b/tests/hermes_cli/test_serve_producer_review_boundaries.py
+new file mode 100644
+index 00000000000..f82fdbc2338
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_review_boundaries.py
+@@ -0,0 +1,75 @@
++"""Independent review probes; disposable local fixtures only."""
++import os
++import select
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('fifo', [False, True])
++def test_fifo_ledger_does_not_hold_launch_gate_forever(tmp_path, fifo):
++    root = tmp_path / 'home'
++    root.mkdir()
++    if fifo:
++        os.mkfifo(root / 'spawn-ledger.json', 0o600)
++    else:
++        (root / 'spawn-ledger.json').write_text('[]')
++    runtime = tmp_path / 'runtime'
++    script = tmp_path / 'reader.py'
++    script.write_text('''import sys
++from pathlib import Path
++from hermes_cli.serve_producer_admission import LaunchGate, collect_raw_ledger
++with LaunchGate.acquire(Path(sys.argv[1])):
++    print('gate-held', flush=True)
++    collect_raw_ledger(Path(sys.argv[2]))
++''')
++    child = subprocess.Popen([sys.executable, str(script), str(runtime), str(root)],
++                             env=dict(os.environ, PYTHONPATH=str(Path.cwd())),
++                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    timed_out = False
++    try:
++        assert select.select([child.stdout], [], [], 10)[0]
++        assert child.stdout.readline().strip() == 'gate-held'
++        try:
++            child.communicate(timeout=2)
++        except subprocess.TimeoutExpired:
++            timed_out = True
++            from hermes_cli.serve_producer_admission import LaunchGate
++            from hermes_cli.serve_producer_custody import CustodyConflict
++            with pytest.raises(CustodyConflict):
++                LaunchGate.acquire(runtime)
++    finally:
++        if child.poll() is None:
++            child.kill()
++        child.communicate(timeout=10)
++    assert not timed_out, 'FIFO ledger blocks while retaining the shared launch gate'
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('multiple', [False, True])
++def test_colon_pythonpath_import_is_not_unrelated(tmp_path, multiple):
++    installation = Path.cwd()
++    script = tmp_path / 'importer.py'
++    script.write_text('''import sys
++from hermes_cli import serve_producer_protocol
++print(serve_producer_protocol.__file__, flush=True)
++sys.stdin.readline()
++''')
++    child = subprocess.Popen([sys.executable, str(script)], cwd=tmp_path,
++        env=dict(os.environ, HERMES_HOME=str(tmp_path / 'other-home'),
++                 PYTHONPATH=str(installation) + (os.pathsep + str(tmp_path) if multiple else '')),
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        assert select.select([child.stdout], [], [], 10)[0]
++        assert child.stdout.readline().strip() == str(installation / 'hermes_cli/serve_producer_protocol.py')
++        from hermes_cli.serve_producer_census import LinuxProcessCensus
++        from hermes_cli.serve_producer_admission import classify_process
++        adapter = LinuxProcessCensus()
++        record = adapter.read_process(child.pid, adapter.boot_id())
++        result = classify_process(record, (), 'generation', installation=str(installation), home=str(tmp_path / 'scope-home'))
++        assert result.kind != 'unrelated', (result, record.environment)
++    finally:
++        child.communicate(input='done\n', timeout=10)
+diff --git a/tests/hermes_cli/test_serve_producer_review_namespace.py b/tests/hermes_cli/test_serve_producer_review_namespace.py
+new file mode 100644
+index 00000000000..1318104e9af
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_review_namespace.py
+@@ -0,0 +1,29 @@
++"""Review probe: namespace is part of a receipt's process identity."""
++import json
++from dataclasses import asdict, replace
++from pathlib import Path
++import pytest
++from hermes_cli.serve_producer_admission import enroll_launch, read_participants_strict
++
++pytestmark = pytest.mark.platforms('linux')
++
++def test_foreign_same_numeric_identity_is_preserved(tmp_path):
++    runtime = tmp_path / 'runtime'
++    installation = Path(__file__).resolve().parents[2]
++    local = enroll_launch(runtime, 'gateway', installation=installation)
++    foreign = replace(local, namespace='pid:[1]')
++    assert foreign.namespace != local.namespace
++    ledger = runtime / 'participants.json'
++    ledger.write_text(json.dumps([asdict(foreign)]))
++    enroll_launch(runtime, 'gateway', installation=installation)
++    rows = json.loads(ledger.read_text())
++    assert asdict(foreign) in rows, 'live foreign namespace receipt was silently deleted'
++
++def test_distinct_namespaces_can_share_numeric_identity(tmp_path):
++    runtime = tmp_path / 'runtime'
++    installation = Path(__file__).resolve().parents[2]
++    local = enroll_launch(runtime, 'gateway', installation=installation)
++    foreign = replace(local, namespace='pid:[1]')
++    ledger = runtime / 'participants.json'
++    ledger.write_text(json.dumps([asdict(local), asdict(foreign)]))
++    assert len(read_participants_strict(runtime, allow_foreign_namespace=True)) == 2
+diff --git a/tests/hermes_cli/test_serve_producer_review_startup.py b/tests/hermes_cli/test_serve_producer_review_startup.py
+new file mode 100644
+index 00000000000..8039c4437cb
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_review_startup.py
+@@ -0,0 +1,46 @@
++"""Independent exact-head review: supported launch compatibility and classification."""
++import json
++from dataclasses import asdict, replace
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def test_ordinary_gateway_launch_survives_shared_home_namespace(tmp_path, monkeypatch):
++    from hermes_cli import main, plugins
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path)
++    runtime = tmp_path / 'serve-producer-v1'
++    runtime.mkdir(mode=0o700)
++    foreign = dict(identity=dict(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
++                                pid=123, start_ticks=456),
++                   installation='/opt/hermes', generation='a' * 64, role='gateway',
++                   observation='b' * 64, namespace='pid:[1]', guarded=False)
++    ledger = runtime / 'participants.json'
++    ledger.write_text(json.dumps([foreign]))
++    ledger.chmod(0o600)
++    for name in ('_apply_safe_mode', '_apply_user_config_bypass', '_guard_noninteractive_user_config'):
++        monkeypatch.setattr(main, name, lambda *a: None)
++    class DiscoveryReached(BaseException):
++        pass
++    def reached():
++        raise DiscoveryReached()
++    monkeypatch.setattr(plugins, 'start_background_plugin_discovery', reached)
++    # Dormant producer admission must not disable existing gateway startup.
++    with pytest.raises(DiscoveryReached):
++        main._prepare_agent_startup(SimpleNamespace(command='gateway', gateway_command='run'))
++
++
++def test_explicit_hermes_module_is_not_positive_unrelated_evidence():
++    from hermes_cli import serve_producer_admission as admission
++    from hermes_cli.serve_producer_census import Incarnation, ProcessObservation
++    record = ProcessObservation(Incarnation('boot', 123, 456),
++        '/opt/other-venv/bin/python', '/tmp',
++        ('/opt/other-venv/bin/python', '-m', 'hermes_cli.main', 'serve'), ())
++    verdict = admission.classify_process(record, (), 'generation',
++        installation='/opt/current-hermes', home='/home/test/.hermes')
++    assert verdict.kind != 'unrelated', verdict
+diff --git a/website/docs/developer-guide/serve-producer-isolation.md b/website/docs/developer-guide/serve-producer-isolation.md
+index 284d54747a9..2016e1b1537 100644
+--- a/website/docs/developer-guide/serve-producer-isolation.md
++++ b/website/docs/developer-guide/serve-producer-isolation.md
+@@ -30,6 +30,43 @@
+ 
+ ## Current boundary
+ 
++### Admission identity
++
++`serve_producer_identity.ProcessKey` is the only admission identity: boot ID,
++PID-namespace inode (`pid:[...]`), PID, kernel start ticks and launcher-incarnation
++digest. The last component hashes the twice-read executable/argv/environment/cwd
++observation, including its namespace. Source-boundary generation and installation
++are separate validity checks, not substitutes for process identity. A role label
++does not create a different process. Receipt replacement, duplicate rejection,
++classification, broker liveness, explicit legacy retirement and final census
++revalidation use this key. The raw `Incarnation` triple is only a kernel birth
++probe: it cannot authorize classification or be supplied as a retirement ticket.
++
++Shared-home foreign-namespace rows are retained verbatim without probing their
++PIDs, even on numeric identity collisions. Same-boot foreign evidence keeps the
++strict census INCOMPLETE. Uncertain own-namespace retirement (including zombies
++and unreadable exec details) retains evidence without breaking ordinary launch;
++it does not certify retirement. PID reuse may positively retire an old key after
++kernel birth recheck. A changed exec observation alone never does. Missing exec
++details require a separate birth recheck. Boot/namespace changes or incoherent
++observations refuse retirement. A foreign `/proc` numbering view is refused.
++
++Adversarial review of the key found and covered two additional liveness cases:
++an unreadable different-UID successor on a reused PID and a zombie/incomplete
++receipt blocking unrelated startup. Both now retain uncertain evidence; readable
++kernel reuse remains positive retirement. Tests also cover every key component,
++same-namespace duplicates versus two-namespace shared homes, repeated foreign
++retention, raw-birth rejection, missing exec versus actual exit and mismatched
++observations. The three original independent review probe files are preserved
++verbatim alongside the matrix.
++
++This is an observed exec identity, not a kernel exec counter: an unobserved
++identical self-exec cannot be distinguished by procfs. Enrollment remains
++unguarded; only a live process-local broker object plus kernel flock can promote
++it, and that object cannot survive exec. This limitation is not production
++activation evidence. Old-boot foreign rows remain retained within the existing
++hard ledger budgets; no cross-namespace retirement authority is inferred.
++
+ Only `ProjectionRelay.start_for_fixture` starts this skeleton, and it refuses
+ non-pytest callers. No production startup method or release flag is introduced.
+ Non-Linux fixtures retain POSIX family custody without claiming Linux enrollment.
+-- 
+2.43.0
+

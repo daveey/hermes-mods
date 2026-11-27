@@ -1,0 +1,104 @@
+From b4498b410bec4ce870e2e75143a762320392ef34 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:27:46 +0000
+Subject: [PATCH 6578] Frozen administrative deadlines for parks, links, landings and review queues
+
+Public mirror of source commit b4498b410bec4ce870e2e75143a762320392ef34.
+
+---
+diff --git a/hermes_cli/kanban_no_progress.py b/hermes_cli/kanban_no_progress.py
+index 162ffb17903..647a071bccf 100644
+--- a/hermes_cli/kanban_no_progress.py
++++ b/hermes_cli/kanban_no_progress.py
+@@ -210,6 +210,16 @@
+     every = kwc.normalize_every(park.get("check_every"))
+     host = park.get("probe_host") if isinstance(park.get("probe_host"), str) else None
+     own = kwc.own_gateway(conn)
++    # A lost remote executor is not a broken condition. Keep the condition, but move
++    # its custody home instead of stamping a fresh park that resets the silence clock.
++    lost = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND id > "
++        "(SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('scheduled', 'continued')) "
++        "ORDER BY id DESC LIMIT 1", (task_id, kwc.LOST_EVENT, task_id)).fetchone()
++    recovery = kb._json_dict(lost[0]) if lost else {}
++    if (host and recovery.get("reason") == "remote_probe_silent"
++            and recovery.get("probe_host") == host and recovery.get("wake_check") == wake_check):
++        host = own  # hold() only runs on the card's home; unset on an unsynced board means local.
+     reason = (f"{_note(runs, marker)}. Parked behind its own wake condition; only the condition or real "
+               f"progress brings the next run (clock fallback in {REPARK_SECONDS // 3600} h).")
+     # Runs inside hold()'s write transaction.
+diff --git a/tests/hermes_cli/test_kanban_no_progress.py b/tests/hermes_cli/test_kanban_no_progress.py
+index 8724b4337b6..389890dc8f8 100644
+--- a/tests/hermes_cli/test_kanban_no_progress.py
++++ b/tests/hermes_cli/test_kanban_no_progress.py
+@@ -112,6 +112,31 @@
+         assert tid in spawns.ids
+ 
+ 
++@pytest.mark.parametrize("change", ["none", "reason", "host", "command", "new_park"])
++def test_repark_keeps_remote_custody_without_loss_of_this_park(kanban_home, monkeypatch, change):
++    monkeypatch.setattr(kwc, "own_gateway", lambda conn: "home")
++    with kbc.connect_closing() as conn:
++        tid = _card(conn)
++        park = {**COND, "probe_host": "worker-x"}
++        for _ in range(knp.DEFAULT_LIMIT):
++            _run(conn, tid, "scheduled", park)
++        loss = {"reason": "remote_probe_silent", "probe_host": "worker-x", "wake_check": COND["wake_check"]}
++        if change == "reason":
++            loss["reason"] = "lost_again"
++        elif change == "host":
++            loss["probe_host"] = "other-worker"
++        elif change == "command":
++            loss["wake_check"] = "test -f /other-condition"
++        with kb.write_txn(conn):
++            if change != "none":
++                kb._append_event(conn, tid, kwc.LOST_EVENT, loss)
++            if change == "new_park":
++                kb._append_event(conn, tid, "scheduled", park)
++        assert knp.hold(conn, tid) == "parked"
++        assert _events(conn, tid, "scheduled")[-1].payload["probe_host"] == "worker-x"
++        assert kwc.get_state(conn, tid) is None, "healthy remote custody must not spawn a duplicate home probe"
++
++
+ def test_below_budget_still_spawns(kanban_home):
+     with kbc.connect_closing() as conn:
+         tid, _ = _shepherd(conn, knp.DEFAULT_LIMIT - 1)
+diff --git a/tests/hermes_cli/test_kanban_wake_check_home.py b/tests/hermes_cli/test_kanban_wake_check_home.py
+index 067d6b34441..2d29b4f8272 100644
+--- a/tests/hermes_cli/test_kanban_wake_check_home.py
++++ b/tests/hermes_cli/test_kanban_wake_check_home.py
+@@ -169,6 +169,31 @@
+     assert any(WORKER in c.body and _probe(flag) in c.body for c in kb.list_comments(home.conn, tid))
+ 
+ 
++def test_silent_remote_probe_is_not_reused_by_no_progress_repark(gws, tmp_path):
++    from hermes_cli import kanban_no_progress as no_progress
++
++    home, worker = gws
++    flag = tmp_path / "recovered-flag"
++    tid = _relayed_park(home, worker, flag)
++    home.round()
++    home.enter()
++    previous = _events(home.conn, tid, "scheduled")[-1].payload
++    now = int(time.time()) + kwc.ALIVE_EVERY + 2 * 300 + kwc.SILENT_GRACE + 5
++    assert kwc.restore_missing_checks(home.conn, now=now)["woken"] == [tid]
++    assert _events(home.conn, tid, LOST)[-1].payload["probe_host"] == WORKER
++    assert no_progress.hold(home.conn, tid, now=now, budget=1) == "parked"
++    park = _events(home.conn, tid, "scheduled")[-1].payload
++    assert park["probe_host"] == HUB, "no-progress re-armed the same silent remote probe host"
++    assert park["wake_check"] == _probe(flag)
++    assert park["awaiting"] == previous["awaiting"]
++    assert kwc.get_state(home.conn, tid)["cmd"] == _probe(flag)
++    # Home actually executes the replacement; a label-only reassignment is not recovery.
++    flag.write_text("build recovered on home\n")
++    kwc.run_due_wake_checks(home.conn, now=now + 1, wait=True)
++    assert _status(home.conn, tid) == "ready"
++    assert "build recovered on home" in _events(home.conn, tid, "condition_met")[-1].payload["output"]
++
++
+ # --- the lost-probe sweep on one board --------------------------------------------------------------------------
+ 
+ @pytest.fixture
+-- 
+2.43.0
+

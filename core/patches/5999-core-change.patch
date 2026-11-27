@@ -1,0 +1,454 @@
+From 8efbf897552c44338a0f6f5a19746a165bf25761 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:17:24 +0000
+Subject: [PATCH 5999] Kanban spend-decision routing, ownerless stops and hold notices
+
+Public mirror of source commit 8efbf897552c44338a0f6f5a19746a165bf25761.
+
+---
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 9d3774a79ae..c4e2d1db2b0 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -25,9 +25,10 @@
+         scope = execution_restricted(conn, task_id) and not safety
+         prior = json.loads(previous[0]) if previous else None
+         cause = 'safety_refusal' if safety else 'scope_stopped' if scope else None
+-        route = prior.get('producer') if isinstance(prior, dict) else None
++        prior_route = prior.get('producer') if isinstance(prior, dict) else None
++        route = episode_route(conn, task_id, episode) or prior_route
+         live = _live_route(conn, route)
+-        if live and (cause is None or prior.get('cause') == cause):
++        if live and route == prior_route and (cause is None or prior.get('cause') == cause):
+             return
+         if cause:
+             payload['cause'] = cause
+@@ -37,8 +38,37 @@
+ 
+ 
+ 
++def episode_route(conn, task_id: str, episode: str) -> dict | None:
++    """Reuse historical wrappers too; a closed same-episode decision is a disposition, not release."""
++    row = conn.execute(
++        "SELECT t.id,t.status FROM tasks t WHERE t.created_by='kanban-spend-budget' AND "
++        "(t.idempotency_key=? OR EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.id "
++        "AND e.kind='administrative_decision' AND json_valid(e.payload) "
++        "AND json_extract(e.payload,'$.root_task')=? AND json_extract(e.payload,'$.root_episode')=?)) "
++        "ORDER BY CASE WHEN t.status IN ('done','archived') THEN 0 ELSE 1 END,t.created_at,t.id LIMIT 1",
++        (f"spend-budget-decision:{task_id}:{episode}", task_id, episode)).fetchone()
++    return ({'kind': 'dismissed' if row['status'] in ('done', 'archived') else 'supervisor',
++             'task_id': row['id']} if row else None)
++
++
++def dismissed(conn, task_id: str) -> bool:
++    """The stranded backstop must not re-ask a decision the desk already closed."""
++    import json
++    stop = pending_episode(conn, task_id)
++    if stop is None:
++        return False
++    episode = stop.get('uid') or str(stop['id'])
++    route = episode_route(conn, task_id, episode)
++    if route is None:
++        row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
++                           "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1",
++                           (task_id, NOTICE, episode)).fetchone()
++        route = json.loads(row[0]).get('producer') if row else None
++    return bool(route and route['kind'] == 'dismissed')
++
++
+ def _live_route(conn, route) -> bool:
+-    """A notice is not ownership when its decision executor has closed or disappeared."""
++    """Live ownership or a terminal same-episode disposition satisfies routing, never execution."""
+     if not isinstance(route, dict):
+         return False
+     if route.get('kind') == 'supervisor':
+@@ -46,7 +76,7 @@
+         return task is not None and task.status not in ('done', 'archived')
+     # Explicit administrative exhaustion is a terminal routing boundary, not
+     # permission to recurse into another decision owner or release the root hold.
+-    return route.get('kind') in ('chats', 'unavailable')
++    return route.get('kind') in ('chats', 'unavailable', 'dismissed')
+ 
+ 
+ def repair_triage_routes(conn, *, skip: set[str]) -> None:
+@@ -273,7 +303,11 @@
+             if origin is not None and dead(origin.gateway, origin.profile, origin.session):
+                 continue
+         return {"kind": "chats"}
+-    episode = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
++    stop = pending_episode(conn, task_id)
++    episode = (stop.get('uid') or str(stop['id'])) if stop else None
++    existing = episode_route(conn, task_id, episode) if episode else None
++    if existing:
++        return existing
+     from hermes_cli.kanban_refusal_receipt import restricted
+     safety = restricted(conn, task_id)
+     stopped = execution_restricted(conn, task_id)
+diff --git a/hermes_cli/kanban_stranded_brief.py b/hermes_cli/kanban_stranded_brief.py
+new file mode 100644
+index 00000000000..8ad0a04545c
+--- /dev/null
++++ b/hermes_cli/kanban_stranded_brief.py
+@@ -0,0 +1,84 @@
++"""Plain-language decision brief for the stranded-park backstop. [daveey]"""
++from __future__ import annotations
++
++import json
++
++
++def _data(raw):
++    try:
++        value = json.loads(raw or '{}')
++    except (TypeError, ValueError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _text(value, limit=300):
++    return ' '.join(str(value or '').split())[:limit]
++
++
++def reason(entry):
++    data = entry['payload'] if entry else {}
++    disposition = data.get('disposition')
++    detail = disposition.get('summary') if isinstance(disposition, dict) else None
++    why = detail or data.get('summary') or data.get('reason') or data.get('error')
++    if isinstance(why, str) and why not in ('decision_pending', 'scope_stopped', 'capability_unavailable'):
++        return _text(why.replace('_', ' '))
++    return {'spend_budget_triaged': 'The work reached its budget for further attempts.',
++            'decision_retained': 'The decision owner kept the work stopped; further work has not been authorized.',
++            'safety_refused': 'The provider refused the work; a budget decision cannot authorize another attempt.'}.get(
++                entry['kind'] if entry else '', 'The work is stopped and has no active owner to finish it.')
++
++
++def context(conn, row, entry):
++    """Use the real source, not the generated wrapper's routing instructions, as the work summary."""
++    wrapper = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='administrative_decision' "
++                           "ORDER BY id DESC LIMIT 1", (row['id'],)).fetchone()
++    source = None
++    if wrapper and row.get('created_by') == 'kanban-spend-budget':
++        source_id = _data(wrapper[0]).get('root_task')
++        found = conn.execute('SELECT * FROM tasks WHERE id=?', (source_id,)).fetchone()
++        source = dict(found) if found else None
++    work = source or row
++    first = next((line.strip().lstrip('# ').strip() for line in str(work.get('body') or '').splitlines()
++                  if line.strip()), '')
++    summary = _text(first or work.get('title') or 'Unfinished work')
++    return summary, reason(entry), source is not None
++
++
++def request(conn, row, entry, age, evidence):
++    from hermes_cli.kanban_spend_decision import execution_restricted, pending
++    from hermes_cli.kanban_human_request import validate_human_request
++    summary, why, administrative = context(conn, row, entry)
++    tid = row['id']
++    held = pending(conn, tid)
++    restricted = execution_restricted(conn, tid)
++    if administrative:
++        resume = ('Return the decision to an agent to record your direction; source work stays stopped, '
++                  'with no further spend until separately authorized.')
++        drop = 'Dismiss this decision notice; source work stays stopped with no further spend; reopen to reconsider.'
++        recommendation = 'B - keep the existing stop until there is an explicit reason to authorize more work.'
++    elif held or restricted:
++        resume = ('Ask the owner to record a bounded scope and budget decision; no automatic restart or spend. '
++                  'Existing safety and scope restrictions still apply.')
++        drop = 'Archive this card and leave its work unfinished; no further spend; reopen to reconsider.'
++        recommendation = 'B - avoid authorizing more work without a bounded proposal.'
++    else:
++        resume = 'Return the unchanged work to an agent; uses more execution budget; it can be stopped again.'
++        drop = 'Archive this card and leave its work unfinished; no further spend; reopen to reconsider.'
++        recommendation = 'B - leave work stopped rather than restart it without a current owner or plan.'
++    # Preserve the existing Unblock/Archive transition contract. Explicit choices currently turn
++    # even an archive-valued answer into an unblock; describe the two real controls in the brief.
++    release = (f"Unblock = ask the owner to record a bounded decision; the button cannot release this hold. "
++               f"For an ordinary budget stop use `hermes kanban promote {tid} --reason '<what changed>'`; "
++               "scope renewal and safety gates still apply" if held or restricted else
++               "Unblock = return this decision to an agent (not permission to run the source work)" if administrative else
++               "Unblock = it goes back to work as it is")
++    return validate_human_request({
++        'action': f"Decide how to handle: {summary}. {release}; archive = {drop}",
++        'why_human': (f"Tried: checking for an active owner and a usable request after {age // 3600}h stopped. "
++                      "Only you can: choose whether to dismiss this work or give its owner new direction."),
++        'interaction': 'approval',
++        'scope': (f"Situation: {summary} {why}\nOptions:\nA) Unblock: {resume}\nB) Archive: {drop}\n"
++                  f"Recommend: {recommendation}\nIf you do nothing, the work stays stopped with no further spend."),
++        'evidence': evidence,
++    }, kind=row.get('block_kind'))
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index 0e52929f73a..291cf0ed016 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -272,7 +272,8 @@
+     if entry is None:
+         return "no park event recorded"
+     data = entry["payload"]
+-    why = data.get("reason") or data.get("error") or data.get("reason_code") or "(no reason recorded)"
++    from hermes_cli.kanban_stranded_brief import reason
++    why = data.get("reason") or data.get("error") or reason(entry)
+     return f"{entry['kind']}: {' '.join(str(why).split())[:300]}"
+ 
+ 
+@@ -330,7 +331,8 @@
+     from hermes_cli.kanban_retained_wait import explanation
+     if row["status"] == "triage" and explanation(conn, tid, generated_only=False):
+         return True  # a retained card its open parent or recorded wait explains owns no ask (t_2c750e700cdf6fae)
+-    if _source_asks(conn, row):
++    from hermes_cli.kanban_spend_decision import dismissed
++    if _source_asks(conn, row) or dismissed(conn, tid):
+         return True
+     return _armed_wake(conn, tid) or _agent_owned(conn, tid, age=age, defer=defer)
+ 
+@@ -420,24 +422,9 @@
+ # --- the sweep -----------------------------------------------------------------------------------------------------
+ 
+ def _request(conn: sqlite3.Connection, row: dict, entry: Optional[dict], age: int, owner_note: str, kind) -> dict:
+-    """The generated ask. No ``choices``: the default Unblock/Archive buttons answer it (a choice list makes every
+-    answer a non-archive unblock). The action follows the ask-line convention (``user_ask_lint_error``). A pending
+-    spend decision refuses the Unblock button, so its release is the promote command (a new spend window)."""
+-    from hermes_cli.kanban_human_request import validate_human_request
+-    from hermes_cli.kanban_spend_decision import pending as spend_pending
+-    tid = row["id"]
+-    title = " ".join(str(row.get("title") or "").split())[:200]
+-    unblock = (f"Unblock = run `hermes kanban promote {tid} --reason '<what changed>'`, which releases it with a "
+-               "new spend window (the Unblock button is refused while the spend decision is pending)"
+-               if spend_pending(conn, tid) else "Unblock = it goes back to work as it is")
+-    return validate_human_request({
+-        "action": (f"Decide this parked card ({title}): release it, archive it, or re-scope it by replying with the "
+-                   f"new scope. {unblock}; archive = the card and its remaining work are dropped."),
+-        "why_human": f"Parked {age // 3600}h with no live owner and no request ({_reason(entry)})",
+-        "interaction": "approval",
+-        "scope": "This card only",
+-        "evidence": _evidence(entry, owner_note),
+-    }, kind=kind)
++    """Contextual brief, retaining the existing guarded Unblock/Archive controls."""
++    from hermes_cli.kanban_stranded_brief import request
++    return request(conn, {**row, 'block_kind': kind}, entry, age, _evidence(entry, owner_note))
+ 
+ 
+ def _escalate(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now: int, age: int, defer: int,
+diff --git a/tests/hermes_cli/test_kanban_spend_decision.py b/tests/hermes_cli/test_kanban_spend_decision.py
+new file mode 100644
+index 00000000000..c162933f43b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_decision.py
+@@ -0,0 +1,93 @@
++"""A desk disposition belongs to a stop episode, never to the last comment. [daveey]"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++from tests.hermes_cli.test_kanban_spend_route_repair import _route, _stop
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def _wrappers(conn, tid):
++    return list(conn.execute("SELECT id,idempotency_key FROM tasks WHERE created_by='kanban-spend-budget' "
++                             "AND idempotency_key LIKE ?", (f"spend-budget-decision:{tid}:%",)))
++
++
++@pytest.mark.parametrize("status", ["archived", "done"])
++@pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
++def test_archived_wrapper_not_refiled_same_episode(kanban_home, status, cause):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        decision.ensure_producer(conn, tid)
++        sup = _route(conn, tid)["task_id"]
++        if status == "archived":
++            assert kb.archive_task(conn, sup)
++        else:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (sup,))
++        kb.add_comment(conn, tid, "desk", "Keep stopped; no further spend")
++        for _ in range(3):
++            sweep_stale_triage(conn)
++        assert len(_wrappers(conn, tid)) == 1
++        assert _route(conn, tid) == {"kind": "dismissed", "task_id": sup}
++        assert decision.pending(conn, tid)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert decision.execution_restricted(conn, tid) == bool(cause)
++
++
++def test_dismissal_receipt_survives_wrapper_removal(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn)
++        decision.ensure_producer(conn, tid)
++        sup = _route(conn, tid)["task_id"]
++        assert kb.archive_task(conn, sup)
++        decision.ensure_producer(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM tasks WHERE id=?", (sup,))
++        assert decision.dismissed(conn, tid)
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid) == {"kind": "dismissed", "task_id": sup}
++        assert _wrappers(conn, tid) == []
++        assert decision.pending(conn, tid)
++
++
++def test_new_episode_refiles_after_archive(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn)
++        decision.ensure_producer(conn, tid)
++        first = _route(conn, tid)["task_id"]
++        assert kb.archive_task(conn, first)
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid)["kind"] == "dismissed"
++        assert kb.promote_task(conn, tid, actor="operator", reason="new bounded scope")[0]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, decision.EVENT, {"reason": "second budget stop"})
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid)["kind"] == "supervisor"
++        assert _route(conn, tid)["task_id"] != first
++        assert len(_wrappers(conn, tid)) == 2
++
++
++def test_key_stable_across_comments(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn)
++        episode = decision.pending_episode(conn, tid)
++        key = f"spend-budget-decision:{tid}:{episode.get('uid') or str(episode['id'])}"
++        kb.add_comment(conn, tid, "desk", "Context added before publication")
++        decision.ensure_producer(conn, tid)
++        assert _wrappers(conn, tid)[0]["idempotency_key"] == key
++        sup = _route(conn, tid)["task_id"]
++        # Lost notice, including an old event-id key, must reuse the administrative identity.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET idempotency_key=? WHERE id=?", (f"spend-budget-decision:{tid}:legacy", sup))
++            conn.execute("DELETE FROM task_events WHERE task_id=? AND kind=?", (tid, decision.NOTICE))
++        kb.add_comment(conn, tid, "desk", "Another comment is not another stop")
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid)["task_id"] == sup
++        assert len(_wrappers(conn, tid)) == 1
+diff --git a/tests/hermes_cli/test_kanban_spend_route_repair.py b/tests/hermes_cli/test_kanban_spend_route_repair.py
+index ce9e69bc8d7..45357ed2b7b 100644
+--- a/tests/hermes_cli/test_kanban_spend_route_repair.py
++++ b/tests/hermes_cli/test_kanban_spend_route_repair.py
+@@ -42,9 +42,12 @@
+                 conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, old))
+         decision.ensure_producer(conn, tid)
+         route = _route(conn, tid)
+-        assert route["kind"] == "supervisor"
+-        assert route["task_id"] != old
+-        assert kb.get_task(conn, route["task_id"]).status not in ("done", "archived")
++        if status in ("done", "archived"):
++            assert route == {"kind": "dismissed", "task_id": old}
++        else:
++            assert route["kind"] == "supervisor"
++            assert (route["task_id"] == old) == (status == "null")
++            assert kb.get_task(conn, route["task_id"]).status not in ("done", "archived")
+         count = len(helpers._events(conn, tid, decision.NOTICE))
+         decision.ensure_producer(conn, tid)
+         assert len(helpers._events(conn, tid, decision.NOTICE)) == count
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index 7d37addf787..f8674ce4a28 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -122,10 +122,10 @@
+         assert status == "triage"
+         assert card_is_open_human_ask(status, kind, raw)
+         request = json.loads(raw)
+-        assert request["interaction"] == "approval" and request["scope"] == "This card only"
+-        assert request["action"].startswith("Decide this parked card (Bounded work): release it, archive it, or re-sc")
+-        assert f"Unblock = run `hermes kanban promote {tid} --reason" in request["action"]
+-        assert request["why_human"].startswith("Parked 3h with no live owner and no request (spend_budget_triaged")
++        assert request["interaction"] == "approval" and "Situation: Bounded work" in request["scope"]
++        assert request["action"].startswith("Decide how to handle: Bounded work")
++        assert f"hermes kanban promote {tid} --reason" in request["action"]
++        assert request["why_human"].startswith("Tried:") and "Only you can:" in request["why_human"]
+         assert "spend_budget_triaged" in request["evidence"] and "runs=" in request["evidence"]
+         assert "choices" not in request
+         # The desk chat is bound: a synced shepherd link (no profile, as local reconcile wants it) and a tui sub.
+@@ -140,6 +140,46 @@
+         assert [e.kind for e in seen] == [stranded.EVENT]
+ 
+ 
++@pytest.mark.parametrize("detail", [None, "Further work needs a new budget"])
++def test_ask_has_summary_choices_consequences_recommendation(kanban_home, own_gateway, detail):
++    with kbc.connect_closing() as conn:
++        source = stopped(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET body=? WHERE id=?", ("Fix the frozen sidebar in the Mac app.\nImplementation detail", source))
++        assert budget.hold(conn, source) == "triage"
++        sup = _events(conn, source, decision.NOTICE)[-1]["producer"]["task_id"]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (sup,))
++            kb._append_event(conn, sup, "decision_retained", {"disposition": {"summary": detail}})
++            kb._append_event(conn, sup, "triage_sweep_capped", {"cap": 3})
++        assert _sweep(conn, now=_later(3), cfg={}) == [sup]
++        ask = json.loads(_row(conn, sup)[2])
++        assert "Fix the frozen sidebar in the Mac app." in ask["scope"]
++        assert (detail or "The decision owner kept the work stopped") in ask["scope"]
++        assert "Situation:" in ask["scope"] and "Options:" in ask["scope"]
++        assert "A)" in ask["scope"] and "B)" in ask["scope"] and "Recommend:" in ask["scope"]
++        assert "If you do nothing" in ask["scope"]
++        assert "no further spend" in ask["scope"]
++        assert ask["why_human"].startswith("Tried:") and "Only you can:" in ask["why_human"]
++        assert "decision_retained:" not in ask["scope"]
++        assert "(no reason recorded)" not in str(ask)
++        assert decision.pending(conn, source)
++
++
++def test_dismissed_spend_episode_is_not_reasked_on_source(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        source = stopped(conn)
++        assert budget.hold(conn, source) == "triage"
++        sup = _events(conn, source, decision.NOTICE)[-1]["producer"]["task_id"]
++        assert kb.archive_task(conn, sup)
++        # Even before producer reconciliation, archive is already a disposition.
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        decision.ensure_producer(conn, source)
++        assert _sweep(conn, now=_later(6), cfg={}) == []
++        assert _row(conn, source)[2] is None
++        assert decision.pending(conn, source)
++
++
+ def test_remote_desk_is_a_hub_subscription(kanban_home, own_gateway):
+     with kbc.connect_closing() as conn:
+         tid = _parked(conn)
+@@ -198,8 +238,8 @@
+         assert _sweep(conn, now=_later(3), cfg={}) == []
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (sup,))
+-        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+-        assert card_is_open_human_ask(*_row(conn, tid))
++        assert _sweep(conn, now=_later(3), cfg={}) == []
++        assert not card_is_open_human_ask(*_row(conn, tid))
+ 
+ 
+ def _reparked_supervisor(conn):
+@@ -209,7 +249,7 @@
+     assert budget.hold(conn, tid) == "triage"
+     (notice,) = _events(conn, tid, decision.NOTICE)
+     with kb.write_txn(conn):
+-        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (notice["producer"]["task_id"],))
++        conn.execute("DELETE FROM tasks WHERE id=?", (notice["producer"]["task_id"],))
+     assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+     decision.ensure_producer(conn, tid)
+     sup = _events(conn, tid, decision.NOTICE)[-1]["producer"]["task_id"]
+@@ -274,7 +314,7 @@
+         status, kind, raw = _row(conn, tid)
+         assert kind == "needs_input"
+         assert card_is_open_human_ask(status, kind, raw)
+-        assert "agent_block_escalated: retry needed" in json.loads(raw)["why_human"]
++        assert "retry needed" in json.loads(raw)["scope"]
+ 
+ 
+ def test_created_parked_card_uses_creation_as_episode(kanban_home, own_gateway):
+@@ -377,7 +417,7 @@
+             kb._append_event(conn, tid, "triage_sweep_capped", {"cap": 3})
+         assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+         assert len(_events(conn, tid, stranded.EVENT)) == 2
+-        assert "blocked: parked again" in json.loads(_row(conn, tid)[2])["why_human"]
++        assert "parked again" in json.loads(_row(conn, tid)[2])["scope"]
+ 
+ 
+ def test_thresholds_come_from_config(kanban_home, own_gateway):
+-- 
+2.43.0
+

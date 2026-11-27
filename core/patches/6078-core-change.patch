@@ -1,0 +1,275 @@
+From 9754401a7f2f24234109f8fe1cfb953dde02a98a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:20:35 -0800
+Subject: [PATCH 6078] TUI RPC method lanes, projects tree caching and GC budget
+
+Public mirror of source commit 9754401a7f2f24234109f8fe1cfb953dde02a98a.
+
+---
+diff --git a/gateway/gc_budget.py b/gateway/gc_budget.py
+index d9d2bc01810..fbc468c84f3 100644
+--- a/gateway/gc_budget.py
++++ b/gateway/gc_budget.py
+@@ -77,7 +77,7 @@
+ 
+ 
+ def snapshot() -> dict:
+-    """``{threshold, generations: {n: {runs, cpu_s, wall_s, max_wall_s, collected}}}`` since :func:`apply`."""
++    """``{threshold, generations: {n: {runs, cpu_s, wall_s, max_wall_s, collected}}}`` since :func:`apply_gateway_gc_budget`."""
+     return {
+         "threshold": list(gc.get_threshold()),
+         "timed": _on_gc in gc.callbacks,
+diff --git a/tests/gateway/test_gc_budget.py b/tests/gateway/test_gc_budget.py
+index 0ca002a6022..34017cd0e14 100644
+--- a/tests/gateway/test_gc_budget.py
++++ b/tests/gateway/test_gc_budget.py
+@@ -55,13 +55,33 @@
+     assert full["cpu_s"] >= 0
+ 
+ 
+-def test_timer_survives_a_collection_started_while_the_accounting_lock_is_held(restore_gc):
++def test_timer_takes_no_accounting_lock(restore_gc):
++    """Another thread holds the accounting lock for the whole collection: a timer that took it would hang."""
++    import threading
++
+     from hermes_cli import loop_accounting
+ 
+     gc_budget.apply_gateway_gc_budget({})
+-    with loop_accounting._lock:  # a collection can begin inside any allocation, this one included
+-        gc.collect()
+-    assert gc_budget.snapshot()["generations"]["2"]["runs"] >= 1
++    gc_budget._totals.clear()
++    held, release = threading.Event(), threading.Event()
++
++    def hold():
++        with loop_accounting._lock:
++            held.set()
++            release.wait(30)
++
++    holder = threading.Thread(target=hold)
++    holder.start()
++    assert held.wait(10)
++    collector = threading.Thread(target=gc.collect)
++    collector.start()
++    collector.join(10)
++    finished = not collector.is_alive()
++    release.set()
++    holder.join(10)
++    collector.join(10)
++    assert finished
++    assert gc_budget.snapshot()["generations"]["2"]["runs"] == 1
+ 
+ 
+ def test_accounting_snapshot_reports_gc(restore_gc):
+diff --git a/tests/tui_gateway/test_coalesced_build.py b/tests/tui_gateway/test_coalesced_build.py
+index 65d237b81b9..f38ca9f26c4 100644
+--- a/tests/tui_gateway/test_coalesced_build.py
++++ b/tests/tui_gateway/test_coalesced_build.py
+@@ -103,6 +103,8 @@
+             if c._states["k"].waiters == 2:
+                 break
+         threading.Event().wait(0.01)
++    else:
++        pytest.fail("follower never queued")
+     release.set()
+     leader.join(10)
+     follower.join(10)
+diff --git a/tests/tui_gateway/test_non_workspace_policy_cache.py b/tests/tui_gateway/test_non_workspace_policy_cache.py
+index 8367adf9d44..d0e5054e111 100644
+--- a/tests/tui_gateway/test_non_workspace_policy_cache.py
++++ b/tests/tui_gateway/test_non_workspace_policy_cache.py
+@@ -1,6 +1,7 @@
+ """The never-a-workspace roots are resolved once per input set, not once per path. [daveey]"""
+ from __future__ import annotations
+ 
++import os
+ import tempfile
+ 
+ import pytest
+@@ -48,6 +49,9 @@
+     profiles.mkdir()
+     assert not server._is_non_workspace_path(str(outside / "cache"))
+     (profiles / "linked").symlink_to(outside, target_is_directory=True)
++    # Kernels with coarse timestamps can give both writes one mtime; production is bounded by the TTL.
++    stamp = profiles.stat().st_mtime_ns + 1_000_000
++    os.utime(profiles, ns=(stamp, stamp))
+     assert server._is_non_workspace_path(str(outside / "cache"))
+ 
+ 
+@@ -85,8 +89,6 @@
+ 
+ 
+ def _count_realpath(monkeypatch):
+-    import os
+-
+     calls = []
+     real = os.path.realpath
+     monkeypatch.setattr(server.os.path, "realpath", lambda p, *a, **k: calls.append(str(p)) or real(p, *a, **k))
+@@ -108,8 +110,6 @@
+ 
+ 
+ def test_canonical_path_sees_a_relinked_alias_after_the_ttl(homes, monkeypatch):
+-    import os
+-
+     home, _, _ = homes
+     one, two, alias = home / "one", home / "two", home / "alias"
+     one.mkdir()
+@@ -131,3 +131,20 @@
+     for i in range(35):
+         server._canonical_workspace_path(f"/nonexistent-hhp/{i}")
+     assert len(server._canonical_memo) <= 10
++
++
++def test_policy_roots_do_not_inherit_a_stale_canonical_answer(homes, monkeypatch, tmp_path):
++    """A root also asked about as a path must not make the policy two TTLs stale."""
++    import hermes_constants
++
++    first, second = tmp_path / "store-1", tmp_path / "store-2"
++    first.mkdir()
++    second.mkdir()
++    link = tmp_path / "hermes-link"
++    link.symlink_to(first, target_is_directory=True)
++    monkeypatch.setattr(server, "_canonical_memo", {})
++    assert server._canonical_workspace_path(str(link)) == os.path.normcase(os.path.realpath(first))
++    link.unlink()
++    link.symlink_to(second, target_is_directory=True)
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: link)  # new key: the policy is rebuilt now
++    assert server._non_workspace_policy()[1].count(os.path.normcase(os.path.realpath(second))) == 1
+diff --git a/tests/tui_gateway/test_projects_tree_coalesced.py b/tests/tui_gateway/test_projects_tree_coalesced.py
+new file mode 100644
+index 00000000000..9d90e9ef0a0
+--- /dev/null
++++ b/tests/tui_gateway/test_projects_tree_coalesced.py
+@@ -0,0 +1,87 @@
++"""Overlapping identical ``projects.tree`` RPCs share one legacy build. [daveey]"""
++from __future__ import annotations
++
++import contextlib
++import threading
++
++import pytest
++
++from tui_gateway import coalesced_build, server
++
++
++@pytest.fixture
++def legacy_tree(monkeypatch):
++    from hermes_cli import projects_fact_routes
++
++    monkeypatch.setattr(projects_fact_routes, "read", lambda *a, **k: None)
++    monkeypatch.setattr(projects_fact_routes, "legacy", lambda profile: contextlib.nullcontext())
++    monkeypatch.setattr(server, "_profile_db", lambda params=None, **k: contextlib.nullcontext(object()))
++    builds, lock = [], threading.Lock()
++    first_started, release_first = threading.Event(), threading.Event()
++
++    def build(db, params, **kwargs):
++        with lock:
++            builds.append(kwargs)
++            n = len(builds)
++        if n == 1:
++            first_started.set()
++            assert release_first.wait(10)
++        return {"projects": [{"id": f"build-{n}"}], "scoped_session_ids": [f"s{n}"]}, f"active-{n}"
++
++    monkeypatch.setattr(server, "_stamped_project_tree", build)
++    return builds, first_started, release_first
++
++
++def _tree(params=None):
++    resp = server._methods["projects.tree"](1, params or {})
++    assert "error" not in resp, resp.get("error")
++    return resp["result"]
++
++
++def test_overlapping_requests_share_one_build_begun_after_they_asked(legacy_tree):
++    builds, first_started, release_first = legacy_tree
++    results = {}
++    leader = threading.Thread(target=lambda: results.setdefault("leader", _tree()))
++    leader.start()
++    assert first_started.wait(10)
++    followers = [threading.Thread(target=lambda i=i: results.setdefault(i, _tree())) for i in range(5)]
++    for t in followers:
++        t.start()
++    for _ in range(300):
++        with coalesced_build.project_tree._cond:
++            if sum(s.waiters for s in coalesced_build.project_tree._states.values()) == 6:
++                break
++        threading.Event().wait(0.01)
++    else:
++        pytest.fail("followers never queued behind the running build")
++    release_first.set()
++    for t in (leader, *followers):
++        t.join(10)
++        assert not t.is_alive()
++    assert len(builds) == 2
++    assert results["leader"] == {"projects": [{"id": "build-1"}], "active_id": "active-1",
++                                 "scoped_session_ids": ["s1"]}
++    assert all(results[i]["active_id"] == "active-2" for i in range(5))
++    assert coalesced_build.project_tree._states == {}
++
++
++def test_a_different_selector_builds_on_its_own(legacy_tree):
++    builds, first_started, release_first = legacy_tree
++    results = {}
++    slow = threading.Thread(target=lambda: results.setdefault("slow", _tree()))
++    slow.start()
++    assert first_started.wait(10)
++    other = _tree({"preview_limit": 7})  # returns while the default-selector build is still running
++    assert other["active_id"] == "active-2"
++    assert [b["preview_limit"] for b in builds] == [3, 7]
++    release_first.set()
++    slow.join(10)
++    assert results["slow"]["active_id"] == "active-1"
++
++
++def test_callers_get_their_own_result_dict(legacy_tree):
++    _, _, release_first = legacy_tree
++    release_first.set()
++    one = _tree()
++    one["active_id"] = "changed by a caller"
++    assert _tree()["active_id"] == "active-2"
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 6d846894a4f..fe896c4deab 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -141,12 +141,18 @@
+ 
+ # ``realpath`` is one ``lstat`` per path component, and each releases the GIL. A tree build resolves
+ # every session cwd several times; overlapping builds repeat syscall-heavy work
+-# and GIL handoffs. A re-pointed symlink is seen after the TTL.
++# handoffs (a third of its CPU, spent in the kernel). The key is the path string alone: a re-pointed
++# symlink anywhere in its chain, or a path that appears later, is seen after the TTL.
+ _CANONICAL_TTL_S = 30.0
+ _CANONICAL_MAX = 20000
+ _canonical_memo: dict[str, tuple[float, str]] = {}
+ 
+ 
++def _resolve_workspace_path(path: str) -> str:
++    """The uncached resolution: for answers that are stored or that seed another cache."""
++    return os.path.normcase(os.path.realpath(path)) if path else ""
++
++
+ def _canonical_workspace_path(path: str) -> str:
+     """Resolve local aliases before policy checks and project/repo/lane keying."""
+     if not path:
+@@ -194,7 +200,7 @@
+              # no-tmp: ok — classify OS temp roots, not scratch-file creation.
+              "/tmp", "/private/tmp", "/var/folders", key[4])
+     dirs = frozenset(_non_workspace_dirs())
+-    prefixes = tuple(sorted({_canonical_workspace_path(p) for p in roots if p}))
++    prefixes = tuple(sorted({_resolve_workspace_path(p) for p in roots if p}))  # one TTL, not two
+     _non_workspace_memo = (key, now + _NON_WORKSPACE_TTL_S, dirs, prefixes)
+     return dirs, prefixes
+ 
+@@ -341,7 +347,7 @@
+         cwd = str(row.get("cwd") or "")
+         if _is_non_workspace_path(cwd):
+             continue
+-        root = _canonical_workspace_path(git_probe.common_repo_root(cwd))
++        root = _resolve_workspace_path(git_probe.common_repo_root(cwd))  # backfilled to the store below
+         if not root:
+             continue
+         cwd_to_root[cwd] = root
+-- 
+2.43.0
+

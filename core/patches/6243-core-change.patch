@@ -1,0 +1,165 @@
+From 77fc5ec5a89848d3f0a27f636bae706bc7d1408b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:24:49 +0000
+Subject: [PATCH 6243] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit 77fc5ec5a89848d3f0a27f636bae706bc7d1408b.
+
+---
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+index 70a4de85b26..74a6653ae0c 100644
+--- a/hermes_cli/fact_board_inputs.py
++++ b/hermes_cli/fact_board_inputs.py
+@@ -16,11 +16,12 @@
+ budget failed every one there (failed even when it finished: ``_build`` re-checks the time); a board capture
+ now has ``max_capture_seconds`` (30 s), below the 60 s validity, so a slow capture still lands as fresh evidence.
+ 
+-Every ``ViewOwner`` uses this source, so the project tree's views (``fact_tree_startup``) are paced and limited the
+-same way. A capture queued behind a wedged shared worker reports no failure: its evidence goes stale when its 60 s
+-validity expires (``fact_expiry``) instead of within the owner's 10 s budget. The next refresh is timed from the
+-last evidence's observation, not its commit: one selector whose captures finish within 30 s keeps its validity;
+-in a round of several views, earlier views' evidence is older by the later captures' durations.
++Every ``ViewOwner`` uses this source, so the project tree's views (``fact_tree_startup``) are paced the same way;
++the tree passes its own bounds (300 s validity, 60 s capture limit: its four-selector cycle outgrew 60 s). A capture
++queued behind a wedged shared worker reports no failure: its evidence goes stale when its validity (60 s for a
++board, 300 s for the tree) expires (``fact_expiry``) instead of within the owner's 10 s budget. The next refresh is
++timed from the last evidence's observation, not its commit: one selector whose captures finish within 30 s keeps its
++validity; in a round of several views, earlier views' evidence is older by the later captures' durations.
+ """
+ from collections import deque
+ from contextvars import copy_context
+diff --git a/hermes_cli/fact_tree_startup.py b/hermes_cli/fact_tree_startup.py
+index 7a399a94763..30eeb6a88c1 100644
+--- a/hermes_cli/fact_tree_startup.py
++++ b/hermes_cli/fact_tree_startup.py
+@@ -31,6 +31,18 @@
+             return Unavailable('tree_owner_unavailable')
+ 
+ 
++# The tree's captured input stays servable this long (BoardInputSource valid_seconds; the board keeps 60 s).
++# Representative observation: tree selectors walked profiles and queued
++# with board views on one capture worker. A
++# loaded backend could exceed input validity before recapture;
++# expired inputs made GET /api/profiles/projects/tree answer 503 dependency_unavailable.
++# while every per-profile sessions.content clock was fresh. Refresh is still every 30 s; this bounds how stale a
++# served tree, and a project_sessions drill-in on the same owner, can get while a slow recapture cycles, and a
++# single capture may take up to TREE_CAPTURE_SECONDS. A failed capture still marks its input stale at once.
++TREE_INPUT_VALID_SECONDS = 300
++TREE_CAPTURE_SECONDS = 60
++
++
+ class TreeRuntime:
+     def __init__(self, *, targets=None):
+         from hermes_cli.config import get_hermes_home
+@@ -51,7 +63,8 @@
+                     for name, home in self.targets if (home / 'state.db').exists()]
+         paths = [path for _name, home in self.targets for path in (home, home / 'state.db', home / 'projects.db')]
+         self.owner = ViewOwner(self.scope, partial(fact_tree_inputs.capture, self.targets, self.source_id),
+-            fact_tree_inputs.project, ('tree', 'project_sessions'), paths=paths, bindings=bindings, consumer='projects')
++            fact_tree_inputs.project, ('tree', 'project_sessions'), paths=paths, bindings=bindings, consumer='projects',
++            input_options={'valid_seconds': TREE_INPUT_VALID_SECONDS, 'max_capture_seconds': TREE_CAPTURE_SECONDS})
+ 
+     def start(self):
+         self.handle = self.owner.start()
+diff --git a/hermes_cli/fact_view_owner.py b/hermes_cli/fact_view_owner.py
+index 428ffadcb08..3cac1b3d505 100644
+--- a/hermes_cli/fact_view_owner.py
++++ b/hermes_cli/fact_view_owner.py
+@@ -16,12 +16,14 @@
+ 
+ 
+ class ViewOwner:
+-    def __init__(self, scope, capture, render, views, *, paths=(), bindings=(), consumer='board'):
++    def __init__(self, scope, capture, render, views, *, paths=(), bindings=(), consumer='board', input_options=None):
++        """``input_options``: the native input source's bounds (``BoardInputSource`` refresh/validity/gap/limit)."""
+         self.scope, self.consumer = scope, consumer
+         self.store = process_store()
+         engine = ReducerEngine(self.store, scope)
+         from hermes_cli.fact_contract import SourceId
+-        self.source = BoardInputSource(engine, SourceId(scope, 'board.input', 'native'), capture, paths=paths)
++        self.source = BoardInputSource(engine, SourceId(scope, 'board.input', 'native'), capture, paths=paths,
++                                       **(input_options or {}))
+         self.owner = self.transport = self.handle = None
+         self.lifecycle = IncrementalLifecycle({(scope, consumer)})
+         # Views depend only on each binding's SourceState (an invalidation clock), never its rows, so the
+diff --git a/tests/hermes_cli/test_fact_board_pacing.py b/tests/hermes_cli/test_fact_board_pacing.py
+index 47bb68ad935..dd1cb659e8f 100644
+--- a/tests/hermes_cli/test_fact_board_pacing.py
++++ b/tests/hermes_cli/test_fact_board_pacing.py
+@@ -252,9 +252,9 @@
+ 
+ 
+ def test_every_view_owner_paces_its_views():
+-    """The project tree's views run on the same source as the board's."""
++    """Every ViewOwner's input source is paced (the tree passes its own validity and limit, fact_tree_startup)."""
+     from hermes_cli.fact_view_owner import ViewOwner
+-    owner = ViewOwner(Scope('installation', 'default', 'tree'), lambda *a: None, lambda *a: None, ('tree',))
++    owner = ViewOwner(Scope('installation', 'default', 'board'), lambda *a: None, lambda *a: None, ('board',))
+     assert owner.source._gap == 5 and owner.source._capture_seconds == 30
+ 
+ 
+diff --git a/tests/hermes_cli/test_fact_tree_input_validity.py b/tests/hermes_cli/test_fact_tree_input_validity.py
+new file mode 100644
+index 00000000000..ab70b008a70
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_tree_input_validity.py
+@@ -0,0 +1,56 @@
++"""The project tree's captured input outlives a slow capture cycle (``fact_tree_startup``). [daveey]
++
++Representative observation: tree selectors walked profiles and queued with board views on
++a shared capture worker. A loaded backend could exceed input validity; the
++inputs expired before their recapture and the projects tree answered 503 dependency_unavailable.
++"""
++import time
++
++from hermes_cli.fact_board_inputs import BoardCapture
++from hermes_cli.fact_contract import Scope, freeze
++from hermes_cli.fact_tree_startup import TreeRuntime
++from hermes_cli.fact_view_owner import ViewOwner
++
++
++def _published(source, view, selector, observed_at):
++    key = source.input_key(view, selector)
++    source.commit(BoardCapture(key, freeze({'rows': []}), (), observed_at))
++    return source.engine.store.snapshot(source.engine.scope).get(key)
++
++
++def test_a_tree_input_stays_servable_for_five_minutes():
++    runtime = TreeRuntime(targets=())
++    now = time.time()
++    fact = _published(runtime.owner.source, 'tree', {'surface': 'native', 'profile': None, 'preview_limit': 3,
++                                                     'session_limit': 2000}, now)
++    assert fact.health == 'fresh'
++    assert fact.valid_until - fact.observed_at == 300  # five minutes, not the board's 60 s
++    assert runtime.owner.source._refresh == 30  # still refreshed every 30 s
++    assert runtime.owner.source._capture_seconds == 60
++
++
++def test_a_tree_input_captured_two_minutes_ago_is_still_valid():
++    """Past the board's 60 s and inside the tree's 300 s: the slow cycle the hub saw (inputs aged 64-178 s)."""
++    runtime = TreeRuntime(targets=())
++    now = time.time()
++    fact = _published(runtime.owner.source, 'tree', {'surface': 'native', 'profile': None, 'preview_limit': 2000,
++                                                     'session_limit': 2000}, now - 120)
++    assert fact.valid_until > now  # still within its validity: fact_expiry leaves it servable
++
++
++def test_a_failed_tree_capture_still_fails_closed_at_once():
++    runtime = TreeRuntime(targets=())
++    source = runtime.owner.source
++    selector = {'surface': 'native', 'profile': None, 'preview_limit': 3, 'session_limit': 2000}
++    _published(source, 'tree', selector, time.time())
++    key = source.input_key('tree', selector)
++    source.commit(BoardCapture(key=key, failed=True, observed_at=time.time()))
++    fact = source.engine.store.snapshot(source.engine.scope).get(key)
++    assert fact.health == 'stale' and fact.error_code == 'board_capture_failed'
++
++
++def test_the_board_input_keeps_its_one_minute_validity():
++    owner = ViewOwner(Scope('installation', 'default', 'board'), lambda *a: None, lambda *a: None, ('board',))
++    fact = _published(owner.source, 'board', {'n': 1}, time.time())
++    assert fact.valid_until - fact.observed_at == 60
++    assert owner.source._capture_seconds == 30
+-- 
+2.43.0
+

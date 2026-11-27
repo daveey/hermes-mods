@@ -1,0 +1,402 @@
+From 9a1f8c880a9bc82046a5680c553b053d489f3649 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:19:51 +0000
+Subject: [PATCH 6194] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 9a1f8c880a9bc82046a5680c553b053d489f3649.
+
+---
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 355aec07134..abcf1b76e0d 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -78,8 +78,8 @@
+ # no longer re-reads every board's counts, the links projection and the attention pass (t_01a1cee98aaa8db1). Every
+ # other kind, and any update or delete of an event row, still bumps.
+ UNREAD_EVENT_KINDS = ("heartbeat",)
+-# Kinds a cached activity reader selects from task_events (session-activity UNSEEN_KINDS). An insert of any
+-# other kind still bumps ``revision`` (notify reads it) but not ``projection_revision``.
++# Kinds the links and annotation projection caches select (session-activity UNSEEN_KINDS). An insert of any
++# other kind still bumps ``revision`` (notify and the counts cache read it) but not ``projection_revision``.
+ PROJECTION_EVENT_KINDS = ("blocked", "completed", "crashed", "gave_up", "status", "timed_out")
+ _BUMP = f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1;"
+ _BUMP_PROJECTION = (f"UPDATE {REVISION_TABLE} SET projection_revision = projection_revision + 1 WHERE id = 1;")
+@@ -278,6 +278,7 @@
+ # (t_01a19d0bcab45558). Any trigger or table change bumps ``schema_version`` (and a replaced file has a new inode),
+ # so a matching version proves the same coverage; one statement reads both, in one snapshot.
+ _COVERED: dict[tuple, int] = {}
++_PROJECTION_COVERED: dict[tuple, int] = {}
+ _COVERED_LOCK = threading.Lock()
+ _COVERED_MAX = 256
+ 
+@@ -305,6 +306,33 @@
+     return revision
+ 
+ 
++def _projection_covered_read(conn: sqlite3.Connection, path: Path, db: tuple | None,
++                             tables: tuple[str, ...]) -> tuple | None:
++    """``read_projection_key``, skipping the schema scan once ``schema_version`` still matches."""
++    memo_key = (str(path), db[0], db[1], tables) if db is not None else None
++    with _COVERED_LOCK:
++        version = _PROJECTION_COVERED.get(memo_key) if memo_key is not None else None
++    if version is not None:
++        try:
++            row = conn.execute(
++                f"SELECT projection_revision, (SELECT schema_version FROM pragma_schema_version) "
++                f"FROM {REVISION_TABLE} WHERE id = 1").fetchone()
++        except sqlite3.OperationalError:
++            row = None
++        if row is not None and int(row[1]) == version:
++            return (int(row[0]), int(row[1]))
++    found = read_projection_key(conn, tables)
++    if memo_key is not None:
++        with _COVERED_LOCK:
++            if found is None:
++                _PROJECTION_COVERED.pop(memo_key, None)
++            else:
++                if len(_PROJECTION_COVERED) >= _COVERED_MAX:
++                    _PROJECTION_COVERED.clear()
++                _PROJECTION_COVERED[memo_key] = found[1]
++    return found
++
++
+ # Zero-budget SQLite probes must not race each other's reader lifecycle opens.
+ # The reader cache is shared, not thread-local: serialize probes before entering
+ # it, so concurrent healthy readers compare the SAME connection's data_version
+@@ -388,9 +416,9 @@
+ 
+ 
+ def projection_content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple | None:
+-    """Links/annotation key from one open, or None only when the probe lock was not acquired.
++    """Links/annotation key from one open, or None when the probe lock was not acquired or the file is missing.
+ 
+-    None is the only case the caller retries via ``content_key``. A file with no projection
++    None is the case the caller retries via ``content_key``. A file with no projection
+     counter is answered as the notify key on this same connection. A busy or unreadable file
+     returns an unequal stat key. Opening again would spend a second busy budget on a board
+     that is already locked.
+@@ -406,7 +434,7 @@
+             return None
+         try:
+             with open_ro(path) as conn:
+-                row = read_projection_key(conn, tables)
++                row = _projection_covered_read(conn, path, db, tables)
+                 if row is not None:
+                     return ("projection", db[0], db[1], *row)
+                 # Same open as ``_content_key``: an older file must not hide a write, and must
+diff --git a/hermes_cli/kanban_annotation_local.py b/hermes_cli/kanban_annotation_local.py
+index aa9a6181bfc..14232be383a 100644
+--- a/hermes_cli/kanban_annotation_local.py
++++ b/hermes_cli/kanban_annotation_local.py
+@@ -262,7 +262,8 @@
+         with cached_ro(Path(path), busy_budget=0) as conn:
+             conn.row_factory = sqlite3.Row
+             try:
+-                rows = links.replica_link_rows(conn, Path(path), gateway, profile, content)
++                rows = links.replica_link_rows(conn, Path(path), gateway, profile,
++                                               links.shadow_link_key(Path(path), content))
+                 try:
+                     row = conn.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
+                     pulled = float(row[0]) if row and row[0] is not None else None
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index c23f0bcc1f1..3ccc655fad3 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -108,14 +108,15 @@
+     from hermes_cli import kanban_session_activity as ksa
+ 
+     wall = time.time()
+-    local = ksa._activity_fingerprint(include_shadows=False)
++    counts_local = ksa._activity_fingerprint(include_shadows=False)
++    links_local = ksa._activity_fingerprint(include_shadows=False, projection=True)
+     shadows = ksa._shadow_fingerprint()
+-    if not ksa._revalidate.revalidatable(local + shadows, wall):
++    if not ksa._revalidate.revalidatable(counts_local + shadows, wall):
+         return None
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+-    return {COUNTS: (local, shadows, ledger, plain), LINKS: (local, ledger),
+-            ATTENTION: (local, _done_key(scope, wall))}
++    return {COUNTS: (counts_local, shadows, ledger, plain), LINKS: (links_local, ledger),
++            ATTENTION: (links_local, _done_key(scope, wall))}
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index e45e795c183..a27314e3fff 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -602,6 +602,16 @@
+     return max(HUB_STALE_AFTER_S, 3 * period)
+ 
+ 
++def shadow_link_key(path: Path, content: tuple | None = None) -> tuple:
++    """The one key both link-row memo callers pass. A stat key is kept, so a busy file never hits."""
++    from hermes_cli.kanban_activity_revision import SHADOW_TABLES, is_revision
++    from hermes_cli.kanban_session_activity import _projection_content_key
++
++    if content is not None and not is_revision(content):
++        return content
++    return _projection_content_key(path, SHADOW_TABLES)
++
++
+ def _read_replica(path: Path, gateway: str,
+                   profile: str) -> tuple[list[dict[str, Any]], Optional[float], dict[str, dict]]:
+     """Every unreleased link of this gateway+profile's chats in one replica, with its card row (or none when the
+@@ -615,11 +625,10 @@
+     release is unverified, whose owner-written ``shepherd`` sibling was released because the card closed. It hid 19
+     such hub cards from chat 20261026_170127_f07c32 that the ledger lists as ``unknown`` (laptop-1 links_diff,
+     2026-11-13). Each link now carries its own answer, as ``replica_cards`` says: only a released link drops it."""
+-    from hermes_cli.kanban_activity_revision import SHADOW_TABLES
+-    from hermes_cli.kanban_session_activity import _board_content_key, cached_ro  # lazy: that module imports this one
++    from hermes_cli.kanban_session_activity import cached_ro  # lazy: that module imports this one
+     # [daveey] The link rows only change with the replica's tasks/task_chat_links content; a pull that only moves
+     # ``pulled_at`` (every few seconds) re-reads the stamp, not the ~10k links. Rows are read-only to callers.
+-    content = _board_content_key(path, SHADOW_TABLES)
++    content = shadow_link_key(path)
+     with cached_ro(path) as conn:
+         conn.row_factory = sqlite3.Row
+         rows = replica_link_rows(conn, path, gateway, profile, content)
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 35e7e4a8019..f50b26c132f 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -819,24 +819,23 @@
+ 
+ 
+ def _projection_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
+-    """Links/annotation key: ignores task_events inserts those caches do not read. An older or busy file is
+-    answered by that one open; the fallback here is only a probe-lock miss, which did not open the file."""
++    """Links/annotation key. A probe-lock miss or a missing file falls back to the notify key."""
+     key = _revision.projection_content_key(path, tables, lambda p: cached_ro(p, busy_budget=0))
+     if key is not None:
+         return key
+     return _board_content_key(path, tables)
+ 
+ 
+-def _activity_fingerprint(*, include_shadows: bool = True) -> tuple:
+-    """Count inputs include sync shadows; the origin-ledger projection never reads them."""
++def _activity_fingerprint(*, include_shadows: bool = True, projection: bool = False) -> tuple:
++    """Counts use the notify key: that read also selects park, lifecycle and containment events."""
+     pinned = getattr(_revalidate.inputs_pin, "fingerprints", None)
+-    if pinned is not None and pinned[int(include_shadows)] is not None:
++    if not projection and pinned is not None and pinned[int(include_shadows)] is not None:
+         return pinned[int(include_shadows)]
+     hub = _hub_db_path()
+     signature = [_hub_content_signature(hub)] if hub is not None else []
+-    # [daveey] Each board's content revision (``kanban_activity_revision``), not its stat: bookkeeping writes
+-    # (sync stamps, dispatch stamps, a replica's pull stamp) rewrite the files ~61x/min with no task change.
+-    signature.extend((str(db), _projection_content_key(db)) for db in _board_db_paths())
++    # Bookkeeping rewrites the files ~61x/min with no task change; the counter ignores those columns.
++    key_of = _projection_content_key if projection else _board_content_key
++    signature.extend((str(db), key_of(db)) for db in _board_db_paths())
+     if include_shadows:
+         signature.extend(_shadow_fingerprint())
+         signature.extend(_origin_ledger_fingerprint())
+@@ -845,7 +844,7 @@
+ 
+ def _shadow_fingerprint() -> tuple:
+     """What ``_activity_fingerprint()`` appends to the local one: each sync shadow's content key."""
+-    return tuple((str(db), _projection_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
++    return tuple((str(db), _board_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
+ 
+ 
+ def _board_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
+@@ -945,7 +944,7 @@
+ 
+ def _links_fingerprint() -> tuple:
+     """Every store the remote inventory reads except state.db (alias tips), which the TTL bounds instead."""
+-    return (*_activity_fingerprint(include_shadows=False), *_origin_ledger_fingerprint())
++    return (*_activity_fingerprint(include_shadows=False, projection=True), *_origin_ledger_fingerprint())
+ 
+ 
+ def _origin_ledger_fingerprint() -> tuple:
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index 6a6f6373395..797eb51c386 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -19,6 +19,7 @@
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_session_activity as ksa
+ from hermes_cli import kanban_suspend_ledger as ledger
++from hermes_cli.kanban_counts_scopes import CountSnapshot
+ from tests.hermes_cli import kanban_sync_support as support
+ 
+ ME, OTHER = "macbook", "hub"
+@@ -113,9 +114,9 @@
+ 
+ 
+ def test_an_unread_event_wakes_notify_but_not_the_links_or_annotation_key(board):
+-    """A comment or claim event still moves the notify counter, and does not move the links or annotation key.
+-    An unseen kind and a task-status write move both. This is the notification-loss guard: dropping the
+-    notify bump would hide the event from the gate.
++    """A comment still moves the notify counter and the counts key (the counts read selects every event kind),
++    and does not move the links key. An unseen kind and a task-status write move both. Dropping the notify
++    bump would hide the event from the gate.
+     """
+     tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
+     path = ksa._board_db_paths()[0]
+@@ -131,20 +132,24 @@
+         board.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'commented', 1)", (tid,))
+     assert notify_key() != before_notify  # notification-loss: the gate key must move
+     assert ksa._board_content_key(path) != before_notify
+-    assert ksa._activity_fingerprint() == before_fp
++    assert ksa._activity_fingerprint() != before_fp  # counts readers select this kind
+     assert ksa._links_fingerprint() == before_links
+ 
++    before_links = ksa._links_fingerprint()
+     before_fp = ksa._activity_fingerprint()
+     with kbc.write_txn(board):
+         board.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'claimed', 2)", (tid,))
+-    assert ksa._activity_fingerprint() == before_fp
++    assert ksa._activity_fingerprint() != before_fp
++    assert ksa._links_fingerprint() == before_links
+     assert notify_key() != before_notify
+ 
+     before_fp = ksa._activity_fingerprint()
++    before_links = ksa._links_fingerprint()
+     before_notify = notify_key()
+     with kbc.write_txn(board):
+         board.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'completed', 3)", (tid,))
+     assert ksa._activity_fingerprint() != before_fp
++    assert ksa._links_fingerprint() != before_links
+     assert notify_key() != before_notify
+ 
+     before_fp = ksa._activity_fingerprint()
+@@ -319,3 +324,53 @@
+     board.execute("DROP TRIGGER kanban_activity_rev_tasks_update")
+     board.commit()
+     assert ksa._board_content_key(path)[0] == "stat" and len(scans) == 2
++
++
++def test_event_only_park_or_wake_moves_the_counts_key_not_the_links_key(board):
++    """A park or wake event committed after its task row (a feed page boundary) is an event the counts
++    read selects and the links projection does not. The counts cache must not keep the pre-event execution.
++    """
++    import time
++
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++    now = int(time.time())
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++    payload = {"reason": "waiting for CI", "wake_at": now + 3600, "clock_only": True,
++               "awaiting": {"kind": "ci", "ref": "run 1", "why": "CI"}}
++    before = ksa._all_counts(include_snapshot=True)
++    fp0 = ksa._activity_fingerprint()
++    links0 = ksa._links_fingerprint()
++    reads0, _ = ksa._read_board(path, parked=True, stalled=True)
++    with kbc.write_txn(board):
++        kb._append_event(board, tid, "scheduled", payload)
++    assert ksa._activity_fingerprint() != fp0
++    assert ksa._links_fingerprint() == links0
++    reads1, _ = ksa._read_board(path, parked=True, stalled=True)
++    assert reads0["execution"] != reads1["execution"]
++    after = ksa._all_counts(include_snapshot=True)
++    assert isinstance(before, CountSnapshot) and isinstance(after, CountSnapshot)
++    assert after.execution is not before.execution
++    assert reads1["execution"][tid]["state"] == "waiting"
++
++
++def test_event_only_condition_met_moves_the_counts_key(board):
++    import time
++
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++    now = int(time.time())
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'scheduled' WHERE id = ?", (tid,))
++        kb._append_event(board, tid, "scheduled", {"reason": "r", "wake_at": now + 3600, "clock_only": True})
++    before = ksa._all_counts(include_snapshot=True)
++    fp0 = ksa._activity_fingerprint()
++    with kbc.write_txn(board):
++        kb._append_event(board, tid, "condition_met", {"reason": "probe passed"})
++    assert ksa._activity_fingerprint() != fp0
++    reads1, _ = ksa._read_board(path, parked=True, stalled=True)
++    after = ksa._all_counts(include_snapshot=True)
++    assert isinstance(before, CountSnapshot) and isinstance(after, CountSnapshot)
++    assert after.execution is not before.execution
++    assert reads1["execution"][tid]["state"] == "unknown"
+diff --git a/tests/hermes_cli/test_kanban_annotation_narrow_local.py b/tests/hermes_cli/test_kanban_annotation_narrow_local.py
+index bb7cd5d354d..4daf5749c58 100644
+--- a/tests/hermes_cli/test_kanban_annotation_narrow_local.py
++++ b/tests/hermes_cli/test_kanban_annotation_narrow_local.py
+@@ -310,3 +310,30 @@
+         narrow.reset()
+         assert key(world) == incremental, f"step {step} op {op}"
+     assert own.stats["board_patches"] > 0
++
++
++def test_shadow_link_memo_shares_one_key(world, monkeypatch):
++    """``shadows_part`` and ``_read_replica`` share one slot. Different keys re-read an unchanged shadow."""
++    from pathlib import Path
++
++    from hermes_cli import kanban_chat_links as links
++
++    shadow = Path(world["shadow"])
++    monkeypatch.setattr(ksa, "_replica_paths", lambda: [shadow])
++    links._reset_for_tests()
++    reads = []
++    real = links._read_replica_links
++
++    def counted(conn, gateway, profile):
++        reads.append(1)
++        return real(conn, gateway, profile)
++
++    monkeypatch.setattr(links, "_read_replica_links", counted)
++    for _ in range(3):
++        own.shadows_part([(str(shadow), dict(ksa._shadow_fingerprint())[str(shadow)])], PROFILE)
++        links._read_replica(shadow, ME, PROFILE)
++    assert len(reads) == 1
++    world["sconn"].execute("INSERT INTO task_events (task_id, kind) VALUES ('r1', 'commented')")
++    own.shadows_part([(str(shadow), dict(ksa._shadow_fingerprint())[str(shadow)])], PROFILE)
++    links._read_replica(shadow, ME, PROFILE)
++    assert len(reads) == 1
+diff --git a/tests/hermes_cli/test_kanban_annotation_snapshot.py b/tests/hermes_cli/test_kanban_annotation_snapshot.py
+index 86acee8c368..50b3007b00c 100644
+--- a/tests/hermes_cli/test_kanban_annotation_snapshot.py
++++ b/tests/hermes_cli/test_kanban_annotation_snapshot.py
+@@ -8,7 +8,7 @@
+     clock = [100.0]
+     calls = []
+     monkeypatch.setattr(activity.time, "monotonic", lambda: clock[0])
+-    monkeypatch.setattr(activity, "_activity_fingerprint", lambda: ())
++    monkeypatch.setattr(activity, "_activity_fingerprint", lambda **_kw: ())
+     monkeypatch.setattr(activity, "_origin_scope", lambda: ("owner", "default"))
+     monkeypatch.setattr(activity, "_extra_waiting", dict)
+     monkeypatch.setattr(activity, "attention_task_counts", dict)
+diff --git a/tests/hermes_cli/test_kanban_poll_cache_guarantees.py b/tests/hermes_cli/test_kanban_poll_cache_guarantees.py
+index d25b0bc55ed..eaf79cd38dd 100644
+--- a/tests/hermes_cli/test_kanban_poll_cache_guarantees.py
++++ b/tests/hermes_cli/test_kanban_poll_cache_guarantees.py
+@@ -84,25 +84,13 @@
+     paths = [tmp_path / "kanban.db", tmp_path / "kanban" / "boards" / "second" / "kanban.db"]
+     conns = [helpers._board(p, [(f"t{i}", "running", "s1")]) for i, p in enumerate(paths)]
+     reads = Counter()
+-    real, real_projection = ksa._board_content_key, ksa._projection_content_key
+-    nested = []
++    real = ksa._board_content_key
+ 
+     def counted(path, *args):
+-        if not nested:  # the projection probe's lock-miss fallback is the same read, not a second one
+-            reads[path] += 1
+-        return real(path, *args)
+-
+-    def counted_projection(path, *args):
+-        # The fingerprint reads through the projection probe, which answers an older board itself.
+         reads[path] += 1
+-        nested.append(path)
+-        try:
+-            return real_projection(path, *args)
+-        finally:
+-            nested.pop()
++        return real(path, *args)
+ 
+     monkeypatch.setattr(ksa, "_board_content_key", counted)
+-    monkeypatch.setattr(ksa, "_projection_content_key", counted_projection)
+     try:
+         assert ksa._board_db_paths() == paths
+         assert all(real(path)[0] == "revision" for path in paths)
+-- 
+2.43.0
+

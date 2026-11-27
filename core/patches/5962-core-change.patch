@@ -1,0 +1,422 @@
+From 6c375a6abf289e7451bfdad1c92cebccf04aa529 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:43:01 +0000
+Subject: [PATCH 5962] Kanban chat links, adoption provenance and rejected-retain archive
+
+Public mirror of source commit 6c375a6abf289e7451bfdad1c92cebccf04aa529.
+
+---
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 0e933dbf790..f362be9b330 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1801,9 +1801,7 @@
+     return row["status"] if row else None
+ 
+ 
+-def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+-    row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-    return int(row["current_run_id"]) if row and row["current_run_id"] else None
++from hermes_cli.kanban_db_run import _current_run_id
+ 
+ 
+ # Distinguishes "caller named the acting profile" (which may legitimately be
+@@ -2150,6 +2148,8 @@
+     ``enforce_max_runtime`` and ``detect_crashed_workers`` remain the upper bounds for genuinely wedged or
+     dead workers.
+     """
++    from hermes_cli.kanban_run_end_retry import drain
++    drain(conn)
+     now = int(time.time())
+     reclaimed = 0
+     host_prefix = _host_prefix()
+diff --git a/hermes_cli/kanban_db_run.py b/hermes_cli/kanban_db_run.py
+index 348d201000e..065a812d514 100644
+--- a/hermes_cli/kanban_db_run.py
++++ b/hermes_cli/kanban_db_run.py
+@@ -5,6 +5,11 @@
+ import time
+ from typing import Optional
+ 
++def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return int(row["current_run_id"]) if row and row["current_run_id"] else None
++
++
+ def _end_run(
+     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
+     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
+diff --git a/hermes_cli/kanban_run_end_lease.py b/hermes_cli/kanban_run_end_lease.py
+index 8246d9a00db..e44267c41d7 100644
+--- a/hermes_cli/kanban_run_end_lease.py
++++ b/hermes_cli/kanban_run_end_lease.py
+@@ -15,7 +15,12 @@
+ release with their own outcome, and a neutral release sent first would hide the charge. (Archive and
+ descendant reopen close the run ``reclaimed`` too, but as uncharged operator transitions, so they queue.)
+ 
+-Only while the outbox is stalled (:func:`outbox_stalled`). Board ``releaseTask`` returns a card it still
++Only while the outbox is stalled (:func:`outbox_stalled`) for the immediate
++post-commit attempt. ``kanban_run_end_retry`` also captures a durable obligation
++in the ending transaction: after the same 120s grace the dispatcher retries it
++independently of the push loop, including when no card is still running. This
++covers a fresh queue that stalls only AFTER the one-shot callback has returned.
++Board ``releaseTask`` returns a card it still
+ sees ``running`` to ``ready`` (and drops a placement card's ``runs_on``). On a healthy host the direct
+ release would usually beat the row push, so a parked or done card would read ``ready`` on the Board
+ until the push lands, open to a claim from another machine. There the row push ends the lease itself,
+@@ -70,10 +75,14 @@
+     uid = sync.run_uid(conn, run_id)
+     if uid is None:
+         return
+-    if getattr(conn, "in_transaction", False):
+-        _PENDING.setdefault(id(conn), []).append((task_id, uid))
+-    else:
+-        _release(conn, task_id, uid)
++    from hermes_cli import kanban_run_end_retry
++    if not conn.in_transaction:
++        from hermes_cli.kanban_db_connect import write_txn
++        with write_txn(conn):
++            note(conn, task_id, run_id)
++        return
++    kanban_run_end_retry.note(conn, task_id, uid)
++    _PENDING.setdefault(id(conn), []).append((task_id, uid))
+ 
+ 
+ def flush(conn: sqlite3.Connection, *, committed: bool) -> None:
+@@ -94,7 +103,8 @@
+         if not outbox_stalled(conn):
+             return  # the row push ends the lease on the Board, with no window where the card reads ready
+         _log.info("kanban sync: outbox stalled; releasing the Board lease of %s run %s at its end", task_id, uid)
+-        sync.release_lease(conn, task_id, uid)
++        from hermes_cli import kanban_run_end_retry
++        kanban_run_end_retry.send(conn, task_id, uid)
+     except Exception as exc:  # health: allow BLE001 -- best-effort: the lease expires on the server instead
+         _log.warning("kanban sync: lease release for %s run %s failed (%s: %s); it expires on the server",
+                      task_id, uid, type(exc).__name__, exc)
+diff --git a/hermes_cli/kanban_run_end_retry.py b/hermes_cli/kanban_run_end_retry.py
+new file mode 100644
+index 00000000000..aaa1c2976f9
+--- /dev/null
++++ b/hermes_cli/kanban_run_end_retry.py
+@@ -0,0 +1,69 @@
++"""Host-local custody of neutral run-end releases, independent of row sync. [daveey]
++
++The ordinary status push has 120s to close the Board lease without a ready window.
++If it does not, the dispatcher retries the same exact-run release used by the
++already-stalled fast path. This does not override server expiry or repair a
++charged run. A failed call stays durable; a successor run is fenced by the Board.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++TABLE = "kanban_run_end_retries"
++GRACE_SECONDS = 120
++BATCH_SIZE = 16
++
++
++def note(conn: sqlite3.Connection, task: str, uid: str) -> None:
++    """Called in the run-ending transaction, so rollback drops the obligation too."""
++    state = sync.sync_state(conn)
++    assert state is not None  # callers require a configured primary board
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (run_uid TEXT PRIMARY KEY, "
++                 "task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, "
++                 "gateway TEXT NOT NULL, board TEXT NOT NULL, due_at INTEGER NOT NULL)")
++    conn.execute(f"INSERT OR IGNORE INTO {TABLE} VALUES (?, ?, ?, ?, ?)",
++                 (uid, task, state["gateway_id"], state["board_id"], int(time.time()) + GRACE_SECONDS))
++
++
++def drain(conn: sqlite3.Connection) -> None:
++    """Bounded dispatcher maintenance, including when no card remains running."""
++    if sync.board_mode(conn) != "primary" or conn.in_transaction:
++        return
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone():
++        return
++    now = int(time.time())
++    state = sync.sync_state(conn)
++    assert state is not None  # callers require a configured primary board
++    rows = conn.execute(f"SELECT * FROM {TABLE} WHERE due_at<=? AND gateway=? AND board=? "
++                        "ORDER BY due_at,run_uid LIMIT ?",
++                        (now, state["gateway_id"], state["board_id"], BATCH_SIZE)).fetchall()
++    for row in rows:
++        send(conn, row["task_id"], row["run_uid"])
++
++
++def send(conn: sqlite3.Connection, task: str, uid: str) -> None:
++    """Only a committed closed run and its original gateway may send this release."""
++    row = conn.execute(f"SELECT q.*,r.ended_at FROM {TABLE} q JOIN task_runs r ON r.uid=q.run_uid "
++                       "AND r.task_id=q.task_id WHERE q.run_uid=? AND q.task_id=?", (uid, task)).fetchone()
++    if row is None or row["ended_at"] is None:
++        return  # a rolled-back savepoint did not end the run
++    state = sync.sync_state(conn)
++    assert state is not None  # callers require a configured primary board
++    if state["gateway_id"] != row["gateway"] or state["board_id"] != row["board"]:
++        return  # custody is host-local, not permission to act through a new principal
++    try:
++        sync._client().release(board_id=row["board"], task_uid=task, run_uid=uid, gateway_id=row["gateway"])
++    except sync._CLIENT_ERRORS as exc:
++        _log.info("kanban run-end release for %s/%s deferred: %s", task, uid, exc)
++        from hermes_cli.kanban_db_connect import write_txn
++        with write_txn(conn):
++            conn.execute(f"UPDATE {TABLE} SET due_at=? WHERE run_uid=?", (int(time.time()) + GRACE_SECONDS, uid))
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        conn.execute(f"DELETE FROM {TABLE} WHERE run_uid=?", (uid,))
+diff --git a/tests/hermes_cli/test_kanban_parked_lease_retry.py b/tests/hermes_cli/test_kanban_parked_lease_retry.py
+new file mode 100644
+index 00000000000..b54bc9f6630
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parked_lease_retry.py
+@@ -0,0 +1,195 @@
++"""A primary holder can park before its healthy push loop later stops. [daveey]"""
++from __future__ import annotations
++
++from pathlib import Path
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    yield from support.synced_conn(home)
++
++
++@pytest.fixture
++def client():
++    yield from support.lease_client()
++
++
++def claimed(board, client):
++    sync.set_mode(board, "primary")
++    task = kb.create_task(board, title="park on a new helper", assignee="worker")
++    assert kb.claim_task(board, task)
++    run = kb.get_task(board, task).current_run_id
++    uid = sync.run_uid(board, run)
++    helper = kb.create_task(board, title="new helper", assignee="worker")
++    kb.link_tasks(board, helper, task, expected_child_run_id=run)
++    return task, run, uid
++
++
++def released(client):
++    return [fields for kind, fields in client.calls if kind == "release"]
++
++
++def test_dependency_park_retries_release_after_push_stops(board, client, monkeypatch):
++    task, run, uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on linked helper", kind="dependency", expected_run_id=run)
++    assert kb.get_task(board, task).status == "todo"
++    assert not released(client)  # healthy/fresh outbox: no ready window at the park
++    # The process exits cleanly now. Its post-commit in-memory queue is gone.
++    # No sync push occurs, and the next independent dispatcher sweep is later.
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    assert kb.release_stale_claims(board) == 0
++    assert [(r["task_uid"], r["run_uid"]) for r in released(client)] == [(task, uid)]
++    assert kb.get_task(board, task).consecutive_failures == 0
++    assert not [e for e in kb.list_events(board, task) if e.kind in ("failure_finalized", "reclaimed")]
++    kb.release_stale_claims(board)
++    assert len(released(client)) == 1
++
++
++def test_obligation_survives_a_new_connection(board, client, monkeypatch):
++    from hermes_cli.kanban_db_connect import connect
++    task, run, uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    other = connect(Path(path))
++    try:
++        kb.release_stale_claims(other)
++    finally:
++        other.close()
++    assert [r["run_uid"] for r in released(client)] == [uid]
++
++
++def test_failed_retry_is_durable_and_backed_off(board, client, monkeypatch):
++    task, run, uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++    original = client.release
++    attempts = []
++
++    def offline(**fields):
++        attempts.append(fields)
++        raise sync.LeaseUnavailable("offline fixture")
++
++    monkeypatch.setattr(client, "release", offline)
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    kb.release_stale_claims(board)
++    assert len(attempts) == 1
++    monkeypatch.setattr(client, "release", original)
++    monkeypatch.setattr(time, "time", lambda: now + 242)
++    kb.release_stale_claims(board)
++    assert [r["run_uid"] for r in released(client)] == [uid]
++    assert kb.get_task(board, task).status == "todo"
++
++
++def test_no_early_retry_and_empty_drain_is_read_only(board, client, monkeypatch):
++    task, run, _uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++    monkeypatch.setattr(time, "time", lambda: now + 119)
++    statements = []
++    board.set_trace_callback(statements.append)
++    try:
++        kb.release_stale_claims(board)
++    finally:
++        board.set_trace_callback(None)
++    assert not released(client)
++    assert not [s for s in statements if s.upper().startswith(("BEGIN", "INSERT", "UPDATE", "DELETE", "CREATE"))]
++
++
++def test_foreign_principal_cannot_replay_obligation(board, client, monkeypatch):
++    task, run, _uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++    with kb.write_txn(board):
++        board.execute("UPDATE kanban_sync_state SET gateway_id='other-holder'")
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    assert released(client) == []
++
++
++def test_savepoint_rollback_keeps_run_and_never_releases(board, client, monkeypatch):
++    task, _run, _uid = claimed(board, client)
++    now = time.time()
++    with kb.write_txn(board):
++        board.execute("SAVEPOINT undone")
++        kb._end_or_synthesize_run(board, task, outcome="blocked", status="todo", synthesize=False)
++        board.execute("ROLLBACK TO undone")
++        board.execute("RELEASE undone")
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    assert released(client) == []
++
++
++def test_batch_is_bounded_and_foreign_receipts_do_not_starve_it(board, client, monkeypatch):
++    from hermes_cli import kanban_run_end_retry as retry
++    now = time.time()
++    monkeypatch.setattr(time, "time", lambda: now)
++    expected = []
++    # Each receipt corresponds to a distinct committed clean run.
++    for _ in range(retry.BATCH_SIZE + 1):
++        task, run, uid = claimed(board, client)
++        assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++        expected.append(uid)
++    with kb.write_txn(board):
++        board.execute(f"INSERT INTO {retry.TABLE} SELECT 'foreign-' || run_uid,task_id,'elsewhere',board,0 "
++                      f"FROM {retry.TABLE}")
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    assert len(released(client)) == retry.BATCH_SIZE
++    kb.release_stale_claims(board)
++    assert sorted(r["run_uid"] for r in released(client)) == sorted(expected)
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow"])
++def test_retry_cannot_send_outside_primary(board, client, monkeypatch, mode):
++    task, run, _uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++    sync.set_mode(board, mode)
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    assert not released(client)
++
++
++def test_retry_never_sends_inside_a_write_transaction(board, client, monkeypatch):
++    task, run, _uid = claimed(board, client)
++    now = time.time()
++    assert kb.block_task(board, task, reason="wait on helper", kind="dependency", expected_run_id=run)
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    with kb.write_txn(board):
++        kb.release_stale_claims(board)
++        assert not released(client)
++    kb.release_stale_claims(board)
++    assert len(released(client)) == 1
++
++
++def test_real_crash_without_park_does_not_get_neutral_release(board, client, monkeypatch):
++    task, _run, _uid = claimed(board, client)
++    now = time.time()
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    assert released(client) == []
++    assert kb.get_task(board, task).status == "running"
++
++
++def test_rolled_back_park_has_no_later_release(board, client, monkeypatch):
++    task, _run, _uid = claimed(board, client)
++    now = time.time()
++    with pytest.raises(RuntimeError, match="abort"):
++        with kb.write_txn(board):
++            kb._end_or_synthesize_run(board, task, outcome="blocked", status="todo", synthesize=False)
++            raise RuntimeError("abort")
++    monkeypatch.setattr(time, "time", lambda: now + 121)
++    kb.release_stale_claims(board)
++    assert released(client) == []
+diff --git a/tests/hermes_cli/test_worker_drain_results_gate.py b/tests/hermes_cli/test_worker_drain_results_gate.py
+index eecedd01211..67c99de1ecb 100644
+--- a/tests/hermes_cli/test_worker_drain_results_gate.py
++++ b/tests/hermes_cli/test_worker_drain_results_gate.py
+@@ -5,7 +5,6 @@
+ 
+ from hermes_cli import machine_persistent_jobs as jobs, worker_drain_results_gate as gate
+ from hermes_cli.kanban_db_sync import SYNC_SCHEMA_SQL
+-from hermes_cli.kanban_run_end_lease import _release
+ 
+ 
+ def _board(tmp_path, rows=0, name='kanban.db'):
+@@ -73,16 +72,23 @@
+ 
+ def test_real_release_leaves_pending_row_so_gate_holds(tmp_path, monkeypatch):
+     """The real kanban_run_end_lease._release drops the Board lease with the row pending."""
+-    path = _board(tmp_path, rows=1)
+-    conn = sqlite3.connect(path)
+-    conn.execute('ALTER TABLE kanban_sync_outbox ADD COLUMN retry_after INTEGER')  # migration column
+-    conn.execute('CREATE TABLE task_runs(uid TEXT, ended_at INTEGER)')
+-    conn.execute("INSERT INTO task_runs VALUES ('u1', 5)")
+-    released = []
+-    from hermes_cli import kanban_db_sync as sync
+-    monkeypatch.setattr(sync, 'release_lease', lambda c, t, u: released.append((t, u)))
+-    _release(conn, 't1', 'u1')
+-    conn.commit()
+-    conn.close()
+-    assert released == [('t1', 'u1')]  # lease gone, a process census would be zero
++    from hermes_cli import kanban_db as kb, kanban_db_sync as sync
++    from tests.hermes_cli import kanban_sync_support as support
++    from contextlib import contextmanager
++    home = support.kanban_home(tmp_path, monkeypatch)
++    with contextmanager(support.synced_conn)(home) as conn, contextmanager(support.lease_client)() as client:
++        sync.set_mode(conn, 'primary')
++        task = kb.create_task(conn, title='park', assignee='worker')
++        assert kb.claim_task(conn, task)
++        run = kb.get_task(conn, task).current_run_id
++        uid = sync.run_uid(conn, run)
++        helper = kb.create_task(conn, title='helper', assignee='worker')
++        kb.link_tasks(conn, helper, task, expected_child_run_id=run)
++        assert kb.parent_ids(conn, task) == [helper]
++        with kb.write_txn(conn):
++            conn.execute('UPDATE kanban_sync_outbox SET created_at=1')
++        assert kb.block_task(conn, task, reason='helper', kind='dependency', expected_run_id=run)
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++    released = [fields for action, fields in client.calls if action == 'release']
++    assert [fields['run_uid'] for fields in released] == [uid]
+     assert gate.gate_count(0, [path]) is None
+-- 
+2.43.0
+

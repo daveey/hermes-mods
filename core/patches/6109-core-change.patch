@@ -1,0 +1,274 @@
+From 089e43304f453abe53e4bc28c5a87e37a8f8fece Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:51:20 +0000
+Subject: [PATCH 6109] Kanban spend-decision routing, ownerless stops and hold notices
+
+Public mirror of source commit 089e43304f453abe53e4bc28c5a87e37a8f8fece.
+
+---
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 4310cbc95c1..dee737a78f5 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -331,6 +331,13 @@
+     from hermes_cli.kanban_refusal_receipt import restricted
+     safety = restricted(conn, task_id)
+     stopped = execution_restricted(conn, task_id)
++    # A decision card's only power is ``spend_promote``, which releases an ordinary budget stop and nothing else.
++    # A stop with a cause (capability_unavailable, scope_stopped, safety_refusal) gets no card: its worker could
++    # only retain it, a second stop and no decision. The stranded-park escalation owns it (kanban_stranded_park),
++    # so the card built below is always for an ordinary stop.
++    import json
++    if safety or stopped or (stop and json.loads(stop['payload'] or '{}').get('cause')):
++        return {'kind': 'unavailable'}
+     import json as _json
+     stop = pending_episode(conn, task_id)
+     listed = _json.loads(stop['payload'] or '{}').get('refused_providers') if stop is not None and safety else None
+@@ -346,9 +353,7 @@
+              + "Source title and stop reason (historical evidence):\n" + forwarded_text(task.title) + "\n"
+              + forwarded_text(note) + "\n\n" + guidance + action
+              + "\n\nApply the disposition on the source before completing this decision card; a recommendation or "
+-             "completion alone does not change its hold. If authority/capability is unavailable, retain this "
+-             "decision card as a non-executing owner with the exact prerequisite instead of completing and "
+-             "leaving the source ownerless. Never renew spend or bypass safety/scope gates implicitly.",
++             "completion alone does not change its hold. Never renew spend or bypass safety/scope gates implicitly.",
+         assignee=_supervisor_profile(), created_by="kanban-spend-budget", workspace_kind="scratch",
+         idempotency_key=f"spend-budget-decision:{task_id}:{episode}", tenant=task.tenant)
+     stop = pending_episode(conn, task_id)
+diff --git a/tests/hermes_cli/test_kanban_spend_decision.py b/tests/hermes_cli/test_kanban_spend_decision.py
+index c162933f43b..cbeefcc52c4 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision.py
++++ b/tests/hermes_cli/test_kanban_spend_decision.py
+@@ -7,7 +7,7 @@
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_spend_decision as decision
+ from hermes_cli.kanban_triage_sweep import sweep_stale_triage
+-from tests.hermes_cli.test_kanban_spend_route_repair import _route, _stop
++from tests.hermes_cli.test_kanban_spend_route_repair import _carded_stop, _route, _stop
+ from tests.hermes_cli import test_kanban_spend_budget as helpers
+ 
+ kanban_home = helpers.kanban_home
+@@ -22,8 +22,7 @@
+ @pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
+ def test_archived_wrapper_not_refiled_same_episode(kanban_home, status, cause):
+     with kbc.connect_closing() as conn:
+-        tid = _stop(conn, cause)
+-        decision.ensure_producer(conn, tid)
++        tid = _carded_stop(conn, cause)
+         sup = _route(conn, tid)["task_id"]
+         if status == "archived":
+             assert kb.archive_task(conn, sup)
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_causes.py b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+new file mode 100644
+index 00000000000..41570d4af7f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+@@ -0,0 +1,106 @@
++"""Only an ordinary budget stop gets a decision card; a stop with a cause is left to the stranded park. [daveey]
++
++A "Spend budget decision" card can do one thing: promote its source (``spend_promote``). That releases a plain
++run/token budget stop and nothing else. For a ``capability_unavailable``, ``scope_stopped`` or ``safety_refusal``
++stop the card's worker could only retain the card, creating another stop without a decision. With
++no live owning chat such a stop now records the producer ``{"kind": "unavailable"}`` and the
++stranded-park escalation is its owner.
++"""
++from __future__ import annotations
++
++import pytest
++
++from gateway.session_context import scoped_current_session_id
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_containment_actor as support
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++from tests.hermes_cli import test_kanban_spend_budget_hold as hold_helpers
++from tests.hermes_cli import test_kanban_spend_decision_routing as routing
++from tests.hermes_cli.test_kanban_spend_route_repair import _route, _stop
++
++kanban_home = helpers.kanban_home
++board = support.board
++own_gateway = routing.own_gateway
++
++CAUSES = ["capability_unavailable", "scope_stopped", "safety_refusal"]
++
++
++def _cards(conn):
++    return [r[0] for r in conn.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'")]
++
++
++def _notices(conn, tid):
++    return helpers._events(conn, tid, decision.NOTICE)
++
++
++@pytest.mark.parametrize("reason", ["capability_unavailable", "scope_stopped"])
++def test_retain_with_no_live_chat_is_unavailable_and_files_no_card(board, monkeypatch, reason):
++    """The worker's own ``kanban_retain`` is the entry path: its stop carries the cause and no card is made."""
++    from hermes_cli import kanban_retain as retain
++    tid, _, session = support.bind(board, monkeypatch)
++    with scoped_current_session_id(session):
++        result = retain.retain(board, board="default", summary="Cannot finish from here", reason=reason,
++                               next_step="Owner supplies the missing prerequisite",
++                               release_condition="Prerequisite exists", evidence=["fixture"])
++    (event,) = _notices(board, tid)
++    assert event.payload["producer"] == {"kind": "unavailable"}
++    assert result["next_action"]["owner"] == {"kind": "unavailable"}
++    assert _cards(board) == []
++    assert kb.get_task(board, tid).status == "triage" and decision.pending(board, tid)
++
++
++@pytest.mark.parametrize("cause", CAUSES)
++def test_stop_with_a_cause_and_no_live_chat_is_unavailable_and_files_no_card(kanban_home, cause):
++    """The dispatcher's producer repair is the other entry path (safety stops only arrive this way)."""
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid) == {"kind": "unavailable"}
++        assert _cards(conn) == []
++        # The route is terminal for the episode: later sweeps neither re-notify nor file a card.
++        decision.ensure_producer(conn, tid)
++        decision.repair_triage_routes(conn, skip=set())
++        assert len(_notices(conn, tid)) == 1 and _cards(conn) == []
++        assert kb.get_task(conn, tid).status == "triage" and decision.pending(conn, tid)
++
++
++def test_restriction_recorded_apart_from_the_stop_files_no_card(kanban_home):
++    """A budget stop restricted by a later ``decision_hold_restricted`` has no cause on the stop event itself."""
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn)
++        episode = decision.pending_episode(conn, tid)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_hold_restricted",
++                             {"cause": "scope_stopped", "episode": episode.get("uid") or str(episode["id"])})
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid) == {"kind": "unavailable"}
++        assert _cards(conn) == []
++
++
++def test_plain_budget_stop_with_no_live_chat_still_gets_a_decision_card(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = hold_helpers.stopped(conn)
++        assert budget.hold(conn, tid) == "triage"
++        (event,) = _notices(conn, tid)
++        producer = event.payload["producer"]
++        assert producer["kind"] == "supervisor" and _cards(conn) == [producer["task_id"]]
++        card = kb.get_task(conn, producer["task_id"])
++        assert card.status not in ("done", "archived")
++        assert f"hermes kanban promote {tid} --reason" in card.body and "or archive it" in card.body
++        assert "split or re-scope" in card.body
++        assert "retain this decision card" not in card.body and "non-executing owner" not in card.body
++        assert "authority unavailable" not in card.body
++
++
++@pytest.mark.parametrize("cause", [None, *CAUSES])
++def test_live_owning_chat_is_still_the_route(kanban_home, own_gateway, cause):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        routing._links(conn, tid, ("remote", "default", "human-chat"))
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid) == {"kind": "chats"}
++        assert routing._subs(conn, tid) == [("hub", "remote/default/human-chat")]
++        assert _cards(conn) == []
+diff --git a/tests/hermes_cli/test_kanban_spend_route_repair.py b/tests/hermes_cli/test_kanban_spend_route_repair.py
+index abcb3997a4a..0c512c267ae 100644
+--- a/tests/hermes_cli/test_kanban_spend_route_repair.py
++++ b/tests/hermes_cli/test_kanban_spend_route_repair.py
+@@ -24,12 +24,26 @@
+     return helpers._events(conn, tid, decision.NOTICE)[-1].payload["producer"]
+ 
+ 
++def _carded_stop(conn, cause=None):
++    """A stop that already has its decision card. A stop with a cause gets none of its own
++    (test_kanban_spend_decision_causes), so the cause arrives after the card, as a scope retain on a budget stop
++    does."""
++    tid = _stop(conn)
++    decision.ensure_producer(conn, tid)
++    if cause:
++        episode = decision.pending_episode(conn, tid)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_hold_restricted",
++                             {"cause": cause, "episode": episode.get("uid") or str(episode["id"])})
++        decision.ensure_producer(conn, tid)
++    return tid
++
++
+ @pytest.mark.parametrize("status", ["done", "archived", "missing", "null"])
+ @pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
+ def test_closed_or_null_producer_is_replaced_without_execution_release(kanban_home, status, cause):
+     with kbc.connect_closing() as conn:
+-        tid = _stop(conn, cause)
+-        decision.ensure_producer(conn, tid)
++        tid = _carded_stop(conn, cause)
+         old = _route(conn, tid)["task_id"]
+         with kb.write_txn(conn):
+             if status == "null":
+@@ -44,6 +58,8 @@
+         route = _route(conn, tid)
+         if status in ("done", "archived"):
+             assert route == {"kind": "dismissed", "task_id": old}
++        elif cause and status == "missing":
++            assert route == {"kind": "unavailable"}  # a restricted stop is never given a new decision card
+         else:
+             assert route["kind"] == "supervisor"
+             assert (route["task_id"] == old) == (status == "null")
+@@ -57,11 +73,12 @@
+ 
+ 
+ @pytest.mark.parametrize("filter", ["fresh", "gated", "contained", "capped", "foreign"])
+-def test_sweep_repairs_missing_routes_before_release_filters(kanban_home, monkeypatch, filter):
++@pytest.mark.parametrize("cause", [None, "scope_stopped"])
++def test_sweep_repairs_missing_routes_before_release_filters(kanban_home, monkeypatch, filter, cause):
+     from hermes_cli import kanban_containment_connections as containment
+     from hermes_cli import kanban_wake_check as wake
+     with kbc.connect_closing() as conn:
+-        tid = _stop(conn, "scope_stopped")
++        tid = _stop(conn, cause)
+         kb.add_comment(conn, tid, "diagnostic", "frequent fresh diagnostic does not defer decision ownership")
+         if filter == "gated":
+             monkeypatch.setattr(sweep, "_gate_exclusion", lambda: "AND 0 ")
+@@ -75,10 +92,12 @@
+         assert sweep.sweep_stale_triage(conn) == []
+         notices = helpers._events(conn, tid, decision.NOTICE)
+         assert bool(notices) == (filter != "foreign")
+-        if notices:
++        if notices and cause:
++            assert _route(conn, tid) == {"kind": "unavailable"}
++        elif notices:
+             assert kb.get_task(conn, _route(conn, tid)["task_id"]).status == "ready"
+         assert kb.get_task(conn, tid).status == "triage"
+-        assert decision.execution_restricted(conn, tid)
++        assert decision.execution_restricted(conn, tid) == bool(cause)
+ 
+ 
+ def test_failed_publication_retries_and_does_not_starve_other_stops(kanban_home, monkeypatch):
+@@ -96,8 +115,9 @@
+         monkeypatch.setattr(decision, "producer", real)
+         sweep.sweep_stale_triage(conn)
+         owner = kb.get_task(conn, _route(conn, first)["task_id"])
+-        assert "retain this decision card" in owner.body
+-        assert "instead of completing" in owner.body
++        assert f"hermes kanban promote {first} --reason" in owner.body and "or archive it" in owner.body
++        # Retaining the card would be a second stop with no decision.
++        assert "retain this decision card" not in owner.body and "non-executing owner" not in owner.body
+         assert kb.get_task(conn, first).status == "triage"
+ 
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 2abd3a38c7a..65779432e2b 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -769,6 +769,10 @@
+ A local owning chat that is archived, hidden or gone, or ended and idle longer
+ than `kanban.stranded_owner_idle_seconds` (default 86400), is not a route: the
+ decision then goes to the supervisor card.
++Only an ordinary budget stop gets that card: its one power, a promote, releases
++nothing else. A stop with a cause (`capability_unavailable`, `scope_stopped`,
++`safety_refusal`) and no live chat records producer kind `unavailable`, files no
++card and is left to the stranded-park escalation below.
+ 
+ **Stranded parked cards.** A parked card (`triage` or `blocked`) never stays
+ invisible. Every `kanban.stranded_sweep_interval_seconds` (default 300) the
+-- 
+2.43.0
+

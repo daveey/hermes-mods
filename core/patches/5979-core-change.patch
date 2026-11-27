@@ -1,0 +1,251 @@
+From 6e1e6abb4789278af64da012100363d8edd54cd6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:54:52 +0000
+Subject: [PATCH 5979] Kanban admission and display read-cost reductions
+
+Public mirror of source commit 6e1e6abb4789278af64da012100363d8edd54cd6.
+
+---
+diff --git a/hermes_cli/kanban_admission_score.py b/hermes_cli/kanban_admission_score.py
+index cf6d38cdfd2..83ccdc24d17 100644
+--- a/hermes_cli/kanban_admission_score.py
++++ b/hermes_cli/kanban_admission_score.py
+@@ -4,9 +4,12 @@
+          + age * ready_minutes - failure * consecutive_failures``
+ 
+ Effective priority and open descendants come from the same graph as
+-:func:`kanban_dispatch_priority.order_with_remote_waiters`: the full replica, with local rows and a local child's
+-edge set overriding it. Readiness age is the current ready/review interval (the stranded-ready diagnostic's floor:
+-latest ready-entry event, latest run end, else creation), not card age. One call is one snapshot: nothing is cached
++:func:`kanban_dispatch_priority.order_with_remote_waiters`: the replica, with local rows and a local child's
++edge set overriding it. Each source contributes only its open rows, edges into open (or unknown) children, and the
++rows named by the caller or needed for local custody. Done/archived rows never change a score, and reading all of
++them made every dispatcher pass crawl in a busy gateway (each fetched row re-takes the GIL). Readiness age is the
++current ready/review interval (the stranded-ready diagnostic's floor: latest ready-entry event, latest run end, else
++creation), not card age. One call is one snapshot: nothing is cached
+ or written (stored priority included), so completion, unlink or archive take effect on the next call.
+ 
+ Turn owners rank first. A card the local turn-urgency observation (:mod:`kanban_turn_urgency`) names as holding the
+@@ -99,7 +102,7 @@
+     return validate_weights(admission_policy().get("weights"))
+ 
+ 
+-def _graph(conn: sqlite3.Connection, candidate_ids, *, now_s=None):
++def _graph(conn: sqlite3.Connection, candidate_ids, *, include_ids=(), now_s=None):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_worker_node as wn
+ 
+@@ -115,14 +118,16 @@
+                 # do not swallow RuntimeError from graph/history implementation.
+                 replica = None
+             if replica is not None:
+-                remote, edges, metadata, since = _source_snapshot(replica, candidate_ids)
++                remote, edges, metadata, since = _source_snapshot(replica, candidate_ids, include_ids=include_ids)
+         except (sqlite3.Error, OSError):
+             # Never retain graph fragments after a failed history/edge read.
+             remote, edges, metadata, since = [], [], {}, {}
+         finally:
+             if replica is not None:
+                 replica.close()
+-    local, local_edges, local_metadata, local_since = _source_snapshot(conn, candidate_ids)
++    # Remote open rows are looked up locally too, so a local done/archived row still overrides them (custody).
++    local, local_edges, local_metadata, local_since = _source_snapshot(
++        conn, candidate_ids, include_ids=[*include_ids, *(r[0] for r in remote)])
+     local_ids = {r[0] for r in local}
+     tasks = {r[0]: (r[1] or 0, r[2]) for r in remote}
+     tasks.update((r[0], (r[1] or 0, r[2])) for r in local)
+@@ -166,11 +171,19 @@
+     return isinstance(key, str) and key.startswith(ALARM_KEY_PREFIXES)
+ 
+ 
+-def _source_snapshot(conn, candidate_ids):
++OPEN_STATUS = "status NOT IN ('done', 'archived')"
++
++
++def _source_snapshot(conn, candidate_ids, *, include_ids=()):
+     """One consistent source view without committing a caller-owned transaction.
+ 
+     The two databases cannot share an atomic snapshot; local custody wins when
+     merging them. A savepoint pins each source's graph and history together.
++
++    Rows are the open tasks plus any task named in ``candidate_ids`` or ``include_ids`` whatever its status; edges
++    are those whose child is open here or absent here. Other done/archived rows cannot affect a score (descendants
++    count only open children), so they are not read: completed local rows
++    can dominate the snapshot, increasing unnecessary work per lane and dispatcher pass.
+     """
+     conn.execute("SAVEPOINT admission_score_read")
+     try:
+@@ -178,10 +191,18 @@
+         # urgency floor; never infer an alarm from user-editable title prose.
+         columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+         key_column = "idempotency_key" if "idempotency_key" in columns else "NULL"
++        select = f"SELECT id, priority, status, {key_column} FROM tasks"
++        rows = {r[0]: tuple(r) for r in conn.execute(f"{select} WHERE {OPEN_STATUS}")}
++        named = [tid for tid in dict.fromkeys((*candidate_ids, *include_ids)) if tid not in rows]
++        for offset in range(0, len(named), 400):
++            batch = named[offset:offset + 400]
++            marks = ",".join("?" for _ in batch)
++            rows.update((r[0], tuple(r)) for r in conn.execute(f"{select} WHERE id IN ({marks})", batch))
+         tasks = [(tid, max(priority or 0, 900) if _alarm_key(key) else priority, status)
+-                 for tid, priority, status, key in conn.execute(
+-                     f"SELECT id, priority, status, {key_column} FROM tasks")]
+-        edges = conn.execute("SELECT parent_id, child_id FROM task_links").fetchall()
++                 for tid, priority, status, key in rows.values()]
++        edges = conn.execute(
++            "SELECT l.parent_id, l.child_id FROM task_links l LEFT JOIN tasks t ON t.id = l.child_id "
++            f"WHERE t.id IS NULL OR t.{OPEN_STATUS}").fetchall()
+         metadata, since = _candidate_state(conn, candidate_ids)
+         return tasks, edges, metadata, since
+     finally:
+@@ -240,7 +261,7 @@
+ 
+     Return only extant task identities. Stored values are never changed.
+     """
+-    tasks, children, _metadata, _since, _owners = _graph(conn, [])
++    tasks, children, _metadata, _since, _owners = _graph(conn, [], include_ids=list(task_ids))
+     return {tid: min(PRIORITY_CAP, max([tasks[tid][0], *(tasks[c][0] for c in _descendants(tid, children))]))
+             for tid in task_ids if tid in tasks}
+ 
+diff --git a/tests/hermes_cli/test_kanban_score_open_snapshot.py b/tests/hermes_cli/test_kanban_score_open_snapshot.py
+new file mode 100644
+index 00000000000..788312837b2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_score_open_snapshot.py
+@@ -0,0 +1,117 @@
++"""The admission snapshot reads open rows, not whole tables, and keeps the full-table answers.
++
++A dispatcher pass ranks every lane, and each rank read every task and edge row of the hub DB and the replica. In the
++a busy gateway each fetched row re-takes the GIL, delaying dispatch and leaving ready
++cards without claims or skip reasons. These tests pin bounded reads and unchanged scores.
++"""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_admission_score as score
++
++
++def _database():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript("""
++        CREATE TABLE tasks (id TEXT PRIMARY KEY, priority INTEGER, status TEXT, created_at INTEGER,
++                            admission_class TEXT, consecutive_failures INTEGER);
++        CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER);
++        CREATE TABLE task_runs (task_id TEXT, ended_at INTEGER);
++        CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
++    """)
++    return conn
++
++
++@pytest.fixture
++def sources(monkeypatch):
++    from hermes_cli import kanban_db_sync, kanban_worker_node
++
++    local, remote = _database(), _database()
++
++    class Reader:
++        def execute(self, *args):
++            return remote.execute(*args)
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr(kanban_db_sync, "board_mode", lambda conn: "primary")
++    monkeypatch.setattr(kanban_worker_node, "open_replica", lambda conn: Reader())
++    monkeypatch.setattr(score, "_apply_turn_floor", lambda conn, tasks, now_s=None: frozenset())
++    yield local, remote
++    local.close()
++    remote.close()
++
++
++def add(conn, tid, status="ready", priority=0, created=1000):
++    conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, 'normal', 0)", (tid, priority, status, created))
++
++
++def link(conn, parent, child):
++    conn.execute("INSERT INTO task_links VALUES (?, ?)", (parent, child))
++
++
++def test_snapshot_skips_closed_history(sources):
++    local, _ = sources
++    for i in range(3000):
++        add(local, f"done-{i}", "done", priority=1000)
++        link(local, f"done-{i}", f"done-{(i + 1) % 3000}")
++    for i in range(500):
++        add(local, f"arch-{i}", "archived", priority=1000)
++    add(local, "cand")
++    add(local, "open-child", "todo", priority=700)
++    link(local, "cand", "open-child")
++    link(local, "cand", "done-7")
++
++    tasks, edges, _meta, _since = score._source_snapshot(local, ["cand"])
++    assert sorted(t[0] for t in tasks) == ["cand", "open-child"]
++    assert [tuple(e) for e in edges] == [("cand", "open-child")]
++
++    (_, parts), = score.rank(local, [{"id": "cand"}], now_ms=2_000_000, weights={})
++    assert (parts.effective_priority, parts.descendants) == (700, 1)
++
++
++def test_named_rows_are_read_whatever_their_status(sources):
++    local, _ = sources
++    add(local, "finished", "done", priority=400)
++    add(local, "gone", "archived", priority=300)
++    tasks, _edges, _meta, _since = score._source_snapshot(local, ["finished"], include_ids=["gone"])
++    assert sorted(t[0] for t in tasks) == ["finished", "gone"]
++    # effective_priorities still answers for closed ids it is asked about, as the full read did.
++    assert score.effective_priorities(local, ["finished", "gone", "missing"]) == {"finished": 400, "gone": 300}
++
++
++def test_local_done_row_still_overrides_open_replica_row(sources):
++    local, remote = sources
++    add(local, "cand")
++    add(remote, "child", "todo", priority=900)
++    link(remote, "cand", "child")
++    (_, open_parts), = score.rank(local, [{"id": "cand"}], now_ms=2_000_000, weights={})
++    assert (open_parts.effective_priority, open_parts.descendants) == (900, 1)
++
++    add(local, "child", "done", priority=900)  # local custody: the child finished here
++    (_, parts), = score.rank(local, [{"id": "cand"}], now_ms=2_000_000, weights={})
++    assert (parts.effective_priority, parts.descendants) == (0, 0)
++
++
++def test_edge_to_child_known_only_to_replica_still_counts(sources):
++    local, remote = sources
++    add(local, "cand")
++    link(local, "cand", "remote-child")  # child row never reached the hub DB
++    add(remote, "remote-child", "ready", priority=800)
++    (_, parts), = score.rank(local, [{"id": "cand"}], now_ms=2_000_000, weights={})
++    assert (parts.effective_priority, parts.descendants) == (800, 1)
++
++
++def test_more_named_ids_than_one_batch(sources):
++    local, remote = sources
++    add(local, "cand")
++    for i in range(950):
++        add(remote, f"r{i}", "todo", priority=i)
++        add(local, f"r{i}", "done", priority=i)
++        link(remote, "cand", f"r{i}")
++    # Every open replica row is closed locally: all 950 custody lookups must land (3 batches).
++    (_, parts), = score.rank(local, [{"id": "cand"}], now_ms=2_000_000, weights={})
++    assert (parts.effective_priority, parts.descendants) == (0, 0)
+diff --git a/tests/hermes_cli/test_kanban_score_sources.py b/tests/hermes_cli/test_kanban_score_sources.py
+index cef84de5b51..78203cddd82 100644
+--- a/tests/hermes_cli/test_kanban_score_sources.py
++++ b/tests/hermes_cli/test_kanban_score_sources.py
+@@ -204,10 +204,10 @@
+ 
+     original = score._source_snapshot
+ 
+-    def broken_snapshot(conn, ids):
++    def broken_snapshot(conn, ids, **kwargs):
+         if conn is not local:
+             raise RuntimeError("implementation bug")
+-        return original(conn, ids)
++        return original(conn, ids, **kwargs)
+ 
+     monkeypatch.setattr(score, "_source_snapshot", broken_snapshot)
+     with pytest.raises(RuntimeError, match="implementation bug"):
+-- 
+2.43.0
+

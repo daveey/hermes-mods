@@ -1,0 +1,310 @@
+From 592a99b45a905cf3c9a800831488a9b7e041f1ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:44:16 +0000
+Subject: [PATCH 6266] Explicit Carbon routing and model-neutral obligations
+
+Public mirror of source commit 592a99b45a905cf3c9a800831488a9b7e041f1ed.
+
+---
+diff --git a/hermes_cli/kanban_model_neutral.py b/hermes_cli/kanban_model_neutral.py
+index b2f10ad577c..db7259182f5 100644
+--- a/hermes_cli/kanban_model_neutral.py
++++ b/hermes_cli/kanban_model_neutral.py
+@@ -205,14 +205,70 @@
+                     raise ValueError(f'{ERROR}; refused line: {source_line}{_TEXT_GUIDANCE}')
+ 
+ 
++NEUTRAL_ROUTE = 'any qualified route'
++_ROUTE_OCCURRENCE = re.compile(_ROUTE_NAME + r'(?:/[\w-]+)?|' + _PROVIDER_NAME, re.IGNORECASE)
++
++
++def _passes(text):
++    try:
++        validate_text(text)
++    except ValueError:
++        return False
++    return True
++
++
++def neutral_line(line):
++    """The refused line with only the route identities its obligations name made neutral.
++
++    Every other byte, including non-model gates sharing the line and any mention the
++    recognizer accepts (exclusions, provenance), stays verbatim and active. Returns
++    None when no identity substitution can make the line acceptable (a nameless
++    machine directive such as ``require_model: true``). No lexical guess decides
++    which prose is a gate: only the unchanged ingress recognizer is consulted.
++    """
++    spans = [m.span() for m in _ROUTE_OCCURRENCE.finditer(line)]
++
++    def render(chosen):
++        out, last = [], 0
++        for index, (start, end) in enumerate(spans):
++            if index in chosen:
++                out += [line[last:start], NEUTRAL_ROUTE]
++                last = end
++        return ''.join(out) + line[last:]
++
++    chosen = set(range(len(spans)))
++    if not spans or not _passes(render(chosen)):
++        return None
++    # Restore each identity the recognizer does not need neutralized, so author
++    # exclusions and execution provenance on the same line are never rewritten.
++    for index in range(len(spans)):
++        if _passes(render(chosen - {index})):
++            chosen.discard(index)
++    return render(chosen)
++
++
++def retained_line(line, separator='\n'):
++    """Quote a refused line as history and keep its neutralized remainder active.
++
++    Returns None when the line has no acceptable neutral form; callers then decide
++    conservatively rather than silently inactivating unrecognized obligations.
++    """
++    neutral = neutral_line(line)
++    if neutral is None:
++        return None
++    return _EVIDENCE + json.dumps(line, ensure_ascii=False) + separator + neutral
++
++
+ def forwarded_text(text):
+-    """Retain superseded legacy directives as labelled evidence, not new policy."""
++    """Retain superseded legacy directives as labelled evidence, not new policy.
++
++    A refused line's other obligations are forwarded active with the named route
++    neutralized; only a nameless pure directive line is quoted alone.
++    """
+     lines = []
+     for line in (text or '').splitlines():
+-        try:
+-            validate_text(line)
+-        except ValueError:
+-            line = _EVIDENCE + json.dumps(line, ensure_ascii=False)
++        if not _passes(line):
++            line = retained_line(line) or _EVIDENCE + json.dumps(line, ensure_ascii=False)
+         lines.append(line)
+     return '\n'.join(lines)
+ 
+diff --git a/hermes_cli/kanban_model_retirement.py b/hermes_cli/kanban_model_retirement.py
+index 37608bd5f72..ced55770b5b 100644
+--- a/hermes_cli/kanban_model_retirement.py
++++ b/hermes_cli/kanban_model_retirement.py
+@@ -10,7 +10,7 @@
+ 
+ from agent.model_routing import is_class_selector
+ from hermes_cli import kanban_db as kb
+-from hermes_cli.kanban_model_neutral import validate_text
++from hermes_cli.kanban_model_neutral import _REQUIRED, retained_line, validate_text
+ from hermes_cli.kanban_wake_check import foreign_copy, own_gateway
+ 
+ FIELDS = ('model_override', 'provider_override', 'model_pin_mandatory')
+@@ -57,7 +57,14 @@
+ 
+ 
+ def retired_body(body):
+-    """Quote refused lines only, retaining original line terminators and all other bytes."""
++    """Quote refused lines as history and keep their other obligations active.
++
++    A refused line is followed by itself with only the named route neutralized, so
++    non-model gates sharing it (CI, review, merge rules) never become inactive. A
++    nameless pure directive (``require_model: true``) is quoted alone. A line with no
++    acceptable neutral form is left unchanged for an owner edit rather than
++    inactivating text the recognizer cannot attribute.
++    """
+     out = []
+     for line in (body or '').splitlines(keepends=True):
+         text = line.rstrip('\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029')
+@@ -65,7 +72,10 @@
+         try:
+             validate_text(text)
+         except ValueError:
+-            text = PREFIX + json.dumps(text, ensure_ascii=False)
++            if _REQUIRED.fullmatch(text):
++                text = PREFIX + json.dumps(text, ensure_ascii=False)
++            else:
++                text = retained_line(text, ending or '\n') or text
+         out.append(text + ending)
+     return ''.join(out)
+ 
+@@ -78,7 +88,8 @@
+         return False
+     return edit_task(conn, row['id'], body=body, expected_body=row['body'], home_open_only=True,
+                      audit_comment=(AUTHOR, 'Superseded model/provider mandates were retained as JSON historical '
+-                                    'evidence (model_policy_no_pins); all other body text is unchanged.'))
++                                    'evidence (model_policy_no_pins); each such line stays active after it '
++                                    'with only the named route made neutral, and all other text is unchanged.'))
+ 
+ 
+ def sweep(conn, *, limit=64):
+diff --git a/tests/hermes_cli/test_kanban_history_contract.py b/tests/hermes_cli/test_kanban_history_contract.py
+index 06816d44585..e3235b64af0 100644
+--- a/tests/hermes_cli/test_kanban_history_contract.py
++++ b/tests/hermes_cli/test_kanban_history_contract.py
+@@ -17,9 +17,17 @@
+ 
+ 
+ def decoded(body):
++    """Historical lines decoded; each one's neutral active companion is asserted and skipped."""
++    from hermes_cli.kanban_model_neutral import neutral_line
+     prefix = 'Historical run instruction (superseded and not active): '
+-    return '\n'.join(json.loads(line[len(prefix):]) if line.startswith(prefix) else line
+-                     for line in body.splitlines())
++    out, lines = [], iter(body.splitlines())
++    for line in lines:
++        if line.startswith(prefix):
++            line = json.loads(line[len(prefix):])
++            if neutral_line(line) is not None:
++                assert next(lines) == neutral_line(line)
++        out.append(line)
++    return '\n'.join(out)
+ 
+ 
+ def source(conn):
+diff --git a/tests/hermes_cli/test_kanban_model_retirement.py b/tests/hermes_cli/test_kanban_model_retirement.py
+index 777250971fe..690f53def31 100644
+--- a/tests/hermes_cli/test_kanban_model_retirement.py
++++ b/tests/hermes_cli/test_kanban_model_retirement.py
+@@ -87,7 +87,8 @@
+         monkeypatch.setattr(edits, 'edit_task', observed)
+         assert sweep(conn) == 1
+         expected = ('scope  \r\n' + PREFIX + json.dumps('  require_model: true') + '\r\n\n'
+-                    + 'exclude: claude-opus-5-5\n' + PREFIX + json.dumps('Use only grok-4.6.') + '\rtrailing no newline')
++                    + 'exclude: claude-opus-5-5\n' + PREFIX + json.dumps('Use only grok-4.6.') + '\r'
++                    + 'Use only any qualified route.\rtrailing no newline')
+         assert kb.get_task(conn, tid).body == expected
+         assert len(calls) == 1
+         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='edited'", (tid,)).fetchone()[0] == 1
+@@ -148,7 +149,8 @@
+     from hermes_cli.kanban_model_retirement import retired_body
+     accepted = PREFIX + json.dumps('Use only grok-4.6.') + '\nuntouched λ  \n'
+     source = accepted + 'Use only grok-4.6. λ  ' + ending
+-    assert retired_body(source) == accepted + PREFIX + json.dumps('Use only grok-4.6. λ  ', ensure_ascii=False) + ending
++    assert retired_body(source) == (accepted + PREFIX + json.dumps('Use only grok-4.6. λ  ', ensure_ascii=False)
++                                    + (ending or '\n') + 'Use only any qualified route. λ  ' + ending)
+ 
+ 
+ def test_cas_concurrent_set_model_wins(board):
+diff --git a/tests/hermes_cli/test_kanban_model_retirement_preserve.py b/tests/hermes_cli/test_kanban_model_retirement_preserve.py
+new file mode 100644
+index 00000000000..7668508e486
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_model_retirement_preserve.py
+@@ -0,0 +1,90 @@
++"""Retiring a textual pin must not inactivate other obligations on the same line."""
++import json
++
++import pytest
++
++from hermes_cli.kanban_model_neutral import _active_text, forwarded_text, validate_text
++from hermes_cli.kanban_model_retirement import PREFIX, retired_body
++
++NEUTRAL_ROUTE = 'any qualified route'
++
++# The actual pre-retirement acceptance sentence of t_3cf74a57be54d904 (abridged
++# to the clauses around its single refused clause), plus the ingress fixtures that
++# already pair a pin with non-model gates.
++MIXED = [
++    ('Acceptance: named failing-before regressions. Mandatory exact-head Opus, source CI and normal '
++     'card train gates on every shipping prefix. Never hand merge.',
++     ('source CI and normal card train gates on every shipping prefix', 'Never hand merge',
++      'Mandatory exact-head ' + NEUTRAL_ROUTE)),
++    ('Do not bypass CI. Use only grok-4.6 / xai-oauth.', ('Do not bypass CI.',)),
++    ('Get semantic RED. Mandatory exact-head anthropic/claude-opus-5-5 independent review; never hand merge.',
++     ('Get semantic RED.', 'independent review; never hand merge.')),
++    ('Independent primary Opus review, exact-head CI, normal merge queue.',
++     ('exact-head CI, normal merge queue.',)),
++    # Non-English obligations are kept verbatim; nothing guesses which prose is a gate.
++    ('Fehler beheben. Must use claude-opus-5-5 für die Prüfung; CI grün halten.',
++     ('Fehler beheben.', 'für die Prüfung; CI grün halten.')),
++    ('Needs fresh independent review (claude-opus-5-5) before merge; keep CI green.',
++     ('before merge; keep CI green.',)),
++]
++
++
++def _active(body):
++    return '\n'.join(_active_text(line) for line in body.splitlines())
++
++
++@pytest.mark.parametrize('line,kept', MIXED)
++@pytest.mark.parametrize('ending', ['\n', '\r\n', ''])
++def test_retired_body_keeps_same_line_gates_active(line, kept, ending):
++    with pytest.raises(ValueError):
++        validate_text(line)
++    body = 'scope\n' + line + ending
++    out = retired_body(body)
++    validate_text(out)
++    assert retired_body(out) == out
++    lines = out.splitlines(keepends=True)
++    assert lines[0] == 'scope\n'
++    # History keeps the exact original line; the active copy follows it.
++    assert lines[1] == PREFIX + json.dumps(line, ensure_ascii=False) + (ending or '\n')
++    active = _active(out)
++    for gate in kept:
++        assert gate in active
++    assert out.endswith(ending)
++
++
++@pytest.mark.parametrize('line,kept', MIXED)
++def test_forwarded_text_keeps_same_line_gates_active(line, kept):
++    out = forwarded_text('lead\n' + line)
++    validate_text(out)
++    assert forwarded_text(out) == out
++    assert PREFIX + json.dumps(line, ensure_ascii=False) in out.splitlines()
++    active = _active(out)
++    for gate in kept:
++        assert gate in active
++
++
++def test_only_obligation_identity_is_neutralized_not_exclusions_or_provenance():
++    line = 'Author was gpt-6.1-sol; exclude: claude-opus-5-5. Use only grok-4.6; keep CI green.'
++    with pytest.raises(ValueError):
++        validate_text(line)
++    out = retired_body(line)
++    neutral = out.splitlines()[1]
++    assert neutral == ('Author was gpt-6.1-sol; exclude: claude-opus-5-5. Use only '
++                       + NEUTRAL_ROUTE + '; keep CI green.')
++
++
++def test_nameless_pure_directive_is_quoted_alone():
++    assert retired_body('  require_model: true\n') == PREFIX + json.dumps('  require_model: true') + '\n'
++    assert forwarded_text('require_model: true') == PREFIX + json.dumps('require_model: true')
++
++
++def test_f03c_actual_line_restores_every_non_model_gate():
++    line = ('Acceptance: named failing-before regressions for actual findings, green complete '
++            'focused/integration tests and zero vacuous skips. Mandatory exact-head Opus, source CI and '
++            'normal card train gates on every shipping prefix. Merge only when gates pass; no hand merge, '
++            'express-lane bypass, or deployment claims without installed proof.')
++    active = _active(retired_body(line))
++    for gate in ('named failing-before regressions', 'zero vacuous skips', 'source CI and normal card train gates',
++                 'no hand merge', 'deployment claims without installed proof'):
++        assert gate in active
++    assert 'Opus' not in active
+diff --git a/tests/hermes_cli/test_kanban_review_edge_probe.py b/tests/hermes_cli/test_kanban_review_edge_probe.py
+index 41e87ea6bd5..51b45f64121 100644
+--- a/tests/hermes_cli/test_kanban_review_edge_probe.py
++++ b/tests/hermes_cli/test_kanban_review_edge_probe.py
+@@ -76,13 +76,17 @@
+ 
+ 
+ def test_forwarded_directives_remain_lossless_inert_evidence(board):
+-    from hermes_cli.kanban_model_neutral import forwarded_text
++    from hermes_cli.kanban_model_neutral import forwarded_text, neutral_line
+ 
+     source = 'Review must use gpt-5 only. "quoted"\nrequire_model: true'
+     forwarded = forwarded_text(source)
+     assert forwarded_text(forwarded) == forwarded
+     prefix = 'Historical run instruction (superseded and not active): '
+-    assert '\n'.join(json.loads(line.removeprefix(prefix)) for line in forwarded.splitlines()) == source
++    lines = forwarded.splitlines()
++    # The named line keeps its non-model text active right after its exact history.
++    assert lines[1] == neutral_line(json.loads(lines[0].removeprefix(prefix)))
++    assert lines[1].startswith('Review must use any qualified route only.')
++    assert '\n'.join(json.loads(line.removeprefix(prefix)) for line in (lines[0], lines[2])) == source
+     with original.kbc.connect() as conn:
+         tid = original.kb.create_task(conn, title='remove legacy restriction', body=forwarded,
+                                       assignee='default')
+-- 
+2.43.0
+

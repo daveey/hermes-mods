@@ -1,0 +1,470 @@
+From 609668a7966e5235b55c9d0a696a9a6ecdcf6de5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:37:06 +0000
+Subject: [PATCH 5996] Kanban admission and display read-cost reductions
+
+Public mirror of source commit 609668a7966e5235b55c9d0a696a9a6ecdcf6de5.
+
+---
+diff --git a/hermes_cli/kanban_contained_display.py b/hermes_cli/kanban_contained_display.py
+new file mode 100644
+index 00000000000..c0caf659f91
+--- /dev/null
++++ b/hermes_cli/kanban_contained_display.py
+@@ -0,0 +1,107 @@
++"""Invocation-local containment evidence for wait display, never lifecycle authority.
++
++One read snapshot captures selected histories and their receipt/attestation inputs.
++Nothing survives the display invocation, so the next board revision cannot reuse
++an old verdict; strict readers and SQLite guard functions retain literal reads.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any
++
++from hermes_cli.kanban_containment_state import _payload, _stop, fingerprint, reduce_events
++
++
++class Capture:
++    def __init__(self, conn, task_ids):
++        cursor = conn.execute(
++            "SELECT uid,task_id,kind,payload,created_at FROM task_events "
++            "WHERE task_id IN (SELECT value FROM json_each(?)) "
++            "AND kind IN ('contained','containment_released','containment_closed')", (json.dumps(task_ids),))
++        names = [c[0] for c in cursor.description]
++        self.events = {}
++        for row in cursor:
++            event = dict(zip(names, row))
++            self.events.setdefault(str(event['task_id']), []).append(event)
++        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++        self.board = None
++        row = None
++        if 'kanban_sync_state' in tables:
++            row = conn.execute("SELECT board_id FROM kanban_sync_state LIMIT 1").fetchone()
++            self.board = row[0] if row else None
++        self.synced = 'kanban_sync_state' in tables and row is not None
++        self.evidence = {}
++        self.accepted = {}
++        self.attestations = {}
++
++        uids = json.dumps([e['uid'] for events in self.events.values() for e in events])
++        if self.synced and 'containment_canonical_receipts' in tables:
++            self.evidence = dict(conn.execute(
++                "SELECT uid,evidence FROM containment_canonical_receipts "
++                "WHERE uid IN (SELECT value FROM json_each(?))", (uids,)))
++            if 'containment_sync_acceptances' in tables:
++                # Newest acceptance wins, exactly as accepted_evidence (including rowid ties).
++                for uid, raw in conn.execute(
++                        "SELECT receipt_uid,evidence FROM containment_sync_acceptances "
++                        "WHERE receipt_uid IN (SELECT value FROM json_each(?)) "
++                        "ORDER BY accepted_at,rowid", (uids,)):
++                    self.accepted[uid] = raw
++        elif not self.synced and 'containment_attestations' in tables:
++            self.attestations = {r[0]: tuple(r[1:]) for r in conn.execute(
++                "SELECT receipt_uid,task_id,episode_uid,receipt_sha256,episode_sha256 "
++                "FROM containment_attestations WHERE receipt_uid IN (SELECT value FROM json_each(?))", (uids,))}
++
++    def verify(self, receipt, stop):
++        if self.synced:
++            from hermes_cli.kanban_containment_replica import verified_evidence
++            # Decode only on demand: malformed unused evidence must remain irrelevant.
++            return verified_evidence(receipt, stop, self._cached(stop.get('uid')),
++                                     self._cached(receipt.get('uid')), self.board)
++        data, frozen = _payload(receipt), _stop(stop)
++        if data is None or frozen is None:
++            return False
++        return self.attestations.get(receipt.get('uid')) == (
++            receipt.get('task_id'), stop.get('uid'), fingerprint(data), fingerprint(frozen))
++
++    def _cached(self, uid):
++        if uid in self.accepted:
++            newer = json.loads(self.accepted[uid])
++            if newer is not None:
++                return newer
++        return json.loads(self.evidence[uid]) if uid in self.evidence else None
++
++    def active(self, tid, marker):
++        events = self.events.get(tid, ())
++        hold = reduce_events(events, verify_release=self.verify)
++        if hold is None or hold.unresolved or marker not in hold.episodes:
++            return None
++        return next((e for e in events if e['kind'] == 'contained' and e['uid'] == marker), None)
++
++
++def producer_runs(conn, stops):
++    """Keep the literal SQL comparison (including NULL/storage types), in one query."""
++    rows = [[tid, spec['producer']['task_id'], stop.get('created_at') or 0]
++            for tid, (stop, spec) in stops.items()
++            if isinstance(spec.get('producer'), dict) and spec['producer'].get('task_id')]
++    if not rows:
++        return {}
++    try:
++        return dict(conn.execute(
++            "SELECT json_extract(value,'$[0]'),EXISTS(SELECT 1 FROM task_runs "
++            "WHERE task_id=json_extract(value,'$[1]') AND outcome='completed' "
++            "AND ended_at>json_extract(value,'$[2]')) FROM json_each(?)", (json.dumps(rows),)))
++    except sqlite3.Error:  # the literal producer reader treats unavailable history as unknown
++        return {}
++
++
++def read(conn, task_ids, *, replica: Any = ...):
++    from hermes_cli import kanban_contained_wait
++    owns = not conn.in_transaction
++    if owns:
++        conn.execute('BEGIN')
++    try:
++        return kanban_contained_wait.read(conn, task_ids, replica=replica, display=True)
++    finally:
++        if owns:
++            conn.rollback()
+diff --git a/hermes_cli/kanban_contained_wait.py b/hermes_cli/kanban_contained_wait.py
+index 5a32ae1c125..54aceb5a96e 100644
+--- a/hermes_cli/kanban_contained_wait.py
++++ b/hermes_cli/kanban_contained_wait.py
+@@ -101,7 +101,7 @@
+     return next((e for e in events if e["kind"] == "contained" and e["uid"] == marker), None)
+ 
+ 
+-def read(conn: sqlite3.Connection, task_ids: Iterable[str], *, replica: Any = ...) -> dict[str, dict[str, Any]]:
++def read(conn: sqlite3.Connection, task_ids: Iterable[str], *, replica: Any = ..., display: bool = False) -> dict[str, dict[str, Any]]:
+     """``{task_id: contained facts}`` for the held triage cards among ``task_ids``::
+ 
+         {episode, contained_at, authority: {id, status, at}, producer: {id, status, released} | None}
+@@ -118,10 +118,13 @@
+                             (json.dumps(ids),)).fetchall()
+     except sqlite3.Error:
+         return {}
++    from hermes_cli.kanban_contained_display import Capture, producer_runs
++    capture = Capture(conn, [str(tid) for tid, _ in rows]) if display and rows else None
+     stops: dict[str, tuple[dict, dict]] = {}
+     for tid, marker in rows:
+         try:
+-            stop = _active_episode(conn, str(tid), str(marker))
++            stop = (capture.active(str(tid), str(marker)) if capture is not None
++                    else _active_episode(conn, str(tid), str(marker)))
+         except Exception:
+             logger.debug("contained wait: episode read failed for %s", tid, exc_info=True)
+             continue
+@@ -133,6 +136,7 @@
+     need = [spec["authority"]["task_id"] for _, spec in stops.values()]
+     need += [spec["producer"]["task_id"] for _, spec in stops.values() if isinstance(spec.get("producer"), dict)]
+     known = statuses(conn, need) if replica is ... else statuses(conn, need, replica=replica)
++    latest = producer_runs(conn, stops) if display else {}
+     out: dict[str, dict[str, Any]] = {}
+     for tid, (stop, spec) in stops.items():
+         a_id = spec["authority"]["task_id"]
+@@ -146,6 +150,7 @@
+             p_id = producer["task_id"]
+             p_status = known.get(p_id, ("unknown", None))[0]
+             info["producer"] = {"id": p_id, "status": p_status,
+-                                "released": _producer_released(conn, p_id, stop.get("created_at"))}
++                                "released": (bool(latest.get(tid))
++                                             if display else _producer_released(conn, p_id, stop.get("created_at")))}
+         out[tid] = info
+     return out
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index b1ce6937d1c..164a319ffb6 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -120,7 +120,14 @@
+ 
+ def verified(conn: sqlite3.Connection, release: dict, stop: dict) -> bool:
+     s, r = _cached(conn, stop.get("uid")), _cached(conn, release.get("uid"))
+-    if s is None or r is None or s["board"] != r["board"] or s["board"] != _board(conn) or not _matches(stop, s) or not _matches(release, r):
++    if s is None or r is None or s["board"] != r["board"]:
++        return False
++    return verified_evidence(release, stop, s, r, _board(conn))
++
++
++def verified_evidence(release: dict, stop: dict, s: dict | None, r: dict | None, board: str | None) -> bool:
++    """The same canonical verifier over captured evidence; no SQL or authority cache."""
++    if s is None or r is None or s["board"] != r["board"] or s["board"] != board or not _matches(stop, s) or not _matches(release, r):
+         return False
+     try:
+         certify = canonical.certified_closure if release.get("kind") == "containment_closed" else canonical.certified_release
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index 123270617e8..916e4370db6 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -231,8 +231,13 @@
+     out: dict[str, dict] = {}
+     try:
+         hosts = hosts_seen(conn)
+-        for tid in dict.fromkeys(str(t) for t in task_ids):
+-            derived = card_state(conn, tid, now=now, hosts=hosts)
++        ids = list(dict.fromkeys(str(t) for t in task_ids))
++        statuses = dict(conn.execute("SELECT id,status FROM tasks WHERE id IN (SELECT value FROM json_each(?))",
++                                     (json.dumps(ids),)))
++        for tid in ids:
++            if statuses.get(tid) != 'scheduled':
++                continue
++            derived = card_state(conn, tid, now=now, hosts=hosts, status=statuses[tid])
+             if derived is not None:
+                 out[tid] = derived
+     except sqlite3.Error:
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index ea16028da5c..ec75385ef4e 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -62,29 +62,22 @@
+     pick = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in ("id", "status", "block_kind", "human_request",
+                                                                           "awaiting"))
+     parked: dict[str, tuple] = {}
+-    for i in range(0, len(ids), 500):
+-        chunk = ids[i:i + 500]
+-        ph = ",".join("?" for _ in chunk)
+-        for tid, status, kind, request, awaiting in conn.execute(
+-                f"SELECT {pick} FROM tasks t WHERE t.id IN ({ph}) AND t.status IN ('scheduled', 'blocked', 'triage')",
+-                chunk):
+-            parked[str(tid)] = (status, kind, request, awaiting)
++    for tid, status, kind, request, awaiting in conn.execute(
++            f"SELECT {pick} FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) "
++            "AND t.status IN ('scheduled', 'blocked', 'triage')", (json.dumps(ids),)):
++        parked[str(tid)] = (status, kind, request, awaiting)
+     if not parked:
+         return {}, {}
+     events: dict[str, tuple] = {}
+-    keys = list(parked)
+     kph = ",".join("?" for _ in kwi.PARK_EVENT_KINDS)
+-    for i in range(0, len(keys), 500):
+-        chunk = keys[i:i + 500]
+-        ph = ",".join("?" for _ in chunk)
+-        try:
+-            for tid, kind, payload, at in conn.execute(
+-                    f"SELECT e.task_id, e.kind, e.payload, e.created_at FROM task_events e WHERE e.id IN ("
+-                    f"SELECT MAX(id) FROM task_events WHERE task_id IN ({ph}) AND kind IN ({kph}) GROUP BY task_id)",
+-                    (*chunk, *kwi.PARK_EVENT_KINDS)):
+-                events[str(tid)] = (kind, payload, at)
+-        except sqlite3.Error:  # board predates task_events
+-            break
++    try:
++        for tid, kind, payload, at in conn.execute(
++                "SELECT e.task_id, e.kind, e.payload, e.created_at FROM task_events e WHERE e.id IN ("
++                "SELECT MAX(id) FROM task_events WHERE task_id IN (SELECT value FROM json_each(?)) "
++                f"AND kind IN ({kph}) GROUP BY task_id)", (json.dumps(list(parked)), *kwi.PARK_EVENT_KINDS)):
++            events[str(tid)] = (kind, payload, at)
++    except sqlite3.Error:  # board predates task_events
++        pass
+     if replica is ...:
+         _overlay_contained(conn, parked, events)
+     else:
+@@ -98,9 +91,9 @@
+     if not triage:
+         return
+     try:
+-        from hermes_cli import kanban_contained_wait
+-        rows = (kanban_contained_wait.read(conn, triage) if replica is ...
+-                else kanban_contained_wait.read(conn, triage, replica=replica))
++        from hermes_cli import kanban_contained_display
++        rows = (kanban_contained_display.read(conn, triage) if replica is ...
++                else kanban_contained_display.read(conn, triage, replica=replica))
+         for tid, info in rows.items():
+             events[tid] = ("contained", {"contained": info}, info.get("contained_at"))
+     except Exception:  # display-only: the card keeps its ordinary triage description
+diff --git a/tests/hermes_cli/test_kanban_contained_display.py b/tests/hermes_cli/test_kanban_contained_display.py
+new file mode 100644
+index 00000000000..0cb163e99c0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_contained_display.py
+@@ -0,0 +1,196 @@
++"""Query-count regression for the profiles-session external wait display path."""
++from __future__ import annotations
++
++import json
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_contained_display as display
++from hermes_cli import kanban_contained_wait as literal
++from hermes_cli import kanban_external_activity as external
++from hermes_cli.kanban_containment_state import fingerprint
++from hermes_cli.kanban_db_sync import uuid7
++from tests.hermes_cli import test_kanban_containment_replica as replica_helpers
++from tests.hermes_cli import test_kanban_contained_strand as local_helpers
++
++kanban_home = replica_helpers.kanban_home
++synced_conn = replica_helpers.synced_conn
++board = local_helpers.board
++
++
++def seed(conn, count):
++    conn.executescript('''
++        CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT,block_kind TEXT,human_request TEXT,
++                           awaiting TEXT,containment_episode TEXT,completed_at REAL,title TEXT);
++        CREATE TABLE task_events(id INTEGER PRIMARY KEY,uid TEXT,task_id TEXT,kind TEXT,payload TEXT,created_at REAL);
++        CREATE TABLE task_runs(task_id TEXT,outcome TEXT,ended_at REAL);
++        CREATE TABLE kanban_sync_state(board_id TEXT);
++        INSERT INTO kanban_sync_state VALUES ('fixture');
++        CREATE TABLE containment_canonical_receipts(uid TEXT PRIMARY KEY,evidence TEXT);
++        CREATE TABLE containment_sync_acceptances(receipt_uid TEXT,evidence TEXT,accepted_at REAL);
++    ''')
++    ids = []
++    for i in range(count):
++        tid = f't_{i:016x}'
++        ids.append(tid)
++        target = {'board': 'fixture', 'gateway': 'fixture-home', 'task_id': tid}
++        authority = {**target, 'task_id': 't_ffffffffffffffff'}
++        stop = {'version': 1, 'target': target, 'policy': {'version': 1, 'authority': authority},
++                'producer_baseline': None}
++        episode = uuid7()
++        release = {'version': 1, 'episode': episode, 'containment_sha256': fingerprint(stop),
++                   'resume_status': 'ready', 'evidence': {'kind': 'authority', 'authority': authority, 'run_uid': uuid7()}}
++        conn.execute("INSERT INTO tasks VALUES (?,'triage',NULL,NULL,NULL,?,NULL,'Held')", (tid, episode))
++        for uid, kind, payload in [(episode, 'contained', stop), (uuid7(), 'containment_released', release)]:
++            conn.execute('INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES (?,?,?,?,100)',
++                         (uid, tid, kind, json.dumps(payload)))
++    conn.execute("INSERT INTO tasks VALUES ('t_ffffffffffffffff','done',NULL,NULL,NULL,NULL,150,'Authority')")
++    conn.commit()
++    return ids
++
++
++def counted(conn, fn):
++    statements = []
++    conn.set_trace_callback(statements.append)
++    try:
++        value = fn()
++    finally:
++        conn.set_trace_callback(None)
++    return value, statements
++
++
++def test_display_is_constant_queries_and_matches_strict_reader():
++    for count in (1, 30, 600):
++        with closing(sqlite3.connect(':memory:')) as conn:
++            ids = seed(conn, count)
++            expected, old = counted(conn, lambda: literal.read(conn, ids, replica=None))
++            actual, new = counted(conn, lambda: display.read(conn, ids, replica=None))
++            assert len(actual) == count
++            assert actual == expected
++            assert len(new) <= 10, new
++            assert len(old) >= count * 5
++            print(f'rows={count} strict_queries={len(old)} display_queries={len(new)}')
++            assert not conn.in_transaction
++
++
++@pytest.mark.parametrize('legacy', [False, True])
++def test_profiles_request_wait_queries_do_not_scale_with_sessions(tmp_path, monkeypatch, legacy):
++    from hermes_cli.web_routers import profiles
++    path = tmp_path / 'board.db'
++    with closing(sqlite3.connect(path)) as conn:
++        ids = seed(conn, 40)
++    pairs = [(f's{i}', tid) for i, tid in enumerate(ids)]
++    statements = []
++    if legacy:
++        monkeypatch.setattr(display, 'read', literal.read)
++
++    def open_ro(_path):
++        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    def annotate(rows, **kwargs):
++        external.stamp_boards(rows, lambda: [path], open_ro, lambda conn: pairs,
++                              lambda row: [row['id']], signature=None)
++
++    monkeypatch.setattr(profiles, '_profile_targets', lambda label: [('default', None)])
++    monkeypatch.setattr(profiles, '_read_serial_profile_db', lambda *args: (
++        [{'id': sid, 'source': 'cli', 'started_at': 100} for sid, _ in pairs], len(pairs)))
++    monkeypatch.setattr(profiles, '_corrupt_profile_stores', lambda targets: {})
++    monkeypatch.setattr(profiles, 'annotate_kanban_activity', annotate)
++    for name in ('goal', 'cron', 'background', 'turn', 'subagent'):
++        monkeypatch.setattr(profiles, f'annotate_{name}_activity', lambda rows: None)
++    monkeypatch.setattr(profiles, 'annotate_review_wait', lambda rows: None)
++    external.reset_for_tests()
++    app = FastAPI()
++    app.include_router(profiles.sessions_router)
++    with TestClient(app) as client:
++        response = client.get('/api/profiles/sessions?limit=50')
++    assert response.status_code == 200, response.text
++    assert len(response.json()['sessions']) == len(pairs)
++    if legacy:
++        assert len(statements) > 400, statements
++    else:
++        assert len(statements) <= 25, statements
++    print(f'GET legacy={legacy} sessions={len(pairs)} board_queries={len(statements)}')
++    external.reset_for_tests()
++
++
++def test_certified_release_capture_and_next_revision(synced_conn):
++    from hermes_cli import kanban_containment_replica as receipts
++    conn = synced_conn
++    tid, _, stop, release, hub = replica_helpers.scenario(conn)
++    replica_helpers.apply(conn, hub, [replica_helpers.event(stop, hub, 1)])
++    replica_helpers.apply(conn, hub, [replica_helpers.event(release, hub, 2)])
++    events = [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (tid,))]
++    s = next(e for e in events if e['kind'] == 'contained')
++    r = next(e for e in events if e['kind'] == 'containment_released')
++    captured = display.Capture(conn, [tid])
++    assert captured.verify(r, s) is True
++    assert receipts.verified(conn, r, s) is True
++    conn.execute("UPDATE kanban_sync_state SET board_id='different'")
++    assert display.Capture(conn, [tid]).verify(r, s) is False
++    assert receipts.verified(conn, r, s) is False
++    assert captured.verify(r, s) is True  # never installed into the strict/UDF reader
++
++
++@pytest.mark.parametrize('producer', [False, True])
++def test_local_display_matches_strict_and_preserves_caller_transaction(board, producer):
++    tid, _, prod = local_helpers._contained(board, producer=producer)
++    board.execute('BEGIN')
++    if prod:
++        board.execute("INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at) "
++                      "VALUES (?,'done','completed',1,2000000000)", (prod,))
++    assert display.read(board, [tid], replica=None) == literal.read(board, [tid], replica=None)
++    assert board.in_transaction
++    board.rollback()
++
++
++def test_local_attestation_is_checked_without_authorizing_strict_callers(board):
++    from hermes_cli.kanban_containment_connections import verifier
++    from tests.hermes_cli import test_kanban_containment_lifecycle as lifecycle
++    tid, _, authority, target, spec = lifecycle.setup(board)
++    episode = lifecycle.contain(board, tid, target, spec)['episode']
++    lifecycle.release(board, target, episode, authority)
++    events = [dict(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?', (tid,))]
++    stop = next(e for e in events if e['kind'] == 'contained')
++    receipt = next(e for e in events if e['kind'] == 'containment_released')
++    captured = display.Capture(board, [tid])
++    assert captured.verify(receipt, stop) is True
++    assert verifier(board, receipt, stop) is True
++    altered = {**receipt, 'payload': '{}'}
++    assert captured.verify(altered, stop) is False
++    assert verifier(board, altered, stop) is False
++
++
++def test_failed_display_capture_releases_only_its_own_snapshot():
++    with closing(sqlite3.connect(':memory:')) as conn:
++        ids = seed(conn, 1)
++        conn.execute('DROP TABLE task_events')
++        with pytest.raises(sqlite3.Error):
++            display.read(conn, ids, replica=None)
++        assert not conn.in_transaction
++
++
++@pytest.mark.parametrize('raw', ['null', '{"source":"new"}', 'malformed'])
++def test_acceptance_precedence_and_lazy_decode_match_literal(raw):
++    from hermes_cli import kanban_containment_replica as receipts
++    with closing(sqlite3.connect(':memory:')) as conn:
++        ids = seed(conn, 1)
++        uid = conn.execute("SELECT uid FROM task_events WHERE kind='contained'").fetchone()[0]
++        conn.execute('INSERT INTO containment_canonical_receipts VALUES (?,?)', (uid, '{"source":"first"}'))
++        conn.execute('INSERT INTO containment_sync_acceptances VALUES (?,?,100)', (uid, '{"source":"older"}'))
++        conn.execute('INSERT INTO containment_sync_acceptances VALUES (?,?,100)', (uid, raw))
++        captured = display.Capture(conn, ids)
++        if raw == 'malformed':
++            with pytest.raises(ValueError):
++                receipts._cached(conn, uid)
++            with pytest.raises(ValueError):
++                captured._cached(uid)
++        else:
++            assert captured._cached(uid) == receipts._cached(conn, uid)
+-- 
+2.43.0
+

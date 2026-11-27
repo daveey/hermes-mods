@@ -1,0 +1,238 @@
+From 5653c2b696cf205f6b6c08ae21f687ae2629b3d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:05:01 +0000
+Subject: [PATCH 6197] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit 5653c2b696cf205f6b6c08ae21f687ae2629b3d9.
+
+---
+diff --git a/hermes_cli/fact_content_owner.py b/hermes_cli/fact_content_owner.py
+index fd0a9997bb8..9c4dcbf10bc 100644
+--- a/hermes_cli/fact_content_owner.py
++++ b/hermes_cli/fact_content_owner.py
+@@ -24,6 +24,11 @@
+     Board and project-tree owners bound kanban.db and state.db only for
+     SourceState, but published every row into the shared process store.
+     Publications exceeded the fact budget, repeatedly rebuilding both sources.
++
++    A clock-only source is also paced (:data:`CLOCK_ONLY_INTERVAL`): its feed pass opened a guarded connection,
++    ran change reads and re-projected dependent views on every write. Repeated
++    work across boards kept the shared fact-change-feed busy in the dashboard
++    backend. The views it invalidates are paced the same way.
+     """
+     source: object
+     path: object
+@@ -31,6 +36,9 @@
+     clock_only: bool = False
+ 
+ 
++CLOCK_ONLY_INTERVAL = 5.0  # seconds between feed passes of a clock-only source; board inputs pace at 5 s too
++
++
+ def _ids_only(conn, ids):
+     """Clock-only hydration: the cursor alone is published, so rows carry nothing but their id.
+     Same input contract as the scalar row hydrators (capture transaction, <= 500 string ids)."""
+@@ -76,6 +84,8 @@
+                 raise ValueError('clock-only binding takes no hydrate')
+             hydrate = _ids_only if binding.clock_only else rows if binding.hydrate is None else binding.hydrate
+             adapter = adapter_type(source, binding.path, hydrate)
++            if binding.clock_only:
++                adapter.min_interval = CLOCK_ONLY_INTERVAL
+             publisher = SourcePublisher(engines[source.scope], source, kind, clock_only=binding.clock_only)
+             self._publishers[adapter] = publisher
+             self._by_source[source] = publisher
+diff --git a/hermes_cli/fact_feed.py b/hermes_cli/fact_feed.py
+index 7937e0da940..a5907184673 100644
+--- a/hermes_cli/fact_feed.py
++++ b/hermes_cli/fact_feed.py
+@@ -41,6 +41,9 @@
+     failures: int = 0
+     active: bool = True
+     watch: object = None
++    # Optional adapter pacing: a wake schedules no pass sooner than min_interval after the last one started.
++    min_interval: float = 0.0
++    last_start: float | None = None
+     publication: object = field(default_factory=threading.RLock)
+     # Owner-thread only: exception types already traced in this failure streak.
+     traced: set = field(default_factory=set)
+@@ -72,7 +75,7 @@
+         self._thread.start()
+ 
+     def register(self, adapter):
+-        source = _Source(adapter)
++        source = _Source(adapter, min_interval=max(0.0, float(getattr(adapter, "min_interval", 0) or 0)))
+         # Arm first: even a synchronous wake during watch setup is retained.
+         source.watch = adapter.watch(lambda: self._wake(source))
+         with self._condition:
+@@ -92,7 +95,12 @@
+             if source.active and not self._stopping:
+                 # Leading edge; more hints cannot postpone it. During capture,
+                 # this becomes the trailing capture without losing a late write.
++                # A paced source's edge waits out its interval: a burst of hints
++                # coalesces into one trailing pass; clock-only
++                # kanban.db bindings previously re-captured on every write.
+                 now = time.monotonic()
++                if source.min_interval and source.last_start is not None:
++                    now = max(now, source.last_start + source.min_interval)
+                 source.due = now if source.due is None else min(source.due, now)
+                 self._condition.notify_all()
+ 
+@@ -139,6 +147,7 @@
+                     self._condition.wait(delay)
+                     continue
+                 source.due = None
++                source.last_start = time.monotonic()
+                 return source
+         return None
+ 
+diff --git a/hermes_cli/fact_process.py b/hermes_cli/fact_process.py
+index 9668bc5d315..283ecc1fc84 100644
+--- a/hermes_cli/fact_process.py
++++ b/hermes_cli/fact_process.py
+@@ -40,6 +40,11 @@
+         self.capturing = self.closed = False
+         self.watch_handle = None
+ 
++    @property
++    def min_interval(self):
++        """The wrapped adapter's pacing for the shared ChangeFeed (0: every wake is a pass)."""
++        return getattr(self.adapter, 'min_interval', 0)
++
+     def watch(self, wake):
+         self.watch_handle = self.context.run(self.adapter.watch, wake)
+         return self
+diff --git a/tests/hermes_cli/test_fact_clock_only.py b/tests/hermes_cli/test_fact_clock_only.py
+index c8c746baacc..e1c8860505d 100644
+--- a/tests/hermes_cli/test_fact_clock_only.py
++++ b/tests/hermes_cli/test_fact_clock_only.py
+@@ -25,6 +25,13 @@
+ SCOPE = Scope("install", "profile", "board")
+ 
+ 
++@pytest.fixture(autouse=True)
++def _fast_clock_pacing(monkeypatch):
++    """Clock-only sources pace their feed passes (5 s in production); a short pace keeps these waits short."""
++    from hermes_cli import fact_content_owner
++    monkeypatch.setattr(fact_content_owner, "CLOCK_ONLY_INTERVAL", 0.2)
++
++
+ @dataclass(frozen=True)
+ class _Cursor:
+     n: int
+diff --git a/tests/hermes_cli/test_fact_feed_pacing.py b/tests/hermes_cli/test_fact_feed_pacing.py
+new file mode 100644
+index 00000000000..07d4ed3da1b
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_feed_pacing.py
+@@ -0,0 +1,108 @@
++"""A paced feed source coalesces a burst of wakes into one trailing pass (``ChangeFeed`` min_interval). [daveey]
++
++Representative observation: clock-only kanban.db bindings for board and project-tree owners
++ran a feed pass on every write. Guarded connections, repeated
++change reads and re-projections kept the dashboard's shared feed busy.
++"""
++import threading
++import time
++from types import SimpleNamespace
++
++from hermes_cli.fact_content_owner import CLOCK_ONLY_INTERVAL, ContentBinding, ContentOwner
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_process import _Adapter
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++from tests.hermes_cli import test_fact_task_source as tasks
++from tests.waiting import wait_until
++
++home, board = tasks.home, tasks.board
++
++
++class Paced:
++    def __init__(self, min_interval):
++        self.min_interval = min_interval
++        self.starts = []
++        self.wake = None
++
++    def watch(self, wake):
++        self.wake = wake
++        return self
++
++    def close(self):
++        pass
++
++    def capture(self, cursor, budget):
++        self.starts.append(time.monotonic())
++        return SimpleNamespace(after=len(self.starts))
++
++
++def _feed(adapter):
++    feed = ChangeFeed(lambda *a: None, lambda *a: None)
++    feed.register(adapter)
++    assert wait_until(lambda: len(adapter.starts) == 1, timeout=5)  # registration's own pass
++    return feed
++
++
++def test_a_burst_of_wakes_becomes_one_pass_after_the_interval():
++    source = Paced(0.3)
++    feed = _feed(source)
++    try:
++        for _ in range(10):
++            source.wake()
++        assert wait_until(lambda: len(source.starts) == 2, timeout=5)
++        assert source.starts[1] - source.starts[0] >= 0.3 - 0.01  # paced from last_start, stamped just before
++        # health: allow HX013 -- the quiet interval after the trailing pass IS the behaviour under test
++        threading.Event().wait(0.5)
++        assert len(source.starts) == 2  # the whole burst cost one pass
++    finally:
++        feed.close()
++
++
++def test_an_unpaced_source_still_runs_on_the_leading_edge():
++    source = Paced(0)
++    feed = _feed(source)
++    try:
++        woke = time.monotonic()
++        source.wake()
++        assert wait_until(lambda: len(source.starts) == 2, timeout=5)
++        assert source.starts[1] - woke < 0.3
++    finally:
++        feed.close()
++
++
++def test_a_quiet_paced_source_runs_at_once_once_its_interval_has_passed():
++    source = Paced(1.0)
++    feed = _feed(source)
++    try:
++        # health: allow HX013 -- an idle period longer than the interval IS the precondition under test
++        threading.Event().wait(1.1)
++        woke = time.monotonic()
++        source.wake()
++        assert wait_until(lambda: len(source.starts) == 2, timeout=5)
++        assert source.starts[1] - woke < 0.5  # at once, not a full interval after the wake
++    finally:
++        feed.close()
++
++
++def test_the_process_wrapper_forwards_pacing():
++    assert _Adapter(Paced(2.5), owner=None).min_interval == 2.5
++    assert _Adapter(SimpleNamespace(), owner=None).min_interval == 0
++
++
++def test_only_clock_only_content_bindings_are_paced(board):
++    path = next(r[2] for r in board.execute("PRAGMA database_list") if r[1] == "main")
++    scope = Scope("install", "profile")
++    clock, rows = SourceId(scope, "tasks.content", "clock"), SourceId(scope, "tasks.content", "rows")
++    store = FactStore()
++    owner = ContentOwner({scope: ReducerEngine(store, scope)},
++                         [ContentBinding(clock, path, clock_only=True), ContentBinding(rows, path)])
++    try:
++        paced = {adapter.source: getattr(adapter, "min_interval", 0) for adapter in owner._publishers
++                 if getattr(adapter, "source", None) in (clock, rows) and hasattr(adapter, "path")}
++        assert paced == {clock: CLOCK_ONLY_INTERVAL, rows: 0}
++        states = [owner.publisher(source).state_key for source in (clock, rows)]
++        assert wait_until(lambda: all(store.snapshot(scope).get(key) is not None for key in states), timeout=10)
++    finally:
++        owner.close()  # after both first passes: no "source owner closed" capture error in the log
+-- 
+2.43.0
+

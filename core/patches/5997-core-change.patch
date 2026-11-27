@@ -1,0 +1,328 @@
+From 5dacde084cd97db8caaca039e042f0dd2add89c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:04:33 +0000
+Subject: [PATCH 5997] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit 5dacde084cd97db8caaca039e042f0dd2add89c9.
+
+---
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+index 44e53d28944..a94efb8bc72 100644
+--- a/hermes_cli/kanban_containment_guard.py
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -77,8 +77,8 @@
+     from hermes_cli.kanban_sync_quarantine import held
+     if held(conn, task_id):
+         return True
+-    # One row for both schemas: this runs as a SQL function on every guarded write, inside sync page applies.
+-    from hermes_cli.kanban_table_columns import tables_columns
++    # Page cache when applying; retain the combined aggregate fallback for guarded writes.
++    from hermes_cli.kanban_sync_apply_schema import tables_columns
+     columns, task_columns = tables_columns(conn, "task_events", "tasks")
+     uid = "uid" if "uid" in columns else "NULL AS uid"
+     cursor = conn.execute(f"SELECT {uid},task_id,kind,payload FROM task_events WHERE task_id=? "
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 68de789fec4..a36a75660e9 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -561,16 +561,9 @@
+ 
+ 
+ def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+-    """``PRAGMA table_info`` names, built inside SQLite as ONE row (see kanban_table_columns).
+-
+-    Order is the pragma scan order (cid) in practice, not a documented SQLite guarantee; ``ORDER BY`` inside the
+-    aggregate needs SQLite 3.44. Only install_triggers compares order, and a difference there just rebuilds them.
+-
+-    apply_remote_changes holds the board write lock for a whole page and reads schemas several times per change;
+-    one row per column re-taking the GIL can hold
+-    the lock long enough to starve the dispatcher."""
+-    row = conn.execute("SELECT json_group_array(name) FROM pragma_table_info(?)", (table,)).fetchone()
+-    return json.loads(row[0])
++    """Ordered page-local columns, with the one-row aggregate fallback outside apply."""
++    from hermes_cli.kanban_sync_apply_schema import table_columns as columns
++    return columns(conn, table)
+ 
+ 
+ def captured_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+@@ -1348,11 +1341,11 @@
+     pull and the snapshot rebuild) keeps every task field that has an unanswered local edit in the outbox, read
+     in the same transaction as the apply. ``keep`` (the live-file rebuild sweep) is asked about each change inside
+     that transaction; a change it refuses is skipped. [daveey]"""
+-    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_sync_apply_schema import page_writer
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     from hermes_cli import kanban_containment_replica as containment
+     containment.prepare_apply(conn, changes)
+-    with write_txn(conn):
++    with page_writer(conn, SYNCED_TABLES, cache=bool(changes) and keep is None):
+         result.revision_before = _repair_revision(conn)
+         # Serialize with set_mode(off): a feed fetched before detach must not
+         # overwrite locally held custody after the detach transaction commits.
+diff --git a/hermes_cli/kanban_sync_apply_schema.py b/hermes_cli/kanban_sync_apply_schema.py
+new file mode 100644
+index 00000000000..3e11122c13d
+--- /dev/null
++++ b/hermes_cli/kanban_sync_apply_schema.py
+@@ -0,0 +1,68 @@
++"""Page-local ordered sync schema, prepared before acquiring the board writer."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++import json
++
++
++@dataclass
++class Schema:
++    conn: object
++    version: int
++    columns: dict[str, tuple[str, ...]]
++
++
++_SCHEMA: ContextVar[Schema | None] = ContextVar('kanban_sync_apply_schema', default=None)
++
++
++def _prepare(conn, tables):
++    # Preserve unqualified PRAGMA resolution for unusual attached/temp layouts.
++    if any(row[1] not in {'main', 'temp'} for row in conn.execute('PRAGMA database_list')):
++        return None
++    placeholders = ','.join('?' for _ in tables)
++    if conn.execute(f'SELECT 1 FROM sqlite_temp_master WHERE name IN ({placeholders}) LIMIT 1', tables).fetchone():
++        return None
++    # One SQLite snapshot/result row: no Python/GIL handoff for each column.
++    probes = ', '.join('(SELECT json_group_array(name) FROM (SELECT name FROM pragma_table_info(?) ORDER BY cid))' for _ in tables)
++    row = conn.execute('SELECT (SELECT schema_version FROM pragma_schema_version), ' + probes, tables).fetchone()
++    return Schema(conn, row[0], {table: tuple(json.loads(cell)) for table, cell in zip(tables, tuple(row)[1:])})
++
++
++@contextmanager
++def page_writer(conn, tables, *, cache):
++    """Keep the existing atomic page; cache only immutable schema, never outbox/row state.
++
++    A rare concurrent migration refreshes the fixed-size schema snapshot under the
++    acquired writer. Arbitrary schema-changing keep callbacks use the old path.
++    This shortens a writer transaction; it is not a page wall-clock deadline.
++    """
++    from hermes_cli.kanban_db_connect import write_txn
++    prepared = _prepare(conn, tables) if cache else None
++    with write_txn(conn):
++        if prepared is not None and conn.execute('PRAGMA schema_version').fetchone()[0] != prepared.version:
++            prepared = _prepare(conn, tables)
++        token = _SCHEMA.set(prepared)
++        try:
++            yield
++        finally:
++            _SCHEMA.reset(token)
++
++
++def table_columns(conn, table):
++    schema = _SCHEMA.get()
++    if schema is not None and schema.conn is conn and table in schema.columns:
++        return list(schema.columns[table])
++    row = conn.execute('SELECT json_group_array(name) FROM (SELECT name FROM pragma_table_info(?) ORDER BY cid)',
++                       (table,)).fetchone()
++    return json.loads(row[0])
++
++
++def tables_columns(conn, *tables):
++    """Containment's combined fallback stays one aggregate result outside page scope."""
++    schema = _SCHEMA.get()
++    if schema is not None and schema.conn is conn and all(table in schema.columns for table in tables):
++        return tuple(frozenset(schema.columns[table]) for table in tables)
++    from hermes_cli.kanban_table_columns import tables_columns as uncached
++    return uncached(conn, *tables)
+diff --git a/tests/hermes_cli/test_kanban_sync_apply_schema_cache.py b/tests/hermes_cli/test_kanban_sync_apply_schema_cache.py
+new file mode 100644
+index 00000000000..7d3cf1df8c2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_apply_schema_cache.py
+@@ -0,0 +1,184 @@
++"""Feed-page schema discovery must not convoy while holding the board writer."""
++from __future__ import annotations
++
++import contextlib
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_sync_apply_schema as schema
++
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_sync_apply import _ch, _task_fields
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def synced_conn(kanban_home):
++    yield from support.synced_conn(kanban_home)
++
++
++def test_large_page_schema_probes_do_not_scale_under_writer(synced_conn, monkeypatch):
++    conn = synced_conn
++    changes = [_ch(n, 'tasks', f't_schema{n:012d}', _task_fields()) for n in range(1, 257)]
++    queries = []
++    started = [False]
++    apply_one = sync._apply_one
++
++    def apply_row(*args):
++        started[0] = True
++        return apply_one(*args)
++
++    monkeypatch.setattr(sync, '_apply_one', apply_row)
++    conn.set_trace_callback(lambda sql: queries.append((sql, conn.in_transaction and started[0])))
++    try:
++        result = sync.apply_remote_changes(conn, changes, new_cursor=256, observers=False)
++    finally:
++        conn.set_trace_callback(None)
++    assert result.applied == 256
++    assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_schema%'").fetchone()[0] == 256
++    assert sync.sync_state(conn)['cursor'] == 256
++    assert sync.sync_state(conn)['applying'] == 0
++    assert not sync.outbox(conn)
++    probes = [(sql, held) for sql, held in queries
++              if 'table_info' in sql.lower() and not sql.lstrip().startswith('--')]
++    assert probes, 'schema discovery must actually be exercised'
++    assert not any(held for _sql, held in probes), probes
++    # One prepared aggregate plus the unchanged two status-origin BEGIN checks.
++    assert len(probes) <= 3, 'schema discovery must be page-, not row-sized'
++
++
++def test_schema_refreshes_migration_between_prepare_and_writer(synced_conn, monkeypatch):
++    conn = synced_conn
++    prepare = schema._prepare
++    seen = []
++
++    def migrate(connection, tables):
++        prepared = prepare(connection, tables)
++        assert prepared is not None
++        seen.append(prepared.version)
++        if len(seen) == 1:
++            with contextlib.closing(sqlite3.connect(conn.execute('PRAGMA database_list').fetchone()[2])) as writer:
++                writer.execute('ALTER TABLE tasks ADD COLUMN remote_extension TEXT')
++        return prepared
++
++    monkeypatch.setattr(schema, '_prepare', migrate)
++    with schema.page_writer(conn, sync.SYNCED_TABLES, cache=True):
++        assert 'remote_extension' in schema.table_columns(conn, 'tasks')
++    assert len(seen) == 2
++    assert seen[1] > seen[0]
++    assert schema._SCHEMA.get() is None
++
++
++def test_page_failure_rolls_back_rows_cursor_echo_guard_and_scope(synced_conn, monkeypatch):
++    from hermes_cli import kanban_db as kb
++
++    conn = synced_conn
++    local = kb.create_task(conn, title='pending local edit', assignee='worker')
++    pending = sync.outbox(conn)
++    assert pending
++    before = sync.sync_state(conn)
++    apply = sync._apply_one
++    calls = []
++
++    def fail_late(*args):
++        calls.append(True)
++        if len(calls) == 128:
++            raise ValueError('injected late page failure')
++        return apply(*args)
++
++    monkeypatch.setattr(sync, '_apply_one', fail_late)
++    changes = [_ch(1, 'tasks', local, _task_fields(), client_op_id=pending[0]['op_id'])]
++    changes.extend(_ch(n, 'tasks', f't_rollback{n:010d}', _task_fields()) for n in range(2, 257))
++    with pytest.raises(ValueError, match='injected late page failure'):
++        sync.apply_remote_changes(conn, changes, new_cursor=256, observers=False)
++    assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_rollback%'").fetchone()[0] == 0
++    assert sync.sync_state(conn) == before
++    assert sync.outbox(conn) == pending
++    assert schema._SCHEMA.get() is None
++    monkeypatch.setattr(sync, '_apply_one', apply)
++    recovered = sync.apply_remote_changes(conn, changes, new_cursor=256, observers=False)
++    assert recovered.applied == 255
++    assert recovered.skipped_echo == 1
++    assert pending[0]['op_id'] not in {op['op_id'] for op in sync.outbox(conn)}
++
++
++@pytest.mark.parametrize('layout', ['attached', 'temp_shadow'])
++def test_unusual_resolution_uses_uncached_columns(synced_conn, layout):
++    conn = synced_conn
++    if layout == 'attached':
++        conn.execute("ATTACH DATABASE ':memory:' AS auxiliary")
++    else:
++        conn.execute('CREATE TEMP TABLE tasks (shadow_column TEXT)')
++    with schema.page_writer(conn, sync.SYNCED_TABLES, cache=True):
++        assert schema._SCHEMA.get() is None
++        if layout == 'temp_shadow':
++            assert schema.table_columns(conn, 'tasks') == ['shadow_column']
++
++
++def test_cached_columns_are_ordered_copied_and_connection_scoped(synced_conn):
++    conn = synced_conn
++    expected = [row[1] for row in conn.execute('PRAGMA table_info(tasks)')]
++    with contextlib.closing(sqlite3.connect(':memory:')) as other:
++        other.execute('CREATE TABLE tasks (other_column TEXT)')
++        with schema.page_writer(conn, sync.SYNCED_TABLES, cache=True):
++            assert schema.table_columns(conn, 'tasks') == expected
++            columns = schema.table_columns(conn, 'tasks')
++            columns.clear()
++            assert schema.table_columns(conn, 'tasks') == expected
++            assert schema.table_columns(other, 'tasks') == ['other_column']
++        assert schema._SCHEMA.get() is None
++
++
++def test_large_page_preparation_allows_real_dispatch_tick(synced_conn, kanban_home, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_model_retirement as retirement
++    from hermes_cli import kanban_ratio_routing as ratio
++
++    conn = synced_conn
++    support.write_routed_sync_config(kanban_home, True)
++    tid = kb.create_task(conn, title='ready during page schema discovery', assignee='default')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    monkeypatch.setattr(retirement, 'sweep', lambda _conn: None)
++    monkeypatch.setattr(ratio, 'begin_tick', lambda _conn: None)
++    monkeypatch.setattr(dispatch, 'reap_worker_zombies', lambda: None)
++    monkeypatch.setattr(dispatch, 'reap_terminal_workers', lambda _conn: [])
++    prepare = schema._prepare
++    spawned = []
++    path = conn.execute('PRAGMA database_list').fetchone()[2]
++    with contextlib.closing(kbc.connect(Path(path))) as dispatcher:
++        def interleave(connection, tables):
++            prepared = prepare(connection, tables)
++            if connection.in_transaction:
++                assert spawned == [tid]  # dispatcher schema setup legitimately refreshes the cookie
++                return prepared
++            result = dispatch.dispatch_once(dispatcher, spawn_fn=lambda task, *_: spawned.append(task.id),
++                                            reconcile_orphans=False, max_in_progress=16, max_spawn=1)
++            assert [row[0] for row in result.spawned] == [tid], result
++            return prepared
++
++        monkeypatch.setattr(schema, '_prepare', interleave)
++        changes = [_ch(n, 'tasks', f't_interleave{n:010d}', _task_fields()) for n in range(1, 257)]
++        assert sync.apply_remote_changes(conn, changes, new_cursor=256, observers=False).applied == 256
++    assert spawned == [tid]
++    assert kb.get_task(conn, tid).status == 'running'
++    assert sync.sync_state(conn)['cursor'] == 256
++
++
++def test_keep_callback_uses_uncached_schema(synced_conn, monkeypatch):
++    def forbidden(*_args):
++        pytest.fail('arbitrary keep callbacks must not use a schema snapshot')
++
++    monkeypatch.setattr(schema, '_prepare', forbidden)
++    changes = [_ch(1, 'tasks', 't_keep00000000001', _task_fields())]
++    assert sync.apply_remote_changes(synced_conn, changes, new_cursor=1,
++                                     keep=lambda *_: True, observers=False).applied == 1
+-- 
+2.43.0
+

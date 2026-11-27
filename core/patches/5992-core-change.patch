@@ -1,0 +1,165 @@
+From ea92ac0f3e108ba99bdb8c64a119d5bbd097655e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:13:55 +0000
+Subject: [PATCH 5992] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit ea92ac0f3e108ba99bdb8c64a119d5bbd097655e.
+
+---
+diff --git a/hermes_cli/fact_source_watch.py b/hermes_cli/fact_source_watch.py
+index 519e77991cd..68d1565123e 100644
+--- a/hermes_cli/fact_source_watch.py
++++ b/hermes_cli/fact_source_watch.py
+@@ -22,6 +22,10 @@
+ _shared = None
+ 
+ 
++class _OwnerStopped(RuntimeError):
++    """A queued terminal removal won admission; retry on a fresh owner."""
++
++
+ class _Request:
+     def __init__(self, action):
+         self.action = action
+@@ -61,6 +65,10 @@
+         return request
+ 
+     def add(self, watch):
++        # A timed-out last removal can precede this command. Never allocate or
++        # acknowledge coverage after it has closed the owner's control channel.
++        if self._stopped:
++            raise _OwnerStopped('native owner drained before source admission')
+         events = FileEvents()
+         try:
+             events.replace(watch._paths, directories=watch._directories)
+@@ -168,21 +176,27 @@
+         self._close_request = None
+         self._closed = False
+         with _shared_lock:
+-            if _shared is not None and _shared._stopped:
++            while True:
++                if _shared is not None and _shared._stopped:
++                    self._owner = _shared
++                    self._finish_owner()
++                if _shared is None:
++                    _shared = _NativeOwner()
+                 self._owner = _shared
+-                self._finish_owner()
+-            if _shared is None:
+-                _shared = _NativeOwner()
+-            self._owner = _shared
+-            try:
+-                # Acknowledged only after coverage exists: bootstrap cannot race
+-                # registration, including when another source is already live.
+-                self._owner.submit(lambda: self._owner.add(self)).wait()
+-            except BaseException:
+-                cleanup = self._owner.submit(lambda: self._owner.remove(self))
+-                cleanup.wait()
+-                self._finish_owner()
+-                raise
++                try:
++                    # Acknowledged only after coverage exists. A pending remove
++                    # can stop this owner after our caller-side stopped check.
++                    self._owner.submit(lambda: self._owner.add(self)).wait()
++                    break
++                except _OwnerStopped:
++                    # No descriptors were allocated. Retire/join the drained
++                    # owner before retrying; a failed join retains its custody.
++                    self._finish_owner()
++                except BaseException:
++                    cleanup = self._owner.submit(lambda: self._owner.remove(self))
++                    cleanup.wait()
++                    self._finish_owner()
++                    raise
+ 
+     def check(self):
+         with self._lock:
+diff --git a/tests/hermes_cli/test_review_watch_drain_admission.py b/tests/hermes_cli/test_review_watch_drain_admission.py
+new file mode 100644
+index 00000000000..b6989883dba
+--- /dev/null
++++ b/tests/hermes_cli/test_review_watch_drain_admission.py
+@@ -0,0 +1,80 @@
++"""Native admission remains live after a timed-out last-watch removal."""
++import os
++import threading
++
++import pytest
++from hermes_cli import fact_source_watch as native
++
++
++@pytest.mark.platforms('linux')
++def test_new_watch_after_timed_out_last_remove_stays_live(tmp_path, monkeypatch):
++    a = tmp_path / 'a.db'
++    b = tmp_path / 'b.db'
++    a.write_text('initial')
++    entered, release, admitted = threading.Event(), threading.Event(), threading.Event()
++    hint = threading.Event()
++    watch = native.NativeSourceWatch((a,), lambda: None)
++    owner = watch._owner
++    original = native.FileEvents.replace
++    armed = True
++
++    def delayed_rearm(events, *args, **kwargs):
++        nonlocal armed
++        if events is watch._events and armed:
++            armed = False
++            entered.set()
++            assert release.wait(15)
++        return original(events, *args, **kwargs)
++
++    monkeypatch.setattr(native.FileEvents, 'replace', delayed_rearm)
++    result = {}
++    successor = None
++    thread = None
++    try:
++        a.write_text('changed')
++        assert entered.wait(5)
++        with pytest.raises(TimeoutError):
++            watch.close()  # actual five-second timeout; removal stays queued
++        submit = owner.submit
++
++        def mark_admission(action):
++            request = submit(action)
++            admitted.set()
++            return request
++
++        monkeypatch.setattr(owner, 'submit', mark_admission)
++
++        def create():
++            try:
++                result['watch'] = native.NativeSourceWatch((b,), hint.set)
++            except BaseException as exc:
++                result['error'] = exc
++
++        thread = threading.Thread(target=create)
++        thread.start()
++        assert admitted.wait(3)
++        release.set()
++        thread.join(5)
++        assert not thread.is_alive()
++        assert 'error' not in result, result.get('error')
++        successor = result['watch']
++        owner._thread.join(2)
++        successor.check()
++        assert successor._owner._thread.is_alive(), 'successful watch admitted onto a dead owner'
++        b.write_text('new source')
++        assert hint.wait(5)
++    finally:
++        release.set()
++        if thread is not None:
++            thread.join(5)
++        watch.close()
++        if successor is not None:
++            descriptor = successor._events._fd
++            successor.close()
++            if successor in owner._watches:
++                # Keep the authentic broken-owner RED fixture leak-free.
++                successor._events.close()
++                owner._watches.discard(successor)
++            else:
++                with pytest.raises(OSError):
++                    os.fstat(descriptor)
+-- 
+2.43.0
+

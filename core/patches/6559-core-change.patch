@@ -1,0 +1,216 @@
+From c69e4e8012a2e1e80b2fcbf8686f8d0ba0bb90fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:17:31 +0000
+Subject: [PATCH 6559] Session list reads, status checkpoints and early startup
+
+Public mirror of source commit c69e4e8012a2e1e80b2fcbf8686f8d0ba0bb90fa.
+
+---
+diff --git a/hermes_state_process_checkpoint.py b/hermes_state_process_checkpoint.py
+new file mode 100644
+index 00000000000..036104d8c12
+--- /dev/null
++++ b/hermes_state_process_checkpoint.py
+@@ -0,0 +1,44 @@
++"""Read-only status evidence for processes supervised by a different backend.
++
++The tool registry and completion receipts are not a complete live inventory after
++restart. Check the same profile checkpoint used by process_manage's foreign route,
++without adopting a process, starting a watcher or changing its completion custodian.
++"""
++from __future__ import annotations
++
++import json
++
++
++def checkpoint_items(registry, owner, known):
++    from tools.environments.sandbox_scope import sandbox_visible
++    from tools.process_registry import _checkpoint_path
++    from tools.process_registry_results import _owns_result
++
++    try:
++        entries = json.loads(_checkpoint_path().read_text(encoding='utf-8-sig'))
++    except FileNotFoundError:
++        return []
++    if not isinstance(entries, list):
++        raise ValueError('malformed process checkpoint')
++    items = []
++    for entry in entries:
++        if not isinstance(entry, dict) or not isinstance(entry.get('parent_session_id'), str):
++            raise ValueError('process checkpoint owner unavailable')
++        if not _owns_result(owner, entry['parent_session_id']):
++            continue
++        pid = entry.get('session_id')
++        if not isinstance(pid, str) or not pid.startswith('proc_'):
++            raise ValueError('process checkpoint identity unavailable')
++        if pid in known:
++            continue  # current registry/structured completion is authoritative
++        if (entry.get('pid_scope', 'host') != 'host'
++                or not sandbox_visible(entry.get('sandbox_key', ''))):
++            raise ValueError('process checkpoint scope unavailable')
++        host_pid, birth = entry.get('pid'), entry.get('host_start_time')
++        if type(host_pid) is not int or host_pid <= 0 or type(birth) is not int or birth <= 0:
++            raise ValueError('process checkpoint birth unavailable')
++        if registry._detached_host_fate(host_pid, birth) != 'running':
++            raise ValueError('process checkpoint missing completion evidence')
++        items.append({'kind': 'process', 'id': f'process:{pid}', 'state': 'running',
++                      'label': str(entry.get('command') or pid)[:120], 'at': 0.0})
++    return items
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index 088181c4321..c4bcab08b87 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -165,10 +165,12 @@
+ def _process_items(db: Any, tip: str) -> list[dict]:
+     """Live and retained processes of this chat from the registry's strict qualified inventory."""
+     from tools.process_registry import process_registry
++    from hermes_state_process_checkpoint import checkpoint_items
+ 
+     with _so()._owner_scope(db):
+         rows = process_registry.list_sessions(include_retained=True, strict=True, owner_session_id=tip)
+-    items = []
++        checkpoints = checkpoint_items(process_registry, tip, {row['session_id'] for row in rows})
++    items = list(checkpoints)
+     for row in rows:
+         if row.get("status") != "exited":
+             state = "running"
+diff --git a/tests/hermes_state/test_session_status_checkpoint_fences.py b/tests/hermes_state/test_session_status_checkpoint_fences.py
+new file mode 100644
+index 00000000000..fb8411d65ff
+--- /dev/null
++++ b/tests/hermes_state/test_session_status_checkpoint_fences.py
+@@ -0,0 +1,74 @@
++"""Checkpoint liveness never overrides completion, owner or sandbox custody."""
++import json
++
++import pytest
++
++from tests.hermes_state import test_session_status_checkpoint_process as fixtures
++from tests.hermes_state import test_session_status_refresh as status
++from tools import process_registry as processes
++
++board = fixtures.board
++receipts = fixtures.receipts
++db = fixtures.db
++
++
++def checkpoint(tmp_path, monkeypatch, entries):
++    path = tmp_path / 'processes.json'
++    path.write_text(json.dumps(entries))
++    monkeypatch.setattr(processes, '_checkpoint_path', lambda: path)
++    return path
++
++
++def entry(**changes):
++    return {'session_id': 'proc_example', 'parent_session_id': 'chat',
++            'pid': 12345, 'host_start_time': 999, 'pid_scope': 'host',
++            'command': 'sleep 600', **changes}
++
++
++@pytest.mark.parametrize('change', [
++    {'pid': True}, {'pid': 0}, {'host_start_time': True}, {'host_start_time': 0},
++    {'session_id': None}, {'session_id': 'wrong'}, {'pid_scope': 'container'},
++    {'parent_session_id': None},
++])
++def test_unverifiable_checkpoint_cannot_certify_green(db, tmp_path, monkeypatch, change):
++    status.turn(db)
++    checkpoint(tmp_path, monkeypatch, [entry(**change)])
++    monkeypatch.setattr(processes.process_registry, '_detached_host_fate',
++                        lambda *args: pytest.fail('invalid identity must not reach kernel probe'))
++    value = status.refresh(db)
++    assert value['kind'] != 'done'
++    assert value['coverage']['state'] == 'unknown'
++
++
++@pytest.mark.parametrize('code,expected', [(0, 'done'), (3, 'unresolved')])
++def test_structured_receipt_outranks_stale_checkpoint(db, receipts, tmp_path, monkeypatch, code, expected):
++    status.turn(db)
++    status.receipt(receipts, exit_code=code)
++    checkpoint(tmp_path, monkeypatch, [entry()])
++    monkeypatch.setattr(processes.process_registry, '_detached_host_fate',
++                        lambda *args: pytest.fail('completion is authoritative'))
++    value = status.refresh(db)
++    assert value['kind'] == expected
++    assert value['coverage']['state'] == 'complete'
++
++
++def test_absent_checkpoint_remains_known_empty(db, tmp_path, monkeypatch):
++    status.turn(db)
++    monkeypatch.setattr(processes, '_checkpoint_path', lambda: tmp_path / 'absent')
++    assert status.refresh(db)['kind'] == 'done'
++
++
++def test_unreadable_checkpoint_does_not_hide_retained_failure(db, receipts, tmp_path, monkeypatch):
++    status.turn(db)
++    status.receipt(receipts, exit_code=3)
++    path = checkpoint(tmp_path, monkeypatch, [])
++    path.write_text('{broken')
++    value = status.refresh(db)
++    assert value['kind'] != 'done'
++    assert value['coverage']['state'] == 'unknown'
++    # Even with an unavailable live inventory, loss of the retained failure must
++    # not be interpreted as success. Recovery restores the structured evidence.
++    path.write_text('[]')
++    recovered = status.refresh(db)
++    assert recovered['kind'] == 'unresolved'
++    assert recovered['failures'][0]['id'] == 'process:proc_example'
+diff --git a/tests/hermes_state/test_session_status_checkpoint_process.py b/tests/hermes_state/test_session_status_checkpoint_process.py
+new file mode 100644
+index 00000000000..70d5499c82d
+--- /dev/null
++++ b/tests/hermes_state/test_session_status_checkpoint_process.py
+@@ -0,0 +1,51 @@
++"""A process supervised by another backend must veto a completed session."""
++import json
++
++import pytest
++
++from tools import process_registry as processes
++from tests.hermes_state import test_session_status_refresh as fixtures
++
++board = fixtures.board
++receipts = fixtures.receipts
++db = fixtures.db
++turn = fixtures.turn
++refresh = fixtures.refresh
++
++
++@pytest.mark.parametrize('fate', ['running', 'gone'])
++def test_foreign_checkpoint_process_vetoes_green(db, tmp_path, monkeypatch, fate):
++    turn(db)
++    checkpoint = tmp_path / 'processes.json'
++    checkpoint.write_text(json.dumps([{
++        'session_id': 'proc_foreign', 'parent_session_id': 'chat',
++        'pid': 12345, 'host_start_time': 999, 'pid_scope': 'host',
++        'command': 'sleep 600',
++    }]))
++    monkeypatch.setattr(processes, '_checkpoint_path', lambda: checkpoint)
++    monkeypatch.setattr(processes.process_registry, '_detached_host_fate', lambda pid, birth: fate)
++    value = refresh(db)
++    assert value['kind'] != 'done', value
++    assert value['presentation']['stripe'] != 'done', value
++    if fate == 'running':
++        assert value['kind'] == 'waiting'
++        assert value['on'][0]['state'] == 'running'
++        assert value['on'][0]['id'] == 'process:proc_foreign'
++
++
++def test_foreign_checkpoint_other_owner_is_not_this_sessions_work(db, tmp_path, monkeypatch):
++    turn(db)
++    checkpoint = tmp_path / 'processes.json'
++    checkpoint.write_text(json.dumps([{'session_id': 'proc_other', 'parent_session_id': 'other'}]))
++    monkeypatch.setattr(processes, '_checkpoint_path', lambda: checkpoint)
++    assert refresh(db)['kind'] == 'done'
++
++
++def test_malformed_checkpoint_is_unknown_not_empty(db, tmp_path, monkeypatch):
++    turn(db)
++    checkpoint = tmp_path / 'processes.json'
++    checkpoint.write_text('{}')
++    monkeypatch.setattr(processes, '_checkpoint_path', lambda: checkpoint)
++    value = refresh(db)
++    assert value['presentation']['stripe'] != 'done'
++    assert value['coverage']['state'] == 'unknown'
+-- 
+2.43.0
+

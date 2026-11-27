@@ -1,0 +1,218 @@
+From fe60990f664c204e644bbf87d3192c1bb804896b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:18:04 +0000
+Subject: [PATCH 6315] Read-first spend decisions and scope release fences
+
+Public mirror of source commit fe60990f664c204e644bbf87d3192c1bb804896b.
+
+---
+diff --git a/hermes_cli/kanban_db_promote.py b/hermes_cli/kanban_db_promote.py
+index 2ecb1df887d..6636455631f 100644
+--- a/hermes_cli/kanban_db_promote.py
++++ b/hermes_cli/kanban_db_promote.py
+@@ -10,10 +10,14 @@
+     dry_run: bool = False,
+     precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
+ ) -> tuple[bool, Optional[str]]:
+-    """Promote todo/blocked/triage, or a scheduled spend stop, after caller and parent checks.
++    """Promote todo/blocked/triage, or decide a scheduled/ready spend stop, after caller and parent checks.
+ 
+     System callers omit the precondition. Manual boundaries check unread comments
+     under the write lock; dry runs validate without writing anything.
++    Plain automatic promotions do not decide a spend episode. A ready card can
++    therefore still need this explicit decision. If the home lost the stop row,
++    first recover history with ``kanban sync reconcile``; never infer clearance
++    from ready status or replace the local reducer with replica-only evidence.
+     """
+     from hermes_cli.kanban_spend_decision import execution_refusal
+     if refusal := execution_refusal(conn, task_id):
+@@ -22,10 +26,10 @@
+     if cur_status is None:
+         return False, f"task {task_id} not found"
+     from hermes_cli.kanban_spend_decision import pending
+-    if cur_status not in _kb._PROMOTABLE_STATUSES and not (cur_status == "scheduled" and pending(conn, task_id)):
++    if cur_status not in _kb._PROMOTABLE_STATUSES and not (cur_status in ("scheduled", "ready") and pending(conn, task_id)):
+         return False, (
+             f"task {task_id} is {cur_status!r}; promote only applies to "
+-            f"'todo', 'blocked' or 'triage'"
++            f"'todo', 'blocked' or 'triage', or 'scheduled'/'ready' with a pending spend decision"
+         )
+     # No override: claim_task re-checks parents regardless of who promoted the card.
+     unsatisfied = [pid for pid, st in _kb.parent_states(conn, task_id) if st not in ("done", "archived")]
+@@ -45,12 +49,12 @@
+             return False, refusal
+         if precondition and (refusal := precondition(conn)):
+             return False, refusal
+-        # A scheduled exception authorizes only an unresolved spend decision, rechecked under the writer lock.
+-        if cur_status == "scheduled" and not pending(conn, task_id):
++        # Ready/scheduled exceptions authorize only a pending decision, rechecked under the writer lock.
++        if cur_status in ("scheduled", "ready") and not pending(conn, task_id):
+             return False, f"task {task_id} spend decision changed during promotion"
+         upd = conn.execute(
+             "UPDATE tasks SET status = 'ready' "
+-            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage', 'scheduled') AND status = ?", (task_id, cur_status),
++            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage', 'scheduled', 'ready') AND status = ?", (task_id, cur_status),
+         )
+         if upd.rowcount != 1:
+             return False, f"task {task_id} status changed during promotion"
+diff --git a/tests/hermes_cli/test_kanban_promote.py b/tests/hermes_cli/test_kanban_promote.py
+index 3e88fd98592..fe1318628af 100644
+--- a/tests/hermes_cli/test_kanban_promote.py
++++ b/tests/hermes_cli/test_kanban_promote.py
+@@ -9,6 +9,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ from pathlib import Path
+ 
+ import pytest
+@@ -111,3 +112,49 @@
+             assert kb.get_task(conn, c).status == "ready"
+ 
+ 
++def test_cli_decides_ready_stop_after_plain_promotions(kanban_home, capsys):
++    from hermes_cli import kanban_spend_decision as decision
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Ready with an undecided capability stop")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, decision.EVENT, {"cause": "capability_unavailable"})
++            for _ in range(3):
++                kb._append_event(conn, tid, "promoted", {})
++        assert decision.pending(conn, tid)
++    args = _promote_ns(tid, reason=["Prerequisite now done; original bounded scope"], as_json=True)
++    assert kb_cli._cmd_promote(args) == 0
++    assert json.loads(capsys.readouterr().out)["promoted"] is True
++    with kbc.connect_closing() as conn:
++        assert not decision.pending(conn, tid)
++        events = kb.list_events(conn, tid)
++        manual = [e for e in events if e.kind == "promoted_manual"]
++        assert len(manual) == 1
++        assert manual[0].payload["from_status"] == "ready"
++    # An ordinary ready card cannot be re-promoted to mint another spend decision.
++    assert kb_cli._cmd_promote(args) == 1
++
++
++@pytest.mark.parametrize("cause", ["safety_refusal", "scope_stopped"])
++def test_ready_decision_does_not_clear_execution_restriction(conn, cause):
++    from hermes_cli import kanban_spend_decision as decision
++    tid = kb.create_task(conn, title="Restricted ready copy")
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, decision.EVENT, {"cause": cause})
++    for dry in (True, False):
++        assert not kb.promote_task(conn, tid, actor="operator", dry_run=dry)[0]
++    assert decision.pending(conn, tid)
++    assert not any(e.kind == "promoted_manual" for e in kb.list_events(conn, tid))
++
++
++def test_ready_decision_cannot_bypass_open_parent(conn):
++    from hermes_cli import kanban_spend_decision as decision
++    tid, (parent,) = _stuck_todo(conn, parents_done=False)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT, {"cause": "capability_unavailable"})
++    for dry in (True, False):
++        ok, why = kb.promote_task(conn, tid, actor="operator", dry_run=dry)
++        assert not ok and parent in why
++    assert decision.pending(conn, tid)
++
++
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_hold.py b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+index fc874913d1e..e9a1340b820 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget_hold.py
++++ b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+@@ -169,26 +169,28 @@
+         assert tid in sweep.sweep_stale_triage(conn, now=int(time.time()) + 7200)
+ 
+ 
++@pytest.mark.parametrize("status", ["scheduled", "ready"])
+ @pytest.mark.parametrize("held", [False, True])
+-def test_scheduled_spend_decision_can_be_promoted(kanban_home, held):
++def test_scheduled_spend_decision_can_be_promoted(kanban_home, held, status):
+     with kbc.connect_closing() as conn:
+-        tid = kb.create_task(conn, title="Scheduled decision", assignee="default")
++        tid = kb.create_task(conn, title="Stranded decision", assignee="default")
+         with kb.write_txn(conn):
+-            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+             if held:
+                 kb._append_event(conn, tid, budget.EVENT, {"reason": "spent"})
++                kb._append_event(conn, tid, "promoted", {})
+         before = len(helpers._events(conn, tid, "promoted_manual"))
+         assert kb.promote_task(conn, tid, actor="operator", reason="bounded rescope", dry_run=True)[0] == held
+-        assert kb.get_task(conn, tid).status == "scheduled"
++        assert kb.get_task(conn, tid).status == status
+         assert len(helpers._events(conn, tid, "promoted_manual")) == before
+         ok, _ = kb.promote_task(conn, tid, actor="operator", reason="bounded rescope")
+         assert ok == held
+         if not held:
+-            assert kb.get_task(conn, tid).status == "scheduled"
++            assert kb.get_task(conn, tid).status == status
+             return
+         assert kb.get_task(conn, tid).status == "ready"
+         assert not decision.pending(conn, tid)
+-        assert helpers._events(conn, tid, "promoted_manual")[-1].payload["from_status"] == "scheduled"
++        assert helpers._events(conn, tid, "promoted_manual")[-1].payload["from_status"] == status
+         # The ordinary scheduled-unblock path is usable again after the recorded decision.
+         assert kb.schedule_task(conn, tid, reason="short cooldown", clock_only=True,
+                                 awaiting={"kind": "clock", "why": "cooldown"})
+@@ -196,12 +198,13 @@
+         assert kb.get_task(conn, tid).status == "ready"
+ 
+ 
++@pytest.mark.parametrize("status", ["scheduled", "ready"])
+ @pytest.mark.parametrize("changed", ["decision", "running", "triage"])
+-def test_scheduled_promotion_rechecks_under_writer(kanban_home, changed):
++def test_scheduled_promotion_rechecks_under_writer(kanban_home, changed, status):
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="Promotion race", assignee="default")
+         with kb.write_txn(conn):
+-            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+             kb._append_event(conn, tid, budget.EVENT, {})
+         def racing(c):
+             if changed == "decision":
+@@ -210,7 +213,7 @@
+                 c.execute("UPDATE tasks SET status=? WHERE id=?", (changed, tid))
+         ok, why = kb.promote_task(conn, tid, actor="operator", precondition=racing)
+         assert not ok and why and "changed during promotion" in why
+-        assert kb.get_task(conn, tid).status == ("scheduled" if changed == "decision" else changed)
++        assert kb.get_task(conn, tid).status == (status if changed == "decision" else changed)
+         assert len(helpers._events(conn, tid, "promoted_manual")) == int(changed == "decision")
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_reconcile.py b/tests/hermes_cli/test_kanban_sync_reconcile.py
+index 3542cada0e6..0fedd87575e 100644
+--- a/tests/hermes_cli/test_kanban_sync_reconcile.py
++++ b/tests/hermes_cli/test_kanban_sync_reconcile.py
+@@ -135,3 +135,27 @@
+     out = json.loads(capsys.readouterr().out)
+     assert rc == 0 and out["queued"] == {"tasks": 1, "task_events": 1} and out["clean"] is True
+     assert tid in svc.board(BOARD)["rows"]["tasks"]
++
++
++def test_reconcile_missing_stop_then_decide_ready_card(live, svc, kanban_home):
++    from hermes_cli import kanban_spend_decision as decision
++    tid = kb.create_task(live, title="Ready but held on Board", assignee="worker")
++    with kb.write_txn(live):
++        kb._append_event(live, tid, decision.EVENT, {"cause": "capability_unavailable"})
++        kb._append_event(live, tid, "promoted", {})
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    stop = decision.pending_episode(live, tid)
++    assert stop is not None
++    uid = stop["uid"]
++    _without_capture(live, "DELETE FROM task_events WHERE uid=?", (uid,))
++    assert not decision.pending(live, tid)
++    report = ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++    assert report["restored"] == {"task_events": 1}
++    with ksc.open_shadow(BOARD, ME) as replica:
++        assert decision.pending(replica, tid) and decision.pending(live, tid)
++        assert decision.pending_episode(live, tid)["uid"] == uid
++    assert kb.promote_task(live, tid, actor="operator", reason="Prerequisite delivered; bounded scope")[0]
++    ksc.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    ksc.reconcile(BOARD, kanban_home / "kanban.db", hub=svc.hub(ME))
++    with ksc.open_shadow(BOARD, ME) as replica:
++        assert not decision.pending(replica, tid) and not decision.pending(live, tid)
+-- 
+2.43.0
+

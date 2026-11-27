@@ -1,0 +1,143 @@
+From ded82f02239d79b376cb1efa21c1c5ac99b482ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:27:12 -0800
+Subject: [PATCH 6114] TUI RPC method lanes, projects tree caching and GC budget
+
+Public mirror of source commit ded82f02239d79b376cb1efa21c1c5ac99b482ac.
+
+---
+diff --git a/tests/tui_gateway/test_rpc_method_lanes.py b/tests/tui_gateway/test_rpc_method_lanes.py
+index 47f8c686eb4..a7ecff2a651 100644
+--- a/tests/tui_gateway/test_rpc_method_lanes.py
++++ b/tests/tui_gateway/test_rpc_method_lanes.py
+@@ -119,8 +119,8 @@
+             lanes.run(submit, "slow", lambda: done.append("ran-0"), lambda: done.append(0))
+             lanes.run(submit, "slow", ran.set, lambda: done.append(1))
+             assert futures[0].cancel()
+-            assert done[0] == 0  # cancelled before it started: cleanup ran, the waiting call was handed over
+-            assert len(futures) == 2
++            assert done[0] == 0  # cancelled before it started: its cleanup ran on the cancelling thread
++            _wait_until(lambda: len(futures) == 2)  # the waiting call is handed over off that thread
+         finally:
+             release.set()
+         blocker.result(10)
+@@ -128,6 +128,43 @@
+     assert done == [0, 1] and lanes.snapshot() == {}
+ 
+ 
++def test_calls_of_one_method_start_in_the_order_they_were_accepted():
++    lanes = MethodLanes(1)
++    started, finished = [], []
++    with ThreadPoolExecutor(max_workers=3) as pool:
++        gate = threading.Event()
++        lanes.run(pool.submit, "slow", lambda: (started.append(0), gate.wait(10)), lambda: finished.append(0))
++        for n in range(1, 6):
++            lanes.run(pool.submit, "slow", lambda n=n: started.append(n), lambda n=n: finished.append(n))
++        _wait_until(lambda: started == [0])
++        gate.set()
++        _wait_until(lambda: len(finished) == 6)
++    assert started == [0, 1, 2, 3, 4, 5] and finished == [0, 1, 2, 3, 4, 5]
++
++
++def test_shutdown_that_cancels_queued_calls_does_not_deadlock_with_waiters():
++    """``shutdown(cancel_futures=True)`` cancels under the executor's lock; the hand-off must not
++    call ``submit`` on that thread. Every accepted call still gets its done hook."""
++    lanes = MethodLanes(1)
++    release, done = threading.Event(), []
++    pool = ThreadPoolExecutor(max_workers=1)
++    blocker = pool.submit(release.wait, 10)  # the only worker is busy: the admitted call stays queued
++    try:
++        lanes.run(pool.submit, "slow", lambda: done.append("ran"), lambda: done.append(0))
++        lanes.run(pool.submit, "slow", lambda: done.append("ran"), lambda: done.append(1))
++        lanes.run(pool.submit, "slow", lambda: done.append("ran"), lambda: done.append(2))
++        stopper = threading.Thread(target=lambda: pool.shutdown(wait=False, cancel_futures=True), daemon=True)
++        stopper.start()
++        stopper.join(10)
++        assert not stopper.is_alive(), "shutdown deadlocked on the lane hand-off"
++        _wait_until(lambda: sorted(done) == [0, 1, 2])
++    finally:
++        release.set()
++    blocker.result(10)
++    _wait_until(lambda: lanes.snapshot() == {})
++    assert sorted(done) == [0, 1, 2]
++
++
+ class Transport:
+     def __init__(self):
+         self.frames = queue.Queue()
+@@ -165,7 +202,8 @@
+             assert server.dispatch({"id": "resume", "method": "test.resume"}, transport) is None
+             first = transport.frames.get(timeout=10)
+             assert first["id"] == "resume" and first["result"] == {"resumed": True}
+-            assert server._method_lanes.snapshot() == {"test.slow": {"running": 2, "waiting": 6}}
++            # The resume frame is written before its lane entry is cleared (done callback): wait for that.
++            _wait_until(lambda: server._method_lanes.snapshot() == {"test.slow": {"running": 2, "waiting": 6}})
+         finally:
+             release.set()
+         answered = sorted(transport.frames.get(timeout=10)["id"] for _ in range(8))
+diff --git a/tui_gateway/rpc_method_lanes.py b/tui_gateway/rpc_method_lanes.py
+index 7645458e8bd..0ecb6b1eb70 100644
+--- a/tui_gateway/rpc_method_lanes.py
++++ b/tui_gateway/rpc_method_lanes.py
+@@ -66,7 +66,7 @@
+         except BaseException:
+             self._finished(method)
+             raise
+-        future.add_done_callback(lambda _: self._done(method, on_done))
++        future.add_done_callback(lambda done: self._done(method, on_done, done))
+ 
+     def _should_warn(self, method: str) -> bool:  # under the lock
+         now = time.monotonic()
+@@ -75,14 +75,22 @@
+         self._warned_at[method] = now
+         return True
+ 
+-    def _done(self, method: str, on_done: Callable[[], object]) -> None:
++    def _done(self, method: str, on_done: Callable[[], object], future) -> None:
+         try:
+             on_done()
+         finally:
+-            self._finished(method)
++            if future.cancelled():
++                # A cancel runs this callback on the cancelling thread. ``shutdown(cancel_futures=True)``
++                # cancels while holding the executor's own lock, and ``submit`` takes that lock: handing
++                # the slot over inline would deadlock the shutdown. Hand over from a thread of its own.
++                threading.Thread(target=self._finished, args=(method,), name="tui-rpc-lane-handoff",
++                                 daemon=True).start()
++            else:
++                self._finished(method)
+ 
+     def _finished(self, method: str) -> None:
+         """One call of *method* left the pool: hand its slot to the next waiting call, else free it."""
++        interrupt: BaseException | None = None  # a non-Exception from ``submit``: re-raised once the lane is settled
+         while True:
+             with self._lock:
+                 queue = self._waiting.get(method)
+@@ -94,16 +102,22 @@
+                     else:
+                         self._running.pop(method, None)
+                         self._warned_at.pop(method, None)
++                    if interrupt is not None:
++                        raise interrupt
+                     return
+                 submit, fn, on_done = queue.popleft()
+             try:
+                 future = submit(fn)
+-            except Exception:  # the pool is shut down: the call never runs, its caller's cleanup still does
++            except BaseException as exc:  # the pool is shut down: the call never runs, its caller's cleanup still does
+                 logger.warning("rpc pool: could not start a waiting %s call", method, exc_info=True)
++                if not isinstance(exc, Exception) and interrupt is None:
++                    interrupt = exc
+                 try:
+                     on_done()
+                 except Exception:
+                     logger.warning("rpc pool: cleanup failed for an unstarted %s call", method, exc_info=True)
+                 continue
+-            future.add_done_callback(lambda _, done=on_done: self._done(method, done))
++            future.add_done_callback(lambda done, hook=on_done: self._done(method, hook, done))
++            if interrupt is not None:
++                raise interrupt
+             return
+-- 
+2.43.0
+

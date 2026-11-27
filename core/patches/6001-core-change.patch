@@ -1,0 +1,82 @@
+From e1a7465afe9ed7a7524ee8f0b1b6576e1cbec3bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:53:26 +0000
+Subject: [PATCH 6001] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit e1a7465afe9ed7a7524ee8f0b1b6576e1cbec3bf.
+
+---
+diff --git a/hermes_cli/kanban_sync_snapshot_tasks.py b/hermes_cli/kanban_sync_snapshot_tasks.py
+index da643e111c5..47e0729e2ec 100644
+--- a/hermes_cli/kanban_sync_snapshot_tasks.py
++++ b/hermes_cli/kanban_sync_snapshot_tasks.py
+@@ -43,7 +43,7 @@
+     while True:
+         checkpoint()
+         page = hub.snapshot_page(board, "tasks", after)
+-        changes = [ksc._row_change("tasks", r) for r in page.get("rows", [])]
++        changes = [_change(r) for r in page.get("rows", [])]
+         if partition is not None:
+             changes = ksc.own_partition(conn, changes, partition)
+         changes = _unmoved(conn, changes)
+@@ -58,10 +58,34 @@
+         after = str(page["next"])
+ 
+ 
++def _change(row: dict) -> sync.RemoteChange:
++    """A snapshot row as the upsert the first pass applied."""
++    return sync.RemoteChange(seq=0, table="tasks", uid=str(row["uid"]), op="upsert", fields=row,
++                             version=int(row.get("version") or 0), hlc=str(row.get("hlc") or ""),
++                             origin_gateway=str(row.get("origin_gateway") or ""))
++
++
++_CHUNK = 500  # bound values per IN (...) read, as elsewhere in kanban sync
++
++
+ def _unmoved(conn: sqlite3.Connection, changes: list) -> list:
+-    """The changes whose card holds exactly that Board version here (a newer row waits for the feed)."""
+-    if not changes:
+-        return []
+-    ids = [ch.uid for ch in changes]
+-    held = dict(conn.execute(f"SELECT id, sync_version FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids))
+-    return [ch for ch in changes if ch.version and held.get(ch.uid) == ch.version]
++    """The changes whose card holds exactly that Board version here and differs from it in a synced column.
++
++    A newer row waits for the feed; an identical one needs no write (most of a 22k-card board). A reference
++    column (a local run id against the Board's run uid) is not compared."""
++    refs = {column for table, column in sync.REF_COLUMNS if table == "tasks"}
++    compared = sync.SYNCED_COLUMNS["tasks"] - refs
++    out = []
++    for index in range(0, len(changes), _CHUNK):
++        part = changes[index:index + _CHUNK]
++        ids = [ch.uid for ch in part]
++        local = {r["id"]: r for r in conn.execute(
++            f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)}
++        for ch in part:
++            row = local.get(ch.uid)
++            if row is None or not ch.version or row["sync_version"] != ch.version:
++                continue
++            keys = compared & set(ch.fields) & set(row.keys())
++            if any(row[k] != ch.fields[k] for k in keys):
++                out.append(ch)
++    return out
+diff --git a/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py b/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py
+index f1088bd6fa2..a5aead2d3a8 100644
+--- a/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py
++++ b/tests/hermes_cli/test_kanban_sync_snapshot_tasks.py
+@@ -117,3 +117,12 @@
+     assert snapshot_tasks.reassert(synced_conn, hub, "fixture", partition="worker") == 1
+     assert _card(synced_conn, "t_foreign") is None
+     assert _card(synced_conn, target) == ("done", DONE_AT, 40)
++
++
++def test_reassert_skips_rows_that_already_match(synced_conn):
++    """An untouched card at the Board version is not written again (most of a real board)."""
++    target, _, stop, release, proofs = fixture.scenario(synced_conn)
++    hub = SnapshotHub(proofs, _board(synced_conn, target, stop, release, proofs))
++    _rebuild(synced_conn, hub)
++    assert _card(synced_conn, target) == ("done", DONE_AT, 40)
++    assert snapshot_tasks.reassert(synced_conn, hub, "fixture") == 0
+-- 
+2.43.0
+

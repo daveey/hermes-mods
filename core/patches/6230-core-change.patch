@@ -1,0 +1,195 @@
+From 1a573ea669a9930e8ef05fbc356440d67cce6375 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:43:23 +0000
+Subject: [PATCH 6230] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit 1a573ea669a9930e8ef05fbc356440d67cce6375.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index ee6a5d712ce..dd6423ff3cf 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -234,6 +234,13 @@
+         row['escalation']['state'] = 'unavailable'
+         row['instruction'] = f"{row.get('instruction') or ''} Private hold: {facts['private_hold']}".strip()
+         row['evidence_state'] = 'unknown'
++    elif (not deadline and not invalid_creation and not row['blocker']
++          and row['owner']['kind'] == 'assignee' and row['owner'].get('refs')
++          and task['status'] in ('ready', 'running') and row['action'] == 'execute_current_scope'):
++        # A runnable card (queued for admission, or a live executor) is not an administrative
++        # wait: it needs no deadline. UNKNOWN eligibility and every hold above still show, and an
++        # exact confirmed contract deadline still composes onto it (kanban_actionability_confirmed).
++        row['escalation']['state'] = 'not_required'
+     elif not deadline:
+         row['violations'].append('escalation_deadline_missing')
+         row['escalation']['state'] = 'unavailable'
+diff --git a/hermes_cli/kanban_actionability_confirmed.py b/hermes_cli/kanban_actionability_confirmed.py
+index 5767a94c671..b7f6403624f 100644
+--- a/hermes_cli/kanban_actionability_confirmed.py
++++ b/hermes_cli/kanban_actionability_confirmed.py
+@@ -97,8 +97,11 @@
+     """
+     if (row['status'] not in NONTERMINAL or facts.get('pending_command')):
+         return row
+-    needs_deadline = (not row['escalation']['at'] and row['escalation']['state'] == 'unavailable'
+-                      and bool({'escalation_deadline_missing', 'private_hold'} & set(row['violations'])))
++    # A runnable row needs no administrative deadline, but an exact confirmed one still applies.
++    needs_deadline = not row['escalation']['at'] and (
++        row['escalation']['state'] == 'not_required' or (
++            row['escalation']['state'] == 'unavailable'
++            and bool({'escalation_deadline_missing', 'private_hold'} & set(row['violations']))))
+     needs_owner = row['owner']['kind'] == 'unavailable' and 'owner_missing' in row['violations']
+     if row['escalation']['state'] == 'not_applicable' or (
+             not needs_deadline and not needs_owner and 'escalation_overdue' not in row['violations']):
+diff --git a/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py b/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
+index 19668aeffa7..15ada25f568 100644
+--- a/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
++++ b/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
+@@ -103,10 +103,16 @@
+     with kbc.write_txn(live):
+         for sql, params in changes[change]:
+             live.execute(sql, params)
++    # The ordinary ready fixture is runnable, so its missing deadline is no violation
++    # (not_required). Custody is the point: no unconfirmed or stale contract may fill it,
++    # and every card that still waits keeps its missing-deadline violation.
++    waits = change in ('status', 'dependency')
+     for row in (describe(live, tid, now=source['created_at']),
+                 next(r for r in report(live, now=source['created_at'])['rows'] if r['task_id'] == tid)):
+         assert row['escalation']['at'] is None
+-        assert 'escalation_deadline_missing' in row['violations']
++        assert wire['contract_uid'] not in row['source_refs']
++        assert ('escalation_deadline_missing' in row['violations']) is waits
++        assert row['escalation']['state'] == ('unavailable' if waits else 'not_required')
+         assert row['evidence_state'] == 'unknown'
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_actionability_private.py b/tests/hermes_cli/test_kanban_actionability_private.py
+index 81d8b60eb65..a0d14cabc71 100644
+--- a/tests/hermes_cli/test_kanban_actionability_private.py
++++ b/tests/hermes_cli/test_kanban_actionability_private.py
+@@ -110,9 +110,9 @@
+                'run_evidence_known': True, 'run': {'id': 1, 'status': 'running', 'ended_at': None}}
+     plain = project(running, now=1000)
+     named = project({**running, 'private_hold': 'parent t_p stop_undecided'}, now=1000)
+-    assert 'escalation_deadline_missing' in plain['violations']
+-    assert named['violations'] == [v if v != 'escalation_deadline_missing' else 'private_hold'
+-                                   for v in plain['violations']]
++    # A live executor needs no administrative deadline, but a named private hold still shows.
++    assert plain['violations'] == [] and plain['escalation']['state'] == 'not_required'
++    assert named['violations'] == ['private_hold'] and named['escalation']['state'] == 'unavailable'
+     assert (named['action'], named['blocker'], named['release'], named['owner']) == (
+         plain['action'], plain['blocker'], plain['release'], plain['owner'])
+     assert named['instruction'].endswith('Private hold: parent t_p stop_undecided')
+diff --git a/tests/hermes_cli/test_kanban_actionability_runnable_deadlines.py b/tests/hermes_cli/test_kanban_actionability_runnable_deadlines.py
+new file mode 100644
+index 00000000000..6bab7caa1db
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_runnable_deadlines.py
+@@ -0,0 +1,103 @@
++"""Runnable ownership is not an administrative wait; holds remain visible."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli.kanban_actionability import project
++
++
++@pytest.mark.parametrize('status', ['ready', 'running'])
++def test_unblocked_executor_does_not_require_administrative_deadline(status):
++    facts = {'task': {'id': 'executor', 'status': status, 'assignee': 'default'},
++             'run': {'status': 'running', 'ended_at': None}, 'run_evidence_known': True}
++    row = project(facts, now=1000)
++    assert row['action'] == 'execute_current_scope'
++    assert row['blocker'] is None
++    assert row['evidence_state'] == 'unknown'
++    assert row['escalation']['at'] is None
++    assert row['escalation']['state'] == 'not_required'
++    assert 'escalation_deadline_missing' not in row['violations']
++
++
++@pytest.mark.parametrize('status', ['ready', 'running'])
++@pytest.mark.parametrize('restriction', [
++    {'stop': {'cause': 'scope_stopped'}},
++    {'containment': 'episode'},
++    {'human_step': 'Owner must sign in'},
++    {'dependencies': [{'task_id': 'parent', 'status': 'todo', 'trigger': 'Parent completes'}]},
++    {'lane_hold': True},
++])
++def test_executor_status_cannot_hide_an_administrative_wait(status, restriction):
++    facts = {'task': {'id': 'executor', 'status': status, 'assignee': 'default'},
++             'run': {'status': 'running', 'ended_at': None}, 'run_evidence_known': True,
++             **restriction}
++    row = project(facts, now=1000)
++    assert row['blocker'] is not None
++    assert 'escalation_deadline_missing' in row['violations']
++
++
++@pytest.mark.parametrize('extra,violation', [
++    ({'private_hold': 'scope_stop_not_renewed'}, 'private_hold'),
++    ({'invalid_creation_intent': True}, 'creation_intent_invalid'),
++    ({'administrative_owner': {'kind': 'unavailable', 'refs': []}}, 'owner_missing'),
++    ({'pending_command': {'request_uid': 'unsettled'}}, 'escalation_deadline_missing'),
++])
++def test_executor_exemption_preserves_unresolved_custody(extra, violation):
++    facts = {'task': {'id': 'executor', 'status': 'ready', 'assignee': 'default'}, **extra}
++    row = project(facts, now=1000)
++    assert violation in row['violations']
++    assert row['escalation']['state'] == 'unavailable'
++
++
++@pytest.mark.parametrize('status', ['todo', 'review', 'blocked', 'scheduled', 'triage'])
++def test_other_nonterminal_states_still_require_deadlines(status):
++    row = project({'task': {'id': 'waiting', 'status': status, 'assignee': 'default'}}, now=1000)
++    assert 'escalation_deadline_missing' in row['violations']
++
++
++def test_existing_deadline_is_not_erased():
++    row = project({'task': {'id': 'executor', 'status': 'ready', 'assignee': 'default'},
++                   'deadline_at': 2000}, now=1000)
++    assert row['escalation']['at'] == 2000
++    assert row['escalation']['state'] == 'pending'
++
++
++def test_missing_run_is_not_exempted():
++    row = project({'task': {'id': 'lost', 'status': 'running', 'assignee': 'default'},
++                   'run_evidence_known': True}, now=1000)
++    assert 'running_without_current_run' in row['violations']
++    assert 'escalation_deadline_missing' in row['violations']
++
++
++def test_real_ready_and_claimed_sources_reach_describe_and_report(tmp_path):
++    """The census path: an ordinary created/claimed source is runnable, not stranded."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_actionability_cli import report
++    from hermes_cli.kanban_actionability_sources import describe
++    from hermes_cli.kanban_db_connect import connect
++    with connect(tmp_path / 'kanban.db') as conn:
++        ready = kb.create_task(conn, title='queued work', assignee='default')
++        running = kb.create_task(conn, title='claimed work', assignee='default')
++        assert kb.claim_task(conn, running) is not None
++        listed = {r['task_id']: r for r in report(conn)['rows']}
++        for tid, status in ((ready, 'ready'), (running, 'running')):
++            for row in (describe(conn, tid), listed[tid]):
++                assert row['status'] == status
++                assert row['action'] == 'execute_current_scope' and row['blocker'] is None
++                assert row['escalation'] == {'at': None, 'route': 'existing_decision_requested',
++                                             'state': 'not_required', 'receipt_uid': None}
++                assert row['violations'] == []
++                assert row['evidence_state'] == 'unknown'
++
++
++def test_claimed_card_that_loses_its_run_is_still_flagged(tmp_path):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_actionability_sources import describe
++    from hermes_cli.kanban_db_connect import connect
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='lost executor', assignee='default')
++        assert kb.claim_task(conn, tid) is not None
++        conn.execute("UPDATE task_runs SET status='crashed', ended_at=1 WHERE task_id=?", (tid,))
++        row = describe(conn, tid)
++        assert row['blocker'] is not None
++        assert 'escalation_deadline_missing' in row['violations']
+-- 
+2.43.0
+

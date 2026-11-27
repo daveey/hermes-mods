@@ -1,0 +1,148 @@
+From 4c7f26e7fe02861314b5f0d74002d29a7dd03ad8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:31:25 +0000
+Subject: [PATCH 6035] Isolated native sessions capture and bounded startup
+
+Public mirror of source commit 4c7f26e7fe02861314b5f0d74002d29a7dd03ad8.
+
+---
+diff --git a/tests/hermes_cli/test_sessions_capture_batch.py b/tests/hermes_cli/test_sessions_capture_batch.py
+index 495c9b497a5..d7944dd9f49 100644
+--- a/tests/hermes_cli/test_sessions_capture_batch.py
++++ b/tests/hermes_cli/test_sessions_capture_batch.py
+@@ -1,4 +1,5 @@
+ """Bounded batch publication keeps fairness, per-view faults and trailing writes."""
++import json
+ from types import SimpleNamespace
+ 
+ from hermes_cli.fact_capture import CaptureBudget
+@@ -64,3 +65,30 @@
+     owner._next_capture = 0
+     owner.commit(owner.capture(None, CaptureBudget()))
+     assert [selector['id'] for _, selector in seen[1]] == [4, 5]
++
++
++def test_batch_trims_long_stamp_selectors_to_request_frame():
++    from hermes_cli.sessions_capture_process import MAX_REQUEST
++    store = FactStore()
++    scope = Scope('batch', 'sessions')
++    seen = []
++
++    def batch(views):
++        seen.append(list(views))
++        return [b'ok'] * len(views)
++
++    owner = SessionsSource(store, SourceId(scope, 'sessions.display', 'test'), [],
++                           lambda *_: b'unexpected', capture_many=batch)
++    owner._watch = SimpleNamespace(check=lambda: None)
++    pad = 'x' * 7000
++    for index in range(3):
++        owner.demand('sessions_stamps', {'profile': 'default', 'ids': f'{pad}-{index}'})
++    owner.commit(owner.capture(None, CaptureBudget()))
++    assert len(seen) == 1
++    assert 1 <= len(seen[0]) < 3
++    wire = json.dumps({'views': seen[0]}, allow_nan=False).encode()
++    assert len(wire) <= MAX_REQUEST
++    selected_ids = [selector['ids'] for _, selector in seen[0]]
++    assert selected_ids == [f'{pad}-{index}' for index in range(len(seen[0]))]
++    remaining = [owner._selectors[key][1]['ids'] for key in owner._dirty]
++    assert remaining == [f'{pad}-{index}' for index in range(len(seen[0]), 3)]
+diff --git a/tests/hermes_cli/test_sessions_capture_process.py b/tests/hermes_cli/test_sessions_capture_process.py
+index eaa9303e0ac..615dca38550 100644
+--- a/tests/hermes_cli/test_sessions_capture_process.py
++++ b/tests/hermes_cli/test_sessions_capture_process.py
+@@ -158,6 +158,91 @@
+     assert set(calls) == set(names)
+ 
+ 
++def test_canonical_worker_batch_keeps_all_seven_annotations(tmp_path, monkeypatch):
++    from hermes_cli.web_routers import profiles
++    from hermes_cli.sessions_capture_worker import capture_many
++    from tests.hermes_cli.test_sessions_native_startup import selected
++    from tests.hermes_cli.test_profiles_sidebar_scope import _seed_session
++    home = tmp_path / 'home'
++    home.mkdir()
++    _seed_session(home, 'seven-family-row', source='cli')
++    monkeypatch.setattr(profiles, '_profile_targets', lambda *a: [('default', home)])
++    calls = []
++    names = ('kanban_activity', 'goal_activity', 'cron_activity', 'background_activity',
++             'turn_activity', 'subagent_activity', 'review_wait')
++    for name in names:
++        original = getattr(profiles, 'annotate_' + name)
++        def recorded(rows, *args, _name=name, _original=original, **kwargs):
++            calls.append(_name)
++            return _original(rows, *args, **kwargs)
++        monkeypatch.setattr(profiles, 'annotate_' + name, recorded)
++    payload = json.loads(capture_many([('sessions', selected()), ('sessions_sidebar', {})]))
++    assert payload['results'][0]['body']['sessions'][0]['id'] == 'seven-family-row'
++    assert payload['results'][1]['body']['recents']['sessions']
++    assert set(calls) == set(names)
++
++
++@pytest.mark.parametrize('body', [
++    b'{"results":[]}',
++    b'{"results":[{"body":{"sessions":[]}},"nope"]}',
++    b'{"results":[{"oops":true}]}',
++    b'{"results":[{"body":[]}]}',
++    b'{"results":[{"unavailable":"timeout"}]}',
++    b'{"nope":1}',
++])
++def test_capture_many_malformed_result_is_typed(body):
++    capture = CaptureProcess(command=command(frame(body)))
++    with pytest.raises(CaptureUnavailable) as error:
++        capture.capture_many([('sessions', {})])
++    assert error.value.reason == 'invalid_body'
++    assert capture._child is None
++
++
++def test_capture_many_oversized_response_kills_and_reaps(monkeypatch):
++    from hermes_cli import sessions_capture_process as module
++    original = module.spawn_owned
++    children = []
++    def recorded(*args, **kwargs):
++        child = original(*args, **kwargs)
++        children.append(child)
++        return child
++    monkeypatch.setattr(module, 'spawn_owned', recorded)
++    capture = CaptureProcess(seconds=.5, command=command(
++        'import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write(b"\\x00\\x40\\x00\\x01"); sys.stdout.buffer.flush()'))
++    with pytest.raises(CaptureUnavailable) as error:
++        capture.capture_many([('sessions', {})])
++    assert error.value.reason == 'response_bytes'
++    assert children and all(child.poll() is not None for child in children)
++    assert capture._child is None
++
++
++def test_capture_many_timeout_kills_and_reaps(monkeypatch):
++    from hermes_cli import sessions_capture_process as module
++    original = module.spawn_owned
++    children = []
++    def recorded(*args, **kwargs):
++        child = original(*args, **kwargs)
++        children.append(child)
++        return child
++    monkeypatch.setattr(module, 'spawn_owned', recorded)
++    capture = CaptureProcess(seconds=.5, command=command('import time; time.sleep(30)'))
++    started = time.monotonic()
++    with pytest.raises(CaptureUnavailable) as error:
++        capture.capture_many([('sessions', {}), ('sessions_sidebar', {})])
++    assert error.value.reason == 'timeout'
++    assert time.monotonic() - started < 3
++    assert children and all(child.poll() is not None for child in children)
++    assert capture._child is None
++
++
++def test_capture_many_rejects_view_count_without_spawn():
++    capture = CaptureProcess(command=['must-not-spawn'])
++    with pytest.raises(CaptureUnavailable, match='request_views'):
++        capture.capture_many([])
++    with pytest.raises(CaptureUnavailable, match='request_views'):
++        capture.capture_many([('sessions', {})] * 5)
++
++
+ def test_cold_twelve_profile_capture_under_parent_gil_contention(tmp_path, monkeypatch):
+     import inspect
+     import sqlite3
+-- 
+2.43.0
+

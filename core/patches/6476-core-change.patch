@@ -1,0 +1,273 @@
+From 5f47ccd75ed903ea62c17873f4bb71e514ae534b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:30:05 +0000
+Subject: [PATCH 6476] Kanban sync refusal audits and diagnostic drift supersession
+
+Public mirror of source commit 5f47ccd75ed903ea62c17873f4bb71e514ae534b.
+
+---
+diff --git a/hermes_cli/kanban_sync_actionability_drift.py b/hermes_cli/kanban_sync_actionability_drift.py
+index 5951f2db815..452b482412a 100644
+--- a/hermes_cli/kanban_sync_actionability_drift.py
++++ b/hermes_cli/kanban_sync_actionability_drift.py
+@@ -93,6 +93,14 @@
+             if conn.execute('SELECT 1 FROM task_events WHERE uid=? AND task_id=?',
+                             (frozen['source_uids'][0]['uid'], wire['task'])).fetchone() is None:
+                 return False  # A missing original is not proof of a newer source.
++        statuses = [conn.execute('SELECT status FROM tasks WHERE id=?', (wire['task'],)).fetchone()
++                    for conn in (live, shadow)]
++        terminal_history = any(conn.execute(
++            "SELECT 1 FROM task_events WHERE task_id=? AND kind='completed' LIMIT 1",
++            (wire['task'],)).fetchone() is not None for conn in (live, shadow))
++        if terminal_history or any(row is not None and row[0] in ('done', 'archived') for row in statuses):
++            from hermes_cli.kanban_sync_actionability_terminal import superseded
++            return superseded(live, shadow, wire['task'], frozen['source_uids'][0]['uid'])
+         comparable = {**frozen, 'source_uids': [{'uid': s['uid']} for s in frozen['source_uids']]}
+         current, replica = _source(live, wire['task']), _source(shadow, wire['task'])
+         return _valid_facts(current, portable_only=True) and current == replica and current != comparable
+diff --git a/hermes_cli/kanban_sync_actionability_terminal.py b/hermes_cli/kanban_sync_actionability_terminal.py
+new file mode 100644
+index 00000000000..3164263b2d0
+--- /dev/null
++++ b/hermes_cli/kanban_sync_actionability_terminal.py
+@@ -0,0 +1,102 @@
++"""Read-only, done-only proof for rejected diagnostic supersession. [daveey]
++
++The shadow is the authoritative replica supplied by sync diff. This is not a
++completion writer, an actionability source, or a transport retirement receipt.
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli.kanban_actionability_selection import KINDS
++from hermes_cli.kanban_sync_divergence import consistent_uid_milliseconds
++
++# These could contradict completion, even when a stale row still says done.
++_TRANSITIONS = frozenset(kind for kinds in KINDS.values() for kind in kinds) | {
++    'completed', 'archived', 'reopened', 'review_reopened', 'status', 'status_healed',
++    'spawned', 'worker_bound', 'gave_up', 'triage_swept', 'decision_retained',
++    'contained', 'containment_resumed', 'claimed', 'changes_requested',
++    'containment_released', 'containment_closed',
++}
++_IDLE = ('current_run_id', 'claim_lock', 'claim_expires', 'worker_pid', 'containment_episode')
++
++
++def _clock(event):
++    second = event['created_at']
++    if type(second) is not int or second < 0:
++        raise ValueError('invalid event second')
++    return second, consistent_uid_milliseconds(event['uid'], second)
++
++
++def _before(left, right):
++    a, b = _clock(left), _clock(right)
++    return a[0] < b[0] or (a[0] == b[0] and a[1] is not None and b[1] is not None and a[1] < b[1])
++
++
++def _event(event):
++    if (not isinstance(event['uid'], str) or not event['uid']
++            or event.get('deleted_at') is not None):
++        raise ValueError('missing event identity')
++    _clock(event)
++    payload = json.loads(event['payload'])
++    if not isinstance(payload, dict):
++        raise ValueError('invalid event payload')
++    return {k: event[k] for k in ('uid', 'task_id', 'kind', 'created_at')} | {'payload': payload}
++
++
++def _proof(conn, task_id, source_uid):
++    rows = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchall()
++    if len(rows) != 1:
++        return None
++    task = dict(rows[0])
++    if (task['status'] != 'done' or task.get('deleted_at') is not None
++            or any(task[k] is not None for k in _IDLE)
++            or type(task['completed_at']) is not int):
++        return None
++    events = [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (task_id,))]
++    sources = [e for e in events if e['uid'] == source_uid]
++    completions = [e for e in events if e['kind'] == 'completed']
++    if len(sources) != 1 or not completions:
++        return None
++    # A latest completion must be strictly ordered after every earlier completion.
++    last = next((e for e in completions if all(
++        other is e or _before(other, e) for other in completions)), None)
++    if last is None or not _before(sources[0], last):
++        return None
++    original, completion = _event(sources[0]), _event(last)
++    for event in events:
++        try:
++            data = json.loads(event['payload'])
++        except (ValueError, TypeError):
++            data = None
++        transition = event['kind'] in _TRANSITIONS or isinstance(data, dict) and 'status' in data
++        if transition and event is not last:
++            _event(event)  # Malformed potential lifecycle evidence cannot disappear.
++            if not _before(event, last):
++                return None
++    # Resolve local run references independently; compare portable UID and clocks.
++    runs = [dict(r) for r in conn.execute('SELECT * FROM task_runs WHERE task_id=?', (task_id,))]
++    if any(not isinstance(r['uid'], str) or not r['uid'] or r.get('deleted_at') is not None
++           or type(r['started_at']) is not int or type(r['ended_at']) is not int
++           or not 0 <= r['started_at'] <= r['ended_at'] <= last['created_at']
++           or r['status'] in (None, 'running') or not isinstance(r['outcome'], str)
++           for r in runs):
++        return None
++    completed = [r for r in runs if r['id'] == last['run_id']]
++    if len(completed) != 1:
++        return None
++    run = completed[0]
++    if (not isinstance(run['uid'], str) or not run['uid'] or run.get('deleted_at') is not None
++            or run['status'] not in ('done', 'completed') or run['outcome'] != 'completed'
++            or not run['started_at'] <= task['completed_at'] <= run['ended_at'] <= last['created_at']):
++        return None
++    if any(r['ended_at'] > run['ended_at'] for r in runs):
++        return None
++    return {'source': original, 'completion': completion, 'completed_at': task['completed_at'],
++            'run': {k: run[k] for k in ('uid', 'status', 'outcome', 'started_at', 'ended_at')},
++            'assignee': task['assignee']}
++
++
++def superseded(live, shadow, task_id, source_uid):
++    """Called only after exact immutable rejected-command custody verifies."""
++    current = _proof(live, task_id, source_uid)
++    return current is not None and current == _proof(shadow, task_id, source_uid)
+diff --git a/tests/hermes_cli/test_kanban_sync_actionability_terminal.py b/tests/hermes_cli/test_kanban_sync_actionability_terminal.py
+new file mode 100644
+index 00000000000..823c8cc3b17
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_actionability_terminal.py
+@@ -0,0 +1,129 @@
++"""Done-task diagnostic supersession is proof, never transport delivery. [daveey]"""
++import json
++import uuid
++
++import pytest
++
++from hermes_cli import kanban_sync_actionability_drift as audit
++pytest_plugins = ['tests.hermes_cli.test_kanban_sync_actionability_drift']
++
++
++@pytest.fixture(name='completed')
++def completed_store(stores):
++    live, shadow, op = stores
++    for conn in (live, shadow):
++        for column in ('claim_lock TEXT', 'claim_expires INTEGER', 'worker_pid INTEGER', 'completed_at INTEGER'):
++            conn.execute('ALTER TABLE tasks ADD COLUMN ' + column)
++        for column in ('status TEXT', 'outcome TEXT', 'started_at INTEGER', 'ended_at INTEGER'):
++            conn.execute('ALTER TABLE task_runs ADD COLUMN ' + column)
++        conn.execute('ALTER TABLE task_events ADD COLUMN run_id INTEGER')
++        conn.execute("INSERT INTO task_runs VALUES (9,'completed-run','t_card','done','completed',124,125)")
++        conn.execute("UPDATE tasks SET status='done',completed_at=125 WHERE id='t_card'")
++        conn.execute("INSERT INTO task_events VALUES (2,'completion','t_card','completed',125,'{}',NULL,9)")
++    return live, shadow, op
++
++
++def test_todo_to_done_is_audited_without_mutating_or_delivering(completed):
++    from hermes_cli.kanban_sync_client import diff
++    from hermes_cli.kanban_rejected_retain_retirement import retire
++
++    live, shadow, op = completed
++    before = [list(c.iterdump()) for c in (live, shadow)]
++    assert audit._source(live, 't_card') is None  # ordinary selection stays unchanged
++    assert audit.audited_rejection(live, shadow, op)
++    report = diff(live, shadow, 'macbook')
++    assert report['clean'], report
++    assert report['rejected_ops'] == 1
++    assert report['audited_retain_rejections'] == [op['op_id']]
++    assert retire(live, None, 'default', op)['action'] == 'retained'
++    assert [list(c.iterdump()) for c in (live, shadow)] == before
++
++
++@pytest.mark.parametrize('copies', ['live', 'shadow', 'both'])
++@pytest.mark.parametrize('sql', [
++    "UPDATE tasks SET status='archived' WHERE id='t_card'",
++    "UPDATE tasks SET status='ready' WHERE id='t_card'",
++    "UPDATE tasks SET current_run_id=9 WHERE id='t_card'",
++    "UPDATE tasks SET claim_lock='worker' WHERE id='t_card'",
++    "UPDATE tasks SET claim_expires=999 WHERE id='t_card'",
++    "UPDATE tasks SET worker_pid=1 WHERE id='t_card'",
++    "UPDATE tasks SET containment_episode='held' WHERE id='t_card'",
++    "UPDATE tasks SET completed_at=126 WHERE id='t_card'",
++    "DELETE FROM task_events WHERE kind='completed'",
++    "UPDATE task_events SET payload='{' WHERE kind='completed'",
++    "UPDATE task_events SET deleted_at=1 WHERE kind='completed'",
++    "UPDATE task_events SET created_at=123 WHERE kind='completed'",
++    "UPDATE task_events SET run_id=NULL WHERE kind='completed'",
++    "UPDATE task_runs SET ended_at=NULL",
++    "UPDATE task_runs SET outcome='continued'",
++    "UPDATE task_runs SET status='running'",
++    "UPDATE task_runs SET started_at=126",
++    "INSERT INTO task_runs VALUES (10,'active','t_card','running',NULL,126,NULL)",
++    "INSERT INTO task_events VALUES (3,'reopen','t_card','reopened',126,'{}',NULL,NULL)",
++    "INSERT INTO task_events VALUES (3,'claim','t_card','claimed',126,'{}',NULL,NULL)",
++    "INSERT INTO task_events VALUES (3,'status','t_card','status',126,'{',NULL,NULL)",
++    "UPDATE task_events SET payload='[]' WHERE uid='source'",
++    "UPDATE task_events SET deleted_at=1 WHERE uid='source'",
++    "INSERT INTO task_events VALUES (3,'change','t_card','changes_requested',126,'{}',NULL,NULL)",
++    "INSERT INTO task_events VALUES (3,'release','t_card','containment_released',126,'{',NULL,NULL)",
++    "INSERT INTO task_events VALUES (3,'custom','t_card','custom',126,'{\"status\":\"ready\"}',NULL,NULL)",
++    "INSERT INTO task_runs VALUES (10,'later','t_card','blocked','blocked',126,127)",
++    "INSERT INTO task_runs VALUES (10,'bad','t_card','blocked','blocked',126,123)",
++])
++def test_unproven_terminal_evidence_stays_dirty(completed, copies, sql):
++    live, shadow, op = completed
++    for name, conn in [('live', live), ('shadow', shadow)]:
++        if copies in ('both', name):
++            conn.execute(sql)
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE task_events SET uid='other' WHERE kind='completed'",
++    "UPDATE task_events SET payload='{\"summary\":\"different\"}' WHERE kind='completed'",
++    "UPDATE task_events SET payload='{\"different\":1}' WHERE uid='source'",
++    "UPDATE task_runs SET uid='other'",
++])
++def test_divergent_portable_custody_stays_dirty(completed, sql):
++    live, shadow, op = completed
++    shadow.execute(sql)
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++def test_local_event_and_run_ids_are_not_portable_order(completed):
++    live, shadow, op = completed
++    shadow.execute("UPDATE task_runs SET id=99")
++    shadow.execute("UPDATE task_events SET run_id=99 WHERE kind='completed'")
++    shadow.execute("UPDATE task_events SET id=100-id")
++    assert audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('column,value', [
++    ('request_json', '{}'), ('request_sha256', 'bad'), ('delivery_state', 'confirmed'),
++    ('canonical_receipt_json', '{}'), ('contract_key', 'other'),
++])
++def test_terminal_branch_never_bypasses_command_custody(completed, column, value):
++    live, shadow, op = completed
++    live.execute(f'UPDATE kanban_actionability_commands SET {column}=?', (value,))
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('status', ['done', 'completed'])
++def test_writer_clocks_can_cross_seconds(completed, status):
++    live, shadow, op = completed
++    for conn in (live, shadow):
++        conn.execute('UPDATE task_runs SET status=?,ended_at=126', (status,))
++        conn.execute("UPDATE task_events SET created_at=127 WHERE kind='completed'")
++    assert audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('milliseconds,expected', [(125001, True), (125000, False), (124999, False)])
++def test_same_second_requires_strict_portable_precision(milliseconds, expected):
++    from hermes_cli.kanban_sync_actionability_terminal import _before
++
++    def event(ms):
++        uid = str(uuid.UUID(int=(ms << 80) | (7 << 76) | (2 << 62)))
++        return {'uid': uid, 'created_at': 125, 'id': 999999-ms}
++
++    assert _before(event(125000), event(milliseconds)) is expected
++    assert not _before({'uid': 'legacy', 'created_at': 125}, event(125001))
+-- 
+2.43.0
+

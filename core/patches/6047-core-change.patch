@@ -1,0 +1,290 @@
+From 15d731d30dae01576139def9d895fd833868d690 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 03:47:46 +0000
+Subject: [PATCH 6047] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit 15d731d30dae01576139def9d895fd833868d690.
+
+---
+diff --git a/hermes_cli/annotation_file_events.py b/hermes_cli/annotation_file_events.py
+index b8dad1b7fc4..1ec23923cf7 100644
+--- a/hermes_cli/annotation_file_events.py
++++ b/hermes_cli/annotation_file_events.py
+@@ -46,6 +46,7 @@
+         self._directories: set[int] = set()
+         self._controls: dict[int, set[str]] = {}
+         self.control_only = False
++        self.coverage_lost = False
+         self._wake_lock = threading.Lock()
+ 
+     def _open(self):
+@@ -109,6 +110,7 @@
+             raise
+         old, self._fd = self._fd, fd
+         self._names, self._directories, self._controls = names, directory_wds, control_names
++        self.coverage_lost = False
+         os.close(old)
+ 
+     def wake(self):
+@@ -135,6 +137,7 @@
+         readable = self._readable(timeout)
+         changed = self._wake_read in readable
+         self.control_only = not changed
++        self.coverage_lost = False
+         if changed:
+             os.read(self._wake_read, 65536)
+         if self._fd not in readable:
+@@ -153,9 +156,14 @@
+                 offset += _HEADER.size
+                 name = os.fsdecode(data[offset:offset + length].split(b'\0', 1)[0])
+                 offset += length
+-                source = bool(mask & (_OVERFLOW | _LOST)) or wd in self._directories or (
++                lost = bool(mask & (_OVERFLOW | _LOST))
++                self.coverage_lost |= lost
++                source = lost or wd in self._directories or (
+                     name in self._names.get(wd, ())
+                 )
++                # Ancestor creation/retargeting can expose a previously absent
++                # directory. Refresh coverage for structural changes, not writes.
++                self.coverage_lost |= source and bool(mask & (0x40 | 0x80 | 0x100 | 0x200))
+                 control = name in self._controls.get(wd, ())
+                 changed |= source or control
+                 self.control_only &= not source
+diff --git a/hermes_cli/fact_source_watch.py b/hermes_cli/fact_source_watch.py
+index 68d1565123e..68042598081 100644
+--- a/hermes_cli/fact_source_watch.py
++++ b/hermes_cli/fact_source_watch.py
+@@ -113,7 +113,10 @@
+         try:
+             if not repair and not watch._events.wait(0):
+                 return
+-            watch._events.replace(watch._paths, directories=watch._directories)
++            # Ordinary writes keep the installed watches. Reinstall only after
++            # overflow, unmount, or a watch that inotify dropped.
++            if repair or watch._events.coverage_lost:
++                watch._events.replace(watch._paths, directories=watch._directories)
+             with watch._lock:
+                 watch._error = None
+             watch._retry_at = None
+diff --git a/tests/hermes_cli/test_annotation_file_events.py b/tests/hermes_cli/test_annotation_file_events.py
+index 39cfc274357..03cde7f25b3 100644
+--- a/tests/hermes_cli/test_annotation_file_events.py
++++ b/tests/hermes_cli/test_annotation_file_events.py
+@@ -26,6 +26,7 @@
+ 
+         monkeypatch.setattr(module.os, 'read', read)
+         assert events.wait(0)
++        assert events.coverage_lost
+         assert not events.control_only
+ 
+ @pytest.mark.parametrize('mask', [0x400, 0x800, 0x2000, 0x8000])
+diff --git a/tests/hermes_cli/test_fact_shared_watch.py b/tests/hermes_cli/test_fact_shared_watch.py
+index 8f681ebb612..4b686c889f2 100644
+--- a/tests/hermes_cli/test_fact_shared_watch.py
++++ b/tests/hermes_cli/test_fact_shared_watch.py
+@@ -64,7 +64,8 @@
+ @pytest.mark.parametrize('operation', ['replace', 'wait'])
+ def test_rearm_error_is_reported_then_repaired_in_subscriber_context(
+         tmp_path, monkeypatch, operation):
+-    path = tmp_path / 'source.db'
++    path = tmp_path / 'watched' / 'source.db'
++    path.parent.mkdir()
+     path.write_text('initial')
+     failed = threading.Event()
+     repaired = threading.Event()
+@@ -90,7 +91,12 @@
+     monkeypatch.setattr(native.FileEvents, operation, fail_once)
+     try:
+         armed.set()
+-        cue_path(path).write_text('restore hint')
++        if operation == 'replace':
++            # A write retains coverage; moving a watched directory loses it and
++            # must still exercise the real rearm/error/retry path.
++            path.parent.rename(path.parent.with_name(path.parent.name + '-moved'))
++        else:
++            cue_path(path).write_text('restore hint')
+         assert failed.wait(5)
+         assert repaired.wait(5)
+         watch.check()
+diff --git a/tests/hermes_cli/test_native_watch_rearm.py b/tests/hermes_cli/test_native_watch_rearm.py
+new file mode 100644
+index 00000000000..6c0cdb5eb46
+--- /dev/null
++++ b/tests/hermes_cli/test_native_watch_rearm.py
+@@ -0,0 +1,54 @@
++"""Ordinary writes hint without tearing down native coverage. [daveey]"""
++import sys
++import time
++
++import pytest
++
++from hermes_cli.annotation_file_events import FileEvents
++from hermes_cli.fact_source_watch import NativeSourceWatch
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.skipif(
++    not sys.platform.startswith('linux'), reason='Linux native notification boundary')
++
++
++def test_ordinary_writes_hint_without_reinstall(tmp_path, monkeypatch):
++    path = tmp_path / 'state.db'
++    path.write_bytes(b'init')
++    hints = []
++    original = FileEvents.replace
++    calls = []
++
++    def counted(self, *args, **kwargs):
++        calls.append(self)
++        return original(self, *args, **kwargs)
++
++    monkeypatch.setattr(FileEvents, 'replace', counted)
++    watch = NativeSourceWatch((path,), lambda: hints.append(time.monotonic()))
++    try:
++        assert wait_until(lambda: calls, timeout=2), 'coverage must install before writes'
++        baseline = len(calls)
++        for i in range(12):
++            path.write_bytes(b'x' * (i + 1))
++        assert wait_until(lambda: hints, timeout=2), 'native watch must hint on ordinary writes'
++        assert len(calls) == baseline, (
++            'ordinary IN_MODIFY must not replace inotify coverage; '
++            f'got {len(calls)} installs after {baseline} baseline')
++    finally:
++        watch.close()
++
++
++def test_new_parent_directory_retains_future_write_hints(tmp_path):
++    path = tmp_path / 'later' / 'state.db'
++    hints = []
++    watch = NativeSourceWatch((path,), lambda: hints.append(time.monotonic()))
++    try:
++        path.parent.mkdir()
++        assert wait_until(lambda: hints, timeout=2)
++        watch._owner.submit(lambda: None).wait()
++        baseline = len(hints)
++        path.write_bytes(b'new source')
++        assert wait_until(lambda: len(hints) > baseline, timeout=2), (
++            'ancestor creation must install coverage for future source writes')
++    finally:
++        watch.close()
+diff --git a/tests/hermes_cli/test_review_enqueue_wakeup.py b/tests/hermes_cli/test_review_enqueue_wakeup.py
+new file mode 100644
+index 00000000000..70c97af1802
+--- /dev/null
++++ b/tests/hermes_cli/test_review_enqueue_wakeup.py
+@@ -0,0 +1,34 @@
++"""Local delivery still wakes after publication with main's original lock order. [daveey]"""
++import threading
++
++import pytest
++
++from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
++from hermes_cli.fact_store import FactStore
++
++
++@pytest.mark.parametrize('post_enqueue_notify', [False, True])
++def test_quiet_publication_wakes_local_delivery(monkeypatch, post_enqueue_notify):
++    store = FactStore()
++    scope = Scope('review', 'default')
++    owner = InProcessFacts(store, {scope}, demand=lambda *args: None)
++    handle = owner.acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')}))
++    initial = threading.Event()
++    delivered = threading.Event()
++
++    def receive(delta):
++        (delivered if delta.upserts else initial).set()
++
++    sub = handle.v1.subscribe(scope, (), None, None, receive)
++    try:
++        assert initial.wait(3)
++        store.publish([Fact(FactKey(scope, 'TaskFact', 't'), {'v': 1})])
++        if post_enqueue_notify:
++            with store._condition:
++                store._condition.notify_all()
++        assert delivered.wait(2), 'committed delta queued but local delivery slept through its only wake'
++    finally:
++        sub.close()
++        handle.close()
++        owner.close()
+diff --git a/tests/hermes_cli/test_review_expiry_enqueue_lock.py b/tests/hermes_cli/test_review_expiry_enqueue_lock.py
+new file mode 100644
+index 00000000000..cf3d77c5398
+--- /dev/null
++++ b/tests/hermes_cli/test_review_expiry_enqueue_lock.py
+@@ -0,0 +1,45 @@
++"""Expiry publication and ordinary publish both finish under main's lock order. [daveey]"""
++import threading
++import time
++
++import pytest
++
++from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_expiry import ExpiryWorker
++from hermes_cli.fact_store import FactStore
++
++
++@pytest.mark.parametrize('expiry', [False, True])
++def test_expiry_and_offlock_enqueue_make_progress(monkeypatch, expiry):
++    store = FactStore()
++    scope = Scope('review', 'default')
++    expires = FactKey(scope, 'TaskFact', 'expires')
++    key = FactKey(scope, 'TaskFact', 'other')
++    store.publish([Fact(expires, {'v': 0}, health='fresh', valid_until=time.time() - 1)])
++    store.subscribe(scope, (), None, None, lambda delta: None)
++    store.drain()
++    first = threading.Thread(name='review-publisher', target=lambda: store.publish([Fact(key, {'v': 1})]))
++    first.start()
++    worker = None
++    second = None
++    try:
++        if expiry:
++            worker = ExpiryWorker(store)
++        else:
++            second = threading.Thread(target=lambda: store.publish([Fact(key, {'v': 2})]))
++            second.start()
++        first.join(4)
++        if second:
++            second.join(4)
++        assert not first.is_alive()
++        if second:
++            assert not second.is_alive()
++        if expiry:
++            expired = store.snapshot(scope).get(expires)
++            assert expired is not None and expired.health == 'stale'
++    finally:
++        first.join(5)
++        if second:
++            second.join(5)
++        if worker:
++            worker.close()
+diff --git a/tests/hermes_cli/test_review_watch_drain_admission.py b/tests/hermes_cli/test_review_watch_drain_admission.py
+index b6989883dba..305dea31851 100644
+--- a/tests/hermes_cli/test_review_watch_drain_admission.py
++++ b/tests/hermes_cli/test_review_watch_drain_admission.py
+@@ -16,8 +16,15 @@
+     watch = native.NativeSourceWatch((a,), lambda: None)
+     owner = watch._owner
+     original = native.FileEvents.replace
++    real_wait = native.FileEvents.wait
+     armed = True
+ 
++    def wait_loss(self, timeout=None):
++        changed = real_wait(self, timeout)
++        if changed and self is getattr(watch, '_events', None):
++            self.coverage_lost = True
++        return changed
++
+     def delayed_rearm(events, *args, **kwargs):
+         nonlocal armed
+         if events is watch._events and armed:
+@@ -26,6 +33,7 @@
+             assert release.wait(15)
+         return original(events, *args, **kwargs)
+ 
++    monkeypatch.setattr(native.FileEvents, 'wait', wait_loss)
+     monkeypatch.setattr(native.FileEvents, 'replace', delayed_rearm)
+     result = {}
+     successor = None
+-- 
+2.43.0
+

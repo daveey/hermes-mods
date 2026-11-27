@@ -1,0 +1,356 @@
+From 1d3a9b1511eb7fc250f85b1c0ef6e1055a86dc35 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:22:48 +0000
+Subject: [PATCH 6031] Sessions request path: transport packing, scoped enrichment and coalesced polls
+
+Public mirror of source commit 1d3a9b1511eb7fc250f85b1c0ef6e1055a86dc35.
+
+---
+diff --git a/hermes_cli/subagent_session_activity.py b/hermes_cli/subagent_session_activity.py
+index 10bd8c5af78..cf4f8a8b15f 100644
+--- a/hermes_cli/subagent_session_activity.py
++++ b/hermes_cli/subagent_session_activity.py
+@@ -1,13 +1,15 @@
+ """Read-only persisted child activity, on the existing session annotation cadence.
+ 
+-One SELECT per profile store per three seconds, no lifecycle/liveness claims from absence.
++One indexed SELECT per requested profile/parent set per three seconds; no liveness claims from absence.
+ Unended children older than the six-hour discovery window and persist-disabled children are
+ not covered; stale rows inside the window remain explicit unknown observations.
+ """
+ from __future__ import annotations
+ from hermes_cli.kanban_annotation_facts import consumer as _fact_consumer
+ 
++import json
+ import logging
++from collections import OrderedDict
+ import sqlite3
+ import threading
+ import time
+@@ -18,7 +20,7 @@
+ 
+ _log = logging.getLogger(__name__)
+ _lock = threading.Lock()
+-_cache = {}
++_cache = OrderedDict()
+ _WINDOW = 6 * 3600
+ 
+ 
+@@ -32,11 +34,13 @@
+     return [(profile_for_state_path(path), path) for path in paths]
+ 
+ 
+-def _children(path, now):
++def _children(path, now, parents):
+     mono = time.monotonic()
++    key = (path, tuple(sorted(parents)))
+     with _lock:
+-        cached = _cache.get(path)
++        cached = _cache.get(key)
+         if cached is not None and mono < cached[0]:
++            _cache.move_to_end(key)
+             return cached[1]
+         # URI mode=ro never creates a store or invokes migrations. A read failure is
+         # unknown, not a successful empty inventory; do not fall back to mode=rw.
+@@ -44,14 +48,17 @@
+             conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)
+             try:
+                 rows = conn.execute(
+-                    "SELECT id, parent_session_id, last_activity_at, started_at FROM sessions "
+-                    "WHERE source='subagent' AND parent_session_id IS NOT NULL AND ended_at IS NULL "
+-                    "AND started_at >= ?", (now - _WINDOW,)).fetchall()
++                    "SELECT id, parent_session_id, last_activity_at, started_at FROM sessions INDEXED BY idx_sessions_parent "
++                    "WHERE source='subagent' AND parent_session_id IN (SELECT value FROM json_each(?)) "
++                    "AND ended_at IS NULL AND started_at >= ?", (json.dumps(key[1]), now - _WINDOW)).fetchall()
+             finally:
+                 conn.close()
+         except (sqlite3.Error, OSError, ValueError):
+             rows = None
+-        _cache[path] = (mono + 3, rows)
++        _cache[key] = (mono + 3, rows)
++        _cache.move_to_end(key)
++        while len(_cache) > 128:
++            _cache.popitem(last=False)
+         return rows
+ 
+ 
+@@ -67,9 +74,16 @@
+     except ADAPTER_ERRORS:
+         _log.debug("subagent scope unavailable", exc_info=True)
+         gateway, paths = None, []
++    parents_by_profile = {}
++    for row in rows:
++        parents = parents_by_profile.setdefault(row.get('profile') or 'default', set())
++        parents.update(parent for parent in (row.get('id'), row.get('_lineage_root_id'),
++                                             *(row.get('_lineage_ids') or ())) if isinstance(parent, str))
+     by_profile = {}
+     for profile, path in paths:
+-        children = _children(path, now)
++        if profile not in parents_by_profile:
++            continue
++        children = _children(path, now, parents_by_profile[profile])
+         by_profile[profile] = (children or [], "subagent_store_unavailable" if children is None else None)
+     return project_subagent_activity(rows, by_profile=by_profile, gateway=gateway, now=now)
+ 
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 82c61f33808..1b5939db042 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -338,7 +338,7 @@
+             stamp_automated(sessions, Path(db.db_path).parent)
+             if not full:
+                 _strip_session_list_rows(sessions)
+-            annotate_kanban_activity(sessions)
++            annotate_kanban_activity(sessions, display=True)
+             annotate_goal_activity(sessions)
+             annotate_cron_activity(sessions)
+             annotate_background_activity(sessions)
+diff --git a/hermes_state_page_pack.py b/hermes_state_page_pack.py
+new file mode 100644
+index 00000000000..1f9ef0c6801
+--- /dev/null
++++ b/hermes_state_page_pack.py
+@@ -0,0 +1,39 @@
++"""Pack a bounded ranked page into one SQLite/Python row handoff. [daveey]
++
++sqlite3 releases the GIL while stepping AND converting columns. A wide 200-row
++page can therefore convoy thousands of times under unrelated serve CPU work.
++This is only a transport for an already bounded page in the caller's snapshot;
++it neither caches values nor changes filtering, ranking or authority.
++"""
++import json
++
++
++def _quoted(name):
++    return '"' + name.replace('"', '""') + '"'
++
++
++def read_page(conn, sql, params):
++    """Return dict rows with SQLite types, order and binary64 values preserved."""
++    # Prepare only: LIMIT 0 never steps the projection or its correlated probes.
++    names = [column[0] for column in conn.execute(f'SELECT * FROM ({sql}) LIMIT 0', params).description]
++    cells = []
++    for name in names:
++        column = _quoted(name)
++        # JSON numbers round doubles to 15 digits. Transport REAL as SQLite's
++        # round-trip decimal text and BLOB as hex, distinguished by storage type.
++        cells.append(f"json_array(typeof({column}), CASE typeof({column}) "
++                     f"WHEN 'real' THEN printf('%!.26g', {column}) "
++                     f"WHEN 'blob' THEN hex({column}) ELSE {column} END)")
++    packed = conn.execute(f"WITH _packed_rows AS MATERIALIZED ({sql}) "
++                          f"SELECT json_group_array(json_array({','.join(cells)})) "
++                          "FROM _packed_rows", params).fetchone()[0]
++    return [dict(zip(names, (_value(kind, value) for kind, value in row)))
++            for row in json.loads(packed)]
++
++
++def _value(kind, value):
++    if kind == 'real':
++        return float(value)
++    if kind == 'blob':
++        return bytes.fromhex(value)
++    return value
+diff --git a/hermes_state_rank_memo.py b/hermes_state_rank_memo.py
+index 2fad5a77c01..c7718c13471 100644
+--- a/hermes_state_rank_memo.py
++++ b/hermes_state_rank_memo.py
+@@ -411,7 +411,8 @@
+            f"FROM json_each(?)) "
+            f"{head}{last_active_sql} AS last_active, _pg.eff AS _effective_last_active "
+            f"FROM _pg JOIN sessions s ON s.id = _pg.page_id {prompt_join} ORDER BY _pg.ord")
+-    rows = conn.execute(sql, (page,)).fetchall()
++    from hermes_state_page_pack import read_page
++    rows = read_page(conn, sql, (page,))
+     if use_cache and rows:
+         fresh = {}
+         for row in rows:
+diff --git a/tests/hermes_cli/test_sessions_display_annotation.py b/tests/hermes_cli/test_sessions_display_annotation.py
+new file mode 100644
+index 00000000000..c3111fdf82a
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_display_annotation.py
+@@ -0,0 +1,22 @@
++"""The single-profile HTTP list uses the same bounded display enrichment as the merged list."""
++from hermes_cli.web_routers import sessions
++from hermes_state import SessionDB
++
++
++def test_session_payload_uses_display_annotation(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    db = SessionDB(home / 'state.db')
++    db.create_session('visible', source='cli')
++    db.append_message('visible', 'user', 'hello')
++    called = []
++    monkeypatch.setattr(sessions, '_open_session_db_for_profile', lambda *a, **kw: db)
++    monkeypatch.setattr(sessions, 'annotate_kanban_activity', lambda rows, **kw: called.append(kw))
++    try:
++        result = sessions._list_sessions_payload(20, 0, 0, 'exclude', 'recent', None, None, None,
++                                                  None, False, 'include', None)
++        assert result['sessions'][0]['id'] == 'visible'
++        assert called == [{'display': True}]
++    finally:
++        db.close()
+diff --git a/tests/hermes_cli/test_subagent_page_scope.py b/tests/hermes_cli/test_subagent_page_scope.py
+new file mode 100644
+index 00000000000..7f5d15829a1
+--- /dev/null
++++ b/tests/hermes_cli/test_subagent_page_scope.py
+@@ -0,0 +1,53 @@
++"""Page-scoped subagent discovery must not scan unrelated profile inventories."""
++import sqlite3
++
++from hermes_cli import subagent_session_activity as activity
++from hermes_state import SessionDB
++
++
++def test_discovery_reads_only_the_page_profiles_and_parents(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    db = SessionDB(home / 'state.db')
++    now = 1700000000
++    try:
++        def seed(conn):
++            conn.executemany("INSERT INTO sessions(id,source,started_at) VALUES (?,'cli',?)",
++                             [('parent', now)] + [(f'foreign{i}', now) for i in range(3000)])
++            conn.executemany('INSERT INTO sessions(id,source,started_at,parent_session_id) VALUES (?, ?, ?, ?)',
++                             [('wanted', 'subagent', now, 'parent')] +
++                             [(f'other{i}', 'subagent', now, f'foreign{i}') for i in range(3000)])
++        db._execute_write(seed)
++        # It is discoverable, but the page does not request it. Opening its store
++        # would make an unrelated outage/workload part of this request.
++        unrelated = home / 'profiles' / 'other'
++        unrelated.mkdir(parents=True)
++        (unrelated / 'state.db').touch()
++        real = sqlite3.connect
++        counts = {'steps': 0, 'queries': 0, 'opens': 0}
++
++        def connect(path, **kwargs):
++            assert '/profiles/other/' not in str(path)
++            counts['opens'] += 1
++            conn = real(path, **kwargs)
++            conn.set_progress_handler(lambda: counts.__setitem__('steps', counts['steps'] + 100) or 0, 100)
++            conn.set_trace_callback(lambda sql: counts.__setitem__('queries', counts['queries'] + 1))
++            return conn
++
++        monkeypatch.setattr(activity.sqlite3, 'connect', connect)
++        monkeypatch.setattr(activity.time, 'time', lambda: now + 10)
++        monkeypatch.setattr(activity, 'local_scope', lambda: ('edge', 'default'))
++        activity._reset_cache_for_tests()
++        rows = activity.annotate_subagent_activity([{'id': 'tip', '_lineage_ids': ['parent']}])
++        observed = rows[0]['execution_observations']
++        assert [o['identity']['generation'] for o in observed] == ['session=wanted']
++        assert counts['opens'] == 1
++        assert counts['queries'] <= 2
++        assert counts['steps'] < 2000, counts
++        # A new parent set must not hit the prior page's cached subset.
++        rows = activity.annotate_subagent_activity([{'id': 'foreign0'}])
++        assert rows[0]['execution_observations'][0]['identity']['generation'] == 'session=other0'
++    finally:
++        activity._reset_cache_for_tests()
++        db.close()
+diff --git a/tests/hermes_state/test_rank_projection_transport.py b/tests/hermes_state/test_rank_projection_transport.py
+new file mode 100644
+index 00000000000..c96cc472224
+--- /dev/null
++++ b/tests/hermes_state/test_rank_projection_transport.py
+@@ -0,0 +1,82 @@
++"""Bound SQLite/Python page handoffs without changing SQLite value semantics."""
++import math
++import random
++import sqlite3
++import struct
++import threading
++
++import pytest
++
++import hermes_state_rank_memo as memo
++
++
++class RecordingConnection:
++    def __init__(self, conn):
++        self.conn = conn
++        self.returned = 0
++        self.statements = 0
++
++    def execute(self, sql, params=()):
++        self.statements += 1
++        cursor = self.conn.execute(sql, params)
++        owner = self
++
++        class Cursor:
++            description = cursor.description
++
++            def fetchall(self):
++                rows = cursor.fetchall()
++                owner.returned += len(rows)
++                return rows
++
++            def fetchone(self):
++                row = cursor.fetchone()
++                owner.returned += row is not None
++                return row
++
++        return Cursor()
++
++
++@pytest.mark.parametrize('count', [1, 200, 2000])
++def test_project_has_constant_python_row_handoffs(count):
++    conn = sqlite3.connect(':memory:')
++    conn.row_factory = sqlite3.Row
++    conn.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY, started REAL)')
++    conn.executemany('INSERT INTO sessions VALUES (?, ?)', [(str(i), 1700000000.125) for i in range(count)])
++    measured = RecordingConnection(conn)
++    try:
++        steps = [0]
++        conn.set_progress_handler(lambda: steps.__setitem__(0, steps[0] + 100) or 0, 100)
++        rows = memo.project(measured, memo.RankMemo(threading.Lock()),
++                            [(str(i), None, None, i) for i in range(count)],
++                            'SELECT s.id, s.started, ', '', 'unused', 's.started', 0)
++        assert [r['id'] for r in rows] == [str(i) for i in range(count)]
++        assert measured.statements <= 2
++        assert steps[0] <= 150 * count + 1000, steps
++        assert measured.returned <= 1, 'page must cross SQLite/Python as one packed row'
++    finally:
++        conn.close()
++
++
++def test_packed_page_preserves_values_and_column_names():
++    from hermes_state_page_pack import read_page
++    conn = sqlite3.connect(':memory:')
++    conn.row_factory = sqlite3.Row
++    conn.execute('CREATE TABLE cells(value)')
++    values = [None, 0, 2**63 - 1, -(2**63), 'a\x00b\n"é', b'\x00\xff', 1.0000000000000002,
++              1700000000.1234567, -0.0000000000000001, 5e-324, float('inf'), -float('inf')]
++    randoms = random.Random(42)
++    for _ in range(1000):
++        value = struct.unpack('!d', randoms.getrandbits(64).to_bytes(8, 'big'))[0]
++        if math.isfinite(value):
++            values.append(value)
++    conn.executemany('INSERT INTO cells VALUES (?)', [(v,) for v in values])
++    try:
++        rows = read_page(conn, 'SELECT value AS "a""b" FROM cells ORDER BY rowid', ())
++        actual = [r['a"b'] for r in rows]
++        assert actual == values
++        assert [type(v) for v in actual] == [type(v) for v in values]
++        assert math.isinf(actual[11])
++        assert read_page(conn, 'SELECT value FROM cells WHERE 0', ()) == []
++    finally:
++        conn.close()
+diff --git a/tests/hermes_state/test_recency_hot_rows.py b/tests/hermes_state/test_recency_hot_rows.py
+index c35e3eb139b..62cf00923c0 100644
+--- a/tests/hermes_state/test_recency_hot_rows.py
++++ b/tests/hermes_state/test_recency_hot_rows.py
+@@ -50,6 +50,7 @@
+ class _Cursor:
+     def __init__(self, cursor, sql, log):
+         self._cursor, self._sql, self._log = cursor, sql, log
++        self.description = cursor.description
+ 
+     def fetchall(self):
+         rows = self._cursor.fetchall()
+-- 
+2.43.0
+

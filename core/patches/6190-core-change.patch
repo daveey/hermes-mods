@@ -1,0 +1,315 @@
+From b9fb627fdef8f6ec2a013f4b4d50a2f04fddb37a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:21:51 +0000
+Subject: [PATCH 6190] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit b9fb627fdef8f6ec2a013f4b4d50a2f04fddb37a.
+
+---
+diff --git a/hermes_cli/kanban_actionability_confirmed.py b/hermes_cli/kanban_actionability_confirmed.py
+index cd5dfb0a710..b677739ae8e 100644
+--- a/hermes_cli/kanban_actionability_confirmed.py
++++ b/hermes_cli/kanban_actionability_confirmed.py
+@@ -30,23 +30,23 @@
+             not isinstance(s, dict) or set(s) != {'uid', 'version'} or
+             type(s['version']) is not int or s['version'] <= 0 for s in sources):
+         return False
+-    if [s['uid'] for s in sources] != facts.get('source_refs'):
++    from hermes_cli.kanban_actionability_selection import select
++    selected = select(task['status'], reader.events(task['id']),
++                      episode=task.get('containment_episode') or facts.get('stop_episode'),
++                      order_key=lambda e: (e['created_at'], e['id']))
++    if selected is None or [s['uid'] for s in sources] != [reader.uid(selected)]:
+         return False
+-    # Include satisfied parents too, matching the canonical contract's full graph.
+-    # The read-only adapter already computes the effective restricted status.
+-    effective = {d['task_id']: d for d in facts.get('dependencies', [])}
+-    parents = []
+-    for (pid,) in reader.conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id',
+-                                      (task['id'],)):
+-        parent = reader.task(pid)
+-        if parent is None:
+-            return False
+-        status = parent['status']
+-        dep = effective.get(pid, {})
+-        if status in ('done', 'archived') and (dep.get('restricted') or parent.get('containment_episode')):
+-            status = 'triage'
+-        parents.append({'id': pid, 'status': status})
+-    return f.get('dependencies') == parents
++    # The obligation is fixed, not a lease on parent progress. Match the entire
++    # parent set (including satisfied/absent replicas), never parent statuses.
++    # _dependencies still reports missing evidence as UNKNOWN and preserves stops.
++    recorded = f.get('dependencies')
++    if not isinstance(recorded, list) or any(
++            not isinstance(dep, dict) or not isinstance(dep.get('id'), str) for dep in recorded):
++        return False
++    recorded_ids = [dep['id'] for dep in recorded]
++    parents = [pid for (pid,) in reader.conn.execute(
++        'SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task['id'],))]
++    return len(set(recorded_ids)) == len(recorded_ids) and sorted(recorded_ids) == parents
+ 
+ 
+ def _confirmed(reader, task, facts):
+diff --git a/hermes_cli/kanban_actionability_observation.py b/hermes_cli/kanban_actionability_observation.py
+index 7356ae73a63..c9705b4a5b6 100644
+--- a/hermes_cli/kanban_actionability_observation.py
++++ b/hermes_cli/kanban_actionability_observation.py
+@@ -6,15 +6,11 @@
+ """
+ from __future__ import annotations
+ 
+-import json
+ from urllib.parse import quote
+ 
+ from hermes_cli.kanban_actionability import NONTERMINAL
++from hermes_cli.kanban_actionability_selection import select
+ 
+-KINDS = {'todo': ('created', 'linked', 'dependency_wait'), 'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
+-         'review': ('review_requested', 'created'), 'blocked': ('blocked',),
+-         'scheduled': ('scheduled', 'continued'),
+-         'triage': ('failure_finalized', 'spend_budget_decision_ready', 'created'), 'running': ('claimed',)}
+ PRIVATE = {'spend_budget_triaged', 'decision_hold_restricted', 'scope_renewed'}
+ 
+ 
+@@ -22,21 +18,6 @@
+     return ValueError('complete canonical actionability source unavailable or changed')
+ 
+ 
+-def _todo_assignment(event, events):
+-    """Live assignment parks remain todo with a blocked event; human history does not."""
+-    if event.get('kind') != 'blocked':
+-        return False
+-    try:
+-        payload = event.get('payload')
+-        payload = payload if isinstance(payload, dict) else json.loads(payload)
+-    except (TypeError, ValueError):
+-        return False
+-    if not isinstance(payload, dict) or payload.get('kind') != 'assignment':
+-        return False
+-    key = (event['created_at'], event['ord'], event['uid'])
+-    return not any(e.get('kind') == 'unblocked' and (e['created_at'], e['ord'], e['uid']) > key for e in events)
+-
+-
+ def _integer(value, minimum=0):
+     return type(value) is int and minimum <= value <= 9007199254740991
+ 
+@@ -104,13 +85,10 @@
+     if task['created_on'] != hub.ident.gateway or task['status'] not in NONTERMINAL:
+         raise _invalid()
+     episode = task['containment_episode']
+-    allowed = KINDS[task['status']]
+-    candidates = [e for e in data['events'] if e['uid'] == episode] if episode else [
+-        e for e in data['events'] if e['kind'] in allowed
+-        or task['status'] == 'todo' and _todo_assignment(e, data['events'])]
+-    if not candidates:
++    event = select(task['status'], data['events'], episode=episode,
++                   order_key=lambda e: (e['created_at'], e['ord'], e['uid']))
++    if event is None:
+         raise _invalid()  # no invented legacy first-observed clock
+-    event = max(candidates, key=lambda e: (e['created_at'], e['ord'], e['uid']))
+     links = _links(hub, board, head)
+     parent_ids = sorted(l['parent_id'] for l in links if l['child_id'] == task_id)
+     if len(parent_ids) > 128 or len(set(parent_ids)) != len(parent_ids):
+diff --git a/hermes_cli/kanban_actionability_selection.py b/hermes_cli/kanban_actionability_selection.py
+new file mode 100644
+index 00000000000..f67269b4252
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_selection.py
+@@ -0,0 +1,27 @@
++"""Shared ordinary semantic-source selection; ordering remains adapter-owned."""
++from __future__ import annotations
++
++import json
++
++KINDS = {'todo': ('created', 'linked', 'dependency_wait'), 'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
++         'review': ('review_requested', 'created'), 'blocked': ('blocked',),
++         'scheduled': ('scheduled', 'continued'),
++         'triage': ('failure_finalized', 'spend_budget_decision_ready', 'created'), 'running': ('claimed',)}
++
++
++def select(status, events, *, order_key, episode=None):
++    """Select one source without treating comments as clocks or releases as grants."""
++    def assignment(event):
++        if status != 'todo' or event.get('kind') != 'blocked':
++            return False
++        try:
++            raw = event.get('payload')
++            data = raw if isinstance(raw, dict) else json.loads(raw)
++        except (TypeError, ValueError):
++            return False
++        return isinstance(data, dict) and data.get('kind') == 'assignment' and not any(
++            e.get('kind') == 'unblocked' and order_key(e) > order_key(event) for e in events)
++
++    candidates = [e for e in events if e.get('uid') == episode] if episode else [
++        e for e in events if e['kind'] in KINDS.get(status, ()) or assignment(e)]
++    return max(candidates, key=order_key) if candidates else None
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index b4280dafb28..bd61079a309 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -7,10 +7,12 @@
+ 
+ from hermes_cli.kanban_actionability import owner, project, valid_awaiting
+ from hermes_cli.kanban_actionability_evidence import EVIDENCE_ERRORS, effective
++from hermes_cli.kanban_actionability_selection import KINDS as SOURCE_KINDS, select
+ 
+-KINDS = ('created', 'blocked', 'dependency_wait', 'scheduled', 'continued', 'spend_budget_triaged',
++KINDS = tuple(dict.fromkeys((*('created', 'blocked', 'dependency_wait', 'scheduled', 'continued', 'spend_budget_triaged',
+          'decision_hold_restricted', 'decision_retained', 'decision_protected_stopped',
+-         'spend_budget_decision_ready', 'promoted_manual', 'archived', 'contained')
++         'spend_budget_decision_ready', 'promoted_manual', 'archived', 'contained'),
++         *(kind for kinds in SOURCE_KINDS.values() for kind in kinds))))
+ 
+ 
+ def record(raw) -> dict:
+@@ -241,9 +243,13 @@
+     stop, _restricted, receipt_only = _state(reader, tid, events)
+     schedule = next((e for e in events if e['kind'] in ('scheduled', 'continued')), None)
+     # Notes/notices do not replace the material source or reset its deadline.
+-    source = stop or (schedule if task['status'] == 'scheduled' else next(
+-        (e for e in events if e['kind'] not in ('spend_budget_decision_ready', 'decision_retained',
+-                                             'decision_protected_stopped')), None))
++    source = stop or select(task['status'], events,
++                            order_key=lambda e: (e['created_at'], e['id']))
++    if not stop and task['status'] == 'triage':
++        # Decision notices are not material clocks. Preserve legacy triage
++        # diagnostics; confirmed ordinary custody selects its source separately.
++        source = next((e for e in events if e['kind'] not in (
++            'spend_budget_decision_ready', 'decision_retained', 'decision_protected_stopped')), None)
+     deps, missing = _dependencies(reader, tid)
+     episode = (stop['data'].get('episode') or stop['data'].get('episode_uid') or reader.uid(stop)) if stop else None
+     episode = episode if isinstance(episode, str) and episode else None
+diff --git a/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py b/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
+index 0d1b32398cc..19668aeffa7 100644
+--- a/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
++++ b/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
+@@ -14,8 +14,11 @@
+ live = support.live
+ 
+ 
+-def confirmed(live):
++def confirmed(live, *, parent=None):
+     tid, payload = support.contract(live)
++    if parent is not None:
++        live.execute('INSERT INTO task_links (parent_id,child_id) VALUES (?,?)', (parent, tid))
++        payload['facts']['dependencies'] = [{'id': parent, 'status': 'todo'}]
+     source = live.execute("SELECT uid,created_at FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()
+     payload.update(first_observed=source['created_at'], deadline_at=source['created_at'] + 3600,
+                    owner={'kind': 'assignee', 'refs': ['default']})
+@@ -107,6 +110,48 @@
+         assert row['evidence_state'] == 'unknown'
+ 
+ 
++@pytest.mark.parametrize('status', ['todo', 'running', 'done', 'archived', 'triage', 'missing'])
++def test_parent_status_does_not_renew_or_erase_fixed_obligation(live, status):
++    parent = kb.create_task(live, title='existing prerequisite', assignee='default')
++    live.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
++    tid, payload, source, _ = confirmed(live, parent=parent)
++    if status == 'missing':
++        # A foreign parent can be absent from a partial replica; retain the link.
++        live.execute('PRAGMA foreign_keys=OFF')
++        live.execute('DELETE FROM tasks WHERE id=?', (parent,))
++    else:
++        live.execute('UPDATE tasks SET status=? WHERE id=?', (status, parent))
++    before = list(live.iterdump())
++    for row in (describe(live, tid, now=source['created_at']),
++                next(r for r in report(live, now=source['created_at'])['rows'] if r['task_id'] == tid)):
++        assert row['escalation']['at'] == payload['deadline_at']
++        assert row['evidence_state'] == 'unknown'
++        assert 'escalation_deadline_missing' not in row['violations']
++    assert list(live.iterdump()) == before
++
++
++def test_new_parent_stop_remains_visible_with_fixed_obligation(live):
++    parent = kb.create_task(live, title='protected prerequisite', assignee='default')
++    live.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
++    tid, payload, source, _ = confirmed(live, parent=parent)
++    kb._append_event(live, parent, 'spend_budget_triaged', {'cause': 'scope_stopped'})
++    with_contract = describe(live, tid, now=source['created_at'])
++    live.execute("UPDATE kanban_actionability_commands SET delivery_state='pending' WHERE task_id=?", (tid,))
++    without_contract = describe(live, tid, now=source['created_at'])
++    assert with_contract['escalation']['at'] == payload['deadline_at']
++    for key in ('action', 'blocker', 'release', 'dependencies', 'evidence_state'):
++        assert with_contract[key] == without_contract[key]
++    assert any(dep['task_id'] == parent for dep in with_contract['dependencies'])
++
++
++def test_removed_parent_invalidates_fixed_obligation(live):
++    parent = kb.create_task(live, title='old prerequisite', assignee='default')
++    live.execute("UPDATE tasks SET status='todo' WHERE id=?", (parent,))
++    tid, _, source, _ = confirmed(live, parent=parent)
++    live.execute('DELETE FROM task_links WHERE child_id=?', (tid,))
++    assert describe(live, tid, now=source['created_at'])['escalation']['at'] is None
++
++
+ def test_comment_and_clock_do_not_renew_confirmed_deadline_or_identity(live):
+     tid, payload, source, _ = confirmed(live)
+     before = describe(live, tid, now=source['created_at'])
+diff --git a/tests/hermes_cli/test_kanban_actionability_source_parity.py b/tests/hermes_cli/test_kanban_actionability_source_parity.py
+new file mode 100644
+index 00000000000..1407bc92b29
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_source_parity.py
+@@ -0,0 +1,59 @@
++"""Recorder and local report must select the same ordinary lifecycle source."""
++import json
++
++import pytest
++
++from hermes_cli.kanban_actionability_creation import validated_intent
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli.kanban_actionability_observation import observe
++from tests.hermes_cli.test_kanban_actionability_observation import Hub, inventory
++
++
++def test_todo_latest_link_is_shared_source(tmp_path):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='ordinary dependency wait', assignee='default')
++        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'scheduled', {'wake_at': 100})
++        kb._append_event(conn, tid, 'linked', {'parent_id': 'historical-parent'})
++        events = [dict(row) for row in conn.execute(
++            'SELECT * FROM task_events WHERE task_id=? ORDER BY id', (tid,))]
++        hub = Hub()
++        data = inventory(tid, 'todo')
++        data['events'] = [{**event, 'uid': event.get('uid') or str(event['id']),
++                           'ord': index, 'version': 1, 'deleted_at': None}
++                          for index, event in enumerate(events, 1)]
++        hub.data[tid] = data
++        expected = observe(hub, 'default', tid)['facts']['source_uids'][0]['uid']
++        before = list(conn.iterdump())
++        actual = describe(conn, tid)
++        assert actual['source_refs'] == [expected]
++        assert actual['action'] != 'execute_current_scope'
++        assert list(conn.iterdump()) == before
++        assert json.loads(events[-1]['payload'])['parent_id'] == 'historical-parent'
++
++
++@pytest.mark.parametrize('status,kind', [('todo', 'linked'), ('running', 'claimed')])
++def test_valid_park_intent_is_not_reported_corrupt_after_new_source(tmp_path, monkeypatch, status, kind):
++    """Live census shape: valid scheduled bytes survive a later link/claim in history."""
++    monkeypatch.setattr('time.time', lambda: 1_800_000_000)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='park then advance', assignee='default')
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'scheduled', {
++            'wake_at': 1_800_000_100, 'awaiting': {'kind': 'clock'}})
++        event = dict(conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone())
++        event['data'] = json.loads(event['payload'])
++        task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        assert validated_intent(task, event, parent_ids=[]) is not None
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++        kb._append_event(conn, tid, kind, {})
++        latest = dict(conn.execute('SELECT * FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1', (tid,)).fetchone())
++        before = list(conn.iterdump())
++        row = describe(conn, tid)
++        assert 'creation_intent_invalid' not in row['violations']
++        assert row['source_refs'] == [latest.get('uid') or str(latest['id'])]
++        assert row['escalation']['at'] is None  # no inherited or renewed deadline
++        assert list(conn.iterdump()) == before
+-- 
+2.43.0
+

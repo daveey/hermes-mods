@@ -1,0 +1,963 @@
+From 657f04cd25d0f4e886af9c175dedc4f8bea6b900 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:01:37 +0000
+Subject: [PATCH 6051] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit 657f04cd25d0f4e886af9c175dedc4f8bea6b900.
+
+---
+diff --git a/hermes_cli/serve_producer_admission.py b/hermes_cli/serve_producer_admission.py
+new file mode 100644
+index 00000000000..2f82f863c79
+--- /dev/null
++++ b/hermes_cli/serve_producer_admission.py
+@@ -0,0 +1,170 @@
++"""Fail-closed admission orchestration; deliberately not wired to serve yet.
++
++The host supplies strict collectors and canonical process classification, never
++client-supplied receipts. A COMPLETE cut is scoped to one held gate acquisition;
++there is no persisted clean bit that a successor or boot may reuse. This module
++provides no default permissive collector/classifier and does not start producers.
++"""
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++from pathlib import Path
++
++from hermes_cli.serve_producer_census import CensusUnavailable, Incarnation, ProcessCensus
++from hermes_cli.serve_producer_custody import FamilyCustody, _acquire_runtime
++
++# Each collector must enumerate its exact configured scope (including disabled or
++# empty scope receipts), distinguish errors and return positive evidence refs.
++REQUIRED_COLLECTORS = frozenset(('raw_ledger', 'profile_controls', 'supervisor_ports',
++                                 'supported_launchers', 'installation_access'))
++
++
++class AdmissionUnavailable(RuntimeError):
++    """External production stays dormant while exclusion cannot be established."""
++
++
++@dataclass(frozen=True)
++class CollectorEvidence:
++    refs: tuple[str, ...]
++    conflicts: tuple[str, ...]
++
++
++@dataclass(frozen=True)
++class Classification:
++    identity: Incarnation
++    kind: str  # participant or positively unrelated; legacy/unknown are conflicts
++    proof: str
++
++
++@dataclass(frozen=True)
++class AdmissionCut:
++    boot_id: str
++    generation: str
++    installation: str
++    census: ProcessCensus | None
++    collectors: tuple[tuple[str, CollectorEvidence], ...]
++    classifications: tuple[Classification, ...]
++    legacy_candidates: tuple[Incarnation, ...]
++    retired: tuple[Incarnation, ...]
++    errors: tuple[str, ...]
++    _acquisition: object
++
++    @property
++    def complete(self) -> bool:
++        return not self.errors
++
++
++class LaunchGate:
++    """Stable nonblocking launch mutex; hold through registration+family admission.
++
++    This gate alone does not fence pre-integration processes. Family custody must
++    outlive this short launch critical section and all live producer callbacks.
++    """
++
++    def __init__(self, fd: int):
++        self._custody = FamilyCustody(fd)
++        self._pid = os.getpid()
++        self._acquisition = object()
++
++    @classmethod
++    def acquire(cls, runtime: Path) -> LaunchGate:
++        return cls(_acquire_runtime(runtime, 'admission'))
++
++    def __enter__(self):
++        self._held()
++        return self
++
++    def __exit__(self, *_exc):
++        self.close()
++
++    def close(self):
++        self._custody.close()
++
++    def _held(self):
++        if self._custody.fd is None or os.getpid() != self._pid:
++            raise AdmissionUnavailable('launch gate must remain held by collecting process')
++
++    def inspect(self, *, boot_id: str, generation: str, installation: str,
++                census, collectors: dict, classify, legacy_candidates: tuple[Incarnation, ...],
++                exited) -> AdmissionCut:
++        """Run strict host observations inside the gate; never from an HTTP path.
++
++        `exited` must affirm the exact candidate incarnation is gone, including
++        spawners, not just absent from the current ledger. Exceptions are unknown.
++        All adapters are mandatory: no best-effort inventory fallback exists.
++        """
++        self._held()
++        errors, evidence, classified, retired = [], [], [], []
++        if not all(isinstance(value, str) and value for value in (boot_id, generation, installation)):
++            errors.append('identity:missing')
++        for name in sorted(REQUIRED_COLLECTORS):
++            _collect(name, collectors.get(name), evidence, errors)
++        observation = _census(census, boot_id, errors)
++        if observation is not None:
++            for record in observation.processes:
++                _classify(record, classify, classified, errors)
++        for identity in legacy_candidates:
++            try:
++                if exited(identity) is not True:
++                    errors.append(f'legacy:{identity.pid}:not_retired')
++                else:
++                    retired.append(identity)
++            except (OSError, ValueError, CensusUnavailable) as exc:
++                errors.append(f'legacy:{identity.pid}:{type(exc).__name__}')
++        self._held()
++        return AdmissionCut(boot_id, generation, installation, observation, tuple(evidence),
++                            tuple(classified), tuple(legacy_candidates), tuple(retired),
++                            tuple(errors), self._acquisition)
++
++    def require(self, cut: AdmissionCut, *, boot_id: str, generation: str, installation: str):
++        self._held()
++        if cut._acquisition is not self._acquisition:
++            raise AdmissionUnavailable('different launch-gate acquisition')
++        if (cut.boot_id, cut.generation, cut.installation) != (boot_id, generation, installation):
++            raise AdmissionUnavailable('admission identity changed')
++        if not cut.complete:
++            raise AdmissionUnavailable('incomplete producer-admission evidence')
++
++
++def _collect(name, callback, evidence, errors):
++    if callback is None:
++        errors.append(f'{name}:missing')
++        return
++    try:
++        result = callback()
++        if not isinstance(result, CollectorEvidence) or not result.refs or not all(result.refs):
++            errors.append(f'{name}:no_positive_evidence')
++            return
++        evidence.append((name, result))
++        errors.extend(f'{name}:{conflict}' for conflict in result.conflicts)
++    except (OSError, ValueError, CensusUnavailable) as exc:
++        errors.append(f'{name}:{type(exc).__name__}')
++
++
++def _census(callback, boot_id, errors):
++    try:
++        result = callback()
++        if not isinstance(result, ProcessCensus):
++            errors.append('processes:missing')
++            return None
++        errors.extend(f'processes:{error}' for error in result.errors)
++        if result.boot_id != boot_id:
++            errors.append('processes:boot_changed')
++        return result
++    except (OSError, ValueError, CensusUnavailable) as exc:
++        errors.append(f'processes:{type(exc).__name__}')
++        return None
++
++
++def _classify(record, callback, classified, errors):
++    try:
++        result = callback(record)
++        if not isinstance(result, Classification) or result.identity != record.identity:
++            errors.append(f'pid:{record.identity.pid}:classification_identity')
++            return
++        classified.append(result)
++        if result.kind not in ('participant', 'unrelated') or not result.proof:
++            errors.append(f'pid:{record.identity.pid}:unproven_classification')
++    except (OSError, ValueError, CensusUnavailable) as exc:
++        errors.append(f'pid:{record.identity.pid}:{type(exc).__name__}')
+diff --git a/hermes_cli/serve_producer_census.py b/hermes_cli/serve_producer_census.py
+new file mode 100644
+index 00000000000..575cde88782
+--- /dev/null
++++ b/hermes_cli/serve_producer_census.py
+@@ -0,0 +1,289 @@
++"""Bounded, read-only observations for producer admission (not admission itself).
++
++A complete collection says every enumerated same-UID incarnation was observed;
++it does NOT say Python processes are unrelated or that launchers participate.
++Admission must classify these records under its held launch gate, join strict
++ledger/control/launcher receipts and positively retire legacy spawners. No current
++serve calls this module; in particular it cannot activate external production.
++"""
++from __future__ import annotations
++
++import json
++import math
++import os
++import sys
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++MAX_PROCESSES = 8192
++MAX_OBSERVATION_BYTES = 32 * 1024 * 1024
++_MAX_PROC_FILE = 1024 * 1024
++_MAX_LEDGER = 8 * 1024 * 1024
++_IDENTITY_ENV = frozenset(('HERMES_HOME', 'HERMES_RUNTIME_DIR', 'HERMES_PROFILE',
++                           'HERMES_PROCESS_SPAWN', 'PYTHONPATH', 'VIRTUAL_ENV'))
++
++
++class CensusUnavailable(RuntimeError):
++    """Incomplete evidence must not become an empty successful inventory."""
++
++
++class IncarnationChanged(CensusUnavailable):
++    """PID reuse or exec-time identity mutation prevents a coherent observation."""
++
++
++@dataclass(frozen=True, order=True)
++class Incarnation:
++    boot_id: str
++    pid: int
++    start_ticks: int
++
++
++@dataclass(frozen=True)
++class ProcessObservation:
++    identity: Incarnation
++    exe: str
++    cwd: str
++    argv: tuple[str, ...]
++    environment: tuple[tuple[str, str], ...]
++
++    @property
++    def retained_bytes(self) -> int:
++        strings = (self.exe, self.cwd, *self.argv,
++                   *(part for pair in self.environment for part in pair))
++        return (512 + sys.getsizeof(self.argv) + sys.getsizeof(self.environment)
++                + sum(sys.getsizeof(pair) for pair in self.environment)
++                + sum(sys.getsizeof(value) for value in strings))
++
++
++@dataclass(frozen=True)
++class ProcessCensus:
++    boot_id: str
++    started_at: float
++    finished_at: float
++    processes: tuple[ProcessObservation, ...]
++    exited: tuple[Incarnation, ...]
++    errors: tuple[str, ...]
++
++    @property
++    def complete(self) -> bool:
++        return not self.errors
++
++
++def _read_bytes(path: Path, limit: int) -> bytes:
++    with path.open('rb') as stream:
++        value = stream.read(limit + 1)
++    if len(value) > limit:
++        raise CensusUnavailable('observation byte budget')
++    return value
++
++
++def _bounded_names(path: Path, limit: int, *, numeric: bool = False) -> tuple[str, ...]:
++    names = []
++    with os.scandir(path) as entries:
++        for entry in entries:
++            if numeric and not (entry.name.isascii() and entry.name.isdecimal()):
++                continue
++            if len(names) >= limit:
++                raise CensusUnavailable('process_budget' if numeric else 'pending ledger count budget')
++            names.append(entry.name)
++    return tuple(sorted(names))
++
++
++class LinuxProcessCensus:
++    """Linux adapter; explicit proc root also supports isolated synthetic fixtures.
++
++    Never scans cwd with Path.resolve(): readlink is sufficient identity evidence
++    and does not stat arbitrary/deleted foreign directories. Environment bytes are
++    reduced immediately to an explicit nonsecret identity allowlist, never logged.
++    """
++
++    def __init__(self, proc_root: Path = Path('/proc')):
++        self.root = Path(proc_root)
++
++    def boot_id(self) -> str:
++        value = _read_bytes(self.root / 'sys/kernel/random/boot_id', 128).decode('ascii').strip()
++        if not value:
++            raise CensusUnavailable('missing boot identity')
++        return value
++
++    def pids(self) -> tuple[int, ...]:
++        return tuple(sorted(int(name) for name in _bounded_names(self.root, MAX_PROCESSES, numeric=True)))
++
++    def identity(self, pid: int, boot: str) -> Incarnation:
++        raw = _read_bytes(self.root / str(pid) / 'stat', 8192)
++        fields = raw.rsplit(b')', 1)[1].split()
++        birth = int(fields[19])
++        if birth <= 0 or int(raw.split(b' ', 1)[0]) != pid:
++            raise CensusUnavailable('invalid process identity')
++        return Incarnation(boot, pid, birth)
++
++    def _uid(self, pid: int) -> int:
++        status = _read_bytes(self.root / str(pid) / 'status', 65536)
++        for line in status.splitlines():
++            if line.startswith(b'Uid:'):
++                return int(line.split()[1])
++        raise CensusUnavailable('missing process uid')
++
++    def _details(self, pid: int):
++        directory = self.root / str(pid)
++        exe, cwd = os.readlink(directory / 'exe'), os.readlink(directory / 'cwd')
++        raw = _read_bytes(directory / 'cmdline', _MAX_PROC_FILE)
++        if raw.count(b'\0') > 4096:
++            raise CensusUnavailable('argument count budget')
++        argv = tuple(os.fsdecode(part) for part in raw.rstrip(b'\0').split(b'\0'))
++        environment = []
++        for item in _read_bytes(directory / 'environ', _MAX_PROC_FILE).split(b'\0'):
++            key, separator, value = item.partition(b'=')
++            if separator and os.fsdecode(key) in _IDENTITY_ENV:
++                if len(environment) >= 64:
++                    raise CensusUnavailable('identity environment count budget')
++                environment.append((os.fsdecode(key), os.fsdecode(value)))
++        return exe, cwd, argv, tuple(sorted(environment))
++
++    def read_process(self, pid: int, boot: str) -> ProcessObservation:
++        identity = self.identity(pid, boot)
++        details = self._details(pid)
++        # exec preserves startticks: compare actual executable/argv/env/cwd too.
++        # This detects observed mutation, not an atomic kernel-wide snapshot;
++        # supported launch fencing and strict classification remain mandatory.
++        if self._details(pid) != details or self.identity(pid, boot) != identity:
++            raise IncarnationChanged('process changed while reading')
++        return ProcessObservation(identity, *details)
++
++    def _observe(self, pid, boot, processes, exited, errors):
++        identity = None
++        try:
++            # A UID read is required even for excluded processes; denial is not absence.
++            if self._uid(pid) != os.getuid():  # windows-footgun: ok — explicit Linux proc adapter
++                return
++            identity = self.identity(pid, boot)
++            record = self.read_process(pid, boot)
++            if record.identity != identity or self._uid(pid) != os.getuid():  # windows-footgun: ok — Linux adapter
++                raise IncarnationChanged('process changed before observation')
++            processes.append(record)
++        except FileNotFoundError:
++            try:
++                current = self.identity(pid, boot)
++            except FileNotFoundError:
++                if identity is not None:
++                    exited.append(identity)
++                else:
++                    errors.append(f'pid:{pid}:unobserved_exit')
++                return
++            except (OSError, ValueError, IndexError, CensusUnavailable) as exc:
++                errors.append(f'pid:{pid}:{type(exc).__name__}')
++                return
++            label = 'IncarnationChanged' if identity is not None and current != identity else 'FileNotFoundError'
++            errors.append(f'pid:{pid}:{label}')
++        except (OSError, ValueError, IndexError, CensusUnavailable) as exc:
++            errors.append(f'pid:{pid}:{type(exc).__name__}')
++
++    def collect(self) -> ProcessCensus:
++        started, boot = time.monotonic(), ''
++        processes, exited, errors = [], [], []
++        try:
++            boot = self.boot_id()
++            pids = self.pids()
++            if len(pids) > MAX_PROCESSES:
++                raise CensusUnavailable('process_budget')
++            retained = 0
++            for pid in pids:
++                before = len(processes)
++                self._observe(pid, boot, processes, exited, errors)
++                if len(processes) > before:
++                    retained += processes[-1].retained_bytes
++                if retained > MAX_OBSERVATION_BYTES:
++                    processes.pop()
++                    raise CensusUnavailable('retained_byte_budget')
++            if self.pids() != pids:
++                errors.append('census:membership_changed')
++            for record in processes:
++                try:
++                    if self.read_process(record.identity.pid, boot) != record:
++                        errors.append(f'pid:{record.identity.pid}:final_identity_changed')
++                except (OSError, ValueError, IndexError, CensusUnavailable) as exc:
++                    errors.append(f'pid:{record.identity.pid}:final:{type(exc).__name__}')
++            if self.boot_id() != boot:
++                errors.append('census:boot_changed')
++        except CensusUnavailable as exc:
++            errors.append(f'census:{exc}')
++        except (OSError, ValueError, IndexError) as exc:
++            errors.append(f'census:{type(exc).__name__}')
++        return ProcessCensus(boot, started, time.monotonic(), tuple(processes), tuple(exited), tuple(errors))
++
++
++def _positive_number(value) -> bool:
++    return type(value) in (int, float) and math.isfinite(value) and value > 0
++
++
++def _valid_row(row) -> bool:
++    if not isinstance(row, dict) or len(row) > 32 or any(
++            not isinstance(key, str) or type(value) not in (str, int, float, bool, type(None))
++            for key, value in row.items()):
++        return False
++    required = {'pid', 'create_time', 'purpose', 'install', 'spawner_pid',
++                'spawner_create', 'registered_at', 'argv'}
++    if not required <= row.keys() or type(row['pid']) is not int or row['pid'] <= 0:
++        return False
++    if not all(isinstance(row[key], str) and row[key] for key in ('purpose', 'install', 'argv')):
++        return False
++    if not all(_positive_number(row[key]) for key in ('create_time', 'registered_at')):
++        return False
++    for key in ('boot_start', 'spawner_boot'):
++        if row.get(key) is not None and not _positive_number(row[key]):
++            return False
++    if any(key in row and not isinstance(row[key], str) for key in ('host', 'profile', 'hermes_home')):
++        return False
++    if row.get('boot_id') is not None and not isinstance(row['boot_id'], str):
++        return False
++    if 'isolated' in row and type(row['isolated']) is not bool:
++        return False
++    if row.get('port') is not None and (type(row['port']) is not int or not 0 < row['port'] < 65536):
++        return False
++    parent, birth = row['spawner_pid'], row['spawner_create']
++    return ((parent is None and birth is None)
++            or (type(parent) is int and parent > 0 and _positive_number(birth)))
++
++
++def read_ledger_strict(path: Path) -> tuple[dict, ...]:
++    """Read raw legacy ledger AND pending rows without quarantine/skip/repair.
++
++    A missing ledger or malformed row is INCOMPLETE. An explicitly encoded [] is
++    readable evidence only, never proof that no unregistered process exists.
++    """
++    try:
++        first_raw = _read_bytes(path, _MAX_LEDGER)
++        rows = json.loads(first_raw.decode('utf-8-sig'))
++        if not isinstance(rows, list) or len(rows) > MAX_PROCESSES or not all(_valid_row(row) for row in rows):
++            raise CensusUnavailable('invalid ledger schema')
++        pending = path.with_name(path.name + '.pending')
++        try:
++            names = _bounded_names(pending, MAX_PROCESSES)
++        except FileNotFoundError:
++            names = ()
++        total = len(first_raw)
++        pending_bytes = {}
++        for name in names:
++            candidate = pending / name
++            if candidate.suffix != '.json' or candidate.is_symlink():
++                raise CensusUnavailable('unknown pending ledger entry')
++            raw = _read_bytes(candidate, _MAX_LEDGER - total)
++            total += len(raw)
++            pending_bytes[name] = raw
++            row = json.loads(raw.decode('utf-8-sig'))
++            if not _valid_row(row):
++                raise CensusUnavailable('invalid pending ledger schema')
++            rows.append(row)
++        # Folding moves rows from pending into main. Validate BOTH sources after
++        # the cut; checking only pending names misses a continuously present row.
++        if _read_bytes(path, _MAX_LEDGER) != first_raw:
++            raise CensusUnavailable('main ledger changed')
++        if pending.exists() and _bounded_names(pending, MAX_PROCESSES) != names:
++            raise CensusUnavailable('pending ledger changed')
++        for name, raw in pending_bytes.items():
++            if _read_bytes(pending / name, len(raw)) != raw:
++                raise CensusUnavailable('pending ledger content changed')
++        return tuple(rows)
++    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
++        raise CensusUnavailable(f'ledger:{type(exc).__name__}') from exc
+diff --git a/hermes_cli/serve_producer_custody.py b/hermes_cli/serve_producer_custody.py
+index 64ec5f8d316..7e518acfdd9 100644
+--- a/hermes_cli/serve_producer_custody.py
++++ b/hermes_cli/serve_producer_custody.py
+@@ -32,21 +32,7 @@
+         """Nonblocking acquisition; caller deliberately pass_fds=(owner.fd,)."""
+         if family not in _FAMILIES:
+             raise ValueError('unknown producer family')
+-        try:
+-            import fcntl
+-        except ImportError as exc:
+-            raise CustodyUnsafe('no strict custody adapter for this platform') from exc
+-        runtime = Path(runtime)
+-        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+-        try:
+-            directory = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+-        except OSError as exc:
+-            raise CustodyUnsafe('private directory required') from exc
+-        try:
+-            _private(os.fstat(directory), directory=True)
+-            return cls(_acquire_file(directory, family, fcntl))
+-        finally:
+-            os.close(directory)
++        return cls(_acquire_runtime(runtime, family))
+ 
+     def close(self) -> None:
+         """Close only this process's descriptor, preserving inherited custody."""
+@@ -55,6 +41,25 @@
+             os.close(fd)
+ 
+ 
++def _acquire_runtime(runtime: Path, name: str) -> int:
++    """Shared stable-file mechanics for family fences and the admission gate."""
++    try:
++        import fcntl
++    except ImportError as exc:
++        raise CustodyUnsafe('no strict custody adapter for this platform') from exc
++    runtime = Path(runtime)
++    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
++    try:
++        directory = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    except OSError as exc:
++        raise CustodyUnsafe('private directory required') from exc
++    try:
++        _private(os.fstat(directory), directory=True)
++        return _acquire_file(directory, name, fcntl)
++    finally:
++        os.close(directory)
++
++
+ def _private(info: os.stat_result, *, directory: bool) -> None:
+     expected = 0o700 if directory else 0o600
+     kind_ok = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+diff --git a/tests/hermes_cli/test_serve_producer_admission.py b/tests/hermes_cli/test_serve_producer_admission.py
+new file mode 100644
+index 00000000000..ae653d0489d
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_admission.py
+@@ -0,0 +1,111 @@
++"""Admission cuts are usable only under the same held launch-gate acquisition."""
++from dataclasses import replace
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++from hermes_cli.serve_producer_census import Incarnation, ProcessCensus, ProcessObservation
++from hermes_cli.serve_producer_custody import CustodyConflict
++
++
++def _processes():
++    identity = Incarnation('boot', 123, 42)
++    process = ProcessObservation(identity, '/python', '/core', ('python',), ())
++    return ProcessCensus('boot', 10, 11, (process,), (), ())
++
++
++def _collectors():
++    return {name: lambda: admission.CollectorEvidence(('positive-receipt',), ())
++            for name in admission.REQUIRED_COLLECTORS}
++
++
++def _classified(record):
++    return admission.Classification(record.identity, 'participant', 'verified-launch-receipt')
++
++
++def _cut(gate, **kwargs):
++    return gate.inspect(boot_id='boot', generation='generation', installation='/installation',
++                        census=kwargs.get('census', _processes),
++                        collectors=kwargs.get('collectors', _collectors()),
++                        classify=kwargs.get('classify', _classified),
++                        legacy_candidates=kwargs.get('legacy_candidates', ()),
++                        exited=kwargs.get('exited', lambda identity: False))
++
++
++@pytest.mark.platforms('posix')
++def test_positive_cut_works_only_while_exact_gate_is_held(tmp_path):
++    gate = admission.LaunchGate.acquire(tmp_path / 'runtime')
++    cut = _cut(gate)
++    gate.require(cut, boot_id='boot', generation='generation', installation='/installation')
++    with pytest.raises(CustodyConflict):
++        admission.LaunchGate.acquire(tmp_path / 'runtime')
++    gate.close()
++    with pytest.raises(admission.AdmissionUnavailable, match='held'):
++        gate.require(cut, boot_id='boot', generation='generation', installation='/installation')
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as successor:
++        with pytest.raises(admission.AdmissionUnavailable, match='acquisition'):
++            successor.require(cut, boot_id='boot', generation='generation', installation='/installation')
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('key,value', [('boot_id', 'new-boot'), ('generation', 'new-generation'),
++                                       ('installation', '/different')])
++def test_boot_installation_or_launcher_generation_change_invalidates_cut(tmp_path, key, value):
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++        cut = _cut(gate)
++        expected = dict(boot_id='boot', generation='generation', installation='/installation')
++        expected[key] = value
++        with pytest.raises(admission.AdmissionUnavailable, match='identity'):
++            gate.require(cut, **expected)
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('failure', ['missing', 'exception', 'no_proof', 'conflict'])
++def test_every_required_collector_must_prove_success(tmp_path, failure):
++    collectors = _collectors()
++    key = next(iter(collectors))
++    if failure == 'missing':
++        del collectors[key]
++    elif failure == 'exception':
++        def denied():
++            raise PermissionError('not absence')
++        collectors[key] = denied
++    elif failure == 'no_proof':
++        collectors[key] = lambda: admission.CollectorEvidence((), ())
++    else:
++        collectors[key] = lambda: admission.CollectorEvidence(('receipt',), ('unknown socket owner',))
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++        cut = _cut(gate, collectors=collectors)
++        assert not cut.complete
++        assert any(key in error for error in cut.errors)
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('kind', ['legacy', 'unknown'])
++def test_unknown_python_and_legacy_snapshots_never_admit(tmp_path, kind):
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++        cut = _cut(gate, classify=lambda record: admission.Classification(record.identity, kind, '/snapshot'))
++        assert not cut.complete
++        with pytest.raises(admission.AdmissionUnavailable, match='incomplete'):
++            gate.require(cut, boot_id='boot', generation='generation', installation='/installation')
++
++
++@pytest.mark.platforms('posix')
++def test_legacy_spawner_must_be_affirmatively_retired_not_missing_from_census(tmp_path):
++    legacy = Incarnation('boot', 456, 7)
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++        assert not _cut(gate, legacy_candidates=(legacy,)).complete
++        assert _cut(gate, legacy_candidates=(legacy,), exited=lambda value: value == legacy).complete
++        def denied(identity):
++            raise PermissionError('not exit')
++        assert not _cut(gate, legacy_candidates=(legacy,), exited=denied).complete
++
++
++@pytest.mark.platforms('posix')
++def test_empty_best_effort_and_stale_census_are_not_positive_proof(tmp_path):
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++        cut = _cut(gate, census=lambda: replace(_processes(), errors=('ledger:missing',)))
++        assert not cut.complete
++        assert not _cut(gate, census=lambda: replace(_processes(), boot_id='old-boot')).complete
++        assert not _cut(gate, classify=lambda record: admission.Classification(
++            replace(record.identity, start_ticks=41), 'participant', 'wrong-incarnation')).complete
+diff --git a/tests/hermes_cli/test_serve_producer_census.py b/tests/hermes_cli/test_serve_producer_census.py
+new file mode 100644
+index 00000000000..206fca5942f
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_census.py
+@@ -0,0 +1,305 @@
++"""Strict read-only census never interprets missing observations as retirement."""
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_producer_census as census
++
++
++def _proc(root, pid=123, birth=42, *, uid=None):
++    directory = root / str(pid)
++    directory.mkdir()
++    fields = ['S'] + ['0'] * 18 + [str(birth)] + ['0'] * 4
++    (directory / 'stat').write_text(f'{pid} (name with ) paren) ' + ' '.join(fields))
++    (directory / 'status').write_text(f'Uid:\t{os.getuid() if uid is None else uid}\t0\t0\t0\n')
++    (directory / 'cmdline').write_bytes(b'python\0-m\0hermes_cli.main\0serve\0')
++    (directory / 'environ').write_bytes(b'HERMES_HOME=/example/home\0SECRET_MUST_NOT_ESCAPE=secret\0')
++    (directory / 'exe').symlink_to('/example/python')
++    (directory / 'cwd').symlink_to('/example/core')
++    return directory
++
++
++def _reader(tmp_path):
++    (tmp_path / 'sys/kernel/random').mkdir(parents=True)
++    (tmp_path / 'sys/kernel/random/boot_id').write_text('test-boot\n')
++    return census.LinuxProcessCensus(tmp_path)
++
++
++@pytest.mark.platforms('linux')
++def test_reads_exact_incarnation_and_only_identity_environment(tmp_path):
++    reader = _reader(tmp_path)
++    _proc(tmp_path)
++    result = reader.collect()
++    assert result.complete
++    assert result.errors == ()
++    (record,) = result.processes
++    assert record.identity == census.Incarnation('test-boot', 123, 42)
++    assert record.argv == ('python', '-m', 'hermes_cli.main', 'serve')
++    assert dict(record.environment) == {'HERMES_HOME': '/example/home'}
++    assert record.exe == '/example/python'
++    assert record.cwd == '/example/core'
++
++
++@pytest.mark.platforms('linux')
++def test_permission_denial_is_incomplete_not_disappearance(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    directory = _proc(tmp_path)
++    original = census._read_bytes
++
++    def denied(path, limit):
++        if path == directory / 'environ':
++            raise PermissionError('denied')
++        return original(path, limit)
++
++    monkeypatch.setattr(census, '_read_bytes', denied)
++    result = reader.collect()
++    assert not result.complete
++    assert result.processes == ()
++    assert result.exited == ()
++    assert result.errors == ('pid:123:PermissionError',)
++
++
++@pytest.mark.platforms('linux')
++def test_pid_reuse_does_not_certify_old_or_new_process(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    directory = _proc(tmp_path)
++    original = reader.identity
++    calls = 0
++
++    def reused(pid, boot):
++        nonlocal calls
++        calls += 1
++        value = original(pid, boot)
++        return census.Incarnation(boot, pid, 43) if calls > 1 else value
++
++    monkeypatch.setattr(reader, 'identity', reused)
++    result = reader.collect()
++    assert not result.complete
++    assert result.errors == ('pid:123:IncarnationChanged',)
++    assert result.processes == ()
++    assert directory.exists()
++
++
++@pytest.mark.platforms('linux')
++def test_missing_file_in_live_process_is_not_exit(tmp_path):
++    reader = _reader(tmp_path)
++    directory = _proc(tmp_path)
++    (directory / 'cmdline').unlink()
++    result = reader.collect()
++    assert not result.complete
++    assert result.errors == ('pid:123:FileNotFoundError',)
++    assert result.exited == ()
++
++
++@pytest.mark.platforms('linux')
++def test_rechecked_exit_is_explicit_not_a_silent_skip(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    _proc(tmp_path)
++    original = reader.identity
++    calls = 0
++
++    def exited(pid, boot):
++        nonlocal calls
++        calls += 1
++        if calls > 1:
++            raise FileNotFoundError('gone')
++        return original(pid, boot)
++
++    monkeypatch.setattr(reader, 'identity', exited)
++    result = reader.collect()
++    assert result.complete
++    assert result.exited == (census.Incarnation('test-boot', 123, 42),)
++    assert result.processes == ()
++
++
++@pytest.mark.platforms('linux')
++def test_process_appearing_during_enumeration_makes_cut_incomplete(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    _proc(tmp_path)
++    original = reader.pids
++    calls = 0
++
++    def pids():
++        nonlocal calls
++        calls += 1
++        return original() if calls == 1 else (123, 456)
++
++    monkeypatch.setattr(reader, 'pids', pids)
++    result = reader.collect()
++    assert not result.complete
++    assert 'census:membership_changed' in result.errors
++
++
++@pytest.mark.platforms('linux')
++def test_raw_identity_read_has_no_producer_imports_on_real_self():
++    reader = census.LinuxProcessCensus(Path('/proc'))
++    record = reader.read_process(os.getpid(), reader.boot_id())
++    assert record.identity.pid == os.getpid()
++    assert record.identity.start_ticks > 0
++    assert record.exe
++    assert record.argv
++
++
++@pytest.mark.parametrize('contents', [b'', b'{}', b'null', b'[null]', b'[{"pid":1}]', b'not-json'])
++def test_invalid_ledger_cannot_be_complete(tmp_path, contents):
++    path = tmp_path / 'spawn-ledger.json'
++    path.write_bytes(contents)
++    with pytest.raises(census.CensusUnavailable):
++        census.read_ledger_strict(path)
++    assert path.read_bytes() == contents  # no quarantine, repair or writes
++
++
++def test_missing_ledger_is_not_empty_success(tmp_path):
++    with pytest.raises(census.CensusUnavailable, match='ledger'):
++        census.read_ledger_strict(tmp_path / 'missing')
++
++
++def test_pending_rows_are_strict_and_not_silently_filtered(tmp_path):
++    path = tmp_path / 'spawn-ledger.json'
++    row = {'pid': 123, 'create_time': 1.0, 'purpose': 'serve', 'install': 'install',
++           'spawner_pid': None, 'spawner_create': None, 'registered_at': 2.0, 'argv': 'python'}
++    path.write_text(json.dumps([row]))
++    pending = path.with_name(path.name + '.pending')
++    pending.mkdir()
++    (pending / 'one.json').write_text(json.dumps(row | {'pid': 456}))
++    assert [entry['pid'] for entry in census.read_ledger_strict(path)] == [123, 456]
++    (pending / 'bad.json').write_text('null')
++    with pytest.raises(census.CensusUnavailable):
++        census.read_ledger_strict(path)
++
++
++@pytest.mark.platforms('linux')
++def test_census_budget_and_boot_change_fail_closed(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    _proc(tmp_path)
++    monkeypatch.setattr(census, 'MAX_PROCESSES', 0)
++    assert reader.collect().errors == ('census:process_budget',)
++    monkeypatch.setattr(census, 'MAX_PROCESSES', 8192)
++    boots = iter(['test-boot', 'changed-boot'])
++    monkeypatch.setattr(reader, 'boot_id', lambda: next(boots))
++    result = reader.collect()
++    assert not result.complete
++    assert 'census:boot_changed' in result.errors
++
++
++@pytest.mark.platforms('linux')
++def test_exec_details_mutation_with_unchanged_birth_is_incomplete(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    directory = _proc(tmp_path)
++    original = reader._details
++    changed = False
++
++    def exec_after_details(pid):
++        nonlocal changed
++        result = original(pid)
++        if not changed:
++            changed = True
++            (directory / 'exe').unlink()
++            (directory / 'exe').symlink_to('/different/runtime')
++        return result
++
++    monkeypatch.setattr(reader, '_details', exec_after_details)
++    result = reader.collect()
++    assert not result.complete
++    assert result.errors == ('pid:123:IncarnationChanged',)
++
++
++@pytest.mark.platforms('linux')
++def test_reuse_after_observation_is_not_hidden_by_equal_pid_lists(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    _proc(tmp_path)
++    original = reader.pids
++    calls = 0
++
++    def reused():
++        nonlocal calls
++        calls += 1
++        if calls == 2:
++            path = tmp_path / '123/stat'
++            path.write_text(path.read_text().replace(' 42 ', ' 43 '))
++        return original()
++
++    monkeypatch.setattr(reader, 'pids', reused)
++    result = reader.collect()
++    assert not result.complete
++    assert result.errors == ('pid:123:final_identity_changed',)
++
++
++def test_pending_to_main_fold_cannot_disappear_from_read(tmp_path, monkeypatch):
++    path = tmp_path / 'spawn-ledger.json'
++    path.write_text('[]')
++    pending = path.with_name(path.name + '.pending')
++    pending.mkdir()
++    row = {'pid': 123, 'create_time': 1.0, 'purpose': 'serve', 'install': 'install',
++           'spawner_pid': None, 'spawner_create': None, 'registered_at': 2.0, 'argv': 'python'}
++    queued = pending / 'one.json'
++    queued.write_text(json.dumps(row))
++    original = census._read_bytes
++    changed = False
++
++    def folded(candidate, limit):
++        nonlocal changed
++        result = original(candidate, limit)
++        if candidate == path and not changed:
++            changed = True
++            path.write_text(json.dumps([row]))
++            queued.unlink()
++        return result
++
++    monkeypatch.setattr(census, '_read_bytes', folded)
++    with pytest.raises(census.CensusUnavailable, match='main ledger changed'):
++        census.read_ledger_strict(path)
++
++
++@pytest.mark.platforms('linux')
++def test_argument_object_memory_and_separator_count_are_bounded(tmp_path, monkeypatch):
++    reader = _reader(tmp_path)
++    directory = _proc(tmp_path)
++    (directory / 'cmdline').write_bytes(b'a\0' * 4000)
++    monkeypatch.setattr(census, 'MAX_OBSERVATION_BYTES', 20000)
++    assert 'census:retained_byte_budget' in reader.collect().errors
++    (directory / 'cmdline').write_bytes(b'\0' * 4097)
++    assert not reader.collect().complete
++
++
++def test_directory_enumeration_stops_before_materializing_oversized_input(tmp_path, monkeypatch):
++    from types import SimpleNamespace
++    visited = []
++
++    class Entries:
++        def __enter__(self):
++            return self
++        def __exit__(self, *_exc):
++            return False
++        def __iter__(self):
++            for value in range(100):
++                visited.append(value)
++                yield SimpleNamespace(name=str(value))
++
++    monkeypatch.setattr(census.os, 'scandir', lambda path: Entries())
++    with pytest.raises(census.CensusUnavailable, match='process_budget'):
++        census._bounded_names(tmp_path, 2, numeric=True)
++    assert visited == [0, 1, 2]
++
++
++@pytest.mark.parametrize('changed', [
++    {'pid': True}, {'create_time': None}, {'registered_at': float('nan')},
++    {'boot_start': -1}, {'spawner_boot': True}, {'boot_id': 123},
++    {'isolated': 'false'}, {'port': 65536}, {'profile': None},
++    {'spawner_pid': 456, 'spawner_create': None}, {'unexpected': {'nested': 'value'}},
++])
++def test_malformed_optional_ledger_identity_is_not_ignored(tmp_path, changed):
++    path = tmp_path / 'spawn-ledger.json'
++    row = {'pid': 123, 'create_time': 1.0, 'purpose': 'serve', 'install': 'install',
++           'spawner_pid': None, 'spawner_create': None, 'registered_at': 2.0, 'argv': 'python'}
++    path.write_text(json.dumps([row | changed]))
++    with pytest.raises(census.CensusUnavailable):
++        census.read_ledger_strict(path)
++
++
++def test_explicit_empty_ledger_is_readable_not_an_admission_receipt(tmp_path):
++    path = tmp_path / 'spawn-ledger.json'
++    path.write_text('[]')
++    assert census.read_ledger_strict(path) == ()
+-- 
+2.43.0
+

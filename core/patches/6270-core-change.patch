@@ -1,0 +1,248 @@
+From 5ca5e64b72c3294ef991dff3a616668123a0b84f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:59:37 +0000
+Subject: [PATCH 6270] Reviewed import ordering and generated-code producer custody
+
+Public mirror of source commit 5ca5e64b72c3294ef991dff3a616668123a0b84f.
+
+---
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index 71c9a6b76be..15588794578 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -604,6 +604,7 @@
+         self._dep_units = {}  # executed/loaded receipts only, never audited units
+         self._native_loads = []
+         self._unknown_detail = {}
++        self._unknown_sources = {}  # diagnostic producer receipts, never generated-code trust
+         self.interpreter_identity = {
+             "executable": str(Path(sys.executable).resolve()),
+             "version": sys.version, "cache_tag": sys.implementation.cache_tag,
+@@ -1204,6 +1205,7 @@
+                 # Diagnosis only (which code produced it); the unknown stays latched.
+                 self._unknown_detail.setdefault("unrooted-exec:" + filename, set()).add(
+                     f"{producer.f_code.co_filename}:{producer.f_code.co_qualname}")
++                self._unknown_producer_source("unrooted-exec:" + filename, producer.f_code)
+             return
+         if not self._dep_ready():
+             return
+@@ -1290,6 +1292,27 @@
+         if len(self._native_loads) < MAX_DEP_REPORT:
+             self._native_loads.append({"name": name, "caller_component": caller})
+ 
++    def _unknown_producer_source(self, reason, code):
++        """Bind diagnostic attribution to observed source, not a synthetic filename.
++
++        An installer receipt for the producer does not attest its output. Keep
++        every unknown and the closed generator table unchanged.
++        """
++        known = self._known.get(id(code))
++        if known is None or known[0] is not code:
++            return
++        source = self._dep_units.get((code.co_filename, "source", None))
++        if source is None or source["component"] != known[1]:
++            return
++        if len(self._unknown_sources) >= MAX_DEP_REPORT and reason not in self._unknown_sources:
++            return
++        receipts = self._unknown_sources.setdefault(reason, [])
++        receipt = {"filename": code.co_filename, "qualname": code.co_qualname,
++                   "component": source["component"], "source_sha256": source["sha256"],
++                   "trust": "producer source only; generated code remains unknown"}
++        if receipt not in receipts and len(receipts) < 8:
++            receipts.append(receipt)
++
+     def dependency_receipts(self):
+         """Receipts actually used: trusted by installer receipt, not audited, no coverage."""
+         with self._lock:
+@@ -1299,6 +1322,8 @@
+                     "units": [dict(u) for u in self._dep_units.values()],
+                     "native_loads": [dict(n) for n in self._native_loads],
+                     "unknown_producers": {k: sorted(v) for k, v in self._unknown_detail.items()},
++                    "unknown_producer_sources": {k: [dict(r) for r in v]
++                                                 for k, v in self._unknown_sources.items()},
+                     "generated_trust": {"annotationlib.ForwardRef.evaluate": FORWARDREF_TRUST},
+                     "residual_risks": [
+                         "RECORD itself is not receipted",
+diff --git a/tests/hermes_cli/test_code_attestation_loader_order.py b/tests/hermes_cli/test_code_attestation_loader_order.py
+new file mode 100644
+index 00000000000..f974b38f191
+--- /dev/null
++++ b/tests/hermes_cli/test_code_attestation_loader_order.py
+@@ -0,0 +1,45 @@
++"""Import the real plugin loader only after the supported bootstrap boundary."""
++import json
++import os
++import subprocess
++import sys
++
++from tests.hermes_cli import test_code_attestation_route as helpers
++
++core = helpers.core
++python = helpers.python
++pytestmark = helpers.pytestmark
++
++
++def test_supported_bootstrap_observes_loader_imports(tmp_path, core, python):
++    probe = core / 'attest_probe.py'
++    probe.write_text('from hermes_cli.plugins_loader import PluginLoaderMixin\n' + probe.read_text())
++    helpers._git(core, 'add', '.')
++    helpers._git(core, 'commit', '-qm', 'observe real loader after bootstrap')
++    result = helpers.run_stub(tmp_path, python, helpers.current_script(core))
++    assert result['report']['route'] == 'managed-stub'
++    assert result['unknowns'] == [], result['unknowns']
++    filenames = {unit['filename'] for unit in result['units']}
++    assert str(core / 'hermes_cli/plugins_loader.py') in filenames
++
++
++def test_late_direct_ledger_still_latches_preexisting_loader(tmp_path):
++    script = tmp_path / 'late.py'
++    script.write_text('''
++import json, subprocess, sys
++sys.path.insert(0, sys.argv[1])
++from hermes_cli.plugins_loader import PluginLoaderMixin
++from hermes_cli.code_attestation import Attestation
++root = sys.argv[1]
++sha = subprocess.check_output(['git', '-C', root, 'rev-parse', 'HEAD'], text=True).strip()
++a = Attestation(root, sha)
++print(json.dumps(list(a.unknowns())))
++''')
++    result = subprocess.run([sys.executable, str(script), str(helpers.ROOT)], cwd=tmp_path,
++        capture_output=True, text=True, timeout=60, check=False,
++        env={'PATH': os.defpath, 'HOME': str(tmp_path), 'TMPDIR': str(tmp_path),
++             'HERMES_HOME': str(tmp_path / 'home')})
++    assert result.returncode == 0, result.stdout + result.stderr
++    reasons = json.loads(result.stdout)
++    assert 'prehook-module:hermes_cli.plugins_loader' in reasons
++    assert 'bootstrap-provenance-pending' in reasons
+diff --git a/tests/hermes_cli/test_code_attestation_producer_sources.py b/tests/hermes_cli/test_code_attestation_producer_sources.py
+new file mode 100644
+index 00000000000..ec5ed8879ea
+--- /dev/null
++++ b/tests/hermes_cli/test_code_attestation_producer_sources.py
+@@ -0,0 +1,97 @@
++"""Producer-source attribution is diagnostic, not trust in generated code."""
++import textwrap
++
++import pytest
++
++from tests.hermes_cli import test_code_attestation_producers as helpers
++
++SOURCE = r'''
++SOURCE = b"""
++def build():
++    ns = {}
++    exec(compile('def value(): return 42', '<attrs generated>', 'exec'), ns)
++    return ns['value']
++value = build()
++"""
++'''
++
++
++def test_unknown_generator_retains_refusal_with_verified_source_attribution(tmp_path):
++    data = helpers.run(tmp_path, SOURCE + textwrap.dedent(r'''
++        dist('attrs', {'emitter.py': SOURCE})
++        BASE = set(a.unknowns())
++        activate()
++        import emitter
++        assert emitter.value() == 42
++        receipts = a.dependency_receipts()
++        before = a.generation()
++        receipts['unknown_producer_sources']['unrooted-exec:<attrs generated>'][0]['component'] = 'changed'
++        receipts = a.dependency_receipts()
++        assert a.generation() == before
++        print(json.dumps({'new': new(), 'sources': receipts['unknown_producer_sources'],
++                          'gen': generated(), 'core': a.executed_units(),
++                          'source_sha256': hashlib.sha256(SOURCE).hexdigest()}))
++    '''))
++    reason = 'unrooted-exec:<attrs generated>'
++    assert data['new'] == [reason]
++    assert data['gen'] == [] and data['core'] == []
++    receipt, = data['sources'][reason]
++    assert receipt['component'] == 'dependency:attrs-1.0'
++    assert receipt['source_sha256'] == data['source_sha256']
++    assert receipt['filename'].endswith('/emitter.py')
++    assert receipt['qualname'] == 'build'
++    assert receipt['trust'] == 'producer source only; generated code remains unknown'
++
++
++@pytest.mark.parametrize('case', ['skew', 'filename-spoof', 'unreviewed'])
++def test_unreviewed_producer_does_not_gain_source_receipt(tmp_path, case):
++    data = helpers.run(tmp_path, SOURCE + f'\nCASE={case!r}\n' + textwrap.dedent(r'''
++        dist('attrs', {'emitter.py': SOURCE})
++        if CASE == 'skew':
++            (SITE / 'emitter.py').write_bytes(SOURCE + b'\n# changed\n')
++        BASE = set(a.unknowns())
++        activate()
++        if CASE == 'skew':
++            import emitter
++        else:
++            filename = str(SITE / 'emitter.py') if CASE == 'filename-spoof' else '<unreviewed>'
++            changed = SOURCE.replace(b'return 42', b'return 43')
++            exec(compile(changed, filename, 'exec'), {})
++        print(json.dumps({'new': new(), 'sources': a.dependency_receipts()['unknown_producer_sources'],
++                          'gen': generated()}))
++    '''))
++    assert 'unrooted-exec:<attrs generated>' in data['new']
++    assert data['sources'] == {}
++    assert data['gen'] == []
++
++
++def test_producer_diagnostics_are_bounded_and_require_exact_identity(tmp_path):
++    data = helpers.run(tmp_path, r'''
++        code = (lambda: None).__code__
++        source = {'component': 'dependency:example-1.0', 'sha256': 'digest'}
++        key = (code.co_filename, 'source', None)
++        a._dep_units[key] = source
++        a._known[id(code)] = ((lambda: 1).__code__, source['component'])
++        a._unknown_producer_source('wrong-identity', code)
++        assert a._unknown_sources == {}
++        a._known[id(code)] = (code, 'different-component')
++        a._unknown_producer_source('wrong-component', code)
++        assert a._unknown_sources == {}
++        a._known[id(code)] = (code, source['component'])
++        del a._dep_units[key]
++        a._unknown_producer_source('missing-source', code)
++        assert a._unknown_sources == {}
++        a._dep_units[key] = source
++        ca.MAX_DEP_REPORT = 1
++        a._unknown_producer_source('kept', code)
++        a._unknown_producer_source('kept', code)
++        assert len(a._unknown_sources['kept']) == 1
++        a._unknown_producer_source('overflow', code)
++        assert set(a._unknown_sources) == {'kept'}
++        for n in range(12):
++            item = code.replace(co_qualname='emitter_' + str(n))
++            a._known[id(item)] = (item, source['component'])
++            a._unknown_producer_source('kept', item)
++        print(json.dumps({'count': len(a._unknown_sources['kept'])}))
++    ''')
++    assert data['count'] == 8
+diff --git a/website/docs/developer-guide/plugins/code-attestation.md b/website/docs/developer-guide/plugins/code-attestation.md
+index 39d5628610d..46446884b61 100644
+--- a/website/docs/developer-guide/plugins/code-attestation.md
++++ b/website/docs/developer-guide/plugins/code-attestation.md
+@@ -62,6 +62,21 @@
+ Plugin-controlled search-path additions are not automatically registered. An
+ unrooted dependency or unsupported generated code still withholds the capability.
+ 
++`dependency_receipts().unknown_producer_sources` attributes an unsupported
++execution to its producer's previously observed installer-receipted source, when
++that exact live producer code object is known. Each diagnostic contains the
++producer filename, qualname, component and source SHA256. It does **not** attest
++the generated code, add a generator to the closed producer table, or remove or
++reclassify an unknown. A synthetic filename (including an attrs filename) is not
++evidence of source custody. Unobserved, modified or filename-spoofed producers do
++not acquire these receipts. Reports bound this attribution to 4096 reasons and
++8 source receipts per reason; truncating diagnostics never grants trust.
++
++Install attestation through the supported bootstrap before importing the plugin
++loader. Constructing a diagnostic ledger after importing the loader correctly
++latches `prehook-module` refusals; these cannot be repaired by late registration
++or treated as equivalent to a supported-bootstrap observation.
++
+ Identify uses one in-flight verifier with no cached positive. Its 0.4-second
+ absolute deadline includes thread setup and leaves headroom within a 0.5-second
+ identify budget. Late positives are discarded. Slow storage withdraws v2 rather
+-- 
+2.43.0
+

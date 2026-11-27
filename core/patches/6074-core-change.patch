@@ -1,0 +1,555 @@
+From 4a40a8022c32a63edb75e851fb6c211445fdc573 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:55:11 -0800
+Subject: [PATCH 6074] TUI RPC method lanes, projects tree caching and GC budget
+
+Public mirror of source commit 4a40a8022c32a63edb75e851fb6c211445fdc573.
+
+---
+diff --git a/tests/tui_gateway/test_coalesced_build.py b/tests/tui_gateway/test_coalesced_build.py
+new file mode 100644
+index 00000000000..65d237b81b9
+--- /dev/null
++++ b/tests/tui_gateway/test_coalesced_build.py
+@@ -0,0 +1,111 @@
++"""Overlapping identical builds share one that began after each caller asked. [daveey]"""
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from tui_gateway.coalesced_build import Coalescer
++
++
++def test_single_caller_runs_its_own_build_and_leaves_nothing_behind():
++    c = Coalescer()
++    assert c.run("k", lambda: 7) == 7
++    assert c.run("k", lambda: 8) == 8  # not a cache: a later call builds again
++    assert c._states == {}
++
++
++def test_callers_arriving_during_a_build_share_the_next_one_not_the_running_one():
++    c = Coalescer()
++    first_started, release_first = threading.Event(), threading.Event()
++    builds, results, lock = [], {}, threading.Lock()
++
++    def build():
++        with lock:
++            builds.append(len(builds) + 1)
++            n = builds[-1]
++        if n == 1:
++            first_started.set()
++            assert release_first.wait(10)
++        return n
++
++    def call(name):
++        results[name] = c.run("k", build)
++
++    leader = threading.Thread(target=call, args=("leader",))
++    leader.start()
++    assert first_started.wait(10)
++    followers = [threading.Thread(target=call, args=(f"f{i}",)) for i in range(6)]
++    for t in followers:
++        t.start()
++    for _ in range(200):  # every follower is parked behind the running build
++        with c._cond:
++            if c._states["k"].waiters == 7:
++                break
++        threading.Event().wait(0.01)
++    else:
++        pytest.fail("followers never queued")
++    release_first.set()
++    for t in (leader, *followers):
++        t.join(10)
++        assert not t.is_alive()
++    assert results["leader"] == 1
++    assert {results[f"f{i}"] for i in range(6)} == {2}  # one shared build, begun after they asked
++    assert builds == [1, 2]
++    assert c._states == {}
++
++
++def test_keys_do_not_wait_on_each_other():
++    c = Coalescer()
++    gate, started = threading.Event(), threading.Event()
++    out = {}
++
++    def slow():
++        started.set()
++        assert gate.wait(10)
++        return "a"
++
++    t = threading.Thread(target=lambda: out.setdefault("a", c.run("a", slow)))
++    t.start()
++    assert started.wait(10)
++    assert c.run("b", lambda: "b") == "b"  # returned while "a" is still building
++    gate.set()
++    t.join(10)
++    assert out == {"a": "a"}
++
++
++def test_failed_build_reaches_only_its_caller_and_waiters_build_for_themselves():
++    c = Coalescer()
++    started, release = threading.Event(), threading.Event()
++    calls, results, errors = [], {}, {}
++
++    def build():
++        calls.append(1)
++        if len(calls) == 1:
++            started.set()
++            assert release.wait(10)
++            raise RuntimeError("store unavailable")
++        return "ok"
++
++    def call(name):
++        try:
++            results[name] = c.run("k", build)
++        except RuntimeError as exc:
++            errors[name] = str(exc)
++
++    leader = threading.Thread(target=call, args=("leader",))
++    leader.start()
++    assert started.wait(10)
++    follower = threading.Thread(target=call, args=("follower",))
++    follower.start()
++    for _ in range(200):
++        with c._cond:
++            if c._states["k"].waiters == 2:
++                break
++        threading.Event().wait(0.01)
++    release.set()
++    leader.join(10)
++    follower.join(10)
++    assert errors == {"leader": "store unavailable"}
++    assert results == {"follower": "ok"}
++    assert c._states == {}
+diff --git a/tests/tui_gateway/test_git_probe_warm_settled.py b/tests/tui_gateway/test_git_probe_warm_settled.py
+new file mode 100644
+index 00000000000..9509da6642f
+--- /dev/null
++++ b/tests/tui_gateway/test_git_probe_warm_settled.py
+@@ -0,0 +1,96 @@
++"""warm_roots only fans out cwds whose roots are not already cached. [daveey]"""
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from tui_gateway import git_probe
++
++
++@pytest.fixture
++def probes(monkeypatch):
++    git_probe.invalidate()
++    calls = []
++    repos = {}
++
++    def run_git(cwd, *args):
++        calls.append((cwd, args))
++        root = repos.get(cwd, "")
++        if not root:
++            return ""
++        return root if "--show-toplevel" in args else os.path.join(root, ".git")
++
++    monkeypatch.setattr(git_probe, "run_git", run_git)
++    pools = []
++    real = git_probe.ThreadPoolExecutor
++
++    class Pool(real):
++        def __init__(self, *a, **k):
++            pools.append(k.get("max_workers") or (a[0] if a else None))
++            super().__init__(*a, **k)
++
++    monkeypatch.setattr(git_probe, "ThreadPoolExecutor", Pool)
++    yield calls, repos, pools
++    git_probe.invalidate()
++
++
++def test_second_warm_of_the_same_cwds_spawns_no_pool_and_no_git(probes, tmp_path):
++    calls, repos, pools = probes
++    repo, plain, other = (tmp_path / n for n in ("repo", "plain", "other"))
++    for d in (repo, plain, other):
++        d.mkdir()
++    repos[str(repo)] = str(repo)
++    cwds = [str(repo), str(plain), str(other)]
++    git_probe.warm_roots(cwds)
++    assert pools == [3] and calls
++    assert git_probe.resolve(str(repo)) == {"repo_root": str(repo), "worktree_root": str(repo)}
++    assert git_probe.resolve(str(plain)) is None
++    calls.clear()
++    pools.clear()
++    git_probe.warm_roots(cwds)
++    assert pools == [] and calls == []
++
++
++def test_only_the_new_cwd_is_probed(probes, tmp_path):
++    calls, repos, pools = probes
++    old, new = tmp_path / "old", tmp_path / "new"
++    old.mkdir()
++    new.mkdir()
++    git_probe.warm_roots([str(old)])
++    calls.clear()
++    pools.clear()
++    git_probe.warm_roots([str(old), str(new)])
++    assert pools == []  # one pending cwd resolves inline
++    assert {cwd for cwd, _ in calls} == {str(new)}
++
++
++def test_negative_is_reprobed_when_the_dir_changes_or_the_ttl_ends(probes, tmp_path, monkeypatch):
++    calls, repos, pools = probes
++    a, b = tmp_path / "a", tmp_path / "b"
++    a.mkdir()
++    b.mkdir()
++    git_probe.warm_roots([str(a), str(b)])
++    calls.clear()
++    (a / ".git").mkdir()  # `git init`: the dir's own mtime moves
++    os.utime(a, ns=(1, 1))
++    repos[str(a)] = str(a)
++    git_probe.warm_roots([str(a), str(b)])
++    assert {cwd for cwd, _ in calls} == {str(a)}
++    assert git_probe.repo_root(str(a)) == str(a)
++    calls.clear()
++    now = git_probe.time.monotonic()
++    monkeypatch.setattr(git_probe.time, "monotonic", lambda: now + git_probe._NEG_TTL + 1)
++    git_probe.warm_roots([str(a), str(b)])
++    assert {cwd for cwd, _ in calls} == {str(b)}  # the positive stays, the expired negative is asked again
++
++
++def test_repo_with_unresolved_common_root_is_still_warmed(probes, tmp_path):
++    calls, repos, pools = probes
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    repos[str(repo)] = str(repo)
++    assert git_probe.repo_root(str(repo)) == str(repo)  # toplevel cached, common root not yet
++    calls.clear()
++    git_probe.warm_roots([str(repo)])
++    assert any("--git-common-dir" in args for _, args in calls)
+diff --git a/tests/tui_gateway/test_non_workspace_policy_cache.py b/tests/tui_gateway/test_non_workspace_policy_cache.py
+new file mode 100644
+index 00000000000..173d0c0e897
+--- /dev/null
++++ b/tests/tui_gateway/test_non_workspace_policy_cache.py
+@@ -0,0 +1,86 @@
++"""The never-a-workspace roots are resolved once per input set, not once per path. [daveey]"""
++from __future__ import annotations
++
++import tempfile
++
++import pytest
++
++from tui_gateway import server
++
++
++@pytest.fixture
++def homes(tmp_path, monkeypatch):
++    import hermes_constants
++
++    home = tmp_path / "user"
++    internal = home / ".hermes"
++    temp = tmp_path / "system-temp"
++    for path in (internal, temp):
++        path.mkdir(parents=True)
++    monkeypatch.setenv("TMPDIR", str(temp))
++    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: internal)
++    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: internal)
++    monkeypatch.setattr(server, "_non_workspace_memo", None)
++    return home, internal, temp
++
++
++def test_many_paths_resolve_the_roots_once(homes, monkeypatch):
++    home, internal, temp = homes
++    builds = []
++    real = server._non_workspace_dirs
++    monkeypatch.setattr(server, "_non_workspace_dirs", lambda: builds.append(1) or real())
++    paths = [str(home / f"repo-{i}") for i in range(200)]
++    assert not any(server._is_non_workspace_path(p) for p in paths)
++    assert server._is_non_workspace_path(str(internal / "cache"))
++    assert server._is_non_workspace_path(str(temp / "x"))
++    assert server._is_non_workspace_path("/")
++    assert server._is_non_workspace_path("")
++    assert builds == [1]  # was once per asked path, with ~20 root resolutions each
++
++
++def test_new_profile_home_is_seen_at_once(homes):
++    home, internal, _ = homes
++    outside = home / "profile-storage"
++    outside.mkdir()
++    assert not server._is_non_workspace_path(str(outside / "cache"))
++    profiles = internal / "profiles"
++    profiles.mkdir()
++    assert not server._is_non_workspace_path(str(outside / "cache"))
++    (profiles / "linked").symlink_to(outside, target_is_directory=True)
++    assert server._is_non_workspace_path(str(outside / "cache"))
++
++
++def test_changed_home_or_temp_root_is_seen_at_once(homes, monkeypatch, tmp_path):
++    import hermes_constants
++
++    home, internal, _ = homes
++    other = tmp_path / "other-home"
++    other.mkdir()
++    assert not server._is_non_workspace_path(str(other / "x"))
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: other)
++    assert server._is_non_workspace_path(str(other / "x"))
++    env_temp = tmp_path / "env-temp"
++    env_temp.mkdir()
++    assert not server._is_non_workspace_path(str(env_temp / "y"))
++    monkeypatch.setenv("TMPDIR", str(env_temp))
++    assert server._is_non_workspace_path(str(env_temp / "y"))
++
++
++def test_relinked_root_is_seen_after_the_ttl(homes, monkeypatch, tmp_path):
++    import hermes_constants
++
++    home, internal, _ = homes
++    first, second = tmp_path / "store-1", tmp_path / "store-2"
++    first.mkdir()
++    second.mkdir()
++    link = tmp_path / "hermes-link"
++    link.symlink_to(first, target_is_directory=True)
++    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: link)
++    assert server._is_non_workspace_path(str(first / "x"))
++    link.unlink()
++    link.symlink_to(second, target_is_directory=True)
++    now = server.time.monotonic()
++    monkeypatch.setattr(server.time, "monotonic", lambda: now + server._NON_WORKSPACE_TTL_S + 1)
++    assert server._is_non_workspace_path(str(second / "x"))
++    assert not server._is_non_workspace_path(str(first / "x"))
+diff --git a/tui_gateway/coalesced_build.py b/tui_gateway/coalesced_build.py
+new file mode 100644
+index 00000000000..23c4f06ed68
+--- /dev/null
++++ b/tui_gateway/coalesced_build.py
+@@ -0,0 +1,81 @@
++"""Run one expensive build at a time per key without serving anything stale. [daveey]
++
++A caller never receives a build that started before it asked: if a build is running when it
++arrives, it waits for that one to finish and shares the NEXT one with everyone else who arrived
++meanwhile. Overlapping identical requests therefore cost at most two builds in a row instead of
++one concurrent build each, and a caller that just changed something still sees its change.
++
++The legacy ``projects.tree`` RPC had no such bound: a slow build was re-requested by the sidebar
++poll before it finished, so seven identical builds ran at once and each took a minute.
++"""
++from __future__ import annotations
++
++import threading
++from collections.abc import Callable, Hashable
++from typing import Any
++
++_WAIT_POLL_S = 1.0
++
++
++class _State:
++    __slots__ = ("started", "finished", "running", "value", "waiters")
++
++    def __init__(self) -> None:
++        self.started = 0  # builds begun
++        self.finished = 0  # index of the newest build that completed successfully
++        self.running = False
++        self.value: Any = None
++        self.waiters = 0
++
++
++class Coalescer:
++    """``run(key, build)``: the result of a ``build()`` that began after this call was made."""
++
++    def __init__(self) -> None:
++        self._cond = threading.Condition()
++        self._states: dict[Hashable, _State] = {}
++
++    def run(self, key: Hashable, build: Callable[[], Any]) -> Any:
++        with self._cond:
++            state = self._states.get(key)
++            if state is None:
++                state = self._states[key] = _State()
++            need = state.started + 1  # the first build to begin after this request
++            state.waiters += 1
++            try:
++                while state.running and state.finished < need:
++                    self._cond.wait(_WAIT_POLL_S)
++                if state.finished >= need:
++                    value = state.value
++                    self._leave(key, state)
++                    return value
++                state.started += 1
++                mine = state.started
++                state.running = True
++            except BaseException:
++                self._leave(key, state)
++                raise
++        try:
++            value = build()
++        except BaseException:
++            # A failed build certifies nothing: every waiter retries for itself.
++            with self._cond:
++                state.running = False
++                self._leave(key, state)
++                self._cond.notify_all()
++            raise
++        with self._cond:
++            state.running = False
++            state.finished, state.value = mine, value
++            self._leave(key, state)
++            self._cond.notify_all()
++        return value
++
++    def _leave(self, key: Hashable, state: _State) -> None:
++        """Forget an idle key: the shared value is not a cache and must not outlive its callers."""
++        state.waiters -= 1
++        if state.waiters <= 0 and not state.running and self._states.get(key) is state:
++            del self._states[key]
++
++
++project_tree = Coalescer()
+diff --git a/tui_gateway/git_probe.py b/tui_gateway/git_probe.py
+index 7a937e81455..0ca42e67e07 100644
+--- a/tui_gateway/git_probe.py
++++ b/tui_gateway/git_probe.py
+@@ -58,6 +58,17 @@
+             self._neg.clear()
+             self._inflight.clear()
+ 
++    def settled(self, key: str, cwd: str = "") -> str | None:
++        """The answer :meth:`resolve` would return without probing (``""`` = a negative that still
++        holds), or ``None`` when it would have to probe or wait."""
++        with self._lock:
++            if hit := self._roots.get(key):
++                return hit
++            neg = self._neg.get(key)
++        if neg is not None and neg[0] > time.monotonic() and neg[1] == _dir_stamp(cwd):
++            return ""
++        return None
++
+     def resolve(self, key: str, probe, cwd: str = "") -> str:
+         while True:
+             with self._lock:
+@@ -148,10 +159,20 @@
+     return {"repo_root": common_repo_root(cwd) or worktree_root, "worktree_root": worktree_root}
+ 
+ 
++def _settled(cwd: str) -> bool:
++    """True when :func:`resolve` would answer ``cwd`` from the cache alone."""
++    root = _cache.settled(cwd, cwd)
++    if root is None:
++        return False
++    return root == "" or _cache.settled(f"common:{cwd}", cwd) is not None
++
++
+ def warm_roots(cwds: Iterable[str], max_workers: int = _WARM_WORKERS) -> None:
+     """Pre-resolve many cwds' roots in parallel (bounded) so a cold first paint
+     doesn't serialize one git spawn per session cwd; results land in the cache."""
+-    pending = sorted({(cwd or "").strip() for cwd in cwds} - {""})
++    # A cwd whose answers are already cached needs no warm-up. A sidebar poll re-offers every session
++    # cwd; fanning thousands of cache hits through a fresh pool was most of an idle tree build.
++    pending = sorted(cwd for cwd in {(cwd or "").strip() for cwd in cwds} - {""} if not _settled(cwd))
+     if len(pending) == 1:
+         resolve(pending[0])
+     elif pending:
+diff --git a/tui_gateway/methods_config.py b/tui_gateway/methods_config.py
+index 479bb5b9573..1ca99c4af0b 100644
+--- a/tui_gateway/methods_config.py
++++ b/tui_gateway/methods_config.py
+@@ -151,14 +151,22 @@
+     fact_result = projects_fact_routes.read("tree", selector, decoded=True)
+     if fact_result is not None:
+         return _ok(rid, fact_result)
+-    with projects_fact_routes.legacy(params.get("profile")), _profile_db(params) as db:
+-        if db is None:
+-            return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
+-        tree, active_id = _stamped_project_tree(
+-            db, params, preview_limit=int(params.get("preview_limit") or 3), hydrate=False,
+-            session_limit=int(params.get("session_limit") or 2000), include_discovered=True)
+-        return _ok(rid, {"projects": tree["projects"], "active_id": active_id,
+-                         "scoped_session_ids": tree["scoped_session_ids"]})
++    def build() -> dict:
++        with projects_fact_routes.legacy(params.get("profile")), _profile_db(params) as db:
++            if db is None:
++                return {"projects": [], "active_id": None, "scoped_session_ids": []}
++            tree, active_id = _stamped_project_tree(
++                db, params, preview_limit=selector["preview_limit"], hydrate=False,
++                session_limit=selector["session_limit"], include_discovered=True)
++            return {"projects": tree["projects"], "active_id": active_id,
++                    "scoped_session_ids": tree["scoped_session_ids"]}
++
++    # Identical overlapping requests share one build begun after each of them asked (never a stale one).
++    from hermes_constants import get_hermes_home
++    from tui_gateway.coalesced_build import project_tree
++    key = (str(get_hermes_home()), _response_profile_name(params.get("profile")),
++           selector["preview_limit"], selector["session_limit"])
++    return _ok(rid, dict(project_tree.run(key, build)))
+ 
+ 
+ @_projects_handler("projects.project_sessions")
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 921f5693f9f..c77a4b48e42 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -144,22 +144,51 @@
+     return os.path.normcase(os.path.realpath(path)) if path else ""
+ 
+ 
+-def _is_non_workspace_path(path: str) -> bool:
+-    """One auto-discovery policy; explicit user-created projects bypass this filter."""
++# The policy's resolved roots, kept while every input they are derived from is unchanged. One tree
++# build asks about thousands of paths; resolving ~20 roots (and globbing the profiles dir) for each
++# was most of a build's realpath calls. The TTL bounds what the key cannot see: a root whose symlink
++# target is re-pointed in place.
++_NON_WORKSPACE_TTL_S = 30.0
++_non_workspace_memo: tuple | None = None  # (key, monotonic expiry, exact dirs, prefix roots)
++
++
++def _non_workspace_policy() -> tuple[frozenset, tuple]:
++    """``(exact dirs, internal/temp roots)``, both canonical."""
++    global _non_workspace_memo
+     import tempfile
+     from pathlib import Path
+     from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
++    default_home = _get_platform_default_hermes_home()
++    profiles = Path(default_home) / "profiles"
++    try:
++        profiles_stamp = os.stat(profiles).st_mtime_ns  # moves when a profile is added, removed or relinked
++    except OSError:
++        profiles_stamp = None
++    # no-tmp: ok — classify OS temp roots, not scratch-file creation.
++    key = (str(get_hermes_home()), str(default_home), os.path.expanduser("~"), tempfile.gettempdir(),
++           os.getenv("TMPDIR", ""), profiles_stamp)
++    memo = _non_workspace_memo
++    now = time.monotonic()
++    if memo is not None and memo[0] == key and now < memo[1]:
++        return memo[2], memo[3]
++    # Resolve sibling profile homes too: a profile can be symlinked outside the base home.
++    profile_homes = tuple(str(p) for p in profiles.glob("*"))
++    roots = (key[0], key[1], *profile_homes, key[3], "/tmp", "/private/tmp", "/var/folders", key[4])
++    dirs = frozenset(_non_workspace_dirs())
++    prefixes = tuple(sorted({_canonical_workspace_path(p) for p in roots if p}))
++    _non_workspace_memo = (key, now + _NON_WORKSPACE_TTL_S, dirs, prefixes)
++    return dirs, prefixes
++
++
++def _is_non_workspace_path(path: str) -> bool:
++    """One auto-discovery policy; explicit user-created projects bypass this filter."""
+     real = _canonical_workspace_path(path)
+-    if not real or real in _non_workspace_dirs():
++    if not real:
+         return True
+-    # Resolve sibling profile homes too: a profile can be symlinked outside the base home.
+-    default_home = _get_platform_default_hermes_home()
+-    profile_homes = tuple(str(p) for p in (Path(default_home) / "profiles").glob("*"))
+-    roots = (str(get_hermes_home()), str(default_home), *profile_homes,
+-             # no-tmp: ok — classify OS temp roots, not scratch-file creation.
+-             tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", os.getenv("TMPDIR", ""))
+-    return any(real == root or real.startswith(root.rstrip(os.sep) + os.sep)
+-               for root in {_canonical_workspace_path(p) for p in roots if p})
++    dirs, roots = _non_workspace_policy()
++    if real in dirs:
++        return True
++    return any(real == root or real.startswith(root.rstrip(os.sep) + os.sep) for root in roots)
+ 
+ 
+ def _is_repo_junk(root: str) -> bool:
+-- 
+2.43.0
+

@@ -1,0 +1,330 @@
+From 2377f7afaf6f90529e7f93eb68c98db1302aeeb3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 03:15:34 +0000
+Subject: [PATCH 6423] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 2377f7afaf6f90529e7f93eb68c98db1302aeeb3.
+
+---
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index bdc68fb09f9..edee2e52d24 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1837,6 +1837,7 @@
+     "owner-chats": lambda a: importlib.import_module("hermes_cli.kanban_owner_chat").command(a),
+     "delegate": lambda a: importlib.import_module("hermes_cli.kanban_scope_delegate").command(a),
+     "release": lambda a: importlib.import_module("hermes_cli.kanban_release").command(a),
++    "spend-stop-watch": lambda a: importlib.import_module("hermes_cli.kanban_spend_stop_watch").command(a),
+     "governors": lambda a: importlib.import_module("hermes_cli.kanban_governors_cli").governors_command(a),
+     "why": lambda a: importlib.import_module("hermes_cli.kanban_governors_cli").why_command(a),
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 8aa61d37ddc..46cbdc43a69 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -707,6 +707,7 @@
+             "renewal, a spend budget of spent + N runs and the promotion (a card with an open parent waits in "
+             "todo). For a human operator, the card's owning chat or a delegate chat; worker shells are fenced. "
+             "Safety and containment holds are refused"),
++    _cmd("spend-stop-watch", [], help="File once for each spend stop older than 30 minutes with no review or route"),
+     _cmd("spend-budget", [
+         _TASK_ID,
+         _arg("--seen", dest="seen_comment_id", type=int, help="Newest decision comment read; refuse replacing an unread spend-stop budget decision."),
+diff --git a/hermes_cli/kanban_spend_stop_watch.py b/hermes_cli/kanban_spend_stop_watch.py
+new file mode 100644
+index 00000000000..479c84b07dd
+--- /dev/null
++++ b/hermes_cli/kanban_spend_stop_watch.py
+@@ -0,0 +1,87 @@
++"""Model-free backstop for spend stops nobody reviewed or routed. [daveey]"""
++from __future__ import annotations
++
++import argparse
++import sqlite3
++import time
++from typing import cast
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli.kanban_spend_caused_review import effective_cause
++from hermes_cli.kanban_wake_check import foreign_ids
++
++AUTHOR = "spend-stop-watch"
++FILED = "spend_stop_watch_filed"
++
++
++def stale_stops(conn: sqlite3.Connection, *, now: float, older_than: int = 1800) -> list[dict]:
++    """Read home triage stops strictly older than the threshold, without a disposition."""
++    copies = foreign_ids(conn)
++    result = []
++    for row in conn.execute("SELECT id,title,tenant,created_by FROM tasks WHERE status='triage'").fetchall():
++        tid = row['id']
++        if tid in copies or row['created_by'] in (AUTHOR, 'kanban-spend-budget'):
++            continue
++        stop = decision.pending_episode(conn, tid)
++        if stop is None or stop['created_at'] >= now - older_than:
++            continue
++        episode = cast(str, reviewer.episode_of(stop))
++        if reviewer.state(conn, tid, episode) is not None or decision.episode_route(conn, tid, episode) is not None:
++            continue
++        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
++                        "AND json_extract(payload,'$.episode')=?", (tid, FILED, episode)).fetchone():
++            continue
++        result.append({**dict(row), 'episode': episode, 'stop': stop})
++    return result
++
++
++def _file(conn: sqlite3.Connection, card: dict, now: float) -> str:
++    tid, episode, stop = card['id'], card['episode'], card['stop']
++    minutes = int((now - stop['created_at']) // 60)
++    cause = effective_cause(conn, tid, stop) or 'run budget'
++    stopped = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(stop['created_at']))
++    from hermes_cli.kanban_model_neutral import forwarded_text
++    body = (f"Card {tid} stopped at {stopped}. Stop cause: {cause}.\n"
++            "Source title (historical evidence):\n" + forwarded_text(card['title']) + "\n\n"
++            "Neither the spend reviewer nor an owner route picked up this stop.\n"
++            f"Decide {tid}: use `hermes kanban release {tid}` from an authorized owning chat, "
++            "archive it if no longer wanted, or escalate to its owner if authority is missing. "
++            "Worker shells cannot release it directly; do not rerun unchanged work or bypass a safety hold.")
++    new_id = kb.create_task(conn, title=f"Spend stop on {tid} undecided for {minutes} min: no review, no route",
++                            body=body, assignee='default', created_by=AUTHOR, workspace_kind='scratch',
++                            tenant=card['tenant'], idempotency_key=f'{AUTHOR}:{tid}:{episode}')
++    kb._append_event(conn, tid, FILED, {'episode': episode, 'task_id': new_id})
++    return new_id
++
++
++def watch(conn: sqlite3.Connection, *, now: float | None = None) -> list[str]:
++    """File once per episode, atomically with a durable receipt; refusal remains retryable."""
++    now = time.time() if now is None else now
++    if not stale_stops(conn, now=now):
++        return []
++    filed = []
++    # Re-read under the writer lock: two cron fires cannot both publish a card.
++    with kb.write_txn(conn):
++        for card in stale_stops(conn, now=now):
++            try:
++                # A refused create may already have inserted rows; roll back its savepoint.
++                with kb.write_txn(conn, allow_nested=True):
++                    new_id = _file(conn, card, now)
++            except (ValueError, PermissionError):
++                continue
++            filed.append(new_id)
++    return filed
++
++
++def command(args: argparse.Namespace) -> int:
++    """No-agent CLI: silent on no-op, one stable receipt line per filed card."""
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        for new_id in watch(conn):
++            row = conn.execute("SELECT task_id,payload FROM task_events WHERE kind=? "
++                               "AND json_extract(payload,'$.task_id')=?", (FILED, new_id)).fetchone()
++            episode = kb._json_dict(row['payload'])['episode']
++            print(f"filed {new_id} for {row['task_id']} stop {episode}")
++    return 0
+diff --git a/tests/hermes_cli/test_kanban_spend_stop_watch.py b/tests/hermes_cli/test_kanban_spend_stop_watch.py
+new file mode 100644
+index 00000000000..e76f1ca20f2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_stop_watch.py
+@@ -0,0 +1,171 @@
++"""No-agent orphan-stop backstop, with isolated boards and real CLI parsing."""
++import argparse
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_spend_stop_watch as watchdog
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++NOW = 2_000_000_000
++
++
++def stop(conn, *, age=1860, creator=None, cause=None):
++    tid = kb.create_task(conn, title='Finish acceptance', assignee='default', created_by=creator)
++    episode = next_stop(conn, tid, NOW - age, cause)
++    return tid, episode
++
++
++def next_stop(conn, tid, at, cause=None):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT, {'cause': cause})
++        conn.execute("UPDATE task_events SET created_at=? WHERE id=(SELECT MAX(id) FROM task_events WHERE task_id=?)",
++                     (at, tid))
++    return reviewer.episode_of(decision.pending_episode(conn, tid))
++
++
++def filed(conn):
++    return conn.execute("SELECT * FROM tasks WHERE created_by=?", (watchdog.AUTHOR,)).fetchall()
++
++
++@pytest.mark.parametrize('cause', [None, 'scope_stopped'])
++def test_files_one_with_context_and_repeats_silently(kanban_home, cause):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, cause=cause)
++        assert [c['id'] for c in watchdog.stale_stops(conn, now=NOW)] == [tid]
++        result = watchdog.watch(conn, now=NOW)
++        assert len(result) == 1
++        card = kb.get_task(conn, result[0])
++        assert card.assignee == 'default'
++        assert tid in card.body and 'Finish acceptance' in card.body
++        assert (cause or 'run budget') in card.body
++        assert 'UTC' in card.body and f'hermes kanban release {tid}' in card.body
++        assert '31 min' in card.title
++        assert card.idempotency_key == f'spend-stop-watch:{tid}:{ep}'
++        assert watchdog.watch(conn, now=NOW) == []
++        assert len(filed(conn)) == 1
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_terminal_watch_card_does_not_refile(kanban_home, status):
++    with kbc.connect_closing() as conn:
++        stop(conn)
++        first, = watchdog.watch(conn, now=NOW)
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, first))
++        assert watchdog.watch(conn, now=NOW) == []
++        assert len(filed(conn)) == 1
++
++
++@pytest.mark.parametrize('age', [1740, 1800])
++def test_not_strictly_older(kanban_home, age):
++    with kbc.connect_closing() as conn:
++        stop(conn, age=age)
++        assert watchdog.watch(conn, now=NOW) == []
++
++
++@pytest.mark.parametrize('creator', ['spend-stop-watch', 'kanban-spend-budget'])
++def test_never_recurse(kanban_home, creator):
++    with kbc.connect_closing() as conn:
++        stop(conn, creator=creator)
++        assert watchdog.watch(conn, now=NOW) == []
++
++
++def test_reviewed_episode(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.QUEUED, {'episode': ep})
++        assert watchdog.watch(conn, now=NOW) == []
++
++
++def test_real_decision_route(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        kb.create_task(conn, title='Decide stop', assignee='default', created_by='kanban-spend-budget',
++                       idempotency_key=f'spend-budget-decision:{tid}:{ep}')
++        assert decision.episode_route(conn, tid, ep) is not None
++        assert watchdog.watch(conn, now=NOW) == []
++
++
++def test_foreign_copy(kanban_home, monkeypatch):
++    from hermes_cli import kanban_wake_check as wakes
++    monkeypatch.setattr(wakes, 'own_gateway', lambda conn: 'home')
++    with kbc.connect_closing() as conn:
++        tid, _ = stop(conn)
++        with kb.write_txn(conn):
++            conn.execute('ALTER TABLE tasks ADD COLUMN created_on TEXT')
++            conn.execute("UPDATE tasks SET created_on='elsewhere' WHERE id=?", (tid,))
++        assert tid in wakes.foreign_ids(conn)
++        assert watchdog.watch(conn, now=NOW) == []
++
++
++def test_new_episode_ignores_previous_review_route_and_marker(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        assert len(watchdog.watch(conn, now=NOW)) == 1
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.QUEUED, {'episode': ep})
++        kb.create_task(conn, title='Previous decision', assignee='default', created_by='kanban-spend-budget',
++                       idempotency_key=f'spend-budget-decision:{tid}:{ep}')
++        newer = next_stop(conn, tid, NOW - 1850)
++        assert newer != ep
++        assert len(watchdog.watch(conn, now=NOW)) == 1
++        assert len(filed(conn)) == 2
++
++
++@pytest.mark.parametrize('condition', ['not_triage', 'no_stop', 'decided'])
++def test_only_pending_triage_stops(kanban_home, condition):
++    with kbc.connect_closing() as conn:
++        tid, _ = stop(conn)
++        with kb.write_txn(conn):
++            if condition == 'not_triage':
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++            elif condition == 'no_stop':
++                conn.execute('DELETE FROM task_events WHERE task_id=? AND kind=?', (tid, decision.EVENT))
++            else:
++                kb._append_event(conn, tid, 'promoted_manual', {})
++                conn.execute('UPDATE task_events SET created_at=? WHERE id=(SELECT MAX(id) FROM task_events)', (NOW,))
++        assert watchdog.watch(conn, now=NOW) == []
++
++
++@pytest.mark.parametrize('error', [ValueError, PermissionError])
++def test_refusal_rolls_back_and_can_retry(kanban_home, monkeypatch, error):
++    with kbc.connect_closing() as conn:
++        stop(conn)
++        create = kb.create_task
++        def refuse(*args, **kwargs):
++            create(*args, **kwargs)
++            raise error('admission refused')
++        with monkeypatch.context() as scoped:
++            scoped.setattr(kb, 'create_task', refuse)
++            assert watchdog.watch(conn, now=NOW) == []
++        assert filed(conn) == []
++        assert len(watchdog.watch(conn, now=NOW)) == 1
++
++
++def cli():
++    from hermes_cli import kanban, kanban_parser
++    parser = argparse.ArgumentParser()
++    kanban_parser.build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(['kanban', 'spend-stop-watch']))
++
++
++def test_cli_silent(kanban_home, capsys):
++    assert cli() == 0
++    assert capsys.readouterr() == ('', '')
++
++
++def test_cli_reports_exact_receipt(kanban_home, capsys, monkeypatch):
++    monkeypatch.setattr(watchdog.time, 'time', lambda: NOW)
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++    assert cli() == 0
++    with kbc.connect_closing() as conn:
++        card, = filed(conn)
++    assert capsys.readouterr().out == f"filed {card['id']} for {tid} stop {ep}\n"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 3656133b7ef..141b8e51d30 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -896,6 +896,20 @@
+ are fenced from the verb like every other board write, so a card cannot
+ exempt itself.
+ 
++#### Unclaimed spend-stop watchdog
++
++A hub script-only cron can run `hermes kanban spend-stop-watch` every ten minutes
++(use `hermes kanban --board <slug> spend-stop-watch` for a specific board).
++This model-free check files one default-assignee card for each home triage stop
++strictly older than 30 minutes with no spend-review state and no episode decision
++route. It never releases the stopped work itself. Watchdog and spend-decision
++cards are excluded. A durable receipt on the stopped card prevents another filing
++for that episode even after the watchdog card is done or archived; a later stop
++gets its own receipt. Admission refusals remain retryable without a receipt.
++The command exits 0 silently when nothing is filed; otherwise it prints
++`filed <new id> for <task id> stop <episode>` per card. Installing the cron is an
++operator deployment step, not a side effect of invoking the command.
++
+ #### Workers and systemd cgroups
+ 
+ Workers are fire-and-forget processes that outlive the dispatcher tick, so
+-- 
+2.43.0
+

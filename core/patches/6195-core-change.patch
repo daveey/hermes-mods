@@ -1,0 +1,284 @@
+From 14e5b102c623f04c5a8665a3a47135913228c612 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:12:37 +0000
+Subject: [PATCH 6195] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 14e5b102c623f04c5a8665a3a47135913228c612.
+
+---
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index abcf1b76e0d..7fd89220406 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -78,9 +78,18 @@
+ # no longer re-reads every board's counts, the links projection and the attention pass (t_01a1cee98aaa8db1). Every
+ # other kind, and any update or delete of an event row, still bumps.
+ UNREAD_EVENT_KINDS = ("heartbeat",)
+-# Kinds the links and annotation projection caches select (session-activity UNSEEN_KINDS). An insert of any
+-# other kind still bumps ``revision`` (notify and the counts cache read it) but not ``projection_revision``.
+-PROJECTION_EVENT_KINDS = ("blocked", "completed", "crashed", "gave_up", "status", "timed_out")
++# Kinds a reader still keyed on ``projection_revision`` selects. Attention is not on this key: a done check
++# is plugin code and may select any kind, so it compares ``revision``.
++# - the links fingerprint (and the annotation part that shares it): ``UNSEEN_KINDS``, plus the local-board
++#   reads in ``_project_remote_links`` -> ``observe_owner_task`` (``archived``, ``goal_verified``,
++#   ``pr_acceptance``, ``request_withdrawn``, ``scheduled``, ``continued``, ``decision_requested``, ``contained``)
++# - the shadow link-row memo: ``contained`` (``_authority``)
++# An insert of any other kind still bumps ``revision`` (notify, the counts cache and attention) but not
++# ``projection_revision``.
++PROJECTION_EVENT_KINDS = (
++    "archived", "blocked", "completed", "contained", "continued", "crashed", "decision_requested",
++    "gave_up", "goal_verified", "pr_acceptance", "request_withdrawn", "scheduled", "status", "timed_out",
++)
+ _BUMP = f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1;"
+ _BUMP_PROJECTION = (f"UPDATE {REVISION_TABLE} SET projection_revision = projection_revision + 1 WHERE id = 1;")
+ # [daveey] P2 per-task change cursor (t_01a1d59d3ef805c4): which tasks each bump touched.
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index 3ccc655fad3..6d27ce48f7b 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -16,8 +16,10 @@
+   seconds and that cache bounds them by its TTL instead. Keying links on them forced a
+   full ledger projection under ``_links_lock`` on nearly every wake,
+   delaying strict links readers including the Desktop action queue;
+-- ``attention``: the boards' content revisions and the files the done checks declared (a declared board or sync
+-  replica by its content revision, never its stat).
++- ``attention``: the boards' notify revisions (``revision``, not the projection counter) and the files the
++  done checks declared (a declared board or sync replica by that same notify revision, never its stat and never
++  the projection counter). A done check is plugin code and may select any event kind, so this key cannot be the
++  projection counter.
+ 
+ Plain inputs are everything else the holder watches for the scope (state.db, the hub database, config files, the
+ mutation cue), keyed by ``kanban_annotation_watch.signature`` (stat, header change counter, WAL-index header). A
+@@ -79,12 +81,12 @@
+ def _done_key(scope: tuple[str, ...], wall: float) -> object:
+     """The done checks' declared inputs; unequal to everything while any check is undeclared.
+ 
+-    A declared board is left out: the attention key carries every board's content revision. A declared sync
+-    replica is keyed by its content revision as well. Both files are rewritten several times a second by
+-    bookkeeping (claims, heartbeats, pull stamps) that moves no row a reader selects, and a stat key over them
+-    would rerun every done check on each of those writes. A replica whose revision cannot vouch (no counter and a
+-    stat not yet settled, or unreadable) makes the key unequal to everything. Any other declared file is keyed by
+-    its change signature."""
++    A declared board is left out: the attention key carries every board's notify revision. A declared sync
++    replica is keyed by that same counter (``revision``), not the projection counter: a done check is plugin
++    code and may select any event kind. Both files are rewritten several times a second by bookkeeping (claims,
++    heartbeats, pull stamps) that moves no row a reader selects, and a stat key over them would rerun every done
++    check on each of those writes. A replica whose revision cannot vouch (no counter and a stat not yet settled,
++    or unreadable) makes the key unequal to everything. Any other declared file is keyed by its change signature."""
+     from hermes_cli import kanban_annotation_host as host
+     from hermes_cli import kanban_session_activity as ksa
+ 
+@@ -97,7 +99,7 @@
+     paths -= {str(p) for p in ksa._board_db_paths()}
+     shadow_dir = _replica_dir()
+     replicas = sorted(p for p in paths if p.endswith(".db") and os.path.dirname(p) == shadow_dir)
+-    content = tuple((p, ksa._projection_content_key(Path(p), ksa._revision.SHADOW_TABLES)) for p in replicas)
++    content = tuple((p, ksa._board_content_key(Path(p), ksa._revision.SHADOW_TABLES)) for p in replicas)
+     if not ksa._revalidate.revalidatable(content, wall):
+         return object()
+     return (tuple(sorted(ksa._done_checks)), content, _signature(scope, paths - set(replicas)))
+@@ -116,7 +118,7 @@
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+     return {COUNTS: (counts_local, shadows, ledger, plain), LINKS: (links_local, ledger),
+-            ATTENTION: (links_local, _done_key(scope, wall))}
++            ATTENTION: (counts_local, _done_key(scope, wall))}
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index f5e2aeed1a1..48ea2c93ab7 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -113,9 +113,10 @@
+     name replaces it; the returned callable unregisters. Optional event callbacks
+     have the same no-DB-read contract as ``register_waiting_source``; undeclared
+     checks retain bounded fallback rather than silently missing external inputs.
+-    A declared board or sync replica is keyed by its content revision (``kanban_activity_revision.LOCAL_TABLES`` /
+-    ``SHADOW_TABLES``), not by its file: a check that reads a table outside those lists does not rerun on a write
+-    to it until the attention cache's own bound. Other declared files are keyed by their stat."""
++    A declared board or sync replica is keyed by its notify revision (``revision``, not the projection counter;
++    ``kanban_activity_revision.LOCAL_TABLES`` / ``SHADOW_TABLES``), not by its file: a done check is plugin code
++    and may select any event kind. A check that reads a table outside those lists does not rerun on a write to it
++    until the attention cache's own bound. Other declared files are keyed by their stat."""
+     from hermes_cli import kanban_session_activity as activity
+     activity._host_copy.declare_events(name, fn, watch_paths, next_deadline, done_check=True)
+     activity._done_checks[name] = fn
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index 797eb51c386..11e41ceb232 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -109,8 +109,54 @@
+     assert ksa._board_content_key(ksa._board_db_paths()[0]) != before
+ 
+ 
+-def test_projection_kinds_match_the_unseen_reader():
+-    assert set(rev.PROJECTION_EVENT_KINDS) == set(ksa.UNSEEN_KINDS)
++def test_a_created_event_does_not_move_the_links_key_a_contained_event_does(board):
++    """``created`` is a done-check kind (attention keys on the notify revision). ``contained`` is a
++    shadow-link kind (that memo keys on the projection revision).
++    """
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    notify = ksa._activity_fingerprint()
++    links_key = ksa._links_fingerprint()
++    with kbc.write_txn(board):
++        board.execute(
++            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'created', 1)", (tid,))
++    assert ksa._activity_fingerprint() != notify
++    assert ksa._links_fingerprint() == links_key
++    links_key = ksa._links_fingerprint()
++    with kbc.write_txn(board):
++        board.execute(
++            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'contained', 2)", (tid,))
++    assert ksa._links_fingerprint() != links_key
++
++
++def test_projection_kinds_cover_the_unseen_reader_and_the_shadow_authority():
++    """Links select ``UNSEEN_KINDS``. The shadow memo also selects ``contained``. Attention is not on this key."""
++    assert set(ksa.UNSEEN_KINDS) <= set(rev.PROJECTION_EVENT_KINDS)
++    assert "contained" in rev.PROJECTION_EVENT_KINDS
++    assert "created" not in rev.PROJECTION_EVENT_KINDS
++
++
++# Kinds ``_project_remote_links`` -> ``observe_owner_task`` selects from the local board, which the links
++# fingerprint keys on ``projection_revision``. ``created`` is a done-check kind and stays off this key.
++_LINKS_PROJECTION_KINDS = (
++    "archived", "completed", "contained", "continued", "decision_requested", "goal_verified",
++    "pr_acceptance", "request_withdrawn", "scheduled",
++)
++
++
++def test_kinds_the_links_projection_selects_move_its_key_created_does_not(board):
++    assert set(_LINKS_PROJECTION_KINDS) <= set(rev.PROJECTION_EVENT_KINDS)
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    links_key = ksa._links_fingerprint()
++    with kbc.write_txn(board):
++        board.execute(
++            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'created', 1)", (tid,))
++    assert ksa._links_fingerprint() == links_key, "a created event rebuilt the links projection"
++    for n, kind in enumerate(_LINKS_PROJECTION_KINDS, start=2):
++        links_key = ksa._links_fingerprint()
++        with kbc.write_txn(board):
++            board.execute(
++                "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, ?, ?)", (tid, kind, n))
++        assert ksa._links_fingerprint() != links_key, kind
+ 
+ 
+ def test_an_unread_event_wakes_notify_but_not_the_links_or_annotation_key(board):
+@@ -326,9 +372,9 @@
+     assert ksa._board_content_key(path)[0] == "stat" and len(scans) == 2
+ 
+ 
+-def test_event_only_park_or_wake_moves_the_counts_key_not_the_links_key(board):
+-    """A park or wake event committed after its task row (a feed page boundary) is an event the counts
+-    read selects and the links projection does not. The counts cache must not keep the pre-event execution.
++def test_event_only_park_moves_the_counts_key_and_the_links_key(board):
++    """A park event committed after its task row (a feed page boundary) is an event both caches select.
++    Counts read it for execution state. The links projection's ``publish_ask`` selects ``scheduled``.
+     """
+     import time
+ 
+@@ -346,7 +392,7 @@
+     with kbc.write_txn(board):
+         kb._append_event(board, tid, "scheduled", payload)
+     assert ksa._activity_fingerprint() != fp0
+-    assert ksa._links_fingerprint() == links0
++    assert ksa._links_fingerprint() != links0
+     reads1, _ = ksa._read_board(path, parked=True, stalled=True)
+     assert reads0["execution"] != reads1["execution"]
+     after = ksa._all_counts(include_snapshot=True)
+diff --git a/tests/hermes_cli/test_kanban_annotation_narrow_local.py b/tests/hermes_cli/test_kanban_annotation_narrow_local.py
+index 4daf5749c58..fa82c921719 100644
+--- a/tests/hermes_cli/test_kanban_annotation_narrow_local.py
++++ b/tests/hermes_cli/test_kanban_annotation_narrow_local.py
+@@ -312,6 +312,37 @@
+     assert own.stats["board_patches"] > 0
+ 
+ 
++def test_a_contained_event_alone_refreshes_the_shadow_link_authority(world):
++    """The shadow link memo's enrich walk reads ``kind='contained'``. An event-only commit of that
++    kind must not keep serving the row without its authority.
++    """
++    import json
++
++    from hermes_cli import kanban_chat_links as links
++
++    sconn, shadow = world["sconn"], world["shadow"]
++    sconn.execute("ALTER TABLE tasks ADD COLUMN containment_episode TEXT")
++    sconn.execute("ALTER TABLE task_events ADD COLUMN uid TEXT")
++    sconn.execute("ALTER TABLE task_events ADD COLUMN payload TEXT")
++    sconn.execute(
++        "INSERT INTO tasks (id, title, status, assignee, created_at, started_at, priority, block_kind, "
++        "human_request, created_on, lease_expires, containment_episode) VALUES "
++        "('p', 'parent', 'triage', 'w', 1, NULL, 0, NULL, NULL, 'owner', 100, 'ep1')")
++    sconn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('p', 'r1')")
++    links._reset_for_tests()
++
++    def authority():
++        rows, _pulled, _runs = links._read_replica(shadow, ME, PROFILE)
++        blocked = next(r for r in rows if r["id"] == "r1").get("blocked_upstream") or {}
++        return (blocked.get("contained") or {}).get("authority") or {}
++
++    assert authority().get("id", "") == ""
++    sconn.execute(
++        "INSERT INTO task_events (task_id, kind, uid, payload) VALUES ('p', 'contained', 'ep1', ?)",
++        (json.dumps({"policy": {"authority": {"task_id": "r2"}}}),))
++    assert authority() == {"id": "r2", "status": "running"}
++
++
+ def test_shadow_link_memo_shares_one_key(world, monkeypatch):
+     """``shadows_part`` and ``_read_replica`` share one slot. Different keys re-read an unchanged shadow."""
+     from pathlib import Path
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index b3b1953610a..1e14659f83d 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -444,6 +444,45 @@
+     assert world.counts == 2, 'fresh counts in a saved slot were read again'
+ 
+ 
++def test_a_created_event_alone_reruns_the_done_check(world):
++    """A done check is plugin code and may select ``created``. An event-only commit (a feed page
++    that lands the event after the task row) must rerun the check. It must not rebuild links.
++    """
++    from hermes_cli import kanban_activity_revision as revision
++
++    world.conn.execute(
++        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
++        "created_at INTEGER)")
++    revision.ensure_revision(world.conn, revision.LOCAL_TABLES)
++
++    def honest(card):
++        world.checks += 1
++        row = world.conn.execute(
++            "SELECT 1 FROM task_events WHERE kind='created' "
++            "AND json_extract(payload, '$.creator_task_id') = ?",
++            (card["id"],)).fetchone()
++        return row is None
++
++    # The host ignores a declared source whose function is not the registered check.
++    ksa._done_checks["fixture"] = honest
++    host._done_event_sources["fixture"] = (honest, lambda: [world.board], lambda: None)
++    _refresh()
++    assert world.checks == 1 and _published()[10] == {"s1": 1}
++    _refresh()
++    assert world.checks == 1, "a wake with no write reran the check"
++    world.conn.execute("INSERT INTO tasks VALUES ('follow', 'running', 's9')")
++    _refresh()
++    after_row, links_after_row = world.checks, world.links
++    assert after_row == 2, "the follow-up task row did not rerun the check"
++    world.conn.execute(
++        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'created', ?, 1)",
++        ("follow", '{"creator_task_id": "d1"}'))
++    _refresh()
++    assert world.checks == after_row + 1, "a created event alone did not rerun the done check"
++    assert _published()[10] == {}, "the holder kept publishing the card after its follow-up existed"
++    assert world.links == links_after_row, "a created event rebuilt the links projection"
++
++
+ def test_links_key_is_the_links_cache_fingerprint(world, tmp_path, monkeypatch):
+     """undated representative observation: the links part keyed on state.db and the hub database (written every few seconds), so the
+     holder re-projected the origin ledger under ``_links_lock`` on nearly every wake and the Desktop action queue
+-- 
+2.43.0
+

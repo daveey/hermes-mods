@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 5949 by `repair_hostname_escapes_5949.py` (snapshot 5923: `repair_hostname_escapes_5923.py`) (snapshot 5836: `repair_hostname_escapes_5836.py`) (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 6595 by `repair_hostname_escapes_6595.py` (snapshot 5949: `repair_hostname_escapes_5949.py`) (snapshot 5923: `repair_hostname_escapes_5923.py`) (snapshot 5836: `repair_hostname_escapes_5836.py`) (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-5949 patches, one entry per non-merge source commit through `4252743d44bef7fb852ca145bb861ac8e4a47225`.
+6595 patches, one entry per non-merge source commit through `26aaccc5a5b4fb5c247825d92579efd0765a9596`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -41,6 +41,94 @@ The 4353–5011 append adds two source-derived bridges before entries 4353 and 4
 The 5040–5406 append retains 51 bridges and three ancestry-only markers. Its one feature-branch merge is tree-identical to the automatic merge, so no new bridge is required. Snapshot policy: [mirror-policy-5406.json](mirror-policy-5406.json); replay plan: [mirror-replay-5406.json](mirror-replay-5406.json); acceptance evidence: [mirror-5406-verification.md](mirror-5406-verification.md).
 
 The 5438–5836 append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Policy: [mirror-policy-5836.json](mirror-policy-5836.json); replay plan: [mirror-replay-5836.json](mirror-replay-5836.json); verification receipt: [mirror-5836-verification.md](mirror-5836-verification.md). All previously published patch and bridge bytes remain unchanged.
+
+## Mirror 5950–6595
+
+This 646-entry append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Frozen source: `26aaccc5a5b4fb5c247825d92579efd0765a9596`. Policy: [mirror-policy-6595.json](mirror-policy-6595.json); replay plan: [mirror-replay-6595.json](mirror-replay-6595.json); acceptance: [mirror-6595-verification.md](mirror-6595-verification.md). Earlier patch and bridge bytes remain unchanged. Source-test lists are coverage references, not fresh suite execution or live deployment proof. The sidebar search disclosure reuses its existing action; no new keyboard binding is introduced.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Advisory integrity inventory stops at its deadline](mirror-6595-a-attestation-advisory-deadline.md) | 5950–5952 | gateway capsule identify path and code attestation inventory |
+| [Fact change feed: bounded failure logging and busy-open tolerance](mirror-6595-a-fact-change-feed-failure-logging.md) | 5953–5955, 5961, 5964–5965 | fact change feed, capture open path, failure streak logging |
+| [Test fixture and flake hardening with CI push diagnostics](mirror-6595-a-test-fixture-and-flake-hardening.md) | 5956–5957, 5973, 6005, 6008–6009, 6017, 6020–6021, 6044, 6093, 6140, 6160 | tests and CI gate scripts only |
+| [Isolated native sessions capture and bounded startup](mirror-6595-a-sessions-native-capture-process.md) | 5958–5960, 5978, 6012–6014, 6034–6035, 6118 | native sessions capture subprocess, cold bootstrap, first-read bounds |
+| [Kanban chat links, adoption provenance and rejected-retain archive](mirror-6595-a-kanban-chat-link-and-retain-custody.md) | 5962, 6032–6033, 6090, 6100, 6112, 6161–6163 | chat link reconcile, adoption, retain custody |
+| [Kanban spend-decision routing, ownerless stops and hold notices](mirror-6595-a-kanban-spend-decision-routing-and-hold-notices.md) | 5963, 5999, 6109–6111, 6157–6158 | stranded park, decision cards, own-hold notices |
+| [Kanban scratch archive: foreign ownership, retention and promisor clones](mirror-6595-a-kanban-scratch-archive-custody.md) | 5966–5971, 5980–5984 | kanban gc scratch archiving, ownership adoption, retention |
+| [Kanban sync: bounded feed apply, replica write guards and snapshot rebuild](mirror-6595-a-kanban-sync-apply-and-replica-integrity.md) | 5972, 5987, 5997, 6000–6002, 6015–6016, 6018, 6086, 6103–6104 | sync page apply, replica shadow files, snapshot rebuild, outbox age |
+| [Desktop startup-timeout recovery and gateway-drain retry](mirror-6595-a-desktop-startup-and-drain-recovery.md) | 5974–5977, 6072, 6098–6099, 6101–6102, 6105 | Desktop boot overlay, IPC deadlines, drain retries, send failures |
+| [Kanban admission and display read-cost reductions](mirror-6595-a-kanban-admission-and-display-read-costs.md) | 5979, 5994–5996, 6010–6011, 6164 | admission snapshot, links projection, wait display, board history |
+| [SQLite raw-reader reclamation cadence and GIL-held lockguard scans](mirror-6595-a-sqlite-reader-reclamation-and-lockguard-gil.md) | 5985–5986, 6117, 6119–6120 | sqlite_safe_read descriptor sweep, board lockguard fd scan |
+| [Fact runtime: shared process owner, lazy scoped activation and watch rearm](mirror-6595-a-fact-process-ownership-and-scoped-activation.md) | 5988–5993, 6047–6049, 6073 | fact feed ownership, board activation, native watch |
+| [Kanban wake notices, ready-entry registry and external-park display](mirror-6595-a-kanban-wake-ready-entry-and-external-park-display.md) | 5998, 6045–6046, 6080, 6092 | wake confirmation, unproven notices, ready-entry clocks, timer display |
+| [Kanban actionability: frozen obligations and administrative deadlines](mirror-6595-a-kanban-actionability-obligation-custody.md) | 6003–6004, 6132–6136 | actionability reader, recovery obligations, creation-time intents |
+| [Kanban dispatcher: bounded storage waits and typed verdicts](mirror-6595-a-kanban-dispatch-storage-contention.md) | 6006–6007, 6026–6029 | dispatch tick, writer contention, claim refusal verdicts |
+| [Kanban spend budget: window semantics, input checks and immediate reviewer](mirror-6595-a-kanban-spend-budget-window-and-reviewer.md) | 6019, 6069–6071, 6094–6097 | spend-budget CLI, promote window, spend reviewer |
+| [Backup snapshot pruning and settled-result compaction](mirror-6595-a-state-storage-reclamation.md) | 6022–6024, 6065–6067 | quick-snapshot prune, state_meta result horizon |
+| [Fact store, reducer and capture CPU reductions](mirror-6595-a-fact-store-and-capture-cpu-reductions.md) | 6025, 6030, 6043, 6068, 6125, 6159 | fact encoding, reducers, board evidence capture |
+| [Sessions request path: transport packing, scoped enrichment and coalesced polls](mirror-6595-a-sessions-request-path-bounds.md) | 6031, 6062, 6091, 6126–6127 | sessions list/detail routes, rank transport, lane isolation |
+| [Early native-sessions capture at serve boot and update-admission hold](mirror-6595-a-serve-early-boot-and-update-admission.md) | 6036, 6087–6089 | serve boot ordering, warmup shutdown, signal installation, rollover hold |
+| [Kanban source-custody base (stage A, inert)](mirror-6595-a-kanban-source-custody-stage-a.md) | 6037–6042 | source pin store, barrier, publication argv, write-txn boundary |
+| [Serve producer isolation (dormant panel producer and admission)](mirror-6595-a-serve-producer-isolation-dormant.md) | 6050–6061 | serve producer protocol, custody, census, launch gate |
+| [Desktop request-stage evidence and trusted session-tasks diagnostic](mirror-6595-a-desktop-request-stage-and-trusted-diagnostics.md) | 6063–6064, 6122–6124 | poll stage correlation, trusted identity route |
+| [TUI RPC method lanes, projects tree caching and GC budget](mirror-6595-a-tui-gateway-lanes-and-projects-tree.md) | 6074–6079, 6113–6116 | tui_gateway RPC pool, project tree, gc |
+| [Kanban creation requires durable owning authority](mirror-6595-a-kanban-creation-authority-ingress.md) | 6081–6085, 6106, 6121 | agent create ingress, self-work, observer ancestry |
+| [Kanban release command and delegate scope renewal](mirror-6595-a-kanban-release-and-delegate-renewal.md) | 6107–6108, 6128–6131, 6137–6139 | hermes kanban release/delegate, Desktop Unblock |
+| [Kanban canonical home, execution separation and explicit-home readers](mirror-6595-a-kanban-canonical-home-and-explicit-home-reads.md) | 6141–6156 | creation home transport, field contracts, scope-explicit readers |
+| [Fail-closed startup readiness and natural controller rollover](mirror-6595-b-startup-readiness.md) | 6165–6168, 6175–6176, 6198–6204, 6248, 6294–6295 | startup-readiness |
+| [Primary reconnect ownership and exact sidebar list batching](mirror-6595-b-primary-routing.md) | 6169–6173, 6229, 6301–6303 | primary-routing |
+| [Read-first spend decisions and scope release fences](mirror-6595-b-spend-release.md) | 6174, 6286, 6315, 6322–6324, 6340, 6353–6354, 6376–6379 | spend-release |
+| [Source-derived actionability and fixed waiting obligations](mirror-6595-b-actionability.md) | 6177, 6190, 6196, 6216–6217, 6230, 6232, 6247, 6283, 6314 | actionability |
+| [Standing producer owner chats and local origin custody](mirror-6595-b-owner-chats.md) | 6178–6185, 6206–6207, 6220–6222, 6287, 6348 | owner-chats |
+| [Conservative sync repair, lease custody and UDF budgets](mirror-6595-b-sync-evidence.md) | 6186–6187, 6205, 6244–6246, 6336, 6346–6347, 6372 | sync-evidence |
+| [Exact-request single-use self-work admission exception](mirror-6595-b-selfwork-exception.md) | 6188–6189 | selfwork-exception |
+| [Semantic annotation parts and fail-fresh caching](mirror-6595-b-annotation-parts.md) | 6191–6195, 6228, 6280–6282, 6298, 6328–6334, 6339 | annotation-parts |
+| [Bounded fact capture, degradation and prepared recency](mirror-6595-b-fact-capture.md) | 6197, 6241, 6243, 6261, 6284–6285, 6359 | fact-capture |
+| [Owning-chat stop-only control for ended shadow work](mirror-6595-b-ended-stop.md) | 6208–6212, 6242 | ended-stop |
+| [Conditional terminal-run reservation and indexed wait history](mirror-6595-b-terminal-wake.md) | 6213–6215, 6312, 6349 | terminal-wake |
+| [Durable notice fanout and opt-in native scheduling](mirror-6595-b-notification-custody.md) | 6218–6219, 6227, 6252–6260, 6279, 6290–6291, 6357–6358 | notification-custody |
+| [Dormant zero-tool business-review adapter](mirror-6595-b-business-review.md) | 6223–6225, 6238 | business-review |
+| [Advisory maintenance, helper edges and human containment closure](mirror-6595-b-maintenance-containment.md) | 6226, 6299–6300, 6337, 6355–6356 | maintenance-containment |
+| [Background owner chats, card counts and elapsed clocks](mirror-6595-b-sidebar-cards.md) | 6231, 6296–6297, 6313, 6317–6319 | sidebar-cards |
+| [Recorded governor explanations and lightweight why startup](mirror-6595-b-governor-diagnostics.md) | 6233–6237, 6250–6251, 6292–6293, 6342–6343, 6351 | governor-diagnostics |
+| [Worker origin inheritance and durable forwarding refusals](mirror-6595-b-origin-forwarding.md) | 6239, 6262–6263, 6277, 6369–6371, 6374 | origin-forwarding |
+| [Deterministic fixture sampling and composed transport CI](mirror-6595-b-ci-fixtures.md) | 6240, 6350, 6352, 6360–6364 | ci-fixtures |
+| [Schema-discovered targeted computer scrolling](mirror-6595-b-scroll-schema.md) | 6249 | scroll-schema |
+| [Explicit Carbon routing and model-neutral obligations](mirror-6595-b-model-policy.md) | 6264–6267, 6288–6289, 6335, 6341, 6375 | model-policy |
+| [Reviewed import ordering and generated-code producer custody](mirror-6595-b-attestation-custody.md) | 6268–6276 | attestation-custody |
+| [Sized titlebar tools and Sessions tab-strip contributions](mirror-6595-b-desktop-contributions.md) | 6278, 6338, 6344–6345 | desktop-contributions |
+| [Immutable historical rejection observations and fresh audit cuts](mirror-6595-b-history-audit.md) | 6304–6311, 6316 | history-audit |
+| [Host-local workspace binding and prior-home history recovery](mirror-6595-b-workspace-history.md) | 6320–6321, 6325–6327 | workspace-history |
+| [Durable send outcomes and accurate composer recovery](mirror-6595-b-submission-outcomes.md) | 6365–6368, 6373 | submission-outcomes |
+| [Test isolation, fixture lifecycle and CI case partitioning](mirror-6595-c-test-isolation-and-fixture-lifecycle.md) | 6380–6381, 6383–6385, 6387, 6391, 6437, 6443–6445, 6449, 6454, 6467, 6470, 6474, 6485, 6504, 6530–6532, 6539, 6591–6592 | Test-only hardening: dashboard-mount draining, joined fixture workers, virtual clocks, wait-for-ack ordering, shard splits of large cron guard suites; plus one gateway catalog-ordering fix. |
+| [Annotation readers, batched revisions and settlement generations](mirror-6595-c-annotation-reader-lifecycle-and-settlement-revisions.md) | 6382, 6400–6401, 6471–6473, 6480–6482, 6493–6494, 6549–6550, 6566, 6582 | Board annotation read path: SQLite UDF registration, warm/waiting reader admission, batched revision probes, board reuse on wakes, parked-edge reads, column probe, monotonic settlement marks. |
+| [Create-path flag validation, creator-source audit and origin index](mirror-6595-c-kanban-create-path-audit-and-flags.md) | 6386, 6492, 6546–6548 | REST create validation, stored creator-source audit, and a task_id index for origin markers. |
+| [Private-hold diagnostic: released capability stops and stacked historical releases](mirror-6595-c-kanban-private-hold-capability-release.md) | 6388–6390, 6553 | Private-history classifier recognises exact capability-stop releases; explicit stacked capability release option. |
+| [Run-route provenance labels and subscription-class judge routing](mirror-6595-c-kanban-route-provenance-and-subscription-judges.md) | 6392–6394, 6478 | Route receipts say dynamic vs pin; spend review and hub admission select by subscription class; review route observations retained. |
+| [Kanban sync refusal audits and diagnostic drift supersession](mirror-6595-c-kanban-sync-refusal-and-drift-audits.md) | 6395–6399, 6403–6406, 6461–6462, 6476, 6563, 6581 | Receipted policy refusals vs drift, audit composition, fence continuity, partition audits, supersession proofs. |
+| [Class-authorised credential staging for managed workers](mirror-6595-c-managed-worker-class-credentials.md) | 6402, 6457–6460 | Private credential staging uses eligible routes of the explicitly selected class and the effective launch model. |
+| [Bounded private code-provenance diagnostic snapshots](mirror-6595-c-code-provenance-diagnostic-snapshots.md) | 6407–6413, 6468–6469, 6593 | Passive private capture/page verb, collector, progress phases, dependency-unit sizing. |
+| [Frozen administrative deadlines for parks, links, landings and review queues](mirror-6595-c-kanban-actionability-deadlines.md) | 6414–6416, 6453, 6463, 6479, 6483, 6499, 6516–6518, 6578 | Deadline stamping and census rules for escalation_deadline_missing; remote probe rehome. |
+| [Spend review, decided-triage repair and spend-stop watch](mirror-6595-c-kanban-spend-review-and-stop-watch.md) | 6417–6436 | Delayed caused-stop review, standard-class routing, notices, watch CLI, malformed-stop isolation, bounded request scan. |
+| [Local answer recovery and authority contract tests](mirror-6595-c-kanban-local-authority-recovery.md) | 6438–6442 | Home-local ActionStore adapter for answer recovery; contract tests. |
+| [Retired profile home guards](mirror-6595-c-profile-retirement-guards.md) | 6446–6448, 6450 | Late writers cannot resurrect renamed/deleted profiles. |
+| [Dispatch storage cancellation and governor observations](mirror-6595-c-dispatch-cancellation-and-governor-observations.md) | 6451, 6475, 6490, 6567–6568 | Pass-wide cancellation signal; governor snapshots; expiry after I/O. |
+| [CI flaky-test intake supplement records](mirror-6595-c-ci-flaky-intake-records.md) | 6452, 6505–6507, 6529 | Documentation-only append of immutable CI occurrence records and dispositions under the existing intake document. |
+| [Sync loop efficiency and write ordering](mirror-6595-c-kanban-sync-loop-and-write-order.md) | 6455–6456, 6557–6558 | Reader key reuse, 1s idle tick, parked event order. |
+| [Sessions facts-mode CPU accounting, capture timing and collect attribution](mirror-6595-c-sessions-facts-capture-accounting.md) | 6464–6466, 6554–6555 | Accounting for facts-mode serving and capture children; opt-in timing; collect substeps. |
+| [Session list reads, status checkpoints and early startup](mirror-6595-c-session-list-reads-status-and-startup.md) | 6477, 6502–6503, 6551–6552, 6559–6561 | Packed reads, probe memo, foreign process checkpoints, early-owned promotion, summary marker leaf. |
+| [Usage-accounting gate and pool pickup budgets](mirror-6595-c-kanban-usage-accounting-and-pickup.md) | 6484, 6540–6542, 6556 | Unsettled-run accounting gate, observe-by-default mode, pickup slots for debt cards. |
+| [Lane PR observations and CI park whole-commit wait](mirror-6595-c-kanban-lanes-pr-and-ci-wait.md) | 6486–6488, 6523 | Head-bound GraphQL snapshot, no-check heads, CI widened waits. |
+| [Release mandate and typed stop recovery](mirror-6595-c-kanban-release-mandate-and-stop-recovery.md) | 6489, 6497–6498, 6500–6501, 6543–6545 | Worker context mandate, human instructions, uid binding, recovery advice. |
+| [Desktop kanban model-requirement and recovery transport test harnesses](mirror-6595-c-desktop-e2e-and-transport-test-harnesses.md) | 6491, 6579–6580, 6586–6590 | Test additions. |
+| [Desktop Background section, stripes and bounded reports](mirror-6595-c-desktop-sidebar-background-and-reporting.md) | 6495–6496, 6565, 6569–6576 | Background grouping and counts; stripe-report sender. |
+| [Desktop sidebar: hidden search and removed New session row](mirror-6595-c-desktop-sidebar-search-and-new-session-row.md) | 6508–6512 | Sidebar chrome: New session row removed, search revealed by shortcut. |
+| [Request-stage diagnostics, stream phases and process custody](mirror-6595-c-request-stage-and-process-diagnostics.md) | 6513–6515, 6562, 6564, 6577 | Read admission stages, result POST stages, Gemini stream clocks, SIGINT, desktop defer. |
+| [Forward retry identity](mirror-6595-c-kanban-forward-retry-identity.md) | 6519–6522 | Later-run retry identity. |
+| [Refusal boundary for refused providers](mirror-6595-c-kanban-refusal-boundary.md) | 6524–6528 | Final execution fences. |
+| [Bounded owner reassessment](mirror-6595-c-kanban-owner-reassessment.md) | 6533–6538 | Opt-in reassessment parks, target observation, replica quarantine, evidence overflow. |
+| [Inert native-owner ask binding and eligibility producer](mirror-6595-c-native-owner-ask-binding.md) | 6583–6585, 6594–6595 | Read-only canonical binding modules; inert. |
+
 
 ## Mirror 5924–5949
 
@@ -4469,16 +4557,16 @@ The 5407–5437 append retains 51 bridges and three ancestry-only markers and ad
 
 ## Applying
 
-For the current **5949-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5949.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **6595-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-6595.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 4252743d44bef7fb852ca145bb861ac8e4a47225 \
+  --source-tip 26aaccc5a5b4fb5c247825d92579efd0765a9596 \
   --base ea405e49a5e281558b3eeb3a13af66c6116cd0f2 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5949.json" \
-  --replay-plan "$MODS/core/mirror-replay-5949.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-6595.json" \
+  --replay-plan "$MODS/core/mirror-replay-6595.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -4640,12 +4728,12 @@ git commit -m 'Explicit upstream integration bridge before 4353'
 git am -3 --empty=keep "${patches[@]:4352:145}"
 git apply --index --3way "$MODS/core/bridges/mirror-5011-before-4498.diff"
 git commit -m 'Explicit redaction resolution bridge before 4498'
-git am -3 --empty=keep "${patches[@]:4497:1452}"
+git am -3 --empty=keep "${patches[@]:4497:2098}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_5949.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_6595.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_5949.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_6595.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

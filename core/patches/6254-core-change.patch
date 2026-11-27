@@ -1,0 +1,298 @@
+From ca34fc8b5b4cd35ce3d4fb8053fb01d20b3c3ce5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:22:23 +0000
+Subject: [PATCH 6254] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit ca34fc8b5b4cd35ce3d4fb8053fb01d20b3c3ce5.
+
+---
+diff --git a/gateway/kanban_notification_schedule.py b/gateway/kanban_notification_schedule.py
+index 9dbde6e2ad0..4fba4ed7f04 100644
+--- a/gateway/kanban_notification_schedule.py
++++ b/gateway/kanban_notification_schedule.py
+@@ -28,6 +28,10 @@
+         self.native = native
+         self.native_action = None
+ 
++    @property
++    def legacy(self):
++        return not self.was_bound or (self.native and not self.facts_bound and self.native_action is None)
++
+     def _native_due(self, now, legacy_due):
+         from tui_gateway.notification_gateway_sources import enabled
+         if not self.native or not enabled():
+diff --git a/tests/tui_gateway/test_gateway_native_source_lifecycle.py b/tests/tui_gateway/test_gateway_native_source_lifecycle.py
+index 500bb6ade60..1c0a0dbf865 100644
+--- a/tests/tui_gateway/test_gateway_native_source_lifecycle.py
++++ b/tests/tui_gateway/test_gateway_native_source_lifecycle.py
+@@ -56,8 +56,10 @@
+     assert not owner.ready
+     assert owner.retry_at == 3
+     owner.watch.failed = False
++    owner.changed()  # a healthy hint must not cancel the outstanding inventory/recovery check
+     owner.step(2.5, reconcile=False)
+     assert not owner.ready
++    assert owner.retry_at == 3
+     owner.step(3, reconcile=False)
+     assert owner.ready
+     assert action.due(legacy_due=False)
+@@ -97,3 +99,85 @@
+     assert not owner.ready
+     owner.step(30, reconcile=True)
+     assert attempts == [1, 1]
++
++
++def test_roster_census_arms_successor_before_closing_predecessor(owner, monkeypatch, tmp_path):
++    from hermes_cli import fact_source_watch
++    owner.add(lambda: None)
++    owner.step(0, reconcile=True)
++    old = owner.watch
++    monkeypatch.setattr(sources, 'inventory', lambda: ((tmp_path / 'successor.db',), ()))
++    fail = [True]
++
++    def successor(*args, **kwargs):
++        assert not old.closed
++        if fail[0]:
++            raise OSError('cannot yet arm successor scope')
++        return Watch()
++
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', successor)
++    owner.step(30, reconcile=True)
++    assert owner.watch is old
++    assert not old.closed
++    assert not owner.ready
++    fail[0] = False
++    owner.step(31, reconcile=False)
++    assert old.closed
++    assert owner.watch is not old
++    assert owner.ready
++    assert owner.signature == ((tmp_path / 'successor.db',), ())
++
++
++def test_registration_context_survives_owner_thread_scope(monkeypatch, tmp_path):
++    from contextvars import ContextVar
++    from hermes_cli import fact_source_watch
++    marker = ContextVar('native_registration_scope', default='outside')
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((tmp_path / (marker.get() + '.db'),), ()))
++    token = marker.set('registered')
++    owner = sources.Sources(threading.Event())
++    marker.reset(token)
++    try:
++        owner.add(lambda: None)
++        owner.step(0, reconcile=True)
++        assert owner.signature == ((tmp_path / 'registered.db',), ())
++        assert marker.get() == 'outside'
++    finally:
++        owner.close()
++
++
++def test_native_to_bound_owner_never_reactivates_legacy_on_detach(owner, monkeypatch):
++    from gateway.kanban_notification_schedule import BoundActions
++    from hermes_cli.fact_fake import FakeStore
++    from tests.tui_gateway import test_notification_facts as helpers
++    from tui_gateway import notification_facts, notification_loaded_f
++
++    scheduler = notification_loaded_f.Scheduler(clock=lambda: 0)
++    scheduler.gateway_sources = owner
++    monkeypatch.setattr(notification_loaded_f, '_owner', scheduler)
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    gate = BoundActions(lambda: None, native=True)
++    store = FakeStore()
++    helpers.ready_siblings(store)
++    binding = None
++    try:
++        assert gate.legacy
++        assert not gate.due(0, legacy_due=True)
++        owner.step(0, reconcile=True)
++        assert not gate.legacy
++        binding = notification_facts.bind(store, helpers.SCOPE, '/canonical/native-transition')
++        binding.report_ready()
++        store.activate(helpers.SCOPE)
++        store.drain()
++        assert gate.due(0, legacy_due=True)
++        assert gate.native_action is None
++        assert not gate.legacy
++        binding.close()
++        assert not gate.due(0, legacy_due=True)
++        assert not gate.legacy
++        assert gate.native_action is None
++    finally:
++        gate.close()
++        if binding is not None:
++            binding.close()
++        scheduler.close()
+diff --git a/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py b/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py
+index fbf1f51418e..da90c61a09d 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py
++++ b/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py
+@@ -182,6 +182,8 @@
+     import threading
+     from types import SimpleNamespace
+ 
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '0')  # explicitly exercise the legacy rollback path
++
+     owner = None
+     if bound:
+         store = FakeStore()
+diff --git a/tests/tui_gateway/test_native_unloaded_entry_loop.py b/tests/tui_gateway/test_native_unloaded_entry_loop.py
+new file mode 100644
+index 00000000000..c6602a71afb
+--- /dev/null
++++ b/tests/tui_gateway/test_native_unloaded_entry_loop.py
+@@ -0,0 +1,117 @@
++"""The production unloaded loop activates shared native coverage without a fact binding."""
++import threading
++from types import SimpleNamespace
++
++from hermes_cli import host_loop_lease
++from tests.tui_gateway import test_kanban_unloaded_fact_schedule as helpers
++from tui_gateway import kanban_unloaded as unloaded
++from tui_gateway import kanban_unloaded_gates as gates
++from tui_gateway import kanban_unloaded_schedule as scheduling
++from tui_gateway import notification_gateway_sources as sources
++from tui_gateway import notification_loaded_f as loaded
++from tui_gateway.notice_fanout_result import FanoutResult
++
++
++def test_native_unloaded_entry_retry_lease_maintenance_and_off_deadline(monkeypatch):
++    now = [0.0]
++    scheduler = loaded.Scheduler(clock=lambda: now[0])
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    monkeypatch.setenv('HERMES_KANBAN_UNLOADED_SWEEP_S', '5')
++    monkeypatch.setenv('HERMES_KANBAN_UNLOADED_FIRST_S', '0')
++    monkeypatch.setattr(scheduling.time, 'monotonic', lambda: now[0])
++    monkeypatch.setattr(gates.time, 'time', lambda: 1000 + now[0])
++    monkeypatch.setattr(host_loop_lease, 'host_loops_retired', lambda: False)
++    monkeypatch.setattr(unloaded.wake_slots, 'set_holder', lambda _: None)
++    monkeypatch.setattr(gates, 'probe', lambda *a, **kw: gates.Inputs())
++    calls, beats, released = [], [], []
++    stop = threading.Event()
++    lease = helpers.Lease()
++    monkeypatch.setattr(lease, 'beat', lambda: beats.append(now[0]))
++    monkeypatch.setattr(lease, 'release', lambda: released.append(True), raising=False)
++    monkeypatch.setattr(unloaded, 'make_lease', lambda: lease)
++
++    class Wake:
++        flag = False
++
++        def set(self):
++            self.flag = True
++
++        def clear(self):
++            self.flag = False
++
++        def is_set(self):
++            return self.flag
++
++        def wait(self, timeout):
++            now[0] += timeout
++            if now[0] == 11:
++                scheduler.gateway_sources.changed()
++            if now[0] == 12:
++                monkeypatch.setenv('HERMES_FACTS_GATEWAY', '0')
++                self.set()  # explicit rollback observation between legacy deadlines
++            if now[0] >= 18:
++                stop.set()
++            scheduler.step()
++
++    def host(*args, **kwargs):
++        calls.append(now[0])
++        result = FanoutResult()
++        if len(calls) == 1:
++            result.incomplete = True
++            result.next_deadline = 3
++        gates.run('card_change_pass', lambda: result, live=set())
++
++    monkeypatch.setattr(unloaded, 'threading', SimpleNamespace(Event=Wake))
++    monkeypatch.setattr(unloaded, 'host_pass', host)
++    gates.reset_for_tests()
++    try:
++        unloaded._loop(stop)
++        assert calls == [1, 3, 11, 16]
++        assert 0 in beats and 8 in beats  # source quietness does not stop lease maintenance
++        assert released == [True]
++        assert not scheduler.gateway_sources.actions
++    finally:
++        gates.reset_for_tests()
++        scheduler.close()
++
++
++def test_native_quiet_role_handoff_and_retirement(monkeypatch):
++    from hermes_cli import fact_source_watch
++    from tests.tui_gateway import test_gateway_native_source_lifecycle as native_helpers
++
++    scheduler = loaded.Scheduler(clock=lambda: 0)
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', native_helpers.Watch)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    retired = [False]
++    calls = []
++    monkeypatch.setattr(host_loop_lease, 'host_loops_retired', lambda: retired[0])
++    monkeypatch.setattr(unloaded.wake_slots, 'set_holder', lambda _: None)
++    monkeypatch.setattr(gates, 'probe', lambda *a, **kw: gates.Inputs())
++    monkeypatch.setattr(unloaded, 'host_pass', lambda *a, **kw: calls.append('host'))
++    monkeypatch.setattr(unloaded, 'residual_pass', lambda: calls.append('residual'))
++    lease = helpers.Lease()
++    schedule = scheduling.UnloadedSchedule(lambda: None, 60, native=True)
++    try:
++        unloaded.run_pass(lease, schedule=schedule)
++        assert calls == []
++        scheduler.step()
++        unloaded.run_pass(lease, schedule=schedule)
++        unloaded.run_pass(lease, schedule=schedule)
++        assert calls == ['host']
++        lease.holder = False
++        unloaded.run_pass(lease, schedule=schedule)
++        assert calls == ['host', 'residual']
++        retired[0] = True
++        assert unloaded.run_pass(lease, schedule=schedule) == 'retired'
++        assert schedule.gate.retry_at == float('inf')
++        retired[0] = False
++        lease.holder = True
++        unloaded.run_pass(lease, schedule=schedule)
++        assert calls == ['host', 'residual', 'host']
++    finally:
++        schedule.close()
++        scheduler.close()
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 7e954ebbc61..767acedea50 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -901,7 +901,7 @@
+                     schedule.gate.retry_at = time.monotonic() + interval
+                     logger.warning("kanban unloaded pass failed", exc_info=True)
+                 maintenance = time.monotonic() + interval
+-                if not schedule.gate.was_bound and schedule.role != "retired":
++                if schedule.gate.legacy and schedule.role != "retired":
+                     # An early report wake may not admit legacy work. Keep its
+                     # outstanding deadline rather than postponing it a full interval.
+                     maintenance = min(maintenance, schedule.next_legacy)
+diff --git a/tui_gateway/notification_gateway_sources.py b/tui_gateway/notification_gateway_sources.py
+index 38c5c03b505..c5995958fe5 100644
+--- a/tui_gateway/notification_gateway_sources.py
++++ b/tui_gateway/notification_gateway_sources.py
+@@ -109,11 +109,12 @@
+                         old.close()
+                 if self.watch is not None:
+                     self.watch.check()
+-                if not self.ready:
+-                    log.info('gateway notification native sources ready (%d paths; shared 30s census)',
+-                             len(signature[0]))
+-                self.ready = True
+-                self.retry_at = float('inf')
++                if refresh:
++                    if not self.ready:
++                        log.info('gateway notification native sources ready (%d paths; shared 30s census)',
++                                 len(signature[0]))
++                    self.ready = True
++                    self.retry_at = float('inf')
+             except NotImplementedError:
+                 self.ready = False
+                 self.retry_at = float('inf')  # unsupported platform: census only, not a 1s retry loop
+-- 
+2.43.0
+

@@ -1,0 +1,123 @@
+From 8ee6010ce27b26bf42b674036770b3ad16a6cb09 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:45:21 +0000
+Subject: [PATCH 6217] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit 8ee6010ce27b26bf42b674036770b3ad16a6cb09.
+
+---
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index be1f7c17c06..52e5424fa8c 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -281,6 +281,26 @@
+     return result
+ 
+ 
++def _chat_producer(awaited: Optional[dict]) -> Optional[str]:
++    """Admitted chat producers identify a subscribed question, not a ref."""
++    if awaited and awaited["kind"] == "chat" and awaited["why"]:
++        return f"owning chat ({awaited['why'][:80]})"
++    return None
++
++
++def _blocked_wait(kind: Optional[str]) -> Optional[tuple]:
++    if kind in AGENT_BLOCK_KINDS:
++        return f"blocked:{kind}", f"an agent to clear a {kind} block", True
++    if kind == "dependency":
++        return "dependency", "a parent card", False
++    if kind is None:
++        return "blocked:untyped", "an agent to clear an untyped block", True, False
++    if kind != "time":
++        # Another human kind without a validated ask is not an agent-owned park.
++        return f"blocked:{kind}", f"an unvalidated ask ({kind})", False
++    return None
++
++
+ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park: Any = None,
+              park_kind: Any = None, since: Any = None, awaiting: Any = None, reason: Any = None,
+              now: Optional[float] = None) -> Optional[dict[str, Any]]:
+@@ -328,17 +348,13 @@
+             return out("triage:block_loop", "a human or shared blocker (block loop)", False)
+         return out("triage:intake", "triage", False)
+     if status == "blocked":
+-        if kind in AGENT_BLOCK_KINDS:
+-            return out(f"blocked:{kind}", f"an agent to clear a {kind} block", True)
+-        if kind == "dependency":
+-            return out("dependency", "a parent card", False)
+-        if kind is None:
+-            return out("blocked:untyped", "an agent to clear an untyped block", True, certain=False)
+-        if kind != "time":
+-            # another human kind without a validated ask: the user's move, just not visible. (An ask-less
+-            # needs_input is agent-owned, handled above; a validated ask returns early as ``human``.)
+-            return out(f"blocked:{kind}", f"an unvalidated ask ({kind})", False)
++        if blocked := _blocked_wait(kind):
++            return out(*blocked)
+     # scheduled, or blocked kind=time: a park. Who produces what it waits for?
++    if chat := _chat_producer(awaited):
++        # Admitted chat waits name their question rather than a ref. Preserve the
++        # producer through local/replica classification and remote confirmation.
++        return out("scheduled", chat, False)
+     if awaited and awaited["inferred"] and not (awaited["kind"] == "card" and awaited["ref"]):
+         # Core's guess from the park text (every park on the "no producer, no park" core records one): an inferred
+         # clock/external wait is just the legacy wake mechanism, judged below like a park with no ``awaiting``.
+diff --git a/tests/hermes_cli/test_kanban_wait_info.py b/tests/hermes_cli/test_kanban_wait_info.py
+index 6975fabe06f..2577d897797 100644
+--- a/tests/hermes_cli/test_kanban_wait_info.py
++++ b/tests/hermes_cli/test_kanban_wait_info.py
+@@ -148,6 +148,52 @@
+     assert (kwi.describe_replica(human, now=NOW) or {})["wait_state"] == "human"
+ 
+ 
++@pytest.mark.parametrize("inferred", [False, True])
++def test_chat_backed_scheduled_owner_is_a_live_producer(tmp_path, monkeypatch, inferred):
++    import subprocess
++    from hermes_cli import kanban_awaiting as awaiting_gate
++
++    # Historical park2085077: admitted chat waits name their question in why, not ref.
++    awaited = {"kind": "chat", "why": "Owning-chat exact source sequencing disposition",
++               "inferred": inferred}
++    park = {"awaiting": awaited, "wake_check": "python3 /fixture/source-artifact-v24.py"}
++    info = d("scheduled", park=park, since=NOW - 30 * H)
++    assert info["agent_owned"] is False
++    assert info["wait_state"] == "waiting" and info["premise"] is None
++    assert info["waiting_on"] == "owning chat (Owning-chat exact source sequencing disposition)"
++    card = {"status": "scheduled", "awaiting": awaited,
++            "run": {"outcome": "scheduled", "ended_at": NOW - 30 * H}}
++    assert (kwi.describe_replica(card, now=NOW) or {})["agent_owned"] is False
++    db = tmp_path / "kanban.db"
++    _board(db, [{"id": "t_5f0d878cd1c10371", "status": "scheduled", "session": "s_owner",
++                 "events": [("scheduled", park, int(NOW - 30 * H))]}])
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
++    rc, out = kwc.check_local("task", "t_5f0d878cd1c10371")
++    assert rc == 1 and "agent-owned park" not in out and "orphan producer" not in out
++    # Real remote-response parser, with only its transport simulated.
++    monkeypatch.setattr(kwc.subprocess, "run", lambda argv, **kw:
++                        subprocess.CompletedProcess(argv, rc, stdout=out, stderr=""))
++    awaiting_gate.confirm_remote({"kind": "card", "ref": "t_5f0d878cd1c10371", "gateway": "hub"})
++
++
++@pytest.mark.parametrize("kind,why", [("chat", ""), ("unknown", "question"), ("human", "decision")])
++def test_unbacked_or_hidden_wait_still_has_no_producer(kind, why):
++    assert d("scheduled", awaiting={"kind": kind, "why": why}, since=NOW - 30 * H)["agent_owned"] is True
++
++
++@pytest.mark.parametrize("status,kind,human,expected", [
++    ("blocked", "time", False, "owning chat (question)"),
++    ("blocked", "transient", False, "an agent to clear a transient block"),
++    ("blocked", "dependency", False, "a parent card"),
++    ("blocked", None, False, "an agent to clear an untyped block"),
++    ("blocked", "needs_input", True, "you"),
++    ("triage", None, False, "triage"),
++])
++def test_chat_classification_does_not_override_block_or_human_precedence(status, kind, human, expected):
++    info = d(status, block_kind=kind, human=human, awaiting={"kind": "chat", "why": "question"})
++    assert info["waiting_on"] == expected
++
++
+ # ---- session activity: sidebar count + strip rows --------------------------------------------------------------
+ def _board(path: Path, cards: list[dict]) -> None:
+     path.parent.mkdir(parents=True, exist_ok=True)
+-- 
+2.43.0
+

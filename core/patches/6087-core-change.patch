@@ -1,0 +1,636 @@
+From 93f03aa2f8918ec9d58fdc9eb087f8373fd35202 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 05:59:17 +0000
+Subject: [PATCH 6087] Early native-sessions capture at serve boot and update-admission hold
+
+Public mirror of source commit 93f03aa2f8918ec9d58fdc9eb087f8373fd35202.
+
+---
+diff --git a/hermes_cli/dashboard_server_start.py b/hermes_cli/dashboard_server_start.py
+new file mode 100644
+index 00000000000..a9b463c540b
+--- /dev/null
++++ b/hermes_cli/dashboard_server_start.py
+@@ -0,0 +1,24 @@
++"""Dashboard server import/auth/start seam, held under early capture custody."""
++
++
++def run_server(args, *, headless, owner, prepare_auth, bootstrap, mcp_after_bind):
++    from hermes_cli.web_server import start_server
++
++    # TTY-only interactive auth setup; noninteractive callers retain fail-closed
++    # start_server behavior. Plugins were already discovered before early capture.
++    prepare_auth(args)
++    if headless:
++        from hermes_cli.observability.shared_metrics_process import begin_process
++        begin_process('serve')
++    start_server(
++        host=args.host,
++        port=args.port,
++        open_browser=not args.no_open,
++        allow_public=getattr(args, 'insecure', False),
++        initial_profile=getattr(args, 'open_profile', '') or '',
++        headless=headless,
++        isolated=getattr(args, 'isolated', False),
++        **bootstrap,
++        start_mcp_discovery_after_bind=mcp_after_bind,
++        early_sessions_owner=owner,
++    )
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 594532269ea..45fba5ee919 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2515,32 +2515,14 @@
+     supported_launch('serve' if _headless_backend else 'dashboard')
+     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
+     _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
+-
+-    from hermes_cli.web_server import start_server
+-
+-    # Interactive auth setup: if this bind will engage the auth gate but no
+-    # provider is registered yet, offer to configure one here (TTY only)
+-    # instead of hard-failing inside start_server. Non-interactive callers
+-    # (Docker/s6, CI, --no-open pipelines) fall through to start_server's
+-    # fail-closed SystemExit unchanged.
+-    _maybe_setup_dashboard_auth_interactively(args)
+-    if _headless_backend:
+-        from hermes_cli.observability.shared_metrics_process import begin_process
+-        begin_process("serve")
+-
+-    # The in-browser Chat tab (embedded TUI over PTY/WebSocket) is always
+-    # available — desktop and dashboard both rely on `/api/ws` + `/api/pty`.
+-    start_server(
+-        host=args.host,
+-        port=args.port,
+-        open_browser=not args.no_open,
+-        allow_public=getattr(args, "insecure", False),
+-        initial_profile=getattr(args, "open_profile", "") or "",
+-        headless=_headless_backend,
+-        isolated=getattr(args, "isolated", False),
+-        **_ssh_bootstrap_server_kwargs(_token_file, _ssh_session_token, _ssh_owner_nonce),
+-        start_mcp_discovery_after_bind=_mcp_discovery_after_bind,
+-    )
++    from hermes_cli.sessions_early_boot import early_sessions
++
++    with early_sessions(headless=_headless_backend, isolated=getattr(args, 'isolated', False)) as owner:
++        from hermes_cli.dashboard_server_start import run_server
++        run_server(args, headless=_headless_backend, owner=owner,
++                   prepare_auth=_maybe_setup_dashboard_auth_interactively,
++                   bootstrap=_ssh_bootstrap_server_kwargs(_token_file, _ssh_session_token, _ssh_owner_nonce),
++                   mcp_after_bind=_mcp_discovery_after_bind)
+ 
+ 
+ def cmd_completion(args, parser=None):
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+new file mode 100644
+index 00000000000..4bdf497b0ee
+--- /dev/null
++++ b/hermes_cli/sessions_early_boot.py
+@@ -0,0 +1,69 @@
++"""Pre-import native capture custody, after producer admission and plugin discovery."""
++from contextlib import contextmanager
++import os
++import signal
++import sys
++
++
++class EarlySessions:
++    """One owner across CLI import, app startup, and failed shutdown."""
++    def __init__(self, runtime):
++        self.runtime = runtime
++        self.adopted = False
++        self.closed = False
++
++    def adopt(self):
++        if self.adopted or self.closed:
++            raise RuntimeError('early sessions custody already consumed')
++        self.adopted = True
++        return self.runtime
++
++    def close(self):
++        if not self.closed:
++            self.runtime.close()
++            self.closed = True  # failed drain retains custody for the outer retry
++
++
++@contextmanager
++def early_sessions(*, headless, isolated):
++    # Preserve legacy/embedded/non-Linux ordering and the supported rollback.
++    # health: allow HX002 -- creator-defined startup switch, not a credential
++    enabled = os.environ.get('HERMES_FACTS_SESSIONS', '1').strip().lower() not in ('0', 'off', 'false', 'no')
++    if not headless or not enabled or not sys.platform.startswith('linux'):
++        yield None
++        return
++    from hermes_cli.proof_home import assert_backend_home
++    from hermes_cli.update_proxy_env import restore_user_proxy_env
++    from hermes_cli.isolated_scope import record_launch_scope
++    from hermes_cli.process_identity import is_desktop_owned_backend
++
++    assert_backend_home(isolated=isolated)
++    restore_user_proxy_env()
++    record_launch_scope(isolated=isolated, desktop_owned=is_desktop_owned_backend())
++    from hermes_cli.sessions_native_startup import SessionsRuntime
++    from hermes_cli.web_routers import profiles
++
++    owner = EarlySessions(SessionsRuntime(profiles, profiles._profile_targets('sessions facts startup')))
++    previous = {}
++
++    def stop(signum, frame):
++        owner.close()
++        handler = previous[signum]
++        if callable(handler):
++            handler(signum, frame)
++        elif handler != signal.SIG_IGN:
++            raise SystemExit(128 + signum)
++
++    try:
++        for signum in (signal.SIGTERM, signal.SIGINT):
++            previous[signum] = signal.signal(signum, stop)
++        owner.runtime.start_background()
++        yield owner
++    finally:
++        try:
++            owner.close()
++        finally:
++            for signum, handler in previous.items():
++                # Do not remove a later installed exit-flush handler.
++                if signal.getsignal(signum) is stop:
++                    signal.signal(signum, handler)
+diff --git a/hermes_cli/sessions_native_startup.py b/hermes_cli/sessions_native_startup.py
+index d6ab57d926f..b90392c7940 100644
+--- a/hermes_cli/sessions_native_startup.py
++++ b/hermes_cli/sessions_native_startup.py
+@@ -192,12 +192,17 @@
+     if not enabled or not sys.platform.startswith('linux'):
+         yield
+         return
+-    targets = await asyncio.to_thread(profiles._profile_targets, 'sessions facts startup')
+-    runtime = SessionsRuntime(profiles, targets)
++    owner = getattr(app.state, 'early_sessions_owner', None)
++    if owner is None:
++        targets = await asyncio.to_thread(profiles._profile_targets, 'sessions facts startup')
++        runtime = SessionsRuntime(profiles, targets)
++    else:
++        runtime = owner.adopt()
+     app.state.sessions_facts = runtime  # custody survives a failed startup/unwind
+     try:
+-        runtime.start_background()
++        if owner is None:
++            runtime.start_background()
+         yield
+     finally:
+-        await asyncio.to_thread(runtime.close)
++        await asyncio.to_thread(runtime.close if owner is None else owner.close)
+         app.state.sessions_facts = None
+diff --git a/hermes_cli/web_boot_services.py b/hermes_cli/web_boot_services.py
+new file mode 100644
+index 00000000000..4e29a5e0212
+--- /dev/null
++++ b/hermes_cli/web_boot_services.py
+@@ -0,0 +1,78 @@
++"""Bind native display surfaces before standalone service warmup, fail closed elsewhere."""
++import asyncio
++from contextlib import asynccontextmanager
++
++from starlette.responses import JSONResponse
++
++_DISPLAY_PATHS = frozenset(('/api/health', '/api/profiles/sessions',
++                            '/api/profiles/sessions/sidebar', '/api/profiles/sessions/stamps'))
++
++
++class BootServicesMiddleware:
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope['type'] in ('http', 'websocket'):
++            ready = getattr(scope['app'].state, 'boot_services_ready', None)
++            if ready is not None and not ready.is_set():
++                if scope['type'] == 'websocket':
++                    await send({'type': 'websocket.close', 'code': 1013})
++                    return
++                if scope['method'] != 'GET' or scope['path'] not in _DISPLAY_PATHS:
++                    response = JSONResponse({'detail': 'Backend services warming'}, status_code=503,
++                                            headers={'Retry-After': '1'})
++                    await response(scope, receive, send)
++                    return
++        await self.app(scope, receive, send)
++
++
++@asynccontextmanager
++async def services_lifespan(app, services):
++    listener = getattr(app.state, 'http_listener_ready', None)
++    if (listener is None or getattr(app.state, 'sessions_facts', None) is None
++            or getattr(app.state, 'gateway_runner', None) is not None):
++        async with services(app):
++            yield
++        return
++    ready, stop = asyncio.Event(), asyncio.Event()
++    app.state.boot_services_ready = ready
++
++    async def warm():
++        await listener.wait()
++        async with services(app):
++            ready.set()
++            await stop.wait()
++
++    task = asyncio.create_task(warm(), name='standalone-service-warmup')
++    def report_failure(done):
++        if not done.cancelled() and (error := done.exception()) is not None:
++            import logging
++            logging.getLogger(__name__).error('Standalone service warmup failed; routes remain unavailable',
++                                             exc_info=(type(error), error, error.__traceback__))
++    task.add_done_callback(report_failure)
++    try:
++        yield
++    finally:
++        ready.clear()
++        stop.set()
++        # Before the listener starts no service owns resources. Once it starts,
++        # do not cancel a half-entered lifespan and lose its shutdown custody.
++        try:
++            if not listener.is_set():
++                task.cancel()
++                await asyncio.gather(task, return_exceptions=True)
++            else:
++                cancelled = False
++                while not task.done():
++                    try:
++                        await asyncio.shield(task)
++                    except asyncio.CancelledError:
++                        # Cancellation of the serving lifespan cannot abandon a
++                        # half-entered service owner or release sessions first.
++                        cancelled = True
++                task.result()
++                if cancelled:
++                    raise asyncio.CancelledError
++        finally:
++            app.state.boot_services_ready = None
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 486dd240a45..ecfe9df06e9 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -225,6 +225,8 @@
+ app.add_middleware(AuthBodyLimitMiddleware)
+ from hermes_cli.sessions_native_startup import SessionsMiddleware
+ app.add_middleware(SessionsMiddleware)
++from hermes_cli.web_boot_services import BootServicesMiddleware
++app.add_middleware(BootServicesMiddleware)
+ 
+ 
+ # Memory-provider OAuth connect routes live in the memory layer, not here.
+@@ -1714,6 +1716,7 @@
+     start_mcp_discovery_after_bind: bool = False,
+     ssh_lock_path: Optional[Path] = None,
+     ssh_ownership_id: Optional[str] = None,
++    early_sessions_owner=None,
+ ):
+     """Start the web UI server.
+ 
+@@ -1805,6 +1808,8 @@
+         _log.warning("eager multi-profile activation failed", exc_info=True)
+ 
+     async def _serve():
++        app.state.early_sessions_owner = early_sessions_owner
++        app.state.http_listener_ready = asyncio.Event()
+         # startup split from main_loop so the bound (ephemeral) port is readable.
+         if not config.loaded:
+             config.load()
+@@ -1813,6 +1818,7 @@
+             await server.startup()
+             if server.should_exit:
+                 return
++            app.state.http_listener_ready.set()
+ 
+             _on_server_started(
+                 server,
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 9369c17dbc2..b86224bf5a9 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -322,8 +322,9 @@
+     from hermes_cli.sessions_native_startup import lifespan as sessions_lifespan
+     from hermes_cli.fact_tree_startup import lifespan as tree_lifespan
+     from hermes_cli.fact_annotation_lifespan import lifespan as annotation_lifespan
++    from hermes_cli.web_boot_services import services_lifespan
+     try:
+-        async with links_lifespan(app), annotation_lifespan(app), sessions_lifespan(app), tree_lifespan(app), plugin_lifespan(app), lifespan(app):
++        async with links_lifespan(app), annotation_lifespan(app), sessions_lifespan(app), tree_lifespan(app), plugin_lifespan(app), services_lifespan(app, lifespan):
+             yield
+     finally:
+         host_attach.enable_stale_while_revalidate(False)
+diff --git a/tests/hermes_cli/test_sessions_early_boot.py b/tests/hermes_cli/test_sessions_early_boot.py
+new file mode 100644
+index 00000000000..ced243488ca
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_early_boot.py
+@@ -0,0 +1,97 @@
++"""Early capture keeps one owner through import failures and app adoption."""
++from types import SimpleNamespace
++import signal
++
++from fastapi import FastAPI
++import pytest
++
++from hermes_cli import sessions_early_boot as early
++from hermes_cli import sessions_native_startup as native
++
++
++@pytest.fixture
++def boot(monkeypatch):
++    from hermes_cli import isolated_scope, process_identity, proof_home, update_proxy_env
++    from hermes_cli.web_routers import profiles
++    calls = []
++    runtime = SimpleNamespace(start_background=lambda: calls.append('start'),
++                              close=lambda: calls.append('close'))
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    monkeypatch.setattr(early.sys, 'platform', 'linux')
++    monkeypatch.setattr(proof_home, 'assert_backend_home', lambda **kw: calls.append('preflight'))
++    monkeypatch.setattr(update_proxy_env, 'restore_user_proxy_env', lambda: calls.append('proxy'))
++    monkeypatch.setattr(process_identity, 'is_desktop_owned_backend', lambda: False)
++    monkeypatch.setattr(isolated_scope, 'record_launch_scope', lambda **kw: calls.append(('scope', kw)))
++    monkeypatch.setattr(profiles, '_profile_targets', lambda reason: calls.append('targets') or [('default', '/unused')])
++    monkeypatch.setattr(native, 'SessionsRuntime', lambda *a: runtime)
++    return calls, runtime
++
++
++@pytest.mark.parametrize('error', [ImportError, SystemExit, OSError, KeyboardInterrupt])
++def test_pre_adoption_failures_close(boot, error):
++    calls, _ = boot
++    with pytest.raises(error):
++        with early.early_sessions(headless=True, isolated=True):
++            raise error()
++    assert calls == ['preflight', 'proxy', ('scope', {'isolated': True, 'desktop_owned': False}), 'targets', 'start', 'close']
++
++
++@pytest.mark.asyncio
++async def test_adoption_no_duplicate_start_or_close(boot):
++    calls, runtime = boot
++    app = FastAPI()
++    with early.early_sessions(headless=True, isolated=False) as owner:
++        app.state.early_sessions_owner = owner
++        async with native.lifespan(app):
++            assert app.state.sessions_facts is runtime
++            with pytest.raises(RuntimeError, match='consumed'):
++                owner.adopt()
++        assert owner.closed
++        assert app.state.sessions_facts is None
++    assert calls.count('start') == calls.count('close') == 1
++
++
++@pytest.mark.parametrize('signum', [signal.SIGTERM, signal.SIGINT])
++def test_signal_in_import_gap_drains_and_chains(boot, signum):
++    calls, _ = boot
++    original = signal.getsignal(signum)
++    def previous(sig, frame):
++        calls.append('previous')
++        raise SystemExit(123)
++    signal.signal(signum, previous)
++    try:
++        with pytest.raises(SystemExit, match='123'):
++            with early.early_sessions(headless=True, isolated=False):
++                signal.getsignal(signum)(signum, None)
++        assert calls[-2:] == ['close', 'previous']
++        assert signal.getsignal(signum) is previous
++    finally:
++        signal.signal(signum, original)
++
++
++@pytest.mark.parametrize('mode', ['legacy', 'dashboard', 'darwin'])
++def test_rollback_does_not_touch_runtime(boot, monkeypatch, mode):
++    calls, _ = boot
++    if mode == 'legacy':
++        monkeypatch.setenv('HERMES_FACTS_SESSIONS', '0')
++    if mode == 'darwin':
++        monkeypatch.setattr(early.sys, 'platform', 'darwin')  # os-marker: ok — unsupported-watch rollback only; no macOS APIs
++    with early.early_sessions(headless=mode != 'dashboard', isolated=False) as owner:
++        assert owner is None
++    assert not calls
++
++
++def test_failed_drain_retains_owner():
++    calls = []
++    def close():
++        calls.append('close')
++        if len(calls) == 1:
++            raise TimeoutError('retained')
++    owner = early.EarlySessions(SimpleNamespace(close=close))
++    with pytest.raises(TimeoutError):
++        owner.close()
++    assert not owner.closed
++    owner.close()
++    assert owner.closed
++    with pytest.raises(RuntimeError):
++        owner.adopt()
+diff --git a/tests/hermes_cli/test_web_boot_services.py b/tests/hermes_cli/test_web_boot_services.py
+new file mode 100644
+index 00000000000..b17c788792b
+--- /dev/null
++++ b/tests/hermes_cli/test_web_boot_services.py
+@@ -0,0 +1,203 @@
++"""Native sessions can answer while unrelated standalone services warm."""
++import asyncio
++from contextlib import asynccontextmanager
++from types import SimpleNamespace
++
++from fastapi import FastAPI
++import httpx
++import pytest
++
++
++@pytest.mark.asyncio
++async def test_services_wait_for_listener_and_gate_unready_routes():
++    from hermes_cli.web_boot_services import BootServicesMiddleware, services_lifespan
++    app = FastAPI()
++    app.state.http_listener_ready = asyncio.Event()
++    app.state.sessions_facts = SimpleNamespace()
++    app.add_middleware(BootServicesMiddleware)
++    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
++
++    @asynccontextmanager
++    async def services(app):
++        entered.set()
++        await release.wait()
++        try:
++            yield
++        finally:
++            closed.set()
++
++    @app.get('/api/health')
++    @app.get('/api/profiles/sessions')
++    @app.get('/api/profiles/sessions/sidebar')
++    @app.get('/api/private')
++    async def response():
++        return {'sessions': [{'id': 'real-row'}]}
++
++    async with services_lifespan(app, services):
++        assert not entered.is_set()
++        app.state.http_listener_ready.set()
++        await asyncio.wait_for(entered.wait(), 2)
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
++            for path in ('/api/health', '/api/profiles/sessions', '/api/profiles/sessions/sidebar'):
++                assert (await client.get(path)).status_code == 200
++            pending = await client.get('/api/private')
++            assert pending.status_code == 503
++            assert pending.headers['retry-after'] == '1'
++            assert (await client.post('/api/health')).status_code == 503
++            assert (await client.get('/api/profiles/sessions/unsafe')).status_code == 503
++            release.set()
++            await asyncio.wait_for(app.state.boot_services_ready.wait(), 2)
++            assert (await client.get('/api/private')).status_code == 200
++    assert closed.is_set()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('mode', ['legacy', 'embedded', 'no_listener'])
++async def test_other_startup_modes_still_wait_for_services(mode):
++    from hermes_cli.web_boot_services import services_lifespan
++    app = FastAPI()
++    app.state.http_listener_ready = asyncio.Event() if mode != 'no_listener' else None
++    app.state.sessions_facts = None if mode == 'legacy' else SimpleNamespace()
++    app.state.gateway_runner = object() if mode == 'embedded' else None
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    @asynccontextmanager
++    async def services(app):
++        entered.set()
++        await release.wait()
++        yield
++
++    context = services_lifespan(app, services)
++    opening = asyncio.create_task(context.__aenter__())
++    await asyncio.wait_for(entered.wait(), 2)
++    assert not opening.done()
++    release.set()
++    await opening
++    await context.__aexit__(None, None, None)
++
++
++@pytest.mark.asyncio
++async def test_shutdown_before_bind_does_not_start_services():
++    from hermes_cli.web_boot_services import services_lifespan
++    app = FastAPI()
++    app.state.http_listener_ready = asyncio.Event()
++    app.state.sessions_facts = SimpleNamespace()
++
++    @asynccontextmanager
++    async def services(app):
++        pytest.fail('services ran before listener')
++        yield
++
++    async with services_lifespan(app, services):
++        pass
++    assert app.state.boot_services_ready is None
++
++
++@pytest.mark.asyncio
++async def test_real_native_lifespan_keeps_health_open_while_services_warm(monkeypatch):
++    from hermes_cli import web_server, web_server_app
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    monkeypatch.setenv('HERMES_FACTS_LINKS', '0')
++    monkeypatch.setenv('HERMES_FACTS_ANNOTATION', '0')
++    monkeypatch.setenv('HERMES_FACTS_BOARD', '0')
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    @asynccontextmanager
++    async def services(app):
++        entered.set()
++        await release.wait()
++        yield
++
++    monkeypatch.setattr(web_server_app, 'standalone_lifespan', services)
++    app = web_server.app
++    monkeypatch.setattr(app.state, 'http_listener_ready', asyncio.Event(), raising=False)
++    async with app.router.lifespan_context(app):
++        assert app.state.sessions_facts is not None
++        assert not entered.is_set()
++        app.state.http_listener_ready.set()
++        await asyncio.wait_for(entered.wait(), 2)
++        try:
++            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test',
++                    headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN}) as client:
++                assert (await client.get('/api/health')).status_code == 200
++                pending = await client.get('/api/models')
++                assert pending.status_code == 503
++                assert 'warming' in pending.text
++        finally:
++            release.set()
++
++
++@pytest.mark.asyncio
++async def test_failed_warmup_remains_fail_closed(caplog):
++    from hermes_cli.web_boot_services import BootServicesMiddleware, services_lifespan
++    app = FastAPI()
++    app.state.http_listener_ready = asyncio.Event()
++    app.state.sessions_facts = SimpleNamespace()
++    app.add_middleware(BootServicesMiddleware)
++    failed = asyncio.Event()
++
++    @asynccontextmanager
++    async def services(app):
++        failed.set()
++        raise RuntimeError('warmup failed')
++        yield
++
++    with pytest.raises(RuntimeError, match='warmup failed'):
++        async with services_lifespan(app, services):
++            app.state.http_listener_ready.set()
++            await failed.wait()
++            async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url='http://test') as client:
++                assert (await client.get('/api/models')).status_code == 503
++            assert not app.state.boot_services_ready.is_set()
++    await asyncio.sleep(0)  # deliver the completed task's logging callback
++    assert 'routes remain unavailable' in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_ws_refused_during_warmup():
++    from hermes_cli.web_boot_services import BootServicesMiddleware
++    ready = asyncio.Event()
++    app = SimpleNamespace(state=SimpleNamespace(boot_services_ready=ready))
++    sent = []
++    async def forbidden(*args):
++        pytest.fail('uninitialized websocket handler called')
++    async def send(message):
++        sent.append(message)
++    await BootServicesMiddleware(forbidden)({'type': 'websocket', 'app': app}, forbidden, send)
++    assert sent == [{'type': 'websocket.close', 'code': 1013}]
++
++
++@pytest.mark.asyncio
++async def test_cancelled_half_start_shutdown_keeps_custody():
++    from hermes_cli.web_boot_services import services_lifespan
++    app = FastAPI()
++    app.state.http_listener_ready = asyncio.Event()
++    app.state.sessions_facts = SimpleNamespace()
++    entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
++
++    @asynccontextmanager
++    async def services(app):
++        entered.set()
++        await release.wait()
++        try:
++            yield
++        finally:
++            closed.set()
++
++    context = services_lifespan(app, services)
++    await context.__aenter__()
++    app.state.http_listener_ready.set()
++    await entered.wait()
++    closing = asyncio.create_task(context.__aexit__(None, None, None))
++    # One event-loop turn ensures shutdown is shield-waiting on the half-start.
++    await asyncio.sleep(0)
++    closing.cancel()
++    await asyncio.sleep(0)
++    assert not closing.done()
++    assert app.state.boot_services_ready is not None
++    assert not closed.is_set()
++    release.set()
++    with pytest.raises(asyncio.CancelledError):
++        await closing
++    assert closed.is_set()
++    assert app.state.boot_services_ready is None
+-- 
+2.43.0
+

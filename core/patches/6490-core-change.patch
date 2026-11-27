@@ -1,0 +1,185 @@
+From 2b49dbf72c9ec285f9fc2bb161a10ecf5efd17b4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:56:45 +0000
+Subject: [PATCH 6490] Dispatch storage cancellation and governor observations
+
+Public mirror of source commit 2b49dbf72c9ec285f9fc2bb161a10ecf5efd17b4.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 4a108bfb769..e1f7ba6f78f 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1896,6 +1896,8 @@
+     from hermes_cli import kanban_annotation_mutation as annotation_mutation
+     from hermes_cli import kanban_sync_status_origin as status_origin
+ 
++    # [daveey] Dispatch cancellation is a BaseException: a contended COMMIT must still roll back.
++    from hermes_cli.kanban_dispatch_storage import DispatchWriteContended as _DispatchWriteContended
+     boundary.arm()
+     boundary.execute("BEGIN IMMEDIATE")
+     opt_in = bool(boundary.no_retry or boundary.done is not None)
+@@ -1919,7 +1921,7 @@
+         try:
+             status_origin.bind(conn, origin_armed)
+             boundary.execute("COMMIT")
+-        except Exception:
++        except (Exception, _DispatchWriteContended):
+             # COMMIT exhausted retries with the txn still open; roll back so the
+             # connection isn't poisoned for the next BEGIN IMMEDIATE.
+             boundary.cleanup_failed()
+diff --git a/hermes_cli/kanban_dispatch_storage.py b/hermes_cli/kanban_dispatch_storage.py
+index d8692ce762e..e525d397aae 100644
+--- a/hermes_cli/kanban_dispatch_storage.py
++++ b/hermes_cli/kanban_dispatch_storage.py
+@@ -14,8 +14,13 @@
+ _clock = time.monotonic
+ 
+ 
+-class DispatchWriteContended(sqlite3.OperationalError):
+-    """A dispatcher exhausted its SQLite lock-wait allowance; retry next pass."""
++class DispatchWriteContended(BaseException):
++    """A dispatcher exhausted its SQLite lock-wait allowance; retry next pass.
++
++    Pass-wide cancellation, not a service failure: outside ``Exception`` (like
++    ``asyncio.CancelledError``) so no best-effort ``except Exception`` handler can
++    swallow it and keep working. Only ``run`` consumes it.
++    """
+ 
+ 
+ @dataclass
+@@ -82,7 +87,7 @@
+     with _budget(conn) as budget:
+         try:
+             result = work()
+-        except sqlite3.OperationalError as exc:
++        except (sqlite3.OperationalError, DispatchWriteContended) as exc:
+             from hermes_cli.kanban_db_connect import _is_busy_error
+             if not budget.preclaim or (not isinstance(exc, DispatchWriteContended) and not _is_busy_error(exc)):
+                 raise
+diff --git a/tests/hermes_cli/test_kanban_dispatch_cancel_signal.py b/tests/hermes_cli/test_kanban_dispatch_cancel_signal.py
+new file mode 100644
+index 00000000000..cc352a4ce44
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_cancel_signal.py
+@@ -0,0 +1,117 @@
++"""Pass-wide storage cancellation must be unswallowable by best-effort handlers."""
++from contextlib import closing
++import logging
++import sqlite3
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_storage as storage
++from hermes_cli.kanban_db_dispatch import DispatchResult
++from tests.hermes_cli import test_kanban_hold_failure_isolation as helpers
++
++kanban_home = helpers.kanban_home
++_log = logging.getLogger('tests.best_effort_service')
++
++
++def test_cancellation_is_not_an_ordinary_exception():
++    # Every `except Exception` / `except sqlite3.Error` service boundary, present
++    # or future, lets it through; only kanban_dispatch_storage.run consumes it.
++    assert issubclass(storage.DispatchWriteContended, BaseException)
++    assert not issubclass(storage.DispatchWriteContended, Exception)
++
++
++def _best_effort_write(conn):
++    """A service nobody listed: broad catch, traceback log, then keep going."""
++    try:
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_wake_checks(task_id, cmd, every, next_at) VALUES ('t_x', 'true', 120, 0)")
++    except Exception:
++        _log.warning('best-effort service failed', exc_info=True)
++
++
++def test_unlisted_best_effort_handler_cannot_swallow_real_contention(kanban_home, caplog):
++    with kbc.connect_closing() as conn:
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        after = []
++
++        def tick():
++            _best_effort_write(conn)
++            after.append('continued')
++            return DispatchResult()
++
++        with closing(sqlite3.connect(path, isolation_level=None)) as blocker:
++            blocker.execute('BEGIN IMMEDIATE')
++            try:
++                result = storage.run(conn, tick, board='default')
++            finally:
++                blocker.rollback()
++        assert result.storage_skip_reason == storage.REASON
++        assert after == []
++        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
++        assert [r.getMessage() for r in warnings] == [
++            'kanban dispatch skipped: reason=storage_write_contended board=default']
++        assert warnings[0].exc_info is None
++        assert not conn.in_transaction
++        caplog.clear()
++        assert storage.run(conn, tick, board='default').storage_skip_reason is None
++        assert after == ['continued']
++        assert conn.execute('SELECT count(*) FROM task_wake_checks').fetchone()[0] == 1
++        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++
++
++def test_ordinary_sqlite_error_in_a_pass_stays_local(kanban_home, caplog):
++    with kbc.connect_closing() as conn:
++        after = []
++
++        def tick():
++            try:
++                with kb.write_txn(conn):
++                    conn.execute('INSERT INTO no_such_table VALUES (1)')
++            except Exception:
++                _log.warning('best-effort service failed', exc_info=True)
++            after.append('continued')
++            return DispatchResult()
++
++        assert storage.run(conn, tick, board='default').storage_skip_reason is None
++        assert after == ['continued']
++        assert not conn.in_transaction
++
++
++def test_commit_boundary_cancellation_releases_the_transaction(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        real = storage._Budget.execute
++
++        def execute(self, sql):
++            if sql == 'COMMIT':
++                self.contended = True
++                raise storage.DispatchWriteContended(storage.REASON)
++            return real(self, sql)
++
++        monkeypatch.setattr(storage._Budget, 'execute', execute)
++
++        def tick():
++            with kb.write_txn(conn):
++                conn.execute("INSERT INTO task_wake_checks(task_id, cmd, every, next_at) VALUES ('t_x', 'true', 120, 0)")
++            return DispatchResult()
++
++        assert storage.run(conn, tick, board='default').storage_skip_reason == storage.REASON
++        assert not conn.in_transaction
++        monkeypatch.setattr(storage._Budget, 'execute', real)
++        assert storage.run(conn, tick, board='default').storage_skip_reason is None
++        assert conn.execute('SELECT count(*) FROM task_wake_checks').fetchone()[0] == 1
++
++
++def test_writer_outside_a_dispatch_pass_keeps_operational_error(kanban_home):
++    with kbc.connect_closing() as conn:
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        conn.execute('PRAGMA busy_timeout = 0')
++        with closing(sqlite3.connect(path, isolation_level=None)) as blocker:
++            blocker.execute('BEGIN IMMEDIATE')
++            try:
++                try:
++                    with kb.write_txn(conn):
++                        raise AssertionError('acquired a held writer lock')
++                except sqlite3.OperationalError as exc:
++                    assert not isinstance(exc, storage.DispatchWriteContended)
++            finally:
++                blocker.rollback()
+-- 
+2.43.0
+

@@ -1,0 +1,129 @@
+From 30f095eb14f68912453e119e305c1e2649b63349 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:56:59 +0000
+Subject: [PATCH 6286] Read-first spend decisions and scope release fences
+
+Public mirror of source commit 30f095eb14f68912453e119e305c1e2649b63349.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 4c5d43322ca..4363287e678 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -165,6 +165,12 @@
+            for res in results):
+         return (msg + " Local updater admission hold blocks claims before the Board lease; "
+                 "inspect core-update/holds/hermes-sync and its updater owner.")
++    spend_holds = {"decision_pending", "spend_budget_exhausted", "spend_policy_unavailable"}
++    if any(res is not None and any(reason in spend_holds for _, reason in res.claim_deferred)
++           for res in results):
++        return (msg + " Local spend/decision admission refused claims before the Board lease; "
++                "inspect the retained decision and its owning chat, budget evidence or policy availability. "
++                "Other holds are listed above; do not reset leases or release a decision merely to start work.")
+     if repin:
+         # No pool worker can run these (Board ``no_eligible_worker``); each card carries the repin command.
+         msg += f" Not a stall, waiting for a manual repin: {', '.join(repin)}."
+diff --git a/hermes_cli/kanban_spend_claim.py b/hermes_cli/kanban_spend_claim.py
+index de7db2040c3..17dc220318b 100644
+--- a/hermes_cli/kanban_spend_claim.py
++++ b/hermes_cli/kanban_spend_claim.py
+@@ -15,12 +15,17 @@
+     from hermes_cli import kanban_spend_pr_owner as owner
+ 
+     from hermes_cli.config_backend import ConfigBackendUnavailable
++    from hermes_cli import kanban_db_sync as sync
++
++    def refuse(reason):
++        sync.defer_claim(task_id, reason, sync.ORIGIN_LOCAL)
++        return True
+ 
+     try:
+         board = budget.limits()
+     except ConfigBackendUnavailable:
+         # A missing policy cannot authorize spending; do not crash the dispatcher either.
+-        return lambda: True
++        return lambda: refuse("spend_policy_unavailable")
+     pr = None
+     if not decision.pending(conn, task_id):
+         lim = budget.card_limits(conn, task_id, board)
+@@ -29,10 +34,12 @@
+ 
+     def refused():
+         if decision.pending(conn, task_id):
+-            return True
++            return refuse("decision_pending")
+         lim = budget.card_limits(conn, task_id, board)
+         if budget.over(budget.spend(conn, task_id), lim) is None:
+             return False
+-        return pr is None or pr not in owner.recognised_prs(conn, task_id)
++        if pr is None or pr not in owner.recognised_prs(conn, task_id):
++            return refuse("spend_budget_exhausted")
++        return False
+ 
+     return refused
+diff --git a/tests/hermes_cli/test_kanban_spend_claim_accounting.py b/tests/hermes_cli/test_kanban_spend_claim_accounting.py
+index b9d2bca4446..5a01ff9ece5 100644
+--- a/tests/hermes_cli/test_kanban_spend_claim_accounting.py
++++ b/tests/hermes_cli/test_kanban_spend_claim_accounting.py
+@@ -58,10 +58,58 @@
+         monkeypatch.setattr("hermes_cli.config.load_config", down)
+         claim = kb.claim_task if lane == "ready" else kb.claim_review_task
+         assert claim(conn, tid) is None
++        from hermes_cli import kanban_db_sync as sync
++        refusal = sync.pop_claim_deferral(tid)
++        assert refusal == "spend_policy_unavailable"
++        assert refusal.origin == sync.ORIGIN_LOCAL
+         assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == lane
+         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
+ 
+ 
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("pending", [False, True])
++def test_foreign_spend_refusal_is_local_before_board_lease(kanban_home, github, monkeypatch, lane, pending):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli.kanban_dispatch_verdict import claim_refused
++    from types import SimpleNamespace
++
++    with kbc.connect_closing() as conn:
++        tid = helpers.owner(conn)
++        sync.apply_sync_schema_steps(conn)
++        github[0]["state"] = "CLOSED"
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=?, created_on='dead-worker' WHERE id=?", (lane, tid))
++        if pending:
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "spend_budget_triaged", {"cause": "capability_unavailable"})
++                kb._append_event(conn, tid, "triage_swept", {"assignee": "worker"})
++        assert decision.pending(conn, tid) == pending
++
++        def unexpected_lease(*args, **kwargs):
++            pytest.fail("a retained/exhausted task must not request a Board lease")
++
++        monkeypatch.setattr(sync, "claim_gate", unexpected_lease)
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        before = conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0]
++        assert claim(conn, tid) is None
++        refusal = sync.pop_claim_deferral(tid)
++        assert refusal is not None
++        assert refusal == ("decision_pending" if pending else "spend_budget_exhausted")
++        assert refusal.origin == sync.ORIGIN_LOCAL
++        result = SimpleNamespace(claim_deferred=[], quiet_deferred=[], capsule_refused=[])
++        claim_refused(result, tid, refusal)
++        assert result.claim_deferred == [(tid, refusal)]
++        from hermes_cli.kanban_db_dispatch_stuck import stuck_warning
++        warning = stuck_warning(6, [kb.DispatchResult(claim_deferred=[(tid, refusal)])])
++        assert "before the Board lease" in warning
++        assert "Board lease refused" not in warning
++        assert "owning chat" in warning
++        assert sync.pop_claim_deferral(tid) is None
++        assert kb.get_task(conn, tid).status == lane
++        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == before
++
++
+ def test_transaction_rechecks_override_and_publication_identity(kanban_home, github):
+     with kbc.connect_closing() as conn:
+         tid = helpers.owner(conn)
+-- 
+2.43.0
+

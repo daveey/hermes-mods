@@ -1,0 +1,285 @@
+From 8998731fc4a8205e6775db90ca7c23f54acfcbd6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:38:08 +0000
+Subject: [PATCH 6003] Kanban actionability: frozen obligations and administrative deadlines
+
+Public mirror of source commit 8998731fc4a8205e6775db90ca7c23f54acfcbd6.
+
+---
+diff --git a/hermes_cli/kanban_actionability_confirmed.py b/hermes_cli/kanban_actionability_confirmed.py
+new file mode 100644
+index 00000000000..e8adfa9f47b
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_confirmed.py
+@@ -0,0 +1,113 @@
++"""Compose confirmed home diagnostic custody; never infer execution authority. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_actionability_transport as transport
++from hermes_cli.kanban_actionability import NONTERMINAL, positive_time
++
++
++def _matches(reader, task, facts, payload):
++    f = payload.get('facts')
++    if not isinstance(f, dict):
++        return False
++    run_uid = None
++    if task.get('current_run_id') is not None:
++        if 'uid' not in reader.columns('task_runs'):
++            return False
++        run = reader.conn.execute('SELECT uid FROM task_runs WHERE id=? AND task_id=?',
++                                  (task['current_run_id'], task['id'])).fetchone()
++        if run is None:
++            return False
++        run_uid = run[0]
++    if any(f.get(k) != v for k, v in (
++            ('status', task['status']), ('assignee', task.get('assignee')),
++            ('current_run_uid', run_uid),
++            ('root_episode', task.get('containment_episode') or facts.get('stop_episode')))):
++        return False
++    sources = f.get('source_uids')
++    if not isinstance(sources, list) or any(
++            not isinstance(s, dict) or set(s) != {'uid', 'version'} or
++            type(s['version']) is not int or s['version'] <= 0 for s in sources):
++        return False
++    if [s['uid'] for s in sources] != facts.get('source_refs'):
++        return False
++    # Include satisfied parents too, matching the canonical contract's full graph.
++    # The read-only adapter already computes the effective restricted status.
++    effective = {d['task_id']: d for d in facts.get('dependencies', [])}
++    parents = []
++    for (pid,) in reader.conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id',
++                                      (task['id'],)):
++        parent = reader.task(pid)
++        if parent is None:
++            return False
++        status = parent['status']
++        dep = effective.get(pid, {})
++        if status in ('done', 'archived') and (dep.get('restricted') or parent.get('containment_episode')):
++            status = 'triage'
++        parents.append({'id': pid, 'status': status})
++    return f.get('dependencies') == parents
++
++
++def _confirmed(reader, task, facts):
++    if ('kanban_actionability_commands' not in reader.tables or
++            not {'uid', 'origin_gateway'} <= reader.event_columns):
++        return
++    required = {'op_id', 'contract_key', 'task_id', 'phase', 'delivery_state', 'request_json',
++                'request_sha256', 'canonical_receipt_json'}
++    if not required <= reader.columns('kanban_actionability_commands'):
++        return
++    for owned in reader.rows("SELECT * FROM kanban_actionability_commands WHERE task_id=? "
++                             "AND phase='contract' AND delivery_state='confirmed'", (task['id'],)):
++        try:
++            wire = json.loads(owned['request_json'])
++            payload = wire['payload']
++            receipt = json.loads(owned['canonical_receipt_json'])
++            if not isinstance(wire, dict) or not isinstance(payload, dict) or not isinstance(receipt, dict):
++                continue
++            if (wire.get('client_op_id') != owned['op_id'] or payload.get('contract_key') != owned['contract_key'] or
++                    transport.digest(owned['request_json']) != owned['request_sha256'] or
++                    transport.envelope(task['id'], payload) != wire or not _matches(reader, task, facts, payload)):
++                continue
++            event = reader.rows("SELECT * FROM task_events WHERE uid=? AND task_id=? "
++                                "AND kind='actionability_contract'", (wire['contract_uid'], task['id']))
++            if len(event) != 1 or not task.get('created_on') or event[0]['origin_gateway'] != task['created_on']:
++                continue
++            if event[0].get('deleted_at') is not None or json.loads(event[0]['payload']) != receipt:
++                continue
++            if (receipt.get('contract') != payload or receipt.get('request_uid') != wire['client_op_id'] or
++                    receipt.get('request_sha256') != owned['request_sha256'] or
++                    receipt.get('home_gateway') != task['created_on']):
++                continue
++            deadline = positive_time(payload.get('deadline_at'))
++            if deadline:
++                yield wire, deadline
++        except (KeyError, TypeError, ValueError):
++            continue  # Damaged custody is not positive diagnostic evidence.
++
++
++def compose(reader, task, facts, row, *, now):
++    """Only an exact confirmed local receipt may fill a missing diagnostic deadline.
++
++    Foreign replicas have no confirmation custody and remain unknown. The canonical
++    confirm path independently verifies immutable version-1 home evidence. This
++    reader checks persisted local custody consistency, not a new canonical read.
++    ACK-only rows, arbitrary events, and stale lifecycle/graph premises never
++    qualify. Only missing deadlines are filled; existing source policy is intact.
++    """
++    if (row['status'] not in NONTERMINAL or row['escalation']['at'] or
++            row['escalation']['state'] != 'unavailable' or
++            'escalation_deadline_missing' not in row['violations'] or facts.get('pending_command')):
++        return row
++    contracts = sorted(_confirmed(reader, task, facts), key=lambda item: (item[1], item[0]['contract_uid']))
++    if not contracts:
++        return row
++    wire, deadline = contracts[0]
++    row['escalation']['at'] = deadline
++    row['escalation']['state'] = 'pending'
++    row['violations'] = [v for v in row['violations'] if v != 'escalation_deadline_missing']
++    if row['blocker'] and now >= row['escalation']['at'] and 'escalation_overdue' not in row['violations']:
++        row['violations'].append('escalation_overdue')
++    row['source_refs'] = list(dict.fromkeys([*row['source_refs'], wire['contract_uid']]))
++    # Do not replace semantic identity, action, owner, blocker, release policy or UNKNOWN eligibility.
++    return row
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 0e950d6f48e..657897bb794 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -264,4 +264,6 @@
+         runs = reader.rows('SELECT * FROM task_runs WHERE id=? AND task_id=?', (task['current_run_id'], tid))
+         facts['run'] = runs[0] if runs else None
+     facts['unknown'] |= bool(stop and not episode)
+-    return project(facts, now=int(time.time()) if now is None else now)
++    from hermes_cli.kanban_actionability_confirmed import compose
++    observed_at = int(time.time()) if now is None else now
++    return compose(reader, task, facts, project(facts, now=observed_at), now=observed_at)
+diff --git a/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py b/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
+new file mode 100644
+index 00000000000..0d1b32398cc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_confirmed_reader.py
+@@ -0,0 +1,137 @@
++"""Confirmed diagnostic custody must compose into the source-derived report. [daveey]"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_actionability_transport as act
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_actionability_cli import report
++from hermes_cli.kanban_actionability_sources import describe
++from tests.hermes_cli import test_kanban_actionability_transport as support
++
++live = support.live
++
++
++def confirmed(live):
++    tid, payload = support.contract(live)
++    source = live.execute("SELECT uid,created_at FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()
++    payload.update(first_observed=source['created_at'], deadline_at=source['created_at'] + 3600,
++                   owner={'kind': 'assignee', 'refs': ['default']})
++    payload['facts']['source_uids'] = [{'uid': source['uid'], 'version': 1}]
++    with kbc.write_txn(live):
++        owned = act.reserve(live, tid, payload)
++    wire = json.loads(owned['request_json'])
++    receipt = {'version': 1, 'request_uid': wire['client_op_id'],
++               'request_sha256': act.digest(act.canonical(wire)),
++               'home_gateway': 'fixture', 'contract': wire['payload']}
++    row = {'uid': wire['contract_uid'], 'task_id': tid, 'kind': 'actionability_contract',
++           'version': 1, 'deleted_at': None, 'origin_gateway': 'fixture', 'ord': 2,
++           'created_at': source['created_at'], 'payload': json.dumps(receipt)}
++
++    class Hub:
++        ident = SimpleNamespace(gateway='fixture')
++
++        def actionability_capability(self, board):
++            assert not live.in_transaction
++            return {'actionability_record': 1, 'frozen_replay': 1, 'diagnostic_only': True,
++                    'hlc': '9999999999999-0000-server'}
++
++        def ops(self, board, sent):
++            assert sent == [wire]
++            return {'results': [{'client_op_id': wire['client_op_id'], 'status': 'applied'}]}
++
++        def row_evidence(self, board, table, uid):
++            assert uid == wire['contract_uid']
++            return {'board': board, 'table': table, 'uid': uid, 'state': 'live', 'row': row}
++
++    task_before = dict(live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    runs_before = list(live.execute('SELECT * FROM task_runs WHERE task_id=?', (tid,)))
++    unconfirmed = describe(live, tid, now=source['created_at'])
++    result = act.confirm(live, Hub(), 'default', owned['op_id'])
++    assert describe(live, tid, now=source['created_at'])['contract_key'] == unconfirmed['contract_key']
++    assert result['delivery_state'] == 'confirmed' and result['execution_authority'] is False
++    assert dict(live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == task_before
++    assert list(live.execute('SELECT * FROM task_runs WHERE task_id=?', (tid,))) == runs_before
++    task = kb.get_task(live, tid)
++    assert task is not None and task.status == 'ready'
++    current = act.command(live, owned['op_id'])
++    assert current is not None and current['canonical_receipt_json'] == act.canonical(receipt)
++    assert live.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='actionability_contract'", (tid,)).fetchone()
++    return tid, payload, source, wire
++
++
++def test_confirmed_contract_reaches_describe_and_report_without_releasing_scope(live):
++    tid, payload, source, _ = confirmed(live)
++    direct = describe(live, tid, now=source['created_at'])
++    listed = report(live, now=source['created_at'])['rows'][0]
++    for projection in (direct, listed):
++        assert projection['escalation']['at'] == payload['deadline_at']
++        assert 'escalation_deadline_missing' not in projection['violations']
++        assert projection['evidence_state'] == 'unknown'  # confirmation is not current eligibility
++
++
++@pytest.mark.parametrize('change', ['ack', 'pending', 'rejected', 'digest', 'receipt', 'receipt-list',
++                                    'receipt-null', 'op-id', 'contract-key', 'event', 'home',
++                                    'status', 'assignee', 'source', 'dependency', 'run'])
++def test_unconfirmed_damaged_or_stale_contract_does_not_hide_violation(live, change):
++    tid, _, source, wire = confirmed(live)
++    parent = kb.create_task(live, title='new real prerequisite', assignee='default') if change == 'dependency' else None
++    changes = {
++        'ack': [("UPDATE kanban_actionability_commands SET delivery_state='acknowledged'", ())],
++        'pending': [("UPDATE kanban_actionability_commands SET delivery_state='pending'", ())],
++        'rejected': [("UPDATE kanban_actionability_commands SET delivery_state='rejected'", ())],
++        'digest': [("UPDATE kanban_actionability_commands SET request_sha256='not-the-digest'", ())],
++        'op-id': [("UPDATE kanban_actionability_commands SET op_id='different'", ())],
++        'contract-key': [("UPDATE kanban_actionability_commands SET contract_key='different'", ())],
++        'event': [('DELETE FROM task_events WHERE uid=?', (wire['contract_uid'],))],
++        'home': [("UPDATE tasks SET created_on='other-home' WHERE id=?", (tid,))],
++        'status': [("UPDATE tasks SET status='triage' WHERE id=?", (tid,))],
++        'assignee': [("UPDATE tasks SET assignee='other-profile' WHERE id=?", (tid,))],
++        'source': [("UPDATE task_events SET uid='different-source' WHERE uid=?", (source['uid'],))],
++        'dependency': [('INSERT INTO task_links (parent_id,child_id) VALUES (?,?)', (parent, tid))],
++        'run': [("INSERT INTO task_runs (task_id,profile,status,started_at) VALUES (?,'default','running',1)", (tid,)),
++                ('UPDATE tasks SET current_run_id=(SELECT MAX(id) FROM task_runs WHERE task_id=?) WHERE id=?', (tid, tid))],
++    }
++    for label, raw in (('receipt', '{}'), ('receipt-list', '[]'), ('receipt-null', 'null')):
++        changes[label] = [('UPDATE kanban_actionability_commands SET canonical_receipt_json=?', (raw,)),
++                          ('UPDATE task_events SET payload=? WHERE uid=?', (raw, wire['contract_uid']))]
++    with kbc.write_txn(live):
++        for sql, params in changes[change]:
++            live.execute(sql, params)
++    for row in (describe(live, tid, now=source['created_at']),
++                next(r for r in report(live, now=source['created_at'])['rows'] if r['task_id'] == tid)):
++        assert row['escalation']['at'] is None
++        assert 'escalation_deadline_missing' in row['violations']
++        assert row['evidence_state'] == 'unknown'
++
++
++def test_comment_and_clock_do_not_renew_confirmed_deadline_or_identity(live):
++    tid, payload, source, _ = confirmed(live)
++    before = describe(live, tid, now=source['created_at'])
++    with kbc.write_txn(live):
++        kb._append_event(live, tid, 'commented', {'author': 'default', 'len': 10})
++    after = describe(live, tid, now=payload['deadline_at'] + 1)
++    assert after['escalation']['at'] == before['escalation']['at'] == payload['deadline_at']
++    assert after['contract_key'] == before['contract_key']
++    assert after['release'] == before['release']
++
++
++@pytest.mark.parametrize('status,deadline,state,violations,pending', [
++    ('done', None, 'unavailable', ['escalation_deadline_missing'], None),
++    ('ready', 200, 'unavailable', ['escalation_deadline_missing'], None),
++    ('ready', None, 'not_applicable', ['escalation_deadline_missing'], None),
++    ('ready', None, 'unavailable', [], None),
++    ('ready', None, 'unavailable', ['escalation_deadline_missing'], {'request_uid': 'original-frozen-request'}),
++])
++def test_nonmissing_or_unresolved_deadline_is_not_rewritten(status, deadline, state, violations, pending):
++    from hermes_cli.kanban_actionability import project
++    from hermes_cli.kanban_actionability_confirmed import compose
++    facts = {'task': {'id': 'root', 'status': 'ready', 'assignee': 'default'}, 'pending_command': pending}
++    row = project(facts, now=100)
++    row.update(status=status, violations=violations)
++    row['escalation'].update(at=deadline, state=state)
++    before = json.loads(json.dumps(row))
++    # object() has no query API: all guards must run before touching optional custody.
++    assert compose(object(), facts['task'], facts, row, now=100) == before
+-- 
+2.43.0
+

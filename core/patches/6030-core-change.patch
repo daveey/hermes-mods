@@ -1,0 +1,175 @@
+From 9ebae0c90d4c7f66af879052b45fc9af43e47a45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:03:45 +0000
+Subject: [PATCH 6030] Fact store, reducer and capture CPU reductions
+
+Public mirror of source commit 9ebae0c90d4c7f66af879052b45fc9af43e47a45.
+
+---
+diff --git a/hermes_cli/fact_store.py b/hermes_cli/fact_store.py
+index e16cb5b5d28..bbfcdbc6265 100644
+--- a/hermes_cli/fact_store.py
++++ b/hermes_cli/fact_store.py
+@@ -45,6 +45,11 @@
+         return Ready(fact.value["encoded"], self.epoch, self.rev)
+ 
+ 
++def _same_content(old: Fact | None, fact: Fact) -> bool:
++    """*fact* equals the stored *old* apart from ``rev``: publishing it changes nothing."""
++    return old is not None and replace(fact, rev=old.rev) == old
++
++
+ class FactStore:
+     """Owner publishes entire generations; request readers retain immutable snapshots."""
+ 
+@@ -109,15 +114,34 @@
+                 deleted_keys: Iterable[FactKey] = ()) -> int:
+         # Validate wire values before committing, and never encode under the publication lock.
+         # Reserve room for owner-generated stale health without budget growth.
+-        prepared = []
++        # [daveey] An upsert equal to the stored fact (rev aside) is not encoded: its size is only used when it
++        # changes, and its content was validated when it was stored. The reducers hand every dirty derived fact
++        # back unchanged; re-encoding them can dominate feed work and hold the
++        # GIL, delaying syscall-heavy requests such as /api/profiles/sessions. If a skipped fact
++        # changes at commit, all are sized and it commits once more.
++        upserts = list(upserts)
++        deleted_keys = tuple(deleted_keys)
+         for fact in upserts:
+             deadline = fact.valid_until
+             if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+                 raise ValueError("invalid_validity_deadline")
+-            prepared.append((fact, encoded_size(fact) + 128))
+-        return self._publish(prepared, deleted_keys)
++        with self._condition:
++            current = self._facts
++        sizes = [None if _same_content(current.get(fact.key), fact) else encoded_size(fact) + 128
++                 for fact in upserts]
++        revision = self._publish(list(zip(upserts, sizes)), deleted_keys)
++        if revision is None:
++            # A skipped fact is a change after all: the store moved meanwhile, or this batch's own deletes or an
++            # earlier duplicate key changed what it is compared with. Size every skipped fact outside the lock
++            # and commit once more; with every fact sized, _publish cannot refuse again.
++            prepared = [(fact, encoded_size(fact) + 128 if size is None else size)
++                        for fact, size in zip(upserts, sizes)]
++            revision = self._publish(prepared, deleted_keys)
++        return revision
+ 
+     def _publish(self, prepared, deleted_keys):
++        """Commit *prepared* ``(fact, size)``; None (nothing committed) when a fact passed unsized because it
++        matched the store has since become a change, so the caller sizes it outside the lock and retries."""
+         with self._condition:
+             staged = self._facts
+             sizes = self._sizes
+@@ -130,6 +154,8 @@
+                 old = staged.get(fact.key)
+                 normalized = replace(fact, rev=old.rev if old else 0)
+                 if old != normalized:
++                    if size is None:
++                        return None
+                     staged = staged.put(fact.key, replace(fact, rev=self._rev + 1))
+                     sizes = sizes.put(fact.key, size)
+                 touched.add(fact.key)
+diff --git a/tests/hermes_cli/test_fact_store.py b/tests/hermes_cli/test_fact_store.py
+index 2fc08dd6f77..6ac151938be 100644
+--- a/tests/hermes_cli/test_fact_store.py
++++ b/tests/hermes_cli/test_fact_store.py
+@@ -115,3 +115,96 @@
+             boundary.wait(timeout=5)
+         result.result(timeout=5)
+     assert {fact.value for fact in store.snapshot(scope).get_many(keys)} == {50}
++
++
++def test_unchanged_upserts_are_not_reencoded_but_changes_are(monkeypatch):
++    """undated representative observation: the reducers republish every dirty derived fact unchanged and the store JSON-encoded each one
++    to size it, though the size is only used for a change, adding unnecessary feed work."""
++    from hermes_cli import fact_store as store_mod
++    from hermes_cli.fact_contract import Fact, FactKey, Scope
++
++    scope = Scope("install", "default", "board")
++    big, small = FactKey(scope, "ViewFact", "big"), FactKey(scope, "TaskFact", "small")
++    store = store_mod.FactStore()
++    encoded = []
++    real = store_mod.encoded_size
++    monkeypatch.setattr(store_mod, "encoded_size", lambda fact: encoded.append(fact.key) or real(fact))
++    first = store.publish((Fact(big, {"rows": list(range(500))}), Fact(small, {"status": "ready"})))
++    assert sorted(k.id for k in encoded) == ["big", "small"]
++    encoded.clear()
++    # same content again (as a reducer hands back an unchanged derived fact): no encode, no new revision
++    assert store.publish((Fact(big, {"rows": list(range(500))}), Fact(small, {"status": "ready"}))) == first
++    assert encoded == []
++    # one changed, one unchanged: only the change is encoded and committed
++    second = store.publish((Fact(big, {"rows": list(range(500))}), Fact(small, {"status": "done"})))
++    assert encoded == [small] and second == first + 1
++    assert store.snapshot(scope).get(small).value["status"] == "done"
++
++
++def test_unchanged_skip_keeps_byte_budget_and_wire_validation():
++    from hermes_cli.fact_contract import Fact, FactKey, Scope
++    from hermes_cli.fact_store import FactStore
++
++    scope = Scope("install", "default", "board")
++    key = FactKey(scope, "ViewFact", "v")
++    store = FactStore(fact_bytes=4096)
++    store.publish((Fact(key, {"text": "x" * 100}),))
++    before = store._fact_bytes
++    store.publish((Fact(key, {"text": "x" * 100}),))  # unchanged: budget untouched
++    assert store._fact_bytes == before
++    with pytest.raises(ValueError, match="fact_budget_exceeded"):  # a change is still sized and budgeted
++        store.publish((Fact(key, {"text": "x" * 8000}),))
++    with pytest.raises(TypeError):  # a new value that cannot cross the wire is still refused
++        store.publish((Fact(FactKey(scope, "ViewFact", "bad"), {"obj": object()}),))
++
++
++def test_a_fact_that_changes_after_the_unchanged_check_is_sized_on_retry(monkeypatch):
++    """The equality check runs outside the publication lock; a concurrent publish can change the stored fact
++    before the commit. The commit then refuses the unsized fact and publish sizes it and retries."""
++    from hermes_cli import fact_store as store_mod
++    from hermes_cli.fact_contract import Fact, FactKey, Scope
++
++    scope = Scope("install", "default", "board")
++    key = FactKey(scope, "TaskFact", "t")
++    store = store_mod.FactStore()
++    store.publish((Fact(key, {"status": "ready"}),))
++    real_publish = store._publish
++    raced = []
++
++    def racing(prepared, deleted_keys):
++        if not raced:  # another writer lands between the check and this commit
++            raced.append(True)
++            real_publish([(Fact(key, {"status": "running"}), 200)], ())
++        return real_publish(prepared, deleted_keys)
++    monkeypatch.setattr(store, "_publish", racing)
++    encoded = []
++    real = store_mod.encoded_size
++    monkeypatch.setattr(store_mod, "encoded_size", lambda fact: encoded.append(fact.key) or real(fact))
++    rev = store.publish((Fact(key, {"status": "ready"}),))  # equal to the store at check time
++    assert encoded == [key], "the raced fact was committed without being sized"
++    assert store.snapshot(scope).get(key).value["status"] == "ready" and rev == store.snapshot(scope).rev
++
++
++@pytest.mark.parametrize("case", ["delete_then_same", "changed_then_original"])
++def test_a_batch_that_changes_its_own_comparison_commits_and_returns(case):
++    """Review undated representative observation: the unchanged check compares with the stored fact, the commit with the batch so far.
++    A key deleted and re-upserted unchanged, or a key given twice as [changed, original], must commit (as before
++    the skip), not loop."""
++    import threading
++    from hermes_cli.fact_contract import Fact, FactKey, Scope
++    from hermes_cli.fact_store import FactStore
++
++    scope = Scope("install", "default", "board")
++    key = FactKey(scope, "TaskFact", "k")
++    store = FactStore()
++    store.publish((Fact(key, {"v": 1}),))
++    result = []
++    if case == "delete_then_same":
++        work = lambda: result.append(store.publish((Fact(key, {"v": 1}),), deleted_keys=(key,)))
++    else:
++        work = lambda: result.append(store.publish((Fact(key, {"v": 2}), Fact(key, {"v": 1}))))
++    thread = threading.Thread(target=work, daemon=True)
++    thread.start()
++    thread.join(5)
++    assert result, "publish did not return"
++    assert result[0] == 2 and store.snapshot(scope).get(key).value["v"] == 1
+-- 
+2.43.0
+

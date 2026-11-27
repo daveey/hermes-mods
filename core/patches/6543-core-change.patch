@@ -1,0 +1,243 @@
+From be08e4db8d9b486d280d07644b7673af9aa92435 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:36:41 +0000
+Subject: [PATCH 6543] Release mandate and typed stop recovery
+
+Public mirror of source commit be08e4db8d9b486d280d07644b7673af9aa92435.
+
+---
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 107a3128216..907f6da272b 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -775,7 +775,13 @@
+             board=board, seen=seen, precondition=precondition, env=os.environ if env is None else env,
+             ancestry=ancestry))
+     except _Refusal as exc:
+-        return _refused(out, exc.code, str(exc), **exc.more)
++        from hermes_cli.kanban_stop_recovery import refusal_context
++        try:
++            recovery, context = refusal_context(conn, tid)
++        except (ValueError, RuntimeError, sqlite3.Error):
++            recovery = {'authorization': 'not_granted', 'next_operation': 'inspect_stop'}
++            context = ' Recovery diagnostic unavailable; read current stop and restrictions. No authority granted.'
++        return _refused(out, exc.code, str(exc) + context, recovery=recovery, **exc.more)
+ 
+ 
+ def _current_decision_card(conn: sqlite3.Connection, named: str, tid: str, episode: str) -> None:
+diff --git a/hermes_cli/kanban_stop_recovery.py b/hermes_cli/kanban_stop_recovery.py
+new file mode 100644
+index 00000000000..a5add83b557
+--- /dev/null
++++ b/hermes_cli/kanban_stop_recovery.py
+@@ -0,0 +1,62 @@
++"""Read-only stop recovery diagnostics; these never grant lifecycle authority. [daveey]"""
++from __future__ import annotations
++
++from hermes_cli import kanban_spend_decision as decision
++
++
++def describe(conn, task_id: str) -> dict:
++    """Describe effective restrictions before suggesting an operation, independently of caller identity.
++
++    A capability stop is not a scope stop, but an older uncovered restriction still dominates it.
++    Keep this advisory separate from authorization and every mutation precondition.
++    """
++    from hermes_cli import kanban_scope_renewal as renewal
++    from hermes_cli.kanban_containment_connections import held as contained
++    from hermes_cli.kanban_sync_quarantine import refusal as quarantined
++    from hermes_cli.kanban_refusal_receipt import restricted as safety_restricted
++    from hermes_cli.kanban_stop_ended import stopped_at
++    from hermes_cli.kanban_db import _json_dict
++
++    stop = decision.pending_episode(conn, task_id)
++    payload = _json_dict(stop['payload']) if stop else {}
++    cause = payload.get('cause')
++    evidence = ({'episode': renewal.key(stop), 'kind': stop['kind'], 'cause': cause,
++                 'accounting_boundary': payload.get('accounting_boundary')} if stop else None)
++    if safety_restricted(conn, task_id):
++        operation, instruction = 'resolve_safety_boundary', (
++            'Provider safety restriction retained; no supported execution release. '
++            'Owning supervisor must resolve the scope/authority boundary without rerunning refused work.')
++    elif quarantine := quarantined(conn, task_id):
++        operation, instruction = 'resolve_sync_quarantine', quarantine
++    elif contained(conn, task_id):
++        operation, instruction = 'resume-contained', 'Use the exact contained episode and scoped resume authority.'
++    elif stopped_at(conn, task_id) is not None:
++        operation, instruction = 'resolve_administrative_stop', (
++            'Owning supervisor must resolve the recorded administrative stop; scope renewal does not cover it.')
++    elif decision.execution_restricted(conn, task_id):
++        operation, instruction = 'renew-scope', renewal.ROUTE.format(task=task_id)
++    elif stop and (cause == 'capability_unavailable' or cause == 'scope_stopped'):
++        # A covered scope stop can still await its separate guarded promotion.
++        operation, instruction = 'promote', (
++            f"Read the current card and record the whole-acceptance mandate, then preflight on its home gateway: "
++            f"`hermes kanban promote {task_id} '<what changed; preserve original acceptance>' "
++            '--dry-run --json`. Honor any exact --seen requirement and every independent guard; '
++            'recheck the existing spend window before changing any budget.')
++    else:
++        operation, instruction = 'inspect_stop', 'Read the exact current stop and restrictions before choosing recovery.'
++    return {'version': 1, 'stop': evidence, 'next_operation': operation, 'instruction': instruction,
++            'expected_actor': ['owning_chat', 'authorized_operator'], 'authorization': 'not_granted'}
++
++
++def refusal_context(conn, task_id: str) -> tuple[dict, str]:
++    """Structured and rendered advice for a refused release; no writes, grants or identity assertions."""
++    recovery = describe(conn, task_id)
++    stop = recovery['stop']
++    cause = str(stop['cause']) if stop else 'no pending stop'
++    text = (f" Current stop: {cause}; next guarded candidate: {recovery['next_operation']}. "
++            + recovery['instruction']
++            + ' Expected actor: the owning chat or an authorized operator, subject to that operation\'s guards. '
++            'run_in_user_terminal remains agent-origin; opening a terminal or confirming its command is not '
++            'human authentication. Use the original owning chat on its authenticated gateway, not an SSH '
++            'session identity assertion. This diagnostic grants no authority.')
++    return recovery, text
+diff --git a/tests/hermes_cli/test_kanban_stop_recovery.py b/tests/hermes_cli/test_kanban_stop_recovery.py
+new file mode 100644
+index 00000000000..a2e5ac22196
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stop_recovery.py
+@@ -0,0 +1,139 @@
++"""Recovery advice is typed evidence, never execution clearance."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_release as release
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_scope_renewal as scope
++
++board = scope.board
++
++
++def capability_stop(conn):
++    tid = kb.create_task(conn, title='Capability unavailable', assignee='default')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT,
++                         {'cause': 'capability_unavailable', 'accounting_boundary': False})
++    return tid
++
++
++def refused(conn, tid):
++    before = list(conn.iterdump())
++    out = release.release(conn, tid, writer=('agent', 'foreign-chat', '42:HERMES_SESSION_ID'),
++                          env={'HERMES_SESSION_ID': 'foreign-chat'}, ancestry=[{}], runs=10)
++    assert out['refusal'] == 'not_scope_authority'
++    assert list(conn.iterdump()) == before
++    return out
++
++
++def test_identity_refusal_exposes_capability_stop_and_guarded_promote(board):
++    tid = capability_stop(board)
++    out = refused(board, tid)
++    recovery = out['recovery']
++    assert recovery['stop']['cause'] == 'capability_unavailable'
++    assert recovery['stop']['accounting_boundary'] is False
++    assert recovery['next_operation'] == 'promote'
++    assert recovery['authorization'] == 'not_granted'
++    assert 'owning_chat' in recovery['expected_actor']
++    assert '--dry-run --json' in recovery['instruction']
++    assert 'run_in_user_terminal' in out['message']
++    assert 'capability_unavailable' in out['message']
++
++
++@pytest.mark.parametrize('restriction,operation', [
++    ('scope', 'renew-scope'), ('safety', 'resolve_safety_boundary'),
++    ('administrative', 'resolve_administrative_stop'), ('containment', 'resume-contained'),
++])
++def test_independent_restriction_dominates_later_capability_stop(board, monkeypatch, restriction, operation):
++    from hermes_cli import kanban_stop_recovery as recovery
++    tid, _, _ = scope.stopped(board, monkeypatch)
++    if restriction == 'safety':
++        kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal'})
++    elif restriction == 'administrative':
++        # Historical stop shape; the production administrative API requires a separate authenticated operator.
++        from hermes_cli.kanban_stop_ended import KIND
++        kb._append_event(board, tid, KIND, {'reason': 'fixture historical stop'})
++    elif restriction == 'containment':
++        monkeypatch.setattr('hermes_cli.kanban_containment_guard.pending', lambda *a, **kw: True)
++    kb._append_event(board, tid, decision.EVENT, {'cause': 'capability_unavailable', 'accounting_boundary': False})
++    board.commit()
++    before = list(board.iterdump())
++    advice = recovery.describe(board, tid)
++    assert advice['next_operation'] == operation
++    assert advice['authorization'] == 'not_granted'
++    assert list(board.iterdump()) == before
++
++
++def test_renewed_scope_does_not_hide_ordinary_recovery(board, monkeypatch):
++    from hermes_cli import kanban_stop_recovery as recovery
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    scope.link(board, tid)
++    scope.renew(board, tid, episode, scope.mandate(board, tid))
++    assert not decision.execution_restricted(board, tid)
++    assert recovery.describe(board, tid)['next_operation'] == 'promote'
++
++
++def test_malformed_stop_never_advises_ordinary_promote(board):
++    from hermes_cli import kanban_stop_recovery as recovery
++    tid = capability_stop(board)
++    board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind=?",
++                  (json.dumps({'cause': {'invalid': True}}), tid, decision.EVENT))
++    board.commit()
++    assert recovery.describe(board, tid)['next_operation'] == 'inspect_stop'
++
++
++def test_advertised_preflight_parses(board):
++    import argparse
++    import shlex
++    from hermes_cli.kanban_parser import build_parser
++    from hermes_cli.kanban_stop_recovery import describe
++    tid = capability_stop(board)
++    command = describe(board, tid)['instruction'].split('`')[1]
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    args = parser.parse_args(shlex.split(command)[1:])
++    assert args.task_id == tid and args.dry_run and args.json
++
++
++def test_diagnostic_failure_preserves_original_refusal(board, monkeypatch):
++    from hermes_cli import kanban_stop_recovery
++    tid = capability_stop(board)
++    def unavailable(*args):
++        raise ValueError('diagnostic unavailable')
++    monkeypatch.setattr(kanban_stop_recovery, 'refusal_context', unavailable)
++    before = list(board.iterdump())
++    out = release.release(board, tid, runs=0)
++    assert out['refusal'] == 'invalid_runs'
++    assert out['recovery']['next_operation'] == 'inspect_stop'
++    assert list(board.iterdump()) == before
++
++
++def test_sync_quarantine_has_its_own_recovery(board):
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    from hermes_cli.kanban_stop_recovery import describe
++    tid = capability_stop(board)
++    for table, columns in quarantine._TABLES.items():
++        board.execute(f'CREATE TABLE IF NOT EXISTS {table} ({columns})')
++    board.execute('INSERT INTO containment_sync_quarantine VALUES (?,?,?,?,?,?,?)',
++                  ('fixture-receipt', tid, 'fixture', 'contained', 'event_differs', '{}', 1))
++    board.execute('INSERT INTO containment_sync_quarantine_tasks VALUES (?,?,?)',
++                  (tid, 'fixture-receipt', 'direct'))
++    board.commit()
++    before = list(board.iterdump())
++    advice = describe(board, tid)
++    assert advice['next_operation'] == 'resolve_sync_quarantine'
++    assert advice['instruction'] == quarantine.refusal(board, tid)
++    assert list(board.iterdump()) == before
++
++
++def test_authenticated_containment_release_is_not_still_held(board):
++    from tests.hermes_cli import test_kanban_containment_lifecycle as lifecycle
++    from hermes_cli.kanban_stop_recovery import describe
++    relay, _consumer, authority, target, spec = lifecycle.setup(board)
++    result = lifecycle.contain(board, relay, target, spec)
++    assert describe(board, relay)['next_operation'] == 'resume-contained'
++    lifecycle.release(board, target, result['episode'], authority)
++    assert describe(board, relay)['next_operation'] != 'resume-contained'
+-- 
+2.43.0
+

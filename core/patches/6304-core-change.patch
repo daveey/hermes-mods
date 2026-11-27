@@ -1,0 +1,374 @@
+From ff65bef7b2e143eda0d00981eb87d4a0ef2f7272 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:43:01 +0000
+Subject: [PATCH 6304] Immutable historical rejection observations and fresh audit cuts
+
+Public mirror of source commit ff65bef7b2e143eda0d00981eb87d4a0ef2f7272.
+
+---
+diff --git a/hermes_cli/kanban_history_residue_source.py b/hermes_cli/kanban_history_residue_source.py
+new file mode 100644
+index 00000000000..71d92811e8a
+--- /dev/null
++++ b/hermes_cli/kanban_history_residue_source.py
+@@ -0,0 +1,159 @@
++"""Strict parsing of host-reported historical rejection bytes, never identity certification.
++
++The returned source retains unverified extra columns. Nothing here admits, retires,
++replays or modifies transport, events, holds or execution authority. [daveey]
++"""
++from __future__ import annotations
++
++import json
++import math
++
++MAX_BYTES = 131072
++MAX_DEPTH = 64
++CONTAINMENT = 'containment_hold: use scoped resume-contained; generic writes cannot satisfy containment'
++SPEND = 'spend_decision_pending: restricted episode has no execution release'
++
++
++class Refused(ValueError):
++    """No audit classification is established by these bytes."""
++
++
++def _require(ok: bool, reason: str) -> None:
++    if not ok:
++        raise Refused(reason)
++
++
++def _pairs(pairs: list[tuple[str, object]]) -> dict:
++    result = {}
++    for key, value in pairs:
++        _require(key not in result, 'duplicate_key')
++        result[key] = value
++    return result
++
++
++def _constant(_value: str):
++    raise Refused('nonfinite_number')
++
++
++def strict_object(raw: object) -> dict:
++    """Bounded UTF-8 JSON object; reject duplicates, nonfinite values and surrogates."""
++    if not isinstance(raw, str):
++        raise Refused('json_required')
++    try:
++        size = len(raw.encode('utf-8'))
++    except UnicodeError as exc:
++        raise Refused('invalid_unicode') from exc
++    _require(size <= MAX_BYTES, 'json_size')
++    try:
++        value = json.loads(raw, object_pairs_hook=_pairs, parse_constant=_constant)
++    except Refused:
++        raise
++    except (ValueError, RecursionError) as exc:
++        raise Refused('invalid_json') from exc
++    stack = [(value, 0)]
++    while stack:
++        item, depth = stack.pop()
++        _require(depth <= MAX_DEPTH, 'json_depth')
++        if isinstance(item, str):
++            try:
++                item.encode('utf-8')
++            except UnicodeError as exc:
++                raise Refused('invalid_unicode') from exc
++        elif isinstance(item, dict):
++            stack.extend((part, depth + 1) for pair in item.items() for part in pair)
++        elif isinstance(item, list):
++            stack.extend((part, depth + 1) for part in item)
++        elif isinstance(item, float):
++            _require(math.isfinite(item), 'nonfinite_number')
++    _require(isinstance(value, dict), 'object_required')
++    return value
++
++
++def _text(value: object) -> bool:
++    return isinstance(value, str) and bool(value.strip()) and len(value) <= 2048
++
++
++def _positive(value: object) -> bool:
++    return type(value) is int and 0 < value < 2**53
++
++
++def decode_source(raw: str) -> dict:
++    """Validate the narrow frozen event shape without repairing or normalizing it."""
++    row = strict_object(raw)
++    fields = strict_object(row.get('fields'))
++    payload = strict_object(fields.get('payload'))
++    wire = strict_object(row.get('wire_json'))
++    _require(set(fields) == {'task_id', 'run_uid', 'kind', 'payload', 'created_at'}, 'source_fields')
++    _require(_text(row.get('op_id')) and _text(row.get('row_uid')) and _text(row.get('hlc'))
++             and row.get('table_name') == 'task_events' and row.get('op') == 'upsert'
++             and row.get('state') == 'rejected' and _positive(row.get('attempts'))
++             and _text(fields['task_id']) and fields['run_uid'] is None
++             and _positive(fields['created_at']), 'source_shape')
++    expected = {'client_op_id': row['op_id'], 'table': row['table_name'], 'uid': row['row_uid'],
++                'op': row['op'], 'fields': fields, 'hlc': row['hlc'], 'frozen_replay': 1}
++    # Python equality conflates True with 1. JSON byte equality after key ordering does not.
++    _require(json.dumps(wire, sort_keys=True, ensure_ascii=True) ==
++             json.dumps(expected, sort_keys=True, ensure_ascii=True), 'frozen_wire_mismatch')
++    allowed = (row.get('last_error') == CONTAINMENT and fields['kind'] == 'blocked'
++               and payload.get('metadata_only') is True and payload.get('classified_in_place') is True)
++    allowed = allowed or (row.get('last_error') == SPEND and fields['kind'] == 'promoted_manual')
++    _require(allowed, 'unsupported_rejection')
++    return row
++
++
++def _absence(value: object, *, board: str, event: str, head: int) -> None:
++    if not isinstance(value, dict):
++        raise Refused('absence_object')
++    _require((value.get('board'), value.get('table'), value.get('uid')) == (board, 'task_events', event)
++             and type(value.get('head')) is int and value['head'] == head
++             and value.get('state') == 'never_existed' and type(value.get('floor')) is int
++             and value['floor'] == 0 and 'row' in value and value['row'] is None
++             and 'tombstone' in value and value['tombstone'] is None, 'absence_unproven')
++
++
++def validate_current(raw: str, exact_source: str, *, gateway: str, board: str, head: int) -> dict:
++    """Validate response structure only, NOT HTTP origin, local custody, freshness or admission.
++
++    Callers must independently bind this result to a successful nonbusy refresh,
++    an empty authenticated same-head feed cut, exact immutable custody and matching
++    local/replica rows under read reservations. A saved result is not fresh proof.
++    """
++    row = decode_source(exact_source)
++    fields = strict_object(row['fields'])
++    data = strict_object(raw)
++    _require(set(data) == {'version', 'gateway', 'receipt', 'current'} and type(data['version']) is int
++             and data['version'] == 1 and data['gateway'] == gateway, 'proof_identity')
++    receipt, current = data['receipt'], data['current']
++    _require(isinstance(receipt, dict) and isinstance(current, dict), 'proof_objects')
++    _require(type(receipt.get('version')) is int and receipt['version'] == 1
++             and receipt.get('gateway') == gateway and receipt.get('source_json') == exact_source
++             and receipt.get('disposition') == 'retained_unreplayed'
++             and _text(receipt.get('reason')), 'receipt_identity')
++    for key, expected in {'canonical_acceptance': False, 'historical_identity_certified': False,
++                          'execution_authority': False, 'reported_rejection_only': True, 'snapshot_only': True}.items():
++        _require(receipt.get(key) is expected, 'receipt_authority')
++    _require(_positive(receipt.get('observed_at_ms')) and type(receipt.get('observed_head')) is int
++             and receipt['observed_head'] >= 0 and isinstance(receipt.get('parent'), dict)
++             and receipt['parent'].get('uid') == fields['task_id']
++             and receipt['parent'].get('created_on') == gateway, 'historical_snapshot')
++    _absence(receipt.get('absence'), board=board, event=row['row_uid'], head=receipt['observed_head'])
++    _require(type(head) is int and head >= 0 and type(current.get('observed_head')) is int
++             and current['observed_head'] == head and _positive(current.get('observed_at_ms')),
++             'current_cut')
++    for key, expected in {'no_lease': True, 'no_running_run': True, 'no_retained_op_receipt': True,
++                          'op_history_certified': False, 'execution_authority': False}.items():
++        _require(current.get(key) is expected, 'current_authority')
++    # This is raw retention metadata, not a certified never-seen-operation proof.
++    _require('retained_receipt_floor1' in current and (current['retained_receipt_floor1'] is None
++             or isinstance(current['retained_receipt_floor1'], str)), 'receipt_retention_metadata')
++    parent = current.get('parent')
++    if not isinstance(parent, dict):
++        raise Refused('current_parent')
++    _require(parent.get('uid') == fields['task_id']
++             and parent.get('id') == fields['task_id'] and parent.get('created_on') == gateway
++             and _positive(parent.get('version')) and parent.get('status') in ('triage', 'archived')
++             and parent.get('delete_pending') == 0, 'current_parent')
++    for key in ('current_run_uid', 'lease_holder', 'lease_run_uid', 'lease_expires', 'deleted_at'):
++        _require(key in parent and parent[key] is None, 'current_parent_active')
++    _absence(current.get('absence'), board=board, event=row['row_uid'], head=head)
++    return current
+diff --git a/tests/hermes_cli/test_kanban_history_residue_proof.py b/tests/hermes_cli/test_kanban_history_residue_proof.py
+new file mode 100644
+index 00000000000..3a35871de1a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_proof.py
+@@ -0,0 +1,68 @@
++"""Contract-shape checks derived from Board history_residue.ts (not a live proof)."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_history_residue_source as source
++
++from tests.hermes_cli.test_kanban_history_residue_source import specimen
++
++
++def proof():
++    raw = json.dumps(specimen())
++    parent = {'uid': 't_stopped', 'id': 't_stopped', 'version': 7, 'created_on': 'home', 'status': 'triage',
++              'current_run_uid': None, 'lease_holder': None, 'lease_run_uid': None,
++              'lease_expires': None, 'deleted_at': None, 'delete_pending': 0}
++    absence = {'board': 'default', 'table': 'task_events', 'uid': 'event-original',
++               'state': 'never_existed', 'floor': 0, 'head': 100, 'row': None, 'tombstone': None}
++    receipt = {'version': 1, 'gateway': 'home', 'source_json': raw, 'reason': 'Keep history',
++               'disposition': 'retained_unreplayed', 'canonical_acceptance': False,
++               'historical_identity_certified': False, 'execution_authority': False,
++               'reported_rejection_only': True, 'snapshot_only': True, 'observed_at_ms': 50,
++               'observed_head': 100, 'parent': parent.copy(), 'absence': absence.copy()}
++    current = {'observed_at_ms': 90, 'observed_head': 100, 'parent': parent.copy(), 'absence': absence.copy(),
++               'no_lease': True, 'no_running_run': True, 'no_retained_op_receipt': True,
++               'op_history_certified': False, 'retained_receipt_floor1': None, 'execution_authority': False}
++    return raw, {'version': 1, 'gateway': 'home', 'receipt': receipt, 'current': current}
++
++
++def test_separates_historical_receipt_from_current_safe_parent_and_cache_uncertainty():
++    raw, data = proof()
++    data['current']['parent']['version'] = 8
++    data['current']['retained_receipt_floor1'] = '0000000000000123'
++    validated = source.validate_current(json.dumps(data), raw, gateway='home', board='default', head=100)
++    assert validated == data['current']
++    assert validated['op_history_certified'] is False
++
++
++@pytest.mark.parametrize('fault', ['source-byte', 'gateway', 'version', 'head', 'head-bool', 'board', 'event',
++    'snapshot', 'acceptance', 'identity-certified', 'execution', 'reported', 'lease', 'run',
++    'op-retained', 'op-history', 'active', 'pointer', 'lease-holder', 'lease-run', 'lease-expiry',
++    'deleted', 'delete-pending', 'owner', 'task', 'absence-state', 'floor', 'row', 'tombstone'])
++def test_changed_or_misleading_proof_cannot_be_classified(fault):
++    raw, data = proof()
++    current, receipt = data['current'], data['receipt']
++    if fault == 'source-byte': receipt['source_json'] += ' '
++    if fault == 'gateway': data['gateway'] = 'other'
++    if fault == 'version': data['version'] = True
++    if fault == 'head': current['observed_head'] = 101
++    if fault == 'head-bool': current['observed_head'] = True
++    if fault == 'board': current['absence']['board'] = 'other'
++    if fault == 'event': current['absence']['uid'] = 'other'
++    receipt_flags = {'snapshot': 'snapshot_only', 'acceptance': 'canonical_acceptance',
++                     'identity-certified': 'historical_identity_certified', 'execution': 'execution_authority',
++                     'reported': 'reported_rejection_only'}
++    if fault in receipt_flags: receipt[receipt_flags[fault]] = not receipt[receipt_flags[fault]]
++    flags = {'lease': 'no_lease', 'run': 'no_running_run', 'op-retained': 'no_retained_op_receipt', 'op-history': 'op_history_certified'}
++    if fault in flags: current[flags[fault]] = not current[flags[fault]]
++    patches = {'active': {'status': 'ready'}, 'pointer': {'current_run_uid': 'run'},
++               'lease-holder': {'lease_holder': 'other'}, 'lease-run': {'lease_run_uid': 'run'},
++               'lease-expiry': {'lease_expires': 1}, 'deleted': {'deleted_at': 1},
++               'delete-pending': {'delete_pending': 1}, 'owner': {'created_on': 'other'}, 'task': {'uid': 'other'}}
++    current['parent'].update(patches.get(fault, {}))
++    if fault == 'absence-state': current['absence']['state'] = 'unknown'
++    if fault == 'floor': current['absence']['floor'] = 1
++    if fault == 'row': current['absence']['row'] = {}
++    if fault == 'tombstone': current['absence']['tombstone'] = {}
++    with pytest.raises(source.Refused):
++        source.validate_current(json.dumps(data), raw, gateway='home', board='default', head=100)
+diff --git a/tests/hermes_cli/test_kanban_history_residue_source.py b/tests/hermes_cli/test_kanban_history_residue_source.py
+new file mode 100644
+index 00000000000..53ec616f105
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_source.py
+@@ -0,0 +1,118 @@
++"""Exact-byte history-residue parsing is not retirement or execution authority."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_history_residue_source as source
++
++
++def specimen():
++    fields = {'task_id': 't_stopped', 'run_uid': None, 'kind': 'promoted_manual',
++              'payload': '{}', 'created_at': 100}
++    wire = {'client_op_id': 'op-original', 'table': 'task_events', 'uid': 'event-original',
++            'op': 'upsert', 'fields': fields, 'hlc': '100-0000-home', 'frozen_replay': 1}
++    return {'op_id': wire['client_op_id'], 'table_name': wire['table'], 'row_uid': wire['uid'],
++            'op': wire['op'], 'fields': json.dumps(fields), 'wire_json': json.dumps(wire),
++            'hlc': wire['hlc'], 'state': 'rejected', 'attempts': 2, 'identity_state': 'ambiguous',
++            'last_error': 'spend_decision_pending: restricted episode has no execution release'}
++
++
++def test_preserves_exact_source_and_unverified_ambiguous_claim():
++    row = specimen()
++    raw = json.dumps(row, indent=2)
++    assert source.decode_source(raw) == row
++    assert row['identity_state'] == 'ambiguous'
++
++
++@pytest.mark.parametrize('layer', ['source', 'fields', 'wire_json', 'payload'])
++def test_duplicate_keys_refused_before_information_is_lost(layer):
++    row = specimen()
++    if layer == 'source':
++        raw = json.dumps(row)[:-1] + ',"state":"rejected"}'
++    else:
++        if layer == 'payload':
++            fields = json.loads(row['fields'])
++            fields['payload'] = '{"same":1,"same":1}'
++            row['fields'] = json.dumps(fields)
++            wire = json.loads(row['wire_json'])
++            wire['fields'] = fields
++            row['wire_json'] = json.dumps(wire)
++        else:
++            key = 'task_id' if layer == 'fields' else 'client_op_id'
++            value = 't_stopped' if layer == 'fields' else 'op-original'
++            row[layer] = row[layer][:-1] + ',' + json.dumps(key) + ':' + json.dumps(value) + '}'
++        raw = json.dumps(row)
++    with pytest.raises(source.Refused, match='^duplicate_key$'):
++        source.decode_source(raw)
++
++
++@pytest.mark.parametrize('bad', ['NaN', 'Infinity', '-Infinity', '1e999'])
++def test_nonfinite_json_is_never_canonical_evidence(bad):
++    row = specimen()
++    raw = json.dumps(row)[:-1] + ',"unverified":' + bad + '}'
++    with pytest.raises(source.Refused, match='^nonfinite_number$'):
++        source.decode_source(raw)
++
++
++@pytest.mark.parametrize('layer', ['source', 'fields', 'wire_json', 'payload'])
++def test_malformed_unicode_and_excess_depth_refused(layer):
++    row = specimen()
++    if layer == 'source':
++        row['unverified'] = '\ud800'
++    elif layer == 'payload':
++        fields = json.loads(row['fields'])
++        fields['payload'] = '{"bad":"\\ud800"}'
++        row['fields'] = json.dumps(fields)
++    else:
++        row[layer] = '{"bad":"\\ud800"}'
++    with pytest.raises(source.Refused, match='^invalid_unicode$'):
++        source.decode_source(json.dumps(row))
++    row = specimen()
++    raw = json.dumps(row)[:-1] + ',"deep":' + '[' * 80 + '0' + ']' * 80 + '}'
++    with pytest.raises(source.Refused, match='^json_depth$'):
++        source.decode_source(raw)
++
++
++@pytest.mark.parametrize('key,value', [('attempts', True), ('attempts', 0), ('hlc', ''),
++    ('op_id', ''), ('row_uid', ''), ('table_name', 'tasks'), ('op', 'delete'),
++    ('state', 'pending'), ('last_error', 'unknown')])
++def test_unsupported_or_inconsistent_source_is_refused(key, value):
++    row = specimen()
++    row[key] = value
++    with pytest.raises(source.Refused):
++        source.decode_source(json.dumps(row))
++
++
++@pytest.mark.parametrize('key,value', [('run_uid', 'run'), ('created_at', True),
++    ('created_at', 0), ('created_at', 2**53), ('kind', 'started'), ('task_id', '')])
++def test_adjacent_valid_frozen_field_shapes_are_refused(key, value):
++    row = specimen()
++    fields = json.loads(row['fields'])
++    fields[key] = value
++    row['fields'] = json.dumps(fields)
++    wire = json.loads(row['wire_json'])
++    wire['fields'] = fields
++    row['wire_json'] = json.dumps(wire)
++    with pytest.raises(source.Refused):
++        source.decode_source(json.dumps(row))
++
++
++def test_blocked_metadata_only_source_supported_without_certifying_it():
++    row = specimen()
++    fields = json.loads(row['fields'])
++    fields.update(kind='blocked', payload='{"metadata_only":true,"classified_in_place":true}')
++    row['fields'] = json.dumps(fields)
++    wire = json.loads(row['wire_json'])
++    wire['fields'] = fields
++    row['wire_json'] = json.dumps(wire)
++    row['last_error'] = 'containment_hold: use scoped resume-contained; generic writes cannot satisfy containment'
++    assert source.decode_source(json.dumps(row)) == row
++
++
++def test_bool_frozen_flag_cannot_equal_integer_flag():
++    row = specimen()
++    wire = json.loads(row['wire_json'])
++    wire['frozen_replay'] = True
++    row['wire_json'] = json.dumps(wire)
++    with pytest.raises(source.Refused, match='^frozen_wire_mismatch$'):
++        source.decode_source(json.dumps(row))
+-- 
+2.43.0
+

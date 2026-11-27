@@ -1,0 +1,181 @@
+From c0f50f5db93055d3dc3c773577773e0c744148b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:00:59 +0000
+Subject: [PATCH 6483] Frozen administrative deadlines for parks, links, landings and review queues
+
+Public mirror of source commit c0f50f5db93055d3dc3c773577773e0c744148b9.
+
+---
+diff --git a/hermes_cli/kanban_actionability_creation.py b/hermes_cli/kanban_actionability_creation.py
+index a767afe90b2..03a2620212a 100644
+--- a/hermes_cli/kanban_actionability_creation.py
++++ b/hermes_cli/kanban_actionability_creation.py
+@@ -27,6 +27,10 @@
+     """Derive once from source clocks; the same pure function verifies recorded intent."""
+     if not isinstance(payload, dict):
+         return None
++    if kind == 'spend_review_settled' and payload.get('verdict') == 'release':
++        parents = release_parents(task.get('id'), payload)
++        if parents is None or parents != payload.get('actionability_parent_ids'):
++            return None
+     timed = kind == 'scheduled' or (kind == 'continued' and payload.get('status') == 'scheduled')
+     todo = _todo_entry(kind, payload)
+     if not timed and kind != 'blocked' and not todo:
+@@ -94,6 +98,18 @@
+     return (intent['deadline_at'], source.get('uid') or str(source['id'])) if intent and intent['status'] == task['status'] else None
+ 
+ 
++def release_parents(task_id, payload):
++    """Only a canonical receipt's explicit todo landing can name release-wait parents."""
++    landing = payload.get('landing') if isinstance(payload, dict) and payload.get('verdict') == 'release' else None
++    if not isinstance(landing, dict) or set(landing) != {'status', 'parent_ids'} or landing['status'] != 'todo':
++        return None
++    parents = landing['parent_ids']
++    if (not isinstance(parents, list) or not parents or not all(_text(p) and p != task_id for p in parents)
++            or parents != sorted(set(parents))):
++        return None
++    return parents
++
++
+ def stamp(conn, task_id, kind, payload, *, now):
+     """Freeze ordinary administrative policy with the actual source event clock."""
+     if kind not in ('scheduled', 'blocked', 'continued', 'dependency_wait', 'linked', 'unlinked', 'unblocked', *LANDINGS):
+@@ -102,8 +118,10 @@
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+     # A confirmed Board wait_on receipt: the Board linked ``parent`` and parked the card in todo in that
+     # receipt's transaction, and this replica still shows the triage it left. Freeze the wait as it landed.
+-    receipt = bool(kind == 'spend_review_settled' and isinstance(payload, dict) and payload.get('verdict') == 'wait_on'
+-                   and payload.get('status') == 'todo' and _text(payload.get('parent')) and payload['parent'] != task_id
++    release = release_parents(task_id, payload) if kind == 'spend_review_settled' else None
++    receipt = bool(kind == 'spend_review_settled' and isinstance(payload, dict) and payload.get('status') == 'todo'
++                   and (release is not None or (payload.get('verdict') == 'wait_on'
++                        and _text(payload.get('parent')) and payload['parent'] != task_id))
+                    and row is not None and row['status'] == 'triage')
+     if receipt and row is not None:
+         row = {**dict(row), 'status': 'todo', 'block_kind': None, 'human_request': None}
+@@ -115,7 +133,9 @@
+         from hermes_cli.kanban_db_sync import run_uid
+         from hermes_cli.kanban_actionability_parents import snapshot
+         parents = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,))]
+-        if receipt:
++        if release is not None:
++            parents = release  # frozen canonical edges, never guessed from this replica
++        elif receipt:
+             parents = sorted({*parents, payload['parent']})
+         if kind in ('linked', 'unlinked', 'unblocked', *LANDINGS) and not parents:
+             return original  # no parent to wait on: not a dependency wait, so nothing to freeze
+diff --git a/hermes_cli/kanban_spend_caused_review.py b/hermes_cli/kanban_spend_caused_review.py
+index f7b2cffb324..0e2cf2477d0 100644
+--- a/hermes_cli/kanban_spend_caused_review.py
++++ b/hermes_cli/kanban_spend_caused_review.py
+@@ -255,6 +255,9 @@
+         # confirmed receipt is the landing; naming it lets the event seam freeze the wait before sync
+         # projects the Board's rows, leaving no interval in which the todo card has no clock.
+         settled.update(status="todo", parent=receipt["target"])
++    from hermes_cli.kanban_actionability_creation import release_parents
++    if release_parents(task_id, receipt) is not None:
++        settled.update(status='todo', landing=receipt['landing'])
+     with kb.write_txn(conn):
+         kb._append_event(conn, task_id, reviewer.SETTLED, settled)
+     return "settled"  # canonical effect confirmed; normal sync, not this helper, projects clearance
+diff --git a/tests/hermes_cli/test_kanban_release_landing_deadline.py b/tests/hermes_cli/test_kanban_release_landing_deadline.py
+new file mode 100644
+index 00000000000..82af4d99312
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_release_landing_deadline.py
+@@ -0,0 +1,92 @@
++"""Canonical release landing provenance, not a guess from replica status. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli.kanban_actionability_sources import describe
++from tests.hermes_cli import test_kanban_spend_review_landing as support
++
++kanban_home = support.kanban_home
++board = support.board
++clock = support.clock
++
++
++def _receipt(board, landing):
++    def mutate(row):
++        row['payload'] = json.dumps({**json.loads(row['payload']), 'landing': landing})
++    board[0].mutate = mutate
++
++
++def test_release_landing_freezes_before_parent_and_status_projection(kanban_home, spend_reviewer, board, clock):
++    with kbc.connect_closing() as conn:
++        tid, parent, ep, verdict = support._reviewed(conn, {
++            'decision': 'release', 'reason': 'Finish acceptance', 'remaining_quote': support.support.QUOTE})
++        _receipt(board, {'status': 'todo', 'parent_ids': [parent]})
++        spend_reviewer.append(verdict)
++        at = conn.execute('SELECT MAX(created_at) FROM task_events').fetchone()[0]
++        with clock(at + 4):
++            assert reviewer.review(conn, tid, ep) == 'settled'
++        assert kb.get_task(conn, tid).status == 'triage'
++        assert not conn.execute('SELECT 1 FROM task_links WHERE child_id=?', (tid,)).fetchone()
++        event, data = support._settled(conn, tid)
++        deadline = event['created_at'] + support.DAY
++        assert data['actionability_intent']['deadline_at'] == deadline
++        assert data['actionability_parent_ids'] == [parent]
++        assert describe(conn, tid)['action'] == 'decide_scope'  # a receipt alone never clears the stop
++        # Project the Board's canonical renewal/comment/promotion rows, not a local release.
++        from hermes_cli.kanban_scope_renewal import digest
++        mandate = 'Canonical release mandate for the fixture'
++        with kb.write_txn(conn):
++            comment_id = conn.execute('INSERT INTO task_comments (task_id,author,body,created_at) VALUES (?,?,?,?)',
++                                     (tid, reviewer.AUTHOR, mandate, event['created_at'] - 1)).lastrowid
++            conn.execute('INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)',
++                         (tid, 'scope_renewed', json.dumps({'version': 1, 'episode': ep,
++                          'covered_restriction_uids': [ep], 'mandate_comment_uid': str(comment_id),
++                          'mandate_body_sha256': digest(mandate)}), event['created_at'] - 1))
++            conn.execute('INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,?,?,?)',
++                         (tid, 'promoted_manual', json.dumps({'actor': reviewer.AUTHOR}), event['created_at'] - 1))
++            conn.execute('INSERT INTO task_links (parent_id,child_id) VALUES (?,?)', (parent, tid))
++            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
++        for now in (event['created_at'] + 1, deadline + 1):
++            row = describe(conn, tid, now=now)
++            assert row['action'] == 'satisfy_dependency'
++            assert parent in row['blocker']['prerequisite']
++            assert row['escalation']['at'] == deadline
++            assert support.MISSING not in row['violations']
++        assert 'escalation_overdue' in row['violations']
++        # The canonical landing and copied edge snapshot must agree, not merely each look valid.
++        from hermes_cli.kanban_actionability_creation import validated_intent
++        task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++        forged = {**data, 'landing': {'status': 'todo', 'parent_ids': ['t_other']}}
++        assert validated_intent(task, {'kind': reviewer.SETTLED, 'created_at': event['created_at'],
++                                      'data': forged}) is None
++        # No borrowing after the card leaves todo, or when its parents disagree.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert describe(conn, tid, now=deadline + 2)['escalation']['at'] != deadline
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
++            conn.execute('DELETE FROM task_links WHERE child_id=?', (tid,))
++        assert describe(conn, tid, now=deadline + 2)['escalation']['at'] != deadline
++
++
++@pytest.mark.parametrize('landing', [None, {}, {'status': 'ready', 'parent_ids': ['P']},
++    {'status': 'todo', 'parent_ids': []}, {'status': 'todo', 'parent_ids': ['P', 'P']},
++    {'status': 'todo', 'parent_ids': ['SELF']}, {'status': 'todo', 'parent_ids': [7]},
++    {'status': 'todo', 'parent_ids': ['P'], 'extra': True}])
++def test_release_without_valid_todo_receipt_never_infers_landing(kanban_home, spend_reviewer, board, landing):
++    with kbc.connect_closing() as conn:
++        tid, parent, ep, verdict = support._reviewed(conn, {
++            'decision': 'release', 'reason': 'Finish acceptance', 'remaining_quote': support.support.QUOTE})
++        if isinstance(landing, dict):
++            landing = {**landing, 'parent_ids': [({'P': parent, 'SELF': tid}.get(p, p))
++                       for p in landing.get('parent_ids', [])]}
++        _receipt(board, landing)
++        spend_reviewer.append(verdict)
++        assert reviewer.review(conn, tid, ep) == 'settled'
++        data = support._settled(conn, tid)[1]
++        assert 'actionability_intent' not in data
++        assert kb.get_task(conn, tid).status == 'triage'
+-- 
+2.43.0
+

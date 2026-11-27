@@ -1,0 +1,742 @@
+From d1edf0d156733d17ef9d9969455985955c8ead0e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:01:40 +0000
+Subject: [PATCH 6461] Kanban sync refusal audits and diagnostic drift supersession
+
+Public mirror of source commit d1edf0d156733d17ef9d9969455985955c8ead0e.
+
+---
+diff --git a/hermes_cli/kanban_history_residue_board.py b/hermes_cli/kanban_history_residue_board.py
+index c4ca98da7b3..f60a5bb27d3 100644
+--- a/hermes_cli/kanban_history_residue_board.py
++++ b/hermes_cli/kanban_history_residue_board.py
+@@ -47,7 +47,15 @@
+     from hermes_cli.kanban_sync_guard import board_sync_lock
+     paths = _paths(live, shadow, board)
+     _require(not pulled.busy and not pulled.more, 'diagnostic_refresh_incomplete')
+-    with board_sync_lock(paths[0]), closing(_ledger(board)) as ledger:
++    with board_sync_lock(paths[0]):
++        return _audit_diff_locked(live, shadow, hub, board, pulled=pulled, started=started)
++
++
++def _audit_diff_locked(live, shadow, hub, board, *, pulled, started):
++    """Internal composition: caller retains the ordinary board sync fence."""
++    _paths(live, shadow, board)
++    _require(not pulled.busy and not pulled.more, 'diagnostic_refresh_incomplete')
++    with closing(_ledger(board)) as ledger:
+         identity = transport.scope(hub, board)
+         rows = ledger.execute(f'SELECT op_id FROM {custody.INTENTS} WHERE endpoint=? AND board=? AND gateway=? '
+                               'ORDER BY op_id LIMIT ?', (*identity, cut.MAX_OPS + 1)).fetchall()
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 9c0fef626cc..67484b9b3b2 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -15,6 +15,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++from contextlib import ExitStack
+ import json
+ import sqlite3
+ import time
+@@ -97,62 +98,35 @@
+     slug = _board(args)
+     ident = ksc.load_identity()
+     started = time.monotonic()
+-    # Refresh first, before opening the replica. Only when no sync round holds the board (one replica puller per
+-    # board per host); a busy round's replica is compared as it stands. A diagnostic: it never rebuilds the replica
+-    # (a Resync is reported as refresh_error) and never transfers attachments (t_01a1d41c2612ebc0).
+-    refresh_error = None
+-    pulled = ksc.Pulled()
+-    try:
+-        from hermes_cli.kanban_sync_diagnostic import refresh
+-        refresh_hub = ksc.Hub(ident)
++    # One normal sync fence spans refresh, comparison and both read-only audits.
++    # Never rebuild/transfer attachments; never hold SQLite reservations over HTTP.
++    with ExitStack() as stack:
++        from hermes_cli.kanban_sync_diagnostic import fresh_cut
++        hub = ksc.Hub(ident)
++        stack.callback(hub.close)
++        refresh_error = None
++        pulled = ksc.Pulled()
+         try:
+-            pulled = refresh(slug, refresh_hub, ident.gateway, _path(slug))
+-        finally:
+-            refresh_hub.close()
+-    except (ksc.HubError, ksc.Resync, OSError) as exc:
+-        refresh_error = str(exc)
+-    else:
++            pulled = stack.enter_context(fresh_cut(slug, hub, ident.gateway, _path(slug)))
++        except (ksc.HubError, ksc.Resync, OSError) as exc:
++            refresh_error = str(exc)
+         if pulled.more:
+             refresh_error = (f"the replica is still behind the feed head after {ksc.PULL_PAGE_BUDGET} pages; the "
+                              "sync loop is catching up, rerun later")
+-    live = kbc.connect(_path(slug))
+-    shadow = ksc.open_shadow(slug, ident.gateway)
+-    try:
++        live = kbc.connect(_path(slug))
++        stack.callback(live.close)
++        shadow = ksc.open_shadow(slug, ident.gateway)
++        stack.callback(shadow.close)
+         report = ksc.diff(live, shadow, ident.gateway)
+         if refresh_error is not None:
+             report.update(clean=False, unavailable=True, refresh_error=refresh_error)
+         elif pulled.busy:
+-            report["refresh_skipped"] = "a sync round holds the board; compared against its replica as it stands"
++            # Busy is unknown, not drift or a fresh clean cut. The unchanged
++            # monitor breaks its dirty streak on unavailable rather than filing.
++            report.update(clean=False, unavailable=True,
++                          refresh_skipped="a sync round holds the board; compared against its replica as it stands")
+         else:
+-            from hermes_cli import kanban_history_residue_board as history
+-            if report['rejected_ops']:
+-                from hermes_cli import kanban_sync_refusal_audit as refusal
+-                from hermes_cli.kanban_sync_guard import board_sync_lock
+-                hub = ksc.Hub(ident)
+-                try:
+-                    with board_sync_lock(_path(slug)):
+-                        report = refusal.report(live, shadow, hub, slug, started=started)
+-                except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
+-                    report.update(clean=False, server_refusal_audit_error=str(exc))
+-                finally:
+-                    hub.close()
+-            proven = set(report.get('audited_server_refusals', [])) | set(report['audited_retain_rejections'])
+-            # An unconfirmed history intent must not turn a server-receipted
+-            # refusal into unknown custody; it is retained unchanged, not used.
+-            if history.ledger_path(slug).exists() and report['rejected_ops'] > len(proven):
+-                hub = ksc.Hub(ident)
+-                try:
+-                    audit = history.audit_diff(live, shadow, hub, slug, pulled=pulled, started=started)
+-                    report = {**audit['diff'], 'history_audit_head': audit['head']}
+-                    if getattr(args, 'history_evidence', False):
+-                        report['history_audit_evidence'] = audit
+-                except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
+-                    report.update(clean=False, history_audit_error=str(exc))
+-                finally:
+-                    hub.close()
+-    finally:
+-        live.close()
+-        shadow.close()
++            report = _audit_diff(args, live, shadow, hub, slug, pulled, started, report)
+     report = {"board": slug, **report}
+     if not args.json:
+         for key in ("missing_in_shadow", "extra_in_shadow"):
+@@ -163,6 +137,28 @@
+     return 0 if report["clean"] else 1
+ 
+ 
++def _audit_diff(args, live, shadow, hub, slug, pulled, started, report):
++    """Compose audits under the caller's continuous normal synchronization fence."""
++    from hermes_cli import kanban_history_residue_board as history
++    if report['rejected_ops']:
++        from hermes_cli import kanban_sync_refusal_audit as refusal
++        try:
++            report = refusal.report(live, shadow, hub, slug, started=started)
++        except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
++            report.update(clean=False, server_refusal_audit_error=str(exc))
++    proven = set(report.get('audited_server_refusals', [])) | set(report['audited_retain_rejections'])
++    # Never union cached proofs; history revalidates the mixed set under its CAS.
++    if history.ledger_path(slug).exists() and report['rejected_ops'] > len(proven):
++        try:
++            audit = history._audit_diff_locked(live, shadow, hub, slug, pulled=pulled, started=started)
++            report = {**audit['diff'], 'history_audit_head': audit['head']}
++            if getattr(args, 'history_evidence', False):
++                report['history_audit_evidence'] = audit
++        except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
++            report.update(clean=False, history_audit_error=str(exc))
++    return report
++
++
+ def _run(args: argparse.Namespace) -> int:
+     results = ksc.sync_all_once()
+     rows = [{"board": r.board, "mode": r.mode, "pulled": r.pulled, "pushed": r.push.sent if r.push else 0,
+diff --git a/hermes_cli/kanban_sync_diagnostic.py b/hermes_cli/kanban_sync_diagnostic.py
+index 4447be430d2..a1ef7561492 100644
+--- a/hermes_cli/kanban_sync_diagnostic.py
++++ b/hermes_cli/kanban_sync_diagnostic.py
+@@ -1,9 +1,43 @@
+ """Bounded quiet-window diagnostic refresh; no lock bypass or replay. [daveey]"""
+ from __future__ import annotations
+ 
++from contextlib import contextmanager, ExitStack
+ import threading
+ import time
+ 
++from hermes_cli.kanban_sync_guard import board_sync_lock, SyncRoundBusy
++
++
++@contextmanager
++def fresh_cut(board, hub, gateway, path):
++    """Hold the ordinary sync fence continuously from pull through caller audits.
++
++    Release between behind chunks and on failed acquisition; never retry caller
++    exceptions. Bounds admit new starts only; existing HTTP deadlines still apply.
++    """
++    from hermes_cli.kanban_sync_client import Pulled, _pulled_replica
++
++    deadline = time.monotonic() + MAX_SECONDS
++    result = Pulled(busy=True)
++    for attempt in range(MAX_ATTEMPTS):
++        with ExitStack() as stack:
++            try:
++                stack.enter_context(board_sync_lock(path))
++            except SyncRoundBusy:
++                result = Pulled(busy=True)
++            else:
++                with _pulled_replica(board, hub, gateway, diagnostic=True) as (_, result, _rebuilt):
++                    if not result.more:
++                        yield result
++                        return
++        remaining = deadline - time.monotonic()
++        if attempt + 1 == MAX_ATTEMPTS or remaining <= 0:
++            break
++        _wait(min(RETRY_SECONDS, remaining))
++        if time.monotonic() >= deadline:
++            break
++    yield result
++
+ MAX_ATTEMPTS = 12
+ MAX_SECONDS = 8.0
+ RETRY_SECONDS = 0.25
+diff --git a/tests/fixtures/kanban_drift_monitor.py.txt b/tests/fixtures/kanban_drift_monitor.py.txt
+new file mode 100644
+index 00000000000..90d3693d07d
+--- /dev/null
++++ b/tests/fixtures/kanban_drift_monitor.py.txt
+@@ -0,0 +1,260 @@
++"""One scheduled fleet drift consumer, with durable incidents and native Kanban tools.
++
++Configuration is host-local JSON: owner_gateway, state_path, targets (key -> argv),
++assignee and optional board, timeout (per-target seconds, default 90), and alerting:
++unavailable_alert_after and absent_alert_after (seconds, or a map by target key with "*"),
++presence (target key -> argv; exit 0 = host up) and presence_timeout (default 15).
++Each command must return the sync diff JSON (exit 0/1).
++No credentials, hostnames or schedules are shipped in this module.
++"""
++from __future__ import annotations
++
++import argparse
++import fcntl
++import json
++import os
++from pathlib import Path
++import subprocess
++import re
++import time
++import uuid
++
++# Core's placement scan (hermes_cli.kanban_placement.portable_reason) skips text inside complete pairs of these
++# markers. A drift report is full of host words (state paths, kanban.db, gateway names); unfenced, they make the
++# repair card look home-bound, so on the hub "auto" costs an admission-judge call and a hub:write requirement.
++EVIDENCE_OPEN = "<!-- placement:evidence -->"
++EVIDENCE_CLOSE = "<!-- /placement:evidence -->"
++_MARKER = re.compile(r"<!--\s*/?\s*placement:evidence\s*-->", re.IGNORECASE)
++# Board-size counters that grow with every new card. They are not drift evidence, so a report that differs only in
++# them is the same finding and gets no new comment (otherwise every sample re-posted an unchanged report).
++VOLATILE = ("checked", "foreign_cards")
++
++
++def finding(report):
++    """The part of a report that says what drifted: everything but the board-size counters."""
++    return {k: v for k, v in report.items() if k not in VOLATILE}
++
++
++def fence_evidence(text):
++    """``text`` inside one evidence fence, with every marker in it removed (also ones re-formed from nested halves),
++    so pasted evidence can neither end the fence early nor open a fake one that hides instructions."""
++    text = text or ""
++    while True:
++        cleaned = _MARKER.sub("", text)
++        if cleaned == text:
++            break
++        text = cleaned
++    return f"{EVIDENCE_OPEN}\n{text.strip(chr(10))}\n{EVIDENCE_CLOSE}"
++
++
++class Monitor:
++    def __init__(self, path, tool, *, assignee="default", board="default"):
++        self.path = Path(path)
++        self.tool = tool
++        self.assignee, self.board = assignee, board
++        self.state = json.loads(self.path.read_text()) if self.path.exists() else {"version": 1, "targets": {}}
++
++    def save(self):
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = self.path.with_suffix(".tmp")
++        with tmp.open("w") as stream:
++            json.dump(self.state, stream, sort_keys=True)
++            stream.flush()
++            os.fsync(stream.fileno())
++        tmp.replace(self.path)
++
++    def sample(self, key, report):
++        row = self.state["targets"].setdefault(key, {"streak": 0, "incident": None, "card": None})
++        row.update(last_sample=report, sampled_at=time.time())
++        if row["card"]:
++            card = self.tool("kanban_show", {"task_id": row["card"], "board": self.board})["task"]
++            if card["status"] in ("done", "archived"):
++                row.update(streak=0, incident=None, card=None)
++        if report.get("unavailable") or type(report.get("clean")) is not bool:
++            row["streak"] = 0  # unknown breaks consecutive dirty, never clears the incident
++            if row.get("unavailable_since") is None:
++                row["unavailable_since"] = row["sampled_at"]
++            self.save()
++            return row
++        row["unavailable_since"] = None  # any real sample (clean or dirty) ends the dark period
++        if report["clean"]:
++            row["streak"] = 0
++            self.save()
++            return row
++        row["streak"] += 1
++        if row["streak"] < 2:
++            self.save()
++            return row
++        if not row["incident"]:
++            row["incident"] = str(uuid.uuid4())
++        self.save()  # write-ahead identity: a crash after create reuses the same key
++        body = (f"Fleet sync drift on {key}, confirmed on consecutive samples. "
++                "Investigate and repair through normal sync semantics; preserve rejection audits and worker fences. "
++                "No human action is requested. Verify fresh authoritative state and attach per-row evidence.\n\n"
++                + fence_evidence(json.dumps(report, sort_keys=True)))
++        if not row["card"]:
++            # placement "auto", never "local": on the hub "local" is a hub slot that core's admission judge must
++            # admit, and it denies routine repair work (pool workers have hub ssh + hub-admin), so the create was
++            # refused and no repair card was ever filed (cron-0d63c0cf26). "auto" joins the worker pool.
++            title = f"Repair persistent Kanban sync drift: {key}"
++            create = {"title": title, "body": body,
++                      "assignee": self.assignee, "requires": ["terminal", "file", "kanban"],
++                      "placement": "auto", "board": self.board,
++                      "idempotency_key": "kanban-drift:" + key + ":" + row["incident"],
++                      "completion_contract": "local-only"}
++            result = self.tool("kanban_create", create)
++            if result.get("code") == "create_overlap":
++                result = self._resolve_overlap(key, create, result)
++            row["card"] = result.get("task_id") or result.get("id") or result.get("task", {}).get("id")
++            if not row["card"]:
++                raise RuntimeError("Kanban create returned no card: " + json.dumps(result))
++            self.save()
++            card = self.tool("kanban_show", {"task_id": row["card"], "board": self.board})["task"]
++            if card["id"] != row["card"]:
++                raise RuntimeError("Kanban readback identity mismatch")
++        elif finding(row.get("last_report") or {}) != finding(report):
++            self.tool("kanban_comment", {"task_id": row["card"], "board": self.board, "body": body})
++        row["last_report"] = report
++        self.save()
++        return row
++
++    def _resolve_overlap(self, key, create, refusal):
++        """Core refuses a create whose title shares words with an open card. It already skips this monitor's own
++        cards (same idempotency-key prefix), but not cards without that key: a decision card quoting another
++        target's repair title matches, e.g. macbook/default was refused against hub/default's "Spend budget
++        decision: ..." card on every pass. When every match is about another target, retry once declaring them
++        distinct. A match about this same target (": <key>" in its title) keeps the guard: the refusal is
++        returned unchanged and fails loudly in the caller, as does a second refusal."""
++        matches = refusal.get("matches") or []
++        ids = [m.get("id") for m in matches]
++        same_target = re.compile(r":\s*" + re.escape(key) + r"(?![\w/.-])")
++        if not matches or not all(ids) or any(same_target.search(m.get("title") or "") for m in matches):
++            return refusal
++        return self.tool("kanban_create", dict(
++            create, distinct_from=ids,
++            distinct_reason=f"The drift monitor files one repair card per target; this one is {key}, "
++                            "and every matched card is about a different target."))
++
++
++def collect(argv, timeout=90):
++    result = None
++    try:
++        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
++        report = json.loads(result.stdout)
++        if result.returncode not in (0, 1) or not isinstance(report, dict) or type(report.get("clean")) is not bool:
++            raise ValueError(f"invalid diff response (exit {result.returncode})")
++        if result.returncode == 1 and report["clean"]:
++            raise ValueError("failed command claimed clean")
++        return report
++    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
++        report = {"clean": False, "unavailable": True, "error": str(exc)}
++        if result is not None:
++            report.update(exit_code=result.returncode, stderr=result.stderr[-2000:])
++        return report
++
++
++# Repair cards this monitor files are owned by core's standing "Kanban owner: kanban-drift" chat
++# (hermes_cli.kanban_owner_chat), so a scope or budget stop on one is decided by that chat, not left for a human.
++PRODUCER = "kanban-drift"
++PRODUCER_ENV = "HERMES_KANBAN_PRODUCER"
++
++
++def native_tool(name, args):
++    from model_tools import handle_function_call
++    os.environ[PRODUCER_ENV] = PRODUCER  # named over the cron job's default, so the owner chat reads as this monitor
++    result = json.loads(handle_function_call(name, args))
++    if result.get("error") or result.get("success") is False:
++        raise RuntimeError(json.dumps(result))
++    return result
++
++
++DEFAULT_UNAVAILABLE_ALERT_AFTER = 21600  # seconds; a sleeping laptop is normal, days of silence are not
++
++
++def alert_after(config, key):
++    """Seconds a target may stay unavailable before the run fails: an int, or a map with optional "*"."""
++    value = config.get("unavailable_alert_after", DEFAULT_UNAVAILABLE_ALERT_AFTER)
++    if isinstance(value, dict):
++        value = value.get(key, value.get("*", DEFAULT_UNAVAILABLE_ALERT_AFTER))
++    return float(value)
++
++
++DEFAULT_ABSENT_ALERT_AFTER = 7 * 86400  # seconds a host may be powered off/offline before the run fails
++
++
++def absent_after(config, key):
++    value = config.get("absent_alert_after", DEFAULT_ABSENT_ALERT_AFTER)
++    if isinstance(value, dict):
++        value = value.get(key, value.get("*", DEFAULT_ABSENT_ALERT_AFTER))
++    return float(value)
++
++
++def host_present(argv, timeout=15):
++    """Presence probe: exit 0 = host up, other exit = host down. A probe that cannot run or
++    times out counts as up, so a broken probe keeps sampling failures loud instead of hiding them."""
++    try:
++        return subprocess.run(argv, capture_output=True, timeout=timeout).returncode == 0
++    except (OSError, subprocess.SubprocessError):
++        return True
++
++
++def classify(config, receipts, now):
++    """Return ({stale key: reason}, [absent keys]) for targets in a dark period.
++
++    Without a `presence` command a target is stale once dark longer than unavailable_alert_after
++    (reason unavailable_too_long). With one, a host that is down is `absent` (expected: a closed
++    laptop) and fails only after absent_alert_after (absent_too_long); a host that is up while its
++    sample fails is the real blind spot and fails after unavailable_alert_after (sample_failing_while_up)."""
++    presence = config.get("presence") or {}
++    stale, absent = {}, []
++    for key, row in receipts.items():
++        since = row.get("unavailable_since")
++        if since is None:
++            continue
++        dark = now - since
++        if key not in presence:
++            if dark > alert_after(config, key):
++                stale[key] = "unavailable_too_long"
++            continue
++        up = host_present(presence[key], config.get("presence_timeout", 15))
++        row["host_present"] = up
++        if not up:
++            absent.append(key)
++            if dark > absent_after(config, key):
++                stale[key] = "absent_too_long"
++        elif dark > alert_after(config, key):
++            stale[key] = "sample_failing_while_up"
++    return stale, sorted(absent)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--config", required=True)
++    args = parser.parse_args()
++    config = json.loads(Path(args.config).read_text())
++    from hermes_cli.kanban_sync_client import load_identity
++    if load_identity().gateway != config["owner_gateway"]:
++        raise RuntimeError("Consumer must run on its configured owner gateway")
++    state = Path(config["state_path"]).expanduser()
++    state.parent.mkdir(parents=True, exist_ok=True)
++    with state.with_suffix(".lock").open("a") as lock:
++        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        monitor = Monitor(state, native_tool, assignee=config.get("assignee", "default"), board=config.get("board", "default"))
++        receipts = {}
++        for key, argv in config["targets"].items():
++            report = collect(argv, config.get("timeout", 90))
++            try:
++                receipts[key] = dict(monitor.sample(key, report))
++            except Exception as exc:
++                receipts[key] = {"last_sample": report, "consumer_error": str(exc)}
++        now = time.time()
++        stale, absent = classify(config, receipts, now)
++        print(json.dumps({"sampled_at": now, "stale_targets": sorted(stale), "stale_reasons": stale,
++                          "absent_targets": absent, "targets": receipts}, sort_keys=True))
++        # Exit 1 = a consumer error, or a stale target (see classify). A briefly unavailable
++        # target, or an absent host within absent_alert_after, only resets its streak: exit 0.
++        return int(bool(stale) or any(r.get("consumer_error") for r in receipts.values()))
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_continuity.py b/tests/hermes_cli/test_kanban_diagnostic_continuity.py
+new file mode 100644
+index 00000000000..afca26d483e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_diagnostic_continuity.py
+@@ -0,0 +1,135 @@
++"""Real CLI and unchanged deployed monitor exercise refresh-to-audit exclusion.
++
++The monitor fixture is byte-identical to the deployed module at diagnosis:
++SHA256 f031ad086270daf6222a54a1c974b5a9e8acb440c207675b75af1b0bc0f5ccbc.
++Only its subprocess transport is adapted to the configured SQLite/HTTP fixtures.
++"""
++from contextlib import ExitStack, contextmanager, redirect_stdout
++from importlib.machinery import SourceFileLoader
++import importlib.util
++import io
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_refusal_audit as refusal
++from hermes_cli.kanban_sync_guard import board_sync_lock, SyncRoundBusy
++from tests.hermes_cli import test_kanban_history_residue_cli as fixtures
++
++configured = fixtures.configured
++stores = fixtures.stores
++
++
++def _monitor():
++    path = Path(__file__).parents[1] / 'fixtures' / 'kanban_drift_monitor.py.txt'
++    spec = importlib.util.spec_from_loader('unchanged_drift_monitor', SourceFileLoader('unchanged_drift_monitor', str(path)))
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_busy_exhaustion_is_unknown_not_clean_or_monitor_drift(configured, monkeypatch, tmp_path, capsys):
++    from hermes_cli import kanban_sync_diagnostic as diagnostic
++    paths, _hub, _calls, _state, _connect = configured
++    waits = []
++    monkeypatch.setattr(diagnostic, '_wait', lambda seconds: waits.append(seconds))
++    with board_sync_lock(paths[0]):
++        assert fixtures.cli.cmd_sync(fixtures.args('diff', '--json')) == 1
++    report = json.loads(capsys.readouterr().out)
++    assert report['clean'] is False and report['unavailable'] is True
++    assert report['refresh_skipped'] and len(waits) == diagnostic.MAX_ATTEMPTS - 1
++    monitor = _monitor()
++    tools = []
++    consumer = monitor.Monitor(tmp_path / 'busy-monitor.json', lambda *a: tools.append(a))
++    for _ in range(2):
++        result = consumer.sample('fixture/default', report)
++        assert result['streak'] == 0 and result['unavailable_since'] is not None
++    assert tools == []
++
++
++@pytest.mark.parametrize('mode', ['refusal', 'history', 'mixed'])
++@pytest.mark.parametrize('fault', [None, 'field', 'unproven', 'race'])
++def test_competing_sync_cannot_take_refresh_to_audit_gap(configured, monkeypatch, tmp_path, mode, fault):
++    paths, hub, calls, _state, connect = configured
++    fixtures.board.observe_board('default', 'op-original', 'Keep history')
++    live = connect(paths[0])
++    row = dict(live.execute('SELECT * FROM kanban_sync_outbox').fetchone())
++    if mode == 'mixed':
++        row.update(op_id='server-op', row_uid='server-event')
++        live.execute(f"INSERT INTO kanban_sync_outbox ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
++                     tuple(row.values()))
++    reason, _, detail = row['last_error'].partition(': ')
++    proof = dict(version=1, board='default', gateway='home', execution_authority=False,
++                 historical_identity_certified=False, receipt=dict(client_op_id=row['op_id'],
++                 status='rejected', reason=reason, detail=detail or None))
++    def receipt(*a):
++        if fault == 'race':
++            connect(paths[0]).execute('UPDATE kanban_sync_outbox SET attempts=attempts+1')
++        return None if mode == 'history' or fault == 'unproven' else proof
++    monkeypatch.setattr(refusal, '_receipt', receipt)
++    if fault == 'field':
++        live.execute("UPDATE tasks SET title='real drift'")
++    if fault == 'unproven':
++        live.execute("UPDATE kanban_sync_outbox SET last_error='unknown: not audited'")
++    before = list(live.iterdump())
++    calls.clear()  # remaining paths must be GET-only; no historical-intent replay
++
++    # Transport is simulated; normal flock, SQLite, CLI and audit cuts are real.
++    @contextmanager
++    def pulled(*a, **kw):
++        assert kw.get('diagnostic') is True
++        yield None, client.Pulled(), False
++    monkeypatch.setattr(client, '_pulled_replica', pulled)
++    competitor = ExitStack()
++    attempts = []
++    def compete():
++        try:
++            competitor.enter_context(board_sync_lock(paths[0]))
++        except SyncRoundBusy:
++            attempts.append('blocked')
++        else:
++            attempts.append('acquired')
++    original_diff = client.diff
++    original_changes = hub.changes
++    def diff(*a, **kw):
++        compete()  # after pull and immediately before ordinary diff / refusal audit
++        return original_diff(*a, **kw)
++    def changes(*a, **kw):
++        compete()  # both audits' empty-feed boundaries, including history after refusal
++        return original_changes(*a, **kw)
++    monkeypatch.setattr(client, 'diff', diff)
++    monkeypatch.setattr(hub, 'changes', changes)
++    monitor = _monitor()
++    def run(argv, **kw):
++        assert argv == ['fixture-cli', 'sync', 'diff', '--json']
++        output = io.StringIO()
++        with redirect_stdout(output):
++            rc = fixtures.cli.cmd_sync(fixtures.args('diff', '--json'))
++        return SimpleNamespace(returncode=rc, stdout=output.getvalue(), stderr='')
++    monkeypatch.setattr(monitor.subprocess, 'run', run)
++    tools = []
++    consumer = monitor.Monitor(tmp_path / 'monitor.json', lambda *a: tools.append(a))
++    try:
++        report = monitor.collect(['fixture-cli', 'sync', 'diff', '--json'])
++        assert report['clean'] is (fault is None)
++        if fault is None:
++            assert not report.get('unavailable') and not report.get('refresh_skipped')
++            if mode != 'history':
++                assert report['audited_server_refusals'] == [row['op_id']]
++            if mode != 'refusal':
++                assert report['audited_history_rejections'] == ['op-original']
++            for _ in range(2):
++                assert consumer.sample('fixture/default', report)['streak'] == 0
++            assert tools == []
++        assert attempts and set(attempts) == {'blocked'}
++        assert all(c[0] == 'GET' for c in calls)
++        if fault != 'race':
++            assert list(live.iterdump()) == before
++    finally:
++        competitor.close()
++    with board_sync_lock(paths[0]):
++        pass  # caller completion releases the normal fence
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_window.py b/tests/hermes_cli/test_kanban_diagnostic_window.py
+index 355b3e9c97d..7f66692cafa 100644
+--- a/tests/hermes_cli/test_kanban_diagnostic_window.py
++++ b/tests/hermes_cli/test_kanban_diagnostic_window.py
+@@ -43,6 +43,52 @@
+     assert len(calls) == 1
+ 
+ 
++@pytest.mark.parametrize('fault', ['busy', 'more', 'deadline', 'caller', 'pull'])
++def test_fresh_cut_bounds_and_cleanup(monkeypatch, tmp_path, fault):
++    from contextlib import contextmanager
++    from hermes_cli.kanban_sync_guard import board_sync_lock, SyncRoundBusy
++
++    path = tmp_path / 'board.db'
++    calls, waits = [], []
++    clock = [0.0]
++    monkeypatch.setattr(diagnostic.time, 'monotonic', lambda: clock[0])
++    def wait(seconds):
++        waits.append(seconds)
++        clock[0] += seconds
++        if fault == 'more':
++            with board_sync_lock(path):
++                pass  # behind chunks release before bounded wait
++    monkeypatch.setattr(diagnostic, '_wait', wait)
++    @contextmanager
++    def pull(*a, **kw):
++        calls.append(kw)
++        with pytest.raises(SyncRoundBusy):
++            with board_sync_lock(path):
++                pass
++        if fault == 'pull':
++            raise OSError('offline')
++        if fault == 'deadline':
++            clock[0] += diagnostic.MAX_SECONDS
++        yield None, client.Pulled(more=fault in ('more', 'deadline')), False
++    monkeypatch.setattr(client, '_pulled_replica', pull)
++    if fault == 'busy':
++        with board_sync_lock(path):
++            with diagnostic.fresh_cut('default', None, 'home', path) as result:
++                assert result.busy
++        assert calls == [] and len(waits) == diagnostic.MAX_ATTEMPTS - 1
++    elif fault in ('pull', 'caller'):
++        with pytest.raises((OSError, SyncRoundBusy), match='offline|caller'):
++            with diagnostic.fresh_cut('default', None, 'home', path):
++                raise SyncRoundBusy('caller')
++        assert len(calls) == 1  # neither caller exceptions nor HTTP errors retry
++    else:
++        with diagnostic.fresh_cut('default', None, 'home', path) as result:
++            assert result.more and not result.busy
++        assert len(calls) == (1 if fault == 'deadline' else diagnostic.MAX_ATTEMPTS)
++    with board_sync_lock(path):
++        pass
++
++
+ def test_errors_are_not_busy_retries(monkeypatch):
+     def pull(*a, **kw):
+         raise OSError('offline')
+diff --git a/tests/hermes_cli/test_kanban_history_residue_board.py b/tests/hermes_cli/test_kanban_history_residue_board.py
+index eabcabd7014..914db3b87d0 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_board.py
++++ b/tests/hermes_cli/test_kanban_history_residue_board.py
+@@ -1,4 +1,5 @@
+ """Configured entry points compose real SQLite custody, local fences and cut reports."""
++from contextlib import contextmanager
+ import json
+ import sqlite3
+ from types import SimpleNamespace
+@@ -70,6 +71,15 @@
+         response = state.get('proof')
+         return json.dumps(response if 'current=1' in path else response['receipt'] if response else None).encode()
+ 
++    @contextmanager
++    def pulled(*args, **kw):
++        assert kw == {'diagnostic': True}
++        with pytest.raises(SyncRoundBusy):
++            with board_sync_lock(paths[0]):
++                pass  # composed diagnostic already owns the normal fence
++        yield None, client.Pulled(), False
++
++    monkeypatch.setattr(client, '_pulled_replica', pulled)
+     monkeypatch.setattr(client, '_pull_replica', pull)
+     monkeypatch.setattr(board.transport, '_request', request)
+     yield paths, hub, calls, state, connect
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cli.py b/tests/hermes_cli/test_kanban_history_residue_cli.py
+index bd41a7b97d0..bb7d8a7d42c 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_cli.py
++++ b/tests/hermes_cli/test_kanban_history_residue_cli.py
+@@ -1,4 +1,5 @@
+ """Exercise actual parser/CLI paths: a persisted receipt alone never makes a diff clean."""
++from contextlib import contextmanager
+ import argparse
+ import json
+ 
+@@ -32,12 +33,14 @@
+ def test_cli_cannot_hide_refresh_failure_with_saved_custody(configured, capsys, monkeypatch, fault):
+     _paths, _hub, _calls, state, _connect = configured
+     board.observe_board('default','op-original','Keep history')
+-    if fault in ('busy','more'):
+-        monkeypatch.setattr(cli.ksc, '_pull_replica', lambda *a, **k: cli.ksc.Pulled(**{fault: True}))
+-    if fault == 'offline':
+-        def offline(*a, **kw):
+-            raise OSError('offline fixture')
+-        monkeypatch.setattr(cli.ksc, '_pull_replica', offline)
++    if fault in ('busy','more','offline'):
++        from hermes_cli import kanban_sync_diagnostic as diagnostic
++        @contextmanager
++        def refresh_fault(*a, **kw):
++            if fault == 'offline':
++                raise OSError('offline fixture')
++            yield cli.ksc.Pulled(**{fault: True})
++        monkeypatch.setattr(diagnostic, 'fresh_cut', refresh_fault)
+     if fault == 'stale': state['proof']['current']['observed_head'] = 99
+     if fault == 'wrong-parent': state['proof']['current']['parent']['title'] = 'other'
+     assert cli.cmd_sync(args('diff','--json')) == 1
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index 8f5b5e7d1e0..1ec4da5d488 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -384,9 +384,9 @@
+     with board_sync_lock(kanban_home / "kanban.db"):
+         kanban_sync_cli._diff(argparse.Namespace(board=BOARD, json=True))
+     report = json.loads(capsys.readouterr().out)
+-    assert "refresh_skipped" in report and not report.get("unavailable")
+-    # A busy sample of a zero-drift board stays clean: busy is not drift (review of #4387).
+-    assert report["clean"] is True and not report["rejected_ops"]
++    assert "refresh_skipped" in report and report.get("unavailable") is True
++    # Busy is unknown, not fresh clean or dirty: the unchanged monitor ignores it.
++    assert report["clean"] is False and not report["rejected_ops"]
+     assert _replica_state()[0] == before
+ 
+ 
+-- 
+2.43.0
+

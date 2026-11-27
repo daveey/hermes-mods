@@ -1,0 +1,336 @@
+From ba03067fb3447d21cfecfac5f5d4cb6024ad6077 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:32:32 +0000
+Subject: [PATCH 6142] Kanban canonical home, execution separation and explicit-home readers
+
+Public mirror of source commit ba03067fb3447d21cfecfac5f5d4cb6024ad6077.
+
+---
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 441c8c31ff8..e45e795c183 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -752,11 +752,12 @@
+ 
+ 
+ def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str, ...], *,
+-                     stale_ok: bool = False) -> list[dict[str, Any]]:
++                     stale_ok: bool = False, cards: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+     """Cold start with an unreadable replica: the ledger's rows for that board, all stale (never "no cards")."""
+     from hermes_cli.kanban_session_activity import _remote_links
+     try:
+-        cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
++        if cards is None:
++            cards = _remote_links(stale_ok=True) if stale_ok else _remote_links()
+     except Exception as exc:  # health: allow BLE001 -- log both-source failure, then preserve the failed-read contract
+         _log.warning("kanban chat links: replica and ledger both unreadable for %s (%s)", board, exc)
+         raise
+@@ -882,11 +883,23 @@
+     return replicas, profile
+ 
+ 
++def _replica_inputs(replicas, profile, origin_cards, stale_after_s):
++    """Bind all acquisition inputs together; explicit scope never discovers a process-home policy or ledger."""
++    explicit = replicas is not None and profile is not None
++    if explicit and origin_cards is None:
++        origin_cards = []
++    replicas, profile = _replica_scope(replicas, profile)
++    if stale_after_s is None:
++        from hermes_cli.kanban_session_activity import HUB_STALE_AFTER_S
++        stale_after_s = HUB_STALE_AFTER_S if explicit else _stale_after_s()
++    return replicas, profile, origin_cards, stale_after_s
++
++
+ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
+                   replicas: Optional[list[tuple[str, Path]]] = None, *, now: Optional[float] = None,
+                   ledger_fallback: bool = True, unreadable_out: Optional[list[str]] = None,
+                   stale_ok: bool = False, origin_cards: Optional[list[dict[str, Any]]] = None,
+-                  profile: Optional[str] = None) -> list[dict[str, Any]]:
++                  profile: Optional[str] = None, stale_after_s: Optional[float] = None) -> list[dict[str, Any]]:
+     """This gateway's chats' (``session_ids``, one lineage; ``None`` = every chat) unreleased links to cards created
+     on OTHER gateways, from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends.
+ 
+@@ -905,13 +918,18 @@
+       ledger (``source`` ``ledger-profile-board``) while no readable replica has its row, so the chat keeps it;
+     - ``stale_ok`` (the Desktop linked-card strip): the owner labels come from the last ledger projection rather
+       than waiting behind a rebuild of it. [daveey] Without it the strip's ``stale_ok`` stopped at this call and
+-      ``/api/session-kanban-tasks`` queued on ``_links_lock`` for every board write (3-7 s in a wake burst)."""
++      ``/api/session-kanban-tasks`` queued on ``_links_lock`` for every board write (3-7 s in a wake burst).
++
++    Explicit ``replicas`` plus ``profile`` bind acquisition without consulting process home: omitted
++    ``origin_cards`` means no ledger rows, and omitted ``stale_after_s`` uses ``HUB_STALE_AFTER_S``.
++    Pass the owning home's freshness policy explicitly to override that bound. Legacy omitted scope
++    retains process-home replica/profile, sync policy and ledger resolution.
++    """
+     ids = None if session_ids is None else set(str(s) for s in session_ids if s)
+     if ids is not None and not ids:
+         return []
+-    replicas, profile = _replica_scope(replicas, profile)
++    replicas, profile, origin_cards, stale_after = _replica_inputs(replicas, profile, origin_cards, stale_after_s)
+     now = time.time() if now is None else now
+-    stale_after = _stale_after_s()
+     index: Optional[tuple[dict[tuple[str, str], list[tuple[str, str, str, bool]]], list[dict[str, Any]]]] = None
+     out: dict[tuple[str, str], dict[str, Any]] = {}
+     read_ok: set[str] = set()
+@@ -931,7 +949,7 @@
+             _log.info("kanban chat links: replica %s unreadable (%s); %s", path, exc,
+                       "keeping its last rows as stale" if hit else "falling back to the ledger, stale")
+             if hit is None:
+-                for c in _ledger_fallback(board, gateway, profile, statuses, stale_ok=stale_ok):
++                for c in _ledger_fallback(board, gateway, profile, statuses, stale_ok=stale_ok, cards=origin_cards):
+                     if ids is None or c["session"] in ids:
+                         out.setdefault((c["session"], c["key"]), c)
+                 continue
+@@ -993,7 +1011,8 @@
+                 r, board=board, gateway=gateway, key=key, owner=owner, owner_profile=owner_profile, pulled=pulled,
+                 stale=stale))
+     # One ledger read per call serves the owner labels and the profile-board cards.
+-    index = index if index is not None else _profile_board_index(stale_ok)
++    if index is None:
++        index = _profile_board_index(stale_ok) if origin_cards is None else _ledger_index(stale_ok, origin_cards)
+     _merge_profile_board(out, _profile_board_cards(index[1], gateway, profile, statuses, replicas, read_ok, ids), ids)
+     return list(out.values())
+ 
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 31c83ddfcaf..43f4745fa96 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -563,7 +563,7 @@
+ 
+ 
+ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+-            now: float | None = None) -> list[dict]:
++            now: float | None = None, home: Path | None = None) -> list[dict]:
+     """Owner-qualified receipt rows, including explicit unknown and released rows.
+ 
+     Consumers filter this single projection, never infer release from an absent
+@@ -674,7 +674,8 @@
+                     continue
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+                     from hermes_cli.kanban_origin_local import observe_local_binding
+-                    local = observe_local_binding(binding, profile=profile, now=now)
++                    local = (observe_local_binding(binding, profile=profile, now=now) if home is None else
++                             observe_local_binding(binding, profile=profile, now=now, home=home))
+                     # An unreadable local authority must not fall back to a stale
+                     # own replica, even one which previously proved completion.
+                     current = local is not None
+diff --git a/hermes_cli/kanban_origin_local.py b/hermes_cli/kanban_origin_local.py
+index ccc8a901efd..209fda0ce9c 100644
+--- a/hermes_cli/kanban_origin_local.py
++++ b/hermes_cli/kanban_origin_local.py
+@@ -4,7 +4,7 @@
+ import sqlite3
+ 
+ 
+-def observe_local_binding(binding: dict, *, profile: str, now: float) -> dict | None:
++def observe_local_binding(binding: dict, *, profile: str, now: float, home=None) -> dict | None:
+     """Never infer an owner from an ID or release a receipt without its marker.
+ 
+     Caller has already matched the trusted local gateway and profile. Shared or
+@@ -16,12 +16,19 @@
+     from hermes_cli.kanban_origin_ledger import observe_owner_task
+     from hermes_cli.profiles import get_active_profile_name
+ 
++    from pathlib import Path
+     owner = binding['owner']
+-    home = get_hermes_home().resolve()
++    explicit = home is not None
++    home = Path(home).resolve() if explicit else get_hermes_home().resolve()
+     board = owner['board']
++    from hermes_cli.kanban_sync_client import BOARD_ID_RE
++    if not BOARD_ID_RE.fullmatch(board) or owner['profile'] != profile:
++        return None
+     expected = home / 'kanban.db' if board == 'default' else home / 'kanban/boards' / board / 'kanban.db'
+-    if (profile != get_active_profile_name() or owner['profile'] != profile
+-            or kb.kanban_home().resolve() != home or kb.kanban_db_path(board).resolve() != expected):
++    if not expected.resolve().is_relative_to(home):
++        return None
++    if not explicit and (profile != get_active_profile_name()
++                         or kb.kanban_home().resolve() != home or kb.kanban_db_path(board).resolve() != expected):
+         return None
+     try:
+         with closing(_ro(expected)) as conn:
+diff --git a/tests/hermes_cli/test_explicit_home_reader_args.py b/tests/hermes_cli/test_explicit_home_reader_args.py
+index 7125c5a6416..3effbda84ef 100644
+--- a/tests/hermes_cli/test_explicit_home_reader_args.py
++++ b/tests/hermes_cli/test_explicit_home_reader_args.py
+@@ -24,11 +24,8 @@
+     monkeypatch.setattr("hermes_cli.kanban_execution_observations.card_scope", boom)
+     ksa._read_session_tasks(path, ["chat"], ("running",), scope=("gw-home", "researcher"))
+     assert called == []
+-    try:
++    import pytest
++
++    with pytest.raises(AssertionError, match="card_scope:"):
+         ksa._read_session_tasks(path, ["chat"], ("running",))
+-    except AssertionError:
+-        pass
+-    else:
+-        # omitted scope must consult card_scope; if the board has no listed rows
+-        # the helper may return before enrich — then still require the patch path.
+-        assert True
++    assert called == [path]
+diff --git a/tests/hermes_cli/test_origin_explicit_home.py b/tests/hermes_cli/test_origin_explicit_home.py
+new file mode 100644
+index 00000000000..9e8d212c04d
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_explicit_home.py
+@@ -0,0 +1,48 @@
++"""Explicit owner-board overlays use only the caller's home, never process scope."""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_local as local
++from hermes_cli import kanban_origin_ledger as ledger
++
++
++def test_explicit_local_binding_reads_authorized_board(tmp_path, monkeypatch):
++    home = tmp_path / 'authorized'
++    home.mkdir()
++    binding = {'owner': {'gateway': 'gw', 'profile': 'research', 'board': 'default', 'task_id': 't_owned'},
++               'origin': {'gateway': 'gw', 'profile': 'research', 'session': 'chat'}}
++    with sqlite3.connect(home / 'kanban.db') as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT, status TEXT)')
++        conn.execute("INSERT INTO tasks VALUES ('t_owned', 'running')")
++        conn.execute('CREATE TABLE origin_creation_intents (task_id TEXT, binding_json TEXT)')
++        conn.execute('INSERT INTO origin_creation_intents VALUES (?, ?)', ('t_owned', json.dumps(binding)))
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('explicit local owner overlay consulted process home')
++
++    monkeypatch.setattr('hermes_constants.get_hermes_home', forbidden)
++    monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', forbidden)
++    monkeypatch.setattr('hermes_cli.kanban_db.kanban_home', forbidden)
++    monkeypatch.setattr('hermes_cli.kanban_db.kanban_db_path', forbidden)
++    monkeypatch.setattr(ledger, 'observe_owner_task', lambda conn, task, now: task)
++    row = local.observe_local_binding(binding, profile='research', now=100, home=home)
++    assert (row['id'], row['status']) == ('t_owned', 'running')
++    assert local.observe_local_binding(binding, profile='other', now=100, home=home) is None
++    # Existing matching-marker requirement remains authoritative even inside a trusted home.
++    with sqlite3.connect(home / 'kanban.db') as conn:
++        conn.execute('DELETE FROM origin_creation_intents')
++    assert local.observe_local_binding(binding, profile='research', now=100, home=home) is None
++
++
++def test_explicit_local_overlay_refuses_outside_board(tmp_path):
++    home = tmp_path / 'authorized'
++    home.mkdir()
++    (home / 'kanban.db').symlink_to(tmp_path / 'foreign.db')
++    binding = {'owner': {'profile': 'research', 'board': 'default', 'task_id': 't_owned'}}
++    assert local.observe_local_binding(binding, profile='research', now=100, home=home) is None
++    binding['owner']['board'] = '../foreign'
++    assert local.observe_local_binding(binding, profile='research', now=100, home=home) is None
+diff --git a/tests/hermes_cli/test_replica_explicit_acquisition.py b/tests/hermes_cli/test_replica_explicit_acquisition.py
+new file mode 100644
+index 00000000000..160623f2602
+--- /dev/null
++++ b/tests/hermes_cli/test_replica_explicit_acquisition.py
+@@ -0,0 +1,73 @@
++"""Explicit replica acquisition owns config, ledger, fallback and freshness inputs."""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli.test_kanban_chat_links import ME, OTHER, _ledger_row, _replica
++
++
++@pytest.fixture(autouse=True)
++def isolated_links(monkeypatch):
++    links._reset_for_tests()
++
++    def forbidden(*args, **kwargs):
++        pytest.fail("explicit acquisition read ambient home")
++
++    monkeypatch.setattr(sync, "sync_config", forbidden)
++    monkeypatch.setattr(activity, "_remote_links", forbidden)
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", forbidden)
++    monkeypatch.setattr("hermes_cli.kanban_sync_client.board_paths", forbidden)
++    yield
++    links._reset_for_tests()
++
++
++def test_empty_explicit_scope_does_not_reuse_ambient_profile_index():
++    # Seed a foreign owner's projection; empty input must replace, not reuse it.
++    links._ledger_index(cards=[{**_ledger_row("t_foreign", "s1"), "profile": "work"}])
++    assert links.replica_cards(["s1"], ME, replicas=[], profile="default", origin_cards=[]) == []
++
++
++@pytest.mark.parametrize("origin", [None, []])
++def test_explicit_scope_without_ledger_is_empty(tmp_path, origin):
++    assert links.replica_cards(["s1"], ME, replicas=[("default", tmp_path / "missing.db")],
++                               profile="default", origin_cards=origin) == []
++
++
++def test_cold_unreadable_replica_uses_only_supplied_ledger(tmp_path):
++    row = _ledger_row("t_scoped", "s1")
++    unreadable = []
++    got = links.replica_cards(["s1"], ME, replicas=[("default", tmp_path / "missing.db")],
++                              profile="default", origin_cards=[row], unreadable_out=unreadable)
++    assert unreadable == ["default"]
++    assert [(c["id"], c["stale"], c["source"]) for c in got] == [("t_scoped", True, "ledger-fallback")]
++
++
++@pytest.mark.parametrize("threshold, stale", [(None, False), (10, True), (100, False)])
++def test_populated_replica_uses_explicit_freshness_and_owner(tmp_path, threshold, stale):
++    rep = tmp_path / "scope.db"
++    _replica(rep, [("t_scoped", "SCOPED", "running", OTHER)], [("t_scoped", ME, "s1", "created", 0)])
++    with sqlite3.connect(rep) as conn:
++        conn.execute("CREATE TABLE kanban_sync_state (pulled_at REAL)")
++        conn.execute("INSERT INTO kanban_sync_state VALUES (950)")
++        conn.execute("UPDATE task_chat_links SET chat_profile = 'research'")
++    row = {**_ledger_row("t_scoped", "s1"), "profile": "owner", "origin_profile": "research"}
++    got = links.replica_cards(["s1"], ME, replicas=[("default", rep)], profile="research",
++                              origin_cards=[row], now=1000, stale_after_s=threshold)
++    assert len(got) == 1
++    assert (got[0]["title"], got[0]["profile"], got[0]["origin_profile"], got[0]["stale"]) == (
++        "SCOPED", "owner", "research", stale)
++    assert got[0]["synced_at"] == 950
++
++
++def test_omitted_profile_preserves_legacy_policy_and_ledger(monkeypatch):
++    calls = []
++    monkeypatch.setattr(sync, "sync_config", lambda: calls.append("config") or {})
++    monkeypatch.setattr(activity, "_remote_links", lambda: calls.append("ledger") or [])
++    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: calls.append("profile") or "default")
++    assert links.replica_cards(["s1"], ME, replicas=[]) == []
++    assert calls == ["profile", "config", "ledger"]
+diff --git a/tests/hermes_cli/test_review_4255_scope.py b/tests/hermes_cli/test_review_4255_scope.py
+new file mode 100644
+index 00000000000..c52f1722108
+--- /dev/null
++++ b/tests/hermes_cli/test_review_4255_scope.py
+@@ -0,0 +1,22 @@
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_session_activity as activity
++
++
++def test_explicit_replica_does_not_read_ambient_config(monkeypatch):
++    def forbidden():
++        raise AssertionError('ambient sync_config consulted')
++    monkeypatch.setattr(sync, 'sync_config', forbidden)
++    assert links.replica_cards(['chat'], 'explicit-gw', replicas=[], profile='explicit-profile', origin_cards=[], ledger_fallback=False) == []
++
++
++def test_explicit_empty_origin_cards_do_not_read_ambient_ledger(monkeypatch):
++    calls = []
++    def forbidden(*args, **kwargs):
++        calls.append((args, kwargs))
++        raise AssertionError('ambient remote ledger consulted')
++    monkeypatch.setattr(links, '_stale_after_s', lambda: 300)
++    monkeypatch.setattr(activity, '_remote_links', forbidden)
++    links._reset_for_tests()
++    assert links.replica_cards(['chat'], 'explicit-gw', replicas=[], profile='explicit-profile', origin_cards=[], ledger_fallback=False) == []
++    assert calls == []
+-- 
+2.43.0
+

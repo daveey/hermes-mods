@@ -1,0 +1,133 @@
+From db0b49c79cee12bf19e34b1301b8636c89babdd6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:18:49 +0000
+Subject: [PATCH 6171] Primary reconnect ownership and exact sidebar list batching
+
+Public mirror of source commit db0b49c79cee12bf19e34b1301b8636c89babdd6.
+
+---
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 0d4cb5f608e..1c720c2a727 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -7356,7 +7356,7 @@
+ // calls this immediately before every gateway.connect() so each WS upgrade
+ // carries a freshly-minted ticket. For local/token connections this just
+ // reuses the static token (no minting needed).
+-async function freshGatewayWsUrl(profile, webContentsId, opts = {}) {
++async function freshGatewayWsUrl(profile, webContentsId, opts: { inheritsPrimary?: boolean } = {}) {
+   // Named pool callers mint on their own backend. Primary descriptors must
+   // retain inheritance: their alias/name may also identify a local pool.
+   // Descriptor lookup and ticket mint must make the same backend choice.
+@@ -7364,8 +7364,9 @@
+   const connection = await ensure()
+ 
+   if (connection.gatewayEndpoint) {
+-    return localGatewayDial({ ensure, forget: () => forgetLocalGatewayDescriptor(profile), launchHome: HERMES_HOME,
+-      prepare: (baseUrl, ticket) => localGatewayDials.prepare(baseUrl, ticket, webContentsId), profile: String(profile ?? '') })
++    const dialProfile = opts.inheritsPrimary ? connection.profile : String(profile ?? '')
++    return localGatewayDial({ ensure, forget: () => forgetLocalGatewayDescriptor(dialProfile), launchHome: HERMES_HOME,
++      prepare: (baseUrl, ticket) => localGatewayDials.prepare(baseUrl, ticket, webContentsId), profile: dialProfile })
+   }
+ 
+   if (connection.authMode === 'oauth') {
+diff --git a/apps/desktop/electron/primary-reconnect-main.test.ts b/apps/desktop/electron/primary-reconnect-main.test.ts
+index 616746d9e06..38c53859624 100644
+--- a/apps/desktop/electron/primary-reconnect-main.test.ts
++++ b/apps/desktop/electron/primary-reconnect-main.test.ts
+@@ -35,14 +35,21 @@
+   return found
+ }
+ 
+-function harness() {
++function harness(localGateway = false) {
+   const primary = { baseUrl: 'https://hub.invalid', wsUrl: 'wss://hub.invalid/api/ws', authMode: 'oauth', headers: { Authorization: 'fixture' }, mode: 'remote' }
+-  const local = { baseUrl: 'http://local.invalid', wsUrl: 'ws://local.invalid/api/ws', headers: {}, mode: 'local' }
++  const local = { baseUrl: 'http://local.invalid', wsUrl: 'ws://local.invalid/api/ws', headers: {}, mode: 'local', ...(localGateway ? { gatewayEndpoint: {} } : {}) }
+   const handlers = new Map<string, (...args: any[]) => any>()
+-  const start = vi.fn(async () => primary)
++  const start = vi.fn(async () => ({ ...primary, ...(localGateway ? { gatewayEndpoint: {} } : {}) }))
+   const pool = vi.fn(async () => local)
+   const mint = vi.fn(async () => 'one-use-fixture')
+   const registry = vi.fn(async () => ({ ...local, profile: 'coding' }))
++  const forget = vi.fn()
++  const dial = vi.fn(async (opts: { profile: string; forget: () => unknown; ensure: () => Promise<unknown> }) => {
++    await opts.forget()
++    await opts.ensure()
++
++    return opts.profile
++  })
+ 
+   const deps = {
+     primaryBootRequest, joinPrimaryBoot, primaryDialClaimKey,
+@@ -56,6 +63,8 @@
+     setWslBridgeProfileState: vi.fn(), assertNotPassiveSpawn: vi.fn(), newPoolEntry: () => ({}),
+     logPoolSpawnFailure: vi.fn(), forgetFailedPoolEntry: vi.fn(),
+     mintGatewayWsTicket: mint,
++    localGatewayDial: dial, forgetLocalGatewayDescriptor: forget, HERMES_HOME: '/fixture/home',
++    localGatewayDials: { prepare: vi.fn() },
+     buildGatewayWsUrlWithTicket: (base: string, ticket: string) => `${base.replace('https:', 'wss:')}/api/ws?ticket=${ticket}`,
+     rememberRemoteWsHeaders: vi.fn(),
+     windowConnectionRoutes: new Map([[7, { connectionId: 'foreground', profile: 'coding', registryScoped: true }]]),
+@@ -81,10 +90,34 @@
+   const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+   const api = new Function(...Object.keys(deps), compiled)(...Object.values(deps))
+ 
+-  return { api, start, pool, mint, registry, primary, local }
++  return { api, start, pool, mint, registry, primary, local, forget, dial }
+ }
+ 
+ describe('production main/preload primary reconnect routing', () => {
++  it('lets an inherited profile-less reconnect bypass the foreground registry route at the real IPC handler', async () => {
++    const h = harness()
++    const connection = await h.api.getConnection(undefined, { inheritsPrimary: true })
++    expect(connection.baseUrl).toBe(h.primary.baseUrl)
++    expect(connection.profile).toBe('remote-primary')
++    expect(h.registry).not.toHaveBeenCalled()
++  })
++
++  it('uses the inherited primary label for local ticket routing and stale descriptor recovery', async () => {
++    const h = harness(true)
++    expect(await h.api.getGatewayWsUrl('default', { inheritsPrimary: true })).toBe('remote-primary')
++    expect(h.dial).toHaveBeenCalledWith(expect.objectContaining({ profile: 'remote-primary' }))
++    expect(h.forget).toHaveBeenCalledWith('remote-primary')
++    expect(h.start).toHaveBeenCalledWith('remote-primary', true)
++    expect(h.pool).not.toHaveBeenCalled()
++  })
++
++  it('keeps a named local gateway ticket and recovery scoped to the named caller', async () => {
++    const h = harness(true)
++    expect(await h.api.getGatewayWsUrl('default')).toBe('default')
++    expect(h.forget).toHaveBeenCalledWith('default')
++    expect(h.start).not.toHaveBeenCalled()
++  })
++
+   it('reconnects the inherited descriptor to the pinned primary, not the same-named local pool or foreground', async () => {
+     const h = harness()
+     const connection = await h.api.getConnection('default', { inheritsPrimary: true })
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-target.test.tsx b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-target.test.tsx
+index d85304f93bb..8b1e5871c67 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-target.test.tsx
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-remote-target.test.tsx
+@@ -63,17 +63,13 @@
+   tearDownBootHarness()
+ })
+ 
+-it('keeps send on the REST-readable remote target after a primary disconnect', async () => {
++it('keeps send on the same remote target after a primary disconnect', async () => {
+   render(<BootHarness />)
+   await flushAsync()
+   expect(FakeWebSocket.instances[0].url).toBe(remote.wsUrl)
+ 
+-  // History reads remain pinned to the remote REST source across a WS drop.
+-  const read = vi.fn(async (connectionId: string) => (connectionId === 'hub' ? { id: target } : null))
+-  expect(await read('hub')).toEqual({ id: target })
+   act(() => FakeWebSocket.instances[0].drop())
+   await advanceBackoff()
+-  expect(await read('hub')).toEqual({ id: target })
+   expect(FakeWebSocket.instances.at(-1)?.url).toBe(remote.wsUrl)
+ 
+   const pending = requestGatewayForAgent('hub', 'default', 'session.resume', { session_id: target }).catch(
+-- 
+2.43.0
+

@@ -1,0 +1,628 @@
+From 4f56089da71a563a42f1017d01994388f049f1b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:27:12 +0000
+Subject: [PATCH 6015] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit 4f56089da71a563a42f1017d01994388f049f1b6.
+
+---
+diff --git a/docs/designs/kanban-feed-writer-budget.md b/docs/designs/kanban-feed-writer-budget.md
+new file mode 100644
+index 00000000000..8cddd4a77f6
+--- /dev/null
++++ b/docs/designs/kanban-feed-writer-budget.md
+@@ -0,0 +1,48 @@
++# Feed writer reservations
++
++`pull()` applies ordered feed pages in prefixes of at most 32 rows. Each prefix
++commits its rows and cursor together. Intermediate cursors are feed `seq` values;
++the final prefix commits the response's `next` (which may skip partition-filtered
++rows). Non-increasing/missing sequences are accepted only when the complete page
++fits one reservation; they cannot be used as resumable prefix cursors.
++
++Each reservation has a 250 ms monotonic budget. Python checks between rows and at
++transaction exit complement SQLite's progress callback every 1,000 VM opcodes.
++An over-budget prefix rolls back, halves its row limit, and retries in order.
++A single over-budget row fails the pull without advancing its cursor. The next
++round retries that row, not an uncommitted suffix. This is a cooperative bound on
++application/VM work, not a real-time guarantee against OS descheduling, one slow
++SQLite opcode, rollback I/O, or COMMIT/fsync. No network I/O runs in a feed writer
++transaction. The atomic repair/snapshot API remains available unchanged.
++
++Schema columns are captured outside the reservation and reused for its page.
++A 5 ms scheduling opportunity after each reservation avoids immediately retaking
++the writer ahead of an already waiting dispatcher. SQLite has no FIFO guarantee;
++the contention regression checks measured dispatcher acquisition, while the
++separate dispatcher-side timeout remains the ultimate admission-wait bound.
++
++Before prefixes begin, authenticated containment receipt observations establish
++conservative holds for the entire page. A stop event in a later prefix must not
++allow an earlier ready task row or its post-commit hooks to expose claimability.
++A crash after a prefix retains both the cursor and these durable holds; a release
++only becomes effective through the existing certified event application.
++
++## Outbox service during catch-up
++
++A sync round still pushes before pulling. It additionally offers the same send
++policy between feed prefixes and before fetching each page whenever five seconds
++have elapsed since the last service. Therefore applying a large page cannot
++suppress a send opportunity beyond five seconds plus one bounded reservation
++(and its post-commit observers). HTTP fetch/certification and snapshots retain
++their existing transport deadlines; these are not preempted by the VM budget.
++The opportunities apply during replica and live-file pulls, and never occur
++inside their writer transactions. Send counts accumulate into the round result.
++
++These sends deliberately retain `before_head=True`, terminal status protection,
++FIFO, rejection resolution and reserved-key handling. A run row intentionally
++held until head is not made safe to push by a timer. Thus the bound is on
++**eligible push opportunities**, not acknowledgement of every outbox row despite
++an unavailable Board, retained safety hold or transport failure. Catch-up keeps
++its existing 20-page budget and immediate next-round selection. The 30-minute
++live acceptance must separately establish actual oldest pending age below 300 s;
++unit timing alone is not a delivery claim.
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index 164a319ffb6..718566ca2ab 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -223,12 +223,13 @@
+         from hermes_cli.kanban_containment_connections import verifier
+         guard.install(conn, verify_release=lambda r, s: verifier(conn, r, s))
+         for ch in changes:
+-            if ch.table == "task_events" and ch.fields.get("kind") in ("containment_released", "containment_closed"):
++            if ch.table == "task_events" and ch.fields.get("kind") in ("contained", "containment_released", "containment_closed"):
+                 proof = _cached(conn, ch.uid)
+                 if proof is not None:
+                     data = _payload(proof["row"])
++                    episode = ch.uid if ch.fields["kind"] == "contained" else data["episode"]
+                     conn.execute("INSERT OR IGNORE INTO containment_observations(task_id,episode) VALUES (?,?)",
+-                                 (ch.fields.get("task_id"), data["episode"]))
++                                 (ch.fields.get("task_id"), episode))
+ 
+ 
+ def event_permit(conn: sqlite3.Connection, uid: str, task: str, kind: str, payload: str) -> int:
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index a36a75660e9..478ed96b65d 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1344,8 +1344,9 @@
+     from hermes_cli.kanban_sync_apply_schema import page_writer
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     from hermes_cli import kanban_containment_replica as containment
++    from hermes_cli.kanban_sync_apply_budget import check_budget, transaction_budget
+     containment.prepare_apply(conn, changes)
+-    with page_writer(conn, SYNCED_TABLES, cache=bool(changes) and keep is None):
++    with page_writer(conn, SYNCED_TABLES, cache=bool(changes) and keep is None), transaction_budget(conn):
+         result.revision_before = _repair_revision(conn)
+         # Serialize with set_mode(off): a feed fetched before detach must not
+         # overwrite locally held custody after the detach transaction commits.
+@@ -1355,6 +1356,7 @@
+             conn.execute("UPDATE kanban_sync_state SET applying = 1")
+             own = _state(conn)["gateway_id"]
+             for change in changes:
++                check_budget()
+                 if keep is not None and not keep(conn, change):
+                     result.skipped += 1
+                     continue
+diff --git a/hermes_cli/kanban_sync_apply_budget.py b/hermes_cli/kanban_sync_apply_budget.py
+new file mode 100644
+index 00000000000..c0cc477d58d
+--- /dev/null
++++ b/hermes_cli/kanban_sync_apply_budget.py
+@@ -0,0 +1,169 @@
++"""Short feed writer reservations and cooperative outbox service between them.
++
++The atomic apply API remains available for repair callers. Feed callers commit
++ordered prefixes, each with its cursor. No cursor is advanced past an uncommitted
++row. SQLite VM deadlines abort oversized batches; retry halves them, and a single
++oversized row fails closed rather than monopolizing the writer indefinitely.
++"""
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import sqlite3
++import threading
++import time
++from itertools import pairwise
++from typing import Any
++
++MAX_ROWS = 32
++MAX_TRANSACTION_S = 0.25
++PUSH_INTERVAL_S = 5.0
++_SCHEMA: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_apply_schema", default=None)
++_LIMIT: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_apply_limit", default=None)
++_DEADLINE: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_apply_deadline", default=None)
++_SERVICE: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_pull_service", default=None)
++_YIELD = threading.Event()
++
++
++class ApplyBudgetExceeded(sqlite3.OperationalError):
++    """A rolled-back feed batch exceeded its writer budget."""
++
++
++def cached_columns(conn, table):
++    cache = _SCHEMA.get()
++    return cache[1].get(table) if cache is not None and cache[0] is conn else None
++
++
++def columns(conn, table):
++    cached = cached_columns(conn, table)
++    if cached is not None:
++        return cached
++    from hermes_cli.kanban_table_columns import table_columns
++    return table_columns(conn, table)
++
++
++def check_budget():
++    deadline = _DEADLINE.get()
++    if deadline is not None and time.monotonic() >= deadline:
++        raise ApplyBudgetExceeded("feed transaction exceeded writer budget")
++
++
++@contextlib.contextmanager
++def schema_cache(conn):
++    from hermes_cli import kanban_db_sync as sync
++    if _SCHEMA.get() is not None and _SCHEMA.get()[0] is conn:
++        yield
++        return
++    snapshot = {table: sync.table_columns(conn, table) for table in (*sync.SYNCED_TABLES, "kanban_sync_outbox")}
++    token = _SCHEMA.set((conn, snapshot))
++    try:
++        yield
++    finally:
++        _SCHEMA.reset(token)
++
++
++@contextlib.contextmanager
++def transaction_budget(conn):
++    """Installed only after BEGIN, removed before rollback/COMMIT.
++
++    This bounds SQLite VM work and checks Python-side work at transaction exit.
++    OS scheduling, fsync and one SQLite opcode are not preemptible wall-time
++    guarantees. No networking belongs inside the apply transaction.
++    """
++    limit = _LIMIT.get()
++    if limit is None:
++        yield
++        return
++    deadline = time.monotonic() + limit
++    token = _DEADLINE.set(deadline)
++    def expired():
++        return time.monotonic() >= deadline
++    conn.set_progress_handler(expired, 1000)
++    try:
++        yield
++        if expired():
++            raise ApplyBudgetExceeded("feed transaction exceeded writer budget")
++    except sqlite3.OperationalError as exc:
++        if expired() and "interrupted" in str(exc):
++            raise ApplyBudgetExceeded("feed transaction exceeded SQLite VM budget") from exc
++        raise
++    finally:
++        conn.set_progress_handler(None, 0)
++        _DEADLINE.reset(token)
++
++
++@contextlib.contextmanager
++def push_service(callback):
++    """A round supplies a non-transactional, existing-policy send opportunity."""
++    token = _SERVICE.set([callback, time.monotonic()])
++    try:
++        yield
++    finally:
++        _SERVICE.reset(token)
++
++
++def service_pushes():
++    service = _SERVICE.get()
++    if service is not None and time.monotonic() - service[1] >= PUSH_INTERVAL_S:
++        service[0]()
++        service[1] = time.monotonic()
++
++
++def round_pushes(live, hub, slug, gateway, mode, result, evidence):
++    from hermes_cli import kanban_sync_client as client
++    def send():
++        try:
++            client._send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True, seen=evidence)
++        except (client.HubError, OSError) as exc:
++            client._log.info("kanban sync: %s interleaved push failed (%s)", slug, exc)
++    return push_service(send)
++
++
++def apply_page(conn, changes, *, new_cursor, **kwargs):
++    if conn.in_transaction:
++        raise RuntimeError("bounded feed apply requires its own writer reservations")
++    from hermes_cli import kanban_containment_replica as containment
++    # Establish conservative holds for every certified receipt before any prefix
++    # can publish readiness. Releases remain held until their event is applied.
++    containment.prepare_apply(conn, changes)
++    with schema_cache(conn):
++        return _apply_page(conn, changes, new_cursor=new_cursor, **kwargs)
++
++
++def _apply_page(conn, changes, *, new_cursor, **kwargs):
++    from hermes_cli import kanban_db_sync as sync
++    if conn.in_transaction:
++        raise RuntimeError("bounded feed apply requires its own writer reservations")
++    # A feed is strictly ordered; snapshots/repair sequences use the atomic API.
++    ordered = all(a.seq < b.seq for a, b in pairwise(changes))
++    result = sync.ApplyResult(cursor=new_cursor)
++    offset, size = 0, MAX_ROWS
++    while offset < len(changes) or (not changes and offset == 0):
++        service_pushes()
++        batch = changes[offset:offset + size]
++        if offset + len(batch) < len(changes) and (not ordered or not 0 < batch[-1].seq < new_cursor):
++            raise ValueError("feed prefix requires ordered sequence cursors below page next")
++        cursor = new_cursor if offset + len(batch) == len(changes) else batch[-1].seq
++        token = _LIMIT.set(MAX_TRANSACTION_S)
++        try:
++            applied = sync.apply_remote_changes(conn, batch, new_cursor=cursor, **kwargs)
++        except ApplyBudgetExceeded:
++            if size == 1:
++                raise
++            size = max(1, size // 2)
++            _YIELD.wait(0.005)
++            continue
++        finally:
++            _LIMIT.reset(token)
++        result.applied += applied.applied
++        result.skipped += applied.skipped
++        result.skipped_echo += applied.skipped_echo
++        result.status_changed.update(applied.status_changed)
++        offset += len(batch)
++        if not batch:
++            break
++        # SQLite does not promise FIFO writer admission. Give an already-waiting
++        # dispatcher a real scheduling window, not an immediate reacquisition.
++        _YIELD.wait(0.005)
++    service_pushes()
++    return result
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 62d21ac3a6e..d130df06009 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -36,7 +36,7 @@
+ import urllib.parse
+ import urllib.request
+ from contextlib import ExitStack, contextmanager
+-from dataclasses import astuple, dataclass, field
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+@@ -847,6 +847,7 @@
+     that gateway's cards. [daveey]"""
+     from hermes_cli.kanban_sync_stop import checkpoint
+     total = pages = 0
++    from hermes_cli.kanban_sync_apply_budget import apply_page, service_pushes
+     changed: dict[str, str] = {}  # status changes applied, for the parks that name those cards
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+     while True:
+@@ -854,6 +855,7 @@
+             return Pulled(total, more=True, status_changed=changed)  # unbounded, a backlog starved the round's push for hours
+         pages += 1
+         checkpoint()
++        service_pushes()
+         page = acw.changes_page(hub, board, cursor, changed)  # a Resync carries the pages applied before it
+         checkpoint()
+         changes = [c for c in (adapt(ch) for ch in page.get("changes", [])) if c is not None]
+@@ -871,8 +873,8 @@
+         # flight): ``local_pending_wins`` checks again inside the apply transaction.
+         from hermes_cli.kanban_sync_quarantine import certified_page
+         changes = certified_page(conn, hub, board, changes)
+-        applied = sync.apply_remote_changes(conn, changes, new_cursor=nxt, board=board, observers=observers,
+-                                            local_pending_wins=True)
++        applied = apply_page(conn, changes, new_cursor=nxt, board=board, observers=observers,
++                             local_pending_wins=True)
+         changed.update(getattr(applied, "status_changed", None) or {})
+         total += len(page.get("changes", []))
+         cursor = nxt
+@@ -1037,7 +1039,8 @@
+             _send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True, seen=evidence)
+         except (HubError, OSError) as exc:
+             _log.info("kanban sync: %s push before the pull failed (%s); pulling anyway", slug, exc)
+-        with quarantine.mirroring(live), _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
++        from hermes_cli.kanban_sync_apply_budget import round_pushes
++        with round_pushes(live, hub, slug, gateway, mode, result, evidence), quarantine.mirroring(live), _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+             quarantine.adopt(replica, live)
+             quarantine.notify(live, slug)  # one hub card per new receipt (kanban_sync_quarantine_notice); never raises
+             result.pulled = pulled
+@@ -1113,19 +1116,8 @@
+           after_pull: bool, before_head: bool, seen: Optional[dict] = None) -> None:
+     """Push the outbox and resolve rejections, adding to ``result``. A round does this before its pulls and after
+     them (``after_pull``, which also transfers attachments); for ``before_head`` see :func:`push`."""
+-    with credited(live):  # acknowledgements and the Board's merged rows: sync bookkeeping, not local edits
+-        pushed = push(live, hub, slug, gateway, primary=mode == "primary", before_head=before_head, seen=seen)
+-    result.push = pushed if result.push is None else PushResult(*map(sum, zip(astuple(result.push), astuple(pushed))))
+-    if after_pull:
+-        from hermes_cli.kanban_sync_attachments import transfer_pending
+-        transfer_pending(live, hub, slug)
+-    from hermes_cli.kanban_sync_rejections import resolve_rejections
+-    from hermes_cli.kanban_sync_reserved_key import advance
+-    try:  # children of a corrected reserved-key card follow its accepted parent (no-op without a receipt)
+-        advance(live, hub, slug)
+-    except (HubError, SyncUnavailable, OSError) as exc:
+-        _log.info("kanban sync: %s reserved-key advance deferred (%s)", slug, exc)
+-    result.rejection_resolutions += resolve_rejections(live, hub, slug)
++    from hermes_cli.kanban_sync_round_send import send
++    send(live, hub, slug, gateway, mode, result, after_pull=after_pull, before_head=before_head, seen=seen)
+ 
+ 
+ def sync_all_once(hub: Optional[Hub] = None, *,
+diff --git a/hermes_cli/kanban_sync_round_send.py b/hermes_cli/kanban_sync_round_send.py
+new file mode 100644
+index 00000000000..11f972c16b1
+--- /dev/null
++++ b/hermes_cli/kanban_sync_round_send.py
+@@ -0,0 +1,21 @@
++"""Shared round send policy, including cooperative sends during long pulls."""
++from __future__ import annotations
++
++from dataclasses import astuple
++
++
++def send(live, hub, slug, gateway, mode, result, *, after_pull, before_head, seen=None):
++    from hermes_cli import kanban_sync_client as client
++    with client.credited(live):
++        pushed = client.push(live, hub, slug, gateway, primary=mode == "primary", before_head=before_head, seen=seen)
++    result.push = pushed if result.push is None else client.PushResult(*map(sum, zip(astuple(result.push), astuple(pushed))))
++    if after_pull:
++        from hermes_cli.kanban_sync_attachments import transfer_pending
++        transfer_pending(live, hub, slug)
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    from hermes_cli.kanban_sync_reserved_key import advance
++    try:
++        advance(live, hub, slug)
++    except (client.HubError, client.SyncUnavailable, OSError) as exc:
++        client._log.info("kanban sync: %s reserved-key advance deferred (%s)", slug, exc)
++    result.rejection_resolutions += resolve_rejections(live, hub, slug)
+diff --git a/hermes_cli/kanban_sync_status_origin.py b/hermes_cli/kanban_sync_status_origin.py
+index 6f9bb54d3b5..de788202c0a 100644
+--- a/hermes_cli/kanban_sync_status_origin.py
++++ b/hermes_cli/kanban_sync_status_origin.py
+@@ -27,8 +27,8 @@
+         # at CREATE time, then breaks an unrelated later mutation: check first.
+         required = {"tasks": {"id", "status"},
+                     "kanban_sync_outbox": {"op_id", "row_uid", "table_name", "op", "fields", "status_origin"}}
+-        if any(not columns <= {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+-               for table, columns in required.items()):
++        from hermes_cli.kanban_sync_apply_budget import columns
++        if any(not needed <= set(columns(conn, table)) for table, needed in required.items()):
+             return False
+         conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_TABLE} (op_id TEXT PRIMARY KEY, task_id TEXT)")
+         conn.execute(f"DELETE FROM temp.{_TABLE}")
+diff --git a/tests/hermes_cli/test_kanban_containment_feed_predicates.py b/tests/hermes_cli/test_kanban_containment_feed_predicates.py
+index d601cb046f2..bc4dd043d8a 100644
+--- a/tests/hermes_cli/test_kanban_containment_feed_predicates.py
++++ b/tests/hermes_cli/test_kanban_containment_feed_predicates.py
+@@ -55,6 +55,7 @@
+     def apply(*_a, **_k):
+         assert calls == ["certify"]
+         calls.append("apply")
++        return client.sync.ApplyResult(cursor=_k["new_cursor"])
+ 
+     monkeypatch.setattr(quarantine, "certified_page", certify)
+     monkeypatch.setattr(client.sync, "apply_remote_changes", apply)
+diff --git a/tests/hermes_cli/test_kanban_sync_apply_budget.py b/tests/hermes_cli/test_kanban_sync_apply_budget.py
+new file mode 100644
+index 00000000000..8cae54e93a2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_apply_budget.py
+@@ -0,0 +1,213 @@
++"""Bounded feed transactions retain ordered durable cursor prefixes."""
++from __future__ import annotations
++
++import sqlite3
++import threading
++import time
++from itertools import pairwise
++
++import pytest
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_apply_budget as budget
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_sync_apply import _ch, _task_fields
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    yield from support.synced_conn(home)
++
++
++def test_large_page_yields_to_dispatcher(conn, monkeypatch):
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    if not path:
++        pytest.fail("concurrency proof needs a file-backed board")
++    page = [_ch(i, "tasks", f"t_budget{i:016x}", _task_fields()) for i in range(1, 193)]
++    started, acquired = threading.Event(), threading.Event()
++    errors = []
++    waits = []
++
++    def dispatcher():
++        try:
++            with sqlite3.connect(path, timeout=2) as other:
++                started.wait(2)
++                before = time.monotonic()
++                other.execute("BEGIN IMMEDIATE")
++                waits.append(time.monotonic() - before)
++                other.execute("CREATE TABLE dispatcher_probe (value INTEGER)")
++                other.execute("INSERT INTO dispatcher_probe VALUES (1)")
++                other.commit()
++                acquired.set()
++        except (sqlite3.Error, RuntimeError) as exc:
++            errors.append(exc)
++
++    original = sync._apply_one
++    observed = []
++
++    def apply_one(db, change, own, result):
++        started.set()
++        if change.seq > budget.MAX_ROWS:
++            observed.append(acquired.is_set())
++        original(db, change, own, result)
++
++    monkeypatch.setattr(sync, "_apply_one", apply_one)
++    thread = threading.Thread(target=dispatcher)
++    thread.start()
++    try:
++        result = budget.apply_page(conn, page, new_cursor=200, observers=False)
++    finally:
++        thread.join(3)
++    assert not thread.is_alive() and not errors
++    assert acquired.is_set() and any(observed)
++    assert waits and waits[0] < budget.MAX_TRANSACTION_S + 0.5
++    assert result.applied == len(page)
++    assert sync.sync_state(conn)["cursor"] == 200
++    assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_budget%'").fetchone()[0] == len(page)
++
++
++def test_crash_resumes_committed_prefix(conn, monkeypatch):
++    page = [_ch(i, "tasks", f"t_resume{i:016x}", _task_fields()) for i in range(1, 90)]
++    original = sync._apply_one
++
++    def crash(db, change, own, result):
++        if change.seq == budget.MAX_ROWS + 2:
++            raise RuntimeError("injected crash")
++        original(db, change, own, result)
++
++    monkeypatch.setattr(sync, "_apply_one", crash)
++    with pytest.raises(RuntimeError, match="injected crash"):
++        budget.apply_page(conn, page, new_cursor=100, observers=False)
++    cursor = sync.sync_state(conn)["cursor"]
++    assert cursor == budget.MAX_ROWS
++    assert not conn.in_transaction
++    assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_resume%'").fetchone()[0] == cursor
++    monkeypatch.setattr(sync, "_apply_one", original)
++    budget.apply_page(conn, [ch for ch in page if ch.seq > cursor], new_cursor=100, observers=False)
++    budget.apply_page(conn, page, new_cursor=100, observers=False)
++    assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_resume%'").fetchone()[0] == len(page)
++
++
++def test_schema_lookups_outside_writer(conn):
++    import traceback
++    stacks = []
++    statements = []
++    def trace(sql):
++        statements.append((conn.in_transaction, sql))
++        if conn.in_transaction and "TABLE_INFO" in sql.upper() and len(stacks) < 4:
++            stacks.append("".join(traceback.format_stack(limit=12)))
++    conn.set_trace_callback(trace)
++    try:
++        page = [_ch(i, "tasks", f"t_schema{i:016x}", _task_fields()) for i in range(1, 80)]
++        budget.apply_page(conn, page, new_cursor=100, observers=False)
++    finally:
++        conn.set_trace_callback(None)
++    lookups = [(inside, sql) for inside, sql in statements if "TABLE_INFO" in sql.upper()]
++    assert lookups and not any(inside for inside, _ in lookups), "\n".join(stacks)
++    assert len(lookups) <= len(sync.SYNCED_TABLES) + 1
++
++
++def test_sql_deadline_rolls_back_single_row(conn, monkeypatch):
++    monkeypatch.setattr(budget, "MAX_ROWS", 1)
++    def expensive(db, change, own, result):
++        db.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) "
++                   "SELECT sum(x) FROM n").fetchone()
++    monkeypatch.setattr(sync, "_apply_one", expensive)
++    start = time.monotonic()
++    with pytest.raises(budget.ApplyBudgetExceeded):
++        budget.apply_page(conn, [_ch(1, "tasks", "t_deadline00000001", _task_fields())],
++                          new_cursor=1, observers=False)
++    assert time.monotonic() - start < 2
++    assert not conn.in_transaction
++    assert sync.sync_state(conn)["cursor"] == 0
++    assert sync.sync_state(conn)["applying"] == 0
++    assert conn.execute("SELECT 42").fetchone()[0] == 42
++
++
++def test_slow_batch_retries_smaller_without_reordering(conn, monkeypatch):
++    clock = [0.0]
++    monkeypatch.setattr(budget.time, "monotonic", lambda: clock[0])
++    original = sync._apply_one
++    visits = []
++    def slow(db, change, own, result):
++        original(db, change, own, result)
++        visits.append(change.seq)
++        clock[0] += 0.1
++    monkeypatch.setattr(sync, "_apply_one", slow)
++    page = [_ch(i, "tasks", f"t_slow{i:016x}", _task_fields()) for i in range(1, 10)]
++    applied = budget.apply_page(conn, page, new_cursor=10, observers=False)
++    assert applied.applied == 9
++    assert len(visits) > 9  # deadline really aborted and replayed a rolled-back prefix
++    assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_slow%'").fetchone()[0] == 9
++    assert sync.sync_state(conn)["cursor"] == 10
++
++
++def test_push_opportunities_between_batches_outside_writer(conn, monkeypatch):
++    clock = [0.0]
++    monkeypatch.setattr(budget.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(budget, "MAX_TRANSACTION_S", 1000)
++    original = sync._apply_one
++    def advance(db, change, own, result):
++        original(db, change, own, result)
++        clock[0] += 0.1
++    monkeypatch.setattr(sync, "_apply_one", advance)
++    sends = []
++    def send():
++        assert not conn.in_transaction
++        sends.append((clock[0], sync.sync_state(conn)["cursor"]))
++    page = [_ch(i, "tasks", f"t_push{i:016x}", _task_fields()) for i in range(1, 193)]
++    with budget.push_service(send):
++        budget.apply_page(conn, page, new_cursor=200, observers=False)
++    assert len(sends) >= 2
++    assert all(cursor < 200 for _, cursor in sends[:-1])
++    times = [0, *[stamp for stamp, _ in sends], clock[0]]
++    assert max(b - a for a, b in pairwise(times)) <= budget.PUSH_INTERVAL_S + budget.MAX_ROWS * 0.1
++
++
++def test_batched_end_state_matches_atomic_page(conn, monkeypatch):
++    page = [_ch(i, "tasks", f"t_equal{i:016x}", _task_fields()) for i in range(1, 90)]
++    page += [_ch(100 + i, "tasks", f"t_equal{i:016x}", {"title": f"updated {i}"}, version=2)
++             for i in range(1, 90)]
++    sync.apply_remote_changes(conn, page, new_cursor=200, observers=False)
++    expected = [tuple(row) for row in conn.execute("SELECT * FROM tasks ORDER BY id")]
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("DELETE FROM tasks")
++    conn.execute("UPDATE kanban_sync_state SET applying=0,cursor=0")
++    # Tombstones are irrelevant to this controlled rewind of a disposable fixture.
++    conn.execute("DELETE FROM kanban_sync_tombstones")
++    budget.apply_page(conn, page, new_cursor=200, observers=False)
++    assert [tuple(row) for row in conn.execute("SELECT * FROM tasks ORDER BY id")] == expected
++
++
++def test_certified_stop_after_batch_cut_holds_before_prefix_hooks(conn, monkeypatch):
++    from hermes_cli import kanban_containment_connections as connections
++    from hermes_cli import kanban_containment_replica as replica
++    from hermes_cli import kanban_db as kb
++    from tests.hermes_cli import test_kanban_containment_replica as fixtures
++    target, child, stop, _, hub = fixtures.scenario(conn)
++    monkeypatch.setattr(budget, "MAX_ROWS", 1)
++    page = [sync.RemoteChange(1, "tasks", target, "upsert", {"status": "ready"}, 10, "", "home"),
++            fixtures.event(stop, hub, 2)]
++    replica.certify_page(conn, hub, "fixture", page)
++    observed = []
++    def after_commit(db, result, board):
++        observed.append((connections.held(db, target), kb.get_task(db, target).status))
++        assert kb.claim_task(db, target) is None
++    monkeypatch.setattr(sync, "_after_commit", after_commit)
++    budget.apply_page(conn, page, new_cursor=2, board="fixture")
++    assert observed == [(True, "triage"), (True, "triage")]
++    assert kb.get_task(conn, child).status == "todo"
++
++
++def test_small_legacy_page_without_sequence_is_atomic(conn):
++    page = [_ch(0, "tasks", f"t_legacy{i:016x}", _task_fields()) for i in range(2)]
++    assert budget.apply_page(conn, page, new_cursor=10, observers=False).applied == 2
++
++
++def test_unordered_prefix_cannot_advance_cursor(conn, monkeypatch):
++    monkeypatch.setattr(budget, "MAX_ROWS", 1)
++    page = [_ch(0, "tasks", f"t_badseq{i:016x}", _task_fields()) for i in range(2)]
++    with pytest.raises(ValueError, match="ordered sequence cursors"):
++        budget.apply_page(conn, page, new_cursor=10, observers=False)
++    assert sync.sync_state(conn)["cursor"] == 0
+-- 
+2.43.0
+

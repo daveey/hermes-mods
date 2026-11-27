@@ -1,0 +1,170 @@
+From fadbfe94e6c5853d32c6321b1ded423743cefa32 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 06:45:01 +0000
+Subject: [PATCH 6337] Advisory maintenance, helper edges and human containment closure
+
+Public mirror of source commit fadbfe94e6c5853d32c6321b1ded423743cefa32.
+
+---
+diff --git a/hermes_cli/kanban_decision_maintenance.py b/hermes_cli/kanban_decision_maintenance.py
+index d92d604574f..d4aad28740f 100644
+--- a/hermes_cli/kanban_decision_maintenance.py
++++ b/hermes_cli/kanban_decision_maintenance.py
+@@ -1,6 +1,7 @@
+ """Own-hold decision and provider upkeep before dispatcher capacity admission. [daveey]"""
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import loop_accounting as la
++from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+ 
+ 
+ def run(conn, result, *, board, dry_run):
+@@ -18,5 +19,7 @@
+     from hermes_cli import kanban_db_dispatch_quota as quota
+     try:
+         result.quota_block_released = la.timed('dispatch.release_recovered_quota_blocks', quota.release_recovered_quota_blocks, conn)
++    except DispatchWriteContended:
++        raise
+     except Exception:  # health: allow BLE001 -- retain existing best-effort provider maintenance
+         kb._log.warning('kanban: releasing recovered quota-wall blocks failed', exc_info=True)
+diff --git a/hermes_cli/kanban_parent_held.py b/hermes_cli/kanban_parent_held.py
+index dad895eb485..cec2ec5bcf3 100644
+--- a/hermes_cli/kanban_parent_held.py
++++ b/hermes_cli/kanban_parent_held.py
+@@ -50,6 +50,7 @@
+ def sweep(conn) -> None:
+     """Canonical-home publication before capacity admission; unchanged ticks are read-only."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+     from hermes_cli.kanban_hold_notices import bind, creator
+     from hermes_cli.kanban_wake_check import foreign_ids
+     copies = foreign_ids(conn)
+@@ -68,6 +69,8 @@
+                     bind(conn, child)
+                     kb._append_event(conn, child, 'parent_held', signal)
+                     creator(conn, child, 'parent:' + signal['revision'], text(signal))
++        except DispatchWriteContended:
++            raise
+         except Exception:  # health: allow BLE001 -- rollback this advisory and retry; never satisfy its edge
+             kb._log.warning('kanban: parent-held publication failed for %s', child, exc_info=True)
+ 
+diff --git a/hermes_cli/kanban_scope_renewal_alarm.py b/hermes_cli/kanban_scope_renewal_alarm.py
+index 290cd7fa34c..dba5623accf 100644
+--- a/hermes_cli/kanban_scope_renewal_alarm.py
++++ b/hermes_cli/kanban_scope_renewal_alarm.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+ 
+ PREFIX = 'scope-renewal-loop:'
+ THRESHOLD = 5
+@@ -66,5 +67,7 @@
+             continue
+         try:
+             _file(conn, tid)
++        except DispatchWriteContended:
++            raise
+         except Exception:  # health: allow BLE001 -- rollback this incident and preserve unrelated upkeep
+             kb._log.warning('kanban: scope renewal alarm failed for %s', tid, exc_info=True)
+diff --git a/tests/hermes_cli/test_kanban_decision_contention.py b/tests/hermes_cli/test_kanban_decision_contention.py
+new file mode 100644
+index 00000000000..43466de2b35
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_decision_contention.py
+@@ -0,0 +1,42 @@
++"""Pass cancellation crosses each best-effort decision-maintenance boundary."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_quota as quota
++from hermes_cli import kanban_decision_maintenance as maintenance
++from hermes_cli import kanban_dispatch_storage as storage
++from hermes_cli import kanban_scope_renewal_alarm as alarm
++from tests.hermes_cli import test_kanban_hold_failure_isolation as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize('operation', ['renewal', 'quota'])
++@pytest.mark.parametrize('cancelled', [True, False])
++def test_decision_maintenance_propagates_pass_cancellation(kanban_home, monkeypatch, caplog, operation, cancelled):
++    with kbc.connect_closing() as conn:
++        tid = helpers._held(conn, 'runs')
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'scope_renewed', {})
++
++        def cancel(*args, **kwargs):
++            if cancelled:
++                raise storage.DispatchWriteContended(storage.REASON)
++            raise RuntimeError('local maintenance fault')
++
++        if operation == 'renewal':
++            monkeypatch.setattr(alarm, '_file', cancel)
++            tick = lambda: alarm.sweep(conn)
++        else:
++            from hermes_cli.kanban_db_dispatch import DispatchResult
++            monkeypatch.setattr(quota, 'release_recovered_quota_blocks', cancel)
++            tick = lambda: maintenance.run(conn, DispatchResult(), board='default', dry_run=True)
++        if cancelled:
++            with pytest.raises(storage.DispatchWriteContended):
++                tick()
++            assert not caplog.records
++        else:
++            tick()
++            assert len(caplog.records) == 1
++            assert caplog.records[0].exc_info is not None
+diff --git a/tests/hermes_cli/test_kanban_maintenance_contention.py b/tests/hermes_cli/test_kanban_maintenance_contention.py
+index edf21e22816..f5a7933172a 100644
+--- a/tests/hermes_cli/test_kanban_maintenance_contention.py
++++ b/tests/hermes_cli/test_kanban_maintenance_contention.py
+@@ -8,6 +8,7 @@
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_dispatch_storage as storage
+ from hermes_cli import kanban_hold_notices as notices
++from hermes_cli import kanban_parent_held as parents
+ from hermes_cli import kanban_suspend_ledger as ledger
+ from hermes_cli.kanban_db_dispatch import DispatchResult
+ from tests.hermes_cli import test_kanban_hold_failure_isolation as helpers
+@@ -15,11 +16,16 @@
+ kanban_home = helpers.kanban_home
+ 
+ 
+-@pytest.mark.parametrize('operation', ['stamp', 'holds'])
++@pytest.mark.parametrize('operation', ['stamp', 'holds', 'parents'])
+ def test_maintenance_stops_on_real_writer_contention(kanban_home, caplog, operation):
+     with kbc.connect_closing() as conn:
+         first = helpers._held(conn, 'runs')
+         second = helpers._held(conn, 'runs')
++        parent = None
++        if operation == 'parents':
++            parent = helpers._held(conn, 'runs')
++            kb.link_tasks(conn, parent, first)
++            kb.link_tasks(conn, parent, second)
+         before = [kb.list_events(conn, tid) for tid in (first, second)]
+         path = conn.execute('PRAGMA database_list').fetchone()[2]
+         timeout = conn.execute('PRAGMA busy_timeout').fetchone()[0]
+@@ -28,6 +34,8 @@
+         def tick():
+             if operation == 'stamp':
+                 ledger.record_dispatch_pass(conn, now=1000)
++            elif operation == 'parents':
++                parents.sweep(conn)
+             else:
+                 notices.sweep(conn)
+             after.append('continued after exhausted storage budget')
+@@ -54,6 +62,10 @@
+         assert after == ['continued after exhausted storage budget']
+         if operation == 'stamp':
+             assert conn.execute('SELECT at FROM kanban_dispatch_stamp').fetchone()[0] == 1000
++        elif operation == 'parents':
++            for tid in (first, second):
++                assert len([e for e in kb.list_events(conn, tid) if e.kind == 'parent_held']) == 1
++                assert kb.parent_states(conn, tid) == [(parent, 'triage')]
+         else:
+             assert len(helpers._decisions(conn, first)) == len(helpers._decisions(conn, second)) == 1
+         assert not caplog.records
+-- 
+2.43.0
+

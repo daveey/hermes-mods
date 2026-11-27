@@ -1,0 +1,207 @@
+From c220e7c80ea25496546b3d885b921b57f549d72e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:37:17 +0000
+Subject: [PATCH 6299] Advisory maintenance, helper edges and human containment closure
+
+Public mirror of source commit c220e7c80ea25496546b3d885b921b57f549d72e.
+
+---
+diff --git a/docs/kanban-helpers.md b/docs/kanban-helpers.md
+new file mode 100644
+index 00000000000..b716795a914
+--- /dev/null
++++ b/docs/kanban-helpers.md
+@@ -0,0 +1,30 @@
++# Assistance cards are not prerequisites
++
++A helper that only supplies attachments, diagnostics or administrative assistance
++must not become a prerequisite of its own source. Declare the relationship in
++the helper's body as a standalone line:
++
++```text
++<!-- kanban-helper-for: t_0123456789abcdef -->
++```
++
++Use the actual source ID verbatim (classic eight-hex and synced sixteen-hex IDs
++are supported). This is an explicit, refusal-only declaration, not a permission,
++completion receipt or inference from a title. Multiple lines can declare multiple
++sources. Worker creates already inherit creator ownership; do not add a
++helper → source dependency merely to associate the cards. The source may create
++a helper without putting either card in the other's `parents` list.
++
++`kanban_link` returns `helper_parent_forbidden` when that helper is proposed as a
++parent of the named source. Internal graph insertion and source creation with
++that parent also refuse; the creation transaction rolls back. The error explains
++how to preserve ownership without adding the edge. Other source IDs are not
++implicitly classified, and untyped creator children remain ordinary prerequisites.
++A review, required landing, safety decision or genuinely blocking producer must
++remain an ordinary dependency, not be declared an assistance-only helper.
++
++This declaration does not make any parent non-gating. Existing edges, archived
++restrictions, spend stops and containment remain unchanged. Adding the declaration
++after an edge exists does not remove or waive it. Recovery of historical edges
++requires the existing authorized dependency/scope workflow; neither this marker
++nor archiving a card is a recovery grant.
+diff --git a/hermes_cli/kanban_dependency_validation.py b/hermes_cli/kanban_dependency_validation.py
+index 90831157570..ec71be598cc 100644
+--- a/hermes_cli/kanban_dependency_validation.py
++++ b/hermes_cli/kanban_dependency_validation.py
+@@ -13,6 +13,9 @@
+     missing = _missing_task_ids(conn, [parent_id, child_id])
+     if missing:
+         raise missing_dependency_error(missing)
++    from hermes_cli.kanban_helper_parent import check_helper_parent
++
++    check_helper_parent(conn, parent_id, child_id)
+     conn.execute(
+         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+         (parent_id, child_id),
+@@ -65,6 +68,9 @@
+     """Refuse an edge that would cycle or hang under a never-finishing standing card. [daveey]"""
+     if would_cycle(conn, parent_id, child_id):
+         raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
++    from hermes_cli.kanban_helper_parent import check_helper_parent
++
++    check_helper_parent(conn, parent_id, child_id)
+     from hermes_cli.kanban_standing_parent import standing_parent_error, standing_reason
+     standing = standing_reason(conn, parent_id)
+     if standing:
+diff --git a/hermes_cli/kanban_helper_parent.py b/hermes_cli/kanban_helper_parent.py
+new file mode 100644
+index 00000000000..3bbea1edd77
+--- /dev/null
++++ b/hermes_cli/kanban_helper_parent.py
+@@ -0,0 +1,18 @@
++"""Prospective, refusal-only declaration for non-prerequisite assistance cards."""
++import re
++
++# A standalone machine-readable declaration, not a title/creator heuristic.
++_DECLARATION = re.compile(r'^<!-- kanban-helper-for: (t_(?:[0-9a-f]{16}|[0-9a-f]{8})) -->$', re.MULTILINE)
++
++
++def check_helper_parent(conn, parent_id: str, child_id: str) -> None:
++    """Refuse helper -> its declared source; never remove or waive an edge."""
++    row = conn.execute('SELECT body FROM tasks WHERE id=?', (parent_id,)).fetchone()
++    if row and child_id in _DECLARATION.findall(row['body'] or ''):
++        raise ValueError(
++            f'helper_parent_forbidden: cannot link {parent_id} -> {child_id}: '
++            'the parent explicitly declares assistance for this source, not a prerequisite. '
++            'Keep creator_task_id ownership without this dependency; '
++            'use a separate ordinary review/landing card for genuinely required work. '
++            'Existing dependencies and retained restrictions are unchanged.'
++        )
+diff --git a/tests/hermes_cli/test_kanban_helper_parent.py b/tests/hermes_cli/test_kanban_helper_parent.py
+new file mode 100644
+index 00000000000..58f2a382bb5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_helper_parent.py
+@@ -0,0 +1,106 @@
++"""Explicit source-bound helpers must not gate the card they assist."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli.test_kanban_standing_parent_link import kanban_home
++from tests.hermes_cli.test_kanban_actionability_dependencies import board, restrict
++
++assert kanban_home and board
++
++
++def test_declared_helper_cannot_become_source_prerequisite(kanban_home):
++    with kbc.connect() as conn:
++        source = kb.create_task(conn, title='source')
++        helper = kb.create_task(conn, title='attachment recovery', creator_task_id=source,
++                                body=f'<!-- kanban-helper-for: {source} -->\nRecover evidence only.')
++        with pytest.raises(ValueError, match='helper_parent_forbidden.*creator_task_id'):
++            kb.link_tasks(conn, helper, source)
++        assert kb.parent_ids(conn, source) == []
++        assert kb.get_task(conn, source).status == 'ready'
++
++
++@pytest.mark.parametrize('entry', ['internal', 'create'])
++def test_internal_and_creation_edges_cannot_evade_refusal(kanban_home, entry):
++    from hermes_cli.kanban_dependency_validation import insert_link
++    with kbc.connect() as conn:
++        # Fixed valid source IDs cover synced boards as well as classic IDs.
++        source = kb.create_task(conn, title='source')
++        helper = kb.create_task(conn, title='helper', body=f'<!-- kanban-helper-for: {source} -->')
++        before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
++        if entry == 'internal':
++            with pytest.raises(ValueError, match='helper_parent_forbidden'):
++                with kbc.write_txn(conn):
++                    insert_link(conn, helper, source)
++        else:
++            # A declared helper can predate source creation (deterministic graph builders).
++            conn.execute('UPDATE tasks SET body=? WHERE id=?',
++                         ('<!-- kanban-helper-for: t_0123456789abcdef -->', helper))
++            conn.commit()
++            from unittest.mock import patch
++            with patch.object(kb._sync, 'new_task_id', return_value='t_0123456789abcdef'):
++                with pytest.raises(ValueError, match='helper_parent_forbidden'):
++                    kb.create_task(conn, title='new source', parents=[helper])
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
++        assert kb.parent_ids(conn, source) == []
++
++
++@pytest.mark.parametrize('kind', ['review', 'landing', 'escalation', 'helper title'])
++def test_untyped_creator_children_remain_real_prerequisites(kanban_home, kind):
++    with kbc.connect() as conn:
++        source = kb.create_task(conn, title='source')
++        parent = kb.create_task(conn, title=kind, creator_task_id=source)
++        kb.link_tasks(conn, parent, source)
++        assert kb.parent_ids(conn, source) == [parent]
++        assert (parent, 'ready') in kb.parent_states(conn, source)
++
++
++def test_declaration_only_refuses_its_exact_source_and_does_not_waive_existing_edges(kanban_home):
++    from hermes_cli.kanban_dependency_validation import check_link_parent
++    with kbc.connect() as conn:
++        source = kb.create_task(conn, title='source')
++        other = kb.create_task(conn, title='other')
++        helper = kb.create_task(conn, title='helper')
++        kb.link_tasks(conn, helper, source)
++        # Classification after an old link must not clear it, even with archived status.
++        conn.execute('UPDATE tasks SET body=?, status=? WHERE id=?',
++                     (f'<!-- kanban-helper-for: {source} -->', 'archived', helper))
++        conn.commit()
++        with pytest.raises(ValueError, match='helper_parent_forbidden'):
++            check_link_parent(conn, helper, source)
++        assert kb.parent_ids(conn, source) == [helper]
++        kb.link_tasks(conn, helper, other)
++        assert kb.parent_ids(conn, other) == [helper]
++
++
++def test_public_tool_returns_actionable_refusal(kanban_home):
++    from tools.registry import registry
++    import tools.kanban_tools
++    assert tools.kanban_tools
++    with kbc.connect() as conn:
++        source = kb.create_task(conn, title='source')
++        helper = kb.create_task(conn, title='helper', body=f'<!-- kanban-helper-for: {source} -->')
++    tool = registry.get_entry('kanban_link')
++    assert tool is not None
++    result = json.loads(tool.handler({'parent_id': helper, 'child_id': source}))
++    assert 'helper_parent_forbidden' in result['error']
++    assert 'creator_task_id' in result['error']
++    with kbc.connect() as conn:
++        assert kb.parent_ids(conn, source) == []
++
++
++def test_declaring_old_archived_helper_never_releases_restricted_edge(board):
++    helper = kb.create_task(board, title='historical assistance')
++    source = kb.create_task(board, title='source', parents=[helper])
++    restrict(board, helper)
++    assert kb.archive_task(board, helper)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET body=? WHERE id=?',
++                      (f'<!-- kanban-helper-for: {source} -->', helper))
++    kb.recompute_ready(board)
++    assert kb.unsatisfied_parents(board, source) == [(helper, 'archived:restricted')]
++    assert kb.get_task(board, source).status == 'todo'
++    assert kb.claim_task(board, source) is None
++    assert kb.parent_ids(board, source) == [helper]
+-- 
+2.43.0
+

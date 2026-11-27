@@ -1,0 +1,230 @@
+From 86fb214de818b926543145fd6af15e5e1fa1af99 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:28:28 +0000
+Subject: [PATCH 6348] Standing producer owner chats and local origin custody
+
+Public mirror of source commit 86fb214de818b926543145fd6af15e5e1fa1af99.
+
+---
+diff --git a/hermes_cli/kanban_owner_chat.py b/hermes_cli/kanban_owner_chat.py
+index a2ec3b73cf6..ec51502ce45 100644
+--- a/hermes_cli/kanban_owner_chat.py
++++ b/hermes_cli/kanban_owner_chat.py
+@@ -193,10 +193,21 @@
+ def attach(conn, task_id: str, producer: str) -> str:
+     """Inside create's transaction: make the producer's owner chat this card's creating chat."""
+     sid = ensure(producer)
+-    link(conn, task_id, producer, sid)
++    _attach_ensured(conn, task_id, producer, sid)
+     return sid
+ 
+ 
++def _attach_ensured(conn, task_id: str, producer: str, sid: str) -> bool:
++    """Only callers that just ensured the local producer session issue custody.
++
++    Keep this separate from link(): replicated/projected links are not an issuer.
++    """
++    from hermes_cli.kanban_owner_origin import record
++    added = link(conn, task_id, producer, sid)
++    record(conn, task_id, sid)
++    return added
++
++
+ def link(conn, task_id: str, producer: str, sid: str) -> bool:
+     """Kanban-side half of :func:`attach`: link and record ``sid`` (an ensured owner chat) as the creating chat.
+     False (and no event) when the card already had exactly that link."""
+@@ -270,7 +281,7 @@
+         log.warning("kanban owner chat for %s unavailable; card %s created ownerless", name, task_id, exc_info=True)
+         _append_event(conn, task_id, UNAVAILABLE, {"producer": name, "error": str(exc)[:500]})
+         return
+-    link(conn, task_id, name, sid)
++    _attach_ensured(conn, task_id, name, sid)
+     if not kca.has_authority(conn, task_id, creator_task_id, durable=True):
+         raise kca.CreateAuthorityRefused(
+             f"the owner chat for producer {name!r} could not be linked as this card's owner; nothing was created.")
+@@ -436,7 +447,7 @@
+         if ref != sid:  # a notice to a deleted/archived owner chat is dropped: stop binding the card to it
+             conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND chat_id IN (?, ?)",
+                          (task_id, ref, here + ref))
+-    return link(conn, task_id, producer, sid) or sid in dead
++    return _attach_ensured(conn, task_id, producer, sid) or sid in dead
+ 
+ 
+ def maybe_backfill(conn, *, now: float) -> Optional[dict]:
+diff --git a/hermes_cli/kanban_owner_origin.py b/hermes_cli/kanban_owner_origin.py
+new file mode 100644
+index 00000000000..89bd684efba
+--- /dev/null
++++ b/hermes_cli/kanban_owner_origin.py
+@@ -0,0 +1,36 @@
++"""Local custody issued by the producer-owner attachment, never by link lookup."""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_origin_native as native
++from hermes_cli.kanban_origin_ledger import validate_binding
++
++
++def record(conn, task_id: str, sid: str) -> None:
++    """Internal to the trusted ensure+attach path, in its board write transaction.
++
++    The producer has just ensured its registered local owner session. Plain link
++    writers, replayed events and replica readers must never invoke this issuer.
++    Existing native custody is immutable; attaching a producer cannot replace it.
++    """
++    scope = native._primary_scope(conn)
++    if scope is None or native._receipt(conn, task_id) is not None:
++        return
++    gateway, profile, board = scope
++    row = conn.execute("SELECT created_at FROM tasks WHERE id=? AND "
++                       "(created_on IS NULL OR created_on=?)", (task_id, gateway)).fetchone()
++    if row is None:
++        return
++    if not conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND chat_gateway=? "
++                        "AND COALESCE(chat_profile,'default')=? AND chat_session=? "
++                        "AND kind='created' AND released=0", (task_id, gateway, profile, sid)).fetchone():
++        return
++    binding = {"binding_id": "native-" + task_id, "version": 1, "publication_version": 1,
++               "origin": {"gateway": gateway, "profile": profile, "session": sid},
++               "owner": {"gateway": gateway, "profile": profile, "board": board, "task_id": task_id},
++               "task_record_key": f"{profile}/{board}/{task_id}"}
++    validate_binding(binding)
++    native._install_revocation(conn)
++    conn.execute("INSERT INTO origin_native_receipts VALUES (?,?,NULL,?)",
++                 (task_id, json.dumps(binding, sort_keys=True), row[0]))
+diff --git a/tests/hermes_cli/test_kanban_selfwork_owner_chat.py b/tests/hermes_cli/test_kanban_selfwork_owner_chat.py
+index 86bd725c2c2..bf7204b9f37 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_owner_chat.py
++++ b/tests/hermes_cli/test_kanban_selfwork_owner_chat.py
+@@ -41,10 +41,17 @@
+ 
+ 
+ def test_intake_card_is_owned_by_its_repository_owner_chat(request_envelope, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        from hermes_cli import kanban_db_sync as sync
++        sync.set_mode(conn, "primary")
+     created = invoke(request_envelope, monkeypatch, capsys)
+     assert created.get("created") is True, created
+     tid, slot = created["task_id"], _slot(request_envelope)
+     with kbc.connect_closing() as conn:
++        from hermes_cli import kanban_origin_native as native
++        binding = native._receipt(conn, tid)
++        assert binding is not None
++        assert binding["origin"]["session"] == owner.session_id(slot)
+         assert _owner_sessions(conn, tid) == [owner.session_id(slot)]
+         assert kca.has_authority(conn, tid, None, durable=True)
+         assert [e["producer"] for e in _attached(conn)] == [slot]
+diff --git a/tests/hermes_cli/test_owner_chat_origin_forward.py b/tests/hermes_cli/test_owner_chat_origin_forward.py
+new file mode 100644
+index 00000000000..8b5c6ebd7de
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_chat_origin_forward.py
+@@ -0,0 +1,104 @@
++"""Producer attachment must mint local custody, not just projected ownership."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_origin_native as native
++from hermes_cli import kanban_owner_chat as owner
++from hermes_cli.kanban_origin_forward import authorize
++from tests.hermes_cli import test_kanban_owner_chat as owner_fixtures
++
++synced = owner_fixtures.synced
++_fresh_cache = owner_fixtures._fresh_cache
++
++
++@pytest.fixture(autouse=True)
++def primary(synced, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync, kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("hub", {"hub"}))
++    sync.set_mode(synced, "primary")
++    assert native._primary_scope(synced) == ("hub", "default", "default")
++
++
++def test_selfwork_owner_attachment_authorizes_worker_a2(synced, tmp_path):
++    conn = synced
++    assert native._primary_scope(conn) is not None, [tuple(r) for r in conn.execute("SELECT * FROM kanban_sync_state")]
++    task = kb.create_task(conn, title="Selfwork intake", created_by="selfwork:hermes-core")
++    sid = owner.session_id("selfwork:hermes-core")
++    origin = {"gateway": "hub", "profile": "default", "session": sid}
++    creator = {"gateway": "hub", "profile": "default", "board": "default", "task_id": task}
++    binding = authorize(ledger=tmp_path / "absent.db", origin=origin, creator=creator,
++        gateway="hub", profile="default", sender="gw:worker-a2", run_uid="run-a2",
++        lease={"task_id": task, "holder": "worker-a2", "run_uid": "run-a2", "expires": 2000},
++        now_ms=1000, session_exists=lambda value: value == sid,
++        native_lookup=lambda o, c: native.lookup(o, c, gateway="hub"))
++    assert binding["origin"] == origin
++    assert binding["owner"] == creator
++    assert binding["binding_id"] == "native-" + task
++
++
++def test_link_projection_alone_does_not_mint_custody(synced):
++    task = kb.create_task(synced, title="No producer", settle_owner_chat=False)
++    sid = owner.ensure("selfwork:hermes-core")
++    owner.link(synced, task, "selfwork:hermes-core", sid)
++    assert native._receipt(synced, task) is None
++
++
++def test_existing_custody_is_not_replaced_by_another_producer(synced):
++    task = kb.create_task(synced, title="Original", created_by="original")
++    binding = native._receipt(synced, task)
++    assert binding is not None
++    owner.attach(synced, task, "selfwork:hermes-core")
++    assert native._receipt(synced, task) == binding
++    other = binding["origin"] | {"session": owner.session_id("selfwork:hermes-core")}
++    assert native.lookup(other, binding["owner"], gateway="hub") is None
++    for field in ("profile", "board"):
++        assert native.lookup(binding["origin"], binding["owner"] | {field: "other"}, gateway="hub") is None
++
++
++def test_backfill_issues_only_for_newly_ensured_attachments(synced):
++    historical = kb.create_task(synced, title="Historical", settle_owner_chat=False)
++    sid = owner.ensure("old")
++    owner.link(synced, historical, "old", sid)
++    unowned = kb.create_task(synced, title="Needs owner", created_by="repair", settle_owner_chat=False)
++    result = owner.backfill(synced, apply=True)
++    assert result["linked"] == 1
++    assert native._receipt(synced, historical) is None
++    assert native._receipt(synced, unowned)["origin"]["session"] == owner.session_id("repair")
++    assert owner.backfill(synced, apply=True)["linked"] == 0
++
++
++def test_producer_custody_rolls_back_with_attachment(synced):
++    task = kb.create_task(synced, title="Unowned", settle_owner_chat=False)
++    synced.execute("SAVEPOINT attachment")
++    owner.attach(synced, task, "selfwork:hermes-core")
++    assert native._receipt(synced, task) is not None
++    synced.execute("ROLLBACK TO attachment")
++    assert native._receipt(synced, task) is None
++    synced.execute("RELEASE attachment")
++
++
++@pytest.mark.parametrize("mode", ["shadow", "replica", "off"])
++def test_nonprimary_attachment_never_issues_custody(synced, mode):
++    synced.execute("UPDATE kanban_sync_state SET mode=?", (mode,))
++    task = kb.create_task(synced, title="Nonprimary", created_by="selfwork:hermes-core")
++    assert native._receipt(synced, task) is None
++
++
++def test_foreign_task_attachment_never_issues_custody(synced):
++    task = kb.create_task(synced, title="Foreign", settle_owner_chat=False)
++    synced.execute("UPDATE tasks SET created_on='foreign' WHERE id=?", (task,))
++    owner.attach(synced, task, "selfwork:hermes-core")
++    assert native._receipt(synced, task) is None
++
++
++@pytest.mark.parametrize("holder", ["worker-a1", "worker-a3"])
++def test_producer_receipt_does_not_relax_exact_worker_lease(synced, tmp_path, holder):
++    task = kb.create_task(synced, title="Selfwork intake", created_by="selfwork:hermes-core")
++    sid = owner.session_id("selfwork:hermes-core")
++    with pytest.raises(ValueError, match="origin_forward_lease_invalid"):
++        authorize(ledger=tmp_path / "absent.db",
++            origin={"gateway": "hub", "profile": "default", "session": sid},
++            creator={"gateway": "hub", "profile": "default", "board": "default", "task_id": task},
++            gateway="hub", profile="default", sender="gw:worker-a2", run_uid="run-a2",
++            lease={"task_id": task, "holder": holder, "run_uid": "run-a2", "expires": 2000},
++            now_ms=1000, session_exists=lambda _: True,
++            native_lookup=lambda o, c: native.lookup(o, c, gateway="hub"))
+-- 
+2.43.0
+

@@ -1,0 +1,354 @@
+From 388479e796af78884ab28df767b4449917317c2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:08:27 +0000
+Subject: [PATCH 6117] SQLite raw-reader reclamation cadence and GIL-held lockguard scans
+
+Public mirror of source commit 388479e796af78884ab28df767b4449917317c2d.
+
+---
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index a0639aa3ef3..052694c3ada 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -144,35 +144,51 @@
+     return _resolved(value)
+ 
+ 
+-# Board paths are resolved on every cached read, under the board lock in ``recover``. ``realpath`` makes one
+-# GIL-releasing syscall per path component; with a hundred busy serve threads each one waits out the switch
+-# interval, which was a top board-lock holder on the hub after the fd-scan fix (t_01a1ce5c1d7bfe42).
+-# An absolute path's resolution is reused for ``_RESOLVE_TTL_S``: a symlink retargeted under a live board is seen
+-# within that window (board paths are not retargeted in practice). Relative paths depend on the cwd: never cached.
+-# Plain dict get/set/clear are atomic under the GIL; a racing clear only costs one extra ``realpath``.
++# Board paths are resolved on every cached read, under the board lock in ``recover``. ``os.path.realpath``
++# makes one GIL-releasing syscall per path component; with a hundred busy serve threads each one waits out
++# the switch interval, which was a top board-lock holder on the hub after the fd-scan fix (t_8e6bc192f29b8daa).
++# An absolute path's resolution is reused for ``_RESOLVE_TTL_S``. A miss uses a GIL-held libc realpath so the
++# lock is not held across that walk; a symlink retargeted under a live board is seen within the TTL (board
++# paths are not retargeted in practice). Relative paths depend on the cwd: never cached.
++# Plain dict get/set/clear are atomic under the GIL; a racing clear only costs one extra resolve.
+ _RESOLVE_TTL_S = 30.0
+ _CACHE_MAX = 256
+ _clock = time.monotonic
+ _resolved_paths: dict[str, tuple[str, float]] = {}
+ 
+ 
++def _resolve_now(value: str) -> str:
++    """Resolve ``value`` without releasing the GIL when the native sweep is on.
++
++    The cache in ``_resolved`` skips this on a hit. A miss still runs under the board lifecycle
++    lock, so it must not call ``os.path.realpath`` (one releasing syscall per component).
++    """
++    from hermes_state_lockguard_fdscan import held_realpath
++
++    held = held_realpath(value)
++    if held is not None:
++        return held
++    return os.path.realpath(value)
++
++
+ def _resolved(value: str) -> str:
+     if not os.path.isabs(value):
+-        return os.path.realpath(value)
++        return _resolve_now(value)
+     now = _clock()
+     hit = _resolved_paths.get(value)
+     if hit is not None and now - hit[1] < _RESOLVE_TTL_S:
+         return hit[0]
+-    real = os.path.realpath(value)
++    real = _resolve_now(value)
+     if len(_resolved_paths) >= _CACHE_MAX:
+         _resolved_paths.clear()
+     _resolved_paths[value] = (real, now)
+     return real
+ 
+ 
+-# A clean ``stranded_sidecars`` scan reads every ``/proc/self/fd`` link under the board lock (~7 s for 600 fds behind
+-# 4 busy threads). A handle is stranded only when the board's ``-shm`` or ``-wal`` is replaced or deleted, which
+-# changes that file's ``(st_dev, st_ino)`` (a held inode cannot be reused); so a clean verdict is reused while both
++# A clean ``stranded_sidecars`` scan used to read every ``/proc/self/fd`` link with ``os.readlink`` under the
++# board lock (~7 s for 600 fds behind 4 busy threads). The miss path is now a GIL-held sweep. A handle is
++# stranded only when the board's ``-shm`` or ``-wal`` is replaced or deleted, which changes that file's
++# ``(st_dev, st_ino)`` (a held inode cannot be reused); so a clean verdict is still reused while both
+ # identities are unchanged, for at most ``_CLEAN_SCAN_TTL_S``. A positive verdict is never reused.
+ _CLEAN_SCAN_TTL_S = 5.0
+ _clean_scans: dict[str, tuple[object, float]] = {}
+diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
+index d5df85f1aff..81ce5f2bd96 100644
+--- a/hermes_cli/kanban_lockguard.py
++++ b/hermes_cli/kanban_lockguard.py
+@@ -232,7 +232,15 @@
+ 
+ def _canonical(path: Any) -> str:
+     try:
+-        return os.path.realpath(os.fspath(path))
++        raw = os.fspath(path)
++        if isinstance(raw, bytes):
++            raw = os.fsdecode(raw)
++        from hermes_state_lockguard_fdscan import held_realpath
++
++        held = held_realpath(raw)
++        if held is not None:
++            return held
++        return os.path.realpath(raw)
+     except (OSError, TypeError, ValueError):
+         return str(path)
+ 
+@@ -240,26 +248,42 @@
+ def stranded_sidecars(db_path: Any) -> list[str]:
+     """Deleted ``-wal``/``-shm`` generations of *db_path* that THIS process still holds open: its
+     connections read a dead WAL index and need every handle to the board closed and reopened.
+-    Linux only (``/proc``); ``[]`` elsewhere or when unreadable."""
++    Linux only (``/proc``); ``[]`` elsewhere or when unreadable.
++
++    The walk runs while the caller holds the board lifecycle lock. ``os.readlink`` would release
++    the GIL on every descriptor and stall that lock for seconds under a busy interpreter, so the
++    native sweep keeps the GIL (``proc_fd_targets``). The ``os.readlink`` loop remains only where
++    that sweep is unavailable.
++    """
+     base = _canonical(db_path)
+     watched = {base + "-wal", base + "-shm"}
++    from hermes_cli.sqlite_safe_read import lock_safe_fds
++    from hermes_state_lockguard_fdscan import proc_fd_targets
++
++    skip = lock_safe_fds()
++    targets = proc_fd_targets()
++    if targets is None:
++        return _stranded_via_os_readlink(watched, skip)
++    deleted = " (deleted)"
++    return [target for fd, target in targets.items()
++            if fd not in skip and target.endswith(deleted) and target[:-len(deleted)] in watched]
++
++
++def _stranded_via_os_readlink(watched: set[str], skip: frozenset[int] | set[int]) -> list[str]:
+     out: list[str] = []
+     try:
+         names = os.listdir("/proc/self/fd")
+     except OSError:
+         return out
+-    # Lock-safe pread fds (quarantine copies, header probes) are not connections: skip them.
+-    from hermes_cli.sqlite_safe_read import lock_safe_fds
+-
+-    skip = lock_safe_fds()
++    deleted = " (deleted)"
+     for name in names:
+-        if name.isdigit() and int(name) in skip:
++        if not name.isdigit() or int(name) in skip:
+             continue
+         try:
+             target = os.readlink(f"/proc/self/fd/{name}")
+         except OSError:
+             continue
+-        if target.endswith(" (deleted)") and target[: -len(" (deleted)")] in watched:
++        if target.endswith(deleted) and target[:-len(deleted)] in watched:
+             out.append(target)
+     return out
+ 
+diff --git a/hermes_state_lockguard_fdscan.py b/hermes_state_lockguard_fdscan.py
+index 82a32a9045a..c90f5c4f63e 100644
+--- a/hermes_state_lockguard_fdscan.py
++++ b/hermes_state_lockguard_fdscan.py
+@@ -80,9 +80,27 @@
+         return None
+     finally:
+         os.close(probe)
++    _bind_readlink(libc, ctypes)
+     return native, read_status
+ 
+ 
++def _bind_readlink(libc, ctypes) -> None:
++    """Publish ``readlink`` and ``realpath`` only after ``_build_native`` has proved this libc."""
++    global _readlink, _realpath
++    readlink = libc.readlink
++    readlink.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
++    readlink.restype = ctypes.c_ssize_t
++    _readlink = readlink
++    realpath = libc.realpath
++    realpath.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
++    realpath.restype = ctypes.c_char_p
++    _realpath = realpath
++
++
++_readlink = None  # GIL-held libc.readlink; None when the native sweep is off
++_realpath = None  # GIL-held libc.realpath; None when the native sweep is off
++
++
+ _built = _build_native()
+ _native = _built[0] if _built else None
+ _read_status = _built[1] if _built else None
+@@ -102,6 +120,76 @@
+     return _os_identity(fd)
+ 
+ 
++def held_realpath(path: str) -> Optional[str]:
++    """``os.path.realpath`` without releasing the GIL. ``None`` if the native sweep is off.
++
++    ``os.path.realpath`` lstats each component and drops the GIL on every one. Under the board
++    lifecycle lock that re-acquire waits out every busy thread's switch interval, so a cold
++    resolve held the lock for seconds (``t_8e6bc192f29b8daa`` cached the hit; the miss remained).
++    ``libc.realpath`` via ``PyDLL`` keeps the GIL for the syscall: busy threads wait on us.
++    A missing final component is kept, matching ``os.path.realpath``.
++    """
++    fn = _realpath
++    if fn is None or not isinstance(path, str) or not path:
++        return None
++    import ctypes
++
++    buf = ctypes.create_string_buffer(4096)
++
++    def once(candidate: str) -> Optional[str]:
++        if not candidate:
++            return None
++        got = fn(os.fsencode(candidate), buf)
++        if not got:
++            return None
++        return os.fsdecode(got)
++
++    direct = once(path)
++    if direct is not None:
++        return direct
++    parent = path
++    missing: list[str] = []
++    while True:
++        parent, tail = os.path.split(parent)
++        if not tail:
++            break
++        missing.append(tail)
++        resolved = once(parent if parent else ".")
++        if resolved is not None:
++            for part in reversed(missing):
++                resolved = os.path.join(resolved, part)
++            return resolved
++        if not parent or parent == os.sep:
++            break
++    return None
++
++
++def proc_fd_targets() -> Optional[dict[int, str]]:
++    """``fd -> readlink(/proc/self/fd/N)`` without releasing the GIL per descriptor.
++
++    ``os.readlink`` drops the GIL. On a busy interpreter each re-acquire waits a switch
++    interval, so a few hundred descriptors held a board lifecycle lock for seconds
++    (``stranded_sidecars`` runs inside ``recover``). ``None`` means the caller must use
++    ``os.readlink`` (native sweep off). A private buffer: callers do not hold ``_LOCK``.
++    """
++    readlink = _readlink
++    if readlink is None:
++        return None
++    size = _fd_table_size()
++    if size is None or size <= 0 or size > MAX_NATIVE_SWEEP:
++        return None  # caller uses os.readlink; this table is outside the native sweep
++    import ctypes
++
++    buf = ctypes.create_string_buffer(4096)
++    out: dict[int, str] = {}
++    for fd in range(size):
++        n = readlink(f"/proc/self/fd/{fd}".encode(), buf, len(buf) - 1)
++        if n <= 0 or n >= len(buf) - 1:
++            continue  # closed, gone, or truncated: not a sidecar path we can trust
++        out[fd] = buf.raw[:n].decode("utf-8", "surrogateescape")
++    return out
++
++
+ def native_enabled() -> bool:
+     return _native is not None
+ 
+diff --git a/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py b/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py
+index b77fb993b88..3d450519bde 100644
+--- a/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py
++++ b/tests/hermes_cli/test_kanban_lifecycle_lock_syscalls.py
+@@ -37,22 +37,20 @@
+ def test_board_path_resolves_once_per_ttl_and_again_after(monkeypatch, tmp_path):
+     clock = _Clock()
+     calls = []
+-    real = os.path.realpath
++    real = gen._resolve_now
+     monkeypatch.setattr(gen, "_clock", clock)
+-    monkeypatch.setattr(gen.os.path, "realpath", lambda v: calls.append(v) or real(v))
++    monkeypatch.setattr(gen, "_resolve_now", lambda v: calls.append(v) or real(v))
+     db = str(tmp_path / "kanban.db")
+ 
+-    # realpath recurses on each path component (Python 3.14); count only resolutions of the board path itself.
+     first = gen._path(db)
+-    once = len(calls)
+-    assert once >= 1
++    assert calls == [db]
+     for _ in range(50):
+         assert gen._path(db) == first
+-    assert len(calls) == once                   # reused: no syscall at all
++    assert calls == [db]                        # reused: no resolve at all
+ 
+     clock.t += gen._RESOLVE_TTL_S + 0.1
+     assert gen._path(db) == first
+-    assert len(calls) == 2 * once               # resolved again after the TTL
++    assert calls == [db, db]                    # resolved again after the TTL
+ 
+ 
+ def test_retargeted_symlink_is_seen_after_the_ttl(monkeypatch, tmp_path):
+diff --git a/tests/hermes_state/test_lockguard_fd_scan_gil.py b/tests/hermes_state/test_lockguard_fd_scan_gil.py
+index 7cd81701325..9f267dd9d5c 100644
+--- a/tests/hermes_state/test_lockguard_fd_scan_gil.py
++++ b/tests/hermes_state/test_lockguard_fd_scan_gil.py
+@@ -114,3 +114,59 @@
+             os.close(fd)
+     # Per-fd hand-off: ~600 x 5 ms = seconds. GIL-held sweep: a few switch intervals at most.
+     assert worst < 0.1, f"scan took {worst:.3f}s with one busy thread"
++
++
++def test_stranded_sidecar_scan_stays_inside_the_reader_timeout(tmp_path):
++    """``os.readlink`` and ``os.path.realpath`` release the GIL. Under a busy interpreter each
++    re-acquire waits a switch interval, so ``stranded_sidecars`` (called from ``recover`` while
++    the board lifecycle lock is held) stretched a sub-millisecond walk into seconds and every
++    reader raised ``BoardLifecycleBusy``. The call must finish inside the 0.5s reader timeout.
++    """
++    if not sys.platform.startswith("linux"):
++        pytest.skip("procfs sidecar scan")
++    from hermes_cli import kanban_lockguard
++
++    wal = tmp_path / "board.db-wal"
++    held = os.open(wal, os.O_RDWR | os.O_CREAT, 0o600)
++    os.unlink(wal)  # still open: readlink reports " (deleted)"
++    filler = [os.open(os.devnull, os.O_RDONLY) for _ in range(400)]
++    stop = threading.Event()
++
++    def spin():
++        while not stop.is_set():
++            sum(range(80))
++
++    spinners = [threading.Thread(target=spin, daemon=True) for _ in range(24)]
++    old = sys.getswitchinterval()
++    sys.setswitchinterval(0.005)
++    for spinner in spinners:
++        spinner.start()
++    try:
++        started = time.perf_counter()
++        # Scan on this thread: it already holds the GIL, so the measurement is the walk,
++        # not how long a fresh thread waits to be scheduled behind the spinners.
++        found = kanban_lockguard.stranded_sidecars(tmp_path / "board.db")
++        elapsed = time.perf_counter() - started
++    finally:
++        stop.set()
++        sys.setswitchinterval(old)
++        for spinner in spinners:
++            spinner.join(2)
++        os.close(held)
++        for fd in filler:
++            os.close(fd)
++    assert elapsed < 0.5, f"stranded scan took {elapsed:.3f}s; reader timeout is 0.5s"
++    assert any(str(wal) in item for item in found)
++
++
++def test_held_realpath_matches_os_path_realpath(tmp_path, monkeypatch):
++    from hermes_state_lockguard_fdscan import held_realpath
++
++    if held_realpath("/tmp") is None:
++        pytest.skip("native realpath off")
++    link = tmp_path / "link"
++    link.symlink_to(tmp_path)
++    missing = tmp_path / "no-such-board.db"
++    monkeypatch.chdir(tmp_path)
++    for path in (str(tmp_path), str(missing), str(link / "no-such-board.db"), "kanban.db"):
++        assert held_realpath(path) == os.path.realpath(path)
+-- 
+2.43.0
+

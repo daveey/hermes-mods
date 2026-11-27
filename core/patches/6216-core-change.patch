@@ -1,0 +1,477 @@
+From 89a7851ad86d00698363043f91aaaa1a203f46e3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:20:00 +0000
+Subject: [PATCH 6216] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit 89a7851ad86d00698363043f91aaaa1a203f46e3.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 77cc5289221..ee6a5d712ce 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -95,6 +95,10 @@
+         deps = facts['dependencies']
+         _block(row, '; '.join(f"{d['task_id']} ({d['status'] or 'unknown'})" for d in deps),
+                '; '.join(d['trigger'] for d in deps), action='satisfy_dependency')
++    elif facts.get('lane_hold') and not facts.get('stop'):
++        row['owner'] = {'kind': 'assignee', 'refs': ['lane-planner']}
++        _block(row, 'lane capacity', 'lane admission', action='wait_for_lane_admission')
++        row['release']['authority'] = 'unavailable'
+     elif status == 'scheduled':
+         _schedule(row, facts, now)
+     elif status == 'running':
+@@ -223,7 +227,14 @@
+     if invalid_creation:
+         row['violations'].append('creation_intent_invalid')
+         row['evidence_state'] = 'unknown'
+-    if not deadline:
++    if not deadline and facts.get('private_hold'):
++        # Record path refuses this card (PrivateHold): name that blocker instead of a missing deadline.
++        # Action, blocker and release policy stay source-derived.
++        row['violations'].append('private_hold')
++        row['escalation']['state'] = 'unavailable'
++        row['instruction'] = f"{row.get('instruction') or ''} Private hold: {facts['private_hold']}".strip()
++        row['evidence_state'] = 'unknown'
++    elif not deadline:
+         row['violations'].append('escalation_deadline_missing')
+         row['escalation']['state'] = 'unavailable'
+         row['evidence_state'] = 'unknown'
+diff --git a/hermes_cli/kanban_actionability_confirmed.py b/hermes_cli/kanban_actionability_confirmed.py
+index b677739ae8e..5767a94c671 100644
+--- a/hermes_cli/kanban_actionability_confirmed.py
++++ b/hermes_cli/kanban_actionability_confirmed.py
+@@ -98,7 +98,7 @@
+     if (row['status'] not in NONTERMINAL or facts.get('pending_command')):
+         return row
+     needs_deadline = (not row['escalation']['at'] and row['escalation']['state'] == 'unavailable'
+-                      and 'escalation_deadline_missing' in row['violations'])
++                      and bool({'escalation_deadline_missing', 'private_hold'} & set(row['violations'])))
+     needs_owner = row['owner']['kind'] == 'unavailable' and 'owner_missing' in row['violations']
+     if row['escalation']['state'] == 'not_applicable' or (
+             not needs_deadline and not needs_owner and 'escalation_overdue' not in row['violations']):
+@@ -118,7 +118,7 @@
+     if needs_deadline:
+         row['escalation']['at'] = deadline
+         row['escalation']['state'] = 'pending'
+-        row['violations'] = [v for v in row['violations'] if v != 'escalation_deadline_missing']
++        row['violations'] = [v for v in row['violations'] if v not in ('escalation_deadline_missing', 'private_hold')]
+         if row['blocker'] and now >= deadline and 'escalation_overdue' not in row['violations']:
+             row['violations'].append('escalation_overdue')
+     if row['escalation']['at'] == deadline:
+diff --git a/hermes_cli/kanban_actionability_observation.py b/hermes_cli/kanban_actionability_observation.py
+index c9705b4a5b6..abb43f5c0f0 100644
+--- a/hermes_cli/kanban_actionability_observation.py
++++ b/hermes_cli/kanban_actionability_observation.py
+@@ -1,18 +1,19 @@
+ """Authenticated source discovery for explicit administrative recovery. [daveey]
+ 
+-Fail closed on private stop/renewal provenance: execution inventory deliberately
+-cannot attest that authority. Canonical ingress still repeats every premise CAS.
+-No replica IDs, local clock, source-subset selection or new release permission.
++Fail closed on private stop/renewal provenance that is still in force. Only history the
++Board's ordered record shows resolved (``kanban_actionability_private``) may be observed,
++and a held card raises ``PrivateHold``. A scope renewal whose mandate digest cannot be
++re-checked from the event stream stays held. Canonical ingress still repeats every premise
++CAS. No replica IDs, local clock, source-subset selection or new release permission.
+ """
+ from __future__ import annotations
+ 
+ from urllib.parse import quote
+ 
+ from hermes_cli.kanban_actionability import NONTERMINAL
++from hermes_cli.kanban_actionability_private import PrivateHold, held
+ from hermes_cli.kanban_actionability_selection import select
+ 
+-PRIVATE = {'spend_budget_triaged', 'decision_hold_restricted', 'scope_renewed'}
+-
+ 
+ def _invalid():
+     return ValueError('complete canonical actionability source unavailable or changed')
+@@ -42,11 +43,13 @@
+                 or event['uid'] in uids or event.get('task_id') != task_id
+                 or not _integer(event.get('ord'), 1) or event['ord'] in orders
+                 or not _integer(event.get('version'), 1) or not _integer(event.get('created_at'))
+-                or event.get('deleted_at') is not None or not isinstance(event.get('kind'), str)
+-                or event['kind'] in PRIVATE):
++                or event.get('deleted_at') is not None or not isinstance(event.get('kind'), str)):
+             raise _invalid()
+         uids.add(event['uid'])
+         orders.add(event['ord'])
++    reason = held(task['status'], data['events'])
++    if reason is not None:
++        raise PrivateHold(task_id, reason)
+     return data
+ 
+ 
+diff --git a/hermes_cli/kanban_actionability_private.py b/hermes_cli/kanban_actionability_private.py
+new file mode 100644
+index 00000000000..7f7d9317d75
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_private.py
+@@ -0,0 +1,87 @@
++"""Resolved-versus-held classification of private stop history in Board custody. [daveey]
++
++Pure function over ordered events (Board ``ord``, or a caller's explicit order). It only decides
++whether an administrative observation may be recorded; it never releases, promotes, renews or
++reruns anything, and a recorded deadline grants no execution. Fail closed:
++
++* safety evidence is never resolved, whatever follows it;
++* a card in ``triage`` with private history is currently held;
++* an ordinary budget stop (no ``cause``) is resolved only by a later ``promoted_manual``/``archived``;
++* a scope stop needs a later renewal that froze its uid AND a caller-verified mandate digest
++  (``verified_cover``). Event bytes alone cannot re-read the mandate comment, so an unverified
++  renewal stays ``mandate_unverifiable``;
++* anything unparseable or unattributable stays held.
++"""
++from __future__ import annotations
++
++import json
++
++STOPS = frozenset({'spend_budget_triaged', 'decision_hold_restricted'})
++RENEWAL = 'scope_renewed'
++PRIVATE = STOPS | {RENEWAL}
++DECISIONS = frozenset({'promoted_manual', 'archived'})
++
++
++class PrivateHold(ValueError):
++    """Private stop history is still in force: an explicit blocker, not a missing deadline."""
++
++    def __init__(self, task_id: str, reason: str):
++        super().__init__(f'private stop currently held on {task_id}: {reason}')
++        self.task_id, self.reason = task_id, reason
++
++
++def _payload(event):
++    raw = event.get('payload')
++    if isinstance(raw, str):
++        try:
++            raw = json.loads(raw)
++        except ValueError:
++            return None
++    return raw if isinstance(raw, dict) else None
++
++
++def held(status, events, *, verified_cover=frozenset()):
++    """Reason the private history still holds, or ``None`` when there is none or all of it is resolved."""
++    private = [e for e in events if e['kind'] in PRIVATE]
++    if not private:
++        return None
++    if status == 'triage':
++        return 'card_in_triage'
++    payloads = {}
++    for event in private:
++        payload = _payload(event)
++        if payload is None:
++            return 'private_payload_unverifiable'
++        if payload.get('cause') == 'safety_refusal' or payload.get('superseded_by_safety_stop') is True:
++            return 'safety_restriction'
++        payloads[event['uid']] = payload
++    decisions = sorted(e['ord'] for e in events if e['kind'] in DECISIONS)
++    renewals = []
++    for event in private:
++        if event['kind'] != RENEWAL:
++            continue
++        covered = payloads[event['uid']].get('covered_restriction_uids')
++        if not isinstance(covered, list) or not covered or not all(isinstance(u, str) and u for u in covered):
++            return 'renewal_unverifiable'
++        renewals.append((event['ord'], frozenset(covered)))
++    cover = verified_cover if isinstance(verified_cover, frozenset) else frozenset(verified_cover)
++    for event in private:
++        if event['kind'] not in STOPS:
++            continue
++        floor = event['ord']
++        cause = payloads[event['uid']].get('cause')
++        if cause == 'scope_stopped':
++            after = [o for o, covered in renewals if o > floor and event['uid'] in covered]
++            if not after:
++                return 'scope_stop_not_renewed'
++            if event['uid'] not in cover:
++                return 'mandate_unverifiable'
++            floor = min(after)
++        elif cause is not None or event['kind'] != 'spend_budget_triaged':
++            return 'restriction_unattributable'
++        if not any(o > floor for o in decisions):
++            return 'stop_undecided'
++    # A renewal whose stop is not in this stream still carries an unchecked mandate: fail closed.
++    if any(not covered <= cover for _ord, covered in renewals):
++        return 'mandate_unverifiable'
++    return None
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index bbe26b6835e..5c65fcb1d79 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -5,7 +5,7 @@
+ import sqlite3
+ import time
+ 
+-from hermes_cli.kanban_actionability import owner, project, valid_awaiting
++from hermes_cli.kanban_actionability import owner, positive_time, project, valid_awaiting
+ from hermes_cli.kanban_actionability_evidence import EVIDENCE_ERRORS, effective
+ from hermes_cli.kanban_actionability_selection import KINDS as SOURCE_KINDS, select
+ 
+@@ -204,7 +204,6 @@
+ def _administration(reader: Reader, events: list[dict], episode: str | None) -> tuple[dict, dict]:
+     scoped = [e for e in events if episode and (e['data'].get('episode') or e['data'].get('episode_uid')) == episode]
+     routes, deadlines = [], []
+-    from hermes_cli.kanban_actionability import positive_time
+     for event in scoped:
+         p = event['data']
+         next_action = record(p.get('next_action'))
+@@ -237,6 +236,43 @@
+         return row
+ 
+ 
++def _private_reason(conn, task, reader) -> str | None:
++    """Local-order hold. A missing event column is not a hold; scope digests stay unverified."""
++    if not reader.events_complete:
++        return None
++    from hermes_cli.kanban_actionability_private import DECISIONS, PRIVATE, held
++    kinds = tuple(PRIVATE | DECISIONS)
++    live = ' AND deleted_at IS NULL' if 'deleted_at' in reader.event_columns else ''
++    try:
++        rows = reader.rows(
++            f"SELECT * FROM task_events WHERE task_id=? AND kind IN ({','.join('?' * len(kinds))}){live} ORDER BY id",
++            (task['id'], *kinds))
++    except sqlite3.OperationalError:
++        return None
++    private = [row for row in rows if row['kind'] in PRIVATE]
++    if not private or any(not reader.uid(row) for row in private):
++        return None  # Unattributed (synced, UIDless) history stays UNKNOWN, not a positive hold classification.
++    events = [{'uid': str(row['id']), 'kind': row['kind'], 'ord': row['id'], 'payload': row['payload']} for row in rows]
++    return held(task['status'], events)
++
++
++def _lane_gate_at(conn, tid, reader) -> int | None:
++    """Creation time of the latest lane_gated event while the lane still holds the card, else None."""
++    if ('block_kind' not in reader.columns('tasks') or
++            not {'task_id'} <= reader.columns('task_runs') or not reader.events_complete):
++        return None
++    from hermes_cli.kanban_lanes import HELD
++    live = ' AND deleted_at IS NULL' if 'deleted_at' in reader.event_columns else ''
++    try:
++        if conn.execute(f'SELECT 1 FROM tasks WHERE id=? AND {HELD}', (tid,)).fetchone() is None:
++            return None
++        gate = conn.execute(f"SELECT created_at FROM task_events WHERE task_id=? AND kind='lane_gated'{live} "
++                            'ORDER BY id DESC LIMIT 1', (tid,)).fetchone()
++    except sqlite3.OperationalError:
++        return None
++    return positive_time(gate[0]) if gate else None
++
++
+ def _describe(conn, tid, *, now, reader):
+     """Source-derived diagnostics only. Foreign/canonical freshness is explicitly UNKNOWN."""
+     reader = reader or Reader(conn)
+@@ -287,6 +323,26 @@
+             facts['unknown'] = True
+     if schedule:
+         facts.update(wake_at=schedule['data'].get('wake_at'), awaiting=schedule['data'].get('awaiting'))
++    if not facts.get('deadline_at'):
++        reason = _private_reason(conn, task, reader)
++        if reason is None:
++            for dep in deps:
++                parent = reader.task(dep['task_id'])
++                if parent is None:
++                    continue
++                parent_reason = _private_reason(conn, parent, reader)
++                if parent_reason:
++                    reason = f"parent {dep['task_id']} {parent_reason}"
++                    break
++        if reason:
++            facts['private_hold'] = reason
++    lane_deadline = None
++    if not facts.get('stop') and not facts.get('private_hold') and not deps:
++        gate_at = _lane_gate_at(conn, tid, reader)
++        if gate_at:
++            facts['lane_hold'] = True
++            # Fixed at the source, never renewed by a later census observation; a recorded contract wins.
++            lane_deadline = gate_at + 86400
+     wake_columns = reader.columns('task_wake_checks')
+     if {'task_id', 'cmd'} <= wake_columns:
+         probe = conn.execute('SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()
+@@ -299,4 +355,10 @@
+     facts['unknown'] |= bool(stop and not episode)
+     from hermes_cli.kanban_actionability_confirmed import compose
+     observed_at = int(time.time()) if now is None else now
+-    return compose(reader, task, facts, project(facts, now=observed_at), now=observed_at)
++    row = compose(reader, task, facts, project(facts, now=observed_at), now=observed_at)
++    if lane_deadline and not row['escalation']['at'] and 'escalation_deadline_missing' in row['violations']:
++        row['escalation'].update(at=lane_deadline, state='pending')
++        row['violations'] = [v for v in row['violations'] if v != 'escalation_deadline_missing']
++        if row['blocker'] and observed_at >= lane_deadline:
++            row['violations'].append('escalation_overdue')
++    return row
+diff --git a/tests/hermes_cli/test_kanban_actionability_private.py b/tests/hermes_cli/test_kanban_actionability_private.py
+new file mode 100644
+index 00000000000..81d8b60eb65
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_private.py
+@@ -0,0 +1,165 @@
++"""Resolved private history may be observed; history still in force stays an explicit hold."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_actionability_private import PrivateHold, held
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli import kanban_actionability_observation as source
++from tests.hermes_cli.test_kanban_actionability_observation import Hub
++
++
++def ev(uid, ord_, kind, **payload):
++    return {'uid': uid, 'task_id': 't_root', 'kind': kind, 'version': 1, 'ord': ord_,
++            'created_at': 100 + ord_, 'deleted_at': None, 'payload': json.dumps(payload)}
++
++
++STOP = ev('stop', 2, 'spend_budget_triaged')
++SCOPE = ev('scope', 2, 'spend_budget_triaged', cause='scope_stopped')
++RENEW = ev('renew', 3, 'scope_renewed', episode='scope', covered_restriction_uids=['scope'])
++
++
++@pytest.mark.parametrize('status,events', [
++    ('ready', []),
++    ('ready', [STOP, ev('go', 3, 'promoted_manual')]),
++    ('todo', [STOP, ev('gone', 3, 'archived')]),
++])
++def test_absent_or_resolved_ordinary_history_is_not_held(status, events):
++    assert held(status, events) is None
++
++
++def test_verified_scope_cover_resolves_only_after_renewal_and_decision():
++    events = [SCOPE, RENEW, ev('go', 4, 'promoted_manual')]
++    assert held('ready', events) == 'mandate_unverifiable'
++    assert held('ready', events, verified_cover=frozenset({'scope'})) is None
++
++
++@pytest.mark.parametrize('status,events,reason', [
++    ('ready', [STOP], 'stop_undecided'),
++    ('ready', [ev('go', 1, 'promoted_manual'), STOP], 'stop_undecided'),
++    ('triage', [STOP, ev('go', 3, 'promoted_manual')], 'card_in_triage'),
++    ('ready', [STOP, ev('go', 3, 'promoted_manual'), ev('again', 4, 'spend_budget_triaged')], 'stop_undecided'),
++    ('ready', [ev('safe', 2, 'spend_budget_triaged', cause='safety_refusal'),
++               ev('go', 3, 'promoted_manual')], 'safety_restriction'),
++    ('ready', [ev('safe', 2, 'decision_hold_restricted', superseded_by_safety_stop=True),
++               ev('go', 3, 'promoted_manual')], 'safety_restriction'),
++    ('ready', [SCOPE, ev('go', 3, 'promoted_manual')], 'scope_stop_not_renewed'),
++    ('ready', [SCOPE, RENEW, ev('go', 4, 'promoted_manual')], 'mandate_unverifiable'),
++    ('ready', [SCOPE, ev('renew', 3, 'scope_renewed', covered_restriction_uids=['other']),
++               ev('go', 4, 'promoted_manual')], 'scope_stop_not_renewed'),
++    ('ready', [SCOPE, ev('renew', 3, 'scope_renewed'), ev('go', 4, 'promoted_manual')], 'renewal_unverifiable'),
++    ('ready', [ev('hold', 2, 'decision_hold_restricted'), ev('go', 3, 'promoted_manual')],
++     'restriction_unattributable'),
++    ('ready', [ev('odd', 2, 'spend_budget_triaged', cause='capability_unavailable'),
++               ev('go', 3, 'promoted_manual')], 'restriction_unattributable'),
++    ('ready', [ev('odd', 2, 'spend_budget_triaged', cause='decision_pending'),
++               ev('go', 3, 'promoted_manual')], 'restriction_unattributable'),
++    ('ready', [SCOPE, ev('renew', 3, 'scope_renewed', covered_restriction_uids=[]),
++               ev('go', 4, 'promoted_manual')], 'renewal_unverifiable'),
++    ('ready', [ev('renew', 3, 'scope_renewed', covered_restriction_uids=['elsewhere'])], 'mandate_unverifiable'),
++    ('ready', [STOP, ev('go', 3, 'promoted_manual'),
++               ev('renew', 4, 'scope_renewed', covered_restriction_uids=['elsewhere'])], 'mandate_unverifiable'),
++    ('ready', [dict(STOP, payload='{'), ev('go', 3, 'promoted_manual')], 'private_payload_unverifiable'),
++    ('ready', [dict(STOP, payload=None), ev('go', 3, 'promoted_manual')], 'private_payload_unverifiable'),
++])
++def test_history_in_force_names_its_hold(status, events, reason):
++    assert held(status, events) == reason
++
++
++def test_observation_records_resolved_and_refuses_held_card_and_parent():
++    hub = Hub()
++    hub.data['t_root']['events'] += [STOP, ev('go', 3, 'promoted_manual')]
++    assert source.observe(hub, 'default', 't_root')['facts']['status'] == 'ready'
++    hub.data['t_root']['events'].append(ev('again', 4, 'spend_budget_triaged'))
++    with pytest.raises(PrivateHold) as caught:
++        source.observe(hub, 'default', 't_root')
++    assert caught.value.reason == 'stop_undecided' and isinstance(caught.value, ValueError)
++    hub = Hub()
++    hub.pages[0]['rows'] = [{'uid': 'l1', 'child_id': 't_root', 'parent_id': 't_parent', 'deleted_at': None}]
++    hub.pages[0]['next'] = 'l1'
++    hub.data['t_parent']['events'].append(dict(STOP, task_id='t_parent'))
++    with pytest.raises(PrivateHold) as caught:
++        source.observe(hub, 'default', 't_root')
++    assert caught.value.task_id == 't_parent'
++    hub.data['t_parent']['events'].append(dict(ev('go', 3, 'promoted_manual'), task_id='t_parent'))
++    assert source.observe(hub, 'default', 't_root')['facts']['dependencies'] == [{'id': 't_parent', 'status': 'done'}]
++
++
++def test_census_names_current_hold_instead_of_missing_deadline(tmp_path):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='held budget stop', assignee='default')
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'spend_budget_triaged', {'note': 'ordinary stop'})
++        row = describe(conn, tid, now=1_700_000_000)
++        assert 'private_hold' in row['violations']
++        assert 'escalation_deadline_missing' not in row['violations']
++        assert 'Private hold: stop_undecided' in row['instruction']
++        assert row['blocker']['prerequisite'] == 'spend_budget'
++
++
++def test_private_hold_only_replaces_a_missing_deadline_never_the_next_step():
++    from hermes_cli.kanban_actionability import project
++    parked = {'task': {'id': 'p', 'status': 'scheduled', 'assignee': 'default'},
++              'wake_at': 1000, 'awaiting': {'kind': 'clock'}, 'probe': None}
++    plain = project(parked, now=1000)
++    held_row = project({**parked, 'private_hold': 'restriction_unattributable'}, now=1000)
++    assert held_row == plain and 'private_hold' not in held_row['violations']
++    running = {'task': {'id': 'r', 'status': 'running', 'assignee': 'default', 'current_run_id': 1},
++               'run_evidence_known': True, 'run': {'id': 1, 'status': 'running', 'ended_at': None}}
++    plain = project(running, now=1000)
++    named = project({**running, 'private_hold': 'parent t_p stop_undecided'}, now=1000)
++    assert 'escalation_deadline_missing' in plain['violations']
++    assert named['violations'] == [v if v != 'escalation_deadline_missing' else 'private_hold'
++                                   for v in plain['violations']]
++    assert (named['action'], named['blocker'], named['release'], named['owner']) == (
++        plain['action'], plain['blocker'], plain['release'], plain['owner'])
++    assert named['instruction'].endswith('Private hold: parent t_p stop_undecided')
++
++
++def test_census_names_parent_hold_and_safety_never_resolves(tmp_path):
++    with connect(tmp_path / 'kanban.db') as conn:
++        parent = kb.create_task(conn, title='stopped parent', assignee='default')
++        kb._append_event(conn, parent, 'spend_budget_triaged', {'cause': 'safety_refusal'})
++        kb._append_event(conn, parent, 'promoted_manual', {})
++        child = kb.create_task(conn, title='child', assignee='default', parents=[parent])
++        row = describe(conn, child, now=1_700_000_000)
++        # Existing parent-stop precedence is untouched; a safety stop never reads as resolved or releasable.
++        assert row['action'] != 'execute_current_scope' and parent in row['instruction']
++        assert row['release']['authority'] in ('unavailable', 'existing_lifecycle_gates')
++        assert row['release'].get('command') in (None, '')
++        assert held('done', [dict(ev('safe', 2, 'spend_budget_triaged', cause='safety_refusal'), task_id=parent),
++                             dict(ev('go', 3, 'promoted_manual'), task_id=parent)]) == 'safety_restriction'
++
++
++def test_uidless_private_history_stays_unknown_not_resolved(tmp_path, monkeypatch):
++    from hermes_cli import kanban_actionability_sources as sources
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='synced history', assignee='default')
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'spend_budget_triaged', {})
++        monkeypatch.setattr(sources.Reader, 'uid', lambda self, event: None)
++        assert sources._private_reason(conn, {'id': tid, 'status': 'ready'}, sources.Reader(conn)) is None
++
++
++def test_lane_gated_triage_is_lane_capacity_not_an_owner_decision(tmp_path):
++    now = 1_700_000_000
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='lane held', assignee='default')
++        conn.execute("UPDATE tasks SET status='triage', block_kind='lane_gate' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'lane_gated', {'lane': 'hermes', 'reason': 'limit:cards_per_day'})
++        row = describe(conn, tid, now=now)
++        assert row['action'] == 'wait_for_lane_admission'
++        assert row['owner'] == {'kind': 'assignee', 'refs': ['lane-planner']}
++        assert row['blocker']['prerequisite'] == 'lane capacity'
++        assert row['blocker']['trigger'] == 'lane admission'
++        gate_at = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='lane_gated'", (tid,)).fetchone()[0]
++        assert row['escalation']['at'] == gate_at + 86400
++        later = describe(conn, tid, now=now + 172800)
++        assert later['escalation']['at'] == row['escalation']['at']
++        assert 'escalation_deadline_missing' not in row['violations']
++        assert row['release']['authority'] == 'unavailable'
++        kb._append_event(conn, tid, 'lane_admitted', {'lane': 'hermes'})
++        released = describe(conn, tid, now=now)
++        assert released['action'] != 'wait_for_lane_admission'
+-- 
+2.43.0
+

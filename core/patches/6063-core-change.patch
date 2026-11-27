@@ -1,0 +1,1112 @@
+From e81f074c266e82b315539b54ff773e6a06036197 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:26:32 +0000
+Subject: [PATCH 6063] Desktop request-stage evidence and trusted session-tasks diagnostic
+
+Public mirror of source commit e81f074c266e82b315539b54ff773e6a06036197.
+
+---
+diff --git a/apps/desktop/electron/api-transport.ts b/apps/desktop/electron/api-transport.ts
+index ecc167b0a87..f8b3794be50 100644
+--- a/apps/desktop/electron/api-transport.ts
++++ b/apps/desktop/electron/api-transport.ts
+@@ -200,7 +200,7 @@
+  * so a large upload (kanban attachments, up to 25 MB) on a slow link is not
+  * cut at the JSON budget. The idle timer still catches a stalled upload.
+  */
+-function startRequestDeadline(timeoutMs: number, now: () => number = Date.now) {
++function startRequestDeadline(timeoutMs: number, now: () => number = Date.now, onDeadline?: () => void) {
+   const startedAt = now()
+ 
+   return {
+@@ -208,6 +208,7 @@
+       const budgetMs = requestDeadlineBudgetMs(timeoutMs, bodyBytes)
+ 
+       const expire = (afterMs: number) => {
++        onDeadline?.()
+         const error = requestTimeoutError(afterMs)
+         onTimeout(error)
+         req.destroy(error)
+@@ -240,10 +241,12 @@
+   {
+     body,
+     onError,
+-    requestState
+-  }: { body?: Buffer; onError: (error: Error) => void; requestState?: { bodySent?: boolean } }
++    requestState,
++    observeRequest
++  }: { body?: Buffer; onError: (error: Error) => void; requestState?: { bodySent?: boolean }; observeRequest?: (req: http.ClientRequest) => void }
+ ): http.ClientRequest {
+   const req = open()
++  observeRequest?.(req)
+ 
+   req.on('error', onError)
+   deadline.arm(req, onError, body?.length)
+diff --git a/apps/desktop/electron/json-fetch.ts b/apps/desktop/electron/json-fetch.ts
+index 9dfce53126b..6039e4ce570 100644
+--- a/apps/desktop/electron/json-fetch.ts
++++ b/apps/desktop/electron/json-fetch.ts
+@@ -22,6 +22,7 @@
+ import { decodeDeltaBody, readEncodingHeaders } from './delta-reads'
+ import { displayTranscriptHeaders, GzipExpansionError, isDisplayTranscriptRead } from './display-transcript'
+ import { DEFAULT_FETCH_TIMEOUT_MS, resolveTimeoutMs } from './hardening'
++import { requestStages } from './request-stages'
+ 
+ // Oversized gzip pages retry as identity, bounded by actual received bytes rather than Content-Length.
+ export const TRANSCRIPT_IDENTITY_MAX_BYTES = 64 * 1024 * 1024
+@@ -47,7 +48,8 @@
+     async (requestState: any) => {
+       // [daveey] Total per-attempt deadline from here: covers grant minting, Agent queue wait, connect and response.
+       const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+-      const deadline = startRequestDeadline(timeoutMs)
++      const stages = requestStages(url, options.method || 'GET')
++      const deadline = startRequestDeadline(timeoutMs, Date.now, stages?.deadline)
+ 
+       // Mint inside each retry: a grant authorizes exactly one HTTP request.
+       const nativeHeaders = options.gatewayDescriptor
+@@ -106,7 +108,8 @@
+                   // the gateway's OAuth gate verifies it via the provider stack with
+                   // no cookie involved.
+                   ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
+-                  ...(body ? { 'Content-Length': String(body.length) } : {})
++                  ...(body ? { 'Content-Length': String(body.length) } : {}),
++                  ...(stages ? { 'X-Hermes-Req-Id': stages.id } : {})
+                 }
+               },
+               res => {
+@@ -187,7 +190,7 @@
+                 })
+               }
+             ),
+-          { body, onError: reject, requestState }
++          { body, onError: reject, requestState, observeRequest: stages?.attach }
+         )
+       })
+     },
+@@ -205,7 +208,8 @@
+     (requestState: any) =>
+       new Promise((resolve, reject) => {
+         const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+-        const deadline = startRequestDeadline(timeoutMs)
++        const stages = requestStages(url, options.method || 'GET')
++        const deadline = startRequestDeadline(timeoutMs, Date.now, stages?.deadline)
+         const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+         let parsed
+ 
+@@ -239,7 +243,8 @@
+                   ...deps.remoteHeaders(url),
+                   ...(options.headers || {}),
+                   'Content-Type': 'application/json',
+-                  ...(body ? { 'Content-Length': String(body.length) } : {})
++                  ...(body ? { 'Content-Length': String(body.length) } : {}),
++                  ...(stages ? { 'X-Hermes-Req-Id': stages.id } : {})
+                 }
+               },
+               res => {
+@@ -283,7 +288,7 @@
+                 })
+               }
+             ),
+-          { body, onError: reject, requestState }
++          { body, onError: reject, requestState, observeRequest: stages?.attach }
+         )
+       }),
+     { method: options.method || 'GET' }
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 3e9602bd86f..721fbdcac19 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -569,6 +569,7 @@
+ import { applyLaunchSwitches, readDesktopLaunchConfig } from './renderer-heap-flags'
+ import { loadRendererLoadErrorPage } from './renderer-load-error-page'
+ import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
++import { withApiRequestStages } from './request-stages'
+ import { fetchRosterSourceData } from './roster-source-fetch'
+ import { rosterSourceStatus } from './roster-source-status'
+ import { registerSaveDialogIpc } from './save-text-file'
+@@ -15713,14 +15714,12 @@
+ }
+ 
+ async function handleHermesApiRequest(request) {
+-  // Registry-pinned request (request.connectionId): the renderer is working
+-  // against a REGISTERED gateway connection, so the data — cron jobs and their
+-  // run sessions included — lives in THAT host's state.db, not any local
+-  // profile's. Resolve the backend through the registry (same pool the job
+-  // list and WS traffic use) instead of the legacy profile route; a shared
+-  // remote/cloud host serves every profile via ?profile=, so scope the path.
+-  // An absent/empty id falls through to the byte-identical v1 route below.
+-  // Explicit `local` stays registry-pinned so it cannot inherit a v1 remote.
++  return withApiRequestStages(request, () => handleHermesApiRequestUntraced(request))
++}
++
++async function handleHermesApiRequestUntraced(request) {
++  // Registry-pinned reads use that gateway's state and shared REST/WS pool, not local profile state.
++  // An absent id keeps the legacy profile route; explicit `local` cannot inherit a legacy remote.
+   const registryConnectionId = apiRequestRegistryConnectionId(request)
+ 
+   if (registryConnectionId) {
+diff --git a/apps/desktop/electron/request-stages.test.ts b/apps/desktop/electron/request-stages.test.ts
+new file mode 100644
+index 00000000000..c02871513ee
+--- /dev/null
++++ b/apps/desktop/electron/request-stages.test.ts
+@@ -0,0 +1,223 @@
++import fs from 'node:fs/promises'
++import http from 'node:http'
++import type { AddressInfo } from 'node:net'
++import os from 'node:os'
++import path from 'node:path'
++
++import ts from 'typescript'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { destroyKeepaliveAgents, keepAliveAgent, sendWithRequestDeadline, startRequestDeadline } from './api-transport'
++import { fetchJsonWith, fetchPublicJsonWith } from './json-fetch'
++import * as tracing from './request-stages'
++
++const deps = { remoteHeaders: () => ({}), nativeHeaders: async () => null }
++const route = '/api/plugins/user-steps/requests'
++
++function capture() {
++  const rows: any[] = []
++  const buffer = new tracing.StageBuffer(async lines => { rows.push(...lines.trim().split('\n').map(line => JSON.parse(line))) })
++
++  return { rows, buffer }
++}
++
++async function serverFor(handler: http.RequestListener) {
++  const server = http.createServer(handler)
++  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++
++  return { base, close: async () => {
++    server.closeAllConnections()
++    await new Promise<void>(resolve => server.close(() => resolve()))
++  } }
++}
++
++afterEach(() => { vi.restoreAllMocks(); destroyKeepaliveAgents() })
++
++describe('request-stage capture', () => {
++  it('executes the actual main dispatcher wrapper with trace and error identity intact', async () => {
++    const source = await fs.readFile(new URL('./main.ts', import.meta.url), 'utf8')
++    const ast = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true)
++    const declaration = ast.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === 'handleHermesApiRequest')!
++    const { rows, buffer } = capture()
++    const failure = new Error('private')
++
++    const operation = vi.fn(async request => {
++      if (request.fail) { throw failure }
++
++      return 42
++    })
++
++    // Execute production declaration while isolating only Electron's heavy bootstrap.
++    const handle = new Function('withApiRequestStages', 'handleHermesApiRequestUntraced',
++      declaration.getText(ast) + '; return handleHermesApiRequest')(
++      (request, run) => tracing.withApiRequestStages(request, run, buffer), operation)
++
++    expect(await handle({ path: route })).toBe(42)
++    await expect(handle({ path: route, fail: true })).rejects.toBe(failure)
++    await buffer.flush()
++    expect(operation).toHaveBeenCalledTimes(2)
++    expect(rows.map(row => row.stage)).toEqual(['api_call', 'api_end', 'api_call', 'api_error'])
++  })
++
++  it('persists and rotates four bounded files using asynchronous IO', async () => {
++    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'request-stages-'))
++    const file = path.join(directory, 'capture.jsonl')
++
++    try {
++      const write = tracing.stageFileWriter(file, 60)
++
++      for (let i = 0; i < 40; i++) { await write(JSON.stringify({ seq: i }) + '\n') }
++      expect((await fs.readdir(directory)).sort()).toEqual(['capture.jsonl', 'capture.jsonl.1', 'capture.jsonl.2', 'capture.jsonl.3'])
++
++      for (const name of await fs.readdir(directory)) { expect((await fs.stat(path.join(directory, name))).size).toBeLessThanOrEqual(60) }
++      expect((await fs.readFile(file, 'utf8')).trim().split('\n').map(line => JSON.parse(line)).at(-1).seq).toBe(39)
++      // Reinitializing discovers the existing length rather than silently exceeding the cap.
++      const resumed = tracing.stageFileWriter(file, 60)
++      await resumed('{"seq":40}\n')
++      expect((await fs.stat(file)).size).toBeLessThanOrEqual(60)
++      const buffer = new tracing.StageBuffer(tracing.stageFileWriter(path.join(file, 'invalid')))
++      buffer.emit('lost')
++      await buffer.flush()
++      expect(buffer.ioLost).toBe(1)
++    } finally { await fs.rm(directory, { recursive: true, force: true }) }
++  })
++
++  it('records real JSON helper stages, header and logical gate wait without private data', async () => {
++    const { rows, buffer } = capture()
++    const real = tracing.requestStages
++    vi.spyOn(tracing, 'requestStages').mockImplementation((url, method) => real(url, method, buffer))
++    const ids: string[] = []
++
++    const server = await serverFor((req, res) => {
++      ids.push(String(req.headers['x-hermes-req-id']))
++      res.end('{"ok":true}')
++    })
++
++    try {
++      for (const fetch of [fetchJsonWith, (_deps, url) => fetchPublicJsonWith(_deps, url)]) {
++        const answer = await tracing.withApiRequestStages({ path: route + '?token=DO_NOT_LOG' }, async () => {
++          // Yield before fetch, as a real asynchronous dial/gate does.
++          await Promise.resolve()
++
++          return fetch(deps, server.base + route + '?token=DO_NOT_LOG', null)
++        }, buffer)
++
++        expect(answer).toEqual({ ok: true })
++      }
++
++      await buffer.flush()
++      expect(ids).toHaveLength(2)
++      expect(new Set(ids).size).toBe(2)
++
++      for (const id of ids) {
++        expect(id).toMatch(/^[a-f0-9]{32}$/)
++        const events = rows.filter(row => row.id === id)
++        const names = events.map(row => row.stage)
++
++        for (const stage of ['call', 'agent_queue', 'socket_assigned', 'connected', 'write_finished', 'response_start', 'response_end']) {
++          expect(names).toContain(stage)
++        }
++
++        expect(names.indexOf('socket_assigned')).toBeLessThan(names.indexOf('write_finished'))
++        expect(events.find(row => row.stage === 'response_end').bytes).toBe(11)
++        const call = rows.find(row => row.stage === 'api_call' && row.call_id === events[0].call_id)
++        expect(call.mono_ms).toBeLessThanOrEqual(events[0].mono_ms)
++      }
++
++      expect(JSON.stringify(rows)).not.toContain('DO_NOT_LOG')
++    } finally { await server.close() }
++  })
++
++  it('records Agent queue deadline before a socket and does not change POST replay policy', async () => {
++    const { rows, buffer } = capture()
++    const agent = keepAliveAgent(http, 1)
++    let arrived!: () => void
++    const firstArrived = new Promise<void>(resolve => { arrived = resolve })
++    let hits = 0
++    const server = await serverFor(() => { hits++; arrived() })
++    const first = http.get(server.base + route, { agent })
++    first.on('error', () => {})
++    await firstArrived
++
++    try {
++      const trace = tracing.requestStages(server.base + route, 'POST', buffer)!
++      const deadline = startRequestDeadline(50, Date.now, trace.deadline)
++
++      const error = await new Promise<Error>(resolve => {
++        sendWithRequestDeadline(deadline, () => http.request(server.base + route, { agent, method: 'POST' }),
++          { onError: resolve, observeRequest: trace.attach })
++      })
++
++      expect(error.message).toContain('Timed out connecting')
++      await buffer.flush()
++      const names = rows.filter(row => row.id === trace.id).map(row => row.stage)
++      expect(names).toContain('agent_queue')
++      expect(names).toContain('deadline')
++      expect(names).not.toContain('socket_assigned')
++      expect(hits).toBe(1)
++    } finally { first.destroy(); agent.destroy(); await server.close() }
++  })
++
++  it('does not duplicate an ambiguous mutation and assigns retries their own ids', async () => {
++    const { rows, buffer } = capture()
++    const real = tracing.requestStages
++    vi.spyOn(tracing, 'requestStages').mockImplementation((url, method) => real(url, method, buffer))
++    const ids: string[] = []
++
++    const server = await serverFor((req, res) => {
++      ids.push(String(req.headers['x-hermes-req-id']))
++      req.resume()
++      req.on('end', () => {
++        if (req.method === 'POST' || ids.length === 2) { req.socket.destroy() } else { res.end('{}') }
++      })
++    })
++
++    try {
++      await expect(fetchJsonWith(deps, server.base + route, null, { method: 'POST', body: { private: 'DO_NOT_LOG' } })).rejects.toThrow()
++      expect(ids).toHaveLength(1)
++      expect(await fetchJsonWith(deps, server.base + route, null)).toEqual({})
++      expect(ids).toHaveLength(3)
++      expect(new Set(ids).size).toBe(3)
++      await buffer.flush()
++      expect(JSON.stringify(rows)).not.toContain('DO_NOT_LOG')
++    } finally { await server.close() }
++  })
++
++  it('exposes overload and IO gaps while a writer is blocked, then recovers', async () => {
++    let release!: () => void
++    const blocked = new Promise<void>(resolve => { release = resolve })
++    const rows: any[] = []
++    let writes = 0
++
++    const buffer = new tracing.StageBuffer(async lines => {
++      if (++writes === 1) { await blocked; throw new Error('private') }
++      rows.push(...lines.trim().split('\n').map(line => JSON.parse(line)))
++    }, 2)
++
++    buffer.emit('first')
++    const pending = buffer.flush()
++    buffer.emit('second')
++    buffer.emit('third')
++    buffer.emit('drop')
++    expect(buffer.dropped).toBe(1)
++    release()
++    await pending
++    buffer.emit('coverage')
++    await buffer.flush()
++    expect(rows.at(-1)).toMatchObject({ stage: 'coverage', dropped: 1, io_lost: 1, seq: 5 })
++    expect(JSON.stringify(rows)).not.toContain('private')
++  })
++
++  it('skips private paths and preserves outer gate errors', async () => {
++    const { rows, buffer } = capture()
++    expect(tracing.requestStages('http://localhost/private?secret=x', 'GET', buffer)).toBeUndefined()
++    expect(tracing.requestStages('http://[invalid', 'GET', buffer)).toBeUndefined()
++    expect(await tracing.withApiRequestStages({ path: 'http://[invalid' }, async () => 7, buffer)).toBe(7)
++    expect(await tracing.withApiRequestStages({ path: '/private' }, async () => 2, buffer)).toBe(2)
++    const error = new Error('private')
++    await expect(tracing.withApiRequestStages({ path: route }, async () => { throw error }, buffer)).rejects.toBe(error)
++    await buffer.flush()
++    expect(rows.map(row => row.stage)).toEqual(['api_call', 'api_error'])
++  })
++})
+diff --git a/apps/desktop/electron/request-stages.ts b/apps/desktop/electron/request-stages.ts
+new file mode 100644
+index 00000000000..0ef9e41fadf
+--- /dev/null
++++ b/apps/desktop/electron/request-stages.ts
+@@ -0,0 +1,192 @@
++import { AsyncLocalStorage } from 'node:async_hooks'
++// Local-only, bounded transport evidence. No URL queries, headers, bodies or error messages.
++import { randomUUID } from 'node:crypto'
++import fs from 'node:fs/promises'
++import type { ClientRequest } from 'node:http'
++import os from 'node:os'
++import path from 'node:path'
++
++import { resolveDesktopHermesHome } from './data-paths'
++
++const POLL_PATHS = new Set([
++  '/api/plugins/user-steps/requests', '/api/plugins/hub-sync/status',
++  '/api/plugins/kanban/board', '/api/sessions', '/api/health'
++])
++
++type Row = Record<string, string | number | boolean>
++
++/** Bounded admission while one async batch is writing. Never wait for IO in an HTTP callback. */
++export class StageBuffer {
++  private rows: Row[] = []
++  private writing = false
++  private scheduled = false
++  private seq = 0
++  dropped = 0
++  ioLost = 0
++  readonly boot = randomUUID().replaceAll('-', '')
++
++  constructor(private write: (lines: string) => Promise<void>, private capacity = 4096) {}
++
++  emit(stage: string, fields: Row = {}) {
++    const seq = ++this.seq
++
++    if (this.rows.length >= this.capacity) {
++      this.dropped++
++
++      return
++    }
++
++    this.rows.push({ ...fields, stage, seq, boot: this.boot, pid: process.pid,
++      utc_ms: Date.now(), mono_ms: performance.now(), dropped: this.dropped, io_lost: this.ioLost })
++
++    if (!this.scheduled && !this.writing) {
++      this.scheduled = true
++      setImmediate(() => { this.scheduled = false; void this.flush() })
++    }
++  }
++
++  async flush() {
++    if (this.writing) {
++      return
++    }
++
++    this.writing = true
++
++    try {
++      while (this.rows.length) {
++        const batch = this.rows.splice(0, 128)
++
++        try {
++          await this.write(batch.map(row => JSON.stringify(row)).join('\n') + '\n')
++        } catch {
++          // No raw exception text: paths and credentials may be in an IO error.
++          this.ioLost += batch.length
++        }
++      }
++    } finally {
++      this.writing = false
++    }
++  }
++}
++
++let sink: StageBuffer | undefined
++const calls = new AsyncLocalStorage<string>()
++
++function pollUrl(raw: string, base?: string): URL | undefined {
++  try {
++    const parsed = new URL(raw, base)
++
++    return POLL_PATHS.has(parsed.pathname) ? parsed : undefined
++  } catch {
++    // Leave malformed-input errors to the existing request validation boundary.
++    return undefined
++  }
++}
++
++/** Covers registry/gate/dial/coalescing waits before a request has an HTTP Agent. */
++export async function withApiRequestStages<T>(request: { path?: string; method?: string }, operation: () => Promise<T>, output?: StageBuffer): Promise<T> {
++  const parsed = pollUrl(request.path || '/', 'http://localhost')
++
++  if (!parsed) { return operation() }
++  const pathname = parsed.pathname
++  const callId = randomUUID().replaceAll('-', '')
++  const target = output || journal()
++  const fields = { call_id: callId, path: pathname }
++  target.emit('api_call', fields)
++
++  return calls.run(callId, async () => {
++    try {
++      const result = await operation()
++      target.emit('api_end', fields)
++
++      return result
++    } catch (error) {
++      target.emit('api_error', fields)
++      throw error
++    }
++  })
++}
++
++export function stageFileWriter(file: string, maxBytes = 16 * 1024 * 1024) {
++    let size = 0
++    let ready = false
++
++    return async (lines: string) => {
++      if (!ready) {
++        await fs.mkdir(path.dirname(file), { recursive: true })
++
++        try { size = (await fs.stat(file)).size } catch (error) {
++          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { throw error }
++        }
++
++        ready = true
++      }
++
++      if (size + Buffer.byteLength(lines) > maxBytes) {
++        for (let i = 2; i >= 0; i--) {
++          try { await fs.rename(i ? `${file}.${i}` : file, `${file}.${i + 1}`) } catch (error) {
++            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { throw error }
++          }
++        }
++
++        size = 0
++      }
++
++      await fs.appendFile(file, lines, { mode: 0o600 })
++      size += Buffer.byteLength(lines)
++    }
++}
++
++function journal(): StageBuffer {
++  if (!sink) {
++    const file = path.join(resolveDesktopHermesHome({ home: os.homedir() }), 'logs', `request-stages-desktop-${process.pid}.jsonl`)
++    sink = new StageBuffer(stageFileWriter(file))
++    const timer = setInterval(() => sink?.emit('coverage'), 1000)
++    timer.unref()
++  }
++
++  return sink
++}
++
++export function requestStages(url: string, method: string, output?: StageBuffer) {
++  const parsed = pollUrl(url)
++
++  if (!parsed) {
++    return undefined
++  }
++
++  const id = randomUUID().replaceAll('-', '')
++
++  const fields = { id, call_id: calls.getStore() || '', path: parsed.pathname,
++    method: /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$/.test(method) ? method : 'OTHER',
++    port: Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80)) }
++
++  const target = output || journal()
++  const emit = (stage: string, extras: Row = {}) => target.emit(stage, { ...fields, ...extras })
++  emit('call')
++
++  return {
++    id,
++    deadline: () => emit('deadline'),
++    attach(req: ClientRequest) {
++      emit('agent_queue')
++      req.once('socket', socket => {
++        emit('socket_assigned', { reused: req.reusedSocket })
++        const connected = () => emit('connected', { local_port: socket.localPort || 0, remote_port: socket.remotePort || 0 })
++
++        if (socket.connecting) { socket.once('connect', connected) } else { connected() }
++      })
++      // Node finish = flushed to the local socket, not acknowledgement by the hub.
++      req.once('finish', () => emit('write_finished'))
++      req.once('response', res => {
++        emit('response_start', { status: res.statusCode || 0 })
++        let bytes = 0
++        res.on('data', chunk => { bytes += chunk.length })
++        res.once('end', () => emit('response_end', { bytes }))
++        res.once('close', () => emit('response_close', { bytes, complete: res.complete }))
++      })
++      req.once('error', () => emit('error'))
++      req.once('close', () => emit('request_close'))
++    }
++  }
++}
+diff --git a/docs/request-stage-evidence.md b/docs/request-stage-evidence.md
+new file mode 100644
+index 00000000000..247c78fee82
+--- /dev/null
++++ b/docs/request-stage-evidence.md
+@@ -0,0 +1,100 @@
++# Request-stage evidence (local diagnostics)
++
++This observer localizes Desktop JSON poll delays; it **does not repair transport**,
++retry a request, reset an Agent, or select an SSH route. Both implementations
++observe every request on these exact paths (all methods, no completion-rate cap):
++
++- `/api/plugins/user-steps/requests`
++- `/api/plugins/hub-sync/status`
++- `/api/plugins/kanban/board`
++- `/api/sessions`
++- `/api/health`
++
++No request/response bodies, queries, URLs, auth headers, exception text, hostnames,
++connection names or session identifiers enter the journal. A random 32-hex
++`X-Hermes-Req-Id` identifies **one HTTP attempt**. Retries receive new IDs. A
++Desktop `call_id` connects attempts to an outer API call; a coalesced caller may
++share another call's underlying request. Do not count logical calls as HTTP attempts.
++
++## Reading the records
++
++Both sides write JSONL in their resolved Hermes home's `logs/`, with per-process
++filenames: `request-stages-<pid>.jsonl` (backend) and
++`request-stages-desktop-<pid>.jsonl` (Desktop). Each retains a current file plus
++three rotations, 16 MiB each. Archive needed generations promptly: the journal
++is bounded evidence, not a durable audit store. Filenames distinguish overlapping
++backend generations; never inspect only the newest PID during rolling handoff.
++
++Every row includes PID, a random boot identity, increasing `seq`, wall-clock UTC,
++a monotonic clock, cumulative `dropped` and `io_lost`. Backend clocks use
++nanoseconds, Desktop clocks milliseconds. Never compare monotonic clocks across
++processes. Establish clock skew separately before cross-host wall-clock comparisons.
++A background writer emits idle `coverage` rows about once per second. A blocked
++writer also blocks coverage persistence, not requests. A missing/stale heartbeat,
++a gap in sequence, nonzero/increasing loss counts, process termination or missing
++rotations means **coverage unknown**, never “the hub did not receive it.” Loss
++counts repeat in later rows after a writer recovers. No writer progress means no
++claim about unpersisted records. Producers use a 4096-record bounded queue;
++Desktop also has at most one 128-record batch in flight. No producer waits for disk.
++
++### Desktop
++
++- `api_call` / `api_end` / `api_error`: wrap the main-process API dispatcher,
++  including registry, connection/down-gate, dial and coalescing waits. The
++  power-settle admission before this dispatcher and renderer-side IPC queueing
++  are outside this span. The observer records no exception text. Rejection identity is unchanged.
++- `call`: one fetch attempt, before native grant minting. Its `port` is the
++  selected backend origin's numeric port, useful for mapping SSH loopback listeners.
++- `agent_queue`: the `ClientRequest` exists, before writing/end.
++- `socket_assigned`: Node Agent supplied a socket; includes reuse boolean.
++- `connected`: local/remote numeric socket ports are now available.
++- `write_finished`: Node flushed to its **local** socket, NOT hub receipt.
++- `response_start`, `response_end`, `response_close`: Node parsed headers/body;
++  bytes count encoded HTTP payload, before JSON/delta/gzip decoding.
++- `deadline`, `error`, `request_close`: deadline/transport lifecycle, no retry
++  policy changes. A deadline before socket assignment is local Agent queueing;
++  a long api_call→call interval is upstream of the HTTP attempt.
++
++The observer covers Node's authenticated and public JSON helpers. Cookie-based
++Electron OAuth HTTP and WebSockets are outside this journal; the incident's SSH
++JSON polls use Node. A call with no attempt may be coalesced, rejected in a gate,
++or use an uninstrumented transport; absence alone does not discriminate them.
++
++### Backend
++
++- `ingress`: outermost user ASGI middleware, before CORS/auth/session/body gates.
++  It cannot observe bytes stalled before ASGI dispatch or an event loop unable
++  to run. It is not a packet-arrival timestamp.
++- `handler_dispatch`: innermost middleware immediately before router dispatch,
++  after those gates. This is **not** a sync endpoint's threadpool-slot acquisition
++  or lock acquisition; router/threadpool waits are in the following interval.
++- `response_start`: before awaiting the server's send of response headers.
++- `response_start_sent`: that send returned.
++- `response_body`: before each body send, cumulative encoded payload bytes and
++  final-chunk boolean. A blocked final send remains visible without an end event.
++- `response_end`: final body send returned. This is handed to the ASGI server,
++  **not** client receipt/TCP acknowledgement. Kernel/SSH return queueing can follow it.
++- `app_exit`: finally, including errors/cancellation; not success by itself.
++
++Missing, malformed or duplicated request-ID headers get a backend-generated ID
++with `client_id=false` (legacy Desktop compatibility). Valid shared IDs have
++`client_id=true`. A legacy request can only be matched by method/path/time with
++explicit ambiguity; concurrent same-path requests cannot be uniquely paired.
++No endpoint/query/body behavior changes and no header is echoed to a client.
++
++## Deployment / incident gate
++
++Ship through ordinary independent exact-head review and required CI. Verify the
++**serving backend PID's boot commit**, not just checkout HEAD. Begin a bounded
++natural hub-side sample once that side is live; do not wait for Desktop. It may
++rule in measured backend delay, but unmatched legacy requests remain ambiguous.
++Desktop tracing becomes available through its natural bundle updater; verify the
++actual installed bundle stamp and new process evidence, never launch or restart
++Desktop to obtain the sample. Match the same request ID on both sides before
++claiming a precise outbound/return localization. Correlate ASGI send waits/bytes
++with naturally observed TCP queue deltas, not cumulative retransmits alone.
++
++A subsequent transport change still needs its real HTTP/WS recovery/no-mutation-
++replay harness. Do not run a fresh 24h recovery soak until a fix exists. Rollback:
++revert the instrumentation commit through the same ship gates; no config edits or
++Mac-side manual activation are required.
+diff --git a/hermes_cli/web_request_stages.py b/hermes_cli/web_request_stages.py
+new file mode 100644
+index 00000000000..76995fe9542
+--- /dev/null
++++ b/hermes_cli/web_request_stages.py
+@@ -0,0 +1,163 @@
++"""Bounded, local-only request-stage evidence. Never log URLs, queries or headers.
++
++ASGI send completion means handed to the server transport, NOT received by a
++client. Missing ingress proves nothing unless boot/sequence/drop coverage holds.
++"""
++from __future__ import annotations
++
++import json
++import logging.handlers
++import os
++import queue
++import re
++import threading
++import time
++import uuid
++from pathlib import Path
++
++from hermes_constants import get_hermes_home
++
++POLL_PATHS = frozenset({
++    "/api/plugins/user-steps/requests", "/api/plugins/hub-sync/status",
++    "/api/plugins/kanban/board", "/api/sessions", "/api/health",
++})
++_ID = re.compile(r"^[a-f0-9]{32}$")
++_SCOPE_KEY = "hermes.request_stages"
++
++
++class StageJournal:
++    """One worker owns rotating IO; producers only put_nowait fixed-size records.
++
++    Each process has its own four 16MiB files. Sequence, cumulative drops and IO
++    loss counters are repeated in every row and in idle one-second coverage rows.
++    Retention/termination gaps are explicitly NOT evidence of absent requests.
++    """
++
++    def __init__(self, path: Path, capacity: int = 4096, max_bytes: int = 16 * 1024 * 1024):
++        self.max_bytes = max_bytes
++        self.path = path
++        self.pending = queue.Queue(maxsize=capacity)
++        self.boot = uuid.uuid4().hex
++        self.sequence = 0
++        self.dropped = 0
++        self.io_lost = 0
++        self.stopped = threading.Event()
++        self.thread = threading.Thread(target=self._run, name="request-stages", daemon=True)
++        self.thread.start()
++
++    def emit(self, stage: str, **fields) -> None:
++        self.sequence += 1
++        row = {"stage": stage, "seq": self.sequence, "boot": self.boot,
++               "pid": os.getpid(), "utc_ns": time.time_ns(), "mono_ns": time.monotonic_ns(),
++               "dropped": self.dropped, "io_lost": self.io_lost, **fields}
++        try:
++            self.pending.put_nowait(row)
++        except queue.Full:
++            self.dropped += 1
++
++    def _run(self) -> None:
++        handler = None
++        try:
++            while not self.stopped.is_set() or not self.pending.empty():
++                try:
++                    row = self.pending.get(timeout=1)
++                except queue.Empty:
++                    self.emit("coverage")
++                    continue
++                try:
++                    if handler is None:
++                        self.path.parent.mkdir(parents=True, exist_ok=True)
++                        handler = logging.handlers.RotatingFileHandler(
++                            self.path, maxBytes=self.max_bytes, backupCount=3, delay=True,
++                        )
++                    # Use the handler's rotation, but not emit(), which swallows IO errors.
++                    record = logging.LogRecord("stages", logging.INFO, "", 0,
++                                               json.dumps(row, separators=(",", ":")), (), None)
++                    if handler.shouldRollover(record):
++                        handler.doRollover()
++                    if handler.stream is None:
++                        handler.stream = handler._open()
++                    handler.stream.write(record.msg + "\n")
++                    handler.flush()
++                except OSError:
++                    self.io_lost += 1
++                    if handler is not None:
++                        handler.close()
++                    handler = None
++                finally:
++                    self.pending.task_done()
++        finally:
++            if handler is not None:
++                handler.close()
++
++
++_journal = None
++
++
++def journal() -> StageJournal:
++    global _journal
++    if _journal is None:
++        _journal = StageJournal(get_hermes_home() / "logs" / f"request-stages-{os.getpid()}.jsonl")
++    return _journal
++
++
++class RequestStageIngress:
++    """Outermost ASGI observer: before auth/locks; send wait and encoded-body bytes."""
++
++    def __init__(self, app, sink=None):
++        self.app = app
++        self.sink = sink
++
++    async def __call__(self, scope, receive, send):
++        path = scope.get("path", "")
++        if scope["type"] != "http" or path not in POLL_PATHS:
++            return await self.app(scope, receive, send)
++        sink = self.sink or journal()
++        ids = [v for k, v in scope.get("headers", ()) if k.lower() == b"x-hermes-req-id"]
++        supplied = ids[0].decode("ascii", errors="replace") if len(ids) == 1 else ""
++        correlated = bool(_ID.fullmatch(supplied))
++        rid = supplied if correlated else uuid.uuid4().hex
++        # The method is also untrusted input: constrain its cardinality.
++        method = scope.get("method", "")
++        method = method if method in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} else "OTHER"
++        fields = {"id": rid, "client_id": correlated, "path": path, "method": method}
++        scope[_SCOPE_KEY] = (sink, fields)
++        sink.emit("ingress", **fields)
++        total = 0
++
++        async def observed_send(message):
++            nonlocal total
++            kind = message["type"]
++            if kind == "http.response.start":
++                sink.emit("response_start", status=message["status"], **fields)
++            elif kind == "http.response.body":
++                total += len(message.get("body", b""))
++                sink.emit("response_body", bytes=total, final=not message.get("more_body", False), **fields)
++            await send(message)
++            if kind == "http.response.start":
++                sink.emit("response_start_sent", **fields)
++            elif kind == "http.response.body" and not message.get("more_body", False):
++                sink.emit("response_end", bytes=total, **fields)
++
++        try:
++            await self.app(scope, receive, observed_send)
++        finally:
++            sink.emit("app_exit", bytes=total, **fields)
++
++
++class RequestStageHandler:
++    """Innermost middleware: gates finished, immediately before router dispatch.
++
++    This is router/handler dispatch, not a claim a sync endpoint acquired its
++    threadpool slot. The remaining interval includes router and threadpool waits.
++    """
++
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        state = scope.get(_SCOPE_KEY)
++        if state is not None:
++            sink, fields = state
++            sink.emit("handler_dispatch", **fields)
++        return await self.app(scope, receive, send)
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index ab3478a1f1d..b314cd60c1d 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -214,6 +214,11 @@
+ 
+ install_board_busy_handler(app)
+ 
++from hermes_cli.web_request_stages import RequestStageHandler, RequestStageIngress
++
++# First registered = innermost: observe dispatch after the auth/body gates.
++app.add_middleware(RequestStageHandler)
++
+ from hermes_cli.dashboard_auth.body_limit import AuthBodyLimitMiddleware
+ 
+ # Register first (innermost): auth gates run before this, JSON parsing after it.
+@@ -792,6 +797,8 @@
+ # Without this, an OPTIONS preflight from a cross-origin SPA hits the auth
+ # middlewares before CORS can answer, producing 401 instead of 204 + headers.
+ app.add_middleware(_LocalOriginCORSMiddleware, allow_methods=["*"], allow_headers=["*"])
++# Last registered = outermost, including rejected requests and slow gates.
++app.add_middleware(RequestStageIngress)
+ 
+ 
+ # Authenticated-route self-test: one in-process request per minute against a
+diff --git a/tests/hermes_cli/test_web_request_stages.py b/tests/hermes_cli/test_web_request_stages.py
+new file mode 100644
+index 00000000000..98badba27eb
+--- /dev/null
++++ b/tests/hermes_cli/test_web_request_stages.py
+@@ -0,0 +1,229 @@
++"""Request-stage evidence is complete-or-explicitly-gapped, never causal by absence."""
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++
++import pytest
++
++from hermes_cli import web_request_stages as stages
++
++class Sink:
++    def __init__(self):
++        self.rows = []
++
++    def emit(self, stage, **fields):
++        self.rows.append({"stage": stage, **fields})
++
++
++def scope(path="/api/plugins/user-steps/requests", headers=()):
++    return {"type": "http", "path": path, "method": "GET", "headers": headers,
++            "query_string": b"token=DO_NOT_LOG", "client": ("private", 1)}
++
++
++@pytest.mark.asyncio
++async def test_full_asgi_order_bytes_and_sanitization():
++    sink = Sink()
++    rid = b"a" * 32
++
++    async def endpoint(s, receive, send):
++        await send({"type": "http.response.start", "status": 200, "headers": [(b"secret", b"DO_NOT_LOG")]})
++        await send({"type": "http.response.body", "body": b"secret", "more_body": True})
++        await send({"type": "http.response.body", "body": b"xyz"})
++
++    async def gate(s, receive, send):
++        assert sink.rows[0]["stage"] == "ingress"
++        await stages.RequestStageHandler(endpoint)(s, receive, send)
++
++    messages = []
++
++    async def send(message):
++        messages.append(message)
++
++    await stages.RequestStageIngress(gate, sink)(scope(headers=[(b"x-hermes-req-id", rid)]), None, send)
++    assert [r["stage"] for r in sink.rows] == [
++        "ingress", "handler_dispatch", "response_start", "response_start_sent",
++        "response_body", "response_body", "response_end", "app_exit",
++    ]
++    assert all(r["id"] == rid.decode() and r["client_id"] for r in sink.rows)
++    assert sink.rows[-2]["bytes"] == 9
++    assert "DO_NOT_LOG" not in json.dumps(sink.rows)
++    assert "private" not in json.dumps(sink.rows)
++    assert messages[-1]["body"] == b"xyz"
++
++
++@pytest.mark.asyncio
++async def test_send_backpressure_is_not_recorded_as_completed():
++    sink = Sink()
++    started, release = asyncio.Event(), asyncio.Event()
++
++    async def endpoint(s, receive, send):
++        await send({"type": "http.response.body", "body": b"x" * 20})
++
++    async def send(message):
++        started.set()
++        await release.wait()
++
++    task = asyncio.create_task(stages.RequestStageIngress(endpoint, sink)(scope(), None, send))
++    await asyncio.wait_for(started.wait(), 2)
++    assert sink.rows[-1]["stage"] == "response_body"
++    assert sink.rows[-1]["bytes"] == 20
++    assert not any(r["stage"] == "response_end" for r in sink.rows)
++    release.set()
++    await asyncio.wait_for(task, 2)
++    assert sink.rows[-2]["stage"] == "response_end"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("headers", [[], [(b"x-hermes-req-id", b"secret\n" * 100)],
++                                       [(b"x-hermes-req-id", b"a" * 32)] * 2])
++async def test_legacy_and_invalid_ids_get_local_id_without_echo(headers):
++    sink = Sink()
++
++    async def endpoint(s, receive, send):
++        raise ValueError("private error")
++
++    with pytest.raises(ValueError):
++        await stages.RequestStageIngress(endpoint, sink)(scope(headers=headers), None, None)
++    assert [r["stage"] for r in sink.rows] == ["ingress", "app_exit"]
++    assert len(sink.rows[0]["id"]) == 32
++    assert not sink.rows[0]["client_id"]
++    assert "secret" not in json.dumps(sink.rows)
++    assert "private error" not in json.dumps(sink.rows)
++
++
++@pytest.mark.asyncio
++async def test_unselected_and_websocket_bypass_journal():
++    sink = Sink()
++    seen = []
++
++    async def endpoint(s, receive, send):
++        seen.append(s)
++
++    observer = stages.RequestStageIngress(endpoint, sink)
++    await observer(scope("/api/private/secret"), None, None)
++    ws = scope()
++    ws["type"] = "websocket"
++    await observer(ws, None, None)
++    assert len(seen) == 2
++    assert sink.rows == []
++
++
++def test_bounded_overflow_gaps_and_io_loss(tmp_path, monkeypatch):
++    # Drive the real consumer deterministically after filling the ring.
++    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
++    journal = stages.StageJournal(tmp_path / "stages.jsonl", capacity=2)
++    journal.emit("one")
++    journal.emit("two")
++    journal.emit("dropped")
++    assert journal.dropped == 1
++    journal.stopped.set()
++    journal._run()
++    journal.emit("coverage")
++    journal._run()
++    rows = [json.loads(line) for line in journal.path.read_text().splitlines()]
++    assert [r["seq"] for r in rows] == [1, 2, 4]
++    assert rows[-1]["dropped"] == 1
++    bad = stages.StageJournal(tmp_path / "stages.jsonl" / "invalid", capacity=2)
++    bad.emit("lost")
++    bad.stopped.set()
++    bad._run()
++    assert bad.io_lost == 1
++
++
++def test_io_never_runs_on_producer(tmp_path, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    original = stages.logging.handlers.RotatingFileHandler.shouldRollover
++
++    def blocked(handler, record):
++        entered.set()
++        assert release.wait(3)
++        return original(handler, record)
++
++    monkeypatch.setattr(stages.logging.handlers.RotatingFileHandler, "shouldRollover", blocked)
++    journal = stages.StageJournal(tmp_path / "stages.jsonl", capacity=2)
++    try:
++        journal.emit("one")
++        assert entered.wait(2)
++        journal.emit("two")
++        journal.emit("three")
++        journal.emit("drop")
++        assert journal.dropped == 1
++    finally:
++        journal.stopped.set()
++        release.set()
++        journal.thread.join(3)
++    assert not journal.thread.is_alive()
++
++
++def test_real_app_registers_observers_outside_gates():
++    # Importing facade here exercises production registration, not an invented onion.
++    from hermes_cli.web_server import app
++    classes = [m.cls for m in app.user_middleware]
++    assert classes[0] is stages.RequestStageIngress
++    assert classes[-1] is stages.RequestStageHandler
++
++
++@pytest.mark.asyncio
++async def test_production_middleware_chain_preserves_shared_id_and_payload(monkeypatch):
++    import httpx
++    from fastapi import FastAPI
++    from hermes_cli import web_server
++
++    sink = Sink()
++    monkeypatch.setattr(stages, "journal", lambda: sink)
++    monkeypatch.setattr(web_server.app.state, "bound_host", None, raising=False)
++    application = FastAPI(middleware=web_server.app.user_middleware)
++
++    @application.get("/api/health")
++    async def health():
++        return {"ok": True}
++
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://127.0.0.1") as client:
++        response = await client.get("/api/health", headers={"X-Hermes-Req-Id": "b" * 32})
++    assert response.status_code == 200
++    assert response.json() == {"ok": True}
++    names = [r["stage"] for r in sink.rows]
++    assert names[0] == "ingress"
++    assert names.index("handler_dispatch") < names.index("response_start")
++    assert names[-1] == "app_exit"
++    assert all(r["id"] == "b" * 32 for r in sink.rows)
++    end = next(r for r in sink.rows if r["stage"] == "response_end")
++    assert end["bytes"] == len(response.content)
++
++
++def test_rotation_retains_exactly_four_bounded_files(tmp_path, monkeypatch):
++    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
++    journal = stages.StageJournal(tmp_path / "capture" / "stages.jsonl", max_bytes=600)
++    for _ in range(40):
++        journal.emit("coverage")
++    journal.stopped.set()
++    journal._run()
++    files = list(journal.path.parent.iterdir())
++    assert len(files) == 4
++    assert all(p.stat().st_size < 600 for p in files)
++    latest = [json.loads(line) for line in journal.path.read_text().splitlines()]
++    assert latest[-1]["seq"] == 40
++
++
++def test_idle_coverage_is_persisted_without_requests(tmp_path):
++    journal = stages.StageJournal(tmp_path / "stages.jsonl")
++    # Observe actual writer progress with a bounded Event, not a timing sleep.
++    seen = threading.Event()
++    original = journal.emit
++
++    def observed(stage, **fields):
++        original(stage, **fields)
++        if stage == "coverage":
++            seen.set()
++
++    journal.emit = observed
++    try:
++        assert seen.wait(3)
++    finally:
++        journal.stopped.set()
++        journal.thread.join(3)
++    rows = [json.loads(line) for line in journal.path.read_text().splitlines()]
++    assert rows[0]["stage"] == "coverage"
++    assert rows[0]["dropped"] == rows[0]["io_lost"] == 0
+-- 
+2.43.0
+

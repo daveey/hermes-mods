@@ -1,0 +1,146 @@
+From f066cafea9c42a7fc2c215e1cb38faa1f6ed612a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:09:50 +0000
+Subject: [PATCH 6247] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit f066cafea9c42a7fc2c215e1cb38faa1f6ed612a.
+
+---
+diff --git a/hermes_cli/kanban_actionability_creation.py b/hermes_cli/kanban_actionability_creation.py
+index a536dafa42f..df1d71a4b94 100644
+--- a/hermes_cli/kanban_actionability_creation.py
++++ b/hermes_cli/kanban_actionability_creation.py
+@@ -18,7 +18,7 @@
+ 
+ def _todo_entry(kind, payload):
+     """Sources that put (or keep) a card waiting in todo on its parents."""
+-    return kind in ('dependency_wait', 'linked') or (kind == 'unblocked' and payload.get('status') == 'todo')
++    return kind in ('dependency_wait', 'linked', 'unlinked') or (kind == 'unblocked' and payload.get('status') == 'todo')
+ 
+ 
+ def intent_for(task, kind, payload, *, now):
+@@ -34,9 +34,9 @@
+         return None
+     wake = positive_time(payload.get('wake_at')) if timed else None
+     deadline = wake + 600 if wake else (now + 86400 if not timed else None)
+-    # A new edge on a card already waiting in todo keeps that episode's frozen
++    # An edge change on a card already waiting in todo keeps that episode's frozen
+     # obligation, overdue included; it can only ever be earlier, never renewed.
+-    carried = positive_time(payload.get('actionability_carried_deadline')) if kind == 'linked' else None
++    carried = positive_time(payload.get('actionability_carried_deadline')) if kind in ('linked', 'unlinked') else None
+     if carried and deadline:
+         deadline = min(deadline, carried)
+     human = payload.get('human_request')
+@@ -87,22 +87,22 @@
+ 
+ def stamp(conn, task_id, kind, payload, *, now):
+     """Freeze ordinary administrative policy with the actual source event clock."""
+-    if kind not in ('scheduled', 'blocked', 'continued', 'dependency_wait', 'linked', 'unblocked'):
++    if kind not in ('scheduled', 'blocked', 'continued', 'dependency_wait', 'linked', 'unlinked', 'unblocked'):
+         return payload
+     original = payload
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+-    if kind in ('linked', 'unblocked') and (row is None or row['status'] != 'todo' or not isinstance(payload, dict)):
++    if kind in ('linked', 'unlinked', 'unblocked') and (row is None or row['status'] != 'todo' or not isinstance(payload, dict)):
+         return payload  # only a todo entry; every other status keeps its own source
+     if isinstance(payload, dict):
+         from hermes_cli.kanban_db_sync import run_uid
+         from hermes_cli.kanban_actionability_parents import snapshot
+         parents = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,))]
+-        if kind in ('linked', 'unblocked') and not parents:
++        if kind in ('linked', 'unlinked', 'unblocked') and not parents:
+             return original  # no parent to wait on: not a dependency wait, so nothing to freeze
+         payload = {**payload, 'actionability_parent_ids': parents,
+                    'actionability_parent_states': snapshot(conn, parents),
+                    'actionability_run_uid': run_uid(conn, row['current_run_id']) if row else None}
+-        carried = _carried(conn, task_id, dict(row)) if kind == 'linked' and row else None
++        carried = _carried(conn, task_id, dict(row)) if kind in ('linked', 'unlinked') and row else None
+         if carried:
+             payload['actionability_carried_deadline'], payload['actionability_carried_from'] = carried
+     intent = intent_for(dict(row), kind, payload, now=now) if row else None
+diff --git a/hermes_cli/kanban_actionability_selection.py b/hermes_cli/kanban_actionability_selection.py
+index 470b2c23f53..346d8fb6a2a 100644
+--- a/hermes_cli/kanban_actionability_selection.py
++++ b/hermes_cli/kanban_actionability_selection.py
+@@ -3,7 +3,7 @@
+ 
+ import json
+ 
+-KINDS = {'todo': ('created', 'linked', 'dependency_wait', 'unblocked'),
++KINDS = {'todo': ('created', 'linked', 'unlinked', 'dependency_wait', 'unblocked'),
+          'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
+          'review': ('review_requested', 'created'), 'blocked': ('blocked',),
+          'scheduled': ('scheduled', 'continued'),
+diff --git a/tests/hermes_cli/test_kanban_actionability_unlink_deadline.py b/tests/hermes_cli/test_kanban_actionability_unlink_deadline.py
+new file mode 100644
+index 00000000000..5d7a17d3034
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_unlink_deadline.py
+@@ -0,0 +1,64 @@
++"""A remaining dependency retains its original deadline after unlink. [daveey]"""
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from tests.hermes_cli.test_kanban_actionability_todo_sources import T0, _clock, _event, _ref, _refs, _rows
++
++
++def test_unlink_remaining_dependency_carries_overdue_deadline(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='waiting child', assignee='default', parents=[first, second])
++        source, initial = _event(conn, tid, 'dependency_wait')
++        frozen = initial['actionability_intent']['deadline_at']
++        _clock(monkeypatch, frozen + 100)
++        assert kb.unlink_tasks(conn, first, tid)
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == 'todo'
++        unlinked, data = _event(conn, tid, 'unlinked')
++        assert data['actionability_intent']['deadline_at'] == frozen
++        assert data['actionability_carried_from'] == _ref(source)
++        assert data['actionability_parent_ids'] == [second]
++        for row in _rows(conn, tid, frozen + 100):
++            assert row['source_refs'] == _refs(unlinked)
++            assert row['escalation']['at'] == frozen
++            assert 'escalation_overdue' in row['violations']
++            assert 'creation_intent_invalid' not in row['violations']
++            assert 'escalation_deadline_missing' not in row['violations']
++        third = kb.create_task(conn, title='replacement prerequisite', assignee='default')
++        _clock(monkeypatch, frozen + 200)
++        kb.link_tasks(conn, third, tid)
++        linked, data = _event(conn, tid, 'linked')
++        assert data['actionability_carried_from'] == _ref(unlinked)
++        assert data['actionability_intent']['deadline_at'] == frozen
++        kb.unlink_tasks(conn, second, tid)
++        _, data = _event(conn, tid, 'unlinked')
++        assert data['actionability_carried_from'] == _ref(linked)
++        assert data['actionability_intent']['deadline_at'] == frozen
++        kb.unlink_tasks(conn, third, tid)
++        _, data = _event(conn, tid, 'unlinked')
++        assert 'actionability_intent' not in data
++        kb.recompute_ready(conn)
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == 'ready'
++
++
++def test_unlink_parked_child_preserves_schedule_source(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='parked child', assignee='default')
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2027-01-15T08:01:40+00:00',
++                                clock_only=True, awaiting={'kind': 'clock', 'why': 'fixture window'})
++        scheduled, initial = _event(conn, tid, 'scheduled')
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        kb.link_tasks(conn, first, tid)
++        kb.link_tasks(conn, second, tid)
++        kb.unlink_tasks(conn, first, tid)
++        _, data = _event(conn, tid, 'unlinked')
++        assert 'actionability_intent' not in data
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == 'scheduled'
++        assert _event(conn, tid, 'scheduled')[1] == initial
++        assert scheduled['kind'] == 'scheduled'
+-- 
+2.43.0
+

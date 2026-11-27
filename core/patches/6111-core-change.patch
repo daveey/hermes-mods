@@ -1,0 +1,126 @@
+From 99d73bca3024f696f91e612615a3d3140bf59eed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:36:15 +0000
+Subject: [PATCH 6111] Kanban spend-decision routing, ownerless stops and hold notices
+
+Public mirror of source commit 99d73bca3024f696f91e612615a3d3140bf59eed.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index ddb3a7f8ffb..b7255b309d8 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -188,8 +188,9 @@
+         if all(d.get('administrative_owner', {}).get('kind') == 'unavailable' for d in deps):
+             row['violations'].append('dependency_recovery_unavailable')
+     if row['owner']['kind'] == 'unavailable':
+-        # A stopped card whose human request is stored (the stranded-park ask) is owned by that ask.
+-        if not (facts.get('stop') and facts.get('human_step')):
++        # A stopped card still parked with its human request stored (the stranded-park ask) is owned by that
++        # ask. In any other status the stored request is not what the card waits on.
++        if not (facts.get('stop') and facts.get('human_step') and task['status'] in ('triage', 'blocked')):
+             row['violations'].append('owner_missing')
+     elif row['owner']['kind'] == 'unknown' or not row['owner'].get('refs'):
+         row['evidence_state'] = 'unknown'
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 51e9b65ce5b..3dc24df66f7 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -297,8 +297,11 @@
+ 
+ 
+ def _chat_returned(conn, task_id: str, *, paced: bool) -> bool:
+-    """Read-only: does an ownerless stop's card have a live owning chat now? ``paced`` (the dispatcher's unlocked
+-    pre-check) asks at most once per ``_RECHECK_SECONDS`` per card: each answer may open a state.db."""
++    """Read-only: would ``producer`` route this ownerless stop to a chat now? Only an owning chat counts: an
++    observer (the desk chat the stranded-park sweep binds as ``shepherd``, a ``touch``) is never the route, and
++    saying yes for one would take the write lock every recheck to find the same ``unavailable``. ``paced`` (the
++    dispatcher's unlocked pre-check) asks at most once per ``_RECHECK_SECONDS`` per card: each answer may open a
++    state.db."""
+     import time
+     from hermes_cli.kanban_db_connect import _main_db_file
+     from hermes_cli.kanban_origin import gateway_names
+@@ -317,10 +320,16 @@
+         return False
+     own, bound = gateway_names()[0], []
+     with Liveness(idle=settings()[1]) as liveness:
+-        # ``bind`` only records: a chat ``producer`` would bind is live. ``producer`` itself decides the route.
+-        return _chat_route(conn, task_id, task, own, get_active_profile_name(), lambda *chat: bound.append(chat),
+-                           lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own,
+-                                                                        liveness=liveness)) or bool(bound)
++        # ``bind`` only records the live chats ``producer`` would subscribe; True is a live owning subscription.
++        if _chat_route(conn, task_id, task, own, get_active_profile_name(), lambda *chat: bound.append(chat),
++                       lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own,
++                                                                    liveness=liveness)):
++            return True
++    # ``producer`` binds with INSERT OR IGNORE: only a chat with no subscription yet becomes an owning one. An
++    # existing row was judged above, and an observer's row (OBSERVER_SUB_REASONS) stays an observer's.
++    return any(conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? "
++                            "AND thread_id=''", (task_id, platform, chat_id)).fetchone() is None
++               for platform, chat_id in bound)
+ 
+ 
+ def _chat_route(conn, task_id, task, own, active, bind, dead) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_causes.py b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+index 1dea44a91f9..8595e55631a 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision_causes.py
++++ b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+@@ -22,11 +22,13 @@
+ from tests.hermes_cli import test_kanban_spend_budget as helpers
+ from tests.hermes_cli import test_kanban_spend_budget_hold as hold_helpers
+ from tests.hermes_cli import test_kanban_spend_decision_routing as routing
++from tests.hermes_cli import test_kanban_stranded_park as park_tests
+ from tests.hermes_cli.test_kanban_spend_route_repair import _route, _stop
+ 
+ kanban_home = helpers.kanban_home
+ board = support.board
+ own_gateway = routing.own_gateway
++desk_gateway = park_tests.own_gateway
+ 
+ CAUSES = ["capability_unavailable", "scope_stopped", "safety_refusal"]
+ RETAIN = dict(summary="Cannot finish from here", next_step="Owner supplies the missing prerequisite",
+@@ -135,6 +137,41 @@
+         # ``hermes kanban stranded`` reads the stored ask as the owner.
+         assert "owner_missing" not in describe(conn, tid)["violations"]
+         assert _cards(conn) == [] and decision.pending(conn, tid)
++        # Only while the card is still parked: forced out of triage, the stored request owns nothing.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
++        assert "owner_missing" in describe(conn, tid)["violations"]
++
++
++@pytest.mark.parametrize("desk", [f"{park_tests.OWN}/default/desk-chat", "remote/default/desk"], ids=["local", "remote"])
++@pytest.mark.parametrize("cause", CAUSES)
++def test_the_desk_chat_the_sweep_binds_is_an_observer_not_a_returned_owner(kanban_home, desk_gateway, monkeypatch,
++                                                                           cause, desk):
++    """The sweep's ``shepherd`` link and subscription for kanban.triage_owner_chat are live but own nothing:
++    the recheck must not take the write lock for them, ever."""
++    import time
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        decision.ensure_producer(conn, tid)
++        park_tests._session(kanban_home, "desk-chat")
++        stranded._LAST_RUN.clear()
++        assert stranded.sweep_stranded_parks(conn, now=int(time.time()) + 3 * 3600,
++                                             cfg={"kanban": {"triage_owner_chat": desk}}) == [tid]
++        reasons = [r[0] for r in conn.execute("SELECT json_extract(delivery_metadata,'$.reason') FROM "
++                                              "kanban_notify_subs WHERE task_id=?", (tid,))]
++        assert reasons == ["shepherd"]
++        assert conn.execute("SELECT COUNT(*) FROM task_chat_links WHERE task_id=? AND kind='shepherd' "
++                            "AND released=0", (tid,)).fetchone()[0] == 1
++
++        def forbidden(*args, **kwargs):
++            pytest.fail("an observer chat must not make the route recheck take the write lock")
++        monkeypatch.setattr(kb, "write_txn", forbidden)
++        for _ in range(4):
++            decision._RECHECKED.clear()
++            assert decision._producer_repair(conn, tid) is None
++            decision.repair_triage_routes(conn, skip=set())
++            decision.ensure_producer(conn, tid)
++        assert [n.payload["producer"] for n in _notices(conn, tid)] == [{"kind": "unavailable"}]
+ 
+ 
+ @pytest.mark.parametrize("cause", CAUSES)
+-- 
+2.43.0
+

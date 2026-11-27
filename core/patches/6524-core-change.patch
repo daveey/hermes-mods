@@ -1,0 +1,456 @@
+From 17256c5d34497af357e67e10e45555726e8e08c2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:25:03 +0000
+Subject: [PATCH 6524] Refusal boundary for refused providers
+
+Public mirror of source commit 17256c5d34497af357e67e10e45555726e8e08c2.
+
+---
+diff --git a/agent/managed_worker.py b/agent/managed_worker.py
+index 7336a7e1387..355a6054daa 100644
+--- a/agent/managed_worker.py
++++ b/agent/managed_worker.py
+@@ -480,7 +480,19 @@
+     with construction_scope(kanban):
+         for _ in range(3):  # fast selection, ordinary selection, one completion-proof retry
+             try:
+-                return factory(**{**kwargs, **worker_route(policy, kwargs)})
++                from hermes_cli.kanban_refusal_boundary import require_policy
++                from agent.model_routing_exclusions import exclude_providers
++                with exclude_providers(require_policy(policy) or ()):
++                    selected = {**kwargs, **worker_route(policy, kwargs)}
++                    require_policy(policy, model=selected.get('model'), provider=selected.get('provider'))
++                    agent = factory(**selected)
++                try:
++                    if require_policy(policy, model=getattr(agent, 'model', ''), provider=getattr(agent, 'provider', '')):
++                        agent._kanban_refusal_policy = policy
++                except Exception:
++                    retire_agent(agent)
++                    raise
++                return agent
+             except Exception as exc:
+                 wall = quota_exception(exc)
+                 if kanban and wall is not None:
+diff --git a/agent/model_routing_exclusions.py b/agent/model_routing_exclusions.py
+new file mode 100644
+index 00000000000..c773bd7671b
+--- /dev/null
++++ b/agent/model_routing_exclusions.py
+@@ -0,0 +1,19 @@
++"""Execution-scoped provider exclusions, applied before credential selection/allocation."""
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++_EXCLUDED = ContextVar('execution_provider_exclusions', default=frozenset())
++
++
++def provider_allowed(provider):
++    return str(provider or '').strip().lower() not in _EXCLUDED.get()
++
++
++@contextmanager
++def exclude_providers(providers):
++    """Compose restrictions; a nested caller cannot relax its parent's exclusion set."""
++    token = _EXCLUDED.set(_EXCLUDED.get() | frozenset(str(p).strip().lower() for p in providers))
++    try:
++        yield
++    finally:
++        _EXCLUDED.reset(token)
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index a0e3344c12d..02c7e2754da 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -144,6 +144,9 @@
+ 
+ def verify_managed_agent(agent, request):
+     """Fence cached agents and stale overrides at each outbound attempt."""
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    require_policy(getattr(agent, '_kanban_refusal_policy', None),
++                   model=request.get('model', agent.model), provider=agent.provider)
+     config = managed_config()
+     if config is None:
+         return
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index c9772124bb0..2ac19d589c7 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -82,6 +82,9 @@
+         state_path = ":memory:"
+ 
+     def eligible(route):
++        from agent.model_routing_exclusions import provider_allowed
++        if not provider_allowed(route['provider']):
++            return False
+         from hermes_cli.config import is_provider_enabled
+         block = config.get("providers", {}).get(route["provider"], {})
+         if not is_provider_enabled(block):
+@@ -111,6 +114,9 @@
+ 
+     def prepare(metadata):
+         selected, selected_model = metadata["selected_provider"], metadata["selected_model"]
++        from agent.model_routing_exclusions import provider_allowed
++        if not provider_allowed(selected):
++            raise ModelRoutingError('Safety exclusion refuses final provider allocation')
+         runtime._raise_if_provider_disabled(selected)
+         pool = pools[selected, metadata["billing_group"]]
+         entry = pool.select(model=selected_model)
+diff --git a/gateway/session_kanban_scope.py b/gateway/session_kanban_scope.py
+index 6540c079f74..f6cd69280c4 100644
+--- a/gateway/session_kanban_scope.py
++++ b/gateway/session_kanban_scope.py
+@@ -147,6 +147,8 @@
+         env = source_worker_env(policy, kwargs.get('env'))
+         if env is not kwargs.get('env'):
+             kwargs['env'] = env
++        from hermes_cli.kanban_refusal_boundary import require_policy
++        require_policy(policy)
+         rendezvous = attach_capsule_transport(policy)
+         try:
+             process = observing_spawn(spawn, rendezvous, owner_sha=owner_sha)(*args, **kwargs)
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 8c50493932d..bb7be54336b 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -361,6 +361,8 @@
+     plus the run's resolved ``run_route`` receipt (every spawn, tier off included).
+     Returns the reason. Review resolution/receipt failures refuse admission rather than inventing a route."""
+     reason = _apply_model_tier(conn, task, lane=lane, cfg=cfg)
++    from hermes_cli.kanban_refusal_boundary import require_route
++    require_route(conn, task, task.model_override, task.provider_override, lane=lane)
+     if f"+{_REFUSAL_EXHAUSTED}:" in reason:
+         from agent.model_routing import ModelRoutingError
+         raise ModelRoutingError(f"Every eligible provider refused this card's work ({reason.rsplit(':', 1)[1]})")
+@@ -595,6 +597,8 @@
+     if moved:
+         model, provider = moved[0], moved[1]
+         reason = f"{reason}+{_PACED}:{moved[2]}"
++    from hermes_cli.kanban_refusal_boundary import require_route
++    require_route(conn, task, model, provider, lane=lane)
+     origin = (getattr(task, "model_override", None), getattr(task, "provider_override", None))
+     repinned = bool(model) and reason.startswith("pinned+pin_quota_reroute")
+     paced = _paced_receipt(conn, task, reason, lane=lane, cfg=cfg) if is_review else None
+diff --git a/hermes_cli/kanban_refusal_boundary.py b/hermes_cli/kanban_refusal_boundary.py
+new file mode 100644
+index 00000000000..81111c36ad5
+--- /dev/null
++++ b/hermes_cli/kanban_refusal_boundary.py
+@@ -0,0 +1,61 @@
++"""Refusal exclusions are constraints, never a route offer or permission to reroute."""
++from contextlib import closing
++import json
++from pathlib import Path
++import sqlite3
++
++from agent.model_routing import ModelRoutingError, is_class_selector
++
++_UNSET = object()
++
++class RefusedRouteError(ModelRoutingError):
++    """No proven eligible, unrefused execution route; no provider request is permitted."""
++
++
++def require_route(conn, task, model, provider, *, lane='ready'):
++    """Validate the FINAL tuple without choosing a replacement or changing refusal history."""
++    from hermes_cli.kanban_refusal_fallback import refused_providers, eligible_routes
++    refused = refused_providers(conn, task.id)
++    if not refused:
++        return
++    provider = str(provider or '').strip().lower()
++    if not model or is_class_selector(model) or provider in ('', 'auto', 'none'):
++        raise RefusedRouteError('Safety exclusion requires a concrete execution route')
++    if provider in refused:
++        raise RefusedRouteError(f'Safety exclusion refuses execution on {provider}')
++    # A previously admitted peer can disappear before pace consumption, owner admission or exec.
++    # Never fall back to a refused pool (nor silently allocate a different peer) in that case.
++    try:
++        eligible = eligible_routes(conn, task, lane)
++    except Exception as exc:  # health: allow BLE001 -- unknown eligibility never authorizes execution
++        raise RefusedRouteError('Safety exclusion eligibility unavailable') from exc
++    if (model, provider) not in eligible:
++        raise RefusedRouteError('Safety exclusion execution peer is no longer eligible')
++    return tuple(refused)
++
++
++def require_policy(policy, *, model=_UNSET, provider=_UNSET):
++    """Fresh board read at real owner exec and worker construction, including saved policies."""
++    if policy is None or not getattr(policy, 'kanban_json', None):
++        return
++    from hermes_cli import kanban_db as kb
++    context = json.loads(policy.kanban_json)
++    try:
++        with closing(sqlite3.connect(Path(context['db']).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
++            conn.row_factory = sqlite3.Row
++            task = kb.get_task(conn, context['task_id'])
++            from hermes_cli.kanban_refusal_fallback import refused_providers
++            if task is not None and not refused_providers(conn, task.id):
++                return  # Ordinary claims keep their existing scope/source/capsule validators.
++            run = conn.execute('SELECT status,claim_lock,ended_at FROM task_runs WHERE id=? AND task_id=?',
++                               (context['run_id'], context['task_id'])).fetchone()
++            if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
++                    or task.claim_lock != context['claim_lock'] or run is None
++                    or tuple(run) != ('running', context['claim_lock'], None)):
++                raise RefusedRouteError('Safety exclusion execution claim is stale')
++            selected_model = policy.model if model is _UNSET else model
++            selected_provider = policy.provider if provider is _UNSET else provider
++            return require_route(conn, task, selected_model, selected_provider,
++                                 lane=kb._retry_status_for_run(conn, task.id, task.current_run_id))
++    except sqlite3.Error as exc:
++        raise RefusedRouteError('Safety exclusion execution history unavailable') from exc
+diff --git a/tests/agent/test_model_routing_exclusions.py b/tests/agent/test_model_routing_exclusions.py
+new file mode 100644
+index 00000000000..21615b71522
+--- /dev/null
++++ b/tests/agent/test_model_routing_exclusions.py
+@@ -0,0 +1,48 @@
++"""Provider exclusions fence actual allocator eligibility and final prepare; no provider traffic."""
++import pytest
++
++from agent import credential_pool
++from agent import model_routing_runtime as runtime
++from agent.model_routing import ModelRoutingError
++from agent.model_routing_exclusions import exclude_providers, provider_allowed
++from tests.hermes_cli import test_model_routing_runtime as fixtures
++
++routing_home = fixtures.routing_home
++
++
++def test_nested_exclusions_cannot_relax_and_do_not_leak():
++    assert provider_allowed('anthropic')
++    with exclude_providers(['ANTHROPIC']):
++        assert not provider_allowed('anthropic')
++        with exclude_providers(['openai-codex']):
++            assert not provider_allowed('anthropic') and not provider_allowed('openai-codex')
++        assert provider_allowed('openai-codex') and not provider_allowed('anthropic')
++    assert provider_allowed('anthropic')
++
++
++def test_allocator_never_loads_excluded_pool(routing_home, monkeypatch):
++    calls = []
++    def forbidden(*a, **kw):
++        calls.append(a)
++        pytest.fail('excluded pool touched')
++    monkeypatch.setattr(credential_pool, 'load_pool', forbidden)
++    with exclude_providers(['anthropic']), pytest.raises(ModelRoutingError):
++        runtime.resolve_class_runtime('class:deep', 'auto', config=routing_home,
++                                      session_id='excluded-fixture')
++    assert calls == []
++
++
++def test_final_prepare_rejects_wrong_provider_even_if_eligibility_bypassed(routing_home, monkeypatch):
++    def wrong(*a, **kw):
++        kw['prepare']({'selected_provider': 'anthropic', 'selected_model': 'anthropic-deep'})
++    monkeypatch.setattr(runtime, 'resolve_model_route', wrong)
++    with exclude_providers(['anthropic']), pytest.raises(ModelRoutingError, match='final provider allocation'):
++        runtime.resolve_class_runtime('class:deep', 'auto', config=routing_home,
++                                      session_id='wrong-adapter-fixture')
++
++
++def test_ordinary_allocation_and_unrefused_positive_control(routing_home):
++    with exclude_providers(['openai-codex']):
++        rt = runtime.resolve_class_runtime('class:deep', 'auto', config=routing_home,
++                                           session_id='unrefused-fixture')
++    assert rt['provider'] == 'anthropic'
+diff --git a/tests/hermes_cli/test_kanban_refusal_boundary.py b/tests/hermes_cli/test_kanban_refusal_boundary.py
+new file mode 100644
+index 00000000000..59d44e4c497
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refusal_boundary.py
+@@ -0,0 +1,195 @@
++"""Admission → pace → real owner spawn → worker allocation, fake provider adapters only."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent import managed_worker
++from agent.model_routing import ModelRoutingError
++from gateway import session_kanban_scope as scope
++from gateway import session_worker_construct as construct
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_pace_reroute as pace
++from hermes_cli import kanban_refusal_fallback as refusal
++from tests.hermes_cli import test_kanban_refusal_fallback as fixtures
++
++board = fixtures.board
++pools = fixtures.pools
++
++
++@pytest.fixture
++def claimed(board, pools, monkeypatch):
++    conn, context = board
++    # Frozen historical receipt, not a provider call or a replay of refused work.
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome,metadata) "
++                     "VALUES (?, 'safety_refused', 1, 2, 'safety_refused', ?)",
++                     (context['task_id'], json.dumps({'refused_provider': 'anthropic'})))
++    task = kb.get_task(conn, context['task_id'])
++    pace.clear()
++    yield conn, task, context
++    pace.clear()
++
++
++def policy_for(context, provider='openai-codex', model='gpt-test'):
++    return SimpleNamespace(kanban_json=json.dumps(context), model=model, provider=provider)
++
++
++def test_pace_offer_cannot_overwrite_refusal_filter(claimed):
++    conn, task, _ = claimed
++    route = tier.resolve_dispatch_tier(conn, task, lane='ready')
++    assert route[1] == 'openai-codex'
++    pace.offer(task.id, route, ('sonnet-test', 'anthropic', 'openai-codex'))
++    with pytest.raises(ModelRoutingError, match='Safety exclusion'):
++        tier.apply_model_tier(conn, task, lane='ready')
++    assert not fixtures.events(conn, task.id, 'model_tier')
++    assert refusal.refused_providers(conn, task.id) == ['anthropic']
++
++
++def test_peer_lost_during_pace_consumption_fails_closed(claimed, monkeypatch):
++    conn, task, _ = claimed
++    take = pace.take
++
++    def disappear(*args):
++        fixtures.UNSERVED.add('openai-codex')
++        return take(*args)
++
++    monkeypatch.setattr(pace, 'take', disappear)
++    with pytest.raises(ModelRoutingError, match='no longer eligible'):
++        tier.apply_model_tier(conn, task, lane='ready')
++    assert not fixtures.events(conn, task.id, 'model_tier')
++
++
++@pytest.mark.parametrize('provider,model', [('anthropic', 'sonnet-test'), ('auto', 'class:standard')])
++def test_real_owner_spawn_rejects_excluded_or_deferred_route(claimed, monkeypatch, provider, model):
++    _, _, context = claimed
++    called = []
++    monkeypatch.setattr(scope, 'resolve_run_scope', lambda _: None)
++    launch = scope.placing_spawn(lambda *a, **kw: called.append((a, kw)), policy_for(context, provider, model))
++    with pytest.raises(ModelRoutingError, match='Safety exclusion'):
++        launch(['fake-provider-worker'])
++    assert called == []
++
++
++def test_owner_spawn_rechecks_peer_after_admission(claimed, monkeypatch):
++    conn, task, context = claimed
++    tier.apply_model_tier(conn, task, lane='ready')
++    fixtures.UNSERVED.add('openai-codex')
++    called = []
++    monkeypatch.setattr(scope, 'resolve_run_scope', lambda _: None)
++    with pytest.raises(ModelRoutingError, match='no longer eligible'):
++        scope.placing_spawn(lambda *a, **kw: called.append(True), policy_for(context))(['fake'])
++    assert called == []
++
++
++def test_owner_spawn_accepts_eligible_unrefused_route(claimed, monkeypatch):
++    _, _, context = claimed
++    sentinel = object()
++    monkeypatch.setattr(scope, 'resolve_run_scope', lambda _: None)
++    assert scope.placing_spawn(lambda *a, **kw: sentinel, policy_for(context))(['fake']) is sentinel
++
++
++@pytest.mark.parametrize('actual', ['anthropic', None, 'openai-codex'])
++def test_worker_allocation_is_checked_before_execution(claimed, monkeypatch, actual):
++    _, _, context = claimed
++    policy = policy_for(context)
++    frame = {'policy': {'kanban_json': policy.kanban_json}}
++    calls = []
++    monkeypatch.setattr(construct, 'worker_route', lambda *a: {})
++    monkeypatch.setattr('gateway.session_kanban.record_start_failure', lambda *a: None)
++
++    def factory(**kwargs):
++        from agent.model_routing_exclusions import provider_allowed
++        assert not provider_allowed('anthropic') and provider_allowed('openai-codex')
++        calls.append(kwargs)
++        return SimpleNamespace(provider=actual, model='gpt-test',
++                               shutdown_memory_provider=lambda _: None, release_clients=lambda: None)
++
++    if actual != 'openai-codex':
++        with pytest.raises(ModelRoutingError, match='Safety exclusion'):
++            managed_worker._construct_agent(frame, factory, policy, model='gpt-test', provider='openai-codex')
++    else:
++        agent = managed_worker._construct_agent(frame, factory, policy, model='gpt-test', provider='openai-codex')
++        assert agent.provider == actual
++    assert len(calls) == 1
++
++
++def test_worker_refuses_new_exclusion_before_adapter_called(claimed, monkeypatch):
++    _, _, context = claimed
++    policy = policy_for(context, 'anthropic', 'sonnet-test')
++    calls = []
++    monkeypatch.setattr(construct, 'worker_route', lambda *a: {})
++    monkeypatch.setattr('gateway.session_kanban.record_start_failure', lambda *a: None)
++    with pytest.raises(ModelRoutingError, match='Safety exclusion'):
++        managed_worker._construct_agent({'policy': {'kanban_json': policy.kanban_json}},
++                                       lambda **kw: calls.append(kw), policy)
++    assert calls == []
++
++
++def test_request_boundary_rejects_late_provider_change(claimed, monkeypatch):
++    from agent import model_routing_managed as managed
++    _, _, context = claimed
++    agent = SimpleNamespace(model='gpt-test', provider='anthropic', _kanban_refusal_policy=policy_for(context))
++    monkeypatch.setattr(managed, 'managed_config', lambda: None)
++    with pytest.raises(ModelRoutingError, match='Safety exclusion'):
++        managed.verify_managed_agent(agent, {'model': 'gpt-test'})
++
++
++def test_resolution_error_does_not_fall_back_to_profile(claimed, monkeypatch):
++    conn, task, _ = claimed
++    def unavailable(*a, **kw):
++        raise RuntimeError('fake policy reader unavailable')
++    monkeypatch.setattr(tier, 'resolve_dispatch_tier', unavailable)
++    with pytest.raises(ModelRoutingError, match='concrete execution route'):
++        tier.apply_model_tier(conn, task, lane='ready')
++
++
++def test_unknown_eligibility_refuses_instead_of_assuming_available(claimed, monkeypatch):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    _, _, context = claimed
++    def unavailable(*a, **kw):
++        raise OSError('fake eligibility unavailable')
++    monkeypatch.setattr(refusal, 'eligible_routes', unavailable)
++    with pytest.raises(ModelRoutingError, match='eligibility unavailable'):
++        require_policy(policy_for(context))
++
++
++@pytest.mark.parametrize('field,value', [('status', 'done'), ('claim_lock', 'foreign'), ('ended_at', 10)])
++def test_refused_history_requires_live_exact_run(claimed, field, value):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    conn, _, context = claimed
++    with kb.write_txn(conn):
++        conn.execute(f'UPDATE task_runs SET {field}=? WHERE id=?', (value, context['run_id']))
++    with pytest.raises(ModelRoutingError, match='claim is stale'):
++        require_policy(policy_for(context))
++
++
++def test_missing_actual_model_never_uses_policy_default(claimed):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    _, _, context = claimed
++    with pytest.raises(ModelRoutingError, match='concrete execution route'):
++        require_policy(policy_for(context), model=None)
++
++
++def test_worker_route_fallback_refused_before_factory(claimed, monkeypatch):
++    _, _, context = claimed
++    policy = policy_for(context)
++    monkeypatch.setattr(construct, 'worker_route', lambda *a: {'provider': 'anthropic'})
++    monkeypatch.setattr('gateway.session_kanban.record_start_failure', lambda *a: None)
++    called = []
++    with pytest.raises(ModelRoutingError, match='Safety exclusion'):
++        managed_worker._construct_agent({'policy': {'kanban_json': policy.kanban_json}},
++                                       lambda **kw: called.append(kw), policy, model='gpt-test')
++    assert called == []
++
++
++def test_unreadable_history_never_reaches_factory(claimed, monkeypatch, tmp_path):
++    _, _, context = claimed
++    policy = policy_for({**context, 'db': str(tmp_path / 'missing.db')})
++    monkeypatch.setattr('gateway.session_kanban.record_start_failure', lambda *a: None)
++    called = []
++    with pytest.raises(ModelRoutingError, match='history unavailable'):
++        managed_worker._construct_agent({'policy': {'kanban_json': policy.kanban_json}},
++                                       lambda **kw: called.append(kw), policy)
++    assert called == []
+-- 
+2.43.0
+

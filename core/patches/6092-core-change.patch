@@ -1,0 +1,346 @@
+From 1a28450aeaaaaa88b95abd15562ee0ef4e552183 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:30:02 +0000
+Subject: [PATCH 6092] Kanban wake notices, ready-entry registry and external-park display
+
+Public mirror of source commit 1a28450aeaaaaa88b95abd15562ee0ef4e552183.
+
+---
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index dbf4140fd65..44958e056a9 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -988,7 +988,7 @@
+     last_at   INTEGER,
+     last_rc   INTEGER,
+     last_out  TEXT,
+-    fails     INTEGER NOT NULL DEFAULT 0, first_failure_at INTEGER,
++    fails     INTEGER NOT NULL DEFAULT 0, first_failure_at INTEGER, confirm_fails INTEGER NOT NULL DEFAULT 0,
+     generation TEXT, purpose TEXT NOT NULL DEFAULT 'wake'  -- 'wake' (park) | 'ask_resolved' (kanban_ask_resolved)
+ );
+ CREATE INDEX IF NOT EXISTS idx_wake_checks_next_at  ON task_wake_checks(next_at);
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 8302c41fac4..a2d71e72d5e 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1223,6 +1223,7 @@
+         _add_column_if_missing(conn, "task_wake_checks", "generation", "generation TEXT")
+         _add_column_if_missing(conn, "task_wake_checks", "purpose", "purpose TEXT NOT NULL DEFAULT 'wake'")
+         _add_column_if_missing(conn, "task_wake_checks", "first_failure_at", "first_failure_at INTEGER")
++        _add_column_if_missing(conn, "task_wake_checks", "confirm_fails", "confirm_fails INTEGER NOT NULL DEFAULT 0")
+     cols = _column_names(conn, "tasks")
+     for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
+         if name not in cols:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index baa13c1e405..bebb99d1cf7 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -111,7 +111,9 @@
+     return (
+         _arg("--wake-check", dest="wake_check", default=None,
+              help="Shell probe run while parked (bash -lc, 30 s timeout): exit 0 wakes the card at "
+-                  "once, exit 1 = not yet. Required for a park more than 2 h out unless --clock-only."),
++                  "once, exit 1 = not yet. On exit 0 the probe is run again at once and the card wakes only "
++                  "if that run exits 0 too: it must give the same answer when re-run seconds later. "
++                  "Required for a park more than 2 h out unless --clock-only."),
+         _arg("--check-every", dest="check_every", type=int, default=None,
+              help="Seconds between --wake-check probes (default 900, min 120, max 21600)"),
+         _arg("--clock-only", dest="clock_only", action="store_true",
+diff --git a/hermes_cli/kanban_ready_events.py b/hermes_cli/kanban_ready_events.py
+index 8fbe50d6b7d..f48d6a00a4b 100644
+--- a/hermes_cli/kanban_ready_events.py
++++ b/hermes_cli/kanban_ready_events.py
+@@ -14,7 +14,7 @@
+     "created", "promoted", "promoted_manual", "triage_swept",
+     "containment_released", "review_reopened", "reopened", "changes_requested",
+     "reclaimed", "unblocked", "continuation_woken", "condition_met",
+-    "wake_probe_stale", "wake_check_stale", "owner_restart_lost",
++    "wake_probe_stale", "wake_check_stale", "wake_check_flapping", "owner_restart_lost",
+     "wake_check_broken", "wake_check_lost", "ci_run_unstartable",
+     "wake_check_dead_ancestry", "external_ref_broken", "external_service_down",
+     "supervisor_request_wake",
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 56368b5a29e..1256870a735 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -890,10 +890,10 @@
+             return None
+         rc_col = rc if isinstance(rc, int) else -1
+         episode.reconcile(conn, task_id)
+-        if rc == 0 or (diagnostics and diagnostics.get("first_rc") == 0):
+-            episode.reset(conn, task_id)
+-            if rc != 0:
+-                kb._append_event(conn, task_id, "wake_episode_reset")
++        from hermes_cli.kanban_wake_confirm import note_result
++        flapping = note_result(conn, task_id, cmd, rc, tail, diagnostics)
++        if flapping:
++            return flapping
+         from hermes_cli import kanban_external_watch as kew  # [daveey] external-run card record + HERMES_WATCH
+         ext_result, delay = kew.note_probe(conn, task_id, cmd, rc, out, float(now), state["every"])
+         if rc == 0 or (ext_result and ext_result.get("outcome") in ("succeeded", "failed", "cancelled")):
+@@ -1145,13 +1145,16 @@
+     lines: list[str] = []
+     from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT
+ 
+-    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT, episode.STALE_EVENT)
++    from hermes_cli.kanban_wake_confirm import EVENT as FLAPPING_EVENT
++    kinds = (*SCHEDULED_ENTRY_EVENTS, CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT, episode.STALE_EVENT, FLAPPING_EVENT)
+     marks = ",".join("?" for _ in kinds)
+     row = conn.execute(
+         f"SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+         "ORDER BY id DESC LIMIT 1", (task_id, *kinds)).fetchone()
+-    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT, episode.STALE_EVENT):
++    if row is not None and row[0] in (CONDITION_MET_EVENT, BROKEN_EVENT, WAKE_PROBE_STALE_EVENT, episode.STALE_EVENT, FLAPPING_EVENT):
+         payload = kb._json_dict(row[1])
++        if row[0] == FLAPPING_EVENT:
++            return f"## Woken to fix a flapping wake check\n{payload.get('note', '')}\n"
+         if row[0] == episode.STALE_EVENT:
+             return f"## Woken to reconsider a never-passing wake check\n{payload.get('note', '')}\n"
+         if row[0] == WAKE_PROBE_STALE_EVENT and payload.get("reason") == PRODUCER_FINISHED:
+diff --git a/hermes_cli/kanban_wake_confirm.py b/hermes_cli/kanban_wake_confirm.py
+new file mode 100644
+index 00000000000..d76913b66ea
+--- /dev/null
++++ b/hermes_cli/kanban_wake_confirm.py
+@@ -0,0 +1,50 @@
++"""Durable consecutive pass-then-fail wake confirmations. [daveey]"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any
++
++EVENT = "wake_check_flapping"
++FAILED_EVENT = "wake_confirm_failed"
++AFTER = 3
++NOTE = (
++    "This card's wake_check passed and then failed its immediate confirm re-run 3 times in a row. "
++    "A passing probe is run twice and the card wakes only if both runs pass, so a probe that compares "
++    "against the record its own first run just wrote can never wake. Make it give the same answer "
++    "when re-run seconds later."
++)
++
++
++def note_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any,
++                tail: str, diagnostics: dict | None) -> str | None:
++    """Caller holds the write txn and has validated cmd, generation and scheduled status.
++
++    The counter belongs to the execution row: set_check deletes it on every re-park,
++    and _wake deletes it on every wake. The dispatcher's per-attempt generation claim
++    must NOT reset it, but still fences stale results before this helper is called.
++    Any result other than a failed confirmation breaks the consecutive streak.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_episode as episode
++    from hermes_cli.kanban_wake_check import _tail, _wake
++
++    if rc == 0 or (diagnostics and diagnostics.get("first_rc") == 0):
++        episode.reset(conn, task_id)
++        if rc != 0:
++            kb._append_event(conn, task_id, "wake_episode_reset")
++    failed = bool(diagnostics and diagnostics.get("first_rc") == 0 and rc != 0)
++    conn.execute("UPDATE task_wake_checks SET confirm_fails = "
++                 + ("confirm_fails + 1" if failed else "0") + " WHERE task_id = ?", (task_id,))
++    if not failed:
++        return None
++    count = conn.execute("SELECT confirm_fails FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()[0]
++    payload = {"wake_check": cmd, "first_rc": diagnostics["first_rc"],
++               "first_output": _tail(diagnostics.get("first_output", "")),
++               "confirm_rc": rc, "confirm_output": tail, "confirm_fails": count}
++    kb._append_event(conn, task_id, FAILED_EVENT, payload)
++    if count < AFTER:
++        return None
++    woke = _wake(conn, task_id, EVENT, {**payload, "note": NOTE})
++    if woke:
++        kb.add_comment(conn, task_id, "kanban-dispatcher", NOTE)
++    return woke
+diff --git a/tests/hermes_cli/test_kanban_wake_confirm.py b/tests/hermes_cli/test_kanban_wake_confirm.py
+new file mode 100644
+index 00000000000..e87a953fa2e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_confirm.py
+@@ -0,0 +1,167 @@
++"""Immediate confirm failures must be visible and eventually wake their owner."""
++from __future__ import annotations
++
++import shlex
++import sys
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_wake_check as base
++
++kanban_home = base.kanban_home
++BUILD, _events, _running = base.BUILD, base._events, base._running
++
++SENTENCE = ("On exit 0 the probe is run again at once and the card wakes only if that run exits 0 too: "
++            "it must give the same answer when re-run seconds later.")
++NOTE = ("This card's wake_check passed and then failed its immediate confirm re-run 3 times in a row. "
++        "A passing probe is run twice and the card wakes only if both runs pass, so a probe that compares "
++        "against the record its own first run just wrote can never wake. Make it give the same answer "
++        "when re-run seconds later.")
++
++
++def _park(conn, cmd):
++    tid = _running(conn)
++    assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for release",
++                     wake_check=cmd, check_every=120, awaiting=BUILD)
++    return tid
++
++
++@pytest.fixture
++def pair_probe(tmp_path):
++    script = tmp_path / "pair.py"
++    history = tmp_path / "history"
++    enabled = tmp_path / "enabled"
++    steady = tmp_path / "steady"
++    script.write_text("import pathlib, sys\n"
++                      f"p = pathlib.Path({str(history)!r})\n"
++                      f"enabled = pathlib.Path({str(enabled)!r})\n"
++                      f"steady = pathlib.Path({str(steady)!r})\n"
++                      "if not enabled.exists(): sys.exit(1)\n"
++                      "if steady.exists(): print('steady'); sys.exit(0)\n"
++                      "n = int(p.read_text()) if p.exists() else 0\n"
++                      "p.write_text(str(n + 1))\n"
++                      "print(('first ' if n % 2 == 0 else 'confirm ') + 'x' * 600)\n"
++                      "sys.exit(n % 2)\n")
++    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}", enabled, steady
++
++
++def test_three_pairs_survive_restart_and_wake_once(kanban_home, pair_probe):
++    cmd, enabled, _ = pair_probe
++    with kbc.connect_closing() as conn:
++        tid = _park(conn, cmd)
++    enabled.touch()
++    now = int(time.time())
++    for cycle in range(3):
++        # A fresh dispatcher connection each cycle; the real runner also claims a new generation.
++        with kbc.connect_closing() as conn:
++            assert kwc.run_due_wake_checks(conn, now=now + cycle * 121, wait=True)["submitted"] == [tid]
++            events = _events(conn, tid, "wake_confirm_failed")
++            assert len(events) == cycle + 1
++            payload = events[-1].payload
++            assert payload["first_rc"] == 0 and payload["confirm_rc"] == 1
++            assert payload["first_output"] == "x" * kwc.OUTPUT_TAIL_CHARS
++            assert payload["confirm_output"] == "x" * kwc.OUTPUT_TAIL_CHARS
++            assert len(_events(conn, tid, "wake_episode_reset")) == cycle + 1
++            assert kb.get_task(conn, tid).status == ("ready" if cycle == 2 else "scheduled")
++    with kbc.connect_closing() as conn:
++        assert len(_events(conn, tid, "wake_check_flapping")) == 1
++        comment = conn.execute("SELECT author, body FROM task_comments WHERE task_id=?", (tid,)).fetchall()
++        assert NOTE in kwc.render_wake_context(conn, tid)
++        assert ("kanban-dispatcher", NOTE) in [tuple(row) for row in comment]
++        kwc.run_due_wake_checks(conn, now=now + 1000, wait=True)
++        assert len(_events(conn, tid, "wake_check_flapping")) == 1
++
++
++def test_passing_confirm_wakes_normally_and_repark_resets(kanban_home, pair_probe):
++    cmd, enabled, steady = pair_probe
++    with kbc.connect_closing() as conn:
++        tid = _park(conn, cmd)
++        enabled.touch()
++        now = int(time.time())
++        kwc.run_due_wake_checks(conn, now=now, wait=True)
++        assert kb.get_task(conn, tid).status == "scheduled"
++        steady.touch()
++        kwc.run_due_wake_checks(conn, now=now + 121, wait=True)
++        assert kb.get_task(conn, tid).status == "ready"
++        assert len(_events(conn, tid, "condition_met")) == 1
++        assert kwc.get_state(conn, tid) is None
++        steady.unlink()
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            kwc.set_check(conn, tid, cmd, 120, now=now + 242)
++        for cycle in range(2):
++            kwc.run_due_wake_checks(conn, now=now + 242 + cycle * 121, wait=True)
++            assert kb.get_task(conn, tid).status == "scheduled"
++
++
++@pytest.mark.parametrize("change_cmd", [False, True])
++def test_repark_discards_streak_and_old_result(kanban_home, pair_probe, change_cmd):
++    cmd, enabled, _ = pair_probe
++    with kbc.connect_closing() as conn:
++        tid = _park(conn, cmd)
++        enabled.touch()
++        now = int(time.time())
++        kwc.run_due_wake_checks(conn, now=now, wait=True)
++        old = kwc.get_state(conn, tid)["generation"]
++        new_cmd = cmd + " # new" if change_cmd else cmd
++        with kb.write_txn(conn):
++            kwc.set_check(conn, tid, new_cmd, 120, now=now + 121)
++        kwc.apply_result(conn, tid, cmd, 1, "old", generation=old,
++                         diagnostics={"first_rc": 0, "first_output": "old", "confirm_rc": 1})
++        for cycle in range(2):
++            kwc.run_due_wake_checks(conn, now=now + 121 + cycle * 121, wait=True)
++            assert kb.get_task(conn, tid).status == "scheduled"
++        assert not _events(conn, tid, "wake_check_flapping")
++
++
++def test_confirm_rule_documented():
++    from tools.kanban_tools_schemas import _WAKE_CHECK_PROPS
++    from hermes_cli.kanban_parser import build_parser
++
++    assert SENTENCE in _WAKE_CHECK_PROPS["wake_check"]["description"]
++    import argparse
++    parser = build_parser(argparse.ArgumentParser().add_subparsers())
++    schedule = parser._subparsers._group_actions[0].choices["schedule"]
++    action = next(a for a in schedule._actions if a.dest == "wake_check")
++    assert SENTENCE in action.help
++
++
++def test_legacy_migration_adds_zero_counter(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _park(conn, "exit 1")
++        with kb.write_txn(conn):
++            conn.execute("ALTER TABLE task_wake_checks DROP COLUMN confirm_fails")
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT confirm_fails FROM task_wake_checks WHERE task_id=?", (tid,)).fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("rc", [1, 2, "timeout"])
++def test_nonconfirm_result_breaks_streak(kanban_home, rc):
++    with kbc.connect_closing() as conn:
++        tid = _park(conn, "exit 1")
++        generation = kwc.get_state(conn, tid)["generation"]
++        failed = {"first_rc": 0, "first_output": "first", "confirm_rc": 1}
++        kwc.apply_result(conn, tid, "exit 1", 1, "confirm", generation=generation, diagnostics=failed)
++        kwc.apply_result(conn, tid, "exit 1", rc, "waiting", generation=generation)
++        for _ in range(2):
++            kwc.apply_result(conn, tid, "exit 1", 1, "confirm", generation=generation, diagnostics=failed)
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert not _events(conn, tid, "wake_check_flapping")
++
++
++@pytest.mark.parametrize("rc", [2, "timeout"])
++def test_nonzero_confirm_diagnostics_and_threshold(kanban_home, rc):
++    with kbc.connect_closing() as conn:
++        tid = _park(conn, "exit 1")
++        generation = kwc.get_state(conn, tid)["generation"]
++        for _ in range(3):
++            kwc.apply_result(conn, tid, "exit 1", rc, "confirm", generation=generation,
++                             diagnostics={"first_rc": 0, "first_output": "first", "confirm_rc": rc})
++        assert kb.get_task(conn, tid).status == "ready"
++        assert _events(conn, tid, "wake_confirm_failed")[-1].payload["confirm_rc"] == rc
++        assert len(_events(conn, tid, "wake_check_flapping")) == 1
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 174ecf1ac83..20bc6a0fe14 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -294,7 +294,9 @@
+     "wake_check": _prop("string", (
+         "Shell command probed by the dispatcher while the card is parked (bash -lc, 30 s "
+         "timeout, cwd = the task workspace): exit 0 = the condition holds and the card wakes "
+-        "at once (its stdout reaches the next run), exit 1 = not yet. Any other exit 3 times in "
++        "at once (its stdout reaches the next run), exit 1 = not yet. "
++        "On exit 0 the probe is run again at once and the card wakes only if that run exits 0 too: "
++        "it must give the same answer when re-run seconds later. Any other exit 3 times in "
+         "a row wakes the card to fix the probe. REQUIRED for a wait on any readable fact (a DB "
+         "row, a git tag, a file, a log line, a service state) that wakes more than 2 h out, e.g. "
+         "`gh api repos/O/R/tags --jq '.[].name' | grep -q '^v2'`. A probe alone is not a producer: "
+-- 
+2.43.0
+

@@ -1,0 +1,186 @@
+From d9bbbc0472cc5898db3ea4ba39192050f045b4b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:31:56 +0000
+Subject: [PATCH 6455] Sync loop efficiency and write ordering
+
+Public mirror of source commit d9bbbc0472cc5898db3ea4ba39192050f045b4b9.
+
+---
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index bc3b3228e99..62a73cf4f81 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -59,6 +59,24 @@
+     return None if header is None else [header] + schema_rows(conn)
+ 
+ 
++_OWN_PATH = type(Path())  # this platform's concrete class, never a subclass with its own text
++
++
++def reader_key(path: Any) -> str:
++    """``str(Path(path).absolute())``, the kept reader's key, without building a path to get it.
++
++    ``absolute()`` returns an absolute path unchanged and ``Path(p)`` gives a path its own text
++    back, so for an absolute path of the platform's own class ``str(path)`` is that expression.
++    The sync loop asks with such paths on every wait tick, for every board, and the expression
++    ran twice per question. Anything else (a ``str``, a relative path, a subclass) still takes
++    the expression on every call: the working directory is read each time and nothing is kept
++    between calls. Only the spelling of the key is decided here; ``_conn`` stats it every read.
++    """
++    if type(path) is _OWN_PATH and path.is_absolute():
++        return str(path)
++    return str(Path(path).absolute())
++
++
+ class BoardWatch:
+     """One long-lived read-only connection per board file, for the sync loop's cheap questions.
+ 
+@@ -81,12 +99,12 @@
+         self._gen = 0
+         self._answers: dict[str, dict[str, tuple[Any, Any]]] = {}  # path -> tag -> (data_version, answer)
+ 
+-    def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
++    def _conn(self, key: str) -> Optional[tuple[sqlite3.Connection, int]]:
+         # Keep the requested spelling (including symlink/.. semantics). stat
+         # follows the current target on every read; inode changes reopen it.
+         # Aliases may own separate readers, bounded by MAX, instead of walking
+         # every path component twice per unchanged query with realpath.
+-        key = str(Path(path).absolute())
++        # *key* is ``reader_key(path)``, built once per read by the caller.
+         try:
+             st = os.stat(key)
+         except OSError:
+@@ -208,9 +226,9 @@
+         runs under the watch lock on a connection other readers share. A SQLite error drops the reader and
+         every answer for the path; any other exception propagates and stores nothing."""
+         with self._lock:
+-            key = str(Path(path).absolute())
++            key = reader_key(path)
+             try:
+-                got = self._conn(path)
++                got = self._conn(key)
+                 if got is None:
+                     return None
+                 conn, gen = got
+diff --git a/tests/hermes_cli/test_kanban_sync_watch_paths.py b/tests/hermes_cli/test_kanban_sync_watch_paths.py
+index 8be9eb7df0f..f66f310999d 100644
+--- a/tests/hermes_cli/test_kanban_sync_watch_paths.py
++++ b/tests/hermes_cli/test_kanban_sync_watch_paths.py
+@@ -115,3 +115,114 @@
+         assert watch.query(parent / 'board.db', SQL, unchanged_ok=True)[1] == (3,)
+     finally:
+         watch.reset()
++
++
++def _legacy_key(path):
++    from pathlib import Path
++    return str(Path(path).absolute())
++
++
++class _OddPath(type(watch_module.Path())):
++    """A path whose text is not its location: only the platform's own class may skip the expression."""
++
++    def __str__(self):
++        return '/nowhere/odd.db'
++
++
++def _spellings(tmp_path):
++    from pathlib import Path
++    board = tmp_path / 'parent' / 'board.db'
++    return [
++        board, board.parent / 'nested' / '..' / 'board.db', tmp_path / 'link' / '..' / 'board.db',
++        Path(str(board) + '/'), Path('//' + str(board).lstrip('/')), Path(str(tmp_path) + '/./parent/board.db'),
++        board.absolute(), board.resolve(), board.with_name('other.db'), Path('/'),
++        Path('board.db'), Path('parent/board.db'), Path('link/../board.db'), Path('./board.db'), Path('.'), Path(''),
++        str(board), 'board.db', 'link/../board.db', str(board) + '/', '//' + str(board).lstrip('/'), '',
++        _OddPath(board), _OddPath('board.db'),
++    ]
++
++
++def test_reader_key_is_the_legacy_expression(tmp_path, monkeypatch):
++    other = tmp_path / 'elsewhere'
++    other.mkdir()
++    for cwd in (tmp_path, other):
++        monkeypatch.chdir(cwd)
++        for spelling in _spellings(tmp_path):
++            assert watch_module.reader_key(spelling) == _legacy_key(spelling), (cwd, spelling)
++
++
++def test_warm_query_builds_no_path(tmp_path, monkeypatch):
++    path = make_board(tmp_path / 'board.db', 1)
++    watch = watch_module.BoardWatch()
++    try:
++        assert watch.query(path, SQL, unchanged_ok=True)[1] == (1,)
++        built = Mock(wraps=watch_module.Path)
++        monkeypatch.setattr(watch_module, 'Path', built)
++        assert watch.query(path, SQL, unchanged_ok=True)[1] == (1,)
++        assert watch.query(path, SQL)[1] == (1,)
++        assert built.call_count == 0
++        # A spelling the short cut does not cover is still spelled by the expression, once a read.
++        assert watch.query(str(path), SQL, unchanged_ok=True)[1] == (1,)
++        assert built.call_count == 1
++        assert list(watch._conns) == [str(path)]
++    finally:
++        watch.reset()
++
++
++def test_relative_key_tracks_cwd(tmp_path, monkeypatch):
++    from pathlib import Path
++    a, b = tmp_path / 'a', tmp_path / 'b'
++    a.mkdir()
++    b.mkdir()
++    make_board(a / 'board.db', 1)
++    make_board(b / 'board.db', 2)
++    watch = watch_module.BoardWatch()
++    try:
++        for spelling in (Path('board.db'), 'board.db'):
++            monkeypatch.chdir(a)
++            assert watch.query(spelling, SQL, unchanged_ok=True)[1] == (1,)
++            monkeypatch.chdir(b)
++            assert watch.query(spelling, SQL, unchanged_ok=True)[1] == (2,)
++            assert set(watch._conns) == {str(a / 'board.db'), str(b / 'board.db')}
++            assert set(watch._answers) == set(watch._conns)
++    finally:
++        watch.reset()
++
++
++def test_reader_and_answers_share_one_key(tmp_path, monkeypatch):
++    from pathlib import Path
++    make_board(tmp_path / 'board.db', 1)
++    make_board(tmp_path / 'next.db', 2)
++    monkeypatch.chdir(tmp_path)
++    watch = watch_module.BoardWatch()
++    try:
++        for spelling in (Path('board.db'), tmp_path / 'board.db', _OddPath(tmp_path / 'board.db')):
++            assert watch.query(spelling, SQL, unchanged_ok=True)[1] == (1,)
++            assert list(watch._conns) == list(watch._answers) == [str(tmp_path / 'board.db')]
++    finally:
++        watch.reset()
++
++
++def test_replaced_file_revalidates_warm_reader(tmp_path):
++    path = make_board(tmp_path / 'board.db', 1)
++    old_image = path.read_bytes()
++    newer = make_board(tmp_path / 'newer.db', 2)
++    os.utime(path, ns=(1_000_000_000, 1_000_000_000))  # any later write moves the mtime, whatever its grain
++    watch = watch_module.BoardWatch()
++    try:
++        first = watch.query(path, SQL, unchanged_ok=True)
++        assert first[1] == (1,)
++        os.replace(newer, path)  # another inode under the same name
++        second = watch.query(path, SQL, unchanged_ok=True)
++        assert second[1] == (2,) and second[0] != first[0]
++        os.utime(path, ns=(2_000_000_000, 2_000_000_000))
++        assert watch.query(path, SQL, unchanged_ok=True)[1] == (2,)
++        reader = watch._conns[str(path)][1]
++        with open(path, 'r+b') as raw:  # the same inode, older bytes written over it
++            raw.write(old_image)
++            raw.truncate()
++        third = watch.query(path, SQL, unchanged_ok=True)
++        assert third[1] == (1,)
++        assert watch._conns[str(path)][1] is not reader
++    finally:
++        watch.reset()
+-- 
+2.43.0
+

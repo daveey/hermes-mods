@@ -1,0 +1,455 @@
+From 2db86d3f15b53743f01b4fa0bd443ec250dae0d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:21:27 +0000
+Subject: [PATCH 6006] Kanban dispatcher: bounded storage waits and typed verdicts
+
+Public mirror of source commit 2db86d3f15b53743f01b4fa0bd443ec250dae0d7.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 793a6a2cb78..ed87b36d921 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -245,7 +245,8 @@
+     a failure — a long quota window must never trip the circuit breaker."""
+     skipped_locked: bool = False
+     """True when another process held the board's dispatch lock: this tick did
+-    no DB writes; the lock holder is making progress on the same board."""
++    no DB writes; this alone does not establish the lock holder's progress."""
++    dispatch_diagnostic: Optional[dict] = None  # historical locked dry-run evidence, never admission
+     at_capacity: Optional[str] = None
+     """``"max_in_progress=6/6"`` / ``"max_spawn=3/3"`` when the host or board concurrency cap was full this
+     tick, so no worker could start. A ready queue held only by a full cap is correctly idle, not stuck:
+@@ -1905,9 +1906,8 @@
+     _kb._sync.pop_claim_deferral(task_id)
+     claimed = admitted_claim(conn, task_id, assignee, lane, ttl_seconds, spawn_fn, result)
+     if claimed is None:
+-        deferral = _kb._sync.pop_claim_deferral(task_id)
+-        if deferral is not None:  # the lane decides whether this refusal permits later candidates
+-            result.claim_deferred.append((task_id, deferral))
++        from hermes_cli.kanban_dispatch_verdict import claim_refused
++        claim_refused(result, task_id, _kb._sync.pop_claim_deferral(task_id))
+         return False
+     from hermes_cli.kanban_candidate_receipts import claimed as note_claimed
+     note_claimed(task_id)
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 77c4cfd913b..574cd710732 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -18,7 +18,7 @@
+ # classified or not, means the tick was not explained by the claim-quiet defer alone.
+ QUIET_COMPATIBLE_FIELDS = frozenset({
+     "quiet_deferred", "quiet_deadlines",                 # the quiet defer itself
+-    "skipped_locked", "skipped_owned",                   # rows filtered out before the check
++    "skipped_locked", "skipped_owned", "dispatch_diagnostic",  # rows filtered out before the check
+     "scheduling_admitted", "dispatch_owner", "lane_candidates", "admission_budget",  # per-tick census
+     "promoted", "auto_assigned_default", "supervisor_requests", "remote_archived", "reaped_terminal_workers",
+     "stopped_run_scopes", "agent_block_escalated", "ask_rechecked", "woken_continuations",
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 1b97c281f0a..b1ee3ac4430 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -125,15 +125,16 @@
+     """All tick effects are behind the identity read, under the canonical lock."""
+     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+     from hermes_cli.kanban_db_dispatch import DispatchResult
++    from hermes_cli.kanban_dispatch_verdict import locked
+     if getattr(conn, "_dispatch_open_contended", False):
+-        return DispatchResult(skipped_locked=True)
++        return DispatchResult(skipped_locked=True, dispatch_diagnostic=locked(conn) if dry_run else None)
+     try:
+         db_path = connection_db_path(conn, validate=False)
+     except (OSError, ValueError, sqlite3.Error) as exc:
+         return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+     with kbc._dispatch_tick_lock(db_path) as held:
+         if not held:
+-            return DispatchResult(skipped_locked=True)
++            return DispatchResult(skipped_locked=True, dispatch_diagnostic=locked(conn) if dry_run else None)
+         try:
+             connection_db_path(conn)
+             owner = get_dispatch_owner(db_path)
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 6a1b028573b..cca26b2c1ad 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -219,6 +219,8 @@
+ def _tick_skips(result: Any) -> list[tuple[str, str, Any, Optional[float], dict[str, Any]]]:
+     """``(task_id, reason, detail, until, extra)`` for every row ``result`` says the tick passed over."""
+     out: list[tuple[str, str, Any, Optional[float], dict[str, Any]]] = []
++    out += [(tid, "admission_deferred", "hub_claim_screen", None, {})
++            for tid in getattr(result, "admission_deferred", ())]
+     for name in ("skipped_ineligible", "capsule_refused", "no_progress_held", "claim_deferred"):
+         # A claim deferral carries who set it (local gate vs Board); the skip words read it back (:func:`words`).
+         out += [(tid, name, code, None, {"origin": code.origin} if getattr(code, "origin", None) else {})
+@@ -311,6 +313,7 @@
+ 
+ 
+ _WORDS = {
++    "admission_deferred": "held: hub claim screen deferred this card; retry next tick",
+     PINNED_QUOTA_WALL: "held: pinned model {detail} quota-walled",
+     LLM_PACED: "held: LLM quota pacing ({detail} pool)",
+     "review_provider_wall": "held: independent review routes walled on this host",
+diff --git a/hermes_cli/kanban_dispatch_verdict.py b/hermes_cli/kanban_dispatch_verdict.py
+new file mode 100644
+index 00000000000..7a7286459cd
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_verdict.py
+@@ -0,0 +1,52 @@
++"""Read-only diagnostics for a contended tick; never an admission decision. [daveey]"""
++from __future__ import annotations
++
++import sqlite3
++import time
++
++
++def claim_refused(result, task_id, deferral) -> None:
++    """Classify an unacquired claim without duplicating a claim-quiet refusal."""
++    if deferral is not None:
++        result.claim_deferred.append((task_id, deferral))
++    elif not any(tid == task_id for tid, _ in result.quiet_deferred):
++        result.claim_deferred.append((task_id, 'claim_not_acquired'))
++
++
++def print_historical(diagnostic) -> None:
++    """Render optional historical evidence separately from live admission."""
++    import json
++    if diagnostic:
++        print('Historical dispatch evidence: ' + json.dumps(diagnostic, sort_keys=True))
++
++
++def locked(conn) -> dict:
++    """Expose the last *completed* pass, explicitly historical and bounded.
++
++    Observer connections opened during tick contention may read evidence, but
++    must not run policy, acquire a lease, checkpoint WAL or invoke tick hooks.
++    Reading both tables in one SELECT pins the pass and its rows together.
++    """
++    out = dict(reason='dispatch_lock_contended', historical=True,
++               observed_at_ms=int(time.time() * 1000), source='unavailable',
++               last_pass_unavailable='no_completed_pass', receipts=[])
++    from hermes_cli.kanban_candidate_receipts import PASSES, TABLE, PER_PASS
++    try:
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (PASSES,)).fetchone():
++            return out
++        rows = conn.execute(
++            f'SELECT p.pass_id, p.worker, p.pass_time_ms, p.dropped, r.task_id, r.gate, r.reason, r.stage '
++            f'FROM {PASSES} p LEFT JOIN {TABLE} r ON r.pass_id=p.pass_id '
++            f'WHERE p.rowid=(SELECT MAX(rowid) FROM {PASSES}) ORDER BY r.id LIMIT ?', (PER_PASS,)).fetchall()
++        if not rows:
++            return out
++        first = rows[0]
++        out.update(source='last_completed_pass', pass_id=first[0], worker=first[1],
++                   pass_time_ms=first[2], dropped=first[3])
++        out.pop('last_pass_unavailable')
++        out['receipts'] = [dict(task_id=r[4], gate=r[5], reason=r[6], stage=r[7]) for r in rows if r[4]]
++        return out
++    except sqlite3.Error as exc:
++        out['last_pass_unavailable'] = 'evidence_read_failed'
++        out['error_type'] = type(exc).__name__
++        return out
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index feb005512bc..04f7c1a02fb 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -132,6 +132,7 @@
+             "shared_blocker_released": res.shared_blocker_released,
+             "shared_blocker_probed": res.shared_blocker_probed,
+             "skipped_locked": res.skipped_locked,
++            "dispatch_diagnostic": res.dispatch_diagnostic,
+             "skipped_owned": res.skipped_owned,
+             "dispatch_owner": res.dispatch_owner,
+             "ownership_error": res.ownership_error,
+@@ -191,6 +192,8 @@
+         print(f"Released (probe for an idle shared blocker): {', '.join(res.shared_blocker_probed)}")
+     if res.skipped_locked:
+         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
++        from hermes_cli.kanban_dispatch_verdict import print_historical
++        print_historical(res.dispatch_diagnostic)
+     if res.skipped_owned:
+         print(f"Skipped: dispatch owner {res.dispatch_owner or '(unknown)'}; "
+               f"{res.ownership_error or 'dispatcher identity does not match'}")
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index c4e2d1db2b0..b7896f97da0 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -10,33 +10,47 @@
+ 
+ def ensure_producer(conn, task_id: str) -> None:
+     """Repair pre-notice stops too; one durable producer receipt per spend-stop episode."""
+-    import json
++    # Most sweeps are no-ops. Do not queue for the global SQLite writer just
++    # to discover a live route: this runs before ready-card admission while the
++    # dispatcher holds its tick lock. Every actual repair is re-read below.
++    if _producer_repair(conn, task_id) is None:
++        return
+     with kb.write_txn(conn, allow_nested=True):
+-        stop = pending_episode(conn, task_id)
+-        if stop is None:
+-            return
+-        episode = stop.get("uid") or str(stop["id"])
+-        previous = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+-                                "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1",
+-                                (task_id, NOTICE, episode)).fetchone()
+-        payload = json.loads(stop["payload"] or "{}")
+-        from hermes_cli.kanban_refusal_receipt import restricted
+-        safety = restricted(conn, task_id)
+-        scope = execution_restricted(conn, task_id) and not safety
+-        prior = json.loads(previous[0]) if previous else None
+-        cause = 'safety_refusal' if safety else 'scope_stopped' if scope else None
+-        prior_route = prior.get('producer') if isinstance(prior, dict) else None
+-        route = episode_route(conn, task_id, episode) or prior_route
+-        live = _live_route(conn, route)
+-        if live and route == prior_route and (cause is None or prior.get('cause') == cause):
++        repair = _producer_repair(conn, task_id)
++        if repair is None:
+             return
+-        if cause:
+-            payload['cause'] = cause
++        episode, payload, route, live = repair
+         if not live:
+             route = producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
+         kb._append_event(conn, task_id, NOTICE, {**payload, "episode": episode, "producer": route})
+ 
+ 
++def _producer_repair(conn, task_id):
++    """Read-only need check; never authorizes a repair outside its transaction."""
++    import json
++    stop = pending_episode(conn, task_id)
++    if stop is None:
++        return None
++    episode = stop.get("uid") or str(stop["id"])
++    previous = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
++                            "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1",
++                            (task_id, NOTICE, episode)).fetchone()
++    payload = json.loads(stop["payload"] or "{}")
++    from hermes_cli.kanban_refusal_receipt import restricted
++    safety = restricted(conn, task_id)
++    scope = execution_restricted(conn, task_id) and not safety
++    prior = json.loads(previous[0]) if previous else None
++    cause = 'safety_refusal' if safety else 'scope_stopped' if scope else None
++    prior_route = prior.get('producer') if isinstance(prior, dict) else None
++    route = episode_route(conn, task_id, episode) or prior_route
++    live = _live_route(conn, route)
++    if live and route == prior_route and (cause is None or prior.get('cause') == cause):
++        return None
++    if cause:
++        payload['cause'] = cause
++    return episode, payload, route, live
++
++
+ 
+ def episode_route(conn, task_id: str, episode: str) -> dict | None:
+     """Reuse historical wrappers too; a closed same-episode decision is a disposition, not release."""
+diff --git a/tests/hermes_cli/test_kanban_dispatch_verdict.py b/tests/hermes_cli/test_kanban_dispatch_verdict.py
+new file mode 100644
+index 00000000000..a1a4718a160
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_verdict.py
+@@ -0,0 +1,126 @@
++"""A contended dispatcher is observable without executing a second tick."""
++from __future__ import annotations
++
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban_candidate_receipts as receipts
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from tests.hermes_cli import test_kanban_dispatch_lock as lock_fixtures
++
++kanban_home = lock_fixtures.kanban_home
++conn = lock_fixtures.conn
++
++
++@pytest.mark.parametrize('contended_open', [False, True])
++def test_locked_dry_run_returns_last_pass_without_writing(conn, monkeypatch, contended_open):
++    tid = kb.create_task(conn, title='Waiting', assignee='default')
++    with receipts.collect(worker='test', now_ms=123000) as capture:
++        receipts.note(tid, 'capacity', 'test capacity', stage='claim')
++    receipts.persist(conn, capture)
++    if contended_open:
++        monkeypatch.setattr(conn, '_dispatch_open_contended', True)
++    before = conn.total_changes
++    with kbc._dispatch_tick_lock(kb.kanban_db_path()) as held:
++        assert held
++        result = dispatch.dispatch_once(conn, dry_run=True, spawn_fn=lambda *a: pytest.fail('spawn'))
++    assert result.skipped_locked
++    diagnostic = result.dispatch_diagnostic
++    assert diagnostic['reason'] == 'dispatch_lock_contended'
++    assert diagnostic['source'] == 'last_completed_pass'
++    assert diagnostic['pass_time_ms'] == 123000
++    assert diagnostic['receipts'][0]['task_id'] == tid
++    assert diagnostic['receipts'][0]['reason'] == 'test capacity'
++    assert diagnostic['historical'] is True
++    assert conn.total_changes == before
++
++
++def test_locked_without_history_is_explicit(conn):
++    with kbc._dispatch_tick_lock(kb.kanban_db_path()):
++        result = dispatch.dispatch_once(conn, dry_run=True)
++    assert result.dispatch_diagnostic['reason'] == 'dispatch_lock_contended'
++    assert result.dispatch_diagnostic['source'] == 'unavailable'
++    assert result.dispatch_diagnostic['last_pass_unavailable'] == 'no_completed_pass'
++
++
++def test_locked_empty_completed_pass(conn):
++    with receipts.collect(worker='empty', now_ms=456000) as capture:
++        pass
++    receipts.persist(conn, capture)
++    with kbc._dispatch_tick_lock(kb.kanban_db_path()):
++        result = dispatch.dispatch_once(conn, dry_run=True)
++    assert result.dispatch_diagnostic['source'] == 'last_completed_pass'
++    assert result.dispatch_diagnostic['pass_time_ms'] == 456000
++    assert result.dispatch_diagnostic['receipts'] == []
++
++
++def test_locked_evidence_read_failure_is_explicit():
++    import sqlite3
++    from hermes_cli.kanban_dispatch_verdict import locked
++    with sqlite3.connect(':memory:') as closed:
++        pass
++    closed.close()
++    result = locked(closed)
++    assert result['source'] == 'unavailable'
++    assert result['last_pass_unavailable'] == 'evidence_read_failed'
++    assert result['error_type'] == 'ProgrammingError'
++
++
++@pytest.mark.parametrize('as_json', [False, True])
++def test_cli_exposes_locked_verdict(conn, monkeypatch, capsys, as_json):
++    from hermes_cli import kanban_ops
++    from contextlib import contextmanager
++    @contextmanager
++    def connected():
++        yield conn
++    monkeypatch.setattr(kbc, 'connect_closing', connected)
++    with kbc._dispatch_tick_lock(kb.kanban_db_path()):
++        assert kanban_ops._cmd_dispatch(argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=as_json)) == 0
++    output = capsys.readouterr().out
++    if as_json:
++        payload = json.loads(output)
++        assert payload['skipped_locked'] is True
++        assert payload['dispatch_diagnostic']['reason'] == 'dispatch_lock_contended'
++    else:
++        assert 'Historical dispatch evidence:' in output
++        assert 'dispatch_lock_contended' in output
++
++
++@pytest.mark.parametrize('refusal', ['claim', 'screen'])
++def test_free_slot_refusal_is_never_silent(conn, monkeypatch, all_assignees_spawnable, refusal):
++    from hermes_cli import kanban_dispatch_skip as skip
++    from hermes_cli import kanban_db_dispatch_admission as admission
++    from hermes_cli import kanban_hub_admission_claim as screen
++    from tests.hermes_cli.test_kanban_quota_episode import routing
++    routing(monkeypatch)
++    tid = kb.create_task(conn, title='Ready with free capacity', assignee='default')
++    if refusal == 'claim':
++        monkeypatch.setattr(admission, 'admitted_claim', lambda *a: None)
++        expected = 'claim_deferred'
++    else:
++        original = screen.screened_lanes
++        def deferred(c, dry_run, review_enabled, unjudged):
++            ready, review, held = original(c, dry_run, review_enabled, unjudged)
++            return [r for r in ready if r['id'] != tid], review, {*held, tid}
++        monkeypatch.setattr(screen, 'screened_lanes', deferred)
++        expected = 'admission_deferred'
++    for _ in range(2):
++        result = dispatch.dispatch_once(conn, max_spawn=10, max_in_progress=10,
++                                       spawn_fn=lambda *a: pytest.fail('refused card spawned'))
++        assert not result.spawned
++        assert skip.latest(conn, tid)['reason'] == expected
++    events = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='dispatch_skipped'", (tid,)).fetchone()[0]
++    assert events == 1
++
++
++def test_admission_screen_deferral_has_durable_reason(conn):
++    from hermes_cli import kanban_dispatch_skip as skip
++    tid = kb.create_task(conn, title='Screened', assignee='default')
++    result = dispatch.DispatchResult(admission_deferred=[tid])
++    assert skip.record_tick(conn, result) == 1
++    assert skip.latest(conn, tid)['reason'] == 'admission_deferred'
++    assert skip.record_tick(conn, result) == 0  # bounded event history, current observation retained
+diff --git a/tests/hermes_cli/test_kanban_spend_route_repair.py b/tests/hermes_cli/test_kanban_spend_route_repair.py
+index 45357ed2b7b..abcb3997a4a 100644
+--- a/tests/hermes_cli/test_kanban_spend_route_repair.py
++++ b/tests/hermes_cli/test_kanban_spend_route_repair.py
+@@ -101,6 +101,73 @@
+         assert kb.get_task(conn, first).status == "triage"
+ 
+ 
++@pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
++def test_live_route_sweep_needs_no_writer_lock(kanban_home, monkeypatch, cause):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        decision.ensure_producer(conn, tid)
++        count = len(helpers._events(conn, tid, decision.NOTICE))
++        def forbidden(*args, **kwargs):
++            pytest.fail("unchanged decision route must not wait for the SQLite writer")
++        monkeypatch.setattr(kb, "write_txn", forbidden)
++        decision.repair_triage_routes(conn, skip=set())
++        assert len(helpers._events(conn, tid, decision.NOTICE)) == count
++        assert decision.pending(conn, tid)
++
++
++def test_ready_card_reaches_spawn_past_unchanged_spend_routes(
++        kanban_home, monkeypatch, all_assignees_spawnable):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from tests.hermes_cli.test_kanban_quota_episode import routing
++    routing(monkeypatch)
++    with kbc.connect_closing() as conn:
++        stopped = _stop(conn, "scope_stopped")
++        decision.ensure_producer(conn, stopped)
++        ready = kb.create_task(conn, title="Ready with free slot", assignee="default")
++        real = decision.ensure_producer
++        real_txn = kb.write_txn
++        checking = [False]
++        def no_writer_for_noop(*args, **kwargs):
++            if checking[0]:
++                pytest.fail("pre-admission no-op maintenance waited for the writer")
++            return real_txn(*args, **kwargs)
++        def checked(c, tid):
++            checking[0] = True
++            try:
++                return real(c, tid)
++            finally:
++                checking[0] = False
++        monkeypatch.setattr(kb, "write_txn", no_writer_for_noop)
++        monkeypatch.setattr(decision, "ensure_producer", checked)
++        spawned = []
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda task, ws: spawned.append(task.id),
++                                        max_spawn=10, max_in_progress=10)
++        assert ready in spawned
++        assert any(row[0] == ready for row in result.spawned)
++        assert kb.get_task(conn, stopped).status == "triage"
++        assert decision.pending(conn, stopped)
++
++
++def test_repair_rechecks_after_writer_acquisition(kanban_home, monkeypatch):
++    from contextlib import contextmanager
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn)
++        original = kb.write_txn
++        calls = []
++        @contextmanager
++        def raced(c, **kwargs):
++            # Another writer supplied a live route after the read-only check.
++            monkeypatch.setattr(kb, 'write_txn', original)
++            decision.ensure_producer(c, tid)
++            calls.append('other_writer')
++            with original(c, **kwargs):
++                yield
++        monkeypatch.setattr(kb, 'write_txn', raced)
++        decision.ensure_producer(conn, tid)
++        assert calls == ['other_writer']
++        assert len(helpers._events(conn, tid, decision.NOTICE)) == 1
++
++
+ def test_resolved_episode_does_not_reopen_closed_producer(kanban_home):
+     with kbc.connect_closing() as conn:
+         tid = _stop(conn)
+-- 
+2.43.0
+

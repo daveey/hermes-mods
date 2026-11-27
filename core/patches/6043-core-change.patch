@@ -1,0 +1,602 @@
+From ccaa596bb109dc71a486dc4dfb856bf16858c77c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 03:24:15 +0000
+Subject: [PATCH 6043] Fact store, reducer and capture CPU reductions
+
+Public mirror of source commit ccaa596bb109dc71a486dc4dfb856bf16858c77c.
+
+---
+diff --git a/hermes_cli/fact_annotation_membership.py b/hermes_cli/fact_annotation_membership.py
+index ce77425683e..da08c2f274a 100644
+--- a/hermes_cli/fact_annotation_membership.py
++++ b/hermes_cli/fact_annotation_membership.py
+@@ -6,7 +6,7 @@
+ covered by these two sources.
+ """
+ from contextlib import closing
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass
+ import hashlib
+ import json
+ from pathlib import Path
+@@ -14,7 +14,7 @@
+ import time
+ 
+ from hermes_cli.fact_capture import CaptureBudgetExceeded
+-from hermes_cli.fact_contract import Fact, FactKey
++from hermes_cli.fact_contract import Fact, FactKey, evolve
+ from hermes_cli.fact_source_watch import NativeSourceWatch
+ 
+ 
+@@ -120,6 +120,6 @@
+ 
+     def failure(self):
+         old = self.engine.store.snapshot(self.engine.scope).get(self.key)
+-        fact = (replace(old, health='stale', error_code='annotation_capture_failed') if old is not None
++        fact = (evolve(old, health='stale', error_code='annotation_capture_failed') if old is not None
+                 and old.health != 'unknown' else Fact(self.key, {}, error_code='annotation_capture_failed'))
+         self.engine.publish([fact], now=time.time())
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+index 6c243cade6b..208ded9dcd6 100644
+--- a/hermes_cli/fact_board_inputs.py
++++ b/hermes_cli/fact_board_inputs.py
+@@ -14,7 +14,7 @@
+ import time
+ 
+ from hermes_cli.fact_capture import CaptureBudgetExceeded
+-from hermes_cli.fact_contract import Fact, FactKey, freeze
++from hermes_cli.fact_contract import Fact, FactKey, evolve, freeze
+ from hermes_cli.fact_store import view_key
+ from hermes_cli.fact_source_watch import NativeSourceWatch
+ from hermes_cli.fact_capture_queue import submit
+@@ -152,7 +152,7 @@
+ 
+     def _fail(self, key):
+         old = self.engine.store.snapshot(self.engine.scope).get(key)
+-        fact = (replace(old, health='stale', error_code='board_capture_failed') if old is not None
++        fact = (evolve(old, health='stale', error_code='board_capture_failed') if old is not None
+                 else Fact(key, {}, error_code='board_capture_failed'))
+         self.engine.publish([fact], now=time.time())
+ 
+diff --git a/hermes_cli/fact_contract.py b/hermes_cli/fact_contract.py
+index c2208745f7d..f026ec52ad0 100644
+--- a/hermes_cli/fact_contract.py
++++ b/hermes_cli/fact_contract.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Mapping
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, fields
+ from types import MappingProxyType
+ from typing import Any, Literal
+ 
+@@ -72,10 +72,37 @@
+     error_code: str | None = None
+ 
+     def __post_init__(self) -> None:
++        # Freeze only: evolve() skips this for fields it copies, so any check added here must be added there too.
+         object.__setattr__(self, "value", freeze(self.value))
+         object.__setattr__(self, "source_vector", freeze(tuple(self.source_vector)))
+ 
+ 
++_FACT_FIELDS = tuple(item.name for item in fields(Fact))
++
++
++def evolve(fact: Fact, **changes: Any) -> Fact:
++    """``dataclasses.replace`` for a Fact that does not re-freeze what the Fact already holds. [daveey]
++
++    A Fact froze its value and source_vector when it was built, so a copy that only changes rev, health,
++    error_code or timing can share them. replace() runs __post_init__ again, which deep-walks the whole value
++    once per copy, adding unnecessary fact-change-feed work. A value or
++    source_vector given in *changes* is frozen as usual.
++    """
++    unknown = set(changes).difference(_FACT_FIELDS)
++    if unknown:
++        raise TypeError(f"unknown Fact field: {sorted(unknown)[0]}")
++    if type(fact) is not Fact:
++        raise TypeError("evolve requires a Fact")
++    copy = object.__new__(Fact)
++    for name in _FACT_FIELDS:
++        object.__setattr__(copy, name, changes[name] if name in changes else getattr(fact, name))
++    if "value" in changes:
++        object.__setattr__(copy, "value", freeze(changes["value"]))
++    if "source_vector" in changes:
++        object.__setattr__(copy, "source_vector", freeze(tuple(changes["source_vector"])))
++    return copy
++
++
+ @dataclass(frozen=True)
+ class Position:
+     epoch: str
+diff --git a/hermes_cli/fact_expiry.py b/hermes_cli/fact_expiry.py
+index 4073cfc44a5..b7070028624 100644
+--- a/hermes_cli/fact_expiry.py
++++ b/hermes_cli/fact_expiry.py
+@@ -2,7 +2,8 @@
+ import heapq
+ import threading
+ import time
+-from dataclasses import replace
++
++from hermes_cli.fact_contract import evolve
+ 
+ 
+ class ExpiryIndex:
+@@ -34,7 +35,7 @@
+             self.current.pop(key, None)
+             fact = store._facts.get(key)
+             if fact is not None and fact.rev == rev:
+-                prepared.append((replace(fact, health="stale", error_code="validity_expired", valid_until=None),
++                prepared.append((evolve(fact, health="stale", error_code="validity_expired", valid_until=None),
+                                  store._sizes[key]))
+         if prepared:
+             store._publish(prepared, ())
+diff --git a/hermes_cli/fact_reducers.py b/hermes_cli/fact_reducers.py
+index 702b0820122..78498e5e430 100644
+--- a/hermes_cli/fact_reducers.py
++++ b/hermes_cli/fact_reducers.py
+@@ -4,15 +4,15 @@
+ 
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass
+ from graphlib import TopologicalSorter
+ 
+-from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_contract import Fact, FactKey, Scope, evolve
+ from hermes_cli.fact_store import FactStore, Snapshot
+ 
+ 
+ def _changed(old: Fact | None, new: Fact | None) -> bool:
+-    return old != (replace(new, rev=old.rev if old else 0) if new else None)
++    return old != (evolve(new, rev=old.rev if old else 0) if new else None)
+ 
+ 
+ class StagedSnapshot:
+@@ -137,7 +137,7 @@
+             raise ValueError("source scope mismatch")
+         if any(key.kind in self._specs for key in staged):
+             raise ValueError("source cannot publish a derived key")
+-        staged = {key: replace(fact, rev=base.rev + 1) if fact else None
++        staged = {key: evolve(fact, rev=base.rev + 1) if fact else None
+                   for key, fact in staged.items() if _changed(base.get(key), fact)}
+         dirty = self._closure(set(staged) | self._pending)
+         snapshot = StagedSnapshot(base, staged)
+@@ -146,7 +146,7 @@
+             fact, edges[key] = self._reduce(key, snapshot, now)
+             old = base.get(key)
+             if _changed(old, fact):
+-                staged[key] = replace(fact, rev=base.rev + 1) if fact else None
++                staged[key] = evolve(fact, rev=base.rev + 1) if fact else None
+             # Unchanged outputs remain visible through the base snapshot. Do
+             # not send them through FactStore's wire validation/encoding again;
+             # still install newly discovered edges after successful publication.
+diff --git a/hermes_cli/fact_remote_links.py b/hermes_cli/fact_remote_links.py
+index c840cf2d8bb..dc2fc4dc933 100644
+--- a/hermes_cli/fact_remote_links.py
++++ b/hermes_cli/fact_remote_links.py
+@@ -16,7 +16,7 @@
+ import time
+ 
+ from hermes_cli.fact_capture import CaptureBudget, CaptureBudgetExceeded
+-from hermes_cli.fact_contract import Fact, FactKey, freeze
++from hermes_cli.fact_contract import Fact, FactKey, evolve, freeze
+ 
+ _current = ContextVar('remote_links_facts', default=None)
+ 
+@@ -198,7 +198,7 @@
+ 
+     def failure(self, error_code='links_capture_failed'):
+         old = self.engine.store.snapshot(self.engine.scope).get(self.key)
+-        fact = (replace(old, health='stale', error_code=error_code) if old is not None
++        fact = (evolve(old, health='stale', error_code=error_code) if old is not None
+                 and old.health != 'unknown' else Fact(self.key, {}, error_code=error_code))
+         self.engine.publish([fact], now=time.time())
+         from hermes_cli.fact_links_health import changed
+diff --git a/hermes_cli/fact_replica.py b/hermes_cli/fact_replica.py
+index 9c41b357d57..4c4c89d2027 100644
+--- a/hermes_cli/fact_replica.py
++++ b/hermes_cli/fact_replica.py
+@@ -8,7 +8,7 @@
+ import logging
+ import time
+ 
+-from hermes_cli.fact_contract import Delta, Fact, FactKey, Position, Ready, Pending, Unavailable
++from hermes_cli.fact_contract import Delta, Fact, FactKey, Position, Ready, Pending, Unavailable, evolve
+ from hermes_cli.fact_ipc import connect, receive, send
+ from hermes_cli.fact_demand import DemandChannel
+ from hermes_cli.fact_map import FactMap
+@@ -29,7 +29,7 @@
+ 
+     def get(self, key):
+         fact = super().get(key)
+-        return fact if self.online or fact is None else replace(fact, health="stale", error_code="owner_disconnected")
++        return fact if self.online or fact is None else evolve(fact, health="stale", error_code="owner_disconnected")
+ 
+ 
+ class ReplicaV1:
+@@ -67,7 +67,7 @@
+     def _health(self, delta):
+         if self._handle._online:
+             return delta
+-        return replace(delta, upserts=tuple(replace(f, health="stale", error_code="owner_disconnected")
++        return replace(delta, upserts=tuple(evolve(f, health="stale", error_code="owner_disconnected")
+                                             for f in delta.upserts))
+ 
+ 
+diff --git a/hermes_cli/fact_source_commit.py b/hermes_cli/fact_source_commit.py
+index 2eb482d8a93..fa07bd09245 100644
+--- a/hermes_cli/fact_source_commit.py
++++ b/hermes_cli/fact_source_commit.py
+@@ -9,9 +9,9 @@
+ 
+ import json
+ import time
+-from dataclasses import asdict, replace
++from dataclasses import asdict
+ 
+-from hermes_cli.fact_contract import Fact, FactKey, freeze
++from hermes_cli.fact_contract import Fact, FactKey, evolve
+ 
+ 
+ class SourcePublisher:
+@@ -41,14 +41,14 @@
+         return FactKey(self.source.scope, self.kind, token)
+ 
+     def _fact(self, key, value, snapshot, capture, vector):
+-        value = freeze(value)
++        # Built first so the row is frozen once, not once to compare and again to store. [daveey]
++        fact = Fact(key, value, source_vector=vector, observed_at=capture.observed_at, health='fresh')
+         old = snapshot.get(key)
+         # Unchanged rows retain provenance/observation, avoiding false dirty
+         # dependencies on FULL or a cursor-only wake. Recovery changes health.
+-        if old is not None and old.value == value:
+-            return replace(old, health='fresh', error_code=None)
+-        return Fact(key, value, source_vector=vector,
+-                    observed_at=capture.observed_at, health='fresh')
++        if old is not None and old.value == fact.value:
++            return evolve(old, health='fresh', error_code=None)
++        return fact
+ 
+     def commit(self, capture):
+         if capture.before != self.cursor:
+@@ -85,7 +85,7 @@
+                 old = snapshot.get(self.key(identity))
+                 if old is None:
+                     raise ValueError('source membership lost')
+-                facts.append(replace(old, health='fresh', error_code=None))
++                facts.append(evolve(old, health='fresh', error_code=None))
+         if membership_changed or previous_membership is None or previous_membership.health != 'fresh':
+             facts.append(self._fact(self.membership_key, membership_value, snapshot, capture, vector))
+         facts.append(self._fact(self.state_key, {'source_kind': self.source.kind,
+@@ -104,7 +104,7 @@
+         facts = []
+         for key in keys:
+             old = snapshot.get(key)
+-            facts.append(replace(old, health='stale' if self.cursor is not None else 'unknown',
++            facts.append(evolve(old, health='stale' if self.cursor is not None else 'unknown',
+                                  error_code='source_unavailable') if old else
+                          Fact(key, None, health='unknown', error_code='source_unavailable'))
+         self.engine.publish(facts, now=time.time())
+diff --git a/hermes_cli/fact_store.py b/hermes_cli/fact_store.py
+index bbfcdbc6265..42819644c04 100644
+--- a/hermes_cli/fact_store.py
++++ b/hermes_cli/fact_store.py
+@@ -7,11 +7,12 @@
+ import threading
+ import uuid
+ from collections import deque
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass
+ import logging
+ from collections.abc import Iterable, Mapping
+ 
+-from hermes_cli.fact_contract import Delta, Fact, FactKey, Pending, Position, Ready, Scope, Unavailable
++from hermes_cli.fact_contract import (Delta, Fact, FactKey, Pending, Position, Ready, Scope, Unavailable,
++                                      evolve)
+ from hermes_cli.fact_map import FactMap
+ from hermes_cli.fact_expiry import ExpiryIndex
+ from hermes_cli.fact_wire import encode, encoded_size
+@@ -47,7 +48,7 @@
+ 
+ def _same_content(old: Fact | None, fact: Fact) -> bool:
+     """*fact* equals the stored *old* apart from ``rev``: publishing it changes nothing."""
+-    return old is not None and replace(fact, rev=old.rev) == old
++    return old is not None and evolve(fact, rev=old.rev) == old
+ 
+ 
+ class FactStore:
+@@ -152,11 +153,11 @@
+                 touched.add(key)
+             for fact, size in prepared:
+                 old = staged.get(fact.key)
+-                normalized = replace(fact, rev=old.rev if old else 0)
++                normalized = evolve(fact, rev=old.rev if old else 0)
+                 if old != normalized:
+                     if size is None:
+                         return None
+-                    staged = staged.put(fact.key, replace(fact, rev=self._rev + 1))
++                    staged = staged.put(fact.key, evolve(fact, rev=self._rev + 1))
+                     sizes = sizes.put(fact.key, size)
+                 touched.add(fact.key)
+             changed = frozenset(key for key in touched if self._facts.get(key) != staged.get(key))
+diff --git a/hermes_cli/fact_wire.py b/hermes_cli/fact_wire.py
+index 198af9db01c..768e252b72a 100644
+--- a/hermes_cli/fact_wire.py
++++ b/hermes_cli/fact_wire.py
+@@ -15,18 +15,34 @@
+ )}
+ 
+ 
++_CHUNK = 65536
++
++
+ def pack(value):
++    return _pack(value, None)
++
++
++def _pack(value, bytes_sizes):
++    """Transport form of *value*. With a *bytes_sizes* list, bytes pack as an empty chunk list and the length
++    their chunks would have added to the encoding is appended to *bytes_sizes* (sizing without base64)."""
+     if is_dataclass(value) and _TYPES.get(type(value).__name__) is type(value):
+-        return ["record", type(value).__name__, [pack(getattr(value, f.name)) for f in fields(value)]]
++        return ["record", type(value).__name__,
++                [_pack(getattr(value, f.name), bytes_sizes) for f in fields(value)]]
+     if isinstance(value, Mapping):
+-        return ["map", [[pack(k), pack(v)] for k, v in value.items()]]
++        return ["map", [[_pack(k, bytes_sizes), _pack(v, bytes_sizes)] for k, v in value.items()]]
+     if isinstance(value, bytes):
+-        return ["bytes", [base64.b64encode(value[i:i + 65536]).decode("ascii")
+-                          for i in range(0, len(value), 65536)]]
++        if bytes_sizes is not None:
++            # Each chunk encodes as a quoted base64 string ("..." = 4 per 3 bytes, rounded up), comma-separated.
++            whole, tail = divmod(len(value), _CHUNK)
++            chunks = [4 * -(-_CHUNK // 3)] * whole + ([4 * -(-tail // 3)] if tail else [])
++            bytes_sizes.append(sum(chunks) + 2 * len(chunks) + max(len(chunks) - 1, 0))
++            return ["bytes", []]
++        return ["bytes", [base64.b64encode(value[i:i + _CHUNK]).decode("ascii")
++                          for i in range(0, len(value), _CHUNK)]]
+     if isinstance(value, (tuple, list)):
+-        return ["tuple", [pack(v) for v in value]]
++        return ["tuple", [_pack(v, bytes_sizes) for v in value]]
+     if isinstance(value, (set, frozenset)):
+-        return ["set", [pack(v) for v in value]]
++        return ["set", [_pack(v, bytes_sizes) for v in value]]
+     if value is None or isinstance(value, (str, bool, int, float)):
+         return value
+     raise TypeError(type(value).__name__)
+@@ -57,9 +73,18 @@
+     return unpack(json.loads(data))
+ 
+ 
++_SIZER = json.JSONEncoder(ensure_ascii=True, separators=(",", ":"), allow_nan=False)
++
++
+ def encoded_size(value):
+-    return sum(len(part) for part in json.JSONEncoder(
+-        ensure_ascii=True, separators=(",", ":"), allow_nan=False).iterencode(pack(value)))
++    """len(encode(value)), without building the encoding's bytes or any base64. [daveey]
++
++    JSONEncoder.iterencode() always runs json's pure-Python encoder, adding unnecessary sizing work on the
++    fact-change-feed thread. This uses the C one-shot encoder instead (ASCII-only, so
++    characters == bytes), and counts bytes payloads arithmetically so a large bytes view adds no transient copy.
++    """
++    bytes_sizes = []
++    return len(_SIZER.encode(_pack(value, bytes_sizes))) + sum(bytes_sizes)
+ 
+ 
+ def encode_into(value, stream, limit):
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+index fe6326e0a08..d801f9290d0 100644
+--- a/hermes_cli/sessions_native_source.py
++++ b/hermes_cli/sessions_native_source.py
+@@ -6,14 +6,14 @@
+ retains trailing hints; a failed selector cannot starve unrelated selectors.
+ """
+ from collections import OrderedDict
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass
+ import json
+ import logging
+ import threading
+ import time
+ 
+ from hermes_cli.fact_capture import CaptureBudgetExceeded
+-from hermes_cli.fact_contract import Fact
++from hermes_cli.fact_contract import Fact, evolve
+ from hermes_cli.fact_source_watch import NativeSourceWatch
+ from hermes_cli.fact_store import view_key
+ 
+@@ -178,7 +178,7 @@
+                 logger.warning('sessions capture unavailable reason=%s elapsed_seconds=%.3f encoded_bytes=%s',
+                                reason or 'reader_error', time.monotonic() - started, encoded_bytes)
+             old = self.store.snapshot(self.source.scope).get(key)
+-            fact = (replace(old, health='stale', error_code='sessions_capture_failed') if old is not None
++            fact = (evolve(old, health='stale', error_code='sessions_capture_failed') if old is not None
+                     else Fact(key, {}, error_code='sessions_capture_failed'))
+             with self._lock:
+                 if key in self._selectors:
+@@ -218,7 +218,7 @@
+             keys = tuple(self._selectors)
+             for key in keys:
+                 self._dirty.setdefault(key, None)
+-        stale = [replace(fact, health='stale', error_code='sessions_source_failed')
++        stale = [evolve(fact, health='stale', error_code='sessions_source_failed')
+                  for key in keys if (fact := snapshot.get(key)) is not None]
+         self.store.publish(stale)
+ 
+diff --git a/tests/hermes_cli/test_fact_evolve.py b/tests/hermes_cli/test_fact_evolve.py
+new file mode 100644
+index 00000000000..3fd06a8d2d7
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_evolve.py
+@@ -0,0 +1,164 @@
++"""Fact copies share their frozen value; sizing uses the C encoder. [daveey]
++
++Representative observation: the fact-change-feed thread held the GIL during repeated
++dataclasses.replace() walks of already frozen values and pure-Python encoded_size() work.
++"""
++import json
++from dataclasses import dataclass, replace
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import fact_contract, fact_wire
++from hermes_cli.fact_contract import Fact, FactKey, Scope, SourceId, evolve
++from hermes_cli.fact_reducers import ReducerEngine, ReducerSpec
++from hermes_cli.fact_source_commit import SourcePublisher
++from hermes_cli.fact_store import FactStore
++from hermes_cli.fact_wire import encode, encoded_size
++
++SCOPE = Scope("install", "profile", "board")
++
++
++def _big(n=200):
++    return {"rows": [{"id": str(i), "tags": ["a", "b"], "meta": {"n": i}} for i in range(n)]}
++
++
++@pytest.fixture
++def freezes(monkeypatch):
++    """Top-level freeze() walks (freeze recurses through the module name, so nested calls are not counted)."""
++    calls = []
++    depth = [0]
++    real = fact_contract.freeze
++
++    def counting(value):
++        if depth[0] == 0:
++            calls.append(type(value).__name__)
++        depth[0] += 1
++        try:
++            return real(value)
++        finally:
++            depth[0] -= 1
++
++    monkeypatch.setattr(fact_contract, "freeze", counting)
++    return calls
++
++
++def test_evolve_matches_replace_and_shares_the_frozen_value(freezes):
++    fact = Fact(FactKey(SCOPE, "View", "v"), _big(), rev=3, source_vector=[{"c": [1]}], observed_at=1.5,
++                valid_until=9.0, health="fresh")
++    for changes in ({"rev": 7}, {"health": "stale", "error_code": "x"}, {"valid_until": None},
++                    {"rev": 0, "health": "unknown", "observed_at": 2.0}):
++        expected = replace(fact, **changes)
++        freezes.clear()
++        copy = evolve(fact, **changes)
++        assert freezes == []
++        assert copy == expected
++        assert copy.value is fact.value and copy.source_vector is fact.source_vector
++        assert hash(copy.key) == hash(fact.key)
++
++
++def test_evolve_freezes_a_new_value_or_source_vector():
++    fact = Fact(FactKey(SCOPE, "View", "v"), {"a": 1})
++    raw = {"a": [1, {"b": 2}]}
++    copy = evolve(fact, value=raw, source_vector=[{"s": [1]}])
++    raw["a"][1]["b"] = 3
++    assert copy.value["a"] == (1, {"b": 2})
++    assert copy.source_vector == ({"s": (1,)},)
++    with pytest.raises(TypeError):
++        copy.value["a"] = 2
++    assert copy == Fact(FactKey(SCOPE, "View", "v"), {"a": [1, {"b": 2}]}, source_vector=[{"s": [1]}])
++
++
++def test_evolve_refuses_unknown_fields_and_non_facts():
++    fact = Fact(FactKey(SCOPE, "View", "v"), 1)
++    with pytest.raises(TypeError):
++        evolve(fact, revision=2)
++    with pytest.raises(TypeError):
++        evolve(SimpleNamespace(rev=1), rev=2)
++
++
++def test_store_publish_freezes_nothing_for_unchanged_or_changed_facts(freezes):
++    store = FactStore()
++    facts = [Fact(FactKey(SCOPE, "View", str(i)), _big(20)) for i in range(5)]
++    store.publish(facts)
++    changed = Fact(facts[0].key, {"other": [1, 2]})
++    freezes.clear()
++    store.publish(facts[1:])  # unchanged republish
++    store.publish([changed])
++    assert freezes == []
++    assert store.snapshot(SCOPE).get(facts[0].key).value == {"other": (1, 2)}
++
++
++def test_reducer_publish_freezes_only_what_reducers_build(freezes):
++    store = FactStore()
++    engine = ReducerEngine(store, SCOPE)
++    source = FactKey(SCOPE, "Input", "a")
++    output = FactKey(SCOPE, "View", "out")
++    engine.register(ReducerSpec("view", 1, "View", ("Input",), lambda key, snap: {source},
++                                lambda key, snap, now: Fact(key, {"n": snap.get(source).value}, health="fresh")))
++    engine.bind(output)
++    engine.publish([Fact(source, 1)], now=0)
++    upsert = Fact(source, 2)
++    freezes.clear()
++    engine.publish([upsert], now=1)
++    # one value + one source_vector freeze for the reducer's new output; none for the copies on the way in
++    assert len(freezes) == 2
++    assert store.snapshot(SCOPE).get(output).value == {"n": 2}
++
++
++@dataclass(frozen=True)
++class _Cursor:
++    n: int
++
++
++def test_source_commit_freezes_each_row_once(freezes):
++    store = FactStore()
++    engine = ReducerEngine(store, SCOPE)
++    publisher = SourcePublisher(engine, SourceId(SCOPE, "sessions", "local"), "RowInput")
++    rows = [{"id": str(i), "title": f"t{i}", "tags": ["a"]} for i in range(10)]
++
++    def capture(before, after, records):
++        return SimpleNamespace(before=before, after=after, ids=[r["id"] for r in records], records=records,
++                               full=True, observed_at=float(after.n))
++
++    publisher.commit(capture(None, _Cursor(1), rows))
++    unchanged = [dict(row) for row in rows]
++    unchanged[0]["title"] = "changed"
++    freezes.clear()
++    publisher.commit(capture(_Cursor(1), _Cursor(2), unchanged))
++    # per row: Fact.__post_init__ freezes value + source_vector once (2), never a second compare-only freeze;
++    # the state fact adds 2 more. The membership fact is unchanged and not rebuilt.
++    assert len(freezes) == 2 * len(rows) + 2
++    snap = store.snapshot(SCOPE)
++    assert snap.get(publisher.key("0")).value["title"] == "changed"
++    assert snap.get(publisher.key("1")).observed_at == 1.0  # unchanged row keeps its provenance
++
++
++@pytest.mark.parametrize("value", [
++    {"a": [1, 2.5, None, True], "s": "héllo ☃  ", "b": b"\x00\xff" * 40},
++    Fact(FactKey(SCOPE, "View", "v"), _big(50), source_vector=[{"c": 1}], health="fresh"),
++    frozenset({FactKey(SCOPE, "K", "x"), "y"}),
++    (),
++])
++def test_encoded_size_is_the_encoded_length(value):
++    assert encoded_size(value) == len(encode(value))
++
++
++@pytest.mark.parametrize("length", [0, 1, 2, 3, 4, 65535, 65536, 65537, 3 * 65536, 200_001])
++def test_encoded_size_counts_bytes_exactly(length):
++    data = bytes(range(256)) * (length // 256 + 1)
++    data = data[:length]
++    for value in (data, {"encoded": data, "n": 1}, [data, data[:7]],
++                  Fact(FactKey(SCOPE, "View", "v"), {"encoded": data}, health="fresh")):
++        assert encoded_size(value) == len(encode(value))
++
++
++def test_encoded_size_uses_neither_the_python_encoder_nor_base64(monkeypatch):
++    def refuse(*args, **kwargs):
++        raise AssertionError("slow or copying sizing path used")
++
++    value = Fact(FactKey(SCOPE, "View", "v"), dict(_big(5), encoded=b"x" * 300_000))
++    expected = len(encode(value))
++    monkeypatch.setattr(json.encoder, "_make_iterencode", refuse)
++    monkeypatch.setattr(fact_wire.base64, "b64encode", refuse)
++    assert encoded_size(value) == expected
+-- 
+2.43.0
+

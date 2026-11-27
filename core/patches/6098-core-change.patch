@@ -1,0 +1,1255 @@
+From 227a2d06b4faeb7b11e3f6f79776b6a4e9740878 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:12:04 +0000
+Subject: [PATCH 6098] Desktop startup-timeout recovery and gateway-drain retry
+
+Public mirror of source commit 227a2d06b4faeb7b11e3f6f79776b6a4e9740878.
+
+---
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 721fbdcac19..92563d142ef 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -582,6 +582,7 @@
+ } from './secret-storage-policy'
+ import { selectPathsDialogProperties } from './select-paths-dialog'
+ import { selectRunnableBinary } from './select-runnable-binary'
++import { isMergeableSessionListRequest, parseSessionRequestPath } from './session-owner-list-route'
+ import {
+   buildInstanceWindowUrl,
+   buildSessionWindowUrl,
+@@ -15255,17 +15256,13 @@
+ 
+   const method = (request.method || 'GET').toUpperCase()
+ 
+-  let parsed
++  const parsed = parseSessionRequestPath(request.path)
+ 
+-  try {
+-    parsed = new URL(request.path, 'http://x')
+-  } catch {
+-    return undefined
+-  }
++  if (!parsed) { return undefined }
+ 
+   const { pathname, searchParams } = parsed
+ 
+-  if (method === 'GET' && pathname === '/api/profiles/sessions') {
++  if (isMergeableSessionListRequest(method, pathname, searchParams)) {
+     const remoteProfiles = configuredRemoteProfileNames()
+ 
+     const registrySources = await pooledRegistrySessionSources(
+diff --git a/apps/desktop/electron/session-owner-list-route.test.ts b/apps/desktop/electron/session-owner-list-route.test.ts
+new file mode 100644
+index 00000000000..76869751f82
+--- /dev/null
++++ b/apps/desktop/electron/session-owner-list-route.test.ts
+@@ -0,0 +1,19 @@
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++
++import { test } from 'vitest'
++
++import { isMergeableSessionListRequest, parseSessionRequestPath } from './session-owner-list-route'
++
++test('owner proof stays on the pinned backend rather than best-effort sidebar union', () => {
++  assert.equal(parseSessionRequestPath('http://['), null)
++  assert.equal(parseSessionRequestPath('/api/profiles/sessions')?.pathname, '/api/profiles/sessions')
++  const params = new URLSearchParams('profile=all&archive_owner_lookup=1')
++  assert.equal(isMergeableSessionListRequest('GET', '/api/profiles/sessions', params), false)
++  assert.equal(isMergeableSessionListRequest('GET', '/api/profiles/sessions', new URLSearchParams('profile=all')), true)
++  assert.equal(isMergeableSessionListRequest('GET', '/api/profiles/sessions', new URLSearchParams('profile=work')), true)
++  assert.equal(isMergeableSessionListRequest('PATCH', '/api/profiles/sessions', params), false)
++  // Main's normal direct route still authenticates the explicit connection.
++  const main = readFileSync(new URL('./main.ts', import.meta.url), 'utf8')
++  assert.match(main, /if \(isMergeableSessionListRequest\(method, pathname, searchParams\)\)/)
++})
+diff --git a/apps/desktop/electron/session-owner-list-route.ts b/apps/desktop/electron/session-owner-list-route.ts
+new file mode 100644
+index 00000000000..1b0f2511062
+--- /dev/null
++++ b/apps/desktop/electron/session-owner-list-route.ts
+@@ -0,0 +1,10 @@
++/** Owner lookup explicitly enumerates captured connections. Do not substitute
++ * the best-effort sidebar union (which omits down connections) for that read.
++ * The normal pinned backend path still authenticates and scopes every request. */
++export function isMergeableSessionListRequest(method: string, pathname: string, params: URLSearchParams): boolean {
++  return method === 'GET' && pathname === '/api/profiles/sessions' && params.get('archive_owner_lookup') !== '1'
++}
++
++export function parseSessionRequestPath(path: string): URL | null {
++  try { return new URL(path, 'http://x') } catch { return null }
++}
+diff --git a/apps/desktop/src/api/client.ts b/apps/desktop/src/api/client.ts
+index 53dcf5c2a96..a766588b553 100644
+--- a/apps/desktop/src/api/client.ts
++++ b/apps/desktop/src/api/client.ts
+@@ -449,7 +449,7 @@
+     if (!this.readiness.ready) {
+       // The channel's own timeout text, which callers match (`plugins.manage`'s timedOut).
+       const seconds = Math.round((timeoutMs ?? DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS) / 1000)
+-      await this.readiness.wait(deadline, signal, () => new Error(`request timed out after ${seconds}s: ${method}`))
++      await this.readiness.wait(deadline, signal, () => new Error(method === 'session.resume' ? 'Hermes gateway is not connected: protocol readiness timed out' : `request timed out after ${seconds}s: ${method}`))
+       this.requireConnectionGeneration(generation)
+     }
+ 
+diff --git a/apps/desktop/src/api/gateway-drain.ts b/apps/desktop/src/api/gateway-drain.ts
+new file mode 100644
+index 00000000000..6f4cafb0e63
+--- /dev/null
++++ b/apps/desktop/src/api/gateway-drain.ts
+@@ -0,0 +1,11 @@
++/** Explicit maintenance/projection refusal, not a generic owner timeout.
++ * Electron may wrap an HTTP error in its IPC message; retain the producer's
++ * drain marker rather than treating every 503 as a restart. */
++export function isGatewayDrainError(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error)
++
++  const reason = error && typeof error === 'object' ? (error as { data?: { reason?: unknown } }).data?.reason : undefined
++
++  return reason === 'runtime_draining' || reason === 'gateway_draining' ||
++    /owner_unavailable:\s*(?:draining|starting)\b|\bgateway (?:is )?draining\b|\bruntime_draining\b|\bgateway_draining\b|\bsessions projection unavailable\b/i.test(message)
++}
+diff --git a/apps/desktop/src/api/session-write-reconnect.ts b/apps/desktop/src/api/session-write-reconnect.ts
+index fba489edf84..d2a9ab7e932 100644
+--- a/apps/desktop/src/api/session-write-reconnect.ts
++++ b/apps/desktop/src/api/session-write-reconnect.ts
+@@ -74,6 +74,8 @@
+   now?: () => number
+   sleep?: (ms: number) => Promise<void>
+   log?: (line: string) => void
++  /** The caller may hold a cancellable maintenance intent beyond a transport deadline. */
++  retryable?: (error: unknown) => boolean
+ }
+ 
+ function desktopLog(line: string): void {
+@@ -119,7 +121,7 @@
+         budgetMs = Math.max(budgetMs, options.ownerRestartBudgetMs ?? SESSION_WRITE_OWNER_RESTART_BUDGET_MS)
+       }
+ 
+-      const replayable = restarting || isReconnectableSessionWriteError(error)
++      const replayable = options.retryable ? options.retryable(error) : restarting || isReconnectableSessionWriteError(error)
+ 
+       if (!replayable || now() - started + wait > budgetMs) {
+         if (attempt > 1 || replayable) {
+diff --git a/apps/desktop/src/api/session-write-retry.test.ts b/apps/desktop/src/api/session-write-retry.test.ts
+index ce858be3072..a80481f14b1 100644
+--- a/apps/desktop/src/api/session-write-retry.test.ts
++++ b/apps/desktop/src/api/session-write-retry.test.ts
+@@ -4,9 +4,13 @@
+ 
+ vi.mock('@/lib/legacy-session-owner-backfill', () => ({ maybeBackfillLegacySessionOwners: vi.fn() }))
+ vi.mock('@/store/transcript-tail', () => ({ recordTranscriptTail: vi.fn() }))
++vi.mock('@/app/session/hooks/use-session-actions/archive-queue-lifetime', () => ({ archiveQueueLifetime: () => ({
++  run: (run: () => Promise<unknown>) => run(), enqueue: vi.fn(), sleep: async () => {}, dispose: vi.fn()
++}) }))
+ vi.mock('./client', async importOriginal => ({
+   ...await importOriginal<typeof ClientApi>(), hermesApi: vi.fn()
+ }))
++import { archiveDrainWrite } from '@/app/session/hooks/use-session-actions/archive-drain-write'
+ import { sessionWriteRetryAction } from '@/lib/session-write-retry'
+ 
+ import { hermesApi, setApiRequestConnection, setApiRequestProfile } from './client'
+@@ -62,6 +66,16 @@
+     expected_generation: 3, request_id: expect.any(String) })
+ })
+ 
++it('a drain retries the real fenced PATCH with unchanged identity and no new snapshot', async () => {
++  const seen = owner(4, [new Error('503: {"detail":"owner_unavailable: draining: Exclusive maintenance refused"}')])
++  const pinned = pinSessionWriteOwner('work')
++  await archiveDrainWrite('drain-chat', {} as never, () => setSessionArchived('drain-chat', true, pinned))
++  expect(seen.writes).toHaveLength(2)
++  expect(seen.reads()).toBe(1)
++  expect(seen.writes[1]).toEqual(seen.writes[0])
++  expect(seen.writes[0].body).toMatchObject({ archived: true, request_id: expect.any(String), expected_revision: 4 })
++})
++
+ it('a selected row rename is fenced on its own gateway', async () => {
+   const seen = owner(9, [STALLED])
+   const row = { connectionId: 'mini', profile: 'work' }
+diff --git a/apps/desktop/src/app/chat/composer/gateway-restart-notice.test.tsx b/apps/desktop/src/app/chat/composer/gateway-restart-notice.test.tsx
+new file mode 100644
+index 00000000000..d6af9ead7df
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/gateway-restart-notice.test.tsx
+@@ -0,0 +1,20 @@
++import { act, render, screen } from '@testing-library/react'
++import { expect, it, vi } from 'vitest'
++
++vi.mock('@/api/client', () => ({ ambientOwnerConnectionId: () => 'hub' }))
++vi.mock('@/store/session', () => ({ getSessionOwnerHint: () => undefined }))
++import { holdRestartingSessionResume } from '@/store/session-resume-restart'
++
++import { GatewayRestartNotice } from './gateway-restart-notice'
++
++it('paints Hub restarting while that owner/session waits, then clears without losing the draft', () => {
++  const releaseOther = holdRestartingSessionResume(JSON.stringify(['other', 'chat']))
++  render(<><input defaultValue="retained draft" /><GatewayRestartNotice sessionId="chat" /></>)
++  expect(screen.queryByRole('status')).toBeNull()
++  let release!: () => void
++  act(() => { release = holdRestartingSessionResume(JSON.stringify(['hub', 'chat'])) })
++  expect(screen.getByRole('status').textContent).toBe('Hub restarting…')
++  expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('retained draft')
++  act(() => { release(); releaseOther() })
++  expect(screen.queryByRole('status')).toBeNull()
++})
+diff --git a/apps/desktop/src/app/chat/composer/gateway-restart-notice.tsx b/apps/desktop/src/app/chat/composer/gateway-restart-notice.tsx
+new file mode 100644
+index 00000000000..4ff110d4001
+--- /dev/null
++++ b/apps/desktop/src/app/chat/composer/gateway-restart-notice.tsx
+@@ -0,0 +1,23 @@
++import { useStore } from '@nanostores/react'
++
++import { ambientOwnerConnectionId } from '@/api/client'
++import { useI18n } from '@/i18n'
++import { getSessionOwnerHint } from '@/store/session'
++import { $restartingSessionResumes, sessionResumeIsRestarting } from '@/store/session-resume-restart'
++
++import { ActionBadges } from './micro-actions'
++
++/** A real status line, not just a placeholder hidden under a retained draft. */
++export function GatewayRestartNotice({ sessionId }: { sessionId?: string | null }) {
++  const pending = useStore($restartingSessionResumes)
++  const { t } = useI18n()
++  const connectionId = (sessionId && getSessionOwnerHint(sessionId)?.connectionId) || ambientOwnerConnectionId()
++
++  return sessionResumeIsRestarting(sessionId, connectionId, pending)
++    ? <div className="text-xs text-muted-foreground" role="status">{t.composer.placeholderHubRestarting}</div>
++    : null
++}
++
++export function ComposerConnectionBadges({ sessionId, storedSessionId }: { sessionId: string | null; storedSessionId?: string | null }) {
++  return <><GatewayRestartNotice sessionId={storedSessionId ?? sessionId} /><ActionBadges sessionId={sessionId} /></>
++}
+diff --git a/apps/desktop/src/app/chat/composer/index.tsx b/apps/desktop/src/app/chat/composer/index.tsx
+index d3d58f6afa8..def58c65c3e 100644
+--- a/apps/desktop/src/app/chat/composer/index.tsx
++++ b/apps/desktop/src/app/chat/composer/index.tsx
+@@ -63,6 +63,7 @@
+ import { ComposerDirectiveActions } from './directive-actions'
+ import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
+ import { markActiveComposer, onComposerAttachImagesRequest } from './focus'
++import { ComposerConnectionBadges } from './gateway-restart-notice'
+ import { HelpHint } from './help-hint'
+ import { useAtCompletions } from './hooks/use-at-completions'
+ import { useCardWaitingSubmit } from './hooks/use-card-waiting-submit'
+@@ -87,7 +88,6 @@
+ import { useStatusDrawer } from './hooks/use-status-drawer'
+ import { useSessionStatusPresence } from './hooks/use-status-presence'
+ import { shouldConvertPasteToAttachment } from './large-paste'
+-import { ActionBadges } from './micro-actions'
+ import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
+ import { PreparedImageRecovery } from './prepared-image-recovery'
+ import { renderComposerQueueSlot, useComposerQueueScopeKey } from './queue-slot'
+@@ -1308,7 +1308,7 @@
+               5px transparent grab margin — so both strips carry the same inset
+               and share one left edge with it. */}
+           <div className={cn(composerFloatingStrip, 'px-[5px] pb-1.5 empty:hidden')}>
+-            <ActionBadges sessionId={statusSessionId} />
++            <ComposerConnectionBadges sessionId={statusSessionId} storedSessionId={queueSessionKey} />
+             <PreparedImageRecovery
+               occupied={hasText || attachments.length > 0 || busy || disabled}
+               onRestore={(text, restored, id) => {
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/drain-resume.test.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/drain-resume.test.ts
+new file mode 100644
+index 00000000000..904b9fbd1cb
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/drain-resume.test.ts
+@@ -0,0 +1,52 @@
++import { afterEach, expect, it, vi } from 'vitest'
++
++import { clearSingleFlightSessionResumeState, singleFlightSessionResume } from './single-flight-resume'
++import { resumeStoredRuntimeSession } from './utils'
++
++// Both production entry paths must wait INSIDE the shared flight, before any
++// prompt can be admitted. No prompt replay is part of restart recovery.
++afterEach(() => { clearSingleFlightSessionResumeState(); vi.useRealTimers() })
++
++it('open resume holds draining then closed transport until the replacement answers', async () => {
++  vi.useFakeTimers()
++
++  const run = vi.fn().mockRejectedValueOnce(Object.assign(new Error('runtime_draining'), { code: 4001, data: { reason: 'runtime_draining' } }))
++    .mockRejectedValueOnce(new Error('Hermes gateway connection closed'))
++    .mockResolvedValueOnce({ session_id: 'new-runtime' })
++
++  const result = singleFlightSessionResume('drain-open', run, { scope: { connectionId: 'hub', profile: 'work' } })
++  const joiner = singleFlightSessionResume('drain-open', run, { scope: { connectionId: 'hub', profile: 'work' } })
++  const outcome = Promise.all([result, joiner])
++  await vi.runAllTimersAsync()
++  await expect(outcome).resolves.toEqual([{ session_id: 'new-runtime' }, { session_id: 'new-runtime' }])
++  expect(run).toHaveBeenCalledTimes(3)
++})
++
++it('pre-send recovery waits through restart and submits exactly once on the new runtime', async () => {
++  vi.useFakeTimers()
++
++  const requestGateway = vi.fn().mockRejectedValueOnce(new Error('Gateway is draining existing work; retry shortly.'))
++    .mockResolvedValueOnce({ session_id: 'new-runtime' })
++
++  const submit = vi.fn()
++
++  const pending = resumeStoredRuntimeSession('drain-send', { requestGateway: requestGateway as never,
++    resolveProfile: async () => 'work' }).then(runtime => submit(runtime))
++
++  await vi.advanceTimersByTimeAsync(0)
++  expect(submit).not.toHaveBeenCalled()
++  await vi.runAllTimersAsync()
++  await pending
++  expect(submit).toHaveBeenCalledExactlyOnceWith('new-runtime')
++  expect(requestGateway.mock.calls.map(([method, params]) => [method, params.profile])).toEqual([
++    ['session.resume', 'work'], ['session.resume', 'work']
++  ])
++})
++
++it('does not hide an ordinary timeout or permission refusal behind restart recovery', async () => {
++  for (const error of [new Error('request timed out after 30s: session.resume'), new Error('permission_denied')]) {
++    const run = vi.fn().mockRejectedValue(error)
++    await expect(singleFlightSessionResume('terminal', run)).rejects.toBe(error)
++    expect(run).toHaveBeenCalledOnce()
++  }
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/resume-across-restart.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/resume-across-restart.ts
+new file mode 100644
+index 00000000000..f5b35119b80
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/resume-across-restart.ts
+@@ -0,0 +1,33 @@
++import { isGatewayDrainError } from '@/api/gateway-drain'
++import { isReconnectableSessionWriteError, withSessionWriteReconnect } from '@/api/session-write-reconnect'
++import { holdRestartingSessionResume } from '@/store/session-resume-restart'
++
++/** Only resume is replayable here. Never wrap prompt.submit: a restart-wait
++ * owner may already have durably queued that prompt. Pool/boot code owns the
++ * redial; each call of run enters its existing owner-pinned recovery route. */
++export async function resumeAcrossGatewayRestart<T>(key: string, run: () => Promise<T>): Promise<T> {
++  let release: (() => void) | undefined
++  let draining = false
++
++  try {
++    return await withSessionWriteReconnect(async () => {
++      try { return await run() } catch (error) {
++        draining ||= isGatewayDrainError(error)
++
++        if (retryableResume(error, draining)) { release ??= holdRestartingSessionResume(key) }
++        throw error
++      }
++    }, { label: `resume-restart ${key}`, budgetMs: 600_000,
++      retryable: error => retryableResume(error, draining) })
++  } finally { release?.() }
++}
++
++function retryableResume(error: unknown, draining: boolean): boolean {
++  const message = error instanceof Error ? error.message : String(error)
++
++  if ((error as { name?: unknown })?.name === 'AbortError') { return false }
++
++  return isGatewayDrainError(error) || isReconnectableSessionWriteError(error) ||
++    /Hermes gateway (?:is not connected|connection closed|connection changed|unavailable|protocol readiness timed out)|Backend .* is reconnecting; retry after it settles|Timed out waiting for the Hermes gateway to reconnect/i.test(message) ||
++    (draining && /request timed out/i.test(message))
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/single-flight-resume.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/single-flight-resume.ts
+index 149b19e025c..ee62a678729 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/single-flight-resume.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/single-flight-resume.ts
+@@ -1,5 +1,7 @@
+ import { ambientOwnerConnectionId, type ProfileScope } from '@/api/client'
+ 
++import { resumeAcrossGatewayRestart } from './resume-across-restart'
++
+ /**
+  * Single-flight guard for `session.resume`, keyed by backend connection + STORED id.
+  *
+@@ -56,7 +58,7 @@
+   const ready = existing ? existing.promise.then(() => undefined, () => undefined) : Promise.resolve()
+ 
+   const promise = ready
+-    .then(run)
++    .then(() => resumeAcrossGatewayRestart(flightKey, run))
+     .finally(() => {
+       if (_inFlightResumeByStoredSessionId.get(flightKey) === flight) {
+         _inFlightResumeByStoredSessionId.delete(flightKey)
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-across-restart.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-across-restart.ts
+new file mode 100644
+index 00000000000..f6d42f9bd9c
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-across-restart.ts
+@@ -0,0 +1,46 @@
++import { ambientOwnerConnectionId } from '@/api/client'
++import { isGatewayDrainError } from '@/api/gateway-drain'
++import { isReconnectableSessionWriteError, withSessionWriteReconnect } from '@/api/session-write-reconnect'
++import type { SessionOwnerScope } from '@/store/session-request-router'
++import { holdRestartingSessionResume } from '@/store/session-resume-restart'
++
++import { SessionRecoveryAborted } from './utils'
++
++/** ONLY identified submissions may enter this boundary. A lost ACK is replayed
++ * with the exact saved submission_id/payload: the owner returns its receipt,
++ * including restart-wait's queued/unknown verdict, never a second admission.
++ * An identityless legacy send must never enter this function. */
++export async function submitAcrossGatewayRestart<T>(options: {
++  storedSessionId: string | null
++  owner: SessionOwnerScope
++  driftReason: () => string | null
++  onUncertain: () => void
++}, run: () => Promise<T>): Promise<T> {
++  let release: (() => void) | undefined
++  const connectionId = typeof options.owner === 'object' && options.owner
++    ? options.owner.connectionId : ambientOwnerConnectionId()
++  const key = JSON.stringify([connectionId || '', options.storedSessionId])
++
++  try {
++    return await withSessionWriteReconnect(async () => {
++      const drift = options.driftReason()
++      if (drift) { throw new SessionRecoveryAborted(drift, '') }
++
++      try { return await run() } catch (error) {
++        if (retryable(error)) {
++          options.onUncertain()
++          release ??= holdRestartingSessionResume(key)
++        }
++        throw error
++      }
++    }, { label: `submit-restart ${options.storedSessionId}`, budgetMs: 600_000, retryable })
++  } finally { release?.() }
++}
++
++function retryable(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error)
++
++  return isGatewayDrainError(error) || isReconnectableSessionWriteError(error) ||
++
++    /Hermes gateway (?:is not connected|connection closed|unavailable)|Backend .* is reconnecting; retry after it settles|Timed out waiting for the Hermes gateway to reconnect/i.test(message)
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-drain.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-drain.test.tsx
+new file mode 100644
+index 00000000000..3be31e57048
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-drain.test.tsx
+@@ -0,0 +1,124 @@
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import { en } from '@/i18n/en'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $activeGatewayProfile } from '@/store/profile'
++import { $connection, $sessions } from '@/store/session'
++import { $restartingSessionResumes } from '@/store/session-resume-restart'
++import { $sessionStates } from '@/store/session-states'
++
++import { storedJournal } from './prepared-submissions-test-utils'
++import { useSubmitPrompt } from './submit'
++
++vi.mock('@/store/gateway', async original => ({
++  ...(await original<Record<string, unknown>>()),
++  retainGatewayForSessionTurn: vi.fn(async () => () => undefined)
++}))
++
++beforeEach(() => {
++  localStorage.clear(); $sessions.set([]); $sessionStates.set({}); $connection.set(null)
++  $activeGatewayProfile.set('default')
++})
++afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers() })
++
++const draining = () => new JsonRpcGatewayError('runtime_draining', { code: 4001, data: { reason: 'runtime_draining' } })
++const legacyRefusal = () => new JsonRpcGatewayError("unknown field 'submission_id'", { code: 4000 })
++
++function mount(request: ReturnType<typeof vi.fn>, runtime: string | null = 'old-runtime') {
++  let state = createClientSessionState('stored-a')
++  const selected = { current: 'stored-a' as string | null }
++  const deps = {
++    activeSessionIdRef: { current: runtime }, selectedStoredSessionIdRef: selected, busyRef: { current: false }, copy: en.desktop,
++    createBackendSessionForSend: vi.fn(async () => null), getRoutedStoredSessionId: () => null,
++    getRuntimeIdForStoredSession: () => runtime, getRouteToken: () => 'same-route', requestGateway: request,
++    runtimeIdByStoredSessionIdRef: { current: new Map([['stored-a', runtime]]) }, resumeStoredSession: vi.fn(),
++    syncAttachmentsForSubmit: vi.fn(async (sessionId: string) => ({ sessionId, attachments: [] })),
++    updateSessionState: vi.fn((_id: string, update: (s: typeof state) => typeof state) => { state = update(state); return state })
++  }
++  const hook = renderHook(() => useSubmitPrompt(deps as never))
++  return { send: () => hook.result.current('after restart', { submission_id: 'same-input' }), selected, state: () => state }
++}
++
++function receipt(params?: Record<string, unknown>) {
++  return { status: 'started', session_id: params?.session_id, submission_id: params?.submission_id, user_row_id: 42 }
++}
++
++it('actual pre-send resume waits through drain before admitting the one prompt', async () => {
++  vi.useFakeTimers()
++  let resumes = 0
++  const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++    if (method === 'session.resume') {
++      if (++resumes === 1) { throw draining() }
++      return { session_id: 'new-runtime' }
++    }
++    return receipt(params)
++  })
++  const view = mount(request, null)
++  let sent!: Promise<boolean>
++  await act(async () => { sent = view.send(); await vi.advanceTimersByTimeAsync(0) })
++  expect(request.mock.calls.filter(([method]) => method === 'prompt.submit')).toHaveLength(0)
++  expect($restartingSessionResumes.get().size).toBe(1)
++  await act(async () => { await vi.runAllTimersAsync(); expect(await sent).toBe(true) })
++  const submits = request.mock.calls.filter(([method]) => method === 'prompt.submit')
++  expect(submits).toHaveLength(1)
++  expect(submits[0][1]).toMatchObject({ session_id: 'new-runtime', submission_id: 'same-input' })
++  expect(view.state().messages.some(message => message.error)).toBe(false)
++  expect($restartingSessionResumes.get().size).toBe(0)
++})
++
++it.each(['drain', 'closed'] as const)('identified submit survives %s using the same payload and no error bubble', async failure => {
++  vi.useFakeTimers()
++  const request = vi.fn().mockRejectedValueOnce(failure === 'drain' ? draining() : new Error('Hermes gateway connection closed'))
++    .mockImplementation(async (_method, params) => receipt(params))
++  const view = mount(request)
++  let sent!: Promise<boolean>
++  await act(async () => { sent = view.send(); await vi.advanceTimersByTimeAsync(0) })
++  expect($restartingSessionResumes.get().size).toBe(1)
++  await act(async () => { await vi.runAllTimersAsync(); expect(await sent).toBe(true) })
++  expect(request).toHaveBeenCalledTimes(2)
++  expect(request.mock.calls[0][1]).toEqual(request.mock.calls[1][1])
++  expect(view.state().messages.some(message => message.error)).toBe(false)
++  expect(storedJournal()).toEqual({})
++  expect($restartingSessionResumes.get().size).toBe(0)
++})
++
++it.each(['queued', 'unknown'] as const)('a restart-wait %s receipt is accepted, never replayed', async status => {
++  const request = vi.fn(async (_method, params) => ({ ...receipt(params), status, queued_reason: 'core_update', admission_id: 'held' }))
++  const view = mount(request)
++  await act(async () => { expect(await view.send()).toBe(true) })
++  expect(request).toHaveBeenCalledOnce()
++  expect(view.state().messages.some(message => message.error)).toBe(false)
++})
++
++it.each(['closed', 'drain'] as const)('never downgrades an uncertain %s replay on the replacement legacy owner', async failure => {
++  vi.useFakeTimers()
++  const request = vi.fn().mockRejectedValueOnce(failure === 'drain' ? draining() : new Error('Hermes gateway connection closed')).mockRejectedValue(legacyRefusal())
++  const view = mount(request)
++  await act(async () => { const sent = view.send(); await vi.runAllTimersAsync(); expect(await sent).toBe(false) })
++  expect(request).toHaveBeenCalledTimes(2)
++  expect(request.mock.calls.every(([, params]) => params.submission_id === 'same-input')).toBe(true)
++})
++
++it('does not replay an identityless legacy send whose ACK was lost', async () => {
++  const request = vi.fn().mockRejectedValueOnce(legacyRefusal()).mockRejectedValue(new Error('Hermes gateway connection closed'))
++  const view = mount(request)
++  await act(async () => { expect(await view.send()).toBe(false) })
++  expect(request).toHaveBeenCalledTimes(2)
++  expect(request.mock.calls[1][1]).not.toHaveProperty('submission_id')
++  expect($restartingSessionResumes.get().size).toBe(0)
++})
++
++it('navigation during restart cancels the pending intent without sending into the new chat', async () => {
++  vi.useFakeTimers()
++  const request = vi.fn().mockRejectedValueOnce(draining()).mockImplementation(async (_method, params) => receipt(params))
++  const view = mount(request)
++  let sent!: Promise<boolean>
++  await act(async () => { sent = view.send(); await vi.advanceTimersByTimeAsync(0) })
++  view.selected.current = 'other-chat'
++  await act(async () => { await vi.runAllTimersAsync(); expect(await sent).toBe(false) })
++  expect(request).toHaveBeenCalledOnce()
++  expect(view.state().messages.some(message => message.error)).toBe(false)
++  expect($restartingSessionResumes.get().size).toBe(0)
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 2afe9f45ee6..1d1de13c8c0 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -61,6 +61,7 @@
+ } from './prepared-submissions'
+ import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
+ import { captureSubmissionDestination, destinationAfterCreate, sameAuthorityPublishedOwner } from './submission-destination'
++import { submitAcrossGatewayRestart } from './submit-across-restart'
+ import {
+   backendRefusesSubmissionId,
+   noteSubmissionIdAccepted,
+@@ -1200,8 +1201,8 @@
+         // resolver re-registers the stored session and retries once; every
+         // other session-scoped RPC (attach, /compress, rewind, interrupt) goes
+         // through the same helper so one policy covers the whole bug class.
+-        let submitErr: unknown = null
+         let legacyAccepted = false
++        let restartReplayUncertain = Boolean(retained && retained.legacyAttempted !== false)
+         // The identity the backend actually accepted: the live runtime id,
+         // replaced below when a stale binding was recovered.
+         let acceptedRuntimeSessionId = liveSessionId
+@@ -1272,7 +1273,10 @@
+                 const identityEpoch = submissionIdentityEpoch()
+ 
+                 try {
+-                  const receipt = await requestGateway<SubmitReceipt>('prompt.submit', params, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
++                  const receipt = await submitAcrossGatewayRestart({ storedSessionId: targetStoredSessionId,
++                    owner: destination.owner, driftReason: sessionDriftReason,
++                    onUncertain: () => { restartReplayUncertain = true }
++                  }, () => requestGateway<SubmitReceipt>('prompt.submit', params, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS))
+                   noteSubmissionIdAccepted(destination.scopeKey)
+ 
+                   return receipt
+@@ -1288,7 +1292,7 @@
+                   // key (version skew) before any handler ran. Both are pre-admission and
+                   // safe to retry identityless. Never downgrade on a timeout, malformed
+                   // ACK or an ambiguous retry.
+-                  if (!isPreAdmissionRefusal(error) || prepared.legacyAttempted) {
++                  if (!isPreAdmissionRefusal(error) || prepared.legacyAttempted || restartReplayUncertain) {
+                     throw error
+                   }
+ 
+@@ -1462,11 +1466,7 @@
+             return abortForSessionSwitch(sessionId)
+           }
+ 
+-          submitErr = firstErr
+-        }
+-
+-        if (submitErr !== null) {
+-          throw submitErr
++          throw firstErr
+         }
+ 
+         // The gateway admitted it: a failed journal retirement (ENOSPC/EIO) must not report a
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts
+index da10b48bf03..5a3fcde6199 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.test.ts
+@@ -7,6 +7,10 @@
+ 
+ vi.mock('@/hermes', () => ({ setSessionArchived }))
+ vi.mock('@/store/notifications', () => ({ notifyError }))
++vi.mock('./archive-queue-lifetime', () => ({ archiveQueueLifetime: () => ({
++  run: (run: () => Promise<unknown>) => run(), enqueue: vi.fn(),
++  sleep: async () => {}, dispose: vi.fn()
++}) }))
+ 
+ import { commitArchive } from './archive-commit'
+ 
+@@ -67,6 +71,21 @@
+   expect(notifyError.mock.calls[0][2].action).toBeUndefined()
+ })
+ 
++it('holds a draining PATCH then commits once, keeping the owner and suppressing errors', async () => {
++  const owner = { connectionId: 'hermes-hub', profile: 'work' }
++  const hidden = hiddenRow()
++  const onArchived = vi.fn()
++  setSessionArchived.mockRejectedValueOnce(new Error('503: {"detail":"owner_unavailable: draining: Exclusive maintenance refused"}'))
++    .mockRejectedValueOnce(new Error('socket hang up'))
++    .mockResolvedValueOnce({ ok: true })
++  expect(await commitArchive({ copy, retryLabel: 'Retry', hidden, onArchived, owner, rehide: hiddenRow, storedSessionId: 'drain' })).toBe(true)
++  expect(onArchived).toHaveBeenCalledOnce()
++  expect(hidden.restore).not.toHaveBeenCalled()
++  expect(hidden.end).toHaveBeenCalledOnce()
++  expect(notifyError).not.toHaveBeenCalled()
++  expect(setSessionArchived.mock.calls).toEqual(Array.from({ length: 3 }, () => ['drain', true, owner]))
++})
++
+ it('success ends the hide without a toast', async () => {
+   const hidden = hiddenRow()
+   const onArchived = vi.fn()
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+index 09950efd220..bf7a80af92b 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-commit.ts
+@@ -5,6 +5,7 @@
+ import { sessionWriteRetryAction } from '@/lib/session-write-retry'
+ import { notifyError } from '@/store/notifications'
+ 
++import { archiveDrainWrite } from './archive-drain-write'
+ import type { softHideArchivedRow } from './archive-soft-hide'
+ 
+ type HiddenRow = ReturnType<typeof softHideArchivedRow>
+@@ -35,11 +36,9 @@
+   try {
+     let sends = 0
+ 
+-    if (commit.trace) {
+-      await setSessionArchived(storedSessionId, true, owner, () => commit.trace?.(`patch-sent n=${++sends}`))
+-    } else {
+-      await setSessionArchived(storedSessionId, true, owner)
+-    }
++    await archiveDrainWrite(storedSessionId, copy, () => commit.trace
++      ? setSessionArchived(storedSessionId, true, owner, () => commit.trace?.(`patch-sent n=${++sends}`))
++      : setSessionArchived(storedSessionId, true, owner), commit.trace)
+ 
+     // A write ACK alone is not archived=true evidence. Use the same pinned
+     // owner and the real IPC read path. Failed verification never replays a
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-owner.test.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-owner.test.ts
+new file mode 100644
+index 00000000000..1ee3d5bfc55
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-owner.test.ts
+@@ -0,0 +1,120 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++const { api, capture, primary, enqueue, dispose } = vi.hoisted(() => ({ api: vi.fn(), capture: vi.fn(),
++  primary: { value: 'hub', connections: ['hub'] }, enqueue: vi.fn(), dispose: vi.fn() }))
++
++vi.mock('@/api/client', () => ({ hermesApiAs: api }))
++vi.mock('@/store/session', () => ({ sessionMatchesStoredId: (row: { id: string }, id: string) => row.id === id }))
++vi.mock('@/store/connection-registry-state', () => ({ $connectionsRegistry: { get: () => ({ primary: primary.value, connections: primary.connections.map(id => ({ id })) }) } }))
++vi.mock('./archive-soft-hide', () => ({ captureArchiveOwner: capture }))
++vi.mock('./archive-queue-lifetime', () => ({ archiveQueueLifetime: () => ({
++  run: (run: () => Promise<unknown>) => run(), enqueue,
++  sleep: async () => {}, dispose
++}) }))
++
++import type { SessionInfo } from '@/hermes'
++
++import { captureArchiveOwnerAfterDrain } from './archive-drain-owner'
++
++const unresolved = new Error('Session owner could not be resolved; select its row')
++const row = { id: 'chat', connection_id: 'hub', profile: 'work' } as SessionInfo
++beforeEach(() => { vi.resetAllMocks(); primary.value = 'hub'; capture.mockImplementation((_id, selected) => {
++  if (selected) { return selected }
++  throw unresolved
++}) })
++afterEach(() => { primary.value = 'hub'; primary.connections = ['hub'] })
++
++it('holds unresolved ownership during list503, then uses the one proved row from the captured source', async () => {
++  api.mockImplementationOnce(async () => { primary.value = 'other'; throw new Error('503: sessions projection unavailable') })
++    .mockResolvedValueOnce({ sessions: [row], total: 1, offset: 0 })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).resolves.toEqual(row)
++  expect(api.mock.calls.map(([scope]) => scope.connectionId)).toEqual(['hub', 'hub'])
++  expect(enqueue).toHaveBeenCalledOnce()
++  expect(dispose).toHaveBeenCalledOnce()
++  expect(capture.mock.calls.at(-1)?.[1]).toEqual(row)
++})
++
++it.each([{ sessions: [] }, { sessions: [row, { ...row, profile: 'other' }] }])('never guesses from a successful list with zero or multiple owners: $sessions.length', async ({ sessions }) => {
++  api.mockResolvedValue({ sessions, total: sessions.length, offset: 0 })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).rejects.toBe(unresolved)
++  expect(api).toHaveBeenCalledOnce()
++  expect(enqueue).not.toHaveBeenCalled()
++})
++
++it('stamps untagged primary rows with the proving source, not a replacement primary', async () => {
++  api.mockImplementationOnce(async () => { primary.value = 'other'; throw new Error('503: sessions projection unavailable') })
++    .mockResolvedValueOnce({ sessions: [{ ...row, connection_id: undefined }], total: 1, offset: 0 })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).resolves.toEqual(row)
++  expect(capture.mock.calls.at(-1)?.[1].connection_id).toBe('hub')
++})
++
++it.each([false, true])('reads beyond page one before proving a unique owner (duplicate beyond page: %s)', async duplicate => {
++  const first = [row, ...Array.from({ length: 299 }, (_, n) => ({ ...row, id: `other-${n}` }))]
++  api.mockResolvedValueOnce({ sessions: first, total: 301, offset: 0 })
++    .mockResolvedValueOnce({ sessions: [{ ...row, id: duplicate ? 'chat' : 'last', profile: 'other' }], total: 301, offset: 300 })
++  const result = captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)
++  if (duplicate) { await expect(result).rejects.toBe(unresolved) }
++  else { await expect(result).resolves.toEqual(row) }
++  expect(api.mock.calls[1][1].path).toContain('offset=300')
++})
++
++it.each([
++  { sessions: [row], total: 301, offset: 0 },
++  { sessions: [row], total: 1, offset: 0, errors: [{ profile: 'other', error: 'unavailable' }] },
++  { sessions: [row] },
++  { sessions: [row], total: 1, offset: 300 }
++])('refuses incomplete or malformed aggregates', async page => {
++  api.mockResolvedValue(page)
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).rejects.toBe(unresolved)
++})
++
++it('does not queue permission refusal as drain', async () => {
++  api.mockRejectedValue(new Error('403: permission_denied'))
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).rejects.toThrow('permission_denied')
++  expect(api).toHaveBeenCalledOnce()
++  expect(enqueue).not.toHaveBeenCalled()
++})
++
++it('holds a projection failure carried in the native aggregate errors envelope', async () => {
++  api.mockResolvedValueOnce({ sessions: [], total: 0, offset: 0, errors: [{ error: '503: sessions projection unavailable' }] })
++    .mockResolvedValueOnce({ sessions: [row], total: 1, offset: 0 })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).resolves.toEqual(row)
++  expect(enqueue).toHaveBeenCalledOnce()
++  expect(api.mock.calls[0][1].path).toContain('archive_owner_lookup=1')
++})
++
++it('deduplicates pin backfill across cursor pages', async () => {
++  const first = [...Array.from({ length: 300 }, (_, n) => ({ ...row, id: `other-${n}` })), row]
++  api.mockResolvedValueOnce({ sessions: first, total: 301, offset: 0 })
++    .mockResolvedValueOnce({ sessions: [row], total: 301, offset: 300 })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).resolves.toEqual(row)
++  expect(api).toHaveBeenCalledTimes(2)
++})
++
++it('preserves an already captured unlisted primary invocation', async () => {
++  capture.mockReturnValueOnce({ connection_id: 'hub' })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).resolves.toEqual({ connection_id: 'hub' })
++  expect(api).not.toHaveBeenCalled()
++})
++
++it('scans every captured gateway and refuses a same-id sibling on a second gateway', async () => {
++  primary.connections = ['hub', 'other']
++  api.mockResolvedValue({ sessions: [row], total: 1, offset: 0 })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).rejects.toBe(unresolved)
++  expect(api.mock.calls.map(([scope]) => scope.connectionId)).toEqual(['hub', 'other'])
++})
++
++it('does not prove uniqueness when another registered gateway is unavailable', async () => {
++  primary.connections = ['hub', 'other']
++  api.mockResolvedValueOnce({ sessions: [row], total: 1, offset: 0 })
++    .mockRejectedValueOnce(new Error('ECONNREFUSED'))
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).rejects.toThrow('ECONNREFUSED')
++})
++
++it('refuses a topology edit during ownership recovery', async () => {
++  api.mockImplementationOnce(async () => {
++    primary.connections = ['hub', 'other']
++    return { sessions: [row], total: 1, offset: 0 }
++  })
++  await expect(captureArchiveOwnerAfterDrain('chat', undefined, undefined, {} as never)).rejects.toBe(unresolved)
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-owner.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-owner.ts
+new file mode 100644
+index 00000000000..24293cbe3d9
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-owner.ts
+@@ -0,0 +1,46 @@
++import { isGatewayDrainError } from '@/api/gateway-drain'
++import { isReconnectableSessionWriteError, withSessionWriteReconnect } from '@/api/session-write-reconnect'
++import type { SessionInfo } from '@/hermes'
++import type { Translations } from '@/i18n/types'
++import type { ArchiveTrace } from '@/lib/archive-trace'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
++
++import { listArchiveOwner } from './archive-owner-list'
++import { archiveQueueLifetime } from './archive-queue-lifetime'
++import { captureArchiveOwner } from './archive-soft-hide'
++import type { findListedSession } from './utils'
++
++
++/** No owner is guessed while the unified list's projection is unavailable.
++ * Probe every captured registry connection directly before choosing a row. */
++export async function captureArchiveOwnerAfterDrain(id: string, selectedRow: SessionInfo | undefined,
++  listed: ReturnType<typeof findListedSession>, copy: Translations['desktop'], trace?: ArchiveTrace): Promise<SessionInfo> {
++  try {
++    return captureArchiveOwner(id, selectedRow, listed)
++  } catch (error) {
++    if (selectedRow || !(error instanceof Error) || !/Session owner could not be resolved; select its row/.test(error.message)) { throw error }
++    const registry = $connectionsRegistry.get()
++    if (!registry?.primary || !registry.connections.length) { throw error }
++    const connections = registry.connections.map(connection => connection.id)
++    const queue = archiveQueueLifetime(trace?.attemptId ?? id, id, copy)
++    let draining = false
++    try {
++      return await withSessionWriteReconnect(async () => {
++        try {
++          const proved = await listArchiveOwner(id, connections, queue.run, error)
++          // A topology edit invalidates the scope of the proof. Never add a
++          // newly selected source to a previously captured pending intent.
++          if (JSON.stringify($connectionsRegistry.get()?.connections.map(connection => connection.id)) !== JSON.stringify(connections)) { throw error }
++          return captureArchiveOwner(id, proved, listed)
++        } catch (failure) {
++          if (isGatewayDrainError(failure)) {
++            draining = true
++            if (await queue.enqueue()) { trace?.('owner=waiting-projection') }
++          }
++          throw failure
++        }
++      }, { label: `archive-owner ${id}`, budgetMs: Infinity, sleep: queue.sleep,
++        retryable: failure => draining && (isGatewayDrainError(failure) || isReconnectableSessionWriteError(failure)) })
++    } finally { queue.dispose() }
++  }
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-write.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-write.ts
+new file mode 100644
+index 00000000000..cc76e804d73
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-drain-write.ts
+@@ -0,0 +1,37 @@
++import { randomUuid } from '@hermes/shared'
++
++import { isGatewayDrainError } from '@/api/gateway-drain'
++import { isReconnectableSessionWriteError, NonReplayableSessionWriteError, withSessionWriteReconnect } from '@/api/session-write-reconnect'
++import type { Translations } from '@/i18n/types'
++import type { ArchiveTrace } from '@/lib/archive-trace'
++
++import { archiveQueueLifetime } from './archive-queue-lifetime'
++
++/** A maintenance refusal has not applied the mutation. Keep its captured
++ * owner and retained mutation identity; never re-run selection or preflight.
++ * Subsequent transport loss belongs to that same restart. Ordinary authority
++ * timeouts/conflicts still go to the existing explicit Retry UI. */
++export async function archiveDrainWrite<T>(id: string, copy: Translations['desktop'], run: () => Promise<T>, trace?: ArchiveTrace): Promise<T> {
++  const queue = archiveQueueLifetime(trace?.attemptId ?? randomUuid(), id, copy)
++  let draining = false
++
++  try {
++    return await withSessionWriteReconnect(async () => {
++      try {
++        return await queue.run(run)
++      } catch (error) {
++        if (isGatewayDrainError(error) && !(error instanceof NonReplayableSessionWriteError)) {
++          draining = true
++
++          if (await queue.enqueue()) {trace?.('patch=waiting-restart')}
++        }
++
++        throw error
++      }
++    }, { label: `archive-drain ${id}`, budgetMs: Infinity, sleep: queue.sleep,
++      retryable: error => draining && !(error instanceof NonReplayableSessionWriteError) &&
++        (isGatewayDrainError(error) || isReconnectableSessionWriteError(error)) })
++  } finally {
++    queue.dispose()
++  }
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/archive-owner-list.ts b/apps/desktop/src/app/session/hooks/use-session-actions/archive-owner-list.ts
+new file mode 100644
+index 00000000000..bcd24537710
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/archive-owner-list.ts
+@@ -0,0 +1,35 @@
++import { hermesApiAs } from '@/api/client'
++import { isGatewayDrainError } from '@/api/gateway-drain'
++import type { SessionInfo } from '@/hermes'
++import { sessionMatchesStoredId } from '@/store/session'
++
++/** Read each captured connection directly, not the sidebar aggregate: that
++ * aggregate omits dead connections and backfills pins outside its cursor. */
++export async function listArchiveOwner(id: string, connections: readonly string[],
++  run: <T>(read: () => Promise<T>) => Promise<T>, unresolved: Error): Promise<SessionInfo> {
++  const matches = new Map<string, SessionInfo>()
++  for (const connectionId of connections) {
++    let total: number | undefined
++    for (let offset = 0; total === undefined || offset < total; offset += 300) {
++      const page = await run(() => hermesApiAs<{
++        sessions: SessionInfo[]; total: number; offset: number; errors?: { error?: string }[]
++      }>({ connectionId, profile: null }, {
++        path: `/api/profiles/sessions?profile=all&archive_owner_lookup=1&limit=300&offset=${offset}&order=created&min_messages=0&archived=exclude`, timeoutMs: 10_000
++      }))
++      const refusal = page.errors?.find(item => isGatewayDrainError(item.error))
++      if (refusal) { throw new Error(refusal.error) }
++      if (!Number.isSafeInteger(page.total) || page.total < 0 || page.offset !== offset ||
++        page.errors?.length || (total !== undefined && page.total !== total) ||
++        !Array.isArray(page.sessions) || page.sessions.length < Math.min(300, page.total - offset)) { throw unresolved }
++      total = page.total
++      for (const row of page.sessions) {
++        if (!sessionMatchesStoredId(row, id)) { continue }
++        const pinned = { ...row, connection_id: connectionId }
++        matches.set(JSON.stringify([connectionId, row.profile || 'default', row.id]), pinned)
++      }
++      if (matches.size > 1) { throw unresolved }
++    }
++  }
++  if (matches.size !== 1) { throw unresolved }
++  return [...matches.values()][0]
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/fresh-draft-options.ts b/apps/desktop/src/app/session/hooks/use-session-actions/fresh-draft-options.ts
+new file mode 100644
+index 00000000000..bea6a23536a
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/fresh-draft-options.ts
+@@ -0,0 +1,12 @@
++import type { NewChatWorkspaceTarget } from '@/store/session'
++
++export interface FreshSessionDraftOptions {
++  preserveRoute?: boolean
++  replaceRoute?: boolean
++  rotateFreshDraftKey?: boolean
++  workspaceTarget?: NewChatWorkspaceTarget
++}
++
++export function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
++  return typeof target === 'string' ? target.trim() || null : target
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index 4d16fe3bd04..fa8e01d304a 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -82,7 +82,6 @@
+   $yoloActive,
+   getSessionOwnerHints,
+   idsShareLineage,
+-  type NewChatWorkspaceTarget,
+   resolveComposerSessionKey,
+   restoreComposerModelSelection,
+   sessionPinId,
+@@ -170,6 +169,7 @@
+ import { singleFlightSessionResume } from '../use-prompt-actions/single-flight-resume'
+ 
+ import { commitArchive } from './archive-commit'
++import { captureArchiveOwnerAfterDrain } from './archive-drain-owner'
+ import { archivePreflight, captureArchiveOwner, softHideArchivedRow } from './archive-soft-hide'
+ import { branchThroughRowId } from './branch-boundary'
+ import { branchCreateKey } from './branch-create-key'
+@@ -179,6 +179,7 @@
+ import { graftEarlySegmentDeltas, mergeSegmentSnapshotIntoLiveRow } from './current-segment'
+ import { captureDisplayHydration } from './display-hydration'
+ import { overlayCacheWithoutEarlyClarify, withoutEarlyClarifyProjection } from './early-clarify-projection'
++import { type FreshSessionDraftOptions, normalizeNewChatWorkspaceTarget } from './fresh-draft-options'
+ import { goneSessionSwitchInFlight } from './gone-session-switch'
+ import {
+   dispatchedConnectionId,
+@@ -308,20 +309,11 @@
+   setCurrentUsage(current => ({ ...current, input, output, total: input + output }))
+ }
+ 
+-interface FreshSessionDraftOptions {
+-  preserveRoute?: boolean
+-  replaceRoute?: boolean
+-  rotateFreshDraftKey?: boolean
+-  workspaceTarget?: NewChatWorkspaceTarget
+-}
+ 
+ /** resumeSession's per-attempt options plus the connections an owner-follow
+  *  already ruled out ([daveey], see `followedFrom` in resumeSession). */
+ type ResumeSessionOptions = ResumeAttemptOptions & { followedFrom?: readonly string[] }
+ 
+-function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
+-  return typeof target === 'string' ? target.trim() || null : target
+-}
+ 
+ export function useSessionActions({
+   activeSessionId,
+@@ -3437,11 +3429,15 @@
+ 
+       try {
+         archived = captureArchiveOwner(storedSessionId, options?.selectedRow, listed)
+-      } catch (err) {
+-        trace(`failed:${String(err)}`)
+-        notifyError(err, copy.archiveFailed)
++      } catch {
++        try {
++          archived = await captureArchiveOwnerAfterDrain(storedSessionId, options?.selectedRow, listed, copy, trace)
++        } catch (err) {
++          trace(`failed:${String(err)}`)
++          notifyError(err, copy.archiveFailed)
+ 
+-        return
++          return
++        }
+       }
+ 
+       // Hide first: the preflight below can take seconds; cancel/failure restores.
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts b/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+index a531241e4b3..25730762efd 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/reconnect-archive-preflight.ts
+@@ -1,5 +1,6 @@
+ import { randomUuid } from '@hermes/shared'
+ 
++import { isGatewayDrainError } from '@/api/gateway-drain'
+ import { isReconnectableSessionWriteError, withSessionWriteReconnect } from '@/api/session-write-reconnect'
+ import type { SessionInfo } from '@/hermes'
+ import type { Translations } from '@/i18n/types'
+@@ -18,6 +19,7 @@
+   const session = { ...row, connection_id: row?.connection_id || $connectionsRegistry.get()?.primary || undefined } as SessionInfo
+   const queue = archiveQueueLifetime(trace?.attemptId ?? randomUuid(), id, copy)
+   let queued = false
++  const retryable = (error: unknown) => isGatewayDrainError(error) || isReconnectableSessionWriteError(error)
+ 
+   try {
+     return await withSessionWriteReconnect(async () => {
+@@ -25,7 +27,7 @@
+         return await queue.run(() => refreshArchiveTasks(id, session, profile,
+           { retryTransport: true, forceRefresh: queued, signal: queue.signal, trace }))
+       } catch (error) {
+-        if (isReconnectableSessionWriteError(error)) {
++        if (retryable(error)) {
+           trace?.('preflight=waiting-reconnect')
+           queued = true
+ 
+@@ -36,7 +38,7 @@
+       }
+     // Intent lifetime and individual safety-read deadlines are different:
+     // back off indefinitely during transport loss, but bound every full read.
+-    }, { label: `archive-preflight ${id}`, budgetMs: Infinity, sleep: queue.sleep })
++    }, { label: `archive-preflight ${id}`, budgetMs: Infinity, sleep: queue.sleep, retryable })
+   } finally {
+     queue.dispose()
+   }
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+index 408bcda15ee..98f6f82728e 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/refresh-archive-tasks.ts
+@@ -1,4 +1,5 @@
+ import { hermesApiAs } from '@/api/client'
++import { isGatewayDrainError } from '@/api/gateway-drain'
+ import { isReconnectableSessionWriteError } from '@/api/session-write-reconnect'
+ import type { SessionInfo } from '@/hermes'
+ import type { ArchiveTrace } from '@/lib/archive-trace'
+@@ -76,7 +77,7 @@
+     try {
+       return await send<T>(path)
+     } catch (error) {
+-      if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
++      if (options?.retryTransport && (isGatewayDrainError(error) || isReconnectableSessionWriteError(error))) {throw error}
+ 
+       if (!isTimeout(error)) {throw error}
+ 
+@@ -143,7 +144,7 @@
+       }, limit)
+     })])
+   } catch (error) {
+-    if (options?.retryTransport && isReconnectableSessionWriteError(error)) {throw error}
++    if (options?.retryTransport && (isGatewayDrainError(error) || isReconnectableSessionWriteError(error))) {throw error}
+ 
+     return unknownBecause(`${stage} failed`, error)
+   } finally {
+diff --git a/apps/desktop/src/i18n/ar_chat.ts b/apps/desktop/src/i18n/ar_chat.ts
+index c3a7b4a1102..c8fbbed7b8b 100644
+--- a/apps/desktop/src/i18n/ar_chat.ts
++++ b/apps/desktop/src/i18n/ar_chat.ts
+@@ -6,6 +6,7 @@
+     wakingProfile: profile => `جار إيقاظ ${profile}`,
+     placeholderStarting: 'جار بدء Hermes...',
+     placeholderReconnecting: 'جار إعادة الاتصال...',
++    placeholderHubRestarting: 'جار إعادة تشغيل المركز…',
+     placeholderFollowUp: 'اكتب متابعة...',
+     newSessionPlaceholders: ['اسأل Hermes عن شيء...', 'اطلب من Hermes تنفيذ مهمة...', 'ابدأ محادثة جديدة...'],
+     followUpPlaceholders: ['اكتب متابعة...', 'أضف توجيها...', 'اسأل سؤالا آخر...'],
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index 97305622e65..4b7bf4cfb97 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -3803,6 +3803,7 @@
+     wakingProfile: profile => `Wecke ${profile}…`,
+     placeholderStarting: 'Hermes wird gestartet…',
+     placeholderReconnecting: 'Verbindung zu Hermes wird wiederhergestellt…',
++    placeholderHubRestarting: 'Hub wird neu gestartet…',
+     placeholderFollowUp: 'Folge senden',
+     newSessionPlaceholders: [
+       'Was bauen wir?',
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index a61898a49fe..caff9c6052f 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -3362,6 +3362,7 @@
+     wakingProfile: profile => `Waking up ${profile}…`,
+     placeholderStarting: 'Starting Hermes...',
+     placeholderReconnecting: 'Reconnecting to Hermes…',
++    placeholderHubRestarting: 'Hub restarting…',
+     placeholderFollowUp: 'Send follow-up',
+     newSessionPlaceholders: [
+       'What are we building?',
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index ca925d4043b..a8a39dfc757 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -3791,6 +3791,7 @@
+     wakingProfile: profile => `Despertando ${profile}…`,
+     placeholderStarting: 'Iniciando Hermes...',
+     placeholderReconnecting: 'Reconectando con Hermes…',
++    placeholderHubRestarting: 'Reiniciando el hub…',
+     placeholderFollowUp: 'Enviar seguimiento',
+     newSessionPlaceholders: [
+       '¿Qué vamos a construir?',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index 10f431a1228..5a19712c5d6 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -3810,6 +3810,7 @@
+     wakingProfile: profile => `Réveil de ${profile}…`,
+     placeholderStarting: 'Démarrage de Hermes…',
+     placeholderReconnecting: 'Reconnexion à Hermes…',
++    placeholderHubRestarting: 'Redémarrage du hub…',
+     placeholderFollowUp: 'Envoyer un suivi',
+     newSessionPlaceholders: [
+       'Sur quoi travaillons-nous ?',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 8f870d1a399..3d0e7de6623 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -2323,6 +2323,7 @@
+     wakingProfile: profile => `${profile} を起動中…`,
+     placeholderStarting: 'Hermes を起動中...',
+     placeholderReconnecting: 'Hermes に再接続中…',
++    placeholderHubRestarting: 'ハブを再起動中…',
+     placeholderFollowUp: 'フォローアップを送信',
+     newSessionPlaceholders: [
+       '何を作りますか？',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index 0cd2d76aacc..61db65430c8 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -2596,6 +2596,7 @@
+     wakingProfile: profile => `Пробуждаем ${profile}…`,
+     placeholderStarting: 'Запуск Hermes...',
+     placeholderReconnecting: 'Переподключение к Hermes…',
++    placeholderHubRestarting: 'Перезапуск хаба…',
+     placeholderFollowUp: 'Отправить продолжение',
+     newSessionPlaceholders: [
+       'Что будем делать?',
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 2c944ff7067..0934249f26a 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -2951,6 +2951,7 @@
+     wakingProfile: (profile: string) => string
+     placeholderStarting: string
+     placeholderReconnecting: string
++    placeholderHubRestarting: string
+     placeholderFollowUp: string
+     newSessionPlaceholders: readonly string[]
+     followUpPlaceholders: readonly string[]
+diff --git a/apps/desktop/src/i18n/zh-hant_chat.ts b/apps/desktop/src/i18n/zh-hant_chat.ts
+index 9ea353c737a..1ada20d4641 100644
+--- a/apps/desktop/src/i18n/zh-hant_chat.ts
++++ b/apps/desktop/src/i18n/zh-hant_chat.ts
+@@ -6,6 +6,7 @@
+     wakingProfile: profile => `正在喚醒 ${profile}…`,
+     placeholderStarting: '正在啟動 Hermes...',
+     placeholderReconnecting: '正在重新連線至 Hermes…',
++    placeholderHubRestarting: '中樞正在重新啟動…',
+     placeholderFollowUp: '傳送後續訊息',
+     newSessionPlaceholders: [
+       '我們要建立什麼？',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 98ba24a31a6..697785d1e00 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -3203,6 +3203,7 @@
+     wakingProfile: profile => `正在唤醒 ${profile}…`,
+     placeholderStarting: '正在启动 Hermes…',
+     placeholderReconnecting: '正在重新连接 Hermes…',
++    placeholderHubRestarting: '中枢正在重启…',
+     placeholderFollowUp: '发送后续消息',
+     newSessionPlaceholders: [
+       '我们要构建什么？',
+diff --git a/apps/desktop/src/store/session-resume-restart.ts b/apps/desktop/src/store/session-resume-restart.ts
+new file mode 100644
+index 00000000000..9a424ff9aca
+--- /dev/null
++++ b/apps/desktop/src/store/session-resume-restart.ts
+@@ -0,0 +1,27 @@
++import { atom } from 'nanostores'
++
++/** In-flight resume recovery, not messaging-gateway Settings' Restart action.
++ * Keys contain the captured connection and stored session; counted tokens keep
++ * concurrent weak/strong single-flight snapshots from clearing one another. */
++export const $restartingSessionResumes = atom<ReadonlyMap<string, number>>(new Map())
++
++export function holdRestartingSessionResume(key: string): () => void {
++  const current = $restartingSessionResumes.get()
++  $restartingSessionResumes.set(new Map(current).set(key, (current.get(key) ?? 0) + 1))
++  let released = false
++
++  return () => {
++    if (released) { return }
++    released = true
++    const next = new Map($restartingSessionResumes.get())
++    const count = (next.get(key) ?? 1) - 1
++
++    if (count) { next.set(key, count) } else { next.delete(key) }
++    $restartingSessionResumes.set(next)
++  }
++}
++
++export function sessionResumeIsRestarting(sessionId: string | null | undefined, connectionId: string | null | undefined,
++  pending = $restartingSessionResumes.get()): boolean {
++  return Boolean(sessionId && pending.has(JSON.stringify([connectionId || '', sessionId])))
++}
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index cadf567fcb4..b957e8401ac 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -1047,6 +1047,7 @@
+     "composer.openDirective",
+     "composer.pasteImage",
+     "composer.placeholderFollowUp",
++    "composer.placeholderHubRestarting",
+     "composer.placeholderReconnecting",
+     "composer.placeholderStarting",
+     "composer.preparingAudio",
+-- 
+2.43.0
+

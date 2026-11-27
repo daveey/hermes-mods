@@ -1,0 +1,132 @@
+From 4c3da8fdeab55c28de2be75ae2577bd3c8ba62c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:17:54 +0000
+Subject: [PATCH 5961] Fact change feed: bounded failure logging and busy-open tolerance
+
+Public mirror of source commit 4c3da8fdeab55c28de2be75ae2577bd3c8ba62c6.
+
+---
+diff --git a/hermes_cli/fact_capture.py b/hermes_cli/fact_capture.py
+index 7daf4b2b268..0f5177bf619 100644
+--- a/hermes_cli/fact_capture.py
++++ b/hermes_cli/fact_capture.py
+@@ -99,7 +99,10 @@
+     path = Path(path).resolve()
+     ensure_kanban_test_isolation(path)
+     initial = path.stat()
+-    with closing(open_ro(path, timeout=0)) as conn:
++    # Spend up to this capture's own time budget waiting out a busy open: the
++    # tracking registry is held only briefly per open, and timeout=0 failed
++    # nearly every first capture on a busy host (one retry ~0.1 s later each).
++    with closing(open_ro(path, timeout=budget.max_seconds)) as conn:
+         # SQLite refuses oversized rows before Python allocates their values.
+         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, budget.max_bytes)
+         before = _identity(path)
+diff --git a/hermes_cli/fact_feed.py b/hermes_cli/fact_feed.py
+index 119ddc6c98a..7937e0da940 100644
+--- a/hermes_cli/fact_feed.py
++++ b/hermes_cli/fact_feed.py
+@@ -180,7 +180,10 @@
+                 source.traced.add(("capture", type(exc)))
+                 log.exception("source capture/publication failed (attempt %d); retaining cursor", attempt)
+             else:
+-                log.log(logging.WARNING if _visible(attempt) else logging.DEBUG,
++                # A single busy retry is routine contention, not news: warn once
++                # it persists (max backoff, then every _REMIND_EVERY attempts).
++                warn = _visible(attempt) and not (busy and attempt == 1)
++                log.log(logging.WARNING if warn else logging.DEBUG,
+                         "source capture/publication failed (attempt %d%s); retaining cursor: %s",
+                         attempt, ", busy" if busy else "", exc)
+             with source.publication:
+diff --git a/tests/hermes_cli/test_fact_capture.py b/tests/hermes_cli/test_fact_capture.py
+index 8ded10dfa28..849f7e19099 100644
+--- a/tests/hermes_cli/test_fact_capture.py
++++ b/tests/hermes_cli/test_fact_capture.py
+@@ -178,3 +178,34 @@
+         capture_tasks(path, None, slow)
+     with pytest.raises(sqlite3.ProgrammingError):
+         borrowed[0].execute("SELECT 1")
++
++
++def test_briefly_held_tracking_registry_does_not_fail_capture(board, monkeypatch):
++    """A capture waits out a momentary registry holder within its own budget.
++
++    With timeout=0 every first capture on a busy hub failed with "tracking
++    registry is busy" and only succeeded on the feed's retry ~0.1 s later."""
++    import threading
++    from hermes_cli import fact_capture as capture
++    from hermes_cli import sqlite_safe_read
++
++    path, writer = board
++    kb.create_task(writer, title="a", assignee="w")
++    monkeypatch.setattr(capture, "time", time)  # real clock: this test is about waiting
++    held, release = threading.Event(), threading.Event()
++
++    def holder():
++        with sqlite_safe_read._live_lock:
++            held.set()
++            release.wait(2)
++
++    thread = threading.Thread(target=holder)
++    thread.start()
++    assert held.wait(2)
++    threading.Timer(0.005, release.set).start()
++    try:
++        result = capture_tasks(path, None, rows, budget=CaptureBudget(max_seconds=0.5))
++    finally:
++        release.set()
++        thread.join(2)
++    assert result.after is not None
+diff --git a/tests/hermes_cli/test_fact_feed.py b/tests/hermes_cli/test_fact_feed.py
+index e50d71cb7f5..853b44685de 100644
+--- a/tests/hermes_cli/test_fact_feed.py
++++ b/tests/hermes_cli/test_fact_feed.py
+@@ -192,8 +192,11 @@
+     return fact_feed
+ 
+ 
+-@pytest.mark.parametrize("error, tracebacks", [(_sqlite_busy, 0), (lambda: RuntimeError("defect"), 1)])
+-def test_retry_streak_logs_at_most_one_traceback(caplog, fast_retry, error, tracebacks):
++@pytest.mark.parametrize("error, tracebacks, warned", [
++    (_sqlite_busy, 0, [6, 8]),  # one busy retry is routine; only a persisting one warns
++    (lambda: RuntimeError("defect"), 1, [1, 6, 8]),
++])
++def test_retry_streak_logs_at_most_one_traceback(caplog, fast_retry, error, tracebacks, warned):
+     # Each retry used to format a full traceback under the logging lock; at ~2/s
+     # across sources that stalled the gateway event loop past its watchdog.
+     caplog.set_level(logging.DEBUG, logger="hermes_cli.fact_feed")
+@@ -201,9 +204,9 @@
+     records = _feed_records(caplog, "capture/publication failed")[:8]
+     assert len(records) == 8
+     assert sum(r.exc_info is not None for r in records) == tracebacks
+-    # Still visible: attempt 1, max backoff (6) and the periodic reminder (8).
++    # Still visible: max backoff (6), the periodic reminder (8), and a defect's first attempt.
+     visible = [i + 1 for i, r in enumerate(records) if r.levelno >= logging.WARNING]
+-    assert visible == [1, 6, 8]
++    assert visible == warned
+ 
+ 
+ def test_defect_after_busy_start_still_traced(caplog, fast_retry):
+diff --git a/tests/hermes_cli/test_moa_preset_deletion.py b/tests/hermes_cli/test_moa_preset_deletion.py
+index 595c5ffb200..04197837740 100644
+--- a/tests/hermes_cli/test_moa_preset_deletion.py
++++ b/tests/hermes_cli/test_moa_preset_deletion.py
+@@ -274,12 +274,14 @@
+     real_load = utils.fast_safe_load
+     failed_reads = []
+ 
++    from hermes_cli.web_routers.models import set_moa_models
++
+     def in_moa_save():
+         # Only the PUT handler's own read: a background config reader (watchers,
+         # app startup) must not consume the single injected failure first.
+         frame = sys._getframe(1)
+         while frame is not None:
+-            if frame.f_code.co_name == "set_moa_models":
++            if frame.f_code is set_moa_models.__code__:
+                 return True
+             frame = frame.f_back
+         return False
+-- 
+2.43.0
+

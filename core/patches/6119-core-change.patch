@@ -1,0 +1,127 @@
+From b2a0a2013f49e25d00acf8bc0a73a106e7286bc7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:42:05 +0000
+Subject: [PATCH 6119] SQLite raw-reader reclamation cadence and GIL-held lockguard scans
+
+Public mirror of source commit b2a0a2013f49e25d00acf8bc0a73a106e7286bc7.
+
+---
+diff --git a/hermes_state_lockguard_fdscan.py b/hermes_state_lockguard_fdscan.py
+index c90f5c4f63e..99c6e89a2b7 100644
+--- a/hermes_state_lockguard_fdscan.py
++++ b/hermes_state_lockguard_fdscan.py
+@@ -147,21 +147,51 @@
+     direct = once(path)
+     if direct is not None:
+         return direct
+-    parent = path
+-    missing: list[str] = []
+-    while True:
+-        parent, tail = os.path.split(parent)
+-        if not tail:
+-            break
+-        missing.append(tail)
+-        resolved = once(parent if parent else ".")
+-        if resolved is not None:
+-            for part in reversed(missing):
+-                resolved = os.path.join(resolved, part)
+-            return resolved
+-        if not parent or parent == os.sep:
+-            break
+-    return None
++    # libc realpath is strict: a dangling link makes the whole call fail. Walk
++    # its components instead of appending an unresolved suffix literally.
++    cwd = once(".") if not path.startswith("/") else "/"
++    if cwd is None or _readlink is None:
++        return None
++    return _non_strict_realpath(path, cwd, _readlink, buf)
++
++
++def _non_strict_realpath(filename, cwd, readlink, buf):
++    """Non-strict POSIX resolution, using GIL-held readlink even for missing paths.
++
++    An unsuccessful readlink is an ordinary/missing component, just as non-strict
++    os.path.realpath ignores lstat/readlink errors. Stack markers memoize fully
++    resolved links and detect active cycles without a recursion-depth limit.
++    """
++    rest = filename.split("/")[::-1]
++    path = "/" if filename.startswith("/") else cwd
++    seen = {}
++    while rest:
++        name = rest.pop()
++        if name is None:
++            seen[rest.pop()] = path
++            continue
++        if not name or name == ".":
++            continue
++        if name == "..":
++            path = os.path.dirname(path)
++            continue
++        candidate = os.path.join(path, name)
++        n = readlink(os.fsencode(candidate), buf, len(buf))
++        if n < 0:
++            path = candidate
++            continue
++        if n >= len(buf):
++            return None  # never trust a truncated target; caller uses stdlib
++        if candidate in seen:
++            path = seen[candidate] or candidate
++            continue
++        target = os.fsdecode(buf.raw[:n])
++        seen[candidate] = None
++        rest.extend((candidate, None))
++        rest.extend(target.split("/")[::-1])
++        if target.startswith("/"):
++            path = "/"
++    return path
+ 
+ 
+ def proc_fd_targets() -> Optional[dict[int, str]]:
+diff --git a/tests/hermes_state/test_lockguard_realpath_missing.py b/tests/hermes_state/test_lockguard_realpath_missing.py
+new file mode 100644
+index 00000000000..5900db3a267
+--- /dev/null
++++ b/tests/hermes_state/test_lockguard_realpath_missing.py
+@@ -0,0 +1,39 @@
++"""Non-strict path identity must survive deleted databases and symlink targets."""
++import os
++
++import pytest
++
++import hermes_state_lockguard_fdscan as fdscan
++
++pytestmark = pytest.mark.platforms("linux")
++
++
++def test_missing_realpath_preserves_symlink_and_dot_semantics(tmp_path, monkeypatch):
++    if fdscan.held_realpath(str(tmp_path)) is None:
++        pytest.skip("native realpath unavailable")
++    (tmp_path / "alias").symlink_to("missing/target.db")
++    (tmp_path / "absolute").symlink_to(tmp_path / "missing" / "target.db")
++    (tmp_path / "chain").symlink_to("alias")
++    (tmp_path / "loop").symlink_to("loop")
++    (tmp_path / "a").symlink_to("b")
++    (tmp_path / "b").symlink_to("a")
++    monkeypatch.chdir(tmp_path)
++    for name in ("alias", "absolute", "chain", "alias/../board.db", "missing/../board.db",
++                 "missing/./tail", "loop/tail", "a/tail", "chain/../../chain"):
++        assert fdscan.held_realpath(name) == os.path.realpath(name), name
++
++
++def test_dangling_database_alias_finds_held_deleted_wal(tmp_path):
++    from hermes_cli import kanban_lockguard
++
++    target = tmp_path / "target.db"
++    alias = tmp_path / "alias.db"
++    alias.symlink_to(target)
++    wal = tmp_path / "target.db-wal"
++    fd = os.open(wal, os.O_RDWR | os.O_CREAT, 0o600)
++    try:
++        wal.unlink()
++        found = kanban_lockguard.stranded_sidecars(alias)
++        assert any(str(wal) in item for item in found), found
++    finally:
++        os.close(fd)
+-- 
+2.43.0
+

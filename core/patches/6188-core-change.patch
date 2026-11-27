@@ -1,0 +1,1118 @@
+From 0d2bd856f03500697b4c877c9c2e63575e675b1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:42:12 +0000
+Subject: [PATCH 6188] Exact-request single-use self-work admission exception
+
+Public mirror of source commit 0d2bd856f03500697b4c877c9c2e63575e675b1a.
+
+---
+diff --git a/hermes_cli/kanban_card_answer.py b/hermes_cli/kanban_card_answer.py
+index e6c5a6f3f68..0d73aa77514 100644
+--- a/hermes_cli/kanban_card_answer.py
++++ b/hermes_cli/kanban_card_answer.py
+@@ -183,6 +183,17 @@
+     return _record_release(conn, request, fingerprint, receipt, note, provenance)
+ 
+ 
++def _default_unblock(conn, request, fingerprint, receipt, note, origin, fence, ask):
++    """``(exception, released)`` for a default Unblock. On the home's own admission-exception offer
++    (``kanban_selfwork_exception``) the first is its stamp: the caller's plain unblock then records the grant on
++    its event, releases nothing and renews no spend. Otherwise the second is :func:`_release`'s receipt or None."""
++    from hermes_cli import kanban_selfwork_exception as sx
++    exception = sx.granting(conn, request["task"], ask)
++    if exception is not None:
++        return exception, None
++    return None, _release(conn, request, fingerprint, receipt, note, {**request, "originGateway": origin}, fence, ask)
++
++
+ def _owner(conn, task, gateway, *, require_primary=False):
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+     if row is None or ('created_on' in row.keys() and row['created_on'] not in (None, '', gateway)):
+@@ -277,11 +288,13 @@
+         if _receipt(c, request, fingerprint):
+             return "already_recorded"
+         fresh = snapshot(c, request["task"])
+-        return None if fresh == current else "stale_ask"
++        return None if sx.same_offer(c, fresh, current, exception) else "stale_ask"
+ 
++    from hermes_cli import kanban_selfwork_exception as sx
++    exception = None
+     if not archive and not informational and not current["ask"].get("choices") and request["choice"] == "unblock":
+-        released = _release(conn, request, fingerprint, receipt, note, {**request, "originGateway": origin},
+-                            lambda c: fence(c, releasing=True), current["ask"])
++        exception, released = _default_unblock(conn, request, fingerprint, receipt, note, origin,
++                                               lambda c: fence(c, releasing=True), current["ask"])
+         if released is not None:
+             return released
+ 
+@@ -307,9 +320,9 @@
+                            writer_kind='agent', recorded_decision=provenance)
+             kb._append_event(conn, request['task'], 'card_answer_recorded', {FIELD: receipt})
+         return _receipt(conn, request, fingerprint)
++    extra = {FIELD: receipt, **sx.grant_fields(exception, request, fingerprint, origin)}
+     try:
+-        transition(conn, request["task"], precondition=fence, comment=comment,
+-                   event_extra={FIELD: receipt})
++        transition(conn, request["task"], precondition=fence, comment=comment, event_extra=extra)
+     except _AlreadyRecorded as done:
+         return done.receipt
+     recorded = _receipt(conn, request, fingerprint)
+diff --git a/hermes_cli/kanban_card_answer_transport.py b/hermes_cli/kanban_card_answer_transport.py
+index 88724bf7cbd..c953091303b 100644
+--- a/hermes_cli/kanban_card_answer_transport.py
++++ b/hermes_cli/kanban_card_answer_transport.py
+@@ -38,6 +38,17 @@
+         self._opener = urllib.request.build_opener(_NoRedirect())
+ 
+     def read(self, request_id: str) -> dict:
++        try:
++            body = json.loads(self.raw(request_id))
++        except (ValueError, UnicodeError):
++            raise AnswerRefused('courier_record_invalid') from None
++        record = body.get('request') if isinstance(body, dict) else None
++        if not isinstance(record, dict) or record.get('id') != request_id:
++            raise AnswerRefused('courier_record_invalid')
++        return record
++
++    def raw(self, request_id: str) -> bytes:
++        """The response bytes, for a caller that must parse them strictly (duplicate keys, non-finite numbers)."""
+         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.:-]{0,199}', request_id):
+             raise AnswerRefused('courier_request_id_invalid')
+         request = urllib.request.Request(self.url + '/v2/sync/requests/' + urllib.parse.quote(request_id, safe=''),
+@@ -54,11 +65,4 @@
+             raise OSError('courier_record_unavailable') from None
+         if len(raw) > 1024 * 1024:
+             raise AnswerRefused('courier_record_invalid')
+-        try:
+-            body = json.loads(raw)
+-        except (ValueError, UnicodeError):
+-            raise AnswerRefused('courier_record_invalid') from None
+-        record = body.get('request') if isinstance(body, dict) else None
+-        if not isinstance(record, dict) or record.get('id') != request_id:
+-            raise AnswerRefused('courier_record_invalid')
+-        return record
++        return raw
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index b1d43e2b46d..c98cf023f88 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -15,7 +15,7 @@
+ from hermes_cli.kanban_origin_adapter import _gateway
+ 
+ 
+-def _dispatch_owner_tool(name, args, intent, selfwork_context=None):
++def _dispatch_owner_tool(name, args, intent, selfwork_context=None, selfwork_exception=None):
+     """The validated courier selects Kanban explicitly, independent of chat defaults.
+ 
+     Keep registry availability checks (including delegated-child fences) and the
+@@ -28,10 +28,12 @@
+         if not registry.get_definitions({name}, quiet=True):
+             return {'status': 'pending', 'code': 'kanban_tool_unavailable', 'handoff_complete': False}
+         private = {'selfwork_intent': {**intent, **selfwork_context}} if selfwork_context else {}
++        if selfwork_exception is not None:  # its own keyword: never part of either intent or the intake journal
++            private['selfwork_exception'] = selfwork_exception
+         return _dispatch_result(registry.dispatch(name, args, origin_intent=intent, **private))
+ 
+ 
+-def receive(request: dict, *, selfwork_context=None) -> dict:
++def receive(request: dict, *, selfwork_context=None, selfwork_exception=None) -> dict:
+     from hermes_cli.profiles import get_active_profile_name
+     from tools import kanban_tools  # built-in self-registration
+ 
+@@ -86,7 +88,7 @@
+     from hermes_cli.kanban_creation_contract import validate_received
+     validate_received({key: value for key, value in create.items() if key != 'board'})
+     args = {**create, 'board': board}
+-    return _dispatch_owner_tool('kanban_create', args, intent, selfwork_context)
++    return _dispatch_owner_tool('kanban_create', args, intent, selfwork_context, selfwork_exception)
+ 
+ 
+ def _dispatch_result(raw_result):
+diff --git a/hermes_cli/kanban_selfwork_exception.py b/hermes_cli/kanban_selfwork_exception.py
+new file mode 100644
+index 00000000000..dbb94543ac5
+--- /dev/null
++++ b/hermes_cli/kanban_selfwork_exception.py
+@@ -0,0 +1,404 @@
++"""One single-use admission exception for one rejected self-work request. [daveey]
++
++``kanban.self_work.freeze_guards`` refused ``TARGET.request_id`` (``self_work_guard_frozen``). This module lets
++the intake home admit that same request once, with its identity and intent unchanged, after David answers a
++home-filed ask in Desktop. The freeze stays on, the courier's rejection record is never edited, and nothing here
++applies to any other request: the target is a constant, not an argument.
++
++Steps, each its own transaction on the home's primary board:
++
++1. :func:`offer`: the home reads the original request and its rejection from the Hub with its own enrolled
++   credential, checks both against ``TARGET``'s hashes, and replaces the owner card's ask with one it wrote. The
++   ask carries ``STAMP`` and the home's ``OFFERED`` event carries the same stamp and the ask's digest.
++2. The grant: ``kanban_card_answer.apply`` (reached only through ``kanban_card_answer_runtime.owner``, which
++   verifies the recorded Desktop operation at its source) calls :func:`granting` for a default Unblock. A valid
++   offer puts ``GRANT`` on that click's ``unblocked`` event beside the ordinary ``card_answer`` receipt. The card
++   returns to work; nothing is admitted in that transaction.
++3. :func:`reconsider`: the home reads the original again and runs it through the ordinary receiver chain with a
++   private :class:`Capability`. ``kanban_selfwork_intake.admit`` calls :func:`spend` inside its write
++   transaction; that is the only place the grant is consumed and the only refusal it replaces is the freeze's
++   "no open guard owner". An open owner is still reused instead of creating a card.
++
++Trust limit, inherited from the card-answer boundary and not improved here: the proof of David's click is the
++source install's ActionStore row. A process with that user's file access on that machine can write such a row.
++
++Entry is the module CLI only, run in the home profile; no tool or ``hermes`` subcommand is registered and no
++argument selects a request::
++
++    python -m hermes_cli.kanban_selfwork_exception offer | reconsider | status
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import secrets
++import sqlite3
++import sys
++import time
++from typing import NamedTuple, Optional
++
++from hermes_cli import kanban_selfwork as policy
++from hermes_cli.kanban_selfwork_guards import GuardFrozen
++
++STAMP = "selfwork_exception_target"  # human_request field only offer() sets; validate_human_request drops it
++GRANT = "selfwork_exception_grant"  # on the home's own ``unblocked`` event of the verified Desktop click
++OFFERED, SPENT = "selfwork_exception_offered", "selfwork_exception_spent"
++ENVELOPE = ("id", "from", "to_gw", "coll", "key", "action", "args", "base_version")  # selfwork-envelope-v1
++TTL = 72 * 3600
++
++
++class Target(NamedTuple):
++    request_id: str
++    intent_sha256: str  # canonical ENVELOPE fields of the Board record, action still ``selfwork-create``
++    rejection_sha256: str  # canonical ``result`` of that record
++    owner_task: str  # the card whose ask carries the offer
++    approval: str
++
++
++TARGET = Target(
++    "sw-b7f41ff0540e062752a207a2081e6b45f661d7b84d833d53185428ed9a7886f0",
++    "460de0782b49e5a010e8134ce8fc4693935d2a7f00eabbb5780bfc4e9e125704",
++    "db9d484f3f1dd5353d74c4d4dfa2a9c4181127ecc138dbd4e5d5088d1b822392",
++    "t_42bba2bdebc8daba",
++    "47049c49-53cb-44b4-899a-1506e5a0e5e7/1",
++)
++
++
++class Refused(GuardFrozen):
++    """The exception does not apply, so the freeze's refusal stands: definitive, nothing written."""
++
++
++class _Probed(Refused):
++    """offer()'s dry run reached admission; its transaction rolls back."""
++
++
++class Capability:
++    """Private proof that :func:`reconsider` or :func:`offer` authenticated the original for this one call.
++
++    It travels as its own registry keyword, never inside an envelope, an intent or the intake journal."""
++    __slots__ = ("bound", "grant", "probe", "sender", "tenant")
++
++    def __init__(self, sender: str, grant: Optional[dict]):
++        self.sender, self.grant, self.probe, self.tenant, self.bound = sender, grant, grant is None, None, False
++
++    def bind(self, request: dict) -> None:
++        """The envelope the receiver is about to normalise is the one the home hashed."""
++        if _sha({k: request.get(k) for k in ENVELOPE}) != TARGET.intent_sha256 or request.get("from") != self.sender:
++            raise ValueError("self_work_exception_intent_changed")
++        self.bound = True
++
++
++def bind(exception, request: dict) -> None:
++    """Receiver entry: the capability is the home's own and names the envelope about to be normalised."""
++    if type(exception) is not Capability:
++        raise ValueError("self_work_request_invalid")
++    exception.bind(request)
++
++
++def require(exception) -> Capability:
++    if type(exception) is not Capability or not exception.bound:
++        raise policy.SelfWorkError("self-work exception capability is not the home's")
++    return exception
++
++
++def _canon(value) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=True)
++
++
++def _sha(value) -> str:
++    return hashlib.sha256(_canon(value).encode()).hexdigest()
++
++
++def _strict(raw: bytes):
++    """JSON with no duplicate keys and no non-finite numbers: either would make the hashed bytes ambiguous."""
++    def pairs(items):
++        keys = [k for k, _ in items]
++        if len(set(keys)) != len(keys):
++            raise ValueError("duplicate key")
++        return dict(items)
++
++    def constant(name):
++        raise ValueError(name)
++    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
++
++
++def original(records) -> dict:
++    """The exact rejected request as the Hub holds it now, or a refusal. Never rebuilt from a caller's copy."""
++    from hermes_cli.kanban_card_answer import AnswerRefused
++    try:
++        record = _strict(records.raw(TARGET.request_id)).get("request")
++    except AnswerRefused as exc:  # missing or pruned: no reconstruction from prose
++        raise Refused(f"original request unavailable ({exc})") from None
++    except (ValueError, UnicodeError, AttributeError):
++        raise Refused("original request record is not unambiguous JSON") from None
++    if not isinstance(record, dict) or any(k not in record for k in ENVELOPE) or record["id"] != TARGET.request_id:
++        raise Refused("original request record is incomplete")
++    envelope = {k: record[k] for k in ENVELOPE}
++    try:
++        same = _sha(envelope) == TARGET.intent_sha256
++        rejected = record.get("state") == "rejected" and _sha(record.get("result")) == TARGET.rejection_sha256
++    except (TypeError, ValueError):
++        same = rejected = False
++    if not same:
++        raise Refused("original request intent changed")
++    if not rejected:
++        raise Refused("original rejection changed")
++    return envelope
++
++
++def _home(conn) -> str:
++    """This board is the configured self-work intake home's own primary board; returns its gateway."""
++    from hermes_cli import kanban_card_answer as ca
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_selfwork_owner as owner
++    gateway = owner._runtime()[1]
++    board = kb.get_current_board()
++    try:
++        owner.validate_home(conn, {"owner": {"gateway": gateway, "profile": owner._runtime()[2], "board": board},
++                                   "origin": {}}, board)
++        ca._owner(conn, TARGET.owner_task, gateway, require_primary=True)
++    except (policy.SelfWorkError, ca.AnswerRefused) as exc:
++        raise Refused(f"not the intake home's primary board ({exc})") from None
++    return gateway
++
++
++def _own(conn, kind: str) -> list[dict]:
++    from hermes_cli.kanban_release import own_events
++    return own_events(conn, TARGET.owner_task, (kind,))
++
++
++def _bound(stamp) -> bool:
++    return (isinstance(stamp, dict) and set(stamp) == {"version", "task", "request_id", "intent_sha256",
++                                                       "rejection_sha256", "tenant", "scope", "approval",
++                                                       "expires_at", "offer_uid"}
++            and (stamp["version"], stamp["task"], stamp["request_id"], stamp["intent_sha256"],
++                 stamp["rejection_sha256"], stamp["approval"])
++            == (1, TARGET.owner_task, TARGET.request_id, TARGET.intent_sha256, TARGET.rejection_sha256,
++                TARGET.approval)
++            and type(stamp["expires_at"]) is int and isinstance(stamp["offer_uid"], str))
++
++
++def _spent(conn, offer_uid: str) -> bool:
++    return any(e["payload"].get("offer_uid") == offer_uid for e in _own(conn, SPENT))
++
++
++def _grant(conn, offer_uid: str) -> Optional[dict]:
++    """The grant David's verified click recorded for this offer: on this board's own ``unblocked`` event, with
++    the complete card-answer receipt and its decision comment, for a stamp this board's own offer event holds."""
++    from hermes_cli import kanban_card_answer as ca
++    offers = [e["payload"].get(STAMP) for e in _own(conn, OFFERED)]
++    for event in _own(conn, "unblocked"):
++        grant, receipt = event["payload"].get(GRANT), event["payload"].get(ca.FIELD)
++        if (not isinstance(grant, dict) or not isinstance(receipt, dict) or grant.get("offer_uid") != offer_uid
++                or not _bound(grant.get("stamp")) or grant["stamp"] not in offers
++                or grant["stamp"]["offer_uid"] != offer_uid):
++            continue
++        request = {k: receipt.get(k) for k in ("ownerGateway", "ownerProfile", "board", "task", "generation",
++                                               "choice", "operationId")}
++        if (request["choice"] == "unblock" and grant.get("operationId") == request["operationId"]
++                and all(isinstance(v, str) for v in request.values())
++                and ca._valid_receipt(conn, TARGET.owner_task, request, ca.digest(request), "unblocked", receipt)):
++            return grant
++    return None
++
++
++def granting(conn, task: str, ask, *, now: Optional[int] = None) -> Optional[dict]:
++    """The stamp a default Unblock on ``ask`` grants, or None when the click is an ordinary unblock.
++
++    None for any ask this board's own newest offer event does not hold in full: an agent-written ask with the
++    same text, a stamp another gateway wrote into the synced column, an event another gateway pushed. A real
++    offer that expired or was already answered refuses the click instead of unblocking without a grant."""
++    from hermes_cli.kanban_card_answer import AnswerRefused
++    from hermes_cli.kanban_release import STAMP as RELEASE, ask_digest
++    stamp = ask.get(STAMP) if isinstance(ask, dict) else None
++    if task != TARGET.owner_task or not _bound(stamp):
++        return None
++    offers = _own(conn, OFFERED)
++    if (not offers or offers[0]["payload"].get(STAMP) != stamp
++            or offers[0]["payload"].get("ask_sha256") != ask_digest(ask)):
++        return None
++    if RELEASE in ask:
++        raise AnswerRefused("selfwork_exception_offer_invalid")
++    if (int(time.time()) if now is None else now) >= stamp["expires_at"]:
++        raise AnswerRefused("selfwork_exception_offer_expired")
++    if _spent(conn, stamp["offer_uid"]) or _grant(conn, stamp["offer_uid"]) is not None:
++        raise AnswerRefused("selfwork_exception_offer_used")
++    return stamp
++
++
++def same_offer(conn, fresh, current, stamp) -> bool:
++    """card-answer's fence, under the write lock: the ask is the one answered and, when the click grants, its
++    offer is still this board's own, live and unanswered."""
++    return fresh == current and (stamp is None or granting(conn, current["task"], current["ask"]) == stamp)
++
++
++def grant_fields(stamp, request: dict, fingerprint: str, origin: str) -> dict:
++    """What a granting click adds to its ``unblocked`` event, beside the ``card_answer`` receipt."""
++    if stamp is None:
++        return {}
++    return {GRANT: {"offer_uid": stamp["offer_uid"], "stamp": stamp, "originGateway": origin,
++                    "operationId": request["operationId"], "fingerprint": fingerprint}}
++
++
++def check(conn, exception, *, request_id: str, now: int) -> dict:
++    """Read-only: the capability still names a live, unspent grant for this request. Called at preflight and
++    again by :func:`spend` under admission's write lock."""
++    cap = require(exception)
++    if request_id != TARGET.request_id:
++        raise Refused("exception names another request")
++    if cap.probe:
++        return {}
++    grant = _grant(conn, cap.grant["offer_uid"])
++    if grant is None or grant != cap.grant:
++        raise Refused("no verified Desktop grant for this request")
++    if now >= grant["stamp"]["expires_at"]:
++        raise Refused("exception grant expired")
++    if _spent(conn, grant["offer_uid"]):
++        raise Refused("exception grant already used")
++    return grant
++
++
++def spend(conn, exception, *, request_id: str, tenant, now: int) -> None:
++    """Consume the grant. Caller is ``kanban_selfwork_intake.admit`` inside its write transaction, so a later
++    failure there rolls this back and two admissions cannot both pass :func:`check`."""
++    from hermes_cli import kanban_db as kb
++    if not conn.in_transaction:
++        raise policy.SelfWorkError("self-work exception is spent only inside admission")
++    grant = check(conn, exception, request_id=request_id, now=now)
++    _home(conn)
++    if exception.probe:
++        exception.tenant = (tenant,)
++        raise _Probed("probe")
++    if tenant != grant["stamp"]["tenant"]:
++        raise Refused("tenant_drift: admission would use another tenant than the one granted")
++    kb._append_event(conn, TARGET.owner_task, SPENT, {
++        "offer_uid": grant["offer_uid"], "request_id": request_id, "operationId": grant["operationId"],
++        "tenant": tenant, "at": now})
++
++
++def _receive(envelope: dict, grant: Optional[dict]) -> tuple[dict, Capability]:
++    from hermes_cli.kanban_selfwork_receiver import receive
++    cap = Capability(envelope["from"], grant)
++    return receive(envelope, exception=cap), cap
++
++
++def _ask(envelope: dict, tenant) -> dict:
++    from hermes_cli.kanban_human_request import validate_human_request
++    create = envelope["args"]["create"]
++    title, declared = str(create.get("title") or "")[:200], create["self_work"]
++    return validate_human_request({
++        "action": (f"Grant one admission exception for the rejected request \"{title}\" "
++                   f"({TARGET.request_id}), for accounting recovery only. Unblock = the home admits that same "
++                   "request once, unchanged, and this card goes back to work; the guard freeze stays on. "
++                   "Archive = decline: the request stays rejected and this card's delivery is dropped."),
++        "why_human": ("Tried: the request was refused by kanban.self_work.freeze_guards and no open guard owner "
++                      "exists to add it to. Only you can: decide whether this one request may pass the freeze."),
++        "interaction": "approval",
++        "scope": (f"One request, once: {declared.get('repository')}/{declared.get('area')} "
++                  f"kind {declared.get('kind')}, tenant {tenant or 'none'}, sent by {envelope['from']}. "
++                  f"Intent sha256 {TARGET.intent_sha256}. Approval {TARGET.approval}.\n"
++                  "Options:\nA) Unblock: admit this request once; if an open guard owner exists by then, the "
++                  "request is added to it instead of creating a card.\nB) Archive: decline; nothing is admitted.\n"
++                  "Neither option releases any other card or changes the freeze. "
++                  "If you do nothing, the offer expires and nothing is admitted."),
++        "evidence": (f"Hub request {TARGET.request_id}: state rejected, code self_work_guard_frozen, "
++                     f"result sha256 {TARGET.rejection_sha256}, read by this home when it filed this ask."),
++    })
++
++
++def offer(conn, records, *, now: Optional[int] = None) -> dict:
++    """File the home's exact ask on the owner card. The card must already wait on David (``blocked`` with an
++    agent's ask whose scope names the request); only then is that ask replaced, in one transaction with the
++    offer event. Returns the stamp; a live offer is returned as is."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_ask_resolved import store_request
++    from hermes_cli.kanban_release import ask_digest
++    now = int(time.time()) if now is None else now
++    _home(conn)
++    envelope = original(records)
++    result, cap = _receive(envelope, None)  # dry run through the real chain; admission rolls back at spend()
++    if cap.tenant is None:
++        raise Refused(f"request would not reach admission ({result.get('code')}: {result.get('error')})")
++    with kb.write_txn(conn):
++        _home(conn)
++        row = conn.execute("SELECT status, human_request FROM tasks WHERE id=?", (TARGET.owner_task,)).fetchone()
++        try:
++            ask = json.loads(row["human_request"] or "null")
++        except (TypeError, ValueError):
++            ask = None
++        if row["status"] != "blocked" or not isinstance(ask, dict):
++            raise Refused("owner card is not waiting on a human ask")
++        live = granting(conn, TARGET.owner_task, ask, now=now) if STAMP in ask else None
++        if live is not None:
++            return live
++        if STAMP in ask or TARGET.request_id not in str(ask.get("scope") or ""):
++            raise Refused("owner card's ask is not a request for this exception")
++        stamp = {"version": 1, "task": TARGET.owner_task, "request_id": TARGET.request_id,
++                 "intent_sha256": TARGET.intent_sha256, "rejection_sha256": TARGET.rejection_sha256,
++                 "tenant": cap.tenant[0], "scope": "accounting-recovery-only", "approval": TARGET.approval,
++                 "expires_at": now + TTL, "offer_uid": secrets.token_hex(16)}
++        filed = {**_ask(envelope, cap.tenant[0]), STAMP: stamp}
++        store_request(conn, TARGET.owner_task, filed)
++        kb._append_event(conn, TARGET.owner_task, OFFERED, {STAMP: stamp, "ask_sha256": ask_digest(filed)})
++    return stamp
++
++
++def _live_grant(conn) -> Optional[dict]:
++    for event in _own(conn, OFFERED):
++        stamp = event["payload"].get(STAMP)
++        grant = _grant(conn, stamp["offer_uid"]) if _bound(stamp) else None
++        if grant is not None:
++            return grant
++    return None
++
++
++def reconsider(conn, records) -> dict:
++    """Admit the original once under the newest verified grant. The caller supplies nothing: the request, its
++    sender and the grant are all read here. A repeat returns the stored intake receipt and spends nothing."""
++    _home(conn)
++    grant = _live_grant(conn)
++    if grant is None:
++        raise Refused("no verified Desktop grant for this request")
++    result, _ = _receive(original(records), grant)
++    return result
++
++
++def status(conn) -> dict:
++    """Supported readback by the original request ID; the courier's rejection record is separate and unchanged."""
++    grant = _live_grant(conn)
++    offers = [e["payload"].get(STAMP) for e in _own(conn, OFFERED)]
++    row = None
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='self_work_intake' AND type='table'").fetchone():
++        row = conn.execute("SELECT receipt_json FROM self_work_intake WHERE request_id=?",
++                           (TARGET.request_id,)).fetchone()
++    return {"request_id": TARGET.request_id, "owner_task": TARGET.owner_task,
++            "offer": offers[0] if offers else None,
++            "grant": grant and {"offer_uid": grant["offer_uid"], "operationId": grant["operationId"]},
++            "spent": [e["payload"] for e in _own(conn, SPENT)],
++            "admission": json.loads(row[0]) if row else None}
++
++
++def main(argv=None) -> int:
++    from hermes_cli.kanban_card_answer import AnswerRefused
++    from hermes_cli.kanban_card_answer_runtime import _board_db
++    from hermes_cli.kanban_card_answer_transport import Records
++    from hermes_cli.kanban_db_connect import connect_closing
++    argv = list(sys.argv[1:] if argv is None else argv)
++    if len(argv) != 1 or argv[0] not in ("offer", "reconsider", "status"):
++        print(json.dumps({"ok": False, "error": "usage"}))
++        return 64
++    try:
++        with connect_closing(_board_db("default")) as conn:
++            result = (status(conn) if argv[0] == "status" else
++                      offer(conn, Records()) if argv[0] == "offer" else reconsider(conn, Records()))
++        out, code = {"ok": True, "result": result}, 0
++    except (AnswerRefused, policy.SelfWorkError) as exc:
++        out, code = {"ok": False, "refused": str(exc) or "refused"}, 2
++    except (OSError, sqlite3.OperationalError):
++        out, code = {"ok": False, "retryable": True, "error": "unavailable"}, 3
++    print(json.dumps(out, sort_keys=True, default=str))
++    return code
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/hermes_cli/kanban_selfwork_guards.py b/hermes_cli/kanban_selfwork_guards.py
+index 01018e85e2d..0c790b410e6 100644
+--- a/hermes_cli/kanban_selfwork_guards.py
++++ b/hermes_cli/kanban_selfwork_guards.py
+@@ -32,8 +32,11 @@
+     return value
+ 
+ 
+-def choose(conn, value, *, now, tenant=None, report=True):
+-    """Share selection between preflight and admission; caller holds write lock."""
++def choose(conn, value, *, now, tenant=None, report=True, excepted=False):
++    """Share selection between preflight and admission; caller holds write lock.
++
++    ``excepted``: admission already spent a single-use exception for this exact request in this transaction
++    (``kanban_selfwork_exception.spend``). An open owner is still reused; only the no-owner refusal is replaced."""
+     if value['kind'] != 'guard' or not frozen():
+         return batch.choose(conn, value, now=now, tenant=tenant)
+     row = conn.execute(
+@@ -46,6 +49,8 @@
+     if report or row is None:
+         log.info('guard creation frozen: repository=%s area=%s owner=%s',
+                  value['repository'], value['area'], row['id'] if row else 'none')
++    if row is None and excepted:
++        return batch.Decision('create')
+     if row is None:
+         raise GuardFrozen('kanban.self_work.freeze_guards is on: no open guard owner in this area; '
+                                    'add evidence to existing work instead of creating a guard')
+diff --git a/hermes_cli/kanban_selfwork_intake.py b/hermes_cli/kanban_selfwork_intake.py
+index f401ff0e05c..42864bc848f 100644
+--- a/hermes_cli/kanban_selfwork_intake.py
++++ b/hermes_cli/kanban_selfwork_intake.py
+@@ -71,7 +71,7 @@
+ 
+ 
+ def admit(conn, *, request_id, authority, local_gateway, options, now, create_guard=None,
+-          on_created=None, request=None):
++          on_created=None, request=None, exception=None):
+     _authority(conn, authority, local_gateway)
+     if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', request_id):
+         raise policy.SelfWorkError('self-work requires a stable request identity')
+@@ -94,7 +94,10 @@
+         from hermes_cli.kanban_lanes import lane_tenant
+         tenant = lane_tenant(conn, tuple(options.get('parents', ())), options.get('initial_status', 'running'),
+                              options.get('triage', False), options.get('tenant'), options)
+-        decision = guards.choose(conn, value, now=now, tenant=tenant)
++        if exception is not None:  # the one seam that spends it; a rollback below un-spends it
++            from hermes_cli import kanban_selfwork_exception as sx
++            sx.spend(conn, exception, request_id=request_id, tenant=tenant, now=now)
++        decision = guards.choose(conn, value, now=now, tenant=tenant, excepted=exception is not None)
+         if decision.disposition == 'append':
+             receipt = batch.append(conn, decision, value, request_id=request_id,
+                                    title=options['title'], body=options.get('body'),
+@@ -137,9 +140,18 @@
+     raise policy.SelfWorkError('self-work origin adoption has no durable receipt')
+ 
+ 
+-def append_existing(conn, *, request_id, authority, options, request, now):
+-    """Try append before creation preflight; a miss performs no writes."""
++def append_existing(conn, *, request_id, authority, options, request, now, exception=None):
++    """Try append before creation preflight; a miss performs no writes.
++
++    With the home's exception capability this is a read-only check: an early append here would spend the
++    exception outside :func:`admit` and skip the create path's validation, so reuse and create both go on to it."""
+     _authority(conn, authority, authority)
++    if exception is not None:
++        from hermes_cli import kanban_selfwork_exception as sx
++        prior = replay(conn, request_id, request)
++        if prior is None:
++            sx.check(conn, exception, request_id=request_id, now=now)
++        return prior
+     value = policy.contract(options.get('self_work'))
+     with kb.write_txn(conn, allow_nested=True):
+         prior = replay(conn, request_id, request)
+diff --git a/hermes_cli/kanban_selfwork_owner.py b/hermes_cli/kanban_selfwork_owner.py
+index 8681ff5ed35..c10a873dbed 100644
+--- a/hermes_cli/kanban_selfwork_owner.py
++++ b/hermes_cli/kanban_selfwork_owner.py
+@@ -90,9 +90,19 @@
+     return json.loads(json.dumps(args)) if args.get('self_work') is not None else None
+ 
+ 
+-def replay(conn, args, intent, *, origin_intent=None):
++def _sender(exception):
++    """The authenticated original envelope's sender on the exception path, else None (ordinary attribution)."""
++    if exception is None:
++        return None
++    from hermes_cli import kanban_selfwork_exception as sx
++    return sx.require(exception).sender
++
++
++def replay(conn, args, intent, *, origin_intent=None, exception=None):
+     """Revalidate authority even for a replay; never rerun create preflight."""
+     if args.get('self_work') is None:
++        if exception is not None:
++            raise policy.SelfWorkError('self-work exception requires a declared self-work request')
+         return None
+     authority = validate_home(conn, intent, args.get('board'))
+     request = {'args': args, 'intent': intent}
+@@ -102,12 +112,13 @@
+         options = {key: args[key] for key in ('title', 'body', 'self_work', 'tenant', 'board') if key in args}
+         options.update(origin_intent=origin_intent or (intent if 'origin' in intent else None),
+                        creator_task_id=creator_task(conn, intent),
+-                       created_by=intent.get('sender') or _persisted_identity(),
++                       created_by=_sender(exception) or intent.get('sender') or _persisted_identity(),
+                        parents=_coerce_str_list(args.get('parents') or [], 'parents', 'task ids'))
+         from hermes_cli import kanban_selfwork_guards as guards
+         try:
+             receipt = intake.append_existing(conn, request_id=intent['request_id'], authority=authority,
+-                                             options=options, request=request, now=int(time.time()))
++                                             options=options, request=request, now=int(time.time()),
++                                             exception=exception)
+         except guards.GuardFrozen as exc:
+             return guards.refusal(exc)
+     return _render(conn, receipt, intent) if receipt is not None else None
+@@ -131,7 +142,7 @@
+                        **kt._fields(task, kt._ca.CREATED_FIELDS), **extra})
+ 
+ 
+-def create(conn, options, *, after_create, marker_placement, place_origin, request, intent=None):
++def create(conn, options, *, after_create, marker_placement, place_origin, request, intent=None, exception=None):
+     """Called by the existing tool path after normalization/preflight, before INSERT.
+ 
+     Only DB-local effects execute under intake's transaction. Courier origins
+@@ -142,6 +153,8 @@
+     authority = validate_home(conn, intent, options.get('board'))
+     options = dict(options)
+     options['creator_task_id'] = creator_task(conn, intent)
++    if exception is not None:  # the original envelope's sender, never whoever asked for the reconsideration
++        options['created_by'] = _sender(exception)
+     guard = options.pop('insert_guard', None)
+     # Gateway forwarding would split one area across admission journals. Board
+     # execution labels remain valid, but legacy deferred forwarding cannot.
+@@ -152,7 +165,7 @@
+         receipt = intake.admit(conn, request_id=intent['request_id'], authority=authority,
+                                local_gateway=authority, options=options, now=int(time.time()),
+                                create_guard=guard, on_created=after_create,
+-                               request={'args': request, 'intent': intent})
++                               request={'args': request, 'intent': intent}, exception=exception)
+     except guards.GuardFrozen as exc:
+         return guards.refusal(exc)
+     return _render(conn, receipt, intent, marker_placement, place_origin)
+diff --git a/hermes_cli/kanban_selfwork_receiver.py b/hermes_cli/kanban_selfwork_receiver.py
+index be88ebd3d94..cf4bd146b40 100644
+--- a/hermes_cli/kanban_selfwork_receiver.py
++++ b/hermes_cli/kanban_selfwork_receiver.py
+@@ -16,7 +16,9 @@
+ _ID = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}')
+ 
+ 
+-def receive(request: dict) -> dict:
++def receive(request: dict, *, exception=None) -> dict:
++    """``exception`` is the home's private single-use capability (``kanban_selfwork_exception.reconsider``): a
++    typed object in a keyword, never an envelope field. No CLI or tool entry of this module can supply it."""
+     from hermes_cli import kanban_db as kb
+     from tools import kanban_tools  # built-in registration
+     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
+@@ -45,14 +47,19 @@
+             or not isinstance(create, dict) or create.get('self_work') is None
+             or set(body) not in ({'create'}, {'create', 'origin'}, {'create', 'origin', 'creator'})
+             or ('board' in create and create['board'] != board)
+-            or any(k in create for k in ('origin_intent', 'selfwork_intent', 'origin_session', 'creator_task_id'))):
++            or any(k in create for k in ('origin_intent', 'selfwork_intent', 'origin_session', 'creator_task_id',
++                                          'selfwork_exception'))):
+         raise ValueError('self_work_request_invalid')
++    if exception is not None:  # the exact authenticated original, hashed before the action is normalised below
++        from hermes_cli import kanban_selfwork_exception as sx
++        sx.bind(exception, request)
+     if 'origin' in body:
+         from hermes_cli.kanban_origin_owner import receive as receive_origin
+         origin_body = {k: v for k, v in body.items() if k != 'creator'}
+         context = {'creator': body['creator'], 'sender': sender} if 'creator' in body else None
+-        return receive_origin({**request, 'action': 'create', 'args': origin_body}, selfwork_context=context)
+-    if create.get('session_id') is not None:
++        return receive_origin({**request, 'action': 'create', 'args': origin_body}, selfwork_context=context,
++                              selfwork_exception=exception)
++    if exception is not None or create.get('session_id') is not None:
+         raise ValueError('self_work_request_invalid')
+     intent = {'request_id': request['id'], 'sender': sender,
+               'owner': {'gateway': gateway, 'profile': profile, 'board': board}}
+diff --git a/tests/hermes_cli/test_kanban_selfwork_exception.py b/tests/hermes_cli/test_kanban_selfwork_exception.py
+new file mode 100644
+index 00000000000..2e9318ac02d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_exception.py
+@@ -0,0 +1,368 @@
++"""One request, one verified Desktop grant, one admission: real receiver chain, real card-answer runtime."""
++import copy
++import json
++import shutil
++
++import pytest
++
++from hermes_cli import kanban_card_answer as ca
++from hermes_cli import kanban_card_answer_runtime as runtime
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_selfwork_exception as sx
++from hermes_cli.kanban_selfwork_receiver import receive
++from tests.hermes_cli import test_kanban_card_answer_proof as proof_helpers
++from tests.hermes_cli import test_kanban_selfwork_guard_entry as entry
++from tests.hermes_cli import test_kanban_selfwork_guards as guards
++
++world, nochat_envelope, request_envelope = entry.world, entry.nochat_envelope, entry.request_envelope
++
++
++class Hub:
++    """The Hub's request records as this home would read them with its own credential."""
++    gateway = 'owner'
++
++    def __init__(self):
++        self.rows, self.bytes = {}, {}
++
++    def read(self, rid):
++        return copy.deepcopy(self.rows[rid])
++
++    def raw(self, rid):
++        if rid in self.bytes:
++            return self.bytes[rid]
++        if rid not in self.rows:
++            raise ca.AnswerRefused('courier_record_missing')
++        return json.dumps({'request': self.rows[rid]}).encode()
++
++
++@pytest.fixture
++def home(request_envelope, monkeypatch, tmp_path):
++    """A frozen home holding the owner card, and the Hub record of the request it just rejected."""
++    envelope = {**request_envelope, 'base_version': None}
++    envelope['args']['create']['self_work']['kind'] = 'guard'
++    rejection = receive(copy.deepcopy(envelope))
++    assert rejection['code'] == 'self_work_guard_frozen', rejection
++    hub = Hub()
++    hub.rows[envelope['id']] = {**copy.deepcopy(envelope), 'state': 'rejected', 'result': rejection, 'claims': 1}
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE kanban_sync_state SET mode='primary'")
++        conn.commit()
++        tid = kb.create_task(conn, title='Design and deliver accounting recovery', assignee='default')
++        kb.claim_task(conn, tid)
++        assert kb.block_task(conn, tid, reason='Needs the exception', kind='needs_input', human_request={
++            'action': 'Grant the exception. Unblock = grant; archive = decline.', 'why_human': 'policy',
++            'interaction': 'approval', 'scope': 'exception for ' + envelope['id'], 'evidence': 'rejected'})
++    monkeypatch.setattr(sx, 'TARGET', sx.Target(
++        envelope['id'], sx._sha({k: envelope[k] for k in sx.ENVELOPE}), sx._sha(rejection), tid, 'approval/1'))
++    monkeypatch.setattr(runtime, 'Records', lambda: hub)
++    monkeypatch.setattr(runtime, '_profile', lambda: ('default', tmp_path))
++    return {'envelope': envelope, 'hub': hub, 'task': tid, 'dir': tmp_path, 'rejection': rejection}
++
++
++def click(home, choice='unblock', operation='desktop-operation-one'):
++    """David's answer, delivered the way the Hub delivers it: two record IDs to the owner runtime."""
++    with kbc.connect_closing() as conn:
++        answer = dict(ownerGateway='owner', ownerProfile='default', board='default', task=home['task'],
++                      generation=ca.snapshot(conn, home['task'])['generation'], choice=choice,
++                      operationId=operation)
++    _, rows = proof_helpers.records()
++    for row in rows.values():
++        row['args']['answer'] = copy.deepcopy(answer)
++    rows['original']['key'] = 'default/default/' + home['task']
++    rows['proof']['result']['answer'] = copy.deepcopy(answer)
++    home['hub'].rows.update(rows)
++    return runtime.owner('original', 'proof')
++
++
++def offer(home, **kw):
++    with kbc.connect_closing() as conn:
++        return sx.offer(conn, home['hub'], **kw)
++
++
++def reconsider(home):
++    with kbc.connect_closing() as conn:
++        return sx.reconsider(conn, home['hub'])
++
++
++def state(home):
++    with kbc.connect_closing() as conn:
++        journal = None
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='self_work_intake'").fetchone():
++            row = conn.execute('SELECT request_json FROM self_work_intake WHERE request_id=?',
++                               (home['envelope']['id'],)).fetchone()
++            journal = row and row[0]
++        return {'status': sx.status(conn), 'journal': journal,
++                'tasks': [t for t in kb.list_tasks(conn) if t.id != home['task']],
++                'owner': kb.get_task(conn, home['task']),
++                'comments': {t.id: len(kb.list_comments(conn, t.id)) for t in kb.list_tasks(conn)}}
++
++
++def test_offer_click_admit_once(home):
++    stamp = offer(home)
++    assert offer(home) == stamp  # a live offer is returned, not re-filed
++    with kbc.connect_closing() as conn:
++        ask = ca.snapshot(conn, home['task'])['ask']
++    assert ask[sx.STAMP] == stamp and home['envelope']['args']['create']['title'] in ask['action']
++    assert home['envelope']['id'] in ask['action'] and 'Unblock =' in ask['action'] and 'Archive =' in ask['action']
++    assert state(home)['owner'].status == 'blocked' and state(home)['status']['grant'] is None
++    with pytest.raises(sx.Refused, match='no verified Desktop grant'):
++        reconsider(home)
++
++    receipt = click(home)
++    assert receipt['decisionProvenance'] == 'recorded_desktop_operation'
++    after = state(home)
++    assert after['owner'].status == 'ready'  # plain unblock: the card returns to work
++    assert after['status']['grant'] == {'offer_uid': stamp['offer_uid'], 'operationId': 'desktop-operation-one'}
++    assert after['tasks'] == [] and after['status']['spent'] == []  # the click admits nothing
++    assert click_replay(home) == receipt
++
++    result = reconsider(home)
++    assert result['created'] is True and result['code'] == 'origin_bind_pending', result
++    assert result['request_id'] == home['envelope']['id']
++    done = state(home)
++    assert [t.id for t in done['tasks']] == [result['task_id']]
++    assert done['tasks'][0].created_by == home['envelope']['from'] == 'gw:origin'
++    assert [s['offer_uid'] for s in done['status']['spent']] == [stamp['offer_uid']]
++    assert done['status']['admission']['task_id'] == result['task_id']
++    # The origin obligation is the ordinary one: the same binding the courier path records.
++    assert result['origin_creation']['binding']['origin'] == home['envelope']['args']['origin']
++    assert result['origin_creation']['child_request_id'].startswith('origin-bind-')
++
++    again = reconsider(home)  # stored receipt; nothing spent or created twice
++    assert again['replayed'] is True and again['task_id'] == result['task_id']
++    assert len(state(home)['tasks']) == 1 and len(state(home)['status']['spent']) == 1
++    # The Hub's rejection record is what it was. The freeze is still on: another guard request in this area is
++    # added to the now-open owner, and one in an area with no owner is refused as before.
++    assert sx._sha(home['hub'].rows[home['envelope']['id']]['result']) == sx.TARGET.rejection_sha256
++    other = copy.deepcopy(home['envelope'])
++    other['id'] = 'request-owner-other'
++    appended = receive(copy.deepcopy(other))
++    assert appended['disposition'] == 'append' and appended['task_id'] == result['task_id'], appended
++    other['id'], other['args']['create']['self_work']['area'] = 'request-owner-third', 'gateway'
++    assert receive(other)['code'] == 'self_work_guard_frozen'
++    assert len(state(home)['tasks']) == 1 and len(state(home)['status']['spent']) == 1
++
++
++def click_replay(home):
++    del home['hub'].rows['proof']  # a recorded decision replays with its source offline
++    return runtime.owner('original', 'proof')
++
++
++def test_journal_equals_ordinary_admission_of_same_envelope(home, monkeypatch):
++    """Control: the identical envelope through the ordinary chain with the freeze off, in a copy of the board."""
++    from hermes_cli import config
++    files = [p for p in home['dir'].iterdir() if p.name.startswith('kanban.db')]
++    keep = home['dir'] / 'before'
++    keep.mkdir()
++    for path in files:
++        shutil.copy2(path, keep / path.name)
++    original_load = config.load_config
++
++    def unfrozen(*args, **kwargs):
++        value = original_load(*args, **kwargs)
++        value['kanban']['self_work']['freeze_guards'] = False
++        return value
++    with monkeypatch.context() as patch:
++        patch.setattr(config, 'load_config', unfrozen)
++        control = receive(copy.deepcopy(home['envelope']))
++    assert control['created'] is True, control
++    expected = state(home)
++    for path in home['dir'].iterdir():
++        if path.name.startswith('kanban.db'):
++            path.unlink()
++    for path in keep.iterdir():
++        shutil.copy2(path, home['dir'] / path.name)
++
++    offer(home)
++    click(home)
++    result = reconsider(home)
++    actual = state(home)
++    assert actual['journal'] == expected['journal'] and actual['journal'] is not None
++    journal = json.loads(actual['journal'])
++    assert set(journal) == {'args', 'intent'} and set(journal['intent']) == {'request_id', 'owner', 'origin'}
++    create = home['envelope']['args']['create']
++    assert journal['args'] == {**create, 'board': 'default'} and 'tenant' not in create
++    assert (journal['args']['session_id'], journal['intent']['origin']) == ('creator', home['envelope']['args']['origin'])
++    # Attribution differs from the control by design and is asserted on its own.
++    assert expected['tasks'][0].created_by != 'gw:origin'
++    assert actual['tasks'][0].created_by == 'gw:origin'
++    assert actual['tasks'][0].tenant == expected['tasks'][0].tenant
++    assert result['task_id'] == actual['tasks'][0].id
++
++
++def test_open_owner_is_reused_inside_admission(home):
++    stamp = offer(home)
++    click(home)
++    with kbc.connect_closing() as conn:
++        existing = guards.seed(conn, tenant=stamp['tenant'])
++    result = reconsider(home)
++    assert result['disposition'] == 'append' and result['task_id'] == existing, result
++    done = state(home)
++    assert [t.id for t in done['tasks']] == [existing] and done['comments'][existing] == 1
++    assert len(done['status']['spent']) == 1
++
++
++@pytest.mark.parametrize('case', ['agent_ask', 'column_stamp', 'foreign_event', 'other_text'])
++def test_only_the_homes_own_offer_grants(home, case):
++    stamp = offer(home)
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        ask = json.loads(conn.execute('SELECT human_request FROM tasks WHERE id=?', (home['task'],)).fetchone()[0])
++        if case == 'agent_ask':  # the same visible text without the stamp
++            ask.pop(sx.STAMP)
++        elif case == 'column_stamp':  # a stamp written into the synced column, never offered by this board
++            ask[sx.STAMP] = {**stamp, 'offer_uid': 'f' * 32}
++        elif case == 'other_text':  # the stamp kept on text the home did not write
++            ask['action'] += ' Also release everything.'
++        else:  # the offer event arrives from another gateway
++            conn.execute("DELETE FROM task_events WHERE task_id=? AND kind=?", (home['task'], sx.OFFERED))
++            kb._append_event(conn, home['task'], sx.OFFERED, {sx.STAMP: stamp, 'ask_sha256': 'x'})
++            columns = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++            if 'origin_gateway' not in columns:
++                conn.execute('ALTER TABLE task_events ADD COLUMN origin_gateway TEXT')
++            conn.execute("UPDATE task_events SET origin_gateway='foreign' WHERE task_id=? AND kind=?",
++                         (home['task'], sx.OFFERED))
++        conn.execute('UPDATE tasks SET human_request=? WHERE id=?', (json.dumps(ask), home['task']))
++    click(home)
++    after = state(home)
++    assert after['owner'].status == 'ready' and after['status']['grant'] is None  # ordinary unblock, no grant
++    with pytest.raises(sx.Refused):
++        reconsider(home)
++    assert state(home)['tasks'] == []
++
++
++@pytest.mark.parametrize('choice', ['archive', 'held', 'contained', 'expired'])
++def test_no_grant_without_a_clean_unblock(home, monkeypatch, choice):
++    stamp = offer(home)
++    if choice == 'archive':
++        click(home, 'archive')
++        assert state(home)['owner'].status == 'archived'
++    else:
++        if choice == 'held':
++            monkeypatch.setattr('hermes_cli.kanban_spend_decision.pending', lambda c, t: True)
++        elif choice == 'contained':
++            monkeypatch.setattr('hermes_cli.kanban_containment_guard.pending', lambda c, t: True)
++        else:
++            monkeypatch.setattr(sx.time, 'time', lambda: stamp['expires_at'] + 1)
++        with pytest.raises(ca.AnswerRefused):
++            click(home)
++        assert state(home)['owner'].status == 'blocked'
++    assert state(home)['status']['grant'] is None
++    with pytest.raises(sx.Refused):
++        reconsider(home)
++    assert state(home)['tasks'] == []
++
++
++def _bytes(old, new):
++    """Serve the record with one JSON token replaced: the bytes the home reads, not a parsed copy."""
++    return lambda hub, row: hub.bytes.__setitem__(row['id'], json.dumps({'request': row}).replace(old, new).encode())
++
++
++CHANGES = {
++    'title': lambda hub, row: row['args']['create'].update(title=row['args']['create']['title'] + '!'),
++    'origin': lambda hub, row: row['args']['origin'].update(session='another'),
++    'nested': lambda hub, row: row['args']['create']['self_work'].update(area='gateway'),
++    'sender': lambda hub, row: row.update({'from': 'gw:other'}),
++    'result': lambda hub, row: row.update(result={**row['result'], 'error': 'edited'}),
++    'state': lambda hub, row: row.update(state='done'),
++    'missing': lambda hub, row: hub.rows.clear(),
++    'field': lambda hub, row: row.pop('base_version'),
++    'duplicate': _bytes('"claims": 1', '"claims": 1, "claims": 1'),
++    'nan': _bytes('"claims": 1', '"claims": NaN'),
++}
++
++
++@pytest.mark.parametrize('change', sorted(CHANGES))
++def test_changed_or_ambiguous_original_refuses(home, change):
++    CHANGES[change](home['hub'], home['hub'].rows[home['envelope']['id']])
++    with pytest.raises(sx.Refused):
++        offer(home)
++    assert sx.STAMP not in json.dumps(state(home)['owner'].human_request)
++
++
++def test_original_changed_after_grant_admits_nothing(home):
++    offer(home)
++    click(home)
++    home['hub'].rows[home['envelope']['id']]['args']['create']['body'] = 'a different job'
++    with pytest.raises(sx.Refused, match='intent changed'):
++        reconsider(home)
++    assert state(home)['tasks'] == [] and state(home)['status']['spent'] == []
++
++
++@pytest.mark.parametrize('case', ['tenant_drift', 'expired', 'spent', 'create_fails'])
++def test_admission_refusals_spend_nothing(home, monkeypatch, case):
++    stamp = offer(home)
++    click(home)
++    if case == 'tenant_drift':
++        monkeypatch.setattr('hermes_cli.kanban_lanes.lane_tenant', lambda *a, **k: 'another-tenant')
++    elif case == 'expired':
++        monkeypatch.setattr('hermes_cli.kanban_selfwork_owner.time.time', lambda: stamp['expires_at'] + 1)
++    elif case == 'spent':
++        with kbc.connect_closing() as conn:
++            kb._append_event(conn, home['task'], sx.SPENT, {'offer_uid': stamp['offer_uid']})
++    else:
++        def fail(*a, **k):
++            raise RuntimeError('insert failed after the exception was spent')
++        monkeypatch.setattr('hermes_cli.kanban_selfwork.record', fail)
++    result = reconsider(home)
++    assert result.get('created') is not True and result.get('handoff_complete') is False, result
++    after = state(home)
++    assert after['tasks'] == [] and after['journal'] is None
++    assert len(after['status']['spent']) == (1 if case == 'spent' else 0)  # the rollback un-spends it
++    if case == 'create_fails':
++        monkeypatch.undo()
++
++
++def test_capability_is_not_reachable_from_any_envelope_or_caller(home):
++    offer(home)
++    click(home)
++    for key in ('selfwork_exception',):
++        forged = copy.deepcopy(home['envelope'])
++        forged['args']['create'][key] = {'grant': True}
++        with pytest.raises(ValueError, match='self_work_request_invalid'):
++            receive(forged)
++    with pytest.raises(Exception):
++        receive(copy.deepcopy(home['envelope']), exception={'grant': True})
++    other = copy.deepcopy(home['envelope'])
++    other['args']['create']['title'] = 'Something else entirely'
++    with kbc.connect_closing() as conn:
++        grant = sx._live_grant(conn)
++    with pytest.raises(ValueError, match='self_work_exception_intent_changed'):
++        sx._receive(other, grant)
++    unbound = sx.Capability('gw:origin', grant)  # never passed through the receiver's hash check
++    with kbc.connect_closing() as conn, pytest.raises(Exception, match="not the home's"):
++        sx.check(conn, unbound, request_id=home['envelope']['id'], now=0)
++    assert state(home)['tasks'] == [] and state(home)['status']['spent'] == []
++    # validate_human_request drops the stamp from every supplied ask.
++    from hermes_cli.kanban_human_request import validate_human_request
++    assert sx.STAMP not in validate_human_request({
++        'action': 'a', 'why_human': 'b', 'interaction': 'approval', 'scope': 'c', 'evidence': 'd', sx.STAMP: {}})
++
++
++def test_module_cli_is_the_ingress_and_takes_no_request(home, monkeypatch, capsys):
++    """Both triggers carry no authority: no argument names a request, a grant or an envelope."""
++    monkeypatch.setattr('hermes_cli.kanban_card_answer_transport.Records', lambda: home['hub'])
++
++    def run(*argv):
++        code = sx.main(list(argv))
++        return code, json.loads(capsys.readouterr().out)
++    assert run('offer', home['envelope']['id'])[0] == 64 and run('reconsider', '--grant', 'x')[0] == 64
++    assert run('reconsider') == (2, {'ok': False, 'refused': 'no verified Desktop grant for this request'})
++    code, offered = run('offer')
++    assert code == 0 and offered['result']['request_id'] == home['envelope']['id']
++    click(home)
++    code, admitted = run('reconsider')
++    assert code == 0 and admitted['result']['created'] is True, admitted
++    code, read = run('status')
++    assert code == 0 and read['result']['admission']['task_id'] == admitted['result']['task_id']
++    assert read['result']['grant']['operationId'] == 'desktop-operation-one'
++    assert [t.id for t in state(home)['tasks']] == [admitted['result']['task_id']]
++
++
++def test_offer_needs_a_waiting_owner_card_that_asked_for_it(home):
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        ask = json.loads(conn.execute('SELECT human_request FROM tasks WHERE id=?', (home['task'],)).fetchone()[0])
++        ask['scope'] = 'something unrelated'
++        conn.execute('UPDATE tasks SET human_request=? WHERE id=?', (json.dumps(ask), home['task']))
++    with pytest.raises(sx.Refused, match='not a request for this exception'):
++        offer(home)
++    assert state(home)['tasks'] == []  # the dry run left nothing behind
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index fa1d99762d8..035240def16 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1588,7 +1588,7 @@
+         args = _effective_board_args(args, courier_intent)
+         from hermes_cli.kanban_selfwork_owner import replay, snapshot
+         request_args = snapshot(args)
+-        replayed = replay(conn, args, courier_intent, origin_intent=origin_intent)
++        replayed = replay(conn, args, courier_intent, origin_intent=origin_intent, exception=kw.get("selfwork_exception"))
+         if replayed is not None:
+             return replayed
+         _check(*create_ask_check(conn, args, str(assignee)))  # ask line, then its filing probe [daveey]
+@@ -1693,7 +1693,7 @@
+                 from hermes_cli.kanban_selfwork_owner import create
+                 return create(conn, creation_options, after_create=after_create,
+                               marker_placement=marker_placement, place_origin=place_origin, request=request_args,
+-                              intent=courier_intent)
++                              intent=courier_intent, exception=kw.get("selfwork_exception"))
+             new_tid = kb.create_task(conn, **creation_options)
+         except kanban_overlap.OverlapRefused as exc:  # landed under the write lock after the first check
+             return exc.settle()
+-- 
+2.43.0
+

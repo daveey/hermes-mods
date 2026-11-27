@@ -1,0 +1,259 @@
+From de7c468d1806acc13ff44b7417d84c44e85d9489 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:00:15 -0800
+Subject: [PATCH 6177] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit de7c468d1806acc13ff44b7417d84c44e85d9489.
+
+---
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index f7b7d3aa283..2be0c5da1d6 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -327,7 +327,9 @@
+     "evidence=[...])` for your exact admitted run, rather than exiting without a terminal operation, inventing "
+     "containment authority, a human request, or another clock retry. This retains the existing decision hold; "
+     "it grants no execution authority, completes no acceptance, and renews no spend. Administrative ownership is "
+-    "not safety clearance. Stop only after `terminal_for_run=true`; unknown delivery requires recovery of the "
++    "not safety clearance. `release_condition` is a note for whoever runs `hermes kanban release` (a human operator, "
++    "the owning chat or a delegate chat), not a gate: never make release wait on a permission, principal or grant "
++    "nobody on the board can issue. Stop only after `terminal_for_run=true`; unknown delivery requires recovery of the "
+     "same frozen request, never a new request identity or a claim of successful termination.\n"
+     "5. **Finish with the review model encoded by the task graph.** Always include the structured handoff (`summary`, "
+     "`metadata`) on the lifecycle transition itself; never put secrets, tokens, or raw PII in these durable fields. If "
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 42bc7d5896d..77cc5289221 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -25,6 +25,13 @@
+                blocker={'prerequisite': prerequisite, 'trigger': trigger, 'evidence': row['source_refs']})
+ 
+ 
++RELEASE_AUTHORITY = 'kanban_release'
++RELEASE_VERB = ("A human operator, the card's owning chat or a delegate chat runs "
++                "`hermes kanban release {task}` on the card's home gateway "
++                "(goal-level mandate, renew, budget, promote). A condition an earlier run recorded is a note for "
++                "that decision, not a gate")
++
++
+ def _decision(row: dict, facts: dict) -> None:
+     contract = facts.get('next_action') or {}
+     blocker = contract.get('blocker') if isinstance(contract.get('blocker'), dict) else {}
+@@ -42,9 +49,24 @@
+     if isinstance(evidence, list) and all(isinstance(ref, str) for ref in evidence):
+         row['blocker']['evidence'] = list(dict.fromkeys([*row['source_refs'], *evidence]))
+     release = contract.get('release')
+-    if isinstance(release, dict) and isinstance(release.get('condition'), str) and release['condition'].strip():
+-        row['release']['condition'] = release['condition']
+-    row['release']['authority'] = 'unavailable'  # recorded conditions never grant release
++    recorded = (release['condition'] if isinstance(release, dict) and isinstance(release.get('condition'), str)
++                and release['condition'].strip() else None)
++    offer = facts.get('release_offer')
++    if (facts['stop'].get('cause') == 'safety_refusal' or facts.get('containment')
++            or not isinstance(offer, dict) or offer.get('task') != row['task_id']):
++        # Only a stop `hermes kanban release` would act on names it (`release_offer` is kanban_release.offer():
++        # held in triage/scheduled on a pending stop, not safety-restricted). Safety refusals, containment holds,
++        # receipt-only and non-held rows keep 'unavailable': only their own authority lifts them.
++        if recorded:
++            row['release']['condition'] = recorded
++        row['release']['authority'] = 'unavailable'  # recorded conditions never grant release
++        return
++    # A scope or spend stop has a release: name it. Reporting 'unavailable' under the run's own prose made chats
++    # treat a worker-invented prerequisite ("policy-owner permission ... no principal can issue it") as binding,
++    # and cards repeatedly stalled on it. The recorded text never grants release.
++    verb = RELEASE_VERB.format(task=row['task_id'])
++    row['release'] = {'authority': RELEASE_AUTHORITY,
++                      'condition': verb + (f'. Recorded note: {recorded}' if recorded else '')}
+ 
+ 
+ def _status(row: dict, facts: dict, now: int) -> None:
+@@ -185,6 +207,9 @@
+         return row
+     deps = row['dependencies']
+     if deps and all(d.get('restricted') and d.get('evidence_state') == 'known' for d in deps):
++        if row['release']['authority'] == RELEASE_AUTHORITY:
++            row['release']['condition'] = ('Every parent is restricted; a release would only record the decision and '
++                                           'wait on them. ' + row['release']['condition'])
+         row['release']['authority'] = 'unavailable'
+         if all(d.get('administrative_owner', {}).get('kind') == 'unavailable' for d in deps):
+             row['violations'].append('dependency_recovery_unavailable')
+diff --git a/hermes_cli/kanban_actionability_cli.py b/hermes_cli/kanban_actionability_cli.py
+index 272a9ccea0c..f3dbab69fbd 100644
+--- a/hermes_cli/kanban_actionability_cli.py
++++ b/hermes_cli/kanban_actionability_cli.py
+@@ -79,6 +79,8 @@
+         for row in result['rows']:
+             blocker = row['blocker']
+             step = blocker['trigger'] if blocker else row['instruction']
++            if (row.get('release') or {}).get('authority') == 'kanban_release':
++                step += f"; release: hermes kanban release {row['task_id']}"
+             print(f"{row['task_id']} {row['status']} owner={row['owner']} {row['action']}: {step}; "
+                   f"deadline={row['escalation']['at']} evidence={row['evidence_state']} "
+                   f"violations={','.join(row['violations']) or 'none observed'}")
+diff --git a/hermes_cli/kanban_actionability_evidence.py b/hermes_cli/kanban_actionability_evidence.py
+index 7af03a56d63..e9f5d28aa52 100644
+--- a/hermes_cli/kanban_actionability_evidence.py
++++ b/hermes_cli/kanban_actionability_evidence.py
+@@ -58,7 +58,12 @@
+ def render(row):
+     """Bounded prompt/status line, not a generated executable original-scope instruction."""
+     return (f"Actionability: {row['action']}; owner={row['owner']}; "
+-            f"{row['instruction']}; deadline={row['escalation']['at']} "
++            f"{row['instruction']}; "
++            # Short form: the full condition (with the recorded note) stays in the row, so the 1800 cap never
++            # cuts off deadline/evidence/violations.
++            + (f"release: hermes kanban release {row['task_id']}; "
++               if (row.get('release') or {}).get('authority') == 'kanban_release' else '')
++            + f"deadline={row['escalation']['at']} "
+             f"(null=unrecorded); evidence={row['evidence_state']}; "
+             f"violations={','.join(row['violations']) or 'none observed'}")[:1800]
+ 
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 7123b1ea7e9..b4280dafb28 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -106,6 +106,15 @@
+         return {**rows[0], '_ambiguous': len(rows) > 1} if rows else None
+ 
+ 
++def _release_offer(conn, tid: str) -> dict | None:
++    """What `hermes kanban release` would act on for ``tid`` (kanban_release.offer), else None. Read-only."""
++    try:
++        from hermes_cli import kanban_release
++        return kanban_release.offer(conn, tid)
++    except EVIDENCE_ERRORS:
++        return None
++
++
+ def _unresolved_receipt(events: list[dict]) -> dict | None:
+     promoted = False
+     for event in events:
+@@ -252,6 +261,7 @@
+              'deadline_at': next_action.get('escalate_at') or record(next_action.get('escalation')).get('at'),
+              'containment': task.get('containment_episode'), 'pending_command': reader.pending(tid),
+              'human_step': _human_step(task.get('human_request')),
++             'release_offer': _release_offer(conn, tid) if stop and not receipt_only else None,
+              'unknown': reader.synced or reader.partial or missing or bool(receipt_only) or bool(source and not reader.uid(source))
+                         or bool(task.get('human_request') and not _human_step(task['human_request']))}
+     if source and not any((stop, facts['containment'], facts['pending_command'])):
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index e67898f24fc..a5928c62a78 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -100,6 +100,72 @@
+     assert row['release'] == {'authority': 'unavailable', 'condition': 'Recorded condition'}
+ 
+ 
++OFFER = {'task': 't_x', 'episode': 'stop-1'}  # kanban_release.offer(): held in triage on a pending, unrestricted stop
++
++
++def test_releasable_scope_stop_names_its_release_even_under_an_impossible_recorded_gate():
++    """undated representative observation: runs recorded "authenticated policy-owner permission ... no installed principal can issue a
++    grant" and the row said authority 'unavailable', so the owning chat refused `release`. A stop
++    `hermes kanban release` would act on names the verb; the recorded text is only a note."""
++    gate = 'Authenticated policy-owner permission for the exact request identity; generic user confirmation does not release'
++    for cause in ('scope_stopped', 'capability_unavailable', 'decision_pending', 'spend_budget'):
++        row = project({'task': {'id': 't_x', 'status': 'triage', 'assignee': 'default'}, 'deadline_at': 2000,
++                       'stop': {'cause': cause}, 'release_offer': OFFER,
++                       'next_action': {'release': {'condition': gate}}}, now=1000)
++        assert row['release']['authority'] == 'kanban_release'
++        assert row['release']['condition'].startswith("A human operator, the card's owning chat or a delegate chat "
++                                                      'runs `hermes kanban release t_x`')
++        assert row['release']['condition'].endswith('Recorded note: ' + gate)
++        from hermes_cli.kanban_actionability_evidence import render
++        assert 'release: hermes kanban release t_x;' in render(row)
++
++
++@pytest.mark.parametrize('stop,containment,offer', [
++    ({'cause': 'safety_refusal'}, None, OFFER),          # safety wins even if an offer were computed
++    ({'cause': 'scope_stopped'}, {'episode': 'held'}, OFFER),  # containment hold
++    ({'cause': 'scope_stopped'}, None, None),            # not held / receipt-only: release would refuse not_held
++])
++def test_stops_release_would_refuse_keep_release_unavailable(stop, containment, offer):
++    row = project({'task': {'id': 't_x', 'status': 'triage', 'assignee': 'default'}, 'deadline_at': 2000,
++                   'stop': stop, 'containment': containment, 'release_offer': offer,
++                   'next_action': {'release': {'condition': 'Nominated authority run lifts it'}}}, now=1000)
++    assert row['release'] == {'authority': 'unavailable', 'condition': 'Nominated authority run lifts it'}
++
++
++def test_render_keeps_tail_fields_with_maximum_size_retain():
++    row = project({'task': {'id': 't_x', 'status': 'triage', 'assignee': 'default'}, 'deadline_at': 2000,
++                   'stop': {'cause': 'scope_stopped'}, 'release_offer': OFFER,
++                   'next_action': {'instruction': 'i' * 1000, 'release': {'condition': 'c' * 1000}}}, now=1000)
++    from hermes_cli.kanban_actionability_evidence import render
++    line = render(row)
++    assert 'violations=' in line and 'evidence=' in line and 'deadline=2000' in line
++    assert 'release: hermes kanban release t_x;' in line
++
++
++def test_offer_for_another_card_does_not_name_this_one():
++    """A decision card resolves to its root: the row never names a verb that would act on a different card."""
++    row = project({'task': {'id': 't_decision', 'status': 'triage', 'assignee': 'default'}, 'deadline_at': 2000,
++                   'stop': {'cause': 'scope_stopped'}, 'release_offer': OFFER}, now=1000)
++    assert row['release']['authority'] == 'unavailable'
++
++
++def test_blocked_stopped_card_gets_no_release_offer():
++    conn = held_fixture()
++    conn.execute("UPDATE tasks SET status='blocked' WHERE id='root'")
++    row = describe(conn, 'root', now=200)
++    assert row['release']['authority'] == 'unavailable'
++    conn.close()
++
++
++def test_restricted_parents_downgrade_a_named_release_and_say_why():
++    row = project({'task': {'id': 't_x', 'status': 'triage', 'assignee': 'default'}, 'deadline_at': 2000,
++                   'stop': {'cause': 'scope_stopped'}, 'release_offer': OFFER,
++                   'dependencies': [{'task_id': 'p', 'status': 'triage', 'restricted': True, 'evidence_state': 'known',
++                                     'trigger': 'p released'}]}, now=1000)
++    assert row['release']['authority'] == 'unavailable'
++    assert row['release']['condition'].startswith('Every parent is restricted')
++
++
+ @pytest.mark.parametrize('administrative_owner,unknown', [
+     ({'kind': 'task', 'refs': ['carrier']}, False),
+     ({'kind': 'task', 'refs': []}, True),
+@@ -319,7 +385,8 @@
+     pending = delivery in ('pending', 'unknown')
+     assert row['owner']['kind'] == ('unknown' if pending else 'task')
+     assert row['evidence_state'] == ('unknown' if pending else 'known')
+-    assert row['release']['authority'] == 'unavailable'
++    # root is held in triage on a real scope stop: `hermes kanban release root` would act, so the row names it.
++    assert row['release']['authority'] == 'kanban_release'
+     if pending:
+         assert carrier['action'] == 'resolve_release_authority'
+     conn.close()
+diff --git a/tests/hermes_cli/test_kanban_actionability_report.py b/tests/hermes_cli/test_kanban_actionability_report.py
+index 1c60b5d2bc8..1b99ebb711f 100644
+--- a/tests/hermes_cli/test_kanban_actionability_report.py
++++ b/tests/hermes_cli/test_kanban_actionability_report.py
+@@ -86,7 +86,7 @@
+     pending = delivery in ('pending', 'unknown')
+     assert row['owner']['kind'] == ('unknown' if pending else 'task')
+     assert row['evidence_state'] == ('unknown' if pending else 'known')
+-    assert row['release']['authority'] == 'unavailable'
++    assert row['release']['authority'] == 'kanban_release'  # held root on a real stop: release would act
+     assert list(conn.iterdump()) == before
+     conn.close()
+ 
+diff --git a/tools/kanban_retain_tools.py b/tools/kanban_retain_tools.py
+index b2a2b3363f1..a303f1ad332 100644
+--- a/tools/kanban_retain_tools.py
++++ b/tools/kanban_retain_tools.py
+@@ -7,8 +7,11 @@
+     'End this admitted run in non-executing decision triage. '
+     'Does not complete acceptance, renew spend or grant execution. '
+     'No synthetic authority or human ask is required. '
+-    'Provide an administrative next step, evidence and release prerequisite; unavailable authority '
+-    'stays unavailable. Comments, timers and review completion cannot release a restricted scope. '
++    'Provide an administrative next step, evidence and a release_condition: the concrete thing the releaser should '
++    'check, a note and never a gate. Except after a provider safety refusal or a containment hold, the release '
++    "itself is `hermes kanban release <card>` on the card's home gateway by a human operator, the card's owning "
++    "chat or a delegate chat (never this run); never name a permission, principal or grant that does not exist on "
++    'this board as a precondition. Comments, timers and review completion alone do not release a stopped scope. '
+     'After terminal_for_run=true stop. Unknown delivery preserves the exact request; do not replace it.',
+     {'summary': {'type': 'string', 'minLength': 1,
+                  'description': 'Bounded handoff summary, at most 2000 characters.'},
+-- 
+2.43.0
+

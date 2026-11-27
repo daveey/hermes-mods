@@ -1,0 +1,229 @@
+From aa2ed3753756cd38a2d5011eaf3c2f5884884f23 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:21:14 +0000
+Subject: [PATCH 6202] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit aa2ed3753756cd38a2d5011eaf3c2f5884884f23.
+
+---
+diff --git a/hermes_cli/serve_bootstrap_listener.py b/hermes_cli/serve_bootstrap_listener.py
+index dccb39c6999..a008c60e0a0 100644
+--- a/hermes_cli/serve_bootstrap_listener.py
++++ b/hermes_cli/serve_bootstrap_listener.py
+@@ -7,6 +7,7 @@
+ """
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ import asyncio
++import errno
+ import socket
+ import sys
+ import threading
+@@ -16,6 +17,9 @@
+     request_queue_size = 2048  # match uvicorn during reconnect bursts
+ 
+     def server_bind(self):
++        # Match asyncio.create_server: an IPv6 bind must never also expose IPv4.
++        if self.address_family == socket.AF_INET6:
++            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+         if sys.platform == 'win32':
+             # SO_REUSEADDR on Windows can bind over another live listener.
+             self.allow_reuse_address = False
+@@ -91,10 +95,21 @@
+                 # Hostnames may resolve to both loopbacks. Retain every socket,
+                 # like uvicorn, instead of silently narrowing localhost to IPv4.
+                 bound = (address[0], port, *address[2:])
+-                server = Server(bound, _Handler)
++                try:
++                    server = Server(bound, _Handler)
++                except OSError as exc:
++                    # A resolved family may be disabled on this host. Like
++                    # asyncio, retain the other addresses, but never hide a
++                    # conflict or permission failure. HTTPServer closes the
++                    # failed socket before propagating its bind error.
++                    if exc.errno != errno.EADDRNOTAVAIL:
++                        raise
++                    continue
+                 self.servers.append(server)
+                 if not port:
+                     port = server.server_address[1]
++            if not self.servers:
++                raise OSError(errno.EADDRNOTAVAIL, f'No available address for {host}')
+         except OSError as exc:
+             for server in self.servers:
+                 server.server_close()
+diff --git a/hermes_cli/web_server_lifecycle.py b/hermes_cli/web_server_lifecycle.py
+index 680b17c2ed7..516a8bcdff3 100644
+--- a/hermes_cli/web_server_lifecycle.py
++++ b/hermes_cli/web_server_lifecycle.py
+@@ -496,6 +496,7 @@
+         "'hermes serve' / 'hermes dashboard' backend or the Hermes gateway. "
+         "Stop the other process, or pass --port <other> "
+         "(--port 0 picks a free ephemeral port).",
++        file=sys.stderr,
+         flush=True,
+     )
+ 
+diff --git a/tests/hermes_cli/test_serve_bootstrap_addresses.py b/tests/hermes_cli/test_serve_bootstrap_addresses.py
+new file mode 100644
+index 00000000000..e7569584020
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_bootstrap_addresses.py
+@@ -0,0 +1,73 @@
++"""Bootstrap binds preserve asyncio's address-family exposure and fallback."""
++import errno
++import socket
++
++import pytest
++
++from hermes_cli import serve_bootstrap_listener as bootstrap
++from tests.hermes_cli.test_serve_bootstrap_listener import request
++
++
++def ipv6_loopback_available():
++    try:
++        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
++            probe.bind(('::1', 0))
++    except OSError:
++        return False
++    return True
++
++
++def test_ipv6_listener_never_accepts_ipv4():
++    if not ipv6_loopback_available():
++        pytest.skip('IPv6 loopback unavailable')
++    with bootstrap.BootstrapListener('::', 0) as listener:
++        assert request(listener.port, '/api/health', '::1')[0] == 503
++        assert listener.server.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
++        with pytest.raises(OSError):
++            socket.create_connection(('127.0.0.1', listener.port), timeout=2)
++        listener.handoff()
++        # This same socket is handed to ASGI; its exposure cannot change.
++        assert listener.server.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
++
++
++@pytest.mark.parametrize('unavailable_first', [True, False])
++def test_hostname_skips_unavailable_resolved_address(monkeypatch, unavailable_first):
++    unavailable = (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.0.2.1', 0))
++    available = (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 0))
++    addresses = [unavailable, available] if unavailable_first else [available, unavailable]
++    resolve = bootstrap.socket.getaddrinfo
++    monkeypatch.setattr(bootstrap.socket, 'getaddrinfo', lambda *args, **kwargs: addresses)
++    with bootstrap.BootstrapListener('localhost', 0) as listener:
++        monkeypatch.setattr(bootstrap.socket, 'getaddrinfo', resolve)
++        assert len(listener.servers) == 1
++        assert request(listener.port, '/api/health')[0] == 503
++        owned = listener.handoff()
++        assert owned.fileno() >= 0
++    assert owned.fileno() == -1
++
++
++def test_no_available_address_raises_oserror(monkeypatch):
++    monkeypatch.setattr(bootstrap.socket, 'getaddrinfo', lambda *args, **kwargs: [
++        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.0.2.1', 0))])
++    with pytest.raises(OSError):
++        bootstrap.BootstrapListener('localhost', 0)
++
++
++def test_other_bind_error_closes_already_reserved_sockets(monkeypatch):
++    original = bootstrap._BootstrapServer.server_bind
++    sockets = []
++
++    def bind(server):
++        sockets.append(server.socket)
++        if len(sockets) == 2:
++            raise OSError(errno.EACCES, 'controlled bind denial')
++        original(server)
++
++    monkeypatch.setattr(bootstrap.socket, 'getaddrinfo', lambda *args, **kwargs: [
++        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 0)),
++        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.2', 0))])
++    monkeypatch.setattr(bootstrap._BootstrapServer, 'server_bind', bind)
++    with pytest.raises(OSError, match='controlled bind denial'):
++        bootstrap.BootstrapListener('localhost', 0)
++    assert len(sockets) == 2
++    assert all(sock.fileno() == -1 for sock in sockets)
+diff --git a/tests/hermes_cli/test_serve_bootstrap_limits.py b/tests/hermes_cli/test_serve_bootstrap_limits.py
+index a080d7b9c9f..4c401100251 100644
+--- a/tests/hermes_cli/test_serve_bootstrap_limits.py
++++ b/tests/hermes_cli/test_serve_bootstrap_limits.py
+@@ -58,9 +58,8 @@
+                 assert not sender.is_alive()
+ 
+ 
+-def test_windows_exclusive_bind_never_enables_reuseaddr(monkeypatch):
+-    monkeypatch.setattr(bootstrap.sys, 'platform', 'win32')
+-    monkeypatch.setattr(socket, 'SO_EXCLUSIVEADDRUSE', 123456, raising=False)
++@pytest.mark.platforms('windows')
++def test_windows_exclusive_bind_never_enables_reuseaddr():
+     seen = []
+ 
+     class FakeSocket:
+@@ -77,7 +76,7 @@
+     server.socket = FakeSocket()
+     server.server_address = ('127.0.0.1', 1234)
+     server.server_bind()
+-    assert seen == [(123456, 1), ('bind', ('127.0.0.1', 1234))]
++    assert seen == [(socket.SO_EXCLUSIVEADDRUSE, 1), ('bind', ('127.0.0.1', 1234))]
+ 
+ 
+ @pytest.mark.parametrize('error', [OSError(10048, 'address in use'), OSError(98, 'address in use')])
+@@ -112,6 +111,18 @@
+     assert all(sock.fileno() == -1 for sock in sockets)
+ 
+ 
++def test_port_conflict_hint_stays_on_stderr(monkeypatch, capsys):
++    from hermes_cli import web_server_lifecycle as lifecycle
++    sentinels = []
++    monkeypatch.setattr(lifecycle, '_write_machine_sentinel_line', sentinels.append)
++    lifecycle._report_port_in_use('127.0.0.1', 9876)
++    output = capsys.readouterr()
++    assert output.out == ''
++    assert 'Port 9876 on 127.0.0.1 is already in use' in output.err
++    assert len(sentinels) == 1
++
++
++@pytest.mark.platforms('linux', 'macos', 'windows')
+ def test_second_listener_cannot_share_live_port():
+     from hermes_cli.web_server_lifecycle import PORT_IN_USE_EXIT_CODE
+     with bootstrap.BootstrapListener('127.0.0.1', 0) as first:
+diff --git a/tests/hermes_cli/test_serve_bootstrap_listener.py b/tests/hermes_cli/test_serve_bootstrap_listener.py
+index 77a8334d9ae..b8839387ab1 100644
+--- a/tests/hermes_cli/test_serve_bootstrap_listener.py
++++ b/tests/hermes_cli/test_serve_bootstrap_listener.py
+@@ -45,8 +45,12 @@
+ 
+ 
+ @pytest.mark.asyncio
+-@pytest.mark.parametrize('host', ['127.0.0.1', 'localhost'])
++@pytest.mark.parametrize('host', ['127.0.0.1', 'localhost', '::'])
+ async def test_handoff_keeps_answering_until_real_asgi_lifespan_is_ready(host):
++    if host == '::':
++        from tests.hermes_cli.test_serve_bootstrap_addresses import ipv6_loopback_available
++        if not ipv6_loopback_available():
++            pytest.skip('IPv6 loopback unavailable')
+     import uvicorn
+     from fastapi import FastAPI
+     from hermes_cli.serve_bootstrap_listener import BootstrapListener
+@@ -73,7 +77,8 @@
+         startup = asyncio.create_task(listener.startup(server))
+         try:
+             await asyncio.wait_for(entered.wait(), 2)
+-            status, body = await asyncio.to_thread(request, listener.port, '/api/health')
++            status, body = await asyncio.to_thread(
++                request, listener.port, '/api/health', '::1' if host == '::' else '127.0.0.1')
+             assert status == 503 and b'false' in body
+             assert not listener.stopped
+             release.set()
+@@ -83,6 +88,9 @@
+                 status, body = await asyncio.to_thread(
+                     request, listener.port, '/api/health', bound.server_address[0])
+                 assert status == 200 and b'"ok":true' in body
++            if host == '::':
++                with pytest.raises(OSError):
++                    await asyncio.to_thread(socket.create_connection, ('127.0.0.1', listener.port), 2)
+         finally:
+             release.set()
+             await startup
+-- 
+2.43.0
+

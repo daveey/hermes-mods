@@ -1,0 +1,284 @@
+From 4c600ea2381df0147e9659c58194dcfb81b2898a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:44:14 +0000
+Subject: [PATCH 6027] Kanban dispatcher: bounded storage waits and typed verdicts
+
+Public mirror of source commit 4c600ea2381df0147e9659c58194dcfb81b2898a.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 08c1a5f1185..073b60a8048 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2157,6 +2157,8 @@
+         from hermes_cli.kanban_candidate_receipts import global_hold
+         global_hold(conn, "core update drain")
+         return result
++    from hermes_cli.kanban_dispatch_storage import finish_preclaim
++    finish_preclaim(conn)  # pickup can claim/import work; never cancel its custody writes
+     may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+                                                  board=board, spawn_quota=spawn_quota)
+     if not may_spawn:
+@@ -2181,10 +2183,8 @@
+     review_rows = _eligible_rows(conn, all_review, "review", result) if all_review else []
+     hold_ineligible_budgets(conn, result, dry_run=dry_run)
+     result.lane_candidates = len(all_ready) + len(all_review)
+-    # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
+-    # skipped_unassigned — "busy, retry later" differs from "needs routing".
+-    # Resolved BEFORE the review reservation so the reservation can see which
+-    # review rows the lane loop would refuse this tick.
++    # Per-profile cap: busy rows are deferred, not misclassified as unassigned.
++    # Resolve before lane reservation so it sees what the lane loop would refuse.
+     per_profile_cap = max_in_progress_per_profile if (
+         # Per-profile concurrency cap (#21582): when set, track how many workers each assignee already has
+         # in flight, and refuse to spawn when this would push that assignee past the cap. Prevents fan-out
+diff --git a/hermes_cli/kanban_dispatch_storage.py b/hermes_cli/kanban_dispatch_storage.py
+index 652396a181b..d8692ce762e 100644
+--- a/hermes_cli/kanban_dispatch_storage.py
++++ b/hermes_cli/kanban_dispatch_storage.py
+@@ -21,14 +21,16 @@
+ @dataclass
+ class _Budget:
+     conn: sqlite3.Connection
+-    deadline: float
++    remaining: float
+     timeout_ms: int
+     contended: bool = False
++    preclaim: bool = True
+ 
+     def execute(self, sql):
+-        # No waiting after the deadline, but uncontended work still succeeds.
+-        remaining_ms = max(0, int((self.deadline - _clock()) * 1000))
++        # Charge only boundary acquisition, not RPC/CPU or transaction-body time.
++        remaining_ms = max(0, int(self.remaining * 1000))
+         self.conn.execute(f"PRAGMA busy_timeout = {min(self.timeout_ms, remaining_ms)}")
++        started = _clock()
+         try:
+             self.conn.execute(sql)
+         except sqlite3.OperationalError as exc:
+@@ -37,21 +39,34 @@
+                 raise
+             self.contended = True
+             raise DispatchWriteContended(REASON) from exc
++        finally:
++            self.remaining = max(0, self.remaining - (_clock() - started))
+ 
+ 
+ def execute_boundary(conn, sql) -> bool:
+     """True when a dispatch-scoped boundary was handled; ordinary writers are unchanged."""
+     budget = _active.get()
+-    if budget is None or budget.conn is not conn:
++    if budget is None or budget.conn is not conn or not budget.preclaim:
+         return False
+     budget.execute(sql)
+     return True
+ 
+ 
++def finish_preclaim(conn):
++    """Stop cancellation before pickup can acquire execution/process custody."""
++    budget = _active.get()
++    if budget is None or budget.conn is not conn:
++        return
++    if budget.contended:
++        raise DispatchWriteContended(REASON)  # a maintenance helper may have caught it
++    budget.preclaim = False
++    conn.execute(f"PRAGMA busy_timeout = {budget.timeout_ms}")
++
++
+ @contextmanager
+ def _budget(conn):
+     previous = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+-    budget = _Budget(conn, _clock() + WRITE_WAIT_SECONDS, previous)
++    budget = _Budget(conn, WRITE_WAIT_SECONDS, previous)
+     token = _active.set(budget)
+     try:
+         conn.execute(f"PRAGMA busy_timeout = {min(previous, int(WRITE_WAIT_SECONDS * 1000))}")
+@@ -69,7 +84,7 @@
+             result = work()
+         except sqlite3.OperationalError as exc:
+             from hermes_cli.kanban_db_connect import _is_busy_error
+-            if not isinstance(exc, DispatchWriteContended) and not _is_busy_error(exc):
++            if not budget.preclaim or (not isinstance(exc, DispatchWriteContended) and not _is_busy_error(exc)):
+                 raise
+             budget.contended = True
+             result = DispatchResult()
+diff --git a/tests/hermes_cli/test_kanban_dispatch_postclaim_custody.py b/tests/hermes_cli/test_kanban_dispatch_postclaim_custody.py
+new file mode 100644
+index 00000000000..49636513c75
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_postclaim_custody.py
+@@ -0,0 +1,113 @@
++"""Real process custody survives a preclaim-only writer allowance."""
++import contextlib
++import sqlite3
++import threading
++import subprocess
++import sys
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_dispatch_storage as storage
++from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++
++
++@pytest.mark.parametrize('budgeted', [True, False])
++@pytest.mark.parametrize('count', [1, 2])
++def test_postclaim_pid_publication_retains_custody(tmp_path, monkeypatch, budgeted, count):
++    from pathlib import Path
++    from hermes_cli import kanban_model_retirement, kanban_ratio_routing
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    (tmp_path / 'config.yaml').write_text(_managed_yaml())
++    monkeypatch.setattr(kanban_model_retirement, 'sweep', lambda _conn: None)
++    monkeypatch.setattr(kanban_ratio_routing, 'begin_tick', lambda _conn: None)
++    monkeypatch.setattr(dispatch, 'reap_worker_zombies', lambda: None)
++    monkeypatch.setattr(dispatch, 'reap_terminal_workers', lambda _conn: [])
++    monkeypatch.setattr(storage, 'WRITE_WAIT_SECONDS', 0.0)
++    if not budgeted:
++        monkeypatch.setattr(storage, 'run', lambda _conn, work, *, board: work())
++    path = tmp_path / 'kanban.db'
++    threads = []
++    children = []
++    with contextlib.closing(kbc.connect(path)) as conn, contextlib.closing(
++            sqlite3.connect(path, timeout=0, check_same_thread=False)) as writer:
++        tids = [kb.create_task(conn, title=f'postclaim custody {index}', assignee='default') for index in range(count)]
++        with kb.write_txn(conn):
++            conn.executemany("UPDATE tasks SET status='ready' WHERE id=?", [(tid,) for tid in tids])
++        conn.execute('PRAGMA busy_timeout=500')
++        began = threading.Event()
++
++        def spawn(*_args):
++            writer.execute('BEGIN IMMEDIATE')
++            began.set()
++
++            def release():
++                threading.Event().wait(0.05)  # health: allow HX013 -- contention must outlast zero preclaim budget
++                writer.rollback()
++
++            thread = threading.Thread(target=release)
++            threads.append(thread)
++            child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], stdin=subprocess.PIPE)
++            children.append(child)
++            thread.start()
++            return child.pid
++
++        try:
++            result = dispatch.dispatch_once(conn, spawn_fn=spawn, reconcile_orphans=False,
++                                            max_in_progress=16, max_spawn=count)
++            assert began.is_set(), result
++            assert set(row[0] for row in result.spawned) == set(tids), result
++            stored_pids = []
++            for tid, _assignee, _workspace in result.spawned:
++                task = kb.get_task(conn, tid)
++                assert task is not None and task.status == 'running'
++                stored_pids.append(conn.execute('SELECT worker_pid FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0])
++            assert set(stored_pids) == {child.pid for child in children}
++            assert result.storage_skip_reason is None
++            assert conn.execute('PRAGMA busy_timeout').fetchone()[0] == 500
++        finally:
++            for thread in threads:
++                thread.join(timeout=2)
++                assert not thread.is_alive()
++            for child in children:
++                child.stdin.close()
++                child.wait(timeout=3)
++
++
++def test_ready_with_free_slots_records_storage_reason_then_recovers(tmp_path, monkeypatch, caplog):
++    from pathlib import Path
++    from hermes_cli import kanban_model_retirement, kanban_ratio_routing
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    (tmp_path / 'config.yaml').write_text(_managed_yaml())
++    monkeypatch.setattr(kanban_model_retirement, 'sweep', lambda _conn: None)
++    monkeypatch.setattr(kanban_ratio_routing, 'begin_tick', lambda _conn: None)
++    monkeypatch.setattr(dispatch, 'reap_worker_zombies', lambda: None)
++    monkeypatch.setattr(dispatch, 'reap_terminal_workers', lambda _conn: [])
++    monkeypatch.setattr(storage, 'WRITE_WAIT_SECONDS', 0.0)
++    path = tmp_path / 'kanban.db'
++    with contextlib.closing(kbc.connect(path)) as conn, contextlib.closing(sqlite3.connect(path)) as writer:
++        tid = kb.create_task(conn, title='ready storage interleave', assignee='default')
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        spawned = []
++        writer.execute('BEGIN IMMEDIATE')
++        try:
++            result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args),
++                                            reconcile_orphans=False, max_in_progress=16, max_spawn=1)
++            assert result.storage_skip_reason == storage.REASON
++            assert storage.REASON in caplog.text
++            assert not spawned and not result.spawned
++            assert kb.get_task(conn, tid).status == 'ready'
++            assert conn.execute('SELECT count(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 0
++        finally:
++            writer.rollback()
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args),
++                                        reconcile_orphans=False, max_in_progress=16, max_spawn=1)
++        assert [row[0] for row in result.spawned] == [tid]
++        assert len(spawned) == 1
++        assert result.storage_skip_reason is None
++
+diff --git a/tests/hermes_cli/test_kanban_dispatch_write_contention.py b/tests/hermes_cli/test_kanban_dispatch_write_contention.py
+index 4c8a079db0d..90ce5990a94 100644
+--- a/tests/hermes_cli/test_kanban_dispatch_write_contention.py
++++ b/tests/hermes_cli/test_kanban_dispatch_write_contention.py
+@@ -103,7 +103,7 @@
+         assert storage.execute_boundary(conn, "SELECT 1") is False
+ 
+ 
+-def test_shared_deadline_expires_but_uncontended_work_still_commits(monkeypatch):
++def test_non_sql_work_does_not_spend_acquisition_allowance(monkeypatch):
+     from hermes_cli import kanban_dispatch_storage as storage
+     now = [100.0]
+     monkeypatch.setattr(storage, "_clock", lambda: now[0])
+@@ -112,7 +112,7 @@
+         def work():
+             now[0] += storage.WRITE_WAIT_SECONDS + 1
+             kbc._execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+-            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 0
++            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == int(storage.WRITE_WAIT_SECONDS * 1000)
+             conn.execute("INSERT INTO example VALUES (1)")
+             kbc._execute_boundary_with_retry(conn, "COMMIT")
+             return DispatchResult()
+@@ -174,6 +174,35 @@
+     assert "storage_write_contended=1" in describe_suppression([result])
+ 
+ 
++def test_swallowed_preclaim_refusal_stops_before_pickup():
++    from hermes_cli import kanban_dispatch_storage as storage
++    with closing(sqlite3.connect(":memory:")) as conn:
++        picked_up = []
++        def work():
++            budget = storage._active.get()
++            assert budget is not None
++            budget.contended = True  # maintenance caught its boundary refusal
++            storage.finish_preclaim(conn)
++            picked_up.append(True)
++            return DispatchResult()
++        assert storage.run(conn, work, board="sample").storage_skip_reason == storage.REASON
++        assert picked_up == []
++
++
++def test_postclaim_error_is_not_replaced_by_an_empty_result():
++    from hermes_cli import kanban_dispatch_storage as storage
++    with closing(sqlite3.connect(":memory:")) as conn:
++        error = sqlite3.OperationalError("database is locked")
++        def work():
++            storage.finish_preclaim(conn)
++            assert not storage.execute_boundary(conn, "BEGIN IMMEDIATE")
++            raise error
++        with pytest.raises(sqlite3.OperationalError) as caught:
++            storage.run(conn, work, board="sample")
++        assert caught.value is error
++
++
++
+ def test_gateway_storage_skip_counts_as_skipped_pass(monkeypatch):
+     from contextlib import contextmanager
+     from types import SimpleNamespace
+-- 
+2.43.0
+

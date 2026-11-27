@@ -1,0 +1,165 @@
+From 51d3a7bf617a70010df4a6a3748ca1d1a33cc7fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 10:47:17 +0000
+Subject: [PATCH 6165] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit 51d3a7bf617a70010df4a6a3748ca1d1a33cc7fe.
+
+---
+diff --git a/tests/e2e/core/_service_readiness.py b/tests/e2e/core/_service_readiness.py
+new file mode 100644
+index 00000000000..c6755878184
+--- /dev/null
++++ b/tests/e2e/core/_service_readiness.py
+@@ -0,0 +1,20 @@
++"""Listener readiness precedes standalone service readiness; retry only its explicit fence."""
++from __future__ import annotations
++
++import httpx
++
++from tests.waiting import wait_until
++
++
++def service_response(client: httpx.Client, path: str, *, timeout: float = 120) -> httpx.Response:
++    """Return the first non-warmup response, leaving auth and application errors visible."""
++    def probe():
++        response = client.get(path)
++        if response.status_code == 503 and response.headers.get("content-type", "").startswith("application/json"):
++            if response.json() == {"detail": "Backend services warming"}:
++                return None
++        return response
++
++    response = wait_until(probe, timeout=timeout, interval=0.1, what=f"service warmup before GET {path}")
++    assert response is not None
++    return response
+diff --git a/tests/e2e/core/dashboard/_helpers.py b/tests/e2e/core/dashboard/_helpers.py
+index b0b5bf2c3bb..ea9eadab492 100644
+--- a/tests/e2e/core/dashboard/_helpers.py
++++ b/tests/e2e/core/dashboard/_helpers.py
+@@ -282,7 +282,9 @@
+         assert self.port > 0, f"hermes dashboard exited rc={self.proc.returncode}:\n{self.log_tail()}"
+         self.base = f"http://127.0.0.1:{self.port}"
+         self.http = httpx.Client(base_url=self.base, timeout=60.0, trust_env=False)
+-        index = self.http.get("/")
++        from tests.e2e.core._service_readiness import service_response
++
++        index = service_response(self.http, "/")
+         m = _TOKEN_RE.search(index.text)
+         assert index.status_code == 200 and m, f"index.html carried no session token: {index.status_code}"
+         self.token = m.group(1)
+diff --git a/tests/e2e/core/parity/_drive_rpc.py b/tests/e2e/core/parity/_drive_rpc.py
+index f9cd720ea3e..d9d789d7703 100644
+--- a/tests/e2e/core/parity/_drive_rpc.py
++++ b/tests/e2e/core/parity/_drive_rpc.py
+@@ -235,8 +235,15 @@
+ 
+ 
+ def ws_rpc(port: int, token: str) -> tuple[RpcClient, Callable[[], None]]:
++    import httpx
+     from websockets.sync.client import connect
+ 
++    from tests.e2e.core._service_readiness import service_response
++
++    with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=60, trust_env=False,
++                      headers={"X-Hermes-Session-Token": token}) as client:
++        response = service_response(client, "/api/status")
++        assert response.status_code == 200, f"serve service readiness: {response.status_code} {response.text}"
+     ws = connect(f"ws://127.0.0.1:{port}/api/ws?token={token}", open_timeout=30, max_size=None)
+     frames: queue.Queue[str | None] = queue.Queue()
+ 
+diff --git a/tests/e2e/core/parity/desktop_ready_parse.mjs b/tests/e2e/core/parity/desktop_ready_parse.mjs
+index a2bd9f36af5..032746d6809 100644
+--- a/tests/e2e/core/parity/desktop_ready_parse.mjs
++++ b/tests/e2e/core/parity/desktop_ready_parse.mjs
+@@ -6,8 +6,26 @@
+ // stdout. Prints {"port": N} or {"error": "..."}. The Python side therefore never
+ // re-implements or regexes the TS contract: if the parser changes, this follows.
+ import { EventEmitter } from 'node:events'
++import { registerHooks } from 'node:module'
++import { extname } from 'node:path'
+ import { pathToFileURL } from 'node:url'
+ 
++// Electron's bundler resolves extensionless TS imports; native Node does not.
++// Keep executing the real dependency graph rather than copying the parser.
++registerHooks({
++  resolve(specifier, context, nextResolve) {
++    if (specifier.startsWith('.') && !extname(specifier)) {
++      try {
++        return nextResolve(specifier, context)
++      } catch (error) {
++        if (error.code !== 'ERR_MODULE_NOT_FOUND') { throw error }
++        return nextResolve(`${specifier}.ts`, context)
++      }
++    }
++    return nextResolve(specifier, context)
++  },
++})
++
+ const [parserPath, timeoutMs] = process.argv.slice(2)
+ const { waitForDashboardPort } = await import(pathToFileURL(parserPath).href)
+ 
+diff --git a/tests/e2e/core/tenancy/_helpers.py b/tests/e2e/core/tenancy/_helpers.py
+index 0c16a43f8d6..70bd443168a 100644
+--- a/tests/e2e/core/tenancy/_helpers.py
++++ b/tests/e2e/core/tenancy/_helpers.py
+@@ -548,6 +548,15 @@
+         self.port = poll(lambda: port_box[0] if port_box else (self.proc.poll() is not None and -1), 120,
+                          "hermes serve to report its port")
+         assert self.port > 0, f"hermes serve exited rc={self.proc.returncode}"
++        import httpx
++
++        from tests.e2e.core._service_readiness import service_response
++
++        # /api/health is display-ready before services; /api/status crosses the warmup fence.
++        with httpx.Client(base_url=f"http://127.0.0.1:{self.port}", timeout=60, trust_env=False,
++                          headers={"X-Hermes-Session-Token": self.token}) as client:
++            response = service_response(client, "/api/status")
++            assert response.status_code == 200, f"serve service readiness: {response.status_code} {response.text}"
+         self.ws = connect(f"ws://127.0.0.1:{self.port}/api/ws?token={self.token}", open_timeout=90, max_size=None)
+         self._q: queue.Queue[dict[str, Any]] = queue.Queue()
+         self._rid = 0
+diff --git a/tests/e2e/core/test_service_readiness.py b/tests/e2e/core/test_service_readiness.py
+new file mode 100644
+index 00000000000..eb01b9bbb49
+--- /dev/null
++++ b/tests/e2e/core/test_service_readiness.py
+@@ -0,0 +1,36 @@
++"""Readiness probes retry warmup, not authentication failures or application faults."""
++from __future__ import annotations
++
++import httpx
++import pytest
++
++from tests.e2e.core._service_readiness import service_response
++
++
++@pytest.mark.parametrize("status,body", [
++    (200, {"ready": True}),
++    (401, {"detail": "unauthenticated"}),
++    (503, {"detail": "storage unavailable"}),
++])
++def test_warmup_wait_preserves_first_application_response(status, body):
++    requests = []
++
++    def handler(request):
++        requests.append(request)
++        if len(requests) == 1:
++            return httpx.Response(503, json={"detail": "Backend services warming"})
++        return httpx.Response(status, json=body)
++
++    with httpx.Client(base_url="http://127.0.0.1", transport=httpx.MockTransport(handler)) as client:
++        response = service_response(client, "/api/status")
++    assert response.status_code == status and response.json() == body
++    assert len(requests) == 2
++
++
++def test_unfinished_warmup_is_bounded():
++    def handler(request):
++        return httpx.Response(503, json={"detail": "Backend services warming"})
++
++    with httpx.Client(base_url="http://127.0.0.1", transport=httpx.MockTransport(handler)) as client:
++        with pytest.raises(AssertionError, match="service warmup before GET /api/status"):
++            service_response(client, "/api/status", timeout=0)
+-- 
+2.43.0
+

@@ -1,0 +1,817 @@
+From a1f6e65a86ea276ea54f9d44b3ad9d7ca320234e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:29:15 +0000
+Subject: [PATCH 6310] Immutable historical rejection observations and fresh audit cuts
+
+Public mirror of source commit a1f6e65a86ea276ea54f9d44b3ad9d7ca320234e.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_history_residue_boundary_survivors.py b/tests/hermes_cli/test_kanban_history_residue_boundary_survivors.py
+new file mode 100644
+index 00000000000..ab23b5fddbf
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_boundary_survivors.py
+@@ -0,0 +1,218 @@
++"""Malformed boundary inputs and unmasked historical-custody vetoes.
++
++No production/state mutation: stores and the HTTP peer are existing isolated
++fixtures. Refusal tests require Refused, not an arbitrary programming exception.
++"""
++import json
++import socket
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli import kanban_history_residue_http as transport
++from hermes_cli import kanban_history_residue_local as local
++from hermes_cli.kanban_history_residue_source import Refused
++from hermes_cli.kanban_sync_client import Hub, Identity
++from tests.hermes_cli import test_kanban_history_residue_http as http_helpers
++from tests.hermes_cli import test_kanban_history_residue_local as local_helpers
++from tests.hermes_cli.test_kanban_history_residue_custody import SCOPE, request
++
++stores = local_helpers.stores
++db = http_helpers.db
++server = http_helpers.server
++
++
++@pytest.mark.parametrize('bad_scope', [list(SCOPE), SCOPE[:2], (), (*SCOPE, 'extra'),
++                                       ('', 'default', 'home'),
++                                       ('https://board.example', ' ', 'home'),
++                                       ('https://board.example', 'default', '')],
++                         ids=['list', 'short', 'empty', 'long', 'endpoint', 'board', 'gateway'])
++def test_custody_scope_rejected_before_schema(db, bad_scope):
++    raw, _ = request()
++    with pytest.raises(Refused, match='^scope_invalid$'):
++        custody.stage_once(db, bad_scope, raw)
++    assert db.execute('SELECT name FROM sqlite_master').fetchall() == []
++
++
++def test_unknown_integer_request_version_never_installs_intent(db):
++    raw, _ = request()
++    obj = json.loads(raw)
++    obj['version'] = 2
++    with pytest.raises(Refused, match='^request_invalid$'):
++        custody.stage_once(db, SCOPE, json.dumps(obj))
++    assert db.execute('SELECT name FROM sqlite_master').fetchall() == []
++
++
++@pytest.mark.parametrize('version', [7.0, True], ids=['float', 'bool'])
++def test_receipt_parent_version_requires_integer_not_numeric_equality(db, version):
++    raw, receipt = request()
++    obj = json.loads(raw)
++    # True == 1: keep every other request/receipt identity check satisfied.
++    obj['expected_version'] = 1 if version is True else 7
++    raw = json.dumps(obj)
++    receipt['parent']['version'] = version
++    custody.stage_once(db, SCOPE, raw)
++    with pytest.raises(Refused, match='^receipt_request_conflict$'):
++        custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++    assert custody.lookup(db, SCOPE, 'op-original')['receipt_json'] is None
++
++
++@pytest.mark.parametrize('endpoint', ['http://[::1]', 'https://[::1]', 'http://localhost:443'])
++def test_canonical_ipv6_and_nondefault_http_port_are_usable(endpoint):
++    hub = SimpleNamespace(ident=Identity(endpoint, 'key', 'home'))
++    assert transport.scope(hub, 'default') == (endpoint, 'default', 'home')
++
++
++@pytest.mark.parametrize('endpoint', ['http://localhost:80', 'https://[::1]:443'])
++def test_explicit_default_port_is_an_alias_not_new_custody(endpoint):
++    hub = SimpleNamespace(ident=Identity(endpoint, 'key', 'home'))
++    with pytest.raises(Refused, match='^endpoint_noncanonical$'):
++        transport.scope(hub, 'default')
++
++
++@pytest.mark.parametrize('endpoint', ['https://', 'ftp://localhost'])
++def test_missing_hostname_and_non_http_loopback_fail_as_refusals(db, endpoint):
++    raw, _ = request()
++    hub = SimpleNamespace(ident=Identity(endpoint, 'key', 'home'))
++    with pytest.raises(Refused):
++        transport.observe(db, hub, 'default', raw)
++    assert db.execute('SELECT name FROM sqlite_master').fetchall() == []
++
++
++@pytest.mark.parametrize('endpoint', ['https://user@board.example',
++                                     'https://:secret@board.example',
++                                     'https://board.example?query=1',
++                                     'https://board.example#fragment'])
++def test_endpoint_credentials_query_fragment_never_get_custody(db, endpoint):
++    # Both the identity guard and later exact canonical reconstruction veto
++    # these strings. Do not pretend an earlier refusal reason is new authority.
++    raw, _ = request()
++    hub = SimpleNamespace(ident=Identity(endpoint, 'key', 'home'))
++    with pytest.raises(Refused):
++        transport.observe(db, hub, 'default', raw)
++    assert db.execute('SELECT name FROM sqlite_master').fetchall() == []
++
++
++@pytest.mark.parametrize('field', ['board', 'gateway', 'key'])
++def test_empty_transport_identity_cannot_progress_to_custody(db, field, monkeypatch):
++    def forbidden_network(*args):
++        pytest.fail('invalid identity reached network')
++
++    monkeypatch.setattr(transport, '_request', forbidden_network)
++    board, gateway, key = ('', 'home', 'key') if field == 'board' else (
++        ('default', '', 'key') if field == 'gateway' else ('default', 'home', ''))
++    hub = SimpleNamespace(ident=Identity('https://board.example', key, gateway))
++    with pytest.raises(Refused, match='^endpoint_identity$'):
++        transport.current(hub, board, 'op-original')
++    assert db.execute('SELECT name FROM sqlite_master').fetchall() == []
++
++
++def test_nonloopback_request_uses_real_environment_proxy(server, monkeypatch):
++    peer, state, _ = server
++    monkeypatch.setattr(transport.urllib.request, 'getproxies', lambda: {'http': peer.ident.url})
++    monkeypatch.setattr(transport.urllib.request, 'proxy_bypass', lambda host: False)
++    resolve = socket.getaddrinfo
++
++    def only_fixture_resolution(host, *args, **kwargs):
++        if host == 'history.invalid':
++            raise OSError('direct origin resolution forbidden: proxy required')
++        return resolve(host, *args, **kwargs)
++
++    monkeypatch.setattr(socket, 'getaddrinfo', only_fixture_resolution)
++    hub = Hub(Identity('http://history.invalid:9', 'key', 'home'))
++    try:
++        assert transport._request(hub, 'GET', '/history-boundary', None) == b'null'
++        assert len(state['calls']) == 1
++        assert state['calls'][0][1] == 'http://history.invalid:9/history-boundary'
++    finally:
++        hub.close()
++
++
++@pytest.mark.parametrize('column', sorted(sync.JSON_SERVER_COLUMNS['tasks']))
++def test_portable_json_metadata_is_decoded_or_refused(stores, column):
++    live, _, raw = stores
++    live.execute(f'UPDATE tasks SET "{column}"=?', ('{"nested":{"value":1}}',))
++    result = local.snapshot(live, raw, board='default', gateway='home', replica=False)
++    assert result['portable'][column] == {'nested': {'value': 1}}
++    live.execute(f'UPDATE tasks SET "{column}"=?', ('{"duplicate":1,"duplicate":2}',))
++    with pytest.raises(Refused, match='^duplicate_key$'):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
++
++
++def test_row_count_bound_precedes_any_source_materialization():
++    conn = sqlite3.connect(':memory:')
++    seen = []
++    try:
++        conn.execute('CREATE TABLE cells(value TEXT)')
++        conn.executemany('INSERT INTO cells VALUES (?)', [('x',)] * (local.MAX_ROWS + 1))
++
++        def record(cursor, row):
++            seen.append(tuple(c[0] for c in cursor.description))
++            return row
++
++        conn.row_factory = record
++        with pytest.raises(Refused, match='^local_snapshot_bound$'):
++            local._rows(conn, 'SELECT value FROM cells')
++        assert len(seen) == 1  # aggregate only; no raw cell was materialized
++        assert seen[0] != ('value',)
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('fault', ['duplicate-state', 'wrong-gateway', 'wrong-mode'])
++def test_sync_identity_clauses_are_independent(stores, fault):
++    live, _, raw = stores
++    sql = {'duplicate-state': 'INSERT INTO kanban_sync_state SELECT * FROM kanban_sync_state',
++           'wrong-gateway': "UPDATE kanban_sync_state SET gateway_id='elsewhere'",
++           'wrong-mode': "UPDATE kanban_sync_state SET mode='shadow'"}[fault]
++    live.execute(sql)
++    with pytest.raises(Refused, match='^local_sync_identity$'):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
++
++
++@pytest.mark.parametrize('column', ['current_run_id', 'claim_lock', 'claim_expires', 'worker_pid',
++                                    'worker_started_at', 'lease_holder', 'lease_expires'])
++def test_missing_executor_column_is_refused_not_a_keyerror(stores, column):
++    live, _, raw = stores
++    live.execute(f'ALTER TABLE tasks DROP COLUMN "{column}"')
++    with pytest.raises(Refused, match='^local_executor_active$'):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
++
++
++@pytest.mark.parametrize('status,ended', [('done', None), ('running', 123)])
++def test_run_completion_requires_both_terminal_status_and_end(stores, status, ended):
++    live, _, raw = stores
++    live.execute('INSERT INTO task_runs VALUES (1,?,?,?,?)', ('run', 't_stopped', status, ended))
++    with pytest.raises(Refused, match='^local_running_run$'):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
++
++
++@pytest.mark.parametrize('state', ['rejected', 'pending'])
++def test_other_event_work_does_not_alias_selected_source(stores, state):
++    live, _, raw = stores
++    source = json.loads(raw)
++    other = dict(source, op_id='op-second', row_uid='event-second', state=state)
++    live.execute('INSERT INTO kanban_sync_outbox VALUES (' + ','.join('?' for _ in other) + ')',
++                 tuple(other.values()))
++    # fields.task_id selects both ops, but only event-original identifies source.
++    if state == 'pending':
++        with pytest.raises(Refused, match='^local_uncovered_work$'):
++            local.snapshot(live, raw, board='default', gateway='home', replica=False)
++    else:
++        result = local.snapshot(live, raw, board='default', gateway='home', replica=False)
++        assert [op['op_id'] for op in result['ops']] == ['op-original', 'op-second']
++
++
++def test_same_uid_in_wrong_table_is_never_accepted(stores):
++    live, _, raw = stores
++    source = json.loads(raw)
++    other = dict(source, op_id='op-second', table_name='tasks')
++    live.execute('INSERT INTO kanban_sync_outbox VALUES (' + ','.join('?' for _ in other) + ')',
++                 tuple(other.values()))
++    # For C229 the source filter rejects earlier; intact code reaches the
++    # uncovered-table veto. Both must refuse, not produce an audit snapshot.
++    with pytest.raises(Refused):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cut_survivors.py b/tests/hermes_cli/test_kanban_history_residue_cut_survivors.py
+new file mode 100644
+index 00000000000..b01c145d7f9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_cut_survivors.py
+@@ -0,0 +1,173 @@
++"""Unmask independent configured-board and fresh-cut contracts. [daveey]"""
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db
++from hermes_cli import kanban_history_residue_board as board
++from hermes_cli import kanban_history_residue_cut as cut
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_cli as cli
++from hermes_cli.kanban_history_residue_source import Refused
++from tests.hermes_cli import test_kanban_history_residue_board as bf
++from tests.hermes_cli import test_kanban_history_residue_cut as cf
++from tests.hermes_cli import test_kanban_history_residue_cli as clf
++
++stores = bf.stores
++configured = bf.configured
++cut_inputs = cf.cut_inputs
++
++
++def test_read_does_not_create_custody(configured):
++    path = board.ledger_path('default')
++    assert not path.exists()
++    with pytest.raises(sqlite3.OperationalError):
++        board._ledger('default')
++    assert not path.exists()
++
++
++def test_paths_reject_swapped_handles(configured):
++    paths, _, _, _, connect = configured
++    with pytest.raises(Refused, match='configured_paths_required'):
++        board._paths(connect(paths[1]), connect(paths[0]), 'default')
++
++
++def test_paths_reject_identical_configured_databases(configured, monkeypatch):
++    paths, _, _, _, connect = configured
++    monkeypatch.setattr(client, 'shadow_path', lambda _: paths[0])
++    with pytest.raises(Refused, match='configured_paths_required'):
++        board._paths(connect(paths[0]), connect(paths[0]), 'default')
++
++
++@pytest.mark.parametrize('reason', [None, 42, '', '  '])
++def test_reason_refused_before_refresh(configured, reason):
++    with pytest.raises(Refused, match='reason_required'):
++        board.observe_board('default', 'op-original', reason)
++
++
++@pytest.mark.parametrize('flag', ['busy', 'more'])
++def test_observation_requires_complete_refresh(configured, monkeypatch, flag):
++    _, _, calls, _, _ = configured
++    monkeypatch.setattr(client, '_pull_replica', lambda *a, **kw: client.Pulled(**{flag: True}))
++    with pytest.raises(Refused, match='diagnostic_refresh_incomplete'):
++        board.observe_board('default', 'op-original', 'Keep history')
++    assert not calls and not board.ledger_path('default').exists()
++
++
++def test_existing_intent_uses_original_expected_version(configured):
++    paths, _, calls, _, connect = configured
++    board.observe_board('default', 'op-original', 'Keep history')
++    for path in paths:
++        connect(path).execute('UPDATE tasks SET sync_version=8')
++    assert board.observe_board('default', 'op-original', 'Keep history')['recorded']
++    assert [c[0] for c in calls] == ['POST', 'GET', 'GET']
++
++
++@pytest.mark.parametrize('count', [0, 21])
++def test_board_ledger_bound_before_cut(configured, monkeypatch, count):
++    paths, hub, _, _, connect = configured
++    board.observe_board('default', 'op-original', 'Keep history')
++    monkeypatch.setattr(cut, 'MAX_OPS', 0 if count == 21 else 20)
++    if not count:
++        identity = board.transport.scope(hub, 'default')
++        monkeypatch.setattr(board.transport, 'scope', lambda *a: (identity[0], 'other', identity[2]))
++    with pytest.raises(Refused, match='cut_ops_bound'):
++        board.audit_diff(connect(paths[0]), connect(paths[1]), hub, 'default', pulled=client.Pulled(), started=cut.time.monotonic())
++
++
++@pytest.mark.parametrize('change', [None, {'changes': [1]}, {'more': True}, {'head': 100.0}, {'next': 100.0}])
++def test_empty_feed_each_independent_condition(change):
++    data = dict(changes=[], more=False, head=100, next=100)
++    if change is None:
++        data = []
++    else:
++        data.update(change)
++    with pytest.raises(Refused, match='authoritative_feed_changed'):
++        cut._empty(SimpleNamespace(changes=lambda *a: data), 'default', 100)
++
++
++@pytest.mark.parametrize('ids', [[], ['op-original'] * 2, ['op-original'] * 21])
++def test_cut_op_inventory_refused_before_lookup(cut_inputs, ids):
++    live, shadow, ledger, hub, _, _ = cut_inputs
++    with pytest.raises(Refused, match='cut_ops_bound'):
++        cut.verify(live, shadow, ledger, hub, 'default', ids, started=cut.time.monotonic())
++
++
++def test_transaction_trace_uses_reader_then_writer():
++    conn = sqlite3.connect(':memory:', isolation_level=None)
++    trace = []
++    conn.set_trace_callback(trace.append)
++    try:
++        with cut._transaction(conn):
++            pass
++        with cut._transaction(conn, reserve=True):
++            pass
++        assert [s for s in trace if s.startswith('BEGIN')] == ['BEGIN', 'BEGIN IMMEDIATE']
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('head', [True, -1])
++def test_snapshot_cursor_boundary(cut_inputs, monkeypatch, head):
++    original = cut._capture
++    def capture(*a):
++        result = original(*a)
++        for snap in result:
++            snap['state'][0]['cursor'] = head
++        return result
++    monkeypatch.setattr(cut, '_capture', capture)
++    with pytest.raises(Refused, match='replica_cursor_changed'):
++        cf.verify(cut_inputs)
++
++
++@pytest.mark.parametrize('category', ['missing_in_shadow', 'extra_in_shadow', 'child_mismatch'])
++def test_all_ordinary_drift_categories_keep_cut_dirty(cut_inputs, monkeypatch, category):
++    from hermes_cli import kanban_sync_client
++    original = kanban_sync_client.diff
++    def diff(*a):
++        result = original(*a)
++        result[category] = ['unrelated'] if category != 'child_mismatch' else {'task_comments': 1}
++        return result
++    monkeypatch.setattr(kanban_sync_client, 'diff', diff)
++    assert cf.verify(cut_inputs)['diff']['clean'] is False
++
++
++def test_unsealed_refused_before_receipt_decode(cut_inputs, monkeypatch):
++    original = cut.custody.lookup
++    def lookup(*a):
++        row = original(*a)
++        row['receipt_json'] = None
++        return row
++    monkeypatch.setattr(cut.custody, 'lookup', lookup)
++    with pytest.raises(Refused, match='sealed_custody_missing'):
++        cf.verify(cut_inputs)
++
++
++def test_missing_parent_key_refused_at_boundary(cut_inputs, monkeypatch):
++    original = cut.validate_current
++    def validate(*a, **kw):
++        result = original(*a, **kw)
++        del result['parent']['title']
++        return result
++    monkeypatch.setattr(cut, 'validate_current', validate)
++    with pytest.raises(Refused, match='canonical_parent_changed'):
++        cf.verify(cut_inputs)
++
++
++def test_no_ledger_does_not_attempt_audit(configured, monkeypatch, capsys):
++    calls = []
++    def audit(*a, **kw):
++        calls.append(True)
++        raise Refused('unexpected_audit')
++    monkeypatch.setattr(board, 'audit_diff', audit)
++    cli.cmd_sync(clf.args('diff', '--json'))
++    assert not calls
++    assert 'history_audit_error' not in json.loads(capsys.readouterr().out)
++
++
++def test_evidence_remains_explicit(configured, capsys):
++    board.observe_board('default', 'op-original', 'Keep history')
++    assert cli.cmd_sync(clf.args('diff', '--json')) == 0
++    assert 'history_audit_evidence' not in json.loads(capsys.readouterr().out)
+diff --git a/tests/hermes_cli/test_kanban_history_residue_source_survivors.py b/tests/hermes_cli/test_kanban_history_residue_source_survivors.py
+new file mode 100644
+index 00000000000..720b9530322
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_source_survivors.py
+@@ -0,0 +1,397 @@
++"""Single-fault contract cases for every clause of kanban_history_residue_source.
++
++Each malformed input violates exactly one predicate and keeps every earlier check satisfied
++(including the frozen wire echo), so dropping or flipping that predicate changes the outcome:
++either a malformed input is accepted or a non-Refused exception (AttributeError, TypeError,
++KeyError) escapes. Reasons are asserted exactly where a later guard would otherwise mask.
++"""
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_history_residue_source as source
++
++from tests.hermes_cli.test_kanban_history_residue_source import specimen
++
++CONTAINMENT = source.CONTAINMENT
++SPEND = source.SPEND
++KEYS = ('uid', 'id', 'version', 'created_on', 'status', 'current_run_uid', 'lease_holder',
++        'lease_run_uid', 'lease_expires', 'deleted_at', 'delete_pending')
++
++
++def build(row_updates=None, fields_updates=None, payload=None):
++    """A self-consistent source row: the wire echo always matches whatever fields say."""
++    row = specimen()
++    fields = json.loads(row['fields'])
++    fields.update(fields_updates or {})
++    if payload is not None:
++        fields['payload'] = json.dumps(payload)
++    row['fields'] = json.dumps(fields)
++    row.update(row_updates or {})
++    wire = {'client_op_id': row['op_id'], 'table': row['table_name'], 'uid': row['row_uid'],
++            'op': row['op'], 'fields': fields, 'hlc': row['hlc'], 'frozen_replay': 1}
++    row['wire_json'] = json.dumps(wire)
++    return row
++
++
++def refused(row, reason):
++    with pytest.raises(source.Refused, match='^' + reason + '$'):
++        source.decode_source(json.dumps(row))
++
++
++def blocked(**payload):
++    base = {'metadata_only': True, 'classified_in_place': True}
++    base.update(payload)
++    return build({'last_error': CONTAINMENT}, {'kind': 'blocked'}, base)
++
++
++def proof():
++    raw = json.dumps(specimen())
++    parent = {'uid': 't_stopped', 'id': 't_stopped', 'version': 7, 'created_on': 'home', 'status': 'triage',
++              'current_run_uid': None, 'lease_holder': None, 'lease_run_uid': None,
++              'lease_expires': None, 'deleted_at': None, 'delete_pending': 0}
++    absence = {'board': 'default', 'table': 'task_events', 'uid': 'event-original',
++               'state': 'never_existed', 'floor': 0, 'head': 100, 'row': None, 'tombstone': None}
++    receipt = {'version': 1, 'gateway': 'home', 'source_json': raw, 'reason': 'Keep history',
++               'disposition': 'retained_unreplayed', 'canonical_acceptance': False,
++               'historical_identity_certified': False, 'execution_authority': False,
++               'reported_rejection_only': True, 'snapshot_only': True, 'observed_at_ms': 50,
++               'observed_head': 100, 'parent': copy.deepcopy(parent), 'absence': copy.deepcopy(absence)}
++    current = {'observed_at_ms': 90, 'observed_head': 100, 'parent': copy.deepcopy(parent),
++               'absence': copy.deepcopy(absence), 'no_lease': True, 'no_running_run': True,
++               'no_retained_op_receipt': True, 'op_history_certified': False,
++               'retained_receipt_floor1': None, 'execution_authority': False}
++    return raw, {'version': 1, 'gateway': 'home', 'receipt': receipt, 'current': current}
++
++
++def receipt_refused(mutate, reason):
++    raw, data = proof()
++    receipt = data['receipt']
++    mutate(receipt)
++    with pytest.raises(source.Refused, match='^' + reason + '$'):
++        source.validate_receipt(receipt, raw, gateway='home', board='default')
++
++
++def current_refused(mutate, reason, head=100):
++    raw, data = proof()
++    mutate(data)
++    with pytest.raises(source.Refused, match='^' + reason + '$'):
++        source.validate_current(json.dumps(data), raw, gateway='home', board='default', head=head)
++
++
++# --- baselines: the single-fault inputs below differ from these in exactly one predicate ---
++
++def test_baselines_are_accepted():
++    for row in (build(), blocked(), build({'op_id': 'x' * 2048}), build({'hlc': 'h' * 2048})):
++        assert source.decode_source(json.dumps(row)) == row
++    raw, data = proof()
++    source.validate_receipt(data['receipt'], raw, gateway='home', board='default')
++    assert source.validate_current(json.dumps(data), raw, gateway='home', board='default', head=100) == data['current']
++
++
++# C243: not isinstance(raw, str) -> False (non-str would reach raw.encode and raise AttributeError)
++@pytest.mark.parametrize('raw', [5, None, b'{}', {}, []])
++def test_c243_non_text_json_input_is_a_refusal_not_an_attribute_error(raw):
++    with pytest.raises(source.Refused, match='^json_required$'):
++        source.strict_object(raw)
++    with pytest.raises(source.Refused, match='^json_required$'):
++        source.decode_source(raw)
++
++
++@pytest.mark.parametrize('layer', ['fields', 'wire_json'])
++def test_c243_nested_layer_must_be_embedded_json_text(layer):
++    row = specimen()
++    row[layer] = json.loads(row[layer])
++    with pytest.raises(source.Refused, match='^json_required$'):
++        source.decode_source(json.dumps(row))
++
++
++# C254 (isinstance str), C256 (len <= 2048), C273/C274/C275 (_text of op_id/row_uid/hlc)
++@pytest.mark.parametrize('key', ['op_id', 'row_uid', 'hlc'])
++@pytest.mark.parametrize('bad', [5, None, True, [], '', '   '])
++def test_c254_c273_c274_c275_identity_texts_must_be_nonblank_strings(key, bad):
++    refused(build({key: bad}), 'source_shape')
++
++
++@pytest.mark.parametrize('key', ['op_id', 'row_uid', 'hlc'])
++def test_c256_identity_texts_are_length_bounded_on_a_consistent_wire(key):
++    refused(build({key: 'x' * 2049}), 'source_shape')
++
++
++@pytest.mark.parametrize('bad', ['x' * 2049])
++def test_c256_task_id_text_is_length_bounded(bad):
++    refused(build(fields_updates={'task_id': bad}), 'source_shape')
++
++
++@pytest.mark.parametrize('bad', [5, None, 'x' * 2049])
++def test_c254_c256_receipt_reason_is_text(bad):
++    receipt_refused(lambda r: r.update(reason=bad), 'receipt_identity')
++
++
++# C276 / C277: table and op literals, wire echo kept consistent so only the shape check can refuse
++@pytest.mark.parametrize('value', ['tasks', '', None])
++def test_c276_table_name_must_be_task_events(value):
++    refused(build({'table_name': value}), 'source_shape')
++
++
++@pytest.mark.parametrize('value', ['delete', '', None])
++def test_c277_op_must_be_upsert(value):
++    refused(build({'op': value}), 'source_shape')
++
++
++# C259 / C260 / C261 / C262: each clause of the containment branch alone
++@pytest.mark.parametrize('last_error', [SPEND, 'unknown', None, ''])
++def test_c259_containment_branch_requires_the_containment_error(last_error):
++    row = blocked()
++    row['last_error'] = last_error
++    refused(row, 'unsupported_rejection')
++
++
++@pytest.mark.parametrize('kind', ['promoted_manual', 'started', 'Blocked'])
++def test_c260_containment_error_requires_blocked_kind(kind):
++    row = build({'last_error': CONTAINMENT}, {'kind': kind},
++                {'metadata_only': True, 'classified_in_place': True})
++    refused(row, 'unsupported_rejection')
++
++
++@pytest.mark.parametrize('value', [False, 1, 'true', None])
++def test_c261_metadata_only_must_be_literal_true(value):
++    refused(blocked(metadata_only=value), 'unsupported_rejection')
++
++
++def test_c261_metadata_only_may_not_be_absent():
++    row = build({'last_error': CONTAINMENT}, {'kind': 'blocked'}, {'classified_in_place': True})
++    refused(row, 'unsupported_rejection')
++
++
++@pytest.mark.parametrize('value', [False, 1, 'true', None])
++def test_c262_classified_in_place_must_be_literal_true(value):
++    refused(blocked(classified_in_place=value), 'unsupported_rejection')
++
++
++def test_c262_classified_in_place_may_not_be_absent():
++    row = build({'last_error': CONTAINMENT}, {'kind': 'blocked'}, {'metadata_only': True})
++    refused(row, 'unsupported_rejection')
++
++
++# --- _absence ---
++
++def set_receipt_abs(**kw):
++    return lambda r: r['absence'].update(kw)
++
++
++def set_current_abs(**kw):
++    return lambda d: d['current']['absence'].update(kw)
++
++
++# C247 / C249 / C300 / C311 / C318 / C319: structural type guards precede attribute access
++@pytest.mark.parametrize('bad', [None, [], 'x', 5])
++def test_c247_receipt_absence_must_be_object(bad):
++    receipt_refused(lambda r: r.update(absence=bad), 'absence_object')
++
++
++@pytest.mark.parametrize('bad', [None, [], 'x', 5])
++def test_c247_current_absence_must_be_object(bad):
++    current_refused(lambda d: d['current'].update(absence=bad), 'absence_object')
++
++
++@pytest.mark.parametrize('bad', [None, [], 'x', 5])
++def test_c249_current_parent_must_be_object(bad):
++    current_refused(lambda d: d['current'].update(parent=bad), 'current_parent')
++
++
++@pytest.mark.parametrize('kind', ['none', 'list', 'keys-as-list', 'str'])
++def test_c300_receipt_must_be_object_even_if_its_iterable_names_match(kind):
++    raw, data = proof()
++    keys = list(data['receipt'])
++    bad = {'none': None, 'list': [], 'keys-as-list': keys, 'str': 'x'}[kind]
++    with pytest.raises(source.Refused, match='^receipt_keys$'):
++        source.validate_receipt(bad, raw, gateway='home', board='default')
++
++
++@pytest.mark.parametrize('bad', [None, [], 'x', 5])
++def test_c311_receipt_parent_must_be_object(bad):
++    receipt_refused(lambda r: r.update(parent=bad), 'historical_snapshot')
++
++
++@pytest.mark.parametrize('kind', ['none', 'list', 'keys-as-list'])
++def test_c318_proof_receipt_must_be_object_at_the_response_guard(kind):
++    # Without the guard validate_receipt's own check would refuse with 'receipt_keys' instead.
++    bad = {'none': None, 'list': [], 'keys-as-list': list(proof()[1]['receipt'])}[kind]
++    current_refused(lambda d: d.update(receipt=bad), 'proof_objects')
++
++
++@pytest.mark.parametrize('kind', ['none', 'list', 'keys-as-list'])
++def test_c319_proof_current_must_be_object_at_the_response_guard(kind):
++    # set(current) of a key list equals the key set, so only the guard stops it before .get.
++    bad = {'none': None, 'list': [], 'keys-as-list': list(proof()[1]['current'])}[kind]
++    current_refused(lambda d: d.update(current=bad), 'proof_objects')
++
++
++# C291 / C292 / C294 / C296 / C298: absence record clauses, one fault each
++@pytest.mark.parametrize('head', [100.0, True, '100', None])
++def test_c291_receipt_absence_head_must_be_int(head):
++    receipt_refused(set_receipt_abs(head=head), 'absence_unproven')
++
++
++@pytest.mark.parametrize('head', [100.0, '100', None])
++def test_c291_current_absence_head_must_be_int(head):
++    current_refused(set_current_abs(head=head), 'absence_unproven')
++
++
++def test_c291_bool_head_cannot_equal_integer_cut_head():
++    raw, data = proof()
++    for section in ('receipt', 'current'):
++        data[section]['observed_head'] = 1
++        data[section]['absence']['head'] = True
++    with pytest.raises(source.Refused, match='^absence_unproven$'):
++        source.validate_receipt(data['receipt'], raw, gateway='home', board='default')
++    data['receipt']['absence']['head'] = 1
++    with pytest.raises(source.Refused, match='^absence_unproven$'):
++        source.validate_current(json.dumps(data), raw, gateway='home', board='default', head=1)
++
++
++@pytest.mark.parametrize('head', [99, 101, 0])
++def test_c292_absence_head_must_equal_the_cut_head(head):
++    receipt_refused(set_receipt_abs(head=head), 'absence_unproven')
++    current_refused(set_current_abs(head=head), 'absence_unproven')
++
++
++@pytest.mark.parametrize('floor', [False, 0.0, '0', None])
++def test_c294_absence_floor_must_be_int_zero(floor):
++    receipt_refused(set_receipt_abs(floor=floor), 'absence_unproven')
++    current_refused(set_current_abs(floor=floor), 'absence_unproven')
++
++
++@pytest.mark.parametrize('key', ['row', 'tombstone'])
++def test_c296_c298_absence_must_state_null_row_and_tombstone(key):
++    def drop(section):
++        return lambda x: (x if section == 'receipt' else x['current'])['absence'].pop(key)
++    receipt_refused(drop('receipt'), 'absence_unproven')
++    current_refused(drop('current'), 'absence_unproven')
++
++
++# --- validate_receipt ---
++
++@pytest.mark.parametrize('version', [True, 1.0, '1'])
++def test_c302_receipt_version_must_be_int(version):
++    receipt_refused(lambda r: r.update(version=version), 'receipt_identity')
++
++
++@pytest.mark.parametrize('version', [0, 2, -1])
++def test_c303_receipt_version_must_be_one(version):
++    receipt_refused(lambda r: r.update(version=version), 'receipt_identity')
++
++
++@pytest.mark.parametrize('value', ['retained_replayed', '', None])
++def test_c306_disposition_must_be_retained_unreplayed(value):
++    receipt_refused(lambda r: r.update(disposition=value), 'receipt_identity')
++
++
++@pytest.mark.parametrize('value', ['', '   ', None, 5])
++def test_c307_receipt_reason_must_be_text(value):
++    receipt_refused(lambda r: r.update(reason=value), 'receipt_identity')
++
++
++@pytest.mark.parametrize('value', [0, -1, True, 1.5, '50', None, 2**53])
++def test_c308_receipt_observed_at_must_be_positive_int(value):
++    receipt_refused(lambda r: r.update(observed_at_ms=value), 'historical_snapshot')
++
++
++@pytest.mark.parametrize('head', [100.0, True])
++def test_c309_receipt_observed_head_must_be_int(head):
++    def mutate(r):
++        r['observed_head'] = head
++        r['absence']['head'] = 1 if head is True else 100
++    receipt_refused(mutate, 'historical_snapshot')
++
++
++def test_c310_receipt_observed_head_is_not_negative():
++    def mutate(r):
++        r['observed_head'] = -1
++        r['absence']['head'] = -1
++    receipt_refused(mutate, 'historical_snapshot')
++
++
++@pytest.mark.parametrize('key,value', [('created_on', 'other'), ('created_on', None), ('uid', 'other')])
++def test_c313_receipt_parent_is_bound_to_task_and_gateway(key, value):
++    receipt_refused(lambda r: r['parent'].update({key: value}), 'historical_snapshot')
++
++
++# --- validate_current ---
++
++@pytest.mark.parametrize('extra', [{'extra': 1}, {'op_unknown': True}])
++def test_c314_response_keys_are_exact(extra):
++    current_refused(lambda d: d.update(extra), 'proof_identity')
++
++
++def test_c314_missing_response_key_is_refused():
++    current_refused(lambda d: d.pop('current'), 'proof_identity')
++
++
++@pytest.mark.parametrize('version', [0, 2])
++def test_c316_response_version_must_be_one(version):
++    current_refused(lambda d: d.update(version=version), 'proof_identity')
++
++
++@pytest.mark.parametrize('head', [100.0, True])
++def test_c321_cut_head_argument_must_be_int(head):
++    def mutate(d):
++        if head is True:  # every recorded head is 1 so only the argument's type is wrong
++            for section in ('receipt', 'current'):
++                d[section]['observed_head'] = 1
++                d[section]['absence']['head'] = 1
++    current_refused(mutate, 'current_cut', head=head)  # type: ignore[arg-type]
++
++
++@pytest.mark.parametrize('observed', [100.0, True])
++def test_c323_current_observed_head_must_be_int(observed):
++    def mutate(d):
++        d['current']['observed_head'] = observed
++        if observed is True:
++            d['current']['absence']['head'] = 1
++    current_refused(mutate, 'current_cut', head=1 if observed is True else 100)
++
++
++def test_c322_cut_head_is_not_negative():
++    def mutate(d):
++        d['current']['observed_head'] = -1
++        d['current']['absence']['head'] = -1
++    current_refused(mutate, 'current_cut', head=-1)
++
++
++@pytest.mark.parametrize('value', [0, -1, True, 1.5, '90', None, 2**53])
++def test_c325_current_observed_at_must_be_positive_int(value):
++    current_refused(lambda d: d['current'].update(observed_at_ms=value), 'current_cut')
++
++
++def test_c326_missing_retention_key_is_refused_by_the_exact_key_set():
++    # Equivalence evidence for C326 (not a kill): the guard at line 152 already forces the key.
++    current_refused(lambda d: d['current'].pop('retained_receipt_floor1'), 'current_keys')
++
++
++@pytest.mark.parametrize('value', [5, True, {}, [], 1.5])
++def test_c327_retention_metadata_is_null_or_text(value):
++    current_refused(lambda d: d['current'].update(retained_receipt_floor1=value), 'receipt_retention_metadata')
++
++
++@pytest.mark.parametrize('value', ['other', None, 7, 't_stopped '])
++def test_c329_parent_id_must_equal_task_id(value):
++    current_refused(lambda d: d['current']['parent'].update(id=value), 'current_parent')
++
++
++@pytest.mark.parametrize('value', [0, -1, True, 1.5, '7', None, 2**53])
++def test_c331_parent_version_must_be_positive_int(value):
++    current_refused(lambda d: d['current']['parent'].update(version=value), 'current_parent')
++
++
++@pytest.mark.parametrize('key', ['current_run_uid', 'lease_holder', 'lease_run_uid', 'lease_expires', 'deleted_at'])
++def test_c382_active_pointer_keys_must_be_present(key):
++    current_refused(lambda d: d['current']['parent'].pop(key), 'current_parent_active')
++
++
++@pytest.mark.parametrize('key', ['current_run_uid', 'lease_holder', 'lease_run_uid', 'lease_expires', 'deleted_at'])
++@pytest.mark.parametrize('value', [0, '', False])
++def test_active_pointer_keys_must_be_null_not_falsy(key, value):
++    current_refused(lambda d: d['current']['parent'].update({key: value}), 'current_parent_active')
+-- 
+2.43.0
+

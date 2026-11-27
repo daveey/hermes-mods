@@ -1,0 +1,494 @@
+From 71fd97a5cf3b688e7797f050fe5d9885bfe73a95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:01:47 -0800
+Subject: [PATCH 6356] Advisory maintenance, helper edges and human containment closure
+
+Public mirror of source commit 71fd97a5cf3b688e7797f050fe5d9885bfe73a95.
+
+---
+diff --git a/hermes_cli/kanban_cli_archive.py b/hermes_cli/kanban_cli_archive.py
+index e945aca55e2..6791338ba7b 100644
+--- a/hermes_cli/kanban_cli_archive.py
++++ b/hermes_cli/kanban_cli_archive.py
+@@ -43,6 +43,17 @@
+                 human = for_caller(args.reason)
+             except ContainmentRefused as exc:
+                 return _err(f"cannot archive {', '.join(ids)}: {exc}")
++            from hermes_cli.kanban_containment_human import dependents
++            waiting = {tid: dependents(conn, tid) for tid in ids}
++            for tid, deps in waiting.items():
++                if deps:
++                    print(f"{tid} has {len(deps)} dependent card(s) that will stay waiting, and cannot be unlinked "
++                          "while its containment hold stands:")
++                    for dep, status, title in deps:
++                        print(f"  {dep}  {status:8s}  {title}")
++            if any(waiting.values()) and not getattr(args, "yes", False):
++                return _err("refusing the human operator archive without --yes: the dependent cards above stay "
++                            "waiting on a parent that never succeeds; rerun with --yes to archive anyway")
+         # A card another machine runs under its live Board lease gets a stop request, not a local status write
+         # the Board would reject (kanban_remote_stop). [daveey]
+         from hermes_cli.kanban_remote_stop import RemoteArchiveRefused, archive as _archive
+diff --git a/hermes_cli/kanban_contained_wait.py b/hermes_cli/kanban_contained_wait.py
+index c87ce993252..0dce978d40e 100644
+--- a/hermes_cli/kanban_contained_wait.py
++++ b/hermes_cli/kanban_contained_wait.py
+@@ -78,22 +78,43 @@
+     return found
+ 
+ 
+-def _open_parents(conn: sqlite3.Connection, ids: list[str]) -> dict[str, list[dict]]:
+-    """``{authority: [{id, status}]}``: unmet parents of the parked authorities on this board file (a
+-    containment-closed archive counts as unmet, as it does for readiness). Unknown elsewhere: absent."""
++# A card in one of these does not progress on its own; a ``todo`` card progresses unless every unmet parent is stuck.
++STUCK = ("triage", "blocked")
++PARENT_DEPTH = 6
++
++
++def _unmet(conn: sqlite3.Connection, task: str) -> list[tuple[str, str]]:
++    """``[(parent, status)]`` of ``task``'s unmet parents on this board file; a containment-closed archive is unmet
++    (as it is for readiness). A parent row this file lacks counts as ``unknown`` (progressing, never guessed stuck)."""
+     from hermes_cli.kanban_containment_terminal import parent_status_sql
+-    out: dict[str, list[dict]] = {}
+-    if not ids:
+-        return out
+-    try:
+-        status = parent_status_sql(conn, "p")
+-        for child, parent, state in conn.execute(
+-                f"SELECT l.child_id, l.parent_id, {status} FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+-                "WHERE l.child_id IN (SELECT value FROM json_each(?)) ORDER BY l.parent_id", (json.dumps(ids),)):
+-            if state not in TERMINAL:
+-                out.setdefault(str(child), []).append({"id": str(parent), "status": str(state)})
+-    except sqlite3.Error:
+-        logger.debug("contained wait: authority parent lookup failed", exc_info=True)
++    status = parent_status_sql(conn, "p")
++    rows = conn.execute(f"SELECT l.parent_id, CASE WHEN p.id IS NULL THEN 'unknown' ELSE {status} END "
++                        "FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ? "
++                        "ORDER BY l.parent_id", (task,)).fetchall()
++    return [(str(parent), str(state)) for parent, state in rows if state not in TERMINAL]
++
++
++def _stuck(conn: sqlite3.Connection, task: str, depth: int, seen: frozenset) -> bool:
++    """A ``todo`` card that cannot progress: it has unmet parents and each is stuck (triage, blocked, a closed
++    containment, or recursively a stuck ``todo``). Running/ready/scheduled/unknown parents, no parents, a cycle or
++    the depth bound all count as progressing: stalled is said only when it is certain."""
++    unmet = _unmet(conn, task)
++    if not unmet or depth >= PARENT_DEPTH:
++        return False
++    return all(state in STUCK or (state == "todo" and parent not in seen
++                                  and _stuck(conn, parent, depth + 1, seen | {parent}))
++               for parent, state in unmet)
++
++
++def _authority_parents(conn: sqlite3.Connection, ids: list[str]) -> dict[str, dict]:
++    """``{authority: {parents: [{id, status}], parked: bool}}`` for ``todo`` authorities on this board file."""
++    out: dict[str, dict] = {}
++    for authority in ids:
++        try:
++            parents = [{"id": p, "status": st} for p, st in _unmet(conn, authority)]
++            out[authority] = {"parents": parents, "parked": _stuck(conn, authority, 0, frozenset({authority}))}
++        except sqlite3.Error:
++            logger.debug("contained wait: authority parent lookup failed for %s", authority, exc_info=True)
+     return out
+ 
+ 
+@@ -123,10 +144,10 @@
+ def read(conn: sqlite3.Connection, task_ids: Iterable[str], *, replica: Any = ..., display: bool = False) -> dict[str, dict[str, Any]]:
+     """``{task_id: contained facts}`` for the held triage cards among ``task_ids``::
+ 
+-        {episode, contained_at, authority: {id, status, at, parents?}, producer: {id, status, released} | None}
++        {task, episode, contained_at, authority: {id, status, at, parents?, parked?}, producer: {id, status, released} | None}
+ 
+-    ``at`` is when the authority finished (None while open or unknown). ``parents`` lists a ``todo`` authority's
+-    unmet parents ``[{id, status}]`` when this board file has them. Cards that are not held are absent."""
++    ``at`` is when the authority finished (None while open or unknown). For a ``todo`` authority on this board file,
++    ``parents`` lists its unmet parents ``[{id, status}]`` and ``parked`` says none of them can progress. Cards that are not held are absent."""
+     ids = [str(t) for t in dict.fromkeys(task_ids)]
+     if not ids:
+         return {}
+@@ -156,7 +177,7 @@
+     need = [spec["authority"]["task_id"] for _, spec in stops.values()]
+     need += [spec["producer"]["task_id"] for _, spec in stops.values() if isinstance(spec.get("producer"), dict)]
+     known = statuses(conn, need) if replica is ... else statuses(conn, need, replica=replica)
+-    parked = _open_parents(conn, [a for a in dict.fromkeys(spec["authority"]["task_id"] for _, spec in stops.values())
++    parked = _authority_parents(conn, [a for a in dict.fromkeys(spec["authority"]["task_id"] for _, spec in stops.values())
+                                   if known.get(a, ("unknown",))[0] == "todo"])
+     latest = producer_runs(conn, stops) if display else {}
+     out: dict[str, dict[str, Any]] = {}
+@@ -167,8 +188,9 @@
+             "episode": stop["uid"], "contained_at": stop.get("created_at"),
+             "authority": {"id": a_id, "status": a_status, "at": a_at if a_status in TERMINAL else None},
+             "producer": None}
++        info["task"] = tid
+         if a_id in parked:
+-            info["authority"]["parents"] = parked[a_id]
++            info["authority"].update(parked[a_id])
+         producer = spec.get("producer")
+         if isinstance(producer, dict) and producer.get("task_id"):
+             p_id = producer["task_id"]
+diff --git a/hermes_cli/kanban_containment_human.py b/hermes_cli/kanban_containment_human.py
+index 747646d55b0..8a444776519 100644
+--- a/hermes_cli/kanban_containment_human.py
++++ b/hermes_cli/kanban_containment_human.py
+@@ -86,6 +86,14 @@
+             and isinstance(data["authority_status"], str) and bool(data["authority_status"]))
+ 
+ 
++def dependents(conn, task: str) -> list[tuple[str, str, str]]:
++    """``[(id, status, title)]`` of the unfinished cards that list ``task`` as a parent. A closed containment never
++    satisfies them, and the hold refuses unlinking them."""
++    return [(str(r[0]), str(r[1]), str(r[2] or "")) for r in conn.execute(
++        "SELECT t.id, t.status, t.title FROM task_links l JOIN tasks t ON t.id = l.child_id WHERE l.parent_id = ? "
++        "AND t.status NOT IN ('done', 'archived') ORDER BY t.id", (task,))]
++
++
+ def safety_refusal(conn, task: str) -> Optional[str]:
+     from hermes_cli.kanban_refusal_receipt import restricted
+     if restricted(conn, task):
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index fbb67ced4ab..83133c3d013 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -726,6 +726,8 @@
+              help="Permanently delete already-archived task ids from the board"),
+         _reason("Human operator only: archive a contained card whose authority cannot release it (no live run or "
+                 "lease), recording why on the archive event and as a comment"),
++        _arg("--yes", action="store_true",
++             help="With --reason: archive even though dependent cards will stay waiting on the closed hold"),
+     ], help="Archive one or more tasks"),
+     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
+     _cmd("dispatch", [
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 285c652003e..942aa95816d 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -242,15 +242,16 @@
+     return f"{kind}:{hashlib.sha1(basis.encode()).hexdigest()[:12]}"
+ 
+ 
+-# A contained card's authority in one of these cannot run to release it (kanban_contained_wait ``parents``).
+-PARKED_AUTHORITY = ("todo", "triage")
++# A contained card's authority in one of these cannot run to release it on its own.
++PARKED_AUTHORITY = ("triage", "blocked")
+ 
+ 
+ def describe_contained(info: dict[str, Any], *, now: Optional[float] = None) -> dict[str, Any]:
+     """Wait info for a held card from its ``contained`` episode (``kanban_contained_wait.read``). The wait object
+     carries ``contained: {episode, authority: {id, status}, producer: {id, status} | None}`` (unknown status counts as
+-    open). Authority parked (``todo`` behind unmet parents, or in triage): stalled at once, not agent-owned, naming
+-    the authority and what it waits on. Authority otherwise open: waits on its release. Authority done/archived with the producer still open: waits on the
++    open). Authority that cannot progress (triage, blocked, or ``todo`` whose unmet parents are all stuck, per
++    ``kanban_contained_wait``): stalled at once, not agent-owned, naming the authority and what it waits on.
++    Authority otherwise open (running, ready, ``todo`` behind a progressing parent or none): waits on its release. Authority done/archived with the producer still open: waits on the
+     producer. Authority finished for CONTAINED_STRAND_AFTER_S and no open producer: agent-owned and stalled at once,
+     dated from the authority's completion, premise (contained, episode, authority status, authority completion)."""
+     now = time.time() if now is None else now
+@@ -260,18 +261,20 @@
+              "producer": {"id": producer["id"], "status": producer["status"]} if producer else None}
+     base = {"wait_state": "waiting", "waiting_since": done_at if done_at is not None else epoch_s(info.get("contained_at")), "agent_owned": False, "agent_owned_certain": True,
+             "premise": None, "contained": shown}
+-    if authority["status"] in PARKED_AUTHORITY:
+-        # The authority cannot run, so it cannot release this card: stalled at once, never an ordinary wait.
++    parents = [p for p in authority.get("parents") or [] if isinstance(p, dict) and p.get("id")]
++    listed = ", ".join(f"{p['id']} ({p.get('status') or 'unknown'})" for p in parents)
++    if authority["status"] in PARKED_AUTHORITY or (authority["status"] == "todo" and authority.get("parked") is True):
++        # The authority cannot progress, so it cannot release this card: stalled at once, never an ordinary wait.
+         # Not agent-owned: an agent cannot release for it, and a supervisor card would only restate the hold.
+-        parents = [p for p in authority.get("parents") or [] if isinstance(p, dict) and p.get("id")]
+-        behind = ("itself held in triage" if authority["status"] == "triage" else
+-                  "behind unmet parents " + ", ".join(f"{p['id']} ({p.get('status') or 'unknown'})" for p in parents)
+-                  if parents else "behind unmet parents")
++        behind = (f"itself {authority['status']}" if authority["status"] in PARKED_AUTHORITY
++                  else f"todo behind parents that cannot progress: {listed}")
+         shown["authority"]["waits_on"] = [{"id": p["id"], "status": p.get("status") or "unknown"} for p in parents]
++        card = info.get("task") or "this card"
+         return {**base, "wait_state": "stalled",
+-                "waiting_on": f"its authority {authority['id']}, which is {authority['status']} {behind} and cannot "
+-                              "run to release it; a human operator can archive it with `hermes kanban archive "
+-                              "<id> --reason`"}
++                "waiting_on": f"its authority {authority['id']}, which is {behind}, so nothing will release it; "
++                              f"a human operator can archive it with `hermes kanban archive {card} --reason \"<why>\"`"}
++    if authority["status"] == "todo" and parents:
++        return {**base, "waiting_on": f"release by card {authority['id']} (todo, waiting on {listed})"}
+     if authority["status"] not in ("done", "archived"):
+         return {**base, "waiting_on": f"release by card {authority['id']} ({authority['status']})"}
+     if producer and producer["status"] not in ("done", "archived") and not producer.get("released"):
+@@ -445,7 +448,7 @@
+             "block_loop_detected" if outcome == "blocked" else outcome)
+     contained = card.get("contained") if status == "triage" else None
+     if isinstance(contained, dict):
+-        return describe_contained(contained, now=now)
++        return describe_contained({**contained, "task": contained.get("task") or card.get("id")}, now=now)
+     return describe(status, block_kind=card.get("block_kind"), human=human,
+                     park={"wake_check": card.get("wake_check"), "reason": park.get("reason") or "",
+                           "wake_at": park.get("wake_at"), "unknown_producer": not published},
+diff --git a/tests/hermes_cli/test_kanban_containment_human_archive.py b/tests/hermes_cli/test_kanban_containment_human_archive.py
+index ecb144a4e79..59474677076 100644
+--- a/tests/hermes_cli/test_kanban_containment_human_archive.py
++++ b/tests/hermes_cli/test_kanban_containment_human_archive.py
+@@ -37,20 +37,27 @@
+     monkeypatch.setattr(writer_mod, "cli_comment_writer", lambda **_kw: who)
+ 
+ 
+-def _cli(ids, reason=None) -> int:
+-    return kanban_cli._cmd_archive(argparse.Namespace(task_ids=list(ids), purge_ids=None, reason=reason))
++def _cli(ids, reason=None, yes=False) -> int:
++    return kanban_cli._cmd_archive(argparse.Namespace(task_ids=list(ids), purge_ids=None, reason=reason, yes=yes))
+ 
+ 
+-def _parked(conn, *, live=False):
+-    """A self-contained relay whose authority is TODO behind an open parent (or, ``live``, still claimed)."""
++def _parked(conn, *, live=False, chain=("triage",)):
++    """A self-contained relay whose authority is TODO behind a chain of parents (``chain[0]`` the direct parent's
++    status, each next one that parent's parent; ``()`` none), or, ``live``, still claimed. Returns the direct
++    parent as ``blocker``."""
+     relay, _consumer, authority, target, spec = lifecycle.setup(conn)
+     episode = lifecycle.contain(conn, relay, target, spec)["episode"]
+     blocker = None
+     if not live:
+         conn.execute("UPDATE tasks SET status='todo', current_run_id=NULL, claim_lock=NULL, claim_expires=NULL, "
+                      "worker_pid=NULL WHERE id=?", (authority,))
+-        blocker = kb.create_task(conn, title="Open parent of the authority", assignee="default")
+-        kb.link_tasks(conn, blocker, authority)
++        child = authority
++        for status in chain:
++            parent = kb.create_task(conn, title=f"Parent ({status})", assignee="default")
++            kb.link_tasks(conn, parent, child)
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, parent))
++            blocker = blocker or parent
++            child = parent
+         conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (authority,))
+     return relay, authority, blocker, episode
+ 
+@@ -65,7 +72,7 @@
+ def test_human_cli_archive_closes_a_parked_authority_hold_on_an_unsynced_board(board, monkeypatch, capsys):
+     relay, authority, _blocker, episode = _parked(board)
+     _as(monkeypatch, HUMAN)
+-    assert _cli([relay], REASON) == 0
++    assert _cli([relay], REASON, yes=True) == 0
+     assert f"Archived {relay}" in capsys.readouterr().out
+     assert kb.get_task(board, relay).status == "archived"
+     assert connections.held(board, relay)  # closed, never released: dependents stay unsatisfied
+@@ -103,7 +110,7 @@
+ def test_live_authority_claim_refuses_the_human_archive(board, monkeypatch, capsys):
+     relay, authority, _blocker, _ = _parked(board, live=True)
+     _as(monkeypatch, HUMAN)
+-    assert _cli([relay], REASON) == 1
++    assert _cli([relay], REASON, yes=True) == 1
+     assert "authority_live" in capsys.readouterr().err
+     assert kb.get_task(board, relay).status == "triage"
+     assert kb.get_task(board, authority).status == "running"
+@@ -113,7 +120,7 @@
+     relay, _authority, _blocker, _ = _parked(board)
+     kb._append_event(board, relay, "decision_hold_restricted", {"cause": "safety_refusal"})
+     _as(monkeypatch, HUMAN)
+-    assert _cli([relay], REASON) == 1
++    assert _cli([relay], REASON, yes=True) == 1
+     assert "safety_restricted" in capsys.readouterr().err
+     assert kb.get_task(board, relay).status == "triage"
+     assert not _events(board, relay, "containment_closed")
+@@ -156,6 +163,7 @@
+         super().__init__(conn)
+         self.retain = {"decision_retain": 1, "scope_renewal": 1, "containment_human_archive": 1}
+         self.reject = None
++        self.patched = False
+ 
+     def decision_retain_capability(self, board):
+         assert not self.conn.in_transaction
+@@ -165,8 +173,15 @@
+         if self.reject:
+             self.posts.append(copy.deepcopy(ops))
+             return {"results": [{"client_op_id": ops[0]["client_op_id"], "status": "rejected", **self.reject}]}
+-        result = super().ops(board, ops)
+         human = ops[0].get("human_operator")
++        try:
++            return super().ops(board, ops)
++        finally:  # also when the reply is lost: the Board wrote it all the same
++            if human and not self.patched:
++                self.patched = True
++                self._human(human)
++
++    def _human(self, human):
+         if human:
+             row = self.source.events[self.close_event["event_uid"]]["row"]
+             payload = json.loads(row["payload"])
+@@ -177,7 +192,6 @@
+             audit.update(closure="human_operator", actor_kind="human", actor_gateway=self.ident.gateway,
+                          reason=human["reason"], source_status="triage")
+             self.audit["payload"] = json.dumps(audit)
+-        return result
+ 
+ 
+ def _synced(conn, monkeypatch):
+@@ -198,7 +212,7 @@
+ def test_human_cli_archive_on_a_synced_board_sends_human_operator(synced_conn, monkeypatch, capsys):
+     hub = _synced(synced_conn, monkeypatch)
+     _as(monkeypatch, HUMAN)
+-    assert _cli([hub.target], REASON) == 0, capsys.readouterr().err
++    assert _cli([hub.target], REASON, yes=True) == 0, capsys.readouterr().err
+     [[op]] = hub.posts
+     assert op["op"] == "archive" and op["human_operator"] == {
+         "version": 1, "actor_kind": "human", "episode": hub.stop["event_uid"], "reason": REASON}
+@@ -214,7 +228,7 @@
+     hub = _synced(synced_conn, monkeypatch)
+     hub.retain.pop("containment_human_archive")
+     _as(monkeypatch, HUMAN)
+-    assert _cli([hub.target], REASON) == 1
++    assert _cli([hub.target], REASON, yes=True) == 1
+     assert "board_unsupported" in capsys.readouterr().err
+     assert hub.posts == []
+     assert kb.get_task(synced_conn, hub.target).status == "triage"
+@@ -236,31 +250,116 @@
+     synced_conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, 1)",
+                         (hub.target, "decision_hold_restricted", json.dumps({"cause": "safety_refusal"})))
+     _as(monkeypatch, HUMAN)
+-    assert _cli([hub.target], REASON) == 1
++    assert _cli([hub.target], REASON, yes=True) == 1
+     assert "safety_restricted" in capsys.readouterr().err
+     assert hub.posts == []
+ 
+ 
+-# --- a parked authority is reported as stalled ---------------------------------------------------------------
++# --- a parked authority is reported as stalled; a waiting one is not ----------------------------------------
++
++def _wait(conn, task):
++    wait = _local_wait_info(conn, [task]).get(task)
++    assert wait is not None
++    return wait
++
+ 
+-def test_authority_parked_behind_open_parents_is_stalled_and_named(board):
+-    relay, authority, blocker, _ = _parked(board)
+-    wait = _local_wait_info(board, [relay]).get(relay)
++@pytest.mark.parametrize("chain", [("running",), ("ready",), ("scheduled",), (), ("todo", "running")])
++def test_authority_that_can_still_progress_is_an_ordinary_wait(board, chain):
++    relay, authority, blocker, _ = _parked(board, chain=chain)
++    wait = _wait(board, relay)
++    assert wait["wait_state"] == "waiting" and wait["agent_owned"] is False
++    assert authority in wait["waiting_on"] and "human operator" not in wait["waiting_on"]
++    if blocker:
++        assert blocker in wait["waiting_on"]
++
++
++@pytest.mark.parametrize("chain", [("triage",), ("blocked",), ("todo", "triage"), ("todo", "todo", "blocked")])
++def test_authority_behind_parents_that_cannot_progress_is_stalled_and_named(board, chain):
++    relay, authority, blocker, _ = _parked(board, chain=chain)
++    wait = _wait(board, relay)
+     assert wait["wait_state"] == "stalled" and wait["agent_owned"] is False
+-    assert authority in wait["waiting_on"] and blocker in wait["waiting_on"] and "--reason" in wait["waiting_on"]
+-    assert wait["contained"]["authority"]["waits_on"] == [{"id": blocker, "status": "ready"}]
++    assert authority in wait["waiting_on"] and blocker in wait["waiting_on"]
++    assert f"hermes kanban archive {relay} --reason" in wait["waiting_on"] and "<id>" not in wait["waiting_on"]
++    assert wait["contained"]["authority"]["waits_on"] == [{"id": blocker, "status": chain[0]}]
+ 
+ 
+-def test_authority_in_triage_is_stalled():
+-    card = {"status": "triage", "contained": {
++@pytest.mark.parametrize("status", ["triage", "blocked"])
++def test_authority_that_is_itself_parked_is_stalled(status):
++    card = {"id": "t_00000000000000aa", "status": "triage", "contained": {
+         "episode": "019a98b4-0000-7000-8000-000000000001", "contained_at": 1_800_000_000,
+-        "authority": {"id": "t_1123456789abcdef", "status": "triage", "at": None}, "producer": None}}
++        "authority": {"id": "t_1123456789abcdef", "status": status, "at": None}, "producer": None}}
+     wait = kwi.describe_replica(card, now=1_800_000_100)
+     assert wait["wait_state"] == "stalled" and "t_1123456789abcdef" in wait["waiting_on"]
+-    assert "itself held in triage" in wait["waiting_on"]
++    assert f"itself {status}" in wait["waiting_on"] and "hermes kanban archive t_00000000000000aa" in wait["waiting_on"]
++
++
++def test_replica_todo_authority_without_parent_facts_is_an_ordinary_wait():
++    card = {"id": "t_00000000000000aa", "status": "triage", "contained": {
++        "episode": "019a98b4-0000-7000-8000-000000000001", "contained_at": 1_800_000_000,
++        "authority": {"id": "t_1123456789abcdef", "status": "todo", "at": None}, "producer": None}}
++    assert kwi.describe_replica(card, now=1_800_000_100)["wait_state"] == "waiting"
+ 
+ 
+ def test_running_authority_is_still_an_ordinary_wait(board):
+     relay, authority, _blocker, _ = _parked(board, live=True)
+-    wait = _local_wait_info(board, [relay]).get(relay)
++    wait = _wait(board, relay)
+     assert wait["wait_state"] == "waiting" and wait["waiting_on"] == f"release by card {authority} (running)"
++
++
++# --- dependents, Board refusals, marker fallback, changed retries ---------------------------------------------
++
++def test_human_archive_lists_dependents_and_requires_yes(board, monkeypatch, capsys):
++    relay, _authority, _blocker, _ = _parked(board)
++    consumer = board.execute("SELECT child_id FROM task_links WHERE parent_id=?", (relay,)).fetchone()[0]
++    _as(monkeypatch, HUMAN)
++    assert _cli([relay], REASON) == 1
++    out = capsys.readouterr()
++    assert consumer in out.out and "cannot be unlinked" in out.out and "--yes" in out.err
++    assert kb.get_task(board, relay).status == "triage"
++    assert _cli([relay], REASON, yes=True) == 0
++    assert kb.get_task(board, relay).status == "archived" and kb.get_task(board, consumer).status == "todo"
++
++
++def test_human_archive_without_dependents_needs_no_yes(board, monkeypatch, capsys):
++    relay, _authority, _blocker, _ = _parked(board)
++    consumer = board.execute("SELECT child_id FROM task_links WHERE parent_id=?", (relay,)).fetchone()[0]
++    assert kb.archive_task(board, consumer)
++    _as(monkeypatch, HUMAN)
++    assert _cli([relay], REASON) == 0
++    assert "dependent" not in capsys.readouterr().out
++
++
++@pytest.mark.parametrize("reason,detail", [
++    ("authority_live", "authority t_x has a live run or lease; let it release the card"),
++    ("containment_episode_changed", "the named episode is not the card's current containment episode"),
++])
++def test_synced_board_human_refusals_print_reason_and_detail(synced_conn, monkeypatch, capsys, reason, detail):
++    hub = _synced(synced_conn, monkeypatch)
++    hub.reject = {"reason": reason, "detail": detail}
++    _as(monkeypatch, HUMAN)
++    assert _cli([hub.target], REASON, yes=True) == 1
++    err = capsys.readouterr().err
++    assert f"Board refused terminal archive: {reason} ({detail})" in err and "--reason \"<why>\"" not in err
++    assert len(hub.posts) == 1 and "human_operator" in hub.posts[0][0]
++    assert kb.get_task(synced_conn, hub.target).status == "triage"
++    assert synced_conn.execute("SELECT confirmed FROM containment_delivery").fetchone()[0] == -1
++
++
++def test_unsynced_marker_falls_back_to_the_single_attested_episode(synced_conn, monkeypatch):
++    hub = _synced(synced_conn, monkeypatch)
++    assert synced_conn.execute("SELECT containment_episode FROM tasks WHERE id=?", (hub.target,)).fetchone()[0] is None
++    assert kb.archive_task(synced_conn, hub.target, human=HumanArchive(REASON))
++    assert hub.posts[0][0]["human_operator"]["episode"] == hub.stop["event_uid"]
++
++
++def test_retry_with_a_changed_reason_is_refused_before_the_board(synced_conn, monkeypatch):
++    hub = _synced(synced_conn, monkeypatch)
++    hub.fail = True
++    with pytest.raises(TimeoutError):
++        kb.archive_task(synced_conn, hub.target, human=HumanArchive(REASON))
++    hub.fail = False
++    with pytest.raises(ContainmentRefused, match="different metadata"):
++        kb.archive_task(synced_conn, hub.target, human=HumanArchive("another reason"))
++    assert len(hub.posts) == 1
++    assert kb.archive_task(synced_conn, hub.target, human=HumanArchive(REASON))  # the same reason recovers
++    assert hub.posts[0] == hub.posts[1]
+diff --git a/website/docs/user-guide/features/kanban-containment.md b/website/docs/user-guide/features/kanban-containment.md
+index 3d94913ba79..585831b5954 100644
+--- a/website/docs/user-guide/features/kanban-containment.md
++++ b/website/docs/user-guide/features/kanban-containment.md
+@@ -96,9 +96,15 @@
+ dependency. Enrolled boards send `human_operator: {version: 1, actor_kind: "human",
+ episode, reason}` on the ordinary `archive` op and require
+ `containment_human_archive: 1` in the decision-retain capability; without it
+-core refuses `board_unsupported` before staging anything. A card whose authority
+-is parked like this is reported as stalled, naming the authority and its unmet
+-parents.
++core refuses `board_unsupported` before staging anything. The command first lists
++the unfinished cards that depend on the held card (they stay waiting, and cannot be
++unlinked while the hold stands) and requires `--yes` when there are any.
++
++A held card is reported as stalled only when its authority cannot progress: the
++authority is in triage or blocked, or it is `todo` and every unmet parent is itself
++stuck (triage, blocked, a closed containment, or a stuck `todo`, up to six levels).
++A `todo` authority with no parents or a running, ready or scheduled parent is an
++ordinary wait that names what it waits on.
+ 
+ ## Local and enrolled boards
+ 
+-- 
+2.43.0
+

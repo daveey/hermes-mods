@@ -1,0 +1,166 @@
+From 4237c55420858463bdec3bc7e1a424ff4f5d53a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:49:59 +0000
+Subject: [PATCH 6219] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit 4237c55420858463bdec3bc7e1a424ff4f5d53a7.
+
+---
+diff --git a/tests/tui_gateway/test_notice_fanout_durability.py b/tests/tui_gateway/test_notice_fanout_durability.py
+index a150b50cddb..defeb02493d 100644
+--- a/tests/tui_gateway/test_notice_fanout_durability.py
++++ b/tests/tui_gateway/test_notice_fanout_durability.py
+@@ -16,7 +16,6 @@
+ 
+ def test_chat_hosted_elsewhere_does_not_hold_the_board_cursor(db, monkeypatch, caplog):
+     foreign = "20261123_100853_foreign"
+-    monkeypatch.setattr(helpers.server, "_readopt_wake_profiles", lambda: [None])
+ 
+     @contextlib.contextmanager
+     def profile_db(session, **kwargs):
+@@ -73,11 +72,14 @@
+     assert state.get_cursor(ident) > before
+ 
+ 
+-def test_chat_hosted_here_reports_absent_only_when_every_store_opened(db, tmp_path, monkeypatch):
++def test_chat_hosted_here_reports_absent_only_when_every_store_opened(db, monkeypatch):
++    from pathlib import Path
++    from hermes_constants import get_hermes_home
+     from hermes_state import SessionDB
+-    with contextlib.closing(SessionDB(tmp_path / "second.db")) as second:
++    second_path = Path(get_hermes_home()) / "profiles" / "second" / "state.db"
++    second_path.parent.mkdir(parents=True, exist_ok=True)
++    with contextlib.closing(SessionDB(second_path)) as second:
+         second.create_session("second-chat", "desktop")
+-        monkeypatch.setattr(helpers.server, "_readopt_wake_profiles", lambda: [None, "second"])
+         broken = []
+ 
+         @contextlib.contextmanager
+@@ -103,6 +105,74 @@
+         assert [(r["task_id"], r["skipped"]) for r in nf.card_change_pass()] == [(tid, "not_hosted_here")]
+ 
+ 
++@pytest.mark.parametrize("with_file", [False, True])
++def test_nonprofile_file_does_not_make_hosting_unknown(db, monkeypatch, with_file):
++    from pathlib import Path
++    from hermes_constants import get_hermes_home
++
++    @contextlib.contextmanager
++    def profile_db(session, **kwargs):
++        yield db
++
++    monkeypatch.setattr(helpers.server, "_profile_db", profile_db)
++    root = Path(get_hermes_home()) / "profiles"
++    if with_file:
++        root.mkdir(parents=True, exist_ok=True)
++        (root / "README").write_text("not a profile")
++    else:
++        assert not root.exists()
++    nf.card_change_pass()
++    ident = str(kb.kanban_db_path().resolve())
++    before = state.get_cursor(ident)
++    tid = helpers._card(done=False, chat="absent-chat")
++    assert helpers.ku.chat_hosted_here("absent-chat") is False
++    assert [(r["task_id"], r["skipped"]) for r in nf.card_change_pass()] == [(tid, "not_hosted_here")]
++    assert state.get_cursor(ident) > before
++
++
++@pytest.mark.parametrize("boundary", ["enumeration", "metadata"])
++def test_unreadable_profile_roster_retains_cursor(db, monkeypatch, boundary):
++    from pathlib import Path
++    from hermes_constants import get_hermes_home
++
++    @contextlib.contextmanager
++    def profile_db(session, **kwargs):
++        yield db
++
++    monkeypatch.setattr(helpers.server, "_profile_db", profile_db)
++    root = Path(get_hermes_home()) / "profiles"
++    named = root / "temporarily-unreadable"
++    named.mkdir(parents=True, exist_ok=True)
++    nf.card_change_pass()
++    ident = str(kb.kanban_db_path().resolve())
++    before = state.get_cursor(ident)
++    tid = helpers._card(done=False, chat="chat-in-unreadable-profile")
++    original_iterdir, original_stat = Path.iterdir, Path.stat
++
++    def unreadable_iterdir(path):
++        if path == root:
++            raise PermissionError("profile directory temporarily unavailable")
++        return original_iterdir(path)
++
++    def unreadable_stat(path, *args, **kwargs):
++        if path == named / "state.db":
++            raise PermissionError("profile metadata temporarily unavailable")
++        return original_stat(path, *args, **kwargs)
++
++    with monkeypatch.context() as m:
++        m.setattr(Path, "iterdir" if boundary == "enumeration" else "stat",
++                  unreadable_iterdir if boundary == "enumeration" else unreadable_stat)
++        result = nf.card_change_pass()
++        state.forget_memory_for_tests()
++        assert state.get_cursor(ident) == before
++        assert result.incomplete
++        assert not any(r.get("skipped") == "not_hosted_here" for r in result)
++        assert helpers.ku.chat_hosted_here("chat-in-unreadable-profile") is None
++        assert helpers.ku.chat_hosted_here(helpers.CHAT) is True
++    assert [(r["task_id"], r["skipped"]) for r in nf.card_change_pass()] == [(tid, "not_hosted_here")]
++    assert state.get_cursor(ident) > before
++
++
+ def test_stale_metadata_cas_loss_keeps_durable_cursor(db, monkeypatch):
+     tid = helpers._card(done=False)
+     with contextlib.closing(kbc.connect()) as conn:
+diff --git a/tui_gateway/kanban_chat_hosting.py b/tui_gateway/kanban_chat_hosting.py
+new file mode 100644
+index 00000000000..ecaca05b482
+--- /dev/null
++++ b/tui_gateway/kanban_chat_hosting.py
+@@ -0,0 +1,27 @@
++"""Complete local store discovery for proofs of chat absence, not best-effort wake routing."""
++from pathlib import Path
++import stat
++
++from hermes_constants import get_hermes_home
++
++
++def profile_roster() -> tuple[list[str | None], bool]:
++    """Retain discovered stores on errors; only an error-free roster proves absence."""
++    profiles: list[str | None] = [None]
++    complete = True
++    root = Path(get_hermes_home()) / "profiles"
++    try:
++        entries = list(root.iterdir())
++    except FileNotFoundError:
++        return profiles, True  # A launch-only installation needs no profiles directory.
++    except OSError:
++        return profiles, False
++    for entry in sorted(entries):
++        try:
++            if stat.S_ISREG((entry / "state.db").stat().st_mode):
++                profiles.append(entry.name)
++        except (FileNotFoundError, NotADirectoryError):
++            continue
++        except OSError:
++            complete = False
++    return profiles, complete
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index ee20aa6fc98..3a4f28a5940 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -196,8 +196,10 @@
+ def chat_hosted_here(chat_id: str) -> Optional[bool]:
+     """Prove local presence or absence; an unreadable profile leaves absence unknown."""
+     from tui_gateway import server
+-    unavailable = False
+-    for profile in server._readopt_wake_profiles():
++    from tui_gateway.kanban_chat_hosting import profile_roster
++    profiles, complete = profile_roster()
++    unavailable = not complete
++    for profile in profiles:
+         try:
+             with server._profile_db({"profile": profile} if profile else None) as db:
+                 if db is None:
+-- 
+2.43.0
+

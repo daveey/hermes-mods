@@ -1,0 +1,244 @@
+From 30ff0ecf06d6f26e34cc7ffad5976c3c93bae609 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:56:54 +0000
+Subject: [PATCH 6284] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit 30ff0ecf06d6f26e34cc7ffad5976c3c93bae609.
+
+---
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 869ef2679d1..a610554d4df 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -825,6 +825,9 @@
+ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+ CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
++-- Opt-in predicate keeps this index out of existing readers' implicit tie ordering.
++CREATE INDEX IF NOT EXISTS idx_messages_recency_candidates ON messages(timestamp, session_id)
++    WHERE (timestamp+0 IS NULL OR timestamp+0 IS NOT NULL);
+ -- Partial index for the Insights assistant tool-call scan
+ -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
+ -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+index 9b8bc5f2b25..98a88e2d578 100644
+--- a/hermes_state_recency.py
++++ b/hermes_state_recency.py
+@@ -6,6 +6,10 @@
+ once a second because some session row changes that often. ``ranked_rows`` returns the same rows
+ while running that probe only on a small candidate set that provably contains the page:
+ 
++* On current schemas, the timestamp-leading candidate index reads only messages at or above T.
++  This needs no full-store maxima rebuild and is exact even after message rewrites/deletions.
++  Its opt-in partial predicate keeps the new index out of unrelated readers' query plans.
++* Legacy schemas without that index use the per-store maxima cache below.
+ * A per-store cache keeps each session's in-window ``MAX(messages.timestamp)``, built once with
+   the same probe. Every read folds in the sessions of messages past the watermark, inside the
+   read's own snapshot (``messages.id`` is AUTOINCREMENT, so a new message always lands past it).
+@@ -236,8 +240,10 @@
+ 
+ def _candidates(conn, store, where_clauses, params, need) -> Optional[str]:
+     """The JSON array of session ids that contain the page (module doc), or None to read unrestricted."""
+-    if not store.refresh(conn):
+-        return None
++    # The timestamp-leading index avoids a full message-max rebuild in every fresh
++    # capture child. Legacy schemas keep the existing watermark path below.
++    indexed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
++                           "AND name='idx_messages_recency_candidates'").fetchone() is not None
+     # Among rows with an in-window last_activity_at the index key IS last_activity_at. CASE keeps the
+     # admission filter (JSON markers) off every row that has none.
+     in_window = f"s.last_activity_at {_SQL_IN_WINDOW}"
+@@ -249,6 +255,18 @@
+     if row is None:
+         return None
+     threshold = row[0]
++    if indexed:
++        # Any message max >= T has at least one message in [T, EPOCH_MAX].
++        # Query that covering index range directly, including ancestors in the
++        # same snapshot; no retained maxima or AUTOINCREMENT assumption needed.
++        high_json = conn.execute(
++            "SELECT json_group_array(DISTINCT session_id) FROM messages "
++            "INDEXED BY idx_messages_recency_candidates "
++            "WHERE (timestamp+0 IS NULL OR timestamp+0 IS NOT NULL) "
++            "AND timestamp BETWEEN ? AND ?", (threshold, EPOCH_MAX)).fetchone()[0]
++        return conn.execute(_CANDIDATES_SQL, (threshold, threshold, high_json)).fetchone()[0]
++    if not store.refresh(conn):
++        return None
+     high = [sid for sid, value in store.msg_max.items() if value >= threshold]
+     if len(high) > 2 * need + 64:
+         # Cached maxima a delete lowered stay high until probed again: re-probe them once.
+diff --git a/tests/hermes_cli/test_sessions_capture_scale.py b/tests/hermes_cli/test_sessions_capture_scale.py
+new file mode 100644
+index 00000000000..fb4b239b6ba
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_capture_scale.py
+@@ -0,0 +1,52 @@
++"""Exercise the real first capture child over 30k sessions in twelve profiles."""
++import json
++import time
++
++from hermes_cli.sessions_capture_process import CaptureProcess, CaptureUnavailable
++from hermes_state import SessionDB
++from tests.hermes_state import test_recency_hot_rows as helpers
++from tests.hermes_cli.test_sessions_native_startup import selected
++
++
++def test_first_30k_twelve_home_capture_finishes_in_unchanged_budget(tmp_path, monkeypatch):
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HOME', str(home))
++    for number in range(12):
++        target = home if number == 0 else home / 'profiles' / f'profile-{number}'
++        target.mkdir(parents=True, exist_ok=True)
++        (target / 'config.yaml').write_text('model: test\n')
++        db = SessionDB(db_path=target / 'state.db')
++        try:
++            helpers._seed(db, 2500, prefix=f'p{number}-')
++        finally:
++            db.close()
++    from hermes_cli import sessions_capture_process as module
++    original_spawn = module.spawn_owned
++    diagnostics = tmp_path / 'child-stderr'
++    def diagnostic_spawn(*args, **kwargs):
++        with diagnostics.open('wb') as output:
++            kwargs['stderr'] = output
++            return original_spawn(*args, **kwargs)
++    monkeypatch.setattr(module, 'spawn_owned', diagnostic_spawn)
++    capture = CaptureProcess()  # production's unchanged five-second deadline
++    started = time.monotonic()
++    try:
++        results = capture.capture_many([
++            ['sessions', selected(limit=50, min_messages=1)],
++            ['sessions_sidebar', {}],
++        ])
++        elapsed = time.monotonic() - started
++        assert elapsed < 5, elapsed
++        assert all(not isinstance(body, CaptureUnavailable) for body in results)
++        listing, sidebar = [json.loads(body) for body in results]
++        assert len(listing['sessions']) == 50
++        assert len(listing['profile_totals']) == 12
++        assert listing['total'] == 30_000
++        assert sidebar['recents']['sessions']
++        print(f'first cold 30k/12-home list50+sidebar capture: {elapsed:.3f}s')
++    except CaptureUnavailable as exc:
++        raise AssertionError(diagnostics.read_text()) from exc
++    finally:
++        capture.close()
+diff --git a/tests/hermes_state/test_recency_cold_index.py b/tests/hermes_state/test_recency_cold_index.py
+new file mode 100644
+index 00000000000..ea226cb458c
+--- /dev/null
++++ b/tests/hermes_state/test_recency_cold_index.py
+@@ -0,0 +1,96 @@
++"""Cold capture ranks bounded candidates without rebuilding every message maximum."""
++import sqlite3
++import time
++
++import pytest
++
++import hermes_state_recency as recency
++from hermes_state import SessionDB
++from tests.hermes_state import test_recency_hot_rows as helpers
++
++
++def test_cold_30k_page_avoids_rebuild_and_finishes_in_capture_budget(tmp_path, monkeypatch):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 30_000, messages=10)
++        recency.clear()
++        monkeypatch.setattr(recency, '_rebuilt_maxima', lambda conn: pytest.fail('cold full-store maxima scan'))
++        started = time.monotonic()
++        actual = helpers._page(db, limit=50, include_pinned=True)
++        elapsed = time.monotonic() - started
++        assert elapsed < 5.0, elapsed
++        assert len(actual) == 50
++        assert actual == helpers._exact(db, monkeypatch, limit=50, include_pinned=True)
++    finally:
++        db.close()
++        recency.clear()
++
++
++def test_index_candidates_preserve_old_messages_chains_and_mutations(tmp_path, monkeypatch):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 200)
++        # An old session with a new message must outrank the activity threshold.
++        helpers._write(db, 'UPDATE messages SET timestamp=? WHERE session_id=?', (helpers._BASE + 500, 's00000'))
++        helpers._write(db, "UPDATE sessions SET end_reason='compression' WHERE id='s00001'")
++        helpers._write(db, "UPDATE sessions SET parent_session_id='s00001' WHERE id='s00002'")
++        helpers._write(db, 'UPDATE messages SET timestamp=? WHERE session_id=?', (helpers._BASE + 600, 's00002'))
++        for sql, params in [('', ()), ('DELETE FROM messages WHERE session_id=?', ('s00002',)),
++                            ('UPDATE messages SET timestamp=? WHERE session_id=?', (helpers._BASE - 1, 's00000'))]:
++            if sql:
++                helpers._write(db, sql, params)
++            recency.clear()
++            assert helpers._page(db, limit=50) == helpers._exact(db, monkeypatch, limit=50)
++    finally:
++        db.close()
++        recency.clear()
++
++
++def test_legacy_store_keeps_existing_fallback(tmp_path, monkeypatch):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 200)
++        helpers._write(db, 'DROP INDEX idx_messages_recency_candidates')
++        recency.clear()
++        actual = helpers._page(db, limit=50)
++        assert actual == helpers._exact(db, monkeypatch, limit=50)
++        assert recency._store_for(str(db.db_path)).watermark is not None
++    finally:
++        db.close()
++        recency.clear()
++
++
++def test_index_is_ineligible_for_unmodified_timestamp_readers(tmp_path):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        with db._read_ctx() as conn:
++            with pytest.raises(sqlite3.OperationalError, match='no query solution'):
++                conn.execute('SELECT id FROM messages INDEXED BY idx_messages_recency_candidates WHERE timestamp >= ?', (0,))
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('value', [0.0, recency.EPOCH_MAX, recency.EPOCH_MAX + 1, -1.0, 'bad', float('inf')])
++def test_index_timestamp_boundaries_and_live_changes_match_literal(tmp_path, monkeypatch, value):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 200)
++        for sql, params in [
++            ('UPDATE messages SET timestamp=? WHERE session_id=?', (value, 's00000')),
++            ('UPDATE messages SET timestamp=? WHERE session_id=?', (helpers._BASE + 1000, 's00000')),
++            ('DELETE FROM messages WHERE session_id=?', ('s00000',)),
++        ]:
++            helpers._write(db, sql, params)
++            actual = helpers._page(db, limit=25, offset=25, include_pinned=True)
++            assert actual == helpers._exact(db, monkeypatch, limit=25, offset=25, include_pinned=True)
++        with db._read_ctx() as conn:
++            plan = conn.execute(
++                'EXPLAIN QUERY PLAN SELECT DISTINCT session_id FROM messages '
++                'INDEXED BY idx_messages_recency_candidates '
++                'WHERE (timestamp+0 IS NULL OR timestamp+0 IS NOT NULL) AND timestamp BETWEEN ? AND ?',
++                (helpers._BASE, recency.EPOCH_MAX)).fetchall()
++            assert any('SEARCH' in row[3] and 'idx_messages_recency_candidates' in row[3] for row in plan)
++    finally:
++        db.close()
++        recency.clear()
++
+diff --git a/tests/hermes_state/test_recency_hot_rows.py b/tests/hermes_state/test_recency_hot_rows.py
+index 1db06d60dea..6113b240afd 100644
+--- a/tests/hermes_state/test_recency_hot_rows.py
++++ b/tests/hermes_state/test_recency_hot_rows.py
+@@ -159,6 +159,7 @@
+ def test_reprobe_of_legitimately_high_sessions_steps_through_none(db, monkeypatch):
+     """Sessions outside the page's filter can hold most fresh messages: the re-probe finds them still high
+     and must not bring them back to Python one row each."""
++    _write(db, 'DROP INDEX idx_messages_recency_candidates')  # legacy watermark/re-probe path
+     _seed(db, 100)
+     _seed(db, 600, source="cron", prefix="c")
+     _write(db, "UPDATE messages SET timestamp = timestamp + 100000 WHERE session_id LIKE 'c%'")
+-- 
+2.43.0
+

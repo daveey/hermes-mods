@@ -1,0 +1,644 @@
+From 6a1e263cab2b7c3e5ba8bec4abd2745f3e4d06d8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:57:33 +0000
+Subject: [PATCH 6198] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit 6a1e263cab2b7c3e5ba8bec4abd2745f3e4d06d8.
+
+---
+diff --git a/hermes_cli/dashboard_server_start.py b/hermes_cli/dashboard_server_start.py
+index a9b463c540b..4f1d34319d2 100644
+--- a/hermes_cli/dashboard_server_start.py
++++ b/hermes_cli/dashboard_server_start.py
+@@ -1,11 +1,26 @@
+ """Dashboard server import/auth/start seam, held under early capture custody."""
+ 
+ 
++def prepare_and_run_server(args, *, headless, prepare_runtime, prepare_auth, bootstrap):
++    from contextlib import nullcontext
++    from hermes_cli.serve_bootstrap_listener import BootstrapListener
++    from hermes_cli.sessions_early_boot import early_sessions
++
++    listener = BootstrapListener(args.host, args.port) if headless else nullcontext(None)
++    with listener as bootstrap_listener:
++        with early_sessions(headless=headless, isolated=getattr(args, 'isolated', False)) as owner:
++            mcp_after_bind = prepare_runtime(args, headless)
++            if bootstrap_listener is not None:
++                bootstrap['bootstrap_listener'] = bootstrap_listener
++            run_server(args, headless=headless, owner=owner, prepare_auth=prepare_auth,
++                       bootstrap=bootstrap, mcp_after_bind=mcp_after_bind)
++
++
+ def run_server(args, *, headless, owner, prepare_auth, bootstrap, mcp_after_bind):
+     from hermes_cli.web_server import start_server
+ 
+     # TTY-only interactive auth setup; noninteractive callers retain fail-closed
+-    # start_server behavior. Plugins were already discovered before early capture.
++    # start_server behavior. Plugins were discovered while early capture ran.
+     prepare_auth(args)
+     if headless:
+         from hermes_cli.observability.shared_metrics_process import begin_process
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 45fba5ee919..6bb99c7ecfa 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2514,15 +2514,13 @@
+     from hermes_cli.serve_producer_admission import supported_launch
+     supported_launch('serve' if _headless_backend else 'dashboard')
+     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
+-    _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
+-    from hermes_cli.sessions_early_boot import early_sessions
+-
+-    with early_sessions(headless=_headless_backend, isolated=getattr(args, 'isolated', False)) as owner:
+-        from hermes_cli.dashboard_server_start import run_server
+-        run_server(args, headless=_headless_backend, owner=owner,
+-                   prepare_auth=_maybe_setup_dashboard_auth_interactively,
+-                   bootstrap=_ssh_bootstrap_server_kwargs(_token_file, _ssh_session_token, _ssh_owner_nonce),
+-                   mcp_after_bind=_mcp_discovery_after_bind)
++    from hermes_cli.dashboard_server_start import prepare_and_run_server
++    prepare_and_run_server(
++        args, headless=_headless_backend,
++        prepare_runtime=_dashboard_prepare_runtime,
++        prepare_auth=_maybe_setup_dashboard_auth_interactively,
++        bootstrap=_ssh_bootstrap_server_kwargs(_token_file, _ssh_session_token, _ssh_owner_nonce),
++    )
+ 
+ 
+ def cmd_completion(args, parser=None):
+diff --git a/hermes_cli/serve_bootstrap_listener.py b/hermes_cli/serve_bootstrap_listener.py
+new file mode 100644
+index 00000000000..e996b5e02b4
+--- /dev/null
++++ b/hermes_cli/serve_bootstrap_listener.py
+@@ -0,0 +1,99 @@
++"""Fail-closed bootstrap HTTP listener; transfer the same socket to the full ASGI app.
++
++No plugins, configuration, credentials, or application state are read here. Health
++is public in the full app too. All other requests fail closed until its complete
++authentication stack has been assembled. Application assembly runs concurrently
++with this small responder, not on its serving thread.
++"""
++from http.server import BaseHTTPRequestHandler, HTTPServer
++import asyncio
++import errno
++import socket
++import threading
++
++
++class _Handler(BaseHTTPRequestHandler):
++    protocol_version = 'HTTP/1.0'
++
++    def setup(self):
++        self.request.settimeout(0.1)
++        super().setup()
++
++    def do_GET(self):
++        if self.command in ('GET', 'HEAD') and self.path.split('?', 1)[0] == '/api/health':
++            status, body = 200, b'{"status":"starting","ready":false,"ok":false}'
++        else:
++            status, body = 503, b'{"detail":"Application and authentication warming"}'
++        self.send_response(status)
++        self.send_header('Content-Type', 'application/json')
++        self.send_header('Content-Length', str(len(body)))
++        self.send_header('Connection', 'close')
++        self.send_header('Cache-Control', 'no-store')
++        if status == 503:
++            self.send_header('Retry-After', '1')
++        self.end_headers()
++        if self.command != 'HEAD':
++            self.wfile.write(body)
++
++    # Never parse or execute request bodies during assembly.
++    do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_HEAD = do_GET
++
++    def log_message(self, format, *args):
++        pass
++
++
++class BootstrapListener:
++    def __init__(self, host, port):
++        class Server(HTTPServer):
++            address_family = socket.AF_INET6 if ':' in host else socket.AF_INET
++
++            def handle_error(self, request, client_address):
++                pass  # disconnected bootstrap clients have no application side effects
++
++        try:
++            self.server = Server((host, port), _Handler)
++        except OSError as exc:
++            if exc.errno != errno.EADDRINUSE:
++                raise
++            from hermes_cli.web_server_lifecycle import _report_port_in_use, PORT_IN_USE_EXIT_CODE
++            _report_port_in_use(host, port)
++            raise SystemExit(PORT_IN_USE_EXIT_CODE) from None
++        self.port = self.server.server_address[1]
++        self.thread = threading.Thread(target=self.server.serve_forever,
++                                       kwargs={'poll_interval': 0.01}, name='serve-bootstrap-http', daemon=True)
++        self.thread.start()
++        self.stopped = False
++
++    def handoff(self):
++        if not self.stopped:
++            self.server.shutdown()
++            self.thread.join()
++            self.stopped = True
++        return self.server.socket
++
++    async def startup(self, server):
++        listener, original = self, server.lifespan
++
++        class HandoffLifespan:
++            async def startup(self):
++                await original.startup()
++                if not original.should_exit:
++                    await asyncio.to_thread(listener.handoff)
++
++            def __getattr__(self, name):
++                return getattr(original, name)
++
++        # Uvicorn starts lifespan before accepting. Keep the bootstrap responder
++        # active throughout that wait; stop it only at the actual accept handoff.
++        server.lifespan = HandoffLifespan()
++        try:
++            await server.startup(sockets=[self.server.socket])
++        finally:
++            server.lifespan = original
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        self.handoff()
++        self.server.server_close()
+diff --git a/hermes_cli/serve_exit_flush.py b/hermes_cli/serve_exit_flush.py
+new file mode 100644
+index 00000000000..5666d311af1
+--- /dev/null
++++ b/hermes_cli/serve_exit_flush.py
+@@ -0,0 +1,41 @@
++"""Signal-time flush without importing the agent stack just to install a handler."""
++import contextlib
++import os
++import signal
++import sys
++import threading
++
++_previous = {}
++
++
++def dispatch(signum, frame, previous):
++    if previous == signal.SIG_IGN:
++        return
++    gateway = sys.modules.get('tui_gateway.server')
++    # sys.modules registration precedes execution. Never touch partially bound
++    # method_ctx globals, or cause a signal-time import of the agent/provider tree.
++    if gateway is not None and not getattr(getattr(gateway, '__spec__', None), '_initializing', False):
++        for name in ('_prepare_delegations_before_exit', '_flush_sessions_before_exit',
++                     '_stop_turns_before_exit', '_journal_background_jobs_before_exit'):
++            action = getattr(gateway, name, None)
++            if action is not None:
++                with contextlib.suppress(Exception):
++                    action()
++    if callable(previous):
++        previous(signum, frame)
++    else:
++        signal.signal(signum, signal.SIG_DFL)
++        os.kill(os.getpid(), signum)
++
++
++def _handle(signum, frame):
++    dispatch(signum, frame, _previous[signum])
++
++
++def install():
++    if threading.current_thread() is not threading.main_thread():
++        return False
++    for signum in (signal.SIGTERM, signal.SIGINT):
++        if signal.getsignal(signum) is not _handle:
++            _previous[signum] = signal.signal(signum, _handle)
++    return True
+diff --git a/hermes_cli/web_gateway_lazy.py b/hermes_cli/web_gateway_lazy.py
+new file mode 100644
+index 00000000000..cb51528fd80
+--- /dev/null
++++ b/hermes_cli/web_gateway_lazy.py
+@@ -0,0 +1,36 @@
++"""Publish delivery hooks without eagerly importing the agent/provider tree."""
++import importlib
++
++_OWNER = object()
++
++
++def load_gateway():
++    return importlib.import_module('tui_gateway.server')
++
++
++class GatewayOnDemand:
++    """Hosted-room RPC resolves the server only when it calls a session handler."""
++    def __getattr__(self, name):
++        return getattr(load_gateway(), name)
++
++
++def _inject(**kwargs):
++    return load_gateway().inject_tui_session_message(**kwargs)
++
++
++def install_message_host():
++    from hermes_cli.plugins import get_plugin_manager, publish_tui_message_host
++    publish_tui_message_host(_OWNER, _inject)
++    get_plugin_manager().set_tui_message_injector(_OWNER, _inject)
++
++
++def clear_message_host():
++    from hermes_cli.plugins import get_plugin_manager, clear_published_tui_message_host
++    clear_published_tui_message_host(_OWNER)
++    get_plugin_manager().clear_tui_message_injector(_OWNER)
++
++
++def install_readopt_waker(registry=None):
++    if registry is None:
++        from tools.process_registry import process_registry as registry
++    registry.on_unknown_exit = lambda evt: load_gateway()._readopted_exit_deliver(evt, registry=registry)
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 30e4292f7fa..6037085521d 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1717,6 +1717,7 @@
+     ssh_lock_path: Optional[Path] = None,
+     ssh_ownership_id: Optional[str] = None,
+     early_sessions_owner=None,
++    bootstrap_listener=None,
+ ):
+     """Start the web UI server.
+ 
+@@ -1777,9 +1778,9 @@
+     # uvicorn's capture_signals() so uvicorn re-raises into them as the
+     # "original" handlers — kills outside the serve window are covered too.
+     try:
+-        from tui_gateway.server import install_exit_flush_signal_handlers
++        from hermes_cli.serve_exit_flush import install
+ 
+-        install_exit_flush_signal_handlers()
++        install()
+     except Exception as exc:
+         _log.debug("exit-flush signal handlers not installed: %s", exc)
+ 
+@@ -1787,7 +1788,7 @@
+     # indistinguishable from "backend broken". Probe first so a conflict
+     # surfaces as the BACKEND_PORT_IN_USE sentinel + distinct exit code.
+     # ``--port 0`` is skipped by the probe.
+-    if _port_bind_conflict(host, port):
++    if bootstrap_listener is None and _port_bind_conflict(host, port):
+         _report_port_in_use(host, port)
+         raise SystemExit(PORT_IN_USE_EXIT_CODE)
+ 
+@@ -1815,7 +1816,10 @@
+             config.load()
+         server.lifespan = config.lifespan_class(config)
+         with server.capture_signals():
+-            await server.startup()
++            if bootstrap_listener is None:
++                await server.startup()
++            else:
++                await bootstrap_listener.startup(server)
+             if server.should_exit:
+                 return
+             try:
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index b86224bf5a9..8853304fb32 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -28,7 +28,7 @@
+ @asynccontextmanager
+ async def standalone_lifespan(app: "FastAPI"):
+     from hermes_cli.web_server import (
+-        _eager_reconcile_own_session_db, _warm_gateway_module,
++        _eager_reconcile_own_session_db,
+         _start_desktop_cron_ticker, _dashboard_selftest_loop,
+         _auto_archive_ticker_loop, _terminate_desktop_managed_gateway, _release_ssh_runtime_marker,
+     )
+@@ -58,10 +58,8 @@
+     )
+     eager_reconcile_thread.start()
+ 
+-    # Import hermes_cli.gateway *before* the yield: on Windows + 3.11 the
+-    # import holds the GIL, so run_in_executor still froze the loop 15-22s and
+-    # the Desktop's 10s ready-probe timed out (GH-73083).
+-    _warm_gateway_module()
++    # The listener already answers during app assembly. Do not import the
++    # gateway/provider tree merely to prewarm it; real session/cron demand owns it.
+ 
+     # Snapshot the checkout revision so lazy-import paths (model picker) can
+     # refuse with "restart required" after `hermes update` replaced the code
+@@ -75,10 +73,12 @@
+     # contended state.db migration, so keep it off the pre-yield path: Group
+     # Chat must degrade on its own rather than block every Desktop feature.
+     from tui_gateway import methods_groups as _hosted_groups
+-    import tui_gateway.server
++    from hermes_cli.web_gateway_lazy import (
++        GatewayOnDemand, install_message_host, clear_message_host, install_readopt_waker,
++    )
+ 
+     try:
+-        tui_gateway.server.install_tui_message_injector()
++        install_message_host()
+     except Exception:
+         logger.warning("TUI message injector did not install", exc_info=True)
+ 
+@@ -86,7 +86,7 @@
+ 
+     def _start_hosted_rooms() -> None:
+         try:
+-            _hosted_groups.start_hosted_room_service()
++            _hosted_groups.start_hosted_room_service(server=GatewayOnDemand())
+         except Exception:
+             logger.exception("Hosted Group Chat recovery failed during backend startup")
+         finally:
+@@ -156,7 +156,7 @@
+         from tools.process_registry_readopt import start_checkpoint_keeper, start_tui_orphan_recovery
+ 
+         if is_desktop_owned_backend():  # a `hermes dashboard` hosts no chats: it must not adopt their jobs
+-            tui_gateway.server._install_readopted_exit_waker()
++            install_readopt_waker()
+             start_tui_orphan_recovery()
+         start_checkpoint_keeper()
+     except Exception:
+@@ -238,7 +238,7 @@
+         yield
+     finally:
+         try:
+-            tui_gateway.server.clear_tui_message_injector()
++            clear_message_host()
+         except Exception:
+             logger.debug("TUI message injector clear skipped", exc_info=True)
+         hosted_room_start_cancel.set()
+diff --git a/tests/hermes_cli/test_serve_bootstrap_listener.py b/tests/hermes_cli/test_serve_bootstrap_listener.py
+new file mode 100644
+index 00000000000..dd61b774d94
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_bootstrap_listener.py
+@@ -0,0 +1,84 @@
++"""The bootstrap socket is already serving while application assembly is blocked."""
++import http.client
++import socket
++import asyncio
++from contextlib import asynccontextmanager
++
++import pytest
++
++
++def request(port, path):
++    client = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
++    try:
++        client.request('GET', path)
++        response = client.getresponse()
++        return response.status, response.read()
++    finally:
++        client.close()
++
++
++def test_listener_health_and_closed_application_gate_before_assembly():
++    from hermes_cli.serve_bootstrap_listener import BootstrapListener
++
++    with BootstrapListener('127.0.0.1', 0) as listener:
++        assert request(listener.port, '/api/health')[0] == 200
++        status, body = request(listener.port, '/api/profiles/sessions')
++        assert status == 503
++        assert b'sessions' not in body
++        assert b'authentication' in body
++        owned = listener.handoff()
++        assert owned.getsockname()[1] == listener.port
++        # The listening socket remains reserved across the ownership transfer.
++        other = socket.socket()
++        try:
++            try:
++                other.bind(('127.0.0.1', listener.port))
++            except OSError:
++                pass
++            else:
++                raise AssertionError('bootstrap listener released its port')
++        finally:
++            other.close()
++    assert owned.fileno() == -1
++
++
++@pytest.mark.asyncio
++async def test_handoff_keeps_answering_until_real_asgi_lifespan_is_ready():
++    import uvicorn
++    from fastapi import FastAPI
++    from hermes_cli.serve_bootstrap_listener import BootstrapListener
++
++    entered, release = asyncio.Event(), asyncio.Event()
++
++    @asynccontextmanager
++    async def lifespan(app):
++        entered.set()
++        await release.wait()
++        yield
++
++    app = FastAPI(lifespan=lifespan)
++
++    @app.get('/api/health')
++    def health():
++        return {'ok': True}
++
++    with BootstrapListener('127.0.0.1', 0) as listener:
++        config = uvicorn.Config(app, log_config=None)
++        config.load()
++        server = uvicorn.Server(config)
++        server.lifespan = config.lifespan_class(config)
++        startup = asyncio.create_task(listener.startup(server))
++        try:
++            await asyncio.wait_for(entered.wait(), 2)
++            status, body = await asyncio.to_thread(request, listener.port, '/api/health')
++            assert status == 200 and b'false' in body
++            assert not listener.stopped
++            release.set()
++            await asyncio.wait_for(startup, 2)
++            assert listener.stopped
++            status, body = await asyncio.to_thread(request, listener.port, '/api/health')
++            assert status == 200 and b'"ok":true' in body
++        finally:
++            release.set()
++            await startup
++            await server.shutdown()
+diff --git a/tests/hermes_cli/test_serve_exit_flush.py b/tests/hermes_cli/test_serve_exit_flush.py
+new file mode 100644
+index 00000000000..4b88a968118
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_exit_flush.py
+@@ -0,0 +1,27 @@
++"""No agent import at boot; loaded gateways still receive the full exit flush."""
++import signal
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.mark.parametrize('initializing', [True, False])
++def test_lazy_flush_only_calls_fully_initialized_gateway(monkeypatch, initializing):
++    from hermes_cli import serve_exit_flush as bridge
++    calls = []
++    gateway = SimpleNamespace(__spec__=SimpleNamespace(_initializing=initializing),
++                              _flush_sessions_before_exit=lambda: calls.append('flush'))
++    with monkeypatch.context() as scoped:
++        scoped.setitem(sys.modules, 'tui_gateway.server', gateway)
++        bridge.dispatch(signal.SIGTERM, None, lambda *a: calls.append('previous'))
++    assert calls == (['previous'] if initializing else ['flush', 'previous'])
++
++
++def test_lazy_flush_respects_ignored_signal(monkeypatch):
++    from hermes_cli import serve_exit_flush as bridge
++    gateway = SimpleNamespace(__spec__=None,
++                              _handle_exit_flush_signal=lambda *a: pytest.fail('ignored signal flushed'))
++    with monkeypatch.context() as scoped:
++        scoped.setitem(sys.modules, 'tui_gateway.server', gateway)
++        bridge.dispatch(signal.SIGINT, None, signal.SIG_IGN)
+diff --git a/tests/hermes_cli/test_web_gateway_lazy.py b/tests/hermes_cli/test_web_gateway_lazy.py
+new file mode 100644
+index 00000000000..a6b7fcb4a88
+--- /dev/null
++++ b/tests/hermes_cli/test_web_gateway_lazy.py
+@@ -0,0 +1,44 @@
++"""Startup hooks must not import the agent until actual inference-side demand."""
++from types import SimpleNamespace
++
++
++def test_message_host_loads_gateway_on_delivery_not_publication(monkeypatch):
++    from hermes_cli import web_gateway_lazy as lazy
++    from hermes_cli import plugins
++    calls, published = [], []
++    manager = SimpleNamespace(set_tui_message_injector=lambda *a: None,
++                              clear_tui_message_injector=lambda *a: calls.append('manager-clear'))
++    gateway = SimpleNamespace(inject_tui_session_message=lambda **kw: calls.append(kw) or True)
++    monkeypatch.setattr(plugins, 'get_plugin_manager', lambda: manager)
++    monkeypatch.setattr(plugins, 'publish_tui_message_host', lambda *a: published.append(a))
++    monkeypatch.setattr(plugins, 'clear_published_tui_message_host', lambda owner: calls.append(owner))
++    monkeypatch.setattr(lazy, 'load_gateway', lambda: calls.append('load') or gateway)
++    lazy.install_message_host()
++    assert not calls
++    owner, inject = published[0]
++    assert inject(session_key='fixture', content='notice') is True
++    assert calls == ['load', {'session_key': 'fixture', 'content': 'notice'}]
++    lazy.clear_message_host()
++    assert calls[-2:] == [owner, 'manager-clear']
++
++
++def test_readopt_callback_loads_gateway_only_when_a_job_exits(monkeypatch):
++    from hermes_cli import web_gateway_lazy as lazy
++    calls = []
++    registry = SimpleNamespace(on_unknown_exit=None)
++    gateway = SimpleNamespace(_readopted_exit_deliver=lambda evt, **kw: calls.append((evt, kw)))
++    monkeypatch.setattr(lazy, 'load_gateway', lambda: calls.append('load') or gateway)
++    lazy.install_readopt_waker(registry)
++    assert not calls
++    registry.on_unknown_exit({'session_key': 'fixture'})
++    assert calls == ['load', ({'session_key': 'fixture'}, {'registry': registry})]
++
++
++def test_hosted_service_proxy_resolves_attributes_on_first_use(monkeypatch):
++    from hermes_cli import web_gateway_lazy as lazy
++    calls = []
++    monkeypatch.setattr(lazy, 'load_gateway', lambda: calls.append('load') or SimpleNamespace(_methods={'x': 'handler'}))
++    proxy = lazy.GatewayOnDemand()
++    assert not calls
++    assert proxy._methods == {'x': 'handler'}
++    assert calls == ['load']
+diff --git a/tests/hermes_cli/test_web_server_boot_handshake.py b/tests/hermes_cli/test_web_server_boot_handshake.py
+index 38f90279e60..9dbf83d6aaf 100644
+--- a/tests/hermes_cli/test_web_server_boot_handshake.py
++++ b/tests/hermes_cli/test_web_server_boot_handshake.py
+@@ -5,8 +5,9 @@
+ with Defender scanning every new .pyc) by patching the two helpers that touch
+ the blocking import and measuring response latency.
+ 
+-Covered: the gateway warmup import completes before the lifespan yields
+-(#73083/#73291), backend startup is not blocked by hosted-room recovery, shutdown joins the
++Covered: the gateway warmup no longer gates lifespan readiness, the retained
++bootstrap listener covers slow lifespan assembly, backend startup is not blocked
++by hosted-room recovery, shutdown joins the
+ state.db reconcile worker, and /api/status runs its slow drain-timeout resolution off
+ the event loop so a concurrent fast endpoint (/api/version) still responds.
+ """
+@@ -35,31 +36,18 @@
+     return _slow
+ 
+ 
+-def test_lifespan_warmup_is_synchronous(monkeypatch):
+-    """_warm_gateway_module must finish on the event-loop thread before the
+-    lifespan yields (#73083/#73291). On Windows + Python 3.11 the heavy import
+-    holds the GIL, so moving it to run_in_executor / a background task froze
+-    the loop after the socket opened and the Desktop's ready-probe timed out.
+-    Running it before the yield means no request is served until it is done."""
+-    from fastapi.testclient import TestClient
+-
+-    warm: dict[str, object] = {}
++def test_lifespan_does_not_preload_gateway(monkeypatch):
++    """Ready sessions must not depend on importing the inference/provider tree.
+ 
+-    def _record_warm():
+-        try:
+-            asyncio.get_running_loop()
+-            warm["on_loop_thread"] = True
+-        except RuntimeError:
+-            warm["on_loop_thread"] = False
+-        warm["done"] = True
++    Socket continuity during real lifespan startup is covered separately by the
++    retained bootstrap listener test, including a deliberately blocked lifespan.
++    """
++    from fastapi.testclient import TestClient
+ 
+-    monkeypatch.setattr(web_server_mod, "_warm_gateway_module", _record_warm)
++    warm = []
++    monkeypatch.setattr(web_server_mod, "_warm_gateway_module", lambda: warm.append(True))
+     with TestClient(web_server_mod.app, raise_server_exceptions=False):
+-        assert warm.get("done") is True, "startup completed before the gateway warmup ran"
+-        assert warm.get("on_loop_thread") is True, (
+-            "gateway warmup was moved off the lifespan (executor/background) — "
+-            "the socket now accepts probes while the GIL-holding import runs"
+-        )
++        assert warm == []
+ 
+ 
+ def test_lifespan_enters_and_exits_as_an_async_context_manager(monkeypatch):
+@@ -84,7 +72,8 @@
+     started = threading.Event()
+     release = threading.Event()
+ 
+-    def blocked_failure():
++    def blocked_failure(*, server=None):
++        assert server is not None  # first-use proxy; do not resolve its attributes here
+         started.set()
+         release.wait(timeout=2.0)
+         raise RuntimeError("state.db is locked")
+diff --git a/tui_gateway/methods_groups.py b/tui_gateway/methods_groups.py
+index 905df3f3fd2..1579c4c345f 100644
+--- a/tui_gateway/methods_groups.py
++++ b/tui_gateway/methods_groups.py
+@@ -44,10 +44,11 @@
+     server._profile_execution_policy = _profile_execution_policy
+ 
+ 
+-def start_hosted_room_service():
++def start_hosted_room_service(*, server=None):
+     """Start one process-owned hosted room service idempotently."""
+     global _service
+-    if _bound_server is None:
++    server = _bound_server if server is None else server
++    if server is None:
+         return None
+     from gateway.hosted_rooms import default_db_path
+     from tui_gateway.hosted_room_service import HostedRoomService
+@@ -57,7 +58,7 @@
+             _service.stop(timeout=1.0)
+             _service = None
+         if _service is None:
+-            _service = HostedRoomService(_bound_server, db_path=db_path)
++            _service = HostedRoomService(server, db_path=db_path)
+         _service.start()
+         return _service
+ 
+-- 
+2.43.0
+

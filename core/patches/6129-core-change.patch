@@ -1,0 +1,353 @@
+From b3ebed9250c08ade999424e9b7764ad3c983effc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:54:48 +0000
+Subject: [PATCH 6129] Kanban release command and delegate scope renewal
+
+Public mirror of source commit b3ebed9250c08ade999424e9b7764ad3c983effc.
+
+---
+diff --git a/hermes_cli/kanban_card_answer.py b/hermes_cli/kanban_card_answer.py
+index 617af7f1c16..314dc2deb6a 100644
+--- a/hermes_cli/kanban_card_answer.py
++++ b/hermes_cli/kanban_card_answer.py
+@@ -121,7 +121,8 @@
+ def _receipt(conn, request, fingerprint):
+     task, operation_id = request["task"], request["operationId"]
+     for row in conn.execute(
+-        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived','card_answer_recorded') ORDER BY id DESC",
++        "SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN "
++        "('unblocked','archived','card_answer_recorded','card_answer_released') ORDER BY id DESC",
+         (task,),
+     ):
+         payload = _payload(row[1])
+@@ -136,6 +137,47 @@
+     return None
+ 
+ 
++RELEASED = "card_answer_released"  # receipt of a default Unblock that released a spend/scope stop
++
++
++def _record_release(conn, request, fingerprint, receipt, note, provenance):
++    """The receipt and its decision comment in one transaction, after the release landed."""
++    with kb.write_txn(conn):
++        old = _receipt(conn, request, fingerprint)
++        if old is not None:
++            return old
++        kb.add_comment(conn, request["task"], "user-steps", note, writer_kind="agent", recorded_decision=provenance)
++        kb._append_event(conn, request["task"], RELEASED, {FIELD: receipt})
++    return _receipt(conn, request, fingerprint)
++
++
++def _release(conn, request, fingerprint, receipt, note, provenance, fence):
++    """A default Unblock on a card a spend or scope stop holds (or on the decision card filed for one) is the
++    user's authenticated Desktop operation: release the stopped card as that human act (``kanban_release``).
++    None when the card is not held that way; the caller then applies the plain unblock. A refused release
++    (provider safety, containment) leaves the ask in place and records the reason once per operation.
++
++    The courier delivers the answer to the card's home (``_owner``), so the bound card is local here; a decision
++    card whose stopped card lives on another board is refused by ``release`` (``no_such_task``) like any other."""
++    from hermes_cli import kanban_release
++    task, operation = request["task"], request["operationId"]
++    if kanban_release.held(conn, task) is None:
++        return None
++    error = fence(conn)
++    if error:
++        raise AnswerRefused(error)
++    out = kanban_release.release(conn, task, writer=kanban_release.human_writer("desktop-operation:" + operation),
++                                 author="user-steps", note=kanban_release.desktop_note(operation))
++    if out["outcome"] == "refused":
++        reason = (f"Desktop Unblock did not release {out['target']} ({out['refusal']}): {out['message']}"
++                  f"\nOperation: {operation}")
++        if not conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND author='user-steps' AND body=?",
++                            (task, reason)).fetchone():
++            kb.add_comment(conn, task, "user-steps", reason, system=True)
++        raise AnswerRefused(f"release_refused: {out['refusal']}")
++    return _record_release(conn, request, fingerprint, receipt, note, provenance)
++
++
+ def _owner(conn, task, gateway, *, require_primary=False):
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+     if row is None or ('created_on' in row.keys() and row['created_on'] not in (None, '', gateway)):
+@@ -192,7 +234,18 @@
+             old = _receipt(conn, request, fingerprint)
+             if old is not None:
+                 return old
+-            raise AnswerRefused("stale_ask")
++        # A release by this very operation that died before its receipt: the card left its ask because the
++        # click worked. Record the receipt now instead of refusing the retry.
++        from hermes_cli import kanban_release
++        if request.get("mode") != "comment" and request["choice"] == "unblock" and kanban_release.released_by(
++                conn, request["task"], kanban_release.desktop_note(request["operationId"])):
++            return _record_release(
++                conn, request, fingerprint,
++                {**request, "originGateway": origin, "fingerprint": fingerprint, "destination": "kanban_ask",
++                 "executionStarted": False, "decisionProvenance": "recorded_desktop_operation"},
++                "Choice recorded in Desktop (remote): " + encoded({"label": "Unblock", "value": "unblock"})
++                + "\nOperation: " + request["operationId"], {**request, "originGateway": origin})
++        raise AnswerRefused("stale_ask")
+     options = current["ask"].get("choices") or [
+         {"label": "Unblock", "value": "unblock"}, {"label": "Archive", "value": "archive"},
+     ]
+@@ -208,19 +261,25 @@
+                "decisionProvenance": "recorded_desktop_operation"}
+     note = "Choice recorded in Desktop (remote): " + encoded(choices[0]) + "\nOperation: " + request["operationId"]
+ 
+-    def fence(c):
++    def fence(c, releasing=False):
+         _owner(c, request['task'], owner_gateway, require_primary=require_primary)
+         from hermes_cli.kanban_spend_decision import pending
+         from hermes_cli.kanban_containment_guard import pending as containment_pending
+-        if containment_pending(c, request['task']):
++        if containment_pending(c, request['task']) and not releasing:  # release refuses it with the reason
+             return "containment_hold"
+-        if not archive and not informational and pending(c, request["task"]):
++        if not archive and not informational and not releasing and pending(c, request["task"]):
+             return "spend_decision_pending"
+         if _receipt(c, request, fingerprint):
+             return "already_recorded"
+         fresh = snapshot(c, request["task"])
+         return None if fresh == current else "stale_ask"
+ 
++    if not archive and not informational and not current["ask"].get("choices") and request["choice"] == "unblock":
++        released = _release(conn, request, fingerprint, receipt, note, {**request, "originGateway": origin},
++                            lambda c: fence(c, releasing=True))
++        if released is not None:
++            return released
++
+     transition = kb.archive_task if archive else kb.unblock_task
+     from hermes_cli.kanban_reason_comment import RecordedDecisionComment
+     provenance = {**request, "originGateway": origin}
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 377d8427b15..184f56b4fc5 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -51,6 +51,26 @@
+     return ("human", None, str(evidence or "explicit"))
+ 
+ 
++def desktop_note(operation_id: str) -> str:
++    """The mandate note of a Desktop Unblock click; it identifies the operation that released the card."""
++    return "Desktop Unblock, operation " + str(operation_id)
++
++
++def released_by(conn: sqlite3.Connection, task_id: str, note: str) -> Optional[str]:
++    """The card a release carrying exactly ``note`` already released for ``task_id`` (or for the stop it is the
++    decision card of), else None. A caller that died between the release and its own receipt uses this on the
++    retry to record the receipt instead of releasing twice or refusing."""
++    tid = target(conn, task_id)
++    row = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
++    if row is None or row[0] in _HELD or not note or not note.strip():
++        return None
++    tail = "\n\n" + note.strip()
++    for (body,) in conn.execute("SELECT body FROM task_comments WHERE task_id=? ORDER BY id DESC", (tid,)):
++        if str(body or "").startswith(MARK) and str(body).endswith(tail):
++            return tid
++    return None
++
++
+ def default_runs(cfg: Optional[dict] = None) -> int:
+     """``kanban.release_runs`` (default 10): how many more runs a release grants."""
+     if cfg is None:
+diff --git a/hermes_cli/kanban_stranded_brief.py b/hermes_cli/kanban_stranded_brief.py
+index 7a33b019212..2436ef41909 100644
+--- a/hermes_cli/kanban_stranded_brief.py
++++ b/hermes_cli/kanban_stranded_brief.py
+@@ -55,13 +55,20 @@
+     # The stopped card an Unblock releases (kanban_release): this card, or the one this decision card was filed for.
+     from hermes_cli import kanban_release
+     stopped, runs = kanban_release.held(conn, tid), kanban_release.default_runs()
++    from hermes_cli.kanban_refusal_receipt import restricted as safety_restricted
++    unsafe = bool(stopped) and safety_restricted(conn, stopped)
+     if stopped:
+-        resume = (f'Release {"the stopped work" if administrative else "this card"} to finish its acceptance: {runs} '
++        resume = ('No release: a provider safety hold stays on the work; the click only records that refusal.'
++                  if unsafe else
++                  f'Release {"the stopped work" if administrative else "this card"} to finish its acceptance: {runs} '
+                   'more runs under a goal-level scope; it can be stopped again. Safety holds still apply.')
+         drop = ('Dismiss this decision notice; source work stays stopped with no further spend; reopen to reconsider.'
+                 if administrative else
+                 'Archive this card and leave its work unfinished; no further spend; reopen to reconsider.')
+-        recommendation = 'B - avoid authorizing more work without a bounded proposal.'
++        # A scope or budget stop is a pause on work that already ran, not a finding against it: finishing is the
++        # default. Only a provider safety hold keeps the cautious line.
++        recommendation = ('B - avoid authorizing more work without a bounded proposal.' if unsafe else
++                          'A - release it to finish; the stop was a scope or budget stop, not a safety hold.')
+     elif administrative:
+         resume = ('Return the decision to an agent to record your direction; source work stays stopped, '
+                   'with no further spend until separately authorized.')
+@@ -78,7 +85,9 @@
+         recommendation = 'B - leave work stopped rather than restart it without a current owner or plan.'
+     # Preserve the existing Unblock/Archive transition contract. Explicit choices currently turn
+     # even an archive-valued answer into an unblock; describe the two real controls in the brief.
+-    release = (f"Unblock = release it to finish with {runs} more runs under a goal-level scope "
++    release = ("Unblock = no release: a provider safety hold stays and the click only records that refusal"
++               if unsafe else
++               f"Unblock = release it to finish with {runs} more runs under a goal-level scope "
+                f"(`hermes kanban release {stopped}`); safety holds still apply" if stopped else
+                f"Unblock = ask the owner to record a bounded decision; the button cannot release this hold. "
+                f"For an ordinary budget stop use `hermes kanban promote {tid} --reason '<what changed>'`; "
+diff --git a/tests/hermes_cli/test_kanban_release.py b/tests/hermes_cli/test_kanban_release.py
+index 9a181877d31..31ab154d99f 100644
+--- a/tests/hermes_cli/test_kanban_release.py
++++ b/tests/hermes_cli/test_kanban_release.py
+@@ -235,8 +235,31 @@
+     assert (f'Unblock = release it to finish with 10 more runs under a goal-level scope '
+             f'(`hermes kanban release {tid}`); safety holds still apply') in request['action']
+     assert 'A) Unblock: Release the stopped work to finish its acceptance: 10 more runs' in request['scope']
++    assert 'Recommend: A - release it to finish' in request['scope']
+     # A decision card whose stopped card is no longer held keeps the plain "return to an agent" brief.
+     with kb.write_txn(board):
+         board.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+     plain = brief.request(board, card, None, 3 * 3600, 'events: spend_budget_triaged runs=15')
+     assert 'kanban release' not in plain['action'] and 'return this decision to an agent' in plain['action']
++
++
++def test_brief_on_a_safety_restricted_card_keeps_the_cautious_line(board, monkeypatch):
++    from hermes_cli import kanban_stranded_brief as brief
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal', 'episode': episode})
++    board.commit()
++    row = dict(board.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    request = brief.request(board, row, None, 3 * 3600, 'events: decision_hold_restricted')
++    assert 'Unblock = no release: a provider safety hold stays' in request['action']
++    assert 'Recommend: B - avoid authorizing more work without a bounded proposal.' in request['scope']
++    assert 'release it to finish' not in request['action'] + request['scope']
++
++
++def test_released_by_names_the_card_only_for_the_note_that_released_it(board):
++    tid = spend_stopped(board)
++    note = release.desktop_note('op-7')
++    assert note == 'Desktop Unblock, operation op-7' and release.released_by(board, tid, note) is None
++    run(board, tid, note=note)
++    assert release.released_by(board, tid, note) == tid
++    assert release.released_by(board, tid, release.desktop_note('op-8')) is None
++    assert release.released_by(board, tid, '') is None
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index 74f3fe9df41..e3107912d12 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -128,6 +128,8 @@
+                 f"(`hermes kanban release {tid}`); safety holds still apply") in request["action"]
+         assert "cannot release this hold" not in request["action"]
+         assert "A) Unblock: Release this card to finish its acceptance: 10 more runs" in request["scope"]
++        assert "Recommend: A - release it to finish" in request["scope"]
++        assert "without a bounded proposal" not in request["scope"]
+         assert request["why_human"].startswith("Tried:") and "Only you can:" in request["why_human"]
+         assert "spend_budget_triaged" in request["evidence"] and "runs=" in request["evidence"]
+         assert "choices" not in request
+@@ -609,23 +611,88 @@
+         assert task.status not in ("triage", "blocked", "archived") and task.human_request is None
+ 
+ 
+-def test_spend_pending_unblock_ask_names_release_and_release_frees_the_card(kanban_home, own_gateway):
+-    """The ask on a spend-stopped card names the one-step release, and that release frees the card. A remote
+-    Desktop answer (kanban_card_answer) is a plain unblock and still refuses a pending spend decision: only the
+-    local Desktop click (the user-steps mirror) and the command release."""
++def test_spend_pending_remote_unblock_answer_releases_the_card(kanban_home, own_gateway):
++    """The ask on a spend-stopped card names the one-step release, and the remote Desktop Unblock answer
++    (kanban_card_answer) is that release, recorded as the human act the verified Desktop operation is."""
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert f"`hermes kanban release {tid}`" in json.loads(_row(conn, tid)[2])["action"]
++        receipt = _answer(conn, tid, "unblock")
++        assert receipt["operationId"] == "desktop-op-unblock" and receipt["choice"] == "unblock"
++        assert kb.get_task(conn, tid).status == "ready" and not decision.pending(conn, tid)
++        (mandate,) = [r[0] for r in conn.execute(
++            "SELECT body FROM task_comments WHERE task_id=? AND body LIKE 'Released to finish%'", (tid,))]
++        assert mandate.endswith("Desktop Unblock, operation desktop-op-unblock")
++        written = [json.loads(r[0]) for r in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='commented'", (tid,))]
++        assert any(p.get("writer_kind") == "human" for p in written)
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='card_answer_released'",
++                            (tid,)).fetchone()[0] == 1
++
++
++def _retry(conn, tid, generation):
++    """The same Desktop operation delivered again, with the generation it was recorded against."""
++    from hermes_cli import kanban_card_answer as ca
++    request = {"ownerGateway": "owner", "ownerProfile": "default", "board": "default", "task": tid,
++               "generation": generation, "choice": "unblock", "operationId": "desktop-op-unblock"}
++    return ca.apply(conn, request, owner_gateway="owner", owner_profile="default", board="default",
++                    verify_source=lambda req: {"gateway": "origin", "recorded": True, "answer": req})
++
++
++def test_remote_unblock_retry_returns_the_receipt_and_a_lost_receipt_is_recorded(kanban_home, own_gateway):
+     from hermes_cli import kanban_card_answer as ca
+     from hermes_cli import kanban_release
++    with kbc.connect_closing() as conn:
++        done, crashed = _spend_stopped_on_dead_chat(conn, kanban_home), _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert sorted(_sweep(conn, now=_later(3), cfg={})) == sorted([done, crashed])
++        generation = ca.snapshot(conn, done)["generation"]
++        receipt = _answer(conn, done, "unblock")
++        assert _retry(conn, done, generation) == receipt
++        # The release landed and the process died before the receipt: the retry records it, releasing nothing more.
++        generation = ca.snapshot(conn, crashed)["generation"]
++        out = kanban_release.release(conn, crashed, writer=kanban_release.human_writer("desktop-operation:x"),
++                                     author="user-steps", note=kanban_release.desktop_note("desktop-op-unblock"))
++        assert out["outcome"] == "released"
++        recorded = _retry(conn, crashed, generation)
++        assert recorded["operationId"] == "desktop-op-unblock" and _retry(conn, crashed, generation) == recorded
++        assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND body LIKE 'Released to finish%'",
++                            (crashed,)).fetchone()[0] == 1
++
++
++def test_remote_custom_choice_answer_on_a_held_card_is_unchanged(kanban_home, own_gateway, monkeypatch):
++    from hermes_cli import kanban_card_answer as ca
++    from hermes_cli import kanban_release
++    monkeypatch.setattr(kanban_release, "release", lambda *a, **kw: pytest.fail("custom choices never release"))
+     with kbc.connect_closing() as conn:
+         tid = _spend_stopped_on_dead_chat(conn, kanban_home)
+         assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+-        assert f"`hermes kanban release {tid}`" in json.loads(_row(conn, tid)[2])["action"]
+-        # The fence's spend_decision_pending refusal surfaces from apply() as ask_changed_or_held.
++        ask = json.loads(_row(conn, tid)[2])
++        ask["choices"] = [{"label": "Unblock", "value": "unblock"}, {"label": "Later", "value": "later"}]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(ask), tid))
+         with pytest.raises(ca.AnswerRefused, match="ask_changed_or_held|spend_decision_pending"):
+             _answer(conn, tid, "unblock")
+-        assert _row(conn, tid)[0] == "triage" and _row(conn, tid)[2]
+-        out = kanban_release.release(conn, tid, writer=kanban_release.human_writer("test-operator"))
+-        assert out["outcome"] == "released", out
+-        assert kb.get_task(conn, tid).status == "ready"
++        assert _row(conn, tid)[0] == "triage" and decision.pending(conn, tid)
++
++
++def test_remote_unblock_refused_by_safety_leaves_the_ask_and_records_the_reason(kanban_home, own_gateway):
++    from hermes_cli import kanban_card_answer as ca
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        kb._append_event(conn, tid, "decision_hold_restricted", {"cause": "safety_refusal"})
++        conn.commit()
++        for _ in range(2):  # a redelivery says it once
++            with pytest.raises(ca.AnswerRefused, match="release_refused: safety_restricted"):
++                _answer(conn, tid, "unblock")
++        status, _, raw = _row(conn, tid)
++        assert status == "triage" and json.loads(raw)["action"]
++        notes = [r[0] for r in conn.execute(
++            "SELECT body FROM task_comments WHERE task_id=? AND author='user-steps'", (tid,))]
++        assert len(notes) == 1 and "did not release" in notes[0] and "desktop-op-unblock" in notes[0]
++        assert not conn.execute("SELECT 1 FROM task_comments WHERE task_id=? AND body LIKE 'Released to finish%'",
++                                (tid,)).fetchone()
+ 
+ 
+ # --- the stale-sweep deferral is bounded -----------------------------------------------------------------------------
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 478b37aec2d..5e2218e43cc 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -763,6 +763,9 @@
+ card is refused. A provider safety restriction (`safety_restricted`) and a containment hold
+ (`containment_hold`) are refused, a card no stop holds is `not_held`, and a rerun is
+ `already_released`; a refusal writes nothing. Only a card whose home is this board is released.
++The Desktop Unblock button on such a card's ask, or on its decision card's ask, makes the same release
++(locally through the user-steps mirror, remotely through `kanban_card_answer` on the card's home), recorded as
++a human act with the note `Desktop Unblock, operation <id>`; an ask with its own choices keeps the plain unblock.
+ 
+ An over-budget card that **published** an OPEN PR on
+ `example-org/hermes` targeting `main` is spared from a new spend
+-- 
+2.43.0
+

@@ -1,0 +1,206 @@
+From 8f2fed7504ee32f8b6c8500235b4a9b12f143156 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:34:41 +0000
+Subject: [PATCH 6298] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 8f2fed7504ee32f8b6c8500235b4a9b12f143156.
+
+---
+diff --git a/hermes_cli/kanban_external_activity.py b/hermes_cli/kanban_external_activity.py
+index ba051791aca..4e6f61ec7a1 100644
+--- a/hermes_cli/kanban_external_activity.py
++++ b/hermes_cli/kanban_external_activity.py
+@@ -181,7 +181,15 @@
+ 
+ 
+ def _board_external(path, open_ro, parked_pairs, signature, wall: float) -> dict[str, dict[str, Any]]:
+-    """One board's ``session_external`` map: the stored one while the board is unchanged, else a read of it."""
++    """Recheck the change signal after waiting for any overlapping capture of this board."""
++    from hermes_cli.kanban_external_refresh import board_refresh
++
++    with board_refresh(path):
++        return _read_board_external(path, open_ro, parked_pairs, signature, wall)
++
++
++def _read_board_external(path, open_ro, parked_pairs, signature, wall: float) -> dict[str, dict[str, Any]]:
++    """One board's stored contribution while unchanged, otherwise one short-lived read."""
+     key = str(path)
+     sig = signature(path) if signature is not None else None
+     if sig is not None:
+diff --git a/hermes_cli/kanban_external_refresh.py b/hermes_cli/kanban_external_refresh.py
+new file mode 100644
+index 00000000000..13bed06eea7
+--- /dev/null
++++ b/hermes_cli/kanban_external_refresh.py
+@@ -0,0 +1,25 @@
++"""Serialize overlapping external-display captures by board, without retaining DB handles."""
++from contextlib import contextmanager
++import threading
++
++_lock = threading.Lock()
++_active: dict[str, tuple[threading.Lock, int]] = {}
++
++
++@contextmanager
++def board_refresh(path):
++    """Keep lock identity until the last waiter leaves; unrelated boards do not block."""
++    key = str(path)
++    with _lock:
++        lock, users = _active.get(key, (threading.Lock(), 0))
++        _active[key] = (lock, users + 1)
++    try:
++        with lock:
++            yield
++    finally:
++        with _lock:
++            _, users = _active[key]
++            if users == 1:
++                del _active[key]
++            else:
++                _active[key] = (lock, users - 1)
+diff --git a/tests/hermes_cli/test_kanban_external_singleflight.py b/tests/hermes_cli/test_kanban_external_singleflight.py
+new file mode 100644
+index 00000000000..047551b3d0a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_singleflight.py
+@@ -0,0 +1,137 @@
++"""Concurrent request refreshes share one board read, never a connection."""
++from concurrent.futures import ThreadPoolExecutor
++import sqlite3
++import threading
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_external_activity as activity
++
++
++@pytest.fixture(autouse=True)
++def fresh():
++    activity.reset_for_tests()
++    yield
++    activity.reset_for_tests()
++
++
++@pytest.mark.parametrize('reason', ['cold', 'changed', 'clock'])
++def test_overlapping_requests_recompute_once(monkeypatch, reason):
++    entered = threading.Event()
++    release = threading.Event()
++    duplicate = threading.Event()
++    started = threading.Event()
++    opens = []
++    signature = ['first']
++    wall = [100.0]
++    hold = [False]
++    result = {'s': {'counts': [1, 0, 0], 'cards': []}}
++
++    def open_ro(path):
++        conn = Mock()
++        opens.append(conn)
++        return conn
++
++    def read(conn, pairs, **kwargs):
++        if hold[0]:
++            if entered.is_set():
++                duplicate.set()
++            entered.set()
++            assert release.wait(5)
++        return result
++
++    monkeypatch.setattr(activity, 'session_external', read)
++    monkeypatch.setattr(activity, '_clocked', lambda conn, pairs: reason == 'clock')
++
++    def request():
++        return activity._board_external('board', open_ro, lambda conn: [('s', 't')],
++                                        lambda path: signature[0], wall[0])
++
++    if reason != 'cold':
++        assert request() == result
++        opens.clear()
++        if reason == 'changed':
++            signature[0] = 'second'
++        else:
++            wall[0] += activity._TTL_S + 1
++    hold[0] = True
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        first = pool.submit(request)
++        assert entered.wait(5)
++
++        def second_request():
++            started.set()
++            return request()
++
++        second = pool.submit(second_request)
++        try:
++            assert started.wait(5)
++            duplicate.wait(0.2)
++        finally:
++            release.set()
++        assert first.result(timeout=5) == second.result(timeout=5) == result
++    assert len(opens) == 1, 'one changed-board capture must serve overlapping requests'
++    opens[0].close.assert_called_once()
++
++
++def test_failed_open_does_not_poison_next_request(monkeypatch):
++    conn = Mock()
++    opened = Mock(side_effect=[sqlite3.OperationalError('busy'), conn])
++    monkeypatch.setattr(activity, '_clocked', lambda conn, pairs: False)
++    read = Mock(return_value={'s': {'counts': [1, 0, 0], 'cards': []}})
++    monkeypatch.setattr(activity, 'session_external', read)
++
++    def request():
++        return activity._board_external('board', opened, lambda conn: [('s', 't')], lambda path: 'sig', 100)
++
++    assert request() == {}
++    assert request() == read.return_value
++    assert request() == read.return_value
++    assert opened.call_count == 2
++    assert read.call_count == 1
++    conn.close.assert_called_once()
++
++
++def test_board_locks_are_independent_and_retired_on_exception():
++    from hermes_cli import kanban_external_refresh as refresh
++
++    with refresh.board_refresh('first'):
++        with ThreadPoolExecutor(max_workers=1) as pool:
++            def other():
++                with refresh.board_refresh('second'):
++                    return True
++            assert pool.submit(other).result(timeout=5)
++    assert not refresh._active
++    with pytest.raises(RuntimeError), refresh.board_refresh('first'):
++        raise RuntimeError('capture failed')
++    assert not refresh._active
++
++
++def test_waiter_rechecks_signature_after_prior_capture(monkeypatch):
++    from hermes_cli import kanban_external_refresh as refresh
++
++    started = threading.Event()
++    signal = ['old']
++    seen = []
++    conn = Mock()
++    monkeypatch.setattr(activity, '_clocked', lambda conn, pairs: False)
++    monkeypatch.setattr(activity, 'session_external', lambda *args, **kw: {'new': {}})
++    activity._boards['board'] = ('old', False, 100, {'old': {}})
++
++    def signature(path):
++        seen.append(signal[0])
++        return signal[0]
++
++    def request():
++        started.set()
++        return activity._board_external('board', lambda path: conn, lambda conn: [('s', 't')], signature, 100)
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        with refresh.board_refresh('board'):
++            pending = pool.submit(request)
++            assert started.wait(5)
++            signal[0] = 'new'
++        assert pending.result(timeout=5) == {'new': {}}
++    assert seen == ['new']
++    assert not refresh._active
+-- 
+2.43.0
+

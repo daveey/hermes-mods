@@ -1,0 +1,208 @@
+From cf17f8bf51b5b396abb83025e267b47f398d40ce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:39:51 +0000
+Subject: [PATCH 6496] Desktop Background section, stripes and bounded reports
+
+Public mirror of source commit cf17f8bf51b5b396abb83025e267b47f398d40ce.
+
+---
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe-reporting.test.ts b/apps/desktop/src/app/chat/sidebar/session-row-stripe-reporting.test.ts
+new file mode 100644
+index 00000000000..82317bf5e64
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe-reporting.test.ts
+@@ -0,0 +1,84 @@
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import type * as Hermes from '@/hermes'
++import { canonicalOutcome } from '@/test/canonical-outcome'
++
++const remote = vi.hoisted(() => ({ committed: vi.fn(), reason: vi.fn() }))
++
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<typeof Hermes>()),
++  reportSessionCommittedStripeRemote: remote.committed,
++  reportSessionStripeRemote: remote.reason
++}))
++
++beforeEach(() => {
++  vi.resetModules()
++  vi.useFakeTimers()
++  remote.committed.mockReset()
++  remote.reason.mockReset()
++})
++
++afterEach(() => {
++  vi.useRealTimers()
++})
++
++it.each(['committed', 'reason'] as const)(
++  '%s wiring caps a 74-row burst at four per connection without delaying healthy links',
++  async kind => {
++    const releases: (() => void)[] = []
++    const send = remote[kind]
++
++    send.mockImplementation(() => new Promise<void>(resolve => releases.push(resolve)))
++    // Import the actual sidebar module: bypassing either wrapper must break this test.
++    await import('./session-row-stripe')
++    const committed = await import('@/store/committed-stripe-report')
++    const reason = await import('@/store/session-dot-state')
++
++    const report = (id: string, connection_id?: string) => {
++      const row = { connection_id, id, profile: 'default' }
++
++      if (kind === 'committed') {
++        committed.reportCommittedStripe(row, canonicalOutcome('done'), 'row', 'done')
++      } else {
++        reason.recordStripeTransition(row, 'stuck', 'needs-input')
++      }
++    }
++
++    for (let i = 0; i < 74; i += 1) {
++      report(`hub-${i}`, 'hub')
++    }
++
++    await vi.advanceTimersByTimeAsync(0)
++    expect(send).toHaveBeenCalledTimes(4)
++    expect(send.mock.calls.map(([row]) => row.id)).toEqual(['hub-0', 'hub-1', 'hub-2', 'hub-3'])
++
++    // Four hanging hub POSTs must not hold the local connection or another healthy gateway.
++    report('local')
++    report('peer', 'peer')
++    await vi.advanceTimersByTimeAsync(0)
++    expect(send).toHaveBeenCalledTimes(6)
++    expect(send.mock.calls.slice(4).map(([row]) => row.id)).toEqual(['local', 'peer'])
++
++    releases[0]!()
++    await vi.advanceTimersByTimeAsync(0)
++    expect(send).toHaveBeenCalledTimes(7)
++    expect(send.mock.calls[6]![0].id).toBe('hub-4')
++
++    // Resolve every send, including queued ones, to exercise FIFO drain and slot reclamation.
++    for (let i = 0; i < 76; i += 1) {
++      releases[i]!()
++      await vi.advanceTimersByTimeAsync(0)
++    }
++
++    expect(send.mock.calls.filter(([row]) => row.connection_id === 'hub').map(([row]) => row.id)).toEqual(
++      Array.from({ length: 74 }, (_, i) => `hub-${i}`)
++    )
++    report('hub-next', 'hub')
++    await vi.advanceTimersByTimeAsync(0)
++    expect(send).toHaveBeenCalledTimes(77)
++    releases[76]!()
++    await vi.advanceTimersByTimeAsync(0)
++    committed.resetCommittedStripeReports()
++    reason.resetStripeTransitionLog()
++  }
++)
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index 16f0492573c..8e1ddcac4da 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -29,16 +29,23 @@
+ // [daveey] Every red edge (with its reasons) also goes to the session's own gateway, where the agent can read it.
+ // Both reporters cap their in-flight POSTs: a wake/stall commits every row's paint at once (74 in one tick), and
+ // unbounded they all time out together on a briefly half-open link.
+-const sendStripeReason = boundDiagnosticSender(reportSessionStripeRemote)
+-const sendCommittedStripe = boundDiagnosticSender(reportSessionCommittedStripeRemote)
++// Each reporter has a budget per connection: a half-open gateway cannot delay healthy gateways or local rows.
++const sendStripeReason = boundDiagnosticSender(
++  reportSessionStripeRemote,
++  undefined,
++  undefined,
++  row => row.connection_id
++)
++
++const sendCommittedStripe = boundDiagnosticSender(
++  reportSessionCommittedStripeRemote,
++  undefined,
++  undefined,
++  row => row.connection_id
++)
+ 
+ setStripeReasonReporter((row, stripe, previous, reasons) =>
+-  sendStripeReason(
+-    { connection_id: row.connection_id, id: row.id, profile: row.profile },
+-    stripe,
+-    previous,
+-    reasons
+-  )
++  sendStripeReason({ connection_id: row.connection_id, id: row.id, profile: row.profile }, stripe, previous, reasons)
+ )
+ 
+ // [daveey] Every committed paint of a row with a canonical envelope (any stripe, not red only) is reported with the
+diff --git a/apps/desktop/src/lib/bounded-diagnostic-sender.ts b/apps/desktop/src/lib/bounded-diagnostic-sender.ts
+index 6fdad7ccf69..47939de7ab0 100644
+--- a/apps/desktop/src/lib/bounded-diagnostic-sender.ts
++++ b/apps/desktop/src/lib/bounded-diagnostic-sender.ts
+@@ -8,21 +8,36 @@
+ export function boundDiagnosticSender<A extends unknown[], R>(
+   send: (...args: A) => Promise<R>,
+   limit = 4,
+-  maxQueued = 512
++  maxQueued = 512,
++  keyOf: (...args: A) => unknown = () => undefined
+ ): (...args: A) => Promise<R> {
+-  let active = 0
+-  const waiting: { reject: (e: unknown) => void; run: () => void }[] = []
+-
+-  const pump = () => {
+-    while (active < limit && waiting.length) {
+-      waiting.shift()!.run()
+-    }
+-  }
++  // A half-open gateway must not hold another connection's diagnostics behind its timeouts.
++  const budgets = new Map<unknown, { active: number; waiting: { reject: (e: unknown) => void; run: () => void }[] }>()
+ 
+   return (...args: A) =>
+     new Promise<R>((resolve, reject) => {
++      const key = keyOf(...args)
++      let budget = budgets.get(key)
++
++      if (!budget) {
++        budget = { active: 0, waiting: [] }
++        budgets.set(key, budget)
++      }
++
++      const state = budget
++
++      const pump = () => {
++        while (state.active < limit && state.waiting.length) {
++          state.waiting.shift()!.run()
++        }
++
++        if (state.active === 0 && state.waiting.length === 0) {
++          budgets.delete(key)
++        }
++      }
++
+       const run = () => {
+-        active += 1
++        state.active += 1
+         let p: Promise<R>
+ 
+         try {
+@@ -32,15 +47,15 @@
+         }
+ 
+         void p.then(resolve, reject).finally(() => {
+-          active -= 1
++          state.active -= 1
+           pump()
+         })
+       }
+ 
+-      waiting.push({ reject, run })
++      state.waiting.push({ reject, run })
+ 
+-      if (waiting.length > maxQueued) {
+-        waiting.shift()!.reject(new Error('diagnostic queue full'))
++      if (state.waiting.length > maxQueued) {
++        state.waiting.shift()!.reject(new Error('diagnostic queue full'))
+       }
+ 
+       pump()
+-- 
+2.43.0
+

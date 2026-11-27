@@ -1,0 +1,143 @@
+From 29f24adffa5c501bda69daba438ce4c09bfa20bb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:00:36 +0000
+Subject: [PATCH 6042] Kanban source-custody base (stage A, inert)
+
+Public mirror of source commit 29f24adffa5c501bda69daba438ce4c09bfa20bb.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index e739c6a9179..8302c41fac4 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1729,14 +1729,19 @@
+                 self.finished = False
+ 
+     def cleanup_failed(self) -> None:
+-        """Preserve the propagating error, even if rollback entry is interrupted."""
++        """Preserve the propagating error, even if rollback or finish is interrupted."""
+         try:
+             self.rollback()
+         except BaseException:
+             if not (self.no_retry or self.done is not None):
+                 raise  # keep default-path behavior
+             logging.getLogger(__name__).exception("write_txn: cleanup interrupted")
+-        self.finish()
++        try:
++            self.finish()
++        except BaseException:
++            if not (self.no_retry or self.done is not None):
++                raise  # keep default-path behavior
++            logging.getLogger(__name__).exception("write_txn: cleanup finish interrupted")
+ 
+     def finish(self) -> None:
+         if self.finished:
+@@ -1814,6 +1819,8 @@
+     error. Opt-in mode confirms ownership ended before the callback; an interrupted
+     or unreadable boundary gets one final rollback attempt and close. If close
+     fails, the callback is withheld. The default path is unchanged.
++    In opt-in mode an interrupt in the cleanup finish or the safety net is logged
++    and never replaces the propagating error; a finish that never ran withholds the callback.
+     """
+     if (no_retry or boundary_done is not None) and getattr(conn, "in_transaction", False):
+         raise RuntimeError(
+@@ -1824,8 +1831,18 @@
+     try:
+         with _write_txn_body(conn, allow_nested, boundary) as c:
+             yield c
+-    finally:
+-        boundary.finish()  # safety net (BaseException / pre-BEGIN failure); idempotent
++    except BaseException:
++        # Safety net (BaseException / pre-BEGIN failure); idempotent. In opt-in mode an
++        # interrupt here is logged and never replaces the propagating error.
++        try:
++            boundary.finish()
++        except BaseException:
++            if not (no_retry or boundary_done is not None):
++                raise  # keep default-path behavior
++            logging.getLogger(__name__).exception("write_txn: safety-net finish interrupted")
++        raise
++    else:
++        boundary.finish()  # idempotent
+ 
+ 
+ @contextlib.contextmanager
+diff --git a/tests/hermes_cli/test_kanban_write_txn_interrupt.py b/tests/hermes_cli/test_kanban_write_txn_interrupt.py
+index 5cd25b9081c..6f601de64de 100644
+--- a/tests/hermes_cli/test_kanban_write_txn_interrupt.py
++++ b/tests/hermes_cli/test_kanban_write_txn_interrupt.py
+@@ -69,3 +69,71 @@
+         sys.settrace(None)
+         a.close()
+         b.close()
++
++
++@pytest.mark.parametrize(
++    "phase,entries,expected_callbacks",
++    [("body", (1,), 1), ("commit", (1,), 1),
++     ("body", (2,), 1), ("commit", (1, 2), 0)],
++    ids=["T5", "T6", "T7", "T8"],
++)
++def test_original_error_survives_finish_interrupt(tmp_path, phase, entries, expected_callbacks):
++    a = sqlite3.connect(tmp_path / "finish.db", isolation_level=None, timeout=0)
++    b = sqlite3.connect(tmp_path / "finish.db", isolation_level=None, timeout=0)
++    a.execute("PRAGMA foreign_keys=ON")
++    a.execute("CREATE TABLE parent(id PRIMARY KEY)")
++    a.execute("CREATE TABLE child(pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
++    original = ValueError("body failure")
++    releases = []
++    signals = []
++    calls = []
++
++    def done():
++        b.execute("BEGIN IMMEDIATE")
++        releases.append(True)
++        b.execute("ROLLBACK")
++
++    def trace(frame, event, arg):
++        if (event in ("call", "line")
++                and frame.f_code is kbc._TxnBoundary.finish.__code__ and frame not in calls):
++            calls.append(frame)
++            if len(calls) in entries:
++                signals.append(len(calls))
++                signal.raise_signal(signal.SIGINT)
++        return trace
++
++    def rearm_trace(frame, event, arg):
++        # CPython clears tracing when a trace raises. Re-arm on subsequent calls
++        # so T8 delivers two real signals, without replacing any cleanup method.
++        if event == "call" and sys.gettrace() is None:
++            sys.settrace(trace)
++            frame.f_trace = trace
++
++    caught = None
++    try:
++        try:
++            sys.setprofile(rearm_trace)
++            sys.settrace(trace)
++            with kbc.write_txn(a, no_retry=True, boundary_done=done):
++                a.execute("INSERT INTO child VALUES (99)")
++                if phase == "body":
++                    raise original
++        except BaseException as exc:
++            caught = exc
++        finally:
++            sys.setprofile(None)
++            sys.settrace(None)
++        assert signals == list(entries)
++        if phase == "body":
++            assert caught is original
++        else:
++            assert isinstance(caught, sqlite3.IntegrityError)
++            assert "FOREIGN KEY" in str(caught)
++        b.execute("BEGIN IMMEDIATE")
++        b.execute("ROLLBACK")
++        assert releases == [True] * expected_callbacks
++    finally:
++        sys.setprofile(None)
++        sys.settrace(None)
++        a.close()
++        b.close()
+-- 
+2.43.0
+

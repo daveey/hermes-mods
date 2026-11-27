@@ -1,0 +1,127 @@
+From 8a04f2765f4ea532efba0387ea57c4b4c9a22fd9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:25:26 +0000
+Subject: [PATCH 6227] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit 8a04f2765f4ea532efba0387ea57c4b4c9a22fd9.
+
+---
+diff --git a/tests/tui_gateway/test_automatic_ledger_defer.py b/tests/tui_gateway/test_automatic_ledger_defer.py
+index cd5b796389b..f445b5a1c64 100644
+--- a/tests/tui_gateway/test_automatic_ledger_defer.py
++++ b/tests/tui_gateway/test_automatic_ledger_defer.py
+@@ -92,6 +92,54 @@
+     assert admission.session["_notif_owner_refusal_delay"] == 120
+ 
+ 
++@pytest.mark.parametrize("gateway_owner", [True, False, None])
++@pytest.mark.parametrize("typed", [False, True])
++@pytest.mark.parametrize("reason,cause", [
++    ("SESSION_NOT_OWNED", "lease_foreign"),
++    ("SESSION_COORDINATION_UNAVAILABLE", "lease_foreign"),
++    ("SESSION_NOT_OWNED", "lease_self_orphan"),
++])
++def test_durable_gateway_notification_refusal_is_not_a_takeover(
++    admission, monkeypatch, gateway_owner, typed, reason, cause
++):
++    """Real notification submit/admission, not a mock of the second ownership gate."""
++    from tui_gateway import gateway_background_holder as holders
++    from hermes_cli import active_sessions
++    import hermes_state_pidns
++    import os
++
++    pid = os.getpid() + 100000
++    admission.refusal = SimpleNamespace(
++        reason=reason, ownership_cause=cause, holder_pid=pid)
++    owner = {"holder": f"pid={pid}:pidns=fixture:platform=tui"}
++    monkeypatch.setattr(server, "_foreign_turn_owner", lambda _: owner)
++    monkeypatch.setattr(active_sessions, "active_session_registry_snapshot", lambda _: [])
++    monkeypatch.setattr(hermes_state_pidns, "holder_pid_checkable", lambda _: True)
++    monkeypatch.setattr(holders, "dialed_gateway", lambda _: (
++        None if gateway_owner is None else
++        holders.DialedGateway(pid if gateway_owner else pid + 1, object())))
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: True)
++    before_history = list(admission.session["history"])
++    admission.session["_turn_marker_key"] = "original-live-marker"
++
++    if typed:
++        assert _admit(admission) is None
++    else:
++        assert server._notif_run_submit("rid", "live", admission.session, "notice") is False
++        assert admission.session["_notif_owner_refused_until"] == admission.now + 30
++        assert admission.session["_notif_owner_refusal_delay"] == 60
++        assert "_synthesized_turn" not in admission.session
++        # Repeated polls defer before attempting another submit during the backoff.
++        assert server._notif_owner_refused(admission.session)
++
++    deferred = not typed and gateway_owner is True and reason == "SESSION_NOT_OWNED" and cause == "lease_foreign"
++    assert len(admission.errors) == int(not deferred)
++    assert admission.starts == []
++    assert admission.session["history"] == before_history
++    assert admission.session["running"] is False
++    assert admission.session["_turn_marker_key"] == "original-live-marker"
++
++
+ def test_typed_ledger_refusal_is_not_silenced(admission):
+     admission.refusal = SimpleNamespace(reason="SESSION_NOT_OWNED", ledger_status="queued")
+     assert _admit(admission) is None
+diff --git a/tui_gateway/gateway_background_holder.py b/tui_gateway/gateway_background_holder.py
+index a5b13a61302..45954946cff 100644
+--- a/tui_gateway/gateway_background_holder.py
++++ b/tui_gateway/gateway_background_holder.py
+@@ -127,6 +127,26 @@
+     return gateway
+ 
+ 
++def automatic_owner_wait(session: dict, refusal, *, foreign_owner: Callable[[dict], Optional[dict]]) -> Optional[str]:
++    """Presentation only: automatic work retries behind its ready gateway, never takes custody.
++
++    A durable gateway lease and a gateway queue are two representations of the same busy owner.
++    Unproved/foreign writers and typed sends retain their existing actionable refusal.
++    """
++    if not session.get("_synthesized_turn"):
++        return None
++    from tui_gateway.owner_forward import FORWARDABLE_LEDGER_STATES
++    status = getattr(refusal, "ledger_status", None)
++    if status in FORWARDABLE_LEDGER_STATES:
++        return f"gateway queue holds {status} work"
++    if (getattr(refusal, "reason", None) != "SESSION_NOT_OWNED"
++            or getattr(refusal, "ownership_cause", None) != "lease_foreign"):
++        return None
++    if gateway_background_holder(session, foreign_owner=foreign_owner) is not None:
++        return "local gateway holds the durable turn lease"
++    return None
++
++
+ def retiring_owner_reason(session: dict, *, foreign_owner: Callable[[dict], Optional[dict]],
+                           registry: Optional[Callable[[], list]] = None,
+                           reason_of: Optional[Callable[[int], Optional[str]]] = None,
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 11e04e2be35..ad6249bc81e 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -137,7 +137,7 @@
+     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
+     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
+     bypass that once let a second backend run a duplicate turn."""
+-    from tui_gateway import owner_forward
++    from tui_gateway.gateway_background_holder import automatic_owner_wait
+     from tui_gateway.turn_admission import live_turn_holds, mark_live_turn, note_refusal, owns
+     note_refusal(spared_live_turn=False)
+     with session["history_lock"]:
+@@ -173,10 +173,8 @@
+         if spared:
+             logger.info("Refused submit for session %s left the live turn's state alone",
+                         session.get("session_key") or sid)
+-        elif session.get("_synthesized_turn") and (
+-                getattr(ownership_refusal, "ledger_status", None) in owner_forward.FORWARDABLE_LEDGER_STATES):
+-            logger.info("automatic turn for %s deferred: gateway queue holds %s work",
+-                        session.get("session_key") or sid, ownership_refusal.ledger_status)
++        elif (wait_reason := automatic_owner_wait(session, ownership_refusal, foreign_owner=_foreign_turn_owner)):
++            logger.info("automatic turn for %s deferred: %s", session.get("session_key") or sid, wait_reason)
+         elif _transient_ownership_refusal(ownership_refusal):
+             logger.info("turn for %s deferred: ownership coordination pending (%s, pid=%s)",
+                         session.get("session_key") or sid, ownership_refusal.ownership_cause,
+-- 
+2.43.0
+

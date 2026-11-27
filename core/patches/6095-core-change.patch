@@ -1,0 +1,418 @@
+From adda06681edcfb22cbdcef367e256d35a86fd3af Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:16:27 -0800
+Subject: [PATCH 6095] Kanban spend budget: window semantics, input checks and immediate reviewer
+
+Public mirror of source commit adda06681edcfb22cbdcef367e256d35a86fd3af.
+
+---
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 04f7c1a02fb..a6313f5edeb 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -104,6 +104,8 @@
+             default_assignee=default_assignee,
+             max_in_progress_per_profile=max_in_progress_per_profile,
+         )
++    from hermes_cli.kanban_spend_reviewer import wait_for_reviews
++    wait_for_reviews()  # this process exits next; its spend reviews would die mid-judge and waste an attempt
+     if getattr(args, "json", False):
+         _print_json({
+             **{k: getattr(res, k)
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 094cb06a289..b76ce8a9643 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -11,24 +11,31 @@
+   (episode) gets at most one review.
+ * **Run.** Every dispatcher tick (``start_due``, from the maintenance sweep, before the worker cap) starts due
+   reviews in daemon threads, at most ``MAX_CONCURRENT`` per process, with a ``LEASE_SECONDS`` lease
+-  (``spend_review_started``); an expired lease is retried, and after ``MAX_ATTEMPTS`` the stop is escalated.
++  (``spend_review_started``); the judge call is bounded by ``TIMEOUT`` end to end, an expired lease is retried,
++  and after ``MAX_ATTEMPTS`` the stop is escalated. A one-shot ``hermes kanban dispatch`` waits for the reviews
++  it started (``wait_for_reviews``). Turning the reviewer off releases queued and running stops to the usual
++  routing.
+ * **Judge.** One subscription-model call reads the card, its stop, the runs and comments of the stopped
+   window, and answers ``grant`` (N runs) or ``escalate``.
+-* **Grant** only when, checked again by code under the write lock: the stop is still the card's current,
+-  ordinary, pending stop, still in triage, with no human comment since and no open parent; N is at most the
+-  allowance that just ran out (and ``kanban_spend_promote.MAX_RUNS``); the judge quoted at least
+-  ``QUOTE_MIN`` characters verbatim from that window's run summaries or non-system comments as progress; and
+-  the card has had fewer than ``kanban.spend_review_max_grants`` (default 2) reviewer grants since the last
+-  decision someone else made. The grant is the decision card's promotion (``kanban_spend_promote.apply``):
++* **Queue only** an eligible stop: the reviewer is on, the stop is ordinary (not scope or safety), the card is a
++  home card and not itself a decision card, no closed decision card already disposed of the stop, and the card
++  has had fewer than ``kanban.spend_review_max_grants`` (default 2) reviewer grants since the last decision
++  someone else made. One review per stop, so these hold for the grant too.
++* **Grant** only when code also checks: N is at most the allowance that just ran out (and
++  ``kanban_spend_promote.MAX_RUNS``); the judge quoted at least ``QUOTE_MIN`` characters verbatim from that
++  window's run summaries or non-system comments as progress; and, again under the write lock, the stop is still
++  the card's current, ordinary, pending, undisposed stop, still in triage, with no human comment since and no
++  open parent. The grant is the decision card's promotion (``kanban_spend_promote.apply``):
+   status ready, a ``spend_budget_set`` of exactly N runs, a ``promoted_manual`` that opens a fresh window,
+   and a comment. An open decision card for the same stop is archived as decided.
+ * **Escalate** otherwise (``spend_review_escalated`` plus a comment with the reason): the stop is routed the
+   usual way, so the creator chat is woken or a decision card is opened.
+ 
+-Scope and safety stops are never reviewed. ``kanban.spend_review: false`` turns the reviewer off.
++``kanban.spend_review: false`` turns the reviewer off.
+ """
+ from __future__ import annotations
+ 
++import contextvars
+ import json
+ import logging
+ import re
+@@ -58,6 +65,7 @@
+ 
+ _INFLIGHT: set[tuple[str, str]] = set()
+ _LOCK = threading.Lock()
++_THREADS: list = []
+ 
+ 
+ def settings(cfg: Optional[dict] = None) -> tuple[bool, int]:
+@@ -98,8 +106,9 @@
+ 
+ 
+ def holds(conn: sqlite3.Connection, task_id: str, episode: str) -> bool:
+-    """While a review is queued or running the stop needs no other decision route."""
+-    return state(conn, task_id, episode) in (QUEUED, STARTED)
++    """While a review is queued or running the stop needs no other decision route. With the reviewer off, a
++    queued or running review holds nothing: the stop routes as usual."""
++    return state(conn, task_id, episode) in (QUEUED, STARTED) and settings()[0]
+ 
+ 
+ def episode_of(stop: Optional[dict]) -> Optional[str]:
+@@ -125,15 +134,15 @@
+     return count
+ 
+ 
+-def eligible(conn: sqlite3.Connection, task_id: str, episode: str) -> bool:
+-    """An ordinary stop on a home card that has not been reviewed and is under the grant cap."""
++def eligible(conn: sqlite3.Connection, task_id: str, episode: str, cfg: Optional[tuple[bool, int]] = None) -> bool:
++    """An ordinary, undisposed stop on a home card that has not been reviewed and is under the grant cap."""
+     from hermes_cli import kanban_spend_decision as decision
+     from hermes_cli.kanban_refusal_receipt import restricted
+     from hermes_cli.kanban_wake_check import foreign_copy
+-    enabled, max_grants = settings()
++    enabled, max_grants = cfg or settings()
+     if not enabled or state(conn, task_id, episode) is not None or foreign_copy(conn, task_id):
+         return False
+-    if decision.execution_restricted(conn, task_id) or restricted(conn, task_id):
++    if decision.execution_restricted(conn, task_id) or restricted(conn, task_id) or _disposed(conn, task_id, episode):
+         return False
+     row = conn.execute("SELECT created_by FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     if row is None or row[0] == "kanban-spend-budget" or conn.execute(
+@@ -142,10 +151,17 @@
+     return consecutive_grants(conn, task_id) < max_grants
+ 
+ 
+-def queue(conn: sqlite3.Connection, task_id: str, episode: str, *, backlog: bool = False) -> bool:
++def _disposed(conn: sqlite3.Connection, task_id: str, episode: str) -> bool:
++    """A closed decision card for this stop is a disposition (``episode_route`` kind ``dismissed``), not release."""
++    from hermes_cli.kanban_spend_decision import episode_route
++    return (episode_route(conn, task_id, episode) or {}).get("kind") == "dismissed"
++
++
++def queue(conn: sqlite3.Connection, task_id: str, episode: str, *, backlog: bool = False,
++          cfg: Optional[tuple[bool, int]] = None) -> bool:
+     """Inside the caller's write transaction: queue one review of ``episode`` when eligible."""
+     from hermes_cli import kanban_db as kb
+-    if not eligible(conn, task_id, episode):
++    if not eligible(conn, task_id, episode, cfg):
+         return False
+     kb._append_event(conn, task_id, QUEUED, {"episode": episode, "backlog": backlog})
+     return True
+@@ -162,8 +178,17 @@
+     return episode_of(decision.pending_episode(conn, task_id))
+ 
+ 
+-def queue_backlog(conn: sqlite3.Connection, *, now: int, skip: frozenset | set = frozenset()) -> list[str]:
+-    """Stops routed to a chat or decision card that nobody decided within ``BACKLOG_AFTER`` seconds."""
++def _notice_at(conn: sqlite3.Connection, task_id: str, episode: str) -> Optional[int]:
++    from hermes_cli.kanban_spend_decision import NOTICE
++    row = conn.execute("SELECT MIN(created_at) FROM task_events WHERE task_id = ? AND kind = ? AND json_valid(payload) "
++                       "AND json_extract(payload, '$.episode') = ?", (task_id, NOTICE, episode)).fetchone()
++    return row[0] if row else None
++
++
++def queue_backlog(conn: sqlite3.Connection, *, now: int, cfg: tuple[bool, int],
++                  skip: frozenset | set = frozenset()) -> list[str]:
++    """Stops routed to a chat or decision card that nobody decided within ``BACKLOG_AFTER`` seconds of that
++    stop's own notice. Eligibility is read first, so an ineligible stop never takes the write lock."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_spend_decision import NOTICE
+     rows = conn.execute("SELECT DISTINCT t.id FROM tasks t JOIN task_events e ON e.task_id = t.id "
+@@ -171,13 +196,12 @@
+                         (NOTICE, now - BACKLOG_AFTER)).fetchall()
+     queued = []
+     for (task_id,) in rows:
+-        if task_id in skip:
+-            continue
+-        episode = _current_episode(conn, task_id)
+-        if episode is None or state(conn, task_id, episode) is not None:
++        episode = None if task_id in skip else _current_episode(conn, task_id)
++        noticed = _notice_at(conn, task_id, episode) if episode else None
++        if noticed is None or noticed > now - BACKLOG_AFTER or not eligible(conn, task_id, episode, cfg):
+             continue
+         with kb.write_txn(conn):
+-            if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True):
++            if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True, cfg=cfg):
+                 queued.append(task_id)
+     return queued
+ 
+@@ -204,11 +228,12 @@
+     """Queue the backlog and start every due review this process has room for. Returns started task ids."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_wake_check import foreign_ids
+-    if not settings()[0]:
++    cfg = settings()
++    if not cfg[0]:
+         return []
+     now = int(time.time()) if now is None else int(now)
+     skip = foreign_ids(conn)
+-    queue_backlog(conn, now=now, skip=skip)
++    queue_backlog(conn, now=now, cfg=cfg, skip=skip)
+     db, started = _db_path(conn), []
+     for task_id, episode, attempts in _due(conn, now, skip):
+         if attempts >= MAX_ATTEMPTS:
+@@ -223,17 +248,28 @@
+         with kb.write_txn(conn):
+             kb._append_event(conn, task_id, STARTED, {"episode": episode, "attempt": attempts + 1,
+                                                       "deadline": now + LEASE_SECONDS})
+-        threading.Thread(target=_run, args=(db, task_id, episode), name=f"spend-review-{task_id}",
+-                         daemon=True).start()
++        thread = threading.Thread(target=contextvars.copy_context().run, args=(_run, db, task_id, episode),
++                                  name=f"spend-review-{task_id}", daemon=True)
++        thread.start()
++        _THREADS.append(thread)
+         started.append(task_id)
+     return started
+ 
+ 
++def wait_for_reviews(timeout: float = TIMEOUT + 30) -> None:
++    """A one-shot dispatch process waits for the reviews it started; its exit would kill their threads."""
++    deadline = time.monotonic() + timeout
++    while _THREADS:
++        thread = _THREADS.pop()
++        thread.join(max(0.0, deadline - time.monotonic()))
++
++
+ def _run(db: str, task_id: str, episode: str) -> None:
+     from pathlib import Path
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_hub_admission import _owner_scope
+     try:
+-        with kbc.connect_closing(Path(db)) as conn:
++        with _owner_scope(), kbc.connect_closing(Path(db)) as conn:
+             review(conn, task_id, episode)
+     except Exception:  # health: allow BLE001 -- the lease expires and the next tick retries or escalates
+         logger.exception("kanban: spend review of %s failed; the lease will retry it", task_id)
+@@ -304,20 +340,29 @@
+ 
+ 
+ def judge(ctx: dict) -> Optional[dict]:
+-    """One bounded subscription call; None when it is unavailable or the answer is not JSON."""
++    """One subscription call bounded end to end by ``TIMEOUT``, route and credential resolution included.
++    None when it is unavailable, late, routed anywhere but the subscription judge, or not JSON."""
+     from agent import auxiliary_client as aux
+-    from hermes_cli.kanban_hub_admission import _owner_scope
++    from hermes_cli.kanban_hub_admission import _bounded, _owner_scope
+     user = {k: v for k, v in ctx.items() if not k.startswith("_")}
+     route: dict = {}
+     deadline = time.monotonic() + TIMEOUT
+-    with _owner_scope(), aux.aux_stream_deadline(deadline):
+-        response = aux.call_llm(
+-            task="kanban_spend_review", provider=PROVIDER, model=MODEL, timeout=TIMEOUT, max_tokens=800,
+-            temperature=0, route_info=route,
+-            messages=[{"role": "system", "content": PROMPT.replace("CAP", str(ctx["_cap"]))},
+-                      {"role": "user", "content": json.dumps(user, ensure_ascii=False)}])
+-    if route.get("billing_group") not in (None, "subscription"):
+-        logger.warning("kanban: spend review route %s is not a subscription; escalating", route)
++
++    def ask():
++        with aux.aux_stream_deadline(deadline):
++            return aux.call_llm(
++                task="kanban_spend_review", provider=PROVIDER, model=MODEL, timeout=TIMEOUT, max_tokens=800,
++                temperature=0, route_info=route,
++                messages=[{"role": "system", "content": PROMPT.replace("CAP", str(ctx["_cap"]))},
++                          {"role": "user", "content": json.dumps(user, ensure_ascii=False)}])
++
++    with _owner_scope():
++        response = _bounded(ask, deadline)
++    if response is None:
++        logger.warning("kanban: spend review judge did not answer within %ss; escalating", TIMEOUT)
++        return None
++    if (route.get("provider"), route.get("model"), route.get("billing_group")) != (PROVIDER, MODEL, "subscription"):
++        logger.warning("kanban: spend review route %s is not the subscription judge; escalating", route)
+         return None
+     return parse(response.choices[0].message.content)
+ 
+@@ -380,6 +425,8 @@
+         return "the card waits on a human"
+     if decision.execution_restricted(conn, task_id) or decision.execution_refusal(conn, task_id):
+         return "the stop is a scope or safety stop"
++    if _disposed(conn, task_id, episode):
++        return "a closed decision card already disposed of the stop"
+     after = _event_order(stop)
+     for ev in conn.execute("SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND json_valid(payload) "
+                            "AND (json_extract(payload, '$.writer_kind') = 'human' "
+@@ -424,8 +471,12 @@
+     route = episode_route(conn, task_id, episode)
+     if not route or route.get("kind") != "supervisor":
+         return
+-    kb.archive_task(conn, route["task_id"], comment=(
+-        AUTHOR, f"Decided by the spend reviewer: {task_id} was granted {runs} more run(s) for stop {episode}."))
++    try:
++        kb.archive_task(conn, route["task_id"], comment=(
++            AUTHOR, f"Decided by the spend reviewer: {task_id} was granted {runs} more run(s) for stop {episode}."))
++    except Exception:  # health: allow BLE001 -- the grant stands; the open decision card finds its source promoted
++        logger.warning("kanban: spend reviewer granted %s but could not archive decision card %s",
++                       task_id, route["task_id"], exc_info=True)
+ 
+ 
+ def escalate(conn: sqlite3.Connection, task_id: str, episode: str, reason: str, *, recommendation: str = "") -> str:
+diff --git a/tests/hermes_cli/test_kanban_spend_reviewer.py b/tests/hermes_cli/test_kanban_spend_reviewer.py
+index 5ee6cc11d36..fc3f6858962 100644
+--- a/tests/hermes_cli/test_kanban_spend_reviewer.py
++++ b/tests/hermes_cli/test_kanban_spend_reviewer.py
+@@ -171,3 +171,136 @@
+     assert reviewer.parse('Sure.\n{"decision": "grant", "runs": 2}') == {"decision": "grant", "runs": 2}
+     assert reviewer.parse('{"decision": "maybe"}') is None
+     assert reviewer.parse("no json") is None
++
++
++# --- paths the first review named ---------------------------------------------------------------------------------
++
++def _routed_with_reviewer_off(conn, monkeypatch):
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    tid, episode = _stopped(conn)
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 2))
++    return tid, episode
++
++
++def test_a_stop_a_closed_decision_card_disposed_of_is_never_reviewed(kanban_home, spend_reviewer, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, episode = _routed_with_reviewer_off(conn, monkeypatch)
++        card = decision.episode_route(conn, tid, episode)["task_id"]
++        kb.archive_task(conn, card)
++        assert decision.episode_route(conn, tid, episode)["kind"] == "dismissed"
++        spend_reviewer.append(_grant())
++        assert reviewer.start_due(conn, now=int(time.time()) + reviewer.BACKLOG_AFTER + 5) == []
++        assert reviewer.state(conn, tid, episode) is None and kb.get_task(conn, tid).status == "triage"
++
++
++def test_turning_the_reviewer_off_releases_a_queued_stop_to_the_usual_route(kanban_home, spend_reviewer, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, episode = _stopped(conn)
++        assert reviewer.state(conn, tid, episode) == reviewer.QUEUED
++        monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++        decision.repair_triage_routes(conn, skip=set())
++        assert decision.NOTICE in _kinds(conn, tid)
++
++
++def test_an_ineligible_stalled_stop_never_takes_the_write_lock(kanban_home, spend_reviewer, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, _ = _routed_with_reviewer_off(conn, monkeypatch)
++        monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 0))  # cap 0: never eligible
++        txns = []
++        real = kb.write_txn
++        monkeypatch.setattr(kb, "write_txn", lambda c, **kw: (txns.append(1), real(c, **kw))[1])
++        for tick in range(3):
++            reviewer.start_due(conn, now=int(time.time()) + reviewer.BACKLOG_AFTER + 5 + tick)
++        assert txns == [] and kb.get_task(conn, tid).status == "triage"
++
++
++@pytest.mark.parametrize("route, ok", [
++    ({"provider": reviewer.PROVIDER, "model": reviewer.MODEL, "billing_group": "subscription"}, True),
++    ({"provider": reviewer.PROVIDER, "model": reviewer.MODEL}, False),  # no billing evidence
++    ({"provider": "openrouter", "model": reviewer.MODEL, "billing_group": "subscription"}, False),
++    ({"provider": reviewer.PROVIDER, "model": reviewer.MODEL, "billing_group": "metered"}, False),
++])
++def test_the_judge_answers_only_through_the_subscription_route(monkeypatch, route, ok):
++    from agent import auxiliary_client as aux
++
++    def call_llm(**kw):
++        kw["route_info"].update(route)
++        message = types.SimpleNamespace(content='{"decision": "escalate", "reason": "same wait"}')
++        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
++
++    monkeypatch.setattr(aux, "call_llm", call_llm)
++    verdict = reviewer.judge({"_cap": 3, "_corpus": "", "title": "t"})
++    assert (verdict == {"decision": "escalate", "reason": "same wait"}) is ok
++
++
++def test_a_hung_judge_is_abandoned_at_the_deadline(monkeypatch):
++    from agent import auxiliary_client as aux
++    import threading
++    release = threading.Event()
++    monkeypatch.setattr(reviewer, "TIMEOUT", 1)
++    monkeypatch.setattr(aux, "call_llm", lambda **kw: release.wait(30))
++    try:
++        assert reviewer.judge({"_cap": 3, "_corpus": "", "title": "t"}) is None
++    finally:
++        release.set()
++
++
++def test_safety_stops_are_never_reviewed(kanban_home, spend_reviewer, monkeypatch):
++    from hermes_cli import kanban_refusal_receipt
++    monkeypatch.setattr(kanban_refusal_receipt, "restricted", lambda c, t: True)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Refused", assignee="default")
++        helpers._runs(conn, tid, ksb.DEFAULT_RUNS)
++        assert ksb.hold(conn, tid, lim=helpers.LIMITS) == "triage"
++        episode = reviewer.episode_of(decision.pending_episode(conn, tid))
++        assert reviewer.state(conn, tid, episode) is None
++
++
++def test_a_worker_copy_is_left_to_its_home_board(kanban_home, spend_reviewer, monkeypatch):
++    from hermes_cli import kanban_wake_check
++    with kbc.connect_closing() as conn:
++        tid, episode = _routed_with_reviewer_off(conn, monkeypatch)
++        monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda c, t: True)
++        monkeypatch.setattr(kanban_wake_check, "foreign_ids", lambda c, own=None: {tid})
++        spend_reviewer.append(_grant())
++        assert reviewer.start_due(conn, now=int(time.time()) + reviewer.BACKLOG_AFTER + 5) == []
++        assert reviewer.state(conn, tid, episode) is None
++
++
++def test_an_open_parent_turns_a_grant_into_an_escalation(kanban_home, spend_reviewer, inline):
++    spend_reviewer.append(_grant())
++    with kbc.connect_closing() as conn:
++        tid, episode = _stopped(conn)
++        parent = kb.create_task(conn, title="Prerequisite", assignee="default")
++        kb.link_tasks(conn, parent, tid)
++        reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED
++        assert "open parents" in kb.list_comments(conn, tid)[-1].body
++
++
++def test_reviews_per_process_are_bounded(kanban_home, spend_reviewer, monkeypatch):
++    monkeypatch.setattr(reviewer, "threading", types.SimpleNamespace(
++        Thread=lambda target, args, **kw: types.SimpleNamespace(start=lambda: None, join=lambda t=None: None)))
++    reviewer._INFLIGHT.clear()
++    try:
++        with kbc.connect_closing() as conn:
++            for _ in range(reviewer.MAX_CONCURRENT + 1):
++                _stopped(conn)
++            assert len(reviewer.start_due(conn)) == reviewer.MAX_CONCURRENT
++            assert reviewer.start_due(conn) == []  # every slot is still held
++    finally:
++        reviewer._INFLIGHT.clear()
++        reviewer._THREADS.clear()
++
++
++def test_a_decision_by_someone_else_resets_the_grant_cap(kanban_home, spend_reviewer):
++    with kbc.connect_closing() as conn:
++        tid, _ = _stopped(conn)
++        with kb.write_txn(conn):
++            for _ in range(reviewer.DEFAULT_MAX_GRANTS):
++                kb._append_event(conn, tid, reviewer.GRANTED, {"episode": "old"})
++        assert reviewer.consecutive_grants(conn, tid) == reviewer.DEFAULT_MAX_GRANTS
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "promoted_manual", {"actor": "david", "spend_budget": {"runs": 5}})
++        assert reviewer.consecutive_grants(conn, tid) == 0
+-- 
+2.43.0
+

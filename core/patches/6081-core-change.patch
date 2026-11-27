@@ -1,0 +1,2770 @@
+From 33922f7e62ff93ebcae7fddb698834054080a573 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:50:51 +0000
+Subject: [PATCH 6081] Kanban creation requires durable owning authority
+
+Public mirror of source commit 33922f7e62ff93ebcae7fddb698834054080a573.
+
+---
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 38190942201..dd5f2e08a17 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -478,6 +478,7 @@
+         from hermes_cli.kanban_worker_node import MachinePinRefused, check_machine_pins
+         from hermes_cli.kanban_ask_resolved import AskFilingRefused, check_create_filing, create_context
+         from hermes_cli.kanban_admission_class import AdmissionMetadataError
++        from hermes_cli.kanban_create_authority import CreateAuthorityRefused
+         try:
+             # [daveey] A blocked ask's resolved_check runs once first, as the sweep will run it for this assignee
+             # and workspace: already met or broken refuses the create. A key hit returns the card: no probe.
+@@ -512,6 +513,7 @@
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, placement_checked=True, board=board,
++                require_scope_authority=in_worker or _agent_invoked(),  # human terminals keep human authority
+                 # [daveey] no --runs-on: queue for the worker pool; hub admission's placement and receipt
+                 **cli_create_fields(conn, plan, args, body, ws_kind, ws_path, board, assignee=assignee),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+@@ -521,7 +523,7 @@
+         except WorktreeWorkspaceConfigError as exc:
+             return _err(f"kanban: --workspace: {exc}", 2)
+         except (CapabilityMismatchError, UnknownSkillError, RequiresDeclarationMissing, MachinePinRefused,
+-                AskFilingRefused) as exc:
++                AskFilingRefused, CreateAuthorityRefused) as exc:
+             return _err(f"kanban: {exc.code}: {exc}", 2)
+         except (PinProviderUnresolvedError, ModelProviderMismatchError, AdmissionMetadataError, SelfWorkError) as exc:
+             return _err(f"kanban: {exc}", 2)
+diff --git a/hermes_cli/kanban_create_authority.py b/hermes_cli/kanban_create_authority.py
+new file mode 100644
+index 00000000000..c1181ba3827
+--- /dev/null
++++ b/hermes_cli/kanban_create_authority.py
+@@ -0,0 +1,149 @@
++"""Transactional creation authority for opt-in agent/CLI ingress. [daveey]
++
++A creator name or bare creator-task ID cannot renew scope. Require the actual
++renew-scope actor predicate, or persist a registered creating chat's anchor in
++this same transaction. Internal/system creators do not opt in. No network,
++lifecycle transitions, or authority inferred from ``created_by``.
++"""
++from __future__ import annotations
++
++from hermes_cli.kanban_adoption_authority import gateway as _gateway, released_upstream as _released_upstream
++
++CODE = "scope_authority_missing"
++
++
++class CreateAuthorityRefused(ValueError):
++    """The create has no renewable creator-task or owning-chat authority."""
++    code = CODE
++
++
++def _accepts(conn, task_id, session, gateway, profile, creator=None):
++    """Use the renewal reader itself, including its own-run and creator-event fences.
++
++    These are candidate identities from stored evidence, not authentication of
++    this process and not a renewal. The eventual caller must prove its ancestry.
++    """
++    from hermes_cli.kanban_scope_renewal_cli import resolve_actor
++    from hermes_cli.kanban_scope_renewal import RenewalRefused
++    env = {"HERMES_SESSION_ID": session}
++    if creator:
++        env["HERMES_KANBAN_TASK"] = creator
++    try:
++        resolve_actor(conn, task_id, writer=("agent", session, "1:HERMES_SESSION_ID"),
++                      environs=[env], gateway=gateway, profile=profile)
++    except RenewalRefused:
++        return False
++    return True
++
++
++def has_authority(conn, task_id: str, creator_task_id, *, durable: bool = False) -> bool:
++    """Read-only: some recorded candidate can pass the real renewal authority reader.
++
++    ``durable=True`` ignores the creator-task path: it holds only while the creator is
++    running, so once the creator completes nothing could renew. Only a chat link/sub
++    (inherited from an authentic creating chat, or the caller's own) survives that.
++
++    Machine sessions cannot own chats. A qualified foreign hash needs the same
++    durable provenance as creator-chat inheritance; observer/released links and
++    placeholder IDs never establish ownership. Legacy subscriptions must match
++    the renewal reader exactly (do not strip a foreign qualified destination).
++    """
++    from hermes_cli.kanban_creator_chats import _chat_links
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++    from hermes_cli.kanban_scope_renewal_cli import _sessions
++    from hermes_cli.kanban_session_provenance import proven_foreign_chats
++    from hermes_cli.profiles import get_active_profile_name
++
++    me, profile = _gateway(conn), get_active_profile_name()
++    if creator_task_id and not durable:
++        for session in _sessions(conn, creator_task_id):
++            if session.strip() and not is_placeholder_session(session) and _accepts(
++                    conn, task_id, session, me, profile, creator_task_id):
++                return True
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        proven = None
++        for row in _chat_links(conn, task_id):
++            session = row["chat_session"]
++            if not session or not session.strip() or row.get("kind", "created") != "created" \
++                    or is_placeholder_session(session):
++                continue
++            gateway, chat_profile = row["chat_gateway"], row["chat_profile"]
++            if is_machine_session(gateway or None, session, local_gateway=me, profile=chat_profile):
++                proven = proven if proven is not None else proven_foreign_chats(conn, (task_id,), local_gateway=me)
++                if f"{gateway}/{chat_profile}/{session}" not in proven:
++                    continue
++            if _accepts(conn, task_id, session, gateway, chat_profile or "default"):
++                return True
++    else:
++        for (session,) in conn.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (task_id,)):
++            # _owning_sub uses exact equality with the caller's bare session ID.
++            if session and "/" not in session and session.strip() and not is_placeholder_session(session) \
++                    and not is_machine_session(me or None, session, local_gateway=me, profile=profile) \
++                    and _accepts(conn, task_id, session, me, profile):
++                return True
++    return False
++
++
++def _anchor_registered_session(conn, task_id):
++    """Persist a proven local creating chat, rather than waiting for link reconciliation.
++
++    Front doors stamp registered sessions but subscribe only AFTER create commits.
++    A raw unknown ID is not proof, even when it does not look like a machine ID.
++    This helper runs under create's existing transaction; no schema changes.
++    """
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_placement import is_placeholder_session
++    from hermes_cli.kanban_session_provenance import scoped_sources
++    from hermes_cli.profiles import get_active_profile_name
++
++    row = conn.execute("SELECT session_id, created_at FROM tasks WHERE id=?", (task_id,)).fetchone()
++    session = row[0] if row else None
++    if not session or not session.strip() or "/" in session or is_placeholder_session(session):
++        return
++    me, profile = _gateway(conn), get_active_profile_name()
++    if _released_upstream(conn, task_id, session):
++        return  # an inherited projection of a chat that gave up ownership is not authority
++    # A standalone (never-enrolled) board has no gateway name, but its local store
++    # still proves a registered chat. None means unqualified LOCAL, not a foreign scope.
++    if not scoped_sources(me or None, (session,), local_gateway=me, profile=profile).get(session) \
++            or is_machine_session(me or None, session, local_gateway=me, profile=profile):
++        return
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        # Match the legacy tasks.session_id projection's default-profile UID so
++        # ordinary reconciliation does not create a second owning link.
++        chat_profile = None if profile == "default" else profile
++        conn.execute(
++            "INSERT OR IGNORE INTO task_chat_links "
++            "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++            "VALUES (?,?,?,?,?,'created',0,?)",
++            (link_uid(task_id, me, chat_profile, session, "created"), task_id, me, chat_profile, session, row[1]))
++        # Reconciliation preserves profile-qualified created links only with durable
++        # resolution provenance. A bare tasks.session_id would independently project
++        # a default-profile owner, even if that same ID belongs to a different chat.
++        from hermes_cli.kanban_db import _append_event
++        _append_event(conn, task_id, "creator_chats_resolved",
++                      {"registered_session": session, "chat_gateway": me, "chat_profile": chat_profile})
++        if profile != "default":
++            conn.execute("UPDATE tasks SET session_id=NULL WHERE id=?", (task_id,))
++    conn.execute(
++        "INSERT OR IGNORE INTO kanban_notify_subs "
++        "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++        "VALUES (?,'tui',?,'','notify','{\"reason\":\"create\"}',?, "
++        "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
++        (task_id, session, row[1], task_id))
++
++
++def require(conn, task_id: str, creator_task_id) -> None:
++    # A running creator alone is transient authority; require a chat that outlives it.
++    if has_authority(conn, task_id, creator_task_id, durable=True):
++        return
++    _anchor_registered_session(conn, task_id)
++    if not has_authority(conn, task_id, creator_task_id, durable=True):
++        raise CreateAuthorityRefused(
++            "this card would have no renewable scope authority. Create it from a registered owning chat, "
++            "pass --origin-session with an unreleased created chat anchor, or create it from a creator "
++            "task that descends from a registered owning chat (a running creator alone ends with its run). "
++            "A creator name, bare task ID, placeholder or observer "
++            "subscription is not authority; nothing was created.")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index f362be9b330..dbf4140fd65 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1194,6 +1194,7 @@
+     insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None, placement_audit: Optional[dict] = None,
+     admission_class: str = "normal", admission_frees: Optional[str] = None,
+     self_work: Optional[dict] = None, creation_receipt: Optional[dict] = None,
++    require_scope_authority: bool = False,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1283,12 +1284,8 @@
+     if existing := native_admission.early_existing(conn, idempotency_key, created_by):
+         return existing
+ 
+-    if validate_workspace and workspace_kind == "worktree" and not project_id:
+-        from hermes_cli.kanban_db_workspace import (
+-            WorktreeWorkspaceConfigError, worktree_workspace_problem,
+-        )
+-        if problem := worktree_workspace_problem(workspace_path, board=board):
+-            raise WorktreeWorkspaceConfigError(problem)
++    from hermes_cli.kanban_db_creation import validate_worktree
++    validate_worktree(validate_workspace, workspace_kind, project_id, workspace_path, board)
+     now = int(time.time())
+ 
+     # Only persistent kinds inherit the board ``default_workdir``: a scratch
+@@ -1362,6 +1359,9 @@
+                     creation_receipt=creation_receipt, board=board)
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                 initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin, native_origin)
++                if require_scope_authority:  # agent/CLI ingress: refuse (roll back) an authority-less card
++                    from hermes_cli.kanban_create_authority import require
++                    require(conn, task_id, creator_task_id)
+                 native_admission.require_receipt(conn, task_id)
+             return task_id
+         except sqlite3.IntegrityError:
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index b57fbfd4379..56c4e61b03e 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -2,6 +2,16 @@
+ import json
+ 
+ 
++def validate_worktree(validate_workspace, workspace_kind, project_id, workspace_path, board):
++    """Worktree declaration preflight, before allocating a task ID."""
++    if validate_workspace and workspace_kind == "worktree" and not project_id:
++        from hermes_cli.kanban_db_workspace import (
++            WorktreeWorkspaceConfigError, worktree_workspace_problem,
++        )
++        if problem := worktree_workspace_problem(workspace_path, board=board):
++            raise WorktreeWorkspaceConfigError(problem)
++
++
+ def existing_creation_key(conn, key):
+     """Legacy best-effort lookup; the caller chooses the transaction boundary."""
+     return conn.execute(
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index ad1061bab09..5c698fdb2a6 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -436,4 +436,12 @@
+                                   "requires": required, "priority": priority},
+     )
+     inherit_creator_origin(conn, new_id, root_id, created_at=now)
++    from hermes_cli.kanban import _agent_invoked
++    if _agent_invoked():
++        from hermes_cli.kanban_cli_body import session_identity
++        from hermes_cli.kanban_create_authority import require
++        import os
++        _, session = session_identity(bool(os.environ.get('HERMES_KANBAN_TASK')))
++        conn.execute('UPDATE tasks SET session_id=COALESCE(session_id,?) WHERE id=?', (session, new_id))
++        require(conn, new_id, None)  # a triaged decomposition root is not an admitted creator run
+     return new_id
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 2fe8a3fc148..a8147a87a86 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -145,6 +145,10 @@
+     # before the option existed still matches on retry. [daveey]
+     options.pop("require_declaration", None)
+     options.pop("placement_checked", None)  # internal decision, not part of the immutable envelope
++    # Courier ingress always enforces scope authority itself (below, after the origin is subscribed/linked);
++    # the flag is never an envelope field and a caller cannot waive it. create_task must not check it early:
++    # a courier card anchors its authority only after create, inside this txn. [daveey]
++    options.pop("require_scope_authority", None)
+     # Options added after intents were first stored: omit them while at their default (None) so an
+     # intent stored before the option existed still matches on retry; a real value stays in the
+     # envelope and a differing one remains a conflict.
+@@ -193,6 +197,10 @@
+                               "origin-bind-" + secrets.token_hex(16)))
+         _subscribe_origin(conn, task_id, intent["origin"])
+         _link_origin(conn, task_id, intent["origin"], intent["owner"]["gateway"])
++        # Requirement D, courier ingress: only after the valid origin is subscribed/linked may renewable scope be
++        # anchored. Refusal raises inside write_txn, rolling back card, intent and subscription.
++        from hermes_cli.kanban_create_authority import require
++        require(conn, task_id, options.get("creator_task_id"))
+         return task_id
+ 
+ 
+diff --git a/hermes_cli/kanban_swarm.py b/hermes_cli/kanban_swarm.py
+index e3ba51e164b..0aeaf939d5b 100644
+--- a/hermes_cli/kanban_swarm.py
++++ b/hermes_cli/kanban_swarm.py
+@@ -181,9 +181,16 @@
+         _require_text(spec.profile, f"workers[{i}].profile")
+         _require_text(spec.title, f"workers[{i}].title")
+ 
++    from hermes_cli.kanban import _agent_invoked
++    from hermes_cli.kanban_cli_body import session_identity
++    import os
++    creator = os.environ.get('HERMES_KANBAN_TASK')
++    _, session = session_identity(bool(creator))
+     common = dict(
+         created_by=created_by, tenant=tenant,
+         workspace_kind=workspace_kind, workspace_path=workspace_path,
++        session_id=session, creator_task_id=creator,
++        require_scope_authority=bool(creator) or _agent_invoked(),
+     )
+     root = kb.create_task(
+         conn,
+diff --git a/tests/hermes_cli/test_kanban_ask_resolved_check.py b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+index 909184cc741..6200329d6e9 100644
+--- a/tests/hermes_cli/test_kanban_ask_resolved_check.py
++++ b/tests/hermes_cli/test_kanban_ask_resolved_check.py
+@@ -45,6 +45,8 @@
+     assert db.is_relative_to(home.resolve()), f"board resolved outside the test's home: {db}"
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(home))
+     yield tmp_path
+     kwc._shutdown_for_tests()
+ 
+@@ -513,6 +515,8 @@
+         _running(conn, monkeypatch)                      # a worker creating a card: its own task/run ids are set
+         db = str(kbc._main_db_file(conn))
+     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "creator-claim")
++    from tests.tools.test_kanban_create_overlap import register_chat
++    register_chat(board / '.hermes', 'creator-session')
+     monkeypatch.setenv("HERMES_SESSION_ID", "creator-session")
+     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+     out = json.loads(kt._handle_create({"title": "Pair the watch", "initial_status": "blocked", "requires": [],
+@@ -525,6 +529,8 @@
+ def test_cli_create_files_in_the_sweeps_env_without_the_creators_ids(board, monkeypatch, capsys):
+     with kbc.connect_closing() as conn:
+         db = str(kbc._main_db_file(conn))
++    from tests.tools.test_kanban_create_overlap import register_chat
++    register_chat(board / '.hermes', 's')
+     for key, value in (("HERMES_KANBAN_RUN_ID", "7"), ("HERMES_KANBAN_CLAIM_LOCK", "c"),
+                        ("HERMES_SESSION_ID", "s")):
+         monkeypatch.setenv(key, value)
+diff --git a/tests/hermes_cli/test_kanban_capability_create.py b/tests/hermes_cli/test_kanban_capability_create.py
+index d62005694fc..eb6fc98a36e 100644
+--- a/tests/hermes_cli/test_kanban_capability_create.py
++++ b/tests/hermes_cli/test_kanban_capability_create.py
+@@ -81,6 +81,8 @@
+     monkeypatch.setattr(cli, '_profile_author', lambda: 'restricted')
+     monkeypatch.setattr(cli, '_agent_invoked', lambda: True)
+     monkeypatch.setattr(cli, '_check_dispatcher_presence', lambda: (True, ''))
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(kb.kanban_home(), '20261123_120000_capabilities'))
+     if surface == 'tool':
+         out = json.loads(tools._handle_create({'title': 'Defaulted'}))
+         assert out.get('task_id'), out
+diff --git a/tests/hermes_cli/test_kanban_capability_routing.py b/tests/hermes_cli/test_kanban_capability_routing.py
+index 9adb648daa5..08dbda61f4e 100644
+--- a/tests/hermes_cli/test_kanban_capability_routing.py
++++ b/tests/hermes_cli/test_kanban_capability_routing.py
+@@ -78,6 +78,8 @@
+ 
+     monkeypatch.setattr(kcr, "hub_runner", fake_hub)
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(home))
+     yield {"home": home, "hub": hub, "calls": calls}
+     hub.close()
+ 
+diff --git a/tests/hermes_cli/test_kanban_cli.py b/tests/hermes_cli/test_kanban_cli.py
+index 33bb8631526..7609ff8de0e 100644
+--- a/tests/hermes_cli/test_kanban_cli.py
++++ b/tests/hermes_cli/test_kanban_cli.py
+@@ -319,41 +319,41 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# --json stays machine-readable when create warns about an unlinked card
++# Unknown agent sessions cannot create ownerless cards, including --json calls.
+ # ---------------------------------------------------------------------------
+ 
+ 
+ def _create_unlinked_from_agent(monkeypatch, *flags):
+-    # An agent shell whose session can't be stamped: an unknown HERMES_SESSION_ID marks the
+-    # call agent-invoked, but no chat links the card, so create warns.
++    # An unknown session marks an agent shell but supplies no durable owner.
+     monkeypatch.setenv("HERMES_SESSION_ID", "no-such-session")
+     return kc.run_slash('create "agent card" --assignee default ' + " ".join(flags))
+ 
+ 
+-def test_create_json_via_slash_is_pure_json_with_unlinked_warning_field(kanban_home, monkeypatch):
++def test_create_json_via_slash_refuses_unowned_agent_card(kanban_home, monkeypatch):
+     out = _create_unlinked_from_agent(monkeypatch, "--json")
+-    payload = json.loads(out)  # nothing appended after the object
+-    assert payload["id"].startswith("t_")
+-    assert "is not linked to any chat" in payload["warning"]
+-    assert payload["id"] in payload["warning"]
++    assert 'scope_authority_missing' in out
++    with kbc.connect_closing() as conn:
++        assert not kb.list_tasks(conn)
+ 
+ 
+-def test_create_json_cli_keeps_stdout_pure_and_warns_on_stderr(kanban_home, monkeypatch, capsys):
++def test_create_json_cli_keeps_stdout_pure_and_refuses_on_stderr(kanban_home, monkeypatch, capsys):
+     monkeypatch.setenv("HERMES_SESSION_ID", "no-such-session")
+     parser = argparse.ArgumentParser()
+     kc.build_parser(parser.add_subparsers(dest="_top"))
+     args = parser.parse_args(["kanban", "create", "agent card", "--assignee", "default", "--json"])
+-    kc.kanban_command(args)
++    assert kc.kanban_command(args) == 2
+     captured = capsys.readouterr()
+-    payload = json.loads(captured.out)
+-    assert "is not linked to any chat" in payload["warning"]
+-    assert "is not linked to any chat" in captured.err
++    assert not captured.out
++    assert 'scope_authority_missing' in captured.err
++    with kbc.connect_closing() as conn:
++        assert not kb.list_tasks(conn)
+ 
+ 
+-def test_create_text_mode_still_shows_unlinked_warning(kanban_home, monkeypatch):
++def test_create_text_mode_refuses_unowned_agent_card(kanban_home, monkeypatch):
+     out = _create_unlinked_from_agent(monkeypatch)
+-    assert out.startswith("Created t_")
+-    assert "is not linked to any chat" in out
++    assert 'scope_authority_missing' in out
++    with kbc.connect_closing() as conn:
++        assert not kb.list_tasks(conn)
+ 
+ 
+ def test_create_json_without_warning_has_no_warning_field(kanban_home, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_cli_resolved_assignee.py b/tests/hermes_cli/test_kanban_cli_resolved_assignee.py
+index 5bfb8b4f6b5..182cd9b88da 100644
+--- a/tests/hermes_cli/test_kanban_cli_resolved_assignee.py
++++ b/tests/hermes_cli/test_kanban_cli_resolved_assignee.py
+@@ -26,6 +26,9 @@
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.setattr(cli, "_agent_invoked", lambda: agent)
++    if agent:
++        from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++        monkeypatch.setenv('HERMES_SESSION_ID', register_chat(kanban_home, '20261123_120000_assignee'))
+     monkeypatch.setattr(cli, "_profile_author", lambda: "specialist" if agent else "default")
+     monkeypatch.setattr(kb, "_default_ready_assignee", lambda: "specialist")
+     extra = " --assignee default" if explicit else ""
+diff --git a/tests/hermes_cli/test_kanban_courier_scope_authority.py b/tests/hermes_cli/test_kanban_courier_scope_authority.py
+new file mode 100644
+index 00000000000..806f510a424
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_courier_scope_authority.py
+@@ -0,0 +1,137 @@
++"""Requirement D on courier origin creation: scope authority is enforced AFTER the valid origin is
++subscribed/linked, inside the same transaction, and an authority-less courier card rolls back entirely.
++
++Authority is never invented: the bound origin must be a created, unreleased, provable chat link (the renewal
++reader decides), not a foreign hub subscription alone, a placeholder, or a chat on the owner's own gateway.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_state import SessionDB
++from tools import kanban_tools  # registers kanban_create
++from tools.registry import registry
++
++CHAT = "20230101_120000_8ceb7b"
++
++
++def _owner(tmp_path, monkeypatch, synced):
++    if synced:
++        (tmp_path / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
++    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_TASK", "HERMES_ORIGIN_SESSION"):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_SESSION_KEY", "20230101_120000_6ee265")
++    monkeypatch.setenv("HERMES_SESSION_ID", "20230101_120000_6ee265")
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session("kanban-placement-macbook", "cli")
++    db.close()
++    kb.init_db()
++    return {"request_id": "placement:macbook:0123456789abcdef",
++            "owner": {"gateway": "hub", "profile": "default", "board": "default"},
++            "origin": {"gateway": "macbook", "profile": "default", "session": CHAT}}
++
++
++@pytest.fixture
++def synced(tmp_path, monkeypatch):
++    return _owner(tmp_path, monkeypatch, True)
++
++
++@pytest.fixture
++def legacy(tmp_path, monkeypatch):
++    return _owner(tmp_path, monkeypatch, False)
++
++
++ARGS = {"title": "Build", "assignee": "default", "session_id": "kanban-placement-macbook"}
++TABLES = ("tasks", "origin_creation_intents", "kanban_notify_subs", "task_events")
++
++
++def _counts():
++    with kbc.connect_closing() as conn:
++        out = {}
++        for table in TABLES:
++            if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
++                out[table] = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++            out["task_chat_links"] = conn.execute("SELECT count(*) FROM task_chat_links").fetchone()[0]
++        return out
++
++
++def _create(intent, **extra):
++    return json.loads(str(registry.dispatch("kanban_create", {**ARGS, **extra}, origin_intent=intent)))
++
++
++def _assert_refused(res):
++    assert res.get("created") is not True, res
++    assert "scope authority" in json.dumps(res), res
++
++
++def test_courier_create_with_provable_origin_link_is_created_and_renewable(synced):
++    res = _create(synced)
++    assert res.get("created") is True, res
++    with kbc.connect_closing() as conn:
++        from hermes_cli.kanban_create_authority import has_authority
++        assert has_authority(conn, res["task_id"], None)
++        assert conn.execute("SELECT count(*) FROM task_chat_links WHERE task_id=? AND kind='created' AND released=0",
++                            (res["task_id"],)).fetchone()[0] == 1
++
++
++def test_foreign_hub_subscription_alone_is_not_authority_and_rolls_back_everything(legacy):
++    before = _counts()
++    _assert_refused(_create(legacy))
++    assert _counts() == before  # card, intent, subscription and events all rolled back
++    # An exact retry is refused again rather than adopting a half-written card.
++    _assert_refused(_create(legacy))
++    assert _counts() == before
++
++
++@pytest.mark.parametrize("origin", [
++    {"gateway": "macbook", "profile": "default", "session": "kanban-placement-macbook"},  # placeholder
++    {"gateway": "macbook", "profile": "default", "session": "local-" + "9c" * 32},  # unproven receipt-shaped hash
++])
++def test_origin_without_provable_created_link_is_refused_even_on_synced_owner(synced, origin):
++    before = _counts()
++    _assert_refused(_create({**synced, "origin": origin}))
++    assert _counts() == before
++
++
++def test_created_by_is_not_a_courier_argument_so_it_cannot_supply_authority(legacy):
++    before = _counts()
++    res = _create(legacy, created_by="claude-code-chat")
++    assert res.get("created") is not True and "created_by" in json.dumps(res)
++    assert _counts() == before
++
++
++def test_enforcement_runs_after_subscribe_and_link_not_in_create_task(synced, monkeypatch):
++    """create_task must not be asked for the early check (courier anchors after create), and the authority check
++    must see the subscription and link already written in this transaction."""
++    from hermes_cli import kanban_create_authority as auth
++    seen = {}
++    real_create, real_require = kb.create_task, auth.require
++
++    def create_spy(conn, **kw):
++        seen["early"] = kw.get("require_scope_authority")
++        return real_create(conn, **kw)
++
++    def require_spy(conn, task_id, creator):
++        seen["subs"] = conn.execute("SELECT count(*) FROM kanban_notify_subs WHERE task_id=?", (task_id,)).fetchone()[0]
++        seen["links"] = conn.execute("SELECT count(*) FROM task_chat_links WHERE task_id=?", (task_id,)).fetchone()[0]
++        return real_require(conn, task_id, creator)
++
++    monkeypatch.setattr(kb, "create_task", create_spy)
++    monkeypatch.setattr(auth, "require", require_spy)
++    assert _create(synced).get("created") is True
++    assert not seen["early"]
++    assert seen["subs"] == 1 and seen["links"] == 1
++
++
++def test_authority_flag_is_never_part_of_the_stored_envelope(synced):
++    res = _create(synced)
++    with kbc.connect_closing() as conn:
++        stored = conn.execute("SELECT intent_json FROM origin_creation_intents WHERE task_id=?",
++                              (res["task_id"],)).fetchone()[0]
++    assert "require_scope_authority" not in stored
++    assert _create(synced)["task_id"] == res["task_id"]  # exact retry still adopts the same card
+diff --git a/tests/hermes_cli/test_kanban_create_entry_parity.py b/tests/hermes_cli/test_kanban_create_entry_parity.py
+index 88995ae37be..364363fb49b 100644
+--- a/tests/hermes_cli/test_kanban_create_entry_parity.py
++++ b/tests/hermes_cli/test_kanban_create_entry_parity.py
+@@ -24,7 +24,6 @@
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_session_activity as ksa
+-
+ SID = "20261016_185414_c283c2"
+ _SESSION_ENV = ("HERMES_SESSION_KEY", "HERMES_SESSION_ID", "HERMES_SESSION_SOURCE",
+                 "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_RPC_SOCKET",
+@@ -137,13 +136,27 @@
+     assert "not linked to any chat" not in capsys.readouterr().err
+ 
+ 
+-def test_agent_cli_create_without_a_known_chat_warns(chat, monkeypatch, capsys):
+-    # e.g. execute_code on another host / another profile: agent env, but no known session.
+-    task_id = _run_cli_in({"HERMES_RPC_SOCKET": "sock", "HERMES_SESSION_ID": "not_a_real_session"},
+-                          "orphan", monkeypatch)
+-    err = capsys.readouterr().err
+-    assert f"{task_id} is not linked to any chat" in err
+-    assert f"notify-subscribe {task_id} --platform tui --chat-id" in err
++def test_agent_cli_create_without_a_known_chat_is_refused(chat, monkeypatch, capsys):
++    # e.g. execute_code on another host / another profile: agent env, but no known session. The card would have no
++    # scope authority, so it is refused instead of created orphaned with a "not linked to any chat" warning (req. D).
++    for var in _SESSION_ENV:
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HERMES_RPC_SOCKET", "sock")
++    monkeypatch.setenv("HERMES_SESSION_ID", "not_a_real_session")
++    tokens = [var.set(sc._UNSET) for var in sc._VAR_MAP.values()]
++    engaged = sc._session_context_engaged
++    sc._session_context_engaged = False
++    try:
++        root = argparse.ArgumentParser(prog="hermes")
++        kc.build_parser(root.add_subparsers())
++        assert kc._cmd_create(root.parse_args(["kanban", "create", "orphan"])) == 2
++    finally:
++        sc._session_context_engaged = engaged
++        for var, tok in zip(sc._VAR_MAP.values(), tokens):
++            var.reset(tok)
++    assert "scope_authority_missing" in capsys.readouterr().err
++    with kbc.connect_closing() as conn:
++        assert not [t for t in kb.list_tasks(conn) if t.title == "orphan"]
+ 
+ 
+ def test_plain_user_shell_create_does_not_warn(chat, monkeypatch, capsys):
+@@ -152,7 +165,9 @@
+ 
+ 
+ def test_suggested_notify_subscribe_links_the_orphan(chat, monkeypatch, capsys):
+-    task_id = _run_cli_in({"HERMES_RPC_SOCKET": "sock"}, "orphan to fix", monkeypatch)
++    # An orphan can still exist (internal/legacy creation); the CLI no longer makes one for an agent (req. D).
++    with kbc.connect_closing() as conn:
++        task_id = kb.create_task(conn, title="orphan to fix", assignee="default")
+     root = argparse.ArgumentParser(prog="hermes")
+     kc.build_parser(root.add_subparsers())
+     args = root.parse_args(["kanban", "notify-subscribe", task_id, "--platform", "tui", "--chat-id", SID])
+@@ -174,7 +189,7 @@
+ 
+ 
+ @pytest.mark.parametrize("surface", ["registry", "cli"])
+-def test_create_requires_and_default_creator_parity(restricted_creator, surface):
++def test_create_requires_and_default_creator_parity(restricted_creator, surface, monkeypatch):
+     if surface == "registry":
+         from tools.registry import registry
+         schema = registry.get_schema("kanban_create")
+@@ -187,6 +202,7 @@
+         bad = json.loads(registry.dispatch("kanban_create", {"title": "Denied", "requires": ["terminal"]}))
+         assert bad["code"] == "assignee_capability_mismatch", bad
+     else:
++        monkeypatch.setenv("HERMES_SESSION_ID", SID)  # a registered chat: an agent create needs scope authority
+         root = argparse.ArgumentParser()
+         kc.build_parser(root.add_subparsers())
+         assert kc._cmd_create(root.parse_args(["kanban", "create", "Allowed"])) == 0
+diff --git a/tests/hermes_cli/test_kanban_create_profile_authority.py b/tests/hermes_cli/test_kanban_create_profile_authority.py
+new file mode 100644
+index 00000000000..28e646d7e69
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_create_profile_authority.py
+@@ -0,0 +1,128 @@
++"""Create authority is judged under the ACTUAL creating profile, never by searching all profiles.
++
++A session registered only in profile ``builder``'s state.db is a valid owning chat for a create run AS that
++profile, and must stay refused for a create run as ``default`` (no cross-profile proof). Inherited children of a
++chat-owned creator keep durable authority after the creator completes, in the creating profile.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_create_authority import CreateAuthorityRefused, has_authority
++
++SESSION = "20230101_120000_772203"
++
++
++def _home(tmp_path, monkeypatch, profile):
++    root = tmp_path / ".hermes"
++    (root / "profiles" / "builder").mkdir(parents=True)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    home = root if profile == "default" else root / "profiles" / profile
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
++    for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "HERMES_SESSION_KEY", "HERMES_PROFILE",
++                "HERMES_PROFILE_NAME"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_session_activity as ksa
++    ksa._reset_cache_for_tests()
++    kb.init_db()
++    return root
++
++
++def _register(path, sid=SESSION):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=path / "state.db")
++    try:
++        db.create_session(session_id=sid, source="desktop")
++    finally:
++        db.close()
++
++
++def _links(conn):
++    from hermes_cli import kanban_db_sync as sync
++    start = sync.SYNC_SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS task_chat_links")
++    conn.executescript(sync.SYNC_SCHEMA_SQL[start:sync.SYNC_SCHEMA_SQL.index(";", start) + 1])
++
++
++def _renews(conn, tid, session, profile):
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_scope_renewal_cli import resolve_actor
++    return resolve_actor(conn, tid, writer=("agent", session, "1:HERMES_SESSION_ID"),
++                         environs=[{"HERMES_SESSION_ID": session}], gateway=gateway_names()[0], profile=profile)
++
++
++@pytest.mark.parametrize("profile", ["default", "builder"])
++@pytest.mark.parametrize("default_collision", [False, True])
++def test_registered_creation_authority_survives_reconcile(tmp_path, monkeypatch, profile, default_collision):
++    from hermes_cli import kanban_chat_links, kanban_origin
++    from hermes_cli.kanban_scope_renewal import RenewalRefused
++
++    root = _home(tmp_path, monkeypatch, profile)
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("fixture-gw", set()))
++    _register(root if profile == "default" else root / "profiles" / profile)
++    if profile != "default" and default_collision:
++        _register(root)  # Identical bare session IDs in two profiles are not shared authority.
++    with kbc.connect_closing() as conn:
++        _links(conn)
++        tid = kb.create_task(conn, title="direct", assignee="default", session_id=SESSION,
++                             require_scope_authority=True)
++        assert _renews(conn, tid, SESSION, profile).authority == "chat"
++        for _ in range(2):
++            kanban_chat_links.reconcile(conn, "default", "fixture-gw", ledger=False)
++            assert _renews(conn, tid, SESSION, profile).authority == "chat"
++            owners = list(conn.execute(
++                "SELECT COALESCE(chat_profile,'default') FROM task_chat_links "
++                "WHERE task_id=? AND kind='created' AND released=0", (tid,)))
++            assert [r[0] for r in owners] == [profile]
++            if profile != "default":
++                with pytest.raises(RenewalRefused):
++                    _renews(conn, tid, SESSION, "default")
++
++
++@pytest.mark.parametrize("links", [False, True])
++def test_session_registered_only_in_other_profile_is_refused_for_default(tmp_path, monkeypatch, links):
++    root = _home(tmp_path, monkeypatch, "default")
++    _register(root / "profiles" / "builder")
++    with kbc.connect_closing() as conn:
++        if links:
++            _links(conn)
++        before = list(conn.iterdump())
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="cross-profile", assignee="default", session_id=SESSION,
++                           require_scope_authority=True)
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("links", [False, True])
++def test_session_registered_in_creating_profile_is_authority_and_child_survives_creator(tmp_path, monkeypatch, links):
++    root = _home(tmp_path, monkeypatch, "builder")
++    from hermes_cli import kanban_chat_links, kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("fixture-gw", set()))
++    _register(root / "profiles" / "builder")
++    with kbc.connect_closing() as conn:
++        if links:
++            _links(conn)
++        direct = kb.create_task(conn, title="direct", assignee="default", session_id=SESSION,
++                                require_scope_authority=True)
++        assert has_authority(conn, direct, None, durable=True)
++        assert _renews(conn, direct, SESSION, "builder").authority == "chat"
++        parent = kb.create_task(conn, title="creator", assignee="default", session_id=SESSION)
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
++        kb._append_event(conn, parent, "owner_admitted", {"session_id": "worker-session"})
++        child = kb.create_task(conn, title="inherited child", assignee="default", creator_task_id=parent,
++                               require_scope_authority=True)
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++        conn.commit()
++        assert has_authority(conn, child, parent, durable=True)
++        assert _renews(conn, child, SESSION, "builder").authority == "chat"
++        if links:
++            kanban_chat_links.reconcile(conn, "default", "fixture-gw", ledger=False)
++            assert _renews(conn, direct, SESSION, "builder").authority == "chat"
++            assert _renews(conn, child, SESSION, "builder").authority == "chat"
++        from hermes_cli.kanban_scope_renewal import RenewalRefused
++        with pytest.raises(RenewalRefused):  # the finished creator task itself is no authority
++            _renews(conn, child, "worker-session", "builder")
+diff --git a/tests/hermes_cli/test_kanban_create_scope_authority.py b/tests/hermes_cli/test_kanban_create_scope_authority.py
+new file mode 100644
+index 00000000000..6a3adbb283b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_create_scope_authority.py
+@@ -0,0 +1,354 @@
++"""Requirement D: an agent/CLI create must record scope authority, or be refused (nothing is written).
++
++Incident: a card with created_by='claude-code-chat', session_id NULL and no creator task could never be renewed
++(``renew-scope`` -> not_scope_authority); the DB only recorded ``creator_chats_unresolved``. System/internal
++creators (detectors, human dashboard) keep their semantics, and ``created_by`` is never authority.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_create_authority import CreateAuthorityRefused
++
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(h))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM",
++                "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_SOURCE", "HERMES_RPC_SOCKET", "HERMES_KERNEL_SENTINEL"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_session_activity as ksa
++    ksa._reset_cache_for_tests()
++    kb.init_db()
++    return h
++
++
++def _seed_session(home, sid, source="desktop"):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(session_id=sid, source=source)
++    finally:
++        db.close()
++
++
++def _cli_create(title, *extra):
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    return kc._cmd_create(root.parse_args(["kanban", "create", title, *extra]))
++
++
++def _titles():
++    with kbc.connect_closing() as conn:
++        return [t.title for t in kb.list_tasks(conn)]
++
++
++def test_agent_cli_create_without_authority_is_refused(home, monkeypatch, capsys):
++    monkeypatch.setenv("HERMES_SESSION_ID", "not_a_real_session")  # agent-invoked, no registered chat
++    assert _cli_create("incident card", "--created-by", "claude-code-chat") == 2
++    assert "scope_authority_missing" in capsys.readouterr().err
++    assert "incident card" not in _titles()  # rolled back, not recorded as creator_chats_unresolved
++
++
++def test_agent_cli_create_with_registered_session_records_authority(home, monkeypatch, capsys):
++    _seed_session(home, "20261014_141400_abc123")
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261014_141400_abc123")
++    assert _cli_create("owned") == 0
++    with kbc.connect_closing() as conn:
++        task = next(t for t in kb.list_tasks(conn) if t.title == "owned")
++        assert task.session_id == "20261014_141400_abc123"
++
++
++def test_human_terminal_create_keeps_human_authority(home, capsys):
++    assert _cli_create("by a human") == 0
++    assert "by a human" in _titles()
++
++
++def test_db_requires_creator_task_or_session(home):
++    with kbc.connect_closing() as conn:
++        with pytest.raises(CreateAuthorityRefused) as err:
++            kb.create_task(conn, title="no authority", assignee="default", created_by="claude-code-chat",
++                           require_scope_authority=True)
++        assert err.value.code == "scope_authority_missing"
++        assert conn.execute("SELECT count(*) FROM tasks WHERE title='no authority'").fetchone()[0] == 0
++        assert conn.execute("SELECT count(*) FROM task_events WHERE kind='creator_chats_unresolved'").fetchone()[0] == 0
++        # Mere creator existence is not renewable authority (renew-scope requires a running admitted creator).
++        parent = kb.create_task(conn, title="creator", assignee="default", created_by="user")
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="child", assignee="default", created_by="claude-code-chat",
++                           creator_task_id=parent, require_scope_authority=True)
++        # a machine/placeholder session is not
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="cron card", assignee="default", created_by="x",
++                           session_id="cron_deadbeef_20261014", require_scope_authority=True)
++
++
++def test_internal_creators_keep_semantics(home):
++    """System/detector creation never opts in: no authority needed, nothing invented from created_by."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="detector card", assignee="default", created_by="dup-detector")
++        assert kb.get_task(conn, tid).session_id is None
++        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='creator_chats_resolved'",
++                            (tid,)).fetchone()[0] == 0
++
++
++def test_kanban_create_tool_refuses_authority_less_agent(home, monkeypatch):
++    from tools import kanban_tools as kt
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    out = json.loads(kt._handle_create({"title": "tool incident", "assignee": "default"}))
++    assert "scope_authority_missing" in json.dumps(out) or "scope authority" in json.dumps(out)
++    assert "tool incident" not in _titles()
++
++
++def test_explicit_origin_chat_anchor_without_registered_session_is_authority(home, monkeypatch, capsys):
++    """A validated --origin-session writes an unreleased ``created`` link: renewable authority for a foreign-gateway chat with no registered
++    session row in state.db (platform/chat anchor)."""
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    monkeypatch.setenv("HERMES_SESSION_ID", "not_a_real_session")
++    origin = "@session:research@away/explicit-chat"
++    with kbc.connect_closing() as conn:
++        _links_schema(conn)
++    assert _cli_create("anchored", "--origin-session", origin) == 0
++    with kbc.connect_closing() as conn:
++        tid = next(t.id for t in kb.list_tasks(conn) if t.title == "anchored")
++        assert conn.execute("SELECT count(*) FROM kanban_notify_subs WHERE task_id=? AND chat_id LIKE ?",
++                            (tid, "away/research/%")).fetchone()[0] == 1
++        assert _actor(conn, tid, "explicit-chat", gateway="away", profile="research").authority == "chat"
++
++
++def _links_schema(conn):
++    """The production sync DDL, without enabling sync or reaching a Board."""
++    from hermes_cli import kanban_db_sync as sync
++    start = sync.SYNC_SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS task_chat_links")
++    conn.executescript(sync.SYNC_SCHEMA_SQL[start:sync.SYNC_SCHEMA_SQL.index(";", start) + 1])
++
++
++def _actor(conn, tid, session, *, creator=None, gateway=None, profile="default"):
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_scope_renewal_cli import resolve_actor
++    env = {"HERMES_SESSION_ID": session}
++    if creator:
++        env["HERMES_KANBAN_TASK"] = creator
++    return resolve_actor(conn, tid, writer=("agent", session, "4242:HERMES_SESSION_ID"), environs=[env],
++                         gateway=gateway or gateway_names()[0], profile=profile)
++
++
++@pytest.mark.parametrize("status,admitted", [("ready", False), ("running", False), ("done", True), ("running", True)])
++def test_creator_must_be_running_and_have_renewable_admitted_identity(home, status, admitted):
++    """A creator task alone (no chat ancestry) is transient authority: refused in every state, since once it
++    completes nothing could renew the child. Nothing is written."""
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="bare creator", assignee="default", created_by="user")
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, parent))
++        if admitted:
++            kb._append_event(conn, parent, "owner_admitted", {"session_id": "worker-session"})
++        conn.commit()
++        before = list(conn.iterdump())
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="unrenewable child", assignee="default", creator_task_id=parent,
++                           require_scope_authority=True)
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("links", [False, True])
++def test_creator_with_chat_ancestry_gives_child_durable_authority_after_creator_ends(home, links):
++    """The child inherits the creator's authentic owning chat; that chat can still renew once the creator is done."""
++    session = "20261014_141400_d00d01"
++    _seed_session(home, session)
++    with kbc.connect_closing() as conn:
++        if links:
++            _links_schema(conn)
++        parent = kb.create_task(conn, title="chat-owned creator", assignee="default", session_id=session)
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
++        kb._append_event(conn, parent, "owner_admitted", {"session_id": "worker-session"})
++        child = kb.create_task(conn, title="durable child", assignee="default", creator_task_id=parent,
++                               require_scope_authority=True)
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++        conn.commit()
++        assert _actor(conn, child, session).authority == "chat"
++        with pytest.raises(Exception):  # the finished creator task itself is no authority
++            _actor(conn, child, "worker-session", creator=parent)
++
++
++def test_released_creator_chat_is_not_durable_authority(home):
++    from hermes_cli.kanban_create_authority import has_authority
++    session = "20261014_141400_d00d02"
++    _seed_session(home, session)
++    with kbc.connect_closing() as conn:
++        _links_schema(conn)
++        parent = kb.create_task(conn, title="creator", assignee="default", session_id=session)
++        from hermes_cli.kanban_chat_links import link_uid
++        conn.execute("DELETE FROM task_chat_links WHERE task_id=?", (parent,))
++        conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,"
++                     "created_at) VALUES (?,?,?,?,?,'created',1,1)",
++                     (link_uid(parent, "", None, session, "created"), parent, "", None, session))
++        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=?", (parent,))
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
++        kb._append_event(conn, parent, "owner_admitted", {"session_id": "worker-session"})
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="no live chat", assignee="default", creator_task_id=parent,
++                           require_scope_authority=True)
++        assert not has_authority(conn, parent, None, durable=True)
++
++
++@pytest.mark.parametrize("released", [False, True])
++def test_decompose_preserves_chat_release_and_atomic_refusal(home, monkeypatch, released):
++    from hermes_cli.kanban_create_authority import has_authority
++    from hermes_cli.kanban_db_graph import decompose_triage_task
++
++    session = "20261123_110000_feed01"
++    _seed_session(home, session)
++    monkeypatch.setenv("HERMES_SESSION_ID", "unregistered-agent")
++    with kbc.connect_closing() as conn:
++        _links_schema(conn)
++        root = kb.create_task(conn, title="triage root", assignee="default", triage=True,
++                              session_id=session, require_scope_authority=True)
++        if released:
++            conn.execute("UPDATE task_chat_links SET released=1 WHERE task_id=?", (root,))
++            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=?", (root,))
++        conn.commit()
++        assert has_authority(conn, root, None, durable=True) is (not released)
++        before = list(conn.iterdump())
++
++        def decompose():
++            return decompose_triage_task(
++                conn, root, root_assignee="default", auto_promote=False,
++                children=[{"title": "child", "assignee": "default"}])
++
++        if released:
++            with pytest.raises(CreateAuthorityRefused) as err:
++                decompose()
++            assert err.value.code == "scope_authority_missing"
++            assert list(conn.iterdump()) == before  # no children, links, subs, or root transition
++        else:
++            children = decompose()
++            assert children is not None
++            assert len(children) == 1
++            assert has_authority(conn, children[0], None, durable=True)
++            assert _actor(conn, children[0], session).authority == "chat"
++
++
++@pytest.mark.parametrize("session", ["", "unknown-session", "kanban-placement", "cron_deadbeef_20261014"])
++def test_unproven_raw_session_never_substitutes_for_authority(home, session):
++    with kbc.connect_closing() as conn:
++        before = list(conn.iterdump())
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="unproven raw session", assignee="default", session_id=session,
++                           require_scope_authority=True)
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("links", [False, True])
++def test_registered_chat_is_renewable_immediately_without_later_reconcile(home, links):
++    session = "20261014_141400_cafe00"
++    _seed_session(home, session)
++    with kbc.connect_closing() as conn:
++        if links:
++            _links_schema(conn)
++        tid = kb.create_task(conn, title="registered owner", assignee="default", session_id=session,
++                             require_scope_authority=True)
++        assert _actor(conn, tid, session).authority == "chat"
++
++
++@pytest.mark.parametrize("kind,released,session,profile,gateway,expected", [
++    ("created", 0, "platform-chat", "research", "away", True),
++    ("created", 0, "local-" + "a" * 64, "research", "away", True),
++    ("created", 0, "local-" + "a" * 64, None, "away", False),
++    ("created", 1, "platform-chat", "research", "away", False),
++    ("shepherd", 0, "platform-chat", "research", "away", False),
++    ("touch", 0, "platform-chat", "research", "away", False),
++    ("created", 0, "cron_deadbeef_20261014", "research", "away", False),
++    ("created", 0, "", "research", "away", False),
++    ("created", 0, "kanban-placement", "research", "away", False),
++    ("created", 0, "local-" + "a" * 64, "default", "here", False),
++])
++def test_link_authority_matches_renewal_and_foreign_provenance(home, monkeypatch, kind, released, session,
++                                                             profile, gateway, expected):
++    from hermes_cli import kanban_origin
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_create_authority import has_authority
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    with kbc.connect_closing() as conn:
++        _links_schema(conn)
++        tid = kb.create_task(conn, title="link fixture", assignee="default")
++        conn.execute("INSERT INTO task_chat_links "
++                     "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                     "VALUES (?,?,?,?,?,?,?,1)",
++                     (link_uid(tid, gateway, profile, session, kind), tid, gateway, profile, session, kind, released))
++        conn.commit()
++        assert has_authority(conn, tid, None) is expected
++        if expected:
++            assert _actor(conn, tid, session, gateway=gateway, profile=profile).authority == "chat"
++
++
++def test_foreign_origin_sub_without_link_is_not_renewable_on_legacy_board(home, monkeypatch):
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    with kbc.connect_closing() as conn:
++        before = list(conn.iterdump())
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="legacy foreign anchor", assignee="default",
++                           chat_origin="@session:research@away/platform-chat", require_scope_authority=True)
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("source", ["kanban", "cron", "oneshot", "subagent"])
++@pytest.mark.parametrize("session", ["ordinary-id", "local-" + "b" * 64])
++def test_registered_machine_provenance_never_becomes_chat_authority(home, source, session):
++    _seed_session(home, session, source=source)
++    with kbc.connect_closing() as conn:
++        before = list(conn.iterdump())
++        with pytest.raises(CreateAuthorityRefused):
++            kb.create_task(conn, title="machine is not owner", assignee="default", session_id=session,
++                           require_scope_authority=True)
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("links", [False, True])
++def test_registered_local_hash_is_interactive_when_store_proves_it(home, links):
++    session = "local-" + "c" * 64
++    _seed_session(home, session)
++    with kbc.connect_closing() as conn:
++        if links:
++            _links_schema(conn)
++        tid = kb.create_task(conn, title="interactive local hash", assignee="default", session_id=session,
++                             require_scope_authority=True)
++        assert _actor(conn, tid, session).authority == "chat"
++
++
++@pytest.mark.parametrize("reason", ["shepherd", "touch", None])
++def test_legacy_observer_subscriptions_are_not_authority(home, reason):
++    from hermes_cli.kanban_create_authority import has_authority
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="observer fixture", assignee="default")
++        conn.execute("INSERT INTO kanban_notify_subs "
++                     "(task_id,platform,chat_id,thread_id,delivery_metadata,created_at,last_event_id) "
++                     "VALUES (?,'tui','observer','',?,1,0)", (tid, json.dumps({"reason": reason})))
++        assert not has_authority(conn, tid, None)
++
++
++def test_creator_argument_must_match_recorded_creator_and_not_childs_own_session(home):
++    from hermes_cli.kanban_create_authority import has_authority
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="admitted creator", assignee="default")
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
++        kb._append_event(conn, parent, "owner_admitted", {"session_id": "worker"})
++        unrelated = kb.create_task(conn, title="unrelated child", assignee="default")
++        assert not has_authority(conn, unrelated, parent)
++        child = kb.create_task(conn, title="actual child", assignee="default", creator_task_id=parent)
++        assert has_authority(conn, child, parent)
++        kb._append_event(conn, child, "owner_admitted", {"session_id": "worker"})
++        assert not has_authority(conn, child, parent)
+diff --git a/tests/hermes_cli/test_kanban_create_session_stamp.py b/tests/hermes_cli/test_kanban_create_session_stamp.py
+index 2ec751296fb..861aa8a976f 100644
+--- a/tests/hermes_cli/test_kanban_create_session_stamp.py
++++ b/tests/hermes_cli/test_kanban_create_session_stamp.py
+@@ -21,6 +21,7 @@
+ from hermes_cli import kanban_db_connect as kbc
+ 
+ 
++
+ @pytest.fixture
+ def kanban_home(tmp_path, monkeypatch):
+     home = tmp_path / ".hermes"
+@@ -64,7 +65,12 @@
+ 
+ def test_cli_create_ignores_unknown_session(kanban_home, monkeypatch, capsys):
+     monkeypatch.setenv("HERMES_SESSION_ID", "not_a_real_session")
+-    assert _create("stray env") is None
++    # An unregistered session is not stamped, and an agent create with no other authority is refused (req. D).
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    assert kc._cmd_create(root.parse_args(["kanban", "create", "stray env"])) == 2
++    with kbc.connect_closing() as conn:
++        assert not [t for t in kb.list_tasks(conn) if t.title == "stray env"]
+ 
+ 
+ def test_cli_create_without_session_env_is_unstamped(kanban_home, capsys):
+@@ -73,9 +79,16 @@
+ 
+ def test_cli_create_in_worker_does_not_stamp_worker_session(kanban_home, monkeypatch, capsys):
+     _seed_session(kanban_home, "worker_sess")
++    _seed_session(kanban_home, "owner_chat")  # the registered chat the creator descends from
+     monkeypatch.setenv("HERMES_SESSION_ID", "worker_sess")
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_doesnotexist")
+-    assert _create("worker child") is None
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="creator", assignee="default", session_id="owner_chat")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (creator,))
++            kb._append_event(conn, creator, 'owner_admitted', {'session_id': 'worker_sess'})
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)  # a running admitted creator that descends from a registered owning chat is durable authority
++    # never the worker session; the child inherits the creator's owning chat
++    assert _create("worker child") == "owner_chat"
+ 
+ 
+ def _create_args(*argv: str) -> str:
+diff --git a/tests/hermes_cli/test_kanban_create_skill_validation.py b/tests/hermes_cli/test_kanban_create_skill_validation.py
+index 9a26dcc8a64..3133db9613b 100644
+--- a/tests/hermes_cli/test_kanban_create_skill_validation.py
++++ b/tests/hermes_cli/test_kanban_create_skill_validation.py
+@@ -52,6 +52,17 @@
+     return home
+ 
+ 
++def _own(home, monkeypatch, sid="20261014_141400_abc123") -> None:
++    """Act as a registered owning chat: a genuine agent create needs real renewable authority."""
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(session_id=sid, source="desktop")
++    finally:
++        db.close()
++    monkeypatch.setenv("HERMES_SESSION_ID", sid)
++
++
+ def _count() -> int:
+     with kbc.connect_closing() as conn:
+         return len(kb.list_tasks(conn))
+@@ -86,13 +97,15 @@
+     assert "real-skill" in out["error"], out
+ 
+ 
+-def test_tool_accepts_a_skill_the_assignee_has(board):
++def test_tool_accepts_a_skill_the_assignee_has(board, monkeypatch):
++    _own(board, monkeypatch)
+     out = _tool_create(assignee="default", skills=["real-skill"])
+     assert out.get("ok"), out
+     assert _count() == 1
+ 
+ 
+-def test_tool_checks_the_assignee_profile_not_the_caller(board):
++def test_tool_checks_the_assignee_profile_not_the_caller(board, monkeypatch):
++    _own(board, monkeypatch)
+     assert _tool_create(assignee="default", skills=["other-only"]).get("code") == "unknown_skill"
+     out = _tool_create(assignee="other", skills=["other-only"])
+     assert out.get("ok"), out
+diff --git a/tests/hermes_cli/test_kanban_creator_origin.py b/tests/hermes_cli/test_kanban_creator_origin.py
+index 4402b201a80..8098aa2ed32 100644
+--- a/tests/hermes_cli/test_kanban_creator_origin.py
++++ b/tests/hermes_cli/test_kanban_creator_origin.py
+@@ -10,6 +10,12 @@
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     kb.init_db()
++    from hermes_state import SessionDB  # the owning chat must be a registered session to be authority
++    sdb = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        sdb.create_session(session_id="durable", source="desktop")
++    finally:
++        sdb.close()
+     with kbc.connect_closing() as conn:
+         owner = kb.create_task(conn, title="owner", session_id="durable", triage=True)
+         kn.add_notify_sub(conn, task_id=owner, platform="telegram", chat_id="chat",
+@@ -31,7 +37,11 @@
+             tid = json.loads(capsys.readouterr().out)["id"]
+         assert kb.get_task(conn, tid).session_id == "durable"
+         subs = kn.list_notify_subs(conn, tid)
+-        assert len(subs) == 1 and subs[0]["delivery_mode"] == "wake"
++        wake = [s for s in subs if s["chat_id"] == "chat"]
++        assert len(wake) == 1 and wake[0]["delivery_mode"] == "wake"
++        # The agent-create front door also anchors the registered owning chat as the durable authority sub.
++        extra = [s["chat_id"] for s in subs if s["chat_id"] != "chat"]
++        assert extra == (["durable"] if surface == "cli" else [])
+         assert not conn.execute("SELECT 1 FROM task_links WHERE child_id = ?", (tid,)).fetchone()
+         # No ambient identity guessing in the storage API.
+         plain = kb.create_task(conn, title="plain", session_id="explicit")
+diff --git a/tests/hermes_cli/test_kanban_fairness_creation.py b/tests/hermes_cli/test_kanban_fairness_creation.py
+index 50f53bb3475..6eeb3786d0e 100644
+--- a/tests/hermes_cli/test_kanban_fairness_creation.py
++++ b/tests/hermes_cli/test_kanban_fairness_creation.py
+@@ -264,10 +264,13 @@
+ 
+ def test_origin_retry_excludes_internal_observation(capture):
+     from tests.hermes_cli.test_kanban_origin_creation import intent
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
+ 
+     conn, _session = capture
+-    child = kb.create_task(conn, title="origin", origin_intent=intent())
+-    assert kb.create_task(conn, title="origin", origin_intent=intent(), creation_receipt={"internal": True}) == child
++    chat = register_chat(kb.kanban_home(), '20261123_120000_fairness')
++    child = kb.create_task(conn, title="origin", origin_intent=intent(), session_id=chat)
++    assert kb.create_task(conn, title="origin", origin_intent=intent(), session_id=chat,
++                          creation_receipt={"internal": True}) == child
+     raw = conn.execute("SELECT intent_json FROM origin_creation_intents").fetchone()[0]
+     assert "creation_receipt" not in raw
+ 
+diff --git a/tests/hermes_cli/test_kanban_foreign_desktop_owner.py b/tests/hermes_cli/test_kanban_foreign_desktop_owner.py
+index 9337e3d4430..5eac844fc87 100644
+--- a/tests/hermes_cli/test_kanban_foreign_desktop_owner.py
++++ b/tests/hermes_cli/test_kanban_foreign_desktop_owner.py
+@@ -21,7 +21,7 @@
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_notify as notify
+ from hermes_cli.kanban_session_provenance import proven_foreign_chats
+-from tests.tools.test_kanban_worker_created_chats import WORKER, make_home
++from tests.tools.test_kanban_worker_created_chats import CHAT, WORKER, make_home
+ 
+ MAC = "local-" + "9c" * 32
+ REF = f"macbook/default/{MAC}"
+@@ -46,7 +46,15 @@
+ def _bound(conn, how, origin=ORIGIN):
+     """A card the courier bound to ``origin`` (creation or adoption of an exact existing card)."""
+     if how == "create":
+-        return kb.create_task(conn, title="mac card", origin_intent=_intent("req-create-0001", origin))
++        # A foreign local-<hash> origin is not renewable authority by itself (nothing proves it yet), so the
++        # courier create is anchored by an authentic SessionDB desktop chat (CHAT, registered by make_home).
++        # That anchor is then removed: these tests probe what the resolver proves for the foreign ref alone.
++        tid = kb.create_task(conn, title="mac card", session_id=CHAT, origin_intent=_intent("req-create-0001", origin))
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM task_chat_links WHERE task_id=? AND chat_session=?", (tid, CHAT))
++            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND chat_id=?", (tid, CHAT))
++            conn.execute("UPDATE tasks SET session_id=NULL WHERE id=?", (tid,))
++        return tid
+     from hermes_cli.kanban_origin_creation import adopt_with_origin
+     tid = kb.create_task(conn, title="mac card")
+     return adopt_with_origin(conn, _intent("req-adopt-00001", origin, tid), board="default")
+diff --git a/tests/hermes_cli/test_kanban_graph_identity.py b/tests/hermes_cli/test_kanban_graph_identity.py
+index 29c434caf5b..5e1347fed13 100644
+--- a/tests/hermes_cli/test_kanban_graph_identity.py
++++ b/tests/hermes_cli/test_kanban_graph_identity.py
+@@ -38,6 +38,8 @@
+ def test_parent_tenant_is_inherited_at_creation_boundary(tmp_path, monkeypatch):
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(tmp_path / 'hermes', '20261123_120000_graph'))
+     monkeypatch.delenv("HERMES_TENANT", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     from tools.kanban_tools import _handle_create
+diff --git a/tests/hermes_cli/test_kanban_lane_classifier_transport.py b/tests/hermes_cli/test_kanban_lane_classifier_transport.py
+index a7d9e3cec1e..1058a8e1909 100644
+--- a/tests/hermes_cli/test_kanban_lane_classifier_transport.py
++++ b/tests/hermes_cli/test_kanban_lane_classifier_transport.py
+@@ -86,7 +86,10 @@
+         return "research"
+ 
+     monkeypatch.setattr(lanes, "_fallback_lane", classify)
+-    tid = kb.create_task(conn, title="H3 recovery", assignee="default", origin_intent=intent())
++    from hermes_constants import get_hermes_home
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(get_hermes_home(), "20261123_120000_lane_owner")  # a real owning chat, not a bare ID
++    tid = kb.create_task(conn, title="H3 recovery", assignee="default", origin_intent=intent(), session_id=chat)
+     assert kb.get_task(conn, tid).tenant == "research"
+     assert classifier.cached({}) is None
+     assert calls == ["H3 recovery"]
+diff --git a/tests/hermes_cli/test_kanban_model_tier.py b/tests/hermes_cli/test_kanban_model_tier.py
+index 31b4f61d68a..c9e933b4daa 100644
+--- a/tests/hermes_cli/test_kanban_model_tier.py
++++ b/tests/hermes_cli/test_kanban_model_tier.py
+@@ -32,6 +32,8 @@
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
+     _write_cfg(home)
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(home, '20261123_120000_model'))
+     return home
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_no_pool_audit.py b/tests/hermes_cli/test_kanban_no_pool_audit.py
+index af6bd4761cd..64830582fcf 100644
+--- a/tests/hermes_cli/test_kanban_no_pool_audit.py
++++ b/tests/hermes_cli/test_kanban_no_pool_audit.py
+@@ -34,6 +34,8 @@
+     assert "worker_pools" not in cfg
+     assert cfg["extra_home_markers"] == ["special-device"]
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(profile, "20261123_120000_audit_owner"))
+     args = {"title": "Analyze public data", "assignee": assignee, "body": body, "requires": []}
+     if frontdoor == "db":
+         with kbc.connect() as conn:
+diff --git a/tests/hermes_cli/test_kanban_origin.py b/tests/hermes_cli/test_kanban_origin.py
+index 14cd9c5cff6..b39136d277d 100644
+--- a/tests/hermes_cli/test_kanban_origin.py
++++ b/tests/hermes_cli/test_kanban_origin.py
+@@ -43,6 +43,8 @@
+     conn.close()
+     for var in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", ko.ENV):
+         monkeypatch.delenv(var, raising=False)
++    # Courier creation requires genuine renewal authority, which exists only on a synced board.
++    (tmp_path / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
+     kb.init_db()
+     return tmp_path
+ 
+diff --git a/tests/hermes_cli/test_kanban_origin_adoption.py b/tests/hermes_cli/test_kanban_origin_adoption.py
+index 7e6ef9d883d..961a624055b 100644
+--- a/tests/hermes_cli/test_kanban_origin_adoption.py
++++ b/tests/hermes_cli/test_kanban_origin_adoption.py
+@@ -16,6 +16,8 @@
+     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    # Courier creation requires genuine renewal authority, which exists only on a synced board.
++    (tmp_path / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
+     kb.init_db()
+     with connect_closing() as conn:
+         tid = kb.create_task(conn, title="Existing", session_id="creator")
+diff --git a/tests/hermes_cli/test_kanban_origin_creation.py b/tests/hermes_cli/test_kanban_origin_creation.py
+index 1ebc6829fe3..06fe5af711d 100644
+--- a/tests/hermes_cli/test_kanban_origin_creation.py
++++ b/tests/hermes_cli/test_kanban_origin_creation.py
+@@ -16,6 +16,8 @@
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    # Courier creation requires genuine renewal authority, which exists only on a synced board.
++    (tmp_path / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n")
+     kb.init_db()
+     return tmp_path
+ 
+diff --git a/tests/hermes_cli/test_kanban_origin_notify.py b/tests/hermes_cli/test_kanban_origin_notify.py
+index df49a755369..087c744384a 100644
+--- a/tests/hermes_cli/test_kanban_origin_notify.py
++++ b/tests/hermes_cli/test_kanban_origin_notify.py
+@@ -61,7 +61,8 @@
+             "origin": {"gateway": "macbook", "profile": "default", "session": CHAT}}
+ 
+ 
+-def test_courier_create_subscribes_the_bound_origin_not_the_ambient_session(owner):
++def test_courier_create_subscribes_the_bound_origin_not_the_ambient_session(synced_owner):
++    owner = synced_owner
+     args = {"title": "Build", "assignee": "default", "session_id": "kanban-placement-macbook"}
+     res = json.loads(registry.dispatch("kanban_create", args, origin_intent=owner))
+     assert res.get("created") is True, res
+@@ -125,6 +126,11 @@
+ def test_courier_create_writes_no_link_for_a_chat_on_the_owner_or_a_placeholder(synced_owner, origin):
+     args = {"title": "Build", "assignee": "default"}
+     res = json.loads(str(registry.dispatch("kanban_create", args, origin_intent={**synced_owner, "origin": origin})))
++    if origin['session'].startswith(('kanban-placement-', 'local-')):
++        assert not res.get('created') and 'no renewable scope authority' in str(res), res
++        with kbc.connect_closing() as conn:
++            assert not conn.execute('SELECT 1 FROM tasks').fetchone()
++        return
+     assert res.get("created") is True, res
+     assert _links(res["task_id"]) == []
+     assert "origin_chat_link" not in res  # the origin is told the link still waits for its own reconcile
+@@ -151,7 +157,9 @@
+ def test_courier_create_on_an_owner_without_board_sync_does_not_claim_the_link(owner):
+     res = json.loads(str(registry.dispatch("kanban_create", {"title": "Build", "assignee": "default"},
+                                            origin_intent=owner)))
+-    assert res.get("created") is True and "origin_chat_link" not in res, res
++    assert not res.get('created') and 'no renewable scope authority' in str(res), res
++    with kbc.connect_closing() as conn:
++        assert not conn.execute('SELECT 1 FROM tasks').fetchone()
+ 
+ 
+ def test_courier_adoption_tells_the_origin_it_wrote_the_link(synced_owner):
+@@ -290,6 +298,7 @@
+     for name in ("HERMES_KANBAN_TASK", "HERMES_ORIGIN_SESSION", "HERMES_KANBAN_DB"):
+         monkeypatch.delenv(name, raising=False)
+     monkeypatch.setenv("HERMES_SESSION_ID", STALE)
++    (tmp_path / 'config.yaml').write_text('kanban:\n  sync:\n    enabled: true\n')
+     state = tmp_path / "hub-state"
+     state.mkdir()
+     monkeypatch.setenv("HERMES_HUB_STATE", str(state))
+diff --git a/tests/hermes_cli/test_kanban_origin_owner.py b/tests/hermes_cli/test_kanban_origin_owner.py
+index c2549bbad4d..6e5cc603b61 100644
+--- a/tests/hermes_cli/test_kanban_origin_owner.py
++++ b/tests/hermes_cli/test_kanban_origin_owner.py
+@@ -25,6 +25,8 @@
+     cfg.write_text(json.dumps({'gateway': 'owner'}), encoding='utf-8')
+     monkeypatch.setenv('HERMES_MAIL_CONFIG', str(cfg))
+     monkeypatch.setattr(kanban_tools, '_profile_has_kanban_toolset', lambda: True)
++    # Courier creation requires genuine renewal authority, which exists only on a synced board.
++    (tmp_path / 'config.yaml').write_text('kanban:\n  sync:\n    enabled: true\n')
+     kb.init_db()
+     return {'id': 'request-owner-001', 'from': 'gw:origin', 'to_gw': 'owner',
+             'coll': 'tasks', 'action': 'create', 'key': 'default/default',
+@@ -48,7 +50,7 @@
+     import subprocess
+     import sys
+ 
+-    (tmp_path / 'config.yaml').write_text(config, encoding='utf-8')
++    (tmp_path / 'config.yaml').write_text('kanban:\n  sync:\n    enabled: true\n' + config, encoding='utf-8')
+     command = [sys.executable, '-m', 'hermes_cli.main', '-p', 'default',
+                'kanban', 'origin-create', '--request-file', '-', '--json']
+     results = []
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index ddb99cb26b7..d8473d4e8fb 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -411,6 +411,7 @@
+     sdb = SessionDB(db_path=home / "state.db")
+     sdb.create_session("20261027_183000_abc123", source="desktop")
+     sdb.close()
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261027_183000_abc123")  # the registered owning chat
+     calls: list[list[str]] = []
+     result = {"rc": 0, "help": "usage: hermes-hub create-task [--id ID]"}  # pre-1.8.0 client by default
+ 
+@@ -620,8 +621,9 @@
+     assert kp.remote_task_id("placement:macbook:x1") == "t_01a180ef6421a3f0"
+ 
+ 
+-def test_unpersisted_session_creates_an_unbound_hub_card(mac):
++def test_unpersisted_session_creates_an_unbound_hub_card(mac, monkeypatch):
+     from tools import kanban_tools as kt
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)  # the ambient chat would otherwise be the origin
+     out = json.loads(kt._handle_create({"title": "Regenerate the plugin index", "session_id": "nope"}))
+     argv = mac["calls"][0]
+     assert out["placed"]["origin_session"] is None
+@@ -771,7 +773,7 @@
+         monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+     monkeypatch.setattr(kp, "config", lambda: {"worker_pools": {"macbook": ["worker-1"]}})
+     out = json.loads(kt._handle_create({"title": "Analyze public data", "requires": [],
+-                                        "origin_session": "hub:abc123", "placement": pin}))
++                                        "origin_session": "macbook:20261027_183000_abc123", "placement": pin}))
+     assert out.get("ok"), out
+     with kbc.connect_closing() as conn:
+         assert kb.get_task(conn, out["task_id"]).placement_policy == "worker-first-v1"
+@@ -799,7 +801,7 @@
+     else:
+         args = {"title": "Analyze public data", "requires": []}
+         if surface == "origin-tool":
+-            args["origin_session"] = "hub:abc123"
++            args["origin_session"] = "macbook:20261027_183000_abc123"
+         out = json.loads(kt._handle_create(args))
+         assert out.get("ok"), out
+     with kbc.connect_closing(board="other") as conn:
+diff --git a/tests/hermes_cli/test_kanban_placement_diagnostics.py b/tests/hermes_cli/test_kanban_placement_diagnostics.py
+index 5d72c9f92a4..487ab79e3eb 100644
+--- a/tests/hermes_cli/test_kanban_placement_diagnostics.py
++++ b/tests/hermes_cli/test_kanban_placement_diagnostics.py
+@@ -16,6 +16,8 @@
+     monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+     for name in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "HERMES_SESSION_KEY"):
+         monkeypatch.delenv(name, raising=False)
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(tmp_path, "20261123_120000_diag_owner"))
+     cfg = {"worker_pools": {"hub": ["worker-1"]}, "extra_home_markers": ["special-device"]}
+     monkeypatch.setattr(placement, "config", lambda: cfg)
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+index 78dfd1e541c..a0342a13a2a 100644
+--- a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -50,6 +50,8 @@
+     for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_KANBAN_RUN_ID"):
+         monkeypatch.delenv(var, raising=False)
+     home = support.kanban_home(tmp_path, monkeypatch)
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(home, "20261123_120000_deny_owner"))
+     (home / "config.yaml").write_text(CONFIG)
+     kb.init_db()
+     conn = kbc.connect(home / "kanban.db")
+diff --git a/tests/hermes_cli/test_kanban_portable_reason_audit.py b/tests/hermes_cli/test_kanban_portable_reason_audit.py
+index b8b53862c76..1d1e6fb8d97 100644
+--- a/tests/hermes_cli/test_kanban_portable_reason_audit.py
++++ b/tests/hermes_cli/test_kanban_portable_reason_audit.py
+@@ -104,6 +104,9 @@
+     from tools import kanban_tools as kt
+ 
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from hermes_constants import get_hermes_home
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(get_hermes_home(), "20261123_120000_portable_owner"))
+     result = json.loads(kt._handle_create({"title": "tool audit card", "assignee": "default",
+                                            "requires": requires}))
+     assert result.get("ok"), result
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index f746096674b..d0f9d8576a1 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -82,6 +82,8 @@
+     gh.chmod(0o755)
+     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(tmp_path / 'home', '20261123_120000_pr'))
+     kb.init_db()
+     try:
+         yield state
+diff --git a/tests/hermes_cli/test_kanban_quoted_placement.py b/tests/hermes_cli/test_kanban_quoted_placement.py
+index 7ede4c91667..c8d557dfd76 100644
+--- a/tests/hermes_cli/test_kanban_quoted_placement.py
++++ b/tests/hermes_cli/test_kanban_quoted_placement.py
+@@ -28,6 +28,8 @@
+     monkeypatch.setattr(placement, "config", lambda: {"worker_pools": {"hub": ["worker-1"]}})
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(home, "20261123_120000_quoted_owner"))
+     if frontdoor == "cli":
+         from hermes_cli import kanban as cli
+         result = cli.run_slash(f"create {shlex.quote(title)} --body {shlex.quote(body)}")
+diff --git a/tests/hermes_cli/test_kanban_recovery_ingress.py b/tests/hermes_cli/test_kanban_recovery_ingress.py
+index 49f362d89ae..d94f808df5f 100644
+--- a/tests/hermes_cli/test_kanban_recovery_ingress.py
++++ b/tests/hermes_cli/test_kanban_recovery_ingress.py
+@@ -27,6 +27,9 @@
+     monkeypatch.setattr(placement, "config", dict)
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+     monkeypatch.setattr(tools, "_persisted_identity", lambda: "default")
++    from hermes_constants import get_hermes_home
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(get_hermes_home(), "20261123_120000_ingress_owner"))
+     return conn
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py b/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+index 4f7ec2b727d..054f3fd3b7a 100644
+--- a/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
++++ b/tests/hermes_cli/test_kanban_remote_assignee_entry_paths.py
+@@ -46,6 +46,13 @@
+     from tools import kanban_tools as kt
+     hub, _ = gws
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from hermes_state import SessionDB  # act as a registered owning chat: genuine agent create authority
++    sdb = SessionDB(db_path=hub.home / "state.db")
++    try:
++        sdb.create_session(session_id="20261014_141400_abc123", source="desktop")
++    finally:
++        sdb.close()
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261014_141400_abc123")
+     monkeypatch.setattr("hermes_cli.kanban_capability_registry.self_gateway", lambda: HUB)
+     monkeypatch.setattr(kp, "config", lambda: {"heavy_route": {HUB: WORKER}, "assignees": [PROFILE]})
+     _publish(monkeypatch, {WORKER: {PROFILE: set(NEEDS)}})
+diff --git a/tests/hermes_cli/test_kanban_requires_declaration.py b/tests/hermes_cli/test_kanban_requires_declaration.py
+index eea490c56d0..d78803163fa 100644
+--- a/tests/hermes_cli/test_kanban_requires_declaration.py
++++ b/tests/hermes_cli/test_kanban_requires_declaration.py
+@@ -72,6 +72,8 @@
+         _write_skill(home, skill, text)
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    register_chat(home, '20261123_120000_declaration')
+     return home
+ 
+ 
+@@ -82,6 +84,7 @@
+ 
+ def _tool_create(**args) -> dict:
+     from tools import kanban_tools as kt
++    args.setdefault('session_id', '20261123_120000_declaration')
+     return json.loads(kt._handle_create(args))
+ 
+ 
+@@ -233,7 +236,8 @@
+ 
+ def test_worker_created_child_is_gated(env, monkeypatch):
+     with kbc.connect_closing() as conn:
+-        parent = kb.create_task(conn, title="Orchestrator", assignee="default", requires=["kanban"])
++        parent = kb.create_task(conn, title="Orchestrator", assignee="default", requires=["kanban"],
++                                session_id='20261123_120000_declaration')
+         kb.claim_task(conn, parent)
+         run_id = kb._current_run_id(conn, parent)
+     monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+@@ -272,11 +276,13 @@
+               "origin": {"gateway": "origin", "profile": "work", "session": "s_old"}}
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="Courier", assignee="alpha", origin_intent=intent,
++                             session_id='20261123_120000_declaration',
+                              require_declaration=True)
+         stored = json.loads(conn.execute("SELECT intent_json FROM origin_creation_intents").fetchone()[0])
+         assert "require_declaration" not in stored["options"] and stored["options"]["requires"] is None
+         # A retry of the same envelope (as an older sender would store it) still resolves to the card.
+-        assert kb.create_task(conn, title="Courier", assignee="alpha", origin_intent=intent) == tid
++        assert kb.create_task(conn, title="Courier", assignee="alpha", origin_intent=intent,
++                              session_id='20261123_120000_declaration') == tid
+         assert kb.get_task(conn, tid).requires == []
+ 
+ 
+@@ -291,6 +297,7 @@
+ 
+ 
+ def test_cli_agent_create_parity(env, monkeypatch, capsys):
++    monkeypatch.setenv('HERMES_SESSION_ID', '20261123_120000_declaration')
+     monkeypatch.setenv("HERMES_SESSION_SOURCE", "cli")  # an agent's terminal/execute_code shell
+     rc, out = _cli(["Fix the hub repo", "--assignee", "alpha"], capsys)
+     assert rc == 2 and "requires_declaration_missing" in out
+@@ -315,7 +322,8 @@
+ def test_cli_from_a_worker_shell_is_gated(env, monkeypatch, capsys):
+     """The in_worker branch (HERMES_KANBAN_TASK set, no chat session markers)."""
+     with kbc.connect_closing() as conn:
+-        parent = kb.create_task(conn, title="Orchestrator", assignee="default", requires=["kanban"])
++        parent = kb.create_task(conn, title="Orchestrator", assignee="default", requires=["kanban"],
++                                session_id='20261123_120000_declaration')
+     monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+     from hermes_cli import kanban as kmod
+     assert not kmod._agent_invoked()
+@@ -406,7 +414,8 @@
+     child_env = {k: v for k, v in os.environ.items()
+                  if not k.startswith("HERMES_") and k not in ("PYTHONPATH",)}
+     child_env.update(HERMES_HOME=str(env), HERMES_KANBAN_DB=str(db), HERMES_SESSION_SOURCE="cli",
+-                     HOME=str(tmp_path), PYTHONPATH=str(REPO))
++                     HERMES_SESSION_ID='20261123_120000_declaration',
++                     HOME=str(tmp_path / 'process-home'), PYTHONPATH=str(REPO))
+     probe = subprocess.run(
+         [sys.executable, "-c", "import os; from hermes_cli import kanban_db as k; "
+          "print(os.environ['HERMES_HOME']); print(k.kanban_db_path())"],
+diff --git a/tests/hermes_cli/test_kanban_review_required_plumbing.py b/tests/hermes_cli/test_kanban_review_required_plumbing.py
+index 76ff61c2801..2e9b5ec19f8 100644
+--- a/tests/hermes_cli/test_kanban_review_required_plumbing.py
++++ b/tests/hermes_cli/test_kanban_review_required_plumbing.py
+@@ -26,6 +26,8 @@
+     monkeypatch.setattr(kc, "_check_dispatcher_presence", lambda **kw: (True, ""))
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    monkeypatch.setenv('HERMES_SESSION_ID', register_chat(h, '20261123_120000_review'))
+     return h
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_selfwork_entry.py b/tests/hermes_cli/test_kanban_selfwork_entry.py
+index f77fe5af62a..35cde0c2e57 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_entry.py
++++ b/tests/hermes_cli/test_kanban_selfwork_entry.py
+@@ -22,9 +22,22 @@
+     for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_ORIGIN_SESSION",
+                 "HERMES_SESSION_KEY", "HERMES_SESSION_ID"):
+         monkeypatch.delenv(key, raising=False)
++    register_chat(kb.kanban_home(), '20261123_120000_selfwork')
++    monkeypatch.setenv('HERMES_SESSION_ID', '20261123_120000_selfwork')
+     return board
+ 
+ 
++def register_chat(home, session):
++    """Persist an actual interactive owner in the creating profile's store."""
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / 'state.db')
++    try:
++        db.create_session(session_id=session, source='desktop')
++    finally:
++        db.close()
++    return session
++
++
+ def create(entry, value):
+     if entry == "tool":
+         args = {"title": "Scoped implementation", "requires": [], "placement": "local"}
+diff --git a/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py b/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py
+index 6ec8eabe03f..a4ec28f1501 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py
++++ b/tests/hermes_cli/test_kanban_selfwork_foreign_creator.py
+@@ -19,9 +19,11 @@
+         lane_policy = lanes.Policy({'hermes': lanes.Lane('hermes', gated=True, self_work=True)},
+                                    'hermes', 10)
+         monkeypatch.setattr(lanes, 'safe_policy', lambda: lane_policy)
+-    (tmp_path / 'config.yaml').write_text(json.dumps({'kanban': {'self_work': {
++    (tmp_path / 'config.yaml').write_text(json.dumps({'kanban': {'sync': {'enabled': True}, 'self_work': {
+         'home': {'gateway': 'owner', 'profile': 'default', 'board': 'default'}}}}))
+     with kbc.connect_closing() as conn:
++        from hermes_cli.kanban_db_sync import set_identity
++        set_identity(conn, 'board-owner', 'owner')
+         collision = kb.create_task(conn, title='Unrelated', session_id='wrong-chat')
+     creator = {'gateway': 'origin', 'profile': 'work', 'board': 'default',
+                'task_id': collision, 'run_uid': 'original-run'}
+diff --git a/tests/hermes_cli/test_kanban_selfwork_guard_entry.py b/tests/hermes_cli/test_kanban_selfwork_guard_entry.py
+index 1ead06b9392..0e6a449fa28 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_guard_entry.py
++++ b/tests/hermes_cli/test_kanban_selfwork_guard_entry.py
+@@ -8,7 +8,14 @@
+ from tests.hermes_cli import test_kanban_selfwork_guards as guards
+ 
+ world = support.world
+-request_envelope = support.request_envelope
++nochat_envelope = support.request_envelope
++
++
++@pytest.fixture
++def request_envelope(nochat_envelope):
++    nochat_envelope['args']['origin'] = {'gateway': 'origin', 'profile': 'work', 'session': 'original'}
++    nochat_envelope['args']['create']['session_id'] = 'creator'
++    return nochat_envelope
+ 
+ 
+ @pytest.mark.parametrize('surface', ['cli', 'tool'])
+diff --git a/tests/hermes_cli/test_kanban_selfwork_intake.py b/tests/hermes_cli/test_kanban_selfwork_intake.py
+index a27f8808cc9..657b9ef4edb 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_intake.py
++++ b/tests/hermes_cli/test_kanban_selfwork_intake.py
+@@ -42,7 +42,9 @@
+ 
+ 
+ def test_origin_adoption_and_replay(board):
+-    first = admit(board, origin_intent=origin('origin-0001'))
++    from tests.hermes_cli.test_kanban_selfwork_entry import register_chat
++    chat = register_chat(kb.kanban_home(), '20261123_120000_intake')
++    first = admit(board, session_id=chat, origin_intent=origin('origin-0001'))
+     second = admit(board, 'request-0002', origin_intent=origin('origin-0002', 's_second'))
+     third = admit(board, 'request-0003', origin_intent=origin('origin-0003', 's_second'))
+     assert first['task_id'] == second['task_id'] == third['task_id']
+diff --git a/tests/hermes_cli/test_kanban_selfwork_nochat.py b/tests/hermes_cli/test_kanban_selfwork_nochat.py
+index fe4066c1370..58be39310be 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_nochat.py
++++ b/tests/hermes_cli/test_kanban_selfwork_nochat.py
+@@ -14,39 +14,44 @@
+ @pytest.fixture
+ def request_envelope(world, tmp_path):
+     (tmp_path / 'config.yaml').write_text(json.dumps({'kanban': {'self_work': {
+-        'home': {'gateway': 'owner', 'profile': 'default', 'board': 'default'}}}}), encoding='utf-8')
++        'home': {'gateway': 'owner', 'profile': 'default', 'board': 'default'}},
++        'sync': {'enabled': True}}}), encoding='utf-8')
+     world['action'] = 'selfwork-create'
+     world['args'].pop('origin')
+     world['args']['create'].pop('session_id')
+     world['args']['create'].update(self_work=entry.support.declaration(), requires=[])
++    from hermes_cli.kanban_sync_client import ensure_identity
++    with kbc.connect_closing() as conn:
++        ensure_identity(conn, 'default', 'owner')
+     return world
+ 
+ 
++@pytest.fixture
++def owned_envelope(request_envelope):
++    """Positive replay/render checks need a real durable origin, unlike no-chat refusal."""
++    request_envelope['args']['origin'] = {'gateway': 'origin', 'profile': 'work', 'session': 'original'}
++    request_envelope['args']['create']['session_id'] = 'creator'
++    return request_envelope
++
++
+ def invoke(request, monkeypatch, capsys):
+     return courier.invoke(request, monkeypatch, capsys, command='selfwork-create')
+ 
+ 
+-def test_nochat_create_append_replay_without_ambient_inheritance(request_envelope, monkeypatch, capsys):
++def test_nochat_refuses_without_ambient_inheritance(request_envelope, monkeypatch, capsys):
+     monkeypatch.setenv('HERMES_TENANT', 'ambient-tenant')
+     monkeypatch.setenv('HERMES_SESSION_ID', 'ambient-session')
+     monkeypatch.setenv('HERMES_ORIGIN_SESSION', 'ambient-origin')
+     first = invoke(request_envelope, monkeypatch, capsys)
+-    assert first.get('created') is True, first
+-    assert first['handoff_complete'] is True
+-    assert first['subscribed'] is False
++    assert not first.get('created') and first['handoff_complete'] is False, first
+     request_envelope['id'] = 'request-owner-002'
+     request_envelope['args']['create']['title'] = 'Additional evidence'
+     second = invoke(request_envelope, monkeypatch, capsys)
+-    assert second.get('disposition') == 'append', second
+-    assert second['task_id'] == first['task_id']
+-    assert invoke(request_envelope, monkeypatch, capsys)['replayed'] is True
++    assert not second.get('created') and not second.get('replayed'), second
++    assert not invoke(request_envelope, monkeypatch, capsys).get('replayed')
+     with kbc.connect_closing() as conn:
+-        task = kb.get_task(conn, first['task_id'])
+-        assert task.session_id is None
+-        assert task.tenant != 'ambient-tenant'
+-        assert task.created_by == 'gw:origin'
+-        assert len(kb.list_tasks(conn)) == 1
+-        assert len(kb.list_comments(conn, task.id)) == 1
++        assert not kb.list_tasks(conn)
++        assert conn.execute('SELECT COUNT(*) FROM task_events').fetchone()[0] == 0
+         assert conn.execute('SELECT COUNT(*) FROM kanban_notify_subs').fetchone()[0] == 0
+         # Origin and sync tables are lazy; absence also proves no rows.
+         for table in ('origin_creation_intents', 'task_chat_links'):
+@@ -68,7 +73,8 @@
+ 
+ 
+ @pytest.mark.parametrize('entry_path', ['cli', 'tool'])
+-def test_postcommit_selfwork_error_stays_pending_then_replays(request_envelope, monkeypatch, capsys, entry_path):
++def test_postcommit_selfwork_error_stays_pending_then_replays(owned_envelope, monkeypatch, capsys, entry_path):
++    request_envelope = owned_envelope
+     from hermes_cli import kanban_selfwork as policy, kanban_selfwork_owner as owner
+     from hermes_cli.kanban_selfwork_receiver import receive
+     render = owner._render
+@@ -84,7 +90,7 @@
+     monkeypatch.setattr(owner, '_render', render)
+     replay = call()
+     assert replay['replayed'] is True
+-    assert replay['handoff_complete'] is True
++    assert replay['handoff_complete'] is False  # foreign origin binding is still pending
+     with kbc.connect_closing() as conn:
+         assert len(kb.list_tasks(conn)) == 1
+ 
+@@ -119,7 +125,8 @@
+         assert not kb.list_tasks(conn)
+ 
+ 
+-def test_replay_binds_sender_and_revalidates_home(request_envelope, tmp_path, monkeypatch, capsys):
++def test_replay_binds_sender_and_revalidates_home(owned_envelope, tmp_path, monkeypatch, capsys):
++    request_envelope = owned_envelope
+     first = invoke(request_envelope, monkeypatch, capsys)
+     assert first.get('created') is True, first
+     assert invoke(request_envelope, monkeypatch, capsys)['replayed'] is True
+diff --git a/tests/hermes_cli/test_kanban_selfwork_outbound.py b/tests/hermes_cli/test_kanban_selfwork_outbound.py
+index 6e128d2d1bd..8e0f30346c0 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_outbound.py
++++ b/tests/hermes_cli/test_kanban_selfwork_outbound.py
+@@ -38,7 +38,12 @@
+     assert argv[2:6] == ['owner', 'tasks', 'work/incidents', 'selfwork-create']
+     assert body['create']['self_work'] == entry.support.declaration()
+     assert body['create']['board'] == 'incidents'
+-    assert 'origin' not in body
++    if surface == 'cli':
++        assert body['origin'] == {'gateway': 'origin', 'profile': 'default',
++                                  'session': '20261123_120000_selfwork'}
++        assert body['create']['session_id'] == body['origin']['session']
++    else:
++        assert 'origin' not in body
+ 
+ 
+ def test_full_payload_and_destination_bound_retry(sender):
+diff --git a/tests/hermes_cli/test_kanban_selfwork_owner.py b/tests/hermes_cli/test_kanban_selfwork_owner.py
+index 10824eb705e..408e1fcccca 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_owner.py
++++ b/tests/hermes_cli/test_kanban_selfwork_owner.py
+@@ -17,8 +17,13 @@
+ 
+ def test_real_courier_cli_create_append_and_replay(world, tmp_path, monkeypatch, capsys):
+     (tmp_path / 'config.yaml').write_text(json.dumps({'kanban': {'self_work': {
+-        'home': {'gateway': 'owner', 'profile': 'default', 'board': 'default'}}}}), encoding='utf-8')
++        'home': {'gateway': 'owner', 'profile': 'default', 'board': 'default'}},
++        'sync': {'enabled': True}}}), encoding='utf-8')
+     world['args']['create'].update(self_work=entry.support.declaration(), requires=[])
++    from hermes_cli.kanban_sync_client import ensure_identity
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing() as conn:
++        ensure_identity(conn, 'default', 'owner')
+     first = courier_support.invoke(world, monkeypatch, capsys)
+     assert first.get('created') is True, first
+     world['id'] = 'request-owner-002'
+@@ -35,6 +40,8 @@
+ @pytest.fixture
+ def home(local, monkeypatch):
+     root = kb.kanban_home().resolve()
++    for session in ('origin-session', 'second-origin-session'):
++        entry.register_chat(root, session)
+     config = {'kanban': {'self_work': {'home': {'gateway': 'home', 'profile': 'default', 'board': 'default'}}}}
+     monkeypatch.setattr(owner, '_runtime', lambda: (config, 'home', 'default', root))
+     monkeypatch.setattr(kt, '_landing_placement', lambda conn, args, origin, intent, marker, runs, **kw: (None, runs))
+diff --git a/tests/hermes_cli/test_kanban_selfwork_producer.py b/tests/hermes_cli/test_kanban_selfwork_producer.py
+index 832056bed4d..ce189a133ac 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_producer.py
++++ b/tests/hermes_cli/test_kanban_selfwork_producer.py
+@@ -30,7 +30,7 @@
+ 
+ 
+ @pytest.mark.parametrize('placement', [{}, {'runs_on': ['pool:worker'], 'requires': ['terminal', 'file']}])
+-def test_composed_cli_owner_create_append_and_replay(request_envelope, tmp_path, monkeypatch, capsys, placement):
++def test_composed_cli_owner_refuses_authorityless_create_and_replay(request_envelope, tmp_path, monkeypatch, capsys, placement):
+     from hermes_cli import kanban_selfwork_outbound as outbound
+ 
+     from hermes_cli import kanban_db_sync as sync, kanban_worker_node as wn
+@@ -58,7 +58,8 @@
+         request = {'id': rid, 'from': 'gw:owner', 'to_gw': home['gateway'], 'coll': 'tasks',
+                    'action': 'selfwork-create', 'key': home['profile'] + '/' + home['board'], 'args': body}
+         result = support.invoke(request, monkeypatch, capsys)
+-        assert result.get('handoff_complete') is True, (result, raw_results)
++        assert result == {'status': 'pending', 'code': 'self_work_dispatch_pending', 'handoff_complete': False}, (
++            result, raw_results)
+         requests.append(result)
+         with db:
+             db.execute('INSERT OR REPLACE INTO sent VALUES(?,?,?,?)',
+@@ -82,8 +83,8 @@
+         first = invoke('prepare', {**create_args(), **placement}, monkeypatch, capsys)
+         assert not requests
+         result = invoke('advance', first, monkeypatch, capsys)
+-        assert result['status'] == 'completed', (result, requests)
+-        assert result['disposition'] == 'create'
++        pending = {'version': 1, 'status': 'pending', 'request_id': first['request_id'], 'owner': None}
++        assert result == pending, (result, requests)
+         if placement:
+             for field in ('runs_on', 'requires'):
+                 changed = json.loads(json.dumps(first))
+@@ -92,29 +93,24 @@
+                 assert refused['status'] == 'pending'
+                 assert 'envelope mismatch' in refused['error']
+             assert len(requests) == 1
+-        second = invoke('prepare', {**create_args('page2'), **(
+-            {'runs_on': ['linux'], 'requires': []} if placement else {})}, monkeypatch, capsys)
+-        appended = invoke('advance', second, monkeypatch, capsys)
+-        assert appended['disposition'] == 'append', appended
+-        assert appended['owner'] == result['owner']
+-        assert invoke('advance', second, monkeypatch, capsys) == appended
+-        # Lost courier cache after commit replays the same intake journal receipt.
++        # A headless producer carries no registered chat or native grant. Neither
++        # courier authentication, execution placement nor repeated delivery grants
++        # permission to create, and a pending receipt must never become success.
++        assert invoke('advance', first, monkeypatch, capsys) == pending
+         with db:
+             db.execute('DELETE FROM sent')
+-        assert invoke('advance', second, monkeypatch, capsys) == appended
+-        assert requests[-1]['replayed'] is True
++        assert invoke('advance', first, monkeypatch, capsys) == pending
++        assert len(requests) == 3
++        assert len(raw_results) == 3
++        for raw in raw_results:
++            error = json.loads(raw)
++            assert not error.get('created'), error
++            assert 'authority' in error['error'], error
+         with kbc.connect_closing() as conn:
+-            tasks = kb.list_tasks(conn)
+-            assert len(tasks) == 1
+-            assert tasks[0].idempotency_key == 'page1'
+-            assert 'immutable manifest page page1' in tasks[0].body
+-            if placement:
+-                row = conn.execute('SELECT runs_on,requires FROM tasks WHERE id=?', (tasks[0].id,)).fetchone()
+-                assert json.loads(row[0]) == ['pool:worker']
+-                assert set(json.loads(row[1])) == {'terminal', 'file'}
+-            notes = kb.list_comments(conn, tasks[0].id)
+-            assert len(notes) == 1
+-            assert 'immutable manifest page page2' in notes[0].body
++            assert not kb.list_tasks(conn)
++            for table in ('comments', 'task_events', 'kanban_notify_subs', 'self_work_intake'):
++                if conn.execute('SELECT 1 FROM sqlite_master WHERE name=?', (table,)).fetchone():
++                    assert conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 0
+     finally:
+         db.close()
+ 
+diff --git a/tests/hermes_cli/test_kanban_selfwork_tenant.py b/tests/hermes_cli/test_kanban_selfwork_tenant.py
+index 3bb27679794..64c20a4823b 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_tenant.py
++++ b/tests/hermes_cli/test_kanban_selfwork_tenant.py
+@@ -26,7 +26,8 @@
+     for tenant in ('tenant-a', 'tenant-b'):
+         monkeypatch.setenv('HERMES_TENANT', tenant)
+         # Ordinary product creation establishes the existing public-tool contract.
+-        product = json.loads(kt._handle_create({'title': 'Product ' + tenant, 'requires': [], 'placement': 'local'}))
++        product = json.loads(kt._handle_create({'title': 'Product ' + tenant, 'requires': [], 'placement': 'local',
++                                               'session_id': '20261123_120000_selfwork'}))
+         assert kb.get_task(local, product['task_id']).tenant == tenant
+         receipts.append(json.loads(kt._handle_create({'title': 'Finding ' + tenant, 'requires': [],
+                           **({'tenant': tenant} if explicit else {}),
+diff --git a/tests/hermes_cli/test_kanban_swarm_authority.py b/tests/hermes_cli/test_kanban_swarm_authority.py
+new file mode 100644
+index 00000000000..788f27cd737
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_swarm_authority.py
+@@ -0,0 +1,55 @@
++"""Swarm front door must not create an authority-less fan-out."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_create_authority import CreateAuthorityRefused, has_authority
++from hermes_cli.kanban_swarm import create_swarm, SwarmWorkerSpec
++from tests.hermes_cli.test_kanban_create_scope_authority import home as _home, _seed_session
++
++home = _home
++
++
++def _create(conn):
++    return create_swarm(conn, goal='bounded research', workers=[SwarmWorkerSpec(profile='default', title='Research', body='bounded investigation')],
++                        verifier_assignee='default', synthesizer_assignee='default', created_by='default')
++
++
++def test_swarm_unknown_agent_session_rolls_back_entire_graph(home, monkeypatch):
++    monkeypatch.setenv('HERMES_SESSION_ID', 'unknown-agent')
++    with kbc.connect_closing() as conn:
++        with pytest.raises(CreateAuthorityRefused):
++            _create(conn)
++        assert not conn.execute('SELECT 1 FROM tasks').fetchone()
++
++
++@pytest.mark.parametrize('registered', [False, True])
++def test_decomposition_requires_durable_authority_atomically(home, monkeypatch, registered):
++    from hermes_cli.kanban_db_graph import decompose_triage_task
++    chat = '20261123_110000_456def'
++    if registered:
++        _seed_session(home, chat)
++    monkeypatch.setenv('HERMES_SESSION_ID', chat)
++    with kbc.connect_closing() as conn:
++        root = kb.create_task(conn, title='triage source', assignee='default', triage=True)
++        args = dict(root_assignee='default', children=[{'title': 'bounded child', 'assignee': 'default'}])
++        if not registered:
++            with pytest.raises(CreateAuthorityRefused):
++                decompose_triage_task(conn, root, **args)
++            assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++            assert kb.get_task(conn, root).status == 'triage'
++        else:
++            children = decompose_triage_task(conn, root, **args)
++            assert children and all(has_authority(conn, tid, None) for tid in children)
++
++
++def test_swarm_keeps_registered_chat_authority_after_root_finishes(home, monkeypatch):
++    chat = '20261123_110000_123abc'
++    _seed_session(home, chat)
++    monkeypatch.setenv('HERMES_SESSION_ID', chat)
++    with kbc.connect_closing() as conn:
++        result = _create(conn)
++        assert kb.get_task(conn, result.root_id).status == 'done'
++        for tid in [*result.worker_ids, result.verifier_id, result.synthesizer_id]:
++            assert has_authority(conn, tid, None)
++            assert conn.execute('SELECT session_id FROM tasks WHERE id=?', (tid,)).fetchone()[0] == chat
+diff --git a/tests/hermes_cli/test_kanban_worker_node.py b/tests/hermes_cli/test_kanban_worker_node.py
+index 1fae48b6812..36e7ecfcd60 100644
+--- a/tests/hermes_cli/test_kanban_worker_node.py
++++ b/tests/hermes_cli/test_kanban_worker_node.py
+@@ -39,6 +39,9 @@
+     def __init__(self, root, name, svc, monkeypatch, *, pickup):
+         self.home, self.name, self.svc, self.mp = root / name / ".hermes", name, svc, monkeypatch
+         self.home.mkdir(parents=True)
++        # Durable create authority needs a genuinely registered owning chat in this gateway's own state.db.
++        from tests.tools.test_kanban_create_overlap import register_chat
++        self.chat = register_chat(self.home, f"20261123_120000_{name.replace('-', '_')}_owner")
+         self.enter()
+         from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
+         (self.home / "config.yaml").write_text(
+@@ -50,6 +53,7 @@
+ 
+     def enter(self):
+         self.mp.setenv("HERMES_HOME", str(self.home))
++        self.mp.setenv("HERMES_SESSION_ID", self.chat)
+         sync.set_lease_client(ksc.HubLeaseClient(self.svc.hub(self.name)))
+         wn.set_registry_fetch(lambda: {"me": self.name, "machines": seen_now(MACHINES.values())})
+         return self.conn if hasattr(self, "conn") else None
+diff --git a/tests/hermes_cli/test_origin_worker_custody.py b/tests/hermes_cli/test_origin_worker_custody.py
+index 0e1ef086acb..b0ff9f63e9b 100644
+--- a/tests/hermes_cli/test_origin_worker_custody.py
++++ b/tests/hermes_cli/test_origin_worker_custody.py
+@@ -30,7 +30,8 @@
+     with kbc.connect_closing() as conn:
+         sync.set_mode(conn, 'primary')
+         with interactive_capture(home, fixtures.CHAT) as captured:
+-            parent = kb.create_task(conn, title='root', assignee='default', native_origin=captured)
++            parent = kb.create_task(conn, title='root', assignee='default', session_id=fixtures.CHAT,
++                                    native_origin=captured)
+         assert native._receipt(conn, parent) is not None
+         task = kb.claim_task(conn, parent, claimer='fixture-lock', ttl_seconds=3600)
+         assert task is not None
+diff --git a/tests/tools/test_kanban_create_overlap.py b/tests/tools/test_kanban_create_overlap.py
+index 44c584d8873..6065f1d3ea3 100644
+--- a/tests/tools/test_kanban_create_overlap.py
++++ b/tests/tools/test_kanban_create_overlap.py
+@@ -22,6 +22,17 @@
+             "Metta-AI/unconventional-collab. Checked this turn: current PLAN.md read via gh.")
+ 
+ 
++def register_chat(home, session="20261123_120000_overlap_caller"):
++    """Persist the human caller, not merely a plausible-looking session ID."""
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(session, source="desktop")
++    finally:
++        db.close()
++    return session
++
++
+ @pytest.fixture
+ def home(tmp_path, monkeypatch):
+     h = tmp_path / ".hermes"
+@@ -35,6 +46,7 @@
+     monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(h))
+     return h
+ 
+ 
+diff --git a/tests/tools/test_kanban_create_overlap_race.py b/tests/tools/test_kanban_create_overlap_race.py
+index 60d96020065..aa3fb6b5470 100644
+--- a/tests/tools/test_kanban_create_overlap_race.py
++++ b/tests/tools/test_kanban_create_overlap_race.py
+@@ -83,6 +83,8 @@
+ 
+ 
+ def _spawn(tmp_path, sync, role, entry, cid):
++    # Each contender runs as its own durably registered human chat.
++    helpers.register_chat(Path(os.environ["HERMES_HOME"]), f"chat-{entry}-{cid}")
+     env = {**os.environ, "HERMES_HOME": os.environ["HERMES_HOME"], "HERMES_HUB_STATE": str(tmp_path / "hub-state"),
+            "PYTHONPATH": os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")]),
+            "HERMES_SESSION_ID": f"chat-{entry}-{cid}"}
+diff --git a/tests/tools/test_kanban_create_overlap_roles.py b/tests/tools/test_kanban_create_overlap_roles.py
+index 49b638a094b..1c8365adae5 100644
+--- a/tests/tools/test_kanban_create_overlap_roles.py
++++ b/tests/tools/test_kanban_create_overlap_roles.py
+@@ -44,6 +44,8 @@
+     monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(h))
+     assert str(kb.kanban_db_path()).startswith(str(tmp_path))
+     return h
+ 
+diff --git a/tests/tools/test_kanban_create_overlap_same_creator.py b/tests/tools/test_kanban_create_overlap_same_creator.py
+index e43dfea3c5d..ac05aa0e056 100644
+--- a/tests/tools/test_kanban_create_overlap_same_creator.py
++++ b/tests/tools/test_kanban_create_overlap_same_creator.py
+@@ -221,8 +221,10 @@
+     monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(h)
+     with kbc.connect_closing() as conn:
+-        creator = kb.create_task(conn, title="Review PR #2110 at exact head", assignee="default")
++        creator = kb.create_task(conn, title="Review PR #2110 at exact head", assignee="default", session_id=chat)
+         assert kb.claim_task(conn, creator) is not None
+     monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
+     return creator
+diff --git a/tests/tools/test_kanban_create_overlap_same_creator_guards.py b/tests/tools/test_kanban_create_overlap_same_creator_guards.py
+index 960445895a4..5fc8e735fd0 100644
+--- a/tests/tools/test_kanban_create_overlap_same_creator_guards.py
++++ b/tests/tools/test_kanban_create_overlap_same_creator_guards.py
+@@ -139,8 +139,10 @@
+     monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(h)
+     with kbc.connect_closing() as conn:
+-        creator = kb.create_task(conn, title="Review PR #2110 at exact head", assignee="default")
++        creator = kb.create_task(conn, title="Review PR #2110 at exact head", assignee="default", session_id=chat)
+         assert kb.claim_task(conn, creator) is not None
+     monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
+     return creator
+diff --git a/tests/tools/test_kanban_create_overlap_url_slug.py b/tests/tools/test_kanban_create_overlap_url_slug.py
+index 48631ed972e..0c9e32b4e8d 100644
+--- a/tests/tools/test_kanban_create_overlap_url_slug.py
++++ b/tests/tools/test_kanban_create_overlap_url_slug.py
+@@ -94,6 +94,8 @@
+     monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(h))
+     return h
+ 
+ 
+diff --git a/tests/tools/test_kanban_create_priority_inheritance.py b/tests/tools/test_kanban_create_priority_inheritance.py
+index 1b68e4c3883..1d9b7053b39 100644
+--- a/tests/tools/test_kanban_create_priority_inheritance.py
++++ b/tests/tools/test_kanban_create_priority_inheritance.py
+@@ -27,7 +27,9 @@
+                                            'directory': str(home / 'capture')}}}
+     session = runtime.activate(config, home=home, board='default', source_gateway='test', board_uid='board')
+     monkeypatch.setenv('HERMES_KANBAN_TASK', creator)
+-    monkeypatch.setenv('HERMES_SESSION_ID', helpers.WORKER)
++    # A missing creator on this board still has a genuine creating chat. The
++    # absent creator remains in the capture; its priority must stay unknown.
++    monkeypatch.setenv('HERMES_SESSION_ID', helpers.WORKER if creator_present else helpers.CHAT)
+     try:
+         args = {'title': 'child', 'assignee': 'default', 'requires': [], 'placement': 'local'}
+         if argument != 'omitted':
+diff --git a/tests/tools/test_kanban_creation_audit.py b/tests/tools/test_kanban_creation_audit.py
+index f1b3eafe21e..2e9da51c593 100644
+--- a/tests/tools/test_kanban_creation_audit.py
++++ b/tests/tools/test_kanban_creation_audit.py
+@@ -30,6 +30,10 @@
+     monkeypatch.setattr(placement.reg, "self_gateway", lambda: "hub")
+     monkeypatch.setattr(kt, "_persisted_identity", lambda: "specialist" if case == "implicit-assignee" else "default")
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from hermes_constants import get_hermes_home
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(get_hermes_home(), "20261123_120000_audit_owner")
++    monkeypatch.setenv("HERMES_SESSION_ID", chat)
+     args = {"title": "Analyze public data", "requires": []}
+     project_id = None
+     if case in {"inherited-project", "empty-project"}:
+@@ -38,7 +42,7 @@
+         with projects_db.connect_closing() as conn:
+             project_id = projects_db.create_project(conn, name="Audit", primary_path=str(repo))
+         with kbc.connect() as conn:
+-            parent = kb.create_task(conn, title="Project owner", assignee="default", project_id=project_id)
++            parent = kb.create_task(conn, title="Project owner", assignee="default", project_id=project_id, session_id=chat)
+         monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+         if case == "empty-project":
+             args["project"] = ""
+diff --git a/tests/tools/test_kanban_cross_board_creator_chats.py b/tests/tools/test_kanban_cross_board_creator_chats.py
+index 7008d67d70f..f129af5fefc 100644
+--- a/tests/tools/test_kanban_cross_board_creator_chats.py
++++ b/tests/tools/test_kanban_cross_board_creator_chats.py
+@@ -182,13 +182,21 @@
+     assert placed == []
+ 
+ 
+-def test_deferred_worker_child_of_an_unresolved_creator_records_no_origin(placed, monkeypatch):
++def test_deferred_worker_child_of_an_unresolved_creator_is_refused(placed, monkeypatch):
++    """No creator chat means no authority: the deferred create is refused and rolled back, with no
++    forwarding state, no forward sent, and no fabricated origin."""
+     from hermes_cli import kanban_placement as kp
+     from hermes_cli import kanban_placement_forward as kpf
+     monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "test defer"})
+     with kbc.connect_closing() as conn:
+         creator = kb.create_task(conn, title="unowned creator", assignee="default", session_id=WORKER)
+-    out = _place(creator, monkeypatch)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++    out = json.loads(tools._handle_create({"title": "routed child", "assignee": "default", "requires": []}))
++    assert out.get("ok") is not True and "task_id" not in out, out
++    assert "scope_authority_missing" in out["error"] or "scope authority" in out["error"]
++    assert placed == []
+     with kbc.connect_closing() as conn:
+-        st = kpf.state(conn, out["task_id"])
+-    assert (st["target"], st["origin_session"]) == ("hub", None)
++        assert [t.id for t in kb.list_tasks(conn)] == [creator]
++        assert not conn.execute("SELECT 1 FROM kanban_notify_subs").fetchall()
++        assert not conn.execute("SELECT 1 FROM task_chat_links").fetchall()
++        assert kpf.state(conn, creator) is None or kpf.state(conn, creator).get("origin_session") is None
+diff --git a/tests/tools/test_kanban_explicit_board_pin.py b/tests/tools/test_kanban_explicit_board_pin.py
+index b3ae28ef412..599af50e47f 100644
+--- a/tests/tools/test_kanban_explicit_board_pin.py
++++ b/tests/tools/test_kanban_explicit_board_pin.py
+@@ -26,8 +26,11 @@
+         paths[own_board].parent.symlink_to(backing, target_is_directory=True)
+     for slug in paths:
+         kb.create_board(slug)
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(tmp_path, "20261123_120000_worker_owner")
++    monkeypatch.setenv("HERMES_SESSION_ID", chat)
+     with closing(kbc.connect(board=own_board)) as conn:
+-        tid = kb.create_task(conn, title="worker", assignee="test-worker")
++        tid = kb.create_task(conn, title="worker", assignee="test-worker", session_id=chat)
+     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(paths[own_board]))
+     # A stale current-board hint must not override the database pin.
+diff --git a/tests/tools/test_kanban_hub_admission_tool.py b/tests/tools/test_kanban_hub_admission_tool.py
+index b3fbfb1c5b4..05d393622ad 100644
+--- a/tests/tools/test_kanban_hub_admission_tool.py
++++ b/tests/tools/test_kanban_hub_admission_tool.py
+@@ -44,6 +44,9 @@
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)
+     monkeypatch.setattr(kt, "_persisted_identity", lambda: "default")
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(kanban_home, "20261123_120000_hub_admission_owner")
++    monkeypatch.setenv("HERMES_SESSION_ID", chat)
+ 
+     def use(gateway):
+         monkeypatch.setattr(placement.reg, "self_gateway", lambda: gateway)
+@@ -136,7 +139,7 @@
+ 
+ 
+ @pytest.mark.parametrize("admit", [True, False])
+-def test_tool_courier_create_landing_on_hub_is_judged(on_gateway, admit):
++def test_tool_courier_create_landing_on_hub_is_judged(synced, on_gateway, admit):
+     """A routed create (macbook→hub auto route) is judged on the hub before its txn; a deny
+     re-enrolls it in the pool with requires hub:write (spec owner 11-12)."""
+     judge = on_gateway("hub")
+@@ -159,7 +162,7 @@
+ 
+ 
+ @pytest.mark.parametrize("first", [False, True])
+-def test_tool_courier_replay_reuses_the_first_landing(on_gateway, first):
++def test_tool_courier_replay_reuses_the_first_landing(synced, on_gateway, first):
+     """Review t_01a1ced25af29218: a re-applied request whose verdict flipped (an unavailable deny is
+     not cached) rebuilt a different envelope and raised origin_creation_conflict."""
+     judge = on_gateway("hub")
+diff --git a/tests/tools/test_kanban_lanes_tool_create.py b/tests/tools/test_kanban_lanes_tool_create.py
+index 145049df507..05abc710517 100644
+--- a/tests/tools/test_kanban_lanes_tool_create.py
++++ b/tests/tools/test_kanban_lanes_tool_create.py
+@@ -19,9 +19,11 @@
+ 
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(home, "20261123_120000_worker_owner")
+     conn = kbc.connect()
+     try:
+-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
++        tid = kb.create_task(conn, title="worker-test", assignee="test-worker", session_id=chat)
+         kb.claim_task(conn, tid)
+         run_id = kb._current_run_id(conn, tid)
+     finally:
+diff --git a/tests/tools/test_kanban_persisted_identity.py b/tests/tools/test_kanban_persisted_identity.py
+index 3ead2924844..4894ce550b1 100644
+--- a/tests/tools/test_kanban_persisted_identity.py
++++ b/tests/tools/test_kanban_persisted_identity.py
+@@ -72,6 +72,9 @@
+     for name in ("alpha", "beta", "alpha"):
+         token = set_hermes_home_override(root / "profiles" / name)
+         try:
++            from tests.tools.test_kanban_create_overlap import register_chat
++            chat = register_chat(root / "profiles" / name, f"20261123_120000_{name}_owner")
++            monkeypatch.setenv("HERMES_SESSION_ID", chat)
+             out = json.loads(kt._handle_comment({"task_id": tid, "body": f"from {name}"}))
+             assert out["ok"], out
+             assert _last_comment_author(tid) == name
+diff --git a/tests/tools/test_kanban_provenance.py b/tests/tools/test_kanban_provenance.py
+index e3c66095be2..09aa36fffd8 100644
+--- a/tests/tools/test_kanban_provenance.py
++++ b/tests/tools/test_kanban_provenance.py
+@@ -21,10 +21,12 @@
+                           user_id="user", notifier_profile="default", delivery_mode="notify",
+                           delivery_metadata={"scope_id": "guild", "parent_chat_id": "forum"})
+         expected = kn.list_notify_subs(conn, owner)[0]
+-    if explicit:
+-        state = SessionDB(db_path=tmp_path / "state.db")
+-        state.create_session(explicit, source="cli")
+-        state.close()
++    # The create guard needs a registered durable chat: seed the owner's chat (and any explicit one) in state.db.
++    state = SessionDB(db_path=tmp_path / "state.db")
++    for registered in ("durable", explicit):
++        if registered:
++            state.create_session(registered, source="cli")
++    state.close()
+     monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
+     monkeypatch.setenv("HERMES_SESSION_ID", "ephemeral")
+     monkeypatch.setattr(async_delegation, "_current_origin_session_id", lambda: "api-origin")
+@@ -40,9 +42,12 @@
+         child = kb.get_task(conn, result["task_id"])
+         assert child.session_id == (explicit or "durable")
+         subs = kn.list_notify_subs(conn, child.id)
+-        assert len(subs) == 1
++        inherited = [s for s in subs if s["chat_id"] == expected["chat_id"]]
++        assert len(inherited) == 1
+         for key in ("platform", "chat_id", "user_id", "delivery_mode", "delivery_metadata", "notifier_profile"):
+-            assert subs[0][key] == expected[key]
++            assert inherited[0][key] == expected[key]
++        # The registered chat (explicit, else the owner's durable one) adds its own owning anchor beside the passive policy.
++        assert sorted(s["chat_id"] for s in subs if s is not inherited[0]) == [explicit or "durable"]
+         assert bool(conn.execute("SELECT 1 FROM task_links WHERE child_id = ?", (child.id,)).fetchone()) == linked
+ 
+ 
+@@ -53,16 +58,23 @@
+ 
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    from gateway.session_context import scoped_current_session_id
+     kb.init_db()
++    state = SessionDB(db_path=tmp_path / "state.db")
++    state.create_session("anchor-session", source="discord")  # registered chat: the create guard's authority
++    state.close()
+     tokens = set_session_vars(platform="discord", chat_id="thread", chat_type="thread",
+                              scope_id="guild", parent_chat_id="forum", profile="default")
+     try:
+-        result = json.loads(kt._handle_create(dict(title="direct", assignee="default")))
++        with scoped_current_session_id("anchor-session"):
++            result = json.loads(kt._handle_create(dict(title="direct", assignee="default")))
+     finally:
+         clear_session_vars(tokens)
+     assert result["ok"], result
+     with kbc.connect_closing() as conn:
+-        metadata = kn.list_notify_subs(conn, result["task_id"])[0]["delivery_metadata"]
++        subs = [s for s in kn.list_notify_subs(conn, result["task_id"]) if s["chat_id"] == "thread"]
++        assert len(subs) == 1
++        metadata = subs[0]["delivery_metadata"]
+         assert metadata["scope_id"] == "guild"
+         assert metadata["parent_chat_id"] == "forum"
+ 
+@@ -92,8 +104,17 @@
+     with scoped_current_session_id(session_id):
+         result = json.loads(kt._handle_create({"title": "child", "assignee": "default"}))
+     with kbc.connect_closing() as conn:
++        if not persisted:
++            # An unregistered ambient id is neither stamped nor authority: refused, nothing written.
++            assert result.get("ok") is not True and "task_id" not in result, result
++            assert "scope_authority_missing" in result["error"] or "scope authority" in result["error"]
++            assert kb.list_tasks(conn) == []
++            assert not conn.execute("SELECT 1 FROM kanban_notify_subs").fetchall()
++            assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone() \
++                or not conn.execute("SELECT 1 FROM task_chat_links").fetchall()
++            return
+         task = kb.get_task(conn, result["task_id"])
+-    assert task.session_id == (session_id if persisted else None)
++    assert task.session_id == session_id
+ 
+ 
+ def test_tool_create_stamps_request_scoped_session_over_process_env(tmp_path, monkeypatch):
+diff --git a/tests/tools/test_kanban_redaction.py b/tests/tools/test_kanban_redaction.py
+index 2b149e69a32..c2350515c71 100644
+--- a/tests/tools/test_kanban_redaction.py
++++ b/tests/tools/test_kanban_redaction.py
+@@ -31,9 +31,11 @@
+     from hermes_cli import kanban_db_connect as kbc
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(home, "20261123_120000_worker_owner")
+     conn = kbc.connect()
+     try:
+-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
++        tid = kb.create_task(conn, title="worker-test", assignee="test-worker", session_id=chat)
+         kb.claim_task(conn, tid)
+         run_id = kb._current_run_id(conn, tid)
+     finally:
+diff --git a/tests/tools/test_kanban_tools.py b/tests/tools/test_kanban_tools.py
+index f629a94287c..b9474e25b69 100644
+--- a/tests/tools/test_kanban_tools.py
++++ b/tests/tools/test_kanban_tools.py
+@@ -41,6 +41,23 @@
+ # Handler happy paths
+ # ---------------------------------------------------------------------------
+ 
++def _link_creating_chat(conn, task_id, chat):
++    """A chat can own scope without subscribing to delivery (an explicit opt-out)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.profiles import get_active_profile_name
++    from hermes_cli.kanban_db_sync import apply_sync_schema_steps
++    apply_sync_schema_steps(conn)
++    gateway, profile = gateway_names()[0] or "", get_active_profile_name()
++    with kb.write_txn(conn):
++        conn.execute(
++            "INSERT INTO task_chat_links "
++            "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++            "VALUES (?,?,?,?,?,'created',0,unixepoch())",
++            (link_uid(task_id, gateway, profile, chat, "created"), task_id, gateway, profile, chat))
++
++
+ @pytest.fixture
+ def worker_env(monkeypatch, tmp_path):
+     """Simulate being a worker: HERMES_HOME isolated, HERMES_KANBAN_TASK set
+@@ -57,9 +74,11 @@
+     from hermes_cli import kanban_db_connect as kbc
+     kb._INITIALIZED_PATHS.clear()
+     kb.init_db()
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(home, "20261123_120000_worker_owner")
+     conn = kbc.connect()
+     try:
+-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
++        tid = kb.create_task(conn, title="worker-test", assignee="test-worker", session_id=chat)
+         kb.claim_task(conn, tid)
+         run_id = kb._current_run_id(conn, tid)
+     finally:
+@@ -887,7 +906,7 @@
+ @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
+ @pytest.mark.parametrize("target_scoped", [False, True])
+ def test_create_explicit_scratch_ignores_ambient_board_project(
+-    worker_env, tmp_path, explicit, target_scoped,
++    worker_env, tmp_path, monkeypatch, explicit, target_scoped,
+ ):
+     """#106342: an explicit scratch / empty project wins over the project the
+     session's current board (and, when scoped, the target board itself) carries.
+@@ -898,6 +917,8 @@
+ 
+     repo = tmp_path / "repo"
+     repo.mkdir()
++    # This registered chat is also the caller when its creator's board differs.
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261123_120000_worker_owner")
+     with pdb.connect_closing() as pconn:
+         project_id = pdb.create_project(pconn, name="Ambient", primary_path=str(repo))
+     peer = tmp_path / ".hermes" / "profiles" / "peer"
+@@ -1252,6 +1273,17 @@
+     return out
+ 
+ 
++@pytest.fixture
++def unsubscribed_worker_chat(worker_env):
++    """The creator's chat owns scope but has explicitly opted out of delivery."""
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        creator = kb.get_task(conn, worker_env)
++        assert creator is not None
++        _link_creating_chat(conn, worker_env, creator.session_id)
++
++
++@pytest.mark.usefixtures("unsubscribed_worker_chat")
+ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
+     """A gateway session (platform + chat_id set) gets auto-subscribed
+     to its own kanban_create result, and the response surfaces the
+@@ -1285,6 +1317,7 @@
+     assert s["delivery_mode"] == "notify+wake"
+ 
+ 
++@pytest.mark.usefixtures("unsubscribed_worker_chat")
+ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
+     """TUI / desktop sessions don't have a platform/chat_id (single
+     local channel), but the parent process exports HERMES_SESSION_KEY.
+@@ -1315,6 +1348,7 @@
+     assert subs[0]["delivery_mode"] == "notify"
+ 
+ 
++@pytest.mark.usefixtures("unsubscribed_worker_chat")
+ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
+     """CLI / cron / test sessions have no persistent delivery channel.
+     _maybe_auto_subscribe returns False and no row is written."""
+@@ -1335,6 +1369,7 @@
+     assert _list_subs_for_task(d["task_id"]) == []
+ 
+ 
++@pytest.mark.usefixtures("unsubscribed_worker_chat")
+ def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(monkeypatch, worker_env, tmp_path):
+     """#110068: the inherited HERMES_SESSION_KEY can name a session already superseded
+     by a compaction fork. Auto-subscribe must bind to the live continuation tip resolved
+@@ -1429,6 +1464,18 @@
+     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
+ 
++    # The alternate home has its own registered owning chat and creator. A
++    # delivery opt-out is not an ownership opt-out.
++    from tests.tools.test_kanban_create_overlap import register_chat
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++    chat = register_chat(home)
++    kb.init_db()
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title="unsubscribed creator", session_id=chat)
++        _link_creating_chat(conn, creator, chat)
++        kb.claim_task(conn, creator)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
++
+     from tools import kanban_tools as kt
+     out = kt._handle_create({
+         "title": "no sub gated",
+diff --git a/tests/tools/test_kanban_tools_scratch_home_fence.py b/tests/tools/test_kanban_tools_scratch_home_fence.py
+index de0483a2b0f..81b7a6550f4 100644
+--- a/tests/tools/test_kanban_tools_scratch_home_fence.py
++++ b/tests/tools/test_kanban_tools_scratch_home_fence.py
+@@ -137,7 +137,10 @@
+ def test_scratch_home_scope_covers_local_writes_only(monkeypatch, request, layout):
+     """On a scratch home (outside the root, or in its scratch dir): comment and an explicitly local create
+     work; a create with any other placement, archive (may relay home) and origin adoption stay refused."""
+-    real_root, _scratch, tid = request.getfixturevalue(layout)
++    real_root, scratch, tid = request.getfixturevalue(layout)
++    from tests.tools.test_kanban_create_overlap import register_chat
++    chat = register_chat(scratch, "20261123_120000_scratch_owner")
++    monkeypatch.setenv("HERMES_SESSION_ID", chat)
+     monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(real_root))
+     monkeypatch.delenv("HERMES_KANBAN_TASK")  # act as an orchestrator on the scratch board
+     from tools import kanban_tools as kt
+diff --git a/tests/tools/test_kanban_toolset_opt_in.py b/tests/tools/test_kanban_toolset_opt_in.py
+index 591aa030726..0d766ea1eed 100644
+--- a/tests/tools/test_kanban_toolset_opt_in.py
++++ b/tests/tools/test_kanban_toolset_opt_in.py
+@@ -27,6 +27,9 @@
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    from hermes_constants import get_hermes_home
++    from tests.tools.test_kanban_create_overlap import register_chat
++    monkeypatch.setenv("HERMES_SESSION_ID", register_chat(get_hermes_home()))
+     from hermes_cli.config import load_config, save_config
+     from hermes_cli.tools_config import _apply_toolset_change, _get_platform_tools
+     from tools.registry import registry
+diff --git a/tests/tools/test_kanban_worker_created_chats.py b/tests/tools/test_kanban_worker_created_chats.py
+index 2a36aa6eb70..fca87a7a95b 100644
+--- a/tests/tools/test_kanban_worker_created_chats.py
++++ b/tests/tools/test_kanban_worker_created_chats.py
+@@ -117,40 +117,87 @@
+ 
+ 
+ @pytest.mark.parametrize("entry", ["tool", "cli"])
+-@pytest.mark.parametrize("with_creator", [True, False])
+-def test_headless_explicit_origin_is_unresolved_not_resolved(home, monkeypatch, capsys, entry, with_creator):
+-    """A worker receipt named as origin owns nothing: the card must stay discoverable as unresolved."""
++def test_headless_explicit_origin_without_authority_is_refused(home, monkeypatch, capsys, entry):
++    """A worker receipt named as origin owns nothing and no creator task exists: the agent create is refused
++    (nothing written) instead of only recording ``creator_chats_unresolved``."""
+     from hermes_cli import kanban_origin
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
+-    with kbc.connect_closing() as conn:
+-        creator = kb.create_task(conn, title="unowned creator", assignee="default", session_id=WORKER)
+-    if with_creator:
+-        monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
+     monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
+-    child = create(entry, monkeypatch, capsys, origin=f"@session:default@away/{WORKER}")
++    origin = f"@session:default@away/{WORKER}"
++    if entry == "tool":
++        out = tools._handle_create({"title": "child", "assignee": "default", "requires": [],
++                                    "origin_session": origin, "placement": "local"})
++        assert "scope_authority_missing" in out or "scope authority" in out
++    else:
++        parser = argparse.ArgumentParser()
++        cli.build_parser(parser.add_subparsers())
++        args = parser.parse_args(["kanban", "create", "child", "--assignee", "default", "--origin-session", origin])
++        assert cli._cmd_create(args) == 2
++        assert "scope_authority_missing" in capsys.readouterr().err
+     with kbc.connect_closing() as conn:
+-        kinds = [e.kind for e in kb.list_events(conn, child)]
+-        assert "creator_chats_resolved" not in kinds
+-        assert kinds.count("creator_chats_unresolved") == 1
+-        assert not notify.list_notify_subs(conn, child)
++        assert "child" not in [t.title for t in kb.list_tasks(conn)]
+ 
+ 
+-@pytest.mark.parametrize("entry", ["tool", "cli"])
+-def test_unresolved_worker_records_gap_without_a_chat(home, monkeypatch, capsys, entry):
++def refused_create(entry, capsys, origin=None):
++    """Run an agent create that the ownerless-creation guard must refuse; return what the caller saw."""
++    if entry == "tool":
++        out = tools._handle_create({"title": "child", "assignee": "default", "requires": [],
++                                    "origin_session": origin, "placement": "local"})
++        assert json.loads(out).get("ok") is not True, out
++        return out
++    parser = argparse.ArgumentParser()
++    cli.build_parser(parser.add_subparsers())
++    args = parser.parse_args(["kanban", "create", "child", "--assignee", "default", "--json"]
++                             + (["--origin-session", origin] if origin else []))
++    assert cli._cmd_create(args) == 2
++    captured = capsys.readouterr()
++    return captured.out + captured.err
++
++
++def assert_nothing_created(creator):
++    """Refusal rolled back: no child, no subs/links/gap events, no fabricated origin; creator untouched."""
++    with kbc.connect_closing() as conn:
++        assert [t.id for t in kb.list_tasks(conn)] == [creator]
++        assert not conn.execute("SELECT 1 FROM kanban_notify_subs").fetchall()
++        assert not conn.execute("SELECT 1 FROM task_chat_links").fetchall()
++        kinds = [e.kind for e in kb.list_events(conn, creator)]
++        assert "creator_chats_resolved" not in kinds and "creator_chats_unresolved" not in kinds
++
++
++def seed_ownerless_creator(monkeypatch):
+     with kbc.connect_closing() as conn:
+         creator = kb.create_task(conn, title="unowned creator", assignee="default", session_id=WORKER)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (creator,))
++            kb._append_event(conn, creator, 'owner_admitted', {'session_id': WORKER})
+     monkeypatch.setenv("HERMES_KANBAN_TASK", creator)
+     monkeypatch.setenv("HERMES_SESSION_ID", WORKER)
+     monkeypatch.setenv("HERMES_SESSION_KEY", WORKER)
+-    child = create(entry, monkeypatch, capsys)
++    return creator
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++@pytest.mark.parametrize("with_creator", [True])
++def test_headless_explicit_origin_is_unresolved_not_resolved(home, monkeypatch, capsys, entry, with_creator):
++    """A worker receipt named as origin owns nothing, and a durable ownerless creator task alone is not
++    authority: the create is refused and rolled back, never recorded as resolved or as a headless chat."""
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("here", {"here", "away"}))
++    creator = seed_ownerless_creator(monkeypatch)
++    out = refused_create(entry, capsys, origin=f"@session:default@away/{WORKER}")
++    assert "scope_authority_missing" in out or "scope authority" in out
++    assert_nothing_created(creator)
++
++
++@pytest.mark.parametrize("entry", ["tool", "cli"])
++def test_unresolved_worker_records_gap_without_a_chat(home, monkeypatch, capsys, entry):
++    """An ownerless worker's create (no origin at all) is refused; no gap event, link or sub is fabricated."""
++    creator = seed_ownerless_creator(monkeypatch)
++    out = refused_create(entry, capsys)
++    assert "scope_authority_missing" in out or "scope authority" in out
+     with kbc.connect_closing() as conn:
+         links.reconcile(conn, "default", "here", ledger=False)
+-        assert not conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=?", (child,)).fetchall()
+-        assert not notify.list_notify_subs(conn, child)
+-        gaps = [e for e in kb.list_events(conn, child) if e.kind == "creator_chats_unresolved"]
+-        assert len(gaps) == 1
+-        assert gaps[0].payload["task_id"] == child
+-        assert gaps[0].payload["creator_task_id"] == creator
++    assert_nothing_created(creator)
+ 
+ 
+ @pytest.mark.parametrize("entry", ["tool", "cli"])
+diff --git a/tests/tools/test_placement_qualified_callers.py b/tests/tools/test_placement_qualified_callers.py
+index d9d6ddddc02..6365c70a7c6 100644
+--- a/tests/tools/test_placement_qualified_callers.py
++++ b/tests/tools/test_placement_qualified_callers.py
+@@ -87,7 +87,7 @@
+ 
+ 
+ @pytest.mark.parametrize("owner", ["local", "none"])
+-def test_supported_deferred_create_still_records_placeholder(home, monkeypatch, owner):
++def test_deferred_create_requires_a_durable_owner_before_placeholder(home, monkeypatch, owner):
+     tid = creator(monkeypatch)
+     with kbc.connect_closing() as conn:
+         conn.execute("DELETE FROM task_chat_links WHERE task_id=?", (tid,))
+@@ -96,6 +96,12 @@
+             helpers._link(conn, tid, "here", "default", helpers.CHAT)
+     monkeypatch.setattr(kp, "decide", lambda *a, **k: {"where": "local", "defer": "hub", "why": "parents"})
+     out = json.loads(tools._handle_create({"title": "supported deferred child", "requires": []}))
++    if owner == 'none':
++        assert 'no renewable scope authority' in out['error'], out
++        with kbc.connect_closing() as conn:
++            assert not conn.execute("SELECT 1 FROM tasks WHERE title='supported deferred child'").fetchone()
++            assert kpf.state(conn, tid) is None
++        return
+     assert out["ok"] is True, out
+     with kbc.connect_closing() as conn:
+         st = kpf.state(conn, out["task_id"])
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 0de879c1ca7..afd00bd59f4 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1684,6 +1684,7 @@
+                 # Reject a worktree path the dispatcher could never resolve now, to the
+                 # creator, instead of burning spawn retries on it later. [daveey]
+                 validate_workspace=True, validate_skills=True,
++                require_scope_authority=origin_intent is None,  # origin courier checks after binding; no-chat intake must check here
+                 insert_guard=after_create.guard)  # re-checks overlap under the write lock [daveey]
+             if self_work is not None:
+                 from hermes_cli.kanban_selfwork_owner import create
+-- 
+2.43.0
+

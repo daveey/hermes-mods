@@ -1,0 +1,98 @@
+From a2e0c77673f38e784ef7c9fd569ba95bbd9ef657 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:13:32 -0800
+Subject: [PATCH 6176] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit a2e0c77673f38e784ef7c9fd569ba95bbd9ef657.
+
+---
+diff --git a/hermes_cli/session_owner_discovery.py b/hermes_cli/session_owner_discovery.py
+index 42052586739..166e60fb1ea 100644
+--- a/hermes_cli/session_owner_discovery.py
++++ b/hermes_cli/session_owner_discovery.py
+@@ -40,12 +40,15 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import logging
+ import os
+ import time
+ import weakref
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++_log = logging.getLogger(__name__)
++
+ # Total wall-clock spent discovering one write's owner, from the request's point of view.
+ OWNER_DISCOVERY_BUDGET_S = 6.0
+ # Per-read socket deadline: the single read this replaces.
+@@ -177,7 +180,9 @@
+     last identify. A bare ``control_timeout`` is not replayed by Desktop (it reads it as a stall the
+     server already rode out), so a slow restart turned into a
+     manual Retry. Representative observation: loop stalls during a core-update restart caused
+-    an archive to end on ``control_timeout`` after its starting budget expired.
++    on ``control_timeout`` after the full 24 s starting budget). The cost: an owner that answered
++    ``starting`` once and then hangs for good is replayed by Desktop for its restart window (~150 s)
++    before the user sees Retry, instead of ~24 s. Nothing is written either way.
+ 
+     Reads are shared with concurrent callers for the same home (``_shared_read``); the shared
+     read is shielded, so a caller that leaves on its own deadline never cancels it for others."""
+@@ -207,5 +212,6 @@
+         elif not is_transient(discovery):
+             return discovery
+     if settled is not None and is_transient(discovery):
++        _log.info('owner discovery for %s: last read timed out mid-restart; answering %s', home, settled.state)
+         return settled  # still restarting: the retryable verdict Desktop replays
+     return discovery or _timed_out()  # the first read always runs; this only types the result
+diff --git a/tests/hermes_cli/test_session_owner_discovery_starting.py b/tests/hermes_cli/test_session_owner_discovery_starting.py
+index d5f7682d11b..1501f820e5c 100644
+--- a/tests/hermes_cli/test_session_owner_discovery_starting.py
++++ b/tests/hermes_cli/test_session_owner_discovery_starting.py
+@@ -102,6 +102,15 @@
+     assert clock.now - start <= sod.OWNER_STARTING_BUDGET_S
+ 
+ 
++@pytest.mark.asyncio
++async def test_the_newest_restart_verdict_is_the_one_answered(tmp_path, monkeypatch, caplog):
++    clock = _Clock()
++    _reads(monkeypatch, [GatewayDiscovery('draining'), STARTING, TIMEOUT], clock)
++    with caplog.at_level('INFO', logger=sod.__name__):
++        assert await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep) is STARTING
++    assert 'last read timed out mid-restart' in caplog.text
++
++
+ @pytest.mark.asyncio
+ async def test_a_stall_without_a_restart_seen_stays_control_timeout(tmp_path, monkeypatch):
+     clock = _Clock()
+@@ -111,14 +120,16 @@
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_a_start_ending_on_stalls_answers_the_starting_503(tmp_path, monkeypatch):
+-    """The write path: the starting 503 that Desktop's restart replay matches, nothing forwarded."""
++@pytest.mark.parametrize('settling, detail', [(STARTING, sod.STARTING_DETAIL),
++                                              (GatewayDiscovery('draining'), sod.DRAINING_DETAIL)])
++async def test_a_restart_ending_on_stalls_answers_the_restart_503(tmp_path, monkeypatch, settling, detail):
++    """The write path: the restart 503 that Desktop's restart replay matches, nothing forwarded."""
+     from hermes_cli import web_server_sessions
+ 
+     _fast_poll(monkeypatch)
+     monkeypatch.setattr(sod, 'OWNER_STARTING_BUDGET_S', 0.3)
+     request = _standalone_request(monkeypatch, tmp_path)
+-    _reads(monkeypatch, [STARTING, TIMEOUT])
++    _reads(monkeypatch, [settling, TIMEOUT])
+     attempts, connects = [], []
+     monkeypatch.setattr('hermes_cli.gateway_client.connect_gateway', lambda **kw: connects.append(kw))
+     with _held(attempts) as held:
+@@ -128,7 +139,7 @@
+                 request, None, 's1', request_id='req-1', expected_revision=0,
+                 operation='sidebar', payload={'archived': True})
+     assert exc.value.status_code == 503
+-    assert exc.value.detail == sod.STARTING_DETAIL
++    assert exc.value.detail == detail
+     assert len(attempts) == 1 and connects == []
+ 
+ 
+-- 
+2.43.0
+

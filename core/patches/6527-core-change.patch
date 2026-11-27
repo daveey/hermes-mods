@@ -1,0 +1,200 @@
+From 55951e97822d1558342dc00e794a7593cad36adc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:41:09 +0000
+Subject: [PATCH 6527] Refusal boundary for refused providers
+
+Public mirror of source commit 55951e97822d1558342dc00e794a7593cad36adc.
+
+---
+diff --git a/hermes_cli/kanban_refusal_boundary.py b/hermes_cli/kanban_refusal_boundary.py
+index ce070a49fee..01b17f6c266 100644
+--- a/hermes_cli/kanban_refusal_boundary.py
++++ b/hermes_cli/kanban_refusal_boundary.py
+@@ -42,8 +42,8 @@
+ def require_policy(policy, *, model=_UNSET, provider=_UNSET, request=False):
+     """Fresh board read at real owner exec and worker construction, including saved policies.
+ 
+-    ``request=True`` (outbound request): an ended claim (the run's own terminal board tool) is no longer
+-    live, so only the provider fence applies; a live claim gets the full route check."""
++    ``request=True`` (outbound request): the same ended run with no successor claimant may finish its
++    reply on an unrefused provider; a live claim also requires a concrete route, not peer availability."""
+     if policy is None or not getattr(policy, 'kanban_json', None):
+         return
+     from hermes_cli import kanban_db as kb
+@@ -61,7 +61,7 @@
+             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
+                     or task.claim_lock != context['claim_lock'] or run is None
+                     or tuple(run) != ('running', context['claim_lock'], None)):
+-                # Closing reply: only the SAME run, ended by its own terminal tool, with no other claimant,
++                # Closing reply: only the SAME ended run (including reclaim), with no other claimant,
+                 # on an unrefused concrete route. Never reopens tools/work or authorizes another claim.
+                 if (request and task is not None and run is not None
+                         and run['claim_lock'] == context['claim_lock'] and run['ended_at'] is not None
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index daf599babd7..5f5d5e6d6ed 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -453,6 +453,8 @@
+     import time
+     from hermes_cli import kanban_provider_walls as pw
+     # Separate execution is enforced by verdict custody, not model identity.
++    from hermes_cli.kanban_refusal_fallback import refused_providers
++    safety_refused = set(refused_providers(conn, task.id))
+     override = _override(conn, task)
+     # A card's explicit paid class survives review only when no newer handoff
+     # supersedes it. Ordinary review candidates must never select carbon.
+@@ -479,6 +481,9 @@
+ 
+     def _unavailable(model, provider, level="deep"):
+         norm = pw._norm(provider)
++        if norm in safety_refused:
++            _candidate(collector, level, model, norm, now, (), ["safety_refused"])
++            return True  # A cooldown/deadline cannot restore a refused provider's authority.
+         if not norm or norm == "auto":
+             _candidate(collector, level, model, norm, now, (), ["provider_unresolved"])
+             return True
+@@ -515,7 +520,7 @@
+     candidates = independent_routes(set(), cfg, assignee)
+     independent_candidate = False
+     for model, provider in candidates:
+-        independent_candidate = True
++        independent_candidate |= pw._norm(provider) not in safety_refused
+         if _unavailable(model, provider):
+             continue
+         if override and registry_refusal(model, provider, assignee):
+@@ -526,7 +531,7 @@
+         return model, provider, reason
+     # Refused overrides retain their existing registered-deep-only recovery contract.
+     for model, provider in (() if refusal else independent_routes(set(), cfg, assignee, level="standard")):
+-        independent_candidate = True
++        independent_candidate |= pw._norm(provider) not in safety_refused
+         if _unavailable(model, provider, "standard"):
+             continue
+         if override and registry_refusal(model, provider, assignee):
+@@ -537,7 +542,7 @@
+     detail = f"No eligible {levels} review route"
+     if refusal and override:
+         detail = f"review_model {override[0]!r} is refused here ({refusal.code}); {detail}"
+-    if not independent_candidate and not override and not _downstream(task):
++    if not independent_candidate and not override and not _downstream(task) and not safety_refused:
+         # Keep the normal profile/class tier route when no concrete review policy
+         # is configured. Missing attribution must not disable legacy allocation.
+         from hermes_cli.kanban_model_assignment import _assignee_config
+diff --git a/tests/hermes_cli/test_carbon_dispatch.py b/tests/hermes_cli/test_carbon_dispatch.py
+index 8f3be28bb9c..72c606b49ac 100644
+--- a/tests/hermes_cli/test_carbon_dispatch.py
++++ b/tests/hermes_cli/test_carbon_dispatch.py
+@@ -29,6 +29,7 @@
+ @pytest.mark.parametrize("lane", ["ready", "review"])
+ def test_explicit_card_carbon_survives_tiering(monkeypatch, lane):
+     from hermes_cli import kanban_review_model as review
++    monkeypatch.setattr('hermes_cli.kanban_refusal_fallback.refused_providers', lambda *a: [])  # no DB in this unit
+     monkeypatch.setattr(review, "_override", lambda *a: None)
+     assert tier.resolve_model_tier(None, task("class:carbon"), lane=lane, cfg={}) == (
+         "class:carbon", "auto", "class")
+@@ -53,6 +54,7 @@
+ 
+ def test_explicit_review_handoff_carbon_is_honored_without_deep_fallback(monkeypatch):
+     from hermes_cli import kanban_model_assignment as assignment
++    monkeypatch.setattr('hermes_cli.kanban_refusal_fallback.refused_providers', lambda *a: [])  # no DB in this unit
+     from hermes_cli import kanban_review_model as review
+     monkeypatch.setattr(assignment, "_assignee_config", lambda *a: carbon_config())
+     monkeypatch.setattr(review, "_override", lambda *a: ("class:carbon", "auto"))
+diff --git a/tests/hermes_cli/test_kanban_refusal_review_boundary.py b/tests/hermes_cli/test_kanban_refusal_review_boundary.py
+new file mode 100644
+index 00000000000..2640a3228a3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refusal_review_boundary.py
+@@ -0,0 +1,71 @@
++"""Review selection and outbound no-peer-check safety clauses; no provider calls."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent import model_routing_managed as managed
++from agent.model_routing import ModelRoutingError
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_refusal_fallback as refusal
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_refusal_boundary as fixtures
++
++board = fixtures.board
++pools = fixtures.pools
++claimed = fixtures.claimed
++
++
++def test_apply_review_selects_unrefused_qualified_candidate(claimed):
++    conn, task, _ = claimed
++    kb.request_review(conn, task.id)
++    task = kb.claim_review_task(conn, task.id, claimer=kb._claimer_id())
++    tier.apply_model_tier(conn, task, lane='review')
++    assert (task.model_override, task.provider_override) == ('gpt-6-astra', 'openai-codex')
++    assert refusal.refused_providers(conn, task.id) == ['anthropic']
++    assert kb.get_task(conn, task.id).consecutive_failures == 0
++
++
++def test_apply_review_all_candidates_refused_fails_closed(claimed):
++    conn, task, _ = claimed
++    with kb.write_txn(conn):
++        for provider in ('openai-codex', 'xai-oauth'):
++            conn.execute("INSERT INTO task_runs(task_id,status,started_at,ended_at,outcome,metadata) "
++                         "VALUES (?, 'safety_refused', 1, 2, 'safety_refused', ?)",
++                         (task.id, json.dumps({'refused_provider': provider})))
++    kb.request_review(conn, task.id)
++    task = kb.claim_review_task(conn, task.id, claimer=kb._claimer_id())
++    with pytest.raises(review.ReviewModelsExhausted, match='No eligible'):
++        tier.apply_model_tier(conn, task, lane='review')
++    assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='model_tier'", (task.id,)).fetchone()
++
++
++@pytest.mark.parametrize('provider', ['anthropic', '', 'auto', None])
++def test_terminal_request_checks_actual_not_admitted_provider(claimed, monkeypatch, provider):
++    conn, task, context = claimed
++    kb.complete_task(conn, task.id, summary='Fixture completed without provider calls')
++    agent = SimpleNamespace(model='gpt-test', provider=provider,
++                            _kanban_refusal_policy=fixtures.policy_for(context))
++    monkeypatch.setattr(managed, 'managed_config', lambda: None)
++    with pytest.raises(ModelRoutingError, match='refuses execution on'):
++        managed.verify_managed_agent(agent, {'model': 'gpt-test'})
++    agent.provider = 'openai-codex'
++    managed.verify_managed_agent(agent, {'model': 'gpt-test'})
++
++
++@pytest.mark.parametrize('model,provider', [('class:standard', 'openai-codex'), ('gpt-test', 'auto'),
++                                           ('gpt-test', ''), ('gpt-test', None)])
++@pytest.mark.parametrize('path', ['request', 'review'])
++def test_no_peer_check_still_requires_concrete_tuple(claimed, monkeypatch, model, provider, path):
++    from hermes_cli.kanban_refusal_boundary import require_route
++    conn, task, context = claimed
++    if path == 'request':
++        monkeypatch.setattr(managed, 'managed_config', lambda: None)
++        agent = SimpleNamespace(model=model, provider=provider,
++                                _kanban_refusal_policy=fixtures.policy_for(context))
++        with pytest.raises(ModelRoutingError, match='concrete execution route'):
++            managed.verify_managed_agent(agent, {'model': model})
++    else:
++        with pytest.raises(ModelRoutingError, match='concrete execution route'):
++            require_route(conn, task, model, provider, lane='review')
+diff --git a/tests/hermes_cli/test_kanban_review_resolution_receipt.py b/tests/hermes_cli/test_kanban_review_resolution_receipt.py
+index 40ba711506a..7b0872176e7 100644
+--- a/tests/hermes_cli/test_kanban_review_resolution_receipt.py
++++ b/tests/hermes_cli/test_kanban_review_resolution_receipt.py
+@@ -273,11 +273,12 @@
+ def test_calls_have_no_shared_diagnostics(board, monkeypatch, concurrent):
+     from concurrent.futures import ThreadPoolExecutor
+     from types import SimpleNamespace
++    monkeypatch.setattr('hermes_cli.kanban_refusal_fallback.refused_providers', lambda *a: [])  # isolated collector unit
+     routes(monkeypatch)
+     monkeypatch.setattr(review, "_override", lambda *a: None)
+     monkeypatch.setattr(review, "independent_routes", lambda pin, cfg, assignee, **kw: iter([(assignee, "anthropic")]))
+     def resolve(name):
+-        task = SimpleNamespace(assignee=name, model_override=None)
++        task = SimpleNamespace(id=name, assignee=name, model_override=None)
+         collector = {}
+         result = review.resolve_review_model(None, task, {}, collector=collector)
+         assert not hasattr(task, "collector")
+-- 
+2.43.0
+

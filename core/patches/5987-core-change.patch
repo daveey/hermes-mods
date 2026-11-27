@@ -1,0 +1,135 @@
+From 39148b7f9968df66e74bf2a46e314f4f29b37bb0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:52:39 +0000
+Subject: [PATCH 5987] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit 39148b7f9968df66e74bf2a46e314f4f29b37bb0.
+
+---
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+index c276dc19379..44e53d28944 100644
+--- a/hermes_cli/kanban_containment_guard.py
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -77,7 +77,9 @@
+     from hermes_cli.kanban_sync_quarantine import held
+     if held(conn, task_id):
+         return True
+-    columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    # One row for both schemas: this runs as a SQL function on every guarded write, inside sync page applies.
++    from hermes_cli.kanban_table_columns import tables_columns
++    columns, task_columns = tables_columns(conn, "task_events", "tasks")
+     uid = "uid" if "uid" in columns else "NULL AS uid"
+     cursor = conn.execute(f"SELECT {uid},task_id,kind,payload FROM task_events WHERE task_id=? "
+                           "AND kind IN ('contained','containment_released','containment_closed')", (task_id,))
+@@ -88,7 +90,7 @@
+     observed = set()
+     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_observations'").fetchone():
+         observed.update(r[0] for r in conn.execute("SELECT episode FROM containment_observations WHERE task_id=?", (task_id,)))
+-    if "containment_episode" in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++    if "containment_episode" in task_columns:
+         marker = conn.execute("SELECT containment_episode FROM tasks WHERE id=?", (task_id,)).fetchone()
+         if marker and marker[0] is not None:
+             observed.add(marker[0])
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 2f6291ee73a..68de789fec4 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -561,7 +561,16 @@
+ 
+ 
+ def table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+-    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
++    """``PRAGMA table_info`` names, built inside SQLite as ONE row (see kanban_table_columns).
++
++    Order is the pragma scan order (cid) in practice, not a documented SQLite guarantee; ``ORDER BY`` inside the
++    aggregate needs SQLite 3.44. Only install_triggers compares order, and a difference there just rebuilds them.
++
++    apply_remote_changes holds the board write lock for a whole page and reads schemas several times per change;
++    one row per column re-taking the GIL can hold
++    the lock long enough to starve the dispatcher."""
++    row = conn.execute("SELECT json_group_array(name) FROM pragma_table_info(?)", (table,)).fetchone()
++    return json.loads(row[0])
+ 
+ 
+ def captured_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+diff --git a/tests/hermes_cli/test_kanban_sync_apply_schema_reads.py b/tests/hermes_cli/test_kanban_sync_apply_schema_reads.py
+new file mode 100644
+index 00000000000..274ca4f33ba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_apply_schema_reads.py
+@@ -0,0 +1,72 @@
++"""A sync page apply never reads a schema one row per column.
++
++apply_remote_changes holds the board write lock for a whole page. Each
++change re-ran PRAGMA table_info several times plus containment probes. Re-taking
++the GIL for each row delayed dispatch, claims and notifications.
++Schema reads must be the one-row ``pragma_table_info`` form (kanban_table_columns).
++"""
++from hermes_cli import kanban_containment_guard as guard
++from hermes_cli import kanban_db_connect as db
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import kanban_sync_support as support
++
++ME = "macbook"
++
++
++def _changes(n, start=0):
++    return [sync.RemoteChange(start + i + 1, "tasks", f"t_remote_{start + i}", "upsert",
++                              {"created_on": "worker-a2", "title": f"remote {start + i}", "status": "todo",
++                               "created_at": 1_795_000_000_000},
++                              1, "", "worker-a2") for i in range(n)]
++
++
++def _row_per_column_reads(conn, changes, cursor):
++    seen = []
++    conn.set_trace_callback(seen.append)
++    try:
++        sync.apply_remote_changes(conn, changes, new_cursor=cursor, observers=False)
++    finally:
++        conn.set_trace_callback(None)
++    return sum(1 for sql in seen if sql.lstrip().upper().startswith("PRAGMA TABLE_INFO"))
++
++
++def test_row_per_column_schema_reads_do_not_grow_with_page_size(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = db.connect(home / "kanban.db")
++    try:
++        from hermes_cli.kanban_sync_client import ensure_identity
++        ensure_identity(conn, "default", ME)
++        small = _row_per_column_reads(conn, _changes(2), 2)
++        large = _row_per_column_reads(conn, _changes(40, start=100), 200)
++        assert large == small, (small, large)
++        titles = {r[0] for r in conn.execute("SELECT title FROM tasks WHERE id LIKE 't_remote_%'")}
++        assert {"remote 0", "remote 1", "remote 100", "remote 139"} <= titles
++    finally:
++        conn.close()
++
++
++def test_table_columns_keeps_order_and_sees_ddl(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    conn = db.connect(home / "kanban.db")
++    try:
++        legacy = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
++        assert sync.table_columns(conn, "tasks") == legacy
++        assert sync.table_columns(conn, "no_such_table") == []
++        conn.execute("ALTER TABLE task_links ADD COLUMN memo_probe TEXT")
++        assert sync.table_columns(conn, "task_links")[-1] == "memo_probe"
++    finally:
++        conn.close()
++
++
++def test_containment_pending_reads_schemas_in_one_row(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    conn = db.connect(home / "kanban.db")
++    try:
++        seen = []
++        conn.set_trace_callback(seen.append)
++        guard.pending(conn, "t_absent")
++        conn.set_trace_callback(None)
++        assert not [sql for sql in seen if sql.lstrip().upper().startswith("PRAGMA TABLE_INFO")]
++    finally:
++        conn.close()
+-- 
+2.43.0
+

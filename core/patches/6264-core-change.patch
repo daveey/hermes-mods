@@ -1,0 +1,535 @@
+From b83ea120b91b8f43cbddf7dbef4f372c2f0abaed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:56:58 +0000
+Subject: [PATCH 6264] Explicit Carbon routing and model-neutral obligations
+
+Public mirror of source commit b83ea120b91b8f43cbddf7dbef4f372c2f0abaed.
+
+---
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index 7f0e2b17b7c..3c975eee54c 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -8,7 +8,8 @@
+ 
+ from agent.model_routing_state import RoutingState
+ 
+-CLASSES = frozenset({"deep", "standard", "fast"})
++AUTOMATIC_CLASSES = frozenset({"deep", "standard", "fast"})
++CLASSES = AUTOMATIC_CLASSES | {"carbon"}
+ BILLING = frozenset({"subscription", "credit-funded", "metered"})
+ SUBSCRIPTION_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth"})
+ 
+@@ -27,7 +28,7 @@
+ 
+ def exact_class_selector(model):
+     """Policy membership only; callers own normalization, never this predicate."""
+-    return isinstance(model, str) and model in ('class:fast', 'class:standard', 'class:deep')
++    return isinstance(model, str) and model in {f"class:{level}" for level in CLASSES}
+ 
+ 
+ def _validate_route(route):
+@@ -70,7 +71,7 @@
+         raise ModelRoutingError("Unsupported model_routing policy_version")
+     routes = policy.get("routes", {})
+     if not isinstance(routes, dict) or set(routes) - CLASSES:
+-        raise ModelRoutingError("Registry must contain only deep/standard/fast route lists")
++        raise ModelRoutingError("Registry must contain only deep/standard/fast/carbon route lists")
+     for level, entries in routes.items():
+         if not isinstance(entries, list):
+             raise ModelRoutingError(f"{level} routes must be a list")
+@@ -103,11 +104,14 @@
+ 
+ def eligible_routes(policy, level, requirements=None, excluded=(), eligible=None):
+     """Shared billing/capability filter for allocation and non-allocating probes."""
++    explicit = {(r["provider"], r["model"]) for r in policy.get("routes", {}).get("carbon", [])}
+     return [r for r in policy.get("routes", {}).get(level, [])
+             if r.get("eligible") is True and r.get("funding_verified") is True
++            and (level == "carbon" or (r["model"] != "gemini-4-carbon"
++                 and (r["provider"], r["model"]) not in explicit))
+             and (r["provider"], r["model"]) not in excluded
+             and _capable(r, requirements or {})
+-            and (r["billing"] == "subscription" or
++            and (level == "carbon" or r["billing"] == "subscription" or
+                  (policy.get("allow_metered", False) and not policy.get("enforce_subscription_only", False)))
+             and (eligible is None or eligible(r))]
+ 
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index 2717d4bfb3a..4661b6f436e 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -130,13 +130,14 @@
+ 
+ def verify_selected_route(model, provider, metadata, config):
+     """Validate a resolved tuple in its recorded class, not every registry class."""
+-    if not metadata or metadata.get("billing_group") != "subscription":
++    if not metadata or (metadata.get("billing_group") != "subscription"
++                        and metadata.get("requested_class") != "carbon"):
+         raise ModelRoutingError("Managed request lacks verified subscription provenance; recreate runtime")
+     if (metadata.get("selected_model"), metadata.get("selected_provider")) != (model, provider):
+         raise ModelRoutingError("Managed request changed selected route identity")
+     routes = eligible_routes(config["model_routing"], metadata.get("requested_class"))
+     if not any(route["model"] == model and route["provider"] == provider
+-               and route["billing"] == "subscription" for route in routes):
++               and route["billing"] == metadata["billing_group"] for route in routes):
+         raise ModelRoutingError("Managed request route is no longer eligible in its recorded class")
+ 
+ 
+diff --git a/agent/model_routing_request.py b/agent/model_routing_request.py
+index 0c84650baae..fa66d4a21d2 100644
+--- a/agent/model_routing_request.py
++++ b/agent/model_routing_request.py
+@@ -1,7 +1,7 @@
+ """Validate physical class attempts without allocating or changing cached context."""
+ import json
+ 
+-from agent.model_routing import ModelRoutingError, _capable, validate_policy
++from agent.model_routing import ModelRoutingError, _capable, eligible_routes, validate_policy
+ 
+ 
+ _IDENTITY_FIELDS = frozenset({
+@@ -162,11 +162,11 @@
+     validate_policy(policy)
+     requirements = _requirements(agent, request, streaming)
+     routes = policy.get("routes", {}).get(metadata["requested_class"], [])
+-    allowed = [route for route in routes
++    candidates = eligible_routes(policy, metadata["requested_class"])
++    allowed = [route for route in candidates
+                if route["provider"] == agent.provider and route["model"] == agent.model
+                and route.get("eligible") and route.get("funding_verified")
+                and route["billing"] == metadata["billing_group"]
+-               and (route["billing"] == "subscription" or policy.get("allow_metered", False))
+                and _capable(route, requirements)]
+     if not policy.get("enabled") or not allowed:
+         detail = ""
+@@ -183,7 +183,7 @@
+         recoverable = policy.get("enabled") and any(
+             route.get("eligible") and route.get("funding_verified")
+             and route["billing"] == metadata["billing_group"]
+-            and (route["billing"] == "subscription" or policy.get("allow_metered", False))
++            and route in candidates
+             and _capable(route, context_free)
+             and agent._model_routing_context_floor <= route["capabilities"].get("context_tokens", 0)
+             and output_reservation(agent, request) < route["capabilities"].get("context_tokens", 0)
+diff --git a/apps/desktop/src/plugins/kanban/model-override.test.tsx b/apps/desktop/src/plugins/kanban/model-override.test.tsx
+index 923cc4bc2d5..39ab55ee242 100644
+--- a/apps/desktop/src/plugins/kanban/model-override.test.tsx
++++ b/apps/desktop/src/plugins/kanban/model-override.test.tsx
+@@ -16,6 +16,9 @@
+     expect(Array.from(selector.querySelectorAll('option')).every(option => !option.value || option.value.startsWith('class:'))).toBe(true)
+     fireEvent.change(selector, { target: { value: 'class:deep' } })
+     expect(onChange).toHaveBeenLastCalledWith({ effort: '', model: 'class:deep', provider: 'auto' })
++    fireEvent.change(selector, { target: { value: 'class:carbon' } })
++    expect(onChange).toHaveBeenLastCalledWith({ effort: '', model: 'class:carbon', provider: 'auto' })
++    expect(overrideCreateFields({ effort: '', model: 'class:carbon', provider: 'auto' })).toEqual({ model_override: 'class:carbon', provider_override: 'auto' })
+   })
+ 
+   it('does not display or resubmit a historical concrete pin', () => {
+diff --git a/apps/desktop/src/plugins/kanban/model-override.tsx b/apps/desktop/src/plugins/kanban/model-override.tsx
+index e7552bb02a6..5ab92977fb4 100644
+--- a/apps/desktop/src/plugins/kanban/model-override.tsx
++++ b/apps/desktop/src/plugins/kanban/model-override.tsx
+@@ -10,7 +10,7 @@
+ }
+ 
+ export const EMPTY_OVERRIDE: TaskModelOverride = { effort: '', model: '', provider: '' }
+-const CLASSES = ['class:fast', 'class:standard', 'class:deep'] as const
++const CLASSES = ['class:fast', 'class:standard', 'class:deep', 'class:carbon'] as const
+ 
+ export const isInherited = (value: TaskModelOverride): boolean =>
+   !value.model.trim() && !value.provider.trim() && !value.effort.trim()
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index a834672e841..b540ab6ffa4 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -93,9 +93,11 @@
+     cfg = load_tier_config() if cfg is None else cfg
+     from agent.model_routing import is_class_selector
+     default_model = _str(cfg.get("default_model"))
+-    if not is_class_selector(default_model):
++    if not is_class_selector(default_model) or default_model == "class:carbon":
+         default_model = "class:standard"
+     from hermes_cli.kanban_review_model import is_review_run
++    if _str(getattr(task, "model_override", None)) == "class:carbon":
++        return "class:carbon", "auto", "class"
+     if is_review_run(conn, task, lane):
+         from hermes_cli.kanban_review_model import resolve_review_model
+         review = resolve_review_model(conn, task, cfg)
+@@ -114,7 +116,7 @@
+     from agent.model_routing import is_class_selector
+     strong_model = _str(cfg.get("strong_model"))
+     strong: tuple[Optional[str], Optional[str]]
+-    if strong_model and is_class_selector(strong_model):
++    if strong_model and is_class_selector(strong_model) and strong_model != "class:carbon":
+         # An explicit strong tier names its model, so review/retry work no longer follows whatever the
+         # profile's default happens to be (a profile switch once moved 558 strong runs to a GPT).
+         strong = (strong_model, "auto")
+@@ -366,6 +368,8 @@
+ 
+ def _route_from_base(conn, task, base, *, lane, cfg):
+     """:func:`resolve_dispatch_tier` after the tier and ratio choice: the episode, wall and pace moves of *base*."""
++    if base[0] == "class:carbon":
++        return base
+     from hermes_cli.kanban_quota_episode import active, decision
+     _, route = decision(conn, task, lane=lane, cfg=cfg, base=base)
+     if base[2] == 'pinned':
+diff --git a/hermes_cli/kanban_pin_reroute.py b/hermes_cli/kanban_pin_reroute.py
+index bfeca535482..f82cda82c7d 100644
+--- a/hermes_cli/kanban_pin_reroute.py
++++ b/hermes_cli/kanban_pin_reroute.py
+@@ -189,7 +189,8 @@
+     if not policy.get("enabled"):
+         return None
+     # The pin's strength is its class; a model in no class (or in two) has no peer we can prove equal.
+-    levels = [key for key, routes in policy.get("routes", {}).items() if any(r["model"] == model for r in routes)]
++    levels = [key for key, routes in policy.get("routes", {}).items()
++              if key != "carbon" and any(r["model"] == model for r in routes)]
+     if len(levels) != 1:
+         return None
+     providers = config.get("providers") or {}
+diff --git a/hermes_cli/kanban_quota_episode.py b/hermes_cli/kanban_quota_episode.py
+index 770cd645e30..c86a24675fc 100644
+--- a/hermes_cli/kanban_quota_episode.py
++++ b/hermes_cli/kanban_quota_episode.py
+@@ -191,6 +191,8 @@
+     from hermes_cli.kanban_class_walls import class_wall_routes
+     config = load_tier_config() if cfg is None else cfg
+     strong = str(config.get('strong_model') or '')
++    if strong == 'class:carbon':
++        return None
+     if strong.startswith('class:'):
+         routes, _known = class_wall_routes(task, strong, now=now, extra_walls=walls)
+         return (routes[0]['model'], routes[0]['provider']) if routes else None
+@@ -269,9 +271,11 @@
+         model = block.get('default') if isinstance(block, dict) else block
+     # A concrete default must belong to a known class; never guess its strength.
+     level = str(model or '').removeprefix('class:')
++    if level == 'carbon':
++        return None
+     if not str(model or '').startswith('class:'):
+         levels = [key for key, routes in policy.get('routes', {}).items()
+-                  if any(r['model'] == model for r in routes)]
++                  if key != 'carbon' and any(r['model'] == model for r in routes)]
+         if len(levels) != 1:
+             return None
+         level = levels[0]
+diff --git a/hermes_cli/kanban_ratio_routing.py b/hermes_cli/kanban_ratio_routing.py
+index 5e505c1ba1b..4ce2aced2d0 100644
+--- a/hermes_cli/kanban_ratio_routing.py
++++ b/hermes_cli/kanban_ratio_routing.py
+@@ -247,7 +247,7 @@
+ def _pool_routes(task: Any, default_model: str) -> list[tuple[str, list[str]]]:
+     """``[(pool, [eligible models])]`` in registry order, from the class level of ``default_model``: the level a
+     ``class:<level>`` selector names, else the one level that lists the concrete model."""
+-    from agent.model_routing import CLASSES, ModelRoutingError, eligible_routes, is_class_selector, validate_policy
++    from agent.model_routing import AUTOMATIC_CLASSES, ModelRoutingError, eligible_routes, is_class_selector, validate_policy
+     from agent.model_routing_agent import class_requirements
+     from hermes_cli.config import is_provider_enabled
+     from hermes_cli.kanban_model_assignment import _assignee_config
+@@ -262,10 +262,10 @@
+     if not policy.get("enabled"):
+         return []
+     if is_class_selector(default_model):
+-        levels = [level for level in [default_model.removeprefix("class:")] if level in CLASSES]
++        levels = [level for level in [default_model.removeprefix("class:")] if level in AUTOMATIC_CLASSES]
+     else:
+         levels = [level for level, routes in (policy.get("routes") or {}).items()
+-                  if any(r.get("model") == default_model for r in routes)]
++                  if level in AUTOMATIC_CLASSES and any(r.get("model") == default_model for r in routes)]
+     if len(levels) != 1:
+         return []
+     providers = config.get("providers") or {}
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 8a7f708209a..c4b77995bfb 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -422,6 +422,8 @@
+         why = class_unroutable_reason(override[0], _assignee_config(assignee) or {})
+         if why:
+             raise ReviewModelUnavailable(f"Review model {override[0]} is unroutable: {why}")
++        if override[0] == "class:carbon":
++            return "class:carbon", "auto", "review_override"
+     # Model attribution is audit-only; distinct execution is enforced by verdict custody.
+     from hermes_cli.kanban_llm_pacing_dispatch import held_pools
+     now = time.time()
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 90cb714c645..ea042c6c933 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -1434,7 +1434,7 @@
+ @router.get("/model-options")
+ def model_options():
+     """Class-only choices in the existing dropdown shape; empty selection clears."""
+-    classes = ('class:fast', 'class:standard', 'class:deep')
++    classes = ('class:fast', 'class:standard', 'class:deep', 'class:carbon')
+     return {"providers": [{"slug": "auto", "label": "Auto (routing class)", "models": list(classes)}]}
+ 
+ 
+diff --git a/tests/agent/test_carbon_routing.py b/tests/agent/test_carbon_routing.py
+new file mode 100644
+index 00000000000..81070f9c019
+--- /dev/null
++++ b/tests/agent/test_carbon_routing.py
+@@ -0,0 +1,90 @@
++"""Carbon is an explicitly requested, funded class, never ordinary capacity."""
++from types import SimpleNamespace
++
++import pytest
++
++from agent.model_routing import ModelRoutingError, eligible_routes, exact_class_selector, resolve_model_route
++from agent.model_routing_managed import verify_selected_route
++from tests.agent.test_model_routing import policy
++
++
++def carbon_config(billing="metered"):
++    config = policy()
++    config["model_routing"]["enforce_subscription_only"] = True
++    config["model_routing"]["routes"]["carbon"] = [{
++        "provider": "gemini", "model": "gemini-4-carbon", "billing": billing,
++        "weight": 1, "eligible": True, "funding_verified": True,
++        "capabilities": {"tools": True, "vision": True, "json": True, "streaming": True},
++    }]
++    return config
++
++
++@pytest.mark.parametrize("billing", ["metered", "credit-funded"])
++def test_explicit_carbon_resolves_and_passes_outbound_policy(tmp_path, billing):
++    config = carbon_config(billing)
++    assert exact_class_selector("class:carbon")
++    result = resolve_model_route("class:carbon", config=config, session_id="explicit",
++                                 state_path=tmp_path / "routes.db")
++    assert (result["provider"], result["model"]) == ("gemini", "gemini-4-carbon")
++    assert result["metadata"]["requested_class"] == "carbon"
++    verify_selected_route(result["model"], result["provider"], result["metadata"], config)
++
++
++@pytest.mark.parametrize("level", ["standard", "deep", "fast"])
++@pytest.mark.parametrize("allow_metered", [False, True])
++def test_carbon_cannot_be_ordinary_capacity_or_fallback(tmp_path, level, allow_metered):
++    config = carbon_config()
++    policy = config["model_routing"]
++    policy.update(allow_metered=allow_metered, enforce_subscription_only=False)
++    paid = policy["routes"]["carbon"][0]
++    policy["routes"][level].append(paid)  # even an accidentally duplicated registration cannot spend
++    assert paid not in eligible_routes(policy, level)
++    args = dict(config=config, state_path=tmp_path / "routes.db", session_id=level)
++    assert resolve_model_route("class:" + level, **args)["provider"] != "gemini"
++    excluded = [(r["provider"], r["model"]) for r in policy["routes"][level] if r != paid]
++    with pytest.raises(ModelRoutingError, match="eligible"):
++        resolve_model_route("class:" + level, excluded=excluded, **args)
++    with pytest.raises(ModelRoutingError):
++        resolve_model_route("gemini-4-carbon", "gemini", config=carbon_config())
++
++
++@pytest.mark.parametrize("key", ["eligible", "funding_verified"])
++def test_carbon_still_requires_attestation(key):
++    config = carbon_config()
++    config["model_routing"]["routes"]["carbon"][0][key] = False
++    assert eligible_routes(config["model_routing"], "carbon") == []
++
++
++def test_carbon_physical_request_passes_both_policy_fences(tmp_path, monkeypatch):
++    from agent.model_routing_request import validate_class_request
++    from hermes_cli import config_effective
++    config = carbon_config()
++    config["model_routing"]["routes"]["carbon"][0]["capabilities"]["context_tokens"] = 1_048_576
++    monkeypatch.setattr(config_effective, "load_user_config_effective", lambda: config)
++    result = resolve_model_route("class:carbon", config=config, session_id="physical",
++                                 state_path=tmp_path / "routes.db")
++    agent = SimpleNamespace(model=result["model"], provider=result["provider"],
++                            model_routing=result["metadata"], api_key="fixture-key", api_mode="chat_completions",
++                            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
++                            _credential_pool=None, _model_routing_requirements={})
++    request = {"model": agent.model, "messages": [{"role": "user", "content": "carbon ok"}]}
++    validate_class_request(agent, request, streaming=False)
++    config["model_routing"]["routes"]["carbon"][0]["funding_verified"] = False
++    with pytest.raises(ModelRoutingError):
++        validate_class_request(agent, request, streaming=False)
++
++
++def test_carbon_delegation_inherits_only_requested_class():
++    from agent.kanban_delegation_policy import parent_class
++    assert parent_class(SimpleNamespace(model_routing={"requested_class": "carbon"})) == "class:carbon"
++    assert parent_class(SimpleNamespace(model="gemini-4-carbon")) == "class:standard"
++
++
++def test_managed_carbon_fence_rejects_spoofed_class_or_identity(tmp_path):
++    config = carbon_config()
++    result = resolve_model_route("class:carbon", config=config, session_id="explicit",
++                                 state_path=tmp_path / "routes.db")
++    for change in ({"requested_class": "standard"}, {"billing_group": "subscription"},
++                   {"selected_model": "other"}):
++        with pytest.raises(ModelRoutingError):
++            verify_selected_route(result["model"], result["provider"], {**result["metadata"], **change}, config)
+diff --git a/tests/hermes_cli/test_carbon_dispatch.py b/tests/hermes_cli/test_carbon_dispatch.py
+new file mode 100644
+index 00000000000..4236986845a
+--- /dev/null
++++ b/tests/hermes_cli/test_carbon_dispatch.py
+@@ -0,0 +1,72 @@
++"""Explicit carbon cannot leak into default, review, retry or reroute tiers."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_model_tier as tier
++from tests.agent.test_carbon_routing import carbon_config
++
++
++def task(model=None):
++    return SimpleNamespace(id="card", assignee="default", model_override=model, provider_override=None,
++                           skills=[], title="routine", body="", current_run_id=None)
++
++
++@pytest.mark.parametrize("case", ["default", "retry", "pattern", "review"])
++def test_carbon_cannot_be_configured_as_implicit_tier(monkeypatch, case):
++    from hermes_cli import kanban_review_model as review
++    monkeypatch.setattr(review, "is_review_run", lambda *a: False)
++    monkeypatch.setattr(tier, "_prior_failure", lambda *a: "run_crashed" if case == "retry" else None)
++    cfg = {"default_model": "class:carbon", "strong_model": "class:carbon",
++           "default_model_keep_patterns": ["routine"] if case == "pattern" else []}
++    result = tier.resolve_model_tier(None, task(), lane="review" if case == "review" else "ready", cfg=cfg)
++    assert result[:2] == ("class:standard" if case == "default" else "class:deep", "auto")
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_explicit_card_carbon_survives_tiering(monkeypatch, lane):
++    assert tier.resolve_model_tier(None, task("class:carbon"), lane=lane, cfg={}) == (
++        "class:carbon", "auto", "class")
++    from hermes_cli import kanban_quota_episode as episode
++    monkeypatch.setattr(episode, "decision", lambda *a, **k: pytest.fail("carbon entered quota reroute"))
++    assert tier._route_from_base(None, task("class:carbon"), ("class:carbon", "auto", "class"),
++                                 lane=lane, cfg={}) == ("class:carbon", "auto", "class")
++
++
++def test_automatic_review_and_ratio_and_peer_candidates_exclude_carbon(monkeypatch):
++    from hermes_cli import kanban_model_assignment as assignment
++    from hermes_cli import kanban_ratio_routing as ratio
++    from hermes_cli import kanban_review_model as review
++    from hermes_cli import kanban_pin_reroute as pin
++    monkeypatch.setattr(assignment, "_assignee_config", lambda *a: carbon_config())
++    for level in ("standard", "deep", "fast"):
++        assert all(provider != "gemini" for _, provider in review.independent_routes(set(), {}, "default", level=level))
++    for selector in ("class:carbon", "gemini-4-carbon"):
++        assert ratio._pool_routes(task(), selector) == []
++    assert pin.peer_route(task(), "gemini-4-carbon", {}) is None
++
++
++def test_explicit_review_handoff_carbon_is_honored_without_deep_fallback(monkeypatch):
++    from hermes_cli import kanban_model_assignment as assignment
++    from hermes_cli import kanban_review_model as review
++    monkeypatch.setattr(assignment, "_assignee_config", lambda *a: carbon_config())
++    monkeypatch.setattr(review, "_override", lambda *a: ("class:carbon", "auto"))
++    monkeypatch.setattr(review, "registry_refusal", lambda *a: None)
++    assert review.resolve_review_model(None, task(), {}) == ("class:carbon", "auto", "review_override")
++
++
++def test_no_strong_fallback_or_episode_alternate_to_carbon(monkeypatch):
++    from hermes_cli import kanban_quota_episode as episode
++    from hermes_cli import kanban_model_neutral as neutral
++    monkeypatch.setattr(neutral, "routing_view", lambda t: t)
++    assert episode._strong_fallback(task(), ("class:standard", "auto", "default"), {},
++                                    {"strong_model": "class:carbon"}, 0) is None
++    from hermes_cli import kanban_model_assignment as assignment
++    monkeypatch.setattr(assignment, "_assignee_config", lambda *a: carbon_config())
++    assert episode.alternate_route(None, task(), {"gemini": 100}, ("class:carbon", "auto", "class"), 0) is None
++    assert episode.alternate_route(None, task(), {"gemini": 100}, ("gemini-4-carbon", "gemini", "default"), 0) is None
++
++
++def test_dashboard_exposes_explicit_carbon():
++    from plugins.kanban.dashboard.plugin_api import model_options
++    assert "class:carbon" in model_options()["providers"][0]["models"]
+diff --git a/tests/test_kanban_extraction141_rest.py b/tests/test_kanban_extraction141_rest.py
+index 1d28bd71ef8..0ee6b0b63b0 100644
+--- a/tests/test_kanban_extraction141_rest.py
++++ b/tests/test_kanban_extraction141_rest.py
+@@ -14,7 +14,7 @@
+ FLAGS = ("pin_mandatory", "model_pin_mandatory", "require_model")
+ REFUSED_VALUES = (True, 1, 2, "true", "false", "no", "0", "", [], {}, 0.0, 1.0)
+ ACCEPTED_VALUES = (None, False, 0)
+-EXACT_CLASSES = ("class:fast", "class:standard", "class:deep")
++EXACT_CLASSES = ("class:fast", "class:standard", "class:deep", "class:carbon")
+ 
+ OTHER_BOARD = "unconventional-collab"
+ B1_TITLE = ("Stage B1: run the frozen X/T tuning + confirmation matrix and external-anchor rescoring "
+diff --git a/tests/test_kanban_extraction141_selectors.py b/tests/test_kanban_extraction141_selectors.py
+index 5a75356ce55..4b0595b7322 100644
+--- a/tests/test_kanban_extraction141_selectors.py
++++ b/tests/test_kanban_extraction141_selectors.py
+@@ -8,7 +8,7 @@
+ from agent import kanban_delegation_policy as delegation
+ from hermes_cli import kanban_model_neutral as neutral
+ 
+-CLASSES = ('class:fast', 'class:standard', 'class:deep')
++CLASSES = ('class:fast', 'class:standard', 'class:deep', 'class:carbon')
+ INVALID = ('class:', 'class:bogus', 'class: deep', 'Class:deep', ' class:deep', 'class:deep ', '', None, 0, [], {})
+ 
+ 
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 20bc6a0fe14..9cbcba90b1e 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1083,7 +1083,7 @@
+                 "is blocked for review. Ignored unless goal_mode is "
+                 "true. Defaults to the goal-engine default (20)."
+         )),
+-        "model": _prop("string", "Optional class:<tier> selector (for example class:deep). Concrete model IDs are rejected; omit for dynamic routing."),
++        "model": _prop("string", "Optional class:<tier> selector (class:fast/standard/deep, or explicit-only class:carbon). Concrete model IDs are rejected; omit for dynamic routing."),
+         "provider": _prop("string", "Only auto with a class selector is accepted. Concrete providers are rejected."),
+         "pin_mandatory": _prop("boolean", "Deprecated compatibility field: only false is accepted. Mandatory Kanban model pins are forbidden."),
+     },
+diff --git a/website/docs/developer-guide/plugins/kanban-validation.md b/website/docs/developer-guide/plugins/kanban-validation.md
+index 077abdeb478..0008d2eb63a 100644
+--- a/website/docs/developer-guide/plugins/kanban-validation.md
++++ b/website/docs/developer-guide/plugins/kanban-validation.md
+@@ -16,7 +16,7 @@
+ 
+ - `validate_explicit_selector(model=None, provider=None, *, mandatory=False)` first
+   uses the canonical `validate_selector`, then requires any normalized nonempty
+-  model to be exactly `class:fast`, `class:standard` or `class:deep`. It returns
++  model to be exactly `class:fast`, `class:standard`, `class:deep` or explicit-only `class:carbon`. It returns
+   `(model, 'auto')` for an accepted class and `(None, None)` for an empty selector.
+   A concrete provider, a provider without a model, an unknown class, invalid types,
+   or a truthy mandatory argument raises `ValueError` with the canonical
+diff --git a/website/docs/user-guide/model-class-routing.md b/website/docs/user-guide/model-class-routing.md
+index 8875a081850..82e25f1737b 100644
+--- a/website/docs/user-guide/model-class-routing.md
++++ b/website/docs/user-guide/model-class-routing.md
+@@ -5,7 +5,7 @@
+ # Model class routing
+ 
+ Class routing is an opt-in, profile-local allocator. Set a workload's model to
+-`class:deep`, `class:standard`, or `class:fast`, with provider `auto`. Hermes
++`class:deep`, `class:standard`, `class:fast`, or explicitly `class:carbon`, with provider `auto`. Hermes
+ resolves the marker before constructing a provider request. Classes are operator
+ assignments, not model-name guesses; failure never downgrades to another class.
+ 
+@@ -20,6 +20,7 @@
+ | `model_routing.routes.deep` | `[]` | Exact routes eligible for deep reasoning workloads. |
+ | `model_routing.routes.standard` | `[]` | Exact routes eligible for standard workloads. |
+ | `model_routing.routes.fast` | `[]` | Exact routes eligible for fast workloads. |
++| `model_routing.routes.carbon` | `[]` | Explicit-only routes, including Gemini `gemini-4-carbon`; never automatic capacity. |
+ 
+ Each route requires `provider`, `model`, `billing`, `weight`, and `capabilities`.
+ Identifiers are exact. `weight` is an integer from 1 to 100 and must be identical
+@@ -60,6 +61,17 @@
+ 
+ ## Sessions, pins, and recovery
+ 
++`class:carbon` is explicit spending authorization for its verified metered or
++credit-funded routes, even with `allow_metered: false` and
++`enforce_subscription_only: true`. It still requires funding, eligibility,
++capabilities and a usable credential. Carbon tuples (and `gemini-4-carbon`)
++are excluded from every other class, even if duplicated in its registry.
++Kanban never uses carbon as a default, strong/retry/review tier, ratio allocation,
++or reroute target. An explicit card or review request may name `class:carbon`;
++delegation inherits it only from a parent that requested carbon. No automatic
++fallback crosses into carbon. Concrete paid pins remain rejected under managed
++subscription enforcement; request the class instead.
++
+ Allocation is transactionally stored in `model-routing.sqlite3` under the active
+ profile home. A healthy session/job remains sticky across turns, tools, restarts,
+ resume and compression lineage. Auth, quota or transport recovery may select an
+-- 
+2.43.0
+

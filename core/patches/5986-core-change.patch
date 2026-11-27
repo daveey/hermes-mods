@@ -1,0 +1,97 @@
+From c896576af869e206850ab31a3be860962a5779f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:20:00 +0000
+Subject: [PATCH 5986] SQLite raw-reader reclamation cadence and GIL-held lockguard scans
+
+Public mirror of source commit c896576af869e206850ab31a3be860962a5779f0.
+
+---
+diff --git a/hermes_cli/sqlite_safe_read.py b/hermes_cli/sqlite_safe_read.py
+index cb8e7703eb1..8366cec6171 100644
+--- a/hermes_cli/sqlite_safe_read.py
++++ b/hermes_cli/sqlite_safe_read.py
+@@ -432,8 +432,9 @@
+ _PREAD_FDS: dict[str, tuple[int, int, int]] = {}  # path -> (fd, st_dev, st_ino)
+ _RETIRED_PREAD_FDS: list[int] = []  # superseded inodes: closed only once unlinked (see sweep)
+ # Header-heavy session captures must not fstat the entire process inventory on
+-# every read. Reclaim on the next read after this monotonic deadline; explicit
+-# release/inventory calls still sweep immediately. Linked inodes are never closed.
++# every read. Reclaim main-file fds on the next read after this monotonic
++# deadline; sidecar/retired fds and explicit release/inventory calls stay eager.
++# Linked inodes are never closed.
+ _PREAD_NEXT_SWEEP = 0.0
+ _PREAD_SWEEP_SECONDS = .25
+ 
+@@ -445,7 +446,7 @@
+         return True  # already invalid: nothing to protect, drop it from the cache
+ 
+ 
+-def _release_unlinked_locked() -> None:
++def _release_unlinked_locked(*, sidecars_only: bool = False) -> None:
+     """Close cached reader fds whose inode no path names any more (``st_nlink == 0``).
+ 
+     Closing such an fd is lock-safe: POSIX locks on a dead inode protect nothing, since no
+@@ -453,6 +454,8 @@
+     Keeping it open would pin a deleted -wal/-shm generation on disk forever and show up as a
+     false "stranded on a deleted generation" in every ``/proc/<pid>/fd`` scan."""
+     for key, entry in list(_PREAD_FDS.items()):
++        if sidecars_only and not key.endswith(('-wal', '-shm')):
++            continue
+         if _fd_is_unlinked(entry[0]):
+             _PREAD_FDS.pop(key, None)
+             try:
+@@ -497,6 +500,11 @@
+         if now >= _PREAD_NEXT_SWEEP:
+             _release_unlinked_locked()
+             _PREAD_NEXT_SWEEP = _pread_sweep_now() + _PREAD_SWEEP_SECONDS
++        else:
++            # Sidecar fds must retain their eager cleanup contract: another
++            # process's writer-open scan cannot distinguish a reader from a
++            # stranded SQLite connection. Retired fds are also swept eagerly.
++            _release_unlinked_locked(sidecars_only=True)
+         cached = _PREAD_FDS.get(key)
+         if cached is not None and (cached[1], cached[2]) != (st.st_dev, st.st_ino):
+             _RETIRED_PREAD_FDS.append(_PREAD_FDS.pop(key)[0])  # closed by the sweep once unlinked
+diff --git a/tests/hermes_cli/test_sqlite_pread_sidecar_cadence.py b/tests/hermes_cli/test_sqlite_pread_sidecar_cadence.py
+new file mode 100644
+index 00000000000..a2b67260ee2
+--- /dev/null
++++ b/tests/hermes_cli/test_sqlite_pread_sidecar_cadence.py
+@@ -0,0 +1,34 @@
++"""Sidecar reclamation cannot wait for an amortized main-file sweep. [daveey]"""
++import os
++
++import pytest
++
++from hermes_cli import sqlite_safe_read as reader
++
++
++@pytest.mark.parametrize('suffix', ['-wal', '-shm'])
++def test_unlinked_sidecar_is_reclaimed_on_next_unrelated_read(tmp_path, monkeypatch, suffix):
++    monkeypatch.setattr(reader, '_PREAD_FDS', {})
++    monkeypatch.setattr(reader, '_RETIRED_PREAD_FDS', [])
++    monkeypatch.setattr(reader, '_pread_sweep_now', lambda: 100.0)
++    monkeypatch.setattr(reader, '_PREAD_NEXT_SWEEP', 101.0)
++    main = tmp_path / 'state.db'
++    sidecar = tmp_path / ('state.db' + suffix)
++    other = tmp_path / 'board.db'
++    for path in (main, sidecar, other):
++        path.write_bytes(b'header')
++    try:
++        # Prime the unrelated fd so its next read cannot reuse the reclaimed fd.
++        assert reader.pread_lock_safe(other, 0, 6) == b'header'
++        assert reader.pread_lock_safe(sidecar, 0, 6) == b'header'
++        dead = reader._PREAD_FDS[str(sidecar)][0]
++        sidecar.unlink()
++        assert reader.pread_lock_safe(other, 0, 6) == b'header'
++        # Writer-open guards scan every process: a deferred sidecar reader
++        # looks like a stranded SQLite connection even though it holds no locks.
++        with pytest.raises(OSError):
++            os.fstat(dead)
++        assert str(sidecar) not in reader._PREAD_FDS
++    finally:
++        for fd in {entry[0] for entry in reader._PREAD_FDS.values()} | set(reader._RETIRED_PREAD_FDS):
++            os.close(fd)
+-- 
+2.43.0
+

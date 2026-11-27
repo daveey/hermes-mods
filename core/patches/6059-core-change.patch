@@ -1,0 +1,237 @@
+From 44afc080339bc135980dfbd4e2d65aa1c12e6eac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 03:50:18 +0000
+Subject: [PATCH 6059] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit 44afc080339bc135980dfbd4e2d65aa1c12e6eac.
+
+---
+diff --git a/hermes_cli/serve_producer_custody.py b/hermes_cli/serve_producer_custody.py
+index 7e518acfdd9..9f75903f777 100644
+--- a/hermes_cli/serve_producer_custody.py
++++ b/hermes_cli/serve_producer_custody.py
+@@ -34,6 +34,25 @@
+             raise ValueError('unknown producer family')
+         return cls(_acquire_runtime(runtime, family))
+ 
++    @classmethod
++    def acquire_execution(cls, runtime: Path, family: str) -> FamilyCustody:
++        """Prove previous execution retired, independently of broker custody.
++
++        Only the producer opens this description. Descendants inherit it across
++        fork/exec, so a broker's waitpid cannot admit overlapping replacement
++        work. Keep the stable inode and never unlock a shared description.
++        """
++        if family not in _FAMILIES:
++            raise ValueError('unknown producer family')
++        fd = _acquire_runtime(runtime, f'{family}-execution')
++        owner = cls(fd)
++        try:
++            os.set_inheritable(fd, True)
++        except BaseException:
++            owner.close()
++            raise
++        return owner
++
+     def close(self) -> None:
+         """Close only this process's descriptor, preserving inherited custody."""
+         if self.fd is not None:
+diff --git a/hermes_cli/serve_producer_process.py b/hermes_cli/serve_producer_process.py
+index d1667637314..33246099272 100644
+--- a/hermes_cli/serve_producer_process.py
++++ b/hermes_cli/serve_producer_process.py
+@@ -155,8 +155,9 @@
+                         response = data.receive()
+                         break
+                     except (EOFError, BrokenPipeError, ConnectionResetError):
+-                        # EOF is not death: actual waitpid must confirm exit
+-                        # before another child can inherit producer custody.
++                        # waitpid reaps only the leader. The new exec must also
++                        # acquire panel-execution.lock before provider import;
++                        # surviving descendants make it refuse rather than run.
+                         child.wait()
+                         data.close()
+                         if attempt == 2 or stop.wait(1 << attempt):
+@@ -218,7 +219,19 @@
+     if role == 'broker':
+         broker(channel, config)
+     elif role == 'producer':
+-        producer(channel, config)
++        from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody
++
++        try:
++            execution = FamilyCustody.acquire_execution(Path(config['runtime']), 'panel')
++        except CustodyConflict:
++            # Direct leader exit is not family retirement. Refuse before even
++            # importing provider code; the old descendant keeps both fences.
++            channel.close()
++            return
++        try:
++            producer(channel, config)
++        finally:
++            execution.close()
+     else:
+         raise ProtocolError('unknown fixture role')
+ 
+diff --git a/tests/hermes_cli/test_serve_producer_descendants.py b/tests/hermes_cli/test_serve_producer_descendants.py
+new file mode 100644
+index 00000000000..44d0f98ad1b
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_descendants.py
+@@ -0,0 +1,124 @@
++"""Direct-child exit must not permit production over a surviving fork/exec child."""
++import hashlib
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody
++from hermes_cli.serve_producer_runtime import ProjectionRelay, projection_response
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('exec_descendant', [False, True])
++def test_restart_refuses_before_provider_import_while_descendant_holds_custody(tmp_path, exec_descendant, capfd):
++    # The child drops only transport, as in the independent review probe. The
++    # exec arm also exercises custody inheritance across a real process image.
++    descendant_source = '''import os, select, sys
++from pathlib import Path
++home = Path(sys.argv[1])
++(home / 'descendant').write_text(str(os.getpid()), encoding='ascii')
++while not (home / 'release').exists():
++    select.select([], [], [], .01)
++'''
++    (tmp_path / 'descendant.py').write_text(descendant_source, encoding='utf-8')
++    source = '''import os, select, sys
++from pathlib import Path
++home = Path(__file__).parent
++with (home / 'imports').open('a', encoding='ascii') as stream:
++    stream.write('imported\\n')
++def produce(payload):
++    if (home / 'forked').exists():
++        return {'overlap': True}
++    (home / 'forked').touch()
++    pid = os.fork()
++    if pid == 0:
++        os.close(int(sys.argv[2]))
++        if payload['exec']:
++            os.execl(sys.executable, sys.executable, '-I', str(home / 'descendant.py'), str(home))
++        (home / 'descendant').write_text(str(os.getpid()), encoding='ascii')
++        while not (home / 'release').exists():
++            select.select([], [], [], .01)
++        os._exit(0)
++    while not (home / 'descendant').exists():
++        select.select([], [], [], .01)
++    os._exit(17)
++'''
++    provider = tmp_path / 'provider.py'
++    provider.write_text(source, encoding='utf-8')
++    runtime = tmp_path / 'runtime'
++    relay = ProjectionRelay({'path': str(provider), 'sha256': hashlib.sha256(source.encode()).hexdigest()},
++                            home=tmp_path, runtime=runtime, generation='descendants')
++    try:
++        relay.start_for_fixture()
++        key = relay.submit({'exec': exec_descendant})
++        assert wait_until(lambda: relay.error is not None or relay.read(key) is not None, timeout=15)
++        descendant = int((tmp_path / 'descendant').read_text(encoding='ascii'))
++        os.kill(descendant, 0)
++        fdinfo = Path(f'/proc/{descendant}/fdinfo')
++        held = {os.stat(f'/proc/{descendant}/fd/{entry.name}').st_ino
++                for entry in fdinfo.iterdir() if 'FLOCK' in entry.read_text(encoding='ascii')}
++        assert (runtime / 'panel.lock').stat().st_ino in held
++        assert (runtime / 'panel-execution.lock').stat().st_ino in held
++        assert relay.read(key) is None, 'replacement produced over surviving family work'
++        assert not relay.acknowledged(key)
++        assert relay.error == 'EOFError'
++        assert (tmp_path / 'imports').read_text(encoding='ascii') == 'imported\n'
++        assert projection_response(relay, {'sessions': ['fixture']}).status_code == 503
++        assert relay.close(timeout=10)
++        # The broker has exited, but neither in-process nor external successors
++        # may take the surviving descendant's actual panel fence.
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire(runtime, 'panel')
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire_execution(runtime, 'panel')
++    finally:
++        (tmp_path / 'release').touch()
++        assert relay.close(timeout=10)
++
++    def released():
++        try:
++            successor = FamilyCustody.acquire(runtime, 'panel')
++        except CustodyConflict:
++            return False
++        successor.close()
++        return True
++
++    assert wait_until(released, timeout=10)
++    assert 'Traceback' not in capfd.readouterr().err
++    # Uncertain retirement refused this relay; a fresh relay after actual drain
++    # can import and publish normally without weakening the surviving lock.
++    successor = ProjectionRelay(relay.config['provider'], home=tmp_path, runtime=runtime, generation='after-drain')
++    try:
++        successor.start_for_fixture()
++        key = successor.submit({'exec': exec_descendant})
++        assert wait_until(lambda: successor.acknowledged(key), timeout=10)
++    finally:
++        assert successor.close(timeout=10)
++
++
++@pytest.mark.platforms('posix')
++def test_execution_acquisition_keeps_independent_inheritable_description(tmp_path, monkeypatch):
++    runtime = tmp_path / 'runtime'
++    broker = FamilyCustody.acquire(runtime, 'panel')
++    try:
++        execution = FamilyCustody.acquire_execution(runtime, 'panel')
++        assert os.get_inheritable(execution.fd)
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire_execution(runtime, 'panel')
++        execution.close()
++        # Failed inheritance setup must close its newly acquired description,
++        # not leak a lock that bricks every future producer in this runtime.
++        with monkeypatch.context() as patch:
++            def refuse_inheritance(fd, value):
++                raise OSError('fixture inheritance refused')
++            patch.setattr(os, 'set_inheritable', refuse_inheritance)
++            with pytest.raises(OSError, match='fixture inheritance refused'):
++                FamilyCustody.acquire_execution(runtime, 'panel')
++        recovered = FamilyCustody.acquire_execution(runtime, 'panel')
++        recovered.close()
++        with pytest.raises(ValueError, match='unknown producer family'):
++            FamilyCustody.acquire_execution(runtime, 'not-a-family')
++    finally:
++        broker.close()
+diff --git a/website/docs/developer-guide/serve-producer-isolation.md b/website/docs/developer-guide/serve-producer-isolation.md
+index 2016e1b1537..74bf9c621cc 100644
+--- a/website/docs/developer-guide/serve-producer-isolation.md
++++ b/website/docs/developer-guide/serve-producer-isolation.md
+@@ -13,6 +13,24 @@
+ before importing a provider. Its child inherits the same open file description;
+ closing the broker descriptor never unlocks a surviving child.
+ 
++Restart has an additional, independently opened `panel-execution.lock`. Each
++actual producer must acquire it nonblocking **before any provider import**. The
++broker never holds that description. The producer deliberately leaves it
++inheritable across fork/exec; descendants retaining it prevent the replacement
++from importing or running a provider even after the direct leader was reaped.
++Conflict conservatively ends that relay with unavailable projections (HTTP 503),
++not a kill, forced unlock, timeout-based takeover or resumed request. After actual
++drain, a fresh relay can acquire both stable fences. Ordinary direct-child crash
++without a surviving execution holder still restarts within the existing budget.
++
++These are cooperative inherited-descriptor fences, not arbitrary descendant
++containment: providers must retain the execution fence while doing work and
++explicitly pass it to helpers that otherwise close descriptors. A subprocess
++using `close_fds=True`, deliberate descriptor closure, or replacement of lock
++inodes is not covered. This dormant fixture does not certify such providers or
++production process containment. The panel fence and execution fence are never
++unlinked or explicitly unlocked.
++
+ `BrokerEnrollment` can classify only its own exact enrolled process as a
+ participant. It rechecks boot/birth/exec observation, installation and source
+ boundary generation, canonical runtime and live kernel flock on its descriptor.
+-- 
+2.43.0
+

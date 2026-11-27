@@ -1,0 +1,84 @@
+From 75b477d953be6fc856b56e28ea971bb9b951d26e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:14:09 +0000
+Subject: [PATCH 5973] Test fixture and flake hardening (no production behavior)
+
+Public mirror of source commit 75b477d953be6fc856b56e28ea971bb9b951d26e.
+
+---
+diff --git a/tests/gateway/fixtures/kanban_owner_probe.py b/tests/gateway/fixtures/kanban_owner_probe.py
+index 4320933ccf7..69bd463b138 100644
+--- a/tests/gateway/fixtures/kanban_owner_probe.py
++++ b/tests/gateway/fixtures/kanban_owner_probe.py
+@@ -133,8 +133,28 @@
+             subprocess.Popen = spawn
+             dispatch._set_worker_pid = set_pid
+             try:
+-                with closing(connect(board='owned')) as conn:
+-                    from contextlib import nullcontext
++                from contextlib import nullcontext
++                from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++                # A concurrent native opener may hold the tick lock at initial open.
++                with _dispatch_tick_lock(kb.kanban_db_path(board='owned')) if crash_contended else nullcontext():
++                    initial_conn = connect(board='owned')
++                if crash_contended:
++                    assert getattr(initial_conn, '_dispatch_open_contended', False)
++                    receipt['initial_open_deferred'] = True
++                if getattr(initial_conn, '_dispatch_open_contended', False):
++                    # Contended handles permanently lack native inode provenance.
++                    # Retrying ticks on that same handle can never recover.
++                    initial_conn.close()
++                    from tests.waiting import wait_until
++                    def reopen_when_uncontended():
++                        candidate = connect(board='owned')
++                        if getattr(candidate, '_dispatch_open_contended', False):
++                            candidate.close()
++                            return None
++                        return candidate
++                    initial_conn = wait_until(reopen_when_uncontended, timeout=60,
++                                              what='uncontended native dispatcher connection')
++                with closing(initial_conn) as conn:
+                     from hermes_cli.admission_fence import admission_lock
+                     from hermes_constants import get_default_hermes_root
+                     # A descheduled reservation publisher can own this flock when the first tick runs.
+@@ -170,8 +190,19 @@
+                         # Deterministically elapse this owned attempt; keep real timeout/kill logic.
+                         conn.execute('UPDATE task_runs SET started_at=? WHERE id=?', (int(time.time()) - 3601, task.current_run_id))
+                         conn.commit()
+-                        swept = dispatch.dispatch_once(conn, board='owned', max_spawn=0)
++                        with _dispatch_tick_lock(kb.kanban_db_path(board='owned')) if contended else nullcontext():
++                            swept = dispatch.dispatch_once(conn, board='owned', max_spawn=0)
++                        if contended:
++                            assert swept.skipped_locked, swept
++                            receipt['timeout_tick_deferred'] = True
++                        def timeout_when_unlocked():
++                            nonlocal swept
++                            if swept.skipped_locked:
++                                swept = dispatch.dispatch_once(conn, board='owned', max_spawn=0)
++                            return None if swept.skipped_locked else swept
++                        swept = wait_until(timeout_when_unlocked, timeout=60, what='dispatcher timeout tick lock')
+                         receipt['timed_out'] = swept.timed_out
++                        assert swept.timed_out == [tid], swept
+                         wait_for(lambda: not kb._pid_alive(receipt['managed_pid']))
+                         receipt['managed_dead'] = True
+                         assert receipt['pid_preserved'] and receipt['managed_dead'], receipt
+diff --git a/tests/gateway/test_session_kanban.py b/tests/gateway/test_session_kanban.py
+index 0b5c43ef9f2..57cacd37ea8 100644
+--- a/tests/gateway/test_session_kanban.py
++++ b/tests/gateway/test_session_kanban.py
+@@ -90,10 +90,12 @@
+     policy = Path(receipt['policy_root'])
+     assert policy.is_relative_to(tmp_path) and any(policy.glob('child-*')), policy
+     if mode == 'crash_contended':
++        assert receipt['initial_open_deferred']
+         assert receipt['first_sweep_deferred']
+         assert receipt['run_outcome'] == 'crashed' and receipt['failures'] == 1
+     if mode == 'timeout_contended':
+         assert receipt['initial_claim_deferred']
++        assert receipt['timeout_tick_deferred']
+         assert receipt['run_outcome'] == 'timed_out' and receipt['failures'] == 1
+         assert receipt['pid_preserved'] and receipt['managed_dead']
+     if mode != 'complete':
+-- 
+2.43.0
+

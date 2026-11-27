@@ -1,0 +1,147 @@
+From 53c5b146f0e3ed474dd1ffae989aa42f7d460f7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:33:37 +0000
+Subject: [PATCH 6417] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 53c5b146f0e3ed474dd1ffae989aa42f7d460f7d.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 52b90336cbb..c9cad9b533a 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -58,7 +58,7 @@
+ LEASE_SECONDS = 300
+ MAX_ATTEMPTS = 2
+ MAX_CONCURRENT = 3
+-BACKLOG_AFTER = 1800
++BACKLOG_AFTER = 300
+ DEFAULT_MAX_GRANTS = 2
+ QUOTE_MIN = 30
+ _TEXT_MAX = 1500
+@@ -68,8 +68,7 @@
+ _THREADS: list = []
+ 
+ 
+-def settings(cfg: Optional[dict] = None) -> tuple[bool, int]:
+-    """``kanban.spend_review`` (default on) and ``kanban.spend_review_max_grants`` (default 2)."""
++def _config(cfg: Optional[dict]) -> dict:
+     if cfg is None:
+         try:
+             from hermes_cli.config import load_config
+@@ -78,6 +77,18 @@
+             logger.warning("kanban: spend reviewer could not read config; using defaults", exc_info=True)
+             cfg = {}
+     section = (cfg or {}).get("kanban") or {}
++    return section if isinstance(section, dict) else {}
++
++
++def review_after_seconds(cfg: Optional[dict] = None) -> int:
++    """Delay before reviewing an already-routed stop; invalid values use five minutes."""
++    raw = _config(cfg).get("spend_review_after_seconds", BACKLOG_AFTER)
++    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else BACKLOG_AFTER
++
++
++def settings(cfg: Optional[dict] = None) -> tuple[bool, int]:
++    """Reviewer enablement and consecutive-grant cap (keeps the existing caller contract)."""
++    section = _config(cfg)
+     enabled = section.get("spend_review", True) is not False
+     raw = section.get("spend_review_max_grants", DEFAULT_MAX_GRANTS)
+     grants = raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else DEFAULT_MAX_GRANTS
+@@ -194,14 +205,15 @@
+     stop's own notice. Eligibility is read first, so an ineligible stop never takes the write lock."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_spend_decision import NOTICE
++    delay = review_after_seconds()
+     rows = conn.execute("SELECT DISTINCT t.id FROM tasks t JOIN task_events e ON e.task_id = t.id "
+                         "WHERE t.status = 'triage' AND e.kind = ? AND e.created_at <= ?",
+-                        (NOTICE, now - BACKLOG_AFTER)).fetchall()
++                        (NOTICE, now - delay)).fetchall()
+     queued = []
+     for (task_id,) in rows:
+         episode = None if task_id in skip else _current_episode(conn, task_id)
+         noticed = _notice_at(conn, task_id, episode) if episode else None
+-        if noticed is None or noticed > now - BACKLOG_AFTER or not eligible(conn, task_id, episode, cfg):
++        if noticed is None or noticed > now - delay or not eligible(conn, task_id, episode, cfg):
+             continue
+         with kb.write_txn(conn):
+             if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True, cfg=cfg):
+diff --git a/tests/hermes_cli/test_kanban_spend_review_delay.py b/tests/hermes_cli/test_kanban_spend_review_delay.py
+new file mode 100644
+index 00000000000..8e4714ae1c2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_delay.py
+@@ -0,0 +1,55 @@
++"""Five-minute fallback review configuration; safety stops never enter it."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_reviewer as reviewer
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize("value, expected", [
++    (None, 300), (0, 0), (60, 60), (900, 900), (-1, 300), (True, 300), ("60", 300),
++])
++def test_review_delay_config(value, expected):
++    cfg = {"kanban": {"spend_review_after_seconds": value}}
++    assert reviewer.review_after_seconds(cfg) == expected
++
++
++@pytest.mark.parametrize("delay", [0, 60, 300, 900])
++def test_backlog_uses_configured_delay_at_exact_boundary(kanban_home, spend_reviewer, monkeypatch, delay):
++    from hermes_cli import config
++    from tests.hermes_cli import test_kanban_spend_reviewer as cases
++    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"spend_review_after_seconds": delay}})
++    with kbc.connect_closing() as conn:
++        tid, episode = cases._routed_with_reviewer_off(conn, monkeypatch)
++        noticed = reviewer._notice_at(conn, tid, episode)
++        assert noticed is not None
++        assert reviewer.queue_backlog(conn, now=noticed + delay - 1, cfg=(True, 2)) == []
++        assert reviewer.queue_backlog(conn, now=noticed + delay, cfg=(True, 2)) == [tid]
++        assert reviewer.queue_backlog(conn, now=noticed + delay, cfg=(True, 2)) == []
++
++
++def test_review_delay_default():
++    assert reviewer.BACKLOG_AFTER == 300
++    assert reviewer.review_after_seconds({}) == 300
++
++
++@pytest.mark.parametrize("cause", ["safety_refusal", "unknown_stop"])
++def test_safety_and_unknown_causes_never_queue_or_grant(kanban_home, spend_reviewer, cause):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Held stop", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, "spend_budget_triaged", {"cause": cause, "reason": "Keep held"})
++        episode = reviewer._current_episode(conn, tid)
++        assert episode is not None
++        assert not reviewer.eligible(conn, tid, episode)
++        with kb.write_txn(conn):
++            assert not reviewer.queue(conn, tid, episode, backlog=True)
++        assert reviewer.state(conn, tid, episode) is None
++        assert reviewer.grant(conn, tid, episode, 10, "not authorized", "no evidence") is not None
++        assert kb.get_task(conn, tid).status == "triage"
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index fcef3b49cc5..3656133b7ef 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -747,7 +747,9 @@
+ `promoted_manual`) and archives an open decision card for that stop. Anything
+ else escalates (`spend_review_escalated` and a comment), and the stop is then
+ routed to the creator chat or a decision card as before. A stop already routed
+-there but undecided after 30 minutes gets the same single review. Scope and
++there but undecided after five minutes gets the same single review. The delay
++is configurable as `kanban.spend_review_after_seconds` (default 300; a nonnegative
++integer). New ordinary stops still queue immediately. Scope and
+ safety stops are never reviewed; `kanban.spend_review: false` turns the
+ reviewer off.
+ 
+-- 
+2.43.0
+

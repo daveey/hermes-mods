@@ -1,0 +1,521 @@
+From d1b5cdd7034cc62942debddb362bae596ce6b13a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 10:36:09 +0000
+Subject: [PATCH 6139] Kanban release command and delegate scope renewal
+
+Public mirror of source commit d1b5cdd7034cc62942debddb362bae596ce6b13a.
+
+---
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index a75579e42f6..03bfd392bd5 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -53,6 +53,7 @@
+ _QUIET = frozenset({"commented", RELEASED, "spend_budget_set", "spend_budget_decision_ready", "scope_renewed",
+                     "user_steps_answer", "card_answer_released", "stranded_park_escalated"})
+ ESCALATED = "stranded_park_escalated"  # kanban_stranded_park.EVENT: the home's own record of the ask it filed
++REFILED = "stranded_park_refiled"  # the same record for an ask the sweep re-filed; no second desk notice
+ MANDATE = (MARK + " Budget: {runs} more runs. {limits} Stop only on: a provider safety refusal; a step that needs "
+            "David physically; the same error three times; the run budget. Findings, design changes, review "
+            "CHANGES, CI waits and sandbox refusals of -c scripts are work inside the round. Safety exclusions in "
+@@ -164,35 +165,52 @@
+     ``stranded_park_escalated`` event for this card (:func:`_home_filed`), whose origin the Board attests."""
+     stamp = ask.get(STAMP) if isinstance(ask, dict) else None
+     current = _pending_stop(conn, task_id)
+-    if not isinstance(stamp, dict) or current is None or not _home_filed(conn, task_id, stamp):
++    if not isinstance(stamp, dict) or current is None or not _home_filed(conn, task_id, ask):
+         return None
+     return current["task"] if (stamp.get("task"), stamp.get("episode")) == (current["task"], current["episode"]) else None
+ 
+ 
+-def _home_filed(conn: sqlite3.Connection, task_id: str, stamp: dict) -> bool:
+-    """This board's own sweep filed the ask that carries ``stamp``: the card's newest ``stranded_park_escalated``
+-    event records the same stamp and was written here. A synced event keeps the sending gateway the Board
+-    authenticated (``origin_gateway``); a local one has none. A row another gateway pushed never qualifies."""
++def ask_digest(ask: Any) -> str:
++    """Identity of a filed ask: the sweep records it with the offer, so stored text it did not write is no offer."""
++    import hashlib
++    return hashlib.sha256(json.dumps(ask, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
++
++
++def own_events(conn: sqlite3.Connection, task_id: str, kinds: Sequence[str]) -> list[dict]:
++    """This board's own events of ``kinds`` on the card, newest first: ``{id, kind, payload}``. A synced event
++    keeps the sending gateway the Board authenticated (``origin_gateway``); a local one has none. An event
++    another gateway pushed, or one whose origin a foreign write replaced, is not this board's."""
+     from hermes_cli.kanban_db_sync import sync_state
+     from hermes_cli.kanban_origin import gateway_names
+     columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
+     origin = "origin_gateway" if "origin_gateway" in columns else "NULL"
+-    row = conn.execute(f"SELECT payload, {origin} FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+-                       (task_id, ESCALATED)).fetchone()
+-    if row is None or _payload(row[0]).get(STAMP) != stamp:
+-        return False
+     own = {gateway_names()[0], str((sync_state(conn) or {}).get("gateway_id") or "")}  # never the fleet list
+-    return not row[1] or row[1] in own
++    marks = ",".join("?" for _ in kinds)
++    return [{"id": int(r[0]), "kind": r[1], "payload": _payload(r[2])} for r in conn.execute(
++        f"SELECT id, kind, payload, {origin} FROM task_events WHERE task_id=? AND kind IN ({marks}) ORDER BY id DESC",
++        (task_id, *kinds)) if not r[3] or r[3] in own]
++
++
++def _home_filed(conn: sqlite3.Connection, task_id: str, ask: dict) -> bool:
++    """This board's own sweep filed ``ask``: its newest own filing record for the card (an escalation or a
++    re-file) carries the ask's stamp and, when it recorded one, the ask's digest. A stamp on text the sweep did
++    not write, a row another gateway pushed and a later own filing without the offer all fail."""
++    filings = own_events(conn, task_id, (ESCALATED, REFILED))
++    if not filings or filings[0]["payload"].get(STAMP) != ask.get(STAMP):
++        return False
++    digest = filings[0]["payload"].get("ask_sha256")
++    return digest is None or digest == ask_digest(ask)  # records written before the digest existed carry none
+ 
+ 
+ def dead_offer(conn: sqlite3.Connection, task_id: str, ask: Any) -> bool:
+     """``ask`` carries a release stamp its button cannot honour although a release could be offered now: the
+     stamp names an earlier stop, or this board has no record of filing it (an ask filed before the record
+-    existed, a card rehomed after the ask, an event whose origin was overwritten). The stranded-park sweep
+-    re-files such an ask from its own brief (``kanban_stranded_park``), never by blessing the stored text."""
++    existed, a card rehomed after the ask, an event whose origin was overwritten, text the sweep did not write).
++    A dead offer proves nothing about who wrote it: the stranded-park sweep decides from its own records whether
++    to re-file it or to treat the card as any unowned stop (``kanban_stranded_park``)."""
+     stamp = ask.get(STAMP) if isinstance(ask, dict) else None
+     current = offer(conn, task_id) if isinstance(stamp, dict) else None
+-    return current is not None and (stamp != current or not _home_filed(conn, task_id, stamp))
++    return current is not None and (stamp != current or not _home_filed(conn, task_id, ask))
+ 
+ 
+ def _newest_stop(conn: sqlite3.Connection, tid: str) -> Optional[dict]:
+@@ -508,9 +526,11 @@
+         s.budget = runs
+         try:
+             who = kind if kind in ("human", "agent") else None
++            # The cache-read limit's own attribution, always: a kept one keeps what it had (a person's run-only
++            # override defers to the board limit, and that deference is kept too); a lifted one is this writer's.
++            kept = ksb.carried(s.prior).get("cache_read_writer_kind", "unknown") if s.keeps_limit else who
+             ksb.set_override(conn, s.tid, runs=runs, cache_read_tokens=cache, by=s.by, reason=s.reason,
+-                             seen=s.budget_seen, board=s.board, writer_kind=who,
+-                             cache_read_writer_kind=ksb.carried(s.prior).get("cache_read_writer_kind") if s.keeps_limit else None)
++                             seen=s.budget_seen, board=s.board, writer_kind=who, cache_read_writer_kind=kept)
+         except unread.UnreadComments as exc:  # a budget decision recorded since the check above
+             raise _Refusal("budget_decision_unread", f"{exc}{s.kept}")
+     out.update(spent_runs=spent, budget_runs=s.budget)
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index 4cc507f65fd..81cdfe3c03f 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -119,19 +119,30 @@
+     return Limits(lim.runs if runs is None else runs, lim.cache_read_tokens if cache is None else cache)
+ 
+ 
++RELEASE_REASON = "hermes kanban release:"  # kanban_release's reason prefix on the overrides it writes
++
++
+ def cache_attribution(data: Optional[dict]) -> Optional[str]:
+-    """Who set an override's cache-read limit: ``human``, ``agent``, ``unknown``, or None when the event records
+-    nothing (written before attribution existed). A limit a later writer only carried over keeps its own
+-    attribution (``cache_read_writer_kind``); otherwise it is the event's writer."""
++    """Who set an override's cache-read limit (a number, or None = deferring to the board's): ``human``,
++    ``agent``, ``unknown``, or None when the event records nothing (written before attribution existed). A limit
++    a later writer only carried over keeps its own attribution (``cache_read_writer_kind``); otherwise it is the
++    event's writer. One exception: an agent release written before releases recorded the field may have kept a
++    person's limit under its own ``writer_kind``, so it reads ``unknown``, never ``agent``."""
+     data = data or {}
+-    return data.get("cache_read_writer_kind") or data.get("writer_kind")
++    if data.get("cache_read_writer_kind"):
++        return data["cache_read_writer_kind"]
++    if data.get("writer_kind") == "agent" and str(data.get("reason") or "").startswith(RELEASE_REASON):
++        return "unknown"
++    return data.get("writer_kind")
+ 
+ 
+ def carried(prior: Optional[dict], writer_kind: str = "agent") -> dict:
+     """Attribution fields for an override that sets its own run limit and carries ``prior``'s cache-read limit
+-    over unchanged (the spend reviewer, the operator-courier promote, an agent release that keeps a limit)."""
++    over unchanged (the spend reviewer, the operator-courier promote, an agent release that keeps a limit).
++    A prior override with no cache-read value is carried too: it defers to the board limit, and whoever chose
++    that keeps the choice."""
+     out = {"writer_kind": writer_kind}
+-    if _limit_value((prior or {}).get("cache_read_tokens")) is not None:
++    if override_set(prior):
+         out["cache_read_writer_kind"] = cache_attribution(prior) or "unknown"
+     return out
+ 
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index 051a3cb0109..1b8f98d7655 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -440,7 +440,7 @@
+         if fresh is None:
+             return False
+         fresh = dict(fresh)
+-        if (fresh["status"] not in PARKED or _excluded(conn, fresh, now, age=age, defer=defer)
++        if (fresh["status"] not in PARKED or _excluded(conn, _gated(conn, fresh), now, age=age, defer=defer)
+                 or _escalated(conn, tid, entry)):
+             return False
+         if not contained:
+@@ -457,12 +457,15 @@
+         kb._append_event(conn, tid, EVENT, {
+             "episode_start": entry["created_at"] if entry else int(fresh.get("created_at") or 0),
+             "reason": _reason(entry), "desk_chat": desk_chat, "request": not contained,
+-            # The release offer this sweep stamped on the ask, recorded here too: the ask is a synced column any
+-            # gateway can write, this event's origin is attested (kanban_release._home_filed).
+-            **({"release_target": filed["release_target"]} if not contained and filed.get("release_target") else {})})
++            # The release offer this sweep stamped on the ask, and the ask's digest, recorded here too: the ask is
++            # a synced column any gateway can write, this event's origin is attested (kanban_release._home_filed).
++            **(_record(filed) if not contained else {})})
+     return True
+ 
+ 
++REFILED = "stranded_park_refiled"  # kanban_release.REFILED: not the escalation kind, so no second desk notice
++
++
+ def _dead_offer(conn: sqlite3.Connection, row: dict) -> bool:
+     from hermes_cli import kanban_release
+     try:
+@@ -472,14 +475,41 @@
+     return kanban_release.dead_offer(conn, row["id"], ask)
+ 
+ 
++def _filed_here(conn: sqlite3.Connection, task_id: str, entry: Optional[dict]) -> bool:
++    """This board's own record that it filed an ask for the card in the current park episode: an own-origin
++    escalation event with ``request`` after the park entry. The only evidence a re-file accepts. A stamp on
++    the ask column proves nothing (any gateway can write it), and an event whose origin a foreign write
++    replaced is no longer ours: there is no local-only copy of the original to check, so that shape is not
++    re-filed."""
++    from hermes_cli import kanban_release
++    floor = entry["id"] if entry else 0
++    return any(e["id"] > floor and e["payload"].get("request") is True
++               for e in kanban_release.own_events(conn, task_id, (EVENT,)))
++
++
++def _refiled(conn: sqlite3.Connection, task_id: str, entry: Optional[dict]) -> bool:
++    """A re-file is already recorded for this park episode (any origin: it only ever withholds another)."""
++    return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND id > ? LIMIT 1",
++                        (task_id, REFILED, entry["id"] if entry else 0)).fetchone() is not None
++
++
++def _record(filed: dict) -> dict:
++    """What a filing event records of the ask it stored: the release offer and the ask's identity
++    (``kanban_release._home_filed`` requires both to match before a click releases)."""
++    from hermes_cli import kanban_release
++    if not filed.get("release_target"):
++        return {}
++    return {"release_target": filed["release_target"], "ask_sha256": kanban_release.ask_digest(filed)}
++
++
+ def _refile(conn: sqlite3.Connection, row: dict, entry: Optional[dict], *, now: int, age: int) -> bool:
+     """Replace an ask whose release button is dead with this sweep's own brief and record the offer.
+ 
+-    The click releases only an ask whose stamp this board recorded for the card's pending stop
+-    (``kanban_release.offered``). An ask filed before that record existed, one whose card was rehomed or whose
+-    event lost its origin, and the old ask of a card that has since stopped again all show a button that can
+-    only be refused. The ask is rewritten from the brief, so a stamp that arrived on stored text this board
+-    never wrote gains nothing. Once: after it the stamp is current and recorded."""
++    Only where this board filed an ask for the card in this park episode (``_filed_here``) and has not re-filed
++    it yet (``_refiled``): the ask an earlier core filed without recording the offer, or one whose stored text
++    was changed afterwards. The ask is rewritten from the brief, so stored text this board never wrote gains
++    nothing, and at most once per park episode however often the column is rewritten. The record is a
++    ``stranded_park_refiled`` event, not a second escalation: the desk chat was told once."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_ask_resolved import store_request
+     from hermes_cli.kanban_human_request import NONHUMAN_KINDS
+@@ -487,19 +517,30 @@
+     with kb.write_txn(conn):
+         fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+         fresh = dict(fresh) if fresh is not None else None
+-        if fresh is None or fresh["status"] not in PARKED or _leased(fresh, now) or not _dead_offer(conn, fresh):
++        if (fresh is None or fresh["status"] not in PARKED or _leased(fresh, now) or not _dead_offer(conn, fresh)
++                or not _filed_here(conn, tid, entry) or _refiled(conn, tid, entry)):
+             return False
+         kind = fresh.get("block_kind")
+-        filed = _request(conn, fresh, entry, age, "The earlier ask's release offer had no record on this board or "
+-                         "named an earlier stop", "needs_input" if kind in NONHUMAN_KINDS else kind)
++        if kind in NONHUMAN_KINDS:  # as _escalate: a human ask cannot sit under a dependency/transient/time kind
++            kind = "needs_input"
++            conn.execute("UPDATE tasks SET block_kind = ? WHERE id = ?", (kind, tid))
++        filed = _request(conn, fresh, entry, age, "The earlier ask's release offer was not recorded on this board "
++                         "or its text was changed", kind)
+         store_request(conn, tid, filed)
+-        kb._append_event(conn, tid, EVENT, {
++        kb._append_event(conn, tid, REFILED, {
+             "episode_start": entry["created_at"] if entry else int(fresh.get("created_at") or 0),
+-            "reason": _reason(entry), "desk_chat": None, "request": True, "refiled": True,
+-            **({"release_target": filed["release_target"]} if filed.get("release_target") else {})})
++            "reason": _reason(entry), "request": True, **_record(filed)})
+     return True
+ 
+ 
++def _gated(conn: sqlite3.Connection, row: dict) -> dict:
++    """``row`` as the escalation gates see it. An ask whose release offer is dead is no open ask: without it the
++    card would keep a button that can only be refused and the sweep would never look at it again. It gates like
++    any unowned stop (strand age, live owner, once per episode), and an escalation that passes writes the real
++    ask over it. Nothing is written otherwise, so a rewritten column cannot make this loop."""
++    return {**row, "human_request": None} if _dead_offer(conn, row) else row
++
++
+ def _escalated(conn: sqlite3.Connection, task_id: str, entry: Optional[dict]) -> bool:
+     return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND id > ? LIMIT 1",
+                         (task_id, EVENT, entry["id"] if entry else 0)).fetchone() is not None
+@@ -551,7 +592,8 @@
+             entry = park_entry(conn, tid)
+             start = entry["created_at"] if entry else int(row.get("created_at") or 0)
+             age = now - start
+-            if _dead_offer(conn, row):  # an open ask whose release button cannot work: re-file it, once
++            if _filed_here(conn, tid, entry) and not _refiled(conn, tid, entry) and _dead_offer(conn, row):
++                # This board filed the ask in this episode and its release button cannot work: repair it, once.
+                 try:
+                     if _refile(conn, row, entry, now=now, age=age):
+                         escalated.append(tid)
+@@ -559,7 +601,7 @@
+                     logger.warning("kanban: stranded-park re-file failed for %s", tid, exc_info=True)
+                 continue
+             if (age < park_s or _shared_blocker(entry) or _escalated(conn, tid, entry)
+-                    or _excluded(conn, row, now, age=age, defer=defer_s)):
++                    or _excluded(conn, _gated(conn, row), now, age=age, defer=defer_s)):
+                 continue
+             try:
+                 if live_owner(conn, tid, own=own, liveness=liveness):
+diff --git a/tests/hermes_cli/test_kanban_release.py b/tests/hermes_cli/test_kanban_release.py
+index 050dbf98f13..41fabcc5193 100644
+--- a/tests/hermes_cli/test_kanban_release.py
++++ b/tests/hermes_cli/test_kanban_release.py
+@@ -823,3 +823,43 @@
+     assert out['outcome'] == 'released'
+     assert budget.card_limits(board, tid, budget.limits()) == budget.Limits(0, 0)  # still no run limit; lifted
+     assert budget.hold(board, tid) is None and status(board, tid) == 'ready'
++
++
++def test_a_persons_run_only_override_keeps_its_deference_to_the_board_limit(board):
++    """Human 3 runs / no cache value -> agent release -> stop -> agent release: the board limit still applies."""
++    tid = spend_stopped(board)
++    scope.link(board, tid)
++    budget.set_override(board, tid, runs=3, by='david', reason='three more', writer_kind='human')
++    board_limit = budget.limits().cache_read_tokens
++    assert board_limit > 0
++    shown = as_owner(board, tid)
++    assert as_owner(board, tid, seen=max(shown['unread']))['outcome'] == 'released'
++    first = newest_budget(board, tid)
++    assert first['cache_read_tokens'] is None and first['cache_read_writer_kind'] == 'human'
++    stop_again(board, tid)
++    assert as_owner(board, tid)['outcome'] == 'released'
++    second = newest_budget(board, tid)
++    assert second['cache_read_tokens'] is None and second['cache_read_writer_kind'] == 'human'
++    assert budget.card_limits(board, tid, budget.limits()).cache_read_tokens == board_limit
++
++
++def test_an_agent_release_written_before_attribution_reads_as_unknown_not_agent(board):
++    """Under the first follow-up an agent release that kept a person's limit recorded only writer_kind agent."""
++    era = {'runs': 13, 'cache_read_tokens': 5_000_000, 'by': 'default', 'writer_kind': 'agent',
++           'reason': 'hermes kanban release: 10 more runs (mandate comment 7)'}
++    assert budget.cache_attribution(era) == 'unknown'
++    assert budget.cache_attribution({**era, 'reason': 'tightening'}) == 'agent'  # an agent's own spend-budget
++    assert budget.cache_attribution({**era, 'cache_read_writer_kind': 'agent'}) == 'agent'
++    tid = spend_stopped(board)
++    scope.link(board, tid)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, budget.OVERRIDE_EVENT, era)
++    stop_again(board, tid)
++    out = as_owner(board, tid)
++    assert out['outcome'] == 'released', out
++    kept = newest_budget(board, tid)
++    assert kept['cache_read_tokens'] == 5_000_000 and kept['cache_read_writer_kind'] == 'unknown'
++    # A release that lifts the limit says so: the limit is then this writer's.
++    human = spend_stopped(board)
++    run(board, human)
++    assert newest_budget(board, human)['cache_read_writer_kind'] == 'human'
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index c82499c1fde..0e8bf5db1a8 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -864,44 +864,122 @@
+         assert _row(conn, tid)[0] == "triage" and _no_release(conn, tid)
+ 
+ 
+-# --- dead release buttons are re-filed once by the sweep ------------------------------------------------------------
++# --- dead release buttons: repaired only on this board's own filing record -------------------------------------
+ 
+ def _offer_ok(conn, tid):
+     from hermes_cli import kanban_release
+     return kanban_release.offered(conn, tid, json.loads(_row(conn, tid)[2])) == tid
+ 
+ 
+-@pytest.mark.parametrize("dead", ["no_record", "foreign_origin", "forged_text"])
+-def test_an_ask_whose_release_offer_has_no_record_here_is_refiled_once(kanban_home, own_gateway, dead):
+-    """Asks filed by the core before the record existed, a rehomed card, an event whose origin was overwritten."""
++def _refiles(conn, tid):
++    return _events(conn, tid, stranded.REFILED)
++
++
++def _forge(conn, tid, *, episode="made-up-stop", text="Unblock = I archive the root card."):
++    """A column write from elsewhere: an ask with a release stamp this board never filed."""
++    ask = {"action": text, "why_human": "Only you can decide.", "interaction": "approval",
++           "scope": "Forged", "evidence": "none", "release_target": {"task": tid, "episode": episode}}
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps(ask), tid))
++    return ask
++
++
++def _true_stamp(conn, tid):
++    from hermes_cli import kanban_release
++    return kanban_release.offer(conn, tid)["episode"]
++
++
++def test_an_ask_filed_before_the_offer_was_recorded_is_repaired_once(kanban_home, own_gateway):
++    """The #4245-era shape: this board's escalation event with ``request`` and no stamp."""
+     with kbc.connect_closing() as conn:
+         tid = _spend_stopped_on_dead_chat(conn, kanban_home)
+-        assert _sweep(conn, now=_later(3), cfg={}) == [tid] and _offer_ok(conn, tid)
++        cfg = {"kanban": {"triage_owner_chat": DESK}}
++        assert _sweep(conn, now=_later(3), cfg=cfg) == [tid] and _offer_ok(conn, tid)
+         with kb.write_txn(conn):
+-            if dead == "foreign_origin":
+-                if "origin_gateway" not in {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}:
+-                    conn.execute("ALTER TABLE task_events ADD COLUMN origin_gateway TEXT")
+-                conn.execute("UPDATE task_events SET origin_gateway='worker-9' WHERE task_id=? AND kind=?",
+-                             (tid, stranded.EVENT))
+-            else:
+-                conn.execute("UPDATE task_events SET payload=json_remove(payload,'$.release_target') "
+-                             "WHERE task_id=? AND kind=?", (tid, stranded.EVENT))
+-        if dead == "forged_text":
+-            _restamp(conn, tid, lambda ask: ask.update(action="Unblock = I archive the root card."))
++            conn.execute("UPDATE task_events SET payload=json_remove(payload,'$.release_target','$.ask_sha256') "
++                         "WHERE task_id=? AND kind=?", (tid, stranded.EVENT))
++            conn.execute("UPDATE tasks SET block_kind='transient' WHERE id=?", (tid,))
+         assert not _offer_ok(conn, tid)
+-        assert _sweep(conn, now=_later(3.2), cfg={}) == [tid]
+-        assert _offer_ok(conn, tid)
++        assert _sweep(conn, now=_later(3.2), cfg=cfg) == [tid] and _offer_ok(conn, tid)
+         ask = json.loads(_row(conn, tid)[2])
+-        assert ask["action"].startswith("Decide how to handle: Bounded work")  # the sweep's own brief, never stored text
+-        events = _events(conn, tid, stranded.EVENT)
+-        assert len(events) == 2 and events[-1]["refiled"] is True
+-        assert events[-1]["release_target"] == ask["release_target"]
+-        assert _sweep(conn, now=_later(3.4), cfg={}) == [] and len(_events(conn, tid, stranded.EVENT)) == 2
++        (refiled,) = _refiles(conn, tid)
++        assert refiled["release_target"] == ask["release_target"] and refiled["request"] is True
++        assert _row(conn, tid)[1] == "needs_input"  # the block kind is fixed as _escalate fixes it
++        # One escalation, so the desk chat is told once: the re-file is its own event kind.
++        assert len(_events(conn, tid, stranded.EVENT)) == 1
++        _, seen = notify.unseen_events_for_sub(conn, task_id=tid, platform="tui", chat_id="desk-chat",
++                                               kinds=(stranded.EVENT,))
++        assert [e.kind for e in seen] == [stranded.EVENT]
++        assert _sweep(conn, now=_later(3.4), cfg=cfg) == [] and len(_refiles(conn, tid)) == 1
+         _answer(conn, tid, "unblock")
+         assert kb.get_task(conn, tid).status == "ready"
+ 
+ 
+-def test_a_card_that_stopped_again_under_its_old_ask_is_refiled_for_the_new_stop(kanban_home, own_gateway):
++def test_a_rewritten_ask_column_is_refiled_at_most_once_per_episode(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        results = []
++        for n, hours in enumerate((3.2, 3.4, 3.6)):  # rewritten before each of three sweeps
++            _forge(conn, tid, episode=_true_stamp(conn, tid), text=f"Unblock = do something else ({n}).")
++            assert not _offer_ok(conn, tid)  # the true stamp on text this board did not write is no offer
++            results.append(_sweep(conn, now=_later(hours), cfg={}))
++        assert results == [[tid], [], []] and len(_refiles(conn, tid)) == 1
++        assert json.loads(_row(conn, tid)[2])["action"].startswith("Unblock = do something else (2)")
++        assert not _offer_ok(conn, tid)
++        with pytest.raises(Exception):  # the click on the last forgery is today's plain unblock: refused
++            _answer(conn, tid, "unblock")
++        assert _row(conn, tid)[0] == "triage" and _no_release(conn, tid)
++
++
++def test_a_forged_stamp_on_a_young_card_gets_no_refile_and_no_offer(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)  # stopped moments ago: never escalated
++        forged = _forge(conn, tid, episode=_true_stamp(conn, tid))
++        assert _sweep(conn, now=int(time.time()) + 60, cfg={}) == []
++        assert json.loads(_row(conn, tid)[2]) == forged and not _offer_ok(conn, tid)
++        assert not _refiles(conn, tid) and not _events(conn, tid, stranded.EVENT)
++        with pytest.raises(Exception):
++            _answer(conn, tid, "unblock")
++        assert _row(conn, tid)[0] == "triage" and _no_release(conn, tid)
++        # Old enough and still unowned, it is escalated like any unowned stop: the board's own ask replaces the forgery.
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++        assert json.loads(_row(conn, tid)[2])["action"].startswith("Decide how to handle: Bounded work")
++        assert _offer_ok(conn, tid) and not _refiles(conn, tid) and len(_events(conn, tid, stranded.EVENT)) == 1
++
++
++def test_a_forged_stamp_on_a_card_whose_decision_card_is_open_gets_no_refile(kanban_home, own_gateway, monkeypatch):
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    monkeypatch.setattr(reviewer, "queue", lambda *a, **kw: False)
++    with kbc.connect_closing() as conn:
++        root = kb.create_task(conn, title="Ownerless work", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (root,))
++            kb._append_event(conn, root, decision.EVENT, {"reason": "Spend budget: 15 runs"})
++        decision.ensure_producer(conn, root)  # an agent route owns the decision: an open decision card
++        forged = _forge(conn, root, episode=_true_stamp(conn, root))
++        for hours in (3, 3.2):
++            assert root not in _sweep(conn, now=_later(hours), cfg={})
++        assert json.loads(_row(conn, root)[2]) == forged and not _offer_ok(conn, root)
++        assert not _refiles(conn, root) and not _events(conn, root, stranded.EVENT)
++
++
++def test_an_escalation_whose_origin_was_overwritten_is_not_this_boards_evidence(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid = _spend_stopped_on_dead_chat(conn, kanban_home)
++        assert _sweep(conn, now=_later(3), cfg={}) == [tid] and _offer_ok(conn, tid)
++        with kb.write_txn(conn):
++            if "origin_gateway" not in {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}:
++                conn.execute("ALTER TABLE task_events ADD COLUMN origin_gateway TEXT")
++            conn.execute("UPDATE task_events SET origin_gateway='worker-9' WHERE task_id=? AND kind=?",
++                         (tid, stranded.EVENT))
++        assert not _offer_ok(conn, tid)
++        assert _sweep(conn, now=_later(3.2), cfg={}) == [] and not _refiles(conn, tid) and not _offer_ok(conn, tid)
++
++
++def test_a_card_that_stopped_again_under_its_old_ask_is_escalated_for_the_new_stop(kanban_home, own_gateway):
++    """No filing record exists for the new park episode, so nothing is re-filed: the stale ask is no open ask
++    and the card passes the normal gates like any unowned stop."""
+     from hermes_cli import kanban_release
+     with kbc.connect_closing() as conn:
+         tid = _spend_stopped_on_dead_chat(conn, kanban_home)
+@@ -911,9 +989,12 @@
+             kb._append_event(conn, tid, "promoted_manual", {"actor": "someone", "reason": "one more"})
+             kb._append_event(conn, tid, decision.EVENT, {"reason": "Spend budget: again"})
+         assert decision.pending(conn, tid) and not _offer_ok(conn, tid)
++        assert _sweep(conn, now=int(time.time()) + 60, cfg={}) == []  # too young: nothing written yet
++        assert json.loads(_row(conn, tid)[2])["release_target"] == old
+         assert _sweep(conn, now=_later(3.2), cfg={}) == [tid]
+         new = json.loads(_row(conn, tid)[2])["release_target"]
+         assert new == kanban_release.offer(conn, tid) and new["episode"] != old["episode"] and _offer_ok(conn, tid)
++        assert not _refiles(conn, tid) and len(_events(conn, tid, stranded.EVENT)) == 2
+         _answer(conn, tid, "unblock")
+         assert kb.get_task(conn, tid).status == "ready"
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index bc930f76e77..9763819bb46 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -775,7 +775,9 @@
+ spend reviewer and the operator-courier promote; a limit that is only carried over keeps its own
+ attribution in `cache_read_writer_kind`, so a later agent release keeps it too), and is refused
+ `budget_limit_in_force` when that limit is already reached; a human lifts it, also on a card with no
+-run limit.
++run limit. A person's run-only override defers to the board's cache-read limit and that deference is
++kept the same way. An agent that first restates the numbers with `spend-budget` and then releases
++has made the limit its own; that is not prevented here.
+ 
+ Each release records a `stop_released` event (authority, runs, mandate comment); a rerun after it is
+ `already_released`. A rerun after a failure past the mandate comment reuses that comment (unless newer
+@@ -787,8 +789,13 @@
+ card (or for the decision card of its pending stop) carries a `release_target` stamp that no agent,
+ tool or CLI request can supply, and the sweep records the same stamp on its `stranded_park_escalated`
+ event: a stamp on the synced ask column alone, without this board's own event, offers nothing. An
+-open ask whose stamp has no such record here, or names an earlier stop than the pending one, is
+-re-filed once by the sweep from its own brief (`refiled: true` on the event), so the button works again. An agent-written ask, an ask with its own choices, an ask filed
++ask this board filed in the current park episode whose offer is no longer honoured (filed before
++the record existed, or its stored text changed) is re-filed from the sweep's own brief, at most once
++per episode (`stranded_park_refiled`, no second desk notice). Any other ask with a dead offer, such as
++a stamp this board has no filing record for, a rehomed card, or a card that stopped again under its
++old ask, is not an open ask to the sweep: the card passes the normal escalation gates like any
++unowned stop, and nothing is written until it does. An escalation event whose origin a foreign write
++replaced is not this board's evidence and is not re-filed. An agent-written ask, an ask with its own choices, an ask filed
+ before the stamp existed and a decision card for an earlier stop keep the plain unblock. Local
+ clicks go through the user-steps mirror, remote ones through `kanban_card_answer` on the card's home.
+ 
+-- 
+2.43.0
+

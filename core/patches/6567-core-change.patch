@@ -1,0 +1,362 @@
+From 5317add0d97d9d0755eb1d8a6e4a04310ebc1b82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:29:25 +0000
+Subject: [PATCH 6567] Dispatch storage cancellation and governor observations
+
+Public mirror of source commit 5317add0d97d9d0755eb1d8a6e4a04310ebc1b82.
+
+---
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index a1479487294..7b635d607f0 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -146,6 +146,8 @@
+         result = run(conn, lambda: _tick_work(conn, tick, dry_run), board=board)
+         result.dispatch_owner = owner
+         if result.storage_skip_reason:
++            from hermes_cli.kanban_governor_storage import record
++            record(conn, board=board, dry_run=dry_run)
+             return result  # observers/checkpoints must not re-enter the contended writer
+         kbc._maybe_checkpoint_wal(conn, db_path)
+     # Denied ticks deliberately don't invoke observers, which may mutate state.
+diff --git a/hermes_cli/kanban_governor_storage.py b/hermes_cli/kanban_governor_storage.py
+new file mode 100644
+index 00000000000..cb823a40c9d
+--- /dev/null
++++ b/hermes_cli/kanban_governor_storage.py
+@@ -0,0 +1,87 @@
++"""File-only evidence of a real preclaim abort; never re-enter the board writer."""
++from __future__ import annotations
++
++from contextlib import closing
++import logging
++import sqlite3
++import time
++
++CENSUS_SECONDS = .2
++GOVERNOR = "storage_admission"
++LABEL = "Storage admission"
++SOURCE = "hermes_cli/kanban_dispatch_storage.py:run"
++DETAIL = "Preclaim aborted by storage contention; candidate rules were not observed."
++
++
++def _census(path, review, limit):
++    from hermes_cli.kanban_lockguard import guard, guarded_factory
++    from hermes_cli.sqlite_safe_read import connect_tracked
++
++    deadline = time.monotonic() + CENSUS_SECONDS
++    # The caller already owns the native lifecycle/dispatch identity. A general
++    # opener would run recovery and could write: this bounded observer must not.
++    with closing(connect_tracked(path.as_uri() + "?mode=ro", uri=True, timeout=CENSUS_SECONDS,
++                                 factory=guarded_factory(), wait_for_tracking=False)) as reader:
++        guard(reader, strict=True)
++        reader.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
++        reader.execute("BEGIN")  # read transaction: census and coverage share one WAL view
++        statuses = ("ready", "review") if review else ("ready",)
++        marks = ",".join("?" for _ in statuses)
++        rows = reader.execute(
++            f"SELECT id, status FROM tasks WHERE status IN ({marks}) AND claim_lock IS NULL "
++            "ORDER BY created_at, id LIMIT ?", (*statuses, limit + 1)).fetchall()
++        # Excluded status coverage is explicit, not an inferred zero-hold reading.
++        counts = dict(reader.execute("SELECT status, count(*) FROM tasks GROUP BY status"))
++        if time.monotonic() >= deadline:
++            raise TimeoutError("storage census deadline")
++        return rows, counts
++
++
++def record(conn, *, board, dry_run=False):
++    """Called only for a typed storage abort under the validated owner lock."""
++    from hermes_cli import kanban_governors as governors
++    from hermes_cli.kanban_dispatch_owner import connection_db_path
++    from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
++    from hermes_cli.kanban_suspend_ledger import _configured_interval_seconds
++
++    governors._take_capture(conn)  # discard partial/exceptional tick capture
++    if dry_run:
++        return None
++    try:
++        path = connection_db_path(conn)
++        target = path.with_name(path.name + governors.SUFFIX)
++        previous = governors._read(target) or {}
++        error = None
++        try:
++            rows, counts = _census(path, review_dispatch_enabled(), governors.MAX_CARDS)
++        except (OSError, sqlite3.Error, TimeoutError) as exc:
++            rows, counts, error = [], None, type(exc).__name__
++        now = time.time()  # new abort observation, never old per-card decisions
++        known = {"governor": GOVERNOR, "label": LABEL, "scope": None, "source": SOURCE,
++                 "threshold": "dispatch preclaim write-wait budget", "detail": DETAIL,
++                 "since": now, "phase": "preclaim_aborted"}
++        cards = {tid: {**known, "status": status, "overlaps": None, "overlaps_unknown": []}
++                 for tid, status in rows[:governors.MAX_CARDS]}
++        globals_ = [{**known, "verdict": "stop", "reached": True}]
++        globals_ += [{"governor": gid, "verdict": "unknown", "reached": False, "detail": DETAIL}
++                     for gid in governors.GLOBALS]
++        readings = [{"governor": g["id"], "label": g["label"], "kind": g["kind"], "scope": None,
++                     "active": None, "cards": None, "card_ids": [], "since": None,
++                     "unknown": True} for g in governors.registry() if g["id"] != GOVERNOR]
++        readings.append({**known, "kind": governors.HOLD, "active": True, "cards": len(cards),
++                         "card_ids": list(cards)[:governors.MAX_IDS]})
++        doc = {"version": governors.VERSION, "board": governors._board(conn), "tick_at": now,
++               "phase": "preclaim_aborted", "scheduling_admitted": False,
++               "global_stop": GOVERNOR, "globals": globals_, "governors": readings, "cards": cards,
++               "caps": {}, "idle_total": None, "charged_total": len(cards) if counts is not None else None,
++               "truncated": len(rows) > governors.MAX_CARDS,
++               "coverage": {"complete": False, "excluded_statuses": ["triage"],
++                            "status_counts": counts, "census_error": error}}
++        doc.update(governors.completion_policy(previous, now, _configured_interval_seconds()))
++        if connection_db_path(conn) != path:
++            return None
++        governors._write(target, doc)
++        return doc
++    except Exception:  # health: allow BLE001 -- evidence cannot change the real storage refusal
++        logging.getLogger(__name__).debug("storage admission observation unavailable", exc_info=True)
++        return None
+diff --git a/hermes_cli/kanban_governors.py b/hermes_cli/kanban_governors.py
+index 332fbcb88a1..e49ea5c9050 100644
+--- a/hermes_cli/kanban_governors.py
++++ b/hermes_cli/kanban_governors.py
+@@ -74,6 +74,8 @@
+ # Dispatcher order: ``_dispatch_once_locked`` top to bottom, then ``_dispatch_lane_task``, then the claim
+ # transaction. A card's first stop is the earliest entry here that refused it.
+ _REGISTRY: tuple[Governor, ...] = (
++    Governor("storage_admission", "Storage admission", "board", "hermes_cli/kanban_dispatch_storage.py:run",
++             "dispatch preclaim write-wait budget"),
+     Governor("gateway_drain", "Gateway drain", "host", "hermes_cli/kanban_gateway_drain.py:dispatch_paused",
+              "gateway_state.json gateway_state=draining / restart_requested"),
+     Governor("core_update_drain", "Core-update drain", "host", "hermes_cli/kanban_gateway_drain.py:core_update_hold",
+diff --git a/hermes_cli/kanban_why_fast.py b/hermes_cli/kanban_why_fast.py
+index 7206629f8de..ff5359c7c74 100644
+--- a/hermes_cli/kanban_why_fast.py
++++ b/hermes_cli/kanban_why_fast.py
+@@ -89,7 +89,8 @@
+     first["verdict"] = "stop"
+     return {"task_id": recorded["task_id"], "board": recorded.get("board"), "source": "snapshot",
+             "age_s": recorded.get("age_s"), "freshness_bound_s": recorded.get("freshness_bound_s"),
+-            "status": recorded.get("status"), "first_stop": first, "overlaps": recorded.get("overlaps"),
++            "status": recorded.get("status"), "phase": recorded.get("phase"),
++            "first_stop": first, "overlaps": recorded.get("overlaps"),
+             "overlaps_unknown": recorded.get("overlaps_unknown"), "globals": recorded.get("globals"),
+             "chain": [first], "recorded": recorded, "elapsed_s": round(time.monotonic() - started, 3)}
+ 
+diff --git a/tests/hermes_cli/test_governor_storage_observation.py b/tests/hermes_cli/test_governor_storage_observation.py
+new file mode 100644
+index 00000000000..7a53db0ea9d
+--- /dev/null
++++ b/tests/hermes_cli/test_governor_storage_observation.py
+@@ -0,0 +1,212 @@
++"""Fresh evidence of real preclaim storage aborts, not replayed card decisions."""
++from contextlib import closing
++import json
++import sqlite3
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_owner as owner
++from hermes_cli import kanban_governors as governors
++from hermes_cli import kanban_why_fast as fast
++from hermes_cli.kanban_db_dispatch import DispatchResult
++import pytest
++
++
++@pytest.mark.parametrize("entry", ["owner", "dispatcher"])
++def test_real_storage_abort_publishes_current_candidate_without_writer_reentry(tmp_path, monkeypatch, entry):
++    from hermes_cli import kanban_model_retirement, kanban_ratio_routing
++    from hermes_cli import kanban_dispatch_storage as storage
++    from hermes_cli import kanban_db_dispatch as dispatch
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    monkeypatch.setattr(kanban_model_retirement, "sweep", lambda conn: None)
++    monkeypatch.setattr(kanban_ratio_routing, "begin_tick", lambda conn: None)
++    monkeypatch.setattr(storage, "WRITE_WAIT_SECONDS", .02)
++    monkeypatch.setattr(dispatch, "review_dispatch_enabled", lambda: True)
++    # Retained batch018 why04: the last genuine completion had expired.
++    last_completion, at = 1700724784.5697815, 1700724893.0533526
++    monkeypatch.setattr(governors.time, "time", lambda: at)
++    path = home / "kanban.db"
++    sidecar = path.with_name(path.name + fast.SUFFIX)
++    old = {"version": 1, "board": "default", "tick_at": last_completion,
++           "freshness_bound_s": 102.78792333602905,
++           "cards": {"gone": {"governor": "max_spawn", "status": "ready"}},
++           "caps": {"max_spawn": 0}, "governors": [], "tick_completions": [last_completion]}
++    with closing(kbc.connect(path)) as conn:
++        conn.executemany("INSERT INTO tasks(id, status, claim_lock, created_at, title) VALUES (?, ?, ?, 1, 'fixture')", [
++            ("candidate", "ready", None), ("reviewer", "review", None),
++            ("claimed", "ready", "lease"), ("gated", "triage", None)])
++        conn.commit()
++        governors._write(sidecar, old)
++        assert fast.read_answer(path, "candidate", now=at) is None
++        writes = []
++        conn.set_trace_callback(writes.append)
++        monkeypatch.setattr(kbc, "_maybe_checkpoint_wal", lambda *a: (_ for _ in ()).throw(AssertionError("checkpoint")))
++        with closing(sqlite3.connect(path, isolation_level=None)) as blocker:
++            blocker.execute("BEGIN IMMEDIATE")
++            try:
++                calls = []
++                def tick():
++                    calls.append(True)
++                    kbc._execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
++                    return DispatchResult()
++                if entry == "dispatcher":
++                    monkeypatch.setattr(kanban_model_retirement, "sweep", lambda conn: tick())
++                    result = dispatch.dispatch_once(conn, board="default", spawn_fn=lambda *a: pytest.fail("spawn"))
++                else:
++                    result = owner.run_owned_tick(conn, tick, None, "default", False)
++                assert result.storage_skip_reason == storage.REASON
++                assert calls == [True]
++                doc = json.loads(sidecar.read_text())
++                assert doc["tick_at"] == at
++                assert doc["phase"] == "preclaim_aborted"
++                assert set(doc["cards"]) == {"candidate", "reviewer"}
++                assert doc["cards"]["candidate"]["governor"] == "storage_admission"
++                assert doc["cards"]["candidate"]["overlaps"] is None
++                assert doc["caps"] == {}
++                assert doc["coverage"]["excluded_statuses"] == ["triage"]
++                answer = fast.read_answer(path, "candidate", now=at)
++                assert answer is not None
++                assert answer["source"] == "snapshot"
++                assert answer["phase"] == "preclaim_aborted"
++                assert fast.read_answer(path, "gated", now=at) is None
++                assert fast.read_answer(path, "candidate", now=at + 601) is None
++                assert not any(sql.upper().startswith(("INSERT", "UPDATE", "DELETE", "ROLLBACK")) for sql in writes)
++                assert not conn.in_transaction
++            finally:
++                blocker.rollback()
++
++
++def test_census_never_enters_lifecycle_recovery(tmp_path, monkeypatch):
++    from hermes_cli import kanban_generation as generation
++    from hermes_cli import kanban_governor_storage as observation
++    path = tmp_path / "kanban.db"
++    with closing(kbc.connect(path)) as conn:
++        conn.execute("INSERT INTO tasks(id, status, created_at, title) VALUES ('candidate', 'ready', 1, 'fixture')")
++        conn.commit()
++        def forbidden(*args):
++            pytest.fail("census must not enter lifecycle recovery")
++        monkeypatch.setattr(generation, "recover", forbidden)
++        rows, counts = observation._census(path, False, 5)
++        assert [tuple(row) for row in rows] == [("candidate", "ready")]
++        assert counts == {"ready": 1}
++
++
++@pytest.mark.parametrize("failure", [sqlite3.OperationalError("locked"), TimeoutError("deadline")])
++def test_failed_census_publishes_unknown_without_old_cards(tmp_path, monkeypatch, failure):
++    from hermes_cli import kanban_governor_storage as observation
++    with closing(kbc.connect(tmp_path / "kanban.db")) as conn:
++        def failed(*args):
++            raise failure
++        monkeypatch.setattr(observation, "_census", failed)
++        doc = observation.record(conn, board="default")
++        assert doc is not None
++        assert doc["cards"] == {}
++        assert doc["idle_total"] is None
++        assert doc["charged_total"] is None
++        assert doc["coverage"]["status_counts"] is None
++        assert all(row["active"] is None and row["cards"] is None for row in doc["governors"]
++                   if row["governor"] != "storage_admission")
++
++
++def test_dry_run_does_not_publish(tmp_path):
++    from hermes_cli import kanban_governor_storage as observation
++    path = tmp_path / "kanban.db"
++    with closing(kbc.connect(path)) as conn:
++        assert observation.record(conn, board="default", dry_run=True) is None
++        assert not path.with_name(path.name + fast.SUFFIX).exists()
++
++
++def test_identity_replacement_during_census_cannot_publish(tmp_path, monkeypatch):
++    from hermes_cli import kanban_governor_storage as observation
++    path = tmp_path / "kanban.db"
++    with closing(kbc.connect(path)) as conn:
++        def replace(*args):
++            path.rename(tmp_path / "original.db")
++            path.touch()
++            return [], {}
++        monkeypatch.setattr(observation, "_census", replace)
++        assert observation.record(conn, board="default") is None
++        assert not path.with_name(path.name + fast.SUFFIX).exists()
++
++
++def test_read_census_is_bounded_and_excludes_disabled_review(tmp_path):
++    from hermes_cli import kanban_governor_storage as observation
++    path = tmp_path / "kanban.db"
++    with closing(kbc.connect(path)) as conn:
++        conn.executemany("INSERT INTO tasks(id, status, created_at, title) VALUES (?, ?, 1, 'fixture')", [
++            ("a", "ready"), ("b", "ready"), ("c", "review")])
++        conn.commit()
++        rows, counts = observation._census(path, False, 1)
++        assert [tuple(row) for row in rows] == [("a", "ready"), ("b", "ready")]
++        assert counts == {"ready": 2, "review": 1}
++
++
++def test_expired_query_budget_discards_census(tmp_path, monkeypatch):
++    from hermes_cli import kanban_governor_storage as observation
++    path = tmp_path / "kanban.db"
++    with closing(kbc.connect(path)):
++        times = iter([0., 1.])
++        monkeypatch.setattr(observation.time, "monotonic", lambda: next(times, 1.))
++        with pytest.raises((TimeoutError, sqlite3.OperationalError)):
++            observation._census(path, False, 1)
++
++
++def test_observation_does_not_rollback_callers_transaction(tmp_path):
++    from hermes_cli import kanban_governor_storage as observation
++    with closing(kbc.connect(tmp_path / "kanban.db")) as conn:
++        conn.execute("BEGIN IMMEDIATE")
++        conn.execute("INSERT INTO tasks(id, status, created_at, title) VALUES ('uncommitted', 'ready', 1, 'fixture')")
++        try:
++            doc = observation.record(conn, board="default")
++            assert doc is not None and doc["cards"] == {}
++            assert conn.in_transaction
++            assert conn.execute("SELECT count(*) FROM tasks WHERE id='uncommitted'").fetchone()[0] == 1
++        finally:
++            conn.rollback()
++
++
++def test_publication_error_does_not_escape_or_change_database(tmp_path, monkeypatch):
++    from hermes_cli import kanban_governor_storage as observation
++    with closing(kbc.connect(tmp_path / "kanban.db")) as conn:
++        def failed(*args):
++            raise OSError("read-only evidence directory")
++        monkeypatch.setattr(governors, "_write", failed)
++        before = conn.total_changes
++        assert observation.record(conn, board="default") is None
++        assert conn.total_changes == before
++
++
++def test_census_rows_and_counts_share_one_read_snapshot(tmp_path, monkeypatch):
++    from hermes_cli import kanban_governor_storage as observation, sqlite_safe_read
++    path = tmp_path / "kanban.db"
++    with closing(kbc.connect(path)) as conn:
++        conn.execute("INSERT INTO tasks(id, status, created_at, title) VALUES ('candidate', 'ready', 1, 'fixture')")
++        conn.commit()
++        real_open = sqlite_safe_read.connect_tracked
++        def opened(*args, **kwargs):
++            reader = real_open(*args, **kwargs)
++            class Interleaved:
++                def __getattr__(self, name):
++                    return getattr(reader, name)
++                def execute(self, sql, *parameters):
++                    if sql.startswith("SELECT status, count"):
++                        conn.execute("UPDATE tasks SET status='triage' WHERE id='candidate'")
++                        conn.commit()
++                    return reader.execute(sql, *parameters)
++            return Interleaved()
++        monkeypatch.setattr(sqlite_safe_read, "connect_tracked", opened)
++        rows, counts = observation._census(path, False, 10)
++        assert [tuple(row) for row in rows] == [("candidate", "ready")]
++        assert counts == {"ready": 1}
++
++
++def test_census_board_identity_comes_from_validated_database(tmp_path, monkeypatch):
++    from hermes_cli import kanban_governor_storage as observation
++    with closing(kbc.connect(tmp_path / "kanban.db")) as conn:
++        monkeypatch.setattr(governors, "_board", lambda conn: "actual-board")
++        doc = observation.record(conn, board="caller-hint")
++        assert doc is not None and doc["board"] == "actual-board"
+-- 
+2.43.0
+

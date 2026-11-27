@@ -1,0 +1,192 @@
+From 56b08e11b8c446c411acac936e98ae3ef812c7cf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:35:46 +0000
+Subject: [PATCH 6526] Refusal boundary for refused providers
+
+Public mirror of source commit 56b08e11b8c446c411acac936e98ae3ef812c7cf.
+
+---
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index 02c7e2754da..c98db0b851d 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -146,7 +146,7 @@
+     """Fence cached agents and stale overrides at each outbound attempt."""
+     from hermes_cli.kanban_refusal_boundary import require_policy
+     require_policy(getattr(agent, '_kanban_refusal_policy', None),
+-                   model=request.get('model', agent.model), provider=agent.provider)
++                   model=request.get('model', agent.model), provider=agent.provider, request=True)
+     config = managed_config()
+     if config is None:
+         return
+diff --git a/hermes_cli/kanban_refusal_boundary.py b/hermes_cli/kanban_refusal_boundary.py
+index e8ee75e5f5b..ce070a49fee 100644
+--- a/hermes_cli/kanban_refusal_boundary.py
++++ b/hermes_cli/kanban_refusal_boundary.py
+@@ -12,17 +12,22 @@
+     """No proven eligible, unrefused execution route; no provider request is permitted."""
+ 
+ 
+-def require_route(conn, task, model, provider, *, lane='ready'):
++def require_route(conn, task, model, provider, *, lane='ready', check_peers=True):
+     """Validate the FINAL tuple without choosing a replacement or changing refusal history."""
+     from hermes_cli.kanban_refusal_fallback import refused_providers, eligible_routes
+     refused = refused_providers(conn, task.id)
+     if not refused:
+         return
++    from hermes_cli.kanban_review_model import is_review_run
+     provider = str(provider or '').strip().lower()
+     if not model or is_class_selector(model) or provider in ('', 'auto', 'none'):
+         raise RefusedRouteError('Safety exclusion requires a concrete execution route')
+     if provider in refused:
+         raise RefusedRouteError(f'Safety exclusion refuses execution on {provider}')
++    if not check_peers or is_review_run(conn, task, lane):
++        # Reviewers come from the review resolver, not class peers (as reroute/admission): the refused-provider
++        # fence above still applies, only the peer-eligibility check is skipped.
++        return tuple(refused)
+     # A previously admitted peer can disappear before pace consumption, owner admission or exec.
+     # Never fall back to a refused pool (nor silently allocate a different peer) in that case.
+     try:
+@@ -34,8 +39,11 @@
+     return tuple(refused)
+ 
+ 
+-def require_policy(policy, *, model=_UNSET, provider=_UNSET):
+-    """Fresh board read at real owner exec and worker construction, including saved policies."""
++def require_policy(policy, *, model=_UNSET, provider=_UNSET, request=False):
++    """Fresh board read at real owner exec and worker construction, including saved policies.
++
++    ``request=True`` (outbound request): an ended claim (the run's own terminal board tool) is no longer
++    live, so only the provider fence applies; a live claim gets the full route check."""
+     if policy is None or not getattr(policy, 'kanban_json', None):
+         return
+     from hermes_cli import kanban_db as kb
+@@ -53,10 +61,21 @@
+             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
+                     or task.claim_lock != context['claim_lock'] or run is None
+                     or tuple(run) != ('running', context['claim_lock'], None)):
++                # Closing reply: only the SAME run, ended by its own terminal tool, with no other claimant,
++                # on an unrefused concrete route. Never reopens tools/work or authorizes another claim.
++                if (request and task is not None and run is not None
++                        and run['claim_lock'] == context['claim_lock'] and run['ended_at'] is not None
++                        and run['status'] != 'running' and task.status != 'running'
++                        and task.current_run_id in (None, context['run_id'])
++                        and task.claim_lock in (None, context['claim_lock'])):
++                    selected = str((policy.provider if provider is _UNSET else provider) or '').strip().lower()
++                    if selected in ('', 'auto', 'none') or selected in refused_providers(conn, task.id):
++                        raise RefusedRouteError(f'Safety exclusion refuses execution on {selected or "unknown"}')
++                    return
+                 raise RefusedRouteError('Safety exclusion execution claim is stale')
+             selected_model = policy.model if model is _UNSET else model
+             selected_provider = policy.provider if provider is _UNSET else provider
+-            return require_route(conn, task, selected_model, selected_provider,
++            return require_route(conn, task, selected_model, selected_provider, check_peers=not request,
+                                  lane=kb._retry_status_for_run(conn, task.id, task.current_run_id))
+     except sqlite3.Error as exc:
+         raise RefusedRouteError('Safety exclusion execution history unavailable') from exc
+diff --git a/tests/hermes_cli/test_kanban_refusal_boundary.py b/tests/hermes_cli/test_kanban_refusal_boundary.py
+index 59d44e4c497..34bbbcdf1b5 100644
+--- a/tests/hermes_cli/test_kanban_refusal_boundary.py
++++ b/tests/hermes_cli/test_kanban_refusal_boundary.py
+@@ -193,3 +193,98 @@
+         managed_worker._construct_agent({'policy': {'kanban_json': policy.kanban_json}},
+                                        lambda **kw: called.append(kw), policy)
+     assert called == []
++
++
++@pytest.mark.parametrize('sql,args', [
++    ("UPDATE tasks SET status='done' WHERE id=?", ()),
++    ("UPDATE tasks SET current_run_id=NULL WHERE id=?", ()),
++    ("UPDATE tasks SET claim_lock='foreign' WHERE id=?", ()),
++])
++def test_stale_task_row_clauses_each_refuse_at_spawn(claimed, sql, args):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    conn, task, context = claimed
++    with kb.write_txn(conn):
++        conn.execute(sql, (*args, task.id))
++    with pytest.raises(ModelRoutingError, match='claim is stale'):
++        require_policy(policy_for(context))
++
++
++def test_missing_task_or_run_row_refuses_at_spawn(claimed):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    conn, _task, context = claimed
++    with kb.write_txn(conn):
++        conn.execute('DELETE FROM task_runs WHERE id=?', (context['run_id'],))
++    with pytest.raises(ModelRoutingError, match='claim is stale'):
++        require_policy(policy_for(context))
++
++
++def test_refused_provider_clause_alone_blocks_even_if_peer_listed(claimed, monkeypatch):
++    from hermes_cli.kanban_refusal_boundary import require_route
++    conn, task, _ = claimed
++    monkeypatch.setattr(refusal, 'eligible_routes', lambda *a: [('sonnet-test', 'anthropic')])
++    with pytest.raises(ModelRoutingError, match='refuses execution on anthropic'):
++        require_route(conn, task, 'sonnet-test', 'anthropic')
++
++
++def test_final_request_after_own_terminal_tool_is_not_refused(claimed):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    conn, task, context = claimed
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL WHERE id=?", (task.id,))
++        conn.execute("UPDATE task_runs SET status='done', ended_at=9 WHERE id=?", (context['run_id'],))
++    require_policy(policy_for(context), request=True)  # unrefused provider: final request proceeds
++    with pytest.raises(ModelRoutingError, match='refuses execution on anthropic'):
++        require_policy(policy_for(context, 'anthropic', 'sonnet-test'), request=True)
++    with pytest.raises(ModelRoutingError, match='claim is stale'):
++        require_policy(policy_for(context))  # spawn/construction stays strict
++
++
++def test_review_lane_skips_only_peer_check_not_provider_fence(claimed, monkeypatch):
++    from hermes_cli.kanban_refusal_boundary import require_route
++    conn, task, _ = claimed
++    monkeypatch.setattr(refusal, 'eligible_routes', lambda *a: [])  # no class peers at all
++    assert require_route(conn, task, 'claude-opus-5-5', 'openai-codex', lane='review') == ('anthropic',)
++    with pytest.raises(ModelRoutingError, match='refuses execution on anthropic'):
++        require_route(conn, task, 'claude-opus-5-5', 'anthropic', lane='review')
++    with pytest.raises(ModelRoutingError, match='no longer eligible'):
++        require_route(conn, task, 'gpt-test', 'openai-codex', lane='ready')
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE tasks SET status='running', current_run_id=999, claim_lock='other' WHERE id=?",  # new claimant
++    "UPDATE tasks SET claim_lock='other' WHERE id=?",
++    "UPDATE tasks SET current_run_id=999 WHERE id=?",
++])
++def test_closing_reply_never_covers_another_claimant(claimed, sql):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    conn, task, context = claimed
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL WHERE id=?", (task.id,))
++        conn.execute("UPDATE task_runs SET status='done', ended_at=9 WHERE id=?", (context['run_id'],))
++        conn.execute(sql, (task.id,))
++    with pytest.raises(ModelRoutingError, match='claim is stale'):
++        require_policy(policy_for(context), request=True)
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE task_runs SET claim_lock='other' WHERE id=?",
++    "UPDATE task_runs SET ended_at=NULL, status='running' WHERE id=?",
++])
++def test_closing_reply_requires_same_ended_run(claimed, sql):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    conn, task, context = claimed
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='done', current_run_id=NULL, claim_lock=NULL WHERE id=?", (task.id,))
++        conn.execute("UPDATE task_runs SET status='done', ended_at=9 WHERE id=?", (context['run_id'],))
++        conn.execute(sql, (context['run_id'],))
++    with pytest.raises(ModelRoutingError, match='claim is stale'):
++        require_policy(policy_for(context), request=True)
++
++
++def test_request_boundary_does_not_relabel_quota_wall_as_safety_refusal(claimed):
++    from hermes_cli.kanban_refusal_boundary import require_policy
++    _, _, context = claimed
++    fixtures.UNSERVED.add('openai-codex')  # ordinary mid-run availability loss on the unrefused peer
++    require_policy(policy_for(context), request=True)  # quota/pacing handles it, not a safety refusal
++    with pytest.raises(ModelRoutingError, match='no longer eligible'):
++        require_policy(policy_for(context))  # spawn/construction still fail closed
+-- 
+2.43.0
+

@@ -1,0 +1,326 @@
+From cc6ba6cae625383fe7752d48503f8b46d71dfb81 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 03:03:15 +0000
+Subject: [PATCH 6421] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit cc6ba6cae625383fe7752d48503f8b46d71dfb81.
+
+---
+diff --git a/hermes_cli/kanban_decided_triage.py b/hermes_cli/kanban_decided_triage.py
+new file mode 100644
+index 00000000000..5397509355c
+--- /dev/null
++++ b/hermes_cli/kanban_decided_triage.py
+@@ -0,0 +1,97 @@
++"""Finish a recorded stop decision without renewing scope or granting budget. [daveey]
++
++Home-only maintenance. Existing restriction readers remain authoritative; a
++budget edit is never clearance for scope, safety, containment or a human hold.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++
++
++def _recorded(conn, tid):
++    from hermes_cli.kanban_containment_guard import pending as contained
++    from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
++    from hermes_cli.kanban_goal_recovery import current_park
++    from hermes_cli.kanban_resume_requester import open_recovery_card
++    from hermes_cli.kanban_wake_check import foreign_copy
++
++    row = conn.execute('SELECT status,human_request,block_kind,claim_lock,current_run_id FROM tasks WHERE id=?',
++                       (tid,)).fetchone()
++    if (row is None or row[0] != 'triage' or row[1] or row[2] in HUMAN_BLOCK_KINDS or row[3] or row[4]
++            or foreign_copy(conn, tid) or contained(conn, tid) or decision.execution_refusal(conn, tid)
++            or current_park(conn, tid) or open_recovery_card(conn, tid)):
++        return None
++    stop = decision.pending_episode(conn, tid)
++    if stop is None or stop['kind'] != decision.EVENT:
++        return None
++    from hermes_cli.kanban_sync_divergence import _event_order
++    episode, after = renewal.key(stop), _event_order(stop)
++    # Origin order, not local arrival ids: a synced Board may deliver events out of order.
++    records = [r for r in renewal.renewals(conn, tid)
++               if r['payload']['episode'] == episode and _event_order(r) > after]
++    # A canonical renewal's own proven mandate is its authorization, not a countermand.
++    mandates = set()
++    for r in records:
++        note = renewal._comment(conn, tid, str(r['payload'].get('mandate_comment_uid') or ''))
++        if note is not None:
++            mandates.add(note['id'])
++    # Require the budget producer's episode-bound decision/comment written by a
++    # human: an agent preparing a budget is not authorization. Lookalikes and
++    # overrides predating this stop never count.
++    from hermes_cli.kanban_release_comments import _resolve
++    comments = conn.execute('SELECT * FROM task_comments WHERE task_id=?', (tid,)).fetchall()
++    for r in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_set'", (tid,)):
++        event = dict(r)
++        p = kb._json_dict(event['payload'])
++        ref = p.get('decision_comment')
++        if (_event_order(event) > after and p.get('episode') == episode and p.get('writer_kind') == 'human'
++                and isinstance(ref, dict) and _resolve(comments, event, ref)):
++            records.append(event)
++    if not records:
++        return None
++    recorded = max(records, key=_event_order)
++    # Conservative: any human/relayed instruction since the stop (before or after
++    # the decision) may countermand it; only a renewal's proven mandate is exempt.
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='commented'", (tid,)):
++        event = dict(row)
++        p = kb._json_dict(event['payload'])
++        if ((p.get('writer_kind') == 'human' or p.get('relayed_human') is not None)
++                and _event_order(event) > after):
++            # Wire-local integer ids can collide after sync. Resolve the comment
++            # through the event's portable provenance before exempting a mandate.
++            notes = _resolve(comments, event, p)
++            if not notes or any(note['id'] not in mandates for note in notes):
++                return None
++    # Renewal restores scope, never spend: placement needs cumulative budget left.
++    if budget.over(budget.spend(conn, tid), budget.card_limits(conn, tid, budget.limits())):
++        return None
++    return episode, renewal.key(recorded)
++
++
++def repair_decided_triage(conn) -> list[str]:
++    """Atomically settle already-authorized triage decisions; no writer for no-ops."""
++    repaired = []
++    rows = conn.execute("SELECT id FROM tasks WHERE status='triage'").fetchall()
++    for tid, in rows:
++        observed = _recorded(conn, tid)
++        if observed is None:
++            continue
++        with kb.write_txn(conn):
++            if _recorded(conn, tid) != observed:
++                continue
++            parents = [pid for pid, status in kb.parent_states(conn, tid) if status not in ('done', 'archived')]
++            window = ({'spend_budget': budget.card_limits(conn, tid, budget.limits())._asdict()}
++                      if budget.limit_window(conn, tid) == 'next_promote' else {})
++            # Same decision boundary as release._decide, with placement in the
++            # same transaction so an open dependency cannot leave triage stuck.
++            kb._append_event(conn, tid, 'promoted_manual', {
++                'actor': 'kanban-decided-triage', 'reason': 'Finish already recorded stop decision',
++                'from_status': 'triage', 'episode': observed[0], 'decision_event': observed[1],
++                'waiting_on_parents': parents, **window})
++            conn.execute("UPDATE tasks SET status=? WHERE id=? AND status='triage'",
++                         ('todo' if parents else 'ready', tid))
++            repaired.append(tid)
++    return repaired
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 5230066c548..1030f6b8800 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -276,6 +276,8 @@
+     ``TRIAGE_ENTRY_EVENTS`` event newer than its last ``triage_swept``. Past ``TRIAGE_SWEEP_CAP`` sweeps
+     in ``TRIAGE_SWEEP_CAP_WINDOW`` it is capped instead (see :func:`_cap`). Cards with an open human
+     request, or an open kernel recovery card for their current park, are left alone. Returns swept task ids."""
++    from hermes_cli.kanban_decided_triage import repair_decided_triage
++    repair_decided_triage(conn)
+     now = int(now if now is not None else time.time())
+     cutoff = now - older_than
+     swept: list[str] = []
+diff --git a/tests/hermes_cli/test_kanban_decided_triage.py b/tests/hermes_cli/test_kanban_decided_triage.py
+new file mode 100644
+index 00000000000..8bcea3446c1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_decided_triage.py
+@@ -0,0 +1,193 @@
++"""Maintenance finishes recorded decisions, never invents execution authority."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as connect
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_spend_budget as support
++from tests.hermes_cli import test_kanban_scope_renewal as scope
++
++kanban_home = support.kanban_home
++board = scope.board
++
++
++def repair(conn):
++    from hermes_cli.kanban_decided_triage import repair_decided_triage
++    return repair_decided_triage(conn)
++
++
++def stopped(conn, cause=None):
++    tid = kb.create_task(conn, title='Maintenance decision fixture', assignee='default')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'spend_budget_triaged', {'reason': 'budget used', **({'cause': cause} if cause else {})})
++    return tid
++
++
++def authorize(conn, tid):
++    budget.set_override(conn, tid, runs=10, by='default', reason='approved next round', writer_kind='human')
++
++
++@pytest.mark.parametrize('parent', [False, True])
++def test_budget_decision_finishes_once_and_parents_eventually_release(kanban_home, parent):
++    with connect.connect_closing() as conn:
++        tid = stopped(conn)
++        if parent:
++            pid = kb.create_task(conn, title='Prerequisite', assignee='default')
++            kb.link_tasks(conn, pid, tid)
++        authorize(conn, tid)
++        assert repair(conn) == [tid]
++        assert kb.get_task(conn, tid).status == ('todo' if parent else 'ready')
++        assert not decision.pending(conn, tid)
++        assert repair(conn) == []
++        if parent:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='done' WHERE id=?", (pid,))
++            kb.recompute_ready(conn)
++            assert kb.get_task(conn, tid).status == 'ready'
++
++
++@pytest.mark.parametrize('hold', ['undecided', 'scope_stopped', 'safety_refusal', 'human', 'foreign', 'containment'])
++def test_independent_holds_survive(kanban_home, monkeypatch, hold):
++    with connect.connect_closing() as conn:
++        tid = stopped(conn, hold if hold in ('scope_stopped', 'safety_refusal') else None)
++        if hold != 'undecided':
++            authorize(conn, tid)
++        if hold == 'human':
++            conn.execute("UPDATE tasks SET human_request='Please decide' WHERE id=?", (tid,))
++            conn.commit()
++        if hold == 'foreign':
++            from hermes_cli import kanban_wake_check
++            monkeypatch.setattr(kanban_wake_check, 'foreign_copy', lambda c, t: True)
++        if hold == 'containment':
++            from hermes_cli import kanban_containment_guard
++            monkeypatch.setattr(kanban_containment_guard, 'pending', lambda c, t: True)
++        before = conn.total_changes
++        assert repair(conn) == []
++        assert conn.total_changes == before
++        assert kb.get_task(conn, tid).status == 'triage'
++        assert decision.pending(conn, tid)
++
++
++def test_real_authorized_scope_renewal_is_finished(board, monkeypatch):
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    scope.link(board, tid)
++    scope.renew(board, tid, episode, scope.mandate(board, tid))
++    assert repair(board) == [tid]
++    assert kb.get_task(board, tid).status == 'ready'
++    assert not decision.pending(board, tid)
++
++
++def test_maintenance_hook_handles_fresh_decision_without_stale_sweep(kanban_home):
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++    with connect.connect_closing() as conn:
++        tid = stopped(conn)
++        authorize(conn, tid)
++        assert sweep_stale_triage(conn, older_than=999999) == []
++        assert kb.get_task(conn, tid).status == 'ready'
++        assert not decision.pending(conn, tid)
++
++
++def test_writer_rechecks_independent_hold(kanban_home, monkeypatch):
++    from contextlib import contextmanager
++    with connect.connect_closing() as conn:
++        tid = stopped(conn)
++        authorize(conn, tid)
++        original = kb.write_txn
++
++        @contextmanager
++        def raced(c, **kw):
++            with original(c):
++                c.execute("UPDATE tasks SET human_request='New hold' WHERE id=?", (tid,))
++            with original(c, **kw):
++                yield
++
++        monkeypatch.setattr(kb, 'write_txn', raced)
++        assert repair(conn) == []
++        assert kb.get_task(conn, tid).status == 'triage'
++        assert decision.pending(conn, tid)
++
++
++def test_human_comment_after_decision_and_old_decision_are_not_released(kanban_home):
++    with connect.connect_closing() as conn:
++        tid = stopped(conn)
++        authorize(conn, tid)
++        kb.add_comment(conn, tid, 'human', 'Wait, do not continue', writer_kind='human')
++        assert repair(conn) == []
++        other = stopped(conn)
++        authorize(conn, other)
++        with kb.write_txn(conn):
++            kb._append_event(conn, other, 'spend_budget_triaged', {'reason': 'new stop'})
++        assert repair(conn) == []
++
++
++def test_human_instruction_between_stop_and_budget_and_agent_budget_hold(kanban_home):
++    with connect.connect_closing() as conn:
++        tid = stopped(conn)
++        kb.add_comment(conn, tid, 'human', 'Do not run this yet; budget preparation only.', writer_kind='human')
++        authorize(conn, tid)
++        assert repair(conn) == []
++        prepared = stopped(conn)
++        budget.set_override(conn, prepared, runs=10, by='agent', reason='Prepare budget only', writer_kind='agent')
++        before = conn.total_changes
++        assert repair(conn) == []
++        assert conn.total_changes == before
++        assert kb.get_task(conn, tid).status == kb.get_task(conn, prepared).status == 'triage'
++
++
++def _move(conn, tid, kind, *, shift):
++    """Model a synced event whose origin time differs from its local arrival id."""
++    (eid,) = conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=? AND kind=?', (tid, kind)).fetchone()
++    with kb.write_txn(conn):
++        conn.execute('UPDATE task_events SET created_at=created_at+? WHERE id=?', (shift, eid))
++
++
++def test_reordered_arrival_uses_origin_order(kanban_home):
++    with connect.connect_closing() as conn:
++        # Decision arrived after the stop locally but was made before it at origin.
++        tid = stopped(conn)
++        authorize(conn, tid)
++        _move(conn, tid, budget.OVERRIDE_EVENT, shift=-100)
++        assert repair(conn) == []
++        # A human note that arrived last locally but predates the stop at origin
++        # is not an instruction since the stop.
++        other = stopped(conn)
++        authorize(conn, other)
++        kb.add_comment(conn, other, 'human', 'Old note from before the stop', writer_kind='human')
++        _move(conn, other, 'commented', shift=-100)
++        assert repair(conn) == [other]
++        assert kb.get_task(conn, other).status == 'ready'
++
++
++def test_renewal_alone_never_places_exhausted_budget(board, monkeypatch):
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    support._runs(board, tid, 16)
++    scope.link(board, tid)
++    scope.renew(board, tid, episode, scope.mandate(board, tid))
++    assert budget.over(budget.spend(board, tid), budget.card_limits(board, tid, budget.limits()))
++    before = board.total_changes
++    assert repair(board) == []
++    assert board.total_changes == before
++    assert kb.get_task(board, tid).status == 'triage'
++    assert decision.pending(board, tid)
++
++
++def test_renewal_with_budget_waits_for_parent_then_claims(board, monkeypatch):
++    from hermes_cli.kanban_spend_claim import claim_check
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    support._runs(board, tid, 16)
++    scope.link(board, tid)
++    scope.renew(board, tid, episode, scope.mandate(board, tid))
++    budget.set_override(board, tid, runs=30, by='default', reason='More total room', writer_kind='human')
++    pid = kb.create_task(board, title='Parent', assignee='default')
++    kb.link_tasks(board, pid, tid)
++    assert repair(board) == [tid]
++    assert kb.get_task(board, tid).status == 'todo'
++    assert kb.claim_task(board, tid) is None
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='done' WHERE id=?", (pid,))
++    kb.recompute_ready(board)
++    assert kb.get_task(board, tid).status == 'ready'
++    assert not claim_check(board, tid)()
++    assert kb.claim_task(board, tid) is not None
+-- 
+2.43.0
+

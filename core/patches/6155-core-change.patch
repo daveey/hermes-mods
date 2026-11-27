@@ -1,0 +1,697 @@
+From b69bd6ab9e9b94385dc08f8a7ab5a614cf67a74f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 10:54:49 +0000
+Subject: [PATCH 6155] Kanban canonical home, execution separation and explicit-home readers
+
+Public mirror of source commit b69bd6ab9e9b94385dc08f8a7ab5a614cf67a74f.
+
+---
+diff --git a/hermes_cli/kanban_creation_contract.py b/hermes_cli/kanban_creation_contract.py
+new file mode 100644
+index 00000000000..fc7144f7607
+--- /dev/null
++++ b/hermes_cli/kanban_creation_contract.py
+@@ -0,0 +1,85 @@
++"""Schema-owned canonical create transport; defaults never erase caller intent.
++
++The courier is a typed envelope, not a second independently maintained create
++API. Runtime custody is carried by its authenticated envelope, never model args.
++"""
++from __future__ import annotations
++
++# Exclude only gateway-local controls. Each decision must be covered by the
++# schema census, so adding a model-facing property cannot silently lose it.
++EXCLUDED = {
++    'board': 'The authenticated destination envelope selects the default board.',
++    'placement': 'Consumed into execution runs_on before storage-home selection.',
++    'workspace_kind': 'Only scratch is portable; host source kinds refuse in planning.',
++    'workspace_path': 'A host-local source path cannot be transferred by the courier.',
++    'project': 'A project names a host-local checkout and refuses in planning.',
++    'project_id': 'Internal resolved project identity is host-local, not transport authority.',
++    'origin_session': 'Qualified origin identity is resolved into the authenticated envelope.',
++    'session_id': 'Receiver-local session identity comes only from the courier envelope.',
++    'force_hub': 'Operator admission overrides cannot cross gateway execution boundaries.',
++}
++
++
++def properties():
++    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
++    return KANBAN_CREATE_SCHEMA['parameters']['properties']
++
++
++def payload(args):
++    """Forward all supplied schema fields except documented local controls.
++
++    None retains omission semantics. False, zero and empty containers/strings
++    remain values; validation and defaults are still owned by common create.
++    Unknown internal fields must be classified, not silently discarded.
++    """
++    unknown = set(args) - set(properties()) - set(EXCLUDED)
++    if unknown:
++        raise ValueError('canonical_home_unknown_fields: ' + ','.join(sorted(unknown)))
++    return {key: value for key, value in args.items() if key not in EXCLUDED and value is not None}
++
++
++def validate_forward(create):
++    """Shape-check against the same schema before origin authorization.
++
++    Common create still performs semantic admission. Never accept raw internal
++    kwargs just because this module forwards newly declared public properties.
++    """
++    from jsonschema import Draft7Validator
++    if not isinstance(create, dict):
++        raise ValueError('origin_forward_create_invalid')
++    fields = properties()
++    if set(create) - (set(fields) - set(EXCLUDED)) - {'session_id'}:
++        raise ValueError('origin_forward_create_invalid')
++    for key, value in create.items():
++        if key == 'session_id':
++            continue  # validated as a qualified envelope component by the caller
++        # This boundary owns JSON shape, not semantic admission (for example a
++        # partial human_request must reach common create's typed refusal).
++        shape = {name: fields[key][name] for name in ('type', 'items') if name in fields[key]}
++        if list(Draft7Validator(shape).iter_errors(value)):
++            raise ValueError('origin_forward_create_invalid')
++
++
++def main():
++    """Read-only courier preflight; old cores lacking this entry refuse safely."""
++    import json
++    import sys
++    try:
++        raw = sys.stdin.read(262145)
++        if len(raw.encode('utf-8')) > 262144:
++            raise ValueError('canonical_home_payload_too_large')
++        args = json.loads(raw)
++        if not isinstance(args, dict) or payload(args) != args:
++            raise ValueError('canonical_home_local_control')
++        validate_forward(args)
++        if not all(isinstance(args.get(key), str) and args[key].strip() for key in ('title', 'assignee')):
++            raise ValueError('canonical_home_identity_invalid')
++    except (TypeError, ValueError, RecursionError) as exc:
++        print(json.dumps({'canonical_home': 2, 'valid': False, 'error': str(exc)}))
++        return 2
++    print(json.dumps({'canonical_home': 2, 'valid': True}))
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/hermes_cli/kanban_creation_home.py b/hermes_cli/kanban_creation_home.py
+index 1aa7bcd6068..0f881326381 100644
+--- a/hermes_cli/kanban_creation_home.py
++++ b/hermes_cli/kanban_creation_home.py
+@@ -96,16 +96,10 @@
+     """Expand/contract preflight against the installed client, before any request write."""
+     from hermes_cli import kanban_placement as placement
+     rc, help_text, _ = placement.hub_runner([hub_cli, 'create-task', '--help'])
+-    if rc or 'canonical-home-v1' not in help_text or '--option' not in help_text:
++    if rc or not all(token in help_text for token in ('canonical-home-v2', '--canonical-home', '--option')):
+         raise ValueError('canonical_home_transport_unavailable: update the courier client before forwarding')
+-    if args.get('pin_mandatory'):
+-        raise ValueError('canonical_home_transport_unavailable: mandatory model pin cannot be forwarded')
+-    keys = ('runs_on', 'parents', 'tenant', 'max_retries', 'initial_status', 'human_request',
+-            'requires', 'skills', 'priority')
+-    # Preserve explicit retry overrides and empty label/dependency lists. The
+-    # core owner entrypoint validates typed values; never stringify safety fields.
+-    carried = placement.carried_options(args)
+-    return {key: carried.get(key, args[key]) for key in keys if args.get(key) is not None}
++    from hermes_cli.kanban_creation_contract import payload
++    return payload(args)
+ 
+ 
+ def result(args, fields, *, tid, status, target):
+diff --git a/hermes_cli/kanban_origin_forward_decision.py b/hermes_cli/kanban_origin_forward_decision.py
+index 8c8573fe5a4..903d1e7b856 100644
+--- a/hermes_cli/kanban_origin_forward_decision.py
++++ b/hermes_cli/kanban_origin_forward_decision.py
+@@ -33,27 +33,12 @@
+ 
+ 
+ def _validate_create(create):
+-    # Match the placement courier's surface, not arbitrary owner-tool parameters.
+-    strings = {"title", "body", "assignee", "session_id", "admission_class", "admission_frees",
+-               "model", "provider", "completion_contract", "idempotency_key", "distinct_reason",
+-               "tenant", "initial_status"}
+-    lists = {"skills", "requires", "distinct_from", "runs_on", "parents"}
+-    integers = {"max_runtime_seconds", "priority", "goal_max_turns", "max_retries"}
+-    booleans = {"goal_mode", "review_required", "triage"}
+-    objects = {"human_request"}
+-    allowed = strings | lists | integers | booleans | objects
+-    if (not set(create) <= allowed
+-            or not all(isinstance(create.get(key), str) and create[key].strip()
+-                       for key in ("title", "assignee", "session_id"))
++    from hermes_cli.kanban_creation_contract import validate_forward
++    validate_forward(create)
++    if (not all(isinstance(create.get(key), str) and create[key].strip()
++                for key in ("title", "assignee", "session_id"))
+             or not _matches(_COMPONENT, create["session_id"])):
+         raise ValueError("origin_forward_create_invalid")
+-    for key, value in create.items():
+-        if ((key in strings and not isinstance(value, str))
+-                or (key in lists and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)))
+-                or (key in integers and type(value) is not int)
+-                or (key in booleans and type(value) is not bool)
+-                or (key in objects and not isinstance(value, dict))):
+-            raise ValueError("origin_forward_create_invalid")
+ 
+ 
+ def _validated(request, gateway, profile):
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index d5fc84c82d6..9036b8f3a3c 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -83,6 +83,8 @@
+             or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', create['session_id'])
+             or ('board' in create and create['board'] != board)):
+         raise ValueError('origin_request_invalid')
++    from hermes_cli.kanban_creation_contract import validate_forward
++    validate_forward({key: value for key, value in create.items() if key != 'board'})
+     args = {**create, 'board': board}
+     return _dispatch_owner_tool('kanban_create', args, intent, selfwork_context)
+ 
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 9c53f466074..1ccbe308ec1 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1298,10 +1298,11 @@
+     if not carried and any(args.get(k) not in (None, "", []) for k in (*IDENTITY_OPTIONS, "self_work")):
+         return {"ok": False, "fatal": True, "error": "create identity requires hermes-hub create-task --option"}
+     try:
+-        options = carried_options(args) if carried else {}
+         if canonical_home:
+             from hermes_cli.kanban_creation_home import transport_options
+-            options.update(transport_options(args, hub_cli=hub_cli))
++            options = transport_options(args, hub_cli=hub_cli)
++        else:
++            options = carried_options(args) if carried else {}
+     except (TypeError, ValueError) as exc:
+         return {"ok": False, "fatal": True, "error": str(exc)}
+     transport_args = {**args, "idempotency_key": transport_key} if transport_key else args
+@@ -1312,8 +1313,11 @@
+         # the complete envelope: the same key can also name changed or formerly dropped metadata.
+         return {"ok": True, "request_id": rid, "queued_only": False, "retry": True}
+     argv = [hub_cli, "create-task", target, str(args.get("title") or "untitled").strip()[:300],
+-            "--body", remote_body(args, self_gw=self_gw, target=target, carried=carried),
++            "--body", (args.get("body") or "") if canonical_home else remote_body(
++                args, self_gw=self_gw, target=target, carried=carried),
+             "--assignee", str(args.get("assignee") or "default"), "--id", rid]
++    if canonical_home:
++        argv.append("--canonical-home")
+     for k, v in options.items():
+         argv += ["--option", f"{k}={json.dumps(v)}"]
+     if origin_session:
+diff --git a/tests/hermes_cli/test_creation_home_transport.py b/tests/hermes_cli/test_creation_home_transport.py
+index 5b4aea8aaae..378e9f39813 100644
+--- a/tests/hermes_cli/test_creation_home_transport.py
++++ b/tests/hermes_cli/test_creation_home_transport.py
+@@ -53,7 +53,7 @@
+     def run(argv):
+         argv_seen.append(argv)
+         if argv[-1] == '--help':
+-            return 0, '--option canonical-home-v1' if available else '--option', ''
++            return 0, '--option --canonical-home canonical-home-v2 canonical-home-v1' if available else '--option', ''
+         return 0, 'queued', ''
+ 
+     placement._help_cache.clear()
+diff --git a/tests/hermes_cli/test_kanban_creation_contract.py b/tests/hermes_cli/test_kanban_creation_contract.py
+new file mode 100644
+index 00000000000..c4d1858d9b8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_creation_contract.py
+@@ -0,0 +1,47 @@
++"""Shared schema validation is the courier's read-only expand/contract gate."""
++import io
++import json
++
++import pytest
++
++from hermes_cli import kanban_creation_contract as contract
++from hermes_cli import kanban_origin_forward_decision as forward
++
++
++@pytest.mark.parametrize('args,valid', [
++    ({'title': 'Portable', 'assignee': 'default', 'requires': [], 'human_action_now': True}, True),
++    ({'title': 'Portable', 'assignee': 'default', 'review_required': False, 'priority': 0}, True),
++    ({'title': 'Portable', 'assignee': 'default', 'human_action_now': 'true'}, False),
++    ({'title': 'Portable', 'assignee': 'default', 'priority': True}, False),
++    ({'title': 'Portable', 'assignee': 'default', 'new_unknown': 1}, False),
++    ({'title': 'Portable', 'assignee': 'default', 'creator_task_id': 't_0123456789abcdef'}, False),
++])
++def test_read_only_preflight(monkeypatch, capsys, args, valid):
++    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(args)))
++    assert contract.main() == (0 if valid else 2)
++    assert json.loads(capsys.readouterr().out)['valid'] is valid
++
++
++@pytest.mark.parametrize('key', sorted(contract.EXCLUDED))
++def test_local_controls_cannot_enter_generic_payload(monkeypatch, capsys, key):
++    args = {'title': 'Portable', 'assignee': 'default', key: 'caller-controlled'}
++    monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps(args)))
++    assert contract.main() == 2
++    assert json.loads(capsys.readouterr().out)['valid'] is False
++
++
++def test_new_schema_field_forwards_without_transport_edit(monkeypatch):
++    props = {**contract.properties(), 'new_public_field': {'type': 'object'}}
++    monkeypatch.setattr(contract, 'properties', lambda: props)
++    args = {'title': 'Portable', 'assignee': 'default', 'new_public_field': {'explicit': []}}
++    assert contract.payload(args) == args
++    forward._validate_create({**args, 'session_id': 'qualified-origin'})
++    with pytest.raises(ValueError, match='origin_forward_create_invalid'):
++        forward._validate_create({**args, 'new_public_field': 1, 'session_id': 'qualified-origin'})
++
++
++def test_preflight_requires_complete_finite_bounded_json(monkeypatch, capsys):
++    for text in ['{}', 'not-json', '"' + 'x' * 262145 + '"']:
++        monkeypatch.setattr('sys.stdin', io.StringIO(text))
++        assert contract.main() == 2
++        assert json.loads(capsys.readouterr().out)['valid'] is False
+diff --git a/tests/tools/test_kanban_home_field_contract.py b/tests/tools/test_kanban_home_field_contract.py
+index 952cc1961b7..6dcc6771b6e 100644
+--- a/tests/tools/test_kanban_home_field_contract.py
++++ b/tests/tools/test_kanban_home_field_contract.py
+@@ -107,7 +107,7 @@
+ 
+     def run(argv):
+         if argv[-1] == '--help':
+-            return 0, '--option canonical-home-v1', ''
++            return 0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''
+         sent.append(argv)
+         return 3, 'durably queued', ''
+ 
+diff --git a/tests/tools/test_kanban_home_landing_contract.py b/tests/tools/test_kanban_home_landing_contract.py
+index cb6613adeaa..7124950a21b 100644
+--- a/tests/tools/test_kanban_home_landing_contract.py
++++ b/tests/tools/test_kanban_home_landing_contract.py
+@@ -74,7 +74,7 @@
+             worker.enter()
+         return {'ok': True, 'request_id': 'contract-hold-landing', 'queued_only': True}
+ 
+-    monkeypatch.setattr(placement, 'hub_runner', lambda argv: (0, '--option canonical-home-v1', ''))
++    monkeypatch.setattr(placement, 'hub_runner', lambda argv: (0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''))
+     monkeypatch.setattr(placement, 'create_remote', courier)
+     result = json.loads(tools._handle_create({'title': 'Retry and hold contract', 'assignee': 'default',
+                                              'requires': [], **options}))
+diff --git a/tests/tools/test_kanban_home_schema_contract.py b/tests/tools/test_kanban_home_schema_contract.py
+new file mode 100644
+index 00000000000..3c404d95f49
+--- /dev/null
++++ b/tests/tools/test_kanban_home_schema_contract.py
+@@ -0,0 +1,273 @@
++"""Schema census and real canonical sender -> owner storage parity.
++
++Every model-facing property needs an explicit fixture/decision here. The test
++courier parses the real argv; it never substitutes the sender's in-memory args.
++The older field/landing suites remain independent regression tests, unchanged.
++"""
++import copy
++import json
++import os
++
++import pytest
++
++from hermes_cli import kanban_creation_home as creation
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_placement as placement
++from tests.tools import test_kanban_worker_canonical_home as home
++from tests.tools.test_kanban_home_landing_contract import REQUEST
++from tools import kanban_tools as tools
++from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
++
++svc, gws = home.svc, home.gws
++
++
++@pytest.fixture
++def pool_labels(monkeypatch, gws):
++    # Do not make DB setup autouse: the independent wire census is pure/fast.
++    return home.pool_labels.__wrapped__(monkeypatch, gws)
++PROPERTIES = KANBAN_CREATE_SCHEMA['parameters']['properties']
++MISSING = object()
++# Deliberately independent of production's exclusion table: adding an exclusion
++# must get a reviewable policy decision, not silently remove a regression case.
++EXCLUDED = {
++    'board': 'routing envelope; only the default board is supported',
++    'placement': 'consumed into execution runs_on, never a storage-home pin',
++    'workspace_kind': 'host-local source; only scratch is portable',
++    'workspace_path': 'host-local source cannot be transferred by the courier',
++    'project': 'host-local project source cannot be transferred by the courier',
++    'origin_session': 'qualified transport identity, not a receiver-local argument',
++    'force_hub': 'operator override must never be forwarded',
++}
++# Empty means an explicitly supplied false/zero/empty-container, not omission.
++# Some empty values are invalid: identical typed refusal is part of the contract.
++FIXTURES = {
++    'title': ('', 'Schema contract Ω = exact title'),
++    'assignee': ('', 'default'),
++    'requires': ([], ['terminal']),
++    'body': ('', 'Canonical bytes Ω\n\nline = value\n  trailing spaces  \n'),
++    'parents': ([], ['PARENT']),
++    'tenant': ('', 'tenant-explicit'),
++    'priority': (0, 17),
++    'admission_class': ('', 'normal'),
++    'admission_frees': ('', 'frees: one fixture capacity slot'),
++    'self_work': ({}, {'version': 1, 'repository': 'hermes-core', 'area': 'kanban', 'kind': 'test-gap'}),
++    'workspace_kind': ('', 'scratch'),
++    'workspace_path': ('', '/nonportable/schema-contract-source'),
++    'project': ('', 'schema-contract-missing-project'),
++    'triage': (False, True),
++    'distinct_from': ([], ['PARENT']),
++    'distinct_reason': ('', 'Separate fixture acceptance criteria, not the predecessor scope.'),
++    'hub_reason': ('', 'Fixture rationale retained verbatim, not appended to the body.'),
++    'force_hub': (False, True),
++    'idempotency_key': ('', 'schema-contract-key'),
++    'origin_session': ('', '@session:default@worker-1/canonical-home-owner'),
++    'runs_on': ([], ['machine:macbook']),
++    'placement': ('', 'macbook'),
++    'max_runtime_seconds': (0, 120),
++    'max_retries': (0, 2),
++    'human_request': ({}, REQUEST),
++    'initial_status': ('', 'blocked'),
++    'human_action_now': (False, True),
++    'skills': ([], ['five-whys']),
++    'review_required': (False, True),
++    'goal_mode': (False, True),
++    'completion_contract': ('', 'nousresearch/hermes-agent'),
++    'goal_max_turns': (0, 7),
++    'model': ('', 'class:deep'),
++    'provider': ('', 'auto'),
++    'pin_mandatory': (False, True),
++    'board': ('', 'default'),
++}
++
++
++def test_schema_has_explicit_fixture_and_transport_decision():
++    assert set(FIXTURES) == set(PROPERTIES), 'Schema changed: add omitted/empty/set fixtures and a transport decision'
++    from hermes_cli import kanban_creation_contract as contract
++    assert set(contract.EXCLUDED) & set(PROPERTIES) == set(EXCLUDED)
++    for field, reason in contract.EXCLUDED.items():
++        assert isinstance(reason, str) and len(reason.strip()) >= 15, (field, reason)
++    # Internal compatibility inputs also need documented decisions.
++    for field in ('project_id', 'session_id'):
++        assert field in contract.EXCLUDED
++
++
++@pytest.mark.parametrize('field', sorted(PROPERTIES))
++@pytest.mark.parametrize('shape', ['omitted', 'empty', 'set'])
++def test_schema_transport_options_are_full_minus_documented_exclusions(monkeypatch, field, shape):
++    monkeypatch.setattr(placement, 'hub_runner', lambda argv: (
++        0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''))
++    args = {'title': 'Transport census', 'requires': [], 'runs_on': []}
++    args.pop(field, None)
++    if shape != 'omitted':
++        args[field] = copy.deepcopy(FIXTURES[field][shape == 'set'])
++    options = creation.transport_options(args, hub_cli='fixture-courier')
++    expected = {key: value for key, value in args.items() if key not in EXCLUDED and value is not None}
++    assert options == expected
++
++
++@pytest.mark.parametrize('help_text', ['--option canonical-home-v1', '--canonical-home canonical-home-v2', ''])
++def test_canonical_contract_refuses_unnegotiated_client(monkeypatch, help_text):
++    monkeypatch.setattr(placement, 'hub_runner', lambda argv: (0, help_text, ''))
++    with pytest.raises(ValueError, match='canonical_home_transport_unavailable'):
++        creation.transport_options({'title': 'No downgrade', 'requires': [], 'runs_on': []},
++                                   hub_cli='fixture-courier')
++
++
++def test_transport_omits_none_not_explicit_false_or_empty(monkeypatch):
++    monkeypatch.setattr(placement, 'hub_runner', lambda argv: (
++        0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''))
++    options = creation.transport_options({'title': 'Default semantics', 'requires': [],
++                                         'skills': None, 'priority': 0, 'review_required': False},
++                                        hub_cli='fixture-courier')
++    assert options == {'title': 'Default semantics', 'requires': [], 'priority': 0,
++                       'review_required': False}
++
++
++def _options(argv):
++    result = {}
++    for index, token in enumerate(argv):
++        if token != '--option':
++            continue
++        key, raw = argv[index + 1].split('=', 1)
++        assert key not in result, f'duplicate --option {key}'
++        result[key] = json.loads(raw)
++    return result
++
++
++# These are identity/audit records, not execution fields. Every removed column is
++# named explicitly; newly introduced storage columns stay in the parity check.
++NONDETERMINISTIC = {'id', 'created_at', 'updated_at', 'status_changed_at', 'ready_at',
++                    'started_at', 'completed_at', 'last_activity_at'}
++PROVENANCE = {'created_on', 'session_id', 'created_by', 'creator_task_id',
++              'native_origin', 'chat_origin', 'creation_receipt', 'placement_audit',
++              'placement_policy', 'origin_intent', 'origin_request_id'}
++
++
++def _stored(gateway, task_id):
++    row = dict(gateway.conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
++    return {key: value for key, value in row.items() if key not in NONDETERMINISTIC | PROVENANCE}
++
++
++def _refusal(result):
++    assert not result.get('task_id'), result
++    assert result.get('error'), result
++    # Not every native handler error has a code; never accept an untyped/empty
++    # transport failure as equivalent to a receiver validation error.
++    return result.get('code'), result['error']
++
++
++def assert_schema_sender_to_stored_owner_parity(gws, monkeypatch, pool_labels, field, shape):
++    hub, worker = gws
++    for gateway in gws:
++        skill = gateway.home / 'skills' / 'five-whys' / 'SKILL.md'
++        skill.parent.mkdir(parents=True)
++        skill.write_text('---\nname: five-whys\ndescription: Fixture skill\n---\nFixture.\n')
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.delenv('HERMES_ORIGIN_SESSION', raising=False)
++    monkeypatch.setenv('HERMES_TENANT', 'tenant-source')
++    monkeypatch.setattr(placement.reg, 'self_gateway',
++                        lambda: 'hub' if os.environ['HERMES_HOME'] == str(hub.home) else 'worker-1')
++    monkeypatch.setattr(placement, '_machine_picks_up', lambda _: True)
++    monkeypatch.setattr(placement, 'remote_state', lambda _: None)
++    placement._help_cache.clear()
++    value = MISSING if shape == 'omitted' else copy.deepcopy(FIXTURES[field][shape == 'set'])
++    args = {'title': 'Schema contract fixture', 'body': 'Canonical body\n  exact  \n',
++            'assignee': 'default', 'requires': [], 'runs_on': []}
++    args.pop(field, None)
++    if value is not MISSING:
++        args[field] = value
++    # Supply valid companions without masking the property under test.
++    if field == 'provider' and shape == 'set':
++        args['model'] = 'class:deep'
++    if field in ('initial_status', 'human_request', 'human_action_now'):
++        if field != 'initial_status':
++            args['initial_status'] = 'blocked'
++        if field != 'human_request':
++            args['human_request'] = copy.deepcopy(REQUEST)
++    if field == 'distinct_from' and shape == 'set':
++        args['distinct_reason'] = FIXTURES['distinct_reason'][1]
++    # Shared parent identity is an actual stored predecessor on both boards.
++    if field in ('parents', 'distinct_from') and shape == 'set':
++        parent_ids = []
++        for gateway in gws:
++            gateway.enter()
++            parent_ids.append(kb.create_task(gateway.conn, title='Unrelated fixture predecessor',
++                                            assignee='default', requires=[]))
++        args[field] = [parent_ids[1]]
++    else:
++        parent_ids = None
++
++    sent, received = [], []
++
++    def runner(argv):
++        if argv[-1] == '--help':
++            return 0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''
++        assert argv[1:3] == ['create-task', 'hub']
++        sent.append(argv)
++        options = _options(argv)
++        assert not set(EXCLUDED) & set(options), options
++        # Legacy positional fields remain transport envelope compatibility only;
++        # exact canonical values are the JSON options, which win at the owner.
++        incoming = dict(options)  # v2 takes the complete JSON payload, not positional defaults
++        if parent_ids and field in incoming:
++            incoming[field] = [parent_ids[0] if x == parent_ids[1] else x for x in incoming[field]]
++        intent = {'request_id': argv[argv.index('--id') + 1],
++                  'owner': {'gateway': 'hub', 'profile': 'default', 'board': 'default'},
++                  'origin': {'gateway': 'worker-1', 'profile': 'default',
++                             'session': argv[argv.index('--origin-session') + 1]}}
++        hub.enter()
++        try:
++            received.append(json.loads(tools._handle_create(incoming, origin_intent=intent)))
++        finally:
++            worker.enter()
++        return 3, 'durably queued', ''
++
++    monkeypatch.setattr(placement, 'hub_runner', runner)
++    worker.enter()
++    # Run the ordinary local front door, changing only routing policy.
++    with monkeypatch.context() as local:
++        local.setattr(creation, 'plan', lambda *a, **kw: None)
++        local.setattr(placement, 'config', dict)
++        local_args = copy.deepcopy(args)
++        if field == 'runs_on' and shape == 'omitted':
++            local_args['runs_on'] = ['pool:worker']  # canonical home's documented execution default
++        local_result = json.loads(tools._handle_create(local_args))
++    local_row = _stored(worker, local_result['task_id']) if local_result.get('task_id') else None
++    if local_row is not None:
++        # Don't let the local comparison itself become a cross-board overlap.
++        worker.conn.execute('UPDATE tasks SET status="archived" WHERE id=?', (local_result['task_id'],))
++        worker.conn.commit()
++    monkeypatch.setattr(placement, 'config', lambda: {'worker_queue': {'hub': 'pool:worker'}})
++    worker.enter()
++    forwarded = json.loads(tools._handle_create(copy.deepcopy(args)))
++
++    if field in EXCLUDED:
++        from hermes_cli import kanban_creation_contract as contract
++        assert contract.EXCLUDED[field].strip(), EXCLUDED[field]
++        if sent:
++            assert field not in _options(sent[0])
++            assert received and received[0].get('task_id'), received
++        else:
++            assert not forwarded.get('task_id'), forwarded
++            assert forwarded.get('error'), forwarded
++        return
++    if local_row is None:
++        assert not received or not received[0].get('task_id'), (local_result, received)
++        actual = received[0] if received else forwarded
++        assert _refusal(actual) == _refusal(local_result)
++        return
++    assert len(sent) == len(received) == 1, (forwarded, received)
++    assert forwarded.get('placed', {}).get('gateway') == 'hub', forwarded
++    assert received[0].get('task_id'), received
++    options = _options(sent[0])
++    if value is not MISSING:
++        assert field in options, (field, value, options)
++    if field == 'body' and value is not MISSING:
++        assert options['body'] == value
++    remote_row = _stored(hub, received[0]['task_id'])
++    assert remote_row == local_row
++    assert '--canonical-home' in sent[0]
++    intent = hub.conn.execute('SELECT task_id FROM origin_creation_intents WHERE request_id=?',
++                             (sent[0][sent[0].index('--id') + 1],)).fetchone()
++    assert intent['task_id'] == received[0]['task_id']
++    assert worker.conn.execute('SELECT 1 FROM tasks WHERE id=?', (received[0]['task_id'],)).fetchone() is None
+diff --git a/tests/tools/test_kanban_home_schema_empty.py b/tests/tools/test_kanban_home_schema_empty.py
+new file mode 100644
+index 00000000000..1fffe8e3989
+--- /dev/null
++++ b/tests/tools/test_kanban_home_schema_empty.py
+@@ -0,0 +1,13 @@
++"""Empty-field storage parity; split to respect the per-file test budget."""
++import pytest
++from tests.tools.test_kanban_home_schema_contract import (
++    PROPERTIES, assert_schema_sender_to_stored_owner_parity,
++)
++from tests.tools import test_kanban_home_schema_contract as contract
++
++svc, gws, pool_labels = contract.svc, contract.gws, contract.pool_labels
++
++
++@pytest.mark.parametrize('field', sorted(PROPERTIES))
++def test_empty(gws, monkeypatch, pool_labels, field):
++    assert_schema_sender_to_stored_owner_parity(gws, monkeypatch, pool_labels, field, 'empty')
+diff --git a/tests/tools/test_kanban_home_schema_omitted.py b/tests/tools/test_kanban_home_schema_omitted.py
+new file mode 100644
+index 00000000000..73da370ea66
+--- /dev/null
++++ b/tests/tools/test_kanban_home_schema_omitted.py
+@@ -0,0 +1,13 @@
++"""Omitted-field storage parity; split to respect the per-file test budget."""
++import pytest
++from tests.tools.test_kanban_home_schema_contract import (
++    PROPERTIES, assert_schema_sender_to_stored_owner_parity,
++)
++from tests.tools import test_kanban_home_schema_contract as contract
++
++svc, gws, pool_labels = contract.svc, contract.gws, contract.pool_labels
++
++
++@pytest.mark.parametrize('field', sorted(PROPERTIES))
++def test_omitted(gws, monkeypatch, pool_labels, field):
++    assert_schema_sender_to_stored_owner_parity(gws, monkeypatch, pool_labels, field, 'omitted')
+diff --git a/tests/tools/test_kanban_home_schema_set.py b/tests/tools/test_kanban_home_schema_set.py
+new file mode 100644
+index 00000000000..aa80c90dee6
+--- /dev/null
++++ b/tests/tools/test_kanban_home_schema_set.py
+@@ -0,0 +1,13 @@
++"""Set-field storage parity; split to respect the per-file test budget."""
++import pytest
++from tests.tools.test_kanban_home_schema_contract import (
++    PROPERTIES, assert_schema_sender_to_stored_owner_parity,
++)
++from tests.tools import test_kanban_home_schema_contract as contract
++
++svc, gws, pool_labels = contract.svc, contract.gws, contract.pool_labels
++
++
++@pytest.mark.parametrize('field', sorted(PROPERTIES))
++def test_set(gws, monkeypatch, pool_labels, field):
++    assert_schema_sender_to_stored_owner_parity(gws, monkeypatch, pool_labels, field, 'set')
+diff --git a/tests/tools/test_review_home_immediate_ask.py b/tests/tools/test_review_home_immediate_ask.py
+new file mode 100644
+index 00000000000..5505f4a767b
+--- /dev/null
++++ b/tests/tools/test_review_home_immediate_ask.py
+@@ -0,0 +1,44 @@
++import json
++import os
++import pytest
++from hermes_cli import kanban_db as kb, kanban_placement as placement, kanban_creation_home as creation
++from tests.tools import test_kanban_worker_canonical_home as home
++from tests.tools.test_kanban_home_landing_contract import REQUEST
++from tools import kanban_tools as tools
++svc, gws, pool_labels = home.svc, home.gws, home.pool_labels
++
++@pytest.mark.parametrize('forwarded,diagnostic_restore', [(False, False), (True, False), (True, True)])
++def test_immediate_ask_with_open_parent(gws, monkeypatch, forwarded, diagnostic_restore):
++    hub, worker = gws
++    owner = hub if forwarded else worker
++    owner.enter()
++    parent = kb.create_task(owner.conn, title='Existing prerequisite', assignee='default', requires=[])
++    worker.enter()
++    monkeypatch.setattr(placement.reg, 'self_gateway', lambda: 'hub' if os.environ['HERMES_HOME'] == str(hub.home) else 'worker-1')
++    monkeypatch.setattr(placement, 'config', lambda: {'worker_queue': {'hub': 'pool:worker'}})
++    monkeypatch.setattr(placement, '_machine_picks_up', lambda _: True)
++    if not forwarded:
++        monkeypatch.setattr(creation, 'plan', lambda *a, **kw: None)
++    received = []
++    def run(argv):
++        if argv[-1] == '--help':
++            return 0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''
++        options = {k: json.loads(v) for k,v in (a.split('=',1) for i,a in enumerate(argv) if i and argv[i-1]=='--option')}
++        incoming = {'title': 'Present human choice', 'body': 'Choose A or B now while the prerequisite proceeds.', 'assignee': 'default', **options}
++        if diagnostic_restore:
++            incoming['human_action_now'] = True
++        intent = {'request_id': 'immediate-ask-contract', 'owner': {'gateway':'hub','profile':'default','board':'default'}, 'origin': {'gateway':'worker-1','profile':'default','session':'canonical-home-owner'}}
++        hub.enter()
++        try:
++            received.append(json.loads(tools._handle_create(incoming, origin_intent=intent)))
++        finally:
++            worker.enter()
++        return 3, 'queued', ''
++    monkeypatch.setattr(placement, 'hub_runner', run)
++    monkeypatch.setattr(placement, 'remote_state', lambda _: None)
++    placement._help_cache.clear()
++    out = json.loads(tools._handle_create({'title':'Present human choice','body':'Choose A or B now while the prerequisite proceeds.', 'assignee':'default','requires':[], 'parents':[parent], 'initial_status':'blocked','human_action_now':True,'human_request':REQUEST}))
++    if forwarded:
++        assert received and received[0].get('task_id'), (out, received)
++    else:
++        assert out.get('task_id'), out
+diff --git a/tests/tools/test_review_home_normalization.py b/tests/tools/test_review_home_normalization.py
+index d70bf6ee672..5bb6b79ed4c 100644
+--- a/tests/tools/test_review_home_normalization.py
++++ b/tests/tools/test_review_home_normalization.py
+@@ -21,7 +21,7 @@
+     sent = []
+     def run(argv):
+         if argv[-1] == '--help':
+-            return 0, '--option canonical-home-v1', ''
++            return 0, '--option --canonical-home canonical-home-v2 canonical-home-v1', ''
+         sent.append(argv)
+         return 3, 'queued', ''
+     monkeypatch.setattr(placement, 'hub_runner', run)
+-- 
+2.43.0
+

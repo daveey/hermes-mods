@@ -1,0 +1,352 @@
+From 904cf2bacb1539d10bd34bb0ff4e641f85482c1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:42:47 +0000
+Subject: [PATCH 6325] Host-local workspace binding and prior-home history recovery
+
+Public mirror of source commit 904cf2bacb1539d10bd34bb0ff4e641f85482c1d.
+
+---
+diff --git a/hermes_cli/kanban_pickup_history.py b/hermes_cli/kanban_pickup_history.py
+index 79e08c53943..0777587eb70 100644
+--- a/hermes_cli/kanban_pickup_history.py
++++ b/hermes_cli/kanban_pickup_history.py
+@@ -7,7 +7,8 @@
+ 
+ :func:`refill` repairs such a copy from this board's replica (the Board's full mirror), never inventing a row:
+ 
+-* Only a foreign copy (``created_on`` another gateway) is refilled; this gateway's own cards are authoritative here.
++* Foreign copies refill only their missing prefix. Rehomed own cards additionally recover published
++  pre-handoff gaps through ``kanban_rehome_history``; present ownership is not proof of complete history.
+ * Only the missing *prefix* is filled: replica events older than the earliest event the copy already holds, matched
+   by ``uid``. A newer gap is not a truncation and the feed delivers it; refilling it could race that feed.
+ * Every refilled row keeps its replica ``uid``, ``kind``, ``payload`` and ``created_at``; its run is the local run
+@@ -57,8 +58,11 @@
+     from hermes_cli.kanban_db_connect import write_txn
+     explicit = ids is not None
+     targets = list(ids) if explicit else foreign_copies(conn, own)
+-    report: dict[str, dict] = {}
++    from hermes_cli.kanban_rehome_history import recover
++    report: dict[str, dict] = recover(conn, replica, own, targets if explicit else None)
+     for tid in targets:
++        if tid in report:
++            continue
+         card = conn.execute("SELECT created_on FROM tasks WHERE id = ?", (tid,)).fetchone()
+         if card is None or card[0] in (None, own):
+             if explicit:
+diff --git a/hermes_cli/kanban_rehome_history.py b/hermes_cli/kanban_rehome_history.py
+new file mode 100644
+index 00000000000..e00724d1a1a
+--- /dev/null
++++ b/hermes_cli/kanban_rehome_history.py
+@@ -0,0 +1,119 @@
++"""Recover published pre-rehome evidence skipped by the old primary partition.
++
++Ownership of a task row does not imply custody of its prior home's history. Only
++an identical rehome event held locally and in the replica admits this repair.
++Missing historical events use negative ids, like pickup-prefix refill: no replay
++through notification cursors, no capture, and no mutation of the current task.
++Event consumers deciding spend use canonical timestamp/uid order, not these ids.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def _boundary(conn, replica, tid, own):
++    row = conn.execute('SELECT created_on FROM tasks WHERE id=?', (tid,)).fetchone()
++    remote = replica.execute('SELECT created_on FROM tasks WHERE id=?', (tid,)).fetchone()
++    if row is None or remote is None or row[0] != own or remote[0] != own:
++        return None
++    for event in conn.execute("SELECT uid,payload,origin_gateway FROM task_events WHERE task_id=? AND kind='rehomed' "
++                              "ORDER BY created_at DESC,id DESC", (tid,)):
++        try:
++            payload = json.loads(event['payload'] or '{}')
++        except (TypeError, ValueError):
++            continue
++        if (event['origin_gateway'] != 'server' or not isinstance(payload, dict) or payload.get('to') != own
++                or not isinstance(payload.get('from'), str) or payload['from'] in ('', own)):
++            continue
++        match = replica.execute("SELECT id,payload FROM task_events WHERE task_id=? AND uid=? "
++                                "AND kind='rehomed' AND origin_gateway='server'", (tid, event['uid'])).fetchone()
++        if match is not None and match['payload'] == event['payload']:
++            return match['id']
++    return None
++
++
++def recover(conn, replica, own, ids=None):
++    """Missing pre-handoff events and their real runs, never task fields or release authority."""
++    targets = list(ids) if ids is not None else [r[0] for r in conn.execute(
++        "SELECT t.id FROM tasks t WHERE t.created_on=? AND t.status NOT IN ('done','archived') "
++        "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.id AND e.kind='rehomed')", (own,))]
++    report = {}
++    for tid in targets:
++        if _boundary(conn, replica, tid, own) is None:
++            continue
++        result = _recover_one(conn, replica, tid, own)
++        if ids is not None or result['filled'] or result['unresolved']:
++            report[tid] = result
++    return report
++
++
++def _missing(conn, replica, tid, boundary):
++    held = {r[0] for r in conn.execute('SELECT uid FROM task_events WHERE task_id=?', (tid,))}
++    # The boundary is Board publication order, not the sender's clock: only
++    # evidence already published before the authenticated transfer is imported.
++    return [r for r in replica.execute('SELECT * FROM task_events WHERE task_id=? AND id<? ORDER BY id',
++                                      (tid, boundary)) if r['uid'] and r['uid'] not in held]
++
++
++def _recover_one(conn, replica, tid, own):
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_db_connect import write_txn
++
++    filled = unresolved = 0
++    boundary = _boundary(conn, replica, tid, own)
++    if boundary is None or not _missing(conn, replica, tid, boundary):
++        return {'filled': 0, 'unresolved': 0}
++    with write_txn(conn):
++        boundary = _boundary(conn, replica, tid, own)  # recheck custody under the writer lock
++        if boundary is None or sync._tombstoned(conn, 'tasks', tid):
++            return {'filled': 0, 'unresolved': 0}
++        missing = _missing(conn, replica, tid, boundary)
++        low = conn.execute('SELECT MIN(id) FROM task_events').fetchone()[0]
++        next_id = min(0, low or 0) - 1
++        applying = sync.sync_state(conn)['applying']
++        conn.execute('UPDATE kanban_sync_state SET applying=1')
++        try:
++            for row in reversed(missing):
++                uid = row['uid']
++                if any(sync._tombstoned(db, 'task_events', uid) for db in (conn, replica)):
++                    continue
++                fields = client._row_fields(replica, 'task_events', row)
++                run_uid = fields.get('run_uid')
++                if ((row['run_id'] is not None and run_uid is None)
++                        or (run_uid is not None and not _run(conn, replica, tid, run_uid))):
++                    unresolved += 1
++                    continue
++                cols = sync._local_fields(conn, 'task_events', fields, tid)
++                cols['origin_gateway'] = row['origin_gateway']
++                names = ['id', 'uid', *cols]
++                conn.execute(f"INSERT INTO task_events ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
++                             (next_id, uid, *cols.values()))
++                next_id -= 1
++                filled += 1
++        finally:
++            conn.execute('UPDATE kanban_sync_state SET applying=?', (applying,))
++    return {'filled': filled, 'unresolved': unresolved}
++
++
++def _run(conn, replica, tid, uid):
++    """Fill only absent or untouched placeholder runs; never overwrite real local work."""
++    from hermes_cli import kanban_sync_client as client
++
++    if any(sync._tombstoned(db, 'task_runs', uid) for db in (conn, replica)):
++        return False
++    local = conn.execute('SELECT * FROM task_runs WHERE uid=?', (uid,)).fetchone()
++    if local is not None and local['task_id'] != tid:
++        return False
++    if local is not None and local['status'] != 'pending_sync':
++        return True
++    remote = replica.execute('SELECT * FROM task_runs WHERE uid=? AND task_id=?', (uid, tid)).fetchone()
++    if remote is None or remote['status'] == 'pending_sync':
++        return False
++    if conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_runs' AND row_uid=?", (uid,)).fetchone():
++        return False
++    fields = client._row_fields(replica, 'task_runs', remote)
++    change = sync.RemoteChange(0, 'task_runs', uid, 'upsert', fields, int(remote['sync_version'] or 0), '', '')
++    return sync._upsert_row(conn, change, '', sync.ApplyResult(cursor=0))
+diff --git a/hermes_cli/kanban_sync_repair_content.py b/hermes_cli/kanban_sync_repair_content.py
+index c375cbdbea5..8de6f8df930 100644
+--- a/hermes_cli/kanban_sync_repair_content.py
++++ b/hermes_cli/kanban_sync_repair_content.py
+@@ -61,6 +61,8 @@
+     # concurrent relevant commits therefore re-arm the next pass, never vanish.
+     repaired = client.repair_divergence(live, replica, gateway)
+     client.repair_missing_children(live, replica, gateway)
++    from hermes_cli.kanban_rehome_history import recover
++    recover(live, replica, gateway)
+     if stamp is not None:
+         with _lock:
+             _done[key] = stamp
+diff --git a/tests/hermes_cli/test_kanban_rehome_history.py b/tests/hermes_cli/test_kanban_rehome_history.py
+new file mode 100644
+index 00000000000..bb79b4accb4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rehome_history.py
+@@ -0,0 +1,170 @@
++"""Prior-home evidence is not replayed by a cursor-forward primary partition."""
++from __future__ import annotations
++
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_pickup_history as history
++from hermes_cli import kanban_spend_decision as spend
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as node
++from tests.hermes_cli import test_kanban_worker_node as fixtures
++
++gws, svc = fixtures.gws, fixtures.svc
++
++
++def _world(gws):
++    hub, worker = gws
++    worker.enter()
++    tid = kb.create_task(worker.conn, title="prior home stop", assignee="default")
++    with worker.conn:
++        run = worker.conn.execute(
++            "INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome) "
++            "VALUES (?,'default','done',100,110,'retained')", (tid,)).lastrowid
++        kb._append_event(worker.conn, tid, 'spend_budget_triaged',
++                         {'cause': 'capability_unavailable'}, run_id=run)
++        episode = worker.conn.execute(
++            "SELECT uid FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'", (tid,)).fetchone()[0]
++        kb._append_event(worker.conn, tid, 'decision_retained', {'episode': episode}, run_id=run)
++    worker.round()
++    hub.round()  # cursor passes the foreign rows; they survive only in the replica
++    assert kb.get_task(hub.conn, tid) is None
++    hub.enter()
++    replica = node.open_replica(hub.conn)
++    assert replica is not None
++    card = replica.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++    fields = client._row_fields(replica, 'tasks', card)
++    fields['created_on'] = 'hub'
++    changes = [sync.RemoteChange(0, 'tasks', tid, 'upsert', fields, card['sync_version'] + 1, '', 'server')]
++    # A later event references the old run, producing the real incident's pending_sync placeholder.
++    run_uid = replica.execute('SELECT uid FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0]
++    changes += [sync.RemoteChange(0, 'task_events', sync.uuid7(), 'upsert',
++                                 {'task_id': tid, 'kind': 'worker_result', 'run_uid': run_uid,
++                                  'created_at': 200000}, 0, '', 'worker-1')]
++    rehome = sync.RemoteChange(0, 'task_events', sync.uuid7(), 'upsert',
++                              {'task_id': tid, 'kind': 'rehomed', 'payload': json.dumps(
++                                  {'from': 'worker-1', 'to': 'hub'}), 'created_at': 300000}, 0, '', 'server')
++    changes.append(rehome)
++    replica.close()
++    # Simulate Board-authenticated feed application to both stores, without publishing fixture edits.
++    raw = client.open_shadow(fixtures.BOARD, 'hub')
++    sync.apply_remote_changes(raw, changes, new_cursor=sync.sync_state(raw)['cursor'], observers=False)
++    raw.close()
++    sync.apply_remote_changes(hub.conn, changes, new_cursor=sync.sync_state(hub.conn)['cursor'], observers=False)
++    return hub, tid, episode, run_uid
++
++
++def test_supported_refill_recovers_own_middle_gap_and_placeholder(gws):
++    hub, tid, episode, run_uid = _world(gws)
++    conn = hub.conn
++    assert spend.pending_episode(conn, tid) is None
++    placeholder = conn.execute('SELECT id,status FROM task_runs WHERE uid=?', (run_uid,)).fetchone()
++    assert placeholder['status'] == 'pending_sync'
++    before = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    outbox = [tuple(r) for r in conn.execute('SELECT * FROM kanban_sync_outbox')]
++    top = conn.execute('SELECT MAX(id) FROM task_events').fetchone()[0]
++    replica = node.open_replica(conn)
++    try:
++        report = history.refill(conn, replica, 'hub', [tid])
++        assert report[tid]['filled'] >= 3, report
++        assert report[tid]['unresolved'] == 0
++        stop = spend.pending_episode(conn, tid)
++        assert stop['uid'] == episode
++        assert conn.execute('SELECT status FROM task_runs WHERE id=?', (placeholder['id'],)).fetchone()[0] == 'done'
++        assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE uid=?', (run_uid,)).fetchone()[0] == 1
++        assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == before
++        assert [tuple(r) for r in conn.execute('SELECT * FROM kanban_sync_outbox')] == outbox
++        assert conn.execute('SELECT MAX(id) FROM task_events').fetchone()[0] == top
++        assert history.refill(conn, replica, 'hub', [tid])[tid]['filled'] == 0
++        restored = conn.execute('SELECT origin_gateway FROM task_events WHERE uid=?', (episode,)).fetchone()[0]
++        original = replica.execute('SELECT origin_gateway FROM task_events WHERE uid=?', (episode,)).fetchone()[0]
++        assert restored == original
++        with conn:
++            kb._append_event(conn, tid, 'promoted_manual', {'reason': 'owner decision'})
++        assert spend.pending_episode(conn, tid) is None
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('veto', ['no-rehome', 'wrong-home', 'tombstone', 'peer-marker', 'payload-mismatch'])
++def test_recovery_requires_matching_home_and_preserves_tombstones(gws, veto):
++    hub, tid, episode, _ = _world(gws)
++    conn = hub.conn
++    with conn:
++        conn.execute('UPDATE kanban_sync_state SET applying=1')
++        sql, args = {
++            'no-rehome': ("DELETE FROM task_events WHERE task_id=? AND kind='rehomed'", (tid,)),
++            'wrong-home': ("UPDATE task_events SET payload=? WHERE task_id=? AND kind='rehomed'",
++                           (json.dumps({'from': 'worker-1', 'to': 'another-home'}), tid)),
++            'peer-marker': ("UPDATE task_events SET origin_gateway='worker-1' WHERE task_id=? AND kind='rehomed'", (tid,)),
++            'payload-mismatch': ("UPDATE task_events SET payload=? WHERE task_id=? AND kind='rehomed'",
++                                 (json.dumps({'from': 'another-prior-home', 'to': 'hub'}), tid)),
++            'tombstone': ('INSERT INTO kanban_sync_tombstones(table_name,row_uid,deleted_at) VALUES (?,?,?)',
++                          ('task_events', episode, 400000)),
++        }[veto]
++        conn.execute(sql, args)
++        conn.execute('UPDATE kanban_sync_state SET applying=0')
++    replica = node.open_replica(conn)
++    try:
++        history.refill(conn, replica, 'hub', [tid])
++        assert conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++    finally:
++        replica.close()
++
++
++def test_cli_and_normal_content_repair_recover_prior_home(gws, capsys):
++    from hermes_cli import kanban_sync_cli as cli
++    from hermes_cli import kanban_sync_repair_content as content
++
++    hub, tid, episode, _ = _world(gws)
++    args = argparse.Namespace(board=fixtures.BOARD, task_ids=[tid], json=True)
++    assert cli._refill_history(args) == 0
++    assert json.loads(capsys.readouterr().out)[tid]['filled'] >= 3
++    assert spend.pending_episode(hub.conn, tid)['uid'] == episode
++    with hub.conn:
++        hub.conn.execute('UPDATE kanban_sync_state SET applying=1')
++        hub.conn.execute('DELETE FROM task_events WHERE uid=?', (episode,))
++        hub.conn.execute('UPDATE kanban_sync_state SET applying=0')
++    replica = node.open_replica(hub.conn)
++    assert replica is not None
++    try:
++        content.run(hub.conn, replica, 'hub', path=hub.home / 'kanban.db', inputs=None)
++        assert spend.pending_episode(hub.conn, tid)['uid'] == episode
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('run_state', ['missing', 'real-local', 'pending-write'])
++def test_real_runs_and_unresolved_run_evidence_are_not_overwritten(gws, run_state):
++    hub, tid, episode, run_uid = _world(gws)
++    conn = hub.conn
++    if run_state == 'missing':
++        raw = client.open_shadow(fixtures.BOARD, 'hub')
++        with raw:
++            raw.execute('UPDATE kanban_sync_state SET applying=1')
++            raw.execute("UPDATE task_runs SET status='pending_sync' WHERE uid=?", (run_uid,))
++            raw.execute('UPDATE kanban_sync_state SET applying=0')
++        raw.close()
++    else:
++        with conn:
++            if run_state == 'real-local':
++                conn.execute("UPDATE task_runs SET status='running',summary='preserve local' WHERE uid=?", (run_uid,))
++            else:
++                conn.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                             "VALUES (?,'task_runs',?,'upsert','{}','',1)", (sync.uuid7(), run_uid))
++    replica = node.open_replica(conn)
++    assert replica is not None
++    try:
++        result = history.refill(conn, replica, 'hub', [tid])[tid]
++        if run_state == 'real-local':
++            assert spend.pending_episode(conn, tid)['uid'] == episode
++            assert conn.execute('SELECT summary FROM task_runs WHERE uid=?', (run_uid,)).fetchone()[0] == 'preserve local'
++        else:
++            assert result['unresolved'] == 2
++            assert spend.pending_episode(conn, tid) is None
++    finally:
++        replica.close()
+-- 
+2.43.0
+

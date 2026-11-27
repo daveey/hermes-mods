@@ -1,0 +1,118 @@
+From f7fcd7e20feb04db7d305be21ce80e0716f0f934 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:49:31 -0800
+Subject: [PATCH 6070] Kanban spend budget: window semantics, input checks and immediate reviewer
+
+Public mirror of source commit f7fcd7e20feb04db7d305be21ce80e0716f0f934.
+
+---
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index e7bdd947b1e..42941ca2dc1 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -33,22 +33,30 @@
+ 
+ 
+ def _spent_already(conn, tid: str, runs, cache) -> str:
+-    """Why a new limit would stop the card at once, or ''.
++    """Why the limits this change leaves would stop the card at once, or ''.
+ 
+     In the current window a limit counts the spend already recorded, so ``--runs 3`` on a card with 7 runs
+-    sends it to triage at the next dispatch tick instead of granting 3 more (t_5740ea47954ae326).
+-    A pending ordinary stop opens a fresh window at promote, so nothing is counted there yet."""
++    trips the budget at once instead of granting 3 more (t_5740ea47954ae326). A field not given
++    falls back to the board's limit (the override is replaced whole), so it is checked too. A pending
++    ordinary stop opens a fresh window at promote, so nothing is counted there yet; a restricted one keeps
++    its history, so it is checked like the current window."""
+     if ksb.limit_window(conn, tid) != 'current':
+         return ''
+     spent = ksb.spend(conn, tid)
+-    used = {'runs': spent.runs, 'cache-read-tokens': spent.tokens['cache_read_tokens']}
+-    for flag, limit in (('runs', runs), ('cache-read-tokens', cache)):
+-        if limit and used[flag] >= limit:
+-            return (f"kanban spend-budget: {tid} already spent {used[flag]} {flag} in this window, so "
+-                    f"--{flag} {limit} would send it to triage at the next dispatch tick. The limit counts "
+-                    f"spend already recorded: to allow {limit} more, pass --{flag} {used[flag] + limit}. "
+-                    f"To stop the card, block or archive it instead.")
+-    return ''
++    board = ksb.limits()
++    rows = (('runs', runs, board.runs, spent.runs),
++            ('cache-read-tokens', cache, board.cache_read_tokens, spent.tokens['cache_read_tokens']))
++    tripped = []
++    for flag, given, board_limit, used in rows:
++        limit = board_limit if given is None else given
++        if limit and used >= limit:
++            source = f'--{flag} {limit}' if given is not None else f"the board's {flag} limit {limit}"
++            tripped.append(f"{used} {flag} already spent in this window reach {source}; to allow {limit} more, "
++                           f"pass --{flag} {used + limit}")
++    if not tripped:
++        return ''
++    return (f"kanban spend-budget: {tid}: " + '; '.join(tripped) + ". A limit counts spend already recorded, "
++            "so this would trip the budget at once. To stop the card, block or archive it instead.")
+ 
+ 
+ def command(args: argparse.Namespace) -> int:
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_below_spent.py b/tests/hermes_cli/test_kanban_spend_budget_below_spent.py
+index 6dd4c8e5297..2dbf0b20839 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget_below_spent.py
++++ b/tests/hermes_cli/test_kanban_spend_budget_below_spent.py
+@@ -30,7 +30,7 @@
+ def test_a_limit_already_spent_is_refused_and_names_the_limit_that_grants_more(kanban_home, flag, limit, suggested):
+     tid = _card_with_spend(7)
+     out = cli.run_slash(f'spend-budget {tid} --{flag} {limit} --reason "sample phase"')
+-    assert f'--{flag} {suggested}' in out and 'triage' in out, out
++    assert f'--{flag} {suggested}' in out and 'at once' in out, out
+     with kbc.connect_closing() as conn:
+         assert helpers._events(conn, tid, budget.OVERRIDE_EVENT) == []
+         assert budget.hold(conn, tid, lim=helpers.LIMITS) is None
+@@ -59,3 +59,29 @@
+     assert 'fresh window starting at promote' in out, out
+     with kbc.connect_closing() as conn:
+         assert budget.card_limits(conn, tid, helpers.LIMITS).runs == 2
++
++
++def test_every_tripped_field_is_named_including_the_board_fallback(kanban_home, monkeypatch):
++    tid = _card_with_spend(7)
++    out = cli.run_slash(f'spend-budget {tid} --runs 3 --cache-read-tokens 500 --reason x')
++    assert '--runs 10' in out and '--cache-read-tokens 1200' in out, out
++    # The override is replaced whole: a field not given falls back to the board's limit.
++    monkeypatch.setattr(budget, 'limits', lambda cfg=None: budget.Limits(5, helpers.LIMITS.cache_read_tokens))
++    out = cli.run_slash(f'spend-budget {tid} --cache-read-tokens 100000 --reason x')
++    assert "the board's runs limit 5" in out and '--runs 12' in out, out
++    with kbc.connect_closing() as conn:
++        assert helpers._events(conn, tid, budget.OVERRIDE_EVENT) == []
++
++
++@pytest.mark.parametrize('cause', ['scope_stopped', 'safety_refusal'])
++def test_a_restricted_stop_keeps_its_history_so_a_spent_limit_is_refused(kanban_home, cause):
++    tid = _card_with_spend(8)
++    with kbc.connect_closing() as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.EVENT, {'cause': cause, 'accounting_boundary': False})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        assert budget.limit_window(conn, tid) == 'current'
++    assert '--runs 13' in cli.run_slash(f'spend-budget {tid} --runs 5 --reason x')
++    cli.run_slash(f'spend-budget {tid} --runs 9 --reason x')
++    with kbc.connect_closing() as conn:
++        assert budget.card_limits(conn, tid, helpers.LIMITS).runs == 9
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index f4b78e3df12..0d1e50b55d0 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -791,9 +791,10 @@
+ `--runs` / `--cache-read-tokens` take 0 for no limit; a field not given keeps
+ the board's value; `--exempt` sets both to 0. Every change needs `--reason` and
+ is recorded as a `spend_budget_set` event (who, why, the limits) plus a card
+-comment; the newest one wins. Outside a pending spend stop, a limit counts the
+-runs and tokens already spent in the current window, so one at or below that
+-spend is refused (it would triage the card at the next tick): to grant 3 more
++comment; the newest one wins. Outside an ordinary pending spend stop, a limit
++counts the runs and tokens already spent in the current window, so a change
++that leaves any limit (given, or the board's for a field not given) at or below
++that spend is refused, since it would trip the budget at once: to grant 3 more
+ runs to a card that has spent 7, pass `--runs 10`. A card over its own limit is triaged with
+ `override: true` on the `spend_budget_triaged` event. Exemptions are explicit
+ per card, never inferred from a title, and worker and `delegate_task` shells
+-- 
+2.43.0
+

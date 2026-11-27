@@ -1,0 +1,2071 @@
+From 1f08a284390654b7c94654877d715acaac07ea05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:35:05 +0000
+Subject: [PATCH 6233] Recorded governor explanations and lightweight why startup
+
+Public mirror of source commit 1f08a284390654b7c94654877d715acaac07ea05.
+
+---
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 23b8fa69634..01fb57524a1 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1878,6 +1878,8 @@
+     "owner-chats": lambda a: importlib.import_module("hermes_cli.kanban_owner_chat").command(a),
+     "delegate": lambda a: importlib.import_module("hermes_cli.kanban_scope_delegate").command(a),
+     "release": lambda a: importlib.import_module("hermes_cli.kanban_release").command(a),
++    "governors": lambda a: importlib.import_module("hermes_cli.kanban_governors_cli").governors_command(a),
++    "why": lambda a: importlib.import_module("hermes_cli.kanban_governors_cli").why_command(a),
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote, "resume": _cmd_resume, "quota-release": _cmd_quota_release,
+     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch, "source-release": _cmd_source_release,
+diff --git a/hermes_cli/kanban_admission_pools.py b/hermes_cli/kanban_admission_pools.py
+index 7c4cf10a35b..9d155e5bd4c 100644
+--- a/hermes_cli/kanban_admission_pools.py
++++ b/hermes_cli/kanban_admission_pools.py
+@@ -127,7 +127,11 @@
+ 
+ def pool_admits(result, row):
+     budget = getattr(result, "admission_budget", None)
+-    return budget is None or budget.admits(row_class(row))
++    if budget is None or budget.admits(row_class(row)):
++        return True
++    from hermes_cli.kanban_governors import charge
++    charge(row["id"], "admission_pool", detail={"class": row_class(row)})
++    return False
+ 
+ 
+ def pool_take(result, row):
+@@ -173,9 +177,13 @@
+         free = dispatch_pools(regular_cap)
+     except (OSError, ValueError, TypeError):
+         return 0
++    from hermes_cli.kanban_governors import host_use
+     if free is None:
+-        return regular_cap - running_count - count_running_tasks_other_boards(board)
++        others = count_running_tasks_other_boards(board)
++        host_use(regular_cap, running_count, others)  # the governor snapshot shows the census this tick used
++        return regular_cap - running_count - others
+     regular, priority, used, priority_used = free
++    host_use(regular_cap, running_count, None if used is None else max(0, used - running_count))
+     if result is not None:
+         result.admission_budget = PoolBudget(regular, priority)
+         if regular <= 0:
+diff --git a/hermes_cli/kanban_board_share.py b/hermes_cli/kanban_board_share.py
+index 819f8f953b2..d652b836ecc 100644
+--- a/hermes_cli/kanban_board_share.py
++++ b/hermes_cli/kanban_board_share.py
+@@ -241,6 +241,7 @@
+     except Exception:
+         return 0
+     total = 0
++    per_board: dict[str, int] = {}  # per-board use of the host slots, for the governor snapshot
+     for meta in boards:
+         slug = meta.get("slug") or _kb.DEFAULT_BOARD
+         try:
+@@ -250,6 +251,7 @@
+                 continue
+             if counts is not None and resolved in counts:
+                 total += counts[resolved]
++                per_board[slug] = counts[resolved]
+                 continue
+             if not path.exists():
+                 continue
+@@ -260,10 +262,13 @@
+                 with contextlib.suppress(Exception):
+                     other.close()
+             total += running
++            per_board[slug] = running
+             if counts is not None:
+                 counts[resolved] = running
+         except Exception:
+             continue
++    from hermes_cli.kanban_governors import board_use
++    board_use(per_board)
+     return total
+ 
+ 
+diff --git a/hermes_cli/kanban_candidate_receipts.py b/hermes_cli/kanban_candidate_receipts.py
+index a6f8e89ef39..866b2ac61f8 100644
+--- a/hermes_cli/kanban_candidate_receipts.py
++++ b/hermes_cli/kanban_candidate_receipts.py
+@@ -151,6 +151,8 @@
+ 
+ 
+ def capacity_tail(rows, lane_by_id, reason):
++    from hermes_cli.kanban_governors import tail
++    tail(rows, reason)  # the governor snapshot names the cap that set the budget
+     for row in rows:
+         note(row['id'], 'capacity', reason, stage='claim', status=lane_by_id.get(row['id'], 'ready'))
+ 
+@@ -200,12 +202,14 @@
+ 
+ 
+ @contextmanager
+-def dispatch_pass(conn, *, dry_run=False):
++def dispatch_pass(conn, *, dry_run=False, caps=None):
++    """``caps``: the tick's concurrency settings, for the governor snapshot (``kanban_governors.tick``)."""
+     import socket
+     from hermes_cli.kanban_db_sync import sync_state
++    from hermes_cli.kanban_governors import tick as governor_tick
+     state = sync_state(conn)
+     worker = str(state['gateway_id']) if state else socket.gethostname()
+-    with collect(worker=worker) as capture:
++    with collect(worker=worker) as capture, governor_tick(conn, caps):
+         yield
+     if not dry_run:
+         try:
+diff --git a/hermes_cli/kanban_capacity_evidence.py b/hermes_cli/kanban_capacity_evidence.py
+index 778a71ef317..d49a062c323 100644
+--- a/hermes_cli/kanban_capacity_evidence.py
++++ b/hermes_cli/kanban_capacity_evidence.py
+@@ -188,6 +188,9 @@
+     # One durable reason per passed-over card and ready episode (kanban-dd62aef001); never raises. [daveey]
+     from hermes_cli.kanban_dispatch_skip import record_tick
+     record_tick(conn, result, dry_run=dry_run)
++    # Which governor stopped each idle card this tick, per board (``kanban_governors``); never raises. [daveey]
++    from hermes_cli.kanban_governors import record_tick as record_governors
++    record_governors(conn, result, dry_run=dry_run, update_drain=update_drain)
+ 
+ 
+ def _unknown(reason, **fields):
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 866a6086db1..096d91722f0 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1815,15 +1815,13 @@
+     """
+     def _locked_tick() -> DispatchResult:
+         from hermes_cli.kanban_candidate_receipts import dispatch_pass
+-        with dispatch_pass(conn, dry_run=dry_run):
++        caps = dict(max_spawn=max_spawn, max_in_progress=max_in_progress, spawn_quota=spawn_quota,
++                    max_in_progress_per_profile=max_in_progress_per_profile)
++        with dispatch_pass(conn, dry_run=dry_run, caps=caps):  # caps: the governor snapshot's thresholds
+             result = _dispatch_once_locked(
+-                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+-                max_spawn=max_spawn, max_in_progress=max_in_progress,
+-                failure_limit=failure_limit, stale_timeout_seconds=stale_timeout_seconds,
+-                board=board, default_assignee=default_assignee,
+-                max_in_progress_per_profile=max_in_progress_per_profile,
+-                reconcile_orphans=reconcile_orphans, spawn_quota=spawn_quota,
+-            )
++                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run, failure_limit=failure_limit,
++                stale_timeout_seconds=stale_timeout_seconds, board=board, default_assignee=default_assignee,
++                reconcile_orphans=reconcile_orphans, **caps)
+         from hermes_cli.kanban_capacity_evidence import observe_dispatch
+         observe_dispatch(conn, result, board=board, dry_run=dry_run,
+                          update_drain=observation_update_drain)
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index 7bf8d833a0e..6b3176298f2 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -38,11 +38,13 @@
+         f"ORDER BY {DISPATCH_ORDER}"
+     ).fetchall()
+     from hermes_cli.kanban_containment_connections import drop_held
+-    rows = drop_held(conn, rows)
++    from hermes_cli.kanban_governors import dropped  # the rows each filter removes are charged to its governor
++    rows = dropped(rows, drop_held(conn, rows), "containment")
+     from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
+     from hermes_cli.kanban_lanes import drop_paused
+     from hermes_cli.kanban_lane_workers import drop_full
+-    rows = order_with_remote_waiters(conn, drop_full(conn, drop_paused(conn, rows)))
++    rows = dropped(rows, drop_paused(conn, rows), "lane_paused")
++    rows = order_with_remote_waiters(conn, dropped(rows, drop_full(conn, rows), "lane_max_workers"))
+     if marked_first:  # replica donation reorders within a class, never across the pool partition
+         rows.sort(key=lambda row: row["admission_class"] not in ("capacity", "urgent"))
+     return rows
+diff --git a/hermes_cli/kanban_failure_accounting.py b/hermes_cli/kanban_failure_accounting.py
+index 485f640c36b..e43ae0f81b2 100644
+--- a/hermes_cli/kanban_failure_accounting.py
++++ b/hermes_cli/kanban_failure_accounting.py
+@@ -38,6 +38,9 @@
+     from hermes_cli import kanban_db_dispatch as dispatch
+     from hermes_cli import kanban_failure_summary as summary
+     import json
++    if outcome == "spawn_failed":  # the governor snapshot: this tick tried the card and its spawn failed [daveey]
++        from hermes_cli.kanban_governors import charge
++        charge(task_id, "spawn_failed", detail={"reason": str(error)[:160], "infrastructure": infrastructure})
+ 
+     evidence = {"error": error, **(event_payload_extra or {}), **(diagnostic or {})}
+     refusal = not infrastructure and summary.classify_failure(outcome, evidence) == "provider_refusal"
+diff --git a/hermes_cli/kanban_governors.py b/hermes_cli/kanban_governors.py
+new file mode 100644
+index 00000000000..ee0a35f5eab
+--- /dev/null
++++ b/hermes_cli/kanban_governors.py
+@@ -0,0 +1,777 @@
++"""Dispatch governors: one registry, and a per-board snapshot of what each tick decided. [daveey]
++
++A ready card can wait behind about forty different rules (host slots, lane gates, LLM pacing, labels, walls,
++budgets, drains). Each rule records its own evidence in its own shape, so "why is this card idle" meant reading
++several event kinds and guessing. This module names every rule once and records, per dispatcher tick, which rule
++stopped each idle card.
++
++* :func:`registry` lists every governor in dispatcher order: ``id``, ``label``, ``scope`` (host / board / lane / pool /
++  provider / profile / machine / card), ``source`` (``file:function`` of the predicate the dispatcher calls),
++  ``threshold`` (the config key or constant that sets its limit) and ``kind`` (``hold`` stops a start, ``throttle``
++  slows starts, ``reorder`` changes who goes first).
++* :func:`tick` is the capture one dispatcher tick runs inside (``kanban_candidate_receipts.dispatch_pass``). The
++  few decisions a tick makes without a ``DispatchResult`` bucket report here: rows ``lane_rows`` filtered out, the
++  host-slot census, a full admission pool, the tail behind a spent spawn budget.
++* :func:`record_tick` (the post-result seam, ``kanban_capacity_evidence.observe_dispatch``) turns that capture and
++  the tick's ``DispatchResult`` into the board's snapshot: every idle card charged to exactly ONE governor (the
++  first that stopped it, in dispatcher order), every other governor that also holds it listed as an overlap, and
++  per governor the reading, threshold, since and cards charged. Charges sum to the idle total. It is written to
++  ``<board db>.governors.json`` beside the board DB: machine-local, never synced, no board write.
++* :func:`snapshot` reads it back. A consumer reads what the dispatcher decided; it does not re-derive it.
++
++The first stop always comes from the tick. Overlaps cannot: the dispatcher stops at the first refusal, so the rules
++after it are asked afterwards (``kanban_governors_explain.card_chain``, the same predicate functions, read-only),
++inside a small per-tick time budget; a card the budget did not reach has ``overlaps: null`` (not evaluated), never
++an empty list.
++
++Advisory like every notice: nothing here is read by admission, and a fault never stops a tick.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++import threading
++import time
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++_log = logging.getLogger(__name__)
++
++VERSION = 1
++SUFFIX = ".governors.json"
++MAX_CARDS = 2000  # per-card rows kept in one snapshot; counts stay complete past it
++MAX_IDS = 25  # card ids listed on one governor row
++OVERLAP_BUDGET_SECONDS = 0.3  # per tick, for asking the rules after each card's first stop
++OVERLAP_TTL_SECONDS = 300  # an evaluated overlap list is reused this long while the first stop is unchanged
++UNCHANGED_WRITE_SECONDS = 10  # an unchanged snapshot is rewritten (fresh ``tick_at``) at most this often
++STALE_SECONDS = 180  # a snapshot older than this is reported stale: no dispatcher is ticking this board
++
++HOLD, THROTTLE, REORDER = "hold", "throttle", "reorder"
++
++
++@dataclass(frozen=True)
++class Governor:
++    id: str
++    label: str
++    scope: str
++    source: str
++    threshold: str
++    kind: str = HOLD
++
++
++# Dispatcher order: ``_dispatch_once_locked`` top to bottom, then ``_dispatch_lane_task``, then the claim
++# transaction. A card's first stop is the earliest entry here that refused it.
++_REGISTRY: tuple[Governor, ...] = (
++    Governor("gateway_drain", "Gateway drain", "host", "hermes_cli/kanban_gateway_drain.py:dispatch_paused",
++             "gateway_state.json gateway_state=draining / restart_requested"),
++    Governor("core_update_drain", "Core-update drain", "host", "hermes_cli/kanban_gateway_drain.py:core_update_hold",
++             "agent.core_update_drain hold file"),
++    Governor("max_spawn", "Board spawn cap", "board", "hermes_cli/kanban_db_dispatch.py:_tick_spawn_budget",
++             "kanban.max_spawn"),
++    Governor("host_slots", "Host slots", "host", "hermes_cli/kanban_admission_pools.py:host_remaining",
++             "kanban.max_in_progress"),
++    Governor("board_share", "Board share", "host", "hermes_cli/kanban_board_share.py:shares",
++             "kanban.max_in_progress (free slots ranked across boards)", REORDER),
++    Governor("memory_pressure", "Memory pressure", "host", "hermes_cli/kanban_db_dispatch.py:_memory_pressure_level",
++             "gateway.memory_status.classify_pressure (critical: 0 starts, elevated: 1)", THROTTLE),
++    Governor("containment", "Containment", "card", "hermes_cli/kanban_containment_connections.py:held",
++             "pending containment episode"),
++    Governor("lane_paused", "Lane paused", "lane", "hermes_cli/kanban_lanes.py:drop_paused",
++             "kanban.admission.lanes.<lane>.paused"),
++    Governor("lane_max_workers", "Lane worker cap", "lane", "hermes_cli/kanban_lane_workers.py:drop_full",
++             "kanban.admission.lanes.<lane>.max_workers"),
++    Governor("lane_share", "Lane share order", "lane", "hermes_cli/kanban_lanes.py:order",
++             "kanban.admission.lanes.<lane>.share", REORDER),
++    Governor("hub_claim_screen", "Hub claim screen", "card", "hermes_cli/kanban_hub_admission_claim.py:screen",
++             "kanban_hub_admission_claim.MAX_JUDGED_PER_TICK", THROTTLE),
++    Governor("placement", "Labels / pickup", "machine", "hermes_cli/kanban_worker_node.py:dispatch_refusals",
++             "tasks.runs_on against this machine's labels"),
++    Governor("admission_pool", "Admission pool", "host", "hermes_cli/kanban_admission_pools.py:pool_admits",
++             "kanban.admission priority slots (marked-only pool)"),
++    Governor("unassigned", "Unassigned", "card", "hermes_cli/kanban_db_default_assignee.py:fill_default_assignee",
++             "kanban.default_assignee"),
++    Governor("nonspawnable", "No such profile", "profile",
++             "hermes_cli/kanban_db_dispatch_admission.py:lane_admission_refused", "kanban.dispatch_profiles"),
++    Governor("capsule", "Capsule transport", "card", "hermes_cli/kanban_capsule_admission.py:dispatch_refusal",
++             "registered capsule transport for host_repo cards"),
++    Governor("refusal_fallback", "Safety refusals", "card", "hermes_cli/kanban_refusal_fallback.py:admission",
++             "every eligible provider refused the card"),
++    Governor("class_walls", "Class walls", "provider", "hermes_cli/kanban_class_walls.py:unroutable_class",
++             "model_routing.routes (class has no usable route)"),
++    Governor("review_provider_wall", "Review provider wall", "provider", "hermes_cli/kanban_review_admission.py:hold",
++             "review route quota walls"),
++    Governor("no_progress", "No-progress budget", "card", "hermes_cli/kanban_no_progress.py:hold",
++             "kanban.no_progress_runs"),
++    Governor("spend_budget", "Spend budget", "card", "hermes_cli/kanban_spend_budget.py:hold",
++             "kanban.spend_budget_runs / kanban.spend_budget_cache_read_tokens"),
++    Governor("provider_walls", "Provider walls", "provider", "hermes_cli/kanban_dispatch_skip.py:pinned_quota_hold",
++             "kanban_provider_walls.active_walls / live_quota_wall"),
++    Governor("profile_cap", "Per-profile cap", "profile", "hermes_cli/kanban_db_dispatch.py:_dispatch_lane_task",
++             "kanban.max_in_progress_per_profile"),
++    Governor("model_pin", "Model pin", "card", "hermes_cli/kanban_model_assignment.py:route_model_mismatch",
++             "model_routing registry against the card's pin"),
++    Governor("respawn_guard", "Respawn guard", "card", "hermes_cli/kanban_db_dispatch.py:check_respawn_guard",
++             "rate-limit / infrastructure / owner-restart cooldowns, recent_success, active_pr"),
++    Governor("llm_pool", "LLM pool", "pool", "hermes_cli/kanban_llm_pacing_dispatch.py:hold",
++             "kanban.llm_pacing.reserve_seven_day_percent / reserve_five_hour_percent (every route at reserve)"),
++    Governor("ratio_routing", "Ratio routing", "provider", "hermes_cli/kanban_ratio_routing.py:pick",
++             "llm_pacing.json v2.pools[p].ratio", REORDER),
++    Governor("start_gate", "Plugin start gate", "host", "hermes_cli/kanban_start_gate.py:hold",
++             "kanban_start_gate plugin hook"),
++    Governor("owner_down", "Owner down", "profile", "hermes_cli/kanban_owner_down.py:probe",
++             "the assignee's gateway service is failed / masked / disabled"),
++    Governor("quiet", "Claim quiet", "host", "hermes_cli/kanban_db_dispatch_admission.py:quiet_claim_check",
++             "agent.claim_quiet lease"),
++    Governor("update_fence", "Update fence", "host", "hermes_cli/kanban_admission.py:admission_hold_set",
++             "<root>/core-update/holds/hermes-sync"),
++    Governor("disk_floor", "Disk floor", "host", "hermes_cli/kanban_disk_admission.py:refusal_reason",
++             "kanban.admission.disk_free_floor_bytes"),
++    Governor("worker_resources", "Worker resources", "host", "hermes_cli/worker_resource_admission.py:refusal",
++             "worker compute capacity (pool occupancy, pressure)"),
++    Governor("hub_cpu", "Hub CPU", "host", "hermes_cli/kanban_admission.py:hub_cpu_advisory",
++             "kanban.admission.cpu_busy_below_pct"),
++    Governor("board_lease", "Board lease", "card", "hermes_cli/kanban_dispatch_verdict.py:claim_refused",
++             "the Board's claim lease (lease_held / offline / claim_not_acquired)"),
++    Governor("spawn_failed", "Spawn failed", "card", "hermes_cli/kanban_failure_accounting.py:_record_task_failure",
++             "kanban.failure_limit (retried until the breaker blocks the card)"),
++    # Not dispatcher-tick rules: where a card that is not on a dispatch lane waits.
++    Governor("lane_gate", "Lane gate", "lane", "hermes_cli/kanban_lanes.py:held",
++             "kanban.admission.lanes.<lane>.gated / admit_per_day"),
++    Governor("lane_daily_limit", "Lane daily limit", "lane", "hermes_cli/kanban_lane_daily_limits.py:reason",
++             "kanban.admission.lanes.<lane>.cards_per_day / usd_per_day"),
++    Governor("dependencies", "Open parents", "card", "hermes_cli/kanban_db.py:recompute_ready",
++             "every parent done or archived"),
++    Governor("schedule", "Scheduled wait", "card", "hermes_cli/kanban_continuation.py:wake_due_continuations",
++             "the park's wake time or wake_check"),
++    Governor("unrecorded", "Unrecorded", "card", "hermes_cli/kanban_dispatch_skip.py:unrecorded",
++             "a tick passed the card over without recording why"),
++)
++_BY_ID = {g.id: g for g in _REGISTRY}
++_ORDER = {g.id: index for index, g in enumerate(_REGISTRY)}
++# The caps one tick's spawn budget is the minimum of, in ``_tick_spawn_budget`` order (a tie keeps the earlier).
++_BUDGET_ORDER = ("max_spawn", "host_slots", "board_share", "memory_pressure")
++
++
++def registry() -> list[dict[str, str]]:
++    """Every governor, in dispatcher order."""
++    return [{"id": g.id, "label": g.label, "scope": g.scope, "source": g.source, "threshold": g.threshold,
++             "kind": g.kind} for g in _REGISTRY]
++
++
++def governor(governor_id: str) -> Optional[Governor]:
++    return _BY_ID.get(governor_id)
++
++
++def order_of(governor_id: str) -> int:
++    return _ORDER.get(governor_id, len(_REGISTRY))
++
++
++# --- one tick's capture ----------------------------------------------------------------------------------------
++
++
++@dataclass
++class Tick:
++    caps: dict[str, Any]
++    host: dict[str, Any] = field(default_factory=dict)
++    charges: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
++
++
++_current: ContextVar[Optional[Tick]] = ContextVar("kanban_governor_tick", default=None)
++_finished = threading.local()
++
++
++@contextlib.contextmanager
++def tick(conn: Any, caps: Optional[dict[str, Any]] = None) -> Iterator[Tick]:
++    """Capture one dispatcher tick; :func:`record_tick` picks the finished capture up by connection."""
++    capture = Tick(dict(caps or {}))
++    token = _current.set(capture)
++    try:
++        yield capture
++    finally:
++        _current.reset(token)
++        _finished.capture = (id(conn), capture)
++
++
++def charge(task_id: str, governor_id: str, scope: Optional[str] = None, **detail: Any) -> None:
++    """A tick decision with no ``DispatchResult`` bucket: ``governor_id`` stopped ``task_id``. No-op outside a tick."""
++    capture = _current.get()
++    if capture is not None:
++        capture.charges.setdefault(task_id, []).append({"governor": governor_id, "scope": scope, **detail})
++
++
++def dropped(before: list, after: list, governor_id: str) -> list:
++    """``lane_rows`` seam: the rows a filter removed are charged to its governor. Returns ``after``."""
++    if _current.get() is not None and len(after) != len(before):
++        kept = {row["id"] for row in after}
++        for row in before:
++            if row["id"] not in kept:
++                charge(row["id"], governor_id)
++    return after
++
++
++def tail(rows: list, reason: str) -> None:
++    """Rows behind a spent spawn budget; :func:`record_tick` names the cap that set the budget."""
++    for row in rows:
++        charge(row["id"], "_budget", reason=reason)
++
++
++def host_use(cap: Any, own: Any, others: Any) -> None:
++    """``host_remaining``'s census: the cap, this board's running workers and every other board's."""
++    capture = _current.get()
++    if capture is not None:
++        capture.host.update(cap=cap, own=own, others=others)
++
++
++def board_use(counts: dict[str, int]) -> None:
++    """``count_running_tasks_other_boards``'s per-board running workers, as that census read them."""
++    capture = _current.get()
++    if capture is not None:
++        capture.host["boards"] = dict(counts)
++
++
++def _take_capture(conn: Any) -> Optional[Tick]:
++    done = getattr(_finished, "capture", None)
++    _finished.capture = None
++    return done[1] if done is not None and done[0] == id(conn) else None
++
++
++# --- from one tick's result to charges ---------------------------------------------------------------------------
++
++
++def _capacity(text: Any) -> tuple[Optional[int], Optional[int]]:
++    """``(used, limit)`` out of a ``DispatchResult.at_capacity`` string (``max_in_progress=2/2``)."""
++    import re
++
++    found = re.search(r"=(\d+)/(\d+)", str(text or ""))
++    return (int(found.group(1)), int(found.group(2))) if found else (None, None)
++
++
++def _host_detail(capture: Optional[Tick], board: Optional[str]) -> dict[str, Any]:
++    host = capture.host if capture is not None else {}
++    if not host:
++        return {}
++    boards = dict(host.get("boards") or {})
++    if host.get("own") is not None:
++        boards[board or "default"] = host["own"]
++    return {"boards": boards} if boards else {}
++
++
++def global_stop(result: Any, capture: Optional[Tick], *, board: Optional[str],
++                update_drain: bool = False) -> Optional[dict[str, Any]]:
++    """The governor that kept this whole tick from scheduling, or None when it scheduled.
++
++    The dispatcher returns before scheduling in exactly four places: the gateway is draining, a core-update hold is
++    live, a concurrency cap is full (``at_capacity``) or memory pressure is critical. ``update_drain`` is the
++    gateway's own core-update hold, which it enforces as ``max_spawn=0``.
++    """
++    if getattr(result, "scheduling_admitted", False):
++        return None
++    if getattr(result, "core_update_drain_hold", None) is not None or update_drain:
++        hold = getattr(result, "core_update_drain_hold", None) or {}
++        return {"governor": "core_update_drain", "detail": {k: hold.get(k) for k in ("pid", "path") if hold.get(k)}}
++    capacity = getattr(result, "at_capacity", None)
++    if capacity:
++        used, limit = _capacity(capacity)
++        text = str(capacity)
++        if text.startswith("max_spawn"):
++            return {"governor": "max_spawn", "reading": used, "threshold": limit, "detail": {"at_capacity": text}}
++        if text.startswith("board_share"):
++            return {"governor": "board_share", "reading": 0, "threshold": None, "detail": {"at_capacity": text}}
++        return {"governor": "host_slots", "reading": used, "threshold": limit,
++                "detail": {"at_capacity": text, **_host_detail(capture, board)}}
++    if getattr(result, "memory_pressure", None) == "critical":
++        return {"governor": "memory_pressure", "reading": "critical", "threshold": "critical"}
++    return {"governor": "gateway_drain"}
++
++
++def _budget_cap(result: Any, capture: Optional[Tick], *, board: Optional[str], running: int) -> dict[str, Any]:
++    """Which cap set this tick's spawn budget (the smallest; a tie keeps ``_tick_spawn_budget``'s earlier one)."""
++    caps = capture.caps if capture is not None else {}
++    host = capture.host if capture is not None else {}
++    started = len(getattr(result, "spawned", ()) or ())
++    own = host.get("own") if host.get("own") is not None else max(0, running - started)
++    budgets: dict[str, tuple[int, dict[str, Any]]] = {}
++    if isinstance(caps.get("max_spawn"), int):
++        budgets["max_spawn"] = (caps["max_spawn"] - own, {"reading": own + started, "threshold": caps["max_spawn"]})
++    if isinstance(caps.get("max_in_progress"), int):
++        others = host.get("others") or 0
++        budgets["host_slots"] = (caps["max_in_progress"] - own - others, {
++            "reading": own + others + started, "threshold": caps["max_in_progress"],
++            "detail": _host_detail(capture, board)})
++    if isinstance(caps.get("spawn_quota"), int):
++        budgets["board_share"] = (caps["spawn_quota"], {"reading": started, "threshold": caps["spawn_quota"]})
++    if getattr(result, "memory_pressure", None) == "elevated":
++        budgets["memory_pressure"] = (1, {"reading": "elevated", "threshold": "elevated"})
++    if not budgets:
++        return {"governor": "unrecorded", "detail": {"reason": "spawn budget exhausted, no cap recorded"}}
++    name = min(_BUDGET_ORDER, key=lambda key: budgets[key][0] if key in budgets else float("inf"))
++    return {"governor": name, **budgets[name][1]}
++
++
++def _guard_charge(reason: str) -> Optional[dict[str, Any]]:
++    """A ``respawn_guarded`` reason as a charge; None for the pacing hold (``llm_paced`` carries it)."""
++    from hermes_cli.kanban_llm_pacing import GUARD_REASON
++    from hermes_cli.kanban_review_admission import REASON as REVIEW_WALL
++    from hermes_cli.kanban_start_gate import word
++
++    if reason == GUARD_REASON:
++        return None
++    if word(reason):
++        return {"governor": "start_gate", "scope": word(reason), "detail": {"reason": word(reason)}}
++    if reason in (REVIEW_WALL, "review_model_unavailable"):
++        return {"governor": "review_provider_wall", "detail": {"reason": reason}}
++    if reason.startswith("workspace_"):  # ``kanban_source_launch``: the claim was released, the card retries
++        return {"governor": "spawn_failed", "detail": {"reason": reason}}
++    if reason.startswith("model_"):  # ``ModelProviderMismatchError`` codes (kanban_model_assignment)
++        return {"governor": "model_pin", "detail": {"reason": reason}}
++    return {"governor": "respawn_guard", "detail": {"reason": reason}}
++
++
++def _ineligible_charge(reason: Any) -> dict[str, Any]:
++    text = str(reason)
++    if text.startswith("model_unroutable:"):
++        return {"governor": "class_walls", "detail": {"reason": text.split(":", 1)[1]}}
++    from hermes_cli.kanban_refusal_fallback import EXHAUSTED
++
++    if text == EXHAUSTED:
++        return {"governor": "refusal_fallback", "detail": {"reason": text}}
++    return {"governor": "placement", "detail": {"reason": text}}
++
++
++_CLAIM_GATES = (("hub_cpu", "hub_cpu"), ("hub_admission", "hub_cpu"), ("hub_capacity", "host_slots"),
++                ("worker_resources", "worker_resources"), ("worker_disk", "disk_floor"), ("disk", "disk_floor"),
++                ("update_admission_hold", "update_fence"), ("labels_mismatch", "placement"),
++                ("pinned_only", "placement"), ("containment", "containment"), ("capacity", "host_slots"))
++
++
++def _claim_charge(code: Any) -> dict[str, Any]:
++    """A ``claim_deferred`` code as a charge: this host's admission gates by name, else the Board's lease."""
++    text = str(code)
++    name = next((gov for prefix, gov in _CLAIM_GATES if text.startswith(prefix)), "board_lease")
++    return {"governor": name, "detail": {"reason": text, **({"origin": code.origin}
++                                                             if getattr(code, "origin", None) else {})}}
++
++
++def result_charges(result: Any) -> dict[str, list[dict[str, Any]]]:
++    """``task_id -> charges`` for every row the tick's ``DispatchResult`` says it passed over."""
++    out: dict[str, list[dict[str, Any]]] = {}
++
++    def add(task_id: str, entry: Optional[dict[str, Any]]) -> None:
++        if entry is not None:
++            out.setdefault(task_id, []).append(entry)
++
++    for tid in getattr(result, "admission_deferred", ()):
++        add(tid, {"governor": "hub_claim_screen"})
++    for tid, reason in getattr(result, "skipped_ineligible", ()):
++        add(tid, _ineligible_charge(reason))
++    for tid in getattr(result, "skipped_unassigned", ()):
++        add(tid, {"governor": "unassigned"})
++    for tid in getattr(result, "skipped_nonspawnable", ()):
++        add(tid, {"governor": "nonspawnable"})
++    for tid, code in getattr(result, "capsule_refused", ()):
++        add(tid, {"governor": "capsule", "detail": {"reason": str(code)}})
++    for tid, action in getattr(result, "no_progress_held", ()):
++        spend = str(action).startswith("spend_budget:")
++        add(tid, {"governor": "spend_budget" if spend else "no_progress", "detail": {"action": str(action)}})
++    for tid, model, provider, until in getattr(result, "pinned_quota_held", ()):
++        add(tid, {"governor": "provider_walls", "scope": str(provider), "until": until,
++                  "detail": {"model": model, "provider": provider}})
++    for tid, who, running in getattr(result, "skipped_per_profile_capped", ()):
++        add(tid, {"governor": "profile_cap", "scope": str(who), "reading": running})
++    for tid, reason in getattr(result, "respawn_guarded", ()):
++        add(tid, _guard_charge(str(reason)))
++    for tid, detail, until, extra in getattr(result, "llm_paced", ()):
++        pools = [p.get("provider") for p in (extra or {}).get("providers", ()) if isinstance(p, dict)]
++        add(tid, {"governor": "llm_pool", "until": until,  # one pool governor; the card's own routes are detail
++                  "detail": {"card_routes_at_reserve": pools, "held": detail}})
++    for tid, who, code in getattr(result, "owner_down", ()):
++        add(tid, {"governor": "owner_down", "scope": str(who), "detail": {"reason": str(code)}})
++    for tid, episode in getattr(result, "quiet_deferred", ()):
++        add(tid, {"governor": "quiet", "detail": {"episode": str(episode)}})
++    for tid, code in getattr(result, "claim_deferred", ()):
++        add(tid, _claim_charge(code))
++    return out
++
++
++# --- readings ----------------------------------------------------------------------------------------------------
++
++
++def pool_reading() -> dict[str, Any]:
++    """The LLM pool (every governed provider's accounts together) as this home's dispatchers stored it.
++
++    ``reading``: ``used_pct`` is the mean, over every account read, of that account's used percentage on its
++    binding window (the one closest to, or furthest past, its reserve); ``accounts_under_reserve`` of ``accounts``
++    still have room. ``threshold``: the reserve per window. ``detail.providers`` carries the same numbers per
++    provider. A card is stopped only when every provider it can route to is at reserve (``hold``), so the pool
++    can show room while a card pinned to one exhausted provider waits.
++    """
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++
++    cfg = pacing.load_config()
++    state = pacing._hold_state()
++    providers: dict[str, dict[str, Any]] = {}
++    used_all: list[float] = []
++    under_all = 0
++    for provider in cfg.providers or ():
++        pool = pacing._v2_pool(state, provider) or {}
++        listed = pool.get("accounts") if isinstance(pool.get("accounts"), list) else []
++        binding: dict[Any, tuple[float, float]] = {}  # account -> (margin to reserve, used) on its binding window
++        for account in listed:
++            if not isinstance(account, dict) or not isinstance(account.get("used"), (int, float)):
++                continue
++            margin = float(account["used"]) - float(cfg.reserve.get(str(account.get("kind")), 100.0))
++            if account.get("id") not in binding or margin > binding[account.get("id")][0]:
++                binding[account.get("id")] = (margin, float(account["used"]))
++        used = [value for _margin, value in binding.values()]
++        under = sum(1 for margin, _value in binding.values() if margin < 0)
++        used_all += used
++        under_all += under
++        providers[provider] = {"accounts": len(used), "accounts_under_reserve": under,
++                               "used_pct": round(sum(used) / len(used), 1) if used else None,
++                               "at_reserve": pool.get("at_reserve"), "until": pool.get("until"),
++                               "read_at": pool.get("read_at")}
++    return {"reading": {"used_pct": round(sum(used_all) / len(used_all), 1) if used_all else None,
++                        "accounts_under_reserve": under_all, "accounts": len(used_all)},
++            "threshold": {kind: float(value) for kind, value in cfg.reserve.items()},
++            "detail": {"providers": providers}}
++
++
++def _lane_reading(conn: Any, pol: Any, lane_name: str, governor_id: str, *, now: float) -> dict[str, Any]:
++    from hermes_cli import kanban_lanes as lanes
++
++    lane = pol.lanes[pol.lane_of(lane_name)]
++    if governor_id == "lane_gate":
++        return {"reading": lanes.admitted_today(conn, lane.name, now=now), "threshold": lane.admit_per_day,
++                "detail": {"unit": "admitted today / admit_per_day"}}
++    if governor_id == "lane_max_workers":
++        return {"reading": lanes._running(conn, pol).get(lane.name), "threshold": lane.max_workers}
++    if governor_id == "lane_daily_limit":
++        if lane.cards_per_day is not None:
++            return {"reading": lanes.cards_today(conn, lane.name, now=now, pol=pol), "threshold": lane.cards_per_day,
++                    "detail": {"unit": "cards today / cards_per_day"}}
++        return {"reading": lanes.spent_today(conn, pol, lane.name, now=now), "threshold": lane.usd_per_day,
++                "detail": {"unit": "usd today / usd_per_day"}}
++    return {"detail": {"paused": lane.paused}}
++
++
++def _fill_reading(conn: Any, entry: dict[str, Any], tenant: Any, capture: Optional[Tick], *, now: float,
++                  memo: dict) -> dict[str, Any]:
++    """Add the scope and the reading/threshold a charge did not carry. Reads are memoized per tick."""
++    name = entry["governor"]
++    key: Any = None
++    try:
++        if name.startswith("lane_"):
++            from hermes_cli import kanban_lanes as lanes
++
++            pol = memo.setdefault("policy", lanes.safe_policy())
++            lane = pol.lane_of(tenant) if pol is not None else (tenant or lanes.DEFAULT_LANE)
++            entry["scope"] = lane
++            key = (name, lane)
++            if key not in memo:
++                memo[key] = _lane_reading(conn, pol, lane, name, now=now) if pol is not None else {}
++        elif name == "llm_pool":
++            key = (name, None)
++            if key not in memo:
++                memo[key] = pool_reading()
++        elif name == "profile_cap" and capture is not None:
++            entry.setdefault("threshold", capture.caps.get("max_in_progress_per_profile"))
++    except Exception:  # health: allow BLE001 -- a reading is evidence; the charge itself already stands
++        _log.debug("kanban governors: reading unavailable for %s", name, exc_info=True)
++        memo[key] = {}
++    for field_name, value in (memo.get(key) or {}).items() if key is not None else ():
++        if field_name == "detail":
++            entry["detail"] = {**value, **(entry.get("detail") or {})}
++        else:
++            entry.setdefault(field_name, value)
++    return entry
++
++
++# --- the snapshot ----------------------------------------------------------------------------------------------
++
++
++def _db_path(conn: Any) -> Path:
++    for row in conn.execute("PRAGMA database_list"):
++        if row[1] == "main" and row[2]:
++            return Path(row[2])
++    raise ValueError("kanban governors: the board connection has no on-disk database")
++
++
++def snapshot_path(conn: Any) -> Path:
++    path = _db_path(conn)
++    return path.with_name(path.name + SUFFIX)
++
++
++def _read(path: Path) -> Optional[dict[str, Any]]:
++    try:
++        doc = json.loads(path.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    return doc if isinstance(doc, dict) and doc.get("version") == VERSION else None
++
++
++def _write(path: Path, doc: dict[str, Any]) -> None:
++    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
++    try:
++        tmp.write_text(json.dumps(doc, sort_keys=True, default=str), encoding="utf-8")
++        os.replace(tmp, path)
++    finally:
++        with contextlib.suppress(OSError):
++            tmp.unlink()
++
++
++def _board(conn: Any) -> str:
++    from hermes_cli.kanban_capacity_evidence import _board as board_of
++
++    return board_of(conn)
++
++
++def _lane_cards(conn: Any) -> list[tuple[str, str, Any]]:
++    """``(id, status, tenant)`` of every unclaimed card on a dispatch lane (review only when it dispatches)."""
++    from hermes_cli.kanban_db_dispatch import review_dispatch_enabled
++
++    statuses = ("ready", "review") if review_dispatch_enabled() else ("ready",)
++    marks = ",".join("?" for _ in statuses)
++    return [(row[0], row[1], row[2]) for row in conn.execute(
++        f"SELECT id, status, tenant FROM tasks WHERE status IN ({marks}) AND claim_lock IS NULL "
++        "ORDER BY created_at, id", statuses)]
++
++
++def _gate_cards(conn: Any) -> list[tuple[str, str, Any, str]]:
++    """``(id, 'triage', tenant, governor)`` for cards waiting at a lane gate, told apart by why they were gated."""
++    from hermes_cli import kanban_lanes as lanes
++
++    out = []
++    for row in lanes.held(conn):
++        event = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
++                             (row["id"], lanes.GATED)).fetchone()
++        try:
++            reason = (json.loads(event[0] or "{}") if event else {}).get("reason")
++        except ValueError:
++            reason = None
++        limited = isinstance(reason, str) and reason.startswith("limit:")
++        out.append((row["id"], "triage", row["tenant"], "lane_daily_limit" if limited else "lane_gate"))
++    return out
++
++
++def _card_charges(tid: str, stop: Optional[dict], capture: Optional[Tick], by_result: dict, budget: dict) -> list[dict]:
++    """Every charge the tick made against one lane card, in dispatcher order (the first is its first stop)."""
++    found = ([dict(stop)] if stop is not None else []) + [dict(c) for c in by_result.get(tid, ())]
++    for entry in (capture.charges.get(tid, ()) if capture is not None else ()):
++        found.append({**budget, "detail": {**(budget.get("detail") or {}), "reason": entry.get("reason")}}
++                     if entry["governor"] == "_budget" else dict(entry))
++    if not found:
++        found.append({"governor": "unrecorded"})
++    found.sort(key=lambda entry: order_of(entry["governor"]))
++    unique, seen = [], set()
++    for entry in found:
++        key = (entry["governor"], entry.get("scope"))
++        if key not in seen:
++            seen.add(key)
++            unique.append(entry)
++    return unique
++
++
++def _with_since(entry: dict[str, Any], before: Optional[dict[str, Any]], now: float) -> dict[str, Any]:
++    same = isinstance(before, dict) and before.get("governor") == entry["governor"] \
++        and before.get("scope") == entry.get("scope") and isinstance(before.get("since"), (int, float))
++    entry["since"] = before["since"] if same else int(now)
++    return entry
++
++
++def _overlaps(conn: Any, cards: dict[str, dict], previous: dict[str, Any], now: float) -> None:
++    """Ask the rules after each lane card's first stop what else holds it, inside the tick's budget."""
++    from hermes_cli import kanban_governors_explain as explain
++
++    deadline = time.monotonic() + OVERLAP_BUDGET_SECONDS
++    env = None
++    asked = 0
++    for tid, card in cards.items():
++        if card["status"] not in ("ready", "review"):
++            card["overlaps"] = card["tick_overlaps"]
++            continue
++        before = previous.get(tid) if isinstance(previous.get(tid), dict) else {}
++        fresh = isinstance(before.get("overlaps_at"), (int, float)) and now - before["overlaps_at"] < OVERLAP_TTL_SECONDS
++        if fresh and before.get("governor") == card["governor"] and isinstance(before.get("overlaps"), list):
++            card["overlaps"], card["overlaps_at"] = before["overlaps"], before["overlaps_at"]
++            continue
++        if asked and time.monotonic() >= deadline:  # at least one card a tick, so a slow host still converges
++            card["overlaps"] = None  # not evaluated this tick: never read as "no overlap"
++            continue
++        asked += 1
++        try:
++            env = explain.environment(conn) if env is None else env
++            chain = explain.card_chain(conn, tid, env, after=card["governor"])
++        except Exception:  # health: allow BLE001 -- overlaps are evidence; the first stop already stands
++            _log.debug("kanban governors: overlap check failed for %s", tid, exc_info=True)
++            card["overlaps"] = None
++            continue
++        seen = {(card["governor"], card.get("scope"))} | {(o["governor"], o.get("scope")) for o in card["tick_overlaps"]}
++        extra = [{k: step[k] for k in ("governor", "scope", "reading", "threshold", "detail") if step.get(k) is not None}
++                 for step in chain if step["verdict"] == "stop" and (step["governor"], step.get("scope")) not in seen
++                 and step["governor"] != card["governor"]]
++        card["overlaps"], card["overlaps_at"] = card["tick_overlaps"] + extra, int(now)
++
++
++def _gauges(conn: Any, capture: Optional[Tick], *, board: str, now: float) -> list[dict[str, Any]]:
++    """Readings of the capacity governors whether or not they hold a card (an inactive row still shows use)."""
++    out: list[dict[str, Any]] = []
++    host = capture.host if capture is not None else {}
++    if host.get("cap") is not None and host.get("own") is not None:
++        out.append({"governor": "host_slots", "scope": None, "reading": host["own"] + (host.get("others") or 0),
++                    "threshold": host["cap"], "detail": _host_detail(capture, board)})
++    try:
++        from hermes_cli import kanban_llm_pacing_dispatch as pacing
++
++        if pacing.load_config().enabled:
++            out.append({"governor": "llm_pool", "scope": None, **pool_reading()})
++    except Exception:  # health: allow BLE001 -- a gauge is evidence only
++        _log.debug("kanban governors: pacing gauge unavailable", exc_info=True)
++    try:
++        from hermes_cli import kanban_lanes as lanes
++
++        pol = lanes.enforced()
++        for name, lane in (pol.lanes.items() if pol is not None else ()):
++            if lane.gated:
++                out.append({"governor": "lane_gate", "scope": name, **_lane_reading(conn, pol, name, "lane_gate", now=now)})
++            if lane.max_workers is not None:
++                out.append({"governor": "lane_max_workers", "scope": name,
++                            **_lane_reading(conn, pol, name, "lane_max_workers", now=now)})
++    except Exception:  # health: allow BLE001 -- a gauge is evidence only
++        _log.debug("kanban governors: lane gauge unavailable", exc_info=True)
++    return out
++
++
++def _governor_rows(cards: dict[str, dict], counts: dict[str, int], gauges: list[dict], previous: list, now: float) -> list:
++    rows: dict[tuple, dict[str, Any]] = {}
++    for gauge in gauges:
++        rows[(gauge["governor"], gauge.get("scope"))] = {**gauge, "cards": 0, "card_ids": []}
++    for tid, card in cards.items():
++        row = rows.setdefault((card["governor"], card.get("scope")), {
++            "governor": card["governor"], "scope": card.get("scope"), "cards": 0, "card_ids": []})
++        row["cards"] += 1
++        if len(row["card_ids"]) < MAX_IDS:
++            row["card_ids"].append(tid)
++        for key in ("reading", "threshold", "until", "detail"):
++            if row.get(key) is None and card.get(key) is not None:
++                row[key] = card[key]
++    for name, count in counts.items():
++        if count:
++            rows[(name, None)] = {"governor": name, "scope": None, "cards": count, "card_ids": []}
++    before = {(r.get("governor"), r.get("scope")): r for r in previous if isinstance(r, dict)}
++    out = []
++    for key, row in rows.items():
++        known = _BY_ID.get(row["governor"])
++        row.update(label=known.label if known else row["governor"], kind=known.kind if known else HOLD,
++                   active=row["cards"] > 0)
++        prior = before.get(key) or {}
++        row["since"] = (prior.get("since") if prior.get("active") and prior.get("since") else int(now)) \
++            if row["active"] else None
++        out.append(row)
++    out.sort(key=lambda r: (order_of(r["governor"]), str(r.get("scope") or "")))
++    return out
++
++
++def build(conn: Any, result: Any, capture: Optional[Tick], *, board: str, update_drain: bool = False,
++          previous: Optional[dict[str, Any]] = None, now: Optional[float] = None) -> dict[str, Any]:
++    """The board's snapshot for one finished tick (see the module docstring for the charging rule)."""
++    from hermes_cli.kanban_db_dispatch import count_running_tasks
++
++    now = time.time() if now is None else now
++    previous = previous or {}
++    before = previous.get("cards") if isinstance(previous.get("cards"), dict) else {}
++    stop = global_stop(result, capture, board=board, update_drain=update_drain)
++    budget = _budget_cap(result, capture, board=board, running=count_running_tasks(conn))
++    by_result = result_charges(result)
++    memo: dict = {}
++    cards: dict[str, dict[str, Any]] = {}
++    listed = [(tid, status, tenant, None) for tid, status, tenant in _lane_cards(conn)] + _gate_cards(conn)
++    for tid, status, tenant, gate in listed:
++        charges = [{"governor": gate}] if gate else _card_charges(tid, stop, capture, by_result, budget)
++        charges = [_fill_reading(conn, entry, tenant, capture, now=now, memo=memo) for entry in charges]
++        first = _with_since({**charges[0], "status": status}, before.get(tid), now)
++        first["tick_overlaps"] = [{k: v for k, v in entry.items() if v is not None} for entry in charges[1:]]
++        cards[tid] = first
++    counts = {name: int(conn.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (status,)).fetchone()[0])
++              for name, status in (("dependencies", "todo"), ("schedule", "scheduled"))}
++    idle_total = len(cards) + sum(counts.values())
++    kept = dict(list(cards.items())[:MAX_CARDS])
++    _overlaps(conn, kept, before, now)
++    governors = _governor_rows(cards, counts, _gauges(conn, capture, board=board, now=now),
++                               previous.get("governors") if isinstance(previous.get("governors"), list) else [], now)
++    for card in kept.values():
++        card.pop("tick_overlaps", None)
++    return {"version": VERSION, "board": board, "tick_at": now, "idle_total": idle_total,
++            "caps": dict(capture.caps) if capture is not None else {},  # the limits this tick ran with
++            "charged_total": sum(row["cards"] for row in governors), "truncated": len(cards) > len(kept),
++            "scheduling_admitted": bool(getattr(result, "scheduling_admitted", False)),
++            "global_stop": stop["governor"] if stop else None, "governors": governors, "cards": kept}
++
++
++def _same(doc: dict[str, Any], previous: Optional[dict[str, Any]]) -> bool:
++    if previous is None:
++        return False
++    strip = lambda d: {k: v for k, v in d.items() if k != "tick_at"}
++    return strip(doc) == strip(previous)
++
++
++def record_tick(conn: Any, result: Any, *, dry_run: bool = False, update_drain: bool = False) -> Optional[dict]:
++    """Write the snapshot of one finished tick; returns it, or None when the tick decided nothing. Never raises."""
++    capture = _take_capture(conn)
++    if dry_run or getattr(result, "skipped_locked", False) or getattr(result, "skipped_owned", False) \
++            or getattr(result, "storage_skip_reason", None):
++        return None
++    try:
++        path = snapshot_path(conn)
++        previous = _read(path)
++        doc = build(conn, result, capture, board=_board(conn), update_drain=update_drain, previous=previous)
++        age = doc["tick_at"] - float(previous.get("tick_at") or 0) if previous else None
++        if not (_same(doc, previous) and age is not None and age < UNCHANGED_WRITE_SECONDS):
++            _write(path, doc)
++        return doc
++    except Exception:  # health: allow BLE001 -- the tick already happened; its evidence is advisory
++        _log.debug("kanban governors: snapshot failed", exc_info=True)
++        return None
++
++
++def snapshot(conn: Any, *, now: Optional[float] = None) -> dict[str, Any]:
++    """The board's governor state as its dispatcher last recorded it, with every registry governor present.
++
++    ``available`` False = no tick recorded one here yet; ``stale`` True = the newest is older than
++    :data:`STALE_SECONDS`. Neither reads as "nothing is held": a consumer must show them as unknown.
++    """
++    now = time.time() if now is None else now
++    doc = _read(snapshot_path(conn))
++    board = _board(conn)
++    if doc is None:
++        return {"version": VERSION, "board": board, "available": False, "stale": True, "age_s": None,
++                "governors": _all_governors([]), "cards": {}, "idle_total": None, "charged_total": None}
++    age = max(0.0, now - float(doc.get("tick_at") or 0))
++    return {**doc, "available": True, "age_s": round(age, 1), "stale": age > STALE_SECONDS,
++            "governors": _all_governors(doc.get("governors") or [])}
++
++
++def _all_governors(rows: list) -> list[dict[str, Any]]:
++    seen = {row.get("governor") for row in rows}
++    out = list(rows) + [{"governor": g.id, "scope": None, "label": g.label, "kind": g.kind, "active": False,
++                         "cards": 0, "card_ids": [], "since": None} for g in _REGISTRY if g.id not in seen]
++    out.sort(key=lambda r: (order_of(r["governor"]), str(r.get("scope") or "")))
++    return out
++
++
++def card(conn: Any, task_id: str, *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
++    """One card's recorded first stop and overlaps (``age_s`` = how old that tick is), or None when the last
++    recorded tick did not charge it (not idle then, past :data:`MAX_CARDS`, or no snapshot)."""
++    now = time.time() if now is None else now
++    doc = _read(snapshot_path(conn))
++    found = (doc.get("cards") or {}).get(task_id) if doc else None
++    if not isinstance(found, dict):
++        return None
++    age = max(0.0, now - float(doc.get("tick_at") or 0))
++    known = _BY_ID.get(found.get("governor"))
++    return {**found, "task_id": task_id, "board": doc.get("board"), "tick_at": doc.get("tick_at"),
++            "age_s": round(age, 1), "stale": age > STALE_SECONDS, "label": known.label if known else None,
++            "source": known.source if known else None}
+diff --git a/hermes_cli/kanban_governors_cli.py b/hermes_cli/kanban_governors_cli.py
+new file mode 100644
+index 00000000000..e6e0dd778ed
+--- /dev/null
++++ b/hermes_cli/kanban_governors_cli.py
+@@ -0,0 +1,153 @@
++"""``hermes kanban governors`` and ``hermes kanban why``: read what the dispatcher recorded. [daveey]
++
++``governors`` prints each board's snapshot (``kanban_governors.snapshot``): per governor the reading, threshold,
++since and the cards charged to it. ``why <card>`` answers from that snapshot (the first stop the last tick
++actually made, in well under a second); when the last tick did not charge the card, or with ``--live``, it walks
++the rules itself (``kanban_governors_explain.explain``, read-only) and prints the whole chain.
++"""
++from __future__ import annotations
++
++import argparse
++import time
++from typing import Any, Optional
++
++from hermes_cli import kanban_governors as governors
++
++
++def _ago(since: Any, now: float) -> str:
++    if not isinstance(since, (int, float)):
++        return "-"
++    seconds = max(0, int(now - since))
++    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
++        if seconds >= size:
++            return f"{seconds // size}{unit}"
++    return f"{seconds}s"
++
++
++def _value(value: Any) -> str:
++    if value is None:
++        return "-"
++    if isinstance(value, dict):
++        return ", ".join(f"{k}={v}" for k, v in value.items())
++    return str(value)
++
++
++def _measure(row: dict[str, Any]) -> str:
++    if row.get("reading") is None and row.get("threshold") is None:
++        return ""
++    return f"{_value(row.get('reading'))}/{_value(row.get('threshold'))}"
++
++
++def _name(row: dict[str, Any]) -> str:
++    label = row.get("label") or row.get("governor")
++    return f"{label} · {row['scope']}" if row.get("scope") else str(label)
++
++
++def board_slugs(args: argparse.Namespace) -> list[Optional[str]]:
++    if not getattr(args, "all_boards", False):
++        return [getattr(args, "board", None)]
++    from hermes_cli import kanban_db as kb
++
++    return [meta.get("slug") or kb.DEFAULT_BOARD for meta in kb.list_boards(include_archived=False)]
++
++
++def read_boards(args: argparse.Namespace) -> list[dict[str, Any]]:
++    from hermes_cli import kanban_db_connect as kbc
++
++    out = []
++    for slug in board_slugs(args):
++        try:
++            with kbc.connect_closing(board=slug) as conn:
++                out.append(governors.snapshot(conn))
++        except Exception as exc:  # health: allow BLE001 -- one unreadable board must not hide the others
++            out.append({"version": governors.VERSION, "board": slug, "available": False, "stale": True,
++                        "error": f"{type(exc).__name__}: {exc}", "governors": [], "cards": {}})
++    return out
++
++
++def _print_board(snap: dict[str, Any], now: float) -> None:
++    if not snap.get("available"):
++        why = snap.get("error") or "no dispatcher tick has recorded governors on this board yet"
++        print(f"board {snap.get('board')}: no data ({why})")
++        return
++    stale = "  STALE: no tick for that long, treat as unknown" if snap.get("stale") else ""
++    print(f"board {snap['board']}: {snap['idle_total']} idle card(s), tick {snap['age_s']}s ago{stale}")
++    for row in snap["governors"]:
++        if not row.get("active") and row.get("reading") is None:
++            continue
++        state = f"{row['cards']} card(s) since {_ago(row.get('since'), now)}" if row.get("active") else "ok"
++        ids = " ".join(row.get("card_ids") or [])
++        print(f"  {_name(row):<34} {row.get('kind', ''):<9} {_measure(row):<14} {state}  {ids}".rstrip())
++
++
++def governors_command(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_output import _print_json
++
++    boards = read_boards(args)
++    if getattr(args, "json", False):
++        _print_json({"version": governors.VERSION, "generated_at": time.time(), "registry": governors.registry(),
++                     "boards": boards})
++        return 0
++    now = time.time()
++    for snap in boards:
++        _print_board(snap, now)
++    return 0
++
++
++def why(conn: Any, task_id: str, *, live: bool = False) -> dict[str, Any]:
++    """The recorded first stop when the last tick charged the card (``source: snapshot``), else the dry run."""
++    started = time.monotonic()
++    recorded = None if live else governors.card(conn, task_id)
++    if recorded is None or recorded.get("stale"):
++        from hermes_cli.kanban_governors_explain import explain
++
++        return explain(conn, task_id)
++    first = {k: recorded.get(k) for k in ("governor", "label", "scope", "reading", "threshold", "since", "until",
++                                          "detail", "source", "age_s")}
++    first["verdict"] = "stop"
++    return {"task_id": task_id, "board": recorded.get("board"), "source": "snapshot", "status": recorded.get("status"),
++            "first_stop": first, "overlaps": recorded.get("overlaps"), "chain": [first], "recorded": recorded,
++            "elapsed_s": round(time.monotonic() - started, 3)}
++
++
++def _print_why(answer: dict[str, Any]) -> None:
++    now = time.time()
++    if answer.get("error"):
++        print(f"{answer['task_id']}: {answer['error']}")
++        return
++    first = answer.get("first_stop")
++    head = f"{answer['task_id']} ({answer.get('status')}, board {answer.get('board')})"
++    if first is None:
++        print(f"{head}: nothing holds it" + (f" ({answer['note']})" if answer.get("note") else ""))
++    else:
++        measure = f" {_measure(first)}" if _measure(first) else ""
++        print(f"{head}: stopped by {_name(first)}{measure}, since {_ago(first.get('since'), now)}")
++        print(f"  source: {first.get('source')}  ({answer['source']}, {first.get('age_s')}s old)")
++        if first.get("detail"):
++            print(f"  detail: {_value(first['detail'])}")
++    overlaps = answer.get("overlaps")
++    if overlaps is None:
++        print("  also held by: not evaluated yet (run with --live)")
++    for other in overlaps or ():
++        print(f"  also held by: {_name({**other, 'label': other.get('label') or _label(other)})} {_measure(other)}".rstrip())
++    if answer["source"] == "dry_run":
++        for step in answer.get("chain") or ():
++            print(f"    {step['verdict']:<8} {_name(step):<34} {_measure(step):<14} {_value(step.get('detail'))}".rstrip())
++
++
++def _label(entry: dict[str, Any]) -> str:
++    known = governors.governor(str(entry.get("governor")))
++    return known.label if known else str(entry.get("governor"))
++
++
++def why_command(args: argparse.Namespace) -> int:
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_output import _print_json
++
++    with kbc.connect_closing(board=getattr(args, "board", None)) as conn:
++        answer = why(conn, args.task_id, live=getattr(args, "live", False))
++    if getattr(args, "json", False):
++        _print_json(answer)
++    else:
++        _print_why(answer)
++    return 1 if answer.get("error") else 0
+diff --git a/hermes_cli/kanban_governors_explain.py b/hermes_cli/kanban_governors_explain.py
+new file mode 100644
+index 00000000000..07fc805b675
+--- /dev/null
++++ b/hermes_cli/kanban_governors_explain.py
+@@ -0,0 +1,533 @@
++"""``why`` for one card: the dispatcher's rules asked in dispatcher order, read-only. [daveey]
++
++:func:`explain` walks the same path ``_dispatch_once_locked`` and ``_dispatch_lane_task`` walk for one card and
++returns the ordered chain ``[{governor, verdict, reading, threshold, since, source, age_s}]`` plus ``first_stop``.
++Every step CALLS the predicate the dispatcher calls (named in ``kanban_governors.registry()[..]["source"]``); none
++re-implements one. Unlike a tick it does not stop at the first refusal, so the chain also shows what else would
++hold the card once the first stop clears.
++
++Read-only: the board connection is put in ``PRAGMA query_only`` for the walk, the hold functions are called with
++``dry_run=True`` (the dispatcher's own no-write mode) or through the read half the hold itself calls first, and the
++pacing governor judges the pools as stored (no usage read). A step that cannot be asked outside a real tick (the
++hub claim screen's judge, the Board lease, the board-share quota, the worker-resources census) reads the last
++recorded tick instead (``kanban_governors.card``): ``stop`` when that tick charged the card to it, else ``unknown``.
++A predicate that raises is ``unknown`` with the error, never ``pass``.
++
++Verdicts: ``pass``, ``stop`` (holds the start), ``throttle`` (slows starts, does not hold this one), ``unknown``.
++"""
++from __future__ import annotations
++
++import contextlib
++import time
++from dataclasses import dataclass, field
++from types import SimpleNamespace
++from typing import Any, Callable, Iterator, Optional
++
++from hermes_cli import kanban_governors as governors
++
++PASS, STOP, THROTTLE, UNKNOWN = "pass", "stop", "throttle", "unknown"
++LANES = ("ready", "review")
++# Asked only inside a real tick: read from the last recorded one.
++TICK_ONLY = ("hub_claim_screen", "admission_pool", "worker_resources", "board_lease", "board_share")
++
++
++@dataclass
++class Environment:
++    """What one tick resolves once and every card's walk shares."""
++    board: Optional[str]
++    profile_exists: Optional[Callable[[str], bool]]
++    default_assignee: Optional[str]
++    per_profile_cap: Optional[int]
++    max_spawn: Optional[int]
++    max_in_progress: Optional[int]
++    review_enabled: bool
++    refusals: dict[str, dict[str, str]] = field(default_factory=dict)  # lane status -> dispatch_refusals
++    memo: dict = field(default_factory=dict)
++
++
++def environment(conn: Any) -> Environment:
++    """The dispatcher's limits: the ones its last recorded tick on this board ran with (a gateway resolves them
++    per tick, and ``hermes kanban dispatch --max N`` overrides config), else config read the way it reads it."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli.config import load_config
++
++    try:
++        section = (load_config() or {}).get("kanban", {}) or {}
++    except Exception:  # health: allow BLE001 -- an unreadable config is the dispatcher's "no caps" path too
++        section = {}
++    caps = {"max_spawn": kbd._positive_int(section.get("max_spawn"), None),
++            "max_in_progress": kbd.resolve_max_in_progress(kbd._positive_int(section.get("max_in_progress"), None)),
++            "max_in_progress_per_profile": kbd._positive_int(section.get("max_in_progress_per_profile"), None)}
++    recorded = governors.snapshot(conn)
++    if recorded.get("available") and not recorded.get("stale") and isinstance(recorded.get("caps"), dict):
++        caps.update({key: recorded["caps"].get(key) for key in caps if key in recorded["caps"]})
++    return Environment(
++        board=governors._board(conn), profile_exists=kbd._profile_exists_fn(),
++        default_assignee=kbd._resolve_default_assignee(section.get("default_assignee")),
++        per_profile_cap=caps["max_in_progress_per_profile"], max_spawn=caps["max_spawn"],
++        max_in_progress=caps["max_in_progress"], review_enabled=kbd.review_dispatch_enabled())
++
++
++@contextlib.contextmanager
++def read_only(conn: Any) -> Iterator[None]:
++    """No predicate may write through this connection while the chain is walked."""
++    prior = conn.execute("PRAGMA query_only").fetchone()[0]
++    conn.execute("PRAGMA query_only = ON")
++    try:
++        yield
++    finally:
++        conn.execute(f"PRAGMA query_only = {'ON' if prior else 'OFF'}")
++
++
++def _scratch() -> Any:
++    """A throwaway ``DispatchResult``: the hold functions record on it, nothing reads it afterwards."""
++    from hermes_cli.kanban_db_dispatch import DispatchResult
++
++    return DispatchResult()
++
++
++@dataclass
++class Card:
++    conn: Any
++    task_id: str
++    row: Any
++    task: Any
++    lane: str
++    assignee: Optional[str]
++    env: Environment
++    recorded: Optional[dict[str, Any]]
++
++
++Answer = Optional[dict[str, Any]]  # None = pass; else {verdict?, scope?, reading?, threshold?, until?, detail?}
++
++
++def _stop(**fields: Any) -> dict[str, Any]:
++    return {"verdict": STOP, **{k: v for k, v in fields.items() if v is not None}}
++
++
++def _recorded(card: Card, governor_id: str) -> Answer:
++    """A tick-only rule: what the last recorded tick decided for this card."""
++    rec = card.recorded
++    if rec is None or rec.get("stale"):
++        return {"verdict": UNKNOWN, "detail": {"reason": "asked only inside a dispatcher tick; no fresh tick recorded"}}
++    named = [rec] + [o for o in (rec.get("overlaps") or []) if isinstance(o, dict)]
++    hit = next((entry for entry in named if entry.get("governor") == governor_id), None)
++    if hit is None:
++        return {"verdict": PASS, "age_s": rec.get("age_s"), "detail": {"reason": "not charged by the last tick"}}
++    return _stop(scope=hit.get("scope"), reading=hit.get("reading"), threshold=hit.get("threshold"),
++                 detail=hit.get("detail"), age_s=rec.get("age_s"))
++
++
++# --- card-level steps, in ``lane_rows`` -> ``_dispatch_once_locked`` -> ``_dispatch_lane_task`` -> claim order ------
++
++
++def _containment(card: Card) -> Answer:
++    from hermes_cli.kanban_containment_connections import held
++
++    return _stop() if held(card.conn, card.task_id) else None
++
++
++def _lane_paused(card: Card) -> Answer:
++    from hermes_cli.kanban_lanes import drop_paused
++
++    return None if drop_paused(card.conn, [card.row]) else _stop(**_lane(card, "lane_paused"))
++
++
++def _lane_full(card: Card) -> Answer:
++    from hermes_cli.kanban_lane_workers import drop_full
++
++    return None if drop_full(card.conn, [card.row]) else _stop(**_lane(card, "lane_max_workers"))
++
++
++def _lane(card: Card, governor_id: str) -> dict[str, Any]:
++    from hermes_cli import kanban_lanes as lanes
++
++    pol = lanes.safe_policy()
++    if pol is None:
++        return {}
++    name = pol.lane_of(card.row["tenant"])
++    return {"scope": name, **governors._lane_reading(card.conn, pol, name, governor_id, now=time.time())}
++
++
++def _placement(card: Card) -> Answer:
++    from hermes_cli.kanban_worker_node import dispatch_refusals
++
++    if card.lane not in card.env.refusals:
++        card.env.refusals[card.lane] = dispatch_refusals(card.conn, card.lane)
++    reason = card.env.refusals[card.lane].get(card.task_id)
++    return _stop(detail={"reason": reason}) if reason else None
++
++
++def _unassigned(card: Card) -> Answer:
++    if card.assignee:
++        return None
++    return _stop(detail={"reason": "no assignee" + ("" if card.lane == "ready" else " (review lane takes no default)")})
++
++
++def _needs_assignee(step: Callable[[Card], Answer]) -> Callable[[Card], Answer]:
++    def run(card: Card) -> Answer:
++        if not card.assignee:
++            return {"verdict": UNKNOWN, "detail": {"reason": "no assignee to judge"}}
++        return step(card)
++    return run
++
++
++@_needs_assignee
++def _nonspawnable(card: Card) -> Answer:
++    exists = card.env.profile_exists
++    if exists is None or exists(card.assignee):
++        return None
++    return _stop(scope=card.assignee, detail={"reason": "assignee is not a spawnable profile on this home"})
++
++
++@_needs_assignee
++def _capsule(card: Card) -> Answer:
++    from hermes_cli.kanban_capsule_admission import dispatch_refusal
++
++    code = dispatch_refusal(card.conn, card.task_id, card.assignee, None, dry_run=True)
++    return _stop(detail={"reason": code}) if code is not None else None
++
++
++def _refusal_fallback(card: Card) -> Answer:
++    from hermes_cli.kanban_refusal_fallback import admission
++
++    return _stop() if admission(card.conn, card.task_id, _scratch(), dry_run=True) else None
++
++
++def _class_walls(card: Card) -> Answer:
++    from hermes_cli.kanban_class_walls import unroutable_class
++
++    why = unroutable_class(card.conn, card.task_id, lane=card.lane)
++    return _stop(detail={"reason": why}) if why else None
++
++
++def _review_wall(card: Card) -> Answer:
++    from hermes_cli.kanban_review_admission import hold
++
++    scratch = _scratch()
++    if not hold(card.conn, card.task_id, scratch, lane=card.lane, dry_run=True):
++        return None
++    held = scratch.clock_held.get(card.task_id)
++    return _stop(until=held[1] if held else None, detail={"reason": scratch.respawn_guarded[-1][1]})
++
++
++def _foreign(card: Card) -> bool:
++    from hermes_cli.kanban_wake_check import foreign_copy
++
++    return foreign_copy(card.conn, card.task_id)
++
++
++def _no_progress(card: Card) -> Answer:
++    """``kanban_no_progress.hold``'s read: ``decide`` (the hold itself only writes after it says stop)."""
++    from hermes_cli import kanban_no_progress as np
++
++    if _foreign(card):
++        return None  # a worker-node copy: its home board owns the decision
++    budget = np.limit()
++    runs = np.streak(card.conn, card.task_id)[0]
++    verdict = np.decide(card.conn, card.task_id, budget=budget)
++    answer = {"reading": runs, "threshold": budget or None}
++    return {"verdict": PASS, **answer} if verdict is None else _stop(**answer, detail={"action": verdict[0]})
++
++
++def _spend(card: Card) -> Answer:
++    """``kanban_spend_budget.hold``'s reads: a pending decision, then ``over(spend, card_limits)``."""
++    from hermes_cli import kanban_spend_budget as sb
++    from hermes_cli import kanban_spend_decision as decision
++
++    if _foreign(card):
++        return None
++    if decision.pending(card.conn, card.task_id):
++        return _stop(detail={"reason": "spend decision pending"})
++    lim = sb.card_limits(card.conn, card.task_id, sb.limits())
++    if not lim.runs and not lim.cache_read_tokens:
++        return None
++    spent = sb.spend(card.conn, card.task_id)
++    which = sb.over(spent, lim)
++    answer = {"reading": {"runs": spent.runs, "cache_read_tokens": spent.tokens["cache_read_tokens"]},
++              "threshold": {"runs": lim.runs, "cache_read_tokens": lim.cache_read_tokens}}
++    return {"verdict": PASS, **answer} if which is None else _stop(**answer, detail={"limit": which})
++
++
++def _provider_walls(card: Card) -> Answer:
++    from hermes_cli.kanban_dispatch_skip import pinned_quota_hold
++
++    held = pinned_quota_hold(card.conn, card.task_id) if card.lane == "ready" else None
++    if held is None:
++        return None
++    return _stop(scope=str(held[1]), until=held[2], detail={"model": held[0], "provider": held[1]})
++
++
++@_needs_assignee
++def _profile_cap(card: Card) -> Answer:
++    from hermes_cli import kanban_db as kb
++
++    cap = card.env.per_profile_cap
++    if cap is None:
++        return None
++    running = card.conn.execute(
++        "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?" + kb._sync.held_elsewhere_sql(card.conn),
++        (card.assignee,)).fetchone()[0]
++    answer = {"scope": card.assignee, "reading": int(running), "threshold": cap}
++    return _stop(**answer) if running >= cap else {"verdict": PASS, **answer}
++
++
++def _model_pin(card: Card) -> Answer:
++    from hermes_cli.kanban_model_assignment import route_model_mismatch
++
++    code = route_model_mismatch(card.conn, card.task, dry_run=True)
++    return _stop(detail={"reason": code}) if code else None
++
++
++def _respawn_guard(card: Card) -> Answer:
++    from hermes_cli.kanban_db_dispatch import check_respawn_guard
++
++    reason = check_respawn_guard(card.conn, card.task_id, lane=card.lane)
++    return _stop(detail={"reason": reason}) if reason else None
++
++
++def _llm_pool(card: Card) -> Answer:
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++
++    scratch = _scratch()
++    reading = governors.pool_reading()
++    if not pacing.hold(card.conn, card.row, card.lane, scratch, dry_run=True, refresh=False):
++        return {"verdict": PASS, **reading}
++    _tid, detail, until, extra = scratch.llm_paced[-1]
++    pools = [p.get("provider") for p in (extra or {}).get("providers", ()) if isinstance(p, dict)]
++    return _stop(until=until, reading=reading["reading"], threshold=reading["threshold"],
++                 detail={"card_routes_at_reserve": pools, "held": detail, **reading["detail"]})
++
++
++def _start_gate(card: Card) -> Answer:
++    from hermes_cli import kanban_start_gate as gate
++
++    reason = gate.hold(task_id=card.task_id, lane=card.lane, assignee=card.assignee, board=card.env.board)
++    return _stop(scope=gate.word(reason), detail={"reason": gate.word(reason)}) if reason else None
++
++
++@_needs_assignee
++def _owner_down(card: Card) -> Answer:
++    from hermes_cli.kanban_owner_down import probe
++
++    down = probe(card.assignee)
++    return _stop(scope=card.assignee, detail={"reason": down.code, "unit": down.unit}) if down is not None else None
++
++
++def _quiet(card: Card) -> Answer:
++    from agent.claim_quiet import read_active
++    from hermes_cli.kanban_db_dispatch_admission import _native_local_destination
++
++    lease = read_active()
++    if lease is None or not _native_local_destination(card.conn, card.task_id, None):
++        return None
++    return _stop(until=lease.expires_at, detail={"episode": lease.episode_id})
++
++
++def _update_fence(card: Card) -> Answer:
++    from pathlib import Path
++
++    from hermes_cli.admission_fence import SUPPORTED, is_held
++    from hermes_constants import get_default_hermes_root
++
++    return _stop() if SUPPORTED and is_held(Path(get_default_hermes_root()) / "core-update") else None
++
++
++def _disk_floor(card: Card) -> Answer:
++    from hermes_cli.kanban_disk_admission import refusal_reason
++
++    reason = refusal_reason()
++    return _stop(detail={"reason": reason}) if reason else None
++
++
++def _worker_resources(card: Card) -> Answer:
++    from hermes_cli.worker_compute_capacity import worker_enabled
++
++    return _recorded(card, "worker_resources") if worker_enabled() else None
++
++
++def _hub_cpu(card: Card) -> Answer:
++    """The locked claim gate's two reads (``_final_hub_gate``): the root limit and the sampler's sample."""
++    from hermes_cli import machine_cpu_metrics as cpu
++    from hermes_cli.kanban_admission import HUB_CPU_LIMIT_UNKNOWN, sampler_sample
++
++    state, limit = cpu.root_limit()
++    if state == cpu.OFF:
++        return None
++    if state != cpu.ON:
++        return _stop(detail={"reason": HUB_CPU_LIMIT_UNKNOWN})
++    measured = sampler_sample()
++    if measured is None:
++        return {"verdict": UNKNOWN, "threshold": limit, "detail": {"reason": "no fresh CPU sample"}}
++    pct = measured["cpu_busy_pct"]
++    answer = {"reading": pct, "threshold": limit}
++    return {"verdict": PASS, **answer} if cpu.below(pct, limit) else _stop(**answer)
++
++
++def _tick_only(governor_id: str) -> Callable[[Card], Answer]:
++    return lambda card: _recorded(card, governor_id)
++
++
++CARD_STEPS: tuple[tuple[str, Callable[[Card], Answer]], ...] = (
++    ("containment", _containment), ("lane_paused", _lane_paused), ("lane_max_workers", _lane_full),
++    ("hub_claim_screen", _tick_only("hub_claim_screen")), ("placement", _placement),
++    ("admission_pool", _tick_only("admission_pool")), ("unassigned", _unassigned),
++    ("nonspawnable", _nonspawnable), ("capsule", _capsule), ("refusal_fallback", _refusal_fallback),
++    ("class_walls", _class_walls), ("review_provider_wall", _review_wall), ("no_progress", _no_progress),
++    ("spend_budget", _spend), ("provider_walls", _provider_walls), ("profile_cap", _profile_cap),
++    ("model_pin", _model_pin), ("respawn_guard", _respawn_guard), ("llm_pool", _llm_pool),
++    ("start_gate", _start_gate), ("owner_down", _owner_down), ("quiet", _quiet), ("update_fence", _update_fence),
++    ("disk_floor", _disk_floor), ("worker_resources", _worker_resources), ("hub_cpu", _hub_cpu),
++    ("board_lease", _tick_only("board_lease")),
++)
++
++
++def _entry(governor_id: str, answer: Answer, started: float, *, since: Any = None) -> dict[str, Any]:
++    known = governors.governor(governor_id)
++    answer = dict(answer or {})
++    out = {"governor": governor_id, "label": known.label if known else governor_id,
++           "kind": known.kind if known else governors.HOLD, "verdict": answer.pop("verdict", PASS),
++           "scope": answer.pop("scope", None), "reading": answer.pop("reading", None),
++           "threshold": answer.pop("threshold", None), "since": since,
++           "source": known.source if known else None, "age_s": answer.pop("age_s", 0.0),
++           "ms": round((time.monotonic() - started) * 1000, 1)}
++    out.update(answer)  # until, detail
++    return out
++
++
++def _ask(governor_id: str, step: Callable[[], Answer]) -> dict[str, Any]:
++    started = time.monotonic()
++    try:
++        answer = step()
++    except Exception as exc:  # health: allow BLE001 -- one rule's fault is that rule's ``unknown``, never a pass
++        answer = {"verdict": UNKNOWN, "detail": {"error": f"{type(exc).__name__}: {exc}"[:300]}}
++    return _entry(governor_id, answer, started)
++
++
++def _load_card(conn: Any, task_id: str, env: Environment, recorded: Optional[dict]) -> Optional[Card]:
++    from hermes_cli import kanban_db as kb
++
++    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None:
++        return None
++    assignee = row["assignee"] or (env.default_assignee if row["status"] == "ready" else None)
++    return Card(conn, task_id, row, kb.Task.from_row(row), row["status"], assignee, env, recorded)
++
++
++def card_chain(conn: Any, task_id: str, env: Environment, *, after: Optional[str] = None,
++               recorded: Optional[dict] = None) -> list[dict[str, Any]]:
++    """The card-level rules for one ready/review card, in dispatcher order; ``after`` skips up to and including
++    that governor (the tick asks only what follows a card's first stop). Read-only (:func:`read_only`)."""
++    floor = governors.order_of(after) if after is not None else -1
++    with read_only(conn):
++        card = _load_card(conn, task_id, env, recorded)
++        if card is None or card.lane not in LANES:
++            return []
++        return [_ask(name, lambda step=step: step(card)) for name, step in CARD_STEPS
++                if governors.order_of(name) > floor]
++
++
++# --- board-level steps: ``_dispatch_once_locked`` before any card is looked at -------------------------------------
++
++
++def global_chain(conn: Any, env: Environment, recorded: Optional[dict] = None) -> list[dict[str, Any]]:
++    """The rules that stop a whole tick, asked as the tick asks them."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_gateway_drain as drain
++
++    out = [_ask("gateway_drain", lambda: _stop() if drain.dispatch_paused() else None),
++           _ask("core_update_drain", lambda: _core_update(drain.core_update_hold()))]
++    started = time.monotonic()
++    scratch = _scratch()
++    with governors.tick(conn, {}) as capture:  # the host census lands on a throwaway capture
++        may_spawn, _budget = kbd._tick_spawn_budget(conn, scratch, max_spawn=env.max_spawn,
++                                                    max_in_progress=env.max_in_progress, board=env.board)
++    governors._take_capture(conn)
++    stop = None if may_spawn else governors.global_stop(scratch, capture, board=env.board)
++    own = capture.host.get("own", kbd.count_running_tasks(conn))
++    others = capture.host.get("others")
++    readings = {
++        "max_spawn": {"reading": own, "threshold": env.max_spawn},
++        "host_slots": {"reading": own + others if others is not None else None, "threshold": env.max_in_progress,
++                       "detail": governors._host_detail(capture, env.board)},
++        "memory_pressure": {"reading": scratch.memory_pressure or "ok", "threshold": "critical"},
++    }
++    for name in ("max_spawn", "host_slots"):
++        hit = stop is not None and stop["governor"] == name
++        out.append(_entry(name, {**readings[name], **(stop if hit else {}), "verdict": STOP if hit else PASS}, started))
++    out.append(_entry("board_share", _recorded(SimpleNamespace(recorded=recorded), "board_share"), started))
++    pressure = {"critical": STOP, "elevated": THROTTLE}.get(scratch.memory_pressure or "", PASS)
++    out.append(_entry("memory_pressure", {**readings["memory_pressure"], "verdict": pressure}, started))
++    return out
++
++
++def _core_update(hold: Any) -> Answer:
++    if hold is None:
++        return None
++    return _stop(detail={k: hold.get(k) for k in ("pid", "path") if isinstance(hold, dict) and hold.get(k)})
++
++
++# --- cards that are not on a dispatch lane ----------------------------------------------------------------------
++
++
++def _off_lane(conn: Any, row: Any) -> list[dict[str, Any]]:
++    """Why a card that no tick looks at is waiting: open parents, a scheduled wake, or a lane gate."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_lanes as lanes
++
++    started = time.monotonic()
++    status = row["status"]
++    if status == "todo":
++        opened = [pid for pid, state in kb.parent_states(conn, row["id"]) if state not in ("done", "archived")]
++        return [_entry("dependencies", _stop(reading=len(opened), threshold=0, detail={"open_parents": opened[:20]}),
++                       started)]
++    if status == "scheduled":
++        return [_entry("schedule", _stop(), started)]
++    if status == "triage" and conn.execute(f"SELECT 1 FROM tasks WHERE id = ? AND {lanes.HELD}", (row["id"],)).fetchone():
++        name = next((gov for tid, _s, _t, gov in governors._gate_cards(conn) if tid == row["id"]), "lane_gate")
++        pol = lanes.safe_policy()
++        lane = pol.lane_of(row["tenant"]) if pol is not None else row["tenant"]
++        reading = governors._lane_reading(conn, pol, lane, name, now=time.time()) if pol is not None else {}
++        return [_entry(name, _stop(scope=lane, **reading), started)]
++    return []
++
++
++def explain(conn: Any, task_id: str, *, env: Optional[Environment] = None) -> dict[str, Any]:
++    """Read-only dry run of the dispatcher's decision for one card (see the module docstring)."""
++    started = time.monotonic()
++    env = environment(conn) if env is None else env
++    row = conn.execute("SELECT id, status, tenant, assignee, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    out: dict[str, Any] = {"task_id": task_id, "board": env.board, "source": "dry_run", "status": None,
++                           "chain": [], "first_stop": None, "overlaps": [], "recorded": None}
++    if row is None:
++        return {**out, "error": "no such task", "elapsed_s": round(time.monotonic() - started, 3)}
++    recorded = governors.card(conn, task_id)
++    out.update(status=row["status"], recorded=recorded)
++    if row["status"] in LANES and not row["claim_lock"] and (row["status"] == "ready" or env.review_enabled):
++        chain = global_chain(conn, env, recorded) + card_chain(conn, task_id, env, recorded=recorded)
++    else:
++        with read_only(conn):
++            chain = _off_lane(conn, row)
++        if not chain:
++            out["note"] = f"status {row['status']}: not waiting on the dispatcher"
++    stops = [step for step in chain if step["verdict"] == STOP]
++    if stops:
++        first = stops[0]
++        if recorded is not None and recorded.get("governor") == first["governor"]:
++            first["since"] = recorded.get("since")
++        else:
++            first["since"] = _skip_since(conn, task_id)
++    out.update(chain=chain, first_stop=stops[0] if stops else None, overlaps=stops[1:],
++               elapsed_s=round(time.monotonic() - started, 3))
++    return out
++
++
++def _skip_since(conn: Any, task_id: str) -> Optional[int]:
++    """When the ready episode's current recorded skip began (``kanban_dispatch_skip.latest``), if any."""
++    try:
++        from hermes_cli.kanban_dispatch_skip import latest
++
++        skip = latest(conn, task_id)
++        return int(skip["at"]) if skip and skip.get("at") else None
++    except Exception:  # health: allow BLE001 -- ``since`` is evidence; the verdict stands without it
++        return None
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 51fb6fe648a..2d37bfafd2c 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -327,7 +327,7 @@
+             "detail": f"{accounts} account(s) all at reserve"}
+ 
+ 
+-def _verdicts(conn, task, providers, lane, cfg, host=None) -> Optional[list[dict]]:
++def _verdicts(conn, task, providers, lane, cfg, host=None, refresh=True) -> Optional[list[dict]]:
+     """One verdict per governed candidate pool at reserve (:func:`reserve_hold`, after refreshing it); None when
+     none is (the card starts as routed). ``host``: the board whose dispatcher reads the pools (pickup judges a
+     replica card for this machine).
+@@ -340,7 +340,8 @@
+     now = time.time()
+     verdicts = []
+     for provider in providers:
+-        pace_for(host, provider, cfg, now)
++        if refresh:
++            pace_for(host, provider, cfg, now)
+         verdict = reserve_hold(_hold_state(), provider, now, cfg)
+         if verdict is not None:
+             verdicts.append(verdict)
+@@ -532,8 +533,10 @@
+             **({"until": min(until)} if until else {})}
+ 
+ 
+-def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run: bool = False) -> bool:
+-    """True when the card must wait for its provider's pool to come back under reserve (recorded on ``result``)."""
++def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run: bool = False,
++         refresh: bool = True) -> bool:
++    """True when the card must wait for its provider's pool to come back under reserve (recorded on ``result``).
++    ``refresh=False`` judges the pools as stored, with no usage read (``kanban_governors_explain``)."""
+     try:
+         if not dry_run:
+             # A fresh judgment: an offer from an earlier tick whose claim never happened must not steer this one.
+@@ -544,7 +547,7 @@
+         if judged is None:
+             return False
+         task, providers = judged
+-        verdicts = _verdicts(conn, task, providers, lane, cfg)
++        verdicts = _verdicts(conn, task, providers, lane, cfg, refresh=refresh)
+         if verdicts is None:
+             return False
+         moved = _pace_alternate(conn, task, lane, cfg, conn, verdicts)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 11675976e86..8c0c8007d90 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -756,6 +756,12 @@
+                    _arg("--report", action="store_true", help="Capacity-class effect report (ready-wait p50)"),
+                    _arg("--days", type=int, default=7, help="Report window in days (default 7)"),
+                    _json_flag()], help="Ready/review dispatch order with hub admission score breakdowns"),
++    _cmd("governors", [_arg("--board", default=argparse.SUPPRESS, metavar="<slug>", help="One board (default: current)"),
++                       _arg("--all-boards", action="store_true", help="Every board on this home"), _json_flag()],
++         help="What holds idle cards: per governor the reading, threshold, since and cards charged (last tick)"),
++    _cmd("why", [_TASK_ID, _arg("--board", default=argparse.SUPPRESS, metavar="<slug>", help="The card's board"),
++                 _arg("--live", action="store_true", help="Walk the dispatcher's rules now (read-only dry run)"),
++                 _json_flag()], help="Which governor stops a card, and what else holds it"),
+     _cmd("lanes", children=("lanes_action", [
+         _cmd("show", [_arg("--hours", type=float, default=6.0, help="Trailing window for actual share (default 6)"),
+                       _arg("--local", action="store_true", help="This board only, not the fleet replica"),
+diff --git a/tests/hermes_cli/test_kanban_governors.py b/tests/hermes_cli/test_kanban_governors.py
+new file mode 100644
+index 00000000000..a60f7e22df8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_governors.py
+@@ -0,0 +1,328 @@
++"""Governor snapshot and ``why``: what a real dispatcher tick decided, read back. [daveey]
++
++Every test here runs the real dispatcher (``dispatch_once``) on real board DBs under a temp ``HERMES_HOME`` and then
++reads ``kanban_governors.snapshot`` / ``hermes kanban why``. Only what leaves the machine is replaced: the worker
++spawn (a pid) and, for pacing, the provider usage read (``read_pool``), which here returns the account windows a
++live read would. The pacing verdict, the lane gate, the host-slot census and the placement refusal are the
++dispatcher's own.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban as kcli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_governors as governors
++from hermes_cli import kanban_governors_cli as gcli
++from hermes_cli import kanban_governors_explain as explain
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from tests.hermes_cli import test_kanban_label_backlog_wait as pool_wait
++from tests.hermes_cli import test_kanban_model_tier as model_tier
++
++board = model_tier.board  # one unsynced home whose class routes all land on anthropic
++pool_hub = pool_wait.hub  # a synced hub that cannot lease ``pool:worker`` cards
++
++DAY = 86400
++RESERVE = lp.PacingConfig().reserve[lp.SEVEN_DAY]
++
++
++@pytest.fixture(autouse=True)
++def clean(monkeypatch):
++    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK", "HERMES_TENANT", "HERMES_KANBAN_BOARD",
++                 "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "normal")  # this machine's RAM is not the test
++    for cache in (pd._CACHE, pd._V2_MEMO, pd._CLASS_CACHE):
++        monkeypatch.setattr(pd, {id(pd._CACHE): "_CACHE", id(pd._V2_MEMO): "_V2_MEMO",
++                                 id(pd._CLASS_CACHE): "_CLASS_CACHE"}[id(cache)], {})
++    monkeypatch.setattr(lanes, "_LAST_GOOD", [])
++    monkeypatch.setattr(lanes, "_WARNED", set())
++
++
++def _usage(monkeypatch, used):
++    """The provider usage read answers ``used[0]`` percent on one account's 7-day window (mutable: recovery)."""
++    def read_pool(provider, now):
++        return [lp.Reading(now, "acct-1@pool.test", lp.SEVEN_DAY, float(used[0]), now + 3 * DAY)] \
++            if provider == "anthropic" else []
++    monkeypatch.setattr(pd, "read_pool", read_pool)
++
++
++def _tick(conn, spawned=None, **kw):
++    def spawn(task, workspace, board=None):
++        if spawned is not None:
++            spawned.append(task.id)
++        return os.getpid()
++    return kbd.dispatch_once(conn, spawn_fn=spawn, **kw)
++
++
++def _row(snap, governor, scope=None):
++    return next(r for r in snap["governors"] if r["governor"] == governor and r.get("scope") == scope)
++
++
++def _sums(snap):
++    assert snap["available"] and not snap["stale"]
++    assert sum(r["cards"] for r in snap["governors"]) == snap["idle_total"] == snap["charged_total"]
++
++
++def _why(tid, *flags):
++    return json.loads(kcli.run_slash(" ".join(["why", tid, "--json", *flags])))
++
++
++def test_registry_names_every_governor_once_with_a_live_source():
++    import importlib
++
++    rows = governors.registry()
++    assert len({r["id"] for r in rows}) == len(rows) >= 35
++    for row in rows:
++        assert set(row) == {"id", "label", "scope", "source", "threshold", "kind"} and all(row.values()), row
++        assert row["kind"] in ("hold", "throttle", "reorder")
++        path, name = row["source"].split(":")
++        module = importlib.import_module(path.removesuffix(".py").replace("/", "."))
++        assert callable(getattr(module, name)), row["source"]  # the predicate the dispatcher calls exists
++    # every card-level governor ``why`` walks is registered, in the registry's (dispatcher) order
++    walked = [name for name, _ in explain.CARD_STEPS]
++    assert walked == sorted(walked, key=governors.order_of) and set(walked) <= {r["id"] for r in rows}
++
++
++def test_pacing_pool_at_reserve_holds_the_card_then_recovers(board, monkeypatch):
++    """Acceptance 1 and 2."""
++    used = [RESERVE + 7]
++    _usage(monkeypatch, used)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="needs anthropic", assignee="default")
++        spawned = []
++        result = _tick(conn, spawned)
++        assert spawned == [] and [p[0] for p in result.llm_paced] == [tid]
++
++        snap = governors.snapshot(conn)
++        _sums(snap)
++        pool = _row(snap, "llm_pool")
++        assert (pool["active"], pool["cards"], pool["card_ids"]) == (True, 1, [tid])
++        assert pool["reading"] == {"used_pct": RESERVE + 7, "accounts_under_reserve": 0, "accounts": 1}
++        assert pool["threshold"][lp.SEVEN_DAY] == RESERVE
++        assert [r["governor"] for r in snap["governors"]].count("llm_pool") == 1  # one pool governor, not one a provider
++        anthropic = pool["detail"]["providers"]["anthropic"]  # per-provider numbers are detail on that one entry
++        assert (anthropic["used_pct"], anthropic["accounts_under_reserve"], anthropic["at_reserve"]) == (RESERVE + 7, 0, True)
++        assert set(pool["detail"]["providers"]) == set(lp.PacingConfig().providers)
++        assert pool["since"] is not None
++        assert snap["cards"][tid]["governor"] == "llm_pool" and snap["cards"][tid]["overlaps"] == []
++
++        for flags in ((), ("--live",)):  # from the snapshot, and the read-only dry run: the same first stop
++            answer = _why(tid, *flags)
++            first = answer["first_stop"]
++            assert answer["source"] == ("dry_run" if flags else "snapshot")
++            assert (first["governor"], first["scope"]) == ("llm_pool", None), answer
++            assert (first["reading"]["used_pct"], first["reading"]["accounts_under_reserve"]) == (RESERVE + 7, 0)
++            assert first["threshold"][lp.SEVEN_DAY] == RESERVE
++            assert first["detail"]["card_routes_at_reserve"] == ["anthropic"]
++            assert first["source"] == "hermes_cli/kanban_llm_pacing_dispatch.py:hold"
++        chain = _why(tid, "--live")["chain"]
++        assert [s["governor"] for s in chain if s["verdict"] == "stop"] == ["llm_pool"]
++        assert [s["governor"] for s in chain] == sorted((s["governor"] for s in chain), key=governors.order_of)
++        assert "stopped by LLM pool" in kcli.run_slash(f"why {tid}")
++        assert kb.get_task(conn, tid).status == "ready"  # ``why`` moved nothing
++
++        # Recovery: the pool reads under its reserve, the next tick claims the card, the governor is inactive.
++        used[0] = RESERVE - 45
++        monkeypatch.setattr(pd, "_CACHE", {})
++        state = json.loads(pd.state_path().read_text())
++        state["anthropic"]["read_at"] -= lp.PacingConfig().read_interval + 1  # the read interval has passed
++        pd.state_path().write_text(json.dumps(state))
++        _tick(conn, spawned)
++        assert spawned == [tid] and kb.get_task(conn, tid).status == "running"
++        snap = governors.snapshot(conn)
++        _sums(snap)
++        pool = _row(snap, "llm_pool")
++        assert (pool["active"], pool["cards"], pool["since"]) == (False, 0, None)
++        assert pool["reading"] == {"used_pct": RESERVE - 45, "accounts_under_reserve": 1, "accounts": 1}
++        assert snap["idle_total"] == 0 and tid not in snap["cards"]
++        assert _why(tid)["first_stop"] is None
++
++
++def test_gated_lane_at_admit_per_day_charges_held_cards_to_the_lane_gate(board, monkeypatch):
++    """Acceptance 3."""
++    monkeypatch.setattr(lanes, "_human_shell", lambda: True)
++    model_tier._write_cfg(board, admission={"agent_priority_cap": 100, "lanes": {
++        "hermes": {"share": 20, "gated": True, "admit_per_day": 2},
++        "other": {"share": 10}}})
++    with kbc.connect() as conn:
++        parent = kb.create_task(conn, title="core work", assignee="default", created_by="user",
++                                tenant="hermes")
++        held = [kb.create_task(conn, title=f"follow-up {i}", assignee="default", creator_task_id=parent,
++                               created_by="default", tenant="hermes") for i in range(4)]
++        assert {kb.get_task(conn, t).status for t in held} == {"triage"}
++        for tid in held[:2]:  # the day's budget: two admitted
++            assert lanes.admit(conn, tid, actor="user", reason="today's budget")
++        assert lanes.admitted_today(conn, "hermes") == 2
++        spawned = []
++        _tick(conn, spawned, max_in_progress=1)
++
++        snap = governors.snapshot(conn)
++        _sums(snap)
++        gate = _row(snap, "lane_gate", "hermes")
++        assert (gate["active"], gate["cards"], sorted(gate["card_ids"])) == (True, 2, sorted(held[2:]))
++        assert (gate["reading"], gate["threshold"]) == (2, 2)  # admitted today / admit_per_day
++        for tid in held[2:]:
++            assert (snap["cards"][tid]["governor"], snap["cards"][tid]["scope"]) == ("lane_gate", "hermes")
++            first = _why(tid)["first_stop"]
++            assert (first["governor"], first["reading"], first["threshold"]) == ("lane_gate", 2, 2)
++            assert _why(tid, "--live")["first_stop"]["governor"] == "lane_gate"
++        # the cards the one host slot could not start are charged to the host, not the gate
++        waiting = [t for t in (parent, *held[:2]) if t not in spawned]
++        assert len(spawned) == 1 and {snap["cards"][t]["governor"] for t in waiting} == {"host_slots"}
++
++
++def test_host_slots_are_charged_per_board_and_release_when_the_other_board_finishes(board):
++    """Acceptance 4."""
++    kb.create_board("beta")
++    with kbc.connect(board="default") as a, kbc.connect(board="beta") as b:
++        a_ids = [kb.create_task(a, title=f"a{i}", assignee="default") for i in range(2)]
++        b_ids = [kb.create_task(b, title=f"b{i}", assignee="default") for i in range(2)]
++        started = []
++        _tick(a, started, max_in_progress=2, board="default")
++        assert sorted(started) == sorted(a_ids)
++        result = _tick(b, started, max_in_progress=2, board="beta")
++        assert sorted(started) == sorted(a_ids) and result.at_capacity == "max_in_progress=2/2"
++
++        snap = governors.snapshot(b)
++        _sums(snap)
++        host = _row(snap, "host_slots")
++        assert (host["active"], host["cards"], sorted(host["card_ids"])) == (True, 2, sorted(b_ids))
++        assert (host["reading"], host["threshold"]) == (2, 2)
++        assert host["detail"]["boards"] == {"default": 2, "beta": 0}  # per-board use of the host's slots
++        with kb.scoped_current_board("beta"):
++            for flags in ((), ("--live",)):
++                first = _why(b_ids[0], *flags)["first_stop"]
++                assert (first["governor"], first["reading"], first["threshold"]) == ("host_slots", 2, 2), flags
++                assert first["detail"]["boards"] == {"default": 2, "beta": 0}
++        assert _row(governors.snapshot(a), "host_slots")["cards"] == 0  # board A waits on nothing
++
++        for tid in a_ids:  # board A finishes
++            assert kb.complete_task(a, tid, summary="done", expected_run_id=kb.get_task(a, tid).current_run_id)
++        _tick(b, started, max_in_progress=2, board="beta")
++        assert sorted(started) == sorted(a_ids + b_ids)
++        snap = governors.snapshot(b)
++        _sums(snap)
++        host = _row(snap, "host_slots")
++        assert (host["active"], host["cards"], snap["idle_total"]) == (False, 0, 0)
++        assert host["detail"]["boards"] == {"default": 0, "beta": 0}  # the census that admitted them
++
++        out = json.loads(kcli.run_slash("governors --all-boards --json"))
++        assert {s["board"] for s in out["boards"]} == {"default", "beta"}
++        assert [r["id"] for r in out["registry"]] == [r["id"] for r in governors.registry()]
++
++
++def test_a_card_two_governors_hold_is_charged_once_to_the_first_in_dispatcher_order(pool_hub, monkeypatch):
++    """Acceptance 5: this machine cannot lease the card (labels_mismatch) AND its pool is at reserve."""
++    pool_hub.home.joinpath("config.yaml").write_text(json.dumps({
++        "kanban": {"sync": {"enabled": True}},
++        "model_routing": {"enabled": True, "routes": {level: [{
++            "model": model_tier.OPUS, "provider": "anthropic", "weight": 1, "billing": "subscription",
++            "eligible": True, "funding_verified": True, "capabilities": {"tools": True, "streaming": True}}]
++            for level in ("fast", "standard", "deep")}}}), encoding="utf-8")
++    _usage(monkeypatch, [RESERVE + 10])
++    # The overlap check has a per-tick time budget (next test); 16 parallel test workers are not what it bounds.
++    monkeypatch.setattr(governors, "OVERLAP_BUDGET_SECONDS", 60.0)
++    conn = pool_hub.conn
++    both = [kb.create_task(conn, title=f"pool card {i}", assignee="default", runs_on=list(pool_wait.LABELS))
++            for i in range(2)]
++    paced = kb.create_task(conn, title="leasable here", assignee="default")
++    result = pool_hub.tick()
++    assert not result.spawned
++    assert set(result.skipped_ineligible) == {(tid, "labels_mismatch") for tid in both}
++    assert [p[0] for p in result.llm_paced] == [paced]
++
++    snap = governors.snapshot(conn)
++    _sums(snap)
++    assert snap["idle_total"] == 3
++    placement, pacing = _row(snap, "placement"), _row(snap, "llm_pool")
++    assert (placement["cards"], sorted(placement["card_ids"])) == (2, sorted(both))
++    assert (pacing["cards"], pacing["card_ids"]) == (1, [paced])  # the overlap is not charged a second time
++    assert governors.order_of("placement") < governors.order_of("llm_pool")
++    for tid in both:
++        card = snap["cards"][tid]
++        assert (card["governor"], card["detail"]["reason"]) == ("placement", "labels_mismatch")
++        assert [(o["governor"], o.get("scope")) for o in card["overlaps"]] == [("llm_pool", None)]
++        assert card["overlaps"][0]["reading"] == {"used_pct": RESERVE + 10, "accounts_under_reserve": 0, "accounts": 1}
++        for flags in ((), ("--live",)):
++            answer = _why(tid, *flags)
++            assert answer["first_stop"]["governor"] == "placement", flags
++            assert [o["governor"] for o in answer["overlaps"]] == ["llm_pool"], flags
++    assert snap["cards"][paced]["overlaps"] == []
++
++
++def test_overlaps_past_the_tick_budget_read_not_evaluated_and_fill_in_on_later_ticks(board, monkeypatch):
++    """A tick spends a bounded time on overlaps: a card it did not reach says ``None``, never ``[]``."""
++    _usage(monkeypatch, [10.0])
++    monkeypatch.setattr(governors, "OVERLAP_BUDGET_SECONDS", 0.0)
++    with kbc.connect() as conn:
++        ids = [kb.create_task(conn, title=f"card {i}", assignee="default") for i in range(4)]
++        _tick(conn, max_in_progress=1)
++        waiting = [t for t in ids if kb.get_task(conn, t).status == "ready"]
++        seen = []
++        for _ in waiting:
++            snap = governors.snapshot(conn)
++            _sums(snap)  # the charge never waits for the overlap check
++            assert {snap["cards"][t]["governor"] for t in waiting} == {"host_slots"}
++            seen.append(sorted(str(snap["cards"][t]["overlaps"]) for t in waiting))
++            texts = "".join(kcli.run_slash(f"why {t}") for t in waiting)
++            assert ("not evaluated" in texts) == ("None" in seen[-1])
++            _tick(conn, max_in_progress=1)
++        assert seen == [["None", "None", "[]"], ["None", "[]", "[]"], ["[]", "[]", "[]"]]  # one more card a tick
++
++
++def test_why_reads_the_snapshot_in_well_under_a_second_and_the_dry_run_writes_nothing(board, monkeypatch):
++    """Acceptance 8, the local half: 300 idle cards behind one host slot."""
++    _usage(monkeypatch, [10.0])
++    with kbc.connect() as conn:
++        ids = [kb.create_task(conn, title=f"card {i}", assignee="default") for i in range(300)]
++        _tick(conn, max_in_progress=1)
++        snap = governors.snapshot(conn)
++        _sums(snap)
++        assert _row(snap, "host_slots")["cards"] == 299 == snap["idle_total"]
++        waiting = [t for t in ids if kb.get_task(conn, t).status == "ready"]
++
++        started = time.monotonic()
++        answer = gcli.why(conn, waiting[-1])
++        assert time.monotonic() - started < 1.0
++        assert (answer["source"], answer["first_stop"]["governor"]) == ("snapshot", "host_slots")
++
++        before = (conn.execute("SELECT COUNT(*), MAX(id) FROM task_events").fetchone()[:],
++                  conn.execute("SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (waiting[-1],)).fetchone()[:],
++                  conn.total_changes)
++        started = time.monotonic()
++        live = explain.explain(conn, waiting[-1])
++        assert time.monotonic() - started < 10.0
++        assert live["first_stop"]["governor"] == "host_slots"
++        assert {s["verdict"] for s in live["chain"]} <= {"pass", "stop", "throttle", "unknown"}
++        assert before == (conn.execute("SELECT COUNT(*), MAX(id) FROM task_events").fetchone()[:],
++                          conn.execute("SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
++                                       (waiting[-1],)).fetchone()[:], conn.total_changes)
++        assert conn.execute("PRAGMA query_only").fetchone()[0] == 0  # the walk's read-only guard is released
++
++
++def test_no_snapshot_and_a_stale_one_read_as_unknown_not_as_nothing_held(board):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="never ticked", assignee="default")
++        snap = governors.snapshot(conn)
++        assert (snap["available"], snap["stale"], snap["idle_total"]) == (False, True, None)
++        assert {r["id"] for r in governors.registry()} == {r["governor"] for r in snap["governors"]}
++        assert "no data" in kcli.run_slash("governors")
++        assert _why(tid)["source"] == "dry_run"  # nothing recorded: asked live instead of answered "not held"
++
++        _tick(conn, max_in_progress=1, dry_run=True)  # a dry run decides nothing: no snapshot
++        assert not governors.snapshot(conn)["available"]
++        other = kb.create_task(conn, title="second", assignee="default")
++        _tick(conn, max_in_progress=1)
++        assert governors.snapshot(conn, now=time.time() + governors.STALE_SECONDS + 5)["stale"]
++        waiting = tid if kb.get_task(conn, tid).status == "ready" else other
++        assert governors.card(conn, waiting)["governor"] == "host_slots"
++        assert governors.card(conn, waiting, now=time.time() + governors.STALE_SECONDS + 5)["stale"]
+-- 
+2.43.0
+

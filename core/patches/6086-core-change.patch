@@ -1,0 +1,1050 @@
+From 8c2f541d68576cbeb071791349682b76b46102d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 03:59:56 +0000
+Subject: [PATCH 6086] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit 8c2f541d68576cbeb071791349682b76b46102d5.
+
+---
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index d130df06009..92b82be06ea 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -48,7 +48,8 @@
+ from hermes_cli.kanban_sync_backlog import BUSY_RETRY_S, PULL_PAGE_BUDGET, Pulled
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli import kanban_sync_cpu as sync_cpu
+-from hermes_cli.kanban_sync_pending import pending_task_fields, without_pending
++from hermes_cli.kanban_sync_pending import (discard_replica_writes, guard_replica, pending_task_fields,
++                                           without_pending)
+ from hermes_cli import kanban_sync_refusal as refusal  # one board's ContainmentRefused ends only its round
+ from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+@@ -849,6 +850,7 @@
+     total = pages = 0
+     from hermes_cli.kanban_sync_apply_budget import apply_page, service_pushes
+     changed: dict[str, str] = {}  # status changes applied, for the parks that name those cards
++    discard_replica_writes(conn, hub, board)  # a replica's outbox is never sent: its ops would mask the feed
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+     while True:
+         if max_pages is not None and pages >= max_pages:
+@@ -937,6 +939,7 @@
+         conn = _connect(path)
+         cleanup.callback(conn.close)
+         ensure_identity(conn, slug, gateway)
++        guard_replica(conn)  # only the pull writes a replica (kanban_sync_pending.guard_replica)
+         from hermes_cli import kanban_sync_quarantine as quarantine
+         quarantine.restore(conn, quarantine.load_rebuild(path), path)
+         cleanup.pop_all()
+diff --git a/hermes_cli/kanban_sync_pending.py b/hermes_cli/kanban_sync_pending.py
+index 83e34ecf14b..fed03ad018b 100644
+--- a/hermes_cli/kanban_sync_pending.py
++++ b/hermes_cli/kanban_sync_pending.py
+@@ -2,16 +2,21 @@
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import sqlite3
++from typing import Any
+ 
+ from hermes_cli import kanban_db_sync as sync
+ 
++_log = logging.getLogger(__name__)
++
+ 
+ def pending_task_fields(conn: sqlite3.Connection) -> dict[str, set[str]]:
+-    """Wire fields per task with a local edit still in the outbox (not rejected)."""
++    """Wire fields per task with a local edit still in the outbox (not rejected, and not a replica op being undone:
++    a ``discarding`` op whose undo keeps failing must not keep the card off the Board's next version)."""
+     out: dict[str, set[str]] = {}
+-    for uid, fields in conn.execute("SELECT row_uid, fields FROM kanban_sync_outbox "
+-                                    "WHERE table_name = 'tasks' AND op IN ('upsert', 'import') AND state != 'rejected'"):
++    for uid, fields in conn.execute("SELECT row_uid, fields FROM kanban_sync_outbox WHERE table_name = 'tasks' "
++                                    "AND op IN ('upsert', 'import') AND state NOT IN ('rejected', 'discarding')"):
+         out.setdefault(uid, set()).update(json.loads(fields))
+     return out
+ 
+@@ -27,3 +32,216 @@
+                                    ch.version, ch.hlc, ch.origin_gateway, ch.client_op_id)
+         out.append(ch)
+     return out
++
++
++# Not ``kanban_sync_%``: ``drop_triggers`` (a sync-off open) and the trigger drift check own that prefix.
++REPLICA_GUARD = "replica_outbox_readonly"
++REPLICA_TOMBSTONE_GUARD = "replica_tombstone_readonly"
++_GUARD_SQL = (
++    f"CREATE TRIGGER IF NOT EXISTS {REPLICA_GUARD} BEFORE INSERT ON kanban_sync_outbox "
++    "BEGIN SELECT RAISE(IGNORE); END",
++    f"CREATE TRIGGER IF NOT EXISTS {REPLICA_TOMBSTONE_GUARD} BEFORE INSERT ON kanban_sync_tombstones "
++    f"WHEN {sync._NOT_APPLYING} BEGIN SELECT RAISE(IGNORE); END",
++)
++
++
++def guard_replica(conn: sqlite3.Connection) -> None:
++    """Make a replica keep no trace of a write the feed apply did not make. [daveey]
++
++    On a replica only the capture triggers write the outbox and tombstones (the direct outbox writers: queue,
++    compat, transports, divergence repair, run on live files), and they skip ``applying``, so every op or tombstone a
++    replica could record comes from a write the pull did not make. Nothing sends a replica's outbox, and a pending op
++    masks its field from every later pull (:func:`pending_task_fields`): the earlier loop
++    (:func:`discard_replica_writes`). A tombstone makes the apply skip the Board's row for good. Both inserts are
++    skipped, not refused: replicas also take legitimate local writes outside ``applying`` (the containment schema
++    install and repair, connect-time data migrations), which must keep working. With neither kept, a stray write no
++    longer sticks: the row takes the Board's next version as any pulled row does, and divergence repair sees the gap
++    meanwhile. The pull's own tombstones are written under ``applying`` and kept. Installed once per file; the passive
++    checkpoint after it is best-effort, so the schema change usually lands now rather than as a later main-file
++    rewrite that re-arms the links plan."""
++    have = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
++                                           (REPLICA_GUARD, REPLICA_TOMBSTONE_GUARD))}
++    if len(have) == len(_GUARD_SQL):
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        for sql in _GUARD_SQL:
++            conn.execute(sql)
++    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
++
++
++# ``unknown`` is no row and no tombstone on the Board (below its history floor): for a replica, as gone as the rest.
++_GONE = ("never_existed", "deleted", "unknown")
++_EVIDENCE_PER_ROUND = 64  # Board reads per pull; a larger backlog drains over later rounds
++_NEXT_READ: dict[str, int] = {}  # replica path -> where the next round's reads start, so no op starves at the back
++_SHOWN = 10  # unresolved keys named per warning
++_FAILED_READS_PER_ROUND = 3  # past this the Board is taken as down for the round
++
++
++def _op_keys(table: str, uid: str, fields: str) -> list[tuple[str, str]]:
++    """The Board rows an op's write touched: its own row, and the card of a card-owned row."""
++    keys = [(table, uid)]
++    if table == "task_links":
++        keys.append(("tasks", uid.partition(">")[2]))
++    elif table != "tasks":
++        try:
++            task = (json.loads(fields or "{}") or {}).get("task_id")
++        except (ValueError, AttributeError):  # malformed, or not an object: the op's own row still resolves it
++            task = None
++        if task:
++            keys.append(("tasks", str(task)))
++    return keys
++
++
++def _delete_change(table: str, uid: str) -> sync.RemoteChange:
++    return sync.RemoteChange(seq=0, table=table, uid=uid, op="delete", fields={}, version=0, hlc="",
++                             origin_gateway="")
++
++
++def _read_evidence(hub: Any, board: str, keys: list, path: str) -> tuple[dict, Exception | None]:
++    """At most :data:`_EVIDENCE_PER_ROUND` Board reads, starting where the last round stopped. A key whose read fails
++    is skipped, so one row the Board will not answer for cannot hold back every op after it;
++    :data:`_FAILED_READS_PER_ROUND` failures end the round. Each round starts past the keys the last one tried, so
++    rows that keep failing, or ops a quarantine keeps withheld, cannot starve the ops behind them."""
++    start = _NEXT_READ.get(path, 0) % len(keys)
++    evidence: dict = {}
++    failure: Exception | None = None
++    failures = tried = 0
++    for key in (keys[start:] + keys[:start])[:_EVIDENCE_PER_ROUND]:
++        tried += 1
++        try:
++            reply = hub.row_evidence(board, *key)
++            if not isinstance(reply, dict):
++                raise TypeError(f"Board evidence for {key} is {type(reply).__name__}, not an object")
++            evidence[key] = reply
++        except Exception as exc:  # health: allow BLE001 -- a failed read defers that key's ops to a later round
++            failure, failures = exc, failures + 1
++            if failures >= _FAILED_READS_PER_ROUND:
++                break
++    _NEXT_READ[path] = start + tried
++    return evidence, failure
++
++
++def _restore_page(evidence: dict, state: dict, keys: dict) -> list[sync.RemoteChange]:
++    """The Board's own rows for ``keys`` as one feed page: upserts of rows it holds (runs before cards), then deletes
++    of rows it does not hold."""
++    from hermes_cli.kanban_sync_client import _row_change
++    upserts = sorted((_row_change(table, evidence[(table, uid)]["row"]) for table, uid in keys
++                      if state[(table, uid)] == "live"), key=lambda ch: ch.table == "tasks")
++    return upserts + [_delete_change(table, uid) for table, uid in keys if state[(table, uid)] in _GONE]
++
++
++def discard_replica_writes(conn: sqlite3.Connection, hub: Any, board: str) -> int:
++    """Undo the local writes a replica captured, from the Board's own rows; returns the ops resolved.
++
++    A replica (``sync-shadow/<board>.db``) only pulls: nothing ever sends its outbox. Before :func:`guard_replica` it
++    carried live capture, so a write to it outside the feed apply queued an op that stayed ``pending`` forever, and
++    the pull (:func:`pending_task_fields`) then kept that field's local value over every Board echo. Hub incident
++    case: the legacy in-flight run backfill (``kanban_db_connect._backfill_legacy_inflight_runs``, kept off
++    replicas since an earlier change) gave the hub and worker replicas a ``running`` run the Board never had and pointed
++    t_fd312e79cee2ee94 at it. On the hub the masked ``current_run_uid`` made divergence repair re-send the live value
++    every round (~30 s), raising the card's Board version each time. The producer fix stopped new contamination but
++    left the queued ops in place.
++
++    Every row an op touched (and its card; ``task_links`` by ``parent>child``) is read from the Board, at most
++    :data:`_EVIDENCE_PER_ROUND` per round; a row whose read fails waits for a later round. An op is resolved once all
++    its rows are read and the quarantine filter passes their restore (a withheld restore keeps the op until the
++    quarantine is released). Only resolved ops' rows are touched: rows the Board holds are applied again, rows it does
++    not hold (deleted, never had, or below its history floor) are deleted through the feed's delete handlers, runs
++    before cards, deletes last. Before the apply, in one transaction: the resolved ops leave ``pending`` (a pending op
++    makes the apply keep the local row), a held run's ``sync_version`` is cleared (a stray update leaves it at the
++    Board's version, which the run fence then treats as already applied), any replica tombstone a stray delete wrote
++    for a held row is removed. The restore page re-points a held card at the Board's run in the apply; after it, with
++    the ops' deletion, any card still naming a gone run stops naming it (a backstop: nulled before the apply, a
++    failed apply would leave a card on no run at all). The ops are deleted only after the apply commits, so a failure
++    anywhere leaves them for the next round, marked ``discarding`` so they stop masking the card; an op the
++    quarantine withholds goes back to ``pending`` and waits as it was. A failure after the reads is logged, not
++    raised, so the feed pull that follows still runs, and a page that fails is retried one op at a time, so one row
++    that always fails holds back only its own op. Evidence is not kept between rounds, so an op resolves when all
++    its rows fall in one round's reads.
++
++    A withheld restore is written to the quarantine's withheld ledger like any withheld feed row and replayed at its
++    release, which is harmless: card upserts are version-fenced, a run upsert still meets its pending op or
++    ``sync_version``, and the deletes are of rows the Board does not hold. A delete of a row the replica no longer
++    holds names no card, so the quarantine withholds it while any quarantine on the board is open; it only costs
++    that op a Board read per round until then, and masks nothing (only card ops mask a field). [daveey]"""
++    from pathlib import Path
++    from hermes_cli.kanban_db_connect import _main_db_file
++    path = _main_db_file(conn)
++    if not path or Path(path).parent.name != sync.SHADOW_DIR:
++        return 0
++    ops = [(op_id, _op_keys(table, uid, fields)) for op_id, table, uid, fields in
++           conn.execute("SELECT op_id, table_name, row_uid, fields FROM kanban_sync_outbox ORDER BY rowid")]
++    if not ops:
++        return 0
++    keys = list(dict.fromkeys(key for _, op_keys in ops for key in op_keys))
++    evidence, failure = _read_evidence(hub, board, keys, str(path))
++    try:
++        return _undo(conn, hub, board, ops, keys, evidence, failure)
++    except Exception:  # health: allow BLE001 -- a failed undo must not stop the feed pull that follows
++        _log.warning("kanban sync: %s replica: undoing its local ops as one page failed; trying them one at a time",
++                     board, exc_info=True)
++    done = 0
++    for op in ops:  # one row that always fails must not hold back the rest
++        try:
++            done += _undo(conn, hub, board, [op], op[1], evidence, failure, quiet=True)
++        except Exception as exc:  # health: allow BLE001 -- that op stays for the next round; the feed pull still runs
++            _log.warning("kanban sync: %s replica: undoing op %s (rows %s) failed (%r); kept for the next round",
++                         board, op[0], op[1][:_SHOWN], exc)
++    return done
++
++
++def _undo(conn: sqlite3.Connection, hub: Any, board: str, ops: list, keys: list, evidence: dict,
++          failure: Exception | None, *, quiet: bool = False) -> int:
++    """The second half of :func:`discard_replica_writes`, from the read Board rows: certify, undo, drop the ops."""
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    from hermes_cli.kanban_db_connect import write_txn
++    state = {key: ev.get("state") if ev.get("state") != "live" or ev.get("row") else None
++             for key, ev in evidence.items()}
++    known = ("live", *_GONE)
++    attested = [(op_id, op_keys) for op_id, op_keys in ops if all(state.get(key) in known for key in op_keys)]
++    changes = _restore_page(evidence, state, dict.fromkeys(key for _, op_keys in attested for key in op_keys))
++    todo = quarantine.certified_page(conn, hub, board, changes) if changes else []
++    # An op whose restore the containment quarantine withholds waits with it: undone now, it would leave its rows
++    # neither stray nor the Board's until the quarantine is released.
++    withheld = {(ch.table, ch.uid) for ch in changes} - {(ch.table, ch.uid) for ch in todo}
++    done = [(op_id, op_keys) for op_id, op_keys in attested if not withheld.intersection(op_keys)]
++    held = [(op_id,) for op_id, op_keys in attested if withheld.intersection(op_keys)]
++    if held:  # an earlier failed page may have marked them; a withheld op waits as it was, masking as before
++        with write_txn(conn):
++            conn.executemany("UPDATE kanban_sync_outbox SET state = 'pending' WHERE op_id = ? AND state = 'discarding'",
++                             held)
++    if not done:
++        if quiet:  # one op of a retried page: the page's own warning covers it
++            return 0
++        waiting = [key for key in keys if state.get(key) not in known or key in withheld][:_SHOWN]
++        _log.warning("kanban sync: %s replica holds %d local op(s); none resolved this round (%s)", board, len(ops),
++                     failure or f"unattested or withheld {waiting}")
++        return 0
++    resolved = [op_id for op_id, _ in done]
++    rows = dict.fromkeys(key for _, op_keys in done for key in op_keys)  # only the resolved ops' rows are undone
++    todo = [ch for ch in todo if (ch.table, ch.uid) in rows]
++    live = [key for key in rows if state[key] == "live"]
++    gone = [key for key in rows if state[key] in _GONE]
++    with write_txn(conn):
++        conn.executemany("UPDATE kanban_sync_outbox SET state = 'discarding' WHERE op_id = ?",
++                         [(op_id,) for op_id in resolved])
++        for table, uid in live:
++            conn.execute("DELETE FROM kanban_sync_tombstones WHERE table_name = ? AND row_uid = ?", (table, uid))
++            if table == "task_runs":
++                conn.execute("UPDATE task_runs SET sync_version = NULL WHERE uid = ?", (uid,))
++    gone_runs = [row[0] for table, uid in gone if table == "task_runs"
++                 for row in conn.execute("SELECT id FROM task_runs WHERE uid = ?", (uid,))]
++    cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++    sync.apply_remote_changes(conn, todo, new_cursor=cursor, board=board, observers=False)
++    with write_txn(conn):
++        # Backstop after the apply, not before: the restore page already re-points a held card; nulled before the
++        # apply, a failed apply would leave a card on no run at all instead of its stray one.
++        conn.executemany("UPDATE tasks SET current_run_id = NULL WHERE current_run_id = ?",
++                         [(run_id,) for run_id in gone_runs])
++        conn.executemany("DELETE FROM kanban_sync_outbox WHERE op_id = ?", [(op_id,) for op_id in resolved])
++    unresolved = len(ops) - len(resolved)
++    _log.warning("kanban sync: %s replica held %d local op(s) nothing sends; resolved %d: restored %d row(s) from "
++                 "the Board, deleted %d it does not hold; %d left for later rounds%s", board, len(ops),
++                 len(resolved), len(live), len(gone), unresolved, f" ({failure})" if failure else "")
++    return len(resolved)
+diff --git a/tests/hermes_cli/test_kanban_sync_client.py b/tests/hermes_cli/test_kanban_sync_client.py
+index 04f64331089..f15e237128c 100644
+--- a/tests/hermes_cli/test_kanban_sync_client.py
++++ b/tests/hermes_cli/test_kanban_sync_client.py
+@@ -707,7 +707,11 @@
+                               "rejected" if guard == "rejected" else "pending"))
+             elif guard.endswith("tombstone"):
+                 target = live if guard == "local_tombstone" else shadow
++                if target is shadow:  # a replica tombstone is a pulled one: written under applying
++                    shadow.execute("UPDATE kanban_sync_state SET applying = 1")
+                 target.execute("INSERT INTO kanban_sync_tombstones VALUES (?, ?, 1)", (table, uid))
++                if target is shadow:
++                    shadow.execute("UPDATE kanban_sync_state SET applying = 0")
+             elif guard in ("version_ahead", "parent_version"):
+                 live.execute("UPDATE tasks SET sync_version = sync_version + 1 WHERE id = ?", (subject,))
+             elif guard == "replica_ahead":
+diff --git a/tests/hermes_cli/test_kanban_sync_copy_chat_links.py b/tests/hermes_cli/test_kanban_sync_copy_chat_links.py
+index 7a5911ef1fa..c632cebc774 100644
+--- a/tests/hermes_cli/test_kanban_sync_copy_chat_links.py
++++ b/tests/hermes_cli/test_kanban_sync_copy_chat_links.py
+@@ -72,8 +72,10 @@
+             conn = live if side == "live" else replica
+             table, row_uid = ("tasks", "t_foreign") if target == "task" else ("task_chat_links", uid)
+             with write_txn(conn):
++                conn.execute("UPDATE kanban_sync_state SET applying = 1")  # a replica tombstone is a pulled one
+                 conn.execute("INSERT INTO kanban_sync_tombstones (table_name,row_uid,deleted_at) VALUES (?,?,1)",
+                              (table,row_uid))
++                conn.execute("UPDATE kanban_sync_state SET applying = 0")
+         elif barrier == "existing":
+             with write_txn(live):
+                 live.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,released,created_at) "
+diff --git a/tests/hermes_cli/test_kanban_sync_partition_content.py b/tests/hermes_cli/test_kanban_sync_partition_content.py
+index a2700b2fde0..17040ce959f 100644
+--- a/tests/hermes_cli/test_kanban_sync_partition_content.py
++++ b/tests/hermes_cli/test_kanban_sync_partition_content.py
+@@ -7,6 +7,7 @@
+ from hermes_cli import kanban_sync_client as ksc
+ from hermes_cli import kanban_sync_partition_content as content
+ from hermes_cli import kanban_sync_partition_repair as repair
++from hermes_cli.kanban_sync_pending import REPLICA_GUARD
+ from hermes_cli.kanban_sync_repair_revision import ensure_revision
+ from tests.hermes_cli import test_kanban_sync_repair_window as window
+ 
+@@ -74,8 +75,11 @@
+ @pytest.mark.parametrize("side", ["live", "replica"])
+ @pytest.mark.parametrize("change", ["task", "link", "chat", "outbox", "tombstone", "omission", "trigger"])
+ def test_relevant_mutations_rearm_partition(pair, side, change):
+-    _warm(pair)
+     conn = getattr(pair, side)
++    if side == "replica" and change == "outbox":  # only a file from before the guard holds replica ops
++        with kbc.write_txn(conn):
++            conn.execute(f"DROP TRIGGER {REPLICA_GUARD}")
++    _warm(pair)
+     statements = {
+         "task": "UPDATE tasks SET title='changed' WHERE id=?",
+         "link": "DELETE FROM task_links WHERE parent_id=?",
+@@ -92,7 +96,12 @@
+         "trigger": "DROP TRIGGER kanban_repair_tasks_update",
+     }
+     with kbc.write_txn(conn):
++        pulled = side == "replica" and change == "tombstone"  # a replica tombstone is a pulled one
++        if pulled:
++            conn.execute("UPDATE kanban_sync_state SET applying = 1")
+         conn.execute(statements[change], () if change == "trigger" else (pair.parent,))
++        if pulled:
++            conn.execute("UPDATE kanban_sync_state SET applying = 0")
+     assert not pair.prepare().skip
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_replica_outbox.py b/tests/hermes_cli/test_kanban_sync_replica_outbox.py
+new file mode 100644
+index 00000000000..3f8c1f0e304
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_replica_outbox.py
+@@ -0,0 +1,688 @@
++"""A replica queues no outbox op; ops it captured before the guard are undone from the Board. [daveey]
++
++Hub incident (see ``kanban_sync_pending.discard_replica_writes``): a phantom run the legacy backfill wrote
++into the hub replica left two ``pending`` ops there. The pull kept the card's ``current_run_uid`` on that run over
++every Board echo, and divergence repair re-sent the live value every ~30 s.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_pending as pending
++from tests.hermes_cli import test_kanban_cross_gateway_parents as fixtures
++
++kanban_home = fixtures.kanban_home
++live = fixtures.live
++svc = fixtures.svc
++
++
++@pytest.fixture(autouse=True)
++def _fresh_rotation(monkeypatch):
++    """Each test reads from the start: the read rotation is process state."""
++    monkeypatch.setattr(pending, "_NEXT_READ", {})
++
++
++def _board_card_with_run(live, kanban_home, svc):
++    """A card of this gateway, claimed and finished here, synced: the Board holds its run."""
++    tid = kb.create_task(live, title="replica outbox", assignee="default")
++    client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++    claimed = kb.claim_task(live, tid)
++    assert claimed is not None
++    run_uid = live.execute("SELECT r.uid FROM tasks t JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
++                           (tid,)).fetchone()[0]
++    for _ in range(3):
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++    return tid, run_uid
++
++
++def _guarded(conn) -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
++                        (pending.REPLICA_GUARD,)).fetchone() is not None
++
++
++def _contaminate(replica, tid):
++    """What the legacy backfill did to the hub replica, in a file from before the guard: a captured run insert and
++    a captured card update. The guard is back in place afterwards, as the next ``open_shadow`` puts it."""
++    replica.execute(f"DROP TRIGGER {pending.REPLICA_GUARD}")
++    before = {r[0] for r in replica.execute("SELECT op_id FROM kanban_sync_outbox")}
++    cur = replica.execute("INSERT INTO task_runs (task_id, profile, status, started_at) "
++                          "VALUES (?, 'default', 'running', 1)", (tid,))
++    replica.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (cur.lastrowid, tid))
++    replica.commit()
++    phantom = replica.execute("SELECT uid FROM task_runs WHERE id = ?", (cur.lastrowid,)).fetchone()[0]
++    ops = {(r[1], r[2]) for r in replica.execute("SELECT op_id, table_name, row_uid FROM kanban_sync_outbox")
++           if r[0] not in before}
++    assert ops == {("task_runs", phantom), ("tasks", tid)}  # the replica captured both writes
++    pending.guard_replica(replica)
++    assert _guarded(replica)
++    return phantom
++
++
++def _current_run_uid(conn, tid):
++    row = conn.execute("SELECT r.uid FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
++                       (tid,)).fetchone()
++    return row[0] if row else None
++
++
++def test_pull_drops_replica_writes_and_takes_the_board_run(live, kanban_home, svc):
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        assert _current_run_uid(replica, tid) == run_uid
++        phantom = _contaminate(replica, tid)
++        assert pending.pending_task_fields(replica) == {tid: {"current_run_uid"}}  # what masked every echo
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (phantom,)).fetchone()[0] == 0
++        assert _current_run_uid(replica, tid) == run_uid
++        assert pending.pending_task_fields(replica) == {}
++    finally:
++        replica.close()
++
++
++def test_without_the_discard_the_pull_keeps_the_phantom_run(live, kanban_home, svc, monkeypatch):
++    """The failure the discard removes: the pending op keeps the replica on the phantom run through a Board echo."""
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++        monkeypatch.setattr(client, "discard_replica_writes", lambda *a, **k: 0)  # a round pulls the replica too
++        live.execute("UPDATE tasks SET priority = 7 WHERE id = ?", (tid,))  # a new Board version of the card
++        live.commit()
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        assert replica.execute("SELECT priority FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == 7
++        assert _current_run_uid(replica, tid) == phantom != run_uid  # the Board still names run_uid
++    finally:
++        replica.close()
++
++
++def test_a_live_file_keeps_its_outbox(live, kanban_home, svc):
++    """Only a replica's ops are dropped: a live board's outbox is its unsent local work."""
++    tid = kb.create_task(live, title="unsent", assignee="default")
++    before = live.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0]
++    assert before > 0
++    assert pending.discard_replica_writes(live, svc.hub(fixtures.ME), fixtures.BOARD) == 0
++    assert not _guarded(live)  # the live board's writes are its work: only a replica is guarded
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == before
++    assert kb.get_task(live, tid) is not None
++
++
++def test_failed_board_read_leaves_the_replica_for_the_next_round(live, kanban_home, svc):
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++
++        class Down:
++            def row_evidence(self, *_a):
++                raise OSError("board unreachable")
++
++        assert pending.discard_replica_writes(replica, Down(), fixtures.BOARD) == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 2
++        assert _current_run_uid(replica, tid) == phantom
++        assert sync.sync_state(replica)["applying"] in (0, None)
++    finally:
++        replica.close()
++
++
++def test_a_guarded_replica_queues_no_op_and_the_next_board_version_heals(live, kanban_home, svc):
++    """The guard: a write outside the pull (a migration, the containment install, a stray bug) still runs, queues
++    nothing, and so cannot mask the Board's next version of the row."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        assert _guarded(replica)
++        replica.execute("UPDATE tasks SET priority = 9 WHERE id = ?", (tid,))
++        replica.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'note', '{}', 1)",
++                        (tid,))
++        replica.commit()
++        assert replica.execute("SELECT priority FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == 9
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++        assert pending.pending_task_fields(replica) == {}
++        live.execute("UPDATE tasks SET priority = 3 WHERE id = ?", (tid,))
++        live.commit()
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        assert replica.execute("SELECT priority FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == 3
++    finally:
++        replica.close()
++
++
++def test_a_guarded_replica_still_takes_the_feed(live, kanban_home, svc):
++    """The pull writes under ``applying``, which the capture triggers skip, so the guard never sees it."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    live.execute("UPDATE tasks SET priority = 5, title = 'renamed' WHERE id = ?", (tid,))
++    live.commit()
++    kb.complete_task(live, tid, result="done")
++    for _ in range(2):
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        assert _guarded(replica)
++        row = replica.execute("SELECT priority, title, status FROM tasks WHERE id = ?", (tid,)).fetchone()
++        assert tuple(row) == (5, "renamed", "done")
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    finally:
++        replica.close()
++
++
++def test_a_failed_restore_keeps_the_ops_for_the_next_round(live, kanban_home, svc, monkeypatch):
++    """The ops go only after the Board's rows are in: a failing apply leaves every op, and the next round heals."""
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        _contaminate(replica, tid)
++        real = sync.apply_remote_changes
++
++        def failing(*_a, **_k):
++            raise sqlite3.OperationalError("database is locked")
++
++        monkeypatch.setattr(sync, "apply_remote_changes", failing)
++        # logged, not raised: the feed pull after it still runs
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 2
++        assert pending.pending_task_fields(replica) == {}  # ``discarding`` ops no longer mask the card
++        monkeypatch.setattr(sync, "apply_remote_changes", real)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++        assert _current_run_uid(replica, tid) == run_uid
++    finally:
++        replica.close()
++
++
++def test_a_stray_delete_is_restored_from_the_board(live, kanban_home, svc):
++    """A captured delete also left a replica tombstone, which would make the apply skip the Board's row."""
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        replica.execute(f"DROP TRIGGER {pending.REPLICA_GUARD}")  # a file from before the guard
++        replica.execute(f"DROP TRIGGER {pending.REPLICA_TOMBSTONE_GUARD}")
++        replica.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++        replica.commit()
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_tombstones WHERE row_uid = ?", (tid,)).fetchone()[0]
++        pending.guard_replica(replica)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 1
++        assert replica.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone() is not None
++        assert _current_run_uid(replica, tid) == run_uid
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_tombstones WHERE row_uid = ?", (tid,)).fetchone()[0] == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    finally:
++        replica.close()
++
++
++def test_a_phantom_link_is_removed(live, kanban_home, svc):
++    """``task_links`` ops are keyed ``parent>child``: the Board never had this edge, so it goes."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    other = kb.create_task(live, title="other", assignee="default")
++    client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        replica.execute(f"DROP TRIGGER {pending.REPLICA_GUARD}")
++        replica.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (other, tid))
++        replica.commit()
++        assert [tuple(r) for r in replica.execute("SELECT table_name, row_uid FROM kanban_sync_outbox")] == [
++            ("task_links", f"{other}>{tid}")]
++        pending.guard_replica(replica)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 1
++        assert replica.execute("SELECT COUNT(*) FROM task_links WHERE parent_id = ? AND child_id = ?",
++                               (other, tid)).fetchone()[0] == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    finally:
++        replica.close()
++
++
++class _Attesting:
++    """The fixture Board, with one row's evidence replaced."""
++
++    def __init__(self, hub, key, state):
++        self.hub, self.key, self.state = hub, key, state
++
++    def row_evidence(self, board, table, uid):
++        if (table, uid) == self.key:
++            return {"state": self.state, "row": None}
++        return self.hub.row_evidence(board, table, uid)
++
++    def __getattr__(self, name):
++        return getattr(self.hub, name)
++
++
++def test_a_row_the_board_deleted_is_deleted_here(live, kanban_home, svc):
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++        hub = _Attesting(svc.hub(fixtures.ME), ("task_runs", phantom), "deleted")
++        assert pending.discard_replica_writes(replica, hub, fixtures.BOARD) == 2
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (phantom,)).fetchone()[0] == 0
++        assert _current_run_uid(replica, tid) == run_uid
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    finally:
++        replica.close()
++
++
++def test_a_row_below_the_board_history_floor_is_gone_too(live, kanban_home, svc):
++    """``unknown``: the Board holds no row and no tombstone for it, so for a replica it is gone like the rest."""
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++        hub = _Attesting(svc.hub(fixtures.ME), ("task_runs", phantom), "unknown")
++        assert pending.discard_replica_writes(replica, hub, fixtures.BOARD) == 2
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (phantom,)).fetchone()[0] == 0
++        assert _current_run_uid(replica, tid) == run_uid
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    finally:
++        replica.close()
++
++
++def test_a_stray_update_of_a_held_run_is_restored(live, kanban_home, svc):
++    """A child row the Board holds: the pending op and the run's ``sync_version`` fence must not keep the stray."""
++    _tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        board_row = replica.execute("SELECT status, summary FROM task_runs WHERE uid = ?", (run_uid,)).fetchone()
++        replica.execute(f"DROP TRIGGER {pending.REPLICA_GUARD}")
++        replica.execute("UPDATE task_runs SET status = 'crashed', summary = 'STRAY' WHERE uid = ?", (run_uid,))
++        replica.commit()
++        assert [tuple(r) for r in replica.execute("SELECT table_name, row_uid FROM kanban_sync_outbox")] == [
++            ("task_runs", run_uid)]
++        pending.guard_replica(replica)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 1
++        assert tuple(replica.execute("SELECT status, summary FROM task_runs WHERE uid = ?",
++                                     (run_uid,)).fetchone()) == tuple(board_row)
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    finally:
++        replica.close()
++
++
++def test_a_stray_delete_on_a_guarded_replica_leaves_no_tombstone(live, kanban_home, svc):
++    """Without its tombstone the card comes back with the Board's next version, like any pulled row."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        replica.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++        replica.commit()
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_tombstones WHERE row_uid = ?", (tid,)).fetchone()[0] == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++        live.execute("UPDATE tasks SET priority = 4 WHERE id = ?", (tid,))
++        live.commit()
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        assert replica.execute("SELECT priority FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == 4
++    finally:
++        replica.close()
++
++
++def test_the_pull_keeps_its_own_tombstones_on_a_guarded_replica(live, kanban_home, svc):
++    """The tombstone guard skips only writes outside ``applying``: a Board delete still tombstones the replica."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        kb.delete_task(live, tid)
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        assert replica.execute("SELECT COUNT(*) FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_tombstones WHERE row_uid = ?", (tid,)).fetchone()[0] == 1
++    finally:
++        replica.close()
++
++
++class _FailingAfter:
++    """The fixture Board, failing every read after the first ``n``."""
++
++    def __init__(self, hub, n):
++        self.hub, self.left = hub, n
++
++    def row_evidence(self, board, table, uid):
++        if self.left <= 0:
++            raise OSError("board unreachable")
++        self.left -= 1
++        return self.hub.row_evidence(board, table, uid)
++
++    def __getattr__(self, name):
++        return getattr(self.hub, name)
++
++
++def test_a_partial_board_read_resolves_the_ops_it_covered(live, kanban_home, svc, monkeypatch):
++    """Reads stop at a failure or the per-round cap; ops whose rows were all read resolve now, the rest later."""
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        _contaminate(replica, tid)  # keys in order: the phantom run, then the card both ops name
++        ops = [tuple(r) for r in replica.execute("SELECT table_name FROM kanban_sync_outbox ORDER BY rowid")]
++        assert ops == [("task_runs",), ("tasks",)]
++        assert pending.discard_replica_writes(replica, _FailingAfter(svc.hub(fixtures.ME), 1), fixtures.BOARD) == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 2
++        monkeypatch.setattr(pending, "_EVIDENCE_PER_ROUND", 1)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 0
++        monkeypatch.setattr(pending, "_EVIDENCE_PER_ROUND", 2)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, tid) == run_uid
++    finally:
++        replica.close()
++
++
++def test_a_malformed_op_still_resolves_by_its_own_row(live, kanban_home, svc):
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++        replica.execute("UPDATE kanban_sync_outbox SET fields = '[not json' WHERE table_name = 'task_runs'")
++        replica.commit()
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (phantom,)).fetchone()[0] == 0
++        assert _current_run_uid(replica, tid) == run_uid
++    finally:
++        replica.close()
++
++
++class _Unanswered:
++    """The fixture Board, failing every read of one row."""
++
++    def __init__(self, hub, key):
++        self.hub, self.key = hub, key
++
++    def row_evidence(self, board, table, uid):
++        if (table, uid) == self.key:
++            raise OSError("413 payload too large")
++        return self.hub.row_evidence(board, table, uid)
++
++    def __getattr__(self, name):
++        return getattr(self.hub, name)
++
++
++def test_a_row_the_board_never_answers_for_holds_back_only_its_own_op(live, kanban_home, svc):
++    """A read that always fails is skipped, so the ops after it still resolve round after round."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)  # the phantom run's key is read first
++        hub = _Unanswered(svc.hub(fixtures.ME), ("task_runs", phantom))
++        assert pending.discard_replica_writes(replica, hub, fixtures.BOARD) == 1
++        assert [tuple(r) for r in replica.execute("SELECT table_name, row_uid FROM kanban_sync_outbox")] == [
++            ("task_runs", phantom)]
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (phantom,)).fetchone()[0] == 1
++    finally:
++        replica.close()
++
++
++def test_a_restore_the_quarantine_withholds_keeps_its_op_and_rows(live, kanban_home, svc, monkeypatch):
++    """Undone while its restore is withheld, a row would be neither the stray nor the Board's: the op waits."""
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++        real = quarantine.certified_page
++        monkeypatch.setattr(quarantine, "certified_page", lambda *_a: [])  # a quarantined card: nothing passes
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 0
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 2
++        assert [r[0] for r in replica.execute("SELECT state FROM kanban_sync_outbox")] == ["pending", "pending"]
++        assert _current_run_uid(replica, tid) == phantom  # untouched: no side effect for an op that waits
++        monkeypatch.setattr(quarantine, "certified_page", real)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, tid) == run_uid
++    finally:
++        replica.close()
++
++
++def test_the_guard_installs_once_and_survives_a_sync_trigger_drop(live, kanban_home, svc):
++    _tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        schema = replica.execute("PRAGMA schema_version").fetchone()[0]
++        pending.guard_replica(replica)
++        assert replica.execute("PRAGMA schema_version").fetchone()[0] == schema  # already there: no rewrite
++        with kbc.write_txn(replica):
++            sync.drop_triggers(replica)  # a sync-off open drops ``kanban_sync_%`` triggers only
++        assert _guarded(replica)
++        assert replica.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?",
++                               (pending.REPLICA_TOMBSTONE_GUARD,)).fetchone()[0] == 1
++    finally:
++        replica.close()
++
++
++def test_a_live_file_never_reads_the_board(live, kanban_home, svc):
++    """On a live file the discard is a path check: its outbox is real work, and no Board read is made."""
++    kb.create_task(live, title="unsent", assignee="default")
++
++    class NoBoard:
++        def row_evidence(self, *_a):
++            raise AssertionError("a live file read the Board")
++
++    assert pending.discard_replica_writes(live, NoBoard(), fixtures.BOARD) == 0
++
++
++def test_a_withheld_op_and_a_resolved_one_in_the_same_round(live, kanban_home, svc, monkeypatch):
++    """Only the resolved op's rows are undone: the withheld card keeps its stray run, its pointer and its ops."""
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    held, _held_run = _board_card_with_run(live, kanban_home, svc)
++    freed, freed_run = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        held_phantom = _contaminate(replica, held)
++        freed_phantom = _contaminate(replica, freed)
++        real = quarantine.certified_page
++        # The held card is quarantined: its own row is withheld, while its phantom run's delete passes. That delete
++        # must still wait, since the run's op also names the withheld card.
++        monkeypatch.setattr(quarantine, "certified_page", lambda *a: [ch for ch in real(*a) if ch.uid != held])
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, freed) == freed_run
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (freed_phantom,)).fetchone()[0] == 0
++        assert _current_run_uid(replica, held) == held_phantom
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (held_phantom,)).fetchone()[0] == 1
++        assert {(r[0], r[1]) for r in replica.execute("SELECT table_name, row_uid FROM kanban_sync_outbox")} == {
++            ("task_runs", held_phantom), ("tasks", held)}
++        assert {r[0] for r in replica.execute("SELECT state FROM kanban_sync_outbox")} == {"pending"}
++    finally:
++        replica.close()
++
++
++class _Counting:
++    """A Board that never answers, counting the reads it was asked for."""
++
++    def __init__(self):
++        self.reads = 0
++
++    def row_evidence(self, *_a):
++        self.reads += 1
++        raise OSError("board unreachable")
++
++
++def test_three_failed_reads_end_the_round(live, kanban_home, svc):
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        _contaminate(replica, tid)
++        for _ in range(3):
++            _contaminate(replica, tid)  # more rows than the failure limit
++        hub = _Counting()
++        assert pending.discard_replica_writes(replica, hub, fixtures.BOARD) == 0
++        assert hub.reads == pending._FAILED_READS_PER_ROUND
++    finally:
++        replica.close()
++
++
++class _NeverFor:
++    """The fixture Board, failing every read of the given rows."""
++
++    def __init__(self, hub, keys):
++        self.hub, self.keys = hub, set(keys)
++
++    def row_evidence(self, board, table, uid):
++        if (table, uid) in self.keys:
++            raise OSError("400 bad row")
++        return self.hub.row_evidence(board, table, uid)
++
++    def __getattr__(self, name):
++        return getattr(self.hub, name)
++
++
++def test_rows_that_keep_failing_do_not_starve_the_ops_behind_them(live, kanban_home, svc):
++    """Three rows at the front that always fail would end every round at the same place without the rotation."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        stuck = [_contaminate(replica, tid) for _ in range(3)]
++        last = _contaminate(replica, tid)
++        hub = _NeverFor(svc.hub(fixtures.ME), [("task_runs", uid) for uid in stuck])
++        for _ in range(4):
++            pending.discard_replica_writes(replica, hub, fixtures.BOARD)
++        assert replica.execute("SELECT COUNT(*) FROM task_runs WHERE uid = ?", (last,)).fetchone()[0] == 0
++        assert {r[0] for r in replica.execute("SELECT row_uid FROM kanban_sync_outbox WHERE table_name = 'task_runs'")
++                } == set(stuck)
++    finally:
++        replica.close()
++
++
++def test_one_row_that_always_fails_to_apply_holds_back_only_its_own_op(live, kanban_home, svc, monkeypatch):
++    """The page fails, so the ops are retried one at a time: the healthy card is restored, the bad one waits."""
++    bad, _bad_run = _board_card_with_run(live, kanban_home, svc)
++    good, good_run = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        bad_phantom = _contaminate(replica, bad)
++        _contaminate(replica, good)
++        real = sync.apply_remote_changes
++
++        def refusing(conn, changes, **kwargs):
++            if any(ch.uid == bad for ch in changes):
++                raise sqlite3.IntegrityError("CHECK constraint failed")
++            return real(conn, changes, **kwargs)
++
++        monkeypatch.setattr(sync, "apply_remote_changes", refusing)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, good) == good_run
++        assert {r[0] for r in replica.execute("SELECT row_uid FROM kanban_sync_outbox")} == {bad, bad_phantom}
++    finally:
++        replica.close()
++
++
++def test_the_feed_pull_runs_after_a_failed_undo(live, kanban_home, svc, monkeypatch):
++    """The discard runs first in every pull: its failure must not stop the feed page after it."""
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        _contaminate(replica, tid)
++
++        def broken(*_a, **_k):
++            raise ValueError("evidence reply is not a row")
++
++        monkeypatch.setattr(pending, "_undo", broken)
++        live.execute("UPDATE tasks SET title = 'after the undo failed' WHERE id = ?", (tid,))
++        live.commit()
++        client.sync_board(fixtures.BOARD, kanban_home / "kanban.db", svc.hub(fixtures.ME), fixtures.ME)
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        assert replica.execute("SELECT title FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == "after the undo failed"
++        assert replica.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] == 2  # kept for later
++    finally:
++        replica.close()
++
++
++def test_a_malformed_board_row_leaves_the_feed_and_the_other_ops_alone(live, kanban_home, svc):
++    """Building the restore page is part of the guarded undo: a Board row it cannot read fails only its own op."""
++    bad, _bad_run = _board_card_with_run(live, kanban_home, svc)
++    good, good_run = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        _contaminate(replica, bad)
++        _contaminate(replica, good)
++
++        class Malformed:
++            def __init__(self, hub):
++                self.hub = hub
++
++            def row_evidence(self, board, table, uid):
++                if (table, uid) == ("tasks", bad):
++                    return {"state": "live", "row": {"title": "no uid"}}  # _row_change needs row["uid"]
++                return self.hub.row_evidence(board, table, uid)
++
++            def __getattr__(self, name):
++                return getattr(self.hub, name)
++
++        assert pending.discard_replica_writes(replica, Malformed(svc.hub(fixtures.ME)), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, good) == good_run
++        bad_phantom = replica.execute("SELECT row_uid FROM kanban_sync_outbox WHERE table_name = 'task_runs'"
++                                      ).fetchone()[0]
++        assert {r[0] for r in replica.execute("SELECT row_uid FROM kanban_sync_outbox")} == {bad, bad_phantom}
++    finally:
++        replica.close()
++
++
++def test_a_card_whose_undo_keeps_failing_stays_on_its_stray_run_unmasked(live, kanban_home, svc, monkeypatch):
++    """A failed undo leaves its ops ``discarding`` and the card exactly as stray as before: still on its phantom run
++    (never on no run at all) and no longer masked, so the Board's next version or divergence repair can restore it,
++    the step the earlier mask stopped. The next successful round heals it."""
++    tid, run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        phantom = _contaminate(replica, tid)
++
++        def failing(*_a, **_k):
++            raise sqlite3.OperationalError("disk I/O error")
++
++        real = sync.apply_remote_changes
++        monkeypatch.setattr(sync, "apply_remote_changes", failing)
++        for _ in range(2):
++            assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 0
++        assert {r[0] for r in replica.execute("SELECT state FROM kanban_sync_outbox")} == {"discarding"}
++        assert pending.pending_task_fields(replica) == {}
++        assert _current_run_uid(replica, tid) == phantom
++        monkeypatch.setattr(sync, "apply_remote_changes", real)
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, tid) == run_uid
++    finally:
++        replica.close()
++
++
++def test_a_board_reply_that_is_not_an_object_is_a_failed_read(live, kanban_home, svc):
++    """It holds back only the ops naming that row, like any failed read; the rest resolve."""
++    bad, _bad_run = _board_card_with_run(live, kanban_home, svc)
++    good, good_run = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        client.pull(replica, svc.hub(fixtures.ME), fixtures.BOARD, observers=False)
++        bad_phantom = _contaminate(replica, bad)
++        _contaminate(replica, good)
++        hub = svc.hub(fixtures.ME)
++
++        class NotAnObject:
++            def row_evidence(self, board, table, uid):
++                return None if (table, uid) == ("tasks", bad) else hub.row_evidence(board, table, uid)
++
++            def __getattr__(self, name):
++                return getattr(hub, name)
++
++        assert pending.discard_replica_writes(replica, NotAnObject(), fixtures.BOARD) == 2
++        assert _current_run_uid(replica, good) == good_run
++        assert {r[0] for r in replica.execute("SELECT row_uid FROM kanban_sync_outbox")} == {bad, bad_phantom}
++        assert [r[0] for r in replica.execute("SELECT state FROM kanban_sync_outbox")] == ["pending", "pending"]
++    finally:
++        replica.close()
++
++
++def test_a_withheld_op_a_failed_page_marked_goes_back_to_pending(live, kanban_home, svc, monkeypatch):
++    """Withheld, it waits as it was: masking as before, not unmasked by a page attempt that failed earlier."""
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    tid, _run_uid = _board_card_with_run(live, kanban_home, svc)
++    replica = client.open_shadow(fixtures.BOARD, fixtures.ME)
++    try:
++        _contaminate(replica, tid)
++        replica.execute("UPDATE kanban_sync_outbox SET state = 'discarding'")
++        replica.commit()
++        monkeypatch.setattr(quarantine, "certified_page", lambda *_a: [])
++        assert pending.discard_replica_writes(replica, svc.hub(fixtures.ME), fixtures.BOARD) == 0
++        assert [r[0] for r in replica.execute("SELECT state FROM kanban_sync_outbox")] == ["pending", "pending"]
++    finally:
++        replica.close()
+-- 
+2.43.0
+

@@ -1,0 +1,130 @@
+From 7726b5ccebc031a9d17d654d3ed0e4366794c1ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:42:12 +0000
+Subject: [PATCH 6439] Local answer recovery and authority contract tests
+
+Public mirror of source commit 7726b5ccebc031a9d17d654d3ed0e4366794c1ad.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_selfwork_local_guards.py b/tests/hermes_cli/test_kanban_selfwork_local_guards.py
+new file mode 100644
+index 00000000000..4f939282d33
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_local_guards.py
+@@ -0,0 +1,113 @@
++"""Discriminating local authority refusal tests with disposable source stores."""
++import copy
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_selfwork_exception as sx
++from hermes_cli import kanban_selfwork_local as local
++from hermes_cli import kanban_selfwork_local_source as source
++from tests.hermes_cli import test_kanban_selfwork_local as h
++
++world = h.world
++nochat_envelope = h.nochat_envelope
++request_envelope = h.request_envelope
++home = h.home
++operation = h.operation
++
++
++@pytest.mark.parametrize('guard', ['kanban_spend_decision.pending', 'kanban_refusal_receipt.restricted'])
++@pytest.mark.parametrize('consumption', [False, True])
++def test_independent_hold_blocks_issuance_and_consumption(home, operation, monkeypatch, guard, consumption):
++    if consumption:
++        h.recover(home)
++    monkeypatch.setattr('hermes_cli.' + guard, lambda *a: True)
++    if consumption:
++        with kbc.connect_closing() as conn:
++            grant = local.recorded(conn, operation['snapshot']['ask'][sx.STAMP]['offer_uid'])
++            with pytest.raises(sx.Refused, match='held_or_closed'):
++                local.validate(conn, grant, now=int(local.time.time()))
++        assert h.helpers.reconsider(home).get('created') is not True
++    else:
++        with pytest.raises(sx.Refused, match='held_or_closed'):
++            h.recover(home)
++    with kbc.connect_closing() as conn:
++        assert sx._own(conn, sx.SPENT) == []
++        assert len(sx._own(conn, local.RECOVERED)) == int(consumption)
++
++
++@pytest.mark.parametrize('field', ['retired', 'executionAuthorized'])
++def test_source_authority_constraints(home, operation, field):
++    op = copy.deepcopy(operation['op'])
++    if field == 'retired':
++        op['retired'] = True
++    else:
++        op['intent']['executionAuthorized'] = True
++        # Keep the adjacent fingerprint check valid so it cannot mask this guard.
++        op['receipt']['fingerprint'] = source.digest([op['intent'], op['decision']])
++    with sqlite3.connect(operation['path']) as conn:
++        conn.execute('UPDATE operations SET body=?', (json.dumps(op),))
++    original_bytes = operation['path'].read_bytes()
++    with pytest.raises(sx.Refused):
++        with source.custody(op['operationId'], delivered=True):
++            pass
++    assert operation['path'].read_bytes() == original_bytes
++    with kbc.connect_closing() as conn:
++        assert sx._own(conn, local.RECOVERED) == []
++
++
++def test_recovery_rejects_otherwise_valid_alternate_operation(home, operation):
++    alternate = '11111111-2222-4333-8444-555555555555'
++    op = copy.deepcopy(operation['op'])
++    old = op['operationId']
++    op['operationId'] = alternate
++    op['receipt']['operationId'] = alternate
++    with sqlite3.connect(operation['path']) as conn:
++        conn.execute('UPDATE operations SET id=?,body=?', (alternate, json.dumps(op)))
++        row = conn.execute('SELECT resolution FROM requests').fetchone()
++        resolution = json.loads(row[0])
++        resolution['operationId'] = alternate
++        conn.execute('UPDATE requests SET resolution=?', (json.dumps(resolution),))
++    with kbc.connect_closing() as conn, h.kb.write_txn(conn):
++        rows = conn.execute('SELECT id,payload FROM task_events WHERE task_id=?', (home['task'],)).fetchall()
++        for row in rows:
++            if old in (row['payload'] or ''):
++                conn.execute('UPDATE task_events SET payload=? WHERE id=?',
++                             (row['payload'].replace(old, alternate), row['id']))
++        conn.execute('UPDATE task_comments SET body=replace(body,?,?) WHERE task_id=?', (old, alternate, home['task']))
++    # Prove source and historical unblock remain valid independently of exact-ID policy.
++    with source.custody(alternate, delivered=True) as evidence, kbc.connect_closing() as conn:
++        local.eligible(conn, evidence)
++        local._prior_unblock(conn, evidence)
++        with pytest.raises(sx.Refused, match='local_recovery_operation_mismatch'):
++            local.recover(conn, home['hub'], alternate)
++        assert sx._own(conn, local.RECOVERED) == []
++
++
++@pytest.mark.parametrize('stale', [False, True])
++def test_pending_delivery_generation_cas_with_unchanged_ask(home, operation, stale):
++    op = copy.deepcopy(operation['op'])
++    op['dispatchState'] = 'pending'
++    with sqlite3.connect(operation['path']) as conn:
++        conn.execute('UPDATE operations SET body=?', (json.dumps(op),))
++    with source.custody(op['operationId']) as evidence, kbc.connect_closing() as conn:
++        with h.kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='blocked',human_request=? WHERE id=?",
++                         (json.dumps(evidence['snapshot']['ask']), home['task']))
++            h.kb._append_event(conn, home['task'], 'blocked', {})
++        evidence['snapshot']['generation'] = conn.execute(
++            'SELECT MAX(id) FROM task_events WHERE task_id=?', (home['task'],)).fetchone()[0]
++        if stale:
++            with h.kb.write_txn(conn):
++                h.kb._append_event(conn, home['task'], 'blocked', {})
++        before = conn.execute('SELECT COUNT(*) FROM task_events WHERE task_id=?', (home['task'],)).fetchone()[0]
++        if stale:
++            with pytest.raises(sx.Refused, match='local_ask_changed'):
++                local._deliver(conn, evidence)
++            assert conn.execute('SELECT COUNT(*) FROM task_events WHERE task_id=?', (home['task'],)).fetchone()[0] == before
++            assert h.kb.get_task(conn, home['task']).status == 'blocked'
++        else:
++            assert local._deliver(conn, evidence) == evidence['receipt']
++            assert h.kb.get_task(conn, home['task']).status == 'ready'
+-- 
+2.43.0
+

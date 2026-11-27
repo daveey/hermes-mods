@@ -1,0 +1,366 @@
+From c60b1a7c2b186318936e9e75b65049ec1cc09c7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 05:38:53 +0000
+Subject: [PATCH 6072] Desktop startup-timeout recovery and gateway-drain retry
+
+Public mirror of source commit c60b1a7c2b186318936e9e75b65049ec1cc09c7d.
+
+---
+diff --git a/apps/desktop/src/api/session-write-reconnect.test.ts b/apps/desktop/src/api/session-write-reconnect.test.ts
+index 95d6c8e18d0..58e154f0bf8 100644
+--- a/apps/desktop/src/api/session-write-reconnect.test.ts
++++ b/apps/desktop/src/api/session-write-reconnect.test.ts
+@@ -1,6 +1,11 @@
+ import { describe, expect, it, vi } from 'vitest'
+ 
+-import { isReconnectableSessionWriteError, withSessionWriteReconnect } from './session-write-reconnect'
++import {
++  isOwnerRestartingSessionWriteError,
++  isReconnectableSessionWriteError,
++  NonReplayableSessionWriteError,
++  withSessionWriteReconnect
++} from './session-write-reconnect'
+ 
+ // The failures the MacBook logged for hub session PATCHes on 2026-11-12 (desktop.log, conn=hermes-hub).
+ const HUB_FAILURES = [
+@@ -133,3 +138,74 @@
+     expect(log.mock.calls.at(-1)?.[0]).toMatch(/failed on attempt 4/)
+   })
+ })
++
++// Representative observation: an archive during a planned hub restart must be retried.
++const DRAINING = '503: {"detail":"owner_unavailable: draining: the gateway that owns this profile is restarting; nothing was changed, retry"}'
++const DRAINING_OLD = '503: {"detail":"owner_unavailable: draining: Exclusive maintenance refused: Gateway runtime already owns profile /home/me/.hermes. Drain and stop the gateway, then retry."}'
++const STARTING = '503: {"detail":"owner_unavailable: starting: the gateway that owns this profile is starting; nothing was changed, retry"}'
++
++describe('a gateway restart answered by the owner', () => {
++  it.each([DRAINING, DRAINING_OLD, STARTING])('is replayed: %s', message => {
++    expect(isOwnerRestartingSessionWriteError(new Error(message))).toBe(true)
++  })
++
++  it.each([DEFINITIVE[0], '503: {"detail":"owner_unavailable: update_paused: Exclusive maintenance refused"}', '503: {"detail":"owner_unreachable"}'])(
++    'leaves every other owner answer to the user: %s', message => {
++      expect(isOwnerRestartingSessionWriteError(new Error(message))).toBe(false)
++    })
++
++  it('never replays a legacy write without identity', () => {
++    expect(isOwnerRestartingSessionWriteError(new NonReplayableSessionWriteError(DRAINING))).toBe(false)
++  })
++
++  it('rides out a whole drain + start past the transport window and lands the write', async () => {
++    const c = clock()
++    const log = vi.fn()
++    const drain = new Error(DRAINING)
++    const start = new Error(STARTING)
++    let calls = 0
++
++    // Each answer arrives after the backend's own ~24 s wait; the owner is ready on the fourth send.
++    const run = vi.fn(async () => {
++      calls += 1
++      c.advance(24_000)
++
++      if (calls === 1 || calls === 2) {
++        throw drain
++      }
++
++      if (calls === 3) {
++        throw start
++      }
++
++      return { ok: true }
++    })
++
++    await expect(withSessionWriteReconnect(run, { label: 'PATCH s', log, now: c.now, sleep: c.sleep }))
++      .resolves.toEqual({ ok: true })
++    expect(run).toHaveBeenCalledTimes(4)
++    expect(c.now()).toBeGreaterThan(60_000)
++    expect(log.mock.calls.some(([line]) => /hit a gateway restart/.test(line))).toBe(true)
++    expect(log.mock.calls.at(-1)?.[0]).toMatch(/landed on attempt 4/)
++  })
++
++  it('gives up once the restart window is spent', async () => {
++    const c = clock()
++    const drain = new Error(DRAINING)
++
++    const sends: number[] = []
++
++    const run = vi.fn(async () => {
++      sends.push(c.now())
++      c.advance(24_000)
++      throw drain
++    })
++
++    await expect(withSessionWriteReconnect(run, {
++      label: 'PATCH s', ownerRestartBudgetMs: 100_000, log: vi.fn(), now: c.now, sleep: c.sleep
++    })).rejects.toBe(drain)
++    // No replay starts once the window is spent; the last answer may land just after it.
++    expect(sends.length).toBeGreaterThan(2)
++    expect(Math.max(...sends)).toBeLessThanOrEqual(100_000)
++  })
++})
+diff --git a/apps/desktop/src/api/session-write-reconnect.ts b/apps/desktop/src/api/session-write-reconnect.ts
+index 818f67a9f39..fba489edf84 100644
+--- a/apps/desktop/src/api/session-write-reconnect.ts
++++ b/apps/desktop/src/api/session-write-reconnect.ts
+@@ -17,10 +17,17 @@
+  * renderer never reached the owner, or lost its reply) is retried here with backoff for a bounded
+  * window, and only a write that still fails after it reaches the caller (archive then restores the
+  * row and offers Retry). A backend verdict is never retried here: a definitive refusal (conflict,
+- * not found, permission, client upgrade) ends the write, and a 503 owner_unavailable already rode
+- * out the owner's stall server-side before answering, so it goes to the user's Retry.
++ * not found, permission, client upgrade) ends the write, and a 503 owner_unavailable control_timeout
++ * already rode out the owner's stall server-side before answering, so it goes to the user's Retry.
++ *
++ * The exception is a 503 saying the owner is restarting (`owner_unavailable: starting|draining`):
++ * the backend waits each phase out for at most ~24 s inside the 30 s request deadline, but a whole
++ * restart may outlast either phase budget, causing an archive during
++ draining to fail. Nothing was written, so it is replayed with
++ * the same identity for up to `SESSION_WRITE_OWNER_RESTART_BUDGET_MS`.
+  */
+ export const SESSION_WRITE_RECONNECT_BUDGET_MS = 60_000
++export const SESSION_WRITE_OWNER_RESTART_BUDGET_MS = 150_000
+ const FIRST_DELAY_MS = 1_000
+ const MAX_DELAY_MS = 10_000
+ 
+@@ -30,6 +37,15 @@
+ const RECONNECTABLE =
+   /socket hang up|\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|EHOSTDOWN|ETIMEDOUT)\b|Remote backend "[^"]*" is down|Timed out connecting to Hermes backend|Passive read: no warm backend/i
+ 
++const OWNER_RESTARTING = /\bowner_unavailable: (?:starting|draining): /
++
++/** A backend answer that the owning gateway is mid-restart: nothing was written, only time is needed. */
++export function isOwnerRestartingSessionWriteError(error: unknown): boolean {
++  const message = error instanceof Error ? error.message : String(error)
++
++  return !(error instanceof NonReplayableSessionWriteError) && OWNER_RESTARTING.test(message)
++}
++
+ /** True for a failure that says nothing about the write itself: the route to its owner was down. */
+ export function isReconnectableSessionWriteError(error: unknown): boolean {
+   const message = error instanceof Error ? error.message : String(error)
+@@ -53,6 +69,8 @@
+   /** Short label for the log line, e.g. `PATCH 20261112_055658_bb1bdd`. */
+   label: string
+   budgetMs?: number
++  /** The window once the owner answered that it is restarting (starting/draining). */
++  ownerRestartBudgetMs?: number
+   now?: () => number
+   sleep?: (ms: number) => Promise<void>
+   log?: (line: string) => void
+@@ -71,7 +89,8 @@
+   run: (remainingMs: number) => Promise<T>,
+   options: SessionWriteReconnectOptions
+ ): Promise<T> {
+-  const { label, budgetMs = SESSION_WRITE_RECONNECT_BUDGET_MS, now = Date.now, log = desktopLog } = options
++  const { label, now = Date.now, log = desktopLog } = options
++  let budgetMs = options.budgetMs ?? SESSION_WRITE_RECONNECT_BUDGET_MS
+   const sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
+   const started = now()
+   let delay = FIRST_DELAY_MS
+@@ -94,9 +113,16 @@
+       lastError = error
+       const wait = Math.max(delay, gateRetryHintMs(error))
+       const reason = (error instanceof Error ? error.message : String(error)).slice(0, 160)
++      const restarting = isOwnerRestartingSessionWriteError(error)
++
++      if (restarting) {
++        budgetMs = Math.max(budgetMs, options.ownerRestartBudgetMs ?? SESSION_WRITE_OWNER_RESTART_BUDGET_MS)
++      }
++
++      const replayable = restarting || isReconnectableSessionWriteError(error)
+ 
+-      if (!isReconnectableSessionWriteError(error) || now() - started + wait > budgetMs) {
+-        if (attempt > 1 || isReconnectableSessionWriteError(error)) {
++      if (!replayable || now() - started + wait > budgetMs) {
++        if (attempt > 1 || replayable) {
+           log(`[session-write] ${label} failed on attempt ${attempt} after ${now() - started} ms: ${reason}`)
+         }
+ 
+@@ -104,7 +130,7 @@
+       }
+ 
+       log(
+-        `[session-write] ${label} attempt ${attempt} hit a reconnect (${reason}); replaying the same intent in ${wait} ms`
++        `[session-write] ${label} attempt ${attempt} hit a ${restarting ? 'gateway restart' : 'reconnect'} (${reason}); replaying the same intent in ${wait} ms`
+       )
+       await sleep(wait)
+       delay = Math.min(delay * 2, MAX_DELAY_MS)
+diff --git a/hermes_cli/session_owner_discovery.py b/hermes_cli/session_owner_discovery.py
+index 49e89ba4853..df26a3d2eb4 100644
+--- a/hermes_cli/session_owner_discovery.py
++++ b/hermes_cli/session_owner_discovery.py
+@@ -17,6 +17,13 @@
+ after a restart). ``starting`` is re-read on its own longer budget, which also covers a missed
+ identify deadline while the starting gateway's loop is busy.
+ 
++``draining`` without an endpoint is the other half of the same restart: the outgoing gateway
++still holds the lock while it drains (an archive 10 s into a 30 s drain answered
++"owner_unavailable: draining: ... Drain and stop the gateway, then retry" at once). It is waited
++out on the same budget: the drain ends in ``absent`` (the offline path), ``starting`` or
++``ready``. A drain still running at the deadline answers ``DRAINING_DETAIL``. An update's
++``update_paused`` fence is not this: it stays final on its first read.
++
+ Every other verdict is final on its first read: ``absent`` keeps the offline path, and refusals
+ about authorization, protocol, permissions or profile identity are never retried. Discovery never
+ starts a gateway, and the mutation itself is never retried here: the caller sends it at most
+@@ -66,6 +73,25 @@
+                    "nothing was changed, retry")
+ 
+ 
++# The same for a gateway still draining (a restart or stop in progress) when the budget ran out.
++DRAINING_DETAIL = ("owner_unavailable: draining: the gateway that owns this profile is restarting; "
++                   "nothing was changed, retry")
++
++
++def is_draining(discovery) -> bool:
++    """An outgoing gateway that still holds the profile while it drains: no endpoint to forward to.
++
++    Only a plain drain (a stop or restart, no reason) or its idle exit: an ``update_paused`` fence
++    can last minutes and keeps its own lock remedy, final on its first read."""
++    return (getattr(discovery, "endpoint", None) is None and getattr(discovery, "state", None) == "draining"
++            and getattr(discovery, "reason_code", None) in (None, "idle_exit"))
++
++
++def _settling(discovery) -> bool:
++    """A restart in progress (draining out or starting up): only needs time."""
++    return is_starting(discovery) or is_draining(discovery)
++
++
+ def is_starting(discovery) -> bool:
+     """A gateway that holds the profile but has not published READY: no endpoint yet."""
+     return getattr(discovery, "endpoint", None) is None and getattr(discovery, "state", None) == "starting"
+@@ -83,6 +109,8 @@
+         return CONTROL_TIMEOUT_DETAIL
+     if is_starting(discovery):
+         return STARTING_DETAIL
++    if is_draining(discovery):
++        return DRAINING_DETAIL
+     reason = discovery.reason_code or discovery.state
+     return f"owner_unavailable: {reason}: {lock_detail}"
+ 
+@@ -139,8 +167,8 @@
+     stretch the write past its budget; an abandoned read ends on its own socket timeout and is
+     treated as another ``control_timeout``.
+ 
+-    Until a read says ``starting`` the budget is ``OWNER_DISCOVERY_BUDGET_S`` and at most
+-    ``OWNER_DISCOVERY_ATTEMPTS`` reads. The first ``starting`` moves the deadline to
++    Until a read says ``starting`` or ``draining`` the budget is ``OWNER_DISCOVERY_BUDGET_S`` and at most
++    ``OWNER_DISCOVERY_ATTEMPTS`` reads. The first of those moves the deadline to
+     ``OWNER_STARTING_BUDGET_S`` after the first read began and lifts the read cap: from then on
+     both transient verdicts are re-read until another verdict or that deadline.
+ 
+@@ -150,7 +178,7 @@
+     deadline = began + OWNER_DISCOVERY_BUDGET_S
+     discovery, starting, attempt, last = None, False, 0, None
+     while starting or attempt < OWNER_DISCOVERY_ATTEMPTS:
+-        pause = OWNER_STARTING_POLL_S if is_starting(discovery) else OWNER_DISCOVERY_BACKOFF_S
++        pause = OWNER_STARTING_POLL_S if _settling(discovery) else OWNER_DISCOVERY_BACKOFF_S
+         remaining = deadline - clock()
+         if attempt and remaining < pause + _MIN_ATTEMPT_S:
+             break
+@@ -165,7 +193,7 @@
+             discovery = await asyncio.wait_for(asyncio.shield(read.verdict), timeout=remaining)
+         except TimeoutError:
+             discovery = _timed_out()
+-        if is_starting(discovery):
++        if _settling(discovery):
+             if not starting:
+                 starting, deadline = True, began + OWNER_STARTING_BUDGET_S
+         elif not is_transient(discovery):
+diff --git a/tests/hermes_cli/test_session_owner_discovery_draining.py b/tests/hermes_cli/test_session_owner_discovery_draining.py
+new file mode 100644
+index 00000000000..080fd6130e0
+--- /dev/null
++++ b/tests/hermes_cli/test_session_owner_discovery_draining.py
+@@ -0,0 +1,88 @@
++"""A session write rides out the outgoing half of a gateway restart: a plain ``draining`` owner.
++
++A Desktop archive sent 10 s into a planned gateway restart (systemd stop at
++T+0, 30 s drain, new gateway READY about a minute later) came back at once as a 503
++``owner_unavailable: draining: Exclusive maintenance refused: Gateway runtime already owns profile
++... Drain and stop the gateway, then retry``. Discovery waited out ``starting`` but treated the
++drain before it as final. A plain drain (no reason, or its idle exit) is now waited out on the
++same budget; an update's ``update_paused`` fence stays final (its own tests are unchanged).
++"""
++from types import SimpleNamespace
++
++import pytest
++from fastapi import HTTPException
++
++from hermes_cli import session_owner_discovery as sod
++from hermes_cli.gateway_runtime import GatewayDiscovery
++from tests.hermes_cli.test_session_owner_discovery_retry import _Clock, _reads, _standalone_request
++from tests.hermes_cli.test_session_owner_discovery_starting import _fast_poll, _held
++
++DRAINING = GatewayDiscovery('draining')
++STARTING = GatewayDiscovery('starting')
++READY = SimpleNamespace(state='ready', endpoint='owner-endpoint', reason_code=None, detail=None)
++
++
++@pytest.mark.asyncio
++async def test_a_restart_is_waited_out_from_drain_through_start(tmp_path, monkeypatch):
++    clock = _Clock()
++    start = clock.now
++    seen = _reads(monkeypatch, [DRAINING] * 10 + [STARTING] * 10 + [READY], clock, cost=lambda _t: 0.01)
++    assert await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep) is READY
++    assert len(seen) == 21
++    assert clock.now - start < sod.OWNER_STARTING_BUDGET_S
++
++
++@pytest.mark.asyncio
++async def test_a_drain_that_ends_in_absent_takes_the_offline_path(tmp_path, monkeypatch):
++    clock = _Clock()
++    absent = GatewayDiscovery('absent')
++    seen = _reads(monkeypatch, [DRAINING, DRAINING, absent, READY], clock, cost=lambda _t: 0.01)
++    assert await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep) is absent
++    assert len(seen) == 3
++
++
++@pytest.mark.asyncio
++async def test_an_idle_exit_drain_is_waited_out_too(tmp_path, monkeypatch):
++    clock = _Clock()
++    idle = GatewayDiscovery('draining', reason_code='idle_exit')
++    seen = _reads(monkeypatch, [idle, idle, READY], clock, cost=lambda _t: 0.01)
++    assert await sod.discover_session_owner(tmp_path, clock=clock, sleep=clock.sleep) is READY
++    assert len(seen) == 3
++
++
++def test_only_a_plain_drain_without_an_endpoint_is_draining():
++    assert sod.is_draining(DRAINING) and sod.is_draining(GatewayDiscovery('draining', reason_code='idle_exit'))
++    assert not sod.is_draining(GatewayDiscovery('draining', reason_code='update_paused'))
++    assert not sod.is_draining(GatewayDiscovery('draining', reason_code='replaced'))
++    assert not sod.is_draining(SimpleNamespace(state='draining', endpoint='owner', reason_code=None))
++    assert not sod.is_draining(STARTING) and not sod.is_draining(GatewayDiscovery('absent'))
++
++
++def test_the_drain_detail_asks_for_a_retry_not_a_stop():
++    advice = 'Exclusive maintenance refused: held. Drain and stop the gateway, then retry.'
++    assert sod.owner_unavailable_detail(DRAINING, advice) == sod.DRAINING_DETAIL
++    assert sod.DRAINING_DETAIL.startswith('owner_unavailable: draining: ')
++    assert 'Drain' not in sod.DRAINING_DETAIL and 'stop' not in sod.DRAINING_DETAIL
++
++
++@pytest.mark.asyncio
++async def test_a_gateway_still_draining_past_the_budget_answers_retry_not_drain(tmp_path, monkeypatch):
++    """The draining gateway holds the lock: the offline write loses (never bypassed), nothing is
++    forwarded, and the 503 asks for a retry instead of telling the user to stop the gateway."""
++    from hermes_cli import web_server_sessions
++
++    _fast_poll(monkeypatch)
++    monkeypatch.setattr(sod, 'OWNER_STARTING_BUDGET_S', 0.3)
++    request = _standalone_request(monkeypatch, tmp_path)
++    seen = _reads(monkeypatch, [DRAINING])
++    attempts, connects = [], []
++    monkeypatch.setattr('hermes_cli.gateway_client.connect_gateway', lambda **kw: connects.append(kw))
++    with _held(attempts) as held:
++        monkeypatch.setattr('gateway.runtime_ownership.exclusive_maintenance', held)
++        with pytest.raises(HTTPException) as exc:
++            await web_server_sessions._mutate_session_request(
++                request, None, 's1', request_id='req-1', expected_revision=0,
++                operation='sidebar', payload={'archived': True})
++    assert exc.value.status_code == 503
++    assert exc.value.detail == sod.DRAINING_DETAIL
++    assert len(seen) > sod.OWNER_DISCOVERY_ATTEMPTS and len(attempts) == 1 and connects == []
+-- 
+2.43.0
+

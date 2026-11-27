@@ -1,0 +1,734 @@
+From cc52fe679201d86ca8c6a1ad58d779cf94cc718b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:36:01 +0000
+Subject: [PATCH 6208] Owning-chat stop-only control for ended shadow work
+
+Public mirror of source commit cc52fe679201d86ca8c6a1ad58d779cf94cc718b.
+
+---
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index ebe181a99c5..f04a09432e4 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -165,7 +165,16 @@
+ 
+ 
+ def restricted_since(conn, task_id: str) -> int | None:
+-    """Execution fencing: the earliest restriction a scope renewal does not cover. Safety is never covered."""
++    """Execution fencing: the earliest restriction a scope renewal does not cover. Safety is never covered.
++    An owning-chat administrative stop (``kanban_stop_ended``) is never covered either, and never moves the
++    accounting floor."""
++    from hermes_cli.kanban_stop_ended import stopped_at
++    admin = stopped_at(conn, task_id)
++    since = _restricted_since(conn, task_id)
++    return min(t for t in (admin, since) if t is not None) if (admin, since) != (None, None) else None
++
++
++def _restricted_since(conn, task_id: str) -> int | None:
+     import json
+     from hermes_cli import kanban_scope_renewal as renewal
+     renewed = renewal.covered(conn, task_id)
+diff --git a/hermes_cli/kanban_stop_context.py b/hermes_cli/kanban_stop_context.py
+new file mode 100644
+index 00000000000..b22f4edc568
+--- /dev/null
++++ b/hermes_cli/kanban_stop_context.py
+@@ -0,0 +1,114 @@
++"""Live owner token for the stop-only ``kanban_stop_ended`` control. [daveey]
++
++Plain session ContextVars and a non-None turn event are inherited by copied contexts, threads
++and subprocess environments, so they are not proof that the caller is the owning chat's live
++turn. This token is: the interactive turn runner binds one around its actual tool execution
++(:func:`bound`), every copied context shares the SAME mutable object, and closing it at turn
++end, replacement or cancellation invalidates every copy at once. Nothing exports it to the
++environment and no tool argument can mint one.
++
++Lock order is fixed: this token's lock (bounded), then the board's ``BEGIN IMMEDIATE``.
++Closing takes the same token lock, so a cancellation either lands before the commit (refused)
++or waits for it to finish; never the inverse order.
++"""
++from __future__ import annotations
++
++import itertools
++import os
++import re
++import threading
++from contextlib import contextmanager
++from contextvars import ContextVar
++
++from hermes_cli.kanban_stop_ended import StopRefused
++
++INTERACTIVE_SOURCES = frozenset({'desktop', 'cli', 'tui', 'acp', 'gui'})
++_ROUTING = ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_DELEGATED_CHILD_CONTEXT', 'HERMES_CRON_SESSION')
++LOCK_TIMEOUT_S = 5.0
++_GENERATION = itertools.count(1)
++_CURRENT: ContextVar['OwnerToken | None'] = ContextVar('hermes_stop_only_owner_token', default=None)
++
++
++def _session_source(session_id: str):
++    from hermes_constants import get_hermes_home
++    from hermes_cli.kanban_session_provenance import _read_sources
++    sources, readable = _read_sources(str(get_hermes_home() / 'state.db'), [session_id])
++    return sources.get(session_id) if readable else None
++
++
++def _routing_context() -> bool:
++    from gateway.session_context import get_session_env
++    return any(os.environ.get(k) or get_session_env(k, '') for k in _ROUTING)
++
++
++class OwnerToken:
++    """One interactive turn's stop-only authority. Mutable, shared by copies, closes permanently."""
++
++    def __init__(self, session_id: str, gateway: str, profile: str, *, source_reader=_session_source):
++        self.session_id, self.gateway, self.profile = session_id, gateway, profile or 'default'
++        self.generation = next(_GENERATION)
++        self._lock = threading.Lock()
++        self._open = True
++        self._source_reader = source_reader
++
++    @property
++    def open(self) -> bool:
++        return self._open
++
++    def close(self) -> None:
++        with self._lock:  # waits for an in-flight commit; afterwards every copy refuses
++            self._open = False
++
++    def identity(self) -> dict:
++        return {'gateway': self.gateway, 'profile': self.profile, 'session': self.session_id,
++                'generation': self.generation}
++
++    @contextmanager
++    def held(self):
++        if not self._lock.acquire(timeout=LOCK_TIMEOUT_S):
++            raise StopRefused('stop_ended_owner_busy', 'owner token busy; retry the same request')
++        try:
++            if not self._open or _CURRENT.get() is not self:
++                raise StopRefused('stop_ended_owner_required', 'owner token closed or not this execution\'s token')
++            if _routing_context():
++                raise StopRefused('stop_ended_owner_required', 'machine, cron, Kanban or delegated context')
++            # Fresh, positive provenance at commit time, not a cached classification.
++            if self._source_reader(self.session_id) not in INTERACTIVE_SOURCES:
++                raise StopRefused('stop_ended_owner_required', 'session is not a local interactive chat')
++            yield {k: v for k, v in self.identity().items() if k != 'generation'}
++        finally:
++            self._lock.release()
++
++    def verify_link(self, conn, task_id: str, who: dict) -> None:
++        """Inside the write transaction: exactly this chat holds the card's unreleased ``created`` link."""
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++            raise StopRefused('stop_ended_owner_required', 'board has no chat ownership links')
++        owners = {(r['chat_gateway'], r['chat_profile'] or 'default', r['chat_session']) for r in conn.execute(
++            "SELECT chat_gateway,chat_profile,chat_session FROM task_chat_links "
++            "WHERE task_id=? AND kind='created' AND released=0", (task_id,))}
++        if owners != {(who['gateway'], who['profile'], who['session'])}:
++            raise StopRefused('stop_ended_owner_required',
++                              'caller is not the single unreleased owning chat of this card')
++
++
++def current() -> OwnerToken:
++    token = _CURRENT.get()
++    if token is None or not token.open:
++        raise StopRefused('stop_ended_owner_required', 'no live owning-chat turn is bound to this execution')
++    return token
++
++
++@contextmanager
++def bound(session_id: str, *, gateway: str, profile: str, source: str, source_reader=_session_source):
++    """Bind around one interactive turn's tool execution; closes permanently on exit (any exit)."""
++    token = None
++    if (source in INTERACTIVE_SOURCES and isinstance(session_id, str)
++            and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', session_id) and gateway):
++        token = OwnerToken(session_id, gateway, profile, source_reader=source_reader)
++    reset = _CURRENT.set(token)
++    try:
++        yield token
++    finally:
++        if token is not None:
++            token.close()
++        _CURRENT.reset(reset)
+diff --git a/hermes_cli/kanban_stop_ended.py b/hermes_cli/kanban_stop_ended.py
+new file mode 100644
+index 00000000000..54dfe319d70
+--- /dev/null
++++ b/hermes_cli/kanban_stop_ended.py
+@@ -0,0 +1,202 @@
++"""Owning-chat stop-only control for an ENDED card on a local-executing shadow board. [daveey]
++
++``kanban_retain`` stops only the caller's own admitted run and refuses a shadow board
++(``retain requires owning primary or genuinely local board``); ``kanban_protect_stopped``
++needs a provider-refusal source and an admitted administrative requester. Neither can stop a
++private shadow-board card whose run already ended (shadow-tools M5). This module is that
++control, and nothing more:
++
++- stop only: the card goes to ``triage`` with a genuine ``administrative_stop_restricted``
++  event; no run, lease, decision/spend/failure/safety episode is created; nothing is released;
++- local shadow only: the receipt says ``LOCAL-SHADOW-ONLY`` / ``canonical_protected=false``.
++  The event reaches the Board through the board's ordinary ordered outbox, and only after the
++  Board advertises ``admin_stop_ingress: 1`` (hermes-hub ``admin_stop_ingress.ts``), whose
++  barrier refuses every lease and every foreign write to the held card;
++- owner only: the caller must be the card's current owning interactive chat on this gateway,
++  proven by a live stop-only token (:mod:`hermes_cli.kanban_stop_context`) plus an exact
++  unreleased ``created`` chat link; identity arguments, environment, machine, cron, Kanban
++  worker and delegated contexts are refused before any write;
++- snapshot/apply CAS: without ``expected_digest`` the call is a pure read; applying needs the
++  digest of exactly that snapshot, so a concurrent claim, run, link or event refuses it.
++
++Persistent SQL fences (:mod:`hermes_cli.kanban_stop_guards`) keep the stopped card, its runs,
++events and dependency edges frozen for every later writer on this file.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sqlite3
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++
++KIND = 'administrative_stop_restricted'
++STOPPABLE = ('scheduled', 'todo', 'ready', 'triage', 'blocked', 'review')
++CONFLICTING = ('decision_protected_stopped', KIND)
++MAX_DEADLINE = 14 * 86400
++
++
++class StopRefused(ValueError):
++    """A typed refusal; nothing was written."""
++
++    def __init__(self, code: str, why: str):
++        self.code = code
++        super().__init__(f'{code}: {why}')
++
++
++def canonical(value) -> str:
++    return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False, ensure_ascii=False)
++
++
++def _mode_guard(conn):
++    """Registered AND durable shadow; primary/off keep their own paths (``kanban_retain``)."""
++    state = sync.sync_state(conn)
++    if sync.board_mode(conn) != 'shadow' or not state or state.get('mode') != 'shadow':
++        raise StopRefused('stop_ended_requires_shadow', 'only a local-executing shadow board uses this control')
++    if not state.get('gateway_id') or not state.get('board_id'):
++        raise StopRefused('stop_ended_identity_unknown', 'shadow board has no enrolled board/gateway identity')
++    return state
++
++
++def _rows(conn, sql, args):
++    return [dict(r) for r in conn.execute(sql, args)]
++
++
++def snapshot(conn, task_id: str) -> dict:
++    """Canonical read-only state the CAS digest covers. ``tasks`` has no ``updated_at``; never use it."""
++    task = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if task is None:
++        raise StopRefused('stop_ended_task_missing', 'exact local task does not exist')
++    task = dict(task)
++    ended = conn.execute('SELECT uid,status,outcome,ended_at FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL '
++                         'ORDER BY ended_at DESC, id DESC LIMIT 1', (task_id,)).fetchone()
++    open_runs = conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=? AND ended_at IS NULL', (task_id,)).fetchone()[0]
++    links = {'incoming': sorted(r['parent_id'] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=?', (task_id,))),
++             'outgoing': sorted(r['child_id'] for r in conn.execute('SELECT child_id FROM task_links WHERE parent_id=?', (task_id,)))}
++    restrictions = sorted(r['uid'] or str(r['id']) for r in conn.execute(
++        'SELECT id,uid FROM task_events WHERE task_id=? AND kind IN '
++        "('decision_hold_restricted','spend_budget_triaged','decision_protected_stopped',?)", (task_id, KIND)))
++    return {
++        'version': 1, 'task_id': task_id, 'status': task['status'], 'current_run_id': task['current_run_id'],
++        'claim_lock': task.get('claim_lock'), 'claim_expires': task.get('claim_expires'),
++        'worker_pid': task.get('worker_pid'), 'created_on': task.get('created_on'),
++        'ended_run': dict(ended) if ended else None, 'open_runs': open_runs,
++        'max_event_id': conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?', (task_id,)).fetchone()[0],
++        'links': links, 'restrictions': restrictions,
++    }
++
++
++def digest(snap: dict) -> str:
++    return hashlib.sha256(canonical(snap).encode()).hexdigest()
++
++
++def _eligible(conn, state, snap):
++    if snap['created_on'] not in (None, '', state['gateway_id']):
++        raise StopRefused('stop_ended_foreign_card', 'card lives on another gateway; its home must stop it')
++    from hermes_cli.kanban_foreign_card import check as assert_local_card
++    assert_local_card(conn, snap['task_id'])
++    if (snap['status'] not in STOPPABLE or snap['current_run_id'] is not None or snap['claim_lock']
++            or snap['claim_expires'] or snap['worker_pid'] or snap['open_runs']):
++        raise StopRefused('stop_ended_target_active', 'target must be ended, unclaimed and non-terminal')
++    if not snap['ended_run'] or not snap['ended_run'].get('uid'):
++        raise StopRefused('stop_ended_no_ended_run', 'target has no ended run with a portable UID')
++    if conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind IN (?,?) LIMIT 1',
++                    (snap['task_id'], *CONFLICTING)).fetchone():
++        raise StopRefused('stop_ended_conflicting_hold', 'existing stop custody is kept, never merged or replaced')
++    from hermes_cli.kanban_containment_guard import pending
++    if pending(conn, snap['task_id']):
++        raise StopRefused('stop_ended_conflicting_hold', 'pending containment transport owns this card')
++
++
++def normalize(reason, evidence, escalate_at, now=None) -> dict:
++    now = int(time.time()) if now is None else now
++    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
++        raise StopRefused('stop_ended_invalid', 'reason must be 1..1000 characters')
++    if (not isinstance(evidence, list) or not 1 <= len(evidence) <= 8
++            or any(not isinstance(e, str) or not e.strip() or len(e) > 512 for e in evidence)):
++        raise StopRefused('stop_ended_invalid', 'evidence must be 1..8 strings of at most 512 characters')
++    if type(escalate_at) is not int or not now < escalate_at <= now + MAX_DEADLINE:
++        raise StopRefused('stop_ended_invalid', 'escalate_at must be a fixed future Unix time within 14 days')
++    return {'reason': reason, 'evidence': list(evidence), 'escalate_at': escalate_at}
++
++
++def request_uid(board: str, gateway: str, task_id: str, ended_run_uid: str) -> str:
++    return 'as-' + hashlib.sha256(canonical([board, gateway, task_id, ended_run_uid]).encode()).hexdigest()
++
++
++def _stored(conn, task_id):
++    row = conn.execute('SELECT id,uid,payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id LIMIT 1',
++                       (task_id, KIND)).fetchone()
++    return (row, json.loads(row['payload'])) if row else (None, None)
++
++
++def read(conn, *, board: str, task_id: str) -> dict:
++    """Pure read: snapshot + digest + any stored receipt. Writes nothing, reserves nothing."""
++    state = _mode_guard(conn)
++    snap = snapshot(conn, task_id)
++    row, payload = _stored(conn, task_id)
++    if row is not None:
++        return {'ok': True, 'mode': 'readback', 'receipt': payload['receipt'], 'event_uid': row['uid'],
++                'status': snap['status'], 'execution_restricted': True}
++    _eligible(conn, state, snap)
++    return {'ok': True, 'mode': 'snapshot', 'board': board, 'gateway': state['gateway_id'], 'task_id': task_id,
++            'expected_digest': digest(snap), 'snapshot': snap, 'writes': 0}
++
++
++def apply(conn, *, board: str, task_id: str, expected_digest: str, owner, capability, reason, evidence, escalate_at) -> dict:
++    """CAS-apply the stop. ``owner`` is a live :class:`kanban_stop_context.OwnerToken`; ``capability`` reads the
++    Board's ``admin_stop_ingress`` flag. Lock order: token lock, then BEGIN IMMEDIATE, never the reverse."""
++    frozen = normalize(reason, evidence, escalate_at)
++    if not isinstance(expected_digest, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_digest):
++        raise StopRefused('stop_ended_invalid', 'expected_digest must be the 64-hex snapshot digest')
++    state = _mode_guard(conn)
++    if state['board_id'] != board:
++        raise StopRefused('stop_ended_identity_unknown', 'board does not match the enrolled shadow board')
++    with owner.held() as who:
++        stored_row, stored = _stored(conn, task_id)
++        if stored is None and capability(board) != 1:
++            # Unknown/old Board: a published row would not be a hold there. Refuse, never claim coverage.
++            raise StopRefused('stop_ended_ingress_unsupported', 'Board does not advertise admin_stop_ingress: 1')
++        with kb.write_txn(conn):
++            owner.verify_link(conn, task_id, who)
++            stored_row, stored = _stored(conn, task_id)
++            if stored is not None:
++                request = stored['request']
++                if (request['expected_digest'], request['frozen'], request['owner']) != (expected_digest, frozen, who):
++                    raise StopRefused('stop_ended_conflict', 'card already stopped by a different frozen request')
++                return {**stored['receipt'], 'replayed': True}
++            snap = snapshot(conn, task_id)
++            _eligible(conn, state, snap)
++            if digest(snap) != expected_digest:
++                raise StopRefused('stop_ended_target_changed', 'snapshot changed since the digest was read')
++            uid = request_uid(board, state['gateway_id'], task_id, snap['ended_run']['uid'])
++            receipt = {
++                'version': 1, 'ok': True, 'request_uid': uid, 'board': board, 'gateway': state['gateway_id'],
++                'task_id': task_id, 'ended_run_uid': snap['ended_run']['uid'], 'digest': expected_digest,
++                'protection_scope': 'LOCAL-SHADOW-ONLY', 'canonical_protected': False,
++                'dependency_satisfied': False, 'incomplete': True, 'terminal_for_run': False,
++                'execution_authority': False, 'status': 'triage', 'escalate_at': frozen['escalate_at'],
++            }
++            kb._append_event(conn, task_id, KIND, {
++                'version': 1, 'protection_scope': 'LOCAL-SHADOW-ONLY', 'canonical_protected': False,
++                'dependency_satisfied': False, 'incomplete': True, 'terminal_for_run': False,
++                'request': {'request_uid': uid, 'expected_digest': expected_digest, 'frozen': frozen, 'owner': who},
++                'receipt': receipt})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
++            from hermes_cli.kanban_stop_guards import install
++            install(conn)
++            event_uid = conn.execute('SELECT uid FROM task_events WHERE task_id=? AND kind=?', (task_id, KIND)).fetchone()[0]
++            return {**receipt, 'event_uid': event_uid, 'replayed': False}
++
++
++def stopped_at(conn, task_id: str):
++    """Execution restriction time (feeds ``restricted_since``, never the accounting floor)."""
++    try:
++        row = conn.execute('SELECT MIN(COALESCE(created_at,0)) FROM task_events WHERE task_id=? AND kind=?',
++                           (task_id, KIND)).fetchone()
++    except sqlite3.OperationalError:  # schema-less connection; a real board always has task_events
++        return None
++    return row[0] if row else None
+diff --git a/hermes_cli/kanban_stop_guards.py b/hermes_cli/kanban_stop_guards.py
+new file mode 100644
+index 00000000000..b9e62148938
+--- /dev/null
++++ b/hermes_cli/kanban_stop_guards.py
+@@ -0,0 +1,80 @@
++"""Persistent SQL fences for ``administrative_stop_restricted`` cards. [daveey]
++
++Stored triggers protect every later writer on this file (reopened connections, older local
++code, maintenance) without changing sync selection. A stopped card stays ``triage`` with no
++run, claim or worker; it gets no new runs; its runs, evidence and dependency edges (either
++direction) are immutable; it cannot be deleted, archived, completed or REPLACEd. Unrelated
++cards are untouched: every predicate starts from the stopped card's own evidence row.
++The one allowance is the supported NULL -> uid bootstrap with every other column equal.
++"""
++from __future__ import annotations
++
++from hermes_cli.kanban_stop_ended import KIND
++
++VERSION = 1
++MARKER = 'kanban_stop_ended_guard'
++_STOPPED = f"SELECT task_id FROM task_events WHERE kind='{KIND}'"
++
++
++def _uid_only(table: str, columns: set[str]) -> str:
++    # The NULL -> uid bootstrap, or an exact no-op rewrite (a sync echo of this gateway's own row).
++    same = ' AND '.join(f'NEW.{c} IS OLD.{c}' for c in sorted(columns - {'uid'}))
++    return f'(({same}) AND (NEW.uid IS OLD.uid OR (OLD.uid IS NULL AND NEW.uid IS NOT NULL)))'
++
++
++def _columns(conn, table):
++    return {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
++
++
++def ddl(conn) -> dict[str, tuple[str, str]]:
++    task_cols, run_cols, event_cols = _columns(conn, 'tasks'), _columns(conn, 'task_runs'), _columns(conn, 'task_events')
++    pinned = ["NEW.status IS NOT 'triage'", 'NEW.current_run_id IS NOT NULL', 'NEW.claim_lock IS NOT NULL',
++              'NEW.claim_expires IS NOT NULL']
++    pinned += [f'NEW.{c} IS NOT NULL' for c in ('worker_pid', 'worker_started_at') if c in task_cols]
++    pinned += [f'NEW.{c} IS NOT OLD.{c}' for c in ('title', 'body', 'assignee', 'created_on', 'tenant') if c in task_cols]
++    runs_uid = _uid_only('task_runs', run_cols) if 'uid' in run_cols else '0'
++    events_uid = _uid_only('task_events', event_cols) if 'uid' in event_cols else '0'
++    links = f'OLD.parent_id IN ({_STOPPED}) OR OLD.child_id IN ({_STOPPED})'
++    new_links = f'NEW.parent_id IN ({_STOPPED}) OR NEW.child_id IN ({_STOPPED})'
++    evidence_replace = ('EXISTS (SELECT 1 FROM task_events o WHERE o.id=NEW.id AND o.task_id IN '
++                        f'({_STOPPED}))')
++    if 'uid' in event_cols:
++        evidence_replace = ('EXISTS (SELECT 1 FROM task_events o WHERE (o.id=NEW.id OR (NEW.uid IS NOT NULL AND o.uid=NEW.uid)) '
++                            f'AND o.task_id IN ({_STOPPED}))')
++    return {
++        'task_update': ('BEFORE UPDATE ON tasks', f"OLD.id IN ({_STOPPED}) AND ({' OR '.join(pinned)})"),
++        'task_delete': ('BEFORE DELETE ON tasks', f'OLD.id IN ({_STOPPED})'),
++        # INSERT OR REPLACE fires INSERT (not DELETE) triggers with recursive_triggers OFF.
++        'task_replace': ('BEFORE INSERT ON tasks', f'NEW.id IN ({_STOPPED})'),
++        'run_insert': ('BEFORE INSERT ON task_runs', f'NEW.task_id IN ({_STOPPED})'),
++        'run_update': ('BEFORE UPDATE ON task_runs', f'OLD.task_id IN ({_STOPPED}) AND NOT {runs_uid}'),
++        'run_delete': ('BEFORE DELETE ON task_runs', f'OLD.task_id IN ({_STOPPED})'),
++        'event_update': ('BEFORE UPDATE ON task_events', f'OLD.task_id IN ({_STOPPED}) AND NOT {events_uid}'),
++        'event_delete': ('BEFORE DELETE ON task_events', f'OLD.task_id IN ({_STOPPED})'),
++        'event_replace': ('BEFORE INSERT ON task_events', evidence_replace),
++        'link_insert': ('BEFORE INSERT ON task_links', new_links),
++        'link_update': ('BEFORE UPDATE ON task_links', f'{links} OR {new_links}'),
++        'link_delete': ('BEFORE DELETE ON task_links', links),
++    }
++
++
++def install(conn) -> None:
++    """Idempotent; runs inside the caller's write transaction, so no connection sees an unfenced gap."""
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {MARKER} (version INTEGER NOT NULL)')
++    conn.execute('CREATE INDEX IF NOT EXISTS idx_stop_ended_kind ON task_events(kind, task_id)')
++    for name, (when, predicate) in ddl(conn).items():
++        trigger = f'stop_ended_{name}'
++        sql = f"CREATE TRIGGER {trigger} {when} WHEN {predicate} BEGIN SELECT RAISE(ABORT,'administrative_stop_immutable'); END"
++        old = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trigger,)).fetchone()
++        if old and old[0] == sql:
++            continue
++        conn.execute(f'DROP TRIGGER IF EXISTS {trigger}')
++        conn.execute(sql)
++    if not conn.execute(f'SELECT 1 FROM {MARKER} WHERE version>=?', (VERSION,)).fetchone():
++        conn.execute(f'INSERT INTO {MARKER} (version) VALUES (?)', (VERSION,))
++
++
++def installed(conn) -> bool:
++    """Fail closed: a stopped card with a missing or partial fence set is reported unguarded."""
++    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'stop_ended_%'")}
++    return names >= {f'stop_ended_{n}' for n in ddl(conn)}
+diff --git a/tests/hermes_cli/test_kanban_stop_ended.py b/tests/hermes_cli/test_kanban_stop_ended.py
+new file mode 100644
+index 00000000000..6f8e9143caa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stop_ended.py
+@@ -0,0 +1,281 @@
++"""Owning-chat stop-only control for an ended card on a local-executing shadow board (shadow-tools M5 shape)."""
++from __future__ import annotations
++
++import contextvars
++import json
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_stop_context as ctx
++from hermes_cli import kanban_stop_ended as stop
++from hermes_cli import kanban_stop_guards as guards
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++ME, BOARD, SID = 'hub', 'shadow-tools', 'sess_owner_1'
++INTERACTIVE = staticmethod(lambda _sid: 'desktop')
++
++
++@pytest.fixture
++def shadow(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_routed_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, 'shadow')
++    try:
++        yield conn
++    finally:
++        sync.set_mode(conn, 'off')
++        conn.close()
++
++
++def _link(conn, task, session=SID, gateway=ME, released=0):
++    from hermes_cli.kanban_chat_links import link_uid
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++                     "VALUES (?,?,?,?,?,'created',?,unixepoch())",
++                     (link_uid(task, gateway, 'default', session, 'created'), task, gateway, 'default', session, released))
++
++
++def ended_card(conn):
++    """M5 shape: a source parent, an M6 child, one ended run, now scheduled and unclaimed."""
++    source = kb.create_task(conn, title='source', assignee='default')
++    target = kb.create_task(conn, title='M5', assignee='default', parents=[source])
++    child = kb.create_task(conn, title='M6', assignee='default', parents=[target])
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (target,))
++    assert kb.claim_task(conn, target, claimer='default')
++    kb._end_run(conn, target, outcome='crashed', status='crashed')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='scheduled',current_run_id=NULL,claim_lock=NULL,claim_expires=NULL,"
++                     "worker_pid=NULL WHERE id=?", (target,))
++    _link(conn, target)
++    return source, target, child
++
++
++def args(conn, target, **over):
++    snap = stop.read(conn, board=BOARD, task_id=target)
++    base = dict(board=BOARD, task_id=target, expected_digest=snap['expected_digest'], capability=lambda _b: 1,
++                reason='Owner stop: safety-refused source; keep M5 incomplete and nonexecuting',
++                evidence=['shadow-tools run1 retain refusal'], escalate_at=int(time.time()) + 86400)
++    base.update(over)
++    return base
++
++
++def state(conn, target, source, child):
++    return {
++        'task': dict(conn.execute('SELECT * FROM tasks WHERE id=?', (target,)).fetchone()),
++        'runs': [dict(r) for r in conn.execute('SELECT * FROM task_runs WHERE task_id=? ORDER BY id', (target,))],
++        'links': sorted(tuple(r) for r in conn.execute('SELECT parent_id,child_id FROM task_links')),
++        'events': conn.execute('SELECT COUNT(*) FROM task_events').fetchone()[0],
++        'others': [dict(conn.execute('SELECT * FROM tasks WHERE id=?', (t,)).fetchone()) for t in (source, child)],
++    }
++
++
++def test_snapshot_is_read_only_and_digest_tracks_state(shadow):
++    source, target, child = ended_card(shadow)
++    before = state(shadow, target, source, child)
++    outbox = shadow.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0]
++    one = stop.read(shadow, board=BOARD, task_id=target)
++    assert one['mode'] == 'snapshot' and one['writes'] == 0
++    assert stop.read(shadow, board=BOARD, task_id=target)['expected_digest'] == one['expected_digest']
++    assert state(shadow, target, source, child) == before
++    assert shadow.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] == outbox
++    kb.add_comment(shadow, target, 'x', 'unrelated comment is still state (event id moves)') if hasattr(kb, 'add_comment') else None
++    kb._append_event(shadow, target, 'note', {})
++    assert stop.read(shadow, board=BOARD, task_id=target)['expected_digest'] != one['expected_digest']
++
++
++def test_owner_stops_private_shadow_card_publishes_through_outbox_and_keeps_dependencies(shadow):
++    source, target, child = ended_card(shadow)
++    before = state(shadow, target, source, child)
++    a = args(shadow, target)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
++        result = stop.apply(shadow, owner=token, **a)
++        replay = stop.apply(shadow, owner=token, **a)
++    assert replay == {**result, 'replayed': True}
++    assert result['protection_scope'] == 'LOCAL-SHADOW-ONLY'
++    assert (result['canonical_protected'], result['dependency_satisfied'], result['incomplete'],
++            result['terminal_for_run'], result['execution_authority']) == (False, False, True, False, False)
++    assert result['request_uid'].startswith('as-') and result['ended_run_uid'] == before['runs'][-1]['uid']
++    after = state(shadow, target, source, child)
++    assert after['task']['status'] == 'triage' and after['task']['current_run_id'] is None
++    assert after['runs'] == before['runs'] and after['links'] == before['links'] and after['others'] == before['others']
++    assert decision.execution_restricted(shadow, target)
++    assert decision.restricted_floor(shadow, target) is None  # accounting floor unchanged
++    assert not decision.execution_restricted(shadow, child) and not decision.execution_restricted(shadow, source)
++    # Ordinary ordered outbox carries the genuine event; no fabricated episode/spend/decision rows.
++    ops = [json.loads(r[0]) for r in shadow.execute(
++        "SELECT fields FROM kanban_sync_outbox WHERE table_name='task_events' ORDER BY rowid")]
++    published = [o for o in ops if o.get('kind') == stop.KIND]
++    assert len(published) == 1 and json.loads(published[0]['payload'])['protection_scope'] == 'LOCAL-SHADOW-ONLY'
++    kinds = {r[0] for r in shadow.execute('SELECT kind FROM task_events WHERE task_id=? AND id>?',
++                                          (target, before['task'] and 0))}
++    assert not kinds & {'decision_hold_restricted', 'spend_budget_triaged', 'failure_finalized', 'decision_protected_stopped'}
++    readback = stop.read(shadow, board=BOARD, task_id=target)
++    assert readback['mode'] == 'readback' and readback['receipt']['request_uid'] == result['request_uid']
++    assert guards.installed(shadow)
++
++
++def test_stopped_card_cannot_be_claimed_reopened_relinked_or_replaced(shadow):
++    source, target, child = ended_card(shadow)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
++        stop.apply(shadow, owner=token, **args(shadow, target))
++    shadow.execute('PRAGMA recursive_triggers=OFF')
++    assert not kb.claim_task(shadow, target, claimer='default')
++    writes = [
++        "UPDATE tasks SET status='ready' WHERE id=:t",
++        "UPDATE tasks SET status='done' WHERE id=:t",
++        "UPDATE tasks SET status='archived' WHERE id=:t",
++        "UPDATE tasks SET claim_lock='x' WHERE id=:t",
++        "UPDATE tasks SET body='scope change' WHERE id=:t",
++        "DELETE FROM tasks WHERE id=:t",
++        "INSERT OR REPLACE INTO tasks (id,title,status,created_at) VALUES (:t,'r','ready',0)",
++        "INSERT INTO task_runs (task_id,profile,status,started_at) VALUES (:t,'default','running',0)",
++        "UPDATE task_runs SET outcome='completed' WHERE task_id=:t",
++        "DELETE FROM task_runs WHERE task_id=:t",
++        "DELETE FROM task_links WHERE child_id=:t",
++        "DELETE FROM task_links WHERE parent_id=:t",
++        "INSERT INTO task_links (parent_id,child_id) VALUES (:t,:s)",
++        f"UPDATE task_events SET payload='{{}}' WHERE task_id=:t AND kind='{stop.KIND}'",
++        f"DELETE FROM task_events WHERE task_id=:t AND kind='{stop.KIND}'",
++        f"INSERT OR REPLACE INTO task_events (id,task_id,kind,payload,created_at) SELECT id,task_id,'note','{{}}',0 "
++        f"FROM task_events WHERE task_id=:t AND kind='{stop.KIND}'",
++    ]
++    for sql in writes:
++        before = state(shadow, target, source, child)
++        with pytest.raises(sqlite3.IntegrityError, match='administrative_stop_immutable'):
++            with kb.write_txn(shadow):
++                shadow.execute(sql, {'t': target, 's': source})
++        assert state(shadow, target, source, child) == before, sql
++    # Unrelated cards keep progressing.
++    assert kb.claim_task(shadow, source, claimer='default')
++
++
++@pytest.mark.parametrize('fault', ['no_token', 'closed', 'other_chat', 'released', 'two_owners', 'machine_source',
++                                   'kanban_env', 'foreign_card', 'leased', 'digest', 'ingress', 'primary', 'off',
++                                   'deadline', 'conflicting_hold'])
++def test_unauthorized_or_unsafe_calls_write_nothing(shadow, monkeypatch, fault):
++    source, target, child = ended_card(shadow)
++    a = args(shadow, target)
++    session, gateway, reader = SID, ME, INTERACTIVE
++    if fault == 'other_chat':
++        session = 'sess_intruder'
++    if fault == 'machine_source':
++        reader = staticmethod(lambda _sid: 'kanban')
++    if fault == 'released':
++        with kb.write_txn(shadow):
++            shadow.execute("UPDATE task_chat_links SET released=1 WHERE task_id=?", (target,))
++    if fault == 'two_owners':
++        _link(shadow, target, session='sess_other')
++    if fault == 'kanban_env':
++        monkeypatch.setenv('HERMES_KANBAN_TASK', target)
++    if fault == 'foreign_card':
++        with kb.write_txn(shadow):
++            shadow.execute("UPDATE tasks SET created_on='worker-a3' WHERE id=?", (target,))
++        a = {**a, 'expected_digest': stop.digest(stop.snapshot(shadow, target))}
++    if fault == 'leased':
++        with kb.write_txn(shadow):
++            shadow.execute("UPDATE tasks SET claim_lock='other:1' WHERE id=?", (target,))
++        a = {**a, 'expected_digest': stop.digest(stop.snapshot(shadow, target))}
++    if fault == 'digest':
++        kb._append_event(shadow, target, 'note', {})
++    if fault == 'ingress':
++        a['capability'] = lambda _b: 0
++    if fault == 'primary':
++        sync.set_mode(shadow, 'primary')
++    if fault == 'deadline':
++        a['escalate_at'] = int(time.time()) + 15 * 86400
++    if fault == 'conflicting_hold':
++        kb._append_event(shadow, target, 'decision_protected_stopped', {})
++        a = {**a, 'expected_digest': stop.digest(stop.snapshot(shadow, target))}
++    before = state(shadow, target, source, child)
++    outbox = shadow.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0]
++    if fault == 'off':
++        sync.set_mode(shadow, 'off')
++    with ctx.bound(session, gateway=gateway, profile='default', source='desktop', source_reader=reader) as token:
++        if fault == 'no_token':
++            token = None
++        if fault == 'closed':
++            token.close()
++        with pytest.raises((stop.StopRefused, AttributeError, Exception)) as exc:
++            owner = token if token is not None else ctx.current()
++            stop.apply(shadow, owner=owner, **a)
++    assert not isinstance(exc.value, AssertionError)
++    if fault == 'off':
++        sync.set_mode(shadow, 'shadow')
++    assert state(shadow, target, source, child) == before
++    assert shadow.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] == outbox
++    assert not decision.execution_restricted(shadow, target) or fault == 'conflicting_hold'
++
++
++def test_replay_with_changed_payload_conflicts_and_deadline_is_never_renewed(shadow):
++    source, target, child = ended_card(shadow)
++    a = args(shadow, target)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
++        first = stop.apply(shadow, owner=token, **a)
++        with pytest.raises(stop.StopRefused, match='stop_ended_conflict'):
++            stop.apply(shadow, owner=token, **{**a, 'escalate_at': a['escalate_at'] + 60})
++    count = shadow.execute('SELECT COUNT(*) FROM task_events WHERE kind=?', (stop.KIND,)).fetchone()[0]
++    assert count == 1 and stop.read(shadow, board=BOARD, task_id=target)['receipt'] == {
++        k: v for k, v in first.items() if k not in ('event_uid', 'replayed')}
++
++
++def test_copied_context_shares_invalidation_and_turn_end_closes(shadow):
++    source, target, child = ended_card(shadow)
++    a = args(shadow, target)
++    holder = {}
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
++        copied = contextvars.copy_context()
++    assert not token.open
++    def run():
++        try:
++            copied.run(lambda: stop.apply(shadow, owner=ctx.current(), **a))
++        except stop.StopRefused as exc:
++            holder['err'] = exc.code
++    t = threading.Thread(target=run)
++    t.start()
++    t.join()
++    assert holder['err'] == 'stop_ended_owner_required'
++    assert kb.get_task(shadow, target).status == 'scheduled'
++
++
++def test_cancellation_waits_for_inflight_commit_never_inverse(shadow):
++    source, target, child = ended_card(shadow)
++    a = args(shadow, target)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
++        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
++        def slow_capability(_board):
++            entered.set()
++            release.wait(5)
++            return 1
++        out = {}
++        copied = contextvars.copy_context()
++        worker = threading.Thread(target=lambda: out.setdefault('r', copied.run(
++            lambda: stop.apply(shadow, owner=token, **{**a, 'capability': slow_capability}))))
++        worker.start()
++        entered.wait(5)
++        closer = threading.Thread(target=lambda: (token.close(), closed.set()))
++        closer.start()
++        assert not closed.wait(0.2)  # close blocks on the token lock held by the commit
++        release.set()
++        worker.join(5)
++        closer.join(5)
++        assert closed.is_set() and out['r']['ok'] is True
++        with pytest.raises(stop.StopRefused, match='owner_required'):
++            stop.apply(shadow, owner=token, **a)
++
++
++def test_existing_primary_off_retain_gate_is_unchanged():
++    import inspect
++    from hermes_cli import kanban_retain
++    src = inspect.getsource(kanban_retain.retain)
++    assert "raise ValueError('retain requires owning primary or genuinely local board')" in src
+-- 
+2.43.0
+

@@ -1,0 +1,92 @@
+From 7e3ab513ed2e025058f58e95d41dc0d5b8c5cd91 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:07:30 +0000
+Subject: [PATCH 5953] Fact change feed: bounded failure logging and busy-open tolerance
+
+Public mirror of source commit 7e3ab513ed2e025058f58e95d41dc0d5b8c5cd91.
+
+---
+diff --git a/hermes_cli/fact_feed.py b/hermes_cli/fact_feed.py
+index 4961bf2dee7..1851cbf53bd 100644
+--- a/hermes_cli/fact_feed.py
++++ b/hermes_cli/fact_feed.py
+@@ -13,6 +13,7 @@
+ from dataclasses import dataclass, field
+ 
+ from hermes_cli.fact_capture import CaptureBudget, CapturePending
++from hermes_cli.kanban_generation import is_busy
+ 
+ log = logging.getLogger(__name__)
+ _RETRY = (0.1, 0.2, 0.4, 1.0, 2.0, 5.0)
+@@ -155,7 +156,16 @@
+                     self._condition.notify_all()
+         except Exception as exc:
+             # Plugin isolation boundary: defects must not kill all sources.
+-            log.exception("source capture/publication failed; retaining cursor")
++            # One traceback per failure streak, none for an expected busy open:
++            # formatting a traceback per retry under the shared logging lock
++            # starved the gateway event loop until its watchdog exited (75).
++            attempt, busy = source.failures + 1, is_busy(exc)
++            if attempt == 1 and not busy:
++                log.exception("source capture/publication failed; retaining cursor")
++            else:
++                log.log(logging.WARNING if attempt in (1, len(_RETRY)) else logging.DEBUG,
++                        "source capture/publication failed (attempt %d%s); retaining cursor: %s",
++                        attempt, ", busy" if busy else "", exc)
+             with source.publication:
+                 with self._condition:
+                     if not source.active or self._stopping:
+diff --git a/tests/hermes_cli/test_fact_feed.py b/tests/hermes_cli/test_fact_feed.py
+index ea1906c4f60..5d11e348020 100644
+--- a/tests/hermes_cli/test_fact_feed.py
++++ b/tests/hermes_cli/test_fact_feed.py
+@@ -1,4 +1,6 @@
+ """Exercise the actual owner thread, publication and source-watch boundaries."""
++import logging
++import sqlite3
+ import threading
+ from types import SimpleNamespace
+ import pytest
+@@ -146,3 +148,39 @@
+         assert recovered.wait(3)
+     finally:
+         feed.close()
++
++
++def _failing_feed(error, attempts):
++    source = Adapter()
++    failures, done = [], threading.Event()
++    def capture(cursor):
++        raise error()
++    source.capture_hook = capture
++    def failure(adapter, exc):
++        failures.append(exc)
++        if len(failures) >= attempts:
++            done.set()
++    return source, done, ChangeFeed(lambda *args: None, failure)
++
++
++def _busy():
++    exc = sqlite3.OperationalError("database is locked: SQLite tracking registry is busy")
++    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
++    return exc
++
++
++@pytest.mark.parametrize("error, tracebacks", [(_busy, 0), (lambda: RuntimeError("defect"), 1)])
++def test_retry_streak_logs_at_most_one_traceback(caplog, error, tracebacks):
++    # Each retry used to format a full traceback under the logging lock; at ~2/s
++    # across sources that stalled the gateway event loop past its watchdog.
++    caplog.set_level(logging.DEBUG, logger="hermes_cli.fact_feed")
++    source, done, feed = _failing_feed(error, 3)
++    try:
++        feed.register(source)
++        assert done.wait(5)
++    finally:
++        feed.close()
++    records = [r for r in caplog.records if r.name == "hermes_cli.fact_feed"]
++    assert len(records) >= 3
++    assert sum(r.exc_info is not None for r in records) == tracebacks
++    assert sum(r.levelno >= logging.WARNING for r in records) <= 2
+-- 
+2.43.0
+

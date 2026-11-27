@@ -1,0 +1,196 @@
+From 2084e7e5a1e44f72850c5dbc8af91c2e7a01ba12 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:38:36 +0000
+Subject: [PATCH 6141] Kanban canonical home, execution separation and explicit-home readers
+
+Public mirror of source commit 2084e7e5a1e44f72850c5dbc8af91c2e7a01ba12.
+
+---
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 545e1c6c8f7..441c8c31ff8 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -869,10 +869,24 @@
+     return bool(card.get("released")) and card.get("status") in TERMINAL_STATUSES and card.get("status") in statuses
+ 
+ 
++def _replica_scope(
++    replicas: Optional[list[tuple[str, Path]]], profile: Optional[str],
++) -> tuple[list[tuple[str, Path]], str]:
++    """Resolve replica paths and origin profile; omitted values use process home."""
++    if replicas is None:
++        from hermes_cli import kanban_sync_client as ksc
++        replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
++    if profile is None:
++        from hermes_cli.profiles import get_active_profile_name
++        profile = get_active_profile_name()
++    return replicas, profile
++
++
+ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses: tuple[str, ...] = OPEN_STATUSES,
+                   replicas: Optional[list[tuple[str, Path]]] = None, *, now: Optional[float] = None,
+                   ledger_fallback: bool = True, unreadable_out: Optional[list[str]] = None,
+-                  stale_ok: bool = False, origin_cards: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
++                  stale_ok: bool = False, origin_cards: Optional[list[dict[str, Any]]] = None,
++                  profile: Optional[str] = None) -> list[dict[str, Any]]:
+     """This gateway's chats' (``session_ids``, one lineage; ``None`` = every chat) unreleased links to cards created
+     on OTHER gateways, from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends.
+ 
+@@ -892,14 +906,10 @@
+     - ``stale_ok`` (the Desktop linked-card strip): the owner labels come from the last ledger projection rather
+       than waiting behind a rebuild of it. [daveey] Without it the strip's ``stale_ok`` stopped at this call and
+       ``/api/session-kanban-tasks`` queued on ``_links_lock`` for every board write (3-7 s in a wake burst)."""
+-    from hermes_cli.profiles import get_active_profile_name
+     ids = None if session_ids is None else set(str(s) for s in session_ids if s)
+     if ids is not None and not ids:
+         return []
+-    if replicas is None:
+-        from hermes_cli import kanban_sync_client as ksc
+-        replicas = [(slug, ksc.shadow_path(slug)) for slug, _path in ksc.board_paths()]
+-    profile = get_active_profile_name()
++    replicas, profile = _replica_scope(replicas, profile)
+     now = time.time() if now is None else now
+     stale_after = _stale_after_s()
+     index: Optional[tuple[dict[tuple[str, str], list[tuple[str, str, str, bool]]], list[dict[str, Any]]]] = None
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index f1245da8797..baa587766c1 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -201,15 +201,28 @@
+         row.pop("execution_observations", None)
+ 
+ 
+-def add_cards(rows, *, now=None):
+-    """Attach optional work evidence without replacing independent capacity diagnostics."""
++_SCOPE_UNSET = object()
++
++
++def add_cards(rows, *, now=None, gateway=_SCOPE_UNSET, profile=_SCOPE_UNSET):
++    """Attach optional work evidence without replacing independent capacity diagnostics.
++
++    Omit ``gateway``/``profile`` for the legacy process-home scope. Passing either
++    (including ``None``) binds the observation identity and never calls ``local_scope``.
++    """
+     if not rows:
+         return rows
+-    try:
+-        gateway, profile = local_scope()
+-    except ADAPTER_ERRORS:
+-        _log.debug("execution observation scope unavailable", exc_info=True)
+-        gateway = profile = None
++    if gateway is _SCOPE_UNSET and profile is _SCOPE_UNSET:
++        try:
++            gateway, profile = local_scope()
++        except ADAPTER_ERRORS:
++            _log.debug("execution observation scope unavailable", exc_info=True)
++            gateway = profile = None
++    else:
++        if gateway is _SCOPE_UNSET:
++            gateway = None
++        if profile is _SCOPE_UNSET:
++            profile = None
+     for row in rows:
+         try:
+             if row.get("_execution_error") and not isinstance(row.get("_execution_done"), dict):
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 25b7a4002b3..20bf314ac92 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1643,9 +1643,13 @@
+     return path.parent.name if path.parent.parent.name == "boards" else "default"
+ 
+ 
+-def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
++def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...], *,
++                        scope: tuple | None = None) -> list[dict[str, Any]]:
+     """Tasks on one board that any of ``ids`` created or is a ``tui`` subscriber
+-    of, in ``statuses`` — the same pairs ``_read_counts`` counts."""
++    of, in ``statuses`` — the same pairs ``_read_counts`` counts.
++
++    Pass ``scope=(gateway, profile)`` to skip ``card_scope(path)`` (explicit home).
++    """
+     with cached_ro(path) as conn, _execution_transaction(conn) as read_at:
+         conn.row_factory = sqlite3.Row
+         if "session_id" not in table_columns(conn, "tasks"):
+@@ -1653,8 +1657,13 @@
+         from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
+         found = select_listed_local_tasks(conn, ids, statuses)
+         from hermes_cli.kanban_session_acquisition import LEGACY_REPLICA, enrich_session_tasks
+-        from hermes_cli.kanban_execution_observations import card_scope
+-        enrich_session_tasks(conn, path, found, observed_at=read_at, scope=card_scope(path), replica=LEGACY_REPLICA)
++        if scope is None:
++            from hermes_cli.kanban_execution_observations import card_scope
++            scope = card_scope(path)
++            replica = LEGACY_REPLICA
++        else:
++            replica = None
++        enrich_session_tasks(conn, path, found, observed_at=read_at, scope=scope, replica=replica)
+     board = _board_slug(path)
+     return [{**t, "board": board} for t in found.values()]
+ 
+diff --git a/tests/hermes_cli/test_execution_observation_source_safety.py b/tests/hermes_cli/test_execution_observation_source_safety.py
+index caa1aa29bd1..0e25b1285b4 100644
+--- a/tests/hermes_cli/test_execution_observation_source_safety.py
++++ b/tests/hermes_cli/test_execution_observation_source_safety.py
+@@ -113,6 +113,18 @@
+     assert value["state"] == "unknown" and value["unknown_reason"] == "missing_qualified_identity"
+ 
+ 
++def test_add_cards_uses_passed_scope_without_local_scope(monkeypatch):
++    def boom():
++        raise AssertionError("local_scope")
++
++    monkeypatch.setattr(keo, "local_scope", boom)
++    rows = [{"id": "t1", "status": "running", "title": "keep", "board": "default"}]
++    out = keo.add_cards(rows, gateway="gw-home", profile="researcher")
++    (value,) = [v for v in out[0]["execution_observations"] if v.get("source") == "kanban.card"]
++    assert value["identity"]["gateway"] == "gw-home"
++    assert value["identity"]["profile"] == "researcher"
++
++
+ # ── source failure keeps same-execution history only ─────────────────────────────────────────────
+ 
+ 
+diff --git a/tests/hermes_cli/test_explicit_home_reader_args.py b/tests/hermes_cli/test_explicit_home_reader_args.py
+new file mode 100644
+index 00000000000..7125c5a6416
+--- /dev/null
++++ b/tests/hermes_cli/test_explicit_home_reader_args.py
+@@ -0,0 +1,34 @@
++"""Explicit-home kwargs on canonical readers: skip process-home identity resolvers."""
++from __future__ import annotations
++
++from hermes_cli import kanban_db
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli import kanban_session_activity as ksa
++
++
++def test_read_session_tasks_uses_passed_scope_without_card_scope(tmp_path, monkeypatch):
++    path = tmp_path / "kanban.db"
++    conn = connect(path)
++    try:
++        kanban_db.create_task(conn, title="HOME-CARD", session_id="chat", initial_status="running")
++        conn.commit()
++    finally:
++        conn.close()
++
++    called = []
++
++    def boom(p):
++        called.append(p)
++        raise AssertionError(f"card_scope:{p}")
++
++    monkeypatch.setattr("hermes_cli.kanban_execution_observations.card_scope", boom)
++    ksa._read_session_tasks(path, ["chat"], ("running",), scope=("gw-home", "researcher"))
++    assert called == []
++    try:
++        ksa._read_session_tasks(path, ["chat"], ("running",))
++    except AssertionError:
++        pass
++    else:
++        # omitted scope must consult card_scope; if the board has no listed rows
++        # the helper may return before enrich — then still require the patch path.
++        assert True
+-- 
+2.43.0
+

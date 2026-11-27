@@ -1,0 +1,761 @@
+From a62e099a62a65d76786b8c281615b9a14c166dab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:31:51 +0000
+Subject: [PATCH 6161] Kanban chat links, adoption provenance and rejected-retain archive
+
+Public mirror of source commit a62e099a62a65d76786b8c281615b9a14c166dab.
+
+---
+diff --git a/hermes_cli/kanban_rejected_retain_history.py b/hermes_cli/kanban_rejected_retain_history.py
+new file mode 100644
+index 00000000000..ac4020fc8e7
+--- /dev/null
++++ b/hermes_cli/kanban_rejected_retain_history.py
+@@ -0,0 +1,137 @@
++"""Archive rejected transport with historical correlation, never lifecycle authority.
++
++Separate from live command custody. Only evicted terminal tasks/runs qualify;
++no command reconstruction, task projection, canonical write or original replay.
++"""
++from __future__ import annotations
++
++import base64
++import hashlib
++import sqlite3
++from pathlib import Path
++
++from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_retain_transport import canonical, frozen_wire
++from hermes_cli import kanban_rejected_retain_source as source
++
++
++def _typed(value):
++    """Injective JSON encoding preserves SQLite BLOBs without reserved-key collisions."""
++    if isinstance(value, bytes):
++        return ['bytes', base64.b64encode(value).decode('ascii')]
++    if isinstance(value, dict):
++        return ['dict', [[k, _typed(v)] for k, v in sorted(value.items())]]
++    if isinstance(value, list):
++        return ['list', [_typed(v) for v in value]]
++    return ['scalar', value]
++
++
++def _local(conn, wire):
++    task, run, event = wire['task'], wire['run_uid'], wire['event_uid']
++    rows = []
++    for table, column, uid in (('tasks', 'id', task), ('task_runs', 'uid', run),
++                               ('task_events', 'uid', event)):
++        rows.extend(tuple(r) for r in conn.execute(f'SELECT * FROM {table} WHERE {column}=?', (uid,)))
++        rows.extend(tuple(r) for r in conn.execute(
++            'SELECT * FROM kanban_sync_outbox WHERE table_name=? AND row_uid=? AND op_id<>?',
++            (table, uid, wire['client_op_id'])))
++        rows.extend(tuple(r) for r in conn.execute(
++            'SELECT * FROM kanban_sync_tombstones WHERE table_name=? AND row_uid=?', (table, uid)))
++    # Any surviving current command keeps the existing live-custody contract.
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_failure_commands'").fetchone():
++        rows.extend(tuple(r) for r in conn.execute(
++            'SELECT * FROM kanban_failure_commands WHERE run_uid=? OR task_id=? OR op_id=? OR event_uid=?',
++            (run, task, wire['client_op_id'], event)))
++    return rows
++
++
++def _evidence(hub, board, table, uid):
++    value = hub.row_evidence(board, table, uid)
++    if (not isinstance(value, dict) or value.get('board') != board
++            or value.get('table') != table or value.get('uid') != uid
++            or type(value.get('head')) is not int or value['head'] < 0
++            or type(value.get('floor')) is not int or value['floor'] < 0):
++        raise ValueError('historical retain evidence identity unavailable')
++    return value
++
++
++def _command(wire):
++    text = canonical(wire)
++    return dict(op_id=wire['client_op_id'], request_uid=wire['client_op_id'], task_id=wire['task'],
++                run_uid=wire['run_uid'], event_uid=wire['event_uid'], operation_kind='retain',
++                delivery_state='rejected', canonical_receipt_json=None, rejected_release_op_id=None,
++                request_json=text, request_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest())
++
++
++def _remote(hub, board, wire):
++    task = _evidence(hub, board, 'tasks', wire['task'])
++    run = _evidence(hub, board, 'task_runs', wire['run_uid'])
++    event = _evidence(hub, board, 'task_events', wire['event_uid'])
++    tr, rr = task.get('row'), run.get('row')
++    if (task.get('state') != 'live' or task.get('tombstone') is not None
++            or not isinstance(tr, dict) or tr.get('uid') != wire['task']
++            or not {'current_run_uid', 'lease_run_uid'} <= tr.keys() or tr.get('status') != 'done'
++            or tr.get('current_run_uid') is not None or tr.get('lease_run_uid') is not None
++            or run.get('state') != 'live' or run.get('tombstone') is not None
++            or not isinstance(rr, dict) or rr.get('uid') != wire['run_uid']
++            or rr.get('task_id') != wire['task'] or type(rr.get('ended_at')) is not int
++            or rr['ended_at'] <= 0 or rr.get('status') != 'blocked'
++            or event.get('state') != 'never_existed' or type(event.get('floor')) is not int
++            or event['floor'] != 0 or event.get('row') is not None or event.get('tombstone') is not None):
++        return None
++    return dict(task=task, run=run, event=event)
++
++
++def _archive(conn, op, text, evidence):
++    conn.execute('''CREATE TABLE IF NOT EXISTS kanban_rejected_retain_history_receipts (
++        op_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL,
++        evidence_json TEXT NOT NULL)''')
++    for operation in ('UPDATE', 'DELETE'):
++        conn.execute(f'CREATE TRIGGER IF NOT EXISTS rejected_retain_history_{operation.lower()} '
++                     f'BEFORE {operation} ON kanban_rejected_retain_history_receipts BEGIN '
++                     "SELECT RAISE(ABORT,'rejected_retain_history_immutable'); END")
++    conn.execute('CREATE TRIGGER IF NOT EXISTS rejected_retain_history_insert BEFORE INSERT '
++                 'ON kanban_rejected_retain_history_receipts WHEN EXISTS '
++                 '(SELECT 1 FROM kanban_rejected_retain_history_receipts WHERE op_id=NEW.op_id) BEGIN '
++                 "SELECT RAISE(ABORT,'rejected_retain_history_immutable'); END")
++    digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
++    existing = conn.execute('SELECT * FROM kanban_rejected_retain_history_receipts WHERE op_id=?', (op['op_id'],)).fetchone()
++    if existing is not None:
++        return False  # Never replace or reinterpret an existing historical receipt.
++    conn.execute('INSERT INTO kanban_rejected_retain_history_receipts VALUES (?,?,?,?)',
++                 (op['op_id'], text, digest, canonical(evidence)))
++    conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id=? AND state='rejected'", (op['op_id'],))
++    return True
++
++
++def retire(conn: sqlite3.Connection, hub, board: str, op: dict, state_path: Path) -> dict:
++    report: dict = dict(op_id=op['op_id'], table=op['table_name'], row_uid=op['row_uid'],
++                  classification='unresolved', action='retained', proof='historical rejected source not proven')
++    if (op.get('table_name') != 'tasks' or op.get('op') != 'retain' or op.get('state') != 'rejected'
++            or op.get('last_error') != 'missing_decision_episode'):
++        return report
++    try:
++        wire = frozen_wire(op)
++        if op['fields'] != canonical(wire) or _local(conn, wire):
++            return report
++        expected = _command(wire)  # Correlation only; never inserted as command custody.
++        before = source.discover(state_path, board, expected, wire)
++        if before is None:
++            return report
++        evidence = _remote(hub, board, wire)
++        if evidence is None:
++            return report
++        snapshot = dict(operation=op, source_encoding='typed-json-v1', source=_typed(before), lifecycle_authority=False)
++        text = canonical(snapshot)
++        with write_txn(conn):
++            current = conn.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (op['op_id'],)).fetchone()
++            if (current is None or dict(current) != op or _local(conn, wire)
++                    or source.discover(state_path, board, expected, wire) != before):
++                return report
++            if not _archive(conn, op, text, evidence):
++                return report
++        report.update(classification='historical_rejected_source', action='retired', evidence=evidence,
++                      proof='rejected transport archived; historical source is not an applied retain receipt')
++    except (sqlite3.Error, ValueError, TypeError, KeyError, OSError):
++        return report
++    return report
+diff --git a/hermes_cli/kanban_rejected_retain_source.py b/hermes_cli/kanban_rejected_retain_source.py
+new file mode 100644
+index 00000000000..517cd7e4668
+--- /dev/null
++++ b/hermes_cli/kanban_rejected_retain_source.py
+@@ -0,0 +1,216 @@
++"""Bounded persisted-source correlation, NOT admission or lifecycle authority.
++
++Only reads SQLite; no gateway state constructor, custody restoration, or network.
++Persisted admission/tool records are independent correlation, not signed proof.
++Returned rows retain every original column (including BLOB bytes).
++"""
++from __future__ import annotations
++
++import hashlib
++from itertools import pairwise
++import json
++import math
++from pathlib import Path
++import sqlite3
++
++from hermes_cli.kanban_retain_transport import canonical
++
++MAX_CANDIDATES = 20
++MAX_MESSAGES = 2000
++MAX_BYTES = 4 * 1024 * 1024
++REJECTION = 'retain rejected: immutable custody retained; ordinary failure recovery owns this run'
++
++
++def _pairs(items):
++    result = {}
++    for key, value in items:
++        if key in result:
++            raise ValueError('duplicate JSON key')
++        result[key] = value
++    return result
++
++
++def _json(text):
++    return json.loads(text, object_pairs_hook=_pairs,
++                      parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
++
++
++def _size(row):
++    return sum(len(v) if isinstance(v, bytes) else len(str(v).encode('utf-8'))
++               for v in row.values() if v is not None)
++
++
++def _command(value, op, wire):
++    expected = {'op_id': wire['client_op_id'], 'request_uid': wire['client_op_id'],
++                'run_uid': wire['run_uid'], 'task_id': wire['task'],
++                'event_uid': wire['event_uid'], 'operation_kind': 'retain',
++                'delivery_state': 'rejected', 'canonical_receipt_json': None,
++                'rejected_release_op_id': None, 'request_json': canonical(wire),
++                'request_sha256': hashlib.sha256(canonical(wire).encode('utf-8')).hexdigest()}
++    return isinstance(value, dict) and all(k in value and value[k] == v for k, v in expected.items()) and all(
++        k in op and op[k] == v for k, v in expected.items())
++
++
++def _ordered(*messages):
++    return all(a['id'] < b['id'] and a['timestamp'] < b['timestamp']
++               for a, b in pairwise(messages))
++
++
++def _source(admission, session, messages, board, op, wire):
++    payload = _json(admission['payload_json'])
++    card = payload['kanban_card_v1']
++    run = card['run_id']
++    request = 'kanban:' + json.dumps([board, wire['task'], run], separators=(',', ':'))
++    if (payload.get('finite') is not True or type(run) is not int or run <= 0
++            or card['board'] != board or card['task_id'] != wire['task']
++            or admission['request_id'] != request or admission['status'] != 'terminal'
++            or not admission['admission_id'] or not admission['principal_id']
++            or admission['principal_id'] != session['user_id']
++            or session['source'] != 'kanban' or session['created_source'] != 'kanban'
++            or admission['target_session_id'] != session['id']
++            or type(session['ended_at']) not in (int, float)
++            or not math.isfinite(session['ended_at'])
++            or session['ended_at'] <= session['started_at']):
++        return []
++    shows, calls, results, commands = _messages(session, messages, request, run, op, wire)
++    return _matches(admission, session, shows, calls, results, commands)
++
++
++def _messages(session, messages, request, run, op, wire):
++    shows, calls, results, commands = [], [], [], []
++    for message in messages:
++        if (message['session_id'] != session['id'] or type(message['id']) is not int
++                or type(message['timestamp']) not in (int, float)
++                or not math.isfinite(message['timestamp'])
++                or not session['started_at'] <= message['timestamp'] <= session['ended_at']):
++            raise ValueError('invalid source message')
++        if message['role'] == 'assistant' and message['tool_calls']:
++            entries = _json(message['tool_calls'])
++            if not isinstance(entries, list):
++                raise ValueError('invalid tool calls')
++            for entry in entries:
++                fn = entry['function']
++                if fn['name'] == 'kanban_retain':
++                    args = _json(fn['arguments'])
++                    call_id = entry.get('id')
++                    if (call_id and entry.get('call_id', call_id) == call_id
++                            and args == {k: v for k, v in wire['payload'].items() if k != 'version'}):
++                        calls.append((message, call_id))
++        if message['role'] != 'tool':
++            continue
++        name = message['tool_name']
++        if name not in ('kanban_show', 'kanban_retain', 'terminal'):
++            continue
++        try:
++            value = _json(message['content'])
++        except json.JSONDecodeError:
++            if name == 'terminal':
++                continue  # Ordinary terminal notices are not structured evidence.
++            raise
++        if name == 'kanban_show':
++            task = value['task']
++            events = value['events']
++            claimed = any(e['kind'] == 'claimed' and e['run_id'] == run
++                          and isinstance(e.get('payload'), dict)
++                          and e['payload'].get('run_uid') == wire['run_uid']
++                          and e['created_at'] <= message['timestamp'] for e in events)
++            admitted = any(e['kind'] == 'owner_admitted' and e['run_id'] == run
++                           and e['payload'].get('request_id') == request
++                           and e['payload'].get('session_id') == session['id']
++                           and e['created_at'] <= message['timestamp'] for e in events)
++            if task['id'] == wire['task'] and task['current_run_id'] == run and claimed and admitted:
++                shows.append(message)
++        elif name == 'kanban_retain':
++            if value.get('ok') is False and value.get('terminal_for_run') is False and value.get('error') == REJECTION:
++                results.append(message)
++        elif value.get('exit_code') == 0 and value.get('error') is None:
++            try:
++                rows = _json(value.get('output', ''))
++            except (ValueError, TypeError):
++                continue  # Most terminal output is not JSON command evidence.
++            if isinstance(rows, list) and len(rows) == 1 and _command(rows[0], op, wire):
++                commands.append((message, rows[0]))
++    return shows, calls, results, commands
++
++
++def _matches(admission, session, shows, calls, results, commands):
++    # Refuse dense/ambiguous histories rather than doing a Cartesian scan.
++    if len(shows) * len(calls) * len(results) * len(commands) > MAX_MESSAGES:
++        return []
++    matches = []
++    for show in shows:
++        for call, call_id in calls:
++            for result in results:
++                for evidence, command in commands:
++                    if result['tool_call_id'] == call_id and _ordered(show, call, result, evidence):
++                        matches.append({'kind': 'historical_rejected_source', 'lifecycle_authority': False,
++                                        'admission': admission, 'session': session, 'command': command,
++                                        'messages': [show, call, result, evidence]})
++                        if len(matches) > 1:
++                            return matches
++    return matches
++
++
++def discover(state_path: Path, board: str, op: dict, wire: dict) -> dict | None:
++    """Return one unique historical source, else None; fail closed on bounds/schema.
++
++    Re-run and compare the complete object after external reads to revalidate.
++    No observed_at or current run interpretation is included. BLOBs remain bytes.
++    """
++    conn = None
++    try:
++        if (not isinstance(board, str) or not board or wire['op'] != 'retain'
++                or type(wire['payload']['version']) is not int or wire['payload']['version'] != 1
++                or not _command(op, op, wire)):
++            return None
++        conn = sqlite3.connect(Path(state_path).resolve().as_uri() + '?mode=ro', uri=True)
++        conn.row_factory = sqlite3.Row
++        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_BYTES)
++        conn.execute('PRAGMA query_only=ON')
++        conn.execute('BEGIN')  # One consistent read snapshot across all selected rows.
++        conn.set_authorizer(lambda action, *args: sqlite3.SQLITE_OK if action in (
++            sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION) else sqlite3.SQLITE_DENY)
++        # A VM budget also bounds scans on older state schemas without JSON indexes.
++        budget = [10000]
++        def progress():
++            budget[0] -= 1
++            return budget[0] <= 0
++        conn.set_progress_handler(progress, 1000)
++        admissions = conn.execute("""SELECT * FROM session_admissions
++            WHERE CASE WHEN json_valid(payload_json) THEN
++            json_extract(payload_json,'$.kanban_card_v1.board')=?
++            AND json_extract(payload_json,'$.kanban_card_v1.task_id')=? ELSE 0 END LIMIT ?""",
++                                  (board, wire['task'], MAX_CANDIDATES + 1)).fetchall()
++        if len(admissions) > MAX_CANDIDATES:
++            return None
++        matches, used = [], 0
++        for row in admissions:
++            admission = dict(row)
++            session_rows = conn.execute('SELECT * FROM sessions WHERE id=? LIMIT 2',
++                                        (admission['target_session_id'],)).fetchall()
++            if len(session_rows) != 1:
++                return None
++            session = dict(session_rows[0])
++            used += _size(admission) + _size(session)
++            messages = []
++            cursor = conn.execute('SELECT * FROM messages WHERE session_id=? ORDER BY id LIMIT ?',
++                                  (session['id'], MAX_MESSAGES + 1))
++            for message in cursor:
++                message = dict(message)
++                used += _size(message)
++                messages.append(message)
++                if used > MAX_BYTES or len(messages) > MAX_MESSAGES:
++                    return None
++            try:
++                candidate = _source(admission, session, messages, board, op, wire)
++            except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError):
++                candidate = []  # Malformed records cannot supply a matching source.
++            matches.extend(candidate)
++            if len(matches) > 1:
++                return None
++        return matches[0] if len(matches) == 1 else None
++    except (sqlite3.Error, ValueError, TypeError, KeyError, AttributeError, OverflowError, OSError, RecursionError):
++        return None
++    finally:
++        if conn is not None:
++            conn.close()
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+index 19dca8d81a5..27d1a7cde63 100644
+--- a/hermes_cli/kanban_sync_rejections.py
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -149,7 +149,12 @@
+         if op['op'] == 'retain':
+             from hermes_cli.kanban_rejected_retain_retirement import retire
+             try:
+-                reports.append(retire(conn, hub, board, op))
++                report = retire(conn, hub, board, op)
++                if report['action'] == 'retained':
++                    from hermes_constants import get_hermes_home
++                    from hermes_cli import kanban_rejected_retain_history as history
++                    report = history.retire(conn, hub, board, op, get_hermes_home() / 'state.db')
++                reports.append(report)
+             except (HubError, SyncUnavailable, OSError, ValueError) as exc:
+                 reports.append(dict(op_id=op['op_id'], table=op['table_name'], row_uid=op['row_uid'],
+                                     classification='unresolved', action='retained', proof=str(exc)))
+diff --git a/tests/hermes_cli/test_kanban_rejected_retain_history.py b/tests/hermes_cli/test_kanban_rejected_retain_history.py
+new file mode 100644
+index 00000000000..efe863d3f86
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rejected_retain_history.py
+@@ -0,0 +1,165 @@
++"""Historical custody is archival only; no restored command or lifecycle projection."""
++import hashlib
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from tests.hermes_cli import test_kanban_rejected_retain_source as source_tests
++
++
++@pytest.fixture
++def case(tmp_path):
++    from hermes_cli import kanban_rejected_retain_history as history
++    path, command, wire, *_ = source_tests.fixture_db(tmp_path)
++    db = sqlite3.connect(':memory:')
++    db.row_factory = sqlite3.Row
++    db.executescript('''CREATE TABLE tasks(id TEXT PRIMARY KEY, current_run_id INTEGER);
++        CREATE TABLE task_events(uid TEXT PRIMARY KEY);
++        CREATE TABLE task_runs(id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, ended_at INTEGER);
++        CREATE TABLE kanban_sync_outbox(op_id TEXT PRIMARY KEY,table_name TEXT,row_uid TEXT,
++            op TEXT,fields TEXT,state TEXT,last_error TEXT);
++        CREATE TABLE kanban_sync_tombstones(table_name TEXT,row_uid TEXT,deleted_at INTEGER);''')
++    op = dict(op_id=command['op_id'], table_name='tasks', row_uid=wire['task'], op='retain',
++              fields=command['request_json'], state='rejected', last_error='missing_decision_episode')
++    db.execute('INSERT INTO kanban_sync_outbox VALUES (?,?,?,?,?,?,?)', tuple(op.values()))
++    db.commit()
++    rows = {
++        ('tasks', wire['task']): dict(uid=wire['task'], status='done', current_run_uid=None, lease_run_uid=None),
++        ('task_runs', wire['run_uid']): dict(uid=wire['run_uid'], task_id=wire['task'], ended_at=101, status='blocked'),
++    }
++    def evidence(board, table, uid):
++        row = rows.get((table, uid))
++        return dict(board=board, table=table, uid=uid, head=123, floor=0,
++                    state='live' if row else 'never_existed', row=row, tombstone=None)
++    return history, db, op, wire, path, rows, SimpleNamespace(row_evidence=evidence)
++
++
++def test_archival_preserves_source_wire_rejection_and_never_backfills(case):
++    history, db, op, _wire, path, _, hub = case
++    before = path.read_bytes()
++    report = history.retire(db, hub, 'default', op, path)
++    assert report['action'] == 'retired', report
++    assert report['classification'] == 'historical_rejected_source'
++    assert not db.execute('SELECT * FROM kanban_sync_outbox').fetchall()
++    assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_failure_commands'").fetchone()
++    assert db.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
++    assert db.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 0
++    receipt = dict(db.execute('SELECT * FROM kanban_rejected_retain_history_receipts').fetchone())
++    assert hashlib.sha256(receipt['snapshot_json'].encode()).hexdigest() == receipt['snapshot_sha256']
++    snapshot = json.loads(receipt['snapshot_json'])
++    assert snapshot['operation'] == op
++    assert snapshot['lifecycle_authority'] is False
++    assert snapshot['source_encoding'] == 'typed-json-v1'
++    assert path.read_bytes() == before
++    for sql in ['DELETE FROM kanban_rejected_retain_history_receipts',
++                "UPDATE kanban_rejected_retain_history_receipts SET snapshot_sha256='bad'",
++                'INSERT OR REPLACE INTO kanban_rejected_retain_history_receipts SELECT * FROM kanban_rejected_retain_history_receipts']:
++        with pytest.raises(sqlite3.IntegrityError, match='rejected_retain_history_immutable'):
++            db.execute(sql)
++        db.rollback()
++
++
++@pytest.mark.parametrize('defect', ['local_task','local_run','pending_task','pending_run','tomb_task','tomb_run',
++    'canonical_active','canonical_lease','run_open','run_foreign','run_retained','event_live','event_pruned',
++    'event_tomb','event_identity','head_bool','wrong_board','source_missing','source_changed','task_race','op_race'])
++def test_refuses_adjacent_invalid_or_changed_evidence(case, defect):
++    history, db, op, _wire, path, rows, hub = case
++    if defect == 'local_task': db.execute("INSERT INTO tasks VALUES ('task-1',NULL)")
++    if defect == 'local_run': db.execute("INSERT INTO task_runs VALUES (1,'run-1','task-1',1)")
++    if defect.startswith('pending_'):
++        table, uid = ('tasks','task-1') if defect.endswith('task') else ('task_runs','run-1')
++        db.execute('INSERT INTO kanban_sync_outbox VALUES (?,?,?,?,?,?,?)', ('pending',table,uid,'upsert','{}','pending',None))
++    if defect.startswith('tomb_'):
++        table, uid = ('tasks','task-1') if defect.endswith('task') else ('task_runs','run-1')
++        db.execute('INSERT INTO kanban_sync_tombstones VALUES (?,?,1)', (table,uid))
++    if defect == 'canonical_active': rows['tasks','task-1']['status'] = 'running'
++    if defect == 'canonical_lease': rows['tasks','task-1']['lease_run_uid'] = 'successor'
++    if defect == 'run_open': rows['task_runs','run-1']['ended_at'] = None
++    if defect == 'run_foreign': rows['task_runs','run-1']['task_id'] = 'foreign'
++    if defect == 'run_retained': rows['task_runs','run-1']['status'] = 'retained'
++    if defect == 'event_live': rows['task_events','event-1'] = dict(uid='event-1',kind='decision_retained')
++    if defect == 'source_missing': path = path.parent / 'absent.db'
++    db.commit()
++    original = hub.row_evidence
++    def evidence(*args):
++        r = original(*args)
++        if args[1] == 'task_events':
++            if defect == 'event_pruned': r['floor'] = 1
++            if defect == 'event_tomb': r['tombstone'] = {'uid':'event-1'}
++            if defect == 'event_identity': r['uid'] = 'foreign'
++        if defect == 'head_bool': r['head'] = True
++        if defect == 'wrong_board': r['board'] = 'foreign'
++        if defect == 'source_changed':
++            with sqlite3.connect(path) as state: state.execute("UPDATE session_admissions SET status='active'")
++        if defect == 'task_race':
++            db.execute("INSERT OR IGNORE INTO tasks VALUES ('task-1',NULL)"); db.commit()
++        if defect == 'op_race':
++            db.execute("UPDATE kanban_sync_outbox SET last_error='changed'"); db.commit()
++        return r
++    hub.row_evidence = evidence
++    report = history.retire(db, hub, 'default', op, path)
++    assert report['action'] == 'retained', report
++    assert db.execute('SELECT count(*) FROM kanban_sync_outbox WHERE op_id=?',(op['op_id'],)).fetchone()[0] == 1
++    assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_rejected_retain_history_receipts'").fetchone()
++
++
++def test_normal_resolver_uses_historical_contract_only_when_live_custody_is_missing(case, monkeypatch):
++    from hermes_cli import kanban_sync_rejections as resolver
++    from hermes_cli import kanban_rejected_retain_retirement as current
++    import hermes_constants
++    _history, db, _op, _wire, path, _, hub = case
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: path.parent)
++    monkeypatch.setattr(current, 'retire', lambda *a: dict(action='retained', classification='unresolved'))
++    reports = resolver.resolve_rejections(db, hub, 'default')
++    assert reports[0]['action'] == 'retired', reports
++    assert db.execute('SELECT count(*) FROM kanban_rejected_retain_history_receipts').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('table,key,value', [
++    ('tasks', 'uid', 'foreign'), ('tasks', 'status', 'archived'),
++    ('tasks', 'current_run_uid', 'new-run'), ('tasks', 'lease_run_uid', 'new-run'),
++    ('task_runs', 'uid', 'foreign'), ('task_runs', 'task_id', 'foreign'),
++    ('task_runs', 'ended_at', 0), ('task_runs', 'ended_at', True),
++    ('task_runs', 'ended_at', 101.0), ('task_runs', 'status', 'retained'),
++])
++def test_canonical_row_guards(case, table, key, value):
++    history, db, op, wire, path, rows, hub = case
++    uid = wire['task'] if table == 'tasks' else wire['run_uid']
++    rows[table, uid][key] = value
++    assert history.retire(db, hub, 'default', op, path)['action'] == 'retained'
++
++
++@pytest.mark.parametrize('key', ['current_run_uid', 'lease_run_uid'])
++def test_missing_off_lease_observation_is_not_null(case, key):
++    history, db, op, wire, path, rows, hub = case
++    del rows['tasks', wire['task']][key]
++    assert history.retire(db, hub, 'default', op, path)['action'] == 'retained'
++
++
++@pytest.mark.parametrize('column', ['task_id', 'run_uid', 'op_id', 'event_uid'])
++def test_any_remaining_current_command_custody_vetoes_history(case, column):
++    history, db, op, wire, path, _rows, hub = case
++    db.execute('CREATE TABLE kanban_failure_commands(task_id TEXT, run_uid TEXT, op_id TEXT, event_uid TEXT)')
++    value = {'task_id':wire['task'], 'run_uid':wire['run_uid'], 'op_id':op['op_id'], 'event_uid':wire['event_uid']}[column]
++    db.execute(f'INSERT INTO kanban_failure_commands ({column}) VALUES (?)', (value,))
++    db.commit()
++    assert history.retire(db, hub, 'default', op, path)['action'] == 'retained'
++
++
++def test_source_blob_archive_is_lossless_and_collision_free(case):
++    history, *_ = case
++    value = {'bytes': b'\x00\xff', 'tag-shaped': ['bytes', 'AP8=']}
++    encoded = history._typed(value)
++    def decode(node):
++        import base64
++        tag, data = node
++        if tag == 'bytes': return base64.b64decode(data)
++        if tag == 'dict': return {k:decode(v) for k,v in data}
++        if tag == 'list': return [decode(v) for v in data]
++        return data
++    assert decode(encoded) == value
++    assert history._typed(b'\x00\xff') != history._typed(['bytes', 'AP8='])
++
++
+diff --git a/tests/hermes_cli/test_kanban_rejected_retain_source.py b/tests/hermes_cli/test_kanban_rejected_retain_source.py
+new file mode 100644
+index 00000000000..d30bdcdf08a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rejected_retain_source.py
+@@ -0,0 +1,190 @@
++"""Read-only historical-source correlation, never lifecycle authority."""
++import hashlib
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_retain_transport import canonical
++
++
++def fixture_db(tmp_path):
++    wire = {'op': 'retain', 'client_op_id': 'op-1', 'task': 'task-1',
++            'run_uid': 'run-1', 'event_uid': 'event-1', 'expected_episode': None,
++            'payload': {'version': 1, 'reason': 'decision_pending', 'summary': 'é'}}
++    op = {'op_id': 'op-1', 'request_uid': 'op-1', 'task_id': 'task-1',
++          'run_uid': 'run-1', 'event_uid': 'event-1', 'operation_kind': 'retain',
++          'delivery_state': 'rejected', 'canonical_receipt_json': None,
++          'rejected_release_op_id': None, 'request_json': canonical(wire),
++          'request_sha256': hashlib.sha256(canonical(wire).encode()).hexdigest()}
++    request = 'kanban:["default","task-1",42]'
++    admission = {'seq': 1, 'admission_id': 'admit-1', 'request_id': request,
++                 'principal_id': 'uid:501', 'target_session_id': 's1',
++                 'payload_json': canonical({'finite': True, 'kanban_card_v1': {
++                     'board': 'default', 'task_id': 'task-1', 'run_id': 42}}),
++                 'status': 'terminal'}
++    session = {'id': 's1', 'source': 'kanban', 'created_source': 'kanban',
++               'user_id': 'uid:501', 'started_at': 1.0, 'ended_at': 100.0}
++    show = {'task': {'id': 'task-1', 'current_run_id': 42}, 'events': [
++        {'kind': 'claimed', 'run_id': 42, 'created_at': 2,
++         'payload': {'run_uid': 'run-1'}},
++        {'kind': 'owner_admitted', 'run_id': 42, 'created_at': 3,
++         'payload': {'request_id': request, 'session_id': 's1'}}]}
++    def message(i, role, name=None, content=None, call=None, calls=None):
++        return {'id': i, 'session_id': 's1', 'role': role, 'tool_name': name,
++                'content': content, 'tool_call_id': call, 'tool_calls': calls,
++                'timestamp': float(i), 'display_identity': b'\x00\xff'}
++    def toolcall(i, name, args):
++        return canonical([{'id': i, 'call_id': i, 'function': {
++            'name': name, 'arguments': canonical(args)}}])
++    messages = [message(10, 'tool', 'kanban_show', canonical(show), 'show-call'),
++                message(20, 'assistant', calls=toolcall('retain-call', 'kanban_retain',
++                        {'reason': 'decision_pending', 'summary': 'é'})),
++                message(30, 'tool', 'kanban_retain', canonical({'ok': False,
++                    'terminal_for_run': False, 'error': 'retain rejected: immutable custody retained; ordinary failure recovery owns this run'}), 'retain-call'),
++                message(40, 'tool', 'terminal', canonical({'output': json.dumps([op]),
++                         'exit_code': 0, 'error': None}), 'sql-call')]
++    path = tmp_path / 'state.db'
++    with sqlite3.connect(path) as conn:
++        for table, rows in [('sessions', [session]), ('session_admissions', [admission]), ('messages', messages)]:
++            conn.execute('CREATE TABLE ' + table + ' (' + ','.join(
++                '"' + k + '" ' + ('INTEGER PRIMARY KEY' if k in ('seq',) or (table == 'messages' and k == 'id') else 'BLOB') for k in rows[0]) + ')')
++            for row in rows:
++                conn.execute('INSERT INTO ' + table + ' VALUES (' + ','.join('?' for _ in row) + ')', tuple(row.values()))
++    return path, op, wire, admission, session, messages
++
++
++def test_discover_preserves_exact_source_and_never_changes_database(tmp_path):
++    from hermes_cli.kanban_rejected_retain_source import discover
++    path, op, wire, admission, session, messages = fixture_db(tmp_path)
++    before = path.read_bytes()
++    result = discover(path, 'default', op, wire)
++    assert result is not None
++    assert result['kind'] == 'historical_rejected_source'
++    assert result['lifecycle_authority'] is False
++    assert result['admission'] == admission
++    assert result['session'] == session
++    assert result['messages'] == messages
++    assert result['command'] == op
++    assert discover(path, 'default', op, wire) == result
++    assert path.read_bytes() == before
++
++
++@pytest.mark.parametrize('table,key,value', [
++    ('sessions', 'source', 'cli'),
++    ('sessions', 'created_source', 'cli'),
++    ('sessions', 'user_id', 'uid:502'),
++    ('sessions', 'ended_at', None),
++    ('sessions', 'ended_at', 1.0),
++    ('session_admissions', 'status', 'active'),
++    ('session_admissions', 'admission_id', ''),
++    ('session_admissions', 'request_id', 'kanban:["default","task-1",43]'),
++    ('session_admissions', 'principal_id', 'uid:502'),
++    ('session_admissions', 'payload_json', '{"finite":false,"kanban_card_v1":{"board":"default","task_id":"task-1","run_id":42}}'),
++    ('session_admissions', 'payload_json', '{"finite":true,"kanban_card_v1":{"board":"default","task_id":"task-1","run_id":true}}'),
++])
++def test_admission_session_guards(tmp_path, table, key, value):
++    from hermes_cli.kanban_rejected_retain_source import discover
++    path, op, wire, *_ = fixture_db(tmp_path)
++    with sqlite3.connect(path) as conn:
++        conn.execute(f'UPDATE {table} SET {key}=?', (value,))
++    assert discover(path, 'default', op, wire) is None
++
++
++@pytest.mark.parametrize('defect', [
++    'show-task', 'show-run', 'claim-run', 'owner-request', 'owner-session',
++    'claim-time', 'missing-claim', 'missing-admitted', 'call-name', 'call-args',
++    'call-id', 'result-id', 'result-name', 'result-error', 'result-ok',
++    'result-terminal', 'result-time', 'evidence-time', 'evidence-role',
++    'evidence-name', 'evidence-exit', 'evidence-error', 'evidence-text',
++    'command-hash', 'command-bytes', 'command-receipt', 'command-release',
++    'command-task', 'command-kind', 'command-state', 'command-event',
++    'duplicate-json', 'duplicate-call', 'duplicate-result', 'duplicate-source',
++    'message-overflow', 'byte-overflow', 'admission-overflow',
++])
++def test_independent_evidence_guards(tmp_path, defect):
++    from hermes_cli.kanban_rejected_retain_source import discover
++    path, op, wire, _admission, _, messages = fixture_db(tmp_path)
++    show, call, result, evidence = messages
++    sv, cv, rv, ev = (json.loads(m['content'] or m['tool_calls']) for m in messages)
++    command = json.loads(ev['output'])[0]
++    changes = {
++        'show-task': (sv['task'], 'id', 'foreign'),
++        'show-run': (sv['task'], 'current_run_id', 43),
++        'claim-run': (sv['events'][0]['payload'], 'run_uid', 'foreign'),
++        'owner-request': (sv['events'][1]['payload'], 'request_id', 'foreign'),
++        'owner-session': (sv['events'][1]['payload'], 'session_id', 'foreign'),
++        'claim-time': (sv['events'][0], 'created_at', 21),
++        'call-name': (cv[0]['function'], 'name', 'kanban_comment'),
++        'call-args': (cv[0]['function'], 'arguments', '{"summary":"foreign"}'),
++        'call-id': (cv[0], 'call_id', 'different'),
++        'result-id': (result, 'tool_call_id', 'foreign'),
++        'result-name': (result, 'tool_name', 'terminal'),
++        'result-error': (rv, 'error', 'temporarily unavailable'),
++        'result-ok': (rv, 'ok', True),
++        'result-terminal': (rv, 'terminal_for_run', True),
++        'result-time': (result, 'timestamp', 19),
++        'evidence-time': (evidence, 'timestamp', 29),
++        'evidence-role': (evidence, 'role', 'assistant'),
++        'evidence-name': (evidence, 'tool_name', 'read_file'),
++        'evidence-exit': (ev, 'exit_code', 1),
++        'evidence-error': (ev, 'error', 'failure'),
++        'command-hash': (command, 'request_sha256', '0' * 64),
++        'command-bytes': (command, 'request_json', command['request_json'] + ' '),
++        'command-receipt': (command, 'canonical_receipt_json', '{}'),
++        'command-release': (command, 'rejected_release_op_id', 'release'),
++        'command-task': (command, 'task_id', 'foreign'),
++        'command-kind': (command, 'operation_kind', 'failure'),
++        'command-state': (command, 'delivery_state', 'unknown'),
++        'command-event': (command, 'event_uid', 'foreign'),
++    }
++    if defect in changes:
++        target, key, value = changes[defect]
++        target[key] = value
++    if defect == 'missing-claim': sv['events'].pop(0)
++    if defect == 'missing-admitted': sv['events'].pop()
++    show['content'], call['tool_calls'], result['content'] = json.dumps(sv), json.dumps(cv), json.dumps(rv)
++    ev['output'] = json.dumps([command])
++    evidence['content'] = json.dumps(ev)
++    if defect == 'evidence-text': evidence['content'] = 'Quoted command: ' + evidence['content']
++    if defect == 'duplicate-json': result['content'] = result['content'][:-1] + ',"ok":false}'
++    if defect == 'duplicate-call':
++        cv.append(cv[0]); call['tool_calls'] = json.dumps(cv)
++    with sqlite3.connect(path) as conn:
++        for m in messages:
++            conn.execute('UPDATE messages SET ' + ','.join(k + '=?' for k in m if k != 'id') + ' WHERE id=?',
++                         tuple(v for k, v in m.items() if k != 'id') + (m['id'],))
++        if defect == 'duplicate-result':
++            conn.execute('INSERT INTO messages SELECT 31,session_id,role,tool_name,content,tool_call_id,tool_calls,31,display_identity FROM messages WHERE id=30')
++        if defect in ('duplicate-source', 'admission-overflow'):
++            for i in range(2, 3 if defect == 'duplicate-source' else 23):
++                conn.execute('INSERT INTO session_admissions SELECT ?,admission_id,request_id,principal_id,target_session_id,payload_json,status FROM session_admissions WHERE seq=1', (i,))
++        if defect == 'message-overflow':
++            for i in range(2001):
++                conn.execute('INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?)', (i+100, 's1', 'user', None, '', None, None, 50.0, b''))
++        if defect == 'byte-overflow':
++            conn.execute('UPDATE messages SET display_identity=? WHERE id=20', (b'x' * (4 * 1024 * 1024),))
++    before = path.read_bytes()
++    assert discover(path, 'default', op, wire) is None, defect
++    assert path.read_bytes() == before
++
++
++@pytest.mark.parametrize('message_id,key,value', [
++    (10, 'content', '[]'), (10, 'content', '{"task":null}'),
++    (20, 'tool_calls', '[null]'), (20, 'tool_calls', '[{"function":null}]'),
++    (30, 'content', '[]'), (40, 'content', '[]'),
++])
++def test_malformed_structured_records_fail_closed(tmp_path, message_id, key, value):
++    from hermes_cli.kanban_rejected_retain_source import discover
++    path, op, wire, *_ = fixture_db(tmp_path)
++    with sqlite3.connect(path) as conn:
++        conn.execute(f'UPDATE messages SET {key}=? WHERE id=?', (value, message_id))
++    assert discover(path, 'default', op, wire) is None
++
++
++def test_missing_database_does_not_create_file(tmp_path):
++    from hermes_cli.kanban_rejected_retain_source import discover
++    _, op, wire, *_ = fixture_db(tmp_path)
++    path = tmp_path / 'absent.db'
++    assert discover(path, 'default', op, wire) is None
++    assert not path.exists()
+-- 
+2.43.0
+

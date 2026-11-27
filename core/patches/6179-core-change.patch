@@ -1,0 +1,307 @@
+From 20d4bd050322af8fb356db06252c4fd6da9222d3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:47:29 -0800
+Subject: [PATCH 6179] Standing producer owner chats and local origin custody
+
+Public mirror of source commit 20d4bd050322af8fb356db06252c4fd6da9222d3.
+
+---
+diff --git a/hermes_cli/kanban_owner_chat.py b/hermes_cli/kanban_owner_chat.py
+index f1bc09ecef0..fa2602e26c2 100644
+--- a/hermes_cli/kanban_owner_chat.py
++++ b/hermes_cli/kanban_owner_chat.py
+@@ -38,9 +38,11 @@
+ _GENERATIONS = 10  # a user-deleted owner chat's id is retired for good: the next one takes a fresh suffix
+ RECHECK_S = 600.0  # a cached owner chat is re-validated (archived? deleted?) at most this often per process
+ BACKFILL_EVERY_S = 3600.0
++BACKFILL_CATCHUP_S = 600.0
++BACKFILL_BATCH = 100
+ _ENSURED: dict[tuple[str, str], tuple[str, float]] = {}
+ _LOCK = threading.Lock()
+-_LAST_BACKFILL: dict[str, float] = {}
++_NEXT_BACKFILL: dict[str, float] = {}
+ 
+ 
+ def enabled() -> bool:
+@@ -103,11 +105,12 @@
+     return SessionDB(db_path=path)
+ 
+ 
+-def ensure(producer: str) -> str:
++def ensure(producer: str, *, force: bool = False) -> str:
+     """The producer's live owner chat in this profile's state.db (created, pinned and un-archived as needed).
+ 
+     Within ``RECHECK_S`` of the last check the cached id is returned without touching state.db, so a create
+-    holding the kanban write lock pays for state.db once per producer per process, not per card."""
++    holding the kanban write lock pays for state.db once per producer per process, not per card. ``force``
++    re-validates now (the backfill found the cached chat dead)."""
+     import time
+ 
+     from hermes_constants import get_hermes_home
+@@ -116,7 +119,7 @@
+     key = (path, slug(producer))
+     with _LOCK:
+         cached = _ENSURED.get(key)
+-        if cached and time.monotonic() - cached[1] < RECHECK_S:
++        if cached and not force and time.monotonic() - cached[1] < RECHECK_S:
+             return cached[0]
+         db = _open_store(path)
+         try:
+@@ -153,11 +156,14 @@
+ 
+ def attach(conn, task_id: str, producer: str) -> str:
+     """Inside create's transaction: make the producer's owner chat this card's creating chat."""
+-    return link(conn, task_id, producer, ensure(producer))
++    sid = ensure(producer)
++    link(conn, task_id, producer, sid)
++    return sid
+ 
+ 
+-def link(conn, task_id: str, producer: str, sid: str) -> str:
+-    """Kanban-side half of :func:`attach`: link and record ``sid`` (an ensured owner chat) as the creating chat."""
++def link(conn, task_id: str, producer: str, sid: str) -> bool:
++    """Kanban-side half of :func:`attach`: link and record ``sid`` (an ensured owner chat) as the creating chat.
++    False (and no event) when the card already had exactly that link."""
+     from hermes_cli.kanban_adoption_authority import gateway as _gateway
+     from hermes_cli.kanban_chat_links import link_uid
+     from hermes_cli.kanban_db import _append_event
+@@ -167,17 +173,22 @@
+     chat_profile = None if profile == "default" else profile  # the UID ordinary reconciliation derives
+     created = conn.execute("SELECT created_at FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+-        conn.execute(
++        added = conn.execute(
+             "INSERT OR IGNORE INTO task_chat_links "
+             "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
+             "VALUES (?,?,?,?,?,'created',0,?)",
+-            (link_uid(task_id, me, chat_profile, sid, "created"), task_id, me, chat_profile, sid, created))
++            (link_uid(task_id, me, chat_profile, sid, "created"), task_id, me, chat_profile, sid, created)).rowcount
++        if not added:
++            return False
+         # What reconciliation reads to keep a created link (kanban_chat_links._local_links); a stop then binds
+         # the chat's subscription (kanban_spend_decision._route), so no event wakes it before a decision.
+         _append_event(conn, task_id, "creator_chats_resolved",
+                       {"registered_session": sid, "chat_gateway": me, "chat_profile": chat_profile})
+     else:
+         # A board without links: its owning chat IS its tui subscription (kanban_create_authority legacy branch).
++        if conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=?",
++                        (task_id, sid)).fetchone():
++            return False
+         conn.execute(
+             "INSERT OR IGNORE INTO kanban_notify_subs "
+             "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
+@@ -186,7 +197,7 @@
+             (task_id, sid, created, task_id))
+     _append_event(conn, task_id, EVENT, {"producer": producer, "session": sid, "chat_gateway": me,
+                                          "chat_profile": chat_profile})
+-    return sid
++    return True
+ 
+ 
+ def settle(conn, task_id: str, creator_task_id: Optional[str], *, created_by: Optional[str], strict: bool,
+@@ -223,14 +234,20 @@
+ 
+ 
+ def _owner_refs(conn, task_id: str, links: bool) -> tuple[list[str], bool]:
+-    """``(owner chat ids, has another owning chat)`` among this card's unreleased creating chats."""
++    """``(this gateway and profile's owner chat ids, has another owning chat)`` among the card's unreleased
++    creating chats. An owner chat of another gateway or profile is not judged here: it counts as another owner."""
++    from hermes_cli.kanban_adoption_authority import gateway as _gateway
++    from hermes_cli.profiles import get_active_profile_name
++    profile = get_active_profile_name()
+     if links:
+-        rows = [r[0] for r in conn.execute(
+-            "SELECT chat_session FROM task_chat_links WHERE task_id=? AND kind='created' AND released=0", (task_id,))]
++        me, chat_profile = _gateway(conn), None if profile == "default" else profile
++        rows = [(r[0], r[1] == me and (r[2] or None) == chat_profile) for r in conn.execute(
++            "SELECT chat_session, chat_gateway, chat_profile FROM task_chat_links "
++            "WHERE task_id=? AND kind='created' AND released=0", (task_id,))]
+     else:
+-        rows = [r[0] for r in conn.execute(
++        rows = [(r[0], "/" not in str(r[0] or "")) for r in conn.execute(
+             "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? AND platform='tui'", (task_id,))]
+-    mine = [str(r) for r in rows if str(r or "").rsplit("/", 1)[-1].startswith(PREFIX)]
++    mine = [str(ref) for ref, local in rows if local and str(ref or "").startswith(PREFIX)]
+     return mine, len(mine) < len(rows)
+ 
+ 
+@@ -241,7 +258,7 @@
+                               (task_id,)).fetchone():
+         return None  # its owner let go on purpose; re-owning it would undo that
+     mine, other = _owner_refs(conn, task_id, links)
+-    if mine and not other and not any(live(ref.rsplit("/", 1)[-1]) for ref in mine):
++    if mine and not other and not any(live(ref) for ref in mine):
+         return mine  # owned only by owner chats the user deleted or archived: delivery would go nowhere
+     if kca.has_authority(conn, task_id, None, durable=True):
+         return None
+@@ -282,32 +299,30 @@
+             db.close()
+ 
+ 
+-def backfill(conn, *, apply: bool) -> dict:
+-    """Give each ownerless open card its producer's owner chat (``apply``), re-checked under the write lock.
+-    Links to owner chats the user deleted or archived are released (or unsubscribed) first."""
++def backfill(conn, *, apply: bool, limit: Optional[int] = None) -> dict:
++    """Give each ownerless open card (up to ``limit``) its producer's live owner chat (``apply``), re-checked under
++    the write lock. A card left on a deleted or archived owner chat is re-validated first (``ensure(force=True)``
++    restores an archived chat; a deleted one rotates). On a synced board its dead link stays: creating-chat links
++    are never released on their own gateway (``kanban_chat_links._local_links``), and the live link beside it
++    owns the card. On a board without links the dead subscription is dropped."""
+     from hermes_cli import kanban_db as kb
+     links = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone())
+     db, live = _liveness()
+     try:
+         found, linked = ownerless(conn, live), []
+         if apply:
+-            for task_id, producer in found:
+-                sid = ensure(producer)  # state.db work outside the kanban write lock
++            forced: set[str] = set()
++            for task_id, producer in found[:limit]:
++                dead = _needs_owner(conn, task_id, links, live)
++                if dead is None:
++                    continue
++                force = bool(dead) and producer not in forced
++                sid = ensure(producer, force=force)  # state.db work outside the kanban write lock
++                if force:
++                    forced.add(producer)
+                 with kb.write_txn(conn):
+-                    dead = _needs_owner(conn, task_id, links, live)
+-                    if dead is None:
+-                        continue
+-                    for ref in dead:
+-                        if ref.rsplit("/", 1)[-1] == sid:
+-                            continue  # an archived chat ensure() just restored: keep its link
+-                        if links:
+-                            conn.execute("UPDATE task_chat_links SET released=1 WHERE task_id=? AND kind='created' "
+-                                         "AND chat_session=?", (task_id, ref))
+-                        else:
+-                            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND platform='tui' "
+-                                         "AND chat_id=?", (task_id, ref))
+-                    link(conn, task_id, producer, sid)
+-                    linked.append(task_id)
++                    if _relink(conn, task_id, producer, sid, links, live):
++                        linked.append(task_id)
+     finally:
+         db.close()
+     by_producer: dict[str, int] = {}
+@@ -316,14 +331,30 @@
+     return {"ownerless": len(found), "linked": len(linked), "by_producer": by_producer}
+ 
+ 
++def _relink(conn, task_id: str, producer: str, sid: str, links: bool, live) -> bool:
++    """Under the write lock: own the card by ``sid`` if it still needs an owner. True when newly linked or its
++    archived chat was just restored."""
++    dead = _needs_owner(conn, task_id, links, live)
++    if dead is None:
++        return False
++    for ref in dead if not links else ():
++        if ref != sid:
++            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=?",
++                         (task_id, ref))
++    return link(conn, task_id, producer, sid) or sid in dead
++
++
+ def maybe_backfill(conn, *, now: float) -> Optional[dict]:
+-    """Dispatcher maintenance: at most hourly per board per process, own whatever is still ownerless (a create
+-    that found state.db unavailable, an owner chat the user deleted or archived)."""
++    """Dispatcher maintenance: own whatever is still ownerless (a create that found state.db unavailable, an owner
++    chat the user deleted or archived, cards from before owner chats). It runs in the dispatch tick, so each pass
++    links at most ``BACKFILL_BATCH`` cards; while a batch was full the next pass comes ``BACKFILL_CATCHUP_S`` later,
++    else an hour later."""
+     path = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
+-    if not enabled() or now - _LAST_BACKFILL.get(path, float("-inf")) < BACKFILL_EVERY_S:
++    if not enabled() or now < _NEXT_BACKFILL.get(path, float("-inf")):
+         return None
+-    _LAST_BACKFILL[path] = now
+-    result = backfill(conn, apply=True)
++    result = backfill(conn, apply=True, limit=BACKFILL_BATCH)
++    full = result["ownerless"] > BACKFILL_BATCH
++    _NEXT_BACKFILL[path] = now + (BACKFILL_CATCHUP_S if full else BACKFILL_EVERY_S)
+     if result["linked"]:
+         log.info("kanban owner chats: linked %d ownerless cards %s", result["linked"], result["by_producer"])
+     return result
+diff --git a/tests/hermes_cli/test_kanban_owner_chat.py b/tests/hermes_cli/test_kanban_owner_chat.py
+index c2373207203..22a4ce53d5f 100644
+--- a/tests/hermes_cli/test_kanban_owner_chat.py
++++ b/tests/hermes_cli/test_kanban_owner_chat.py
+@@ -389,14 +389,15 @@
+     assert owner.backfill(synced, apply=True)["linked"] == 1
+     rows = {tuple(r) for r in synced.execute(
+         "SELECT chat_session, released FROM task_chat_links WHERE task_id=? AND kind='created'", (tid,))}
+-    assert rows == {(old, 1), (owner.session_id("ci-main-watch", 2), 0)}
++    # the dead link stays (creating-chat links are never released on their own gateway); the live one owns it
++    assert rows == {(old, 0), (owner.session_id("ci-main-watch", 2), 0)}
+     assert kca.has_authority(synced, tid, None, durable=True)
+     assert owner.backfill(synced, apply=True)["ownerless"] == 0
+ 
+ 
+ def test_dispatcher_maintenance_owns_ownerless_cards_hourly(kanban_home, monkeypatch, owner_backfill):
+     from hermes_cli import kanban_dispatch_maintenance as maintenance
+-    monkeypatch.setattr(owner, "_LAST_BACKFILL", {})
++    monkeypatch.setattr(owner, "_NEXT_BACKFILL", {})
+     monkeypatch.setattr(owner, "enabled", lambda: False)
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="Made while off", assignee="default", created_by="self-heal")
+@@ -436,3 +437,59 @@
+         ids = [r[0] for r in conn.execute("SELECT id FROM tasks")]
+         assert out and len(ids) >= 3
+         assert all(kca.has_authority(conn, t, None, durable=True) for t in ids)
++
++
++def test_backfill_restores_an_archived_owner_chat_even_while_it_is_cached(synced):
++    from hermes_constants import get_hermes_home
++    from hermes_state import SessionDB
++    tid = kb.create_task(synced, title="Watcher card", assignee="default", created_by="ci-main-watch")
++    sid = owner.session_id("ci-main-watch")
++    db = SessionDB(db_path=get_hermes_home() / "state.db")
++    try:
++        db.set_session_archived(sid, True)
++    finally:
++        db.close()
++    assert owner.backfill(synced, apply=True)["linked"] == 1  # the cache is fresh: the backfill must still recheck
++    db = SessionDB(db_path=get_hermes_home() / "state.db")
++    try:
++        assert not db.get_session(sid)["archived"]
++    finally:
++        db.close()
++    assert owner.backfill(synced, apply=True) == {"ownerless": 0, "linked": 0, "by_producer": {}}
++    assert sum(e.kind == owner.EVENT for e in kb.list_events(synced, tid)) == 1
++
++
++def test_an_owner_chat_of_another_gateway_is_not_judged_dead_here(synced, monkeypatch):
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    tid = kb.create_task(synced, title="Inherited", assignee="default", created_by="ci-main-watch")
++    with kb.write_txn(synced):
++        synced.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,"
++                       "released,created_at) VALUES ('u2',?,'worker-1',NULL,?,'created',0,0)",
++                       (tid, owner.session_id("ci-main-watch")))
++    monkeypatch.setattr(owner, "enabled", lambda: True)
++    assert owner._owner_refs(synced, tid, True) == ([], True)
++
++
++def test_the_dispatcher_backfill_links_in_batches_and_catches_up_sooner(kanban_home, monkeypatch, owner_backfill):
++    monkeypatch.setattr(owner, "_NEXT_BACKFILL", {})
++    monkeypatch.setattr(owner, "BACKFILL_BATCH", 2)
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    with kbc.connect_closing() as conn:
++        for n in range(3):
++            kb.create_task(conn, title=f"old {n}", assignee="default", created_by="self-heal")
++        monkeypatch.setattr(owner, "enabled", lambda: True)
++        assert owner.maybe_backfill(conn, now=0.0)["linked"] == 2
++        assert owner.maybe_backfill(conn, now=owner.BACKFILL_CATCHUP_S - 1) is None
++        assert owner.maybe_backfill(conn, now=owner.BACKFILL_CATCHUP_S)["linked"] == 1
++        assert owner.maybe_backfill(conn, now=owner.BACKFILL_CATCHUP_S + owner.BACKFILL_CATCHUP_S) is None
++
++
++def test_dispatcher_maintenance_hook_runs_the_backfill(kanban_home, monkeypatch, owner_backfill):
++    from hermes_cli import kanban_dispatch_maintenance as maintenance
++    monkeypatch.setattr(owner, "_NEXT_BACKFILL", {})
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Before owner chats", assignee="default", created_by="oom-detector")
++        monkeypatch.setattr(owner, "enabled", lambda: True)
++        maintenance._own_ownerless_cards(conn)
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("oom-detector")
+-- 
+2.43.0
+

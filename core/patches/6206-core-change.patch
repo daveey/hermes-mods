@@ -1,0 +1,235 @@
+From e6f2eb0b44b895ad5bcf63266f9ae56364875ae8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:02:20 +0000
+Subject: [PATCH 6206] Standing producer owner chats and local origin custody
+
+Public mirror of source commit e6f2eb0b44b895ad5bcf63266f9ae56364875ae8.
+
+---
+diff --git a/hermes_cli/kanban_owner_chat.py b/hermes_cli/kanban_owner_chat.py
+index dcc5ee5c35d..80e38845c48 100644
+--- a/hermes_cli/kanban_owner_chat.py
++++ b/hermes_cli/kanban_owner_chat.py
+@@ -94,14 +94,32 @@
+ 
+ 
+ def tool_create_options(tool_task_id: Optional[str], selfwork_intent) -> dict:
+-    """``create_task`` owner options for the ``kanban_create`` tool. Receiver-set self-work intake is chat-less
+-    by contract, so it gets no owner chat. Any other chat-less caller is owned by its runner's producer: the cron
+-    job running this tool call, or (only outside an agent turn: a script calling the tool directly)
+-    ``HERMES_KANBAN_PRODUCER``."""
++    """``create_task`` owner options for the ``kanban_create`` tool. A receiver-set self-work intake create needs
++    no requester chat authority (#4252); it is not settled here because the intake home's ``admit`` settles it
++    with its policy slot's producer (:func:`selfwork_producer`) inside its own create transaction. Any other
++    chat-less caller is owned by its runner's producer: the cron job running this tool call, or (only outside an
++    agent turn: a script calling the tool directly) ``HERMES_KANBAN_PRODUCER``."""
+     return {"settle_owner_chat": selfwork_intent is None,
+             "owner_producer": declared_producer(tool_task_id, allow_env=not tool_task_id)}
+ 
+ 
++def selfwork_producer(value: dict) -> str:
++    """The producer of a self-work intake card: its policy slot's repository and area, so every intake card of
++    one slot (created now or backfilled later) shares one standing owner chat."""
++    return f"selfwork:{value['repository']}/{value['area']}"
++
++
++def intake_producer(conn, task_id: str) -> Optional[str]:
++    """:func:`selfwork_producer` of a card the self-work intake admitted (its ``self_work_declared`` event),
++    else None."""
++    from hermes_cli import kanban_selfwork as policy
++    try:
++        value = policy.declared(conn, task_id)
++    except (policy.SelfWorkError, ValueError, TypeError):
++        return None  # a malformed record names no slot: the card keeps its created_by producer
++    return selfwork_producer(value) if value else None
++
++
+ def _open_store(path: str):
+     from hermes_state import SessionDB
+     return SessionDB(db_path=path)
+@@ -336,7 +354,7 @@
+                 "ORDER BY created_at").fetchall():
+             if foreign_copy(conn, task_id) or _needs_owner(conn, task_id, links, live) is None:
+                 continue
+-            out.append((task_id, (created_by or "").strip() or "unattributed"))
++            out.append((task_id, intake_producer(conn, task_id) or (created_by or "").strip() or "unattributed"))
+         return out
+     finally:
+         if db is not None:
+diff --git a/hermes_cli/kanban_selfwork_intake.py b/hermes_cli/kanban_selfwork_intake.py
+index 42864bc848f..81a2715a8ad 100644
+--- a/hermes_cli/kanban_selfwork_intake.py
++++ b/hermes_cli/kanban_selfwork_intake.py
+@@ -113,7 +113,11 @@
+             from hermes_cli.kanban_db_creation import run_insert_guard
+             run_insert_guard(conn, create_guard)
+             with _creation_scope(conn, value):
+-                task_id = kb.create_task(conn, **options)
++                # [daveey] Owned by the slot's standing owner chat, settled in this create transaction. No
++                # requester chat authority is needed (#4252): not strict, so a state.db failure leaves it ownerless.
++                from hermes_cli.kanban_owner_chat import selfwork_producer
++                task_id = kb.create_task(conn, **{**options, 'settle_owner_chat': True,
++                                                  'owner_producer': selfwork_producer(value)})
+             policy.record(conn, task_id, value, day=batch.day_key(now))
+             if on_created is not None:
+                 on_created(conn, task_id)
+diff --git a/tests/hermes_cli/test_kanban_selfwork_owner_chat.py b/tests/hermes_cli/test_kanban_selfwork_owner_chat.py
+new file mode 100644
+index 00000000000..a85df4ab0d0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_owner_chat.py
+@@ -0,0 +1,117 @@
++"""Self-work intake cards are owned by their policy slot's standing owner chat. [daveey]
++
++A card the self-work intake admits used to get no owning chat ("chat-less by contract", #4252), so its worker
++could not file child cards (ship's independent review card) until the hourly owner-chat backfill caught it, and
++the backfill then keyed it by the sender. Now ``admit`` settles it in its create transaction with the producer
++``selfwork:<repository>/<area>``, and the backfill uses the same key for intake cards. The requester still needs
++no chat of its own.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_create_authority as kca
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_owner_chat as owner
++from tests.hermes_cli import test_kanban_selfwork_nochat as nochat
++
++world = nochat.world
++request_envelope = nochat.request_envelope
++invoke = nochat.invoke
++
++
++@pytest.fixture(autouse=True)
++def _owner_chats_on(monkeypatch, owner_chats):
++    monkeypatch.setattr(owner, "_ENSURED", {})
++
++
++def _slot(envelope):
++    value = envelope["args"]["create"]["self_work"]
++    return f"selfwork:{value['repository']}/{value['area']}"
++
++
++def _owner_sessions(conn, tid):
++    return [r[0] for r in conn.execute(
++        "SELECT chat_session FROM task_chat_links WHERE task_id=? AND kind='created' AND released=0", (tid,))]
++
++
++def _attached(conn):
++    return [json.loads(r[0]) for r in conn.execute("SELECT payload FROM task_events WHERE kind=?", (owner.EVENT,))]
++
++
++def test_intake_card_is_owned_by_its_slot_owner_chat(request_envelope, monkeypatch, capsys):
++    created = invoke(request_envelope, monkeypatch, capsys)
++    assert created.get("created") is True, created
++    tid, slot = created["task_id"], _slot(request_envelope)
++    with kbc.connect_closing() as conn:
++        assert _owner_sessions(conn, tid) == [owner.session_id(slot)]
++        assert kca.has_authority(conn, tid, None, durable=True)
++        assert [e["producer"] for e in _attached(conn)] == [slot]
++        assert kb.get_task(conn, tid).created_by == "gw:origin"  # the requester is unchanged and needs no chat
++
++
++def test_append_and_replay_make_no_second_owner_chat(request_envelope, monkeypatch, capsys):
++    first = invoke(request_envelope, monkeypatch, capsys)
++    request_envelope["id"] = "request-owner-002"
++    request_envelope["args"]["create"]["title"] = "Additional evidence"
++    assert invoke(request_envelope, monkeypatch, capsys)["disposition"] == "append"
++    assert invoke(request_envelope, monkeypatch, capsys)["replayed"] is True
++    with kbc.connect_closing() as conn:
++        assert len(_attached(conn)) == 1
++        assert _owner_sessions(conn, first["task_id"]) == [owner.session_id(_slot(request_envelope))]
++        assert len(kb.list_tasks(conn)) == 1
++
++
++def test_intake_create_survives_an_unavailable_owner_chat(request_envelope, monkeypatch, capsys):
++    """#4252's guarantee: an intake create never depends on a chat; state.db trouble leaves it ownerless."""
++    def broken(producer, *, force=False):
++        raise OSError("state.db unavailable")
++    monkeypatch.setattr(owner, "ensure", broken)
++    created = invoke(request_envelope, monkeypatch, capsys)
++    assert created.get("created") is True, created
++    with kbc.connect_closing() as conn:
++        events = [e.kind for e in kb.list_events(conn, created["task_id"])]
++        assert owner.UNAVAILABLE in events and _owner_sessions(conn, created["task_id"]) == []
++
++
++def test_running_worker_files_ship_review_child_through_the_tool(request_envelope, monkeypatch, capsys):
++    from agent import delegation_context
++    from tools import kanban_tools as kt
++    created = invoke(request_envelope, monkeypatch, capsys)
++    root = created["task_id"]
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (root,))
++        kb._append_event(conn, root, "owner_admitted", {"session_id": "20261124_170000_worker"})
++        conn.commit()
++    monkeypatch.setattr(kt, "_is_dispatcher_owned_worker", lambda: True)
++    monkeypatch.setattr(delegation_context, "is_dispatcher_owned_worker_context", lambda: True)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", root)
++    monkeypatch.setenv("HERMES_SESSION_ID", "20261124_170000_worker")
++    out = json.loads(kt._handle_create({
++        "title": "Review PR #9999 @ 0123abcd", "assignee": "default", "requires": [], "placement": "local",
++        "idempotency_key": "core-wt-review:example-org/hermes#9999:0123abcd",
++        "body": "Independent exact-head review."}))
++    assert out.get("ok"), out
++    with kbc.connect_closing() as conn:
++        assert kca.has_authority(conn, out["task_id"], None, durable=True)
++
++
++def test_backfill_links_an_existing_intake_card_to_its_slot_owner_chat(request_envelope, monkeypatch, capsys):
++    monkeypatch.setattr(owner, "enabled", lambda: False)  # a card admitted before intake cards were owned
++    created = invoke(request_envelope, monkeypatch, capsys)
++    monkeypatch.setattr(owner, "enabled", lambda: True)
++    tid, slot = created["task_id"], _slot(request_envelope)
++    with kbc.connect_closing() as conn:
++        assert _owner_sessions(conn, tid) == []
++        assert owner.ownerless(conn, live=lambda sid: True) == [(tid, slot)]
++        assert owner.backfill(conn, apply=True)["by_producer"] == {slot: 1}
++        assert _owner_sessions(conn, tid) == [owner.session_id(slot)]
++        assert owner.session_id("gw:origin") not in _owner_sessions(conn, tid)
++
++
++def test_a_non_intake_card_keeps_its_created_by_producer_in_the_backfill(request_envelope):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="watcher card", assignee="default", created_by="ci-main-watch",
++                             settle_owner_chat=False)
++        assert owner.ownerless(conn, live=lambda sid: True) == [(tid, "ci-main-watch")]
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 16b0c7823cb..698b25d8802 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -756,8 +756,9 @@
+ standing owner chat: one pinned chat per producer, titled
+ `Kanban owner: <producer>`. It is created on first use and seeded with a note
+ on what it decides. The producer is the card's `created_by` for system
+-monitors and watchers, the cron job for cards created from a cron run, and
+-`terminal` for a human's `hermes kanban create`. A scope or budget stop on the
++monitors and watchers, the cron job for cards created from a cron run,
++`selfwork:<repository>/<area>` for a card the self-work intake admits (one per
++policy slot), and `terminal` for a human's `hermes kanban create`. A scope or budget stop on the
+ card then routes to that chat, which can release, re-scope or archive it,
+ instead of waiting for an operator. An agent with no chat of its own is still
+ refused (`scope_authority_missing`). If the owner chat cannot be made, a
+diff --git a/website/docs/user-guide/self-maintenance-batches.md b/website/docs/user-guide/self-maintenance-batches.md
+index f39d09101bd..debcbf4433a 100644
+--- a/website/docs/user-guide/self-maintenance-batches.md
++++ b/website/docs/user-guide/self-maintenance-batches.md
+@@ -45,7 +45,12 @@
+ 
+ At the home, one transaction either creates a card or appends the new title and
+ body as a comment to an open card with the same repository, tenant, area and UTC
+-day. A different day or area creates a new owner. Done and archived cards are not
++day. A different day or area creates a new owner card. The requester needs no
++chat of its own: each card the intake creates is owned by its slot's standing
++owner chat, `Kanban owner: selfwork:<repository>/<area>` (one per repository
++and area, shared by every day's card and by older cards the owner-chat backfill
++links), so a stop on it routes to that chat and its worker can file child cards
++such as a review. Done and archived cards are not
+ reused. Batching does not modify existing dependencies, placement, or acceptance
+ text, and does not bypass review, required CI, or landing checks.
+ 
+-- 
+2.43.0
+

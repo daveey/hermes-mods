@@ -1,0 +1,160 @@
+From 30386567b290cc036e2a9ca2b3935244476e1b1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 06:43:51 +0000
+Subject: [PATCH 6339] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 30386567b290cc036e2a9ca2b3935244476e1b1d.
+
+---
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+index 01542b5256d..3003525fc66 100644
+--- a/plugins/kanban/dashboard/board_rows.py
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -171,10 +171,8 @@
+     return out
+ 
+ 
+-@board_legacy.reader()
+-def version(path: str) -> Optional[tuple]:
+-    """``(generation, dev, ino, schema_version, data_version)`` of ``path``; None when it
+-    cannot be observed (missing file, open/read error): the caller reads uncached."""
++def _observer(path: str) -> Optional[_Observer]:
++    """Acquire current observer custody without redundantly sampling its clock."""
+     path = str(path)
+     now = time.monotonic()
+     try:
+@@ -210,6 +208,22 @@
+                 retired = []  # another thread opened a current one first
+             retired += _sweep(now)
+         _retire(fresh, *retired)
++    with _lock:
++        obs.used = now
++        if _observers.get(path) is obs:
++            _observers.move_to_end(path)
++    return obs
++
++
++@board_legacy.reader()
++def version(path: str) -> Optional[tuple]:
++    """Current commit clock; unobservable boards return None for an uncached read."""
++    obs = _observer(str(path))
++    return _clock(obs) if obs is not None else None
++
++
++def _clock(obs: _Observer) -> Optional[tuple]:
++    path = obs.path
+     try:
+         with obs.lock:
+             schema = obs.conn.execute("PRAGMA schema_version").fetchone()[0]
+@@ -223,11 +237,7 @@
+             gone = _drop_observer(path) if _observers.get(path) is obs else None
+         _retire(gone)
+         return None
+-    with _lock:
+-        obs.used = now
+-        if _observers.get(path) is obs:
+-            _observers.move_to_end(path)
+-    return (obs.gen, ident[0], ident[1], int(schema), int(data))
++    return (obs.gen, *obs.ident, int(schema), int(data))
+ 
+ 
+ @board_legacy.reader()
+@@ -288,23 +298,18 @@
+     """
+     from hermes_cli import kanban_task_change
+ 
+-    ver = version(path)
+-    with _lock:
+-        obs = _observers.get(str(path)) if ver is not None else None
++    obs = _observer(str(path))
+     if obs is None:
+         return fallback()
+     cache_key = (*key, "p2")
+     with obs.refresh:
+-        with obs.lock:
+-            with _lock:
+-                current = _observers.get(str(path)) is obs
+-                hit = _entries.get(cache_key)
+-            # Retain only the observer's commit clock, not a history-reader connection.
+-            # Sample before opening the snapshot: a later commit invalidates next read.
+-            commit_key = (obs.gen, *obs.ident,
+-                          obs.conn.execute("PRAGMA schema_version").fetchone()[0],
+-                          obs.conn.execute("PRAGMA data_version").fetchone()[0]) if current else None
+-        if not current:
++        with _lock:
++            current = _observers.get(str(path)) is obs
++            hit = _entries.get(cache_key)
++        # Sample only after refresh custody: a waiter must see intervening commits.
++        # Failed/retired clocks never certify retained rows.
++        commit_key = _clock(obs) if current else None
++        if commit_key is None:
+             return fallback()
+         if hit is not None and len(hit) > 2 and hit[0] is not None and hit[2] == commit_key:
+             from hermes_cli import loop_accounting
+diff --git a/tests/plugins/test_kanban_board_rows_cache.py b/tests/plugins/test_kanban_board_rows_cache.py
+index c0354ae5666..ee3f6ccb435 100644
+--- a/tests/plugins/test_kanban_board_rows_cache.py
++++ b/tests/plugins/test_kanban_board_rows_cache.py
+@@ -113,6 +113,59 @@
+     assert all(_strip_now(b) == _strip_now(bodies[0]) for b in bodies[1:])
+ 
+ 
++def test_incremental_samples_commit_clock_once_per_read(env):
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++    statements = []
++    obs.conn.set_trace_callback(statements.append)
++    try:
++        for title in ("first", "changed"):
++            if title == "changed":
++                _raw("UPDATE tasks SET title=? WHERE id=?", (title, tid))
++            statements.clear()
++            assert _cards(_read(mod))[tid]["title"] == title
++            clocks = [sql.upper() for sql in statements if sql.upper().startswith("PRAGMA ")]
++            assert clocks == ["PRAGMA SCHEMA_VERSION", "PRAGMA DATA_VERSION"]
++    finally:
++        obs.conn.set_trace_callback(None)
++
++
++def test_incremental_clock_is_sampled_after_refresh_custody(env, monkeypatch):
++    from contextlib import contextmanager
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++
++    @contextmanager
++    def commit_while_acquiring():
++        _raw("UPDATE tasks SET title=? WHERE id=?", ("during wait", tid))
++        yield
++
++    monkeypatch.setattr(obs, "refresh", commit_while_acquiring())
++    assert _cards(_read(mod))[tid]["title"] == "during wait"
++
++
++def test_incremental_failed_clock_drops_observer_and_retries(env):
++    from plugins.kanban.dashboard import board_rows
++
++    mod, _sql_reads, _home = env
++    tid = _create("first")
++    _read(mod)
++    [obs] = board_rows._observers.values()
++    obs.conn.close()
++    _raw("UPDATE tasks SET title=? WHERE id=?", ("after failure", tid))
++    assert _cards(_read(mod))[tid]["title"] == "after failure"
++    assert obs not in board_rows._observers.values()
++    assert _cards(_read(mod))[tid]["title"] == "after failure"
++
++
+ def test_local_commit_is_read_on_the_next_read_without_full_materialization(env):
+     mod, sql_reads, _home = env
+     _create("first")
+-- 
+2.43.0
+

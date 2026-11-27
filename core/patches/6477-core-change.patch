@@ -1,0 +1,948 @@
+From 30e0df4239cc10b5756dcae3103e9716b4fc09e3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:21:41 +0000
+Subject: [PATCH 6477] Session list reads, status checkpoints and early startup
+
+Public mirror of source commit 30e0df4239cc10b5756dcae3103e9716b4fc09e3.
+
+---
+diff --git a/hermes_cli/always_on_http.py b/hermes_cli/always_on_http.py
+new file mode 100644
+index 00000000000..d1a858eaced
+--- /dev/null
++++ b/hermes_cli/always_on_http.py
+@@ -0,0 +1,74 @@
++"""Bounded, direct loopback HTTP reads for the stdlib-only backend roller.
++
++Socket timeouts alone bound inactivity, not a peer making slow progress. Rearm
++from one monotonic deadline at every raw read, including HTTP header parsing.
++No redirects, environment proxies, DNS, reader threads or detached futures.
++JSON decoding is size-bounded, not preemptible; expiry after decode rejects
++the result instead of treating late evidence as successful readiness.
++"""
++from __future__ import annotations
++
++import http.client
++import io
++import json
++import socket
++import time
++
++MAX_RESPONSE_BYTES = 8 * 1024 * 1024
++
++
++class _DeadlineReader(io.RawIOBase):
++    def __init__(self, sock: socket.socket, deadline: float):
++        self.sock, self.deadline = sock, deadline
++
++    def readable(self) -> bool:
++        return True
++
++    def readinto(self, buffer) -> int:
++        left = self.deadline - time.monotonic()
++        if left <= 0:
++            raise TimeoutError("loopback transfer deadline")
++        self.sock.settimeout(left)
++        return self.sock.recv_into(buffer)
++
++
++class _ResponseSocket:
++    def __init__(self, sock: socket.socket, deadline: float):
++        self.sock, self.deadline = sock, deadline
++
++    def makefile(self, mode: str):
++        return io.BufferedReader(_DeadlineReader(self.sock, self.deadline))
++
++
++def get_json(port: int, path: str, token: str, timeout: float) -> tuple[int | None, float, dict | None]:
++    started = time.monotonic()
++    deadline = started + timeout
++    try:
++        if timeout <= 0 or not path.startswith("/") or any(c in path + token for c in "\r\n"):
++            raise ValueError("invalid loopback request")
++        request = (f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{int(port)}\r\n"
++                   f"X-Hermes-Session-Token: {token}\r\nConnection: close\r\n\r\n").encode("ascii")
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
++            sock.settimeout(max(0.000001, deadline - time.monotonic()))
++            sock.connect(("127.0.0.1", int(port)))
++            left = deadline - time.monotonic()
++            if left <= 0:
++                raise TimeoutError("loopback connect deadline")
++            sock.settimeout(left)
++            sock.sendall(request)
++            with http.client.HTTPResponse(_ResponseSocket(sock, deadline)) as response:
++                response.begin()
++                status = response.status
++                body = response.read(MAX_RESPONSE_BYTES + 1)
++                if len(body) > MAX_RESPONSE_BYTES or (response.length is not None and response.length != 0):
++                    raise ValueError("oversized or truncated loopback response")
++        if time.monotonic() >= deadline:
++            raise TimeoutError("loopback response deadline")
++        parsed = None
++        if body[:1] in (b"{", b"["):
++            parsed = json.loads(body)
++        if time.monotonic() >= deadline:
++            raise TimeoutError("loopback decode deadline")
++        return status, time.monotonic() - started, parsed if isinstance(parsed, dict) else None
++    except (OSError, ValueError, RecursionError, http.client.HTTPException):
++        return None, time.monotonic() - started, None
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 524ec0fc5a5..66a423b56b8 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -48,7 +48,7 @@
+ import urllib.error
+ import urllib.parse
+ import urllib.request
+-from concurrent.futures import ThreadPoolExecutor
++
+ from pathlib import Path
+ from typing import Callable, Iterable, Optional
+ 
+@@ -539,21 +539,9 @@
+ 
+     # -- probes --
+     def _http_get(self, port: int, path: str, timeout: float) -> tuple[Optional[int], float, Optional[dict]]:
+-        started = time.monotonic()
+-        request = urllib.request.Request(f"http://127.0.0.1:{int(port)}{path}",
+-                                         headers={"X-Hermes-Session-Token": self.token})
+-        try:
+-            with urllib.request.urlopen(request, timeout=timeout) as response:
+-                body = response.read()
+-                status = response.status
+-        except urllib.error.HTTPError as exc:
+-            return exc.code, time.monotonic() - started, None
+-        except (OSError, ValueError, http.client.HTTPException):
+-            return None, time.monotonic() - started, None
+-        parsed = None
+-        with contextlib.suppress(ValueError):
+-            parsed = json.loads(body) if body[:1] in (b"{", b"[") else None
+-        return status, time.monotonic() - started, parsed if isinstance(parsed, dict) else None
++        from hermes_cli.always_on_http import get_json
++
++        return get_json(port, path, self.token, timeout)
+ 
+     def _http_post(self, port: int, path: str, payload: dict) -> Optional[dict]:
+         request = urllib.request.Request(f"http://127.0.0.1:{int(port)}{path}", method="POST",
+@@ -567,16 +555,16 @@
+             return None
+         return parsed if isinstance(parsed, dict) else None
+ 
+-    def unit_active(self, port: int) -> bool:
++    def unit_active(self, port: int, timeout: float = 15) -> bool:
+         try:
+-            state = (self.systemctl("is-active", backend_unit(port), timeout=15).stdout or "").strip()
++            state = (self.systemctl("is-active", backend_unit(port), timeout=timeout).stdout or "").strip()
+         except (OSError, subprocess.SubprocessError):
+             return False
+         return state in ("active", "activating", "reloading")
+ 
+-    def unit_pid(self, port: int) -> int:
++    def unit_pid(self, port: int, timeout: float = 15) -> int:
+         with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+-            out = self.systemctl("show", "-p", "MainPID", "--value", backend_unit(port), timeout=15).stdout
++            out = self.systemctl("show", "-p", "MainPID", "--value", backend_unit(port), timeout=timeout).stdout
+             return int((out or "0").strip() or 0)
+         return 0
+ 
+@@ -672,23 +660,52 @@
+         log(f"roll ({reason}): {'adopting' if adopted else 'starting'} backend :{port}"
+             f" (active :{active_port or '-'}, HEAD {(head or '?')[:10]})")
+         if active_port is None:
+-            write_active(port, home=self.home, reason=reason)  # nothing serves: point the proxy at it now
++            write_active(port, home=self.home, reason=reason, pendingPromotion=True)  # initial clients may connect
+         else:
+-            write_active(active_port, warming=[port], home=self.home, reason=reason)
++            write_active(active_port, warming=[port], home=self.home, reason=reason,
++                         pendingPromotion=bool(record and record.get("pendingPromotion")))
++        deadline = self.clock() + self.boot_timeout_s
+         if not adopted:
+             with contextlib.suppress(OSError, subprocess.SubprocessError):
+                 self.systemctl("reset-failed", backend_unit(port), timeout=15)
+             started = self.systemctl("start", "--no-block", backend_unit(port), timeout=30)
+             if started.returncode != 0:
+                 log(f"roll: could not start {backend_unit(port)}: {(started.stderr or '').strip()[-200:]}")
+-                self._abandon(port, active_port)
++                self._abandon(port, active_port, may_have_served=adopted or active_port is None)
+                 return False
+-        body = self._await_health(port)
++        body = self._await_health(port, deadline=deadline)
+         if body is None:
+             log(f"roll: backend :{port} did not answer within {self.boot_timeout_s:.0f}s; keeping"
+                 f" :{active_port or '-'}")
+-            self._abandon(port, active_port)
++            self._abandon(port, active_port, may_have_served=adopted or active_port is None)
+             return False
++        if body.get("sessions_early_owner") is True:
++            from hermes_cli.always_on_sessions import await_sessions, incarnation, PROBE_S
++
++            before = incarnation(self, port, deadline)
++            if before is None or not await_sessions(self, port, deadline):
++                log(f"roll: backend :{port} canonical sessions unavailable; keeping :{active_port or '-'}")
++                self._abandon(port, active_port, may_have_served=adopted or active_port is None)
++                return False
++            after = incarnation(self, port, deadline)
++            left = deadline - self.clock()
++            status, _, final = self.get(port, "/api/health", min(PROBE_S, left)) if left > 0 else (None, 0, None)
++            if (after != before or status != 200 or not final or final.get("ok") is not True
++                    or final.get("sessions_early_owner") is not True or final.get("commit") != body.get("commit")
++                    or self.clock() >= deadline or self.admission_deferred(reason) or self.update_in_progress()):
++                self._abandon(port, active_port, may_have_served=adopted or active_port is None)
++                return False
++            write_active(port, home=self.home, pid=before[0], commit=final.get("commit") or "", reason=reason)
++            log(f"roll: switched native sessions to :{port}; broad warming follows synchronously")
++            try:
++                warm_deadline = self.clock() + self.warm_cap_s
++                paths = self.replay_paths(record.get("pid") if record else None)
++                paths += [p for p in self.board_paths(port, deadline=warm_deadline) if p not in paths]
++                warm = self.warm(port, paths, deadline=warm_deadline)
++                log(f"roll: native :{port} warm {warm}")
++            except Exception:  # health: allow BLE001 -- post-publication best effort; never abandon an advertised PID
++                log(f"roll: native :{port} warm failed:\n{traceback.format_exc()}")
++            return True
+         paths = self.replay_paths(record.get("pid") if record else None)
+         paths += [p for p in self.board_paths(port) if p not in paths]
+         warm = self.warm(port, paths)
+@@ -703,28 +720,37 @@
+             f" :{active_port or '-'} retires when idle")
+         return True
+ 
+-    def _abandon(self, port: int, active_port: Optional[int]) -> None:
++    def _abandon(self, port: int, active_port: Optional[int], *, may_have_served: bool = False) -> None:
+         if active_port is not None:
+-            write_active(active_port, home=self.home)
++            record = read_active(self.home)
++            write_active(active_port, home=self.home,
++                         pendingPromotion=bool(record and record.get("pendingPromotion")))
++        if may_have_served:
++            return  # first-boot routing/adoption may hold clients; idle supervision owns retirement
+         with contextlib.suppress(OSError, subprocess.SubprocessError):
+             self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)  # never served a client
+ 
+-    def _await_health(self, port: int) -> Optional[dict]:
+-        deadline = self.clock() + self.boot_timeout_s
++    def _await_health(self, port: int, *, deadline: Optional[float] = None) -> Optional[dict]:
++        deadline = self.clock() + self.boot_timeout_s if deadline is None else deadline
++        timeout = .25  # original legacy allowance follows a missed fast listener probe
+         while self.clock() < deadline:
+-            body = self.health(port)
+-            if body is not None:
++            status, _, body = self.get(port, "/api/health", min(timeout, deadline - self.clock()))
++            if status == 200 and body and body.get("ok"):
+                 return body
+-            self.sleep(1.0)
++            timeout = 10.0
++            self.sleep(max(0, min(.05, deadline - self.clock())))
+         return None
+ 
+     # -- warming --
+-    def board_paths(self, port: int) -> list[str]:
++    def board_paths(self, port: int, *, deadline: Optional[float] = None) -> list[str]:
+         """GET /board for every unarchived board the successor lists. Desktop reads the rarely-polled boards
+         on reconnect, and board reads share 2 admission slots, so one cold board queues the warm ones behind
+         its first read (live 18:41Z: board=default waited 18-22 s). Best effort: no list, no extra paths."""
++        timeout = WARM_REQUEST_TIMEOUT_S if deadline is None else min(WARM_REQUEST_TIMEOUT_S, deadline - self.clock())
++        if timeout <= 0:
++            return []
+         try:
+-            status, _elapsed, body = self.get(port, "/api/plugins/kanban/boards", WARM_REQUEST_TIMEOUT_S)
++            status, _elapsed, body = self.get(port, "/api/plugins/kanban/boards", timeout)
+         except Exception:  # health: allow BLE001 -- warming is best effort: no list, no extra paths
+             return []
+         if status != 200 or not isinstance(body, dict) or not isinstance(body.get("boards"), list):
+@@ -764,27 +790,13 @@
+                 paths.append(url)
+         return paths
+ 
+-    def warm(self, port: int, paths: list[str]) -> dict:
++    def warm(self, port: int, paths: list[str], *, deadline: Optional[float] = None) -> dict:
+         """Two rounds of the paths, concurrently, inside ``warm_cap_s``: the first pays the cold caches, the
+         second shows what Desktop will see. Returns a summary for the log."""
+-        deadline = self.clock() + self.warm_cap_s
+-        summary: dict = {"paths": len(paths)}
+-        with ThreadPoolExecutor(max_workers=WARM_WORKERS) as pool:
+-            for round_no in (1, 2):
+-                left = deadline - self.clock()
+-                if left <= 0:
+-                    summary[f"round{round_no}"] = "skipped (cap)"
+-                    break
+-                timeout = min(WARM_REQUEST_TIMEOUT_S, left)
+-                futures = [pool.submit(self.get, port, path, timeout) for path in paths]
+-                results = []
+-                for future in futures:
+-                    with contextlib.suppress(Exception):
+-                        results.append(future.result(timeout=max(0.1, deadline - self.clock())))
+-                times = sorted(elapsed for _status, elapsed, _body in results)
+-                summary[f"round{round_no}"] = {"done": len(results), "max_s": round(times[-1], 2) if times else None,
+-                                               "errors": sum(1 for status, *_ in results if status != 200)}
+-        return summary
++        from hermes_cli.always_on_warm import warm
++
++        deadline = self.clock() + self.warm_cap_s if deadline is None else deadline
++        return warm(self, port, paths, deadline, workers=WARM_WORKERS, request_timeout=WARM_REQUEST_TIMEOUT_S)
+ 
+     # -- supervision --
+     def drift(self) -> Optional[str]:
+@@ -797,6 +809,8 @@
+             return f"active backend :{port} is not running"
+         if self.update_in_progress():
+             return None
++        if record.get("pendingPromotion"):
++            return f"active backend :{port} promotion incomplete"
+         body = self.health(port)
+         if body is None:
+             # Running but not answering (a starved threadpool): every Desktop call through the proxy
+diff --git a/hermes_cli/always_on_sessions.py b/hermes_cli/always_on_sessions.py
+new file mode 100644
+index 00000000000..3ec709602bc
+--- /dev/null
++++ b/hermes_cli/always_on_sessions.py
+@@ -0,0 +1,74 @@
++"""Native sessions promotion policy for the stdlib-only always-on roller."""
++from __future__ import annotations
++
++LIST_PATH = "/api/profiles/sessions?limit=50&offset=0&order=recent&profile=all&min_messages=1&archived=exclude"
++SIDEBAR_PATH = "/api/profiles/sessions/sidebar?recents_profile=all"
++PROBE_S = .25
++GAP_S = .05
++
++
++def _rows(value):
++    return isinstance(value, list) and all(isinstance(row, dict) and isinstance(row.get("id"), str)
++                                          and bool(row["id"]) for row in value)
++
++
++def complete(body, *, sidebar):
++    """Only canonical, complete envelopes qualify; legitimate empty stores qualify too.
++
++    No database reads, alternate proof endpoint or reduced serializer. HTTP 200 alone
++    does not distinguish a failed/partial profile scan from an empty database.
++    """
++    if not isinstance(body, dict) or body.get("errors") != [] or body.get("storage") != {}:
++        return False
++    if any(body.get(key) for key in ("failed", "retry", "profiles_failed", "incomplete", "error")):
++        return False
++    if sidebar:
++        for key in ("recents", "cron", "messaging"):
++            part = body.get(key)
++            if not isinstance(part, dict) or not _rows(part.get("sessions")):
++                return False
++            if any(part.get(k) for k in ("failed", "retry", "errors", "profiles_failed", "incomplete", "error")):
++                return False
++        return True
++    totals = body.get("profile_totals")
++    return (_rows(body.get("sessions")) and type(body.get("total")) is int and body["total"] >= 0
++            and isinstance(totals, dict) and all(type(n) is int and n >= 0 for n in totals.values())
++            and body["total"] == sum(totals.values()) and body.get("limit") == 50 and body.get("offset") == 0)
++
++
++def incarnation(roller, port, deadline):
++    """Bind canonical reads to the same unit PID and authenticated launch nonce."""
++    left = deadline - roller.clock()
++    pid = roller.unit_pid(port, timeout=min(PROBE_S, left)) if left > 0 else 0
++    if pid <= 0:
++        return None
++    bodies = []
++    for path in ("/api/host/identity", "/api/ssh/ownership"):
++        left = deadline - roller.clock()
++        if left <= 0:
++            return None
++        status, _, body = roller.get(port, path, min(PROBE_S, left))
++        if status != 200 or not body or body.get("ok") is not True:
++            return None
++        bodies.append(body)
++    host, custody = bodies
++    nonce = custody.get("sshOwnerNonce")
++    if (host.get("pid") != pid or not isinstance(nonce, str) or not nonce
++            or custody.get("runtimeIntact") is not True):
++        return None
++    return pid, nonce
++
++
++def await_sessions(roller, port, deadline):
++    pending = {LIST_PATH: False, SIDEBAR_PATH: True}
++    while pending and roller.clock() < deadline:
++        for path, sidebar in list(pending.items()):
++            left = deadline - roller.clock()
++            if left <= 0:
++                break
++            status, _elapsed, body = roller.get(port, path, min(PROBE_S, left))
++            if status == 200 and complete(body, sidebar=sidebar):
++                del pending[path]
++        if pending:
++            roller.sleep(max(0, min(GAP_S, deadline - roller.clock())))
++    return not pending and roller.clock() < deadline
+diff --git a/hermes_cli/always_on_warm.py b/hermes_cli/always_on_warm.py
+new file mode 100644
+index 00000000000..a7b8046e0a4
+--- /dev/null
++++ b/hermes_cli/always_on_warm.py
+@@ -0,0 +1,46 @@
++"""Joined, deadline-owned warm rounds for the stdlib-only roller."""
++from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
++
++
++def warm(roller, port, paths, deadline, *, workers, request_timeout):
++    summary = {"paths": len(paths)}
++
++    def request(path):
++        left = deadline - roller.clock()
++        if left <= 0:
++            return None
++        return roller.get(port, path, min(request_timeout, left))
++
++    # No detached work: even exceptions leave after all admitted transport calls close.
++    with ThreadPoolExecutor(max_workers=workers) as pool:
++        for round_no in (1, 2):
++            if roller.clock() >= deadline:
++                summary[f"round{round_no}"] = "skipped (cap)"
++                break
++            pending = set()
++            remaining = iter(paths)
++            results = []
++            exhausted = False
++            while True:
++                while len(pending) < workers and not exhausted and roller.clock() < deadline:
++                    path = next(remaining, None)
++                    if path is None:
++                        exhausted = True
++                        break
++                    pending.add(pool.submit(request, path))
++                if not pending:
++                    break
++                done, pending = wait(pending, timeout=max(0, deadline - roller.clock()), return_when=FIRST_COMPLETED)
++                for future in done:
++                    try:
++                        result = future.result()
++                    except Exception:  # health: allow BLE001 -- warm transport errors are best effort, pool still joined
++                        result = None
++                    if result is not None:
++                        results.append(result)
++                if roller.clock() >= deadline:
++                    break
++            times = sorted(elapsed for _status, elapsed, _body in results)
++            summary[f"round{round_no}"] = {"done": len(results), "max_s": round(times[-1], 2) if times else None,
++                                          "errors": sum(1 for status, *_ in results if status != 200)}
++    return summary
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 6c2be700ced..584e74f7ec9 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -25,6 +25,13 @@
+             self.closed = True  # failed drain retains custody for the outer retry
+ 
+ 
++def adopted_early_owner(state):
++    """Startup policy only, independent of capture readiness or environment flags."""
++    owner = getattr(state, 'early_sessions_owner', None)
++    return (isinstance(owner, EarlySessions) and owner.adopted and not owner.closed
++            and getattr(state, 'sessions_facts', None) is owner.runtime)
++
++
+ @contextmanager
+ def early_sessions(*, headless, isolated):
+     # Preserve legacy/embedded/non-Linux ordering and the supported rollback.
+diff --git a/hermes_cli/web_routers/status.py b/hermes_cli/web_routers/status.py
+index 0155bb587f1..d406365cfdd 100644
+--- a/hermes_cli/web_routers/status.py
++++ b/hermes_cli/web_routers/status.py
+@@ -180,9 +180,12 @@
+     ``web_server`` import): Desktop refuses to attach to a backend whose commit differs from
+     its checkout, so a serve that outlived ``hermes update`` is never re-adopted.
+     """
++    from hermes_cli.sessions_early_boot import adopted_early_owner
++
+     info = get_version_info()
+     return {"ok": True, "version": info.base_version, "displayVersion": info.display_version,
+             "commit": info.commit,
++            "sessions_early_owner": adopted_early_owner(app.state),
+             "auth_required": bool(getattr(app.state, "auth_required", False)),
+             # Per-lane thread counters (counts only); in-memory, so this route still never waits. [daveey]
+             "thread_lanes": _lane_stats()}
+diff --git a/tests/hermes_cli/test_always_on_http_deadline.py b/tests/hermes_cli/test_always_on_http_deadline.py
+new file mode 100644
+index 00000000000..a3546cab33f
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_http_deadline.py
+@@ -0,0 +1,118 @@
++"""Real loopback transfer bounds for startup probes, including slow progress."""
++from __future__ import annotations
++
++import json
++import socket
++import threading
++import time
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import always_on_rollover as ro
++
++
++@contextmanager
++def peer(reply, *, trickle=False):
++    stop = threading.Event()
++    closed = threading.Event()
++    received = []
++    errors = []
++    with socket.socket() as listener:
++        listener.bind(("127.0.0.1", 0))
++        listener.listen(1)
++        listener.settimeout(2)
++        port = listener.getsockname()[1]
++
++        def serve():
++            try:
++                conn, _ = listener.accept()
++                with conn:
++                    conn.settimeout(2)
++                    request = b""
++                    while b"\r\n\r\n" not in request:
++                        request += conn.recv(4096)
++                    received.append(request)
++                    for part in reply:
++                        conn.sendall(part)
++                        if trickle and stop.wait(.04):
++                            break
++                    # Detect client closure, not just a returned timeout tuple.
++                    if conn.recv(1) == b"":
++                        closed.set()
++            except (BrokenPipeError, ConnectionResetError):
++                closed.set()
++            except OSError as exc:
++                errors.append(exc)
++
++        thread = threading.Thread(target=serve)
++        thread.start()
++        try:
++            yield port, received, closed
++        finally:
++            stop.set()
++            thread.join(3)
++            assert not thread.is_alive()
++            assert not errors
++
++
++@pytest.mark.parametrize("phase", ["headers", "body"])
++def test_get_total_deadline_closes_trickling_peer(phase, tmp_path):
++    if phase == "headers":
++        parts = [b"HTTP/1.1 200 OK\r\nX-Slow: "] + [b"a"] * 15 + [
++            b"\r\nContent-Length: 2\r\n\r\n{}"]
++    else:
++        parts = [b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n"] + [b" "] * 15
++    roller = ro.Roller(token="fixture-token", checkout=None, marker=tmp_path / "marker")
++    with peer(parts, trickle=True) as (port, received, closed):
++        start = time.monotonic()
++        status, elapsed, body = roller._http_get(port, "/api/health", .12)
++        duration = time.monotonic() - start
++        assert duration < .30, (phase, duration)
++        assert status is None and body is None
++        assert elapsed < .30
++        assert closed.wait(1)
++        assert b"X-Hermes-Session-Token: fixture-token\r\n" in received[0]
++
++
++def test_decode_crossing_deadline_cannot_return_success(monkeypatch, tmp_path):
++    from hermes_cli import always_on_http as transport
++    original_clock = time.monotonic
++    original_loads = json.loads
++    offset = [0.0]
++    monkeypatch.setattr(transport.time, "monotonic", lambda: original_clock() + offset[0])
++
++    def decode(body):
++        result = original_loads(body)
++        offset[0] += .2  # decoding itself consumed the remaining budget
++        return result
++
++    monkeypatch.setattr(transport.json, "loads", decode)
++    roller = ro.Roller(token="fixture", checkout=None, marker=tmp_path / "marker")
++    with peer([b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"]) as (port, _, closed):
++        status, _, body = roller._http_get(port, "/api/health", .12)
++        assert status is None and body is None
++        assert closed.wait(1)
++
++
++def test_malformed_json_is_unavailable(tmp_path):
++    body = b'{"nested":[}'
++    reply = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
++    roller = ro.Roller(token="fixture", checkout=None, marker=tmp_path / "marker")
++    with peer([reply]) as (port, _, closed):
++        status, _, parsed = roller._http_get(port, "/api/health", 1)
++        assert status is None and parsed is None
++        assert closed.wait(1)
++
++
++@pytest.mark.parametrize("status", [200, 401, 503])
++def test_get_preserves_status_and_json(status, tmp_path):
++    body = json.dumps({"ok": status == 200}).encode()
++    reply = (f"HTTP/1.1 {status} Fixture\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
++    roller = ro.Roller(token="fixture-token", checkout=None, marker=tmp_path / "marker")
++    with peer([reply]) as (port, _received, closed):
++        actual, _elapsed, parsed = roller._http_get(port, "/api/health", 1)
++        assert actual == status
++        if status == 200:
++            assert parsed == {"ok": True}
++        assert closed.wait(1)
+diff --git a/tests/hermes_cli/test_always_on_sessions_promotion.py b/tests/hermes_cli/test_always_on_sessions_promotion.py
+new file mode 100644
+index 00000000000..be1921a7012
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_sessions_promotion.py
+@@ -0,0 +1,291 @@
++"""Native early-owner promotion precedes unrelated cold route work."""
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import always_on_rollover as ro
++from tests.hermes_cli import test_always_on_rollover as helpers
++
++home = helpers.home
++
++LIST = "/api/profiles/sessions?limit=50&offset=0&order=recent&profile=all&min_messages=1&archived=exclude"
++SIDEBAR = "/api/profiles/sessions/sidebar?recents_profile=all"
++
++
++def complete_list():
++    return {"sessions": [{"id": "persisted-fixture"}], "total": 1, "profile_totals": {"default": 1},
++            "limit": 50, "offset": 0, "errors": [], "storage": {}}
++
++
++def complete_sidebar():
++    return {**{key: {"sessions": [{"id": "persisted-fixture"}]} for key in ("recents", "cron", "messaging")},
++            "errors": [], "storage": {}}
++
++
++def native_roller(home):
++    host = helpers.FakeHost(running={9148}, commits={9148: "a" * 40})
++    ro.write_active(9148)
++    roller = helpers.make_roller(home, host)
++    original = host.get
++
++    def get(port, path, timeout):
++        if path == LIST:
++            host.gets.append((port, path))
++            return 200, 0, complete_list()
++        if path == SIDEBAR:
++            host.gets.append((port, path))
++            return 200, 0, complete_sidebar()
++        if path == "/api/host/identity":
++            return 200, 0, {"ok": True, "pid": 1000 + port}
++        if path == "/api/ssh/ownership":
++            return 200, 0, {"ok": True, "sshOwnerNonce": "fixture-incarnation", "runtimeIntact": True}
++        status, elapsed, body = original(port, path, timeout)
++        if path == "/api/health" and body is not None:
++            body["sessions_early_owner"] = True
++        return status, elapsed, body
++
++    roller.get = get
++    return roller, host
++
++
++def test_native_switches_only_after_both_selectors_before_any_broad_work(home):
++    roller, host = native_roller(home)
++    warm_seen = []
++
++    def replay(pid):
++        assert ro.read_active()["port"] == 9149
++        assert (9149, LIST) in host.gets and (9149, SIDEBAR) in host.gets
++        return []
++
++    def boards(port, *, deadline):
++        assert ro.read_active()["port"] == port
++        return ["/api/plugins/kanban/board?board=fixture"]
++
++    def warm(port, paths, *, deadline):
++        warm_seen.append(ro.read_active())
++        assert paths == ["/api/plugins/kanban/board?board=fixture"]
++        return {"fixture": True}
++
++    roller.replay_paths, roller.board_paths, roller.warm = replay, boards, warm
++    assert roller.roll("fixture") is True
++    assert len(warm_seen) == 1
++    assert warm_seen[0] == ro.read_active()  # warm summary cannot overwrite publication
++    assert ro.read_active()["warming"] == []
++    assert not any(call[0] == "stop" for call in host.calls)
++
++
++@pytest.mark.parametrize("state,expected", [
++    ("pending", True), ("ready", True), ("failed", True), ("absent", False),
++    ("not-adopted", False), ("closed", False), ("foreign", False), ("off", False),
++])
++def test_health_policy_is_actual_adopted_custody_not_capture_readiness(monkeypatch, state, expected):
++    from hermes_cli.web_routers import status
++    from hermes_cli.sessions_early_boot import EarlySessions
++    runtime = SimpleNamespace(ready=state == "ready")
++    owner = EarlySessions(runtime)
++    if state != "not-adopted":
++        owner.adopt()
++    owner.closed = state == "closed"
++    monkeypatch.setattr(status.app.state, "early_sessions_owner", None if state == "absent" else owner, raising=False)
++    current = None if state == "off" else (SimpleNamespace() if state == "foreign" else runtime)
++    monkeypatch.setattr(status.app.state, "sessions_facts", current, raising=False)
++    monkeypatch.setenv("HERMES_FACTS_SESSIONS", "1")  # not authority for the policy
++    assert asyncio.run(status.get_health())["sessions_early_owner"] is expected
++
++
++@pytest.mark.parametrize("replacement", ["pid", "nonce", "auth", "host-pid"])
++def test_native_proof_is_one_authenticated_process_incarnation(home, replacement):
++    roller, _host = native_roller(home)
++    original = roller.get
++    ready = [False]
++
++    def get(port, path, timeout):
++        result = original(port, path, timeout)
++        if path == SIDEBAR:
++            ready[0] = True
++        if ready[0] and path == "/api/host/identity" and replacement == "host-pid":
++            return 200, 0, {"ok": True, "pid": 9999}
++        if ready[0] and path == "/api/ssh/ownership":
++            if replacement == "nonce":
++                return 200, 0, {"ok": True, "sshOwnerNonce": "new-incarnation", "runtimeIntact": True}
++            if replacement == "auth":
++                return 401, 0, {"detail": "Unauthorized"}
++        return result
++
++    roller.get = get
++    roller.unit_pid = lambda port, **kwargs: 9999 if ready[0] and replacement == "pid" else 1000 + port
++    assert roller.roll("replacement") is False
++    assert ro.read_active()["port"] == 9148
++    assert not ro.read_active()["warming"]
++
++
++@pytest.mark.parametrize("adopted", [False, True])
++def test_health_failure_never_stops_first_boot_or_adopted_clients(home, adopted):
++    host = helpers.FakeHost(running={9148, 9149} if adopted else set())
++    if adopted:
++        ro.write_active(9148, warming=[9149])
++    roller = helpers.make_roller(home, host, boot_timeout_s=.2)
++    roller.get = lambda port, path, timeout: (None, 0, None)
++    assert roller.roll("unavailable") is False
++    assert not any(call[0] == "stop" for call in host.calls)
++
++
++def test_first_boot_failed_readiness_is_retried_not_permanently_healthy(home):
++    roller, host = native_roller(home)
++    host.running.clear()
++    host.commits[9148] = "c" * 40  # no commit-drift guard may mask incomplete promotion
++    ro.active_path().unlink()
++    original = roller.get
++    roller.get = lambda port, path, timeout: (503, 0, None) if path == LIST else original(port, path, timeout)
++    assert roller.roll("first boot") is False
++    assert not any(call[0] == "stop" for call in host.calls)
++    assert roller.drift() is not None
++
++
++def test_slow_legacy_health_still_gets_original_request_allowance(home):
++    roller = helpers.make_roller(home, helpers.FakeHost())
++    timeouts = []
++
++    def slow(port, path, timeout):
++        timeouts.append(timeout)
++        roller.sleep(min(.4, timeout))
++        return (200, .4, {"ok": True}) if timeout >= .4 else (None, timeout, None)
++
++    roller.get = slow
++    assert roller._await_health(9148) == {"ok": True}
++    assert any(timeout >= .4 for timeout in timeouts)
++
++
++@pytest.mark.parametrize("selector", [LIST, SIDEBAR])
++@pytest.mark.parametrize("bad", ["auth", "unavailable", "malformed", "errors", "storage", "partial", "failed", "no-rows"])
++def test_partial_or_unavailable_selector_never_promotes(home, selector, bad):
++    roller, host = native_roller(home)
++    original = roller.get
++
++    def get(port, path, timeout):
++        result = original(port, path, timeout)
++        if path != selector:
++            return result
++        body = complete_list() if selector == LIST else complete_sidebar()
++        if bad in ("auth", "unavailable"):
++            return 401 if bad == "auth" else 503, 0, {"detail": "unavailable"}
++        if bad == "malformed":
++            return 200, 0, {}
++        if bad == "errors":
++            body["errors"] = [{"profile": "default", "error": "read failed"}]
++        if bad == "storage":
++            body["storage"] = {"default": "unavailable"}
++        if bad == "partial":
++            body["profiles_failed"] = {"default": {"failed": True}}
++        if bad == "failed":
++            body["failed"] = True
++        if bad == "no-rows":
++            if selector == LIST:
++                body.pop("sessions")
++            else:
++                body["cron"].pop("sessions")
++        return 200, 0, body
++
++    roller.get = get
++    assert roller.roll("bad selector") is False
++    assert ro.read_active()["port"] == 9148
++    assert not ro.read_active()["warming"]
++    assert not any(path == "/api/plugins/kanban/boards" for _, path in host.gets)
++
++
++def test_completed_empty_canonical_stores_are_not_an_unavailable_backend(home):
++    roller, _host = native_roller(home)
++    original = roller.get
++
++    def get(port, path, timeout):
++        if path == LIST:
++            return 200, 0, {**complete_list(), "sessions": [], "total": 0, "profile_totals": {"default": 0}}
++        if path == SIDEBAR:
++            return 200, 0, {**{key: {"sessions": []} for key in ("recents", "cron", "messaging")},
++                            "errors": [], "storage": {}}
++        return original(port, path, timeout)
++
++    roller.get = get
++    assert roller.roll("legitimate empty") is True  # product policy, NOT real-row acceptance
++
++
++def test_each_selector_waits_independently_without_reprobing_success(home):
++    roller, _host = native_roller(home)
++    original = roller.get
++    calls = {LIST: 0, SIDEBAR: 0}
++
++    def get(port, path, timeout):
++        if path in calls:
++            calls[path] += 1
++            if path == SIDEBAR and calls[path] < 3:
++                return 503, 0, {"detail": "facts unavailable"}
++        return original(port, path, timeout)
++
++    roller.get = get
++    roller.replay_paths = lambda pid: []
++    assert roller.roll("independent") is True
++    assert calls == {LIST: 1, SIDEBAR: 3}
++
++
++@pytest.mark.parametrize("fence", ["hold", "marker"])
++def test_update_fence_arriving_during_selector_read_preserves_predecessor(home, fence):
++    roller, host = native_roller(home)
++    original = roller.get
++
++    def get(port, path, timeout):
++        result = original(port, path, timeout)
++        if path == SIDEBAR:
++            target = roller.marker if fence == "marker" else roller.marker.parent / "core-update/holds/hermes-sync"
++            target.parent.mkdir(parents=True, exist_ok=True)
++            target.touch()
++        return result
++
++    roller.get = get
++    assert roller.roll("late fence") is False
++    assert ro.read_active()["port"] == 9148
++    assert 9148 in host.running
++
++
++@pytest.mark.parametrize("failure", ["exception", "death"])
++def test_after_publication_warm_failure_never_restores_or_stops_advertised_backend(home, failure):
++    roller, host = native_roller(home)
++    published = []
++
++    def warm(port, paths, **kwargs):
++        published.append(ro.active_path().read_bytes())
++        if failure == "death":
++            host.running.discard(port)
++            return {}
++        raise RuntimeError("fixture warm failure")
++
++    roller.warm = warm
++    assert roller.roll("post-promotion") is True
++    assert published == [ro.active_path().read_bytes()]
++    assert ro.read_active()["port"] == 9149
++    assert not any(call[0] == "stop" for call in host.calls)
++
++
++@pytest.mark.parametrize("policy", [False, None, 1, "true"])
++def test_legacy_or_nonboolean_policy_keeps_warm_before_switch(home, policy):
++    roller, _host = native_roller(home)
++    original = roller.get
++    canonical = []
++
++    def get(port, path, timeout):
++        status, elapsed, body = original(port, path, timeout)
++        if path == "/api/health" and body:
++            body["sessions_early_owner"] = policy
++        if path == SIDEBAR:
++            canonical.append(path)
++        return status, elapsed, body
++
++    def warm(port, paths):
++        assert ro.read_active()["port"] == 9148
++        return {}
++
++    roller.get, roller.warm = get, warm
++    assert roller.roll("legacy") is True
++    assert canonical == []
+diff --git a/tests/hermes_cli/test_always_on_warm_deadline.py b/tests/hermes_cli/test_always_on_warm_deadline.py
+new file mode 100644
+index 00000000000..5818d9c15a1
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_warm_deadline.py
+@@ -0,0 +1,57 @@
++"""Warm work is synchronously owned, with bounded admission and one shared cap."""
++import threading
++import time
++
++from hermes_cli import always_on_rollover as ro
++from tests.hermes_cli import test_always_on_sessions_promotion as native
++
++home = native.home
++
++
++def test_warm_stops_submitting_at_deadline_and_joins_only_six_inflight(home):
++    roller = ro.Roller(token="fixture", checkout=None, marker=home / "marker", warm_cap_s=.12)
++    lock = threading.Lock()
++    started, finished, inflight, maximum = [], [], [0], [0]
++
++    def get(port, path, timeout):
++        with lock:
++            started.append((path, timeout))
++            inflight[0] += 1
++            maximum[0] = max(maximum[0], inflight[0])
++        threading.Event().wait(timeout)  # health: allow HX013 -- model an admitted transport exhausting its own deadline
++        with lock:
++            inflight[0] -= 1
++            finished.append(path)
++        return 200, timeout, {}
++
++    roller.get = get
++    began = time.monotonic()
++    roller.warm(9148, [f"/api/fixture/{n}" for n in range(42)])
++    assert time.monotonic() - began < .35
++    assert 1 <= len(started) <= 6
++    assert maximum[0] <= 6
++    assert len(finished) == len(started) and inflight[0] == 0
++    assert all(0 < timeout <= .12 for _, timeout in started)
++
++
++def test_board_discovery_and_both_rounds_share_postpromotion_deadline(home):
++    roller, _host = native.native_roller(home)
++    roller.warm_cap_s = .12
++    original = roller.get
++    broad = []
++
++    def get(port, path, timeout):
++        if path == "/api/plugins/kanban/boards":
++            broad.append((path, timeout))
++            assert ro.read_active()["port"] == port
++            roller.sleep(timeout)
++            return 200, timeout, {"boards": [{"slug": "fixture"}]}
++        if path not in (native.LIST, native.SIDEBAR, "/api/health", "/api/host/identity", "/api/ssh/ownership"):
++            broad.append((path, timeout))
++        return original(port, path, timeout)
++
++    roller.get = get
++    assert roller.roll("fixture") is True
++    assert len(broad) == 1  # discovery used the entire cap: no queued warm rounds
++    assert broad[0][0] == "/api/plugins/kanban/boards"
++    assert 0 < broad[0][1] <= .12
+-- 
+2.43.0
+

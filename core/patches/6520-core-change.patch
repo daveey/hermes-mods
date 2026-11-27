@@ -1,0 +1,252 @@
+From d3481ffb62c2e2e7013fe887377ea5ee1f9e11db Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:15:15 +0000
+Subject: [PATCH 6520] Forward retry identity
+
+Public mirror of source commit d3481ffb62c2e2e7013fe887377ea5ee1f9e11db.
+
+---
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index f0aa5ba6ab6..8f9879a164e 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1308,10 +1308,10 @@
+     transport_args = {**args, "idempotency_key": transport_key} if transport_key else args
+     rid = request_id(self_gw, transport_args, origin_session or "", options)
+     prior = remote_state(rid)
+-    if foreign_origin and prior in FAILED_STATES:
+-        # A forwarded envelope carries the creating run's uid, and a terminally failed request is immutable, so a
+-        # later run's retry of the same product key would only collide (request_id_conflict). Give that run its own
+-        # transport identity. The product idempotency_key still travels in ``options``, so the receiver dedupes.
++    if foreign_origin and prior == "rejected" and _forward_binding_retry(rid, options, origin_gateway, origin_profile, origin_session,
++                                                creator, run_uid):
++        # Only a definitive pre-create binding refusal permits a later authenticated run's new envelope.
++        # Keep the product key on the wire; receiver creation idempotency still arbitrates duplicate deliveries.
+         rid = request_id(self_gw, {**transport_args, "idempotency_key": f"{transport_args.get('idempotency_key') or rid}:run:{run_uid}"},
+                          origin_session or "", options)
+         prior = remote_state(rid)
+@@ -1349,13 +1349,39 @@
+             "error": (err or out)[-400:]}
+ 
+ 
++def _forward_binding_retry(rid, options, gateway, profile, session, creator, run_uid) -> bool:
++    """A new transport is allowed only for a later run after the exact pre-create binding refusal.
++
++    This is identity selection, not authority: the courier still authenticates the current run and origin.
++    Missing/malformed history, ambiguous failures and keyless creates must retain the original obligation.
++    """
++    if not options.get("idempotency_key"):
++        return False
++    row = _sent_row(rid)
++    try:
++        if not row or row[0] != "rejected":
++            return False
++        result, body = json.loads(row[1]), json.loads(row[2])
++        args = body["args"]
++        return (result.get("code") == "origin_forward_binding_missing"
++                and result.get("status") == "rejected" and result.get("handoff_complete") is False
++                and body.get("action") == "origin-forward" and body.get("coll") == "sessions"
++                and args.get("origin") == {"gateway": gateway, "profile": profile, "session": session}
++                and args.get("creator") == creator
++                and isinstance(args.get("run_uid"), str) and bool(args["run_uid"])
++                and args["run_uid"] != run_uid
++                and args.get("create", {}).get("idempotency_key") == options["idempotency_key"])
++    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
++        return False
++
++
+ def _sent_row(rid: str) -> Optional[tuple]:
+     try:
+         db = reg._ro(reg.hub_db_path())
+     except Exception:
+         return None
+     try:
+-        return db.execute("SELECT state, result FROM sent WHERE id = ?", (rid,)).fetchone()
++        return db.execute("SELECT state, result, body FROM sent WHERE id = ?", (rid,)).fetchone()
+     except Exception:
+         return None
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_forward_retry_boundary.py b/tests/hermes_cli/test_kanban_forward_retry_boundary.py
+new file mode 100644
+index 00000000000..7784b0c8961
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_forward_retry_boundary.py
+@@ -0,0 +1,67 @@
++"""Fail-closed transport recovery after a definitive binding refusal."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++
++CREATOR = {"gateway": "w", "profile": "default", "board": "default", "task_id": "t_0123456789abcdef"}
++ORIGIN = {"gateway": "hub", "profile": "default", "session": "s1"}
++
++
++def _history():
++    return {"status": "rejected", "code": "origin_forward_binding_missing", "handoff_complete": False}, {
++        "coll": "sessions", "action": "origin-forward", "args": {
++            "origin": ORIGIN, "creator": CREATOR, "run_uid": "run-1", "create": {"idempotency_key": "product-key"}}}
++
++
++@pytest.mark.parametrize("case", [
++    "valid", "same-run", "keyless", "wrong-key", "wrong-creator", "wrong-origin", "missing-run",
++    "done", "sent", "queued", "failed", "expired", "unknown", "other-code", "handoff", "missing-handoff",
++    "wrong-status", "wrong-action", "wrong-collection", "malformed-body", "malformed-result", "absent", "legacy-row",
++])
++def test_binding_retry_boundary(monkeypatch, case):
++    result, body = _history()
++    options, state, run = {"idempotency_key": "product-key"}, "rejected", "run-2"
++    mutations = {
++        "wrong-key": lambda: options.update(idempotency_key="different"),
++        "wrong-creator": lambda: body["args"].update(creator={**CREATOR, "task_id": "t_abcdef0123456789"}),
++        "wrong-origin": lambda: body["args"].update(origin={**ORIGIN, "session": "elsewhere"}),
++        "missing-run": lambda: body["args"].pop("run_uid"),
++        "other-code": lambda: result.update(code="self_work_refused"),
++        "handoff": lambda: result.update(handoff_complete=True),
++        "missing-handoff": lambda: result.pop("handoff_complete"),
++        "wrong-status": lambda: result.update(status="failed"),
++        "wrong-action": lambda: body.update(action="create"),
++        "wrong-collection": lambda: body.update(coll="tasks"),
++    }
++    mutations.get(case, lambda: None)()
++    if case == "same-run":
++        run = "run-1"
++    if case == "keyless":
++        options = {}
++    if case in ("done", "sent", "queued", "failed", "expired", "unknown"):
++        state = None if case == "unknown" else case
++    row = (state, "{" if case == "malformed-result" else json.dumps(result),
++           "{" if case == "malformed-body" else json.dumps(body))
++    if case == "absent":
++        row = None
++    elif case == "legacy-row":
++        row = row[:2]
++    monkeypatch.setattr(kp, "_sent_row", lambda rid: row)
++    assert kp._forward_binding_retry("rid", options, "hub", "default", "s1", CREATOR, run) == (case == "valid")
++
++
++def test_retry_reads_real_immutable_history(monkeypatch, tmp_path):
++    import sqlite3
++
++    path = tmp_path / "courier.db"
++    result, body = _history()
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE sent (id TEXT PRIMARY KEY, state TEXT, result TEXT, body TEXT)")
++        db.execute("INSERT INTO sent VALUES (?, ?, ?, ?)", ("original", "rejected", json.dumps(result), json.dumps(body)))
++    monkeypatch.setattr(kp.reg, "hub_db_path", lambda: path)
++    before = path.read_bytes()
++    assert kp._forward_binding_retry("original", {"idempotency_key": "product-key"}, "hub", "default", "s1", CREATOR, "run-2")
++    assert not kp._forward_binding_retry("original", {"idempotency_key": "product-key"}, "hub", "default", "s1", CREATOR, "run-1")
++    assert path.read_bytes() == before
+diff --git a/tests/hermes_cli/test_kanban_placement_identity.py b/tests/hermes_cli/test_kanban_placement_identity.py
+index b2a297a2fbd..eff9810b65e 100644
+--- a/tests/hermes_cli/test_kanban_placement_identity.py
++++ b/tests/hermes_cli/test_kanban_placement_identity.py
+@@ -183,6 +183,11 @@
+     monkeypatch.setattr(kp, "hub_carries_options", lambda cli: True)
+     monkeypatch.setattr(kp, "hub_runner", courier)
+     monkeypatch.setattr(kp, "remote_state", lambda rid: states.get(rid))
++    monkeypatch.setattr(kp, "_sent_row", lambda rid: (
++        states.get(rid), json.dumps({"status": "rejected", "code": "origin_forward_binding_missing", "handoff_complete": False}),
++        json.dumps({"coll": "sessions", "action": "origin-forward", "args": {
++            "origin": {"gateway": "hub", "profile": "default", "session": "s1"},
++            "creator": creator, "run_uid": stored[rid][0], "create": {"idempotency_key": "product-key"}}})))
+     creator = {"gateway": "w", "profile": "default", "board": "default", "task_id": "t_0123456789abcdef"}
+     call = lambda run: kp.create_remote(
+         {"title": "B3a", "idempotency_key": "product-key"}, target="hub", self_gw="w", origin_session="s1",
+diff --git a/tests/origin_transport/test_terminal_retry.py b/tests/origin_transport/test_terminal_retry.py
+new file mode 100644
+index 00000000000..00020b75922
+--- /dev/null
++++ b/tests/origin_transport/test_terminal_retry.py
+@@ -0,0 +1,86 @@
++"""Compose retry selection with real courier journals and receiving core admission."""
++import contextlib
++import io
++import json
++
++from hermes_cli import kanban_db_connect, kanban_placement as placement, kanban_sync_client
++from hermes_cli import kanban_origin_native as native
++from hermes_constants import get_hermes_home
++from tests.origin_transport import test_forwarding as helpers
++
++network = helpers.network
++
++
++def test_binding_repair_later_runs_dedupe_at_receiver(network, monkeypatch):
++    courier, dbs, service, host, runner, adapter, marker = network
++
++    def send(run):
++        with host("worker-7"), monkeypatch.context() as patch:
++            patch.setattr(courier, "load_config", lambda: {"gateway": "worker-7", "hub_url": "https://example.com"})
++            patch.setattr(courier, "send_queued", lambda db, api: 0)
++            patch.setattr(placement, "hub_carries_options", lambda cli: True)
++            patch.setattr(placement.reg, "hub_db_path", lambda: get_hermes_home() / "courier/hub.db")
++            # Use the exact fixture DB rather than depend on its filename.
++            patch.setattr(placement.reg, "_ro", lambda path: __import__("sqlite3").connect(
++                dbs["worker-7"].execute("PRAGMA database_list").fetchone()[2]))
++
++            def cli(argv):
++                output = io.StringIO()
++                with contextlib.redirect_stdout(output):
++                    rc = courier.main(argv[1:], api=service)
++                return rc, output.getvalue(), ""
++
++            patch.setattr(placement, "hub_runner", cli)
++            result = placement.create_remote({"title": "Build", "assignee": "default", "idempotency_key": "one-product"},
++                target="hub", self_gw="worker-7", origin_session="chat-one", origin_profile="default",
++                origin_gateway="macbook", creator=marker["owner"], run_uid=run, cfg={"creator_session": "worker-session"})
++            assert result["ok"], result
++            body = json.loads(dbs["worker-7"].execute("SELECT body FROM sent WHERE id=?", (result["request_id"],)).fetchone()[0])
++            return {**body, "from": "gw:worker-7"}
++
++    first = send("run-one")
++    with host("macbook"):
++        ledger = get_hermes_home() / "kanban/origin-ledger.db"
++        saved = ledger.read_bytes()
++        ledger.unlink()
++        with monkeypatch.context() as patch:
++            patch.setattr(native, "lookup", lambda *a, **kw: None)
++            courier.journal_request(dbs["macbook"], first)
++            status, rejection = courier.advance_origin_forward(dbs["macbook"], {}, first, runner, service)
++        assert status == "rejected" and rejection["code"] == "origin_forward_binding_missing"
++        assert dbs["macbook"].execute("SELECT count(*) FROM sent").fetchone()[0] == 0
++        ledger.write_bytes(saved)
++    dbs["worker-7"].execute("UPDATE sent SET state='rejected',result=? WHERE id=?", (json.dumps(rejection), first["id"]))
++    dbs["worker-7"].commit()
++    original = tuple(dbs["worker-7"].execute("SELECT body,state,result FROM sent WHERE id=?", (first["id"],)).fetchone())
++    assert send("run-one")["id"] == first["id"]
++    second = send("run-two")
++    assert second["id"] != first["id"] and send("run-two") == second
++    third = send("run-three")
++    assert len({first["id"], second["id"], third["id"]}) == 3
++    created = []
++    for request in (second, third):
++        run = request["args"]["run_uid"]
++        monkeypatch.setattr(kanban_sync_client.Hub, "snapshot_page", lambda *a, **kw: {
++            "table": "leases", "rows": [{"task_id": "t_parent", "holder": "worker-7", "run_uid": run,
++                                        "expires": 9999999999999}], "more": False})
++        with host("macbook"):
++            courier.journal_request(dbs["macbook"], request)
++            status, _ = courier.advance_origin_forward(dbs["macbook"], {}, request, runner, service)
++            assert status == "pending"
++            context = json.loads(dbs["macbook"].execute("SELECT context_json FROM req_ledger WHERE id=?", (request["id"],)).fetchone()[0])
++            child = {**context["forward"], "from": "gw:macbook"}
++        with host("hub"):
++            result = adapter("origin-create", child)
++            if not created:
++                assert result.get("task_id"), result
++                created.append(result["task_id"])
++                assert adapter("origin-create", child)["task_id"] == created[0]
++            else:
++                # A different transport must not adopt another intent's card. The product key
++                # refuses a duplicate rather than manufacturing a new binding/second child.
++                assert result["status"] == "rejected" and result["code"] == "origin_idempotency_conflict", result
++    assert len(created) == 1
++    with host("hub"), kanban_db_connect.connect_closing() as board:
++        assert board.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
++    assert tuple(dbs["worker-7"].execute("SELECT body,state,result FROM sent WHERE id=?", (first["id"],)).fetchone()) == original
+-- 
+2.43.0
+

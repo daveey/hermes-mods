@@ -1,0 +1,171 @@
+From aaaf1ab4d1bfed525b42d0eb901aa3ad538b74bf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 03:30:20 +0000
+Subject: [PATCH 6326] Host-local workspace binding and prior-home history recovery
+
+Public mirror of source commit aaaf1ab4d1bfed525b42d0eb901aa3ad538b74bf.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_rehome_history_guards.py b/tests/hermes_cli/test_kanban_rehome_history_guards.py
+new file mode 100644
+index 00000000000..4740b265eea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rehome_history_guards.py
+@@ -0,0 +1,154 @@
++"""Negative custody controls for prior-home history reconciliation."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_pickup_history as history
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as node
++from tests.hermes_cli import test_kanban_rehome_history as setup
++
++_world, fixtures, gws, svc = setup._world, setup.fixtures, setup.gws, setup.svc
++
++
++def _edit_replica(sql, args):
++    raw = client.open_shadow(fixtures.BOARD, 'hub')
++    try:
++        with raw:
++            raw.execute('UPDATE kanban_sync_state SET applying=1')
++            raw.execute(sql, args)
++            raw.execute('UPDATE kanban_sync_state SET applying=0')
++    finally:
++        raw.close()
++
++
++def test_post_rehome_publication_waits_for_normal_feed(gws):
++    hub, tid, episode, _ = _world(gws)
++    uid = sync.uuid7()
++    raw = client.open_shadow(fixtures.BOARD, 'hub')
++    try:
++        change = sync.RemoteChange(0, 'task_events', uid, 'upsert',
++                                   {'task_id': tid, 'kind': 'commented', 'created_at': 1}, 0, '', 'worker-1')
++        sync.apply_remote_changes(raw, [change], new_cursor=sync.sync_state(raw)['cursor'], observers=False)
++    finally:
++        raw.close()
++    replica = node.open_replica(hub.conn)
++    try:
++        report = history.refill(hub.conn, replica, 'hub', [tid])
++        assert report[tid]['filled'] >= 3
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone()
++        assert hub.conn.execute('SELECT id FROM task_events WHERE uid=?', (uid,)).fetchone() is None
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('prior', ['', 'hub', None, 42])
++def test_prior_home_must_be_distinct_nonempty_string(gws, prior):
++    hub, tid, episode, _ = _world(gws)
++    payload = json.dumps({'from': prior, 'to': 'hub'})
++    with hub.conn:
++        hub.conn.execute('UPDATE kanban_sync_state SET applying=1')
++        hub.conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='rehomed'", (payload, tid))
++        hub.conn.execute('UPDATE kanban_sync_state SET applying=0')
++    _edit_replica("UPDATE task_events SET payload=? WHERE task_id=? AND kind='rehomed'", (payload, tid))
++    replica = node.open_replica(hub.conn)
++    try:
++        history.refill(hub.conn, replica, 'hub', [tid])
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++    finally:
++        replica.close()
++
++
++def test_replica_must_agree_with_current_home(gws):
++    hub, tid, episode, _ = _world(gws)
++    _edit_replica('UPDATE tasks SET created_on=? WHERE id=?', ('worker-1', tid))
++    replica = node.open_replica(hub.conn)
++    try:
++        history.refill(hub.conn, replica, 'hub', [tid])
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++    finally:
++        replica.close()
++
++
++def test_task_tombstone_arriving_at_writer_lock_vetoes_repair(gws, monkeypatch):
++    from hermes_cli import kanban_db_connect as connect
++
++    hub, tid, episode, _ = _world(gws)
++    original = connect.write_txn
++    reached = []
++
++    @contextmanager
++    def tombstone_before_lock(conn, *args, **kwargs):
++        with conn:
++            conn.execute('INSERT INTO kanban_sync_tombstones(table_name,row_uid,deleted_at) VALUES (?,?,?)',
++                         ('tasks', tid, 400000))
++        reached.append(tid)
++        with original(conn, *args, **kwargs):
++            yield
++
++    monkeypatch.setattr(connect, 'write_txn', tombstone_before_lock)
++    replica = node.open_replica(hub.conn)
++    try:
++        report = history.refill(hub.conn, replica, 'hub', [tid])
++        assert reached == [tid]
++        assert report[tid]['filled'] == 0
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_automatic_repair_does_not_restore_gc_pruned_terminal_history(gws, status):
++    from hermes_cli import kanban_sync_repair_content as content
++
++    hub, tid, episode, _ = _world(gws)
++    with hub.conn:
++        hub.conn.execute('UPDATE kanban_sync_state SET applying=1')
++        hub.conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++        hub.conn.execute('UPDATE kanban_sync_state SET applying=0')
++    replica = node.open_replica(hub.conn)
++    try:
++        assert replica.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone()
++        assert not sync._tombstoned(hub.conn, 'task_events', episode)
++        content.run(hub.conn, replica, 'hub', path=hub.home / 'kanban.db', inputs=None)
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++        history.refill(hub.conn, replica, 'hub')
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++        # An explicit operator request remains available for retained terminal evidence.
++        assert history.refill(hub.conn, replica, 'hub', [tid])[tid]['filled'] >= 3
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize('veto', ['local-tombstone', 'replica-tombstone', 'foreign-task', 'unresolved-uid'])
++def test_run_custody_veto_leaves_dependent_events_unresolved(gws, veto):
++    hub, tid, episode, run_uid = _world(gws)
++    if veto == 'replica-tombstone':
++        _edit_replica('INSERT INTO kanban_sync_tombstones(table_name,row_uid,deleted_at) VALUES (?,?,?)',
++                      ('task_runs', run_uid, 400000))
++    elif veto == 'unresolved-uid':
++        _edit_replica('UPDATE task_runs SET uid=NULL WHERE uid=?', (run_uid,))
++    else:
++        with hub.conn:
++            hub.conn.execute('UPDATE kanban_sync_state SET applying=1')
++            if veto == 'local-tombstone':
++                hub.conn.execute('INSERT INTO kanban_sync_tombstones(table_name,row_uid,deleted_at) VALUES (?,?,?)',
++                                 ('task_runs', run_uid, 400000))
++            else:
++                other = kb.create_task(hub.conn, title='unrelated local run owner', assignee='default')
++                hub.conn.execute('UPDATE task_runs SET task_id=? WHERE uid=?', (other, run_uid))
++            hub.conn.execute('UPDATE kanban_sync_state SET applying=0')
++    before = dict(hub.conn.execute('SELECT * FROM task_runs WHERE uid=?', (run_uid,)).fetchone())
++    replica = node.open_replica(hub.conn)
++    try:
++        report = history.refill(hub.conn, replica, 'hub', [tid])[tid]
++        assert report['unresolved'] == 2
++        assert hub.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (episode,)).fetchone() is None
++        assert dict(hub.conn.execute('SELECT * FROM task_runs WHERE uid=?', (run_uid,)).fetchone()) == before
++    finally:
++        replica.close()
+-- 
+2.43.0
+

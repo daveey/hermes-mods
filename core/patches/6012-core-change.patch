@@ -1,0 +1,573 @@
+From 46060d8822716bce18b43c5c3e8490b287bda34b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:44:28 +0000
+Subject: [PATCH 6012] Isolated native sessions capture and bounded startup
+
+Public mirror of source commit 46060d8822716bce18b43c5c3e8490b287bda34b.
+
+---
+diff --git a/docs/designs/sessions-capture-process.md b/docs/designs/sessions-capture-process.md
+new file mode 100644
+index 00000000000..47dbcb42f6d
+--- /dev/null
++++ b/docs/designs/sessions-capture-process.md
+@@ -0,0 +1,39 @@
++# Isolated native sessions capture
++
++Native sessions list, sidebar and stamps captures run in a fresh, owner-custodied
++canonical subprocess, not in the serve interpreter. This removes competition for
++the backend's GIL across canonical SQLite/policy/annotation calls. It does not
++change the canonical SQL, ordering, policies or seven annotation implementations.
++
++The ChangeFeed still owns capture and publication. Requests do no source I/O.
++One helper per runtime may be active; selectors remain bounded by SessionsSource.
++A private stdin/stdout protocol permits one request (16 KiB) and one response
++(4 MiB), each with a four-byte network-order length. The parent checks length
++before allocation, exact framing, JSON shape, EOF and child exit. Stderr is not
++buffered. Child library stdout is redirected away from the protocol.
++
++The five-second monotonic deadline includes command resolution, spawn, imports,
++canonical reads, serialization and transfer. A fault raises CaptureUnavailable
++with a bounded reason; SessionsSource publishes unavailable (or marks prior
++real evidence stale), never an empty successful list. Existing source freshness,
++retry, fairness and capture-duty controls remain unchanged. Each retry gets a
++fresh child, so no inherited worker policy/annotation cache survives a change.
++
++spawn_owned supplies process-group/owner-death custody and drain admission.
++Timeout and runtime close kill/reap the child and clean remaining group members.
++Failed teardown retains custody and refuses replacement. Shutdown cancels the
++helper before joining the bootstrap/feed. A naturally rolled successor creates
++its own runtime; the predecessor never transfers a live helper or DB handle.
++
++Tests include real framed children, crash/truncation/oversize/invalid JSON,
++timeout, close during capture, restart, missing executable, high file descriptors,
++a real canonical store and all seven annotation calls. A separate regression
++creates twelve stores with over 24,000 rows and exercises three fresh canonical
++workers while a CPU spinner runs in the parent. In-process annotation Event
++fixtures explicitly inject a reader to preserve their original holder/drain
++fault boundary; they do not claim subprocess proof.
++
++Capture success is NOT proof of HTTP availability within five seconds of unit
++start. Listener startup, update-admission fences, proxy identity and natural
++rollout must be measured independently. Keep operational containment until the
++live gate passes; do not force a busy backend restart or change its budget.
+diff --git a/hermes_cli/sessions_capture_process.py b/hermes_cli/sessions_capture_process.py
+new file mode 100644
+index 00000000000..2bef9d085c4
+--- /dev/null
++++ b/hermes_cli/sessions_capture_process.py
+@@ -0,0 +1,135 @@
++"""Bounded, owner-custodied canonical sessions capture outside the serve GIL."""
++from __future__ import annotations
++
++
++import json
++import os
++from pathlib import Path
++import selectors
++import struct
++import subprocess
++import threading
++import time
++
++from hermes_cli._launchers import runtime_command
++from hermes_cli._subprocess_compat import kill_process_tree
++from hermes_cli.process_identity import spawn_owned, stop_owned_group_survivors
++from tools.environments.local import build_subprocess_env
++
++MAX_REQUEST = 16 * 1024
++MAX_RESPONSE = 4 * 1024 * 1024
++
++
++class CaptureUnavailable(RuntimeError):
++    def __init__(self, reason):
++        super().__init__(reason)
++        self.reason = reason
++
++
++def _wait(fd, event, deadline):
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        raise CaptureUnavailable('timeout')
++    with selectors.DefaultSelector() as poller:
++        poller.register(fd, event)
++        if not poller.select(remaining):
++            raise CaptureUnavailable('timeout')
++
++
++def _read_exact(fd, count, deadline):
++    data = bytearray()
++    while len(data) < count:
++        _wait(fd, selectors.EVENT_READ, deadline)
++        chunk = os.read(fd, min(65536, count - len(data)))
++        if not chunk:
++            raise CaptureUnavailable('crash_or_truncated_frame')
++        data.extend(chunk)
++    return bytes(data)
++
++
++class CaptureProcess:
++    """One child at a time; close cancels it, and a later capture gets a fresh child."""
++    def __init__(self, *, seconds=5, max_bytes=MAX_RESPONSE, command=None):
++        self.seconds, self.max_bytes = seconds, min(max_bytes, MAX_RESPONSE)
++        self.command = command
++        self._lock = threading.Lock()
++        self._child = None
++        self._closed = False
++
++    def __call__(self, name, selector):
++        started = time.monotonic()
++        deadline = started + self.seconds
++        request = json.dumps({'name': name, 'selector': selector}, allow_nan=False).encode('utf-8')
++        if len(request) > MAX_REQUEST:
++            raise CaptureUnavailable('request_bytes')
++        # Resolve installation-bound Python/dependencies, not ambient python/PYTHONPATH.
++        command = self.command or runtime_command(Path(__file__).resolve().parents[1],
++                                                   module='hermes_cli.sessions_capture_worker')
++        with self._lock:
++            if self._closed:
++                raise CaptureUnavailable('closed')
++            if self._child is not None:
++                raise CaptureUnavailable('busy')
++            try:
++                child = spawn_owned(command, purpose='sessions-canonical-capture',
++                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++                                    env=build_subprocess_env())
++            except OSError as exc:
++                raise CaptureUnavailable('spawn') from exc
++            self._child = child
++        try:
++            # Small request fits the pipe; a non-reading child must not block the owner.
++            os.set_blocking(child.stdin.fileno(), False)
++            wire = struct.pack('!I', len(request)) + request
++            offset = 0
++            while offset < len(wire):
++                _wait(child.stdin, selectors.EVENT_WRITE, deadline)
++                offset += os.write(child.stdin.fileno(), wire[offset:])
++            child.stdin.close()
++            size = struct.unpack('!I', _read_exact(child.stdout.fileno(), 4, deadline))[0]
++            if size > self.max_bytes:
++                raise CaptureUnavailable('response_bytes')
++            body = _read_exact(child.stdout.fileno(), size, deadline)
++            # Require exactly one frame and a successful child exit, within the SAME budget.
++            if _read_trailer(child, deadline):
++                raise CaptureUnavailable('trailing_frame')
++            if child.wait(timeout=max(0, deadline - time.monotonic())) != 0:
++                raise CaptureUnavailable('crash')
++            if time.monotonic() > deadline:
++                raise CaptureUnavailable('timeout')
++            result = json.loads(body)
++            if not isinstance(result, dict):
++                raise CaptureUnavailable('invalid_body')
++            return body
++        except (OSError, ValueError, subprocess.SubprocessError) as exc:
++            raise CaptureUnavailable('transport') from exc
++        finally:
++            if child.poll() is None:
++                kill_process_tree(child)
++            child.wait(timeout=1)
++            child.stdout.close()
++            if not child.stdin.closed:
++                child.stdin.close()
++            if not stop_owned_group_survivors(child.pid, proc=child, grace=0):
++                raise TimeoutError('sessions child group did not stop; custody retained')
++            with self._lock:
++                self._child = None
++
++    def close(self):
++        with self._lock:
++            self._closed = True
++            child = self._child
++        if child is not None:
++            if child.poll() is None:
++                kill_process_tree(child)
++            child.wait(timeout=1)
++            if not stop_owned_group_survivors(child.pid, proc=child, grace=0):
++                raise TimeoutError('sessions child group did not stop; custody retained')
++            with self._lock:
++                if self._child is child:
++                    self._child = None
++
++
++def _read_trailer(child, deadline):
++    _wait(child.stdout, selectors.EVENT_READ, deadline)
++    return os.read(child.stdout.fileno(), 1)
+diff --git a/hermes_cli/sessions_capture_worker.py b/hermes_cli/sessions_capture_worker.py
+new file mode 100644
+index 00000000000..2f1fe603ff1
+--- /dev/null
++++ b/hermes_cli/sessions_capture_worker.py
+@@ -0,0 +1,50 @@
++"""Private one-request worker; stdout contains only one bounded binary frame."""
++from contextlib import redirect_stdout
++import json
++import struct
++import sys
++
++MAX_REQUEST = 16 * 1024
++MAX_RESPONSE = 4 * 1024 * 1024
++
++
++def capture(name, selector):
++    from hermes_cli.web_routers import profiles
++    from hermes_cli.web_json_response import native_json_response
++    readers = {'sessions': profiles.get_profiles_sessions,
++               'sessions_sidebar': profiles.get_profiles_sessions_sidebar.__wrapped__,
++               'sessions_stamps': profiles.get_profiles_session_stamps}
++    # No native binding is installed in this fresh child. Keep the canonical
++    # SQL/policy/ordering and all seven annotation families, bypassing sidebar TTL.
++    return native_json_response(readers[name](**selector)).body
++
++
++def main():
++    incoming, outgoing = sys.stdin.buffer, sys.stdout.buffer
++    header = incoming.read(4)
++    if len(header) != 4:
++        return 2
++    size = struct.unpack('!I', header)[0]
++    if size > MAX_REQUEST:
++        return 2
++    request = incoming.read(size)
++    if len(request) != size or incoming.read(1):
++        return 2
++    value = json.loads(request)
++    if (not isinstance(value, dict) or set(value) != {'name', 'selector'}
++            or value['name'] not in ('sessions', 'sessions_sidebar', 'sessions_stamps')
++            or not isinstance(value['selector'], dict)):
++        return 2
++    # Libraries/plugins may print. Never permit such output to enter IPC framing.
++    with redirect_stdout(sys.stderr):
++        body = capture(value['name'], value['selector'])
++    if len(body) > MAX_RESPONSE:
++        return 3
++    outgoing.write(struct.pack('!I', len(body)))
++    outgoing.write(body)
++    outgoing.flush()
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+index cd64ae9169a..3fc03b14dd1 100644
+--- a/hermes_cli/sessions_native_source.py
++++ b/hermes_cli/sessions_native_source.py
+@@ -135,7 +135,10 @@
+             fact = Fact(key, {'encoded': body}, source_vector=((self.source, self._serial),),
+                         observed_at=observed, valid_until=observed + 2 * self.refresh_seconds,
+                         health='fresh')
+-        except Exception:  # health: allow BLE001 -- isolate capture failures; unknown is not empty success
++        except Exception as error:  # health: allow BLE001 -- isolate capture failures; unknown is not empty success
++            from hermes_cli.sessions_capture_process import CaptureUnavailable
++            if isinstance(error, CaptureUnavailable):
++                reason = error.reason
+             with self._lock:
+                 report = key in self._selectors and key not in self._failed
+                 if report:
+diff --git a/hermes_cli/sessions_native_startup.py b/hermes_cli/sessions_native_startup.py
+index b2c52fbd1cf..ce891aba21a 100644
+--- a/hermes_cli/sessions_native_startup.py
++++ b/hermes_cli/sessions_native_startup.py
+@@ -24,7 +24,9 @@
+ 
+ 
+ class SessionsRuntime:
+-    def __init__(self, profiles, targets):
++    def __init__(self, profiles, targets, *, capture_reader=None):
++        from hermes_cli.sessions_capture_process import CaptureProcess
++        self.capture_reader = capture_reader if capture_reader is not None else CaptureProcess()
+         self.profiles = profiles
+         self.targets = tuple(targets)
+         self.names = frozenset(name for name, _ in targets)
+@@ -61,23 +63,16 @@
+         self.names = frozenset(name for name, _ in targets)
+ 
+     def capture(self, name, selector):
+-        from hermes_cli.web_json_response import native_json_response
+-        readers = {'sessions': self.profiles.get_profiles_sessions,
+-                   'sessions_sidebar': self.profiles.get_profiles_sessions_sidebar,
+-                   'sessions_stamps': self.profiles.get_profiles_session_stamps}
+-        # Bypass the legacy request coalescer/TTL, but retain canonical SQL,
+-        # ordering, projection and seven-family annotation implementations.
+-        reader = readers[name]
+-        if name == 'sessions_sidebar':
+-            reader = reader.__wrapped__  # Skip TTL only; keep load accounting.
+-        result = reader(**selector)
++        import json
++        body = self.capture_reader(name, selector)
++        result = json.loads(body)
+         groups = [result.get('sessions', ())]
+         groups.extend(result.get(key, {}).get('sessions', ()) for key in ('recents', 'cron', 'messaging'))
+         for rows in groups:
+             for row in rows:
+                 if row.get('is_active'):
+                     self.source.refresh_at(row.get('last_active', row.get('started_at', 0)) + 300)
+-        return native_json_response(result).body
++        return body
+ 
+     def wait_projection(self, name, selector, timeout):
+         """Wait on owner memory only; capture remains on the feed thread."""
+@@ -132,6 +127,9 @@
+             self.ready = False
+             self._stopping = True
+             self.store._condition.notify_all()
++        close_reader = getattr(self.capture_reader, 'close', None)
++        if close_reader is not None:
++            close_reader()
+         if self._bootstrap is not None:
+             self._bootstrap.join(5)
+             if self._bootstrap.is_alive():
+diff --git a/tests/hermes_cli/test_sessions_capture_process.py b/tests/hermes_cli/test_sessions_capture_process.py
+new file mode 100644
+index 00000000000..350674e4808
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_capture_process.py
+@@ -0,0 +1,208 @@
++"""Real private children: framing, elapsed budget, crashes and custody."""
++import json
++
++import struct
++import sys
++import threading
++import time
++
++import pytest
++
++from hermes_cli.sessions_capture_process import CaptureProcess, CaptureUnavailable, MAX_REQUEST
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def command(code):
++    return [sys.executable, '-I', '-c', code]
++
++
++def frame(body=b'{"sessions":[{"id":"real-row"}]}'):
++    return f'import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write({struct.pack("!I", len(body)) + body!r}); sys.stdout.buffer.flush()'
++
++
++def test_success_and_fresh_restart():
++    capture = CaptureProcess(command=command(frame()))
++    for _ in range(2):
++        assert json.loads(capture('sessions', {}))['sessions'][0]['id'] == 'real-row'
++        assert capture._child is None
++    capture.close()
++    with pytest.raises(CaptureUnavailable, match='closed'):
++        capture('sessions', {})
++
++
++@pytest.mark.parametrize('code,reason', [
++    ('import time; time.sleep(30)', 'timeout'),
++    ('import sys, os; sys.stdin.buffer.read(); os._exit(7)', 'crash_or_truncated_frame'),
++    ('import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write(b"\\x00\\x40\\x00\\x01"); sys.stdout.buffer.flush()', 'response_bytes'),
++    (frame(b'not json'), 'transport'),
++    (frame(b'[]'), 'invalid_body'),
++    (frame() + '; sys.stdout.buffer.write(b"x"); sys.stdout.buffer.flush()', 'trailing_frame'),
++    ('import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write(b"\\x00\\x00"); sys.stdout.buffer.flush()', 'crash_or_truncated_frame'),
++])
++def test_faults_are_typed_and_reaped(code, reason, monkeypatch):
++    from hermes_cli import sessions_capture_process as module
++    original = module.spawn_owned
++    children = []
++    def recorded(*args, **kwargs):
++        child = original(*args, **kwargs)
++        children.append(child)
++        return child
++    monkeypatch.setattr(module, 'spawn_owned', recorded)
++    capture = CaptureProcess(seconds=.5, command=command(code))
++    started = time.monotonic()
++    with pytest.raises(CaptureUnavailable) as error:
++        capture('sessions', {})
++    assert error.value.reason == reason
++    assert time.monotonic() - started < 3
++    assert children and all(child.poll() is not None for child in children)
++    assert capture._child is None
++
++
++def test_request_limit_precedes_spawn():
++    capture = CaptureProcess(command=['must-not-spawn'])
++    with pytest.raises(CaptureUnavailable, match='request_bytes'):
++        capture('sessions', {'query': 'x' * MAX_REQUEST})
++
++
++def test_close_cancels_inflight_and_prevents_replacement():
++    capture = CaptureProcess(seconds=30, command=command('import time; time.sleep(30)'))
++    errors = []
++    def run():
++        try:
++            capture('sessions', {})
++        except CaptureUnavailable as error:
++            errors.append(error)
++    thread = threading.Thread(target=run)
++    thread.start()
++    deadline = time.monotonic() + 3
++    while capture._child is None and time.monotonic() < deadline:
++        time.sleep(.01)
++    child = capture._child
++    assert child is not None
++    capture.close()
++    thread.join(3)
++    assert not thread.is_alive() and errors
++    assert child.poll() is not None
++    with pytest.raises(CaptureUnavailable, match='closed'):
++        capture('sessions', {})
++
++
++def test_default_canonical_worker_real_store(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HOME', str(home))
++    db = SessionDB(db_path=home / 'state.db')
++    db.create_session('canonical-row', source='cli', model='test')
++    db.close()
++    from hermes_cli import sessions_capture_process as module
++    original = module.spawn_owned
++    diagnostics = tmp_path / 'child-stderr'
++    def diagnostic_spawn(*args, **kwargs):
++        with diagnostics.open('wb') as output:
++            kwargs['stderr'] = output
++            return original(*args, **kwargs)
++    monkeypatch.setattr(module, 'spawn_owned', diagnostic_spawn)
++    capture = CaptureProcess()
++    try:
++        try:
++            from tests.hermes_cli.test_sessions_native_startup import selected
++            result = json.loads(capture('sessions', selected(limit=20)))
++        except CaptureUnavailable:
++            pytest.fail(diagnostics.read_text())
++        assert any(row['id'] == 'canonical-row' for row in result['sessions'])
++    finally:
++        capture.close()
++
++
++def test_spawn_failure_is_typed():
++    with pytest.raises(CaptureUnavailable, match='spawn'):
++        CaptureProcess(command=['/nonexistent/capture-worker'])('sessions', {})
++
++
++def test_high_descriptor_frame_read():
++    import fcntl
++    import os
++    from hermes_cli.sessions_capture_process import _read_exact
++    reader, writer = os.pipe()
++    high = fcntl.fcntl(reader, fcntl.F_DUPFD_CLOEXEC, 1100)
++    try:
++        os.write(writer, b'abcd')
++        assert _read_exact(high, 4, time.monotonic() + 1) == b'abcd'
++    finally:
++        for fd in (reader, writer, high):
++            os.close(fd)
++
++
++def test_canonical_worker_keeps_all_seven_annotations(tmp_path, monkeypatch):
++    from hermes_cli.web_routers import profiles
++    from hermes_cli.sessions_capture_worker import capture
++    from tests.hermes_cli.test_sessions_native_startup import selected
++    from tests.hermes_cli.test_profiles_sidebar_scope import _seed_session
++    home = tmp_path / 'home'
++    home.mkdir()
++    _seed_session(home, 'seven-family-row', source='cli')
++    monkeypatch.setattr(profiles, '_profile_targets', lambda *a: [('default', home)])
++    calls = []
++    names = ('kanban_activity', 'goal_activity', 'cron_activity', 'background_activity',
++             'turn_activity', 'subagent_activity', 'review_wait')
++    for name in names:
++        original = getattr(profiles, 'annotate_' + name)
++        def recorded(rows, *args, _name=name, _original=original, **kwargs):
++            calls.append(_name)
++            return _original(rows, *args, **kwargs)
++        monkeypatch.setattr(profiles, 'annotate_' + name, recorded)
++    assert json.loads(capture('sessions', selected()))['sessions'][0]['id'] == 'seven-family-row'
++    assert set(calls) == set(names)
++
++
++def test_cold_twelve_profile_capture_under_parent_gil_contention(tmp_path, monkeypatch):
++    import inspect
++    import sqlite3
++    from hermes_state import SessionDB
++    from hermes_cli.sessions_fact_routes import selector_for
++    from hermes_cli.web_routers import profiles
++    home = tmp_path / 'home'
++    monkeypatch.setenv('HOME', str(home))
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    for index in range(12):
++        target = home if index == 0 else home / 'profiles' / f'profile-{index}'
++        target.mkdir(parents=True)
++        (target / 'config.yaml').write_text('{}\n', encoding='utf-8')
++        db = SessionDB(db_path=target / 'state.db')
++        db.create_session(f'row-{index}', source='cli', model='test')
++        db.append_message(f'row-{index}', role='user', content='hello')
++        db.close()
++        with sqlite3.connect(target / 'state.db') as conn:
++            conn.executemany('INSERT INTO sessions (id, source, started_at, message_count) VALUES (?, ?, ?, ?)',
++                             [(f'bulk-{index}-{n}', 'cli', time.time() - n, 1) for n in range(2000)])
++    stop = threading.Event()
++    def spin():
++        while not stop.is_set():
++            pass
++    spinner = threading.Thread(target=spin)
++    spinner.start()
++    capture = CaptureProcess()
++    try:
++        # Each call launches a COLD worker, including imports and serialization.
++        selectors = [('sessions', profiles.get_profiles_sessions, {'limit': 100}),
++                     ('sessions_sidebar', profiles.get_profiles_sessions_sidebar, {}),
++                     ('sessions_stamps', profiles.get_profiles_session_stamps,
++                      {'profile': 'default', 'ids': 'row-0'})]
++        for name, reader, params in selectors:
++            started = time.monotonic()
++            result = json.loads(capture(name, selector_for(inspect.signature(reader), (), params)))
++            assert time.monotonic() - started < 5
++            assert result and 'error' not in result
++            print(f'cold-parent-spinner {name}: {time.monotonic() - started:.3f}s')
++            if name == 'sessions':
++                assert len(result['sessions']) == 100
++                assert result['total'] >= 24000
++            elif name == 'sessions_sidebar':
++                assert result['recents']['sessions']
++    finally:
++        stop.set()
++        spinner.join(3)
++        capture.close()
+diff --git a/tests/hermes_cli/test_sessions_cold_bootstrap.py b/tests/hermes_cli/test_sessions_cold_bootstrap.py
+index b53ebf23f32..91b1f5fe36c 100644
+--- a/tests/hermes_cli/test_sessions_cold_bootstrap.py
++++ b/tests/hermes_cli/test_sessions_cold_bootstrap.py
+@@ -16,6 +16,18 @@
+ pytestmark = pytest.mark.platforms('linux')
+ 
+ 
++@pytest.fixture(autouse=True)
++def inprocess_annotation_faults(monkeypatch):
++    # Events injected below exercise the original holder/drain boundary.
++    # Real child custody/framing has separate process integration tests.
++    from hermes_cli.sessions_native_startup import SessionsRuntime
++    from hermes_cli.sessions_capture_worker import capture
++    original = SessionsRuntime.__init__
++    def initialize(self, profiles, targets, **kwargs):
++        original(self, profiles, targets, capture_reader=capture, **kwargs)
++    monkeypatch.setattr(SessionsRuntime, '__init__', initialize)
++
++
+ @pytest.mark.asyncio
+ async def test_real_lifespan_serves_while_canonical_annotation_is_cold(profiles_on_disk, monkeypatch):
+     from hermes_cli import web_server, web_server_app
+diff --git a/tests/hermes_cli/test_sessions_native_startup.py b/tests/hermes_cli/test_sessions_native_startup.py
+index cf35e540658..4bda46d14ba 100644
+--- a/tests/hermes_cli/test_sessions_native_startup.py
++++ b/tests/hermes_cli/test_sessions_native_startup.py
+@@ -32,7 +32,8 @@
+             helpers._seed_session(home, f'{name}-{i}', source=('cli', 'cron', 'telegram', 'cli')[i], pinned=i == 0)
+     observed = time.time()
+     monkeypatch.setattr(time, 'time', lambda: observed)
+-    runtime = SessionsRuntime(profiles, list(profiles_on_disk.items())).start()
++    from hermes_cli.sessions_capture_worker import capture
++    runtime = SessionsRuntime(profiles, list(profiles_on_disk.items()), capture_reader=capture).start()
+     try:
+         yield runtime
+     finally:
+-- 
+2.43.0
+

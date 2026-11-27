@@ -1,0 +1,224 @@
+From 08767b2da0b89d25c317492ba8239dfcbc75fc0e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:43:52 +0000
+Subject: [PATCH 6451] Dispatch storage cancellation and governor observations
+
+Public mirror of source commit 08767b2da0b89d25c317492ba8239dfcbc75fc0e.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 096d91722f0..3133e21f0db 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2139,12 +2139,8 @@
+         _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
+         return result
+     if not dry_run:
+-        from hermes_cli.kanban_worker_placement import dispatch_tick
+-        try:
+-            timed("dispatch.worker_placement", dispatch_tick, conn)
+-        except Exception:
+-            logger = _kb._log
+-            logger.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
++        from hermes_cli.kanban_dispatch_maintenance import place_workers
++        place_workers(conn, timed)
+     from hermes_cli.kanban_gateway_drain import core_update_hold
+     result.core_update_drain_hold = core_update_hold()
+     if result.core_update_drain_hold is not None:  # every caller (CLI, dashboard, gateway) claims nothing
+diff --git a/hermes_cli/kanban_dispatch_maintenance.py b/hermes_cli/kanban_dispatch_maintenance.py
+index f8b6d672799..46e5f674fa8 100644
+--- a/hermes_cli/kanban_dispatch_maintenance.py
++++ b/hermes_cli/kanban_dispatch_maintenance.py
+@@ -1,4 +1,5 @@
+ """Owner maintenance before the spawn cap, including worker quota evidence."""
++from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+ 
+ 
+ def sweep(conn, result, guard_notice, parent_unclaimed, *, checkpoint=lambda: None):
+@@ -21,6 +22,18 @@
+     checkpoint()
+ 
+ 
++def place_workers(conn, timed):
++    """Isolate placement failures, but unwind the pass when its write budget expires."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_worker_placement import dispatch_tick
++    try:
++        timed("dispatch.worker_placement", dispatch_tick, conn)
++    except DispatchWriteContended:
++        raise
++    except Exception:  # health: allow BLE001 -- ordinary placement failures retain local dispatch fallback
++        kb._log.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
++
++
+ def _own_ownerless_cards(conn):
+     """Hourly: every open card gets a live owning chat, including ones created while state.db was down."""
+     import logging
+@@ -28,6 +41,8 @@
+     from hermes_cli.kanban_owner_chat import maybe_backfill
+     try:
+         maybe_backfill(conn, now=time.monotonic())
++    except DispatchWriteContended:
++        raise
+     except Exception:  # health: allow BLE001 -- ownerless cards stay as they were; the next hour retries
+         logging.getLogger(__name__).warning("kanban: owner-chat backfill failed", exc_info=True)
+ 
+@@ -38,5 +53,7 @@
+     from hermes_cli.kanban_spend_reviewer import start_due
+     try:
+         start_due(conn)
++    except DispatchWriteContended:
++        raise
+     except Exception:  # health: allow BLE001 -- held stops stay held; the next tick retries
+         logging.getLogger(__name__).warning("kanban: starting spend reviews failed", exc_info=True)
+diff --git a/hermes_cli/kanban_supervisor_requests.py b/hermes_cli/kanban_supervisor_requests.py
+index e6330a03505..49f67d2f874 100644
+--- a/hermes_cli/kanban_supervisor_requests.py
++++ b/hermes_cli/kanban_supervisor_requests.py
+@@ -752,8 +752,9 @@
+ 
+ 
+ def dispatcher_drain(conn: sqlite3.Connection, *, board: Optional[str] = None) -> list:
+-    """Dispatcher-tick entry: never raises. Config ``kanban.supervisor_requests.enabled: false``
++    """Dispatcher-tick entry: propagates pass cancellation. Config ``kanban.supervisor_requests.enabled: false``
+     (default on, not in config_defaults) leaves requests pending for ``supervisor-requests --drain``."""
++    from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+     try:
+         from hermes_cli import kanban_supervisor_gate
+         refusal = _non_worker_refusal()
+@@ -764,6 +765,8 @@
+                 _log.warning("kanban: not draining supervisor requests in this process: %s", refusal)
+             return []
+         return kanban_supervisor_gate.dispatch(conn, board)
++    except DispatchWriteContended:
++        raise
+     except Exception:  # health: allow BLE001 -- the tick must go on; the rows stay queued
+         _log.warning("kanban: draining supervisor requests failed", exc_info=True)
+         return []
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 1256870a735..e0e01bd7a2e 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -1029,7 +1029,8 @@
+ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None, wait: bool = False) -> dict:
+     """Start every due probe (at most ``MAX_CONCURRENT`` in flight) and return at once;
+     ``wait=True`` (tests, one-shot callers) also waits up to ``TICK_BUDGET_SECONDS`` for them.
+-    Returns ``{"submitted": [task ids], "in_flight": n}``. Never raises."""
++    Returns ``{"submitted": [task ids], "in_flight": n}``. Propagates pass cancellation."""
++    from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+     from hermes_cli import kanban_ci_progress  # [daveey] a card parked on a CI run that never starts
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
+@@ -1112,6 +1113,8 @@
+             conn, _pool(), slots_free=MAX_CONCURRENT - busy - kanban_ci_progress.running_sweeps())
+         if sweep is not None:
+             futures.append(sweep)
++    except DispatchWriteContended:
++        raise
+     except Exception:
+         logger.warning("kanban wake checks: tick failed", exc_info=True)
+     if wait and futures:
+diff --git a/tests/hermes_cli/test_kanban_preclaim_cancellation.py b/tests/hermes_cli/test_kanban_preclaim_cancellation.py
+new file mode 100644
+index 00000000000..eede9ae4d85
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_preclaim_cancellation.py
+@@ -0,0 +1,95 @@
++"""Preclaim best-effort services must not swallow pass-wide cancellation."""
++from contextlib import closing
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_storage as storage
++from hermes_cli import kanban_wake_check as wake
++from hermes_cli.kanban_db_dispatch import DispatchResult
++from tests.hermes_cli import test_kanban_hold_failure_isolation as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_wake_tick_unwinds_on_real_writer_contention(kanban_home, caplog):
++    with kbc.connect_closing() as conn:
++        tid = helpers._held(conn, 'runs')
++        # A wake check on a held card is stale: the real tick must remove it.
++        with kb.write_txn(conn):
++            conn.execute('INSERT INTO task_wake_checks(task_id, cmd, every, next_at) VALUES (?, ?, ?, ?)',
++                         (tid, 'true', 120, 0))
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        after = []
++
++        def tick():
++            wake.run_due_wake_checks(conn, now=1000)
++            after.append('continued')
++            return DispatchResult()
++
++        with closing(sqlite3.connect(path, isolation_level=None)) as blocker:
++            blocker.execute('BEGIN IMMEDIATE')
++            try:
++                result = storage.run(conn, tick, board='default')
++                assert result.storage_skip_reason == storage.REASON
++                assert after == []
++                assert conn.execute('SELECT count(*) FROM task_wake_checks').fetchone()[0] == 1
++                warnings = [r for r in caplog.records if r.levelname == 'WARNING']
++                assert len(warnings) == 1
++                assert warnings[0].exc_info is None
++            finally:
++                blocker.rollback()
++        caplog.clear()
++        assert storage.run(conn, tick, board='default').storage_skip_reason is None
++        assert after == ['continued']
++        assert conn.execute('SELECT count(*) FROM task_wake_checks').fetchone()[0] == 0
++        assert not [r for r in caplog.records if r.levelname == 'WARNING']
++
++
++@pytest.mark.parametrize('boundary', ['supervisor', 'placement', 'owner_backfill', 'spend_reviews'])
++@pytest.mark.parametrize('cancel', [True, False])
++def test_preclaim_boundaries_distinguish_cancellation(kanban_home, monkeypatch, caplog, boundary, cancel):
++    from hermes_cli import kanban_supervisor_requests as supervisor
++    from hermes_cli import kanban_supervisor_gate as gate
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_dispatch_maintenance as maintenance
++    from hermes_cli import kanban_worker_placement as placement
++    from hermes_cli import kanban_gateway_drain as drain
++    from hermes_cli import kanban_owner_chat as owner
++    from hermes_cli import kanban_spend_reviewer as reviews
++
++    error = storage.DispatchWriteContended(storage.REASON) if cancel else ValueError('local service failure')
++
++    def fail(*args, **kwargs):
++        raise error
++
++    with kbc.connect_closing() as conn:
++        if boundary == 'supervisor':
++            monkeypatch.setattr(supervisor, '_non_worker_refusal', lambda: None)
++            monkeypatch.setattr(gate, 'dispatch', fail)
++            call = lambda: supervisor.dispatcher_drain(conn)
++        elif boundary == 'owner_backfill':
++            monkeypatch.setattr(owner, 'maybe_backfill', fail)
++            call = lambda: maintenance._own_ownerless_cards(conn)
++        elif boundary == 'spend_reviews':
++            monkeypatch.setattr(reviews, 'start_due', fail)
++            call = lambda: maintenance._start_spend_reviews(conn)
++        else:
++            monkeypatch.setattr(dispatch, '_run_reclaim_phase', lambda *a, **kw: None)
++            monkeypatch.setattr(maintenance, 'sweep', lambda *a, **kw: None)
++            monkeypatch.setattr(drain, 'dispatch_paused', lambda: False)
++            monkeypatch.setattr(placement, 'dispatch_tick', fail)
++            # Stop normal continuation before any worker pickup or execution.
++            monkeypatch.setattr(drain, 'core_update_hold', lambda: 'test hold')
++            from hermes_cli import kanban_candidate_receipts
++            monkeypatch.setattr(kanban_candidate_receipts, 'global_hold', lambda *a: None)
++            call = lambda: dispatch._dispatch_once_locked(conn)
++        if cancel:
++            with pytest.raises(storage.DispatchWriteContended):
++                call()
++            assert not [r for r in caplog.records if r.exc_info]
++        else:
++            call()
++            assert any(r.exc_info for r in caplog.records)
+-- 
+2.43.0
+

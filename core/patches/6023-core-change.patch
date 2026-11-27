@@ -1,0 +1,146 @@
+From 11ecf73630ea8806e8e316e32b44d84c7819789c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:12:42 -0800
+Subject: [PATCH 6023] Backup snapshot pruning and settled-result compaction
+
+Public mirror of source commit 11ecf73630ea8806e8e316e32b44d84c7819789c.
+
+---
+diff --git a/hermes_cli/backup.py b/hermes_cli/backup.py
+index 0d1397e3b25..e6860560ace 100644
+--- a/hermes_cli/backup.py
++++ b/hermes_cli/backup.py
+@@ -1105,7 +1105,6 @@
+ )
+ 
+ 
+-
+ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
+     home = hermes_home or get_hermes_home()
+     return home / _QUICK_SNAPSHOTS_DIR
+@@ -1299,10 +1298,9 @@
+ 
+     manifest: dict[str, int] = {}  # rel_path -> file size
+     failed_dbs: list[str] = []  # present *.db that could not be snapshotted
+-    # #68805: track protected DB files skipped for size — they are snapshot
+-    # incompleteness just like a failed copy, so pruning must be suppressed
+-    # to preserve the older complete snapshot that may contain the only
+-    # recoverable database.
++    # #68805: track protected DB files skipped for size — the snapshot is
++    # incomplete, so pruning must leave any older snapshot that still holds
++    # one of them (backup_prune.prune_after_snapshot).
+     oversized_skipped: list[str] = []
+ 
+     for rel in _QUICK_STATE_FILES:
+@@ -1443,7 +1441,7 @@
+     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
+     # with known high-churn safety snapshots (for example pre-update) can pass a
+     # smaller keep value so large state.db copies do not accumulate indefinitely.
+-    # Auto-prune policy (#68805 and the size-capped leak) lives in backup_prune.
++    # The policy for an incomplete snapshot (#68805) lives in backup_prune.
+     prune_after_snapshot(
+         root, _QUICK_DEFAULT_KEEP if keep is None else keep, failed_dbs, oversized_skipped
+     )
+diff --git a/hermes_cli/backup_prune.py b/hermes_cli/backup_prune.py
+index 916ce669088..447417a6fe1 100644
+--- a/hermes_cli/backup_prune.py
++++ b/hermes_cli/backup_prune.py
+@@ -56,6 +56,13 @@
+     cap never held it, and keeping them all retained
+     unnecessary snapshots when a large database was skipped.
+     """
++    if oversized_skipped:
++        print(
++            "  ⚠ DB file(s) skipped for size: "
++            + ", ".join(oversized_skipped)
++            + " — any older snapshot that contains them is kept"
++        )
++        logger.warning("Quick snapshot skipped oversized DB file(s): %s", ", ".join(oversized_skipped))
+     if failed_dbs:
+         logger.warning(
+             "Skipping snapshot prune because %d DB(s) failed to capture "
+@@ -66,14 +73,9 @@
+     if not oversized_skipped:
+         _prune_quick_snapshots(root, keep=keep)
+         return
+-    print(
+-        "  ⚠ DB file(s) skipped for size: "
+-        + ", ".join(oversized_skipped)
+-        + " — older snapshots that contain them are kept"
+-    )
+-    logger.warning("Quick snapshot skipped oversized DB file(s): %s", ", ".join(oversized_skipped))
++    # max(keep, 1): an incomplete snapshot never prunes itself (keep=0 did nothing here before).
+     _prune_quick_snapshots(
+         root,
+-        keep=keep,
++        keep=max(keep, 1),
+         protect=lambda d: any((d / rel).is_file() for rel in oversized_skipped),
+     )
+diff --git a/tests/hermes_cli/test_backup.py b/tests/hermes_cli/test_backup.py
+index 9bd501b2055..f653fd728d0 100644
+--- a/tests/hermes_cli/test_backup.py
++++ b/tests/hermes_cli/test_backup.py
+@@ -1614,10 +1614,10 @@
+ 
+ 
+ 
+-    def test_oversized_db_suppresses_pruning(self, hermes_home, capsys):
+-        """#68805: an oversized state.db skipped for size must suppress
+-        pruning so the older complete snapshot (containing the only
+-        recoverable database) is preserved.
++    def test_oversized_db_keeps_the_older_complete_snapshot(self, hermes_home, capsys):
++        """#68805: an oversized state.db skipped for size must not prune
++        the older complete snapshot (containing the only
++        recoverable database).
+ 
+         Reproduces the reviewer's scenario: keep=1 + a state.db exceeding
+         the size cap → the new snapshot omits state.db, failed_dbs stays
+diff --git a/tests/hermes_cli/test_backup_prune.py b/tests/hermes_cli/test_backup_prune.py
+index 94a89137c01..833e30d40e1 100644
+--- a/tests/hermes_cli/test_backup_prune.py
++++ b/tests/hermes_cli/test_backup_prune.py
+@@ -56,3 +56,41 @@
+         snap_ids = {s["id"] for s in backup.list_quick_snapshots(limit=100, hermes_home=hermes_home)}
+         assert {first_id, second_id} <= snap_ids
+         assert third_id is None or third_id in snap_ids
++
++    def test_nested_board_db_skipped_for_size_protects_the_snapshot_holding_it(self, tmp_path):
++        from hermes_cli.backup_prune import prune_after_snapshot
++
++        root = tmp_path / "state-snapshots"
++        rel = "kanban/boards/demo/kanban.db"
++        for name, holds in (("20260101-000001", True), ("20260101-000002", False), ("20260101-000003", False)):
++            (root / name).mkdir(parents=True)
++            if holds:
++                (root / name / rel).parent.mkdir(parents=True)
++                (root / name / rel).write_bytes(b"db")
++
++        prune_after_snapshot(root, 1, [], [rel])
++
++        assert sorted(d.name for d in root.iterdir()) == ["20260101-000001", "20260101-000003"]
++
++    def test_size_skip_with_keep_zero_never_prunes_the_new_snapshot(self, tmp_path):
++        from hermes_cli.backup_prune import prune_after_snapshot
++
++        root = tmp_path / "state-snapshots"
++        for name in ("20260101-000001", "20260101-000002"):
++            (root / name).mkdir(parents=True)
++
++        prune_after_snapshot(root, 0, [], ["state.db"])
++
++        assert [d.name for d in root.iterdir()] == ["20260101-000002"]
++
++    def test_failed_and_oversized_keeps_everything_and_still_reports_the_size_skip(self, tmp_path, capsys):
++        from hermes_cli.backup_prune import prune_after_snapshot
++
++        root = tmp_path / "state-snapshots"
++        for name in ("20260101-000001", "20260101-000002", "20260101-000003"):
++            (root / name).mkdir(parents=True)
++
++        prune_after_snapshot(root, 1, ["kanban.db"], ["state.db"])
++
++        assert len(list(root.iterdir())) == 3
++        assert "skipped for size: state.db" in capsys.readouterr().out
+-- 
+2.43.0
+

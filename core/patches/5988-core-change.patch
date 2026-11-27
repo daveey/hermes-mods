@@ -1,0 +1,878 @@
+From 4422fbfc6cbc910629379bcfab088df72822e739 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:49:40 +0000
+Subject: [PATCH 5988] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit 4422fbfc6cbc910629379bcfab088df72822e739.
+
+---
+diff --git a/hermes_cli/fact_annotation_runtime.py b/hermes_cli/fact_annotation_runtime.py
+index 25b46ca9f99..038a70b1555 100644
+--- a/hermes_cli/fact_annotation_runtime.py
++++ b/hermes_cli/fact_annotation_runtime.py
+@@ -20,7 +20,8 @@
+ from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
+ from hermes_cli.fact_materializers import view_reducer
+ from hermes_cli.fact_reducers import ReducerEngine
+-from hermes_cli.fact_store import FactStore, view_key
++from hermes_cli.fact_store import view_key
++from hermes_cli.fact_process_owner import process_store
+ 
+ 
+ class AnnotationRuntime:
+@@ -29,7 +30,7 @@
+                  budget=CaptureBudget(max_seconds=5)):
+         if not profiles or fallback_profile not in profiles:
+             raise ValueError('annotation profile roster is incomplete')
+-        self.store = FactStore()
++        self.store = process_store()
+         self.scopes = {name: Scope('serve.annotations.' + gateway, name) for name in profiles}
+         self.engines = {scope: ReducerEngine(self.store, scope) for scope in self.scopes.values()}
+         self.handles, self.bindings = {}, {}
+diff --git a/hermes_cli/fact_annotation_sources.py b/hermes_cli/fact_annotation_sources.py
+index 70ec3c2ed26..d082b43cbb7 100644
+--- a/hermes_cli/fact_annotation_sources.py
++++ b/hermes_cli/fact_annotation_sources.py
+@@ -17,7 +17,7 @@
+         for source in operational:
+             if isinstance(source, NativeAnnotationSource):
+                 source.max_keys = budget.max_keys
+-        super().__init__(engines, bindings, budget=budget, operational=operational)
++        super().__init__(engines, bindings, budget=budget, operational=operational, lazy_sources=True)
+ 
+     def demand(self, scope, view, selector):
+         from hermes_cli.fact_annotation_views import selector_for
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+index 8c8b26019e6..6c243cade6b 100644
+--- a/hermes_cli/fact_board_inputs.py
++++ b/hermes_cli/fact_board_inputs.py
+@@ -17,6 +17,7 @@
+ from hermes_cli.fact_contract import Fact, FactKey, freeze
+ from hermes_cli.fact_store import view_key
+ from hermes_cli.fact_source_watch import NativeSourceWatch
++from hermes_cli.fact_capture_queue import submit
+ 
+ 
+ @dataclass(frozen=True)
+@@ -109,9 +110,8 @@
+                 self._active = self._pending.popleft()
+                 self._deadline = time.monotonic() + budget.max_seconds
+                 view, selector = self._wanted[self._active]
+-                self._worker = threading.Thread(target=self._context.run,
+-                    args=(self._build, self._active, view, selector, budget), daemon=True, name='fact-board-capture')
+-                self._worker.start()
++                key = self._active
++                self._worker = submit(lambda: self._context.run(self._build, key, view, selector, budget))
+             if self._deadline is not None and time.monotonic() >= self._deadline:
+                 self._deadline = None
+                 return BoardCapture(key=self._active, after=cursor, failed=True, observed_at=time.time())
+diff --git a/hermes_cli/fact_board_startup.py b/hermes_cli/fact_board_startup.py
+index 36c76b6fc03..0f2e3a953f3 100644
+--- a/hermes_cli/fact_board_startup.py
++++ b/hermes_cli/fact_board_startup.py
+@@ -31,14 +31,28 @@
+         self.boards = tuple(dict.fromkeys(boards if boards is not None else
+                             [self.current, *(b['slug'] for b in kanban_db.list_boards())]))
+         self.owners, self.views = {}, {}
++        self._activating_views = {}
+         self._closed = self._drained = False
+         self._lock = threading.RLock()
+         self._previous = None
++        self._activation_owner = None
++        from hermes_cli.fact_scope_activation import ScopeActivation
++        self._activation = ScopeActivation(self.boards, self._activate)
+ 
+     def start(self):
+-        from hermes_cli import kanban_db
++        from hermes_cli.fact_process_owner import ProcessOwner
+         self.api.board_prewarm.stop_board_prewarm()
+-        for board in self.boards:
++        self._activation_owner = ProcessOwner(lambda *_: None, lambda *_: None)
++        self._activation_owner.register(self._activation)
++        self._previous = self.api.board_fact_views._installed
++        self.api.board_fact_views.install_provider(self, self.provider)
++        return self
++
++    def _activate(self, board):
++        from hermes_cli import kanban_db
++        if not self._closed and board not in self.views:
++            if board in self.owners:
++                raise RuntimeError('board activation custody retained')
+             scope = Scope(self.home, self.profile, board)
+             path = kanban_db.kanban_db_path(board=board)
+             def capture(view, selector, budget, board=board, scope=scope):
+@@ -59,12 +73,11 @@
+                 start_legacy=lambda: None, demand=handle.demand,
+                 hot_selectors=(('board', self.api.board_fact_views.board_selector()), ('projects', {}),
+                                ('boards', {'include_archived': False})))
+-            self.views[board] = view
++            self._activating_views[board] = view
+             view.on_mode('facts', 1)
+             view.prepare()
+-        self._previous = self.api.board_fact_views._installed
+-        self.api.board_fact_views.install_provider(self, self.provider)
+-        return self
++            self.views[board] = view
++            del self._activating_views[board]
+ 
+     def provider(self, board):
+         from hermes_cli.config import get_hermes_home
+@@ -73,6 +86,7 @@
+         if str(get_hermes_home()) != self.home or self._closed:
+             return Unavailable('board_scope_unavailable')
+         if board is None:
++            self._activation.want(self.current)
+             owner = self.owners.get(self.current)
+             if owner is None or owner.handle is None:
+                 return Unavailable('board_scope_unavailable')
+@@ -80,18 +94,27 @@
+             if not isinstance(catalog, Ready):
+                 return Unavailable('board_catalog_unavailable')
+             board = json.loads(catalog.encoded)['current']
++        if board in self.boards:
++            self._activation.want(board)
+         return self.views.get(board, Unavailable('board_scope_unavailable'))
+ 
+     def ready(self, board):
+-        return self.views[board].prepare()
++        self._activation.want(board)
++        view = self.views.get(board)
++        return view.prepare() if view is not None else False
+ 
+     def close(self):
+         with self._lock:
+             if self._drained:
+                 return
+             self._closed = True  # failed teardown keeps a fail-closed installed provider
++        activation = getattr(self, '_activation_owner', None)
++        if activation is not None:
++            activation.close()  # fence activation before draining its child scopes
++        with self._lock:
+             failures = []
+-            for resource in (*self.views.values(), *self.owners.values()):
++            for resource in (*getattr(self, '_activating_views', {}).values(),
++                             *self.views.values(), *self.owners.values()):
+                 try:
+                     resource.close()
+                 except Exception as exc:  # health: allow BLE001 -- retain failed custody and attempt all sibling drains
+diff --git a/hermes_cli/fact_capture_queue.py b/hermes_cli/fact_capture_queue.py
+new file mode 100644
+index 00000000000..6941bd966d3
+--- /dev/null
++++ b/hermes_cli/fact_capture_queue.py
+@@ -0,0 +1,61 @@
++"""One bounded board-capture worker, with independently drainable jobs. [daveey]"""
++from collections import deque
++import threading
++
++_lock = threading.Lock()
++_pending = deque()
++_worker = None
++
++
++class CaptureJob:
++    def __init__(self, callback):
++        self.callback = callback
++        self.done = threading.Event()
++        self.started = False
++        self.cancelled = False
++
++    def is_alive(self):
++        return not self.done.is_set()
++
++    def join(self, timeout=None):
++        with _lock:
++            if not self.started:
++                self.cancelled = True
++                self.callback = None
++                self.done.set()
++        self.done.wait(timeout)
++
++
++def submit(callback):
++    global _worker
++    job = CaptureJob(callback)
++    with _lock:
++        _pending.append(job)
++        if _worker is None:
++            # health: allow HX012 -- each queued callback enters its own saved scope, never the first caller's context
++            _worker = threading.Thread(target=_run, name='fact-board-capture', daemon=True)
++            try:
++                _worker.start()
++            except BaseException:
++                _worker = None
++                _pending.remove(job)
++                raise
++    return job
++
++
++def _run():
++    global _worker
++    while True:
++        with _lock:
++            if not _pending:
++                _worker = None
++                return
++            job = _pending.popleft()
++            if job.cancelled:
++                continue
++            job.started = True
++        try:
++            job.callback()
++        finally:
++            job.callback = None
++            job.done.set()
+diff --git a/hermes_cli/fact_content_owner.py b/hermes_cli/fact_content_owner.py
+index 7fdc12abf5f..7f964c83f63 100644
+--- a/hermes_cli/fact_content_owner.py
++++ b/hermes_cli/fact_content_owner.py
+@@ -8,7 +8,7 @@
+ from dataclasses import dataclass
+ 
+ from hermes_cli.fact_capture import CaptureBudget
+-from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_process_owner import ProcessOwner
+ from hermes_cli.fact_demand_source import DemandSource
+ from hermes_cli.fact_content_rows import task_rows, session_rows
+ from hermes_cli.fact_session_source import SessionContentSource
+@@ -39,7 +39,7 @@
+     Engines can share one FactStore; a source capture and its affected outputs
+     are one atomic generation, not a cross-database snapshot guarantee.
+     """
+-    def __init__(self, engines, bindings, *, budget=CaptureBudget(), operational=()):
++    def __init__(self, engines, bindings, *, budget=CaptureBudget(), operational=(), lazy_sources=False):
+         self._publishers = {}
+         self._by_source = {}
+         for binding in bindings:
+@@ -71,9 +71,17 @@
+             raise ValueError('empty content source set')
+         self._demands = {scope: DemandSource(engine) for scope, engine in engines.items()}
+         self._publishers.update((source, source) for source in self._demands.values())
+-        self.feed = ChangeFeed(self._commit, self._failure, budget=budget)
++        self.feed = ProcessOwner(self._commit, self._failure, budget=budget)
++        self._activation = None
+         try:
+-            for adapter in self._publishers:
++            if lazy_sources:
++                from hermes_cli.fact_scope_activation import ScopeActivation
++                self._activation = ScopeActivation(engines, self._activate)
++                self._publishers[self._activation] = self._activation
++                adapters = (*self._demands.values(), self._activation)
++            else:
++                adapters = tuple(self._publishers)
++            for adapter in adapters:
+                 self.feed.register(adapter)
+         except Exception:  # health: allow BLE001 -- construction unwind retains owner custody on failure
+             try:
+@@ -86,6 +94,11 @@
+         """Startup key/metadata seam, not a request-side source resolver."""
+         return self._by_source[source]
+ 
++    def _activate(self, scope):
++        for adapter in tuple(self._publishers):
++            if getattr(getattr(adapter, 'source', None), 'scope', None) == scope:
++                self.feed.register(adapter)
++
+     def _commit(self, adapter, capture):
+         self._publishers[adapter].commit(capture)
+ 
+@@ -98,6 +111,8 @@
+             raise ValueError('unauthorized demand scope')
+         if not self.feed._thread.is_alive():
+             raise RuntimeError('content owner closed or unavailable')
++        if self._activation is not None:
++            self._activation.want(scope)
+         self._demands[scope].demand(view, selector)
+ 
+     def close(self):
+diff --git a/hermes_cli/fact_links_startup.py b/hermes_cli/fact_links_startup.py
+index e6c3cf3de09..97f1bcb3826 100644
+--- a/hermes_cli/fact_links_startup.py
++++ b/hermes_cli/fact_links_startup.py
+@@ -13,7 +13,7 @@
+ from hermes_cli.fact_contract import Scope, SourceId
+ from hermes_cli.fact_reducers import ReducerEngine
+ from hermes_cli.fact_remote_links import LinksBudget, LinksFacts, RemoteLinksSource
+-from hermes_cli.fact_store import FactStore
++from hermes_cli.fact_process_owner import process_store
+ 
+ _lock = threading.RLock()
+ _runtimes = {}
+@@ -30,7 +30,7 @@
+     def __init__(self, origin):
+         self.origin = origin
+         self.scope = Scope(origin[0], origin[1])
+-        self.store = FactStore()
++        self.store = process_store()
+         self.owner = None
+         self.binding = None
+         self.closed = False
+diff --git a/hermes_cli/fact_process_owner.py b/hermes_cli/fact_process_owner.py
+new file mode 100644
+index 00000000000..755ff934006
+--- /dev/null
++++ b/hermes_cli/fact_process_owner.py
+@@ -0,0 +1,122 @@
++"""One process capture scheduler; independently drainable scoped registrations. [daveey]
++
++The shared feed carries no ambient profile authority. Each registration captures
++its caller context and budget. Closing one owner fences its publications and
++waits for its actual captures, without stopping peers or forgetting failed drains.
++"""
++from contextvars import copy_context
++import threading
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_store import FactStore
++
++_lock = threading.RLock()
++_feed = _store = None
++_owners = set()
++
++
++def process_store():
++    global _store
++    with _lock:
++        if _store is None:
++            _store = FactStore()
++        return _store
++
++
++class _Bound:
++    def __init__(self, adapter, owner):
++        self.adapter, self.owner = adapter, owner
++        self.context = copy_context()
++        self.condition = threading.Condition()
++        self.capturing = self.closed = False
++        self.watch_handle = None
++
++    def watch(self, wake):
++        self.watch_handle = self.adapter.watch(wake)
++        return self
++
++    def capture(self, cursor, budget):
++        with self.condition:
++            if self.closed:
++                raise RuntimeError('source owner closed')
++            self.capturing = True
++        try:
++            return self.context.run(self.adapter.capture, cursor, self.owner.budget)
++        finally:
++            with self.condition:
++                self.capturing = False
++                self.condition.notify_all()
++
++    def commit(self, capture):
++        with self.condition:
++            if not self.closed:
++                self.context.run(self.owner.commit, self.adapter, capture)
++
++    def failure(self, error):
++        with self.condition:
++            if not self.closed:
++                self.context.run(self.owner.failure, self.adapter, error)
++
++    def fence(self, timeout):
++        with self.condition:
++            self.closed = True
++            if not self.condition.wait_for(lambda: not self.capturing, timeout):
++                raise TimeoutError('source capture did not stop; owner custody retained')
++
++    def stop(self):
++        with self.condition:
++            self.closed = True
++
++    def close(self):
++        if self.watch_handle is not None:
++            self.watch_handle.close()
++
++
++class ProcessOwner:
++    def __init__(self, commit, failure, *, budget=CaptureBudget()):
++        global _feed
++        self.commit, self.failure, self.budget = commit, failure, budget
++        self._lock = threading.RLock()
++        self._close_lock = threading.Lock()
++        self._registrations = []
++        self._closed = False
++        with _lock:
++            if _feed is None:
++                _feed = ChangeFeed(lambda source, capture: source.commit(capture),
++                                   lambda source, error: source.failure(error))
++            self._feed = _feed
++            self._thread = _feed._thread
++            _owners.add(self)
++
++    def register(self, adapter):
++        with self._lock:
++            if self._closed:
++                raise RuntimeError('source owner closed')
++            bound = _Bound(adapter, self)
++            registration = self._feed.register(bound)
++            self._registrations.append((bound, registration))
++            return registration
++
++    def close(self, timeout=5):
++        global _feed, _store
++        if threading.current_thread() is self._thread:
++            raise RuntimeError('cannot close capture owner on its feed thread')
++        with self._close_lock:
++            with self._lock:
++                self._closed = True
++                registrations = tuple(self._registrations)
++            for bound, _registration in registrations:
++                bound.stop()
++            for bound, _registration in registrations:
++                bound.fence(timeout)
++            for _bound, registration in registrations:
++                registration.close()
++            self._registrations.clear()
++            with _lock:
++                if self not in _owners:
++                    return
++                if len(_owners) == 1:
++                    self._feed.close(timeout)
++                    _feed = _store = None
++                _owners.remove(self)
+diff --git a/hermes_cli/fact_scope_activation.py b/hermes_cli/fact_scope_activation.py
+new file mode 100644
+index 00000000000..fb6629dcfdb
+--- /dev/null
++++ b/hermes_cli/fact_scope_activation.py
+@@ -0,0 +1,54 @@
++"""Bounded memory-only scope admission on the shared capture owner. [daveey]"""
++from collections import deque
++from contextvars import copy_context
++import threading
++import time
++from types import SimpleNamespace
++
++
++class ScopeActivation:
++    def __init__(self, allowed, activate):
++        self.allowed, self.activate = frozenset(allowed), activate
++        self._lock = threading.Lock()
++        self._pending, self._admitted = deque(), set()
++        self._wake = None
++        self._closed = False
++
++    def want(self, scope):
++        with self._lock:
++            if self._closed or scope not in self.allowed or scope in self._admitted:
++                return
++            self._admitted.add(scope)
++            self._pending.append((scope, copy_context()))
++            wake = self._wake
++        if wake is not None:
++            wake()
++
++    def watch(self, wake):
++        with self._lock:
++            self._wake = wake
++        return self
++
++    def capture(self, cursor, budget):
++        with self._lock:
++            item = self._pending.popleft() if self._pending and not self._closed else None
++        if item is not None:
++            scope, context = item
++            # A partial activation retains registration/drain custody. Never
++            # replace it on a later request; explicit owner close must succeed.
++            context.run(self.activate, scope)
++        with self._lock:
++            deadline = time.monotonic() if self._pending else None
++        return SimpleNamespace(after=cursor, next_deadline=deadline)
++
++    def close(self):
++        with self._lock:
++            self._closed = True
++            self._pending.clear()
++            self._wake = None
++
++    def commit(self, capture):
++        pass
++
++    def failure(self):
++        pass
+diff --git a/hermes_cli/fact_view_owner.py b/hermes_cli/fact_view_owner.py
+index c22b9d8d553..aa99df106d4 100644
+--- a/hermes_cli/fact_view_owner.py
++++ b/hermes_cli/fact_view_owner.py
+@@ -10,13 +10,13 @@
+ from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
+ from hermes_cli.fact_materializers import Projection, view_reducer
+ from hermes_cli.fact_reducers import ReducerEngine
+-from hermes_cli.fact_store import FactStore
++from hermes_cli.fact_process_owner import process_store
+ 
+ 
+ class ViewOwner:
+     def __init__(self, scope, capture, render, views, *, paths=(), bindings=(), consumer='board'):
+         self.scope, self.consumer = scope, consumer
+-        self.store = FactStore()
++        self.store = process_store()
+         engine = ReducerEngine(self.store, scope)
+         from hermes_cli.fact_contract import SourceId
+         self.source = BoardInputSource(engine, SourceId(scope, 'board.input', 'native'), capture, paths=paths)
+diff --git a/hermes_cli/sessions_native_startup.py b/hermes_cli/sessions_native_startup.py
+index 0fc46ffeb59..f6f83c76b6d 100644
+--- a/hermes_cli/sessions_native_startup.py
++++ b/hermes_cli/sessions_native_startup.py
+@@ -17,9 +17,8 @@
+ 
+ from hermes_cli.fact_capture import CaptureBudget
+ from hermes_cli.fact_contract import Scope, SourceId
+-from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_process_owner import ProcessOwner, process_store
+ from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
+-from hermes_cli.fact_store import FactStore
+ from hermes_cli.sessions_fact_routes import PENDING_NATIVE, use
+ from hermes_cli.sessions_native_source import SessionsSource
+ 
+@@ -30,7 +29,7 @@
+         self.targets = tuple(targets)
+         self.names = frozenset(name for name, _ in targets)
+         self.scope = Scope(str(targets[0][1]), 'sessions-display')
+-        self.store = FactStore()
++        self.store = process_store()
+         self.lifecycle = IncrementalLifecycle({(self.scope, 'sessions')})
+         self.feed = self.local = self.handle = self.binding = None
+         paths = [home / filename for _, home in targets for filename in ('state.db', 'config.yaml')]
+@@ -96,7 +95,7 @@
+         self.source.demand(name, selector)
+ 
+     def start(self):
+-        self.feed = ChangeFeed(lambda source, capture: source.commit(capture),
++        self.feed = ProcessOwner(lambda source, capture: source.commit(capture),
+                                lambda source, error: source.failure(),
+                                budget=CaptureBudget(max_bytes=4 * 1024 * 1024, max_seconds=5))
+         try:
+diff --git a/tests/hermes_cli/test_fact_capture_queue.py b/tests/hermes_cli/test_fact_capture_queue.py
+new file mode 100644
+index 00000000000..23357e292e1
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_capture_queue.py
+@@ -0,0 +1,30 @@
++"""Shared board capture serialization and queued cancellation custody. [daveey]"""
++import threading
++from hermes_cli.fact_capture_queue import submit
++
++
++def test_one_worker_and_cancelled_scope_never_runs():
++    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    def blocked():
++        calls.append('first')
++        entered.set()
++        assert release.wait(5)
++    first = submit(blocked)
++    try:
++        assert entered.wait(5)
++        second = submit(lambda: calls.append('cancelled'))
++        third = submit(lambda: (calls.append('third'), completed.set()))
++        assert sum(t.name == 'fact-board-capture' for t in threading.enumerate()) == 1
++        second.join(.01)
++        assert not second.is_alive()
++        assert second.callback is None
++        assert first.is_alive()
++        release.set()
++        assert completed.wait(5)
++        third.join(5)
++        assert calls == ['first', 'third']
++    finally:
++        release.set()
++        first.join(5)
++    assert not first.is_alive()
+diff --git a/tests/hermes_cli/test_fact_content_owner.py b/tests/hermes_cli/test_fact_content_owner.py
+index 57ce8c940bb..e81a022d437 100644
+--- a/tests/hermes_cli/test_fact_content_owner.py
++++ b/tests/hermes_cli/test_fact_content_owner.py
+@@ -104,7 +104,7 @@
+             if self.failed:
+                 self.failed = False
+                 raise TimeoutError('capture still running')
+-    monkeypatch.setattr(module, 'ChangeFeed', Feed)
++    monkeypatch.setattr(module, 'ProcessOwner', Feed)
+     with pytest.raises(ContentStartupError) as caught:
+         ContentOwner({scope: ReducerEngine(FactStore(), scope)}, [binding])
+     caught.value.owner.close()
+diff --git a/tests/hermes_cli/test_fact_links_startup.py b/tests/hermes_cli/test_fact_links_startup.py
+index ab5e29690e4..0bb8e36bf14 100644
+--- a/tests/hermes_cli/test_fact_links_startup.py
++++ b/tests/hermes_cli/test_fact_links_startup.py
+@@ -38,10 +38,11 @@
+         import time
+         from hermes_cli.fact_remote_links import RemoteLinksSource
+         def recapture_scheduled():
+-            with binding.handle.owner.feed._condition:
+-                return any(isinstance(s.adapter, RemoteLinksSource) and s.due is not None
++            feed = binding.handle.owner.feed._feed
++            with feed._condition:
++                return any(isinstance(s.adapter.adapter, RemoteLinksSource) and s.due is not None
+                            and 25 < s.due - time.monotonic() <= 30
+-                           for s in binding.handle.owner.feed._sources)
++                           for s in feed._sources)
+         wait_until(recapture_scheduled)
+         monkeypatch.setattr(activity, '_links_lookup', lambda *a, **k: pytest.fail('legacy display read'))
+         for _ in range(50):
+diff --git a/tests/hermes_cli/test_fact_process_owner.py b/tests/hermes_cli/test_fact_process_owner.py
+new file mode 100644
+index 00000000000..ae49765ae3e
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_process_owner.py
+@@ -0,0 +1,147 @@
++"""Process-wide capture custody, context isolation and independent drains. [daveey]"""
++from contextvars import ContextVar
++from types import SimpleNamespace
++import threading
++
++from hermes_cli.fact_capture import CaptureBudget
++from tests.waiting import wait_until
++
++
++class Source:
++    def __init__(self, seen, context):
++        self.seen, self.context = seen, context
++        self.closed = False
++
++    def watch(self, wake):
++        self.wake = wake
++        return self
++
++    def capture(self, cursor, budget):
++        self.seen.append((self.context.get(), budget.max_seconds))
++        return SimpleNamespace(after=1)
++
++    def close(self):
++        self.closed = True
++
++
++def test_eleven_owners_share_one_feed_and_preserve_source_context():
++    from hermes_cli.fact_process_owner import ProcessOwner
++    context = ContextVar('fact-test-profile', default='foreign')
++    owners, sources, committed = [], [], []
++    try:
++        for index in range(11):
++            owner = ProcessOwner(lambda source, capture: committed.append(source), lambda *_: None,
++                                 budget=CaptureBudget(max_seconds=index + 1))
++            owners.append(owner)
++            token = context.set(str(index))
++            try:
++                source = Source([], context)
++                sources.append(source)
++                owner.register(source)
++            finally:
++                context.reset(token)
++        assert wait_until(lambda: len(committed) == 11)
++        assert len({owner._thread for owner in owners}) == 1
++        assert all(source.seen == [(str(index), index + 1)] for index, source in enumerate(sources))
++        owners[0].close()
++        assert sources[0].closed
++        assert owners[1]._thread.is_alive()
++        sources[1].wake()
++        assert wait_until(lambda: len(sources[1].seen) == 2)
++    finally:
++        for owner in owners:
++            owner.close()
++    assert not owners[-1]._thread.is_alive()
++
++
++def test_close_retains_capture_custody_until_actual_completion():
++    from hermes_cli.fact_process_owner import ProcessOwner
++    entered, release = threading.Event(), threading.Event()
++    committed = []
++    owner = ProcessOwner(lambda *args: committed.append(args), lambda *_: None)
++    class Blocking(Source):
++        def capture(self, cursor, budget):
++            entered.set()
++            assert release.wait(5)
++            return SimpleNamespace(after=1)
++    source = Blocking([], ContextVar('blocking-profile', default='test'))
++    owner.register(source)
++    try:
++        assert entered.wait(5)
++        import pytest
++        with pytest.raises(TimeoutError):
++            owner.close(timeout=.01)
++        assert not source.closed
++        assert owner._thread.is_alive()
++    finally:
++        release.set()
++        owner.close()
++    assert source.closed
++    assert committed == []
++
++
++def test_last_close_replaces_store_epoch_for_next_tenure():
++    from hermes_cli.fact_process_owner import ProcessOwner, process_store
++    first = process_store()
++    owner = ProcessOwner(lambda *_: None, lambda *_: None)
++    assert process_store() is first
++    owner.close()
++    second = process_store()
++    assert second is not first
++    assert second._epoch != first._epoch
++
++
++def test_peer_close_does_not_wait_for_another_owners_capture():
++    from hermes_cli.fact_process_owner import ProcessOwner
++    entered, release = threading.Event(), threading.Event()
++    first = ProcessOwner(lambda *_: None, lambda *_: None)
++    peer = ProcessOwner(lambda *_: None, lambda *_: None)
++    class Blocking(Source):
++        def capture(self, cursor, budget):
++            entered.set()
++            assert release.wait(5)
++            return SimpleNamespace(after=1)
++    try:
++        first.register(Blocking([], ContextVar('peer-blocking', default='test')))
++        assert entered.wait(5)
++        peer.close(timeout=.01)
++        assert first._thread.is_alive()
++    finally:
++        release.set()
++        first.close()
++        peer.close()
++
++
++def test_lazy_sources_watch_only_the_demanded_profile(tmp_path):
++    from hermes_cli.fact_content_owner import ContentOwner
++    from hermes_cli.fact_contract import Scope, SourceId, FactKey
++    from hermes_cli.fact_store import FactStore
++    from hermes_cli.fact_reducers import ReducerEngine
++    from hermes_cli.fact_materializers import Projection, view_reducer
++    scopes = [Scope(str(tmp_path), f'profile-{i}') for i in range(11)]
++    engines = {scope: ReducerEngine(FactStore(), scope) for scope in scopes}
++    watched = []
++    class Operational(Source):
++        def __init__(self, engine):
++            self.engine = engine
++            self.source = SourceId(engine.scope, 'test.input', 'native')
++            self.key = FactKey(engine.scope, 'Input', '')
++        def watch(self, wake):
++            watched.append(self.source.scope)
++            return super().watch(wake)
++        def capture(self, cursor, budget):
++            return SimpleNamespace(after=1)
++        def commit(self, capture):
++            pass
++        def failure(self):
++            pass
++    for engine in engines.values():
++        engine.register(view_reducer([Projection('board', (), lambda *_: (), lambda *_: {})]))
++    owner = ContentOwner(engines, [], operational=[Operational(e) for e in engines.values()], lazy_sources=True)
++    try:
++        assert watched == []
++        owner.demand(scopes[0], 'board', {})
++        assert wait_until(lambda: len(watched) == 1)
++        assert watched == [scopes[0]]
++    finally:
++        owner.close()
+diff --git a/tests/hermes_cli/test_fact_process_views.py b/tests/hermes_cli/test_fact_process_views.py
+new file mode 100644
+index 00000000000..5dd893bcf20
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_process_views.py
+@@ -0,0 +1,18 @@
++"""Real view owners share scheduling while unused scopes stay inert. [daveey]"""
++import threading
++from hermes_cli.fact_contract import Scope
++from hermes_cli.fact_view_owner import ViewOwner
++
++
++def test_eleven_real_views_share_one_feed_and_store(tmp_path):
++    owners = [ViewOwner(Scope(str(tmp_path), f'profile-{i}', 'default'),
++                        lambda *_: None, lambda *_: {}, ('board',)) for i in range(11)]
++    try:
++        for owner in owners:
++            owner.start()
++        assert len({owner.owner.feed._thread for owner in owners}) == 1
++        assert len({id(owner.store) for owner in owners}) == 1
++        assert not any(t.name == 'fact-board-capture' for t in threading.enumerate())
++    finally:
++        for owner in owners:
++            owner.close()
+diff --git a/tests/hermes_cli/test_fact_scope_activation.py b/tests/hermes_cli/test_fact_scope_activation.py
+new file mode 100644
+index 00000000000..90860b1c5f9
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_scope_activation.py
+@@ -0,0 +1,42 @@
++"""Memory-only scope activation and failed-drain custody. [daveey]"""
++from contextvars import ContextVar
++import pytest
++from hermes_cli.fact_scope_activation import ScopeActivation
++from hermes_cli.fact_capture import CaptureBudget
++
++
++def test_want_is_memory_only_deduplicated_scoped_and_context_bound():
++    profile = ContextVar('activation-profile', default='foreign')
++    seen = []
++    source = ScopeActivation(('allowed',), lambda scope: seen.append((scope, profile.get())))
++    source.watch(lambda: None)
++    token = profile.set('authorized')
++    try:
++        source.want('allowed')
++        source.want('allowed')
++        source.want('foreign')
++    finally:
++        profile.reset(token)
++    assert seen == []
++    source.capture(None, CaptureBudget())
++    source.capture(None, CaptureBudget())
++    assert seen == [('allowed', 'authorized')]
++    source.close()
++    source.want('allowed')
++    assert source.capture(None, CaptureBudget()).next_deadline is None
++
++
++def test_failed_activation_is_not_replaced_by_another_request():
++    seen = []
++    def fail(scope):
++        seen.append(scope)
++        raise RuntimeError('partial custody retained')
++    source = ScopeActivation(('allowed',), fail)
++    source.watch(lambda: None)
++    source.want('allowed')
++    with pytest.raises(RuntimeError, match='custody retained'):
++        source.capture(None, CaptureBudget())
++    source.want('allowed')
++    source.capture(None, CaptureBudget())
++    assert seen == ['allowed']
++    source.close()
+diff --git a/tests/plugins/test_board_demand_startup.py b/tests/plugins/test_board_demand_startup.py
+new file mode 100644
+index 00000000000..b4be1ac6fbd
+--- /dev/null
++++ b/tests/plugins/test_board_demand_startup.py
+@@ -0,0 +1,26 @@
++"""Unused discovered board scopes own no capture or watcher. [daveey]"""
++import threading
++from hermes_cli.fact_board_startup import BoardRuntime
++from tests.plugins import test_kanban_board_shadow as helpers
++from tests.waiting import wait_until
++
++shadow_board = helpers.shadow_board
++
++
++def test_eleven_boards_only_activate_the_demanded_scope(shadow_board):
++    runtime = BoardRuntime(shadow_board['mod'], boards=('default', *(f'unused-{i}' for i in range(10))))
++    try:
++        runtime.start()
++        assert runtime.owners == {}
++        assert runtime.views == {}
++        runtime.provider('default')
++        assert wait_until(lambda: runtime.ready('default'), timeout=10)
++        assert set(runtime.owners) == {'default'}
++        assert set(runtime.views) == {'default'}
++        assert sum(t.name == 'fact-change-feed' for t in threading.enumerate()) == 1
++        assert sum(t.name == 'fact-board-capture' for t in threading.enumerate()) <= 1
++        # No source path resolution, watcher or legacy hydration on a request.
++        runtime.provider('unknown')
++        assert set(runtime.owners) == {'default'}
++    finally:
++        runtime.close()
+-- 
+2.43.0
+

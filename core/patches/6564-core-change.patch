@@ -1,0 +1,134 @@
+From afde2e164e5527bfe8b1b20ef776a19ae0940116 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:07:25 +0000
+Subject: [PATCH 6564] Request-stage diagnostics, stream phases and process custody
+
+Public mirror of source commit afde2e164e5527bfe8b1b20ef776a19ae0940116.
+
+---
+diff --git a/tests/tui_gateway/test_automatic_desktop_defer.py b/tests/tui_gateway/test_automatic_desktop_defer.py
+new file mode 100644
+index 00000000000..d479ed476ec
+--- /dev/null
++++ b/tests/tui_gateway/test_automatic_desktop_defer.py
+@@ -0,0 +1,70 @@
++"""Automatic notices behind a verified local Desktop owner retry without a takeover card."""
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import active_sessions
++from tui_gateway import gateway_background_holder as holders
++from tui_gateway import server
++from tests.tui_gateway import test_automatic_ledger_defer as helpers
++
++admission = helpers.admission
++
++
++@pytest.mark.parametrize("typed", [False, True])
++@pytest.mark.parametrize("control", ["local", "foreign_host", "missing_host", "unknown_birth", "dead", "cli", "mixed_cli", "self_only", "extra_unknown", "different_session", "durable_foreign", "missing", "unreadable", "empty_key", "coordination", "self_orphan"])
++def test_desktop_notice_refusal_preserves_custody_and_retry(admission, monkeypatch, typed, control):
++    pid = os.getpid() + 100000
++    if control == "empty_key":
++        admission.session["session_key"] = ""
++    key = admission.session["session_key"]
++    entry = {"session_id": key, "pid": pid, "host": "fixture-local", "surface": "desktop",
++             "process_start_time": 123.0}
++    if control == "foreign_host":
++        entry["host"] = "other-device"
++    if control == "missing_host":
++        entry.pop("host")
++    if control == "self_only":
++        entry["pid"] = os.getpid()
++    if control == "unknown_birth":
++        entry["process_start_time"] = None
++    if control == "cli":
++        entry["surface"] = "cli"
++    if control == "different_session":
++        entry["session_id"] = "another-chat"
++    entries = [] if control == "missing" else [entry]
++    if control == "extra_unknown":
++        entries.append({**entry, "pid": pid + 1, "process_start_time": None})
++    if control == "mixed_cli":
++        entries.append({**entry, "pid": pid + 1, "surface": "cli"})
++
++    def registry(_):
++        if control == "unreadable":
++            raise OSError("fixture registry unavailable")
++        return entries
++
++    monkeypatch.setattr(active_sessions, "active_session_registry_snapshot", registry)
++    monkeypatch.setattr(active_sessions, "owner_host", lambda: "fixture-local")
++    monkeypatch.setattr(active_sessions, "_pid_liveness", lambda p, birth: control != "dead" and birth == 123.0)
++    monkeypatch.setattr(holders, "dialed_gateway", lambda _: None)
++    monkeypatch.setattr(server, "_foreign_turn_owner", lambda _: (
++        {"holder": "uncheckable-foreign-holder"} if control == "durable_foreign" else None))
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: True)
++    admission.refusal = SimpleNamespace(
++        reason="SESSION_COORDINATION_UNAVAILABLE" if control == "coordination" else "SESSION_NOT_OWNED",
++        ownership_cause="lease_self_orphan" if control == "self_orphan" else "lease_foreign", holder_pid=pid)
++    admission.session["_turn_marker_key"] = "live-owner-marker"
++    before = list(admission.session["history"])
++    if typed:
++        assert helpers._admit(admission) is None
++    else:
++        assert server._notif_run_submit("rid", "live", admission.session, "notice") is False
++        assert admission.session["_notif_owner_refused_until"] == admission.now + 30
++        assert admission.session["_notif_owner_refusal_delay"] == 60
++        assert "_synthesized_turn" not in admission.session
++    assert len(admission.errors) == int(typed or control != "local")
++    assert admission.starts == []
++    assert admission.session["history"] == before
++    assert admission.session["_turn_marker_key"] == "live-owner-marker"
++    assert admission.session["running"] is False
+diff --git a/tui_gateway/gateway_background_holder.py b/tui_gateway/gateway_background_holder.py
+index 45954946cff..52713e1cb8d 100644
+--- a/tui_gateway/gateway_background_holder.py
++++ b/tui_gateway/gateway_background_holder.py
+@@ -127,10 +127,32 @@
+     return gateway
+ 
+ 
++def _local_desktop_holder(session: dict, *, foreign_owner: Callable[[dict], Optional[dict]]) -> bool:
++    """Presentation proof only: all holders have birth-matched Desktop leases in this install's registry."""
++    from hermes_cli.active_sessions import active_session_registry_snapshot, owner_host
++    key = str(session.get("session_key") or "")
++    if not key:
++        return False
++    try:
++        entries = active_session_registry_snapshot(session.get("profile_home"))
++        pids = holder_pids(key, foreign_owner(session), entries, os.getpid())
++        desktop_pids = {
++            _registry_pid(entry) for entry in entries
++            if str(entry.get("session_id") or "") == key
++            and entry.get("host") == owner_host() and entry.get("surface") == "desktop"
++            and entry.get("process_start_time")
++        }
++    except (OSError, RuntimeError, ValueError, TypeError):
++        logger.warning("could not verify local Desktop holder for %s", key, exc_info=True)
++        return False
++    return bool(pids) and 0 not in pids and pids <= desktop_pids
++
++
+ def automatic_owner_wait(session: dict, refusal, *, foreign_owner: Callable[[dict], Optional[dict]]) -> Optional[str]:
+-    """Presentation only: automatic work retries behind its ready gateway, never takes custody.
++    """Presentation only: automatic work retries behind its verified local owner, never takes custody.
+ 
+     A durable gateway lease and a gateway queue are two representations of the same busy owner.
++    A birth-matched same-host Desktop registry lease is also a local background wait, not a user action.
+     Unproved/foreign writers and typed sends retain their existing actionable refusal.
+     """
+     if not session.get("_synthesized_turn"):
+@@ -144,6 +166,8 @@
+         return None
+     if gateway_background_holder(session, foreign_owner=foreign_owner) is not None:
+         return "local gateway holds the durable turn lease"
++    if _local_desktop_holder(session, foreign_owner=foreign_owner):
++        return "local Desktop backend holds the chat"
+     return None
+ 
+ 
+-- 
+2.43.0
+

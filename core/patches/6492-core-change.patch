@@ -1,0 +1,185 @@
+From 511a9821bd29d6a619ad03da79a34280c13f2b19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:23:02 +0000
+Subject: [PATCH 6492] Create-path flag validation, creator-source audit and origin index
+
+Public mirror of source commit 511a9821bd29d6a619ad03da79a34280c13f2b19.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index e1f7ba6f78f..44b637a79c0 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1332,6 +1332,8 @@
+         except PermissionError:
+             pass  # a read-only (delegated-child) opener: the next writer stamps; inheritance has a fallback
+ 
++    from hermes_cli.kanban_origin_intent_carry import ensure_task_index
++    ensure_task_index(conn)
+     _rebuild_drifted_tables(conn)
+     ensure_run_bookkeeping_index(conn)
+     _ensure_notify_sub_triggers(conn)
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index 6a61e5e05af..d183d7fba53 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -169,6 +169,8 @@
+             task_id TEXT NOT NULL REFERENCES tasks(id),
+             binding_json TEXT NOT NULL,
+             child_request_id TEXT NOT NULL UNIQUE)""")
++        from hermes_cli.kanban_origin_intent_carry import ensure_task_index
++        ensure_task_index(conn)
+         existing = conn.execute(
+             "SELECT intent_json,task_id FROM origin_creation_intents WHERE request_id=?",
+             (intent["request_id"],),
+@@ -249,6 +251,8 @@
+             task_id TEXT NOT NULL REFERENCES tasks(id),
+             binding_json TEXT NOT NULL,
+             child_request_id TEXT NOT NULL UNIQUE)""")
++        from hermes_cli.kanban_origin_intent_carry import ensure_task_index
++        ensure_task_index(conn)
+         existing = conn.execute(
+             "SELECT intent_json,task_id FROM origin_creation_intents WHERE request_id=?",
+             (intent["request_id"],),
+diff --git a/hermes_cli/kanban_origin_intent_carry.py b/hermes_cli/kanban_origin_intent_carry.py
+index 048d1f2944d..6ceab701316 100644
+--- a/hermes_cli/kanban_origin_intent_carry.py
++++ b/hermes_cli/kanban_origin_intent_carry.py
+@@ -41,6 +41,16 @@
+             child_request_id TEXT NOT NULL UNIQUE)"""
+ 
+ 
++def ensure_task_index(conn: sqlite3.Connection) -> None:
++    """Index owner-marker equality reads without creating the lazy intent table.
++
++    Keep binding_json out of the index: payloads can be large. Equal task IDs
++    retain rowid order, as in the original table scan; no read semantics change.
++    """
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone():
++        conn.execute('CREATE INDEX IF NOT EXISTS idx_origin_intents_task ON origin_creation_intents(task_id)')
++
++
+ def record(conn: sqlite3.Connection, task_id: str, request_id: str, intent_json: str, binding_json: str,
+            child_request_id: str) -> None:
+     """Append the synced copy of a just-inserted ``origin_creation_intents`` row (caller's transaction).
+@@ -89,4 +99,5 @@
+     if row is None:
+         return False
+     conn.execute(INTENTS_DDL)
++    ensure_task_index(conn)
+     return conn.execute("INSERT OR IGNORE INTO origin_creation_intents VALUES (?,?,?,?,?)", row).rowcount == 1
+diff --git a/tests/hermes_cli/test_kanban_origin_intent_index.py b/tests/hermes_cli/test_kanban_origin_intent_index.py
+new file mode 100644
+index 00000000000..4e1c96d80c9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_intent_index.py
+@@ -0,0 +1,106 @@
++"""Owner-local marker lookup must not scan unrelated courier history."""
++import sqlite3
++import json
++
++import pytest
++
++from hermes_cli import kanban_origin_intent_carry as carry
++
++
++def board():
++    conn = sqlite3.connect(':memory:')
++    conn.execute('CREATE TABLE tasks(id TEXT PRIMARY KEY)')
++    conn.execute(carry.INTENTS_DDL)
++    conn.executemany('INSERT INTO origin_creation_intents VALUES(?,?,?,?,?)',
++                     [(f'r{i}', '{}', f't{i}', f'{{"i":{i}}}', f'c{i}') for i in range(4000)])
++    # Preserve table-scan order for several markers on the same task.
++    conn.executemany('INSERT INTO origin_creation_intents VALUES(?,?,?,?,?)',
++                     [(f'z{i}', '{}', 'target', str(i), f'zc{i}') for i in (7, 2, 9)])
++    return conn
++
++
++def steps(conn, sql, params=()):
++    count = 0
++    def tick():
++        nonlocal count
++        count += 1
++        return 0
++    conn.set_progress_handler(tick, 1)
++    try:
++        rows = conn.execute(sql, params).fetchall()
++    finally:
++        conn.set_progress_handler(None, 0)
++    return rows, count
++
++
++def test_marker_lookup_bounded_and_literal_order():
++    with board() as conn:
++        sql = 'SELECT binding_json FROM origin_creation_intents WHERE task_id=?'
++        expected, old_work = steps(conn, sql, ('target',))
++        carry.ensure_task_index(conn)
++        for analyze in (False, True):
++            if analyze:
++                conn.execute('ANALYZE')
++            actual, work = steps(conn, sql, ('target',))
++            assert actual == expected == [('7',), ('2',), ('9',)]
++            assert old_work > 10000
++            assert work < 100
++            assert steps(conn, sql, ('absent',))[1] < 100
++
++
++def test_settled_install_is_schema_noop_and_absence_stays_absent():
++    with sqlite3.connect(':memory:') as conn:
++        carry.ensure_task_index(conn)
++        assert not conn.execute("SELECT name FROM sqlite_master WHERE name='origin_creation_intents'").fetchall()
++    with board() as conn:
++        carry.ensure_task_index(conn)
++        before = conn.execute('PRAGMA schema_version').fetchone()
++        carry.ensure_task_index(conn)
++        assert conn.execute('PRAGMA schema_version').fetchone() == before
++
++
++def test_real_board_reopen_installs_index(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    path = tmp_path / 'kanban.db'
++    with kbc.connect_closing(path) as conn:
++        conn.execute(carry.INTENTS_DDL)
++    kbc.init_db(path)
++    with kbc.connect_closing(path) as conn:
++        assert conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_origin_intents_task'").fetchone()
++
++
++from tests.hermes_cli import test_kanban_sync_restore_origin_intents as restored_support
++kanban_home = restored_support.kanban_home
++svc = restored_support.svc
++live = restored_support.live
++
++
++@pytest.mark.parametrize('how', ['create', 'adopt'])
++def test_lazy_creation_paths_install_index(live, how):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin_creation import adopt_with_origin
++    intent = restored_support._intent()
++    if how == 'create':
++        kb.create_task(live, title='courier', assignee='worker', origin_intent=intent)
++    else:
++        tid = kb.create_task(live, title='existing', assignee='worker')
++        adopt_with_origin(live, {**intent, 'owner': {**intent['owner'], 'task_id': tid}},
++                          board=restored_support.BOARD)
++    assert live.execute("SELECT 1 FROM sqlite_master WHERE name='idx_origin_intents_task'").fetchone()
++
++
++def test_restoring_missing_table_installs_index():
++    with sqlite3.connect(':memory:') as conn:
++        conn.execute('CREATE TABLE tasks(id TEXT PRIMARY KEY)')
++        conn.execute('CREATE TABLE kanban_restored_cards(task_id TEXT)')
++        conn.execute("INSERT INTO kanban_restored_cards VALUES('card')")
++        binding = {'binding_id': 'binding-test', 'version': 1,
++                   'owner': {'gateway': 'owner', 'profile': 'default', 'board': 'default', 'task_id': 'card'},
++                   'origin': {'gateway': 'origin', 'profile': 'default', 'session': 'session'},
++                   'task_record_key': 'default/default/card'}
++        payload = json.dumps({'v': 1, 'request_id': 'request-test', 'intent_json': '{}',
++                              'binding_json': json.dumps(binding), 'child_request_id': 'child-test'})
++        assert carry.restore_from_event(conn, {'kind': carry.EVENT_KIND, 'task_id': 'card',
++                                               'payload': payload}, 'owner')
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='idx_origin_intents_task'").fetchone()
++
+-- 
+2.43.0
+

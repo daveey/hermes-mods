@@ -1,0 +1,87 @@
+From 4bd172773c0ceea643fc000d530ef55b40db887c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:50:11 +0000
+Subject: [PATCH 5964] Fact change feed: bounded failure logging and busy-open tolerance
+
+Public mirror of source commit 4bd172773c0ceea643fc000d530ef55b40db887c.
+
+---
+diff --git a/hermes_cli/fact_capture.py b/hermes_cli/fact_capture.py
+index 0f5177bf619..0ac0ae7057a 100644
+--- a/hermes_cli/fact_capture.py
++++ b/hermes_cli/fact_capture.py
+@@ -103,6 +103,10 @@
+     # tracking registry is held only briefly per open, and timeout=0 failed
+     # nearly every first capture on a busy host (one retry ~0.1 s later each).
+     with closing(open_ro(path, timeout=budget.max_seconds)) as conn:
++        # Only the open waits. A busy read inside the snapshot must still fail
++        # fast as busy (cheap feed retry), not sleep into CaptureBudgetExceeded
++        # and push the source into a paged full re-read.
++        conn.execute("PRAGMA busy_timeout=0")
+         # SQLite refuses oversized rows before Python allocates their values.
+         conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, budget.max_bytes)
+         before = _identity(path)
+diff --git a/tests/hermes_cli/test_fact_capture.py b/tests/hermes_cli/test_fact_capture.py
+index 849f7e19099..3619625fdae 100644
+--- a/tests/hermes_cli/test_fact_capture.py
++++ b/tests/hermes_cli/test_fact_capture.py
+@@ -180,32 +180,50 @@
+         borrowed[0].execute("SELECT 1")
+ 
+ 
++
+ def test_briefly_held_tracking_registry_does_not_fail_capture(board, monkeypatch):
+-    """A capture waits out a momentary registry holder within its own budget.
++    """A capture waits out a momentary registry holder on its open, and only there.
+ 
+     With timeout=0 every first capture on a busy hub failed with "tracking
+     registry is busy" and only succeeded on the feed's retry ~0.1 s later."""
+     import threading
++    from types import SimpleNamespace
+     from hermes_cli import fact_capture as capture
+-    from hermes_cli import sqlite_safe_read
++    from hermes_cli import kanban_generation, sqlite_safe_read
+ 
+     path, writer = board
+     kb.create_task(writer, title="a", assignee="w")
+     monkeypatch.setattr(capture, "time", time)  # real clock: this test is about waiting
+-    held, release = threading.Event(), threading.Event()
++    held, release, released, waited = threading.Event(), threading.Event(), threading.Event(), []
+ 
+     def holder():
+         with sqlite_safe_read._live_lock:
+             held.set()
+-            release.wait(2)
++            release.wait(5)
++        released.set()
++
++    def sleep(seconds):
++        # retry_open's busy wait: proves the open really met the held registry,
++        # then lets the holder go (deterministic, no timer race).
++        waited.append(seconds)
++        release.set()
++        assert released.wait(5)
++
++    monkeypatch.setattr(kanban_generation, "time", SimpleNamespace(monotonic=time.monotonic, sleep=sleep))
++    timeouts = []
++
++    def hydrate(conn, ids):
++        timeouts.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
++        return rows(conn, ids)
+ 
+     thread = threading.Thread(target=holder)
+     thread.start()
+     assert held.wait(2)
+-    threading.Timer(0.005, release.set).start()
+     try:
+-        result = capture_tasks(path, None, rows, budget=CaptureBudget(max_seconds=0.5))
++        result = capture_tasks(path, None, hydrate)  # default budget (20 ms)
+     finally:
+         release.set()
+         thread.join(2)
++    assert waited, "capture never met the held registry"
+     assert result.after is not None
++    assert timeouts and set(timeouts) == {0}, "reads inside the snapshot must not sleep on busy"
+-- 
+2.43.0
+

@@ -1,0 +1,332 @@
+From 2faa43da80ae05265fbe303692a20bf3508c4439 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:03:29 +0000
+Subject: [PATCH 6586] Desktop kanban model-requirement and recovery transport test harnesses
+
+Public mirror of source commit 2faa43da80ae05265fbe303692a20bf3508c4439.
+
+---
+diff --git a/apps/desktop/e2e/core/README.md b/apps/desktop/e2e/core/README.md
+index f8eb31df0e7..1be1e0307a6 100644
+--- a/apps/desktop/e2e/core/README.md
++++ b/apps/desktop/e2e/core/README.md
+@@ -72,6 +72,14 @@
+   enough profiles to condense the sidebar rail; the profile menu lists the
+   ACTIVE gateway's default (checked, home glyph) on both sides of a switch
+   (#106017, #131632).
++- **Kanban model requirement** — `kanban-model-requirement.spec.ts`: the New
++  task form and the task drawer's Model row offer only the profile default and
++  `class:*`; the created card stores the class with the `auto` provider, the
++  drawer clears it, and a card seeded with a pre-rule concrete model reads as
++  the profile default and is replaced by the chosen class (read from the
++  sandbox board's database). Both cards stay unassigned in Triage and the test
++  ends on zero run rows: every Desktop write nudges `POST /dispatch`, which
++  ignores `kanban.dispatch_in_gateway`.
+ - **Transcript images** — `transcript-image-frame.spec.ts`: a portrait image
+   reply, reloaded so it mounts cold in its reserved 4:3 frame, scales into the
+   frame instead of painting over the text below it (#154409).
+diff --git a/apps/desktop/e2e/core/kanban-model-requirement.spec.ts b/apps/desktop/e2e/core/kanban-model-requirement.spec.ts
+new file mode 100644
+index 00000000000..57393b9e752
+--- /dev/null
++++ b/apps/desktop/e2e/core/kanban-model-requirement.spec.ts
+@@ -0,0 +1,268 @@
++/**
++ * Kanban cards carry a class requirement, never a concrete model: the two
++ * Desktop producers (the New task form and the task drawer's Model row),
++ * driven in the real app against the real backend and read back from the
++ * board's own database.
++ *
++ *  1. The New task form offers only "Profile default" and class:* and the card
++ *     it creates stores the chosen class with the `auto` provider.
++ *  2. The drawer puts that card back on the profile default: both columns NULL.
++ *  3. A card that still stores a concrete model from before the rule (seeded
++ *     straight into the sandbox board, the only way such a row can exist now)
++ *     shows as "Profile default"; choosing a class replaces the stored model
++ *     and provider, and no card on the board keeps a concrete one.
++ *
++ * Nothing here may run a card. Every Desktop write is followed by a
++ * `POST /dispatch` nudge that ignores `kanban.dispatch_in_gateway`, so the
++ * fence is the cards themselves: both stay in Triage with no assignee, which
++ * the dispatcher never claims. The gateway's own dispatcher and the Triage
++ * decomposer are switched off as well, and the only provider is the scripted
++ * local one. The test ends by checking that no run row exists and that the
++ * provider never saw either card.
++ */
++
++import * as path from 'node:path'
++import { DatabaseSync } from 'node:sqlite'
++
++import { expect, type Locator, type Page, test } from '@playwright/test'
++
++import {
++  coreAppEnv,
++  type CoreSandbox,
++  createCoreSandbox,
++  hermesCli,
++  launchCoreApp,
++  sandboxProcesses,
++  stopSandboxGateway,
++  waitForInteractive,
++  writeProviderHome
++} from './harness'
++import { startScriptedProvider } from './provider'
++
++const nonce = Math.random()
++  .toString(36)
++  .slice(2, 8)
++  .replace(/[^a-z0-9]/g, 'x')
++  .padEnd(4, 'q')
++
++const LEGACY_TITLE = `Legacy pinned ${nonce}`
++const NEW_TITLE = `Routed card ${nonce}`
++const LEGACY_PIN = { model: 'gpt-6-luna', provider: 'openai-codex' }
++const CLASSES = ['class:fast', 'class:standard', 'class:deep', 'class:carbon']
++
++// English copy of the Kanban plugin (src/plugins/kanban/i18n.ts); the sandbox has no locale override.
++const COPY = {
++  assignee: 'Assignee',
++  close: 'Close',
++  createTask: 'Create task',
++  modelInherit: 'Profile default',
++  newTask: 'New task',
++  parked: "unassigned (parked — won't run)",
++  titlePlaceholderTriage: 'Rough idea — a specifier will flesh it out'
++}
++
++const KANBAN_CONFIG = `kanban:
++  dispatch_in_gateway: false
++  auto_decompose: false
++`
++
++interface StoredCard {
++  assignee: null | string
++  current_run_id: null | number
++  id: string
++  model_override: null | string
++  provider_override: null | string
++  status: string
++  title: string
++}
++
++const boardDb = (sandbox: CoreSandbox) => path.join(sandbox.hermesHome, 'kanban.db')
++
++/** Every card on the sandbox board plus its run count, read-only; null while the file is mid-checkpoint. */
++function storedBoard(sandbox: CoreSandbox): null | { cards: StoredCard[]; runs: number } {
++  let db: DatabaseSync | undefined
++
++  try {
++    db = new DatabaseSync(boardDb(sandbox), { readOnly: true })
++
++    const cards = db
++      .prepare(
++        'SELECT id, title, status, assignee, current_run_id, model_override, provider_override FROM tasks ORDER BY created_at, id'
++      )
++      .all() as unknown as StoredCard[]
++
++    const runs = (db.prepare('SELECT COUNT(*) AS n FROM task_runs').get() as { n: number }).n
++
++    return { cards, runs }
++  } catch {
++    return null
++  } finally {
++    db?.close()
++  }
++}
++
++/** `model/provider` as stored for the card titled `title` ('' = no such card yet, or the read was transient). */
++function storedRequirement(sandbox: CoreSandbox, title: string): string {
++  const card = storedBoard(sandbox)?.cards.find(row => row.title === title)
++
++  return card ? `${card.model_override ?? 'NULL'}/${card.provider_override ?? 'NULL'}` : ''
++}
++
++/** A pre-rule row: created by the CLI, then given the concrete model the rule no longer lets any producer write. */
++function seedLegacyPinnedCard(sandbox: CoreSandbox): string {
++  const created = hermesCli(sandbox, ['kanban', 'create', LEGACY_TITLE, '--triage', '--json'])
++  expect(created.code, created.output).toBe(0)
++
++  const db = new DatabaseSync(boardDb(sandbox))
++
++  try {
++    const changed = db
++      .prepare('UPDATE tasks SET model_override = ?, provider_override = ? WHERE title = ?')
++      .run(LEGACY_PIN.model, LEGACY_PIN.provider, LEGACY_TITLE)
++
++    expect(Number(changed.changes), 'exactly the one CLI-created card was seeded').toBe(1)
++
++    return (db.prepare('SELECT id FROM tasks WHERE title = ?').get(LEGACY_TITLE) as { id: string }).id
++  } finally {
++    db.close()
++  }
++}
++
++const modelSelect = (scope: Locator) => scope.getByRole('combobox', { name: COPY.modelInherit, exact: true })
++
++const optionValues = (select: Locator) =>
++  select.locator('option').evaluateAll(options => options.map(option => (option as HTMLOptionElement).value))
++
++async function openDrawer(page: Page, title: string): Promise<Locator> {
++  await page.locator('[data-slot="kanban-card"]', { hasText: title }).click()
++  const drawer = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: title }) })
++  await expect(drawer, `the drawer for "${title}" opened`).toBeVisible()
++  await expect(modelSelect(drawer), 'the drawer loaded the card detail').toBeVisible()
++
++  return drawer
++}
++
++test('the New task form and the drawer store a class requirement, never a concrete model', async () => {
++  test.setTimeout(240_000)
++  const provider = await startScriptedProvider()
++  const sandbox = createCoreSandbox('kanban-model-requirement')
++  writeProviderHome(sandbox.hermesHome, provider.url, KANBAN_CONFIG)
++  const legacyId = seedLegacyPinnedCard(sandbox)
++
++  expect(storedRequirement(sandbox, LEGACY_TITLE), 'the legacy row holds a concrete model before the app starts').toBe(
++    `${LEGACY_PIN.model}/${LEGACY_PIN.provider}`
++  )
++
++  const { app, page } = await launchCoreApp(coreAppEnv(sandbox))
++  let closed = false
++
++  try {
++    await waitForInteractive(app, page)
++    // Kanban ships off by default; this is the choice the Plugins settings toggle persists.
++    await page.evaluate(() =>
++      localStorage.setItem('hermes.desktop.pluginDecisions.v2', JSON.stringify({ kanban: true }))
++    )
++    await page.reload()
++    await waitForInteractive(app, page)
++    await page.evaluate(() => {
++      window.location.hash = '#/kanban'
++    })
++    await expect(
++      page.locator('[data-slot="kanban-card"]', { hasText: LEGACY_TITLE }),
++      'the board page shows the seeded card'
++    ).toBeVisible()
++
++    await test.step('New task form: only class choices, and the created card stores class + auto', async () => {
++      await page.getByRole('button', { name: COPY.newTask, exact: true }).first().click()
++      const form = page.getByRole('dialog').filter({ has: page.getByPlaceholder(COPY.titlePlaceholderTriage) })
++      await expect(form).toBeVisible()
++      expect(await optionValues(modelSelect(form)), 'the form offers the profile default and classes only').toEqual([
++        '',
++        ...CLASSES
++      ])
++
++      await form.getByPlaceholder(COPY.titlePlaceholderTriage).fill(NEW_TITLE)
++      // Parked: no assignee, so no dispatcher pass can ever claim this card.
++      await form.locator('label', { hasText: COPY.assignee }).getByRole('combobox').click()
++      await page.getByRole('option', { name: COPY.parked, exact: true }).click()
++      await modelSelect(form).selectOption('class:fast')
++      await form.getByRole('button', { name: COPY.createTask, exact: true }).click()
++
++      await expect
++        .poll(() => storedRequirement(sandbox, NEW_TITLE), {
++          message: 'the created card stores the class',
++          timeout: 60_000
++        })
++        .toBe('class:fast/auto')
++      await expect(form, 'the form closed after the create').toBeHidden()
++    })
++
++    await test.step('drawer: back to the profile default clears both columns', async () => {
++      const drawer = await openDrawer(page, NEW_TITLE)
++      await expect(modelSelect(drawer)).toHaveValue('class:fast')
++      await modelSelect(drawer).selectOption('')
++
++      await expect
++        .poll(() => storedRequirement(sandbox, NEW_TITLE), { message: 'the requirement was cleared', timeout: 60_000 })
++        .toBe('NULL/NULL')
++      await drawer.getByRole('button', { name: COPY.close, exact: true }).click()
++      await expect(drawer).toBeHidden()
++    })
++
++    await test.step('drawer on a pre-rule card: the concrete model is not offered, and a class replaces it', async () => {
++      const drawer = await openDrawer(page, LEGACY_TITLE)
++      await expect(modelSelect(drawer), 'a stored concrete model reads as the profile default').toHaveValue('')
++      expect(await optionValues(modelSelect(drawer))).toEqual(['', ...CLASSES])
++      await modelSelect(drawer).selectOption('class:deep')
++
++      await expect
++        .poll(() => storedRequirement(sandbox, LEGACY_TITLE), {
++          message: 'the class replaced the pin',
++          timeout: 60_000
++        })
++        .toBe('class:deep/auto')
++      await drawer.getByRole('button', { name: COPY.close, exact: true }).click()
++      await expect(drawer).toBeHidden()
++    })
++
++    await test.step('nothing ran, and no card keeps a concrete model', async () => {
++      const board = storedBoard(sandbox)
++      expect(board, 'the board database is readable').not.toBeNull()
++      expect(
++        board!.cards.map(card => ({
++          assignee: card.assignee,
++          id: card.id === legacyId ? 'legacy' : 'new',
++          requirement: `${card.model_override ?? 'NULL'}/${card.provider_override ?? 'NULL'}`,
++          run: card.current_run_id,
++          status: card.status
++        }))
++      ).toEqual([
++        { assignee: null, id: 'legacy', requirement: 'class:deep/auto', run: null, status: 'triage' },
++        { assignee: null, id: 'new', requirement: 'NULL/NULL', run: null, status: 'triage' }
++      ])
++      expect(board!.runs, 'no card was ever claimed or spawned').toBe(0)
++      expect(
++        provider.completions.filter(rec => /Legacy pinned|Routed card/.test(JSON.stringify(rec.body ?? null))).length,
++        'the provider never received either card'
++      ).toBe(0)
++    })
++
++    await app.close()
++    closed = true
++    const stopped = stopSandboxGateway(sandbox)
++    expect(stopped.code, stopped.output).toBe(0)
++    await expect
++      .poll(() => sandboxProcesses(sandbox).map(proc => `${proc.pid} ${proc.cmdline.slice(0, 120)}`), {
++        message: 'no sandbox process survives quit + hermes gateway stop',
++        timeout: 60_000
++      })
++      .toEqual([])
++  } finally {
++    if (!closed) {
++      await app.close().catch(() => undefined)
++    }
++
++    await provider.close()
++    sandbox.cleanup()
++  }
++})
+diff --git a/scripts/ci/classify_changes.py b/scripts/ci/classify_changes.py
+index c598ed12513..85bff1b5088 100644
+--- a/scripts/ci/classify_changes.py
++++ b/scripts/ci/classify_changes.py
+@@ -631,6 +631,8 @@
+         "apps/desktop/src/app/chat/sidebar/fleet-",
+         # reconnect-turn-state.spec.ts: the lost-turn card and Discard live in the queue panel.
+         "apps/desktop/src/app/chat/composer/queue-",
++        # kanban-model-requirement.spec.ts: the New task form and the drawer's Model row.
++        "apps/desktop/src/plugins/kanban/",
+     ),
+     "e2e_desktop_update": (
+         *_DESKTOP_E2E_SHARED,
+diff --git a/tests/ci/test_classify_changes.py b/tests/ci/test_classify_changes.py
+index ead4d433224..e10325253f0 100644
+--- a/tests/ci/test_classify_changes.py
++++ b/tests/ci/test_classify_changes.py
+@@ -459,6 +459,10 @@
+         ["apps/desktop/src/app/chat/sidebar/profile-switcher.tsx"],
+         _lanes(frontend=True, e2e_desktop_core=True),
+     ),
++    "desktop kanban plugin (model requirement producers) → desktop core": (
++        ["apps/desktop/src/plugins/kanban/model-override.tsx"],
++        _lanes(frontend=True, e2e_desktop_core=True),
++    ),
+     "desktop update spec → desktop update, not core": (
+         ["apps/desktop/e2e/update/app-update.spec.ts"],
+         _lanes(frontend=True, e2e_desktop_update=True),
+-- 
+2.43.0
+

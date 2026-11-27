@@ -1,0 +1,348 @@
+From 7d6b751dbbc48f2437e70be32de567e7527fbcdf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:03:09 +0000
+Subject: [PATCH 6232] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit 7d6b751dbbc48f2437e70be32de567e7527fbcdf.
+
+---
+diff --git a/hermes_cli/kanban_actionability_creation.py b/hermes_cli/kanban_actionability_creation.py
+index d8b89a07f93..a536dafa42f 100644
+--- a/hermes_cli/kanban_actionability_creation.py
++++ b/hermes_cli/kanban_actionability_creation.py
+@@ -10,18 +10,35 @@
+     return value if isinstance(value, str) and value.strip() else None
+ 
+ 
++# Each of these leaves (or re-enters) the todo phase: an obligation never carries across one.
++EPISODE_EXITS = frozenset({'promoted', 'promoted_manual', 'claimed', 'reclaimed', 'scheduled', 'continued',
++                           'blocked', 'unblocked', 'completed', 'archived', 'review_requested',
++                           'failure_finalized', 'spend_budget_triaged', 'reopened'})
++
++
++def _todo_entry(kind, payload):
++    """Sources that put (or keep) a card waiting in todo on its parents."""
++    return kind in ('dependency_wait', 'linked') or (kind == 'unblocked' and payload.get('status') == 'todo')
++
++
+ def intent_for(task, kind, payload, *, now):
+     """Derive once from source clocks; the same pure function verifies recorded intent."""
+     if not isinstance(payload, dict):
+         return None
+     timed = kind == 'scheduled' or (kind == 'continued' and payload.get('status') == 'scheduled')
+-    if not timed and kind not in ('blocked', 'dependency_wait'):
++    todo = _todo_entry(kind, payload)
++    if not timed and kind != 'blocked' and not todo:
+         return None
+-    status = 'scheduled' if timed else ('todo' if kind == 'dependency_wait' or payload.get('kind') == 'assignment' else 'blocked')
++    status = 'scheduled' if timed else ('todo' if todo or payload.get('kind') == 'assignment' else 'blocked')
+     if task.get('status') != status:
+         return None
+     wake = positive_time(payload.get('wake_at')) if timed else None
+     deadline = wake + 600 if wake else (now + 86400 if not timed else None)
++    # A new edge on a card already waiting in todo keeps that episode's frozen
++    # obligation, overdue included; it can only ever be earlier, never renewed.
++    carried = positive_time(payload.get('actionability_carried_deadline')) if kind == 'linked' else None
++    if carried and deadline:
++        deadline = min(deadline, carried)
+     human = payload.get('human_request')
+     human = _text(human.get('action')) if isinstance(human, dict) else None
+     parents = payload.get('actionability_parent_ids') or []
+@@ -34,7 +51,7 @@
+         reason = 'wake_invalid'
+     elif timed and not valid_awaiting(payload.get('awaiting')):
+         reason = 'producer_malformed'
+-    elif deadline is None or deadline <= now:
++    elif deadline is None or (deadline <= now and deadline != carried):
+         reason = 'deadline_not_future'
+     elif (timed and not (payload.get('awaiting') or _text(payload.get('wake_check')))) or (not timed and not human and not dependencies):
+         reason = 'trigger_missing'
+@@ -48,19 +65,46 @@
+             'invalid_reason': reason, 'execution_authority': False}
+ 
+ 
++def _carried(conn, task_id, task):
++    """The current todo episode's frozen obligation, read in the writer's txn before this event."""
++    from hermes_cli.kanban_actionability_selection import select
++    events = [dict(r) for r in conn.execute(
++        'SELECT * FROM task_events WHERE task_id=? ORDER BY id', (task_id,))]
++    key = lambda e: (e['created_at'], e['id'])  # the census source order
++    source = select('todo', events, order_key=key)
++    if source is None or any(e['kind'] in EPISODE_EXITS and key(e) > key(source) for e in events):
++        return None
++    try:
++        data = json.loads(source['payload'] or 'null')
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(data, dict):
++        return None
++    intent = validated_intent(task, {'kind': source['kind'], 'created_at': source['created_at'], 'data': data})
++    # Provenance: the synced event uid, or the local event id on an unsynced board.
++    return (intent['deadline_at'], source.get('uid') or str(source['id'])) if intent and intent['status'] == 'todo' else None
++
++
+ def stamp(conn, task_id, kind, payload, *, now):
+     """Freeze ordinary administrative policy with the actual source event clock."""
+-    if kind not in ('scheduled', 'blocked', 'continued', 'dependency_wait'):
++    if kind not in ('scheduled', 'blocked', 'continued', 'dependency_wait', 'linked', 'unblocked'):
+         return payload
+     original = payload
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if kind in ('linked', 'unblocked') and (row is None or row['status'] != 'todo' or not isinstance(payload, dict)):
++        return payload  # only a todo entry; every other status keeps its own source
+     if isinstance(payload, dict):
+         from hermes_cli.kanban_db_sync import run_uid
+         from hermes_cli.kanban_actionability_parents import snapshot
+         parents = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,))]
++        if kind in ('linked', 'unblocked') and not parents:
++            return original  # no parent to wait on: not a dependency wait, so nothing to freeze
+         payload = {**payload, 'actionability_parent_ids': parents,
+                    'actionability_parent_states': snapshot(conn, parents),
+                    'actionability_run_uid': run_uid(conn, row['current_run_id']) if row else None}
++        carried = _carried(conn, task_id, dict(row)) if kind == 'linked' and row else None
++        if carried:
++            payload['actionability_carried_deadline'], payload['actionability_carried_from'] = carried
+     intent = intent_for(dict(row), kind, payload, now=now) if row else None
+     return {**payload, 'actionability_intent': intent} if intent is not None else original
+ 
+diff --git a/hermes_cli/kanban_actionability_selection.py b/hermes_cli/kanban_actionability_selection.py
+index f67269b4252..470b2c23f53 100644
+--- a/hermes_cli/kanban_actionability_selection.py
++++ b/hermes_cli/kanban_actionability_selection.py
+@@ -3,25 +3,36 @@
+ 
+ import json
+ 
+-KINDS = {'todo': ('created', 'linked', 'dependency_wait'), 'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
++KINDS = {'todo': ('created', 'linked', 'dependency_wait', 'unblocked'),
++         'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
+          'review': ('review_requested', 'created'), 'blocked': ('blocked',),
+          'scheduled': ('scheduled', 'continued'),
+          'triage': ('failure_finalized', 'spend_budget_decision_ready', 'created'), 'running': ('claimed',)}
+ 
+ 
++def _data(event):
++    try:
++        raw = event.get('payload')
++        data = raw if isinstance(raw, dict) else json.loads(raw)
++    except (TypeError, ValueError):
++        return None
++    return data if isinstance(data, dict) else None
++
++
+ def select(status, events, *, order_key, episode=None):
+     """Select one source without treating comments as clocks or releases as grants."""
+     def assignment(event):
+         if status != 'todo' or event.get('kind') != 'blocked':
+             return False
+-        try:
+-            raw = event.get('payload')
+-            data = raw if isinstance(raw, dict) else json.loads(raw)
+-        except (TypeError, ValueError):
+-            return False
+-        return isinstance(data, dict) and data.get('kind') == 'assignment' and not any(
++        data = _data(event)
++        return data is not None and data.get('kind') == 'assignment' and not any(
+             e.get('kind') == 'unblocked' and order_key(e) > order_key(event) for e in events)
+ 
+-    candidates = [e for e in events if e.get('uid') == episode] if episode else [
+-        e for e in events if e['kind'] in KINDS.get(status, ()) or assignment(e)]
++    def matches(event):
++        if event['kind'] not in KINDS.get(status, ()):
++            return assignment(event)
++        # An unblock is a todo source only when parents re-gated it there; a release to ready is not.
++        return status != 'todo' or event['kind'] != 'unblocked' or (_data(event) or {}).get('status') == 'todo'
++
++    candidates = [e for e in events if e.get('uid') == episode] if episode else [e for e in events if matches(e)]
+     return max(candidates, key=order_key) if candidates else None
+diff --git a/tests/hermes_cli/test_kanban_actionability_todo_sources.py b/tests/hermes_cli/test_kanban_actionability_todo_sources.py
+new file mode 100644
+index 00000000000..f4cf1a87487
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_todo_sources.py
+@@ -0,0 +1,182 @@
++"""Every todo-entry source freezes one administrative deadline; links never renew it. [daveey]"""
++import json
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli.kanban_actionability_cli import report
++from hermes_cli.kanban_actionability_sources import describe
++
++T0 = 1_800_000_000
++
++
++def _clock(monkeypatch, at):
++    monkeypatch.setattr('time.time', lambda: at)
++
++
++def _event(conn, tid, kind):
++    row = conn.execute('SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                       (tid, kind)).fetchone()
++    return row, json.loads(row['payload'] or 'null')
++
++
++def _rows(conn, tid, now):
++    return (describe(conn, tid, now=now), next(r for r in report(conn, now=now)['rows'] if r['task_id'] == tid))
++
++
++def _ref(event):
++    """Carried provenance: the synced uid, or the local id on an unsynced fixture board."""
++    return event['uid'] if 'uid' in event.keys() and event['uid'] else str(event['id'])
++
++
++def _refs(event):
++    return [_ref(event)]
++
++
++def test_link_to_waiting_todo_child_keeps_its_frozen_deadline(tmp_path, monkeypatch):
++    """Observed: a dependency_wait stamped at creation, then an unstamped `linked` replaced it."""
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='waiting child', assignee='default', parents=[first])
++        wait, data = _event(conn, tid, 'dependency_wait')
++        frozen = data['actionability_intent']['deadline_at']
++        assert frozen == T0 + 86400
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        _clock(monkeypatch, T0 + 5000)
++        kb.link_tasks(conn, second, tid)
++        linked, data = _event(conn, tid, 'linked')
++        intent = data['actionability_intent']
++        assert intent['deadline_at'] == frozen  # the new edge does not renew the obligation
++        assert intent['status'] == 'todo' and intent['execution_authority'] is False
++        assert data['actionability_carried_from'] == _ref(wait)
++        assert second in intent['blocker']['trigger'] and first in intent['blocker']['trigger']
++        for row in _rows(conn, tid, T0 + 5000):
++            assert row['source_refs'] == _refs(linked)
++            assert row['escalation']['at'] == frozen
++            assert 'escalation_deadline_missing' not in row['violations']
++
++
++def test_repeated_and_overdue_links_never_renew(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        parent = kb.create_task(conn, title='prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='waiting child', assignee='default', parents=[parent])
++        frozen = T0 + 86400
++        other = kb.create_task(conn, title='later prerequisite', assignee='default')
++        _clock(monkeypatch, frozen + 100)
++        kb.link_tasks(conn, other, tid)
++        kb.link_tasks(conn, other, tid)  # readback/idempotent relink
++        _, data = _event(conn, tid, 'linked')
++        assert data['actionability_intent']['deadline_at'] == frozen
++        assert data['actionability_intent']['invalid_reason'] is None
++        for row in _rows(conn, tid, frozen + 100):
++            assert row['escalation']['at'] == frozen
++            assert 'escalation_overdue' in row['violations']
++            assert 'escalation_deadline_missing' not in row['violations']
++
++
++def test_link_that_demotes_a_ready_child_gets_a_fresh_deadline(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='ready child', assignee='default')
++        parent = kb.create_task(conn, title='new prerequisite', assignee='default')
++        _clock(monkeypatch, T0 + 50)
++        assert kb.link_tasks(conn, parent, tid) is True
++        wait, wait_data = _event(conn, tid, 'dependency_wait')
++        _, data = _event(conn, tid, 'linked')
++        assert data['actionability_intent']['deadline_at'] == T0 + 50 + 86400
++        assert data['actionability_carried_from'] == _ref(wait)
++        assert wait_data['actionability_intent']['deadline_at'] == T0 + 50 + 86400
++        for row in _rows(conn, tid, T0 + 50):
++            assert row['escalation']['at'] == T0 + 50 + 86400
++            assert 'escalation_deadline_missing' not in row['violations']
++
++
++def test_carry_does_not_cross_a_completed_todo_episode(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='child', assignee='default', parents=[first])
++        _clock(monkeypatch, T0 + 1000)
++        kb.complete_task(conn, first, summary='done')
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, tid).status == 'ready'
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        _clock(monkeypatch, T0 + 2000)
++        assert kb.link_tasks(conn, second, tid) is True
++        _, data = _event(conn, tid, 'linked')
++        assert data['actionability_intent']['deadline_at'] == T0 + 2000 + 86400
++
++
++def test_carry_ignores_a_todo_source_from_an_earlier_episode(tmp_path, monkeypatch):
++    """A todo re-entry by a path that writes no todo source must not inherit the old obligation."""
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='child', assignee='default', parents=[first])
++        _clock(monkeypatch, T0 + 1000)
++        kb.complete_task(conn, first, summary='done')
++        kb.recompute_ready(conn)
++        assert kb.get_task(conn, tid).status == 'ready'
++        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))  # an unstamped re-entry
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        _clock(monkeypatch, T0 + 2000)
++        kb.link_tasks(conn, second, tid)
++        _, data = _event(conn, tid, 'linked')
++        assert 'actionability_carried_deadline' not in data
++        assert data['actionability_intent']['deadline_at'] == T0 + 2000 + 86400
++
++
++def test_unblock_into_todo_freezes_a_deadline(tmp_path, monkeypatch):
++    """Observed: scheduled -> linked (unstamped, still scheduled) -> unblocked {status: todo}."""
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='parked child', assignee='default')
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2027-01-15T08:01:40+00:00',
++                                clock_only=True, awaiting={'kind': 'clock', 'why': 'fixture window'})
++        parent = kb.create_task(conn, title='late prerequisite', assignee='default')
++        kb.link_tasks(conn, parent, tid)
++        assert kb.get_task(conn, tid).status == 'scheduled'
++        _clock(monkeypatch, T0 + 300)
++        assert kb.unblock_task(conn, tid)
++        assert kb.get_task(conn, tid).status == 'todo'
++        source, data = _event(conn, tid, 'unblocked')
++        intent = data['actionability_intent']
++        assert intent['deadline_at'] == T0 + 300 + 86400 and intent['status'] == 'todo'
++        assert parent in intent['blocker']['trigger']
++        for row in _rows(conn, tid, T0 + 300):
++            assert row['source_refs'] == _refs(source)
++            assert row['escalation']['at'] == T0 + 300 + 86400
++            assert 'escalation_deadline_missing' not in row['violations']
++
++
++def test_unblock_to_ready_and_link_to_parked_child_stay_unstamped(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='parked child', assignee='default')
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2027-01-15T08:01:40+00:00',
++                                clock_only=True, awaiting={'kind': 'clock', 'why': 'fixture window'})
++        parent = kb.create_task(conn, title='prerequisite', assignee='default')
++        kb.link_tasks(conn, parent, tid)
++        _, linked = _event(conn, tid, 'linked')
++        assert 'actionability_intent' not in linked  # the card still waits on its own schedule
++        kb.unlink_tasks(conn, parent, tid)
++        assert kb.unblock_task(conn, tid)
++        assert kb.get_task(conn, tid).status == 'ready'
++        _, data = _event(conn, tid, 'unblocked')
++        assert not isinstance(data, dict) or 'actionability_intent' not in data
++
++
++def test_tampered_carried_deadline_is_invalid(tmp_path, monkeypatch):
++    _clock(monkeypatch, T0)
++    with connect(tmp_path / 'kanban.db') as conn:
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='waiting child', assignee='default', parents=[first])
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        kb.link_tasks(conn, second, tid)
++        linked, data = _event(conn, tid, 'linked')
++        data['actionability_carried_deadline'] = T0 + 100  # no longer the deadline the intent froze
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(data), linked['id']))
++        row = describe(conn, tid, now=T0)
++        assert row['escalation']['at'] is None
++        assert 'creation_intent_invalid' in row['violations']
+-- 
+2.43.0
+

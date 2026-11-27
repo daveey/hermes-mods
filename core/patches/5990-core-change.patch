@@ -1,0 +1,2636 @@
+From ff703c360bbcf0578411672f0bf039f8588a526d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:00:25 +0000
+Subject: [PATCH 5990] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit ff703c360bbcf0578411672f0bf039f8588a526d.
+
+---
+diff --git a/hermes_cli/fact_annotation_boot.py b/hermes_cli/fact_annotation_boot.py
+index c578fe11062..7ea91dd3d17 100644
+--- a/hermes_cli/fact_annotation_boot.py
++++ b/hermes_cli/fact_annotation_boot.py
+@@ -11,7 +11,7 @@
+ 
+     Bodies are discarded, and cache decorators are unwrapped. The existing
+     source owner captures their selector membership; no body or source cache is
+-    retained here. This runs before HTTP admission, not on a request.
++    retained here. Explicit startup callers/tests only; ``prepare`` never scans.
+     """
+     if readers is None:
+         from hermes_cli.web_routers import profiles
+@@ -50,7 +50,9 @@
+     if on_created is not None:
+         on_created(runtime)
+     try:
+-        runtime.start(seeds(runtime))
++        # Inert install: no sessions scan, no source, no handle. Profiles
++        # activate only when an actual consumer annotates.
++        runtime.start({})
+     except BaseException:
+         runtime.close()
+         raise
+diff --git a/hermes_cli/fact_annotation_runtime.py b/hermes_cli/fact_annotation_runtime.py
+index 038a70b1555..392ec8cdcee 100644
+--- a/hermes_cli/fact_annotation_runtime.py
++++ b/hermes_cli/fact_annotation_runtime.py
+@@ -3,6 +3,12 @@
+ The caller supplies exact profile homes and scoped seed identities. Construction
+ owns no release decision. ``start`` certifies captured inputs and seeded output
+ health before draining legacy; failed readiness never installs a native lookup.
++
++Capture is per profile and lazy. Construction records only inert descriptors
++(scopes, engines, homes). Seeded profiles activate in ``start``; an unseeded
++profile's installed binding is a memory-only placeholder that fails closed
++(``AnnotationUnavailable``, never legacy I/O) and enqueues one coalesced
++background activation through ``fact_process.submit``.
+ """
+ from contextvars import copy_context
+ from pathlib import Path
+@@ -21,7 +27,49 @@
+ from hermes_cli.fact_materializers import view_reducer
+ from hermes_cli.fact_reducers import ReducerEngine
+ from hermes_cli.fact_store import view_key
+-from hermes_cli.fact_process_owner import process_store
++
++_RETRY_SECONDS = 1.0
++
++
++def _process():
++    from hermes_cli import fact_process
++    return fact_process
++
++
++class _LazyBinding:
++    """Installed consumer binding; memory-only and unavailable until its profile is active."""
++    def __init__(self, runtime, profile, scope):
++        self.runtime, self.profile, self.scope = runtime, profile, scope
++        self.real: annotations.AnnotationFacts | None = None
++
++    @property
++    def _mode(self):
++        real = self.real
++        return 'legacy' if real is None else real._mode
++
++    def annotate(self, family, rows, legacy, **kwargs):
++        real = self.real
++        if real is None:
++            self.runtime._request(self.profile, rows)
++            raise annotations.AnnotationUnavailable('annotation profile activating')
++        # Registration precedes certification, and rollback precedes owner
++        # release. Neither interval grants this installed binding legacy I/O.
++        # Share the callback lock so mode cannot change between check and read.
++        with real._lock:
++            if (self.profile in self.runtime._cleanup_pending or real._mode != 'facts'
++                    or real._closed):
++                self.runtime._request(self.profile)
++                raise annotations.AnnotationUnavailable('annotation profile unavailable')
++            try:
++                return real.annotate(family, rows, legacy, **kwargs)
++            except annotations.AnnotationUnavailable:
++                self.runtime._warm(self.profile, rows)
++                raise
++
++    def close(self):
++        real = self.real
++        if real is not None:
++            real.close()
+ 
+ 
+ class AnnotationRuntime:
+@@ -30,37 +78,40 @@
+                  budget=CaptureBudget(max_seconds=5)):
+         if not profiles or fallback_profile not in profiles:
+             raise ValueError('annotation profile roster is incomplete')
+-        self.store = process_store()
++        self._process = _process()
++        self.store = self._process.store()
+         self.scopes = {name: Scope('serve.annotations.' + gateway, name) for name in profiles}
+         self.engines = {scope: ReducerEngine(self.store, scope) for scope in self.scopes.values()}
+-        self.handles, self.bindings = {}, {}
+-        self.owner = self.local = self.registry = None
++        self._homes = {name: Path(home).absolute() for name, home in profiles.items()}
++        self._gateway, self._budget = gateway, budget
++        self.handles, self.owners, self.bindings = {}, {}, {}
++        self.local = self.registry = None
+         self._lock = threading.RLock()
+-        self._stopped = False
++        self._activation = threading.RLock()
++        self._retry_at = {}
++        self._cleanup_pending = set()
++        self._registered = set()
++        self._generations = {name: 0 for name in profiles}
++        self._started = self._stopped = False
+         self._native_profiles = set()
+-        self._closed = False
++        self._closed = self._closing = False
+         self._stop, self._start = stop_legacy, start_legacy
+         self.life = IncrementalLifecycle({(scope, 'annotations') for scope in self.scopes.values()})
+-        sources = []
++        self._lives = {name: self.life for name in profiles}
+         try:
+-            for name, home in profiles.items():
+-                scope, home = self.scopes[name], Path(home).absolute()
+-                engine = self.engines[scope]
+-                engine.register(view_reducer(projections()))
+-                sources.extend(self._sources(engine, scope, home, gateway))
+-            self.owner = NativeAnnotationOwner(self.engines, [], operational=sources, budget=budget)
+-            self.local = InProcessFacts(self.store, set(self.scopes.values()), demand=self.owner.demand)
+-            for name, scope in self.scopes.items():
+-                handle = self.local.acquire(scope, lifecycle=self.life)
+-                self.handles[name] = handle
+-                self.bindings[name] = annotations.AnnotationFacts(handle, scope,
+-                    stop_legacy=lambda name=name: self._pause(name),
+-                    start_legacy=lambda name=name: self._resume(name), view_facts=True)
++            self.local = InProcessFacts(self.store, set(self.scopes.values()), demand=self._demand)
++            self.bindings = {name: _LazyBinding(self, name, scope) for name, scope in self.scopes.items()}
+             self.registry = AnnotationRegistry(self.bindings, fallback_profile)
+         except BaseException:
+             self.close()
+             raise
+ 
++    def _demand(self, scope, view, selector):
++        owner = self.owners.get(scope.profile_id)
++        if owner is None:
++            raise RuntimeError('annotation profile not active')
++        owner.demand(scope, view, selector)
++
+     def _pause(self, profile):
+         with self._lock:
+             self._native_profiles.add(profile)
+@@ -75,6 +126,106 @@
+                 self._start()
+                 self._stopped = False
+ 
++    def _warm(self, profile, rows):
++        owner = self.owners.get(profile)
++        scope = self.scopes[profile]
++        if owner is None:
++            return
++        for row in rows:
++            for family in annotations.FIELDS:
++                try:
++                    owner.demand(scope, 'annotations.' + family,
++                                 selector_for(scope, row, display=family == 'kanban'))
++                except (ValueError, TypeError, KeyError, RuntimeError):
++                    return
++
++    def _request(self, profile, rows=()):
++        """Request-path seam: memory only. Enqueue one coalesced activation."""
++        binding = self.bindings.get(profile)
++        if (self._closing or not self._started or binding is None
++                or (binding.real is not None and profile not in self._cleanup_pending)
++                or time.monotonic() < self._retry_at.get(profile, 0)):
++            return
++        try:
++            rows = [dict(row) for row in rows]
++            self._process.submit(('fact_annotation_runtime.activate', id(self), profile),
++                                 lambda: self._activate(profile, rows))
++        except RuntimeError:
++            pass  # control queue bounded or closed: stay unavailable; the caller retries
++
++    def _build(self, profile):
++        """Register capture sources, acquire the handle, bind. Caller holds ``_activation``."""
++        if profile in self._cleanup_pending:
++            self._teardown(profile)
++        if profile in self.handles:
++            return
++        scope = self.scopes[profile]
++        engine = self.engines[scope]
++        if profile not in self._registered:
++            engine.register(view_reducer(projections()))
++            self._registered.add(profile)
++        sources = self._sources(engine, scope, self._homes[profile], self._gateway)
++        owner = handle = None
++        try:
++            owner = NativeAnnotationOwner({scope: engine}, [], operational=sources, budget=self._budget)
++            self.owners[profile] = owner
++            assert self.local is not None
++            handle = self.local.acquire(scope, lifecycle=self._lives[profile])
++            self.handles[profile] = handle
++            self.bindings[profile].real = annotations.AnnotationFacts(handle, scope,
++                stop_legacy=lambda: self._pause(profile),
++                start_legacy=lambda: self._resume(profile), view_facts=True)
++        except BaseException:
++            self._teardown(profile, owner, handle)
++            raise
++
++    def _teardown(self, profile, owner=None, handle=None):
++        self._cleanup_pending.add(profile)
++        binding = self.bindings.get(profile)
++        if binding is not None and binding.real is not None:
++            self._generations[profile] += 1
++            self._lives[profile].transition('annotations', self.scopes[profile], 'legacy',
++                                           self._generations[profile])
++            binding.close()
++            binding.real = None
++        owner = self.owners.get(profile, owner)
++        if owner is not None:
++            owner.close()
++            self.owners.pop(profile, None)
++        handle = self.handles.get(profile, handle)
++        if handle is not None:
++            handle.close()
++            self.handles.pop(profile, None)
++        # A released consumer capability is permanently retired. Only completed
++        # cleanup permits a new participant; other profiles keep their authority.
++        self._lives[profile] = IncrementalLifecycle({(self.scopes[profile], 'annotations')})
++        self._cleanup_pending.discard(profile)
++
++    def _certify(self, profile):
++        scope = self.scopes[profile]
++        self._lives[profile].report_ready('annotations', scope)
++        self._generations[profile] += 1
++        self._lives[profile].transition('annotations', scope, 'facts', self._generations[profile])
++
++    def _activate(self, profile, rows=()):
++        """Control-worker activation of an unseeded profile; failure stays unavailable."""
++        with self._activation:
++            if self._closing:
++                return
++            try:
++                if profile in self._cleanup_pending:
++                    self._teardown(profile)
++                if self.bindings[profile].real is not None:
++                    return
++                self._build(profile)
++                self._certify(profile)
++                self._warm(profile, rows)
++            except Exception:  # health: allow BLE001 -- failed activation retries later, never serves
++                self._retry_at[profile] = time.monotonic() + _RETRY_SECONDS
++                if profile not in self._cleanup_pending:
++                    self._teardown(profile)
++                raise
++
+     @staticmethod
+     def _sources(engine, scope, home, gateway):
+         from agent.runtime_scope import bind_profile_scope
+@@ -104,17 +255,29 @@
+         return sources
+ 
+     def start(self, seeds, *, timeout=15):
+-        """Seed canonical selectors, await real source+output readiness, then cut over."""
++        """Activate seeded profiles, await real source+output readiness, then cut over.
++
++        Profiles without seeds register no capture source and acquire no handle;
++        they activate later on demand through the installed lazy binding.
++        """
+         # Discovery includes config-only profiles. Only actual seeded consumers
+         # gate cutover; absent stores retain unavailable evidence and reconcile
+         # in the background. Optional PR information never gates serve.
+         keys = {scope: set() for scope in self.scopes.values()}
+-        for profile, rows in seeds.items():
++        active = [profile for profile, rows in seeds.items() if rows]
++        for profile in seeds:
++            self.scopes[profile]  # unauthorized profile fails before any activation
++        with self._activation:
++            if self._closing:
++                raise RuntimeError('annotation runtime closed')
++            for profile in active:
++                self._build(profile)
++        for profile in active:
+             scope = self.scopes[profile]
+-            for row in rows:
++            for row in seeds[profile]:
+                 for family in annotations.FIELDS:
+                     selector = selector_for(scope, row, display=family == 'kanban')
+-                    self.owner.demand(scope, 'annotations.' + family, selector)
++                    self.owners[profile].demand(scope, 'annotations.' + family, selector)
+                     if family != 'review':
+                         keys[scope].add(FactKey(scope, 'AnnotationInput', family))
+                         keys[scope].add(view_key(scope, 'annotations.' + family, selector))
+@@ -130,25 +293,23 @@
+                 if left <= 0:
+                     raise TimeoutError('native annotation sources/seeds not ready; legacy retained')
+                 self.store._condition.wait(left)
+-        for scope in self.scopes.values():
+-            self.life.report_ready('annotations', scope)
+-            self.life.transition('annotations', scope, 'facts', 1)
+-        self.registry.install()
++        with self._activation:
++            for profile in active:
++                self._certify(profile)
++            self.registry.install()
++            self._started = True
+         return self
+ 
+     def close(self):
+-        if self._closed:
+-            return
+-        if self.registry is not None:
+-            self.registry.close()
+-        for name, binding in self.bindings.items():
+-            scope = self.scopes[name]
+-            self.life.transition('annotations', scope, 'legacy', 2)
+-            binding.close()
+-        if self.owner is not None:
+-            self.owner.close()
+-        for handle in self.handles.values():
+-            handle.close()
+-        if self.local is not None:
+-            self.local.close()
+-        self._closed = True
++        with self._lock:
++            if self._closed:
++                return
++            self._closing = True
++        with self._activation:
++            if self.registry is not None:
++                self.registry.close()
++            for name in list(self.bindings):
++                self._teardown(name)
++            if self.local is not None:
++                self.local.close()
++            self._closed = True
+diff --git a/hermes_cli/fact_board_startup.py b/hermes_cli/fact_board_startup.py
+index 0f2e3a953f3..f191407981c 100644
+--- a/hermes_cli/fact_board_startup.py
++++ b/hermes_cli/fact_board_startup.py
+@@ -3,6 +3,9 @@
+ The flag is startup-only. ON admits no legacy board read, including cold views;
+ OFF starts the unchanged prewarm lifetime once. External roster/diagnostic inputs
+ have 30s bounded recapture and 60s local validity, not subsecond upstream truth.
++Mount installs the provider only; a scope's owner is constructed and started on
++first scoped demand via the fact_process activation queue, never on the request
++thread. Failed activations stay fail-closed; close() drains their custody.
+ """
+ import json
+ import os
+@@ -19,6 +22,7 @@
+ 
+ class BoardRuntime:
+     Ready, Pending, Unavailable = Ready, Pending, Unavailable
++    _failed = frozenset()  # instance rebinds to a set in __init__
+ 
+     def __init__(self, api, *, boards=None):
+         from hermes_cli import kanban_db
+@@ -30,55 +34,65 @@
+         self.current = kanban_db.get_current_board()
+         self.boards = tuple(dict.fromkeys(boards if boards is not None else
+                             [self.current, *(b['slug'] for b in kanban_db.list_boards())]))
+-        self.owners, self.views = {}, {}
+-        self._activating_views = {}
++        self.owners, self.views, self._activating_views = {}, {}, {}
++        self._failed = set()
+         self._closed = self._drained = False
+         self._lock = threading.RLock()
+         self._previous = None
+-        self._activation_owner = None
+-        from hermes_cli.fact_scope_activation import ScopeActivation
+-        self._activation = ScopeActivation(self.boards, self._activate)
+ 
+     def start(self):
+-        from hermes_cli.fact_process_owner import ProcessOwner
++        """Install the provider only: no owner, path resolution or thread until demand."""
+         self.api.board_prewarm.stop_board_prewarm()
+-        self._activation_owner = ProcessOwner(lambda *_: None, lambda *_: None)
+-        self._activation_owner.register(self._activation)
+         self._previous = self.api.board_fact_views._installed
+         self.api.board_fact_views.install_provider(self, self.provider)
+         return self
+ 
+     def _activate(self, board):
++        """Build and start one scope's owner; runs on the fact_process worker."""
+         from hermes_cli import kanban_db
+-        if not self._closed and board not in self.views:
+-            if board in self.owners:
+-                raise RuntimeError('board activation custody retained')
+-            scope = Scope(self.home, self.profile, board)
+-            path = kanban_db.kanban_db_path(board=board)
+-            def capture(view, selector, budget, board=board, scope=scope):
+-                result = board_native_inputs.capture(self.api, board, view, dict(selector))
+-                source = SourceId(scope, 'board.input', 'native')
+-                return CapturedInput(result['value'], ((source, result['observations']),), result['observed_at'])
+-            owner = ViewOwner(scope, capture, partial(board_native_inputs.project, self.api), ('board', 'boards', 'projects'),
+-                              paths=(path, path.parent, self.home),
+-                              bindings=[ContentBinding(SourceId(scope, 'tasks.content', 'local'), path)])
+-            self.owners[board] = owner
+-            handle = owner.start()
+-            paths = (str(path),)
+-            def stop(paths=paths):
+-                self.api.board_legacy.stop(paths)
+-                self.api.board_rows.retire(paths)
+-                self.api.board_snapshot.retire(paths)
+-            view = self.api.board_fact_views.bind(handle.v1, scope, stop_legacy=stop,
+-                start_legacy=lambda: None, demand=handle.demand,
+-                hot_selectors=(('board', self.api.board_fact_views.board_selector()), ('projects', {}),
+-                               ('boards', {'include_archived': False})))
+-            self._activating_views[board] = view
+-            view.on_mode('facts', 1)
+-            view.prepare()
++        # The lock is the closing fence: close() cannot interleave with an
++        # activation, and a queued activation that loses the race sees _closed.
++        with self._lock:
++            if self._closed or board in self.views or board in self._failed or board in self.owners:
++                return
++            try:
++                scope = Scope(self.home, self.profile, board)
++                path = kanban_db.kanban_db_path(board=board)
++                def capture(view, selector, budget, board=board, scope=scope):
++                    result = board_native_inputs.capture(self.api, board, view, dict(selector))
++                    source = SourceId(scope, 'board.input', 'native')
++                    return CapturedInput(result['value'], ((source, result['observations']),), result['observed_at'])
++                owner = ViewOwner(scope, capture, partial(board_native_inputs.project, self.api),
++                                  ('board', 'boards', 'projects'), paths=(path, path.parent, self.home),
++                                  bindings=[ContentBinding(SourceId(scope, 'tasks.content', 'local'), path)])
++                self.owners[board] = owner  # custody recorded before start: close() drains a partial owner
++                handle = owner.start()
++                paths = (str(path),)
++                def stop(paths=paths):
++                    self.api.board_legacy.stop(paths)
++                    self.api.board_rows.retire(paths)
++                    self.api.board_snapshot.retire(paths)
++                view = self.api.board_fact_views.bind(handle.v1, scope, stop_legacy=stop,
++                    start_legacy=lambda: None, demand=handle.demand,
++                    hot_selectors=(('board', self.api.board_fact_views.board_selector()), ('projects', {}),
++                                   ('boards', {'include_archived': False})))
++                self._activating_views[board] = view  # retained on failure; close() drains it
++                view.on_mode('facts', 1)
++                view.prepare()
++            except BaseException:
++                self._failed.add(board)  # no legacy fallback, no retry
++                raise
+             self.views[board] = view
+             del self._activating_views[board]
+ 
++    def _request_activation(self, board):
++        from hermes_cli import fact_process
++        try:
++            fact_process.submit(('board', self.home, self.profile, board), lambda: self._activate(board))
++        except RuntimeError:
++            return False  # capacity exceeded: stay fail-closed, no legacy read
++        return True
++
+     def provider(self, board):
+         from hermes_cli.config import get_hermes_home
+         # Scope comes from the already-authenticated native/plugin route context.
+@@ -86,20 +100,27 @@
+         if str(get_hermes_home()) != self.home or self._closed:
+             return Unavailable('board_scope_unavailable')
+         if board is None:
+-            self._activation.want(self.current)
+             owner = self.owners.get(self.current)
++            if owner is None and self.current not in self._failed:
++                self._request_activation(self.current)  # unscoped request == current-board demand
+             if owner is None or owner.handle is None:
+                 return Unavailable('board_scope_unavailable')
+             catalog = owner.handle.v1.snapshot(owner.scope).view('boards', {'include_archived': False})
+             if not isinstance(catalog, Ready):
+                 return Unavailable('board_catalog_unavailable')
+             board = json.loads(catalog.encoded)['current']
+-        if board in self.boards:
+-            self._activation.want(board)
+-        return self.views.get(board, Unavailable('board_scope_unavailable'))
++        view = self.views.get(board)
++        if view is not None:
++            return view
++        if board not in self.boards or board in self._failed:
++            return Unavailable('board_scope_unavailable')
++        if not self._request_activation(board):  # memory lookup + enqueue only
++            return Unavailable('board_scope_unavailable')
++        return Pending('board_activating')
+ 
+     def ready(self, board):
+-        self._activation.want(board)
++        if board in self.boards and board not in self.views and board not in self._failed:
++            self._request_activation(board)  # an explicit readiness probe is scoped demand
+         view = self.views.get(board)
+         return view.prepare() if view is not None else False
+ 
+@@ -108,13 +129,8 @@
+             if self._drained:
+                 return
+             self._closed = True  # failed teardown keeps a fail-closed installed provider
+-        activation = getattr(self, '_activation_owner', None)
+-        if activation is not None:
+-            activation.close()  # fence activation before draining its child scopes
+-        with self._lock:
+             failures = []
+-            for resource in (*getattr(self, '_activating_views', {}).values(),
+-                             *self.views.values(), *self.owners.values()):
++            for resource in (*getattr(self, '_activating_views', {}).values(), *self.views.values(), *self.owners.values()):
+                 try:
+                     resource.close()
+                 except Exception as exc:  # health: allow BLE001 -- retain failed custody and attempt all sibling drains
+diff --git a/hermes_cli/fact_content_owner.py b/hermes_cli/fact_content_owner.py
+index 7f964c83f63..0de934e2cfd 100644
+--- a/hermes_cli/fact_content_owner.py
++++ b/hermes_cli/fact_content_owner.py
+@@ -71,7 +71,8 @@
+             raise ValueError('empty content source set')
+         self._demands = {scope: DemandSource(engine) for scope, engine in engines.items()}
+         self._publishers.update((source, source) for source in self._demands.values())
+-        self.feed = ProcessOwner(self._commit, self._failure, budget=budget)
++        self.feed = ProcessOwner(self._commit, self._failure, budget=budget,
++                                 stores={scope: engine.store for scope, engine in engines.items()})
+         self._activation = None
+         try:
+             if lazy_sources:
+diff --git a/hermes_cli/fact_inprocess.py b/hermes_cli/fact_inprocess.py
+index 3df650d44fe..4bc816f243e 100644
+--- a/hermes_cli/fact_inprocess.py
++++ b/hermes_cli/fact_inprocess.py
+@@ -44,22 +44,15 @@
+         return any(p.has_bindings(scope) for p in self._participants.values())
+ 
+ 
+-class InProcessFacts:
+-    """Sleeping delivery and independent expiry workers; no IPC or process spawn.
++class _SharedDelivery:
++    """Store-owned worker custody, populated only by acquired transports."""
+ 
+-    Callbacks run off publisher/request threads and outside publication locks.
+-    Failed callbacks retain reset custody with exponential .1–5s retry. Readers
+-    fail closed if a worker dies. Closing requires all readers be released.
+-    """
+-    def __init__(self, store, scopes, *, demand):
+-        self.store, self.scopes, self.demand = store, frozenset(scopes), demand
+-        if not self.scopes:
+-            raise ValueError('empty authorized scope set')
+-        self._readers = set()
++    def __init__(self, store):
++        self.store = store
++        self.owners = set()
+         self._stopping = False
+         self._retry = {}
+-        context = copy_context()
+-        self._thread = threading.Thread(target=lambda: context.run(self._run),
++        self._thread = threading.Thread(target=self._run,
+                                         name='fact-local-delivery', daemon=True)
+         self._expiry = ExpiryWorker(store)
+         try:
+@@ -68,34 +61,18 @@
+             self._expiry.close()
+             raise
+ 
+-    def check_control_thread(self):
+-        if threading.current_thread() is self._thread:
+-            raise RuntimeError('cannot close handles/owner from delivery thread')
+-
+-    def check_running(self):
+-        if self._stopping or not self._thread.is_alive() or not self._expiry.thread.is_alive():
+-            raise RuntimeError('local fact owner closed or worker unavailable')
+-
+-    def acquire(self, scope, *, lifecycle):
+-        with self.store._condition:
+-            self.check_running()
+-            if scope not in self.scopes:
+-                raise ValueError('unauthorized_scope')
+-            reader = LocalReader(self, scope)
+-            self._readers.add(reader)
+-            return LocalHandle(reader, lifecycle)
+-
+     def _next(self):
+         with self.store._condition:
+-            while not self._stopping:
++            while not self._stopping and any(not owner._stopping for owner in self.owners):
+                 now = time.monotonic()
+-                for reader in self._readers:
++                readers = [reader for owner in self.owners for reader in owner._readers]
++                for reader in readers:
+                     reader.retiring = {s for s in reader.retiring if s.delivery_lock.locked()}
+-                subscriptions = {s.subscription for r in self._readers for s in r.subscriptions
+-                                 if not s.subscription.closed}
+-                self._retry = {s: pair for s, pair in self._retry.items() if s in subscriptions}
+-                pending = [s for s in subscriptions if s.queue or s.reset_pending]
+-                ready = [s for s in pending if self._retry.get(s, (0, 0))[0] <= now]
++                contexts = {s.subscription: r.owner._context for r in readers for s in r.subscriptions
++                            if not s.subscription.closed}
++                self._retry = {s: pair for s, pair in self._retry.items() if s in contexts}
++                pending = [s for s in contexts if s.queue or s.reset_pending]
++                ready = [(s, contexts[s]) for s in pending if self._retry.get(s, (0, 0))[0] <= now]
+                 if ready:
+                     return ready
+                 waits = [self._retry[s][0] - now for s in pending if s in self._retry]
+@@ -104,14 +81,12 @@
+ 
+     def _run(self):
+         while subscriptions := self._next():
+-            for subscription in subscriptions:
+-                # Own delivery lock acquisition so a concurrent drain cannot
+-                # turn a no-op Subscription.drain into an unbounded busy loop.
++            for subscription, context in subscriptions:
+                 if not subscription.delivery_lock.acquire(blocking=False):
+                     self._retry[subscription] = (time.monotonic() + .1, 0)
+                     continue
+                 try:
+-                    subscription._deliver()
++                    context.run(subscription._deliver)
+                     self._retry.pop(subscription, None)
+                 except Exception:  # health: allow BLE001 -- subscriber isolation retains reset with bounded retry
+                     count = self._retry.get(subscription, (0, 0))[1]
+@@ -121,14 +96,89 @@
+                 finally:
+                     subscription.delivery_lock.release()
+ 
++
++class InProcessFacts:
++    """Sleeping delivery and independent expiry workers; no IPC or process spawn.
++
++    Callbacks run off publisher/request threads and outside publication locks.
++    Failed callbacks retain reset custody with exponential .1–5s retry. Readers
++    fail closed if a worker dies. Closing requires all readers be released.
++    """
++    def __init__(self, store, scopes, *, demand):
++        self.store, self.scopes, self.demand = store, frozenset(scopes), demand
++        if not self.scopes:
++            raise ValueError('empty authorized scope set')
++        self._readers = set()
++        self._stopping = False
++        self._context = copy_context()
++        self._workers = None
++
++    @property
++    def _thread(self):
++        return self._workers._thread if self._workers is not None else None
++
++    @property
++    def _expiry(self):
++        return self._workers._expiry if self._workers is not None else None
++
++    @property
++    def _retry(self):
++        return self._workers._retry if self._workers is not None else {}
++
++    def check_control_thread(self):
++        if threading.current_thread() is self._thread:
++            raise RuntimeError('cannot close handles/owner from delivery thread')
++
++    def check_running(self):
++        workers = self._workers
++        if (self._stopping or workers is None or workers._stopping
++                or not workers._thread.is_alive() or not workers._expiry.thread.is_alive()):
++            raise RuntimeError('local fact owner closed or worker unavailable')
++
++    def acquire(self, scope, *, lifecycle):
++        with self.store._condition:
++            if self._stopping:
++                raise RuntimeError('local fact owner closed or worker unavailable')
++            if scope not in self.scopes:
++                raise ValueError('unauthorized_scope')
++            if self._workers is None:
++                workers = getattr(self.store, '_local_delivery', None)
++                if workers is None:
++                    # Creation and registration share the condition, so the new
++                    # worker cannot observe an empty owner roster at startup.
++                    workers = _SharedDelivery(self.store)
++                    self.store._local_delivery = workers
++                self._workers = workers
++                self.check_running()
++                workers.owners.add(self)
++            self.check_running()
++            reader = LocalReader(self, scope)
++            self._readers.add(reader)
++            self.store._condition.notify_all()
++            return LocalHandle(reader, lifecycle)
++
+     def close(self, timeout=5):
+         self.check_control_thread()
+         with self.store._condition:
+             if self._readers:
+                 raise RuntimeError('local owner retains reader handles')
+             self._stopping = True
++            workers = self._workers
++            if workers is None or self not in workers.owners:
++                return
++            if len(workers.owners) > 1:
++                workers.owners.remove(self)
++                self.store._condition.notify_all()
++                return
++            workers._stopping = True
+             self.store._condition.notify_all()
+-        self._thread.join(timeout)
+-        if self._thread.is_alive():
++        workers._thread.join(timeout)
++        if workers._thread.is_alive():
+             raise TimeoutError('local delivery did not stop; custody retained')
+-        self._expiry.close()
++        workers._expiry.close()
++        if workers._expiry.thread.is_alive():
++            raise TimeoutError('local expiry did not stop; custody retained')
++        with self.store._condition:
++            workers.owners.discard(self)
++            if getattr(self.store, '_local_delivery', None) is workers:
++                self.store._local_delivery = None
+diff --git a/hermes_cli/fact_links_startup.py b/hermes_cli/fact_links_startup.py
+index 97f1bcb3826..dd246037c4d 100644
+--- a/hermes_cli/fact_links_startup.py
++++ b/hermes_cli/fact_links_startup.py
+@@ -13,7 +13,7 @@
+ from hermes_cli.fact_contract import Scope, SourceId
+ from hermes_cli.fact_reducers import ReducerEngine
+ from hermes_cli.fact_remote_links import LinksBudget, LinksFacts, RemoteLinksSource
+-from hermes_cli.fact_process_owner import process_store
++from hermes_cli.fact_process import store as process_store
+ 
+ _lock = threading.RLock()
+ _runtimes = {}
+diff --git a/hermes_cli/fact_process.py b/hermes_cli/fact_process.py
+new file mode 100644
+index 00000000000..9668bc5d315
+--- /dev/null
++++ b/hermes_cli/fact_process.py
+@@ -0,0 +1,198 @@
++"""Process-custodied fact storage, leased capture scheduling and lazy control. [daveey]
++
++A lease drains only its own registrations. Captures and callbacks retain their
++registration context and budget; the shared scheduler itself has no profile.
++"""
++from collections import deque
++from contextvars import Context, copy_context
++import logging
++import threading
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_store import FactStore
++
++_lock = threading.RLock()
++_store = None
++_feed = None
++_leases = set()
++_scopes = {}
++_draining = None
++_control = threading.Condition()
++_queue = deque()
++_pending = set()
++_worker = None
++
++
++def store():
++    global _store
++    with _lock:
++        if _store is None:
++            _store = FactStore()
++        return _store
++
++
++class _Adapter:
++    def __init__(self, adapter, owner):
++        self.adapter, self.owner = adapter, owner
++        self.context = copy_context()
++        self.condition = threading.Condition()
++        self.capturing = self.closed = False
++        self.watch_handle = None
++
++    def watch(self, wake):
++        self.watch_handle = self.context.run(self.adapter.watch, wake)
++        return self
++
++    def capture(self, cursor, ignored_budget):
++        with self.condition:
++            if self.closed:
++                raise RuntimeError('source owner closed')
++            self.capturing = True
++        try:
++            return self.context.run(self.adapter.capture, cursor, self.owner.budget)
++        finally:
++            with self.condition:
++                self.capturing = False
++                self.condition.notify_all()
++
++    def publish(self, callback, value):
++        with self.condition:
++            if not self.closed:
++                self.context.run(callback, self.adapter, value)
++
++    def stop(self):
++        with self.condition:
++            self.closed = True
++
++    def fence(self, timeout):
++        with self.condition:
++            if not self.condition.wait_for(lambda: not self.capturing, timeout):
++                raise TimeoutError('source capture did not stop; owner custody retained')
++
++    def close(self):
++        if self.watch_handle is not None:
++            self.context.run(self.watch_handle.close)
++
++
++def _commit(adapter, capture):
++    adapter.publish(adapter.owner.commit, capture)
++
++
++def _failure(adapter, error):
++    adapter.publish(adapter.owner.failure, error)
++
++
++class FeedLease:
++    """A capture owner's registrations on the single process scheduler."""
++    def __init__(self, commit, failure, *, budget=CaptureBudget(), stores=None):
++        global _feed
++        self._registrations = []
++        self._lock = threading.RLock()
++        self._close_lock = threading.Lock()
++        self._closed = False
++        self._stores = dict(stores or {})
++        self.commit, self.failure, self.budget = commit, failure, budget
++        with _lock:
++            if _draining is not None:
++                raise RuntimeError('fact scheduler drain custody retained')
++            keys = [(id(storage), scope) for scope, storage in self._stores.items()]
++            if any(key in _scopes for key in keys):
++                raise RuntimeError('fact scope custody already retained')
++            if _feed is None:
++                _feed = Context().run(ChangeFeed, _commit, _failure)
++            self._feed = _feed
++            _leases.add(self)
++            _scopes.update((key, self) for key in keys)
++
++    @property
++    def _thread(self):
++        return self._feed._thread
++
++    def register(self, adapter):
++        with self._lock:
++            if self._closed:
++                raise RuntimeError('fact feed lease closed')
++            bound = _Adapter(adapter, self)
++            registration = self._feed.register(bound)
++            self._registrations.append((bound, registration))
++            return registration
++
++    def close(self, timeout=5):
++        if threading.current_thread() is self._thread:
++            raise RuntimeError('cannot close fact feed from capture thread')
++        with self._close_lock:
++            self._close(timeout)
++
++    def _close(self, timeout):
++        global _feed, _draining
++        # Do not hold the process lock while joining captures/watches: callbacks
++        # may enqueue work or close unrelated leases.
++        with self._lock:
++            self._closed = True
++            registrations = tuple(self._registrations)
++        for bound, _registration in registrations:
++            bound.stop()
++        for bound, _registration in registrations:
++            bound.fence(timeout)
++        for bound, registration in registrations:
++            registration.close()
++            self._registrations.remove((bound, registration))
++        with _lock:
++            if self not in _leases:
++                return
++            last = len(_leases) == 1
++            if last:
++                _draining = self
++            else:
++                self._retire()
++                return
++        self._feed.close(timeout)
++        with _lock:
++            self._retire()
++            _feed = None
++            _draining = None
++
++    def _retire(self):
++        # Keep the process store stable: inert consumers may already hold it.
++        # Retire only this tenure's facts before admitting its successor.
++        for scope, storage in self._stores.items():
++            storage.publish(deleted_keys=[key for key in storage.snapshot(scope)._facts if key.scope == scope])
++        _leases.discard(self)
++        for scope, storage in self._stores.items():
++            if _scopes.get((id(storage), scope)) is self:
++                del _scopes[id(storage), scope]
++
++
++def submit(key, callback):
++    """Bounded memory-only activation admission; duplicate work is coalesced."""
++    global _worker
++    with _control:
++        if key in _pending:
++            return
++        if len(_pending) >= 256:
++            raise RuntimeError('fact activation capacity exceeded')
++        _pending.add(key)
++        _queue.append((key, copy_context(), callback))
++        if _worker is None or not _worker.is_alive():
++            _worker = threading.Thread(target=lambda: Context().run(_activate),
++                                       name='fact-activation', daemon=True)
++            _worker.start()
++        _control.notify_all()
++
++
++def _activate():
++    global _worker
++    while True:
++        with _control:
++            if not _queue:
++                _worker = None
++                return
++            key, context, callback = _queue.popleft()
++        try:
++            context.run(callback)
++        except Exception:  # health: allow BLE001 -- activation failure remains fail-closed at the binding
++            logging.getLogger(__name__).exception('fact activation failed')
++        finally:
++            with _control:
++                _pending.discard(key)
+diff --git a/hermes_cli/fact_process_owner.py b/hermes_cli/fact_process_owner.py
+index 755ff934006..47abea6dc1d 100644
+--- a/hermes_cli/fact_process_owner.py
++++ b/hermes_cli/fact_process_owner.py
+@@ -1,122 +1,8 @@
+-"""One process capture scheduler; independently drainable scoped registrations. [daveey]
++"""Compatibility entry points for the process fact scheduler. [daveey]
+ 
+-The shared feed carries no ambient profile authority. Each registration captures
+-its caller context and budget. Closing one owner fences its publications and
+-waits for its actual captures, without stopping peers or forgetting failed drains.
++Both consumer APIs use fact_process's store, scoped custody and capture fences;
++this module owns no scheduler state.
+ """
+-from contextvars import copy_context
+-import threading
++from hermes_cli.fact_process import FeedLease as ProcessOwner, store as process_store
+ 
+-from hermes_cli.fact_capture import CaptureBudget
+-from hermes_cli.fact_feed import ChangeFeed
+-from hermes_cli.fact_store import FactStore
+-
+-_lock = threading.RLock()
+-_feed = _store = None
+-_owners = set()
+-
+-
+-def process_store():
+-    global _store
+-    with _lock:
+-        if _store is None:
+-            _store = FactStore()
+-        return _store
+-
+-
+-class _Bound:
+-    def __init__(self, adapter, owner):
+-        self.adapter, self.owner = adapter, owner
+-        self.context = copy_context()
+-        self.condition = threading.Condition()
+-        self.capturing = self.closed = False
+-        self.watch_handle = None
+-
+-    def watch(self, wake):
+-        self.watch_handle = self.adapter.watch(wake)
+-        return self
+-
+-    def capture(self, cursor, budget):
+-        with self.condition:
+-            if self.closed:
+-                raise RuntimeError('source owner closed')
+-            self.capturing = True
+-        try:
+-            return self.context.run(self.adapter.capture, cursor, self.owner.budget)
+-        finally:
+-            with self.condition:
+-                self.capturing = False
+-                self.condition.notify_all()
+-
+-    def commit(self, capture):
+-        with self.condition:
+-            if not self.closed:
+-                self.context.run(self.owner.commit, self.adapter, capture)
+-
+-    def failure(self, error):
+-        with self.condition:
+-            if not self.closed:
+-                self.context.run(self.owner.failure, self.adapter, error)
+-
+-    def fence(self, timeout):
+-        with self.condition:
+-            self.closed = True
+-            if not self.condition.wait_for(lambda: not self.capturing, timeout):
+-                raise TimeoutError('source capture did not stop; owner custody retained')
+-
+-    def stop(self):
+-        with self.condition:
+-            self.closed = True
+-
+-    def close(self):
+-        if self.watch_handle is not None:
+-            self.watch_handle.close()
+-
+-
+-class ProcessOwner:
+-    def __init__(self, commit, failure, *, budget=CaptureBudget()):
+-        global _feed
+-        self.commit, self.failure, self.budget = commit, failure, budget
+-        self._lock = threading.RLock()
+-        self._close_lock = threading.Lock()
+-        self._registrations = []
+-        self._closed = False
+-        with _lock:
+-            if _feed is None:
+-                _feed = ChangeFeed(lambda source, capture: source.commit(capture),
+-                                   lambda source, error: source.failure(error))
+-            self._feed = _feed
+-            self._thread = _feed._thread
+-            _owners.add(self)
+-
+-    def register(self, adapter):
+-        with self._lock:
+-            if self._closed:
+-                raise RuntimeError('source owner closed')
+-            bound = _Bound(adapter, self)
+-            registration = self._feed.register(bound)
+-            self._registrations.append((bound, registration))
+-            return registration
+-
+-    def close(self, timeout=5):
+-        global _feed, _store
+-        if threading.current_thread() is self._thread:
+-            raise RuntimeError('cannot close capture owner on its feed thread')
+-        with self._close_lock:
+-            with self._lock:
+-                self._closed = True
+-                registrations = tuple(self._registrations)
+-            for bound, _registration in registrations:
+-                bound.stop()
+-            for bound, _registration in registrations:
+-                bound.fence(timeout)
+-            for _bound, registration in registrations:
+-                registration.close()
+-            self._registrations.clear()
+-            with _lock:
+-                if self not in _owners:
+-                    return
+-                if len(_owners) == 1:
+-                    self._feed.close(timeout)
+-                    _feed = _store = None
+-                _owners.remove(self)
++__all__ = ['ProcessOwner', 'process_store']
+diff --git a/hermes_cli/fact_source_watch.py b/hermes_cli/fact_source_watch.py
+index 2cfb82f89b7..519e77991cd 100644
+--- a/hermes_cli/fact_source_watch.py
++++ b/hermes_cli/fact_source_watch.py
+@@ -1,71 +1,213 @@
+-"""Native source hints, armed before bootstrap and rearmed before capture. [daveey]
++"""One process-wide native owner, with independently scoped source leases. [daveey]
+ 
+-Linux uses the existing loss-aware inotify owner. Unsupported native backends
+-fail registration rather than silently polling. Capture retries and watch-repair
+-retries are failure recovery, not periodic source probes.
++FileEvents owns loss-aware coverage and rearming. Its descriptors are multiplexed
++here, rather than unioning paths: unrelated profiles must not all recapture on
++every SQLite write. Only the owner touches FileEvents except its wake() method.
+ """
+ from __future__ import annotations
+ 
++import contextvars
++import logging
++import queue
++import select
+ import threading
++import time
+ 
+ from agent.memory_provider import spawn_context_thread
+ from hermes_cli.annotation_file_events import FileEvents
+ from hermes_cli.fact_source_signal import cue_path
+ 
++_log = logging.getLogger(__name__)
++_shared_lock = threading.Lock()
++_shared = None
++
++
++class _Request:
++    def __init__(self, action):
++        self.action = action
++        self.done = threading.Event()
++        self.error = None
++
++    def wait(self):
++        if not self.done.wait(5.0):
++            raise TimeoutError('native source watch did not stop; descriptors retained')
++        if self.error is not None:
++            raise self.error
++
++
++class _NativeOwner:
++    def __init__(self):
++        self._control = FileEvents()
++        self._requests = queue.Queue()
++        self._watches = set()
++        self._retained = []
++        self._stopped = False
++        try:
++            # Infrastructure belongs to the process, not the first subscriber's
++            # profile or local-work scope. Each callback binds its own context.
++            self._thread = contextvars.Context().run(
++                spawn_context_thread, self._run, name='fact-native-watch', passive=True)
++            self._thread.start()
++        except BaseException:
++            self._control.close()
++            raise
++
++    def submit(self, action):
++        if threading.current_thread() is self._thread:
++            raise RuntimeError('native watch callbacks cannot synchronously change leases')
++        request = _Request(action)
++        self._requests.put(request)
++        self._control.wake()
++        return request
++
++    def add(self, watch):
++        events = FileEvents()
++        try:
++            events.replace(watch._paths, directories=watch._directories)
++        except BaseException:
++            # Failed cleanup still has a process-owned retry path.
++            self._retained.append(events)
++            events.close()
++            self._retained.remove(events)
++            raise
++        watch._events = events
++        self._watches.add(watch)
++
++    def remove(self, watch):
++        if watch in self._watches:
++            watch._events.close()
++            self._watches.remove(watch)
++        if not self._watches:
++            for events in tuple(self._retained):
++                events.close()
++                self._retained.remove(events)
++            self._control.close()
++            self._stopped = True
++
++    def _commands(self):
++        while not self._requests.empty():
++            request = self._requests.get_nowait()
++            try:
++                request.action()
++            except BaseException as exc:  # health: allow BLE001 -- acknowledge the exact owner-command error to its waiting lease
++                request.error = exc
++            finally:
++                request.done.set()
++
++    def _notify(self, watch):
++        try:
++            watch._context.run(watch._wake)
++        except Exception:  # health: allow BLE001 -- one subscriber callback must not kill all native hints
++            # A bad consumer must not kill native hints for every other profile.
++            _log.exception('native source hint callback failed')
++
++    def _capture_hint(self, watch, *, repair=False):
++        try:
++            if not repair and not watch._events.wait(0):
++                return
++            watch._events.replace(watch._paths, directories=watch._directories)
++            with watch._lock:
++                watch._error = None
++            watch._retry_at = None
++            watch._retry = 0.1
++        except OSError as exc:
++            with watch._lock:
++                watch._error = exc
++            watch._retry_at = time.monotonic() + watch._retry
++            watch._retry = min(watch._retry * 2, 5.0)
++        self._notify(watch)
++
++    def _run(self):
++        while not self._stopped:
++            self._commands()
++            if self._stopped:
++                return
++            waiter = select.poll()
++            # FileEvents has no public fileno: these are readiness only; reads,
++            # replacement and closes remain exclusively on this owner thread.
++            waiter.register(self._control._wake_read, select.POLLIN)
++            by_fd = {}
++            deadlines = []
++            for watch in self._watches:
++                if watch._retry_at is not None:
++                    deadlines.append(watch._retry_at)
++                else:
++                    for fd in (watch._events._fd, watch._events._wake_read):
++                        waiter.register(fd, select.POLLIN)
++                        by_fd[fd] = watch
++            timeout = None
++            if deadlines:
++                timeout = max(0, (min(deadlines) - time.monotonic()) * 1000)
++            ready = waiter.poll(timeout)
++            if any(fd == self._control._wake_read for fd, _ in ready):
++                self._control.wait(0)
++            changed = {by_fd[fd] for fd, _ in ready if fd in by_fd}
++            # Process commands on the next iteration so no removed lease can be
++            # called from a stale readiness snapshot after close acknowledges.
++            now = time.monotonic()
++            for watch in tuple(self._watches):
++                repair = watch._retry_at is not None and watch._retry_at <= now
++                if repair or watch in changed:
++                    self._capture_hint(watch, repair=repair)
++
+ 
+ class NativeSourceWatch:
+     def __init__(self, paths, wake, *, directories=()):
++        global _shared
++        if _shared is not None and threading.current_thread() is _shared._thread:
++            raise RuntimeError('native watch callbacks cannot synchronously change leases')
+         paths = tuple(paths)
+         self._paths = paths + tuple(cue_path(path) for path in paths)
+         self._directories = tuple(directories)
+         self._wake = wake
+-        self._stop = threading.Event()
++        self._context = contextvars.copy_context()
+         self._lock = threading.Lock()
+         self._error = None
+-        self._events = FileEvents()
+-        try:
+-            # The initial watch exists before registration lets capture start.
+-            self._events.replace(self._paths, directories=self._directories)
+-            self._thread = spawn_context_thread(self._run, name="fact-native-watch")
+-            self._thread.start()
+-        except BaseException:
+-            self._events.close()
+-            raise
++        self._retry_at = None
++        self._retry = 0.1
++        self._close_request = None
++        self._closed = False
++        with _shared_lock:
++            if _shared is not None and _shared._stopped:
++                self._owner = _shared
++                self._finish_owner()
++            if _shared is None:
++                _shared = _NativeOwner()
++            self._owner = _shared
++            try:
++                # Acknowledged only after coverage exists: bootstrap cannot race
++                # registration, including when another source is already live.
++                self._owner.submit(lambda: self._owner.add(self)).wait()
++            except BaseException:
++                cleanup = self._owner.submit(lambda: self._owner.remove(self))
++                cleanup.wait()
++                self._finish_owner()
++                raise
+ 
+     def check(self):
+         with self._lock:
+             error = self._error
+         if error is not None:
+-            raise OSError("source watch unavailable") from error
++            raise OSError('source watch unavailable') from error
+ 
+-    def _run(self):
+-        retry = 0.1
+-        repair = False
+-        while not self._stop.is_set():
+-            try:
+-                if not repair and not self._events.wait():
+-                    continue
+-                if self._stop.is_set():
+-                    return
+-                self._events.replace(self._paths, directories=self._directories)
+-                with self._lock:
+-                    self._error = None
+-                repair = False
+-                retry = 0.1
+-                self._wake()
+-            except OSError as exc:
+-                with self._lock:
+-                    self._error = exc
+-                self._wake()
+-                repair = True
+-                if self._stop.wait(retry):
+-                    return
+-                retry = min(retry * 2, 5.0)
++    def _finish_owner(self):
++        global _shared
++        if self._owner._stopped:
++            self._owner._thread.join(5.0)
++            if self._owner._thread.is_alive():
++                raise TimeoutError('native source watch did not stop; descriptors retained')
++            if _shared is self._owner:
++                _shared = None
+ 
+     def close(self):
+-        self._stop.set()
+-        self._events.wake()
+-        self._thread.join(5.0)
+-        if self._thread.is_alive():
+-            raise TimeoutError("native source watch did not stop; descriptors retained")
+-        self._events.close()
++        if threading.current_thread() is self._owner._thread:
++            raise RuntimeError('native watch callbacks cannot synchronously change leases')
++        with _shared_lock:
++            if self._closed:
++                return
++            if not self._owner._stopped:
++                if self._close_request is None or self._close_request.done.is_set():
++                    self._close_request = self._owner.submit(lambda: self._owner.remove(self))
++                self._close_request.wait()
++            self._finish_owner()
++            self._closed = True
+diff --git a/hermes_cli/fact_tree_startup.py b/hermes_cli/fact_tree_startup.py
+index dfb5be193d3..7a399a94763 100644
+--- a/hermes_cli/fact_tree_startup.py
++++ b/hermes_cli/fact_tree_startup.py
+@@ -40,7 +40,9 @@
+         self.targets = tuple(sorted(self.targets, key=lambda item: str(item[1]) != self.home))
+         self.names = {name for name, _home in self.targets}
+         self.homes = {str(home): name for name, home in self.targets}
+-        self.scope = Scope(self.home, self.homes.get(self.home, 'default'))
++        # Shared storage needs a distinct materializer namespace from links,
++        # which legitimately uses the same home/profile origin.
++        self.scope = Scope('serve.projects.' + self.home, self.homes.get(self.home, 'default'))
+         self.source_id = SourceId(self.scope, 'board.input', 'native')
+         self.closed = self.drained = False
+         self._previous = None
+diff --git a/hermes_cli/fact_view_owner.py b/hermes_cli/fact_view_owner.py
+index aa99df106d4..798f394f8fe 100644
+--- a/hermes_cli/fact_view_owner.py
++++ b/hermes_cli/fact_view_owner.py
+@@ -10,7 +10,7 @@
+ from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
+ from hermes_cli.fact_materializers import Projection, view_reducer
+ from hermes_cli.fact_reducers import ReducerEngine
+-from hermes_cli.fact_process_owner import process_store
++from hermes_cli.fact_process import store as process_store
+ 
+ 
+ class ViewOwner:
+diff --git a/hermes_cli/sessions_native_startup.py b/hermes_cli/sessions_native_startup.py
+index f6f83c76b6d..b2c52fbd1cf 100644
+--- a/hermes_cli/sessions_native_startup.py
++++ b/hermes_cli/sessions_native_startup.py
+@@ -17,7 +17,7 @@
+ 
+ from hermes_cli.fact_capture import CaptureBudget
+ from hermes_cli.fact_contract import Scope, SourceId
+-from hermes_cli.fact_process_owner import ProcessOwner, process_store
++from hermes_cli.fact_process import FeedLease as ChangeFeed, store as process_store
+ from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
+ from hermes_cli.sessions_fact_routes import PENDING_NATIVE, use
+ from hermes_cli.sessions_native_source import SessionsSource
+@@ -95,9 +95,10 @@
+         self.source.demand(name, selector)
+ 
+     def start(self):
+-        self.feed = ProcessOwner(lambda source, capture: source.commit(capture),
++        self.feed = ChangeFeed(lambda source, capture: source.commit(capture),
+                                lambda source, error: source.failure(),
+-                               budget=CaptureBudget(max_bytes=4 * 1024 * 1024, max_seconds=5))
++                               budget=CaptureBudget(max_bytes=4 * 1024 * 1024, max_seconds=5),
++                               stores={self.scope: self.store})
+         try:
+             self.feed.register(self.source)
+             self.local = InProcessFacts(self.store, [self.scope], demand=self.demand)
+diff --git a/tests/hermes_cli/test_annotation_lazy_profiles.py b/tests/hermes_cli/test_annotation_lazy_profiles.py
+new file mode 100644
+index 00000000000..369702c646d
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_lazy_profiles.py
+@@ -0,0 +1,287 @@
++"""Lazy per-profile annotation capture: unseeded profiles register nothing until demanded."""
++import threading
++
++import pytest
++
++from hermes_cli import fact_annotation_runtime as runtime_module
++from hermes_cli import kanban_annotation_facts as annotations
++from hermes_cli.fact_annotation_runtime import AnnotationRuntime
++from hermes_cli.fact_annotation_startup import binding_for
++from hermes_cli.fact_store import FactStore
++from tests.hermes_cli import test_kanban_session_activity as helpers
++
++kanban_root = helpers.kanban_root
++
++
++class FakeProcess:
++    """Records coalesced submissions; the test runs them like the control worker would."""
++    def __init__(self):
++        self._store, self.queue = FactStore(), {}
++        self.submits = 0
++
++    def store(self):
++        return self._store
++
++    def submit(self, key, callback):
++        self.submits += 1
++        self.queue.setdefault(key, callback)
++
++    def drain(self):
++        queue, self.queue = self.queue, {}
++        for callback in queue.values():
++            callback()
++
++
++@pytest.fixture
++def harness(kanban_root, tmp_path, monkeypatch):
++    process = FakeProcess()
++    monkeypatch.setattr(runtime_module, '_process', lambda: process)
++    built, legacy = [], []
++    real = AnnotationRuntime._sources
++
++    def counting(engine, scope, home, gateway):
++        built.append(scope.profile_id)
++        return real(engine, scope, home, gateway)
++    monkeypatch.setattr(AnnotationRuntime, '_sources', staticmethod(counting))
++    homes = {}
++    for name in ('default', 'named'):
++        homes[name] = tmp_path / name
++        homes[name].mkdir()
++    runtime = AnnotationRuntime(homes, fallback_profile='default', gateway='fixture',
++        stop_legacy=lambda: legacy.append('stop'), start_legacy=lambda: legacy.append('start'))
++    try:
++        yield runtime, process, built, legacy
++    finally:
++        runtime.close()
++
++
++def _rows(profile):
++    return [{'id': 'row', 'profile': profile}]
++
++
++def _legacy(rows, **kwargs):
++    raise AssertionError('legacy I/O must never run')
++
++
++def test_construction_is_inert(harness):
++    runtime, process, built, legacy = harness
++    assert built == [] and runtime.handles == {} and runtime.owners == {}
++    assert process.submits == 0 and legacy == []
++    assert all(binding._mode == 'legacy' for binding in runtime.bindings.values())
++
++
++def test_no_seeds_no_capture_and_lookup_fails_closed_then_activates(harness):
++    runtime, process, built, legacy = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    try:
++        assert built == [] and runtime.handles == {} and legacy == []
++        assert binding_for('named').scope.profile_id == 'named'
++        assert binding_for('absent') is None
++        for _ in range(3):
++            with pytest.raises(annotations.AnnotationUnavailable):
++                annotations.annotate('goal', _rows('named'), _legacy)
++        # Request path: memory only, coalesced to one activation, no source I/O.
++        assert list(process.queue) == [('fact_annotation_runtime.activate', id(runtime), 'named')]
++        assert built == [] and runtime.handles == {}
++        process.drain()
++        assert built == ['named'] and list(runtime.handles) == ['named']
++        assert legacy == ['stop']
++        assert runtime.bindings['default'].real is None
++        # Active but no projection yet: still unavailable, now via the real binding + demand.
++        with pytest.raises(annotations.AnnotationUnavailable):
++            annotations.annotate('goal', _rows('named'), _legacy)
++        assert process.queue == {}
++        with pytest.raises(annotations.AnnotationUnavailable):
++            annotations.annotate('goal', _rows('default'), _legacy)
++        assert list(process.queue) == [('fact_annotation_runtime.activate', id(runtime), 'default')]
++    finally:
++        runtime.close()
++    assert binding_for() is None
++    assert legacy == ['stop', 'start']  # resumed once, after the last native profile closed
++    runtime.close()
++    assert legacy == ['stop', 'start']
++
++
++def test_only_seeded_profile_registers_sources(harness):
++    runtime, process, built, legacy = harness
++    with pytest.raises(TimeoutError):
++        runtime.start({'default': [], 'named': _rows('named')}, timeout=.05)
++    assert built == ['named'] and list(runtime.handles) == ['named']
++    assert legacy == [] and binding_for() is None
++    assert process.submits == 0
++
++
++def test_activation_failure_stays_unavailable_and_backs_off(harness, monkeypatch):
++    runtime, process, _built, _legacy_calls = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    calls = []
++
++    def boom(*args):
++        calls.append(args)
++        raise RuntimeError('boom')
++    monkeypatch.setattr(runtime.local, 'acquire', lambda *a, **k: boom())
++    with pytest.raises(annotations.AnnotationUnavailable):
++        annotations.annotate('goal', _rows('named'), _legacy)
++    with pytest.raises(RuntimeError):
++        process.drain()
++    assert runtime.handles == {} and runtime.owners == {} and runtime.bindings['named'].real is None
++    # Backoff: an immediate re-demand does not enqueue another attempt.
++    with pytest.raises(annotations.AnnotationUnavailable):
++        annotations.annotate('goal', _rows('named'), _legacy)
++    assert process.queue == {}
++    runtime._retry_at.clear()
++    monkeypatch.undo()
++    with pytest.raises(annotations.AnnotationUnavailable):
++        annotations.annotate('goal', _rows('named'), _legacy)
++    assert len(process.queue) == 1 and len(calls) == 1
++
++
++def test_failed_owner_close_retains_custody_and_blocks_replacement(harness, monkeypatch):
++    runtime, _process, built, _legacy_calls = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    runtime._activate('named')
++    owner = runtime.owners['named']
++    handle = runtime.handles['named']
++    close = owner.close
++    attempts = []
++
++    def fail_close():
++        attempts.append(owner)
++        raise RuntimeError('owner still running')
++
++    monkeypatch.setattr(owner, 'close', fail_close)
++    try:
++        with pytest.raises(RuntimeError, match='owner still running'):
++            runtime._teardown('named')
++        assert runtime.owners.get('named') is owner
++        assert runtime.handles.get('named') is handle
++        with pytest.raises(annotations.AnnotationUnavailable):
++            annotations.annotate('goal', _rows('named'), _legacy)
++        runtime._retry_at.clear()
++        with pytest.raises(RuntimeError, match='owner still running'):
++            runtime._activate('named')
++        assert built == ['named']
++        assert len(attempts) == 2
++        assert runtime.owners.get('named') is owner
++        assert runtime.handles.get('named') is handle
++        with pytest.raises(RuntimeError, match='owner still running'):
++            runtime.close()
++        assert not runtime._closed
++        assert runtime.owners.get('named') is owner
++    finally:
++        monkeypatch.setattr(owner, 'close', close)
++        runtime.close()
++    assert runtime._closed and runtime.owners == {} and runtime.handles == {}
++
++
++def test_activation_binding_never_delegates_to_legacy_before_certification(harness, monkeypatch):
++    runtime, _process, _built, _legacy_calls = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    certify = runtime._certify
++    observed = []
++
++    def during_certification(profile):
++        # Deterministically exercise the interval after consumer registration but
++        # before the lifecycle callback has switched it from its default mode.
++        with pytest.raises(annotations.AnnotationUnavailable):
++            annotations.annotate('goal', _rows(profile), _legacy)
++        observed.append(profile)
++        certify(profile)
++
++    monkeypatch.setattr(runtime, '_certify', during_certification)
++    runtime._activate('named')
++    assert observed == ['named']
++    assert runtime.bindings['named']._mode == 'facts'
++    with pytest.raises(annotations.AnnotationUnavailable):
++        annotations.annotate('goal', _rows('named'), _legacy)
++
++
++@pytest.mark.parametrize('failure_stage', ['acquire', 'certify'])
++def test_failed_activation_cleanup_must_finish_before_retry(harness, monkeypatch, failure_stage):
++    runtime, process, built, _legacy_calls = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    acquire, certify = runtime.local.acquire, runtime._certify
++    owner_close = runtime_module.NativeAnnotationOwner.close
++    retained = []
++
++    def fail_activation(*args, **kwargs):
++        raise RuntimeError('activation failed')
++
++    def fail_close(owner):
++        retained.append(owner)
++        raise RuntimeError('cleanup failed')
++
++    monkeypatch.setattr(runtime_module.NativeAnnotationOwner, 'close', fail_close)
++    if failure_stage == 'acquire':
++        monkeypatch.setattr(runtime.local, 'acquire', fail_activation)
++    else:
++        monkeypatch.setattr(runtime, '_certify', fail_activation)
++    try:
++        with pytest.raises(RuntimeError, match='cleanup failed'):
++            runtime._activate('named')
++        owner = retained[0]
++        assert runtime.owners.get('named') is owner
++        assert built == ['named']
++        runtime._retry_at.clear()
++        with pytest.raises(annotations.AnnotationUnavailable):
++            annotations.annotate('goal', _rows('named'), _legacy)
++        with pytest.raises(RuntimeError, match='cleanup failed'):
++            process.drain()
++        assert built == ['named']
++        assert retained == [owner, owner]
++        assert runtime.owners.get('named') is owner
++    finally:
++        monkeypatch.setattr(runtime_module.NativeAnnotationOwner, 'close', owner_close)
++        monkeypatch.setattr(runtime.local, 'acquire', acquire)
++        monkeypatch.setattr(runtime, '_certify', certify)
++    # Cleanup succeeds before a replacement is admitted. Reuse the same reducer
++    # engine and lifecycle; duplicate registration or stale generations fail here.
++    runtime._activate('named')
++    assert built == ['named', 'named']
++    assert runtime.owners['named'] is not owner
++    assert runtime.bindings['named']._mode == 'facts'
++    assert runtime.bindings['named'].real is not None
++
++
++def test_activation_after_close_is_a_noop(harness):
++    runtime, process, built, _legacy_calls = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    with pytest.raises(annotations.AnnotationUnavailable):
++        annotations.annotate('goal', _rows('named'), _legacy)
++    runtime.close()
++    process.drain()
++    assert built == [] and runtime.handles == {}
++
++
++def test_submit_failure_never_falls_back_to_legacy(harness, monkeypatch):
++    runtime, process, built, legacy = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++
++    def full(key, callback):
++        raise RuntimeError('control queue full')
++    monkeypatch.setattr(process, 'submit', full)
++    with pytest.raises(annotations.AnnotationUnavailable):
++        annotations.annotate('goal', _rows('named'), _legacy)
++    assert built == [] and legacy == []
++
++
++def test_concurrent_demand_builds_once(harness):
++    runtime, process, built, _legacy_calls = harness
++    runtime.start({'default': [], 'named': []}, timeout=1)
++    barrier = threading.Barrier(4)
++
++    def demand():
++        barrier.wait()
++        try:
++            annotations.annotate('goal', _rows('named'), _legacy)
++        except annotations.AnnotationUnavailable:
++            pass
++    threads = [threading.Thread(target=demand) for _ in range(4)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++    assert len(process.queue) == 1
++    process.drain()
++    process.drain()
++    assert built == ['named']
+diff --git a/tests/hermes_cli/test_annotation_prepare_inert.py b/tests/hermes_cli/test_annotation_prepare_inert.py
+new file mode 100644
+index 00000000000..5309e0a4646
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_prepare_inert.py
+@@ -0,0 +1,39 @@
++"""Real prepare with a many-profile roster is inert: no scan, source, owner or handle."""
++from collections import Counter
++import threading
++
++from hermes_cli import fact_annotation_boot as boot
++from tests.hermes_cli import test_kanban_session_activity as helpers
++
++kanban_root = helpers.kanban_root
++
++
++def test_eleven_profile_prepare_is_inert(kanban_root, tmp_path, monkeypatch):
++    from hermes_cli import profiles
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli.web_routers import profiles as routes
++    roster = []
++    for i in range(11):
++        home = tmp_path / f'p{i}'
++        home.mkdir()
++        roster.append(('default' if i == 0 else f'p{i}', home))
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(routes, '_profile_targets', lambda reason: roster)
++    monkeypatch.setattr(host, 'suspend_holder', lambda: None)
++    monkeypatch.setattr(host, 'resume_holder', lambda role: None)
++
++    def scanned(*args, **kwargs):
++        raise AssertionError('sessions reader seed scan')
++    monkeypatch.setattr(routes, 'get_profiles_sessions', scanned)
++    monkeypatch.setattr(routes, 'get_profiles_sessions_sidebar', scanned)
++    monkeypatch.setattr(boot, 'seeds', scanned)
++    before = Counter(t.name for t in threading.enumerate() if t.name.startswith('fact-'))
++    runtime = boot.prepare()
++    try:
++        assert Counter(t.name for t in threading.enumerate() if t.name.startswith('fact-')) == before
++        assert len(runtime.bindings) == 11 and runtime._started
++        assert not runtime.handles and not runtime.owners and not runtime._registered
++        assert all(b.real is None for b in runtime.bindings.values())
++        assert all(b._mode == 'legacy' for b in runtime.bindings.values())
++    finally:
++        runtime.close()
+diff --git a/tests/hermes_cli/test_annotation_prepare_lifespan.py b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+index 72b14f99e7f..a003047571b 100644
+--- a/tests/hermes_cli/test_annotation_prepare_lifespan.py
++++ b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+@@ -1,9 +1,11 @@
+ """Real startup owns seven native sources, with no legacy annotation admission."""
+ import asyncio
++import time
+ import pytest
+ 
+ from hermes_cli import fact_annotation_boot as boot
+ from hermes_cli import fact_annotation_lifespan as startup
++from hermes_cli.kanban_annotation_facts import AnnotationUnavailable
+ from hermes_cli.fact_annotation_startup import binding_for
+ from tests.hermes_cli import test_kanban_session_activity as helpers
+ from tests.hermes_cli.annotation_fact_processes import request_guard
+@@ -26,7 +28,7 @@
+     monkeypatch.setenv('HERMES_FACTS_ANNOTATION', '1')
+     monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
+     monkeypatch.setattr(routes, '_profile_targets', lambda reason: [('default', home)])
+-    monkeypatch.setattr(boot, 'seeds', lambda runtime: {'default': [{'id': 'seed'}]})
++    monkeypatch.setattr(boot, 'seeds', lambda *a, **k: pytest.fail('prepare must not scan sessions'))
+     monkeypatch.setattr(kanban, '_remote_cards', lambda *args: [])
+     calls = []
+     monkeypatch.setattr(host, 'suspend_holder', lambda: calls.append('drain'))
+@@ -35,11 +37,23 @@
+         app = SimpleNamespace(state=SimpleNamespace())
+         async with startup.lifespan(app):
+             assert binding_for() is app.state.annotation_facts.bindings['default']
+-            assert calls == ['drain']
++            assert calls == []  # lazy boot: no activation, legacy untouched
+             with request_guard():
+                 row = {'id': 'seed'}
+-                kanban.annotate_kanban_activity([row], display=True)
++                with pytest.raises(AnnotationUnavailable):  # fail closed, never legacy
++                    kanban.annotate_kanban_activity([row], display=True)
+             assert not row.get('kanban_active')
++            runtime = app.state.annotation_facts
++            deadline = time.monotonic() + 15
++            while time.monotonic() < deadline:
++                try:
++                    with request_guard():
++                        kanban.annotate_kanban_activity([{'id': 'seed'}], display=True)
++                    break
++                except AnnotationUnavailable:
++                    await asyncio.sleep(0.1)
++            assert runtime.bindings['default']._mode == 'facts'
++            assert calls == ['drain']
+         assert calls == ['drain', 'resume']
+         assert binding_for() is None
+     try:
+diff --git a/tests/hermes_cli/test_fact_board_lazy.py b/tests/hermes_cli/test_fact_board_lazy.py
+new file mode 100644
+index 00000000000..41b688a806f
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_board_lazy.py
+@@ -0,0 +1,151 @@
++"""Board scopes construct no owner until scoped demand; activation is off-thread. [daveey]"""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import fact_board_startup as startup
++from hermes_cli.fact_contract import Pending, Unavailable
++
++BOARDS = tuple(f'b{i}' for i in range(11))
++
++
++class FakeOwner:
++    started, built = [], []
++
++    def __init__(self, scope, capture, render, views, *, paths=(), bindings=()):
++        FakeOwner.built.append(scope.board_id)
++        self.scope, self.handle, self.closed = scope, None, False
++
++    def start(self):
++        FakeOwner.started.append(self.scope.board_id)
++        self.handle = SimpleNamespace(v1=object(), demand=lambda *a: True)
++        return self.handle
++
++    def close(self):
++        self.closed = True
++
++
++def _api():
++    views = SimpleNamespace(_installed=None, board_selector=dict)
++    def bind(v1, scope, **kw):
++        return SimpleNamespace(close=lambda: None, on_mode=lambda *a: None, prepare=lambda: True, scope=scope)
++    views.bind = bind
++    views.install_provider = lambda owner, provider: setattr(views, '_installed', (owner, provider))
++    return SimpleNamespace(board_prewarm=SimpleNamespace(stop_board_prewarm=lambda: None), board_fact_views=views)
++
++
++@pytest.fixture
++def runtime(monkeypatch, tmp_path):
++    from hermes_cli import kanban_db
++    FakeOwner.started, FakeOwner.built = [], []
++    submitted = []
++    from hermes_cli import fact_process
++    monkeypatch.setattr(fact_process, 'submit', lambda key, callback: submitted.append((key, callback)))
++    monkeypatch.setattr(startup, 'ViewOwner', FakeOwner)
++    monkeypatch.setattr(kanban_db, 'kanban_db_path', lambda board=None: tmp_path / str(board) / 'kanban.db')
++    monkeypatch.setattr(kanban_db, 'get_current_board', lambda: 'b0')
++    rt = startup.BoardRuntime(_api(), boards=BOARDS)
++    rt.submitted = submitted
++    return rt
++
++
++def test_eleven_boards_construct_nothing_until_demand(runtime):
++    runtime.start()
++    assert FakeOwner.built == [] and FakeOwner.started == []
++    assert runtime.owners == {} and runtime.views == {} and runtime.submitted == []
++    assert isinstance(runtime.provider('b0'), Pending)  # current board is lazy too
++    assert FakeOwner.built == []  # request thread only enqueued
++    runtime.submitted[0][1]()
++    assert FakeOwner.built == ['b0'] and set(runtime.owners) == {'b0'}
++    assert runtime.provider('b0') is runtime.views['b0']
++
++
++def test_provider_only_enqueues_then_activates_once(runtime):
++    runtime.start()
++    assert isinstance(runtime.provider('b5'), Pending)
++    assert isinstance(runtime.provider('b5'), Pending)
++    assert FakeOwner.started == [] and FakeOwner.built == []  # request side did no start
++    assert {key for key, _ in runtime.submitted} == {('board', runtime.home, runtime.profile, 'b5')}
++    runtime.submitted[0][1]()
++    runtime.submitted[1][1]()  # duplicate callback is idempotent
++    assert FakeOwner.started == ['b5'] and FakeOwner.built == ['b5']
++    assert runtime.provider('b5') is runtime.views['b5']
++    assert isinstance(runtime.provider('unknown'), Unavailable)
++
++
++def test_close_fences_pending_activation_and_closes_dormant(runtime):
++    runtime.start()
++    runtime.provider('b3')
++    callback = runtime.submitted[0][1]
++    runtime.close()
++    callback()
++    assert FakeOwner.built == [] and 'b3' not in runtime.views and runtime.owners == {}
++    assert isinstance(runtime.provider('b3'), Unavailable)
++
++
++def test_activation_blocks_close_until_complete(runtime, monkeypatch):
++    runtime.start()
++    runtime.provider('b2')
++    callback = runtime.submitted[0][1]
++    gate, entered = threading.Event(), threading.Event()
++    original = FakeOwner.start
++    def slow(self):
++        entered.set()
++        gate.wait(5)
++        return original(self)
++    monkeypatch.setattr(FakeOwner, 'start', slow)
++    worker = threading.Thread(target=callback)
++    worker.start()
++    assert entered.wait(5)
++    closer = threading.Thread(target=runtime.close)
++    closer.start()
++    closer.join(0.2)
++    assert closer.is_alive()  # close waits behind the fence
++    gate.set()
++    worker.join(5), closer.join(5)
++    assert runtime.owners['b2'].closed  # started owner was still drained
++
++
++def test_failed_activation_is_unavailable_without_retry_and_drained(runtime, monkeypatch):
++    runtime.start()
++    runtime.provider('b4')
++    monkeypatch.setattr(FakeOwner, 'start', lambda self: (_ for _ in ()).throw(OSError('x')))
++    with pytest.raises(OSError):
++        runtime.submitted[0][1]()  # fact_process logs and contains this
++    assert isinstance(runtime.provider('b4'), Unavailable)
++    assert len(runtime.submitted) == 1  # no retry
++    owner = runtime.owners['b4']  # partial owner custody retained
++    runtime.close()
++    assert owner.closed
++
++
++def test_failed_view_bind_retains_view_and_owner_for_close(runtime):
++    runtime.start()
++    closed = []
++    def bind(v1, scope, **kw):
++        return SimpleNamespace(close=lambda: closed.append(scope.board_id), scope=scope,
++                               on_mode=lambda *a: (_ for _ in ()).throw(RuntimeError('mode')))
++    runtime.api.board_fact_views.bind = bind
++    runtime.provider('b6')
++    with pytest.raises(RuntimeError):
++        runtime.submitted[0][1]()
++    assert 'b6' not in runtime.views and isinstance(runtime.provider('b6'), Unavailable)
++    runtime.close()
++    assert closed == ['b6'] and runtime.owners['b6'].closed
++
++
++def test_unauthorized_board_never_enqueues(runtime):
++    runtime.start()
++    assert isinstance(runtime.provider('other'), Unavailable)
++    assert runtime.submitted == []
++
++
++def test_unscoped_and_ready_requests_are_current_and_named_demand_only(runtime):
++    runtime.start()
++    assert isinstance(runtime.provider(None), Unavailable)  # enqueue current; no catalog yet
++    assert [key[-1] for key, _ in runtime.submitted] == ['b0']
++    assert runtime.ready('b7') is False
++    assert runtime.ready('nope') is False
++    assert [key[-1] for key, _ in runtime.submitted] == ['b0', 'b7']
++    assert FakeOwner.built == []
+diff --git a/tests/hermes_cli/test_fact_links_startup.py b/tests/hermes_cli/test_fact_links_startup.py
+index 0bb8e36bf14..6df955d9a5c 100644
+--- a/tests/hermes_cli/test_fact_links_startup.py
++++ b/tests/hermes_cli/test_fact_links_startup.py
+@@ -38,11 +38,10 @@
+         import time
+         from hermes_cli.fact_remote_links import RemoteLinksSource
+         def recapture_scheduled():
+-            feed = binding.handle.owner.feed._feed
+-            with feed._condition:
++            with binding.handle.owner.feed._feed._condition:
+                 return any(isinstance(s.adapter.adapter, RemoteLinksSource) and s.due is not None
+                            and 25 < s.due - time.monotonic() <= 30
+-                           for s in feed._sources)
++                           for s in binding.handle.owner.feed._feed._sources)
+         wait_until(recapture_scheduled)
+         monkeypatch.setattr(activity, '_links_lookup', lambda *a, **k: pytest.fail('legacy display read'))
+         for _ in range(50):
+diff --git a/tests/hermes_cli/test_fact_process.py b/tests/hermes_cli/test_fact_process.py
+new file mode 100644
+index 00000000000..d54d2727a7f
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_process.py
+@@ -0,0 +1,129 @@
++"""Real process scheduler custody, profile context and eleven-profile census. [daveey]"""
++from collections import Counter
++from contextvars import ContextVar
++from types import SimpleNamespace
++import threading
++import time
++
++import pytest
++
++from hermes_cli import fact_process as process
++from hermes_cli.fact_board_inputs import CapturedInput
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Fact, FactKey, Scope, Ready
++from hermes_cli.fact_view_owner import ViewOwner
++from tests.waiting import wait_until
++
++
++def test_eleven_authorized_profiles_one_used_thread_census(tmp_path):
++    entered, release = threading.Event(), threading.Event()
++    def capture(view, selector, budget):
++        entered.set()
++        assert release.wait(5)
++        return CapturedInput({'ok': True}, (), time.time())
++    owners = [ViewOwner(Scope(str(tmp_path), f'p{i}'), capture, lambda view, value: dict(value),
++                        ['board'], paths=[tmp_path / f'p{i}' / 'state.db']) for i in range(11)]
++    baseline = Counter(t.name for t in threading.enumerate())
++    assert len({id(owner.store) for owner in owners}) == 1
++    assert Counter(t.name for t in threading.enumerate()) == baseline
++    try:
++        handle = owners[0].start()
++        handle.demand('board', {})
++        assert entered.wait(5)
++        census = Counter(t.name for t in threading.enumerate())
++        delta = {name: census[name] - baseline[name] for name in
++                 ('fact-change-feed', 'fact-board-capture', 'fact-native-watch',
++                  'fact-local-delivery', 'fact-expiry')}
++        print('11 profiles / one consumer:', delta)
++        assert delta['fact-change-feed'] == 1
++        assert delta['fact-board-capture'] == 1
++        assert delta['fact-native-watch'] <= 3
++        assert delta['fact-local-delivery'] == delta['fact-expiry'] == 1
++        assert all(owner.owner is None for owner in owners[1:])
++        release.set()
++        wait_until(lambda: isinstance(handle.v1.snapshot(owners[0].scope).view('board', {}), Ready))
++    finally:
++        release.set()
++        for owner in owners:
++            owner.close()
++    wait_until(lambda: all(Counter(t.name for t in threading.enumerate())[name] == baseline[name]
++                           for name in delta))
++
++
++def test_leases_share_thread_preserve_budget_context_and_independent_close():
++    profile = ContextVar('fact_process_profile', default='unbound')
++    seen = []
++    class Adapter:
++        def watch(self, wake):
++            return SimpleNamespace(close=lambda: None)
++        def capture(self, cursor, budget):
++            seen.append(('capture', profile.get(), budget.max_bytes))
++            return SimpleNamespace(after=1)
++    leases = []
++    try:
++        for name, limit in [('first', 1234), ('second', 2345)]:
++            token = profile.set(name)
++            try:
++                lease = process.FeedLease(lambda adapter, captured: seen.append(('commit', profile.get())),
++                                          lambda *args: pytest.fail('unexpected failure'),
++                                          budget=CaptureBudget(max_bytes=limit))
++                leases.append(lease)
++                lease.register(Adapter())
++            finally:
++                profile.reset(token)
++        assert leases[0]._thread is leases[1]._thread
++        wait_until(lambda: len(seen) == 4)
++        assert ('capture', 'first', 1234) in seen and ('capture', 'second', 2345) in seen
++        assert ('commit', 'first') in seen and ('commit', 'second') in seen
++        leases[0].close()
++        assert leases[1]._thread.is_alive()
++    finally:
++        for lease in leases:
++            lease.close()
++    assert not leases[-1]._thread.is_alive()
++
++
++def test_scope_retirement_does_not_erase_successor_or_sibling(tmp_path):
++    storage = process.store()
++    scope, sibling = Scope(str(tmp_path), 'p'), Scope(str(tmp_path), 'q')
++    key, other = FactKey(scope, 'Input', 'x'), FactKey(sibling, 'Input', 'x')
++    first = process.FeedLease(lambda *a: None, lambda *a: None, stores={scope: storage})
++    second = process.FeedLease(lambda *a: None, lambda *a: None, stores={sibling: storage})
++    successor = None
++    try:
++        storage.publish([Fact(key, 1), Fact(other, 2)])
++        with pytest.raises(RuntimeError, match='scope custody'):
++            process.FeedLease(lambda *a: None, lambda *a: None, stores={scope: storage})
++        first.close()
++        assert storage.snapshot(scope).get(key) is None
++        assert storage.snapshot(sibling).get(other).value == 2
++        successor = process.FeedLease(lambda *a: None, lambda *a: None, stores={scope: storage})
++        storage.publish([Fact(key, 3)])
++        first.close()
++        assert storage.snapshot(scope).get(key).value == 3
++    finally:
++        first.close()
++        second.close()
++        if successor is not None:
++            successor.close()
++
++
++def test_activation_coalesces_active_work_and_restarts_after_idle():
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    calls = []
++    def work():
++        calls.append('first')
++        entered.set()
++        assert release.wait(5)
++    try:
++        process.submit(('test', id(entered)), work)
++        assert entered.wait(5)
++        process.submit(('test', id(entered)), lambda: pytest.fail('duplicate activation'))
++        release.set()
++        wait_until(lambda: process._worker is None)
++        process.submit(('test', id(entered)), lambda: (calls.append('second'), finished.set()))
++        assert finished.wait(5)
++        assert calls == ['first', 'second']
++    finally:
++        release.set()
++        wait_until(lambda: process._worker is None)
+diff --git a/tests/hermes_cli/test_fact_process_owner.py b/tests/hermes_cli/test_fact_process_owner.py
+index ae49765ae3e..0f86b5ce514 100644
+--- a/tests/hermes_cli/test_fact_process_owner.py
++++ b/tests/hermes_cli/test_fact_process_owner.py
+@@ -54,11 +54,33 @@
+     assert not owners[-1]._thread.is_alive()
+ 
+ 
+-def test_close_retains_capture_custody_until_actual_completion():
++def test_both_consumer_apis_share_process_custody():
++    from hermes_cli import fact_process
++    from hermes_cli.fact_process_owner import ProcessOwner, process_store
++    lease = fact_process.FeedLease(lambda *_: None, lambda *_: None)
++    owner = ProcessOwner(lambda *_: None, lambda *_: None)
++    try:
++        assert owner._thread is lease._thread
++        assert process_store() is fact_process.store()
++        lease.close()
++        assert owner._thread.is_alive()
++    finally:
++        lease.close()
++        owner.close()
++
++
++def test_close_retains_capture_custody_until_actual_completion(tmp_path):
++    import pytest
++    from hermes_cli.fact_contract import Scope
++    from hermes_cli.fact_process import FeedLease, store
+     from hermes_cli.fact_process_owner import ProcessOwner
+     entered, release = threading.Event(), threading.Event()
+     committed = []
+-    owner = ProcessOwner(lambda *args: committed.append(args), lambda *_: None)
++    scope = Scope(str(tmp_path), 'blocked')
++    storage = store()
++    owner = ProcessOwner(lambda *args: committed.append(args), lambda *_: None,
++                         stores={scope: storage})
++    peer = FeedLease(lambda *_: None, lambda *_: None)
+     class Blocking(Source):
+         def capture(self, cursor, budget):
+             entered.set()
+@@ -68,27 +90,100 @@
+     owner.register(source)
+     try:
+         assert entered.wait(5)
+-        import pytest
+         with pytest.raises(TimeoutError):
+             owner.close(timeout=.01)
+         assert not source.closed
+         assert owner._thread.is_alive()
++        with pytest.raises(RuntimeError, match='scope custody'):
++            FeedLease(lambda *_: None, lambda *_: None, stores={scope: storage})
+     finally:
+         release.set()
+         owner.close()
++        peer.close()
+     assert source.closed
+     assert committed == []
+ 
+ 
+-def test_last_close_replaces_store_epoch_for_next_tenure():
++def test_watch_close_failure_retains_scope_until_retry(tmp_path):
++    import pytest
++    from hermes_cli.fact_contract import Fact, FactKey, Scope
++    from hermes_cli.fact_process import FeedLease, store
++    from hermes_cli.fact_process_owner import ProcessOwner
++
++    scope = Scope(str(tmp_path), 'watch-retry')
++    storage = store()
++    key = FactKey(scope, 'Input', 'retained')
++
++    class FailedWatch(Source):
++        def close(self):
++            if not self.closed:
++                self.closed = True
++                raise TimeoutError('watch join failed')
++
++    owner = FeedLease(lambda *_: None, lambda *_: None, stores={scope: storage})
++    peer = ProcessOwner(lambda *_: None, lambda *_: None)
++    source = FailedWatch([], ContextVar('watch-retry', default='test'))
++    owner.register(source)
++    storage.publish([Fact(key, 1)])
++    try:
++        with pytest.raises(TimeoutError, match='watch join failed'):
++            owner.close()
++        assert storage.snapshot(scope).get(key) is not None
++        with pytest.raises(RuntimeError, match='scope custody'):
++            ProcessOwner(lambda *_: None, lambda *_: None, stores={scope: storage})
++        owner.close()
++        assert storage.snapshot(scope).get(key) is None
++        successor = ProcessOwner(lambda *_: None, lambda *_: None, stores={scope: storage})
++        successor.close()
++    finally:
++        owner.close()
++        peer.close()
++
++
++def test_failed_final_feed_drain_refuses_new_tenure(monkeypatch):
++    import pytest
++    from hermes_cli.fact_process import FeedLease
++    from hermes_cli.fact_process_owner import ProcessOwner
++
++    owner = ProcessOwner(lambda *_: None, lambda *_: None)
++    close = owner._feed.close
++
++    def fail(timeout):
++        raise TimeoutError('feed join failed')
++
++    try:
++        monkeypatch.setattr(owner._feed, 'close', fail)
++        with pytest.raises(TimeoutError, match='feed join failed'):
++            owner.close()
++        with pytest.raises(RuntimeError, match='drain custody'):
++            FeedLease(lambda *_: None, lambda *_: None)
++    finally:
++        monkeypatch.setattr(owner._feed, 'close', close)
++        owner.close()
++    successor = FeedLease(lambda *_: None, lambda *_: None)
++    successor.close()
++
++
++def test_last_close_retires_facts_without_stranding_inert_consumers(tmp_path):
++    from hermes_cli.fact_contract import Fact, FactKey, Scope
+     from hermes_cli.fact_process_owner import ProcessOwner, process_store
+     first = process_store()
+-    owner = ProcessOwner(lambda *_: None, lambda *_: None)
++    scope = Scope(str(tmp_path), 'retired')
++    key = FactKey(scope, 'Input', 'old')
++    owner = ProcessOwner(lambda *_: None, lambda *_: None, stores={scope: first})
++    first.publish([Fact(key, 'old tenure')])
+     assert process_store() is first
+     owner.close()
+     second = process_store()
+-    assert second is not first
+-    assert second._epoch != first._epoch
++    assert second is first
++    assert second.snapshot(scope).get(key) is None
++    successor = ProcessOwner(lambda *_: None, lambda *_: None, stores={scope: second})
++    try:
++        second.publish([Fact(key, 'new tenure')])
++        owner.close()
++        assert first.snapshot(scope).get(key).value == 'new tenure'
++    finally:
++        successor.close()
+ 
+ 
+ def test_peer_close_does_not_wait_for_another_owners_capture():
+@@ -112,36 +207,31 @@
+         peer.close()
+ 
+ 
+-def test_lazy_sources_watch_only_the_demanded_profile(tmp_path):
+-    from hermes_cli.fact_content_owner import ContentOwner
+-    from hermes_cli.fact_contract import Scope, SourceId, FactKey
+-    from hermes_cli.fact_store import FactStore
+-    from hermes_cli.fact_reducers import ReducerEngine
+-    from hermes_cli.fact_materializers import Projection, view_reducer
++def test_lazy_sources_watch_only_the_demanded_profile(tmp_path, monkeypatch):
++    from hermes_cli.fact_board_inputs import CapturedInput
++    from hermes_cli.fact_contract import Scope
++    from hermes_cli.fact_view_owner import ViewOwner
++    from hermes_cli import fact_board_inputs
++    import time
++
+     scopes = [Scope(str(tmp_path), f'profile-{i}') for i in range(11)]
+-    engines = {scope: ReducerEngine(FactStore(), scope) for scope in scopes}
+     watched = []
+-    class Operational(Source):
+-        def __init__(self, engine):
+-            self.engine = engine
+-            self.source = SourceId(engine.scope, 'test.input', 'native')
+-            self.key = FactKey(engine.scope, 'Input', '')
+-        def watch(self, wake):
+-            watched.append(self.source.scope)
+-            return super().watch(wake)
+-        def capture(self, cursor, budget):
+-            return SimpleNamespace(after=1)
+-        def commit(self, capture):
+-            pass
+-        def failure(self):
+-            pass
+-    for engine in engines.values():
+-        engine.register(view_reducer([Projection('board', (), lambda *_: (), lambda *_: {})]))
+-    owner = ContentOwner(engines, [], operational=[Operational(e) for e in engines.values()], lazy_sources=True)
++    native_watch = fact_board_inputs.NativeSourceWatch
++
++    def watch(paths, wake):
++        watched.extend(paths)
++        return native_watch(paths, wake)
++
++    monkeypatch.setattr(fact_board_inputs, 'NativeSourceWatch', watch)
++    owners = [ViewOwner(scope, lambda *_: CapturedInput({}, (), time.time()),
++                        lambda *_: {}, ('board',), paths=[tmp_path / scope.profile_id / 'state.db'])
++              for scope in scopes]
+     try:
+         assert watched == []
+-        owner.demand(scopes[0], 'board', {})
+-        assert wait_until(lambda: len(watched) == 1)
+-        assert watched == [scopes[0]]
++        owners[0].start().demand('board', {})
++        assert wait_until(lambda: bool(watched))
++        assert all(str(tmp_path / scopes[0].profile_id) in str(path) for path in watched)
++        assert all(owner.owner is None for owner in owners[1:])
+     finally:
+-        owner.close()
++        for owner in owners:
++            owner.close()
+diff --git a/tests/hermes_cli/test_fact_shared_delivery.py b/tests/hermes_cli/test_fact_shared_delivery.py
+new file mode 100644
+index 00000000000..5afab4a3c25
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_shared_delivery.py
+@@ -0,0 +1,155 @@
++"""Lazy store-wide workers retain per-transport reader custody."""
++import threading
++import time
++from contextvars import ContextVar
++
++import pytest
++
++from tests.waiting import wait_until
++
++from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
++from hermes_cli.fact_store import FactStore
++
++
++def test_construction_is_inert_and_eleven_transports_share_workers():
++    scope = Scope('install', 'profile')
++    store = FactStore()
++    before = set(threading.enumerate())
++    owners = [InProcessFacts(store, {scope}, demand=lambda *args: None) for _ in range(11)]
++    handle = None
++    try:
++        assert set(threading.enumerate()) == before
++        handle = owners[0].acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')}))
++        created = set(threading.enumerate()) - before
++        assert sorted(t.name for t in created) == ['fact-expiry', 'fact-local-delivery']
++        handle.close()
++        handle = None
++        owners[0].close()
++        assert all(not thread.is_alive() for thread in created)
++    finally:
++        if handle is not None:
++            handle.close()
++        for owner in owners:
++            owner.close()
++
++
++def test_active_transports_share_workers_but_keep_demands_and_close_independent():
++    store = FactStore()
++    scopes = [Scope('install', name) for name in ('first', 'second')]
++    demands = [[], []]
++    owners = [InProcessFacts(store, {scope}, demand=lambda *args, i=i: demands[i].append(args))
++              for i, scope in enumerate(scopes)]
++    handles = [owner.acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')}))
++               for owner, scope in zip(owners, scopes)]
++    delivered = [threading.Event(), threading.Event()]
++    try:
++        assert owners[0]._thread is owners[1]._thread
++        assert owners[0]._expiry is owners[1]._expiry
++        for i, handle in enumerate(handles):
++            handle.demand('board', {'owner': i})
++            handle.v1.subscribe(scopes[i], (), None, None, lambda _, i=i: delivered[i].set())
++        assert all(event.wait(3) for event in delivered)
++        assert demands == [[(scopes[i], 'board', {'owner': i})] for i in range(2)]
++        handles[0].close()
++        owners[0].close()
++        assert owners[1]._thread.is_alive()
++        assert owners[1]._expiry.thread.is_alive()
++        delivered[1].clear()
++        store.publish([Fact(FactKey(scopes[1], 'TaskFact', 'after-close'), {})])
++        assert delivered[1].wait(3)
++    finally:
++        for handle in handles:
++            handle.close()
++        for owner in owners:
++            owner.close()
++    assert not owners[1]._thread.is_alive()
++    assert not owners[1]._expiry.thread.is_alive()
++
++
++def test_expiry_and_unrelated_close_continue_while_shared_callback_is_blocked():
++    scope = Scope('install', 'profile')
++    store = FactStore()
++    owners = [InProcessFacts(store, {scope}, demand=lambda *args: None) for _ in range(2)]
++    handles = [owner.acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')}))
++               for owner in owners]
++    entered, release = threading.Event(), threading.Event()
++
++    def blocked(_):
++        entered.set()
++        assert release.wait(5)
++
++    try:
++        handles[1].v1.subscribe(scope, (), None, None, blocked)
++        assert entered.wait(3)
++        handles[0].close()
++        owners[0].close(timeout=0)
++        key = FactKey(scope, 'TaskFact', 'expiry')
++        store.publish([Fact(key, {}, health='fresh', valid_until=time.time() - 1)])
++        assert wait_until(lambda: store.snapshot(scope).get(key).health == 'stale', timeout=3)
++        assert owners[1]._thread.is_alive()
++    finally:
++        release.set()
++        for handle in handles:
++            handle.close()
++        for owner in owners:
++            owner.close()
++
++
++def test_shared_callbacks_keep_transport_context():
++    profile = ContextVar('shared-delivery-test-profile', default='unset')
++    scope = Scope('install', 'profile')
++    store = FactStore()
++    owners, handles = [], []
++    observed = []
++    done = [threading.Event(), threading.Event()]
++    try:
++        for i in range(2):
++            token = profile.set(str(i))
++            try:
++                owners.append(InProcessFacts(store, {scope}, demand=lambda *args: None))
++            finally:
++                profile.reset(token)
++            handles.append(owners[-1].acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')})))
++
++            def receive(_, i=i):
++                observed.append((i, profile.get()))
++                done[i].set()
++
++            token = profile.set(str(i))
++            try:
++                handles[-1].v1.subscribe(scope, (), None, None, receive)
++            finally:
++                profile.reset(token)
++        assert all(event.wait(3) for event in done)
++        assert sorted(observed) == [(0, '0'), (1, '1')]
++    finally:
++        for handle in handles:
++            handle.close()
++        for owner in owners:
++            owner.close()
++
++
++def test_failed_last_worker_join_retains_store_custody(monkeypatch):
++    scope = Scope('install', 'profile')
++    store = FactStore()
++    owner = InProcessFacts(store, {scope}, demand=lambda *args: None)
++    handle = owner.acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')}))
++    handle.close()
++    workers = store._local_delivery
++    dormant = InProcessFacts(store, {scope}, demand=lambda *args: None)
++    try:
++        with monkeypatch.context() as patch:
++            patch.setattr(owner._thread, 'join', lambda timeout: None)
++            patch.setattr(owner._thread, 'is_alive', lambda: True)
++            with pytest.raises(TimeoutError, match='custody retained'):
++                owner.close(timeout=0)
++            assert store._local_delivery is workers
++            assert owner in workers.owners
++            with pytest.raises(RuntimeError, match='worker unavailable'):
++                dormant.acquire(scope, lifecycle=IncrementalLifecycle({(scope, 'board')}))
++        owner.close()
++        assert store._local_delivery is None
++    finally:
++        owner.close()
++        dormant.close()
+diff --git a/tests/hermes_cli/test_fact_shared_watch.py b/tests/hermes_cli/test_fact_shared_watch.py
+new file mode 100644
+index 00000000000..8f681ebb612
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_shared_watch.py
+@@ -0,0 +1,182 @@
++"""Process-wide native watch leases retain source and callback isolation."""
++import contextvars
++import os
++import threading
++
++import pytest
++
++from hermes_constants import (
++    get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
++)
++from hermes_cli import fact_source_watch as native
++from hermes_cli.fact_source_signal import cue_path
++from hermes_cli.fact_source_watch import NativeSourceWatch
++
++
++@pytest.mark.platforms('linux')
++def test_many_profiles_share_one_native_thread_and_keep_callback_context(tmp_path):
++    profile = contextvars.ContextVar('watch_profile', default='unbound')
++    watches = []
++    hints = [threading.Event() for _ in range(11)]
++    seen = [[] for _ in hints]
++    baseline = {t.ident for t in threading.enumerate() if t.name == 'fact-native-watch'}
++    try:
++        for index, hint in enumerate(hints):
++            path = tmp_path / str(index) / 'state.db'
++            path.parent.mkdir()
++            path.write_text('bootstrap')
++            token = profile.set(str(index))
++            home_token = set_hermes_home_override(path.parent)
++            try:
++                def wake(index=index, hint=hint):
++                    seen[index].append((profile.get(), get_hermes_home()))
++                    hint.set()
++                watches.append(NativeSourceWatch((path,), wake))
++            finally:
++                reset_hermes_home_override(home_token)
++                profile.reset(token)
++        threads = [t for t in threading.enumerate()
++                   if t.name == 'fact-native-watch' and t.ident not in baseline]
++        assert len(threads) == 1
++        # No command/registration wake is allowed to become a source hint.
++        assert not any(hint.is_set() for hint in hints)
++        for index, hint in enumerate(hints):
++            (tmp_path / str(index) / 'state.db').write_text('changed')
++            assert hint.wait(5)
++            assert set(seen[index]) == {(str(index), tmp_path / str(index))}
++            # Barrier after this readiness batch, not a timing-based negative
++            # assertion: a union-path broadcast would have run siblings by now.
++            watches[index]._owner.submit(lambda: None).wait()
++            assert not any(future.is_set() for future in hints[index + 1:])
++        watches[0].close()
++        watches.pop(0)
++        hints[-1].clear()
++        (tmp_path / '10' / 'state.db').write_text('survives sibling close')
++        assert hints[-1].wait(5)
++    finally:
++        for watch in watches:
++            watch.close()
++    assert not [t for t in threading.enumerate()
++                if t.name == 'fact-native-watch' and t.ident not in baseline]
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('operation', ['replace', 'wait'])
++def test_rearm_error_is_reported_then_repaired_in_subscriber_context(
++        tmp_path, monkeypatch, operation):
++    path = tmp_path / 'source.db'
++    path.write_text('initial')
++    failed = threading.Event()
++    repaired = threading.Event()
++    armed = threading.Event()
++    original = getattr(native.FileEvents, operation)
++    watch = None
++
++    def fail_once(events, *args, **kwargs):
++        if armed.is_set() and events is watch._events:
++            armed.clear()
++            raise OSError('injected rearm failure')
++        return original(events, *args, **kwargs)
++
++    def wake():
++        try:
++            watch.check()
++        except OSError:
++            failed.set()
++        else:
++            repaired.set()
++
++    watch = NativeSourceWatch((path,), wake)
++    monkeypatch.setattr(native.FileEvents, operation, fail_once)
++    try:
++        armed.set()
++        cue_path(path).write_text('restore hint')
++        assert failed.wait(5)
++        assert repaired.wait(5)
++        watch.check()
++    finally:
++        watch.close()
++
++
++@pytest.mark.platforms('linux')
++def test_failed_close_keeps_lease_and_descriptors_for_retry(tmp_path, monkeypatch):
++    path = tmp_path / 'source.db'
++    hint = threading.Event()
++    watch = NativeSourceWatch((path,), hint.set)
++    owner = watch._owner
++    descriptor = watch._events._fd
++    original = native.FileEvents.close
++    fail = True
++
++    def close(events):
++        nonlocal fail
++        if events is watch._events and fail:
++            fail = False
++            raise OSError('injected close failure')
++        return original(events)
++
++    monkeypatch.setattr(native.FileEvents, 'close', close)
++    try:
++        with pytest.raises(OSError, match='injected close failure'):
++            watch.close()
++        os.fstat(descriptor)
++        assert native._shared is owner
++        path.write_text('still covered')
++        assert hint.wait(5)
++    finally:
++        watch.close()
++    assert not owner._thread.is_alive()
++    assert native._shared is None
++
++
++@pytest.mark.platforms('linux')
++def test_failed_initial_registration_releases_empty_process_owner(tmp_path, monkeypatch):
++    def fail(*args, **kwargs):
++        raise OSError('injected registration failure')
++
++    with monkeypatch.context() as patch:
++        patch.setattr(native.FileEvents, 'replace', fail)
++        with pytest.raises(OSError, match='injected registration failure'):
++            NativeSourceWatch((tmp_path / 'source.db',), lambda: None)
++    assert native._shared is None
++    watch = NativeSourceWatch((tmp_path / 'source.db',), lambda: None)
++    watch.close()
++
++
++@pytest.mark.platforms('linux')
++def test_join_timeout_retains_owner_and_close_can_retry(tmp_path, monkeypatch):
++    watch = NativeSourceWatch((tmp_path / 'source.db',), lambda: None)
++    owner = watch._owner
++    original = owner._thread.is_alive
++    calls = 0
++
++    def alive():
++        nonlocal calls
++        calls += 1
++        return True if calls == 1 else original()
++
++    monkeypatch.setattr(owner._thread, 'is_alive', alive)
++    try:
++        with pytest.raises(TimeoutError, match='descriptors retained'):
++            watch.close()
++        assert native._shared is owner
++    finally:
++        watch.close()
++    assert native._shared is None
++
++
++@pytest.mark.platforms('linux')
++def test_directory_and_sqlite_sidecar_hints_are_armed_before_return(tmp_path):
++    directory = tmp_path / 'children'
++    directory.mkdir()
++    path = tmp_path / 'source.db'
++    hint = threading.Event()
++    watch = NativeSourceWatch((path,), hint.set, directories=(directory,))
++    try:
++        (directory / 'new-child').write_text('created immediately')
++        assert hint.wait(5)
++        hint.clear()
++        (tmp_path / 'source.db-wal').write_text('commit')
++        assert hint.wait(5)
++    finally:
++        watch.close()
+-- 
+2.43.0
+

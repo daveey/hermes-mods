@@ -1,0 +1,410 @@
+From f1642c1f0733de5fc50df2316ff9e8db52ed4793 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:21:48 +0000
+Subject: [PATCH 6026] Kanban dispatcher: bounded storage waits and typed verdicts
+
+Public mirror of source commit f1642c1f0733de5fc50df2316ff9e8db52ed4793.
+
+---
+diff --git a/gateway/kanban_watchers_dispatcher.py b/gateway/kanban_watchers_dispatcher.py
+index 2886d13d12f..0eb763ab158 100644
+--- a/gateway/kanban_watchers_dispatcher.py
++++ b/gateway/kanban_watchers_dispatcher.py
+@@ -239,7 +239,8 @@
+                 conn = _kbc().connect(board=slug)
+                 profiles, lanes = self._receipt_scope()
+                 result = _kbd().dispatch_once(conn, board=slug, **kwargs)
+-                if not result.skipped_locked and result.scheduling_admitted:
++                if (not result.skipped_locked and not getattr(result, "storage_skip_reason", None)
++                        and result.scheduling_admitted):
+                     after_profiles, after_lanes = self._receipt_scope()
+                     path = conn.execute("PRAGMA database_list").fetchone()[2]
+                     if path:
+@@ -322,7 +323,7 @@
+         quarantined or lock-skipped board counts as a skip. [daveey]"""
+         with _la.pass_(f"dispatcher.board/{slug}") as acct:
+             result = self.tick_once_for_board(slug, **kwargs)
+-            if result is None or getattr(result, "skipped_locked", False):
++            if result is None or getattr(result, "skipped_locked", False) or getattr(result, "storage_skip_reason", None):
+                 acct.skip()
+             return result
+ 
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index d1eb251c965..91faf1461bc 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1645,6 +1645,9 @@
+ 
+ 
+ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
++    from hermes_cli.kanban_dispatch_storage import execute_boundary
++    if execute_boundary(conn, sql):
++        return
+     for attempt in range(_BUSY_MAX_RETRIES + 1):
+         try:
+             conn.execute(sql)
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index ed87b36d921..08c1a5f1185 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -243,6 +243,7 @@
+     """Task ids whose workers bailed on a provider rate-limit / quota wall
+     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
+     a failure — a long quota window must never trip the circuit breaker."""
++    storage_skip_reason: Optional[str] = None  # bounded SQLite wait exhausted; not the dispatch flock
+     skipped_locked: bool = False
+     """True when another process held the board's dispatch lock: this tick did
+     no DB writes; this alone does not establish the lock holder's progress."""
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 574cd710732..4c5d43322ca 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -30,7 +30,7 @@
+     "llm_paced",
+     "auto_blocked", "respawn_guarded", "no_progress_held", "clock_held", "rate_limited",  # holds / guards
+     "crashed", "timed_out", "stale", "reclaimed", "reconciled_orphans", "released_leftover_claims",
+-    "ownership_error",                                    # worker or claim failures
++    "storage_skip_reason", "ownership_error",             # storage, worker or claim failures
+     "at_capacity", "memory_pressure", "core_update_drain_hold",  # caps and host-wide holds
+ })
+ 
+@@ -78,6 +78,9 @@
+             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+         if getattr(res, "quiet_deferred", None):
+             counts["quiet_claim"] = counts.get("quiet_claim", 0) + len(res.quiet_deferred)
++        storage_skip = getattr(res, "storage_skip_reason", None)
++        if storage_skip:
++            counts[storage_skip] = counts.get(storage_skip, 0) + 1
+         if res.skipped_locked:
+             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+         if res.skipped_owned:
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index b1ee3ac4430..a1479487294 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -142,24 +142,31 @@
+             return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+         if owner is not None and dispatcher_id != owner:
+             return DispatchResult(skipped_owned=True, dispatch_owner=owner)
+-        if not dry_run:
+-            from hermes_cli.kanban_model_retirement import sweep as retire_model_policy
+-            retire_model_policy(conn)
+-        from hermes_cli import kanban_ratio_routing as ratio
+-        try:
+-            ratio.begin_tick(conn)  # ratio routing re-reads this board's start counts once per tick
+-        except Exception:  # health: allow BLE001 -- a memo fault must not stop the tick; ratio routing fails open
+-            ratio.off_this_tick()
+-            logging.getLogger(__name__).warning("kanban dispatch: ratio routing tick start failed; default cards keep "
+-                                                "today's route this tick", exc_info=True)
+-        result = tick()
++        from hermes_cli.kanban_dispatch_storage import run
++        result = run(conn, lambda: _tick_work(conn, tick, dry_run), board=board)
+         result.dispatch_owner = owner
++        if result.storage_skip_reason:
++            return result  # observers/checkpoints must not re-enter the contended writer
+         kbc._maybe_checkpoint_wal(conn, db_path)
+     # Denied ticks deliberately don't invoke observers, which may mutate state.
+     kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+     return result
+ 
+ 
++def _tick_work(conn, tick, dry_run):
++    if not dry_run:
++        from hermes_cli.kanban_model_retirement import sweep as retire_model_policy
++        retire_model_policy(conn)
++    from hermes_cli import kanban_ratio_routing as ratio
++    try:
++        ratio.begin_tick(conn)  # ratio routing re-reads this board's start counts once per tick
++    except Exception:  # health: allow BLE001 -- a memo fault must not stop the tick; ratio routing fails open
++        ratio.off_this_tick()
++        logging.getLogger(__name__).warning("kanban dispatch: ratio routing tick start failed; default cards keep "
++                                            "today's route this tick", exc_info=True)
++    return tick()
++
++
+ def set_dispatch_owner(db_path: Path, owner: str | None) -> str | None:
+     """Operator API: set exact slug, or explicitly clear with None.
+ 
+diff --git a/hermes_cli/kanban_dispatch_storage.py b/hermes_cli/kanban_dispatch_storage.py
+new file mode 100644
+index 00000000000..652396a181b
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_storage.py
+@@ -0,0 +1,79 @@
++"""Bound dispatcher SQLite lock waits without changing ordinary writer retry policy. [daveey]"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++import logging
++import sqlite3
++import time
++
++WRITE_WAIT_SECONDS = 1.0
++REASON = "storage_write_contended"
++_active: ContextVar[_Budget | None] = ContextVar("kanban_dispatch_write_budget", default=None)
++_clock = time.monotonic
++
++
++class DispatchWriteContended(sqlite3.OperationalError):
++    """A dispatcher exhausted its SQLite lock-wait allowance; retry next pass."""
++
++
++@dataclass
++class _Budget:
++    conn: sqlite3.Connection
++    deadline: float
++    timeout_ms: int
++    contended: bool = False
++
++    def execute(self, sql):
++        # No waiting after the deadline, but uncontended work still succeeds.
++        remaining_ms = max(0, int((self.deadline - _clock()) * 1000))
++        self.conn.execute(f"PRAGMA busy_timeout = {min(self.timeout_ms, remaining_ms)}")
++        try:
++            self.conn.execute(sql)
++        except sqlite3.OperationalError as exc:
++            from hermes_cli.kanban_db_connect import _is_busy_error
++            if not _is_busy_error(exc):
++                raise
++            self.contended = True
++            raise DispatchWriteContended(REASON) from exc
++
++
++def execute_boundary(conn, sql) -> bool:
++    """True when a dispatch-scoped boundary was handled; ordinary writers are unchanged."""
++    budget = _active.get()
++    if budget is None or budget.conn is not conn:
++        return False
++    budget.execute(sql)
++    return True
++
++
++@contextmanager
++def _budget(conn):
++    previous = conn.execute("PRAGMA busy_timeout").fetchone()[0]
++    budget = _Budget(conn, _clock() + WRITE_WAIT_SECONDS, previous)
++    token = _active.set(budget)
++    try:
++        conn.execute(f"PRAGMA busy_timeout = {min(previous, int(WRITE_WAIT_SECONDS * 1000))}")
++        yield budget
++    finally:
++        _active.reset(token)
++        conn.execute(f"PRAGMA busy_timeout = {previous}")
++
++
++def run(conn, work, *, board):
++    """Record a typed pass skip outside the contended board database, never retry its body."""
++    from hermes_cli.kanban_db_dispatch import DispatchResult
++    with _budget(conn) as budget:
++        try:
++            result = work()
++        except sqlite3.OperationalError as exc:
++            from hermes_cli.kanban_db_connect import _is_busy_error
++            if not isinstance(exc, DispatchWriteContended) and not _is_busy_error(exc):
++                raise
++            budget.contended = True
++            result = DispatchResult()
++        if budget.contended:
++            result.storage_skip_reason = REASON
++            logging.getLogger(__name__).warning("kanban dispatch skipped: reason=%s board=%s", REASON, board)
++    return result
+diff --git a/tests/hermes_cli/test_kanban_dispatch_write_contention.py b/tests/hermes_cli/test_kanban_dispatch_write_contention.py
+new file mode 100644
+index 00000000000..4c8a079db0d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_write_contention.py
+@@ -0,0 +1,189 @@
++"""A SQLite writer must not monopolize the per-board dispatcher pass."""
++from contextlib import closing
++import sqlite3
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_owner as owner
++from hermes_cli.kanban_db_dispatch import DispatchResult
++
++
++@pytest.mark.parametrize("entry", ["write_txn", "direct", "maintenance", "swallowed"])
++def test_contending_writer_returns_recorded_skip_before_writer_releases(tmp_path, monkeypatch, caplog, entry):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
++    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
++    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
++    from hermes_cli import kanban_model_retirement, kanban_ratio_routing
++    monkeypatch.setattr(kanban_model_retirement, "sweep", lambda conn: None)
++    monkeypatch.setattr(kanban_ratio_routing, "begin_tick", lambda conn: None)
++    path = home / "kanban.db"
++    acquired, release = threading.Event(), threading.Event()
++    failures = []
++
++    def writer():
++        try:
++            with closing(sqlite3.connect(path)) as blocker:
++                blocker.execute("BEGIN IMMEDIATE")
++                acquired.set()
++                release.wait(3)
++                blocker.rollback()
++        except sqlite3.Error as exc:
++            failures.append(exc)
++            acquired.set()
++
++    with closing(kbc.connect(path)) as conn:
++        conn.execute("CREATE TABLE contention_probe (value INTEGER)")
++        original_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
++        worker = threading.Thread(target=writer)
++        worker.start()
++        try:
++            assert acquired.wait(5)
++            assert not failures
++
++            def write():
++                if entry == "direct":
++                    conn.execute("BEGIN IMMEDIATE")
++                    conn.execute("INSERT INTO contention_probe VALUES (1)")
++                    conn.commit()
++                else:
++                    with kb.write_txn(conn):
++                        conn.execute("INSERT INTO contention_probe VALUES (1)")
++
++            def tick():
++                if entry == "swallowed":
++                    try:
++                        write()
++                    except sqlite3.OperationalError:
++                        pass
++                else:
++                    write()
++                return DispatchResult()
++
++            if entry == "maintenance":
++                monkeypatch.setattr(kanban_model_retirement, "sweep", lambda conn: write())
++                callback = lambda: DispatchResult()
++            else:
++                callback = tick
++            started = time.monotonic()
++            result = owner.run_owned_tick(conn, callback, None, "default", False)
++            elapsed = time.monotonic() - started
++            assert getattr(result, "storage_skip_reason", None) == "storage_write_contended"
++            assert elapsed < 2
++            assert "reason=storage_write_contended" in caplog.text
++            assert not conn.in_transaction
++            assert conn.execute("SELECT count(*) FROM contention_probe").fetchone()[0] == 0
++            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == original_timeout
++        finally:
++            release.set()
++            worker.join(5)
++        assert not worker.is_alive()
++        assert not failures
++        # The dispatcher lock and SQLite connection remain usable on the next pass.
++        monkeypatch.setattr(kanban_model_retirement, "sweep", lambda conn: None)
++        result = owner.run_owned_tick(conn, tick, None, "default", False)
++        assert not result.skipped_locked
++        assert conn.execute("SELECT count(*) FROM contention_probe").fetchone()[0] == 1
++
++
++def test_nonbusy_errors_propagate_and_restore_timeout():
++    from hermes_cli import kanban_dispatch_storage as storage
++    with closing(sqlite3.connect(":memory:")) as conn:
++        conn.execute("PRAGMA busy_timeout = 4321")
++        def work():
++            kbc._execute_boundary_with_retry(conn, "NOT SQL")
++        with pytest.raises(sqlite3.OperationalError, match="syntax error"):
++            storage.run(conn, work, board="sample")
++        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 4321
++        assert storage.execute_boundary(conn, "SELECT 1") is False
++
++
++def test_shared_deadline_expires_but_uncontended_work_still_commits(monkeypatch):
++    from hermes_cli import kanban_dispatch_storage as storage
++    now = [100.0]
++    monkeypatch.setattr(storage, "_clock", lambda: now[0])
++    with closing(sqlite3.connect(":memory:", isolation_level=None)) as conn:
++        conn.execute("CREATE TABLE example (value INTEGER)")
++        def work():
++            now[0] += storage.WRITE_WAIT_SECONDS + 1
++            kbc._execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
++            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 0
++            conn.execute("INSERT INTO example VALUES (1)")
++            kbc._execute_boundary_with_retry(conn, "COMMIT")
++            return DispatchResult()
++        result = storage.run(conn, work, board="sample")
++        assert result.storage_skip_reason is None
++        assert conn.execute("SELECT count(*) FROM example").fetchone()[0] == 1
++
++
++def test_ordinary_writer_keeps_retry_policy(monkeypatch):
++    calls = []
++    class Connection:
++        def execute(self, sql):
++            calls.append(sql)
++            if len(calls) == 1:
++                raise sqlite3.OperationalError("database is locked")
++    monkeypatch.setattr(kbc.time, "sleep", lambda seconds: None)
++    kbc._execute_boundary_with_retry(Connection(), "BEGIN IMMEDIATE")
++    assert calls == ["BEGIN IMMEDIATE", "BEGIN IMMEDIATE"]
++
++
++def test_other_connection_is_not_dispatch_scoped():
++    from hermes_cli import kanban_dispatch_storage as storage
++    with closing(sqlite3.connect(":memory:")) as conn, closing(sqlite3.connect(":memory:")) as other:
++        def work():
++            assert storage.execute_boundary(other, "SELECT 1") is False
++            return DispatchResult()
++        storage.run(conn, work, board="sample")
++
++
++def test_commit_contention_rolls_back_without_replaying_body(tmp_path, monkeypatch):
++    from hermes_cli import kanban_dispatch_storage as storage
++    monkeypatch.setattr(storage, "WRITE_WAIT_SECONDS", 0.05)
++    path = tmp_path / "commit-contention.db"
++    with closing(sqlite3.connect(path, isolation_level=None)) as conn:
++        conn.execute("PRAGMA journal_mode = DELETE")
++        conn.execute("CREATE TABLE example (value INTEGER)")
++        with closing(sqlite3.connect(path, isolation_level=None)) as reader:
++            reader.execute("BEGIN")
++            reader.execute("SELECT * FROM example").fetchall()
++            bodies = []
++            def work():
++                with kb.write_txn(conn):
++                    bodies.append(True)
++                    conn.execute("INSERT INTO example VALUES (1)")
++                return DispatchResult()
++            try:
++                result = storage.run(conn, work, board="sample")
++                assert result.storage_skip_reason == storage.REASON
++                assert bodies == [True]
++                assert not conn.in_transaction
++                assert conn.execute("SELECT count(*) FROM example").fetchone()[0] == 0
++            finally:
++                reader.rollback()
++
++
++def test_storage_skip_is_named_in_dispatch_suppression():
++    from hermes_cli.kanban_db_dispatch_stuck import describe_suppression
++    result = DispatchResult(storage_skip_reason="storage_write_contended")
++    assert "storage_write_contended=1" in describe_suppression([result])
++
++
++def test_gateway_storage_skip_counts_as_skipped_pass(monkeypatch):
++    from contextlib import contextmanager
++    from types import SimpleNamespace
++    from gateway import kanban_watchers_dispatcher as watcher
++    skips = []
++    @contextmanager
++    def accounting(name):
++        yield SimpleNamespace(skip=lambda: skips.append(name))
++    monkeypatch.setattr(watcher._la, "pass_", accounting)
++    result = DispatchResult(storage_skip_reason="storage_write_contended")
++    dispatcher = SimpleNamespace(tick_once_for_board=lambda slug: result)
++    assert watcher._KanbanDispatcher._board_pass(dispatcher, "sample") is result
++    assert skips == ["dispatcher.board/sample"]
+-- 
+2.43.0
+

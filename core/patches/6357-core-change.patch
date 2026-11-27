@@ -1,0 +1,164 @@
+From 824edb64d7c17a0f703007e002cbb0d580e68a88 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:44:47 +0000
+Subject: [PATCH 6357] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit 824edb64d7c17a0f703007e002cbb0d580e68a88.
+
+---
+diff --git a/tests/tui_gateway/state_revision_mutex_probe.py b/tests/tui_gateway/state_revision_mutex_probe.py
+new file mode 100644
+index 00000000000..7770bf8741e
+--- /dev/null
++++ b/tests/tui_gateway/state_revision_mutex_probe.py
+@@ -0,0 +1,48 @@
++"""Exercise the real notification revision reader on the affected native runtime."""
++import faulthandler
++import sqlite3
++import sys
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++
++sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
++from tui_gateway.notification_idle import state_revision
++from tui_gateway import kanban_replica_observer
++
++faulthandler.dump_traceback_later(5, exit=True)
++print('RUNTIME', sys.version, sqlite3.sqlite_version, flush=True)
++conn = sqlite3.connect(':memory:', check_same_thread=False)
++lock = threading.Lock()
++entered = threading.Event()
++errors = []
++
++def authorize(*args):
++    if not entered.is_set():
++        entered.set()
++        threading.Event().wait(.5)
++    return sqlite3.SQLITE_OK
++
++conn.set_authorizer(authorize)
++
++def write():
++    try:
++        with lock:
++            conn.execute('CREATE TABLE evidence(value)')
++    except BaseException as exc:
++        errors.append(exc)
++
++thread = threading.Thread(target=write)
++thread.start()
++assert entered.wait(2)
++db = SimpleNamespace(db_path=Path('unused.db'), _lock=lock, _conn=conn)
++kanban_replica_observer.fingerprint = lambda path: 'committed-revision'
++print('REVISION_START', flush=True)
++assert state_revision(db) is None
++thread.join(2)
++assert not thread.is_alive()
++assert not errors, errors
++assert state_revision(db) == 'committed-revision'
++conn.close()
++faulthandler.cancel_dump_traceback_later()
++print('REVISION_FINISHED writer completed; idle revision observed', flush=True)
+diff --git a/tests/tui_gateway/test_notify_state_revision_mutex.py b/tests/tui_gateway/test_notify_state_revision_mutex.py
+new file mode 100644
+index 00000000000..1cd44505a1d
+--- /dev/null
++++ b/tests/tui_gateway/test_notify_state_revision_mutex.py
+@@ -0,0 +1,67 @@
++"""Transaction-state properties belong to SessionDB's writer critical section."""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from tui_gateway import notification_idle as idle
++from tui_gateway import kanban_replica_observer as observer
++
++
++def test_busy_writer_never_inspects_sqlite_connection(tmp_path, monkeypatch):
++    class BusyWriter:
++        @property
++        def in_transaction(self):
++            pytest.fail("poller entered SQLite while its writer mutex was owned")
++
++    lock = threading.Lock()
++    db = SimpleNamespace(db_path=tmp_path / "state.db", _conn=BusyWriter(), _lock=lock)
++    monkeypatch.setattr(observer, "fingerprint", lambda path: pytest.fail("busy writer cannot prove a revision"))
++    lock.acquire()
++    try:
++        assert idle.state_revision(db) is None
++    finally:
++        lock.release()
++
++
++@pytest.mark.parametrize("active", [False, True])
++def test_transaction_property_is_serialized_and_lock_is_released(tmp_path, monkeypatch, active):
++    lock = threading.Lock()
++    class Writer:
++        @property
++        def in_transaction(self):
++            assert lock.locked(), "SQLite properties need the same lock as writes"
++            return active
++
++    db = SimpleNamespace(db_path=tmp_path / "state.db", _conn=Writer(), _lock=lock)
++    stamp = object()
++    monkeypatch.setattr(observer, "fingerprint", lambda path: stamp)
++    assert idle.state_revision(db) is (None if active else stamp)
++    assert not lock.locked()
++
++
++def test_native_authorizer_race_completes_in_subprocess():
++    import subprocess
++    import sys
++    from pathlib import Path
++
++    here = Path(__file__).resolve()
++    result = subprocess.run(
++        [sys.executable, str(here.with_name("state_revision_mutex_probe.py")), str(here.parents[2])],
++        capture_output=True, text=True, timeout=10, check=False,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert "REVISION_FINISHED writer completed; idle revision observed" in result.stdout
++
++
++def test_property_error_releases_writer_lock(tmp_path):
++    lock = threading.Lock()
++    class ClosedWriter:
++        @property
++        def in_transaction(self):
++            raise RuntimeError("closed during test")
++
++    db = SimpleNamespace(db_path=tmp_path / "state.db", _conn=ClosedWriter(), _lock=lock)
++    with pytest.raises(RuntimeError, match="closed during test"):
++        idle.state_revision(db)
++    assert not lock.locked()
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index 350ff4e829f..8ba762c6439 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -154,9 +154,18 @@
+     from tui_gateway.kanban_replica_observer import fingerprint
+ 
+     path = getattr(db, "db_path", None)
+-    writer = getattr(db, "_conn", None)
+-    if path is None or (writer is not None and writer.in_transaction):
+-        return None
++    lock = getattr(db, "_lock", None)
++    if path is None or lock is None or not lock.acquire(blocking=False):
++        return None  # a busy/unknown writer cannot prove committed absence
++    try:
++        writer = getattr(db, "_conn", None)
++        # SQLite 3.54 locks sqlite3_get_autocommit; CPython's in_transaction
++        # getter retains the GIL. Racing a write with a Python authorizer can
++        # invert GIL/connection-mutex ownership. Properties need the writer lock too.
++        if writer is not None and writer.in_transaction:
++            return None
++    finally:
++        lock.release()
+     return fingerprint(path)
+ 
+ 
+-- 
+2.43.0
+

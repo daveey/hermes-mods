@@ -1,0 +1,142 @@
+From 8e8667261fbe250db53a5f240ba6594aa3b0df89 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 05:21:51 +0000
+Subject: [PATCH 6429] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 8e8667261fbe250db53a5f240ba6594aa3b0df89.
+
+---
+diff --git a/hermes_cli/kanban_decided_triage.py b/hermes_cli/kanban_decided_triage.py
+index 3715c736734..d3b7fcd3c78 100644
+--- a/hermes_cli/kanban_decided_triage.py
++++ b/hermes_cli/kanban_decided_triage.py
+@@ -80,22 +80,26 @@
+     repaired = []
+     rows = conn.execute("SELECT id FROM tasks WHERE status='triage'").fetchall()
+     for tid, in rows:
+-        observed = _recorded(conn, tid)
+-        if observed is None:
+-            continue
+-        with kb.write_txn(conn):
+-            if _recorded(conn, tid) != observed:
++        try:
++            observed = _recorded(conn, tid)
++            if observed is None:
+                 continue
+-            parents = [pid for pid, status in kb.parent_states(conn, tid) if status not in ('done', 'archived')]
+-            window = ({'spend_budget': budget.card_limits(conn, tid, budget.limits())._asdict()}
+-                      if budget.limit_window(conn, tid) == 'next_promote' else {})
+-            # Same decision boundary as release._decide, with placement in the
+-            # same transaction so an open dependency cannot leave triage stuck.
+-            kb._append_event(conn, tid, 'promoted_manual', {
+-                'actor': 'kanban-decided-triage', 'reason': 'Finish already recorded stop decision',
+-                'from_status': 'triage', 'episode': observed[0], 'decision_event': observed[1],
+-                'waiting_on_parents': parents, **window})
+-            conn.execute("UPDATE tasks SET status=? WHERE id=? AND status='triage'",
+-                         ('todo' if parents else 'ready', tid))
++            with kb.write_txn(conn):
++                if _recorded(conn, tid) != observed:
++                    continue
++                parents = [pid for pid, status in kb.parent_states(conn, tid) if status not in ('done', 'archived')]
++                window = ({'spend_budget': budget.card_limits(conn, tid, budget.limits())._asdict()}
++                          if budget.limit_window(conn, tid) == 'next_promote' else {})
++                # Same decision boundary as release._decide, with placement in the
++                # same transaction so an open dependency cannot leave triage stuck.
++                kb._append_event(conn, tid, 'promoted_manual', {
++                    'actor': 'kanban-decided-triage', 'reason': 'Finish already recorded stop decision',
++                    'from_status': 'triage', 'episode': observed[0], 'decision_event': observed[1],
++                    'waiting_on_parents': parents, **window})
++                conn.execute("UPDATE tasks SET status=? WHERE id=? AND status='triage'",
++                             ('todo' if parents else 'ready', tid))
+             repaired.append(tid)
++        except Exception:  # health: allow BLE001 -- per-card maintenance boundary; rollback retains hold and siblings proceed
++            import logging
++            logging.getLogger(__name__).exception('decided triage repair failed for %s; hold retained', tid)
+     return repaired
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index c45a02c1c92..8f23b91e920 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -138,6 +138,10 @@
+             payload = json.loads(event['payload'] or '{}')
+         except (TypeError, ValueError):
+             continue
++        # A malformed cause cannot be interpreted as an ordinary budget stop:
++        # callers must retain the hold rather than infer permission to release.
++        if isinstance(payload, dict) and payload.get('cause') is not None and not isinstance(payload['cause'], str):
++            raise ValueError('Malformed spend stop cause')
+         if (renewal.key(event) in renewed and isinstance(payload, dict) and (
+                 payload.get('superseded_by_safety_stop') is not True if event['id'] in receipts
+                 else payload.get('cause') == 'scope_stopped')):
+diff --git a/tests/hermes_cli/test_kanban_decided_triage.py b/tests/hermes_cli/test_kanban_decided_triage.py
+index 89ed7a12e84..174a74d7df3 100644
+--- a/tests/hermes_cli/test_kanban_decided_triage.py
++++ b/tests/hermes_cli/test_kanban_decided_triage.py
+@@ -110,6 +110,64 @@
+         assert not decision.pending(conn, tid)
+ 
+ 
++@pytest.mark.parametrize('cause', [[], {}, ['scope_stopped'], {'safety_refusal': True}],
++                         ids=['list', 'dict', 'nested-scope', 'nested-safety'])
++def test_malformed_cause_retains_hold_and_sweeps_healthy_neighbor(kanban_home, cause):
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++    with connect.connect_closing() as conn:
++        bad = stopped(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, bad, 'spend_budget_triaged', {'cause': cause})
++        good = stopped(conn)
++        authorize(conn, good)
++        assert sweep_stale_triage(conn, older_than=999999) == []
++        assert kb.get_task(conn, bad).status == 'triage'
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual'",
++                                (bad,)).fetchone()
++        assert kb.get_task(conn, good).status == 'ready'
++        assert not decision.pending(conn, good)
++        with pytest.raises(ValueError, match='cause'):
++            decision.pending_episode(conn, bad)
++
++
++@pytest.mark.parametrize('failure', ['observation', 'revalidation', 'write'])
++def test_card_failure_does_not_abort_healthy_neighbor(kanban_home, monkeypatch, caplog, failure):
++    from hermes_cli import kanban_decided_triage as maintenance
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++    with connect.connect_closing() as conn:
++        bad = stopped(conn)
++        good = stopped(conn)
++        for tid in (bad, good):
++            authorize(conn, tid)
++        original_read, original_append = maintenance._recorded, kb._append_event
++        reads = []
++
++        def read(c, tid):
++            if tid == bad:
++                reads.append(tid)
++                if failure == 'observation' or (failure == 'revalidation' and len(reads) == 2):
++                    raise RuntimeError('Injected per-card read failure')
++            return original_read(c, tid)
++
++        def append(c, tid, kind, payload, **kw):
++            result = original_append(c, tid, kind, payload, **kw)
++            if tid == bad and kind == 'promoted_manual' and failure == 'write':
++                raise RuntimeError('Injected per-card write failure')
++            return result
++
++        monkeypatch.setattr(maintenance, '_recorded', read)
++        monkeypatch.setattr(kb, '_append_event', append)
++        assert sweep_stale_triage(conn, older_than=999999) == []
++        assert kb.get_task(conn, bad).status == 'triage'
++        assert decision.pending(conn, bad)
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual'",
++                                (bad,)).fetchone()
++        assert kb.get_task(conn, good).status == 'ready'
++        assert not decision.pending(conn, good)
++        assert bad in caplog.text
++        assert not conn.in_transaction
++
++
+ def test_writer_rechecks_independent_hold(kanban_home, monkeypatch):
+     from contextlib import contextmanager
+     with connect.connect_closing() as conn:
+-- 
+2.43.0
+

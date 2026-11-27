@@ -1,0 +1,148 @@
+From 35f247b28c37e5da1261d77827f0d1707c4d662b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:49:36 -0800
+Subject: [PATCH 6500] Release mandate and typed stop recovery
+
+Public mirror of source commit 35f247b28c37e5da1261d77827f0d1707c4d662b.
+
+---
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 9a4ca0eb19d..afbb88f680e 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -311,18 +311,30 @@
+             or commented.get("recorded_decision") is not None)
+ 
+ 
+-def _unread_human(conn: sqlite3.Connection, tid: str, stop: dict, seen: Optional[int]) -> list[int]:
+-    """Ids of comments a person wrote (or a chat relayed for one) after the stop, newer than ``seen``."""
++def _unread_human(conn: sqlite3.Connection, tid: str, stop: dict, seen: Optional[int]) -> list[Optional[int]]:
++    """Local ids of comments a person wrote (or a chat relayed for one) after the stop, newer than ``seen``; None
++    for one whose text has not synced here (it can never be acknowledged; ``_unread_items``). A synced comment
++    binds by ``comment_uid``: its ``comment_id`` is the writer board's local id, which may be absent here or name
++    another comment. ``comment_id`` binds only an event with no uid to a local comment that has none."""
+     from hermes_cli.kanban_sync_divergence import _event_order
++    synced = "uid" in {r[1] for r in conn.execute("PRAGMA table_info(task_comments)")}
++    local = {int(r[0]): (r[1] if synced else None) for r in conn.execute(
++        f"SELECT id, {'uid' if synced else 'NULL'} FROM task_comments WHERE task_id=?", (tid,))}
++    by_uid = {uid: cid for cid, uid in local.items() if uid}
+     after, out = _event_order(stop), []
+     for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='commented'", (tid,)):
+         event = dict(row)
+         p = _payload(event["payload"])
+-        cid = p.get("comment_id")
+-        if (by_person(p) and _event_order(event) > after
+-                and isinstance(cid, int) and cid > (seen or 0)):
++        if not by_person(p) or _event_order(event) <= after:
++            continue
++        uid, cid = p.get("comment_uid"), p.get("comment_id")
++        if uid:
++            cid = by_uid.get(uid)
++        elif not (isinstance(cid, int) and cid in local and not local[cid]):
++            cid = None
++        if cid is None or cid > (seen or 0):
+             out.append(cid)
+-    return sorted(out)
++    return sorted(out, key=lambda c: (c is None, c or 0))
+ 
+ 
+ def _existing_mandate(conn: sqlite3.Connection, tid: str, stop: dict, body: str, kind: str,
+@@ -450,7 +462,11 @@
+     # id and never stands for, or collides with, a comment id.
+     items: dict = {(item.get("kind", "comment"), item["id"]): dict(item) for item in extra}
+     for cid in _unread_human(conn, tid, stop, None):
+-        row = conn.execute("SELECT author, created_at, body FROM task_comments WHERE id=?", (cid,)).fetchone()
++        if cid is None:  # a person's comment whose text has not synced here
++            items[("comment", None)] = {"id": None, "who": "(human)", "time": "", "body": "(not synced here yet)"}
++            continue
++        row = conn.execute("SELECT author, created_at, body FROM task_comments WHERE id=? AND task_id=?",
++                           (cid, tid)).fetchone()
+         if row is not None:
+             items[("comment", cid)] = {"id": cid, "who": f"{row[0]} (human)", "body": str(row[2] or "")[:600],
+                           "time": datetime.fromtimestamp(int(row[1] or 0), UTC).isoformat()}
+@@ -679,7 +695,9 @@
+             return f"{s.tid} changed during the release"
+         if kind != "human":
+             if people := _unread_human(c, s.tid, s.stop, s.seen):
+-                return f"a human commented on {s.tid} during the release (comment {people[-1]})"
++                last = max((c for c in people if c is not None), default=None)
++                return (f"a human commented on {s.tid} during the release "
++                        f"({f'comment {last}' if last is not None else 'a comment not synced here yet'})")
+             unread.check(c, s.tid, session=session, seen=s.seen, verb="release", board=s.board)
+         kb._append_event(c, s.tid, RELEASED, record)
+         return None
+diff --git a/tests/hermes_cli/test_kanban_worker_stop_rules.py b/tests/hermes_cli/test_kanban_worker_stop_rules.py
+index 5aa588ddc66..c9ad2e9a0f0 100644
+--- a/tests/hermes_cli/test_kanban_worker_stop_rules.py
++++ b/tests/hermes_cli/test_kanban_worker_stop_rules.py
+@@ -365,3 +365,67 @@
+     assert release.by_person({'writer_kind': 'human'}) and release.by_person({'recorded_decision': {}})
+     assert release.by_person({'writer_kind': 'agent', 'relayed_human': {'session': 's'}})
+     assert not release.by_person({}) and not release.by_person({'writer_kind': 'agent'})
++
++
++# --- follow-up 2: unread human comments bind by uid; ordinary prompts stay plain ----------------------------
++
++
++def _synced(board):
++    from hermes_cli import kanban_db_sync as sync
++    sync.apply_sync_schema_steps(board)
++    board.commit()
++
++
++def _remote_human(board, tid, uid, comment_id):
++    """The ``commented`` event a synced human comment brings: its uid, and the writer board's local id."""
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'commented', {'author': 'david', 'comment_id': comment_id, 'comment_uid': uid,
++                                                   'writer_kind': 'human'})
++
++
++def _stop(board, tid):
++    return release._newest_stop(board, tid)
++
++
++def test_a_synced_human_comment_not_here_yet_is_unread_and_unacknowledgeable(board, monkeypatch):
++    _no_worker_env(monkeypatch)
++    _synced(board)
++    tid = rel.spend_stopped(board)
++    _remote_human(board, tid, 'remote-comment-uid', 987654)
++    assert release._unread_human(board, tid, _stop(board, tid), None) == [None]
++    items = release._unread_items(board, tid, _stop(board, tid), ('agent', 's', 'x'), None)
++    assert any(i['id'] is None and 'not synced' in i['body'] for i in items)
++
++
++def test_a_synced_comment_id_that_collides_with_a_local_comment_is_not_that_comment(board, monkeypatch):
++    _no_worker_env(monkeypatch)
++    _synced(board)
++    tid = rel.spend_stopped(board)
++    other = kb.add_comment(board, tid, 'default', 'Unrelated agent note.', writer_kind='agent', writer_session='s')
++    _remote_human(board, tid, 'remote-comment-uid', other)  # the writer board's local id equals ours by chance
++    assert release._unread_human(board, tid, _stop(board, tid), None) == [None]
++    items = release._unread_items(board, tid, _stop(board, tid), ('agent', 's', 'x'), None)
++    assert not any('Unrelated agent note.' in i['body'] for i in items)
++
++
++def test_a_synced_human_comment_that_arrived_binds_to_its_local_id(board, monkeypatch):
++    _no_worker_env(monkeypatch)
++    _synced(board)
++    tid = rel.spend_stopped(board)
++    with kb.write_txn(board):  # as received from another board: the uid binds, the foreign comment_id does not
++        here = board.execute("INSERT INTO task_comments (task_id, author, body, created_at, uid) "
++                             "VALUES (?,?,?,?,?)", (tid, 'david', 'Stop at staging.', 3, 'arrived-uid')).lastrowid
++    _remote_human(board, tid, 'arrived-uid', 424242)
++    assert release._unread_human(board, tid, _stop(board, tid), None) == [here]
++
++
++def test_an_ordinary_card_with_many_comments_renders_no_release_or_instructions(board, monkeypatch):
++    _no_worker_env(monkeypatch)
++    tid = kb.create_task(board, title='Plain work', assignee='default')
++    for i in range(12):
++        kb.add_comment(board, tid, 'david', f'human comment {i}', writer_kind='human')
++        kb.add_comment(board, tid, 'default', f'agent comment {i}', writer_kind='agent', writer_session='s')
++        kb.add_comment(board, tid, 'kanban-dispatcher', f'kernel note {i}')
++    context = kb.build_worker_context(board, tid)
++    assert '## Release mandate' not in context and HUMAN_SECTION not in context
++    assert '## Comment thread' in context
+-- 
+2.43.0
+

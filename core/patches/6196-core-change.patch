@@ -1,0 +1,117 @@
+From 96d3d976209158e2424fa97ec87aabed60d1896a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:53:47 -0800
+Subject: [PATCH 6196] Source-derived actionability and fixed waiting obligations
+
+Public mirror of source commit 96d3d976209158e2424fa97ec87aabed60d1896a.
+
+---
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index bd61079a309..bbe26b6835e 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -109,10 +109,14 @@
+ 
+ 
+ def _release_offer(conn, tid: str) -> dict | None:
+-    """What `hermes kanban release` would act on for ``tid`` (kanban_release.offer), else None. Read-only."""
++    """What `hermes kanban release` would act on for ``tid``, else None. Read-only. Mirrors kanban_release._eligible:
++    offer() (held status, pending stop, safety restriction) plus the same containment guard release refuses on,
++    which also reads `contained` events and sync quarantine, not only tasks.containment_episode."""
+     try:
+         from hermes_cli import kanban_release
+-        return kanban_release.offer(conn, tid)
++        from hermes_cli.kanban_containment_guard import pending as contained
++        offer = kanban_release.offer(conn, tid)
++        return None if offer is None or contained(conn, tid) else offer
+     except EVIDENCE_ERRORS:
+         return None
+ 
+@@ -240,7 +244,7 @@
+     if task is None:
+         raise ValueError(f'unknown task: {tid}')
+     events = reader.events(tid)
+-    stop, _restricted, receipt_only = _state(reader, tid, events)
++    stop, _restricted, unknown = _state(reader, tid, events)
+     schedule = next((e for e in events if e['kind'] in ('scheduled', 'continued')), None)
+     # Notes/notices do not replace the material source or reset its deadline.
+     source = stop or select(task['status'], events,
+@@ -267,8 +271,10 @@
+              'deadline_at': next_action.get('escalate_at') or record(next_action.get('escalation')).get('at'),
+              'containment': task.get('containment_episode'), 'pending_command': reader.pending(tid),
+              'human_step': _human_step(task.get('human_request')),
+-             'release_offer': _release_offer(conn, tid) if stop and not receipt_only else None,
+-             'unknown': reader.synced or reader.partial or missing or bool(receipt_only) or bool(source and not reader.uid(source))
++             # _release_offer is release's own eligibility; unknown evidence never vetoes it. A receipt-only row
++             # (no pending stop) fails it because offer() requires the pending stop release acts on.
++             'release_offer': _release_offer(conn, tid) if stop else None,
++             'unknown': reader.synced or reader.partial or missing or bool(unknown) or bool(source and not reader.uid(source))
+                         or bool(task.get('human_request') and not _human_step(task['human_request']))}
+     if source and not any((stop, facts['containment'], facts['pending_command'])):
+         from hermes_cli.kanban_actionability_creation import validated_intent
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index a5928c62a78..f2734980f16 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -432,7 +432,7 @@
+     event(conn, 'old-bad', 'scheduled', {'awaiting': []}, 99)
+     row = describe(conn, 'root', now=200)
+     assert row['evidence_state'] == 'unknown'
+-    assert row['release']['authority'] == 'unavailable'
++    assert row['release']['authority'] == 'kanban_release'  # unknown provenance never vetoes release's own check
+     conn.close()
+ 
+ 
+@@ -649,8 +649,8 @@
+     assert row['blocker']['prerequisite'] == 'native kanban.sync.pickup on worker-x'
+     assert row['blocker']['trigger'] == 'Verified native pickup'
+     assert row['instruction'] == 'Restore native pickup, then verify the claimed process'
+-    assert row['release']['condition'] == 'Native process claimed and verified'
+-    assert row['release']['authority'] == 'unavailable'
++    assert row['release']['condition'].endswith('Recorded note: Native process claimed and verified')
++    assert row['release']['authority'] == 'kanban_release'  # held on a real stop: release would act
+     conn.close()
+ 
+ 
+@@ -1543,3 +1543,25 @@
+     monkeypatch.setattr(reader, 'columns', unexpected)
+     assert reader.pending('root') is None
+     conn.close()
++
++
++@pytest.mark.parametrize('data', [{'disposition': {'reason': 'scope_stopped'}},
++                                  {'disposition': {'reason': 'capability_unavailable'}, 'superseded_by_safety_stop': True}])
++def test_receipt_only_rows_never_name_the_release(data):
++    """With no pending stop, release refuses not_held; a receipt-only row (even one superseded by a safety stop)
++    stays 'unavailable'. Unknown evidence no longer vetoes the offer, so offer() is what excludes these."""
++    conn = fixture()
++    conn.execute("UPDATE tasks SET status='triage' WHERE id='root'")
++    event(conn, 'receipt', 'decision_retained', {'episode_uid': 'gone', **data}, 101)
++    row = describe(conn, 'root', now=200)
++    assert row['release']['authority'] == 'unavailable'
++    conn.close()
++
++
++def test_contained_event_without_column_keeps_release_unavailable():
++    """release refuses containment_hold from `contained` events too, not only tasks.containment_episode."""
++    conn = held_fixture()
++    event(conn, 'held', 'contained', {'episode': 'held'}, 150)
++    row = describe(conn, 'root', now=200)
++    assert row['release']['authority'] == 'unavailable'
++    conn.close()
+diff --git a/tests/hermes_cli/test_kanban_actionability_report.py b/tests/hermes_cli/test_kanban_actionability_report.py
+index 1b99ebb711f..5f7f6f72a73 100644
+--- a/tests/hermes_cli/test_kanban_actionability_report.py
++++ b/tests/hermes_cli/test_kanban_actionability_report.py
+@@ -160,7 +160,7 @@
+     assert before['contract_key'] == after['contract_key']
+     assert before['escalation']['at'] == after['escalation']['at']
+     assert after['action'] == 'decide_scope'
+-    assert after['release']['authority'] == 'unavailable'
++    assert after['release']['authority'] == 'kanban_release'  # named; comments and notices still never release it
+     assert kb.claim_task(board, tid) is None
+ 
+ 
+-- 
+2.43.0
+

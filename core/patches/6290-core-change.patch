@@ -1,0 +1,639 @@
+From 54088068190f09f2c8b1b51ab169e7b304474adf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:17:35 +0000
+Subject: [PATCH 6290] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit 54088068190f09f2c8b1b51ab169e7b304474adf.
+
+---
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index ac0d277d5bb..ac15fa66850 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -63,8 +63,8 @@
+ _WAKE_KINDS = (*_WAKE_KINDS, "park_progress_notice")
+ _WAKE_KINDS = (*_WAKE_KINDS, "spend_budget_decision_ready")
+ # ``decision_requested`` (hermes_cli.kanban_decision_ask): a card parked on its orchestrator's answer.
+-TERMINAL_KINDS = (*TERMINAL_KINDS, "decision_requested", "wake_probe_unproven_notice")
+-_WAKE_KINDS = (*_WAKE_KINDS, "decision_requested")
++TERMINAL_KINDS = (*TERMINAL_KINDS, "parent_held", "decision_requested", "wake_probe_unproven_notice")
++_WAKE_KINDS = (*_WAKE_KINDS, "parent_held", "decision_requested")
+ 
+ 
+ def diagnostic_event(ev) -> bool:
+@@ -658,6 +658,12 @@
+     return f"⚠ {n.head}: {notice_text(ev.payload)}", None, None
+ 
+ 
++def _fmt_parent_held(ev, n) -> tuple:
++    from hermes_cli.kanban_parent_held import text
++    body = text(ev.payload or {})
++    return f"⏸ {n.head}: {body}", body, None
++
++
+ def _fmt_parent_unclaimed(ev, n) -> tuple:
+     from hermes_cli.kanban_parent_unclaimed import notice_text
+     return f"⏳ {n.head}: {notice_text(ev.payload)}", None, None
+@@ -733,6 +739,7 @@
+     "quota_episode_notice": _fmt_quota_episode,
+     "worker_repin_notice": _fmt_repin_notice,
+     "wake_probe_unproven_notice": _fmt_unproven_notice,
++    "parent_held": _fmt_parent_held,
+     "dependency_parent_unclaimed": _fmt_parent_unclaimed,
+     "spend_budget_decision_ready": _fmt_spend_budget,
+     "chat_wait_unclaimed": _fmt_chat_wait,
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 801413f3380..2ce68c09e31 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -1283,7 +1283,7 @@
+ 
+ def escalated_owner(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     """The owner card when this card's latest event is a re-park escalation."""
+-    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'parent_held' ORDER BY id DESC LIMIT 1",
+                        (task_id,)).fetchone()
+     if not row or row[0] != ESCALATED_EVENT:
+         return None
+@@ -1295,7 +1295,7 @@
+ 
+ def escalated_fired(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+     """``fired_reparks`` of this card's latest event when it is a fire-cap escalation, else None."""
+-    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'parent_held' ORDER BY id DESC LIMIT 1",
+                        (task_id,)).fetchone()
+     if not row or row[0] != ESCALATED_EVENT:
+         return None
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 4f71068ae08..e89ff425756 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -272,7 +272,7 @@
+         # ``continued`` event that carries its wake (t_00d7ca7eed7bf381). [daveey]
+         from hermes_cli.kanban_restore_chat_subs import restored_at
+         restored = restored_at(conn, task_id)
+-        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
++        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind != 'parent_held'", (task_id,)).fetchone()
+         parked_at = max(int(last[0] or 0), restored or 0) if last else restored
+         parked_at = parked_at or int(time.time())
+         return {"payload": {}, "parked_at": parked_at, "timed": False, "event_id": None,
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index ed6cf693f4a..0e293200860 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -32,7 +32,7 @@
+     comment_filter = (
+         "NOT (kind = 'commented' AND json_extract(payload, '$.author') = 'kanban-dispatcher')"
+         if include_replies else "kind != 'commented'"
+-    ) + " AND kind != 'dispatch_skipped'"  # a skip record neither starts nor ends a guard hold
++    ) + " AND kind NOT IN ('dispatch_skipped', 'parent_held')"  # advisory publication does not change a guard
+     events = sorted(
+         (stamp, row[0], row[1], row[2])
+         for row in conn.execute(
+diff --git a/hermes_cli/kanban_decision_maintenance.py b/hermes_cli/kanban_decision_maintenance.py
+index 195c1ed58c9..d92d604574f 100644
+--- a/hermes_cli/kanban_decision_maintenance.py
++++ b/hermes_cli/kanban_decision_maintenance.py
+@@ -9,6 +9,8 @@
+     if not dry_run:
+         from hermes_cli.kanban_hold_notices import sweep as holds
+         la.timed('dispatch.hold_notices', holds, conn)
++        from hermes_cli.kanban_parent_held import sweep as parents
++        la.timed('dispatch.parent_held', parents, conn)
+         from hermes_cli.kanban_scope_renewal_alarm import sweep as renewal_alarm
+         la.timed('dispatch.scope_renewal_alarm', renewal_alarm, conn)
+     from hermes_cli.kanban_provider_walls import tick_upkeep
+diff --git a/hermes_cli/kanban_parent_held.py b/hermes_cli/kanban_parent_held.py
+new file mode 100644
+index 00000000000..dad895eb485
+--- /dev/null
++++ b/hermes_cli/kanban_parent_held.py
+@@ -0,0 +1,78 @@
++"""One advisory per held-prerequisite episode and recorded audience. [daveey]
++
++Publication never changes a dependency, renews scope or creates an executor.
++A vanished delivery subscription alone is not a new decision to publish.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++
++from hermes_cli.kanban_db import _json_dict
++
++
++def current(conn, child: str) -> list[dict]:
++    """Read actual stop events, not maintenance notices that happen to be newer."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    out = []
++    for row in conn.execute(
++            "SELECT p.id,p.status FROM tasks p JOIN task_links l ON l.parent_id=p.id "
++            "JOIN tasks c ON c.id=l.child_id WHERE c.id=? AND c.status NOT IN ('done','archived') "
++            "AND p.status IN ('triage','failed') ORDER BY p.id", (child,)):
++        stops = [dict(e) for e in conn.execute(
++            "SELECT * FROM task_events WHERE task_id=? AND kind IN "
++            "('created','spend_budget_triaged','decision_hold_restricted','decision_retained','gave_up','failure_finalized') "
++            "OR (task_id=? AND kind='status' AND json_valid(payload) AND json_extract(payload,'$.status') IN ('triage','failed'))",
++            (row[0], row[0]))]
++        if stops:
++            event = max(stops, key=_event_order)
++            out.append({'parent_id': row[0], 'parent_status': row[1],
++                        'episode': event.get('uid') or str(event['id']),
++                        'reason': _json_dict(event['payload']).get('reason') or 'Parent requires a decision'})
++    return out
++
++
++def _pending(conn, child):
++    from hermes_cli.kanban_hold_audience import describe
++    authority = describe(conn, child)
++    # Running creator sessions come and go without changing recorded ownership.
++    audience = {'chats': sorted(authority['chats'], key=lambda c: json.dumps(c, sort_keys=True)),
++                'creator_task_id': authority['creator_task_id']}
++    for signal in current(conn, child):
++        revision = hashlib.sha256(json.dumps([signal, audience], sort_keys=True).encode()).hexdigest()
++        if not conn.execute(
++                "SELECT 1 FROM task_events WHERE task_id=? AND kind='parent_held' "
++                "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.revision') END=?",
++                (child, revision)).fetchone():
++            yield {**signal, 'authority': authority, 'revision': revision}
++
++
++def sweep(conn) -> None:
++    """Canonical-home publication before capacity admission; unchanged ticks are read-only."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_hold_notices import bind, creator
++    from hermes_cli.kanban_wake_check import foreign_ids
++    copies = foreign_ids(conn)
++    children = [r[0] for r in conn.execute(
++        "SELECT DISTINCT c.id FROM tasks c JOIN task_links l ON l.child_id=c.id "
++        "JOIN tasks p ON p.id=l.parent_id WHERE c.status NOT IN ('done','archived') "
++        "AND p.status IN ('triage','failed')")]
++    for child in children:
++        if child in copies:
++            continue
++        try:
++            if not list(_pending(conn, child)):
++                continue
++            with kb.write_txn(conn):
++                for signal in _pending(conn, child):
++                    bind(conn, child)
++                    kb._append_event(conn, child, 'parent_held', signal)
++                    creator(conn, child, 'parent:' + signal['revision'], text(signal))
++        except Exception:  # health: allow BLE001 -- rollback this advisory and retry; never satisfy its edge
++            kb._log.warning('kanban: parent-held publication failed for %s', child, exc_info=True)
++
++
++def text(payload: dict) -> str:
++    return (f"Parent {payload.get('parent_id')} is held in {payload.get('parent_status')}: "
++            f"{payload.get('reason')}. The creator/owning chat must disposition this prerequisite. "
++            "The dependency remains open; this notice grants no scope renewal, execution or acceptance.")
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 03bfd392bd5..28a704e5131 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -51,7 +51,7 @@
+                  "superseded. The card's budget after this release: {budget}.")
+ # Events that can follow a recorded release without moving the card: only then is a triage card "still ours".
+ _QUIET = frozenset({"commented", RELEASED, "spend_budget_set", "spend_budget_decision_ready", "scope_renewed",
+-                    "user_steps_answer", "card_answer_released", "stranded_park_escalated"})
++                    "user_steps_answer", "card_answer_released", "stranded_park_escalated", "parent_held"})
+ ESCALATED = "stranded_park_escalated"  # kanban_stranded_park.EVENT: the home's own record of the ask it filed
+ REFILED = "stranded_park_refiled"  # the same record for an ask the sweep re-filed; no second desk notice
+ MANDATE = (MARK + " Budget: {runs} more runs. {limits} Stop only on: a provider safety refusal; a step that needs "
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index f70434f6e89..99b8eaae6d4 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -282,7 +282,8 @@
+     rows = conn.execute(
+         "SELECT t.id, t.title, t.body, t.assignee, t.human_request, t.tenant FROM tasks t "
+         "WHERE t.status = 'triage' " + _gate_exclusion() +
+-        "AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id), t.created_at) <= ? "
++        "AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id "
++        "AND e.kind != 'parent_held'), t.created_at) <= ? "
+         "AND " + _PENDING, (cutoff, *_PENDING_ARGS),
+     ).fetchall()
+     from hermes_cli.kanban_resume_requester import open_recovery_card
+diff --git a/locales/af.yaml b/locales/af.yaml
+index 8834a92383d..e31932b10de 100644
+--- a/locales/af.yaml
++++ b/locales/af.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "het vordering gerapporteer terwyl dit wag; nie voltooi nie"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "het 'n opgeskorte voorvereiste; die eienaar moet besluit"
+       spend_budget_decision_ready: "het sy bestedingsbegroting bereik; wag op 'n bevorder- of argiveerbesluit"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/ar.yaml b/locales/ar.yaml
+index 648cd93eb55..c4672aae440 100644
+--- a/locales/ar.yaml
++++ b/locales/ar.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "أبلغت عن تقدم أثناء الانتظار؛ لم تكتمل"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "لها متطلب سابق معلّق؛ يجب أن يقرر مالكه"
+       spend_budget_decision_ready: "بلغ ميزانية الإنفاق؛ بانتظار قرار إعادة التشغيل أو الأرشفة"
+       status_default: "تغيّرت الحالة"
+       status_joiner: "، "
+diff --git a/locales/de.yaml b/locales/de.yaml
+index d744c292230..d66ae2b4181 100644
+--- a/locales/de.yaml
++++ b/locales/de.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "hat während der Wartezeit Fortschritt gemeldet; nicht abgeschlossen"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "hat eine angehaltene Voraussetzung; deren Eigentümer muss entscheiden"
+       spend_budget_decision_ready: "hat das Ausgabenbudget erreicht; wartet auf Freigabe oder Archivierung"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 3789d4b330d..f0c63f6a929 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -246,6 +246,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "reported progress while parked; not completed"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "has a held prerequisite; its owner must decide"
+       spend_budget_decision_ready: "reached its spend budget; awaiting a promote or archive decision"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/es.yaml b/locales/es.yaml
+index fa919af2441..d02ed6e79e6 100644
+--- a/locales/es.yaml
++++ b/locales/es.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "informó de avances mientras espera; no completada"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "tiene un requisito previo suspendido; su responsable debe decidir"
+       spend_budget_decision_ready: "alcanzó su presupuesto; espera una decisión de reactivación o archivo"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/fr.yaml b/locales/fr.yaml
+index e7b0ee3f9eb..aba14a63e22 100644
+--- a/locales/fr.yaml
++++ b/locales/fr.yaml
+@@ -269,6 +269,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "a signalé des progrès pendant l’attente ; non terminée"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "a un prérequis suspendu ; son responsable doit décider"
+       spend_budget_decision_ready: "a atteint son budget ; attend une décision de relance ou d’archivage"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/ga.yaml b/locales/ga.yaml
+index 200f586ddc2..da4ae293fb8 100644
+--- a/locales/ga.yaml
++++ b/locales/ga.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "thuairiscigh dul chun cinn agus í ar feitheamh; níl sí críochnaithe"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "tá réamhriachtanas ar fionraí; caithfidh a úinéir cinneadh a dhéanamh"
+       spend_budget_decision_ready: "shroich sé a bhuiséad; ag fanacht le cinneadh athsheolta nó cartlannaithe"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/hu.yaml b/locales/hu.yaml
+index 6c40dd6b70b..d83ad2992bd 100644
+--- a/locales/hu.yaml
++++ b/locales/hu.yaml
+@@ -246,6 +246,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "előrehaladásról számolt be várakozás közben; nincs befejezve"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "egy előfeltétele fel van függesztve; a tulajdonos döntése szükséges"
+       spend_budget_decision_ready: "elérte a költségkeretét; újraindítási vagy archiválási döntésre vár"
+       status_default: "állapota megváltozott"
+       status_joiner: ", "
+diff --git a/locales/it.yaml b/locales/it.yaml
+index bd7c38e85fb..b5b11bc8f19 100644
+--- a/locales/it.yaml
++++ b/locales/it.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "ha segnalato progressi durante l’attesa; non completata"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "ha un prerequisito sospeso; il proprietario deve decidere"
+       spend_budget_decision_ready: "ha raggiunto il budget; attende una decisione di riavvio o archiviazione"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/ja.yaml b/locales/ja.yaml
+index 67c83794954..58631a69c73 100644
+--- a/locales/ja.yaml
++++ b/locales/ja.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "待機中に進捗を報告しました。まだ完了していません"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "前提タスクが保留中です。所有者の判断が必要です"
+       spend_budget_decision_ready: "支出予算に達しました。再開またはアーカイブの判断を待っています"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/ko.yaml b/locales/ko.yaml
+index bc82049cd30..04f2d4c04b1 100644
+--- a/locales/ko.yaml
++++ b/locales/ko.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "대기 중 진행 상황을 보고했습니다. 아직 완료되지 않았습니다"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "선행 작업이 보류되어 소유자의 결정이 필요합니다"
+       spend_budget_decision_ready: "지출 예산에 도달했습니다. 재개 또는 보관 결정을 기다립니다"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/pt.yaml b/locales/pt.yaml
+index b735012ac3c..a25b243a02e 100644
+--- a/locales/pt.yaml
++++ b/locales/pt.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "relatou progresso enquanto aguarda; não concluída"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "tem um pré-requisito suspenso; o responsável deve decidir"
+       spend_budget_decision_ready: "atingiu o orçamento; aguarda uma decisão de retomar ou arquivar"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/ru.yaml b/locales/ru.yaml
+index 5f70d91cd8d..d3722169035 100644
+--- a/locales/ru.yaml
++++ b/locales/ru.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "сообщила о прогрессе во время ожидания; не завершена"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "имеет приостановленную предпосылку; требуется решение владельца"
+       spend_budget_decision_ready: "достигла бюджета; ожидает решения о возобновлении или архивировании"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/tr.yaml b/locales/tr.yaml
+index 537026ff0a3..708e6a70965 100644
+--- a/locales/tr.yaml
++++ b/locales/tr.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "beklerken ilerleme bildirdi; tamamlanmadı"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "bir ön koşulu bekletiliyor; sahibi karar vermeli"
+       spend_budget_decision_ready: "harcama bütçesine ulaştı; yeniden başlatma veya arşivleme kararı bekliyor"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/uk.yaml b/locales/uk.yaml
+index 8cb7b852711..196051475b0 100644
+--- a/locales/uk.yaml
++++ b/locales/uk.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "повідомила про прогрес під час очікування; не завершена"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "має призупинену передумову; потрібне рішення власника"
+       spend_budget_decision_ready: "досягла бюджету; очікує рішення про відновлення або архівування"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/zh-hant.yaml b/locales/zh-hant.yaml
+index 100ac7f694f..4e4cd8bc6d9 100644
+--- a/locales/zh-hant.yaml
++++ b/locales/zh-hant.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "在等待期間回報了進度；尚未完成"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "有前置任務被暫停；需由其擁有者決定"
+       spend_budget_decision_ready: "已達到支出預算，等待重新啟動或封存的決定"
+       status_default: "status changed"
+       status_joiner: ", "
+diff --git a/locales/zh.yaml b/locales/zh.yaml
+index b62b4adfae6..dfb5d346eaa 100644
+--- a/locales/zh.yaml
++++ b/locales/zh.yaml
+@@ -243,6 +243,7 @@
+       chat_wait_unclaimed: "is ready with no worker claiming it"
+       park_progress_notice: "在等待期间报告了进展；尚未完成"
+       decision_requested: "is parked until its orchestrator decides"
++      parent_held: "有前置任务被暂停；需由其所有者决定"
+       spend_budget_decision_ready: "已达到支出预算，等待重新启动或归档的决定"
+       status_default: "状态变化"
+       status_joiner: "，"
+diff --git a/tests/hermes_cli/test_kanban_parent_held_residual.py b/tests/hermes_cli/test_kanban_parent_held_residual.py
+new file mode 100644
+index 00000000000..c0aea52eae4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parent_held_residual.py
+@@ -0,0 +1,176 @@
++"""Held-parent publication is deduplicated and cannot invalidate a durable release."""
++import json
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_release as helpers
++
++board = helpers.board
++
++
++def sweep(board):
++    from hermes_cli.kanban_decision_maintenance import run
++    from types import SimpleNamespace
++    run(board, SimpleNamespace(), board='default', dry_run=False)
++
++
++def events(board, child):
++    return board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='parent_held'", (child,)).fetchall()
++
++
++def test_ticks_and_subscription_purge_do_not_repeat_notice(board, monkeypatch):
++    from hermes_cli import kanban_hold_audience as audience
++    from hermes_cli import kanban_hold_notices as notices
++    parent = helpers.spend_stopped(board)
++    child = kb.create_task(board, title='waiting child', assignee='default')
++    kb.link_tasks(board, parent, child)
++    chats = [{'gateway': 'local', 'profile': 'default', 'session': 'owner-chat'}]
++    monkeypatch.setattr(audience, 'describe', lambda *_: {'chats': chats, 'creator_task_id': None, 'creator_active': False})
++    monkeypatch.setattr(notices, 'destinations', lambda *_: [('tui', c['session']) for c in chats])
++    from hermes_cli import kanban_db_notify as notify
++    from gateway.kanban_watchers_notifier import TERMINAL_KINDS
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
++    sweep(board)
++    assert len(events(board, child)) == 1
++    args = dict(task_id=child, platform='tui', chat_id='owner-chat', kinds=TERMINAL_KINDS)
++    delivered = notify.claim_unseen_events_for_sub(board, **args)[2]
++    assert [e.kind for e in delivered] == ['parent_held']
++    assert notify.claim_unseen_events_for_sub(board, **args)[2] == []
++    with kb.write_txn(board):
++        board.execute('UPDATE task_events SET created_at=1 WHERE task_id=?', (child,))
++    assert notify.purge_stale_done_notify_subs(board, max_age_days=1) == 1
++    snapshot = kb.get_task(board, child)
++    for _ in range(8):
++        assert notify.purge_stale_done_notify_subs(board, max_age_days=1) == 0
++        before = board.total_changes
++        sweep(board)
++        assert len(events(board, child)) == 1
++        assert board.total_changes == before
++    assert kb.get_task(board, child).status == snapshot.status
++    assert kb.parent_states(board, child) == [(parent, 'triage')]
++    assert board.execute('SELECT count(*) FROM task_runs WHERE task_id=?', (child,)).fetchone()[0] == 0
++    chats.append({'gateway': 'local', 'profile': 'default', 'session': 'late-owner'})
++    sweep(board)
++    assert len(events(board, child)) == 2
++    sweep(board)
++    assert len(events(board, child)) == 2
++    with kb.write_txn(board):
++        kb._append_event(board, parent, helpers.decision.EVENT, {'reason': 'new stop'})
++    sweep(board)
++    assert len(events(board, child)) == 3
++    payload = json.loads(events(board, child)[-1][0])
++    assert payload['parent_id'] == parent and payload['reason'] == 'new stop'
++
++
++def test_parent_notice_preserves_release_crash_resume(board, monkeypatch):
++    child = helpers.spend_stopped(board)
++    parent = helpers.spend_stopped(board)
++    kb.link_tasks(board, parent, child)
++    real = kb.block_task
++    monkeypatch.setattr(kb, 'block_task', lambda *a, **kw: False)
++    assert helpers.run(board, child)['refusal'] == 'dependency_wait_refused'
++    assert helpers.records(board, child) == 1
++    sweep(board)
++    assert len(events(board, child)) == 1
++    monkeypatch.setattr(kb, 'block_task', real)
++    out = helpers.run(board, child)
++    assert out['outcome'] == 'waiting_on_parents' and out['resumed'], out
++    assert kb.get_task(board, child).status == 'todo'
++    assert helpers.records(board, child) == 1 and helpers.mandates(board, child) == 1
++
++
++def test_notice_keeps_guard_escalation_and_fallback_park_clocks(board):
++    from hermes_cli import kanban_db_dispatch_guard_notice as guard
++    from hermes_cli import kanban_awaiting as awaiting, kanban_continuation as continuation
++    tid = kb.create_task(board, title='guard clock', assignee='default')
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'respawn_guarded', {'reason': 'active_pr'})
++    started = guard.guard_hold_started_at(board, tid)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'parent_held', {})
++    assert guard.guard_hold_started_at(board, tid) == started
++    assert guard.guard_hold_reason(board, tid) == 'active_pr'
++    with kb.write_txn(board):
++        kb._append_event(board, tid, awaiting.ESCALATED_EVENT,
++                         {'owner_task_id': 'owner', 'awaiting': {'fired_reparks': 4}})
++    parked = continuation.park_state(board, tid)['parked_at']
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'parent_held', {})
++        board.execute("UPDATE task_events SET created_at=created_at+1000 WHERE task_id=? AND kind='parent_held'", (tid,))
++    assert awaiting.escalated_owner(board, tid) == 'owner'
++    assert awaiting.escalated_fired(board, tid) == 4
++    assert continuation.park_state(board, tid)['parked_at'] == parked
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'claimed', {})
++    assert awaiting.escalated_owner(board, tid) is None
++    assert guard.guard_hold_started_at(board, tid) is None
++
++
++def test_notice_does_not_postpone_stale_triage(board):
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++    tid = kb.create_task(board, title='old triage', assignee='default', triage=True)
++    with kb.write_txn(board):
++        board.execute('UPDATE task_events SET created_at=100 WHERE task_id=?', (tid,))
++        kb._append_event(board, tid, 'parent_held', {})
++        board.execute("UPDATE task_events SET created_at=9999 WHERE task_id=? AND kind='parent_held'", (tid,))
++    assert tid in sweep_stale_triage(board, older_than=100, now=10000)
++
++
++def test_publication_is_home_only_and_dry_run_is_read_only(board, monkeypatch):
++    from hermes_cli import kanban_parent_held as held, kanban_wake_check as wake
++    from hermes_cli.kanban_decision_maintenance import run
++    from types import SimpleNamespace
++    parent = helpers.spend_stopped(board)
++    child = kb.create_task(board, title='waiting child', assignee='default')
++    kb.link_tasks(board, parent, child)
++    before = board.total_changes
++    run(board, SimpleNamespace(), board='default', dry_run=True)
++    assert board.total_changes == before and events(board, child) == []
++    monkeypatch.setattr(wake, 'foreign_ids', lambda *_: {child})
++    held.sweep(board)
++    assert board.total_changes == before and events(board, child) == []
++    monkeypatch.setattr(wake, 'foreign_ids', lambda *_: set())
++    held.sweep(board)
++    assert len(events(board, child)) == 1
++    with kb.write_txn(board):
++        kb._append_event(board, parent, 'commented', {'reason': 'ordinary chatter'})
++    held.sweep(board)
++    assert len(events(board, child)) == 1
++    with kb.write_txn(board):
++        kb._append_event(board, parent, helpers.decision.EVENT, {'reason': 'new episode'})
++        board.execute("UPDATE tasks SET status='done' WHERE id=?", (child,))
++    held.sweep(board)
++    assert len(events(board, child)) == 1
++
++
++def test_failed_publication_rolls_back_and_retries_once(board, monkeypatch):
++    from hermes_cli import kanban_hold_notices as notices, kanban_parent_held as held
++    parent = helpers.spend_stopped(board)
++    child = kb.create_task(board, title='waiting child', assignee='default')
++    kb.link_tasks(board, parent, child)
++    real = notices.creator
++
++    def fail(*_):
++        raise RuntimeError('controlled notification failure')
++
++    monkeypatch.setattr(notices, 'creator', fail)
++    held.sweep(board)
++    assert events(board, child) == []
++    monkeypatch.setattr(notices, 'creator', real)
++    held.sweep(board)
++    assert len(events(board, child)) == 1
++    held.sweep(board)
++    assert len(events(board, child)) == 1
++    assert kb.parent_states(board, child) == [(parent, 'triage')]
++
++
++def test_notice_has_actionable_waking_formatter():
++    from types import SimpleNamespace
++    from gateway import kanban_watchers_notifier as notifier
++    assert 'parent_held' in notifier.TERMINAL_KINDS
++    assert 'parent_held' in notifier._WAKE_KINDS
++    shown, body, markup = notifier._EVENT_FORMATTERS['parent_held'](
++        SimpleNamespace(payload={'parent_id': 'parent', 'parent_status': 'triage', 'reason': 'decision'}),
++        SimpleNamespace(head='child'))
++    assert 'parent' in shown and 'disposition' in body
++    assert 'no scope renewal' in body and markup is None
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 56acc7277c9..adb4ade9347 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -176,7 +176,7 @@
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+                         "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed",
+                         "chat_wait_unclaimed", "spend_budget_decision_ready", "request_withdrawn", "failure_finalized", "resolved_check_broken",
+-                        "resolved_check_lost", "park_progress_notice", "decision_requested", "wake_probe_unproven_notice")
++                        "resolved_check_lost", "park_progress_notice", "decision_requested", "parent_held", "wake_probe_unproven_notice")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -630,9 +630,10 @@
+     return ": " + notice({**(payload or {}), "task_id": getattr(task, "id", None)})
+ 
+ 
+-def _kb_decision_requested(payload):
++def _kb_decision_requested(payload, *, parent=False):
+     from hermes_cli.kanban_decision_ask import notice_text
+-    return ": " + notice_text(payload)
++    from hermes_cli.kanban_parent_held import text
++    return ": " + (text(payload) if parent else notice_text(payload))
+ 
+ 
+ def _kb_park_progress(payload):
+@@ -648,6 +649,7 @@
+ _KANBAN_EVENT_FORMATTERS = {
+     "park_progress_notice": ("ℹ", lambda t, p, title: _kb_park_progress(p)),
+     "decision_requested": ("❓", lambda t, p, title: _kb_decision_requested(p)),
++    "parent_held": ("⏸", lambda t, p, title: _kb_decision_requested(p, parent=True)),
+     "spend_budget_decision_ready": ("⏸", _kb_spend_budget),
+     "request_withdrawn": ("ℹ", lambda t, p, title: " request withdrawn: the card was archived. "
+                          "No answer is needed for this request; this is not approval and not proof of completion."),
+-- 
+2.43.0
+

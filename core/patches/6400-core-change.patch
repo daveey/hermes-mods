@@ -1,0 +1,238 @@
+From c52397701399fdb95c1ac7442b6f9c4832fbce97 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:56:27 +0000
+Subject: [PATCH 6400] Annotation readers, batched revisions and settlement generations
+
+Public mirror of source commit c52397701399fdb95c1ac7442b6f9c4832fbce97.
+
+---
+diff --git a/hermes_cli/kanban_reader_lifecycle.py b/hermes_cli/kanban_reader_lifecycle.py
+index 959efda3da8..5c754edc29c 100644
+--- a/hermes_cli/kanban_reader_lifecycle.py
++++ b/hermes_cli/kanban_reader_lifecycle.py
+@@ -27,6 +27,50 @@
+     return retry_open(lambda remaining: _cached_entry_once(path, remaining), busy_budget)
+ 
+ 
++def borrow_warm(path):
++    """Return an already-borrowed, attested live entry, or None for ordinary admission.
++
++    No open/close occurs here. Retained tracking custody excludes raw offline access;
++    the borrower lock prevents recovery from closing this connection underneath us.
++    Check siblings too: matching our own SHM is not enough to clear a poisoned or
++    mixed-generation process. All uncertain cases retain lifecycle/recovery admission.
++    """
++    from hermes_cli import kanban_generation as gen, kanban_session_activity as activity
++    from hermes_cli.kanban_lockguard import shm_identity
++
++    key = str(path)
++    with activity._RO_CACHE_LOCK:
++        entry = activity._RO_CACHE.get(key)
++    if entry is None or not entry[2].acquire(blocking=False):
++        return None
++    keep = False
++    try:
++        conn = entry[0]
++        tracked = getattr(conn, "_hermes_tracked_path", None)
++        canonical = getattr(conn, "_hermes_generation_path", None)
++        if tracked is None or tracked != canonical:
++            return None
++        # Snapshot handles before current identity, as recover() does. A first
++        # open must not be compared against a pre-open missing SHM observation.
++        handles = gen._handles(canonical)
++        current = shm_identity(path)
++        st = os.stat(path)
++        with gen._lock:
++            live = conn in gen._connections and canonical not in gen._poisoned
++        if (not live or conn.in_transaction or (st.st_dev, st.st_ino) != entry[1]
++                or current != entry[3] or any(c._hermes_generation_shm is not None
++                    and c._hermes_generation_shm != current for c in handles)):
++            return None
++        with activity._RO_CACHE_LOCK:
++            keep = activity._RO_CACHE.get(key) is entry
++        return (key, entry) if keep else None
++    except (OSError, sqlite3.Error):
++        return None
++    finally:
++        if not keep:
++            entry[2].release()
++
++
+ def is_shared_reader(path, conn) -> bool:
+     """Whether this borrowed connection has retained custody (not a private fallback)."""
+     from hermes_cli import kanban_session_activity as activity
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 3c69c95765d..1a5420f6df0 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -444,13 +444,14 @@
+     While another thread holds the shared connection past ``_RO_SHARED_WAIT_S``, the body gets a private read-only
+     connection instead (closed afterwards; the shared entry is untouched), so concurrent dashboard readers never fail
+     with "cached reader is borrowed" (hub errors.log)."""
+-    from hermes_cli.kanban_reader_lifecycle import cached_entry, try_borrow
++    from hermes_cli.kanban_reader_lifecycle import borrow_warm, cached_entry, try_borrow
+ 
+     started = time.monotonic()
+-    key, entry = cached_entry(path, busy_budget)
++    warm = borrow_warm(path)
++    key, entry = warm if warm is not None else cached_entry(path, busy_budget)
+     conn, _ident, lock, _shm = entry
+     remaining = busy_budget - (time.monotonic() - started)
+-    if not try_borrow(lock, min(remaining, _RO_SHARED_WAIT_S)):
++    if warm is None and not try_borrow(lock, min(remaining, _RO_SHARED_WAIT_S)):
+         # Never more than the shared reader's own SQLite busy timeout, whatever budget the caller passed.
+         with _private_ro(path, min(busy_budget - (time.monotonic() - started), _RO_BUSY_TIMEOUT_S)) as private:
+             yield private
+diff --git a/tests/hermes_cli/test_cached_ro_warm_admission.py b/tests/hermes_cli/test_cached_ro_warm_admission.py
+new file mode 100644
+index 00000000000..68a70258802
+--- /dev/null
++++ b/tests/hermes_cli/test_cached_ro_warm_admission.py
+@@ -0,0 +1,144 @@
++"""A warm read is not an open/close transition; retain cold admission fences."""
++import contextlib
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_generation as generation
++from hermes_cli import kanban_session_activity as activity
++
++
++@pytest.fixture
++def board(tmp_path):
++    activity._reset_cache_for_tests()
++    path = tmp_path / "board.db"
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE t(v)")
++        conn.execute("INSERT INTO t VALUES (1)")
++        conn.commit()
++    yield path
++    activity._reset_cache_for_tests()
++
++
++@contextlib.contextmanager
++def held_elsewhere(lock):
++    holding, release = threading.Event(), threading.Event()
++
++    def hold():
++        with lock:
++            holding.set()
++            release.wait(10)
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    try:
++        assert holding.wait(10)
++        yield
++    finally:
++        release.set()
++        thread.join(10)
++        assert not thread.is_alive()
++
++
++def test_warm_zero_budget_read_during_other_lifecycle_transition(board):
++    with activity.cached_ro(board) as conn:
++        shared = conn
++    with held_elsewhere(generation.lifecycle_lock(board)):
++        with activity.cached_ro(board, busy_budget=0) as conn:
++            assert conn is shared
++            assert conn.execute("SELECT v FROM t").fetchall() == [(1,)]
++    # The next borrow sees a real commit without a TTL or explicit cache kick.
++    with contextlib.closing(sqlite3.connect(board)) as writer:
++        writer.execute("UPDATE t SET v=2")
++        writer.commit()
++    with activity.cached_ro(board, busy_budget=0) as conn:
++        assert conn.execute("SELECT v FROM t").fetchall() == [(2,)]
++
++
++def test_cold_zero_budget_read_keeps_lifecycle_admission(board):
++    with held_elsewhere(generation.lifecycle_lock(board)):
++        with pytest.raises(generation.BoardLifecycleBusy):
++            with activity.cached_ro(board, busy_budget=0):
++                pytest.fail("a cold open entered during a lifecycle transition")
++
++
++def assert_cold_admission(board):
++    from hermes_cli import kanban_reader_lifecycle as readers
++
++    with held_elsewhere(generation.lifecycle_lock(board)):
++        assert readers.borrow_warm(board) is None
++        with pytest.raises(generation.BoardLifecycleBusy):
++            with activity.cached_ro(board, busy_budget=0):
++                pytest.fail("uncertain retained custody bypassed ordinary admission")
++    # Every declined probe released borrower custody, including early returns.
++    assert activity._RO_CACHE[str(board)][2].acquire(blocking=False)
++    activity._RO_CACHE[str(board)][2].release()
++
++
++@pytest.mark.parametrize("invalid", ["poison", "forgotten", "tracking", "shm"])
++def test_uncertain_warm_entry_keeps_lifecycle_admission(board, monkeypatch, invalid):
++    import weakref
++
++    with activity.cached_ro(board) as shared:
++        pass
++    invalidators = {
++        "poison": lambda: monkeypatch.setattr(generation, "_poisoned", {shared._hermes_generation_path}),
++        "forgotten": lambda: monkeypatch.setattr(generation, "_connections", weakref.WeakSet()),
++        "tracking": lambda: monkeypatch.setattr(shared, "_hermes_tracked_path", None),
++        "shm": lambda: monkeypatch.setattr("hermes_cli.kanban_lockguard.shm_identity", lambda path: (-1, -1)),
++    }
++    invalidators[invalid]()
++    assert_cold_admission(board)
++
++
++def test_transaction_declines_warm_admission(board):
++    with activity.cached_ro(board) as shared:
++        pass
++    shared.execute("BEGIN")
++    try:
++        assert_cold_admission(board)
++    finally:
++        shared.rollback()
++
++
++def test_stale_sibling_declines_warm_admission(board, monkeypatch):
++    with activity.cached_ro(board):
++        pass
++    with contextlib.closing(generation.open_ro(board, check_same_thread=False)) as sibling:
++        monkeypatch.setattr(sibling, "_hermes_generation_shm", (-1, -1))
++        assert_cold_admission(board)
++
++
++def test_replaced_main_file_declines_warm_admission(board, tmp_path):
++    from hermes_cli import kanban_reader_lifecycle as readers
++
++    with activity.cached_ro(board):
++        pass
++    replacement = tmp_path / "replacement.db"
++    with contextlib.closing(sqlite3.connect(replacement)) as conn:
++        conn.execute("CREATE TABLE t(v)")
++        conn.execute("INSERT INTO t VALUES (99)")
++        conn.commit()
++    replacement.replace(board)
++    with held_elsewhere(generation.lifecycle_lock(board)):
++        assert readers.borrow_warm(board) is None
++        with pytest.raises(generation.BoardLifecycleBusy):
++            with activity.cached_ro(board, busy_budget=0):
++                pytest.fail("main-file replacement bypassed recovery")
++    with activity.cached_ro(board) as conn:
++        assert conn.execute("SELECT v FROM t").fetchone() == (99,)
++
++
++def test_warm_custody_excludes_raw_probe_without_acquiring_tracking_mutex(board):
++    from hermes_cli import sqlite_safe_read as safe
++
++    with activity.cached_ro(board):
++        pass
++    with held_elsewhere(safe._live_lock):
++        with activity.cached_ro(board, busy_budget=0) as conn:
++            assert conn.execute("SELECT v FROM t").fetchone() == (1,)
++    with pytest.raises(safe.LiveConnectionError):
++        with safe.offline_file_access(board, what="test probe"):
++            pytest.fail("a retained connection must still exclude raw access")
+-- 
+2.43.0
+

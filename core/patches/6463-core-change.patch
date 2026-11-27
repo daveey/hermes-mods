@@ -1,0 +1,327 @@
+From c5131a9e7f8898cd6017a41dc6bdf6cc4569d6d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:19:37 +0000
+Subject: [PATCH 6463] Frozen administrative deadlines for parks, links, landings and review queues
+
+Public mirror of source commit c5131a9e7f8898cd6017a41dc6bdf6cc4569d6d1.
+
+---
+diff --git a/hermes_cli/kanban_actionability_creation.py b/hermes_cli/kanban_actionability_creation.py
+index afc3c29aaf8..9d108bd8756 100644
+--- a/hermes_cli/kanban_actionability_creation.py
++++ b/hermes_cli/kanban_actionability_creation.py
+@@ -97,6 +97,13 @@
+         return payload
+     original = payload
+     row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    # A confirmed Board wait_on receipt: the Board linked ``parent`` and parked the card in todo in that
++    # receipt's transaction, and this replica still shows the triage it left. Freeze the wait as it landed.
++    receipt = bool(kind == 'spend_review_settled' and isinstance(payload, dict) and payload.get('verdict') == 'wait_on'
++                   and payload.get('status') == 'todo' and _text(payload.get('parent')) and payload['parent'] != task_id
++                   and row is not None and row['status'] == 'triage')
++    if receipt and row is not None:
++        row = {**dict(row), 'status': 'todo', 'block_kind': None, 'human_request': None}
+     handoff = row is not None and row['status'] == 'running' and kind in ('linked', 'unlinked')
+     if kind in ('linked', 'unlinked', 'unblocked', *LANDINGS) and (
+             row is None or not (row['status'] == 'todo' or handoff) or not isinstance(payload, dict)):
+@@ -105,6 +112,8 @@
+         from hermes_cli.kanban_db_sync import run_uid
+         from hermes_cli.kanban_actionability_parents import snapshot
+         parents = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,))]
++        if receipt:
++            parents = sorted({*parents, payload['parent']})
+         if kind in ('linked', 'unlinked', 'unblocked', *LANDINGS) and not parents:
+             return original  # no parent to wait on: not a dependency wait, so nothing to freeze
+         payload = {**payload, 'actionability_parent_ids': parents,
+diff --git a/hermes_cli/kanban_actionability_selection.py b/hermes_cli/kanban_actionability_selection.py
+index 3ad9c6df57f..32b6a9e5956 100644
+--- a/hermes_cli/kanban_actionability_selection.py
++++ b/hermes_cli/kanban_actionability_selection.py
+@@ -5,7 +5,10 @@
+ 
+ # A wake or lane admission that found an open parent lands its card in todo and says so in ``status``.
+ LANDINGS = ('condition_met', 'continuation_woken', 'wake_check_broken', 'wake_check_lost', 'wake_check_stale',
+-            'wake_probe_stale', 'lane_admitted')
++            'wake_probe_stale', 'lane_admitted',
++            # The Board applies a spend reviewer's wait_on itself (edge and todo): the home gateway's settlement
++            # of that confirmed receipt is the landing its own writer can stamp.
++            'spend_review_settled')
+ KINDS = {'todo': ('created', 'linked', 'unlinked', 'dependency_wait', 'unblocked', *LANDINGS),
+          'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
+          'review': ('review_requested', 'created'), 'blocked': ('blocked',),
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index b3d6704d474..00998525fe3 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -372,10 +372,12 @@
+         if reason:
+             facts['private_hold'] = reason
+     lane_deadline = None
+-    if not facts.get('stop') and not facts.get('private_hold') and not deps:
++    if not facts.get('stop') and not facts.get('private_hold'):
+         gate_at = _lane_gate_at(conn, tid, reader)
+         if gate_at:
+-            facts['lane_hold'] = True
++            # A lane merge links the held card under its owner: the row then names that dependency, and the
++            # lane gate it is still held at keeps its own clock (a repeated merge link never renews it).
++            facts['lane_hold'] = not deps
+             # Fixed at the source, never renewed by a later census observation; a recorded contract wins.
+             lane_deadline = gate_at + 86400
+     wake_columns = reader.columns('task_wake_checks')
+diff --git a/hermes_cli/kanban_spend_caused_review.py b/hermes_cli/kanban_spend_caused_review.py
+index 6ce640b6108..f7b2cffb324 100644
+--- a/hermes_cli/kanban_spend_caused_review.py
++++ b/hermes_cli/kanban_spend_caused_review.py
+@@ -248,7 +248,13 @@
+                     kb._append_event(conn, task_id, reviewer.SETTLED, {"episode": episode,
+                                      "receipt_uid": receipt["request_uid"], "verdict": receipt["verdict"]})
+         return result
++    settled = {"episode": episode, "receipt_uid": receipt["request_uid"], "verdict": receipt["verdict"]}
++    if receipt["verdict"] == "wait_on":
++        # The Board applied this wait itself, in the receipt's own transaction: it linked the open target
++        # and parked the card in todo, so no core writer froze that dependency wait's deadline. The
++        # confirmed receipt is the landing; naming it lets the event seam freeze the wait before sync
++        # projects the Board's rows, leaving no interval in which the todo card has no clock.
++        settled.update(status="todo", parent=receipt["target"])
+     with kb.write_txn(conn):
+-        kb._append_event(conn, task_id, reviewer.SETTLED, {"episode": episode,
+-                         "receipt_uid": receipt["request_uid"], "verdict": receipt["verdict"]})
++        kb._append_event(conn, task_id, reviewer.SETTLED, settled)
+     return "settled"  # canonical effect confirmed; normal sync, not this helper, projects clearance
+diff --git a/tests/hermes_cli/test_kanban_spend_review_landing.py b/tests/hermes_cli/test_kanban_spend_review_landing.py
+new file mode 100644
+index 00000000000..63155e082fb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_landing.py
+@@ -0,0 +1,228 @@
++"""A Board-applied spend-review wait freezes its deadline at settlement; a lane-merged card keeps its lane clock. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli.kanban_actionability_cli import report
++from hermes_cli.kanban_actionability_sources import describe
++from tests.hermes_cli import test_kanban_failure_transport as transport
++from tests.hermes_cli import test_kanban_spend_caused_review as support
++
++kanban_home = support.kanban_home
++board = support.board
++live = transport.live
++MISSING = 'escalation_deadline_missing'
++DAY = 86400
++
++
++def _rows(conn, tid, now):
++    return describe(conn, tid, now=now), next(r for r in report(conn, now=now)['rows'] if r['task_id'] == tid)
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    """Pin the event seam's clock for one append."""
++    from contextlib import contextmanager
++    from hermes_cli import kanban_db_events as events
++
++    @contextmanager
++    def at(second):
++        with monkeypatch.context() as patch:
++            patch.setattr(events.time, 'time', lambda: float(second))
++            yield
++    return at
++
++
++def _settled(conn, tid):
++    row = conn.execute('SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                       (tid, reviewer.SETTLED)).fetchone()
++    return row, json.loads(row['payload'])
++
++
++def _reviewed(conn, verdict):
++    """A scope stop in triage, reviewed through the real caused-stop path against the fake Board."""
++    if 'uid' not in {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}:
++        # ``board`` only claims primary mode on an unsynced file: give the journal seam the column it reads
++        # there (NULL, so nothing is journaled). Real custody: test_settlement_wait_is_journaled_at_home.
++        conn.execute('ALTER TABLE task_events ADD COLUMN uid TEXT')
++    parent = kb.create_task(conn, title='open prerequisite', assignee='default')
++    tid = kb.create_task(conn, title='Finish acceptance', assignee='default')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'spend_budget_triaged',
++                         {'cause': 'scope_stopped', 'reason': f'{support.QUOTE}; first needs {parent}'})
++    episode = reviewer._current_episode(conn, tid)
++    assert episode is not None
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, decision.NOTICE, {'episode': episode})
++    assert reviewer.queue_backlog(conn, now=reviewer._notice_at(conn, tid, episode) + 300, cfg=(True, 2)) == [tid]
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, reviewer.STARTED, {'episode': episode})
++    return tid, parent, episode, {**verdict, **({'target': parent} if verdict['decision'] in ('wait_on', 'archive') else {})}
++
++
++def test_confirmed_wait_on_receipt_freezes_the_wait_before_sync_projects_it(kanban_home, spend_reviewer, board):
++    with kbc.connect_closing() as conn:
++        tid, parent, ep, verdict = _reviewed(conn, {'decision': 'wait_on', 'reason': 'wait for the prerequisite'})
++        spend_reviewer.append(verdict)
++        assert reviewer.review(conn, tid, ep) == 'settled'
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == 'triage'  # the Board's rows have not been projected yet
++        assert conn.execute('SELECT 1 FROM task_links WHERE child_id=?', (tid,)).fetchone() is None
++        event, data = _settled(conn, tid)
++        assert (data['verdict'], data['status'], data['parent']) == ('wait_on', 'todo', parent)
++        intent = data['actionability_intent']
++        assert intent['status'] == 'todo' and intent['source_kind'] == reviewer.SETTLED
++        assert intent['deadline_at'] == event['created_at'] + DAY and intent['execution_authority'] is False
++        assert data['actionability_parent_ids'] == [parent]
++        assert data['actionability_parent_states'] == [{'id': parent, 'status': 'ready', 'containment_episode': None}]
++
++
++@pytest.mark.parametrize('verdict', [
++    {'decision': 'release', 'reason': 'Finish acceptance', 'remaining_quote': support.QUOTE},
++    {'decision': 'archive', 'reason': 'replaced'}])
++def test_other_confirmed_verdicts_claim_no_landing(kanban_home, spend_reviewer, board, verdict):
++    with kbc.connect_closing() as conn:
++        tid, _parent, ep, verdict = _reviewed(conn, verdict)
++        spend_reviewer.append(verdict)
++        assert reviewer.review(conn, tid, ep) == 'settled'
++        data = _settled(conn, tid)[1]
++        assert data['verdict'] == verdict['decision']
++        assert not {'status', 'parent', 'actionability_intent', 'actionability_parent_ids'} & set(data)
++
++
++def _board_wait(conn, clock, *, settled, status='todo', extra_parent=False):
++    """A budget stop the Board resolved with wait_on: this gateway's settlement, then the Board's raw rows
++    arriving through sync afterwards (later ids, the Board's earlier clock), as observed on the live board."""
++    parent = kb.create_task(conn, title='open prerequisite', assignee='default')
++    tid = kb.create_task(conn, title='Finish acceptance', assignee='default')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'spend_budget_triaged', {'reason': 'run budget'})
++    at = conn.execute('SELECT MAX(created_at) FROM task_events').fetchone()[0]
++    parents = [parent] + ([kb.create_task(conn, title='another', assignee='default')] if extra_parent else [])
++    with kb.write_txn(conn), clock(at + 4):  # the receipt is confirmed after the Board's transaction (178 vs 182 live)
++        kb._append_event(conn, tid, reviewer.SETTLED, {'episode': 'e', 'receipt_uid': 'r', 'verdict': 'wait_on',
++                                                       **({'status': 'todo', 'parent': parent} if settled else {})})
++    with kb.write_txn(conn):
++        for pid in parents:
++            conn.execute('INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)', (pid, tid))
++            conn.execute('INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)',
++                         (tid, 'linked', json.dumps({'parent': pid, 'child': tid}), at))
++        conn.execute('INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)',
++                     (tid, 'promoted_manual', json.dumps({
++                         'actor': reviewer.AUTHOR, 'from_status': 'triage', 'authority_kind': 'spend_reviewer',
++                         'decision': 'wait_on', 'parent': parent}), at))
++        conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++    event = conn.execute('SELECT * FROM task_events WHERE task_id=? AND kind=?', (tid, reviewer.SETTLED)).fetchone()
++    return tid, parent, event
++
++
++def test_projected_board_wait_has_a_fixed_deadline_and_keeps_its_blocker(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        tid, parent, event = _board_wait(conn, clock, settled=True)
++        assert json.loads(event['payload'])['actionability_intent']['deadline_at'] == event['created_at'] + DAY
++        for row in _rows(conn, tid, event['created_at'] + 60):
++            assert row['status'] == 'todo' and row['action'] == 'satisfy_dependency'
++            assert parent in row['blocker']['prerequisite']  # the open parent still blocks: nothing is exempted
++            assert not {MISSING, 'creation_intent_invalid', 'private_hold'} & set(row['violations'])
++            assert row['escalation']['at'] == event['created_at'] + DAY
++        late = describe(conn, tid, now=event['created_at'] + DAY + 1)
++        assert late['escalation']['at'] == event['created_at'] + DAY  # never renewed by a later census
++        assert 'escalation_overdue' in late['violations']
++
++
++def test_board_wait_without_a_named_landing_or_with_other_facts_gets_no_clock(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        # Control (the pre-fix settlement): no landing named, so the Board-written wait has no clock.
++        bare, _parent, event = _board_wait(conn, clock, settled=False)
++        assert 'actionability_intent' not in json.loads(event['payload'])
++        for row in _rows(conn, bare, event['created_at'] + 60):
++            assert row['action'] == 'satisfy_dependency' and MISSING in row['violations']
++        # The card left todo: a ready card never borrows the wait's clock.
++        gone, _parent, event = _board_wait(conn, clock, settled=True, status='ready')
++        assert describe(conn, gone, now=event['created_at'] + 60)['escalation']['at'] != event['created_at'] + DAY
++        # The projected edges differ from the receipt's: the frozen wait does not cover them.
++        other, _parent, event = _board_wait(conn, clock, settled=True, extra_parent=True)
++        row = describe(conn, other, now=event['created_at'] + 60)
++        assert row['escalation']['at'] != event['created_at'] + DAY
++        assert {MISSING, 'creation_intent_invalid'} & set(row['violations'])
++
++
++@pytest.mark.parametrize('payload', [
++    {'verdict': 'release', 'status': 'todo', 'parent': 'PARENT'},
++    {'verdict': 'wait_on', 'parent': 'PARENT'},
++    {'verdict': 'wait_on', 'status': 'todo'},
++    {'verdict': 'wait_on', 'status': 'todo', 'parent': ''},
++    {'verdict': 'wait_on', 'status': 'todo', 'parent': 'SELF'},
++    {'verdict': 'wait_on', 'status': 'todo', 'parent': 7}])
++def test_only_a_wait_on_settlement_naming_its_parent_is_frozen_in_triage(kanban_home, payload):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='open prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='held', assignee='default')
++        named = {'PARENT': parent, 'SELF': tid}
++        payload = {k: named.get(v, v) if isinstance(v, str) else v for k, v in payload.items()}
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, reviewer.SETTLED, {'episode': 'e', 'receipt_uid': 'r', **payload})
++        assert 'actionability_intent' not in _settled(conn, tid)[1]
++
++
++@pytest.mark.parametrize('status', ['ready', 'running', 'blocked', 'scheduled', 'done', 'archived'])
++def test_wait_on_settlement_outside_triage_or_todo_is_not_frozen(kanban_home, status):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='open prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='moved on', assignee='default')
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++            kb._append_event(conn, tid, reviewer.SETTLED, {'episode': 'e', 'receipt_uid': 'r', 'verdict': 'wait_on',
++                                                           'status': 'todo', 'parent': parent})
++        assert 'actionability_intent' not in _settled(conn, tid)[1]
++
++
++def test_settlement_wait_is_journaled_at_home(live):
++    parent = kb.create_task(live, title='open prerequisite', assignee='default')
++    tid = kb.create_task(live, title='stopped', assignee='default')
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(live, tid, reviewer.SETTLED, {'episode': 'e', 'receipt_uid': 'r', 'verdict': 'wait_on',
++                                                       'status': 'todo', 'parent': parent})
++        kb._append_event(live, tid, reviewer.SETTLED, {'episode': 'e', 'receipt_uid': 'r', 'verdict': 'archive'})
++    stamped, plain = live.execute('SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id',
++                                  (tid, reviewer.SETTLED)).fetchall()
++    saved = live.execute('SELECT * FROM kanban_actionability_intents WHERE event_uid=?', (stamped['uid'],)).fetchone()
++    assert saved['source_json'] == stamped['payload'] and saved['state'] == 'pending'
++    assert json.loads(stamped['payload'])['actionability_parent_ids'] == [parent]
++    assert 'actionability_intent' not in json.loads(plain['payload'])
++    assert live.execute('SELECT 1 FROM kanban_actionability_intents WHERE event_uid=?', (plain['uid'],)).fetchone() is None
++
++
++def test_lane_merged_card_keeps_its_lane_gate_clock(kanban_home):
++    with kbc.connect_closing() as conn:
++        owner = kb.create_task(conn, title='existing owner', assignee='default')
++        tid = kb.create_task(conn, title='lane held duplicate', assignee='default')
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage', block_kind='lane_gate' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, 'lane_gated', {'lane': 'hermes'})
++        gate_at = conn.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='lane_gated'",
++                               (tid,)).fetchone()[0]
++        for _merge in range(2):  # the planner re-merges the held card on every pass
++            with kb.write_txn(conn):
++                conn.execute('INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)', (owner, tid))
++                kb._append_event(conn, tid, 'linked', {'parent': owner, 'child': tid})
++                kb._append_event(conn, tid, 'lane_merged', {'into': owner, 'reason': 'already owned'})
++            for row in _rows(conn, tid, gate_at + 60):
++                assert row['status'] == 'triage' and row['action'] == 'satisfy_dependency'
++                assert owner in row['blocker']['prerequisite']  # the dependency is named, not exempted
++                assert MISSING not in row['violations'] and 'escalation_overdue' not in row['violations']
++                assert row['escalation']['at'] == gate_at + DAY
++        late = describe(conn, tid, now=gate_at + DAY)
++        assert late['escalation']['at'] == gate_at + DAY and 'escalation_overdue' in late['violations']
++        # Once the lane no longer holds the card, the lane clock is gone: nothing is borrowed.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET block_kind=NULL WHERE id=?", (tid,))
++        assert describe(conn, tid, now=gate_at + 60)['escalation']['at'] != gate_at + DAY
+-- 
+2.43.0
+

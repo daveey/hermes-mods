@@ -1,0 +1,128 @@
+From 6eadd4b7a0474283b971f2a97c86684cb01fdc58 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:47:38 +0000
+Subject: [PATCH 5963] Kanban spend-decision routing, ownerless stops and hold notices
+
+Public mirror of source commit 6eadd4b7a0474283b971f2a97c86684cb01fdc58.
+
+---
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index af9b6c28f51..0e52929f73a 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -330,9 +330,36 @@
+     from hermes_cli.kanban_retained_wait import explanation
+     if row["status"] == "triage" and explanation(conn, tid, generated_only=False):
+         return True  # a retained card its open parent or recorded wait explains owns no ask (t_2c750e700cdf6fae)
++    if _source_asks(conn, row):
++        return True
+     return _armed_wake(conn, tid) or _agent_owned(conn, tid, age=age, defer=defer)
+ 
+ 
++_DECISION_KEY = "spend-budget-decision:"
++
++
++def _source_asks(conn: sqlite3.Connection, row: dict) -> bool:
++    """A spend-decision supervisor card whose decision is already asked, already made or owned by a newer card. Its
++    source carries an open human ask (promote or archive the source is the decision), the source is gone or no
++    longer spend-pending (promoted, archived, done), or another open supervisor is the source's current decision
++    card. Escalating the parked supervisor then asked David twice for one stop: the source is
++    escalated while ownerless, ``ensure_producer`` opens a new supervisor, that one parks, and it stays parked
++    after the source is answered."""
++    from hermes_cli.kanban_open_asks import card_is_open_human_ask
++    from hermes_cli.kanban_spend_decision import pending
++    key = str(row.get("idempotency_key") or "")
++    if row.get("created_by") != "kanban-spend-budget" or not key.startswith(_DECISION_KEY):
++        return False
++    source_id = key[len(_DECISION_KEY):].split(":", 1)[0]
++    source = conn.execute("SELECT status, block_kind, human_request FROM tasks WHERE id=?", (source_id,)).fetchone()
++    if source is None or source[0] in ("done", "archived") or not pending(conn, source_id):
++        return True
++    if card_is_open_human_ask(source[0], source[1], source[2]):
++        return True
++    current = open_decision_card(conn, source_id)  # a leftover from an earlier stop: the current one owns it
++    return current is not None and current != row["id"]
++
++
+ def _shared_blocker(entry: Optional[dict]) -> bool:
+     """Parked behind a declared shared blocker another card probes (as ``sweep_agent_owned_blocks`` skips)."""
+     return bool(entry and entry["payload"].get("blocker_id"))
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index b8be04e8486..7d37addf787 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -202,6 +202,71 @@
+         assert card_is_open_human_ask(*_row(conn, tid))
+ 
+ 
++def _reparked_supervisor(conn):
++    """The hub shape of undated representative observation: a spend-stopped source escalated while ownerless (its supervisor done), then
++    a new supervisor opened for the same episode, which itself parks with no owner."""
++    tid = stopped(conn)
++    assert budget.hold(conn, tid) == "triage"
++    (notice,) = _events(conn, tid, decision.NOTICE)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (notice["producer"]["task_id"],))
++    assert _sweep(conn, now=_later(3), cfg={}) == [tid]
++    decision.ensure_producer(conn, tid)
++    sup = _events(conn, tid, decision.NOTICE)[-1]["producer"]["task_id"]
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage', block_kind='transient' WHERE id=?", (sup,))
++        kb._append_event(conn, sup, "agent_block_escalated", {"reason": "decision retained"})
++        kb._append_event(conn, sup, "triage_sweep_capped", {"cap": 3})
++    return tid, sup
++
++
++def test_supervisor_of_an_asking_source_is_not_asked_again(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid, sup = _reparked_supervisor(conn)
++        assert card_is_open_human_ask(*_row(conn, tid))
++        assert _sweep(conn, now=_later(6), cfg={}) == []
++        assert not card_is_open_human_ask(*_row(conn, sup))
++        assert _events(conn, sup, stranded.EVENT) == []
++
++
++def test_supervisor_is_asked_once_its_source_ask_is_gone(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid, sup = _reparked_supervisor(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=NULL, block_kind='transient' WHERE id=?", (tid,))
++        assert sup in _sweep(conn, now=_later(6), cfg={})
++        assert card_is_open_human_ask(*_row(conn, sup))
++
++
++@pytest.mark.parametrize("answer", ["promoted", "archived"])
++def test_supervisor_of_an_answered_source_is_not_asked(kanban_home, own_gateway, answer):
++    with kbc.connect_closing() as conn:
++        tid, sup = _reparked_supervisor(conn)
++        if answer == "promoted":
++            ok, err = kb.promote_task(conn, tid, actor="david", reason="re-scoped")
++            assert ok, err
++        else:
++            assert kb.archive_task(conn, tid)
++        assert sup not in _sweep(conn, now=_later(6), cfg={})
++        assert not card_is_open_human_ask(*_row(conn, sup))
++
++
++def test_leftover_supervisor_of_an_earlier_stop_is_not_asked(kanban_home, own_gateway):
++    with kbc.connect_closing() as conn:
++        tid, sup = _reparked_supervisor(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET human_request=NULL, block_kind='transient' WHERE id=?", (tid,))
++        old = kb.create_task(conn, title="Spend budget decision: earlier stop", assignee="default",
++                             created_by="kanban-spend-budget", idempotency_key=f"spend-budget-decision:{tid}:1")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage', block_kind='transient' WHERE id=?", (old,))
++            kb._append_event(conn, old, "agent_block_escalated", {"reason": "decision retained"})
++            kb._append_event(conn, old, "triage_sweep_capped", {"cap": 3})
++        assert stranded.open_decision_card(conn, tid) == sup
++        escalated = _sweep(conn, now=_later(6), cfg={})
++        assert sup in escalated and old not in escalated
++
++
+ def test_transient_triage_card_is_rekinded(kanban_home, own_gateway):
+     with kbc.connect_closing() as conn:
+         tid = _parked(conn, kind="transient")
+-- 
+2.43.0
+

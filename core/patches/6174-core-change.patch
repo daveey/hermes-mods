@@ -1,0 +1,175 @@
+From 788759413eecc276040bc73603d3419946a300e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:53:41 +0000
+Subject: [PATCH 6174] Read-first spend decisions and scope release fences
+
+Public mirror of source commit 788759413eecc276040bc73603d3419946a300e0.
+
+---
+diff --git a/hermes_cli/kanban_spend_override_fence.py b/hermes_cli/kanban_spend_override_fence.py
+index fddcaea8e7a..b102193322d 100644
+--- a/hermes_cli/kanban_spend_override_fence.py
++++ b/hermes_cli/kanban_spend_override_fence.py
+@@ -33,9 +33,14 @@
+     if not changed:
+         return episode
+     last = changed[-1]
+-    reference = json.loads(last['payload'] or '{}').get('decision_comment')
++    decision = json.loads(last['payload'] or '{}')
++    reference = decision.get('decision_comment')
++    # Older automatic grants used the reviewer's author, not the manual budget
++    # writer. Only that recorded producer may select the reviewer fallback.
++    author = ('kanban-spend-reviewer' if decision.get('by') == 'kanban-spend-reviewer'
++              else 'kanban-spend-budget')
+     notes = [e for e in events if e['kind'] == 'commented' and _event_order(e) > _event_order(last)
+-             and json.loads(e['payload'] or '{}').get('author') == 'kanban-spend-budget']
++             and json.loads(e['payload'] or '{}').get('author') == author]
+     rows = conn.execute("SELECT * FROM task_comments WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+     note = last if isinstance(reference, dict) else (notes[0] if notes else last)
+     payload = reference if isinstance(reference, dict) else json.loads(note['payload'] or '{}')
+@@ -51,7 +56,9 @@
+         command = ['hermes', 'kanban']
+         if board:
+             command += ['--board', board]
+-        newest = max((r['id'] for r in unread if r['id'] is not None), default=seen or 0)
+-        command += ['spend-budget', task_id, '--seen', str(newest)]
++        command += ['spend-budget', task_id]
++        if resolved:
++            newest = max(r['id'] for r in resolved)
++            command += ['--seen', str(newest)]
+         raise comments.UnreadComments(unread, shlex.join(command))
+     return episode
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 91dceb84fb3..88b866ed965 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -456,17 +456,22 @@
+         if conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'triage'",
+                         (task_id,)).rowcount != 1:
+             raise RuntimeError(f"{task_id} left triage inside the spend review transaction")
++        cid = kb.add_comment(conn, task_id, AUTHOR,
++                             f"Spend reviewer granted {runs} more run(s) in a fresh window (stop {episode}): {reason}\n"
++                             f"Progress it cited: \"{_clip(quote, 400)}\"", system=True)
++        note = conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone()
++        reference = {"comment_id": cid, "author": AUTHOR}
++        if 'uid' in note.keys() and note['uid']:
++            reference['comment_uid'] = note['uid']
+         kb._append_event(conn, task_id, ksb.OVERRIDE_EVENT, {
+             "runs": runs, "cache_read_tokens": ksb._limit_value(prior.get("cache_read_tokens")),
+-            "by": AUTHOR, "reason": reason, "episode": episode, **ksb.carried(prior)})
++            "by": AUTHOR, "reason": reason, "episode": episode, "decision_comment": reference,
++            **ksb.carried(prior)})
+         kb._append_event(conn, task_id, "promoted_manual", {
+             "actor": AUTHOR, "reason": reason, "from_status": "triage",
+             WINDOW_KEY: {"runs": runs, "episode": episode, "decision": "spend_review"}})
+         kb._append_event(conn, task_id, GRANTED, {"episode": episode, "runs": runs, "reason": reason,
+                                                   "progress_quote": _clip(quote, 400)})
+-        kb.add_comment(conn, task_id, AUTHOR,
+-                       f"Spend reviewer granted {runs} more run(s) in a fresh window (stop {episode}): {reason}\n"
+-                       f"Progress it cited: \"{_clip(quote, 400)}\"", system=True)
+     _close_decision_card(conn, task_id, episode, runs)
+     return None
+ 
+diff --git a/tests/hermes_cli/test_kanban_spend_override_fence.py b/tests/hermes_cli/test_kanban_spend_override_fence.py
+index bbc4ea35d13..66c5f4b39f5 100644
+--- a/tests/hermes_cli/test_kanban_spend_override_fence.py
++++ b/tests/hermes_cli/test_kanban_spend_override_fence.py
+@@ -124,8 +124,9 @@
+             else:
+                 conn.execute("UPDATE task_events SET payload=json_remove(payload,'$.decision_comment') "
+                              "WHERE task_id=? AND kind=?", (tid, budget.OVERRIDE_EVENT))
+-        with pytest.raises(UnreadComments, match='unavailable'):
++        with pytest.raises(UnreadComments, match='unavailable') as refused:
+             _write(conn, tid, 17, seen=10**9)
++        assert '--seen' not in refused.value.rerun
+         assert len(helpers._events(conn, tid, budget.OVERRIDE_EVENT)) == 1
+ 
+ 
+@@ -142,6 +143,52 @@
+         _write(conn, tid, 2, seen=cid)
+ 
+ 
++@pytest.mark.parametrize('synced', [False, True], ids=['local', 'hub-synced'])
++def test_legacy_reviewer_decision_accepts_comment_tool_watermark(kanban_home, monkeypatch, synced):
++    from hermes_cli import kanban as cli
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from tests.hermes_cli import kanban_sync_support as support
++    from tools import kanban_tools as kt
++
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    if synced:
++        support.write_sync_config(kanban_home, True)
++    with kbc.connect_closing() as conn:
++        if synced:
++            sync.install_or_remove(conn, str(kanban_home / 'kanban.db'))
++            client.ensure_identity(conn, 'default', 'fixture')
++        tid, stop = _card(conn)
++        episode = stop.uid or str(stop.id)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.OVERRIDE_EVENT,
++                             {'runs': 2, 'by': 'kanban-spend-reviewer', 'episode': episode})
++            decision_id = kb.add_comment(conn, tid, 'kanban-spend-reviewer',
++                                         f'Spend reviewer granted 2 more run(s) in a fresh window (stop {episode}): bounded',
++                                         system=True)
++    out = json.loads(kt._handle_comment({'task_id': tid, 'body': 'Creator approves bounded Phase B'}))
++    assert out['ok'], out
++    seen = out['comment_id']
++    command = f'spend-budget {tid} --runs 6 --reason bounded'
++    refused = cli.run_slash(command)
++    assert f'--seen {decision_id}' in refused
++    assert 'unavailable' not in refused
++    assert 'spend budget' in cli.run_slash(f'{command} --seen {seen}')
++
++
++@pytest.mark.parametrize('producer', ['kanban-spend-reviewer', 'default'])
++def test_legacy_decision_does_not_borrow_another_producers_comment(kanban_home, producer):
++    with kbc.connect_closing() as conn:
++        tid, _ = _card(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.OVERRIDE_EVENT, {'runs': 2, 'by': producer})
++            wrong_author = 'kanban-spend-budget' if producer == 'kanban-spend-reviewer' else 'kanban-spend-reviewer'
++            cid = kb.add_comment(conn, tid, wrong_author, 'Unrelated decision', system=True)
++        with pytest.raises(UnreadComments, match='unavailable'):
++            _write(conn, tid, seen=cid)
++        assert len(helpers._events(conn, tid, budget.OVERRIDE_EVENT)) == 1
++
++
+ def test_portable_comment_reference_ignores_foreign_integer(kanban_home):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_client as client
+diff --git a/tests/hermes_cli/test_kanban_spend_reviewer.py b/tests/hermes_cli/test_kanban_spend_reviewer.py
+index e9976ce9af3..f4933b3f7f2 100644
+--- a/tests/hermes_cli/test_kanban_spend_reviewer.py
++++ b/tests/hermes_cli/test_kanban_spend_reviewer.py
+@@ -12,6 +12,7 @@
+ from hermes_cli import kanban_spend_budget as ksb
+ from hermes_cli import kanban_spend_decision as decision
+ from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli.kanban_release_comments import UnreadComments
+ from tests.hermes_cli import test_kanban_spend_budget as helpers
+ 
+ kanban_home = helpers.kanban_home
+@@ -77,7 +78,18 @@
+         assert granted["writer_kind"] == "agent" and "cache_read_writer_kind" not in granted
+         assert ksb.spend(conn, tid).runs == 0 and not decision.pending(conn, tid)
+         assert ksb.hold(conn, tid, lim=helpers.LIMITS) is None
+-        assert "Spend reviewer granted 5" in kb.list_comments(conn, tid)[-1].body
++        comment = kb.list_comments(conn, tid)[-1]
++        assert "Spend reviewer granted 5" in comment.body
++        reference = granted['decision_comment']
++        assert reference['comment_id'] == comment.id
++        assert reference['author'] == reviewer.AUTHOR
++        row = conn.execute('SELECT * FROM task_comments WHERE id=?', (comment.id,)).fetchone()
++        if 'uid' in row.keys() and row['uid']:
++            assert reference['comment_uid'] == row['uid']
++        with pytest.raises(UnreadComments) as refused:
++            ksb.set_override(conn, tid, runs=6, by='default', reason='reconcile')
++        assert refused.value.comments[0]['id'] == comment.id
++        ksb.set_override(conn, tid, runs=6, by='default', reason='reconcile', seen=comment.id)
+ 
+ 
+ @pytest.mark.parametrize("verdict", [
+-- 
+2.43.0
+

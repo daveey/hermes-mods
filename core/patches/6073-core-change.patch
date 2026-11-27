@@ -1,0 +1,164 @@
+From c6a6e59f80e561e49afdd2dd8ff7c80b8e9f7189 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 05:48:13 +0000
+Subject: [PATCH 6073] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit c6a6e59f80e561e49afdd2dd8ff7c80b8e9f7189.
+
+---
+diff --git a/hermes_cli/annotation_event_loop.py b/hermes_cli/annotation_event_loop.py
+index 66b343a77f8..40592cd5e02 100644
+--- a/hermes_cli/annotation_event_loop.py
++++ b/hermes_cli/annotation_event_loop.py
+@@ -69,6 +69,16 @@
+             timeout = min(timeout, max(0.0, quiet - time.monotonic()))
+         elif owned and due is not None:
+             timeout = min(timeout, max(0.0, due - time.time()))
++        if deferred:
++            # One source hint already owns the trailing refresh. Watching a
++            # continuously readable descriptor during this floor only drains
++            # more hints for the same work. Sleep on stop until the next lease
++            # beat or refresh deadline, then drain once to retain source versus
++            # control classification (a source may arrive after a control hint).
++            stop.wait(timeout)
++            if stop.is_set():
++                break
++            timeout = 0
+         try:
+             changed = events.wait(timeout)
+             dirty |= changed
+diff --git a/tests/hermes_cli/test_annotation_coalesce_mitigation.py b/tests/hermes_cli/test_annotation_coalesce_mitigation.py
+index 78d24141b45..9b17f94d530 100644
+--- a/tests/hermes_cli/test_annotation_coalesce_mitigation.py
++++ b/tests/hermes_cli/test_annotation_coalesce_mitigation.py
+@@ -16,7 +16,15 @@
+ def test_hundred_events_one_second_and_idle(monkeypatch, control):
+     clock = [100.0]
+     monkeypatch.setattr(loop, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=lambda: clock[0]))
+-    stop = threading.Event()
++    class Stop:
++        def is_set(self):
++            return clock[0] >= 110
++
++        def wait(self, timeout):
++            clock[0] += timeout
++            return self.is_set()
++
++    stop = Stop()
+     calls = []
+     # Initial ownership seeds coverage once. No source work on maintenance ticks.
+     schedule = [101 + i / 100 for i in range(100)]
+@@ -25,12 +33,12 @@
+         def wait(self, timeout):
+             end = clock[0] + timeout
+             if schedule and schedule[0] <= end:
+-                clock[0] = schedule.pop(0)
++                clock[0] = max(clock[0], schedule.pop(0))
++                while schedule and schedule[0] <= clock[0]:
++                    schedule.pop(0)  # one native drain coalesces already queued hints
+                 self.control_only = control
+                 return True
+             clock[0] = end
+-            if clock[0] >= 110:
+-                stop.set()
+             return False
+     loop.run(Events(), stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
+              lambda: calls.append(clock[0]), coalesce=3.0, floor_all=True)
+diff --git a/tests/hermes_cli/test_annotation_event_loop_rearm.py b/tests/hermes_cli/test_annotation_event_loop_rearm.py
+index 11ea5fa376d..7152850af2d 100644
+--- a/tests/hermes_cli/test_annotation_event_loop_rearm.py
++++ b/tests/hermes_cli/test_annotation_event_loop_rearm.py
+@@ -66,6 +66,90 @@
+     assert not writes
+ 
+ 
++def test_ready_source_is_not_redrained_during_coalesce(monkeypatch):
++    clock = Clock()
++    monkeypatch.setattr(loop, 'time', clock)
++    reads, waits, beats = [], [], []
++
++    class Events:
++        control_only = False
++
++        def wait(self, timeout):
++            if clock.is_set():
++                return False
++            assert not waits or clock.now > waits[-1], 'ready source redrained without blocking'
++            waits.append(clock.now)
++            if clock.now == 0:
++                clock.now = .1
++            return True
++
++    def refresh():
++        reads.append(clock.now)
++        if len(reads) == 2:
++            clock.set()
++
++    loop.run(Events(), clock, SimpleNamespace(held=lambda: True, beat=lambda: beats.append(clock.now)),
++             refresh, interval=1, coalesce=3, floor_all=True)
++    assert reads == [0, 3]
++    assert waits == [0, 1, 2, 3]
++    assert beats == [0, 1, 2, 3], 'coalescing must preserve lease maintenance'
++
++
++def test_control_then_source_during_floor_keeps_source_classification(monkeypatch):
++    clock = Clock()
++    monkeypatch.setattr(loop, 'time', clock)
++    seen = []
++
++    class Events:
++        control_only = False
++
++        def wait(self, timeout):
++            if clock.is_set():
++                return False
++            if clock.now == 0:
++                clock.now = .1
++                self.control_only = True
++                return True
++            assert clock.now == 1, 'source hint should be drained at the lease boundary'
++            self.control_only = False
++            return True
++
++    events = Events()
++
++    def refresh():
++        seen.append(events.control_only)
++        if len(seen) == 2:
++            clock.set()
++
++    loop.run(events, clock, SimpleNamespace(held=lambda: True, beat=lambda: None),
++             refresh, interval=1, coalesce=1, floor_all=True)
++    assert seen == [False, False], 'queued source invalidation must not become a control-only read'
++
++
++def test_stop_during_floor_does_not_drain_or_refresh(monkeypatch):
++    clock = Clock()
++    monkeypatch.setattr(loop, 'time', clock)
++    reads = []
++
++    def stopped_wait(timeout):
++        clock.set()
++        return True
++
++    clock.wait = stopped_wait
++
++    class Events:
++        control_only = False
++
++        def wait(self, timeout):
++            assert clock.now == 0, 'stop must not drain after the coalesced wait'
++            clock.now = .1
++            return True
++
++    loop.run(Events(), clock, SimpleNamespace(held=lambda: True, beat=lambda: None),
++             lambda: reads.append(clock.now), interval=1, coalesce=3, floor_all=True)
++    assert reads == [0]
++
++
+ def test_failed_wait_rearms_with_source_refresh(monkeypatch):
+     clock = Clock()
+     monkeypatch.setattr(loop, 'time', clock)
+-- 
+2.43.0
+

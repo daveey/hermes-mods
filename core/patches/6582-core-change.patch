@@ -1,0 +1,350 @@
+From 8f2b6a29401effe5ce519ed3672e921ca3669ede Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 10:26:45 +0000
+Subject: [PATCH 6582] Annotation readers, batched revisions and settlement generations
+
+Public mirror of source commit 8f2b6a29401effe5ce519ed3672e921ca3669ede.
+
+---
+diff --git a/hermes_cli/data/plugin_api.json b/hermes_cli/data/plugin_api.json
+index f5b93d65824..e9d7f902ece 100644
+--- a/hermes_cli/data/plugin_api.json
++++ b/hermes_cli/data/plugin_api.json
+@@ -8,6 +8,13 @@
+     "out, and the names those pages tell authors to call, raise, return or subclass. Re-harvest when they change."
+   ],
+   "groups": [
++    {
++      "source": "certified read-only Kanban settlement generations (caller-owned SQLite snapshot)",
++      "entries": [
++        "hermes_cli.kanban_task_change:changed_since",
++        "hermes_cli.kanban_task_change:settlement_marks"
++      ]
++    },
+     {
+       "source": "developer-guide / plugins docs",
+       "entries": [
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 7fd89220406..1224f7a73bb 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -39,6 +39,11 @@
+ this design carry ``EPOCH_MARK`` in their SQL; ``ensure_revision`` never drops or rewrites triggers a newer epoch
+ installed, so a newer writer's coverage survives this one's init (an older writer still replaces ours: the cursor's
+ trust rules catch that).
++
++Epoch 4 additionally stamps ``kanban_task_change.settlement_rev`` on local settlement-value writes only
++(``SETTLEMENT_COLUMNS``). Unlike a value hash this generation survives A-B-A, and unlike the broad ``rev``
++it ignores comment/run/title churn. Deletion marks remain as tombstones; never prune or reset these generations.
++Type-only and binary-text differences count, even under a column's case-insensitive collation.
+ """
+ 
+ from __future__ import annotations
+@@ -95,7 +100,8 @@
+ # [daveey] P2 per-task change cursor (t_01a1d59d3ef805c4): which tasks each bump touched.
+ CHANGE_TABLE = "kanban_task_change"
+ FULL_MARK = ""  # a bump no task explains (trigger (re)install): cursors older than its rev read in full
+-EPOCH = 3  # 1 = bump-only; 2 = bump + kanban_task_change; 3 = projection_revision beside revision
++EPOCH = 4  # 2 = task marks; 3 = projection revision; 4 = monotonic settlement generations
++SETTLEMENT_COLUMNS = ("id", "status", "block_kind", "completed_at")
+ EPOCH_MARK = f"/* kanban-activity-epoch:{EPOCH} */"
+ _EPOCH_RE = re.compile(r"/\* kanban-activity-epoch:(\d+) \*/")
+ # The task(s) a row belongs to. Every other watched table names it in ``task_id``.
+@@ -104,7 +110,7 @@
+ # A rowid table, not WITHOUT ROWID: generic every-table readers (``SELECT * ... ORDER BY rowid`` snapshots, recovery
+ # scans) expect a rowid on every board table, and the cost difference on a one-row-per-task table is noise.
+ _CHANGE_DDL = (f"CREATE TABLE IF NOT EXISTS {CHANGE_TABLE} (task_id TEXT PRIMARY KEY NOT NULL, "
+-               "rev INTEGER NOT NULL)",
++               "rev INTEGER NOT NULL, settlement_rev INTEGER NOT NULL DEFAULT 0)",
+                f"CREATE INDEX IF NOT EXISTS {CHANGE_INDEX} ON {CHANGE_TABLE}(rev)")
+ 
+ 
+@@ -172,6 +178,24 @@
+     return _BUMP_PROJECTION
+ 
+ 
++def _settlement_changed(columns: list[str]) -> str:
++    return " OR ".join(
++        f"(OLD.{_quote(c)} COLLATE BINARY IS NOT NEW.{_quote(c)} COLLATE BINARY OR "
++        f"typeof(OLD.{_quote(c)}) IS NOT typeof(NEW.{_quote(c)}))"
++        for c in SETTLEMENT_COLUMNS if c in columns)
++
++
++def _settlement_mark(table: str, op: str, columns: list[str]) -> str:
++    """Preserve tombstones: deletion/reinsertion must never reset a selected generation."""
++    if table != "tasks" or "id" not in columns:
++        return ""
++    refs = "NEW.id" if op == "INSERT" else "OLD.id" if op == "DELETE" else "OLD.id, NEW.id"
++    when = f" AND ({_settlement_changed(columns)})" if op == "UPDATE" else ""
++    return (f"UPDATE {CHANGE_TABLE} SET settlement_rev = "
++            f"(SELECT revision FROM {REVISION_TABLE} WHERE id = 1) "
++            f"WHERE task_id IN ({refs}){when};")
++
++
+ def wanted_triggers(conn: sqlite3.Connection, tables: Iterable[str]) -> dict[str, str]:
+     """Trigger name -> CREATE statement for the ``tables`` present in ``conn``, from their live columns."""
+     out: dict[str, str] = {}
+@@ -186,12 +210,16 @@
+             if op == "INSERT" and table == "task_events" and "kind" in columns:
+                 when = " WHEN COALESCE(NEW.kind, '') NOT IN ({})".format(", ".join(f"'{k}'" for k in UNREAD_EVENT_KINDS))
+             out[name] = (f"CREATE TRIGGER {name} AFTER {op} ON {_quote(table)}{when} BEGIN {EPOCH_MARK} {_BUMP} "
+-                         f"{_projection_bump(table, op, columns)} {_marks(op, keys)} END")
++                         f"{_projection_bump(table, op, columns)} {_marks(op, keys)} "
++                         f"{_settlement_mark(table, op, columns)} END")
+         read = [c for c in columns if c not in BOOKKEEPING_COLUMNS.get(table, frozenset())]
+         changed = " OR ".join(_moved(table, c) for c in read)
++        if table == "tasks" and set(columns).intersection(SETTLEMENT_COLUMNS):
++            changed = f"({changed}) OR ({_settlement_changed(columns)})"
+         name = f"{PREFIX}{table}_update"
+         out[name] = (f"CREATE TRIGGER {name} AFTER UPDATE ON {_quote(table)} WHEN {changed} BEGIN {EPOCH_MARK} "
+-                     f"{_BUMP} {_projection_bump(table, 'UPDATE', columns)} {_marks('UPDATE', keys)} END")
++                     f"{_BUMP} {_projection_bump(table, 'UPDATE', columns)} {_marks('UPDATE', keys)} "
++                     f"{_settlement_mark(table, 'UPDATE', columns)} END")
+     return out
+ 
+ 
+@@ -214,7 +242,9 @@
+     if REVISION_TABLE in present:
+         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_quote(REVISION_TABLE)})")}
+         has_projection = "projection_revision" in cols
+-    if has_row and has_projection and found == wanted:
++    has_settlement = CHANGE_TABLE in present and "settlement_rev" in {
++        r[1] for r in conn.execute(f"PRAGMA table_info({_quote(CHANGE_TABLE)})")}
++    if has_row and has_projection and has_settlement and found == wanted:
+         return
+     from hermes_cli.kanban_db_connect import write_txn
+     with write_txn(conn):
+@@ -226,6 +256,9 @@
+         conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} (id, revision) VALUES (1, 0)")
+         for ddl in _CHANGE_DDL:
+             conn.execute(ddl)
++        change_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_quote(CHANGE_TABLE)})")}
++        if "settlement_rev" not in change_cols:
++            conn.execute(f"ALTER TABLE {CHANGE_TABLE} ADD COLUMN settlement_rev INTEGER NOT NULL DEFAULT 0")
+         conn.execute(_BUMP)
+         conn.execute(_BUMP_PROJECTION)
+         conn.execute(_mark("NULL"))  # whatever changed while the triggers were absent or older is unknown
+diff --git a/hermes_cli/kanban_task_change.py b/hermes_cli/kanban_task_change.py
+index 0de6db4fb47..da8fdefeae3 100644
+--- a/hermes_cli/kanban_task_change.py
++++ b/hermes_cli/kanban_task_change.py
+@@ -19,7 +19,7 @@
+ Subject to that writer precondition, a cursor is trusted only when all of these hold in the reader's snapshot;
+ otherwise the answer is ``FULL``:
+ 
+-- the file carries every trigger of epoch >= 2 for the tables it watches, and the change table (``_covered``);
++- the file carries every trigger of epoch >= 3 for the tables it watches, and the change table (``_covered``);
+ - (a) ``MAX(kanban_task_change.rev) == kanban_activity_revision.revision``. An older writer's init replaces our
+   triggers with bump-only ones (and bumps): the counter then runs ahead of the change table;
+ - (b) the revision is not below the cursor's (a database restored in place: same inode, regressed counter);
+@@ -33,6 +33,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import os
+ import sqlite3
+ import threading
+@@ -103,8 +104,8 @@
+         if table not in names:
+             continue  # absent table: nothing to watch
+         for op in ("insert", "update", "delete"):
+-            if rev.trigger_epoch(triggers.get(f"{rev.PREFIX}{table}_{op}")) < rev.EPOCH:
+-                return False  # missing, or an older writer's bump-only trigger
++            if rev.trigger_epoch(triggers.get(f"{rev.PREFIX}{table}_{op}")) < 3:
++                return False  # broad epoch-3 marks suffice; settlement coverage is checked separately
+     return True
+ 
+ 
+@@ -173,6 +174,30 @@
+     return changed, fresh
+ 
+ 
++def settlement_marks(conn: sqlite3.Connection, tails: Iterable[str], cursor: Cursor) -> dict[str, int] | None:
++    """Selected monotonic settlement generations, including deleted tasks, in caller's snapshot.
++
++    Broad task-change coverage predates settlement generations. An older writer/schema may still certify
++    broad marks but never the narrow ones: return None so consumers keep their broad per-task key.
++    Tombstones must not be pruned: delete/reinsert and value ABA must always move these generations.
++    """
++    if not conn.in_transaction:
++        raise ValueError("settlement marks require caller transaction")
++    _changed, fresh = changed_since(conn, cursor, tables=cursor.tables)
++    if fresh != cursor:
++        return None
++    triggers = dict(conn.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name='tasks'"))
++    if any(rev.trigger_epoch(triggers.get(f"{rev.PREFIX}tasks_{op}")) < 4
++           for op in ("insert", "update", "delete")):
++        return None
++    if "settlement_rev" not in {r[1] for r in conn.execute(f"PRAGMA table_info({rev.CHANGE_TABLE})")}:
++        return None
++    return dict(conn.execute(
++        f"SELECT task_id, settlement_rev FROM {rev.CHANGE_TABLE} "
++        "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(sorted(tails)),)))
++
++
+ def _reset_for_tests() -> None:
+     with _COVERED_LOCK:
+         _COVERED.clear()
+diff --git a/tests/hermes_cli/test_kanban_settlement_revision.py b/tests/hermes_cli/test_kanban_settlement_revision.py
+new file mode 100644
+index 00000000000..86455dc93ea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_settlement_revision.py
+@@ -0,0 +1,139 @@
++"""Writer-certified monotonic settlement generations must not suffer value ABA."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++
++
++def mark(conn, task='a'):
++    return conn.execute('SELECT settlement_rev FROM kanban_task_change WHERE task_id=?', (task,)).fetchone()[0]
++
++
++@pytest.fixture
++def board(tmp_path):
++    conn = sqlite3.connect(tmp_path / 'board.db')
++    conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, status, block_kind, completed_at, title TEXT)')
++    conn.execute('CREATE TABLE task_comments (task_id TEXT, body TEXT)')
++    rev.ensure_revision(conn, rev.LOCAL_TABLES)
++    conn.execute("INSERT INTO tasks VALUES ('a', 'done', NULL, 100, 'title')")
++    conn.commit()
++    yield conn
++    conn.close()
++
++
++def test_settlement_generation_survives_value_aba_but_ignores_comments(board):
++    start = mark(board)
++    board.execute("INSERT INTO task_comments VALUES ('a', 'comment')")
++    board.execute("UPDATE tasks SET title='changed' WHERE id='a'")
++    board.commit()
++    assert mark(board) == start
++    board.execute("UPDATE tasks SET status='running' WHERE id='a'")
++    board.commit()
++    middle = mark(board)
++    board.execute("UPDATE tasks SET status='done' WHERE id='a'")
++    board.commit()
++    assert start < middle < mark(board)
++
++
++def test_certified_settlement_marks_include_tombstones(board):
++    from hermes_cli import kanban_task_change as tc
++    with board:
++        board.execute("DELETE FROM tasks WHERE id='a'")
++    board.execute('BEGIN')
++    try:
++        _, cursor = tc.changed_since(board, None)
++        assert tc.settlement_marks(board, {'a', 'missing'}, cursor) == {'a': mark(board)}
++    finally:
++        board.rollback()
++
++
++@pytest.mark.parametrize('before,after', [(1, 1.0), ('done', b'done'), (None, ''), ('', None)])
++def test_storage_type_and_null_aba_stamp_each_transition(board, before, after):
++    board.execute('UPDATE tasks SET completed_at=?', (before,))
++    board.commit()
++    start = mark(board)
++    board.execute('UPDATE tasks SET completed_at=?', (after,))
++    middle = mark(board)
++    board.execute('UPDATE tasks SET completed_at=?', (before,))
++    board.commit()
++    assert start < middle < mark(board)
++    stable = mark(board)
++    board.execute('UPDATE tasks SET completed_at=completed_at, status=status')
++    board.commit()
++    assert mark(board) == stable
++
++
++def test_delete_reinsert_rename_and_reinstall_preserve_generations(board):
++    before = mark(board)
++    board.execute("DELETE FROM tasks WHERE id='a'")
++    deleted = mark(board)
++    board.execute("INSERT INTO tasks VALUES ('a', 'done', NULL, 100, 'title')")
++    inserted = mark(board)
++    board.execute("UPDATE tasks SET id='b' WHERE id='a'")
++    renamed = mark(board)
++    board.commit()
++    assert before < deleted < inserted < renamed == mark(board, 'b')
++    rev.drop_triggers(board)
++    rev.ensure_revision(board, rev.LOCAL_TABLES)
++    assert renamed == mark(board) == mark(board, 'b')
++
++
++def test_upgrade_old_change_table_and_idempotent_init(tmp_path):
++    with sqlite3.connect(tmp_path / 'old.db') as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)')
++        conn.execute('CREATE TABLE kanban_task_change (task_id TEXT PRIMARY KEY NOT NULL, rev INTEGER NOT NULL)')
++        conn.execute("INSERT INTO kanban_task_change VALUES ('a', 23)")
++        conn.commit()
++        rev.ensure_revision(conn, rev.LOCAL_TABLES)
++        assert mark(conn) == 0
++        before = conn.total_changes
++        rev.ensure_revision(conn, rev.LOCAL_TABLES)
++        assert conn.total_changes == before
++        conn.execute("INSERT INTO tasks VALUES ('a', 'done')")
++        assert mark(conn) > 0
++
++
++@pytest.mark.parametrize('failure', ['old', 'missing', 'column', 'cursor'])
++def test_narrow_marks_require_current_writer_coverage(board, failure):
++    from dataclasses import replace
++    from hermes_cli import kanban_task_change as tc
++    if failure in {'old', 'missing'}:
++        sql = board.execute("SELECT sql FROM sqlite_master WHERE name='kanban_activity_rev_tasks_update'").fetchone()[0]
++        board.execute('DROP TRIGGER kanban_activity_rev_tasks_update')
++        if failure == 'old':
++            board.execute(sql.replace('kanban-activity-epoch:4', 'kanban-activity-epoch:3'))
++    elif failure == 'column':
++        rev.drop_triggers(board)
++        board.execute('ALTER TABLE kanban_task_change DROP COLUMN settlement_rev')
++    board.commit()
++    board.execute('BEGIN')
++    try:
++        _, cursor = tc.changed_since(board, None)
++        if cursor is None:
++            assert failure in {'missing', 'column'}
++            return
++        if failure == 'cursor':
++            cursor = replace(cursor, revision=cursor.revision + 1)
++        assert tc.settlement_marks(board, {'a'}, cursor) is None
++    finally:
++        board.rollback()
++
++
++def test_narrow_reader_requires_snapshot(board):
++    from hermes_cli import kanban_task_change as tc
++    _, cursor = tc.changed_since(board, None)
++    with pytest.raises(ValueError, match='caller transaction'):
++        tc.settlement_marks(board, {'a'}, cursor)
++
++
++def test_case_insensitive_columns_still_stamp_exact_value_aba(tmp_path):
++    with sqlite3.connect(tmp_path / 'collated.db') as conn:
++        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT COLLATE NOCASE)')
++        rev.ensure_revision(conn, rev.LOCAL_TABLES)
++        conn.execute("INSERT INTO tasks VALUES ('a', 'done')")
++        before = mark(conn)
++        conn.execute("UPDATE tasks SET status='DONE'")
++        middle = mark(conn)
++        conn.execute("UPDATE tasks SET status='done'")
++        assert before < middle < mark(conn)
+diff --git a/website/docs/developer-guide/plugins/public-api.md b/website/docs/developer-guide/plugins/public-api.md
+index 617f6a3dcbd..59f076eedbd 100644
+--- a/website/docs/developer-guide/plugins/public-api.md
++++ b/website/docs/developer-guide/plugins/public-api.md
+@@ -19,6 +19,8 @@
+ 
+ | Module | Name | Listed from |
+ |---|---|---|
++| `hermes_cli.kanban_task_change` | `changed_since` | certified read-only Kanban settlement generations (caller-owned SQLite snapshot) |
++| `hermes_cli.kanban_task_change` | `settlement_marks` | certified read-only Kanban settlement generations (caller-owned SQLite snapshot) |
+ | `agent.account_usage` | whole module | developer-guide / plugins docs |
+ | `agent.acp_client` | whole module | developer-guide / plugins docs |
+ | `agent.browser_page_backend` | `BrowserPageBackend` | developer-guide / plugins docs |
+-- 
+2.43.0
+

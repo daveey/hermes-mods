@@ -1,0 +1,336 @@
+From 08e62d27f0e2827a4473db6a68e878bc7cb53ce5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:08:16 +0000
+Subject: [PATCH 6306] Immutable historical rejection observations and fresh audit cuts
+
+Public mirror of source commit 08e62d27f0e2827a4473db6a68e878bc7cb53ce5.
+
+---
+diff --git a/hermes_cli/kanban_history_residue_custody.py b/hermes_cli/kanban_history_residue_custody.py
+new file mode 100644
+index 00000000000..02255bc48d6
+--- /dev/null
++++ b/hermes_cli/kanban_history_residue_custody.py
+@@ -0,0 +1,105 @@
++"""Append-only local intent/observation custody, not transport settlement. [daveey]
++
++Only a future authenticated producer may call seal with a Board readback. This
++module makes no network call, certifies no historical admission and never changes
++outbox, events, holds, workers or sync-diff. Unsealed intents survive uncertain
++HTTP outcomes for exact-request reconciliation, never replacement identity.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_history_residue_source import (
++    Refused, _positive, _require, _text, decode_source, strict_object, validate_receipt,
++)
++
++INTENTS = 'kanban_history_residue_intents'
++RECEIPTS = 'kanban_history_residue_receipts'
++
++
++def _scope(scope):
++    _require(isinstance(scope, tuple) and len(scope) == 3 and all(_text(v) for v in scope), 'scope_invalid')
++    for value in scope:
++        try:
++            value.encode('utf-8')
++        except UnicodeError as exc:
++            raise Refused('scope_invalid') from exc
++    return scope
++
++
++def _request(raw):
++    request = strict_object(raw, max_bytes=2 * 1024 * 1024)
++    _require(set(request) == {'version', 'task', 'expected_version', 'source_json', 'reason'}
++             and type(request['version']) is int and request['version'] == 1
++             and _positive(request['expected_version']) and _text(request['reason']), 'request_invalid')
++    row = decode_source(request['source_json'])
++    _require(strict_object(row['fields'])['task_id'] == request['task'], 'request_task')
++    return request, row
++
++
++def _schema(conn):
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {INTENTS} (endpoint TEXT NOT NULL, board TEXT NOT NULL, '
++                 'gateway TEXT NOT NULL, op_id TEXT NOT NULL, event_uid TEXT NOT NULL, request_json TEXT NOT NULL, '
++                 'PRIMARY KEY(endpoint,board,gateway,op_id), UNIQUE(endpoint,board,gateway,event_uid))')
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {RECEIPTS} (endpoint TEXT NOT NULL, board TEXT NOT NULL, '
++                 'gateway TEXT NOT NULL, op_id TEXT NOT NULL, receipt_json TEXT NOT NULL, '
++                 'PRIMARY KEY(endpoint,board,gateway,op_id))')
++    for table in (INTENTS, RECEIPTS):
++        for op in ('UPDATE', 'DELETE'):
++            conn.execute(f'CREATE TRIGGER IF NOT EXISTS {table}_{op.lower()} BEFORE {op} ON {table} '
++                         "BEGIN SELECT RAISE(ABORT,'immutable history observation custody'); END")
++        extra = ' OR event_uid=NEW.event_uid' if table == INTENTS else ''
++        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {table}_insert BEFORE INSERT ON {table} '
++                     f'WHEN EXISTS (SELECT 1 FROM {table} WHERE endpoint=NEW.endpoint AND board=NEW.board '
++                     f'AND gateway=NEW.gateway AND (op_id=NEW.op_id{extra})) '
++                     "BEGIN SELECT RAISE(ABORT,'immutable history observation custody'); END")
++
++
++def lookup(conn, scope, op_id):
++    """Historical bytes only. Missing custody is unknown, not fresh clearance."""
++    scope = _scope(scope)
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (INTENTS,)).fetchone():
++        return None
++    row = conn.execute(f'SELECT request_json FROM {INTENTS} WHERE endpoint=? AND board=? AND gateway=? AND op_id=?',
++                       (*scope, op_id)).fetchone()
++    if row is None:
++        return None
++    receipt = conn.execute(f'SELECT receipt_json FROM {RECEIPTS} WHERE endpoint=? AND board=? AND gateway=? AND op_id=?',
++                           (*scope, op_id)).fetchone()
++    return {'request_json': row[0], 'receipt_json': receipt[0] if receipt else None}
++
++
++def stage(conn, scope, request_json):
++    """Commit exact intent before network I/O. Caller must separately prove live inputs."""
++    scope = _scope(scope)
++    _, row = _request(request_json)
++    _require(not conn.in_transaction, 'custody_nested_transaction')
++    with write_txn(conn):
++        _schema(conn)
++        old = lookup(conn, scope, row['op_id'])
++        if old is not None:
++            _require(old['request_json'] == request_json, 'intent_conflict')
++        else:
++            conn.execute(f'INSERT INTO {INTENTS} VALUES(?,?,?,?,?,?)', (*scope, row['op_id'], row['row_uid'], request_json))
++    return row['op_id']
++
++
++def seal(conn, scope, op_id, receipt_json):
++    """Store exact authenticated readback; this is not current evidence or sync ACK."""
++    scope = _scope(scope)
++    _require(not conn.in_transaction, 'custody_nested_transaction')
++    with write_txn(conn):
++        old = lookup(conn, scope, op_id)
++        if old is None:
++            raise Refused('intent_missing')
++        request, source = _request(old['request_json'])
++        _require(source['op_id'] == op_id, 'intent_identity')
++        receipt = strict_object(receipt_json, max_bytes=2 * 1024 * 1024)
++        validate_receipt(receipt, request['source_json'], gateway=scope[2], board=scope[1])
++        _require(receipt['reason'] == request['reason'] and receipt['parent'].get('version') == request['expected_version']
++                 and type(receipt['parent'].get('version')) is int, 'receipt_request_conflict')
++        if old['receipt_json'] is not None:
++            _require(old['receipt_json'] == receipt_json, 'receipt_conflict')
++        else:
++            conn.execute(f'INSERT INTO {RECEIPTS} VALUES(?,?,?,?,?)', (*scope, op_id, receipt_json))
+diff --git a/hermes_cli/kanban_history_residue_source.py b/hermes_cli/kanban_history_residue_source.py
+index 7dad6c72905..47a24423cc0 100644
+--- a/hermes_cli/kanban_history_residue_source.py
++++ b/hermes_cli/kanban_history_residue_source.py
+@@ -111,6 +111,27 @@
+              and 'tombstone' in value and value['tombstone'] is None, 'absence_unproven')
+ 
+ 
++def validate_receipt(receipt: dict, exact_source: str, *, gateway: str, board: str) -> None:
++    """Check an immutable historical observation, never a current authorization."""
++    row = decode_source(exact_source)
++    fields = strict_object(row['fields'])
++    _require(isinstance(receipt, dict) and set(receipt) == {'version', 'gateway', 'source_json', 'reason',
++             'disposition', 'canonical_acceptance', 'historical_identity_certified', 'execution_authority',
++             'reported_rejection_only', 'snapshot_only', 'observed_at_ms', 'observed_head', 'parent', 'absence'},
++             'receipt_keys')
++    _require(type(receipt.get('version')) is int and receipt['version'] == 1
++             and receipt.get('gateway') == gateway and receipt.get('source_json') == exact_source
++             and receipt.get('disposition') == 'retained_unreplayed' and _text(receipt.get('reason')), 'receipt_identity')
++    for key, expected in {'canonical_acceptance': False, 'historical_identity_certified': False,
++                          'execution_authority': False, 'reported_rejection_only': True, 'snapshot_only': True}.items():
++        _require(receipt.get(key) is expected, 'receipt_authority')
++    _require(_positive(receipt.get('observed_at_ms')) and type(receipt.get('observed_head')) is int
++             and receipt['observed_head'] >= 0 and isinstance(receipt.get('parent'), dict)
++             and receipt['parent'].get('uid') == fields['task_id']
++             and receipt['parent'].get('created_on') == gateway, 'historical_snapshot')
++    _absence(receipt.get('absence'), board=board, event=row['row_uid'], head=receipt['observed_head'])
++
++
+ def validate_current(raw: str, exact_source: str, *, gateway: str, board: str, head: int) -> dict:
+     """Validate response structure only, NOT HTTP origin, local custody, freshness or admission.
+ 
+@@ -127,25 +148,10 @@
+              and data['version'] == 1 and data['gateway'] == gateway, 'proof_identity')
+     receipt, current = data['receipt'], data['current']
+     _require(isinstance(receipt, dict) and isinstance(current, dict), 'proof_objects')
+-    _require(set(receipt) == {'version', 'gateway', 'source_json', 'reason', 'disposition',
+-             'canonical_acceptance', 'historical_identity_certified', 'execution_authority',
+-             'reported_rejection_only', 'snapshot_only', 'observed_at_ms', 'observed_head', 'parent', 'absence'},
+-             'receipt_keys')
++    validate_receipt(receipt, exact_source, gateway=gateway, board=board)
+     _require(set(current) == {'observed_at_ms', 'observed_head', 'parent', 'absence', 'no_lease',
+              'no_running_run', 'no_retained_op_receipt', 'op_history_certified', 'retained_receipt_floor1',
+              'execution_authority'}, 'current_keys')
+-    _require(type(receipt.get('version')) is int and receipt['version'] == 1
+-             and receipt.get('gateway') == gateway and receipt.get('source_json') == exact_source
+-             and receipt.get('disposition') == 'retained_unreplayed'
+-             and _text(receipt.get('reason')), 'receipt_identity')
+-    for key, expected in {'canonical_acceptance': False, 'historical_identity_certified': False,
+-                          'execution_authority': False, 'reported_rejection_only': True, 'snapshot_only': True}.items():
+-        _require(receipt.get(key) is expected, 'receipt_authority')
+-    _require(_positive(receipt.get('observed_at_ms')) and type(receipt.get('observed_head')) is int
+-             and receipt['observed_head'] >= 0 and isinstance(receipt.get('parent'), dict)
+-             and receipt['parent'].get('uid') == fields['task_id']
+-             and receipt['parent'].get('created_on') == gateway, 'historical_snapshot')
+-    _absence(receipt.get('absence'), board=board, event=row['row_uid'], head=receipt['observed_head'])
+     _require(type(head) is int and head >= 0 and type(current.get('observed_head')) is int
+              and current['observed_head'] == head and _positive(current.get('observed_at_ms')),
+              'current_cut')
+diff --git a/tests/hermes_cli/test_kanban_history_residue_custody.py b/tests/hermes_cli/test_kanban_history_residue_custody.py
+new file mode 100644
+index 00000000000..22acacd592d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_custody.py
+@@ -0,0 +1,149 @@
++"""Append-only host custody is historical observation, never current authority."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli.kanban_history_residue_source import Refused
++from tests.hermes_cli.test_kanban_history_residue_proof import proof
++
++
++SCOPE = ('https://board.example', 'default', 'home')
++
++
++def request():
++    raw, data = proof()
++    return json.dumps({'version': 1, 'task': 't_stopped', 'expected_version': 7,
++                       'source_json': raw, 'reason': 'Keep history'}), data['receipt']
++
++
++@pytest.fixture
++def db(tmp_path):
++    conn = sqlite3.connect(tmp_path / 'custody.db', isolation_level=None)
++    conn.row_factory = sqlite3.Row
++    yield conn
++    conn.close()
++
++
++def test_stage_seal_reopen_preserves_exact_bytes_and_never_supplies_current_authority(db):
++    raw, receipt = request()
++    custody.stage(db, SCOPE, raw)
++    custody.seal(db, SCOPE, 'op-original', json.dumps(receipt, indent=2))
++    path = db.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path) as other:
++        other.row_factory = sqlite3.Row
++        saved = custody.lookup(other, SCOPE, 'op-original')
++        assert saved == {'request_json': raw, 'receipt_json': json.dumps(receipt, indent=2)}
++        assert 'current' not in saved
++        assert custody.lookup(other, (SCOPE[0], 'other', 'home'), 'op-original') is None
++        assert custody.lookup(other, (SCOPE[0], 'default', 'other'), 'op-original') is None
++        assert custody.lookup(other, ('https://other', 'default', 'home'), 'op-original') is None
++
++
++def test_identical_retries_are_noop_but_changed_bytes_conflict(db):
++    raw, receipt = request()
++    custody.stage(db, SCOPE, raw)
++    custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++    before = db.total_changes
++    custody.stage(db, SCOPE, raw)
++    custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++    assert db.total_changes == before
++    with pytest.raises(Refused, match='conflict'):
++        custody.stage(db, SCOPE, raw + ' ')
++    with pytest.raises(Refused, match='conflict'):
++        custody.seal(db, SCOPE, 'op-original', json.dumps(receipt) + ' ')
++
++
++@pytest.mark.parametrize('table', ['kanban_history_residue_intents', 'kanban_history_residue_receipts'])
++@pytest.mark.parametrize('mutation', ['UPDATE', 'DELETE', 'REPLACE'])
++def test_original_custody_cannot_be_updated_deleted_or_replaced(db, table, mutation):
++    raw, receipt = request()
++    custody.stage(db, SCOPE, raw)
++    custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++    before = [tuple(r) for r in db.execute(f'SELECT * FROM {table}')]
++    query = {'UPDATE': f'UPDATE {table} SET op_id=op_id', 'DELETE': f'DELETE FROM {table}',
++             'REPLACE': f'INSERT OR REPLACE INTO {table} SELECT * FROM {table}'}[mutation]
++    with pytest.raises(sqlite3.IntegrityError, match='immutable'):
++        db.execute(query)
++    assert [tuple(r) for r in db.execute(f'SELECT * FROM {table}')] == before
++
++
++@pytest.mark.parametrize('change', ['source', 'reason', 'revision', 'task', 'authority', 'gateway'])
++def test_receipt_must_match_frozen_request_not_just_operation_id(db, change):
++    raw, receipt = request()
++    custody.stage(db, SCOPE, raw)
++    if change == 'source': receipt['source_json'] += ' '
++    if change == 'reason': receipt['reason'] += ' changed'
++    if change == 'revision': receipt['parent']['version'] += 1
++    if change == 'task': receipt['parent']['uid'] = 'different'
++    if change == 'authority': receipt['canonical_acceptance'] = True
++    if change == 'gateway': receipt['gateway'] = 'different'
++    with pytest.raises(Refused):
++        custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++    assert custody.lookup(db, SCOPE, 'op-original')['receipt_json'] is None
++
++
++def test_uncertain_delivery_retains_intent_without_manufacturing_receipt(db):
++    raw, _ = request()
++    custody.stage(db, SCOPE, raw)
++    assert custody.lookup(db, SCOPE, 'op-original') == {'request_json': raw, 'receipt_json': None}
++    with pytest.raises(Refused, match='intent_missing'):
++        custody.seal(db, SCOPE, 'another-op', '{}')
++
++
++def test_seal_rollback_keeps_original_intent(db):
++    raw, receipt = request()
++    custody.stage(db, SCOPE, raw)
++    db.execute("CREATE TRIGGER fail_receipt AFTER INSERT ON kanban_history_residue_receipts BEGIN SELECT RAISE(ABORT,'injected'); END")
++    with pytest.raises(sqlite3.IntegrityError, match='injected'):
++        custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++    assert custody.lookup(db, SCOPE, 'op-original')['receipt_json'] is None
++
++
++@pytest.mark.parametrize('change', ['version', 'revision', 'task', 'reason', 'unknown', 'duplicate'])
++def test_bad_request_is_refused_without_installing_any_schema(db, change):
++    raw, _ = request()
++    obj = json.loads(raw)
++    if change == 'version': obj['version'] = True
++    if change == 'revision': obj['expected_version'] = 0
++    if change == 'task': obj['task'] = 'different'
++    if change == 'reason': obj['reason'] = ''
++    if change == 'unknown': obj['execution_authority'] = True
++    raw = json.dumps(obj)
++    if change == 'duplicate': raw = raw[:-1] + ',"version":1}'
++    before = db.execute('SELECT * FROM sqlite_master').fetchall()
++    with pytest.raises(Refused):
++        custody.stage(db, SCOPE, raw)
++    assert db.execute('SELECT * FROM sqlite_master').fetchall() == before
++
++
++@pytest.mark.parametrize('action', ['stage', 'seal'])
++def test_custody_writes_require_their_own_commit_boundary(db, action):
++    raw, receipt = request()
++    custody.stage(db, SCOPE, raw)
++    db.execute('BEGIN')
++    try:
++        with pytest.raises(Refused, match='nested_transaction'):
++            if action == 'stage': custody.stage(db, SCOPE, raw)
++            else: custody.seal(db, SCOPE, 'op-original', json.dumps(receipt))
++        assert db.in_transaction
++    finally:
++        db.rollback()
++
++
++def test_same_event_under_changed_op_identity_cannot_replace_intent(db):
++    raw, _ = request()
++    custody.stage(db, SCOPE, raw)
++    obj = json.loads(raw)
++    source = json.loads(obj['source_json'])
++    source['op_id'] = 'new-op'
++    wire = json.loads(source['wire_json'])
++    wire['client_op_id'] = 'new-op'
++    source['wire_json'] = json.dumps(wire)
++    obj['source_json'] = json.dumps(source)
++    with pytest.raises(sqlite3.IntegrityError, match='immutable'):
++        custody.stage(db, SCOPE, json.dumps(obj))
++    assert custody.lookup(db, SCOPE, 'op-original')['request_json'] == raw
++    assert custody.lookup(db, SCOPE, 'new-op') is None
++
+-- 
+2.43.0
+

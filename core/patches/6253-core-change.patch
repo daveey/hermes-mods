@@ -1,0 +1,857 @@
+From d4c0fd545bed815793a6113fc9a7953c513ef38c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:11:00 +0000
+Subject: [PATCH 6253] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit d4c0fd545bed815793a6113fc9a7953c513ef38c.
+
+---
+diff --git a/gateway/kanban_notification_schedule.py b/gateway/kanban_notification_schedule.py
+index 6f8a19b2a5a..9dbde6e2ad0 100644
+--- a/gateway/kanban_notification_schedule.py
++++ b/gateway/kanban_notification_schedule.py
+@@ -14,21 +14,42 @@
+     after facts activation is not permission to silently resume source polling.
+     """
+ 
+-    def __init__(self, wake):
++    def __init__(self, wake, *, native=False):
+         from tui_gateway.notification_facts import observe_bindings
+         self.wake = wake
+         self.actions = {}
+         self.was_bound = False
++        self.facts_bound = False
+         self.retry_at = float("inf")
+         self.retry_floor = False
+         self.watch = observe_bindings(wake)
+         from hermes_cli.fact_links_health import HealthWatch
+         self.links_health = HealthWatch(wake)
++        self.native = native
++        self.native_action = None
++
++    def _native_due(self, now, legacy_due):
++        from tui_gateway.notification_gateway_sources import enabled
++        if not self.native or not enabled():
++            if self.native_action is not None:
++                self.native_action.close()
++                self.native_action = None
++            if self.retry_floor and now < self.retry_at:
++                return False
++            return legacy_due or now >= self.retry_at
++        if self.native_action is None:
++            from tui_gateway.notification_loaded_f import register_gateway
++            self.native_action = register_gateway(self.wake)
++        self.was_bound = True
++        if self.retry_floor and now < self.retry_at:
++            return False
++        return self.native_action.due(legacy_due=legacy_due) or now >= self.retry_at
+ 
+     def due(self, now: float, *, legacy_due: bool) -> bool:
+         bindings = self.watch.snapshot()
+         owners = {owner for _home, owner in bindings}
+         self.was_bound = self.was_bound or bool(owners)
++        self.facts_bound = self.facts_bound or bool(owners)
+         for owner in self.actions.keys() - owners:
+             self.actions.pop(owner).close()
+         for owner in owners - self.actions.keys():
+@@ -39,11 +60,16 @@
+                 # the close notification wakes a fresh membership reconciliation.
+                 return False
+         if not self.actions:
++            if self.native and not self.facts_bound:
++                return self._native_due(now, legacy_due)
+             # No executor can service this deadline until a binding returns.
+             # Rebinding starts dirty and catches up from durable action state.
+             self.retry_at = float("inf")
+             self.retry_floor = False
+             return legacy_due and not self.was_bound
++        if self.native_action is not None:
++            self.native_action.close()
++            self.native_action = None
+         if self.retry_floor and now < self.retry_at:
+             return False  # bursts must not spend refusal attempts faster than legacy
+         # Consume every pending bit, not just the first true action.
+@@ -56,6 +82,8 @@
+         self.retry_floor = report.pending
+ 
+     def close(self) -> None:
++        if self.native_action is not None:
++            self.native_action.close()
+         self.watch.close()
+         self.links_health.close()
+         for action in self.actions.values():
+diff --git a/gateway/kanban_remote_owner.py b/gateway/kanban_remote_owner.py
+index 79728b4d893..31ebbeb767f 100644
+--- a/gateway/kanban_remote_owner.py
++++ b/gateway/kanban_remote_owner.py
+@@ -232,7 +232,7 @@
+                                 per_link=True)
+             if not getattr(items, "quiet", False):
+                 report.retry()
+-            elif getattr(items, "next_deadline", None) is not None:
++            if getattr(items, "next_deadline", None) is not None:
+                 report.due_at(items.next_deadline)
+             items = [kept for item in items if (kept := _drop_written(item, has, ids, tip)) is not None]
+             items = [kept for item in items if (kept := _adopt_pending(item, pending, ids, tip)) is not None]
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 4778902028d..9f12686fb6c 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -171,7 +171,7 @@
+         from gateway.kanban_notification_schedule import BoundActions, PassReport
+         event = asyncio.Event()
+         loop = asyncio.get_running_loop()
+-        gate = BoundActions(lambda: loop.call_soon_threadsafe(event.set))
++        gate = BoundActions(lambda: loop.call_soon_threadsafe(event.set), native=True)
+         next_legacy = 0.0
+         try:
+             while self._running:
+@@ -237,7 +237,7 @@
+         from gateway.kanban_notification_schedule import BoundActions, PassReport
+         event = asyncio.Event()
+         loop = asyncio.get_running_loop()
+-        gate = BoundActions(lambda: loop.call_soon_threadsafe(event.set))
++        gate = BoundActions(lambda: loop.call_soon_threadsafe(event.set), native=True)
+         next_legacy = 0.0
+         try:
+             while self._running:
+diff --git a/tests/gateway/test_native_notification_entry_loops.py b/tests/gateway/test_native_notification_entry_loops.py
+new file mode 100644
+index 00000000000..5672c1b5267
+--- /dev/null
++++ b/tests/gateway/test_native_notification_entry_loops.py
+@@ -0,0 +1,73 @@
++"""Both gateway entry loops consume native hints without a generic registry."""
++import asyncio
++
++import pytest
++
++from gateway import kanban_watchers as watchers
++from hermes_cli import config
++from tui_gateway import notification_loaded_f as loaded
++from tui_gateway import notification_gateway_sources as sources
++
++
++@pytest.mark.parametrize('remote', [False, True])
++def test_gateway_native_entry_loop_and_off_keep_single_executor(monkeypatch, remote):
++    clock = [0.0]
++    scheduler = loaded.Scheduler(clock=lambda: clock[0])
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    monkeypatch.setattr(config, 'load_config', dict)
++    monkeypatch.setattr(watchers.time, 'monotonic', lambda: clock[0])
++    calls = []
++
++    class Runner(watchers.GatewayKanbanWatchersMixin):
++        _running = True
++        _KANBAN_WATCHER_START_DELAY = 0
++
++        def _active_profile_name(self):
++            return 'default'
++
++    runner = Runner()
++
++    def collect(*args, report, **kwargs):
++        calls.append(clock[0])
++        if clock[0] == 1:
++            report.retry()
++            report.due_at(3)
++        return []
++
++    async def inline(fn, *args, **kwargs):
++        return fn(*args, **kwargs)
++
++    async def wait(awaitable, *, timeout):
++        awaitable.close()
++        clock[0] += 1
++        if clock[0] == 5 and scheduler.gateway_sources is not None:
++            scheduler.gateway_sources.changed()
++        if clock[0] == 6:
++            monkeypatch.setenv('HERMES_FACTS_GATEWAY', '0')
++        if clock[0] == 11:
++            runner._running = False
++        scheduler.step()
++
++    from gateway import kanban_remote_owner
++
++    async def tick(*args, **kwargs):
++        return collect(*args, **kwargs)
++
++    async def legacy_sleep(interval):
++        await wait(asyncio.Event().wait(), timeout=interval)
++
++    monkeypatch.setattr(runner, '_sleep_between_ticks', legacy_sleep)
++    monkeypatch.setattr(watchers, '_notifier_collect', collect)
++    monkeypatch.setattr(kanban_remote_owner, 'tick', tick)
++    monkeypatch.setattr(watchers.asyncio, 'to_thread', inline)
++    monkeypatch.setattr(watchers.asyncio, 'wait_for', wait)
++    monkeypatch.setattr(watchers, '_gc_retention_days', lambda: 30)
++    try:
++        entry = runner._kanban_remote_owner_watcher if remote else runner._kanban_notifier_watcher
++        asyncio.run(entry(interval=5))
++        assert calls == [1, 3, 5, 10]
++        assert not scheduler.gateway_sources.actions
++    finally:
++        scheduler.close()
+diff --git a/tests/gateway/test_native_remote_notice_cutover.py b/tests/gateway/test_native_remote_notice_cutover.py
+new file mode 100644
+index 00000000000..a025762a938
+--- /dev/null
++++ b/tests/gateway/test_native_remote_notice_cutover.py
+@@ -0,0 +1,105 @@
++"""Real replica->gate->FIFO->transcript custody, including OFF and unloaded handoff."""
++import asyncio
++
++
++import pytest
++
++from gateway import kanban_remote_owner as owner
++from gateway.kanban_notification_schedule import BoundActions, PassReport
++from tests.gateway import test_kanban_remote_owner_delivery as helpers
++from tui_gateway import notification_loaded_f as loaded
++from tui_gateway import notification_gateway_sources as sources
++from tui_gateway import kanban_remote_notices as notices
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++env = helpers.env
++TID = 't_ba58978a012174f1'
++
++
++@pytest.mark.parametrize('link_arrival', [False, True])
++def test_native_remote_arrival_ack_failure_off_and_unloaded_exactly_once(env, monkeypatch, link_arrival):
++    hub, runner, authority, fifo, db = env
++    authority.sessions[helpers.CHAT] = helpers._Live(helpers.CHAT)
++    helpers._busy(db, fifo)
++    card = helpers._done(TID)
++    initial = {**card, 'sessions': []} if link_arrival else {**card, 'status': 'running', 'completion_notice': None}
++    helpers._publish(hub, [initial])
++    monkeypatch.setattr(sources, 'inventory', lambda: ((hub / 'hub.db',), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    scheduler = loaded.Scheduler()
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    gate = BoundActions(lambda: None, native=True)
++
++    def tick(now, legacy=False):
++        if not gate.due(now, legacy_due=legacy):
++            return []
++        report = PassReport()
++        result = asyncio.run(owner.tick(runner, report=report))
++        gate.settled(report, now, 10)
++        return result
++
++    try:
++        assert tick(0) == []
++        scheduler.step()
++        assert scheduler.gateway_sources.ready
++        assert tick(0) == []
++        scheduler.event.clear()
++        helpers._publish(hub, [card])
++        assert scheduler.event.wait(5), 'actual native remote commit never reached the shared owner'
++        scheduler.step()
++        assert len(tick(10)) == 1
++        # Same canonical output key as the legacy path; the loaded/unloaded
++        # competitor must stand aside while the FIFO owns the claim.
++        assert fifo.queued()[0]['local_automation_v1']['kanban_cards']
++        assert helpers._sweep([]) == []
++        fifo.boundary()
++        authority.sessions.clear()
++        real_ack = notices.ack
++        monkeypatch.setattr(notices, 'ack', lambda *_: False)
++        tick(20)
++        assert owner._admitted
++        assert helpers._ledger(TID)['delivered'] == 0
++        # OFF must not spawn another delivery owner or reset any durable cursor.
++        monkeypatch.setenv('HERMES_FACTS_GATEWAY', '0')
++        monkeypatch.setattr(notices, 'ack', real_ack)
++        assert tick(30, legacy=True) == []
++        assert not owner._admitted
++        assert helpers._ledger(TID)['delivered'] == notices.DELIVERED
++        assert helpers._sweep([]) == []
++        assert len(helpers._rows(helpers._key(TID))) == 1
++        assert fifo.queued() == []
++        assert not scheduler.gateway_sources.actions
++    finally:
++        gate.close()
++        scheduler.close()
++
++
++def test_unloaded_incomplete_preserves_earlier_deadline():
++    from tui_gateway.kanban_unloaded_gates import run, scheduling
++    from tui_gateway.notice_fanout_result import FanoutResult
++    result = FanoutResult()
++    result.incomplete = True
++    result.next_deadline = 3.0
++    report = PassReport()
++    with scheduling(report):
++        run('card_change_pass', lambda: result, live=set())
++    assert report.pending
++    assert report.next_due(0, 60) == 3.0
++
++
++def test_remote_incomplete_preserves_earlier_deadline(env, monkeypatch):
++    from tui_gateway.notice_fanout_result import FanoutResult
++    hub, runner, authority, fifo, db = env
++    authority.sessions[helpers.CHAT] = helpers._Live(helpers.CHAT)
++    helpers._busy(db, fifo)
++    helpers._publish(hub, [])
++    result = FanoutResult()
++    result.incomplete = True
++    result.next_deadline = 3.0
++    monkeypatch.setattr(notices, 'collect', lambda *a, **kw: result)
++    report = PassReport()
++    owner._collect(runner, authority, owner._owned_lives(runner, authority), report)
++    assert report.pending
++    assert report.next_due(0, 10) == 3.0
+diff --git a/tests/tui_gateway/test_gateway_native_schedule.py b/tests/tui_gateway/test_gateway_native_schedule.py
+new file mode 100644
+index 00000000000..2261229dfc1
+--- /dev/null
++++ b/tests/tui_gateway/test_gateway_native_schedule.py
+@@ -0,0 +1,117 @@
++"""Host executors share loaded-f's source owner without a generic facts binding."""
++import builtins
++import sqlite3
++import threading
++
++import pytest
++
++from gateway.kanban_notification_schedule import BoundActions, PassReport
++from tui_gateway import notification_loaded_f as loaded
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def test_native_gate_catchup_quiet_retry_census_and_off(monkeypatch):
++    from tui_gateway import notification_gateway_sources as sources
++    now = [0.0]
++    scheduler = loaded.Scheduler(clock=lambda: now[0])
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    gate = BoundActions(lambda: None, native=True)
++    try:
++        assert not gate.due(0, legacy_due=True)  # waits until native coverage is armed
++        scheduler.step()
++        assert gate.due(0, legacy_due=False)
++        gate.settled(PassReport(), 0, 5)
++        with monkeypatch.context() as patch:
++            def forbidden(*args, **kwargs):
++                pytest.fail('quiet gate read a source')
++            patch.setattr(builtins, 'open', forbidden)
++            patch.setattr(sqlite3, 'connect', forbidden)
++            assert not gate.due(1, legacy_due=True)
++        scheduler.gateway_sources.changed()
++        scheduler.step()
++        assert gate.due(1, legacy_due=False)
++        gate.settled(PassReport(pending=True), 1, 5)
++        scheduler.gateway_sources.changed()
++        scheduler.step()
++        assert not gate.due(2, legacy_due=True)
++        assert gate.due(6, legacy_due=False)
++        gate.settled(PassReport(), 6, 5)
++        now[0] = 30
++        scheduler.step()  # missed native hint repairs on the same process census
++        assert gate.due(30, legacy_due=False)
++        monkeypatch.setenv('HERMES_FACTS_GATEWAY', '0')
++        assert gate.due(31, legacy_due=True)
++        assert not scheduler.gateway_sources.actions
++        assert not gate.due(31, legacy_due=False)
++    finally:
++        gate.close()
++        scheduler.close()
++
++
++def test_native_source_commit_wakes_same_owner(monkeypatch, tmp_path):
++    from tui_gateway import notification_gateway_sources as sources
++    path = tmp_path / 'hub.db'
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE replica (value TEXT)')
++    monkeypatch.setattr(sources, 'inventory', lambda: ((path,), ()))
++    scheduler = loaded.Scheduler()
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    wake = threading.Event()
++    gate = BoundActions(wake.set, native=True)
++    try:
++        assert not gate.due(0, legacy_due=True)  # waits until native coverage is armed
++        scheduler.step()
++        assert gate.due(0, legacy_due=False)
++        gate.settled(PassReport(), 0, 5)
++        wake.clear()
++        scheduler.event.clear()
++        with sqlite3.connect(path) as conn:
++            conn.execute("INSERT INTO replica VALUES ('remote-only terminal/link')")
++        assert scheduler.event.wait(5)
++        scheduler.step()
++        assert wake.wait(5)
++        assert gate.due(1, legacy_due=False)
++    finally:
++        gate.close()
++        scheduler.close()
++
++
++def test_failed_scope_inventory_quiet_recovery_uses_one_shared_retry(monkeypatch):
++    from tui_gateway import notification_gateway_sources as sources
++    now = [0.0]
++    scheduler = loaded.Scheduler(clock=lambda: now[0])
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    attempts = []
++
++    def inventory():
++        attempts.append(now[0])
++        if len(attempts) == 1:
++            raise OSError('temporary profile inventory refusal')
++        return (), ()
++
++    monkeypatch.setattr(sources, 'inventory', inventory)
++    gates = [BoundActions(lambda: None, native=True) for _ in range(3)]
++    try:
++        assert not any(gate.due(0, legacy_due=True) for gate in gates)
++        scheduler.step()
++        assert not scheduler.gateway_sources.ready
++        assert all(gate.due(0, legacy_due=False) for gate in gates)
++        now[0] = 0.5
++        scheduler.step()
++        assert attempts == [0]
++        now[0] = 1
++        scheduler.step()
++        assert scheduler.gateway_sources.ready
++        assert attempts == [0, 1]
++        now[0] = 30
++        scheduler.step()
++        assert attempts == [0, 1, 30]  # one census, not one per subscriber
++    finally:
++        for gate in gates:
++            gate.close()
++        scheduler.close()
+diff --git a/tests/tui_gateway/test_gateway_native_source_lifecycle.py b/tests/tui_gateway/test_gateway_native_source_lifecycle.py
+new file mode 100644
+index 00000000000..500bb6ade60
+--- /dev/null
++++ b/tests/tui_gateway/test_gateway_native_source_lifecycle.py
+@@ -0,0 +1,99 @@
++"""Native readiness and rollback retain the canonical source inventory scope."""
++import threading
++
++import pytest
++
++from tui_gateway import notification_gateway_sources as sources
++
++
++def test_inventory_keeps_notifier_pin(monkeypatch, tmp_path):
++    from agent import delegation_context
++    from hermes_cli import kanban_db
++    from tui_gateway import kanban_unloaded_gates
++    pin = tmp_path / 'outside-board-dirs.db'
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(pin))
++    monkeypatch.setattr(delegation_context, 'explicit_board_intent_is_pinned', lambda: False)
++    monkeypatch.setattr(kanban_db, '_descendant_may_follow_explicit_board', lambda slug: False)
++    monkeypatch.setattr(kanban_db, 'list_boards', lambda **kw: [{'slug': 'other'}])
++    monkeypatch.setattr(kanban_unloaded_gates, '_profile_paths', tuple)
++    assert kanban_db.kanban_db_path('other') != pin  # unfenced caller is the precondition
++    paths, _ = sources.inventory()
++    assert pin in paths
++
++
++class Watch:
++    def __init__(self, *args, **kwargs):
++        self.closed = False
++        self.failed = False
++        self.checks = 0
++
++    def check(self):
++        self.checks += 1
++        if self.failed:
++            raise OSError('watch backend interrupted')
++
++    def close(self):
++        self.closed = True
++
++
++@pytest.fixture
++def owner(monkeypatch, tmp_path):
++    from hermes_cli import fact_source_watch
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((tmp_path / 'board.db',), ()))
++    value = sources.Sources(threading.Event())
++    yield value
++    value.close()
++
++
++def test_hint_failure_revokes_readiness_then_quiet_retry(owner):
++    action = owner.add(lambda: None)
++    owner.step(0, reconcile=True)
++    assert owner.ready
++    owner.watch.failed = True
++    owner.changed()
++    owner.step(2, reconcile=False)
++    assert not owner.ready
++    assert owner.retry_at == 3
++    owner.watch.failed = False
++    owner.step(2.5, reconcile=False)
++    assert not owner.ready
++    owner.step(3, reconcile=False)
++    assert owner.ready
++    assert action.due(legacy_due=False)
++
++
++def test_last_consumer_off_withdraws_watch_and_on_rearms(owner):
++    first = owner.add(lambda: None)
++    owner.step(0, reconcile=True)
++    old = owner.watch
++    first.close()
++    assert owner.event.is_set()
++    owner.step(1, reconcile=False)
++    assert old.closed
++    assert owner.watch is None
++    assert not owner.ready
++    second = owner.add(lambda: None)
++    assert not second.due(legacy_due=False)
++    owner.step(2, reconcile=False)
++    assert owner.ready
++    assert owner.watch is not old
++    assert second.due(legacy_due=False)
++
++
++def test_unsupported_watch_uses_census_not_one_second_retries(owner, monkeypatch):
++    from hermes_cli import fact_source_watch
++    attempts = []
++
++    def unsupported(*args, **kwargs):
++        attempts.append(1)
++        raise NotImplementedError
++
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', unsupported)
++    owner.add(lambda: None)
++    owner.step(0, reconcile=True)
++    owner.step(1, reconcile=False)
++    assert attempts == [1]
++    assert not owner.ready
++    owner.step(30, reconcile=True)
++    assert attempts == [1, 1]
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 3a4f28a5940..7e954ebbc61 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -887,7 +887,7 @@
+     lease = make_lease()
+     from tui_gateway.kanban_unloaded_schedule import UnloadedSchedule
+     wake = threading.Event()
+-    schedule = UnloadedSchedule(wake.set, interval)
++    schedule = UnloadedSchedule(wake.set, interval, native=True)
+     stop.wait(_env_float("HERMES_KANBAN_UNLOADED_FIRST_S", FIRST_RUN_DELAY_S))
+     maintenance = 0.0
+     try:
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index b196401768b..635eef7cb3c 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -659,7 +659,7 @@
+                 raise
+             if not getattr(result, 'quiet', False):
+                 report.retry()
+-            elif getattr(result, 'next_deadline', None) is not None:
++            if getattr(result, 'next_deadline', None) is not None:
+                 report.due_at(result.next_deadline)
+             return result
+         inputs = probe(kind, every_store=every_store, live=live) if every_store else Inputs()
+diff --git a/tui_gateway/kanban_unloaded_schedule.py b/tui_gateway/kanban_unloaded_schedule.py
+index 989032e1543..b7f0653909e 100644
+--- a/tui_gateway/kanban_unloaded_schedule.py
++++ b/tui_gateway/kanban_unloaded_schedule.py
+@@ -5,8 +5,8 @@
+ 
+ 
+ class UnloadedSchedule:
+-    def __init__(self, wake, interval: float):
+-        self.gate = BoundActions(wake)
++    def __init__(self, wake, interval: float, *, native=False):
++        self.gate = BoundActions(wake, native=native)
+         self.interval = interval
+         self.role = None
+         self.next_legacy = 0.0
+@@ -24,7 +24,9 @@
+             due = True
+         # Ownership changes require catch-up, but a detached facts registry is
+         # never permission to resume scans using the launch profile instead.
+-        if not due and not (changed and (self.gate.actions or not self.gate.was_bound)):
++        native = self.gate.native_action
++        ready = native is not None and native.owner.ready
++        if not due and not (changed and (self.gate.actions or ready or not self.gate.was_bound)):
+             return
+         report = PassReport()
+         try:
+diff --git a/tui_gateway/notification_gateway_sources.py b/tui_gateway/notification_gateway_sources.py
+new file mode 100644
+index 00000000000..38c5c03b505
+--- /dev/null
++++ b/tui_gateway/notification_gateway_sources.py
+@@ -0,0 +1,140 @@
++"""Native wake hints for f2; the loaded-f owner supplies the sole census clock.
++
++No payloads, claims or cursors live here. Existing serialized executors read and
++ACK their durable stores. The 30s census repairs missed hints and source roster
++changes; it says nothing about upstream freshness.
++"""
++from __future__ import annotations
++
++import logging
++import os
++from contextvars import copy_context
++from pathlib import Path
++import threading
++
++log = logging.getLogger(__name__)
++
++
++def enabled():
++    # Dedicated task-mandated emergency switch, not general configuration.
++    return os.environ.get('HERMES_FACTS_GATEWAY', '1').strip().lower() not in {'0', 'false', 'no', 'off'}  # health: allow HX002 -- explicit per-consumer emergency rollback
++
++
++def inventory():
++    from hermes_cli import kanban_db
++    from tui_gateway.kanban_unloaded_gates import _profile_paths
++    from tui_gateway.kanban_remote_notices import hub_db_path, ledger_path
++
++    paths = {hub_db_path(), ledger_path(), *[Path(p) for p in _profile_paths()]}
++    with kanban_db.pin_first_board_resolution():
++        for board in kanban_db.list_boards(include_archived=False):
++            paths.add(kanban_db.kanban_db_path(board.get('slug') or kanban_db.DEFAULT_BOARD))
++    # Do not subscribe to every child of the home: logging/cache writes would
++    # self-wake the executors. DB parent watches already cover replacement and
++    # sidecars. Other host-pass inputs keep the shared 30s maintenance census.
++    return tuple(sorted(paths)), ()
++
++
++class Action:
++    def __init__(self, owner, wake):
++        self.owner, self.wake = owner, wake
++        self.pending = False
++        self.closed = False
++
++    def due(self, *, legacy_due):
++        with self.owner.lock:
++            pending = self.pending
++            self.pending = False
++            return pending and not self.closed
++
++    def close(self):
++        with self.owner.lock:
++            self.closed = True
++            self.owner.actions.discard(self)
++        self.owner.event.set()  # source owner, not the caller, withdraws the final native watch
++
++
++class Sources:
++    def __init__(self, event):
++        self.event = event
++        self.context = copy_context()
++        self.lock = threading.Lock()
++        self.actions = set()
++        self.watch = None
++        self.signature = None
++        self.dirty = True
++        self.retry_at = 0.0
++        self.ready = False
++
++    def add(self, wake):
++        action = Action(self, wake)
++        with self.lock:
++            self.actions.add(action)
++            self.dirty = True
++        self.event.set()
++        return action
++
++    def changed(self):
++        with self.lock:
++            self.dirty = True
++        self.event.set()
++
++    def step(self, now, *, reconcile):
++        with self.lock:
++            if not self.actions:
++                old, self.watch = self.watch, None
++                self.signature = None
++                self.ready = False
++                self.retry_at = 0.0
++            else:
++                old = None
++            dirty = self.dirty
++            self.dirty = False
++            active = bool(self.actions)
++        if old is not None:
++            old.close()
++        if not active:
++            return
++        refresh = reconcile or now >= self.retry_at
++        if refresh or (dirty and self.watch is not None):
++            try:
++                from hermes_cli.fact_source_watch import NativeSourceWatch
++                signature = self.context.run(inventory) if refresh else self.signature
++                if signature != self.signature:
++                    # Arm successor before withdrawing predecessor; no watch gap.
++                    watch = NativeSourceWatch(signature[0], self.changed, directories=signature[1])
++                    old, self.watch = self.watch, watch
++                    self.signature = signature
++                    if old is not None:
++                        old.close()
++                if self.watch is not None:
++                    self.watch.check()
++                if not self.ready:
++                    log.info('gateway notification native sources ready (%d paths; shared 30s census)',
++                             len(signature[0]))
++                self.ready = True
++                self.retry_at = float('inf')
++            except NotImplementedError:
++                self.ready = False
++                self.retry_at = float('inf')  # unsupported platform: census only, not a 1s retry loop
++                log.warning('gateway native notification hints unsupported; shared 30s census only')
++            except (OSError, ValueError, RuntimeError) as exc:
++                self.ready = False
++                self.retry_at = now + 1.0
++                log.warning('gateway notification source readiness unavailable: %s', exc)
++            dirty = True
++        if dirty or reconcile:
++            with self.lock:
++                actions = tuple(self.actions)
++                for action in actions:
++                    action.pending = True
++            for action in actions:
++                action.wake()  # wake only, never execute under the source lock
++
++    def close(self):
++        if self.watch is not None:
++            self.watch.close()
++        with self.lock:
++            for action in self.actions:
++                action.closed = True
++            self.actions.clear()
+diff --git a/tui_gateway/notification_loaded_f.py b/tui_gateway/notification_loaded_f.py
+index 6fe585e242e..25e0f83e213 100644
+--- a/tui_gateway/notification_loaded_f.py
++++ b/tui_gateway/notification_loaded_f.py
+@@ -129,6 +129,7 @@
+         self.source_dirty = True
+         self.last_seq = (0, '', '')
+         self.source_identity = None
++        self.gateway_sources = None
+ 
+     def start(self, *, native=True):
+         if native:
+@@ -148,6 +149,8 @@
+             self.thread.join(5)
+         if self.watch is not None:
+             self.watch.close()
++        if self.gateway_sources is not None:
++            self.gateway_sources.close()
+ 
+     def source_changed(self):
+         with self.lock:
+@@ -203,7 +206,11 @@
+         # but retain their original serialized claim/delivery executors.
+         with self.pass_lock:
+             now = self.clock()
++            if self.gateway_sources is not None:
++                self.gateway_sources.step(now, reconcile=now >= self.next_reconcile)
+             with self.lock:
++                if now >= self.next_reconcile and not self.actions and self.gateway_sources is not None:
++                    self.next_reconcile = now + RECONCILE_SECONDS
+                 scan = bool(self.actions) and (self.source_dirty or now >= self.next_reconcile)
+                 self.source_dirty = False
+             if scan:
+@@ -331,6 +338,19 @@
+ _owner = None
+ 
+ 
++def register_gateway(wake):
++    """Use this same process owner/clock; no generic FactStore activation."""
++    global _owner
++    from tui_gateway.notification_gateway_sources import Sources
++    with _owner_lock:
++        if _owner is None:
++            _owner = Scheduler()
++            _owner.start()
++        if _owner.gateway_sources is None:
++            _owner.gateway_sources = Sources(_owner.event)
++        return _owner.gateway_sources.add(wake)
++
++
+ def register(session, wake):
+     """Lazy process lifetime owner. No feed, lifecycle or other family activation."""
+     global _owner
+@@ -373,7 +393,11 @@
+             owner.invalidate()
+             continue
+         with owner.lock:
+-            delay = max(0.0, owner.next_reconcile - owner.clock()) if owner.actions else None
++            active = owner.actions or (owner.gateway_sources is not None and owner.gateway_sources.actions)
++            deadline = owner.next_reconcile
++            if owner.gateway_sources is not None and owner.gateway_sources.actions:
++                deadline = min(deadline, owner.gateway_sources.retry_at)
++            delay = max(0.0, deadline - owner.clock()) if active else None
+             if delay is not None and (owner.dirty or owner.catchup):
+                 delay = min(delay, 1.0)  # failed keyed capture/catch-up, not a full census
+         owner.event.wait(delay)
+diff --git a/website/docs/developer-guide/gateway-notification-scheduling.md b/website/docs/developer-guide/gateway-notification-scheduling.md
+new file mode 100644
+index 00000000000..7250fada913
+--- /dev/null
++++ b/website/docs/developer-guide/gateway-notification-scheduling.md
+@@ -0,0 +1,49 @@
++# Gateway and unloaded notification source scheduling
++
++The gateway notifier, gateway remote FIFO owner and unloaded host executor use
++`notification_loaded_f.Scheduler`'s existing process lifetime owner and **one
++30-second reconciliation clock**. This is an in-process native wake cutover,
++not activation of `InProcessFacts` or the dedicated `fact_host` transport.
++
++`HERMES_FACTS_GATEWAY` defaults on. Setting it to `0`, `false`, `no` or `off`
++withdraws these native subscriptions at the next executor iteration and restores
++legacy admission. It does not change `display.loaded_notification_f`, restart a
++process, start a second delivery executor, reset a notification cursor or release
++an in-flight delivery. Pending action deadlines/refusal floors survive rollback.
++This narrowly scoped emergency switch is not a secrets setting.
++
++## Sources and readiness
++
++The shared owner captures the canonical board inventory and profile-store paths,
++plus the hub replica and remote notice ledger. Existing Linux native directory
++watches cover each DB and its WAL/SHM/journal, replacement and missing ancestors.
++They are armed before the first healthy catch-up notification. Hints only wake
++existing serialized executors; the canonical collectors, claim CAS, transcript
++keys, FIFO custody and durable ACK paths remain the authorities.
++
++The owner retains the registration context for scoped inventories. Roster changes
++and missed native hints are repaired by the same 30-second census, not by a new
++per-chat or per-subscriber source poller. Inventory/watch failures are explicitly
++not ready and get a shared one-second retry; the existing executor can still do
++conservative recovery work. Unsupported native platforms are census-only, with
++no repeated one-second unsupported-backend retry. Readiness is logged as
++`gateway notification native sources ready`; that is source-watch readiness,
++not certification of a complete generic projection or upstream freshness.
++
++## Timing boundaries
++
++- Native DB commit hints can admit work before the census; callbacks do no delivery.
++- The shared 30-second fallback bounds missed-hint/roster detection, **not**
++  under-one-second upstream truth. Original remote freshness/expiry checks remain.
++- Pending actions retain their collector-provided monotonic deadline even when
++  the same empty result is incomplete. ACK/release and refusal retries retain
++  the same executor and their existing pacing floor.
++- Unloaded lease beats, role transfer and retirement remain independent of source
++  quietness. Other host-pass inputs still receive the shared maintenance census;
++  they are not claimed to have native source coverage here.
++- The loaded chat path retains its own keyed hub batches and canonical serializers;
++  f2 does not turn task-state hints into a durable event history.
++
++Natural gateway/serve boot is required for installed activation. Do not signal a
++serve process or force an update to obtain proof. Combined multi-consumer runtime,
++RSS, painted latency and restart measurements are separate acceptance work.
+-- 
+2.43.0
+

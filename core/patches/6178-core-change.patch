@@ -1,0 +1,1094 @@
+From 2ba03de3fbbabd50d575edb473fb766264797ed8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:23:12 -0800
+Subject: [PATCH 6178] Standing producer owner chats and local origin custody
+
+Public mirror of source commit 2ba03de3fbbabd50d575edb473fb766264797ed8.
+
+---
+diff --git a/cron/monitor.py b/cron/monitor.py
+index 90647dcdce2..618d76d46bf 100644
+--- a/cron/monitor.py
++++ b/cron/monitor.py
+@@ -125,7 +125,7 @@
+         from cron.scheduler_script import _run_job_script
+ 
+         return _run_job_script(monitor_script, workdir=_field(job, "workdir") or None,
+-                               interpreter=job.get("interpreter"))
++                               interpreter=job.get("interpreter"), job_id=str(job.get("id") or "") or None)
+     monitor_url = _field(job, "monitor_url")
+     if monitor_url:
+         return _fetch_monitor_url(monitor_url)
+diff --git a/cron/scheduler_prompt.py b/cron/scheduler_prompt.py
+index 03cae56162d..bdd61f66863 100644
+--- a/cron/scheduler_prompt.py
++++ b/cron/scheduler_prompt.py
+@@ -338,7 +338,7 @@
+             prerun_script if prerun_script is not None
+             else _script._run_job_script(
+                 script_path, workdir=_sched._resolve_job_workdir(job, str(job.get("id") or "")),
+-                interpreter=job.get("interpreter")))
++                interpreter=job.get("interpreter"), job_id=str(job.get("id") or "") or None))
+         if success and not script_output:
+             return None  # no output → nothing to report, skip the AI call
+         heading, intro = (
+diff --git a/cron/scheduler_script.py b/cron/scheduler_script.py
+index 0e21cecaa47..57fb23854bb 100644
+--- a/cron/scheduler_script.py
++++ b/cron/scheduler_script.py
+@@ -473,6 +473,7 @@
+ def _run_job_script(
+     script_path: str, workdir: Optional[str] = None,
+     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
++    job_id: Optional[str] = None,
+ ) -> tuple[bool, str]:
+     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
+     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
+@@ -525,6 +526,9 @@
+         # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
+         env = with_sane_path(build_subprocess_env(strip_launch_profile=True))
+         env.update(env_overlay)
++        if job_id:  # cards this script creates are owned by the job's standing owner chat (kanban_owner_chat)
++            from hermes_cli.kanban_owner_chat import ENV as _OWNER_ENV
++            env.setdefault(_OWNER_ENV, f"cron:{job_id}")
+         logger.info("Cron script %s running on %s", path.name, cron_runner_label())
+         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
+         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
+@@ -607,7 +611,7 @@
+     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
+     def run() -> tuple[bool, str]:
+         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
+-                               interpreter=job.get("interpreter"))
++                               interpreter=job.get("interpreter"), job_id=str(job.get("id") or "") or None)
+ 
+     schedule = job.get("schedule")
+     claim = job.get("run_claim")
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 22e4824bff4..23b8fa69634 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -12,6 +12,7 @@
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
++from hermes_cli.kanban_owner_chat import TERMINAL as TERMINAL_OWNER, declared_producer as _declared_producer
+ import logging
+ import os
+ import re
+@@ -513,7 +514,9 @@
+                 creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                                  if in_worker else None),
+                 validate_workspace=True, validate_skills=True, placement_checked=True, board=board,
+-                require_scope_authority=in_worker or _agent_invoked(),  # human terminals keep human authority
++                require_scope_authority=in_worker or _agent_invoked(),  # agents need their own chat
++                # a human terminal's card is owned by the standing "terminal" owner chat (or its script's producer)
++                owner_producer=None if in_worker or _agent_invoked() else (_declared_producer() or TERMINAL_OWNER),
+                 # [daveey] no --runs-on: queue for the worker pool; hub admission's placement and receipt
+                 **cli_create_fields(conn, plan, args, body, ws_kind, ws_path, board, assignee=assignee),
+                 insert_guard=after_create.guard,  # re-checks overlap under the write lock [daveey]
+@@ -1872,6 +1875,7 @@
+     **dict.fromkeys(("contain", "resume-contained"), lambda a: importlib.import_module("hermes_cli.kanban_containment_cli").command(a)),
+     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+     "renew-scope": lambda a: importlib.import_module("hermes_cli.kanban_scope_renewal_cli").command(a),
++    "owner-chats": lambda a: importlib.import_module("hermes_cli.kanban_owner_chat").command(a),
+     "delegate": lambda a: importlib.import_module("hermes_cli.kanban_scope_delegate").command(a),
+     "release": lambda a: importlib.import_module("hermes_cli.kanban_release").command(a),
+     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 44958e056a9..648e595e556 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1194,7 +1194,7 @@
+     insert_guard: Optional[Callable[[sqlite3.Connection], None]] = None, placement_audit: Optional[dict] = None,
+     admission_class: str = "normal", admission_frees: Optional[str] = None,
+     self_work: Optional[dict] = None, creation_receipt: Optional[dict] = None,
+-    require_scope_authority: bool = False,
++    require_scope_authority: bool = False, owner_producer: Optional[str] = None, settle_owner_chat: bool = True,
+ ) -> str:
+     """Create a task (optionally under ``parents``); returns its id.
+ 
+@@ -1359,9 +1359,9 @@
+                     creation_receipt=creation_receipt, board=board)
+                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
+                 initialize_ownership(conn, task_id, creator_task_id, parents, now, chat_origin, native_origin)
+-                if require_scope_authority:  # agent/CLI ingress: refuse (roll back) an authority-less card
+-                    from hermes_cli.kanban_create_authority import require
+-                    require(conn, task_id, creator_task_id)
++                if settle_owner_chat:  # every card leaves owned or is refused (kanban_owner_chat.settle) [daveey]
++                    from hermes_cli.kanban_owner_chat import settle as settle_owner
++                    settle_owner(conn, task_id, creator_task_id, created_by=created_by, strict=require_scope_authority, producer=owner_producer)
+                 native_admission.require_receipt(conn, task_id)
+             return task_id
+         except sqlite3.IntegrityError:
+diff --git a/hermes_cli/kanban_db_graph.py b/hermes_cli/kanban_db_graph.py
+index 5c698fdb2a6..1fb04c1e6f7 100644
+--- a/hermes_cli/kanban_db_graph.py
++++ b/hermes_cli/kanban_db_graph.py
+@@ -437,11 +437,13 @@
+     )
+     inherit_creator_origin(conn, new_id, root_id, created_at=now)
+     from hermes_cli.kanban import _agent_invoked
+-    if _agent_invoked():
++    from hermes_cli.kanban_owner_chat import settle
++    agent = _agent_invoked()
++    if agent:
+         from hermes_cli.kanban_cli_body import session_identity
+-        from hermes_cli.kanban_create_authority import require
+         import os
+         _, session = session_identity(bool(os.environ.get('HERMES_KANBAN_TASK')))
+         conn.execute('UPDATE tasks SET session_id=COALESCE(session_id,?) WHERE id=?', (session, new_id))
+-        require(conn, new_id, None)  # a triaged decomposition root is not an admitted creator run
++    # a triaged decomposition root is not an admitted creator run: no creator authority for its children
++    settle(conn, new_id, None, created_by=author or "decomposer", strict=agent)
+     return new_id
+diff --git a/hermes_cli/kanban_dispatch_maintenance.py b/hermes_cli/kanban_dispatch_maintenance.py
+index 1a81f6b6a71..2326fbb6612 100644
+--- a/hermes_cli/kanban_dispatch_maintenance.py
++++ b/hermes_cli/kanban_dispatch_maintenance.py
+@@ -11,6 +11,18 @@
+     drain_owner(conn)
+     parent_unclaimed.safe_sweep(conn)  # A capped host is when a parent starves.
+     _start_spend_reviews(conn)
++    _own_ownerless_cards(conn)
++
++
++def _own_ownerless_cards(conn):
++    """Hourly: every open card gets a live owning chat, including ones created while state.db was down."""
++    import logging
++    import time
++    from hermes_cli.kanban_owner_chat import maybe_backfill
++    try:
++        maybe_backfill(conn, now=time.monotonic())
++    except Exception:  # health: allow BLE001 -- ownerless cards stay as they were; the next hour retries
++        logging.getLogger(__name__).warning("kanban: owner-chat backfill failed", exc_info=True)
+ 
+ 
+ def _start_spend_reviews(conn):
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index a8147a87a86..b6a317aa0a7 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -189,7 +189,8 @@
+             if held:
+                 raise OriginError("origin_idempotency_conflict",
+                                   f"idempotency_key {key!r} already names card {held['id']} on this board")
+-        task_id = kb.create_task(conn, **options, placement_checked=True)  # courier retains owner placement
++        task_id = kb.create_task(conn, **options, placement_checked=True,  # courier retains owner placement
++                                 settle_owner_chat=False)  # its origin chat is linked below, then required
+         marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
+                   "owner": {**intent["owner"], "task_id": task_id}, "origin": intent["origin"],
+                   "task_record_key": f"{intent['owner']['profile']}/{intent['owner']['board']}/{task_id}"}
+diff --git a/hermes_cli/kanban_owner_chat.py b/hermes_cli/kanban_owner_chat.py
+new file mode 100644
+index 00000000000..f1bc09ecef0
+--- /dev/null
++++ b/hermes_cli/kanban_owner_chat.py
+@@ -0,0 +1,346 @@
++"""Every card has an owning chat: one standing "Kanban owner" chat per producer. [daveey]
++
++A card is renewable, re-budgetable and archivable only by its owning chat, its running creator task or a human
++operator (``kanban_scope_renewal``). Cards from monitors, watchers, detectors and terminals had none, so a scope or
++budget stop on them required manual operator action despite recurring automated creation.
++
++At creation (``kanban_db.create_task``, inside its write transaction) a card that has no durable owner after the
++usual checks gets its producer's owner chat: a pinned ``desktop`` session titled ``Kanban owner: <producer>`` in
++this profile's state.db, created on first use (seeded with a message saying what it is for, so it is neither an
++empty draft nor a context-free turn when woken) and reused after. It becomes the card's creating chat exactly like
++a registered chat anchored by ``kanban_create_authority`` (a ``created`` link plus ``creator_chats_resolved`` on a
++synced board, a ``tui`` subscription otherwise), so link reconciliation keeps it and decision routing binds it.
++
++* System creators (``require_scope_authority=False``): the producer is ``owner_producer`` or ``created_by``. If the
++  owner chat cannot be made (state.db unavailable), the card is created ownerless with an
++  ``owner_chat_unavailable`` event and ``hermes kanban owner-chats --apply`` owns it later.
++* Agent/CLI ingress (``require_scope_authority=True``): the caller's own chat or creator task as before; with
++  neither, only a producer the caller's runner declared (the cron job, or ``HERMES_KANBAN_PRODUCER`` outside any
++  agent turn) gets an owner chat. Otherwise the create is refused (``scope_authority_missing``).
++* ``kanban.owner_chats: false`` restores the old behaviour exactly.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import re
++import threading
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++PREFIX = "kanban_owner_"
++SOURCE = "desktop"  # interactive: a machine source cannot own a card, and the sidebar lists desktop chats
++EVENT = "owner_chat_attached"
++UNAVAILABLE = "owner_chat_unavailable"
++ENV = "HERMES_KANBAN_PRODUCER"
++TERMINAL = "terminal"
++_GENERATIONS = 10  # a user-deleted owner chat's id is retired for good: the next one takes a fresh suffix
++RECHECK_S = 600.0  # a cached owner chat is re-validated (archived? deleted?) at most this often per process
++BACKFILL_EVERY_S = 3600.0
++_ENSURED: dict[tuple[str, str], tuple[str, float]] = {}
++_LOCK = threading.Lock()
++_LAST_BACKFILL: dict[str, float] = {}
++
++
++def enabled() -> bool:
++    try:
++        from hermes_cli.config import load_config_readonly
++        return bool(((load_config_readonly() or {}).get("kanban") or {}).get("owner_chats", True))
++    except Exception:  # health: allow BLE001 -- create runs this in its write txn; unreadable config keeps the default
++        log.warning("kanban.owner_chats unreadable; keeping owner chats on", exc_info=True)
++        return True
++
++
++def slug(producer: str) -> str:
++    return re.sub(r"[^a-z0-9]+", "_", str(producer or "").lower()).strip("_")[:60] or "unattributed"
++
++
++def session_id(producer: str, generation: int = 1) -> str:
++    return PREFIX + slug(producer) + ("" if generation == 1 else f"_{generation}")
++
++
++def title(producer: str) -> str:
++    name = str(producer or "").strip() or "unattributed"
++    if name.startswith("cron:"):
++        from cron.jobs import get_job
++        job = get_job(name[5:]) or {}
++        if job.get("name"):
++            name = f"cron {job['name']}"
++    return f"Kanban owner: {name}"
++
++
++def brief(producer: str) -> str:
++    return (f"I am the standing owner chat for Kanban cards created by `{producer}`. Those cards have no other chat, "
++            "so when one stops (spend budget, scope stop) or needs a decision, the notice comes here and I decide: "
++            "release it with a goal-level mandate (`hermes kanban release <id> --note ...`), re-scope it, or archive "
++            "it when it is obsolete. I read the card, its runs and comments before deciding, and I never lift a "
++            "provider safety refusal.")
++
++
++def declared_producer(tool_task_id: Optional[str] = None, *, allow_env: bool = True) -> Optional[str]:
++    """The producer a headless caller's runner declared: the cron job running a tool call, else (outside any
++    agent turn only) ``HERMES_KANBAN_PRODUCER``, which the cron script runner sets."""
++    parts = str(tool_task_id or "").split(":")
++    if len(parts) >= 2 and parts[0] == "cron" and parts[1]:
++        return "cron:" + parts[1]
++    if not allow_env:
++        return None
++    return (os.environ.get(ENV) or "").strip() or None
++
++
++def tool_create_options(tool_task_id: Optional[str], selfwork_intent) -> dict:
++    """``create_task`` owner options for the ``kanban_create`` tool. Receiver-set self-work intake is chat-less
++    by contract, so it gets no owner chat. Any other chat-less caller is owned by its runner's producer: the cron
++    job running this tool call, or (only outside an agent turn: a script calling the tool directly)
++    ``HERMES_KANBAN_PRODUCER``."""
++    return {"settle_owner_chat": selfwork_intent is None,
++            "owner_producer": declared_producer(tool_task_id, allow_env=not tool_task_id)}
++
++
++def _open_store(path: str):
++    from hermes_state import SessionDB
++    return SessionDB(db_path=path)
++
++
++def ensure(producer: str) -> str:
++    """The producer's live owner chat in this profile's state.db (created, pinned and un-archived as needed).
++
++    Within ``RECHECK_S`` of the last check the cached id is returned without touching state.db, so a create
++    holding the kanban write lock pays for state.db once per producer per process, not per card."""
++    import time
++
++    from hermes_constants import get_hermes_home
++    from hermes_state_runtime import RuntimeStoreError
++    path = str(get_hermes_home() / "state.db")
++    key = (path, slug(producer))
++    with _LOCK:
++        cached = _ENSURED.get(key)
++        if cached and time.monotonic() - cached[1] < RECHECK_S:
++            return cached[0]
++        db = _open_store(path)
++        try:
++            for generation in range(1, _GENERATIONS + 1):
++                sid = session_id(producer, generation)
++                try:
++                    db.ensure_session(sid, SOURCE)
++                except RuntimeStoreError as exc:
++                    if exc.reason == "not_found":
++                        continue  # deleted by the user: retired for good, take the next generation
++                    raise
++                break
++            else:
++                raise RuntimeError(f"every owner chat id for producer {producer!r} was deleted")
++            row = db.get_session(sid) or {}
++            if not row.get("message_count"):
++                db.append_message(sid, "assistant", brief(producer))
++            if not db.get_session_title(sid):
++                try:
++                    db.set_session_title(sid, title(producer))
++                except ValueError:  # a title clash costs only the label
++                    log.warning("kanban owner chat %s: title %r refused", sid, title(producer))
++            if row.get("archived"):
++                db.set_session_archived(sid, False, notify=False)
++            if not row.get("pinned"):
++                db.set_session_pinned(sid, True)  # pins are exempt from the draft and idle archive sweeps
++        finally:
++            db.close()
++        from hermes_cli import kanban_session_provenance as prov
++        prov._source_cache.pop((path, sid), None)  # a cached "missing" would hide the new chat for 300 s
++        _ENSURED[key] = (sid, time.monotonic())
++    return sid
++
++
++def attach(conn, task_id: str, producer: str) -> str:
++    """Inside create's transaction: make the producer's owner chat this card's creating chat."""
++    return link(conn, task_id, producer, ensure(producer))
++
++
++def link(conn, task_id: str, producer: str, sid: str) -> str:
++    """Kanban-side half of :func:`attach`: link and record ``sid`` (an ensured owner chat) as the creating chat."""
++    from hermes_cli.kanban_adoption_authority import gateway as _gateway
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_db import _append_event
++    from hermes_cli.profiles import get_active_profile_name
++
++    me, profile = _gateway(conn), get_active_profile_name()
++    chat_profile = None if profile == "default" else profile  # the UID ordinary reconciliation derives
++    created = conn.execute("SELECT created_at FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        conn.execute(
++            "INSERT OR IGNORE INTO task_chat_links "
++            "(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++            "VALUES (?,?,?,?,?,'created',0,?)",
++            (link_uid(task_id, me, chat_profile, sid, "created"), task_id, me, chat_profile, sid, created))
++        # What reconciliation reads to keep a created link (kanban_chat_links._local_links); a stop then binds
++        # the chat's subscription (kanban_spend_decision._route), so no event wakes it before a decision.
++        _append_event(conn, task_id, "creator_chats_resolved",
++                      {"registered_session": sid, "chat_gateway": me, "chat_profile": chat_profile})
++    else:
++        # A board without links: its owning chat IS its tui subscription (kanban_create_authority legacy branch).
++        conn.execute(
++            "INSERT OR IGNORE INTO kanban_notify_subs "
++            "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++            "VALUES (?,'tui',?,'','notify','{\"reason\":\"owner\"}',?, "
++            "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
++            (task_id, sid, created, task_id))
++    _append_event(conn, task_id, EVENT, {"producer": producer, "session": sid, "chat_gateway": me,
++                                         "chat_profile": chat_profile})
++    return sid
++
++
++def settle(conn, task_id: str, creator_task_id: Optional[str], *, created_by: Optional[str], strict: bool,
++           producer: Optional[str] = None) -> None:
++    """Leave the card with a durable owner, or refuse the create (raises ``CreateAuthorityRefused``)."""
++    from hermes_cli import kanban_create_authority as kca
++    if not enabled():
++        if strict:
++            kca.require(conn, task_id, creator_task_id)
++        return
++    if kca.has_authority(conn, task_id, creator_task_id, durable=True):
++        return
++    kca._anchor_registered_session(conn, task_id)
++    if kca.has_authority(conn, task_id, creator_task_id, durable=True):
++        return
++    name = (producer or "").strip() or (None if strict else (created_by or "").strip() or "unattributed")
++    if not name:
++        kca.require(conn, task_id, creator_task_id)  # raises: no chat, no creator, no declared producer
++        return
++    try:
++        sid = ensure(name)  # state.db only; the kanban writes below are not covered by this fallback
++    except Exception as exc:  # health: allow BLE001 -- state.db trouble must not stop a monitor filing its card
++        if strict:
++            raise kca.CreateAuthorityRefused(
++                f"the owner chat for producer {name!r} could not be made ({exc}); nothing was created.") from exc
++        from hermes_cli.kanban_db import _append_event
++        log.warning("kanban owner chat for %s unavailable; card %s created ownerless", name, task_id, exc_info=True)
++        _append_event(conn, task_id, UNAVAILABLE, {"producer": name, "error": str(exc)[:500]})
++        return
++    link(conn, task_id, name, sid)
++    if not kca.has_authority(conn, task_id, creator_task_id, durable=True):
++        raise kca.CreateAuthorityRefused(
++            f"the owner chat for producer {name!r} could not be linked as this card's owner; nothing was created.")
++
++
++def _owner_refs(conn, task_id: str, links: bool) -> tuple[list[str], bool]:
++    """``(owner chat ids, has another owning chat)`` among this card's unreleased creating chats."""
++    if links:
++        rows = [r[0] for r in conn.execute(
++            "SELECT chat_session FROM task_chat_links WHERE task_id=? AND kind='created' AND released=0", (task_id,))]
++    else:
++        rows = [r[0] for r in conn.execute(
++            "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? AND platform='tui'", (task_id,))]
++    mine = [str(r) for r in rows if str(r or "").rsplit("/", 1)[-1].startswith(PREFIX)]
++    return mine, len(mine) < len(rows)
++
++
++def _needs_owner(conn, task_id: str, links: bool, live) -> Optional[list[str]]:
++    """None when the card is owned; else the dead owner chats to retire before it gets a live one."""
++    from hermes_cli import kanban_create_authority as kca
++    if links and conn.execute("SELECT 1 FROM task_chat_links WHERE task_id=? AND kind='created' AND released=1",
++                              (task_id,)).fetchone():
++        return None  # its owner let go on purpose; re-owning it would undo that
++    mine, other = _owner_refs(conn, task_id, links)
++    if mine and not other and not any(live(ref.rsplit("/", 1)[-1]) for ref in mine):
++        return mine  # owned only by owner chats the user deleted or archived: delivery would go nowhere
++    if kca.has_authority(conn, task_id, None, durable=True):
++        return None
++    return []
++
++
++def _liveness():
++    from hermes_constants import get_hermes_home
++    db = _open_store(str(get_hermes_home() / "state.db"))
++    seen: dict[str, bool] = {}
++
++    def live(sid: str) -> bool:
++        if sid not in seen:
++            row = db.get_session(sid)
++            seen[sid] = bool(row) and not row.get("archived")
++        return seen[sid]
++    return db, live
++
++
++def ownerless(conn, live=None) -> list[tuple[str, str]]:
++    """``(task_id, producer)`` for open home cards with no live owner (read-only)."""
++    from hermes_cli.kanban_wake_check import foreign_copy
++    links = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone())
++    db = None
++    if live is None:
++        db, live = _liveness()
++    try:
++        out = []
++        for task_id, created_by in conn.execute(
++                "SELECT id, created_by FROM tasks WHERE status NOT IN ('done','archived') "
++                "ORDER BY created_at").fetchall():
++            if foreign_copy(conn, task_id) or _needs_owner(conn, task_id, links, live) is None:
++                continue
++            out.append((task_id, (created_by or "").strip() or "unattributed"))
++        return out
++    finally:
++        if db is not None:
++            db.close()
++
++
++def backfill(conn, *, apply: bool) -> dict:
++    """Give each ownerless open card its producer's owner chat (``apply``), re-checked under the write lock.
++    Links to owner chats the user deleted or archived are released (or unsubscribed) first."""
++    from hermes_cli import kanban_db as kb
++    links = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone())
++    db, live = _liveness()
++    try:
++        found, linked = ownerless(conn, live), []
++        if apply:
++            for task_id, producer in found:
++                sid = ensure(producer)  # state.db work outside the kanban write lock
++                with kb.write_txn(conn):
++                    dead = _needs_owner(conn, task_id, links, live)
++                    if dead is None:
++                        continue
++                    for ref in dead:
++                        if ref.rsplit("/", 1)[-1] == sid:
++                            continue  # an archived chat ensure() just restored: keep its link
++                        if links:
++                            conn.execute("UPDATE task_chat_links SET released=1 WHERE task_id=? AND kind='created' "
++                                         "AND chat_session=?", (task_id, ref))
++                        else:
++                            conn.execute("DELETE FROM kanban_notify_subs WHERE task_id=? AND platform='tui' "
++                                         "AND chat_id=?", (task_id, ref))
++                    link(conn, task_id, producer, sid)
++                    linked.append(task_id)
++    finally:
++        db.close()
++    by_producer: dict[str, int] = {}
++    for _, producer in found:
++        by_producer[producer] = by_producer.get(producer, 0) + 1
++    return {"ownerless": len(found), "linked": len(linked), "by_producer": by_producer}
++
++
++def maybe_backfill(conn, *, now: float) -> Optional[dict]:
++    """Dispatcher maintenance: at most hourly per board per process, own whatever is still ownerless (a create
++    that found state.db unavailable, an owner chat the user deleted or archived)."""
++    path = next((r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
++    if not enabled() or now - _LAST_BACKFILL.get(path, float("-inf")) < BACKFILL_EVERY_S:
++        return None
++    _LAST_BACKFILL[path] = now
++    result = backfill(conn, apply=True)
++    if result["linked"]:
++        log.info("kanban owner chats: linked %d ownerless cards %s", result["linked"], result["by_producer"])
++    return result
++
++
++def command(args) -> int:
++    import json
++
++    from hermes_cli import kanban_db_connect as kbc
++    apply = bool(getattr(args, "apply", False))
++    with kbc.connect_closing() as conn:
++        result = backfill(conn, apply=apply)
++    if getattr(args, "json", False):
++        print(json.dumps(result, sort_keys=True))
++        return 0
++    done = f"linked {result['linked']}" if apply else "pass --apply to link them"
++    print(f"{result['ownerless']} open cards have no owning chat; {done}.")
++    for producer, n in sorted(result["by_producer"].items(), key=lambda kv: -kv[1]):
++        print(f"  {n:5d}  {producer}")
++    return 0
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index cdcf0292605..11675976e86 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -660,6 +660,10 @@
+         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
+         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+     ], help="Manually move one or more todo/blocked/triage tasks to ready (recovery path)"),
++    _cmd("owner-chats", [
++        _arg("--apply", action="store_true", help="Link each ownerless open card to its producer's owner chat"),
++        _json_flag(),
++    ], help="List open home cards with no owning chat; --apply gives each its producer's standing owner chat"),
+     _cmd("renew-scope", [
+         _TASK_ID,
+         _arg("--episode", required=True, help="Uid of the scope stop (spend_budget_triaged event) being renewed"),
+diff --git a/hermes_cli/kanban_swarm.py b/hermes_cli/kanban_swarm.py
+index 0aeaf939d5b..442919d95a8 100644
+--- a/hermes_cli/kanban_swarm.py
++++ b/hermes_cli/kanban_swarm.py
+@@ -22,6 +22,7 @@
+ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_owner_chat import declared_producer as _declared_producer
+ 
+ BLACKBOARD_PREFIX = "[swarm:blackboard] "
+ 
+@@ -191,6 +192,7 @@
+         workspace_kind=workspace_kind, workspace_path=workspace_path,
+         session_id=session, creator_task_id=creator,
+         require_scope_authority=bool(creator) or _agent_invoked(),
++        owner_producer=None if creator or _agent_invoked() else _declared_producer(),
+     )
+     root = kb.create_task(
+         conn,
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index 5d82f8246bd..9e753d56014 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -31,6 +31,21 @@
+     monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, reviewer.DEFAULT_MAX_GRANTS))
+ 
+ 
++@pytest.fixture(autouse=True)
++def _owner_backfill_off(request, monkeypatch):
++    """The dispatcher's hourly owner-chat backfill (``kanban_owner_chat.maybe_backfill``) stays out of the
++    dispatcher suites, which pin exact links and subscriptions; ``owner_backfill`` opts a test in. [daveey]"""
++    if "owner_backfill" in request.fixturenames:
++        return
++    from hermes_cli import kanban_owner_chat as owner
++    monkeypatch.setattr(owner, "maybe_backfill", lambda conn, *, now: None)
++
++
++@pytest.fixture
++def owner_backfill():
++    """Run the real hourly owner-chat backfill from dispatcher maintenance."""
++
++
+ @pytest.fixture
+ def spend_reviewer(monkeypatch):
+     """The reviewer on, its judge a scripted double: append verdict dicts to the returned list."""
+diff --git a/tests/hermes_cli/test_kanban_owner_chat.py b/tests/hermes_cli/test_kanban_owner_chat.py
+new file mode 100644
+index 00000000000..c2373207203
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_chat.py
+@@ -0,0 +1,438 @@
++"""Every card has an owning chat (``kanban_owner_chat``): system producers get one standing ``Kanban owner`` chat
++each, headless agent/CLI creates get one only for a declared producer, and a stop on such a card routes to that
++chat instead of to nobody."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_create_authority as kca
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_owner_chat as owner
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.fixture(autouse=True)
++def _fresh_cache(monkeypatch):
++    monkeypatch.setattr(owner, "_ENSURED", {})
++
++
++def _links(conn, tid):
++    """Owning chats: ``task_chat_links`` on a synced board, else the creating chat's ``tui`` subscription."""
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        return [dict(r) for r in conn.execute(
++            "SELECT chat_session, kind, released FROM task_chat_links WHERE task_id=?", (tid,))]
++    return [{"chat_session": r[0], "kind": "created", "released": 0} for r in conn.execute(
++        "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? AND platform='tui'", (tid,))]
++
++
++def _session(home, sid):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        return db.get_session(sid), db.get_session_title(sid)
++    finally:
++        db.close()
++
++
++def test_a_system_producer_card_gets_its_producers_owner_chat(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Repair sync drift", assignee="default", created_by="kanban-drift")
++        sid = owner.session_id("kanban-drift")
++        assert _links(conn, tid) == [{"chat_session": sid, "kind": "created", "released": 0}]
++        assert conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform='tui' AND chat_id=?",
++                            (tid, sid)).fetchone()
++        assert kca.has_authority(conn, tid, None, durable=True)
++        event = [e for e in kb.list_events(conn, tid) if e.kind == owner.EVENT]
++        assert event and event[0].payload["producer"] == "kanban-drift"
++    row, title = _session(kanban_home, sid)
++    assert row["source"] == "desktop" and title == "Kanban owner: kanban-drift"
++
++
++def test_one_owner_chat_per_producer_is_reused(kanban_home):
++    with kbc.connect_closing() as conn:
++        a = kb.create_task(conn, title="a", assignee="default", created_by="ci-main-watch")
++        b = kb.create_task(conn, title="b", assignee="default", created_by="ci-main-watch")
++        c = kb.create_task(conn, title="c", assignee="default", created_by="self-heal")
++        sessions = {_links(conn, t)[0]["chat_session"] for t in (a, b)}
++        assert sessions == {owner.session_id("ci-main-watch")}
++        assert _links(conn, c)[0]["chat_session"] == owner.session_id("self-heal")
++
++
++def test_a_card_from_a_registered_chat_keeps_that_chat_and_gets_no_owner_chat(kanban_home, monkeypatch):
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=kanban_home / "state.db")
++    try:
++        db.create_session("20261124_120000_human", source="desktop")
++    finally:
++        db.close()
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="From a chat", assignee="default", created_by="default",
++                             session_id="20261124_120000_human", require_scope_authority=True)
++        assert [link["chat_session"] for link in _links(conn, tid)] == ["20261124_120000_human"]
++        assert not any(e.kind == owner.EVENT for e in kb.list_events(conn, tid))
++
++
++def test_headless_agent_create_without_a_producer_is_still_refused(kanban_home):
++    with kbc.connect_closing() as conn:
++        with pytest.raises(kca.CreateAuthorityRefused):
++            kb.create_task(conn, title="Orphan", assignee="default", created_by="default",
++                           require_scope_authority=True)
++        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE title='Orphan'").fetchone()[0] == 0
++
++
++def test_headless_agent_create_with_a_declared_producer_gets_its_owner_chat(kanban_home, monkeypatch):
++    monkeypatch.setenv(owner.ENV, "kanban-drift")
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Drift", assignee="default", created_by="default",
++                             require_scope_authority=True, owner_producer=owner.declared_producer())
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("kanban-drift")
++
++
++def test_declared_producer_is_the_running_cron_job_else_the_env_outside_agent_turns(monkeypatch):
++    monkeypatch.delenv(owner.ENV, raising=False)
++    assert owner.declared_producer(None) is None
++    assert owner.declared_producer("session-tool-task") is None
++    assert owner.declared_producer("cron:a9ff61f12e19:exec1") == "cron:a9ff61f12e19"
++    monkeypatch.setenv(owner.ENV, "kanban-drift")
++    assert owner.declared_producer(None) == "kanban-drift"
++    assert owner.declared_producer(None, allow_env=False) is None
++    assert owner.declared_producer("cron:a9ff61f12e19:exec1") == "cron:a9ff61f12e19"
++
++
++def test_the_kanban_create_tool_refuses_a_headless_caller_and_owns_a_declared_one(kanban_home, monkeypatch):
++    from tools import kanban_tools
++    refused = json.loads(kanban_tools._handle_create({"title": "Headless", "assignee": "default"}))
++    assert refused.get("error") or refused.get("success") is False
++    monkeypatch.setenv(owner.ENV, "kanban-drift")
++    made = json.loads(kanban_tools._handle_create({"title": "Monitor card", "assignee": "default"}))
++    tid = made.get("task_id") or (made.get("task") or {}).get("id")
++    assert tid, made
++    with kbc.connect_closing() as conn:
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("kanban-drift")
++
++
++def test_the_kanban_create_tool_in_a_cron_job_owns_the_card_by_that_job(kanban_home, monkeypatch):
++    from tools import kanban_tools
++    monkeypatch.delenv(owner.ENV, raising=False)
++    made = json.loads(kanban_tools._handle_create({"title": "Cron card", "assignee": "default"},
++                                                  task_id="cron:job123:exec9"))
++    tid = made.get("task_id") or (made.get("task") or {}).get("id")
++    assert tid, made
++    with kbc.connect_closing() as conn:
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("cron:job123")
++
++
++def test_a_cron_script_runs_with_its_jobs_producer(kanban_home, tmp_path, monkeypatch):
++    from cron import scheduler_script
++    scripts = kanban_home / "scripts"
++    scripts.mkdir()
++    script = scripts / "show_producer.py"
++    script.write_text(f"import os\nprint(os.environ.get({owner.ENV!r}, 'none'))\n")
++    monkeypatch.delenv(owner.ENV, raising=False)
++    ok, out = scheduler_script._run_job_script(str(script), job_id="job123")
++    assert ok, out
++    assert out.strip() == "cron:job123"
++
++
++def test_a_stop_on_a_producer_card_routes_to_its_owner_chat(kanban_home):
++    from hermes_cli import kanban_spend_budget as ksb
++    from hermes_cli import kanban_spend_decision as decision
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Watcher card", assignee="default", created_by="pickup-stall-detector")
++        helpers._runs(conn, tid, ksb.DEFAULT_RUNS)
++        assert ksb.hold(conn, tid, lim=helpers.LIMITS) == "triage"
++        with kb.write_txn(conn):
++            route = decision.producer(conn, tid, "test")
++        assert route["kind"] == "chats", route
++        subs = {r[0] for r in conn.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (tid,))}
++        assert owner.session_id("pickup-stall-detector") in subs
++
++
++def test_switched_off_restores_the_old_behaviour(kanban_home, monkeypatch):
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Legacy", assignee="default", created_by="self-heal")
++        assert _links(conn, tid) == []
++        with pytest.raises(kca.CreateAuthorityRefused):
++            kb.create_task(conn, title="Legacy agent", assignee="default", created_by="default",
++                           require_scope_authority=True, owner_producer="kanban-drift")
++
++
++def test_backfill_links_ownerless_open_cards_once(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        monkeypatch.setattr(owner, "enabled", lambda: False)
++        old = kb.create_task(conn, title="Old ownerless", assignee="default", created_by="worker-claim-watch")
++        finished = kb.create_task(conn, title="Done ownerless", assignee="default", created_by="worker-claim-watch")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (finished,))
++        monkeypatch.setattr(owner, "enabled", lambda: True)
++        dry = owner.backfill(conn, apply=False)
++        assert dry == {"ownerless": 1, "linked": 0, "by_producer": {"worker-claim-watch": 1}}
++        assert _links(conn, old) == []
++        applied = owner.backfill(conn, apply=True)
++        assert applied["linked"] == 1
++        assert _links(conn, old)[0]["chat_session"] == owner.session_id("worker-claim-watch")
++        assert _links(conn, finished) == []
++        assert owner.backfill(conn, apply=True)["ownerless"] == 0
++
++
++def test_on_a_synced_board_the_owner_chat_is_a_created_chat_link_and_renews(tmp_path, monkeypatch):
++    from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_sync_client as ksc
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, "default", "hub")
++    ksa._reset_cache_for_tests()
++    try:
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
++        tid = kb.create_task(conn, title="Drift", assignee="default", created_by="kanban-drift")
++        sid = owner.session_id("kanban-drift")
++        rows = conn.execute("SELECT chat_gateway, chat_session, kind, released FROM task_chat_links "
++                            "WHERE task_id=?", (tid,)).fetchall()
++        assert [tuple(r) for r in rows] == [("hub", sid, "created", 0)]
++        # the renewal reader itself accepts the owner chat as this card's owner
++        assert kca._accepts(conn, tid, sid, "hub", "default")
++    finally:
++        conn.close()
++        ksa._reset_cache_for_tests()
++
++
++@pytest.fixture
++def synced(tmp_path, monkeypatch):
++    """A synced board (``task_chat_links``) on gateway ``hub``."""
++    from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_sync_client as ksc
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    ksc.ensure_identity(conn, "default", "hub")
++    ksa._reset_cache_for_tests()
++    try:
++        yield conn
++    finally:
++        conn.close()
++        ksa._reset_cache_for_tests()
++
++
++def test_link_reconcile_keeps_the_owner_chat_as_owner(synced):
++    from hermes_cli import kanban_chat_links as links
++    tid = kb.create_task(synced, title="Drift", assignee="default", created_by="kanban-drift")
++    links.reconcile(synced, "default", "hub", ledger=False)
++    rows = [tuple(r) for r in synced.execute(
++        "SELECT kind, released, chat_session FROM task_chat_links WHERE task_id=? AND kind='created'", (tid,))]
++    assert rows == [("created", 0, owner.session_id("kanban-drift"))]
++    assert kca.has_authority(synced, tid, None, durable=True)
++
++
++def test_on_a_synced_board_a_stop_routes_to_the_owner_chat(synced):
++    from hermes_cli import kanban_spend_budget as ksb
++    from hermes_cli import kanban_spend_decision as decision
++    tid = kb.create_task(synced, title="Watcher card", assignee="default", created_by="pickup-stall-detector")
++    sid = owner.session_id("pickup-stall-detector")
++    assert not synced.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchone(), \
++        "no subscription before a decision: the owner chat is not woken by every completion"
++    helpers._runs(synced, tid, ksb.DEFAULT_RUNS)
++    assert ksb.hold(synced, tid, lim=helpers.LIMITS) == "triage"
++    with kb.write_txn(synced):
++        route = decision.producer(synced, tid, "test")
++    assert route["kind"] == "chats", route
++    bound = [r[0] for r in synced.execute("SELECT chat_id FROM kanban_notify_subs WHERE task_id=?", (tid,))]
++    assert len(bound) == 1 and bound[0].rsplit("/", 1)[-1] == sid, bound
++
++
++def test_the_owner_chat_is_pinned_seeded_and_never_an_empty_draft(kanban_home):
++    from hermes_state import SessionDB
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="a", assignee="default", created_by="ci-main-watch")
++    sid = owner.session_id("ci-main-watch")
++    db = SessionDB(db_path=kanban_home / "state.db")
++    try:
++        row = db.get_session(sid)
++        assert row["pinned"] and row["message_count"] == 1
++        assert sid not in db.empty_draft_ids(older_than_s=-10)
++    finally:
++        db.close()
++
++
++def test_an_archived_owner_chat_is_restored_and_keeps_its_cards(kanban_home, monkeypatch):
++    from hermes_state import SessionDB
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="a", assignee="default", created_by="ci-main-watch")
++    sid = owner.session_id("ci-main-watch")
++    db = SessionDB(db_path=kanban_home / "state.db")
++    try:
++        db.set_session_archived(sid, True)
++    finally:
++        db.close()
++    monkeypatch.setattr(owner, "_ENSURED", {})  # past RECHECK_S, or a new process
++    with kbc.connect_closing() as conn:
++        first = conn.execute("SELECT id FROM tasks WHERE title='a'").fetchone()[0]
++        assert owner.backfill(conn, apply=True)["linked"] == 1  # the hourly pass finds the archived owner
++        assert _links(conn, first) == [{"chat_session": sid, "kind": "created", "released": 0}]
++        kb.create_task(conn, title="b", assignee="default", created_by="ci-main-watch")
++    db = SessionDB(db_path=kanban_home / "state.db")
++    try:
++        assert not db.get_session(sid)["archived"]
++    finally:
++        db.close()
++
++
++def test_a_deleted_owner_chat_is_replaced_and_creates_keep_working(kanban_home, monkeypatch):
++    from hermes_state import SessionDB
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="a", assignee="default", created_by="ci-main-watch")
++    db = SessionDB(db_path=kanban_home / "state.db")
++    try:
++        db.delete_session(owner.session_id("ci-main-watch"))
++    finally:
++        db.close()
++    monkeypatch.setattr(owner, "_ENSURED", {})  # a new process
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="b", assignee="default", created_by="ci-main-watch")
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("ci-main-watch", 2)
++
++
++def test_state_db_trouble_leaves_a_system_card_ownerless_but_refuses_an_agent(kanban_home, monkeypatch):
++    def broken(producer):
++        raise OSError("database is locked")
++    monkeypatch.setattr(owner, "ensure", broken)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Monitor card", assignee="default", created_by="ci-main-watch")
++        assert _links(conn, tid) == []
++        assert any(e.kind == owner.UNAVAILABLE for e in kb.list_events(conn, tid))
++        assert owner.backfill(conn, apply=False)["ownerless"] == 1
++        with pytest.raises(kca.CreateAuthorityRefused):
++            kb.create_task(conn, title="Agent card", assignee="default", created_by="default",
++                           require_scope_authority=True, owner_producer="kanban-drift")
++
++
++def test_inside_an_agent_turn_the_producer_env_var_does_not_buy_ownership(kanban_home, monkeypatch):
++    from tools import kanban_tools
++    monkeypatch.setenv(owner.ENV, "kanban-drift")
++    refused = json.loads(kanban_tools._handle_create({"title": "Agent card", "assignee": "default"},
++                                                     task_id="20261124_120000_agentturn"))
++    assert refused.get("error") or refused.get("success") is False, refused
++    assert owner.declared_producer("20261124_120000_agentturn", allow_env=False) is None
++
++
++def test_a_human_terminal_create_is_owned_by_the_terminal_owner_chat(kanban_home, monkeypatch):
++    import argparse
++
++    from hermes_cli import kanban as kc
++    monkeypatch.delenv(owner.ENV, raising=False)
++    monkeypatch.setattr(kc, "_agent_invoked", lambda: False)
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    assert kc._cmd_create(root.parse_args(["kanban", "create", "Typed by a human", "--assignee", "default"])) == 0
++    with kbc.connect_closing() as conn:
++        tid = conn.execute("SELECT id FROM tasks WHERE title='Typed by a human'").fetchone()[0]
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id(owner.TERMINAL)
++
++
++def test_backfill_leaves_a_card_whose_chat_released_it(synced, monkeypatch):
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    tid = kb.create_task(synced, title="Released", assignee="default", created_by="ci-main-watch")
++    with kb.write_txn(synced):
++        synced.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,"
++                       "released,created_at) VALUES ('u1',?,'hub',NULL,'20261124_120000_gone','created',1,0)", (tid,))
++    monkeypatch.setattr(owner, "enabled", lambda: True)
++    assert owner.backfill(synced, apply=True) == {"ownerless": 0, "linked": 0, "by_producer": {}}
++
++
++def test_owner_chats_cli_lists_then_links(kanban_home, monkeypatch, capsys):
++    import argparse
++
++    from hermes_cli import kanban as kc
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Old", assignee="default", created_by="self-heal")
++    monkeypatch.setattr(owner, "enabled", lambda: True)
++    root = argparse.ArgumentParser(prog="hermes")
++    kc.build_parser(root.add_subparsers())
++    assert kc.kanban_command(root.parse_args(["kanban", "owner-chats", "--json"])) == 0
++    assert json.loads(capsys.readouterr().out)["ownerless"] == 1
++    assert kc.kanban_command(root.parse_args(["kanban", "owner-chats", "--apply"])) == 0
++    assert "linked 1" in capsys.readouterr().out
++    with kbc.connect_closing() as conn:
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("self-heal")
++
++
++def test_a_producer_pays_for_state_db_once_per_process_not_per_card(kanban_home, monkeypatch):
++    opened = []
++    real = owner._open_store
++    monkeypatch.setattr(owner, "_open_store", lambda path: opened.append(path) or real(path))
++    with kbc.connect_closing() as conn:
++        for n in range(3):
++            kb.create_task(conn, title=f"card {n}", assignee="default", created_by="ci-main-watch")
++    assert len(opened) == 1
++
++
++def test_backfill_moves_cards_off_a_deleted_owner_chat(synced, monkeypatch):
++    from hermes_state import SessionDB
++    from hermes_constants import get_hermes_home
++    tid = kb.create_task(synced, title="Watcher card", assignee="default", created_by="ci-main-watch")
++    old = owner.session_id("ci-main-watch")
++    db = SessionDB(db_path=get_hermes_home() / "state.db")
++    try:
++        db.delete_session(old)
++    finally:
++        db.close()
++    monkeypatch.setattr(owner, "_ENSURED", {})
++    assert owner.backfill(synced, apply=True)["linked"] == 1
++    rows = {tuple(r) for r in synced.execute(
++        "SELECT chat_session, released FROM task_chat_links WHERE task_id=? AND kind='created'", (tid,))}
++    assert rows == {(old, 1), (owner.session_id("ci-main-watch", 2), 0)}
++    assert kca.has_authority(synced, tid, None, durable=True)
++    assert owner.backfill(synced, apply=True)["ownerless"] == 0
++
++
++def test_dispatcher_maintenance_owns_ownerless_cards_hourly(kanban_home, monkeypatch, owner_backfill):
++    from hermes_cli import kanban_dispatch_maintenance as maintenance
++    monkeypatch.setattr(owner, "_LAST_BACKFILL", {})
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Made while off", assignee="default", created_by="self-heal")
++        monkeypatch.setattr(owner, "enabled", lambda: True)
++        clock = iter([1000.0, 1000.0 + 60, 1000.0 + owner.BACKFILL_EVERY_S + 1])
++        monkeypatch.setattr(maintenance, "time", __import__("types").SimpleNamespace(monotonic=lambda: next(clock)),
++                            raising=False)
++        assert owner.maybe_backfill(conn, now=1000.0)["linked"] == 1
++        assert _links(conn, tid)[0]["chat_session"] == owner.session_id("self-heal")
++        assert owner.maybe_backfill(conn, now=1060.0) is None
++        assert owner.maybe_backfill(conn, now=1000.0 + owner.BACKFILL_EVERY_S + 1)["ownerless"] == 0
++
++
++def test_a_create_that_opts_out_gets_no_owner_chat(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Self-work intake", assignee="default", created_by="gw:hub",
++                             settle_owner_chat=False)
++        assert _links(conn, tid) == []
++
++
++def test_decomposed_children_of_a_producer_card_are_owned(kanban_home):
++    from hermes_cli.kanban_db_graph import decompose_triage_task
++    with kbc.connect_closing() as conn:
++        root = kb.create_task(conn, title="Root", assignee="default", created_by="ci-main-watch", triage=True)
++        kids = decompose_triage_task(conn, root, root_assignee="default",
++                                     children=[{"title": "a", "assignee": "default"},
++                                               {"title": "b", "assignee": "default"}])
++        assert kids and all(kca.has_authority(conn, k, None, durable=True) for k in kids)
++
++
++def test_every_card_of_a_terminal_swarm_is_owned(kanban_home, monkeypatch):
++    from hermes_cli import kanban_swarm
++    monkeypatch.setattr(kanban_swarm, "_agent_invoked", lambda: False, raising=False)
++    with kbc.connect_closing() as conn:
++        out = kanban_swarm.create_swarm(conn, goal="Find the flake", workers=[kanban_swarm.parse_worker_arg("default:look")],
++                                        verifier_assignee="default", synthesizer_assignee="default")
++        ids = [r[0] for r in conn.execute("SELECT id FROM tasks")]
++        assert out and len(ids) >= 3
++        assert all(kca.has_authority(conn, t, None, durable=True) for t in ids)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 73828cd62de..fa1d99762d8 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -11,6 +11,7 @@
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
++from hermes_cli.kanban_owner_chat import tool_create_options as _owner_options
+ from tools.kanban_tools_model_neutral import model_neutral_create, model_neutral_review
+ import logging
+ import os
+@@ -1683,11 +1684,10 @@
+                 created_by=(selfwork_intent['sender'] if selfwork_intent is not None else _persisted_identity()), session_id=session_id,
+                 native_origin=native_origin,
+                 origin_intent=origin_intent, chat_origin=origin.ref if origin else args.get("origin_session"),
+-                # Reject a worktree path the dispatcher could never resolve now, to the
+-                # creator, instead of burning spawn retries on it later. [daveey]
++                # Reject a worktree path the dispatcher could never resolve now, to the creator, instead of burning spawn retries on it later. [daveey]
+                 validate_workspace=True, validate_skills=True,
+-                # origin courier checks after binding; self-work intake (receiver-set selfwork_intent) is chat-less by contract
+-                require_scope_authority=origin_intent is None and selfwork_intent is None,
++                require_scope_authority=origin_intent is None and selfwork_intent is None,  # courier: after binding
++                **_owner_options(kw.get("task_id"), selfwork_intent),  # self-work intake is chat-less by contract
+                 insert_guard=after_create.guard)  # re-checks overlap under the write lock [daveey]
+             if self_work is not None:
+                 from hermes_cli.kanban_selfwork_owner import create
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 9763819bb46..16b0c7823cb 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -751,6 +751,22 @@
+ safety stops are never reviewed; `kanban.spend_review: false` turns the
+ reviewer off.
+ 
++Every card has an owning chat. A card created from a chat is owned by that
++chat, and a worker's card by its creator's. Any other card gets its producer's
++standing owner chat: one pinned chat per producer, titled
++`Kanban owner: <producer>`. It is created on first use and seeded with a note
++on what it decides. The producer is the card's `created_by` for system
++monitors and watchers, the cron job for cards created from a cron run, and
++`terminal` for a human's `hermes kanban create`. A scope or budget stop on the
++card then routes to that chat, which can release, re-scope or archive it,
++instead of waiting for an operator. An agent with no chat of its own is still
++refused (`scope_authority_missing`). If the owner chat cannot be made, a
++system card is created without an owner (`owner_chat_unavailable`).
++`hermes kanban owner-chats [--apply] [--json]` lists open cards with no owner
++and, with `--apply`, links each one to its producer's owner chat. A card whose
++chat deliberately released it is left alone. `kanban.owner_chats: false`
++restores the old behaviour.
++
+ `hermes kanban release <id> [--ids <id>...] [--runs N] [--note TEXT] [--seen ID]` is the one-step release
+ of a spend or scope stop. Per card it writes one goal-level mandate comment (finish the card's
+ acceptance; stop only on a provider safety refusal, a step that needs David physically, the same
+-- 
+2.43.0
+

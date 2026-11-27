@@ -1,0 +1,215 @@
+From aa9fc1afcfe7c2405c1bdd2e52af08912371aa22 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:06:11 +0000
+Subject: [PATCH 6041] Kanban source-custody base (stage A, inert)
+
+Public mirror of source commit aa9fc1afcfe7c2405c1bdd2e52af08912371aa22.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index d05ef80107c..e739c6a9179 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1679,6 +1679,7 @@
+         self.conn, self.no_retry, self.done = conn, no_retry, done
+         self.prior_timeout: Optional[int] = None
+         self.finished = False
++        self.closed = False
+         self.error: Optional[BaseException] = None
+ 
+     def arm(self) -> None:
+@@ -1700,10 +1701,14 @@
+             return
+         try:
+             self.conn.execute("ROLLBACK")
+-        except sqlite3.Error:
++        except BaseException:
++            logging.getLogger(__name__).exception("write_txn: rollback failed")
+             try:
+                 live = bool(self.conn.in_transaction)
+-            except sqlite3.Error:
++            except BaseException:
++                logging.getLogger(__name__).exception(
++                    "write_txn: in_transaction unreadable after failed rollback; treating the writer as live"
++                )
+                 live = True  # unknown is treated as a live writer
+             if not live:
+                 # SQLite already ended the transaction itself (disk full, I/O error): "no
+@@ -1719,12 +1724,46 @@
+                     "write_txn: rollback and close failed; withholding boundary_done"
+                 )
+             else:
++                self.closed = True
+                 self.prior_timeout = None  # closed connections cannot restore it
+                 self.finished = False
+ 
++    def cleanup_failed(self) -> None:
++        """Preserve the propagating error, even if rollback entry is interrupted."""
++        try:
++            self.rollback()
++        except BaseException:
++            if not (self.no_retry or self.done is not None):
++                raise  # keep default-path behavior
++            logging.getLogger(__name__).exception("write_txn: cleanup interrupted")
++        self.finish()
++
+     def finish(self) -> None:
+         if self.finished:
+             return
++        if (self.no_retry or self.done is not None) and not self.closed:
++            try:
++                live = bool(self.conn.in_transaction)
++            except BaseException:
++                logging.getLogger(__name__).exception(
++                    "write_txn: in_transaction unreadable before boundary_done; treating the writer as live"
++                )
++                live = True
++            if live:
++                try:
++                    self.conn.execute("ROLLBACK")
++                except BaseException:
++                    logging.getLogger(__name__).exception("write_txn: final rollback failed")
++                try:
++                    self.conn.close()
++                except BaseException:
++                    logging.getLogger(__name__).exception(
++                        "write_txn: final close failed; withholding boundary_done"
++                    )
++                    self.finished = True
++                    return
++                self.closed = True
++                self.prior_timeout = None
+         self.finished = True
+         try:
+             if self.prior_timeout is not None:
+@@ -1770,11 +1809,11 @@
+     run-end-lease and wake hook. Callers should also release in their own
+     ``finally``. A callback or timeout-restore failure after COMMIT skips those
+     hooks (committed bytes remain) and is raised; queued leases are discarded
+-    locally and fall back to server expiry. Cleanup errors, including callback
+-    BaseException, deliberately never shadow a body/BEGIN/COMMIT error. Opt-in
+-    mode rolls back on BaseException before the callback; if rollback fails with
+-    a SQLite error, it closes the connection first (withholds the callback if
+-    close also fails). The default path is unchanged.
++    locally and fall back to server expiry. Cleanup errors, including rollback,
++    close and callback BaseException, deliberately never shadow a body/BEGIN/COMMIT
++    error. Opt-in mode confirms ownership ended before the callback; an interrupted
++    or unreadable boundary gets one final rollback attempt and close. If close
++    fails, the callback is withheld. The default path is unchanged.
+     """
+     if (no_retry or boundary_done is not None) and getattr(conn, "in_transaction", False):
+         raise RuntimeError(
+@@ -1827,14 +1866,12 @@
+     except Exception:
+         # SQLite may already have auto-rolled-back (EIO, contention, corruption);
+         # don't let this secondary failure shadow the real one.
+-        boundary.rollback()
+-        boundary.finish()
++        boundary.cleanup_failed()
+         _run_end_lease.flush(conn, committed=False)  # local discard only, no I/O
+         raise
+     except BaseException:
+         if opt_in:
+-            boundary.rollback()
+-            boundary.finish()
++            boundary.cleanup_failed()
+             _run_end_lease.flush(conn, committed=False)
+         raise
+     else:
+@@ -1844,14 +1881,12 @@
+         except Exception:
+             # COMMIT exhausted retries with the txn still open; roll back so the
+             # connection isn't poisoned for the next BEGIN IMMEDIATE.
+-            boundary.rollback()
+-            boundary.finish()
++            boundary.cleanup_failed()
+             _run_end_lease.flush(conn, committed=False)
+             raise
+         except BaseException:
+             if opt_in:
+-                boundary.rollback()
+-                boundary.finish()
++                boundary.cleanup_failed()
+                 _run_end_lease.flush(conn, committed=False)
+             raise
+         boundary.finish()
+diff --git a/tests/hermes_cli/test_kanban_write_txn_interrupt.py b/tests/hermes_cli/test_kanban_write_txn_interrupt.py
+new file mode 100644
+index 00000000000..5cd25b9081c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_write_txn_interrupt.py
+@@ -0,0 +1,71 @@
++"""Real signal cleanup regressions; no SQLite or cleanup substitutes."""
++import signal
++import sqlite3
++import sys
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.mark.parametrize("phase", ["body", "commit"])
++@pytest.mark.parametrize("interrupt", [True, False])
++def test_original_error_survives_rollback_interrupt(tmp_path, phase, interrupt):
++    db = tmp_path / "boundary.db"
++    a = sqlite3.connect(db, isolation_level=None, timeout=0)
++    b = sqlite3.connect(db, isolation_level=None, timeout=0)
++    a.execute("PRAGMA foreign_keys=ON")
++    a.execute("CREATE TABLE parent(id PRIMARY KEY)")
++    a.execute("CREATE TABLE child(pid REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
++    original = ValueError("body failure")
++    releases = []
++    signals = []
++
++    def done():
++        try:
++            b.execute("BEGIN IMMEDIATE")
++        except sqlite3.OperationalError:
++            releases.append(False)
++        else:
++            releases.append(True)
++            b.execute("ROLLBACK")
++
++    def trace(frame, event, arg):
++        if interrupt and event == "call" and frame.f_code is kbc._TxnBoundary.rollback.__code__:
++            sys.settrace(None)
++            signals.append(True)
++            signal.raise_signal(signal.SIGINT)
++        return trace
++
++    caught = None
++    try:
++        try:
++            sys.settrace(trace)
++            with kbc.write_txn(a, no_retry=True, boundary_done=done):
++                a.execute("INSERT INTO child VALUES (99)")
++                if phase == "body":
++                    raise original
++        except BaseException as exc:
++            caught = exc
++        finally:
++            sys.settrace(None)
++        assert signals == ([True] if interrupt else [])
++        if phase == "body":
++            assert caught is original
++        else:
++            assert isinstance(caught, sqlite3.IntegrityError)
++            assert "FOREIGN KEY" in str(caught)
++        assert all(releases), "callback released a live writer"
++        if not interrupt:
++            assert releases == [True]
++        assert len(releases) <= 1
++        b.execute("BEGIN IMMEDIATE")  # writer ownership really ended
++        b.execute("ROLLBACK")
++        try:
++            assert not a.in_transaction
++        except sqlite3.ProgrammingError:
++            pass  # boundary-owned close also ends ownership
++    finally:
++        sys.settrace(None)
++        a.close()
++        b.close()
+-- 
+2.43.0
+

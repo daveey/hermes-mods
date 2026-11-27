@@ -1,0 +1,126 @@
+From 924d55ef1d146353000ca86fd42948353081c44e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:06:34 +0000
+Subject: [PATCH 6401] Annotation readers, batched revisions and settlement generations
+
+Public mirror of source commit 924d55ef1d146353000ca86fd42948353081c44e.
+
+---
+diff --git a/tests/hermes_cli/test_cached_ro_warm_admission.py b/tests/hermes_cli/test_cached_ro_warm_admission.py
+index 68a70258802..947626d3155 100644
+--- a/tests/hermes_cli/test_cached_ro_warm_admission.py
++++ b/tests/hermes_cli/test_cached_ro_warm_admission.py
+@@ -131,6 +131,42 @@
+         assert conn.execute("SELECT v FROM t").fetchone() == (99,)
+ 
+ 
++def test_error_cleanup_retains_tracking_until_lifecycle_owner_releases(board):
++    from hermes_cli import sqlite_safe_read as safe
++
++    with activity.cached_ro(board):
++        pass
++    entered, finished = threading.Event(), threading.Event()
++    errors = []
++
++    def fail_read():
++        try:
++            with activity.cached_ro(board, busy_budget=0):
++                entered.set()
++                raise sqlite3.OperationalError("fixture body failed")
++        except sqlite3.OperationalError as exc:
++            errors.append(str(exc))
++        finally:
++            finished.set()
++
++    thread = threading.Thread(target=fail_read)
++    try:
++        with held_elsewhere(generation.lifecycle_lock(board)):
++            thread.start()
++            assert entered.wait(10)
++            assert not finished.is_set()  # close still owes lifecycle custody
++            # A failed read cannot untrack its descriptor before the actual close.
++            assert safe.has_live_connection(board)
++        thread.join(10)
++        assert not thread.is_alive()
++        assert errors == ["fixture body failed"]
++        assert finished.is_set()
++        assert not safe.has_live_connection(board)
++        assert str(board) not in activity._RO_CACHE
++    finally:
++        thread.join(10)
++
++
+ def test_warm_custody_excludes_raw_probe_without_acquiring_tracking_mutex(board):
+     from hermes_cli import sqlite_safe_read as safe
+ 
+diff --git a/tests/hermes_cli/test_kanban_busy_board_activity.py b/tests/hermes_cli/test_kanban_busy_board_activity.py
+index 66bdffcf370..2100fab8ac9 100644
+--- a/tests/hermes_cli/test_kanban_busy_board_activity.py
++++ b/tests/hermes_cli/test_kanban_busy_board_activity.py
+@@ -58,6 +58,22 @@
+         t.join(5)
+ 
+ 
++@contextmanager
++def _native_held(path: Path):
++    """Block actual reads on this DELETE-journal fixture, not just new opens.
++
++    A warm attested reader can now read through an unrelated lifecycle hold;
++    stale-row and last-count fallback still must work when SQLite itself is busy.
++    """
++    conn = sqlite3.connect(path)
++    try:
++        conn.execute("BEGIN EXCLUSIVE")
++        yield
++    finally:
++        conn.rollback()
++        conn.close()
++
++
+ def test_lifecycle_busy_error_carries_sqlite_busy(tmp_path):
+     db = tmp_path / "kanban.db"
+     _make_board(db, [])
+@@ -93,7 +109,7 @@
+     with sqlite3.connect(free_db) as conn:  # the free board moves, so the counts are recomputed
+         conn.execute("INSERT INTO tasks VALUES ('t3', 'running', 's_free')")
+     rows = [{"id": "s_busy"}, {"id": "s_free"}]
+-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_session_activity"), _held(busy_db):
++    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_session_activity"), _native_held(busy_db):
+         ksa._cache = None  # past the counts TTL
+         ksa.annotate_kanban_activity(rows)
+     assert not any(r.get("kanban_unknown") for r in rows), rows
+@@ -111,7 +127,7 @@
+     _make_board(busy_db, [("t1", "running", "s1")])
+     _make_board(free_db, [("t2", "running", "s1")])
+     assert {t["id"] for t in ksa.session_tasks(["s1"])} == {"t1", "t2"}
+-    with _held(busy_db):
++    with _native_held(busy_db):
+         tasks = {t["id"]: t for t in ksa.session_tasks(["s1"])}
+     assert set(tasks) == {"t1", "t2"}
+     assert tasks["t1"].get("stale") is True
+diff --git a/tests/hermes_cli/test_kanban_content_key_busy_budget.py b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+index 74bd5b9975c..43914c3d777 100644
+--- a/tests/hermes_cli/test_kanban_content_key_busy_budget.py
++++ b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+@@ -34,13 +34,14 @@
+ 
+ def _spy_budgets(monkeypatch):
+     budgets = []
+-    original = lifecycle.cached_entry
++    original = activity.cached_ro
+ 
+-    def spy(path, busy_budget=0.5):
++    def spy(path, *, busy_budget=0.5):
+         budgets.append(busy_budget)
+-        return original(path, busy_budget)
++        return original(path, busy_budget=busy_budget)
+ 
+-    monkeypatch.setattr(lifecycle, "cached_entry", spy)
++    # Measure caller budgets on warm borrows too, not only cold admissions.
++    monkeypatch.setattr(activity, "cached_ro", spy)
+     return budgets
+ 
+ 
+-- 
+2.43.0
+

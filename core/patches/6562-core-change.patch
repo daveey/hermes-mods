@@ -1,0 +1,165 @@
+From e4adc6b22ef10b6e25ddfaa58f44fc9c20eee842 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 05:25:45 +0000
+Subject: [PATCH 6562] Request-stage diagnostics, stream phases and process custody
+
+Public mirror of source commit e4adc6b22ef10b6e25ddfaa58f44fc9c20eee842.
+
+---
+diff --git a/apps/desktop/electron/request-stages.test.ts b/apps/desktop/electron/request-stages.test.ts
+index ba5401dbed3..85aabea1a0c 100644
+--- a/apps/desktop/electron/request-stages.test.ts
++++ b/apps/desktop/electron/request-stages.test.ts
+@@ -35,7 +35,7 @@
+ afterEach(() => { vi.restoreAllMocks(); destroyKeepaliveAgents() })
+ 
+ describe('request-stage capture', () => {
+-  it('executes the actual main dispatcher wrapper with trace and error identity intact', async () => {
++  it.each([route, '/api/plugins/session-mentions/result'])('executes the actual main dispatcher wrapper for %s with trace and error identity intact', async selectedPath => {
+     const source = await fs.readFile(new URL('./main.ts', import.meta.url), 'utf8')
+     const ast = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true)
+     const declaration = ast.statements.find(statement => ts.isFunctionDeclaration(statement) && statement.name?.text === 'handleHermesApiRequest')!
+@@ -53,8 +53,8 @@
+       declaration.getText(ast) + '; return handleHermesApiRequest')(
+       (request, run) => tracing.withApiRequestStages(request, run, buffer), operation)
+ 
+-    expect(await handle({ path: route })).toBe(42)
+-    await expect(handle({ path: route, fail: true })).rejects.toBe(failure)
++    expect(await handle({ path: selectedPath })).toBe(42)
++    await expect(handle({ path: selectedPath, fail: true })).rejects.toBe(failure)
+     await buffer.flush()
+     expect(operation).toHaveBeenCalledTimes(2)
+     expect(rows.map(row => row.stage)).toEqual(['api_call', 'api_end', 'api_call', 'api_error'])
+@@ -83,7 +83,7 @@
+     } finally { await fs.rm(directory, { recursive: true, force: true }) }
+   })
+ 
+-  it('records real JSON helper stages, header and logical gate wait without private data', async () => {
++  it.each([route, '/api/plugins/session-mentions/result'])('records real JSON helper stages for %s without private data', async selectedPath => {
+     const { rows, buffer } = capture()
+     const real = tracing.requestStages
+     vi.spyOn(tracing, 'requestStages').mockImplementation((url, method) => real(url, method, buffer))
+@@ -91,16 +91,19 @@
+ 
+     const server = await serverFor((req, res) => {
+       ids.push(String(req.headers['x-hermes-req-id']))
++      expect(req.method).toBe('POST')
++      req.resume()
+       res.end('{"ok":true}')
+     })
+ 
+     try {
+-      for (const fetch of [fetchJsonWith, (_deps, url) => fetchPublicJsonWith(_deps, url)]) {
+-        const answer = await tracing.withApiRequestStages({ path: route + '?token=DO_NOT_LOG' }, async () => {
++      for (const fetch of [fetchJsonWith, (_deps: typeof deps, url: string, _token: string | null, options: { method: string; body: unknown }) => fetchPublicJsonWith(_deps, url, options)]) {
++        const answer = await tracing.withApiRequestStages({ path: selectedPath + '?token=DO_NOT_LOG', method: 'POST' }, async () => {
+           // Yield before fetch, as a real asynchronous dial/gate does.
+           await Promise.resolve()
+ 
+-          return fetch(deps, server.base + route + '?token=DO_NOT_LOG', null)
++          return fetch(deps, server.base + selectedPath + '?token=DO_NOT_LOG', null,
++            { method: 'POST', body: { private: 'DO_NOT_LOG' } })
+         }, buffer)
+ 
+         expect(answer).toEqual({ ok: true })
+diff --git a/apps/desktop/electron/request-stages.ts b/apps/desktop/electron/request-stages.ts
+index be7848213c8..903c31e191c 100644
+--- a/apps/desktop/electron/request-stages.ts
++++ b/apps/desktop/electron/request-stages.ts
+@@ -10,7 +10,8 @@
+ 
+ const POLL_PATHS = new Set([
+   '/api/plugins/user-steps/requests', '/api/plugins/hub-sync/status',
+-  '/api/plugins/kanban/board', '/api/sessions', '/api/health'
++  '/api/plugins/kanban/board', '/api/sessions', '/api/health',
++  '/api/plugins/session-mentions/result'
+ ])
+ 
+ type Row = Record<string, string | number | boolean>
+diff --git a/docs/request-stage-evidence.md b/docs/request-stage-evidence.md
+index 247c78fee82..eb1e45b3e48 100644
+--- a/docs/request-stage-evidence.md
++++ b/docs/request-stage-evidence.md
+@@ -6,6 +6,7 @@
+ 
+ - `/api/plugins/user-steps/requests`
+ - `/api/plugins/hub-sync/status`
++- `/api/plugins/session-mentions/result` (including result POSTs; payloads remain excluded)
+ - `/api/plugins/kanban/board`
+ - `/api/sessions`
+ - `/api/health`
+diff --git a/hermes_cli/web_request_stages.py b/hermes_cli/web_request_stages.py
+index 8ce46fe795b..ce0aa27ec7e 100644
+--- a/hermes_cli/web_request_stages.py
++++ b/hermes_cli/web_request_stages.py
+@@ -23,6 +23,7 @@
+ POLL_PATHS = frozenset({
+     "/api/plugins/user-steps/requests", "/api/plugins/hub-sync/status",
+     "/api/plugins/kanban/board", "/api/sessions", "/api/health",
++    "/api/plugins/session-mentions/result",
+ })
+ _ID = re.compile(r"^[a-f0-9]{32}$")
+ _SCOPE_KEY = "hermes.request_stages"
+diff --git a/tests/hermes_cli/test_web_request_stages.py b/tests/hermes_cli/test_web_request_stages.py
+index 98badba27eb..6196600a2c7 100644
+--- a/tests/hermes_cli/test_web_request_stages.py
++++ b/tests/hermes_cli/test_web_request_stages.py
+@@ -23,7 +23,8 @@
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_full_asgi_order_bytes_and_sanitization():
++@pytest.mark.parametrize('selected_path', ['/api/plugins/user-steps/requests', '/api/plugins/session-mentions/result'])
++async def test_full_asgi_order_bytes_and_sanitization(selected_path):
+     sink = Sink()
+     rid = b"a" * 32
+ 
+@@ -41,12 +42,14 @@
+     async def send(message):
+         messages.append(message)
+ 
+-    await stages.RequestStageIngress(gate, sink)(scope(headers=[(b"x-hermes-req-id", rid)]), None, send)
++    request_scope = scope(path=selected_path, headers=[(b"x-hermes-req-id", rid)])
++    request_scope["method"] = "POST"
++    await stages.RequestStageIngress(gate, sink)(request_scope, None, send)
+     assert [r["stage"] for r in sink.rows] == [
+         "ingress", "handler_dispatch", "response_start", "response_start_sent",
+         "response_body", "response_body", "response_end", "app_exit",
+     ]
+-    assert all(r["id"] == rid.decode() and r["client_id"] for r in sink.rows)
++    assert all(r["id"] == rid.decode() and r["client_id"] and r["method"] == "POST" for r in sink.rows)
+     assert sink.rows[-2]["bytes"] == 9
+     assert "DO_NOT_LOG" not in json.dumps(sink.rows)
+     assert "private" not in json.dumps(sink.rows)
+@@ -193,6 +196,28 @@
+     assert end["bytes"] == len(response.content)
+ 
+ 
++@pytest.mark.asyncio
++async def test_result_auth_refusal_retains_correlated_ingress(monkeypatch):
++    import httpx
++    from fastapi import FastAPI
++    from hermes_cli import web_server
++
++    sink = Sink()
++    monkeypatch.setattr(stages, "journal", lambda: sink)
++    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "test-stage-token")
++    monkeypatch.setattr(web_server.app.state, "bound_host", None, raising=False)
++    application = FastAPI(middleware=web_server.app.user_middleware)
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url="http://127.0.0.1") as client:
++        response = await client.post("/api/plugins/session-mentions/result?token=DO_NOT_LOG",
++                                     json={"private": "DO_NOT_LOG"}, headers={"X-Hermes-Req-Id": "b" * 32})
++    assert response.status_code == 401
++    assert sink.rows[0]["stage"] == "ingress"
++    assert all(r["id"] == "b" * 32 and r["client_id"] and r["method"] == "POST" for r in sink.rows)
++    assert "handler_dispatch" not in [r["stage"] for r in sink.rows]
++    assert next(r for r in sink.rows if r["stage"] == "response_start")["status"] == 401
++    assert "DO_NOT_LOG" not in json.dumps(sink.rows)
++
++
+ def test_rotation_retains_exactly_four_bounded_files(tmp_path, monkeypatch):
+     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+     journal = stages.StageJournal(tmp_path / "capture" / "stages.jsonl", max_bytes=600)
+-- 
+2.43.0
+

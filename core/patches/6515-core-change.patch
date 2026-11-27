@@ -1,0 +1,264 @@
+From d1f8a821f703575cb461d99aa5da5065bd820d6a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:15:04 +0000
+Subject: [PATCH 6515] Request-stage diagnostics, stream phases and process custody
+
+Public mirror of source commit d1f8a821f703575cb461d99aa5da5065bd820d6a.
+
+---
+diff --git a/agent/shell_hooks.py b/agent/shell_hooks.py
+index 47d73e6f7c8..10bd68b2ff3 100644
+--- a/agent/shell_hooks.py
++++ b/agent/shell_hooks.py
+@@ -11,6 +11,7 @@
+ import logging
+ import os
+ import re
++import signal
+ import subprocess
+ import sys
+ import threading
+@@ -481,6 +482,32 @@
+     return [_find_bash(), *argv]
+ 
+ 
++@contextmanager
++def _defer_hook_spawn_sigint() -> Iterator[None]:
++    """Publish the child handle before a main-thread SIGINT may unwind spawn.
++
++    A caught (not ignored/blocked) signal resets to default at child exec, so
++    hooks do not inherit an ignored SIGINT. Worker threads cannot run Python
++    signal handlers; leave their process-wide handler untouched.
++    """
++    previous = signal.getsignal(signal.SIGINT)
++    if threading.current_thread() is not threading.main_thread() or not callable(previous):
++        yield
++        return
++    pending = []
++
++    def remember(signum, frame):
++        pending[:] = [(signum, frame)]
++
++    signal.signal(signal.SIGINT, remember)
++    try:
++        yield
++    finally:
++        signal.signal(signal.SIGINT, previous)
++        if pending:
++            previous(*pending[0])
++
++
+ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
+     """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome."""
+     result: dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None}
+@@ -508,30 +535,32 @@
+     # script must not inherit; single-profile runs keep the process env byte-for-byte as before.
+     from agent.secret_scope import is_multiplex_active
+     from tools.environments.local import build_subprocess_env
++    proc = None
+     try:
+-        if IS_WINDOWS:
+-            argv = _windows_script_argv(argv)
+-        from hermes_cli.worker_drain_fence import popen_worker  # DrainRefused falls to the generic failure below
+-        proc = popen_worker(subprocess.Popen, argv, drain_purpose='shell_hook',
+-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-                            text=True, encoding='utf-8', errors='replace', shell=False,
+-                            env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
+-    except Exception as exc:
+-        for cls, msg in _POPEN_ERRORS:
+-            if isinstance(exc, cls):
+-                return failed(msg)
+-        if getattr(exc, "winerror", None) == 193:
+-            # Unmapped suffix (.zsh, .fish, .rb, …) — the raw WinError text is localized, so an
+-            # operator on a non-English Windows could not act on it at all.
+-            return failed(f"{argv[0]!r} {_NOT_DIRECTLY_EXECUTABLE}")
+-        return failed(str(exc))
+-    try:
++        with _defer_hook_spawn_sigint():
++            try:
++                if IS_WINDOWS:
++                    argv = _windows_script_argv(argv)
++                from hermes_cli.worker_drain_fence import popen_worker  # DrainRefused is a spawn failure
++                proc = popen_worker(subprocess.Popen, argv, drain_purpose='shell_hook',
++                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                                    text=True, encoding='utf-8', errors='replace', shell=False,
++                                    env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
++            except Exception as exc:
++                for cls, msg in _POPEN_ERRORS:
++                    if isinstance(exc, cls):
++                        return failed(msg)
++                if getattr(exc, "winerror", None) == 193:
++                    # Unmapped script suffix: retain the actionable interpreter guidance.
++                    return failed(f"{argv[0]!r} {_NOT_DIRECTLY_EXECUTABLE}")
++                return failed(str(exc))
+         stdout, stderr = proc.communicate(input=stdin_json, timeout=spec.timeout)
+     except BaseException as exc:
+-        # BaseException: the hook leads its own process group, so Ctrl+C's SIGINT never reaches it — only we can.
+-        kill_process_tree(proc)  # the whole tree — forked helpers holding the pipes would stall the drain
+-        with suppress(Exception):
+-            proc.communicate(timeout=1)
++        # Include spawn handoff: SIGINT must not escape before we own the child.
++        if proc is not None:
++            kill_process_tree(proc)
++            with suppress(Exception):
++                proc.communicate(timeout=1)
+         if not isinstance(exc, Exception):
+             raise
+         if not isinstance(exc, subprocess.TimeoutExpired):  # pragma: no cover — defensive
+diff --git a/tests/agent/test_shell_hooks_tree_kill.py b/tests/agent/test_shell_hooks_tree_kill.py
+index 7fa7f942a33..fc14753d6c9 100644
+--- a/tests/agent/test_shell_hooks_tree_kill.py
++++ b/tests/agent/test_shell_hooks_tree_kill.py
+@@ -21,7 +21,9 @@
+ 
+ import pytest
+ 
++from agent import shell_hooks
+ from agent.shell_hooks import ShellHookSpec, _spawn
++from hermes_cli import worker_drain_fence
+ 
+ pytestmark = pytest.mark.platforms("posix")  # POSIX process-group semantics
+ 
+@@ -190,6 +192,139 @@
+     assert not alive, f"hook {hook_pid} survived the interrupt"
+ 
+ 
++@pytest.mark.parametrize("when", ["before_create", "before_handoff"])
++def test_interrupt_at_spawn_boundary_reaps_real_hook(monkeypatch, tmp_path, when):
++    """OS child readiness can precede the parent's popen_worker return."""
++    original = worker_drain_fence.popen_worker
++    children = []
++    previous = signal.getsignal(signal.SIGINT)
++    script = tmp_path / "hook.sh"
++    script.write_text("#!/bin/sh\nsleep 300\n")
++    script.chmod(0o755)
++
++    def interrupted_handoff(popen, *args, **kwargs):
++        if when == "before_create":
++            signal.raise_signal(signal.SIGINT)
++        proc = original(popen, *args, **kwargs)
++        children.append(proc)
++        if when == "before_handoff":
++            signal.raise_signal(signal.SIGINT)
++        return proc
++
++    monkeypatch.setattr(worker_drain_fence, "popen_worker", interrupted_handoff)
++    try:
++        with pytest.raises(KeyboardInterrupt):
++            _spawn(_spec(str(script), timeout=300), "{}")
++        assert signal.getsignal(signal.SIGINT) is previous
++        assert len(children) == 1
++        assert children[0].poll() is not None, "hook survived interrupted spawn handoff"
++    finally:
++        for proc in children:
++            if proc.poll() is None:
++                os.killpg(proc.pid, signal.SIGKILL)
++            proc.communicate(timeout=5)
++
++
++def test_interrupt_before_spawn_has_no_cleanup_target(monkeypatch):
++    def interrupted(*args, **kwargs):
++        raise KeyboardInterrupt
++
++    def forbidden(*args):
++        pytest.fail("no child exists to clean up")
++
++    previous = signal.getsignal(signal.SIGINT)
++    monkeypatch.setattr(worker_drain_fence, "popen_worker", interrupted)
++    monkeypatch.setattr(shell_hooks, "kill_process_tree", forbidden)
++    with pytest.raises(KeyboardInterrupt):
++        _spawn(_spec("unused"), "{}")
++    assert signal.getsignal(signal.SIGINT) is previous
++
++
++def test_spawn_deferral_preserves_custom_handler(monkeypatch, tmp_path):
++    original = worker_drain_fence.popen_worker
++    children = []
++    calls = []
++    script = tmp_path / "hook.sh"
++    script.write_text("#!/bin/sh\nsleep 300\n")
++    script.chmod(0o755)
++
++    def custom(signum, frame):
++        calls.append(signum)
++        raise RuntimeError("custom interrupt")
++
++    def interrupted_handoff(popen, *args, **kwargs):
++        proc = original(popen, *args, **kwargs)
++        children.append(proc)
++        signal.raise_signal(signal.SIGINT)
++        assert not calls, "handler must run only after the handle is owned"
++        return proc
++
++    previous = signal.signal(signal.SIGINT, custom)
++    monkeypatch.setattr(worker_drain_fence, "popen_worker", interrupted_handoff)
++    try:
++        result = _spawn(_spec(str(script)), "{}")
++        assert result["error"] == "custom interrupt"
++        assert calls == [signal.SIGINT]
++        assert signal.getsignal(signal.SIGINT) is custom
++        assert len(children) == 1 and children[0].poll() is not None
++    finally:
++        signal.signal(signal.SIGINT, previous)
++        for proc in children:
++            if proc.poll() is None:
++                os.killpg(proc.pid, signal.SIGKILL)
++            proc.communicate(timeout=5)
++
++
++@pytest.mark.parametrize("handler", [signal.SIG_IGN, signal.SIG_DFL])
++def test_spawn_deferral_leaves_noncallable_handler_untouched(monkeypatch, handler):
++    previous = signal.signal(signal.SIGINT, handler)
++
++    def forbidden(*args):
++        pytest.fail("noncallable handler must not be replaced")
++
++    try:
++        with monkeypatch.context() as patch:
++            patch.setattr(shell_hooks.signal, "signal", forbidden)
++            with shell_hooks._defer_hook_spawn_sigint():
++                assert signal.getsignal(signal.SIGINT) == handler
++    finally:
++        signal.signal(signal.SIGINT, previous)
++
++
++def test_spawn_deferral_in_worker_does_not_change_global_handler(monkeypatch):
++    previous = signal.getsignal(signal.SIGINT)
++    entered = []
++    errors = []
++
++    def forbidden(*args):
++        pytest.fail("worker thread must not change process signal disposition")
++
++    def worker():
++        try:
++            with shell_hooks._defer_hook_spawn_sigint():
++                entered.append(True)
++        except BaseException as exc:
++            errors.append(exc)
++
++    monkeypatch.setattr(shell_hooks.signal, "signal", forbidden)
++    thread = threading.Thread(target=worker)
++    thread.start()
++    thread.join(timeout=5)
++    assert not thread.is_alive()
++    assert not errors
++    assert entered == [True]
++    assert signal.getsignal(signal.SIGINT) is previous
++
++
++def test_spawn_deferral_does_not_ignore_sigint_in_child(tmp_path):
++    script = tmp_path / "self-interrupt.sh"
++    script.write_text("#!/bin/sh\nkill -INT $$\necho incorrectly-ignored\n")
++    script.chmod(0o755)
++    result = _spawn(_spec(str(script)), "{}")
++    assert result["returncode"] == -signal.SIGINT
++    assert result["stdout"] == ""
++
++
+ def test_missing_command_still_fails_open():
+     r = _spawn(_spec("/nonexistent/hook-command-xyz", timeout=2), "{}")
+     assert r["error"] == "command not found"
+-- 
+2.43.0
+

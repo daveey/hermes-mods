@@ -1,0 +1,135 @@
+From 72c88ed17e6a71e96f047d899c568d73de7aa9e7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:31:23 +0000
+Subject: [PATCH 5959] Isolated native sessions capture and bounded startup
+
+Public mirror of source commit 72c88ed17e6a71e96f047d899c568d73de7aa9e7.
+
+---
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+index 742ff043ee2..cd64ae9169a 100644
+--- a/hermes_cli/sessions_native_source.py
++++ b/hermes_cli/sessions_native_source.py
+@@ -7,6 +7,7 @@
+ """
+ from collections import OrderedDict
+ from dataclasses import dataclass, replace
++import logging
+ import threading
+ import time
+ 
+@@ -15,6 +16,8 @@
+ from hermes_cli.fact_source_watch import NativeSourceWatch
+ from hermes_cli.fact_store import view_key
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ @dataclass(frozen=True)
+ class SessionViewCapture:
+@@ -35,6 +38,7 @@
+         self._selectors = OrderedDict()
+         self._dirty = OrderedDict()
+         self._sizes, self._retry = {}, {}
++        self._failed = set()
+         self._retired = set()
+         self._watch = self._wake = None
+         self._closed = False
+@@ -54,6 +58,7 @@
+         self._selectors.pop(key)
+         self._dirty.pop(key, None)
+         self._retry.pop(key, None)
++        self._failed.discard(key)
+         self._retired.add(key)
+ 
+     def touch(self, name, selector):
+@@ -118,15 +123,27 @@
+             name, selector = self._selectors[key]
+         observed = time.time()
+         self._serial += 1
++        reason, encoded_bytes = 'reader_error', None
+         try:
+             body = self.reader(name, selector)
+-            if (not isinstance(body, bytes) or len(body) > min(budget.max_bytes, self.max_bytes)
+-                    or time.monotonic() - started > budget.max_seconds):
++            encoded_bytes = len(body) if isinstance(body, bytes) else None
++            reason = ('invalid_type' if encoded_bytes is None else
++                      'bytes' if encoded_bytes > min(budget.max_bytes, self.max_bytes) else
++                      'elapsed' if time.monotonic() - started > budget.max_seconds else None)
++            if reason is not None:
+                 raise CaptureBudgetExceeded('sessions view exceeds capture budget')
+             fact = Fact(key, {'encoded': body}, source_vector=((self.source, self._serial),),
+                         observed_at=observed, valid_until=observed + 2 * self.refresh_seconds,
+                         health='fresh')
+         except Exception:  # health: allow BLE001 -- isolate capture failures; unknown is not empty success
++            with self._lock:
++                report = key in self._selectors and key not in self._failed
++                if report:
++                    self._failed.add(key)
++            if report:
++                # No selector, path, payload or exception text; once per failure episode.
++                logger.warning('sessions capture unavailable reason=%s elapsed_seconds=%.3f encoded_bytes=%s',
++                               reason or 'reader_error', time.monotonic() - started, encoded_bytes)
+             old = self.store.snapshot(self.source.scope).get(key)
+             fact = (replace(old, health='stale', error_code='sessions_capture_failed') if old is not None
+                     else Fact(key, {}, error_code='sessions_capture_failed'))
+@@ -137,6 +154,7 @@
+         else:
+             with self._lock:
+                 self._retry.pop(key, None)
++                self._failed.discard(key)
+         with self._lock:
+             # <=50% capture duty under sustained hints, at most five passes/sec.
+             self._next_capture = time.monotonic() + max(.2, time.monotonic() - started)
+diff --git a/tests/hermes_cli/test_sessions_native_source.py b/tests/hermes_cli/test_sessions_native_source.py
+index a5959c246d4..b4ddae0f331 100644
+--- a/tests/hermes_cli/test_sessions_native_source.py
++++ b/tests/hermes_cli/test_sessions_native_source.py
+@@ -138,6 +138,44 @@
+     assert len(calls) == captures
+ 
+ 
++@pytest.mark.parametrize('reason', ['reader_error', 'invalid_type', 'bytes', 'elapsed'])
++def test_capture_failure_reason_is_safe_bounded_and_recovers(source, caplog, reason):
++    owner, clock, _ = source
++    secret = 'private-selector-and-exception'
++    selector = {'id': secret}
++    def fail(*_):
++        if reason == 'reader_error':
++            raise RuntimeError(secret)
++        if reason == 'invalid_type':
++            return secret
++        if reason == 'elapsed':
++            clock[0] += 6
++            return b'valid'
++        return b'x' * 5000
++    owner.reader = fail
++    owner.demand('sessions', selector)
++    with caplog.at_level('WARNING', logger='hermes_cli.sessions_native_source'):
++        step(owner, clock)
++        assert isinstance(owner.store.snapshot(owner.source.scope).view('sessions', selector), Unavailable)
++        clock[0] += 40
++        step(owner, clock)
++        messages = [r.getMessage() for r in caplog.records if r.name == 'hermes_cli.sessions_native_source']
++        assert len(messages) == 1
++        assert f'reason={reason}' in messages[0]
++        assert 'elapsed_seconds=' in messages[0] and 'encoded_bytes=' in messages[0]
++        assert secret not in messages[0]
++        clock[0] += 40
++        owner.reader = lambda *_: b'recovered'
++        step(owner, clock)
++        assert isinstance(owner.store.snapshot(owner.source.scope).view('sessions', selector), Ready)
++        owner.reader = fail
++        owner.invalidate()
++        clock[0] += 40
++        step(owner, clock)
++        messages = [r.getMessage() for r in caplog.records if r.name == 'hermes_cli.sessions_native_source']
++        assert len(messages) == 2
++
++
+ def test_expiry_watch_failure_and_close(source):
+     owner, clock, _ = source
+     owner.demand('sessions', {'id': 'one'})
+-- 
+2.43.0
+

@@ -1,0 +1,424 @@
+From 1cbd643a68267ad5b7ea0cb6191bbe907ff392c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:33:00 +0000
+Subject: [PATCH 6359] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit 1cbd643a68267ad5b7ea0cb6191bbe907ff392c6.
+
+---
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+index 622393eb453..23b7d09a0a8 100644
+--- a/hermes_cli/fact_board_inputs.py
++++ b/hermes_cli/fact_board_inputs.py
+@@ -141,7 +141,7 @@
+                 self._active, self._last_start[key], self._began, self._deadline = key, now, None, None
+                 view, selector = self._wanted[key]
+                 self._worker = submit(lambda: self._context.run(self._build, key, view, selector, budget),
+-                                      lane=self._lane)
++                                      lane=self._lane, on_complete=self._capture_completed)
+             if self._deadline is not None and time.monotonic() >= self._deadline:
+                 self._deadline = None
+                 return BoardCapture(key=self._active, after=cursor, failed=True, observed_at=time.time())
+@@ -180,8 +180,14 @@
+             # Disarm with the result: the queue marks the job done only after this returns, and a capture() in
+             # between must not read this capture's deadline as still running (a stale wait, or a late failure).
+             self._result, self._began, self._deadline = result, None, None
+-            wake = self._wake
+-        wake()
++
++    def _capture_completed(self):
++        # Result-ready is not admission-ready: the saved Context.run must have
++        # returned and the queue job must be retired before waking pending work.
++        with self._lock:
++            wake = None if self._closed else self._wake
++        if wake is not None:
++            wake()
+ 
+     def commit(self, capture):
+         if capture.key is None:
+diff --git a/hermes_cli/fact_capture_queue.py b/hermes_cli/fact_capture_queue.py
+index 0dac557836e..af99c4855bf 100644
+--- a/hermes_cli/fact_capture_queue.py
++++ b/hermes_cli/fact_capture_queue.py
+@@ -17,8 +17,9 @@
+ 
+ 
+ class CaptureJob:
+-    def __init__(self, callback):
++    def __init__(self, callback, on_complete=None):
+         self.callback = callback
++        self.on_complete = on_complete
+         self.done = threading.Event()
+         self.started = False
+         self.cancelled = False
+@@ -30,13 +31,13 @@
+         with _lock:
+             if not self.started:
+                 self.cancelled = True
+-                self.callback = None
++                self.callback = self.on_complete = None
+                 self.done.set()
+         self.done.wait(timeout)
+ 
+ 
+-def submit(callback, lane=DEFAULT_LANE):
+-    job = CaptureJob(callback)
++def submit(callback, lane=DEFAULT_LANE, *, on_complete=None):
++    job = CaptureJob(callback, on_complete)
+     with _lock:
+         pending = _pending.setdefault(lane, deque())
+         pending.append(job)
+@@ -78,6 +79,9 @@
+             finally:
+                 job.callback = None
+                 job.done.set()
++                complete, job.on_complete = job.on_complete, None
++                if complete is not None:
++                    complete()
+     except BaseException:
+         # A callback that escapes with a non-Exception (SystemExit, KeyboardInterrupt) ends this worker: release
+         # the lane so the next submission starts a fresh one, instead of leaving it registered and dead forever.
+diff --git a/tests/hermes_cli/annotation_holder_fixture.py b/tests/hermes_cli/annotation_holder_fixture.py
+new file mode 100644
+index 00000000000..c54ca7c074d
+--- /dev/null
++++ b/tests/hermes_cli/annotation_holder_fixture.py
+@@ -0,0 +1,30 @@
++"""Private native coverage for scheduler/reader idleness assertions."""
++from pathlib import Path
++
++from hermes_cli.annotation_file_events import FileEvents
++
++
++class PrivateHolderEvents(FileEvents):
++    """Retain native descriptors/parser and direct source/control coverage.
++
++    Production ancestor metadata coverage is intentional, but a scheduler test
++    cannot attribute another job's ancestor utime to its own source or readers.
++    The ordinary FileEvents tests retain ancestor creation/chmod/retarget proof.
++    """
++
++    def replace(self, files, *, directories=(), controls=()):
++        files, controls = tuple(files), tuple(controls)
++        assert not directories
++        super().replace(files, controls=controls)
++        names, control_names = {}, {}
++        for values, target, suffixes in (
++            (files, names, ('', '-wal', '-shm', '-journal')),
++            (controls, control_names, ('',)),
++        ):
++            for value in values:
++                path = Path(value)
++                assert path.is_absolute() and path.parent.is_dir()
++                wd = self._install(self._fd, path.parent)
++                assert wd is not None
++                target.setdefault(wd, set()).update(path.name + suffix for suffix in suffixes)
++        self._names, self._controls = names, control_names
+diff --git a/tests/hermes_cli/test_annotation_native_holder.py b/tests/hermes_cli/test_annotation_native_holder.py
+index 20bed2b70ca..89363641b93 100644
+--- a/tests/hermes_cli/test_annotation_native_holder.py
++++ b/tests/hermes_cli/test_annotation_native_holder.py
+@@ -16,6 +16,7 @@
+ from hermes_cli.annotation_event_loop import run
+ from hermes_cli.annotation_file_events import FileEvents
+ from tests.hermes_cli import test_kanban_annotation_host as helpers
++from tests.hermes_cli.annotation_holder_fixture import PrivateHolderEvents
+ 
+ 
+ def _no_confirmations(monkeypatch, delays=()):
+@@ -578,6 +579,7 @@
+     monkeypatch.setattr(ksa, '_done_checks', {})
+     monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
+     monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(path)], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
+     ksa._reset_cache_for_tests()
+     monkeypatch.setattr(host, '_known', {
+         scope: contextvars.copy_context(),
+@@ -595,7 +597,7 @@
+             updated.set()
+         return result
+     monkeypatch.setattr(ksa, '_refresh_annotation_locked', record)
+-    with FileEvents() as events:
++    with PrivateHolderEvents() as events:
+         usage = []
+         def worker():
+             before = resource.getrusage(resource.RUSAGE_THREAD)
+@@ -614,6 +616,7 @@
+             stop.wait(max(host.SETTLE_S) + .5)
+             assert len(calls) <= 1 + len(host.SETTLE_S)
+             updated.clear()
++            os.utime(tmp_path)  # owned reproduction of an unrelated ancestor IN_ATTRIB
+             idle_until = time.monotonic() + 61
+             while time.monotonic() < idle_until:
+                 disk.touch_demand(scope)
+@@ -677,7 +680,7 @@
+         return result
+     monkeypatch.setattr(ksa, '_refresh_annotation_locked', record)
+     settle = max(host.SETTLE_S) + .5
+-    with FileEvents() as events:
++    with PrivateHolderEvents() as events:
+         thread = threading.Thread(target=run, args=(
+             events, stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
+             lambda: host._event_refresh(events)))
+@@ -696,6 +699,7 @@
+                   f'{sum(d > .2 for d in delays)} of {len(delays)} needed a confirmation read')
+             stop.wait(settle)
+             quiet = len(calls)
++            os.utime(tmp_path)  # ancestor metadata is not a new WAL commit
+             stop.wait(3)
+             assert len(calls) == quiet, f'WAL source did not settle: {quiet} -> {len(calls)}'
+         finally:
+@@ -762,7 +766,7 @@
+         return result
+     monkeypatch.setattr(ksa, '_refresh_annotation_locked', record)
+     settle = max(host.SETTLE_S) + .5
+-    with FileEvents() as events:
++    with PrivateHolderEvents() as events:
+         thread = threading.Thread(target=run, args=(
+             events, stop, SimpleNamespace(held=lambda: True, beat=lambda: None),
+             lambda: host._event_refresh(events)))
+@@ -771,6 +775,7 @@
+             assert ready.wait(5)
+             stop.wait(settle)
+             quiet = len(calls)
++            os.utime(tmp_path)  # ancestor metadata must not be blamed on the readers
+             subprocess.run([sys.executable, '-c', _READER, f'file:{path}{mode}'], check=True, timeout=30)
+             stop.wait(settle)
+             assert len(calls) == quiet, f'{len(calls) - quiet} projections followed 12 reader sessions'
+diff --git a/tests/hermes_cli/test_browse_schema_drift.py b/tests/hermes_cli/test_browse_schema_drift.py
+index a4beaf9c8d1..a4ab33a8219 100644
+--- a/tests/hermes_cli/test_browse_schema_drift.py
++++ b/tests/hermes_cli/test_browse_schema_drift.py
+@@ -655,8 +655,15 @@
+     executed = []
+     original = ssr.connect_tracked
+     monkeypatch.setattr(wal, "_darwin_pragma", darwin_pragma)
+-    monkeypatch.setattr(ssr, "connect_tracked",
+-                        lambda *a, **kw: _ArmTrackingConnection(original(*a, **kw), executed))
++    def tracked(database, **kwargs):
++        conn = original(database, **kwargs)
++        # This assertion owns the reconcile connection, not concurrent board
++        # readers using the same process-global SQLite facade.
++        if kwargs.get('tracking_path', database) == path:
++            return _ArmTrackingConnection(conn, executed)
++        return conn
++
++    monkeypatch.setattr(ssr, "connect_tracked", tracked)
+     budget = reconcile._Budget(60)
+     deadline = budget.deadline
+     expires = deadline_hits == "during_macos_pragma"
+@@ -675,6 +682,10 @@
+     else:
+         reconcile._apply_additive_schema(path, budget)
+         assert "last_read_at" in _session_columns(path)
++    # Deterministically interleave the unrelated unarmed connection seen in CI.
++    with closing(ssr.connect_tracked(tmp_path / 'unrelated-board.db')) as other:
++        other.execute('PRAGMA busy_timeout=0')
++        other.execute('SELECT 1')
+     assert [sql for sql, _ in executed][:2] == ["PRAGMA checkpoint_fullfsync=1", "PRAGMA synchronous=FULL"]
+     assert [sql for sql, armed in executed if not armed] == []
+ 
+diff --git a/tests/hermes_cli/test_config_save_integrity.py b/tests/hermes_cli/test_config_save_integrity.py
+index de2d57c6cd5..80bed05d8e7 100644
+--- a/tests/hermes_cli/test_config_save_integrity.py
++++ b/tests/hermes_cli/test_config_save_integrity.py
+@@ -40,18 +40,19 @@
+     def __init__(self, monkeypatch, path):
+         import utils
+         self.path, self.count, self.fail_at, real = str(path), 0, 0, utils.fast_safe_load
++        self.persistent = False
+ 
+         def flaky(stream):
+             if getattr(stream, "name", None) == self.path:
+                 self.count += 1
+-                if self.count == self.fail_at:
++                if self.count == self.fail_at or (self.persistent and self.fail_at and self.count > self.fail_at):
+                     raise OSError(errno.EMFILE, "Too many open files")
+             return real(stream)
+         # Every config read parses through the file config backend, which calls utils.fast_safe_load.
+         monkeypatch.setattr(utils, "fast_safe_load", flaky)
+ 
+-    def arm(self, fail_at=0):
+-        self.count, self.fail_at = 0, fail_at
++    def arm(self, fail_at=0, *, persistent=False):
++        self.count, self.fail_at, self.persistent = 0, fail_at, persistent
+ 
+ 
+ def _fresh_process(home, text, *, keep_last_known_good=False):
+@@ -142,10 +143,17 @@
+     _fresh_process(home, _CONFIG)
+     _CONFIG_PARSE_WARNED.clear()
+     faults = _ReadFaults(monkeypatch, path)
+-    faults.arm(1)
++    # Keep the transient outage active until recovery is explicitly allowed.
++    # A one-shot fault already permits another config reader to clear the shared
++    # failure record before this assertion (the sidebar also reads config).
++    faults.arm(1, persistent=True)
+ 
+-    read()
++    from hermes_cli.config_read_errors import FailedConfigRead
++    assert isinstance(read(), FailedConfigRead)
++    # Force the competing-reader ordering instead of relying on a poller's timing.
++    assert isinstance(read_raw_config(), FailedConfigRead)
+     assert get_active_config_parse_failure() is not None  # unreadable right now: the refusal holds
++    faults.arm()
+     assert read()["display"]["skin"] == "mono"
+ 
+     assert get_active_config_parse_failure() is None
+diff --git a/tests/hermes_cli/test_fact_capture_completion.py b/tests/hermes_cli/test_fact_capture_completion.py
+new file mode 100644
+index 00000000000..20b683d71ef
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_capture_completion.py
+@@ -0,0 +1,71 @@
++"""Capture result availability must not precede the completion wake's custody."""
++import threading
++
++from hermes_cli.fact_capture import CaptureBudget
++from tests.hermes_cli import test_fact_board_inputs as helpers
++from tests.waiting import wait_until
++
++source = helpers.source
++
++
++def test_completion_wakes_only_after_context_exit_and_job_retirement(source):
++    adapter, _engine, calls, _woke = source
++    context = adapter._context
++    published, release, completed = threading.Event(), threading.Event(), threading.Event()
++    notifications = []
++
++    class HeldContext:
++        def run(self, *args):
++            result = context.run(*args)
++            published.set()
++            assert release.wait(5), 'test did not release capture context'
++            return result
++
++    def wake():
++        notifications.append(adapter._worker.is_alive())
++        completed.set()
++
++    adapter.want('board', {'n': 1})
++    adapter.want('board', {'n': 2})
++    adapter._context = HeldContext()
++    adapter._wake = wake
++    try:
++        adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert published.wait(2)
++        # The result may be consumed immediately, but pending work must receive
++        # another wake only after it can enter the saved context again.
++        result = adapter.capture(None, CaptureBudget(max_seconds=2))
++        adapter.commit(result)
++        adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert notifications == [], 'result woke feed before the capture job retired'
++        release.set()
++        assert completed.wait(2), 'completion did not wake the pending selector'
++        assert notifications == [False]
++        adapter._context = context
++        adapter.capture(None, CaptureBudget(max_seconds=2))
++        assert wait_until(lambda: len(calls) == 2, timeout=2)
++        adapter._worker.join(2)
++        assert [view for _thread, view, _selector in calls] == ['board', 'board']
++        assert [selector['n'] for _thread, _view, selector in calls] == [1, 2]
++    finally:
++        release.set()
++        if adapter._worker is not None:
++            adapter._worker.join(2)
++
++
++def test_completion_after_close_does_not_notify_withdrawn_owner(source):
++    adapter, _engine, _calls, woke = source
++    adapter.close()
++    woke.clear()
++    adapter._capture_completed()
++    assert not woke.is_set()
++
++
++def test_cancelled_capture_releases_completion_callback():
++    from hermes_cli.fact_capture_queue import CaptureJob
++    calls = []
++    job = CaptureJob(lambda: calls.append('capture'), lambda: calls.append('complete'))
++    job.join(0)
++    assert not job.is_alive() and job.cancelled
++    assert job.callback is None and job.on_complete is None
++    assert calls == []
+diff --git a/tests/hermes_cli/test_fact_clock_only.py b/tests/hermes_cli/test_fact_clock_only.py
+index e1c8860505d..159de67e648 100644
+--- a/tests/hermes_cli/test_fact_clock_only.py
++++ b/tests/hermes_cli/test_fact_clock_only.py
+@@ -120,7 +120,7 @@
+ 
+ 
+ @pytest.mark.platforms("linux")
+-def test_clock_only_session_owner_advances_state_without_rows(store):
++def test_clock_only_session_owner_advances_state_without_rows(store, monkeypatch):
+     db, _reader, path = store
+     db.create_session("a", "cli")
+     db.create_session("b", "cli")
+@@ -135,8 +135,19 @@
+         before = facts.snapshot(scope).get(state_key)
+         db._execute_write(lambda conn: conn.execute("UPDATE sessions SET input_tokens=37 WHERE id='a'"))
+         assert wait_until(lambda: facts.snapshot(scope).get(state_key).rev > before.rev, timeout=10)
+-        db.create_session("c", "cli")
++        create = db.create_session
++
++        def observed_create(*args, **kwargs):
++            prior = facts.snapshot(scope).get(state_key)
++            result = create(*args, **kwargs)
++            # Force the real feed to win before the writer returns. The old
++            # post-write baseline then waits for a nonexistent second change.
++            assert wait_until(lambda: facts.snapshot(scope).get(state_key).rev > prior.rev, timeout=10)
++            return result
++
++        monkeypatch.setattr(db, 'create_session', observed_create)
+         mid = facts.snapshot(scope).get(state_key)
++        db.create_session("c", "cli")
+         assert wait_until(lambda: facts.snapshot(scope).get(state_key).rev > mid.rev, timeout=10)
+         assert {key.kind for key in facts._facts} == {"SourceState"}
+     finally:
+diff --git a/tests/hermes_cli/test_fact_tree_failures.py b/tests/hermes_cli/test_fact_tree_failures.py
+index 6c9edee6641..938a17e55c8 100644
+--- a/tests/hermes_cli/test_fact_tree_failures.py
++++ b/tests/hermes_cli/test_fact_tree_failures.py
+@@ -45,6 +45,16 @@
+         runtime.start()
+         bound = runtime.provider('default')
+         key = runtime.owner.source.input_key(view, selector)
++        retained = []
++        fail = runtime.owner.source._fail
++
++        def record_failure(failed_key):
++            prior = runtime.owner.store.snapshot(runtime.scope).get(failed_key)
++            if failed_key == key and prior is not None and prior.health == 'fresh':
++                retained.append(prior)
++            return fail(failed_key)
++
++        monkeypatch.setattr(runtime.owner.source, '_fail', record_failure)
+         bound.read(view, selector)
+         previous = None
+         if warm:
+@@ -52,6 +62,12 @@
+             previous = runtime.owner.store.snapshot(runtime.scope).get(key)
+             payload = projects_fact_routes.read(view, selector, decoded=True)
+             assert 'retained-project' in json.dumps(payload)
++            # Force a healthy recapture after the first Ready observation. Its
++            # volatile annotation timestamps may advance; failure retains the
++            # last committed success, not necessarily that first observation.
++            runtime.owner.source._invalidate()
++            assert wait_until(lambda: runtime.owner.store.snapshot(runtime.scope).get(key).rev > previous.rev,
++                              timeout=10)
+             failing.set()
+             runtime.owner.source._invalidate()
+         # The same native legacy input boundary propagates the failure rather
+@@ -64,6 +80,8 @@
+         failed = runtime.owner.store.snapshot(runtime.scope).get(key)
+         assert failed.health == ('stale' if warm else 'unknown')
+         if warm:
++            assert retained
++            previous = retained[-1]
+             assert failed.value == previous.value
+             assert failed.observed_at == previous.observed_at
+             assert failed.source_vector == previous.source_vector
+-- 
+2.43.0
+

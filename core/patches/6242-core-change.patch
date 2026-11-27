@@ -1,0 +1,152 @@
+From 3ff0afaf2c7f7430e82812aed9673e8fdf52cee7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:19:21 +0000
+Subject: [PATCH 6242] Owning-chat stop-only control for ended shadow work
+
+Public mirror of source commit 3ff0afaf2c7f7430e82812aed9673e8fdf52cee7.
+
+---
+diff --git a/hermes_cli/kanban_stop_ended.py b/hermes_cli/kanban_stop_ended.py
+index 4153b23e72b..14a99de8a4d 100644
+--- a/hermes_cli/kanban_stop_ended.py
++++ b/hermes_cli/kanban_stop_ended.py
+@@ -188,12 +188,15 @@
+                 'dependency_satisfied': False, 'incomplete': True, 'terminal_for_run': False,
+                 'request': {'request_uid': uid, 'expected_digest': expected_digest, 'frozen': frozen, 'owner': who},
+                 'receipt': receipt})
+-            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
++            # One statement: with fences already installed by an earlier stop, the event above makes this
++            # card fenced, and a leftover worker_started_at (run endings keep it) would refuse the update.
++            from hermes_cli.kanban_stop_guards import _columns, install
++            token = ',worker_started_at=NULL' if 'worker_started_at' in _columns(conn, 'tasks') else ''
++            conn.execute(f"UPDATE tasks SET status='triage'{token} WHERE id=?", (task_id,))
+             # The clock selector only considers scheduled cards. Remove its probe now too,
+             # without deleting the historical parking event or changing any dependency.
+             from hermes_cli.kanban_wake_check import set_check
+             set_check(conn, task_id, None, None)
+-            from hermes_cli.kanban_stop_guards import install
+             install(conn)
+             event_uid = conn.execute('SELECT uid FROM task_events WHERE task_id=? AND kind=?', (task_id, KIND)).fetchone()[0]
+             return {**receipt, 'event_uid': event_uid, 'replayed': False}
+diff --git a/hermes_cli/kanban_stop_guards.py b/hermes_cli/kanban_stop_guards.py
+index 5c477f9a362..1f7b935e28d 100644
+--- a/hermes_cli/kanban_stop_guards.py
++++ b/hermes_cli/kanban_stop_guards.py
+@@ -80,6 +80,26 @@
+         conn.execute(f'INSERT INTO {MARKER} (version) VALUES (?)', (VERSION,))
+ 
+ 
++def clear_stale_worker_start(conn) -> int:
++    """Drop a stopped card's leftover ``worker_started_at``; returns the rows cleared (no write when none).
++
++    Many run endings (timed park, spend triage, no-progress park) clear ``worker_pid`` and keep the start
++    token. ``task_update`` pins ``NEW.worker_started_at IS NOT NULL``, so on such a row the fence refused
++    every later write, including the sync ack's ``sync_version`` stamp: the board's rounds then failed
++    forever (example-tools, t_4347e49ac1920116). A NULL passes the fence, so this also heals a row
++    stopped before the stop itself cleared the token. Rows with a pid, claim or run are never touched.
++    """
++    if 'worker_started_at' not in _columns(conn, 'tasks'):
++        return 0
++    stale = ('worker_started_at IS NOT NULL AND worker_pid IS NULL AND claim_lock IS NULL '
++             f'AND current_run_id IS NULL AND id IN ({_STOPPED})')
++    if not conn.execute(f'SELECT 1 FROM tasks WHERE {stale} LIMIT 1').fetchone():
++        return 0
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn, allow_nested=True):
++        return conn.execute(f'UPDATE tasks SET worker_started_at=NULL WHERE {stale}').rowcount
++
++
+ def installed(conn) -> bool:
+     """Fail closed: a stopped card with a missing or partial fence set is reported unguarded."""
+     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'stop_ended_%'")}
+diff --git a/hermes_cli/kanban_sync_round_send.py b/hermes_cli/kanban_sync_round_send.py
+index 11f972c16b1..dd92a25373d 100644
+--- a/hermes_cli/kanban_sync_round_send.py
++++ b/hermes_cli/kanban_sync_round_send.py
+@@ -6,6 +6,9 @@
+ 
+ def send(live, hub, slug, gateway, mode, result, *, after_pull, before_head, seen=None):
+     from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_stop_guards import clear_stale_worker_start
++    if clear_stale_worker_start(live):  # else the ack's sync_version stamp is refused and the round never ends
++        client._log.info("kanban sync: %s cleared a stopped card's leftover worker_started_at", slug)
+     with client.credited(live):
+         pushed = client.push(live, hub, slug, gateway, primary=mode == "primary", before_head=before_head, seen=seen)
+     result.push = pushed if result.push is None else client.PushResult(*map(sum, zip(astuple(result.push), astuple(pushed))))
+diff --git a/tests/hermes_cli/test_kanban_stop_sync.py b/tests/hermes_cli/test_kanban_stop_sync.py
+index ea89230eddd..1a8fdef05f1 100644
+--- a/tests/hermes_cli/test_kanban_stop_sync.py
++++ b/tests/hermes_cli/test_kanban_stop_sync.py
+@@ -50,3 +50,69 @@
+     assert kb.get_task(shadow, target).status == 'triage'
+     assert kb.get_task(shadow, target).title == 'M5'
+     assert kb.get_task(shadow, source).title == 'unrelated progress'
++
++
++def _leftover_worker_start(conn, task_id):
++    """Timed parks, spend triage and no-progress parks clear worker_pid and keep the start token."""
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET worker_started_at='boot-1:40|25077876' WHERE id=?", (task_id,))
++
++
++def _stop(conn, target):
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=fixtures.INTERACTIVE) as token:
++        return stop.apply(conn, owner=token, **fixtures.args(conn, target))
++
++
++def _drained(conn, service):
++    return (conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0] == 0
++            and sync.sync_state(conn)['cursor'] == service.board(BOARD)['seq'])
++
++
++def test_stopping_a_card_with_a_leftover_worker_start_keeps_the_board_syncing(shadow):
++    service = FakeService()
++    hub = service.hub(ME)
++    _source, target, _child = fixtures.ended_card(shadow)
++    _leftover_worker_start(shadow, target)
++    _stop(shadow, target)
++    assert shadow.execute('SELECT worker_started_at FROM tasks WHERE id=?', (target,)).fetchone()[0] is None
++    ksc.push(shadow, hub, BOARD, ME, primary=False)  # the ack stamps tasks.sync_version on the stopped row
++    ksc.pull(shadow, hub, BOARD, observers=False)
++    assert _drained(shadow, service)
++    assert kb.get_task(shadow, target).status == 'triage'
++
++
++def test_a_second_stop_on_an_already_fenced_board_accepts_a_leftover_worker_start(shadow):
++    _source, first, _child = fixtures.ended_card(shadow)
++    _stop(shadow, first)  # installs the fences
++    _source2, second, _child2 = fixtures.ended_card(shadow)
++    _leftover_worker_start(shadow, second)
++    assert _stop(shadow, second)['status'] == 'triage'
++    row = shadow.execute('SELECT status, worker_started_at FROM tasks WHERE id=?', (second,)).fetchone()
++    assert tuple(row) == ('triage', None)
++
++
++def test_a_round_heals_a_card_stopped_with_a_leftover_worker_start(shadow):
++    """shadow-tools M5: stopped by a core that kept the token; every round then failed on the ack."""
++    from hermes_cli import kanban_stop_guards as guards
++    from hermes_cli.kanban_sync_round_send import send
++    service = FakeService()
++    hub = service.hub(ME)
++    source, target, child = fixtures.ended_card(shadow)
++    _stop(shadow, target)
++    _leftover_worker_start(shadow, source)  # not stopped: its token is not this heal's business
++    with kb.write_txn(shadow):  # the row as the older stop left it: fenced, token still set
++        shadow.execute('DROP TRIGGER stop_ended_task_update')
++        shadow.execute("UPDATE tasks SET worker_started_at='boot-1:40|25077876' WHERE id=?", (target,))
++        guards.install(shadow)
++    protected = fixtures.state(shadow, target, source, child)
++    send(shadow, hub, BOARD, ME, 'shadow', ksc.RoundResult(board=BOARD, mode='shadow'), after_pull=False, before_head=False)
++    ksc.pull(shadow, hub, BOARD, observers=False)
++    assert _drained(shadow, service)
++    after = fixtures.state(shadow, target, source, child)
++    assert after['task'].pop('worker_started_at') is None and protected['task'].pop('worker_started_at')
++    for row in (after['task'], protected['task'], *after['runs'], *protected['runs']):
++        for moved in ('sync_version', 'field_hlc'):  # the ack and the feed echo; nothing else may differ
++            row.pop(moved, None)
++    assert after['task'] == protected['task'] and after['runs'] == protected['runs'] and after['links'] == protected['links']
++    assert shadow.execute('SELECT worker_started_at FROM tasks WHERE id=?', (source,)).fetchone()[0]
++    assert guards.clear_stale_worker_start(shadow) == 0
+-- 
+2.43.0
+

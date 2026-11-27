@@ -1,0 +1,533 @@
+From 456e81bac160466f9945843ac813fe44102d67d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:54:19 -0800
+Subject: [PATCH 6489] Release mandate and typed stop recovery
+
+Public mirror of source commit 456e81bac160466f9945843ac813fe44102d67d9.
+
+---
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 2be0c5da1d6..2e34ad539d4 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -322,9 +322,18 @@
+     "your card and would stop other cards too (CI billing/quota refused, a service outage), also pass "
+     "`blocker_id=\"<short-slug>\"` to `kanban_block`/`kanban_continue`, reusing an id from \"Open shared "
+     "blockers\" in your context: the dispatcher then probes that wall with one card instead of every card.\n"
+-    "If the scope must remain incomplete and non-executing (a stopped scope, unavailable capability, or pending "
++    "**Stopping a scope is the exception.** Stop only on: a provider safety refusal; a step that needs David "
++    "physically; the same error three times; the run budget; a human's stop instruction, or the owning chat's or "
++    "creator's in a comment after the newest release; a safety exclusion in the card body; or an execution "
++    "restriction the board reports. "
++    "Findings, design changes, review CHANGES, red or pending CI and sandbox refusals are work inside the round: "
++    "fix and continue, or park the wait with `kanban_continue`/`kanban_schedule`. Agent-written stop rules older "
++    "than the newest release mandate, and earlier runs' stop reasons, do not bind you; safety exclusions in the "
++    "card body always do. When the acceptance is met, "
++    "finish with `kanban_complete` (or `kanban_request_review`), never `kanban_retain`. "
++    "If the scope must remain incomplete and non-executing (one of those stops, unavailable capability, or pending "
+     "administrative decision), use `kanban_retain(summary=..., reason=..., next_step=..., release_condition=..., "
+-    "evidence=[...])` for your exact admitted run, rather than exiting without a terminal operation, inventing "
++    "evidence=[...], stop_on=...)` for your exact admitted run, rather than exiting without a terminal operation, inventing "
+     "containment authority, a human request, or another clock retry. This retains the existing decision hold; "
+     "it grants no execution authority, completes no acceptance, and renews no spend. Administrative ownership is "
+     "not safety clearance. `release_condition` is a note for whoever runs `hermes kanban release` (a human operator, "
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 349760ea4f2..568fb96e922 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3542,7 +3542,7 @@
+     if not task:
+         raise ValueError(f"unknown task {task_id}")
+     from hermes_cli.kanban_db_context import (
+-        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
++        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts, _ctx_release,
+         _ctx_role_history,
+     )
+     # One clock reading so every relative age in this rendering agrees.
+@@ -3550,10 +3550,9 @@
+     lines: list[str] = []
+     _ctx_header(lines, task, conn=conn)
+     from hermes_cli.kanban_containment_authority import render_context
+-    authority_notice = render_context(conn, task_id)
+-    if authority_notice:
+-        lines.append(authority_notice)
++    lines += [n for n in (render_context(conn, task_id),) if n]  # containment authority notice
+     _ctx_standing(lines, task, list_comments(conn, task_id))  # [daveey]
++    _ctx_release(lines, conn, task_id)  # the newest release mandate, above older stops [daveey]
+     from hermes_cli.kanban_continuation import render_checkpoint_context
+     checkpoint = render_checkpoint_context(conn, task_id)
+     if checkpoint:
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 22e3ad9893a..c087d1d6424 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -45,6 +45,33 @@
+     lines.append("")
+ 
+ 
++_RELEASED_BY = {"human": "a human operator", "chat": "the card's owning chat", "delegate": "a delegate chat"}
++
++
++def _ctx_release(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
++    """The release that governs this run, ahead of the prior attempts and the comment thread. [daveey]
++
++    Representative observation: releases could be followed by repeated stops. The mandate sat under lengthy
++    earlier stop summaries, framed "stop again if the work needs more"; the next runs
++    re-read those stops as instructions. A newer stop or any execution restriction hides this section
++    (``current_mandate``)."""
++    from hermes_cli.kanban_release import current_mandate
++    from hermes_cli.kanban_scope_renewal import MAX_MANDATE
++    released = current_mandate(conn, task_id)
++    if not released:
++        return
++    who = _RELEASED_BY.get(str(released.get("authority_kind")), "an authorized releaser")
++    lines += ["## Release mandate (governs this run)",
++              f"This card was released after its last stop by {who} (comment {released['comment_id']}). The "
++              "mandate below is this run's scope. It supersedes stop rules agents wrote in older comments or "
++              "mandates; the stop reasons of earlier runs further down are history, not instructions. Safety "
++              "exclusions in the card body and a human's stop instructions still hold. Findings, "
++              "design changes, review CHANGES, red or pending CI and sandbox refusals are work inside it. When "
++              "the acceptance is met, finish with `kanban_complete` (or `kanban_request_review`), not "
++              "`kanban_retain`.",
++              _ctx_cap(released["body"], MAX_MANDATE), ""]
++
++
+ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+     """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
+     reads a bare absolute timestamp as current fact — the relative age is what
+@@ -281,8 +308,12 @@
+     attacker-influenceable body (defense-in-depth). A comment whose ``commented`` event
+     says an agent wrote it (``writer_kind='agent'``) is tagged ``(agent chat)``: David and
+     his agents share one profile, so the author alone can't tell them apart. [daveey]"""
++    from hermes_cli.kanban_release import current_mandate
+     from hermes_cli.kanban_scope_renewal import mandate as _scope_mandate
+     renewed = _scope_mandate(conn, task_id)
++    released = current_mandate(conn, task_id)
++    if released and renewed and renewed["mandate_comment_id"] == released["comment_id"]:
++        renewed = None  # already rendered at the top as the release mandate (_ctx_release)
+     if renewed:  # in full: this comment is the scope the run was released for, not thread history
+         lines += ["## Scope renewal mandate",
+                   f"An earlier run stopped this card's scope. It was renewed ({renewed['authority_kind']}, comment "
+diff --git a/hermes_cli/kanban_rejected_retain_source.py b/hermes_cli/kanban_rejected_retain_source.py
+index 81a8c44ed8a..d935aa6691c 100644
+--- a/hermes_cli/kanban_rejected_retain_source.py
++++ b/hermes_cli/kanban_rejected_retain_source.py
+@@ -51,6 +51,18 @@
+         k in op and op[k] == v for k, v in expected.items())
+ 
+ 
++def _sent(args):
++    """What the tool sent for these call arguments (``kanban_retain.tool_args`` folds ``stop_on`` into the
++    summary); a call the tool refused, or one from before ``stop_on`` existed, is compared as written."""
++    from hermes_cli.kanban_retain import tool_args
++    if not isinstance(args, dict):
++        return args
++    try:
++        return tool_args(args)
++    except ValueError:
++        return args
++
++
+ def _ordered(*messages):
+     return all(a['id'] < b['id'] and a['timestamp'] < b['timestamp']
+                for a, b in pairwise(messages))
+@@ -94,7 +106,7 @@
+                     args = _json(fn['arguments'])
+                     call_id = entry.get('id')
+                     if (call_id and entry.get('call_id', call_id) == call_id
+-                            and args == {k: v for k, v in wire['payload'].items() if k != 'version'}):
++                            and _sent(args) == {k: v for k, v in wire['payload'].items() if k != 'version'}):
+                         calls.append((message, call_id))
+         if message['role'] != 'tool':
+             continue
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index d80cd98cb45..04f0d637877 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -49,7 +49,8 @@
+ _HUMAN_LIMITS = ("Narrower run counts, dollar caps and stop-on-finding conditions that agents wrote earlier are "
+                  "superseded.")
+ _AGENT_LIMITS = ("Narrower run counts, dollar caps and stop-on-finding conditions written by agents earlier are "
+-                 "superseded. The card's budget after this release: {budget}.")
++                 "superseded. Stop conditions in a note below do not add to the stop list that follows. The "
++                 "card's budget after this release: {budget}.")
+ # Events that can follow a recorded release without moving the card: only then is a triage card "still ours".
+ _QUIET = frozenset({"commented", RELEASED, "spend_budget_set", "spend_budget_decision_ready", "scope_renewed",
+                     "user_steps_answer", "card_answer_released", "stranded_park_escalated", "parent_held",
+@@ -231,6 +232,23 @@
+     return {**payload, "_id": row[0]} if payload.get("version") == 1 else None
+ 
+ 
++def current_mandate(conn: sqlite3.Connection, tid: str) -> Optional[dict]:
++    """The release that governs the card's next run: the ``stop_released`` record newer than the card's newest
++    stop, with its mandate comment's ``body`` and local ``comment_id``; None when the newest stop is unreleased,
++    the card is execution-restricted (as ``kanban_scope_renewal.mandate``) or the comment is gone. Read by the
++    worker context (``kanban_db_context._ctx_release``)."""
++    from hermes_cli.kanban_scope_renewal import _comment
++    from hermes_cli.kanban_spend_decision import execution_restricted
++    record = _release_event(conn, tid)
++    if record is None or execution_restricted(conn, tid):
++        return None
++    ref = record.get("mandate_comment_uid") or record.get("mandate_comment_id")
++    comment = _comment(conn, tid, str(ref)) if ref not in (None, "") else None
++    if comment is None or not (comment.get("body") or "").strip():
++        return None
++    return {**record, "body": comment["body"], "comment_id": comment["id"]}
++
++
+ def _untouched_since(conn: sqlite3.Connection, tid: str, record: dict) -> bool:
+     """Nothing moved the card after its release was recorded: every later event is a quiet one, or the
+     ``promoted_manual`` the same release wrote for a dependency wait. A card a block loop, the respawn guard or
+diff --git a/hermes_cli/kanban_retain.py b/hermes_cli/kanban_retain.py
+index 1ac8e91ec37..724273f1f6a 100644
+--- a/hermes_cli/kanban_retain.py
++++ b/hermes_cli/kanban_retain.py
+@@ -12,6 +12,52 @@
+ from hermes_cli import kanban_spend_decision as decision
+ 
+ 
++# The only reasons a worker may stop a scope (``reason='scope_stopped'``): the release mandate's list
++# (``kanban_release.MANDATE``) plus a stop a human, the owning chat or the creator ordered, and a restriction the
++# board itself reports. A finding, a design change, review CHANGES, red or pending CI and a sandbox refusal are
++# none of these, yet treating them as scope stops can cause repeated stops after release.
++# The category travels in the summary (``[stop_on=...] ``) so stops can be counted by it: the Board's retain
++# payload has no field for it. [daveey]
++STOP_ON = {
++    'provider_safety_refusal': 'a provider safety refusal on this work',
++    'needs_david_physically': 'the next step needs David physically (a device in hand, a login only he can do)',
++    'same_error_three_times': 'the same error three times',
++    'run_budget': "the card's run budget is used up",
++    'owner_instruction': ('a human told this card to stop or hand off, or the owning chat or the creator did in a '
++                          'comment after the newest release'),
++    'card_safety_exclusion': 'the next step would cross a safety exclusion written in the card body',
++    'execution_restricted': 'the board reports a safety, containment or unreleased hold on this card',
++}
++NOT_A_STOP = ("Findings, design changes, review CHANGES, red or pending CI and sandbox refusals are work inside the "
++              "round, not stops: fix and continue, or park the wait with kanban_continue or kanban_schedule. "
++              "Agent-written stop rules older than the newest release mandate and earlier runs' stop reasons do "
++              "not count; safety exclusions in the card body and a human's stop instructions do. If the "
++              "acceptance is met, call kanban_complete (or kanban_request_review) instead.")
++_SUMMARY_MAX = 2000
++
++
++def tool_args(args: dict) -> dict:
++    """The ``kanban_retain`` tool's arguments as :func:`retain` takes them, or ValueError. A scope stop must name
++    an allowed ``stop_on``, folded into the summary as ``[stop_on=<category>] ``; other reasons may not carry
++    one. Deterministic, so an identical retry yields the identical frozen request."""
++    args = dict(args)
++    stop_on = args.pop('stop_on', None)
++    if args.get('reason') != 'scope_stopped':
++        if stop_on is not None:
++            raise ValueError("stop_on is only for reason='scope_stopped'")
++        return args
++    if stop_on not in STOP_ON:
++        raise ValueError('A scope stop needs stop_on, one of: ' + ', '.join(STOP_ON) + '. ' + NOT_A_STOP)
++    summary = args.get('summary')
++    if isinstance(summary, str) and summary.strip():
++        tag = f'[stop_on={stop_on}] '
++        tagged = tag + summary.strip().removeprefix(tag.strip()).strip()  # a self-tagged summary is tagged once
++        if len(tagged) > _SUMMARY_MAX:
++            raise ValueError(f'the summary plus its [stop_on=...] tag exceeds {_SUMMARY_MAX} characters; shorten it')
++        args['summary'] = tagged
++    return args
++
++
+ def payload(args: dict) -> dict:
+     allowed = {'summary', 'reason', 'next_step', 'release_condition', 'evidence', 'needs'}
+     if set(args) - allowed or args.get('reason') not in {'scope_stopped', 'decision_pending', 'capability_unavailable'}:
+diff --git a/tests/hermes_cli/test_kanban_retain_local.py b/tests/hermes_cli/test_kanban_retain_local.py
+index a314f5a47f1..1dfc115de62 100644
+--- a/tests/hermes_cli/test_kanban_retain_local.py
++++ b/tests/hermes_cli/test_kanban_retain_local.py
+@@ -24,7 +24,7 @@
+     before = budget._window_start(board, tid, 2999999999)
+     handler = registry.get_entry('kanban_retain').handler
+     with scoped_current_session_id(session):
+-        result = json.loads(handler(ARGS))
++        result = json.loads(handler({**ARGS, 'stop_on': 'owner_instruction'}))  # a scope stop names its stop
+     assert result['terminal_for_run'] is True and result['dependency_satisfied'] is False
+     assert kb.get_task(board, tid).status == 'triage'
+     assert board.execute('SELECT outcome FROM task_runs WHERE id=?', (rid,)).fetchone()[0] == 'retained'
+@@ -33,7 +33,7 @@
+     assert session_called_kanban_terminal([{'role': 'tool', 'name': 'kanban_retain', 'content': json.dumps(result)}])
+     assert not session_called_kanban_terminal([{'role': 'tool', 'name': 'kanban_retain', 'content': '{"ok":false}'}])
+     with scoped_current_session_id(session):
+-        replay = json.loads(handler(ARGS))
++        replay = json.loads(handler({**ARGS, 'stop_on': 'owner_instruction'}))
+     assert replay['event_uid'] == result['event_uid']
+     assert board.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='decision_retained'", (tid,)).fetchone()[0] == 1
+ 
+diff --git a/tests/hermes_cli/test_kanban_retain_process.py b/tests/hermes_cli/test_kanban_retain_process.py
+index ef9df9d61d9..2f8f9fb813f 100644
+--- a/tests/hermes_cli/test_kanban_retain_process.py
++++ b/tests/hermes_cli/test_kanban_retain_process.py
+@@ -33,7 +33,7 @@
+             'started_at':dispatch._process_fingerprint(os.getpid()),'claim_lock':context['claim_lock']}, run_id=context['run_id'])
+     result = json.loads(registry.get_entry('kanban_retain').handler(dict(summary='Incomplete stopped scope',
+         reason='scope_stopped', next_step='Administrative owner must resolve scope',
+-        release_condition='Supported explicit authority', evidence=['synthetic rc0 proof'])))
++        release_condition='Supported explicit authority', evidence=['synthetic rc0 proof'], stop_on='owner_instruction')))
+     assert result.get('terminal_for_run') is True, result
+     _record_worker_result(context, 0, 'retained without acceptance completion')
+     print(json.dumps(result))
+diff --git a/tests/hermes_cli/test_kanban_worker_stop_rules.py b/tests/hermes_cli/test_kanban_worker_stop_rules.py
+new file mode 100644
+index 00000000000..804b24d4533
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_stop_rules.py
+@@ -0,0 +1,207 @@
++"""Worker stop rules: what a released card's next run reads, and what a scope stop must name. [daveey]
++
++Representative observation: releases could be followed by repeated scope stops. The
++next prompt buried the release mandate under earlier summaries, framed "stop
++again if the work needs more", and ``kanban_retain(reason='scope_stopped')`` took any free text."""
++import json
++from contextlib import contextmanager
++
++import pytest
++
++from agent import prompt_builder
++from gateway.session_context import scoped_current_session_id
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_release as release
++from hermes_cli import kanban_retain as retain
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_release as rel
++from tests.hermes_cli import test_kanban_scope_renewal as scope
++from tools import kanban_retain_tools as tool
++
++board = scope.board
++
++
++def _section(context: str, title: str) -> str:
++    return context.split(title, 1)[1].split('\n## ', 1)[0]
++
++
++# --- the release mandate leads the next run's context -------------------------------------------------------
++
++
++def test_released_scope_stop_puts_the_mandate_above_prior_stops_without_stop_again_framing(board, monkeypatch):
++    tid, _, _ = scope.stopped(board, monkeypatch)  # leaves a retained prior attempt with its stop summary
++    out = rel.run(board, tid, runs=7)
++    assert out['outcome'] == 'released'
++    context = kb.build_worker_context(board, tid)
++    assert '## Release mandate (governs this run)' in context
++    section = _section(context, '## Release mandate (governs this run)')
++    assert release.mandate_text(7) in section
++    assert 'not instructions' in section and '`kanban_complete`' in section
++    assert context.index('## Release mandate') < context.index('## Prior attempts on this task')
++    assert context.index('## Release mandate') < context.index('## Comment thread')
++    # The renewal written by the release is the same comment: no second copy with the old framing.
++    assert '## Scope renewal mandate' not in context
++    assert 'stop again if the work needs more' not in context
++
++
++def test_released_budget_stop_shows_the_mandate_although_no_scope_renewal_exists(board):
++    tid = rel.spend_stopped(board)
++    out = rel.run(board, tid, note='Desktop Unblock, operation op-1')
++    assert out['outcome'] == 'released' and out['scope_renewed'] is False
++    context = kb.build_worker_context(board, tid)
++    section = _section(context, '## Release mandate (governs this run)')
++    assert release.MARK in section and 'Desktop Unblock, operation op-1' in section
++    assert 'by a human operator' in section
++
++
++def test_a_stop_after_the_release_hides_the_stale_mandate(board):
++    tid = rel.spend_stopped(board)
++    assert rel.run(board, tid)['outcome'] == 'released'
++    with kb.write_txn(board):
++        kb._append_event(board, tid, decision.EVENT, {'reason': 'Spend budget: 25 runs'})
++    assert release.current_mandate(board, tid) is None
++    assert '## Release mandate' not in kb.build_worker_context(board, tid)
++
++
++def test_an_execution_restriction_after_the_release_hides_the_mandate(board, monkeypatch):
++    tid = rel.spend_stopped(board)
++    assert rel.run(board, tid)['outcome'] == 'released'
++    assert release.current_mandate(board, tid) is not None
++    monkeypatch.setattr(decision, 'execution_restricted', lambda conn, task: True)
++    assert release.current_mandate(board, tid) is None
++    assert '## Release mandate' not in kb.build_worker_context(board, tid)
++
++
++def test_the_release_header_keeps_card_safety_exclusions_and_human_stops(board):
++    tid = rel.spend_stopped(board)
++    rel.run(board, tid)
++    section = _section(kb.build_worker_context(board, tid), '## Release mandate (governs this run)')
++    assert "Safety exclusions in the card body and a human's stop instructions still hold." in section
++
++
++def test_a_plain_renewal_keeps_its_own_section(board, monkeypatch):
++    """A renew-scope mandate that is not a release keeps its narrow framing (a human may have meant it)."""
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    scope.link(board, tid)
++    scope.renew(board, tid, episode, scope.mandate(board, tid))
++    promoted, why = kb.promote_task(board, tid, actor='fixture', reason='renewed scope')
++    assert promoted, why
++    context = kb.build_worker_context(board, tid)
++    assert '## Scope renewal mandate' in context and '## Release mandate' not in context
++
++
++# --- an agent's release note cannot re-narrow the stop list ------------------------------------------------
++
++
++def test_agent_mandate_says_note_stop_conditions_do_not_add_and_a_humans_does_not(board, monkeypatch):
++    agent = release.mandate_text(10, 'Stop only if the keyboard defect fails 3 times.', agent=True, budget='24 runs')
++    assert 'Stop conditions in a note below do not add to the stop list that follows.' in agent
++    assert agent.index('do not add to the stop list') < agent.index('Stop only on:')
++    assert 'do not add to the stop list' not in release.mandate_text(10, 'x')  # a human's wording is whole
++
++
++# --- the worker prompt ------------------------------------------------------------------------------------
++
++
++def test_worker_guidance_lists_the_stops_and_says_complete_not_retain():
++    text = prompt_builder.KANBAN_GUIDANCE
++    assert '**Stopping a scope is the exception.**' in text
++    for stop in ('a provider safety refusal', 'a step that needs David physically', 'the same error three times',
++                 'the run budget'):
++        assert stop in text
++    assert 'review CHANGES, red or pending CI and sandbox refusals are work inside the round' in text
++    assert 'When the acceptance is met, finish with `kanban_complete` (or `kanban_request_review`), never `kanban_retain`' in text
++    assert 'stop_on=...' in text
++    assert 'safety exclusions in the card body always do' in text
++
++
++# --- kanban_retain: a scope stop names an allowed stop --------------------------------------------------------
++
++
++@pytest.fixture
++def captured(board, monkeypatch):
++    """The real tool handler on ``board`` with the retain call itself recorded instead of run."""
++    from tools import kanban_tools
++    calls = []
++
++    @contextmanager
++    def _board(_):
++        yield None, board
++
++    monkeypatch.setattr(kanban_tools, '_board', _board)
++    monkeypatch.setattr(retain, 'retain', lambda conn, **kw: calls.append(kw) or {'ok': True, 'terminal_for_run': True})
++    return calls
++
++
++def test_schema_offers_the_stop_categories():
++    props = tool.SCHEMA['parameters']['properties']
++    assert props['stop_on']['enum'] == list(retain.STOP_ON)
++    assert 'stop_on' not in tool.SCHEMA['parameters']['required']
++    assert 'kanban_complete' in tool.SCHEMA['description'] and 'needs stop_on' in tool.SCHEMA['description']
++
++
++def test_scope_stop_without_stop_on_is_refused_and_nothing_is_retained(captured):
++    out = json.loads(tool.handle(dict(scope.ARGS)))
++    assert out['ok'] is False and out['terminal_for_run'] is False
++    assert 'needs stop_on' in out['error'] and 'kanban_complete' in out['error']
++    assert 'review CHANGES' in out['error'] and 'kanban_complete' in out['next_step']
++    assert captured == []
++
++
++def test_scope_stop_with_free_text_category_is_refused(captured):
++    out = json.loads(tool.handle({**scope.ARGS, 'stop_on': 'pr_landed'}))
++    assert out['ok'] is False and captured == []
++
++
++def test_scope_stop_with_a_category_carries_it_in_the_summary(captured):
++    out = json.loads(tool.handle({**scope.ARGS, 'stop_on': 'same_error_three_times'}))
++    assert out['ok'] is True
++    assert len(captured) == 1 and 'stop_on' not in captured[0]
++    assert captured[0]['summary'] == '[stop_on=same_error_three_times] ' + scope.ARGS['summary']
++
++
++def test_a_card_safety_exclusion_is_an_allowed_stop_and_a_self_tagged_summary_is_tagged_once(captured):
++    assert 'card_safety_exclusion' in retain.STOP_ON
++    summary = '[stop_on=card_safety_exclusion] Next step would touch production keys the card excludes.'
++    out = json.loads(tool.handle({**scope.ARGS, 'summary': summary, 'stop_on': 'card_safety_exclusion'}))
++    assert out['ok'] is True and captured[0]['summary'] == summary
++
++
++def test_other_reasons_pass_unchanged_and_refuse_a_stop_on(captured):
++    args = {**scope.ARGS, 'reason': 'capability_unavailable'}
++    assert json.loads(tool.handle(dict(args)))['ok'] is True
++    assert len(captured) == 1 and {k: v for k, v in captured[0].items() if k != 'board'} == args
++    refused = json.loads(tool.handle({**args, 'stop_on': 'run_budget'}))
++    assert refused['ok'] is False and len(captured) == 1
++
++
++def test_a_tagged_summary_over_the_bound_is_refused(captured):
++    out = json.loads(tool.handle({**scope.ARGS, 'summary': 'x' * 1990, 'stop_on': 'run_budget'}))
++    assert out['ok'] is False and 'shorten' in out['error'] and captured == []
++
++
++def test_end_to_end_the_stop_record_names_its_category(board, monkeypatch):
++    """Through the real retain: the stop event a census counts begins with the category."""
++    from tests.hermes_cli import test_kanban_containment_actor as support
++    from tools import kanban_tools
++
++    @contextmanager
++    def _board(_):
++        yield None, board
++
++    monkeypatch.setattr(kanban_tools, '_board', _board)
++    tid, _, session = support.bind(board, monkeypatch)
++    with scoped_current_session_id(session):
++        out = json.loads(tool.handle({**scope.ARGS, 'stop_on': 'needs_david_physically'}))
++    assert out['ok'] is True and out['terminal_for_run'] is True, out
++    reason = json.loads(board.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                                      (tid, decision.EVENT)).fetchone()[0])['reason']
++    assert reason.startswith('[stop_on=needs_david_physically] ')
++
++
++def test_rejected_retain_source_still_matches_a_tagged_call():
++    from hermes_cli.kanban_rejected_retain_source import _sent
++    args = {**scope.ARGS, 'stop_on': 'run_budget'}
++    assert _sent(args) == retain.tool_args(args)
++    legacy = dict(scope.ARGS)  # a scope stop written before stop_on existed is compared as written
++    assert _sent(legacy) == legacy
+diff --git a/tools/kanban_retain_tools.py b/tools/kanban_retain_tools.py
+index a303f1ad332..de70f0b3cab 100644
+--- a/tools/kanban_retain_tools.py
++++ b/tools/kanban_retain_tools.py
+@@ -1,12 +1,18 @@
+ """Stop-only own-run lifecycle disposition, gated with the existing Kanban tools."""
+ import json
+ 
++from hermes_cli.kanban_retain import STOP_ON
+ from tools.kanban_containment_tools import _schema
+ 
+ SCHEMA = _schema('kanban_retain',
+     'End this admitted run in non-executing decision triage. '
+     'Does not complete acceptance, renew spend or grant execution. '
+     'No synthetic authority or human ask is required. '
++    "A scope stop (reason='scope_stopped') needs stop_on, one of: "
++    + '; '.join(f'{k} ({v})' for k, v in STOP_ON.items()) + '. '
++    'Findings, design changes, review CHANGES, red or pending CI and sandbox refusals are not stops: fix and '
++    'continue, or park the wait with kanban_continue or kanban_schedule. If the acceptance is met, call '
++    'kanban_complete (or kanban_request_review) instead. '
+     'Provide an administrative next step, evidence and a release_condition: the concrete thing the releaser should '
+     'check, a note and never a gate. Except after a provider safety refusal or a containment hold, the release '
+     "itself is `hermes kanban release <card>` on the card's home gateway by a human operator, the card's owning "
+@@ -16,6 +22,8 @@
+     {'summary': {'type': 'string', 'minLength': 1,
+                  'description': 'Bounded handoff summary, at most 2000 characters.'},
+      'reason': {'type': 'string', 'enum': ['decision_pending', 'scope_stopped', 'capability_unavailable']},
++     'stop_on': {'type': 'string', 'enum': list(STOP_ON),
++                 'description': "Required when reason='scope_stopped': which allowed stop this is."},
+      'next_step': {'type': 'string', 'minLength': 1, 'maxLength': 1000},
+      'release_condition': {'type': 'string', 'minLength': 1, 'maxLength': 1000},
+      'evidence': {'type': 'array', 'minItems': 1, 'maxItems': 8,
+@@ -29,6 +37,12 @@
+     from hermes_cli import kanban_retain
+     from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+     from hermes_cli.kanban_sync_client import HubError
++    try:
++        args = kanban_retain.tool_args(args)
++    except ValueError as exc:  # nothing written: the run goes on (work, park or complete)
++        return json.dumps({'ok': False, 'terminal_for_run': False, 'error': str(exc),
++                           'next_step': 'Continue the work, park a wait with kanban_continue/kanban_schedule, or '
++                                        'complete with kanban_complete when the acceptance is met.'})
+     try:
+         with kt._board(args.get('board')) as (_, conn):
+             from hermes_cli.kanban_db_sync import board_slug_for_path, sync_state
+-- 
+2.43.0
+

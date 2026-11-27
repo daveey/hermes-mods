@@ -1,0 +1,294 @@
+From cb3a2da173f1ba3901717539e910a0ebb4c9be83 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:02:14 +0000
+Subject: [PATCH 6471] Annotation readers, batched revisions and settlement generations
+
+Public mirror of source commit cb3a2da173f1ba3901717539e910a0ebb4c9be83.
+
+---
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index e0557e2282a..05e5808f988 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -155,15 +155,19 @@
+ def keys(scope: tuple[str, ...]) -> dict[str, object] | None:
+     """One key per part, read now in ``scope``'s context; None when the inputs cannot be vouched for."""
+     from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_annotation_revision as revision
+ 
+     wall = time.time()
+-    counts_local = _part_fingerprint(COUNTS)
+-    links_local = _part_fingerprint(LINKS)
++    local = [(str(p), revision.content_keys(p)) for p in ksa._board_db_paths()]
++    hub = ksa._hub_db_path()
++    hub_key = (ksa._hub_content_signature(hub),) if hub is not None else ()
++    fingerprints = {part: tuple((path, values[part]) for path, values in local) + hub_key
++                    for part in (COUNTS, LINKS, ATTENTION)}
+     shadows = _part_fingerprint(COUNTS, shadows=True)
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+-    return {COUNTS: (counts_local, shadows, ledger, plain), LINKS: (links_local, ledger),
+-            ATTENTION: (_part_fingerprint(ATTENTION), _done_key(scope, wall)), WAITING: _waiting_key()}
++    return {COUNTS: (fingerprints[COUNTS], shadows, ledger, plain), LINKS: (fingerprints[LINKS], ledger),
++            ATTENTION: (fingerprints[ATTENTION], _done_key(scope, wall)), WAITING: _waiting_key()}
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+diff --git a/hermes_cli/kanban_annotation_revision.py b/hermes_cli/kanban_annotation_revision.py
+index 28a5a349ae0..a6e85f7a713 100644
+--- a/hermes_cli/kanban_annotation_revision.py
++++ b/hermes_cli/kanban_annotation_revision.py
+@@ -113,7 +113,7 @@
+     return [c for c in columns if (c not in names if mode == "except" else c in names)]
+ 
+ 
+-def _expected(conn, kind: Kind, master: dict):
++def _expected(conn, kind: Kind, master: dict, columns=None):
+     """Exact ``{name: sql}`` the schema must hold, or ``None`` when coverage cannot be certified.
+ 
+     Containment ``containment_*`` tables outside the enumerated sets are refused here, and so is any
+@@ -128,7 +128,13 @@
+             continue
+         if entry[0] != "table":
+             return None
+-        cols = _selected(spec, _columns(conn, name))
++        if columns is None:
++            live_columns = _columns(conn, name)
++        else:
++            if name not in columns:
++                columns[name] = _columns(conn, name)
++            live_columns = columns[name]
++        cols = _selected(spec, live_columns)
+         if not cols or (spec != _ALL and spec[0] == "only" and set(cols) != set(spec[1])):
+             return None
+         for op in ("INSERT", "DELETE", "UPDATE"):
+@@ -198,25 +204,35 @@
+ 
+ 
+ def _read(conn: sqlite3.Connection, identity: tuple, kind: Kind):
++    return read_revisions(conn, identity, (kind,))[kind.name]
++
++
++def read_revisions(conn: sqlite3.Connection, identity: tuple, kinds) -> dict:
++    """Validate parts in one snapshot; schema/columns are shared only within this call."""
++    values = dict.fromkeys(k.name for k in kinds)
+     opened = not conn.in_transaction
+     try:
+         if opened:
+             conn.execute("BEGIN")
+         schema = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+         master = _master(conn)
+-        if (kind in (COUNTS, LINKS) and _foreign_containment(master)) or not _intact_readonly(conn, kind, master):
+-            return None
+-        row = conn.execute(f"SELECT revision FROM {kind.table} WHERE id = 1").fetchone()
+-        return None if row is None else (*identity, int(row[0]), schema)
++        columns = {}
++        foreign = _foreign_containment(master)
++        for kind in kinds:
++            if (kind in (COUNTS, LINKS) and foreign) or not _intact_readonly(conn, kind, master, columns):
++                continue
++            row = conn.execute(f"SELECT revision FROM {kind.table} WHERE id = 1").fetchone()
++            values[kind.name] = None if row is None else (*identity, int(row[0]), schema)
++        return values
+     except sqlite3.Error:
+-        return None
++        return dict.fromkeys(values)
+     finally:
+         if opened and conn.in_transaction:
+             conn.execute("ROLLBACK")
+ 
+ 
+-def _intact_readonly(conn, kind: Kind, master: dict) -> bool:
+-    wanted = _expected(conn, kind, master)
++def _intact_readonly(conn, kind: Kind, master: dict, columns=None) -> bool:
++    wanted = _expected(conn, kind, master, columns)
+     return wanted is not None and _ours(master, kind) == wanted
+ 
+ 
+@@ -232,11 +248,16 @@
+ 
+ def content_key(path, part: str) -> tuple:
+     """Fresh coverage/restore-aware holder key. Unknown never compares equal, and never writes."""
++    return content_keys(path, (part,))[part]
++
++
++def content_keys(path, parts=('counts', 'links', 'attention')) -> dict:
++    """One bounded probe and snapshot for a board's requested independent part keys."""
+     from hermes_cli import kanban_activity_revision as revision
+     from hermes_cli import kanban_session_activity as activity
+ 
+-    kind = {'counts': COUNTS, 'attention': ATTENTION, 'links': LINKS}[part]
+-    unknown = ('unknown', object())
++    kinds = tuple({'counts': COUNTS, 'attention': ATTENTION, 'links': LINKS}[part] for part in parts)
++    unknown = {k.name: ('unknown', object()) for k in kinds}
+     lock = revision.probe_lock(path)
+     if not lock.acquire(timeout=0.05):
+         return unknown
+@@ -245,8 +266,11 @@
+         if before is None:
+             return unknown
+         with activity.cached_ro(path, busy_budget=0) as conn:
+-            value = _read(conn, (conn, before), kind)
+-        return unknown if value is None or revision.file_stat(path)[0] != before else ('part', part, *value)
++            values = read_revisions(conn, (conn, before), kinds)
++        if revision.file_stat(path)[0] != before:
++            return unknown
++        return {part: unknown[part] if value is None else ('part', part, *value)
++                for part, value in values.items()}
+     except (OSError, sqlite3.Error):
+         return unknown
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_annotation_revision.py b/tests/hermes_cli/test_kanban_annotation_revision.py
+index d206004a0ea..c20a85a0569 100644
+--- a/tests/hermes_cli/test_kanban_annotation_revision.py
++++ b/tests/hermes_cli/test_kanban_annotation_revision.py
+@@ -47,6 +47,115 @@
+     kbc._INITIALIZED_PATHS.discard(str((home / "kanban.db").resolve()))
+ 
+ 
++def test_batch_reads_schema_and_each_table_once(conn):
++    expected = {k.name: rev._read(conn, ID, k) for k in rev.KINDS}
++    statements = []
++    conn.set_trace_callback(statements.append)
++    try:
++        assert rev.read_revisions(conn, ID, rev.KINDS) == expected
++    finally:
++        conn.set_trace_callback(None)
++    assert statements.count("BEGIN") == statements.count("ROLLBACK") == 1
++    assert statements.count("PRAGMA schema_version") == 1
++    assert statements.count("SELECT name, type, sql FROM sqlite_master") == 1
++    columns = [s for s in statements if s.startswith("PRAGMA table_xinfo")]
++    assert columns and len(columns) == len(set(columns))
++    assert not conn.in_transaction
++
++
++def test_batch_preserves_caller_transaction_and_refreshes_schema(conn):
++    conn.execute("BEGIN")
++    before = rev.read_revisions(conn, ID, rev.KINDS)
++    assert conn.in_transaction
++    conn.rollback()
++    conn.execute("ALTER TABLE tasks ADD COLUMN batch_new TEXT")
++    conn.commit()
++    assert set(rev.read_revisions(conn, ID, rev.KINDS).values()) == {None}
++    rev.ensure_revisions(conn)
++    after = rev.read_revisions(conn, ID, rev.KINDS)
++    assert all(after[k] is not None and after[k] != before[k] for k in before)
++    conn.execute("UPDATE tasks SET batch_new='updated'")
++    conn.commit()
++    newer = rev.read_revisions(conn, ID, rev.KINDS)
++    assert all(newer[k] != after[k] for k in after)
++
++
++def test_batch_unknown_part_does_not_poison_other_parts(conn):
++    conn.execute("DROP TRIGGER kanban_annotation_counts_task_events_insert")
++    conn.commit()
++    values = rev.read_revisions(conn, ID, rev.KINDS)
++    assert values['counts'] is None
++    assert values['attention'] is not None and values['links'] is not None
++
++
++def test_batch_concurrent_commit_stays_in_one_snapshot(conn, monkeypatch):
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    other = sqlite3.connect(path)
++    before = rev.read_revisions(conn, ID, rev.KINDS)
++    original = rev._master
++
++    def racing_master(reader):
++        result = original(reader)
++        other.execute("UPDATE tasks SET title='concurrent batch'")
++        other.commit()
++        return result
++
++    try:
++        with monkeypatch.context() as patcher:
++            patcher.setattr(rev, '_master', racing_master)
++            assert rev.read_revisions(conn, ID, rev.KINDS) == before
++        assert not conn.in_transaction
++        after = rev.read_revisions(conn, ID, rev.KINDS)
++        assert all(after[k] != before[k] for k in before)
++    finally:
++        other.close()
++
++
++def test_batch_content_keys_unchanged_change_and_unknown(conn, monkeypatch):
++    from pathlib import Path
++    from hermes_cli import kanban_activity_revision as activity_revision
++    from hermes_cli import kanban_session_activity as activity
++
++    path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
++    before = rev.content_keys(path)
++    assert all(v[0] == 'part' for v in before.values())
++    assert before == rev.content_keys(path)
++    assert before == {k: rev.content_key(path, k) for k in before}
++    conn.execute("UPDATE tasks SET title='content changed'")
++    conn.commit()
++    after = rev.content_keys(path)
++    assert all(after[k] != before[k] for k in before)
++    original = activity_revision.file_stat
++    calls = []
++
++    def replaced(p):
++        calls.append(p)
++        return original(p) if len(calls) % 2 else (('replacement',), None)
++
++    with monkeypatch.context() as patcher:
++        patcher.setattr(activity_revision, 'file_stat', replaced)
++        unknown = rev.content_keys(path)
++        assert all(v[0] == 'unknown' for v in unknown.values())
++        assert all(rev.content_keys(path)[k] != unknown[k] for k in unknown)
++    assert rev.content_keys(path) == after
++    with activity.cached_ro(path) as reader:
++        assert not reader.in_transaction
++
++
++def test_batch_query_error_rolls_back_and_retries(conn, monkeypatch):
++    original = rev._columns
++
++    def broken(*args):
++        raise sqlite3.OperationalError('unavailable')
++
++    with monkeypatch.context() as patcher:
++        patcher.setattr(rev, '_columns', broken)
++        assert set(rev.read_revisions(conn, ID, rev.KINDS).values()) == {None}
++        assert not conn.in_transaction
++    assert rev._columns is original
++    assert all(v is not None for v in rev.read_revisions(conn, ID, rev.KINDS).values())
++
++
+ def both(conn):
+     return rev.read_counts_revision(conn, ID), rev.read_attention_revision(conn, ID)
+ 
+diff --git a/tests/hermes_cli/test_kanban_annotation_semantic_parts.py b/tests/hermes_cli/test_kanban_annotation_semantic_parts.py
+index 4b491473d77..589e295fef7 100644
+--- a/tests/hermes_cli/test_kanban_annotation_semantic_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_semantic_parts.py
+@@ -16,6 +16,26 @@
+     revision.ensure_revisions(world.conn)
+ 
+ 
++def test_holder_batches_local_parts_with_identical_keys(world, monkeypatch):
++    from hermes_cli import kanban_annotation_parts as parts
++
++    _install(world)
++    expected = {p: parts._part_fingerprint(p) for p in ('counts', 'links', 'attention')}
++    calls = []
++    original = revision.content_keys
++
++    def counted(path, requested=('counts', 'links', 'attention')):
++        calls.append((path, tuple(requested)))
++        return original(path, requested)
++
++    monkeypatch.setattr(revision, 'content_keys', counted)
++    result = parts.keys(helpers.SCOPE)
++    assert result['counts'][0] == expected['counts']
++    assert result['links'][0] == expected['links']
++    assert result['attention'][0] == expected['attention']
++    assert calls == [(world.board, ('counts', 'links', 'attention'))]
++
++
+ def test_irrelevant_board_storm_reads_no_part(world):
+     _install(world)
+     # Complete declaration: this check reads only its card and the explicit file.
+-- 
+2.43.0
+

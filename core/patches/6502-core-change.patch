@@ -1,0 +1,672 @@
+From c6bcdad8af731c51275d19516f8e690d5ee91479 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:13:29 +0000
+Subject: [PATCH 6502] Session list reads, status checkpoints and early startup
+
+Public mirror of source commit c6bcdad8af731c51275d19516f8e690d5ee91479.
+
+---
+diff --git a/hermes_cli/kanban_contained_wait.py b/hermes_cli/kanban_contained_wait.py
+index 0dce978d40e..500b8133e95 100644
+--- a/hermes_cli/kanban_contained_wait.py
++++ b/hermes_cli/kanban_contained_wait.py
+@@ -152,8 +152,9 @@
+     if not ids:
+         return {}
+     try:
+-        if "containment_episode" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
+-            return {}
++        # [daveey] No separate schema probe: ``PRAGMA table_info(tasks)`` handed Python one row per column (59 on
++        # the hub board, each a GIL release in the Desktop backend) on every session-list board read. A board
++        # without the column (or the table) fails this statement at prepare time, the same empty answer.
+         rows = conn.execute("SELECT id, containment_episode FROM tasks WHERE status = 'triage' "
+                             "AND containment_episode IS NOT NULL AND id IN (SELECT value FROM json_each(?))",
+                             (json.dumps(ids),)).fetchall()
+diff --git a/hermes_cli/kanban_external_activity.py b/hermes_cli/kanban_external_activity.py
+index 4e6f61ec7a1..134e6a3972e 100644
+--- a/hermes_cli/kanban_external_activity.py
++++ b/hermes_cli/kanban_external_activity.py
+@@ -96,10 +96,10 @@
+     waits = _eta_waits(conn, {t for _s, t in pairs}, wall)
+     titles = {}
+     ids = list(set(states) | {t for t, w in waits.items() if w.get("wait_kind") == "clock"})
+-    for i in range(0, len(ids), 500):
+-        chunk = ids[i:i + 500]
+-        titles.update((str(t), str(n or "")) for t, n in conn.execute(
+-            f"SELECT id, title FROM tasks WHERE id IN ({','.join('?' for _ in chunk)})", chunk))
++    if ids:  # one packed row, not one per card (each row step is a GIL release in the Desktop backend) [daveey]
++        from hermes_state_page_pack import read_rows
++        titles.update((str(t), str(n or "")) for t, n in read_rows(
++            conn, "SELECT id, title FROM tasks WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(ids),), 2))
+     for sid, tid in sorted(pairs):
+         derived = states.get(tid)
+         wait = waits.get(tid)
+diff --git a/hermes_cli/kanban_external_display.py b/hermes_cli/kanban_external_display.py
+index b502567bbd4..0d6e768762b 100644
+--- a/hermes_cli/kanban_external_display.py
++++ b/hermes_cli/kanban_external_display.py
+@@ -24,18 +24,20 @@
+             if blob:
+                 payload = bytes.fromhex(payload)
+             self.rows[tid, kind] = (eid, payload, at)
++        # Packed like the events above: one row per card would be one GIL release each in the Desktop backend.
++        from hermes_state_page_pack import read_rows
+         self.wakes = {}
+         try:
+-            self.wakes = {tid: (cmd, every) for tid, cmd, every in conn.execute(
+-                "SELECT task_id,cmd,every FROM task_wake_checks "
+-                "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(ids),))}
++            self.wakes = {tid: (cmd, every) for tid, cmd, every in read_rows(
++                conn, "SELECT task_id,cmd,every FROM task_wake_checks "
++                "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(ids),), 3)}
+         except sqlite3.Error:
+             pass  # optional machine-local table; same fallback as literal plan
+         self.last_at = {}
+         try:
+-            self.last_at = dict(conn.execute(
+-                "SELECT task_id,last_at FROM task_wake_checks WHERE task_id IN (SELECT value FROM json_each(?))",
+-                (json.dumps(ids),)))
++            self.last_at = dict(read_rows(
++                conn, "SELECT task_id,last_at FROM task_wake_checks WHERE task_id IN (SELECT value FROM json_each(?))",
++                (json.dumps(ids),), 2))
+         except sqlite3.Error:
+             pass  # independent compatibility/error boundary in literal _shell_seen
+         self._blockers = None
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index 30fa5d2a689..42b085af5ec 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -260,8 +260,10 @@
+     try:
+         hosts = hosts_seen(conn)
+         ids = list(dict.fromkeys(str(t) for t in task_ids))
+-        statuses = dict(conn.execute("SELECT id,status FROM tasks WHERE id IN (SELECT value FROM json_each(?))",
+-                                     (json.dumps(ids),)))
++        # One packed row, not one per parked card: each row step is a GIL release in the Desktop backend. [daveey]
++        from hermes_state_page_pack import read_rows
++        statuses = dict(read_rows(
++            conn, "SELECT id,status FROM tasks WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(ids),), 2))
+         from hermes_cli.kanban_external_display import Capture
+         selected = [tid for tid in ids if statuses.get(tid) == 'scheduled']
+         if not selected:
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index ec75385ef4e..01354003b34 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -53,6 +53,7 @@
+     """``(parked, events)``: the stored rows ``_describe_waits`` turns into wait info. Separate so a board memo can
+     keep the rows and re-judge their age at each read (the stall cut-off moves with the clock, the rows do not)."""
+     from hermes_cli import kanban_wait_info as kwi
++    from hermes_state_page_pack import read_rows
+ 
+     ids = [str(t) for t in dict.fromkeys(task_ids)]
+     if not ids:
+@@ -61,20 +62,25 @@
+     cols = table_columns(conn, "tasks")  # one result row, not one per column
+     pick = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in ("id", "status", "block_kind", "human_request",
+                                                                           "awaiting"))
++    # [daveey] Each result row is a GIL release in the Desktop backend (kanban_table_columns), so both reads hand
++    # their rows over packed in one (hermes_state_page_pack: types, order and doubles preserved). The session list
++    # read ~140 hub parked cards here per board change: ~220 row steps, seconds under the serve's GIL convoy.
+     parked: dict[str, tuple] = {}
+-    for tid, status, kind, request, awaiting in conn.execute(
++    for tid, status, kind, request, awaiting in read_rows(conn,
+             f"SELECT {pick} FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) "
+-            "AND t.status IN ('scheduled', 'blocked', 'triage')", (json.dumps(ids),)):
++            "AND t.status IN ('scheduled', 'blocked', 'triage')", (json.dumps(ids),), 5):
+         parked[str(tid)] = (status, kind, request, awaiting)
+     if not parked:
+         return {}, {}
+     events: dict[str, tuple] = {}
+     kph = ",".join("?" for _ in kwi.PARK_EVENT_KINDS)
+     try:
+-        for tid, kind, payload, at in conn.execute(
++        # The newest park event per card, probed per card through (kind, task_id, id): grouped over ``task_id``
++        # SQLite walked every event of each card (idx_events_task), ~40 ms on the hub board, for the same ids.
++        for tid, kind, payload, at in read_rows(conn,
+                 "SELECT e.task_id, e.kind, e.payload, e.created_at FROM task_events e WHERE e.id IN ("
+-                "SELECT MAX(id) FROM task_events WHERE task_id IN (SELECT value FROM json_each(?)) "
+-                f"AND kind IN ({kph}) GROUP BY task_id)", (json.dumps(list(parked)), *kwi.PARK_EVENT_KINDS)):
++                "SELECT (SELECT MAX(x.id) FROM task_events x WHERE x.task_id = j.value "
++                f"AND x.kind IN ({kph})) FROM json_each(?) j)", (*kwi.PARK_EVENT_KINDS, json.dumps(list(parked))), 4):
+             events[str(tid)] = (kind, payload, at)
+     except sqlite3.Error:  # board predates task_events
+         pass
+diff --git a/hermes_cli/web_server_sessions.py b/hermes_cli/web_server_sessions.py
+index e7e32383fdf..7cd4ae926be 100644
+--- a/hermes_cli/web_server_sessions.py
++++ b/hermes_cli/web_server_sessions.py
+@@ -3,6 +3,7 @@
+ 
+ import logging
+ import asyncio
++import threading
+ import time
+ from contextlib import contextmanager
+ from pathlib import Path
+@@ -336,6 +337,40 @@
+         raise HTTPException(status_code=409, detail=str(exc)) from exc
+ 
+ 
++# [daveey] Read-only opens whose declared-schema probe already passed in this process: (realpath, st_dev, st_ino,
++# PRAGMA schema_version, connection class, probe statements). The probe is ~25 statements per open, and every
++# session-list miss opens a fresh read-only SessionDB per changed profile, so the probe was most of
++# ``_read_profile_db``'s statements; in the Desktop backend each statement can wait out a GIL switch interval.
++# ``schema_version`` is bumped by every DDL from any process and the file identity changes when the store is
++# replaced, so an equal key proves the same schema the probe accepted: no clock, no TTL. A failed probe is never
++# remembered, so drift (#140315) and damage are probed and reported on every open, as before.
++_PROBED_STORES: set = set()
++_PROBED_STORES_MAX = 512
++_PROBED_LOCK = threading.Lock()
++
++
++def _file_identity(db_path: Path):
++    import os
++    try:
++        real = os.path.realpath(db_path)
++        st = os.stat(real)
++    except OSError:
++        return None
++    return real, st.st_dev, st.st_ino
++
++
++def _probe_key(conn, identity, probes):
++    """The memo key for this open, or None when it cannot be read cheaply (the caller then probes)."""
++    import sqlite3
++    if identity is None:
++        return None
++    try:
++        cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
++    except sqlite3.Error:
++        return None
++    return (*identity, cookie, type(conn), probes)
++
++
+ def _session_db_read_probe_statements() -> tuple:
+     """Probe the declared schema without reconciling it on a browsing request."""
+     from hermes_state_schema import schema_read_probe_statements
+@@ -376,12 +411,23 @@
+     )
+ 
+     def _open_probed():
++        identity = _file_identity(db_path)  # before connecting: a swap during the open never matches
+         db = SessionDB(db_path=db_path, read_only=True)
+         try:
+             conn = getattr(db, "_conn", None)
+             if conn is not None:
+-                for statement in _session_db_read_probe_statements():
+-                    conn.execute(statement).fetchone()
++                probes = _session_db_read_probe_statements()
++                key = _probe_key(conn, identity, probes)
++                with _PROBED_LOCK:
++                    probed = key is not None and key in _PROBED_STORES
++                if not probed:
++                    for statement in probes:
++                        conn.execute(statement).fetchone()
++                    if key is not None and _probe_key(conn, _file_identity(db_path), probes) == key:
++                        with _PROBED_LOCK:
++                            if len(_PROBED_STORES) >= _PROBED_STORES_MAX:
++                                _PROBED_STORES.clear()
++                            _PROBED_STORES.add(key)
+             return db
+         except BaseException:
+             db.close()
+diff --git a/hermes_state_page_pack.py b/hermes_state_page_pack.py
+index 54508f2ceda..ce9437acea9 100644
+--- a/hermes_state_page_pack.py
++++ b/hermes_state_page_pack.py
+@@ -29,14 +29,7 @@
+ def _read(conn, sql, params, chunk):
+     # Prepare only: LIMIT 0 never steps the projection or its correlated probes.
+     names = [column[0] for column in conn.execute(f'SELECT * FROM ({sql}) LIMIT 0', params).description]
+-    cells = []
+-    for name in names:
+-        column = _quoted(name)
+-        # JSON numbers round doubles to 15 digits. Transport REAL as SQLite's
+-        # round-trip decimal text and BLOB as hex, distinguished by storage type.
+-        cells.append(f"json_array(typeof({column}), CASE typeof({column}) "
+-                     f"WHEN 'real' THEN printf('%!.26g', {column}) "
+-                     f"WHEN 'blob' THEN hex({column}) ELSE {column} END)")
++    cells = [_cell(_quoted(name)) for name in names]
+     prefix = f"WITH _packed_rows AS MATERIALIZED ({sql}) "
+     source, suffix = '_packed_rows', ''
+     if chunk:
+@@ -53,6 +46,28 @@
+             for packed in packed_rows for row in json.loads(packed[0])]
+ 
+ 
++def read_rows(conn, sql, params, width):
++    """``conn.execute(sql, params).fetchall()`` as tuples in ONE statement and one handed-out row. [daveey]
++
++    For a reader whose ``width`` result columns are known: no prepare-only probe for their names, the columns are
++    renamed by position (a wrong ``width`` fails at prepare). Same transport as ``read_page``: SQLite types, row
++    order and binary64 values are preserved."""
++    cols = [f"_pack_c{i}" for i in range(width)]
++    packed = conn.execute(
++        f"WITH _packed_rows({','.join(cols)}) AS MATERIALIZED ({sql}) "
++        f"SELECT json_group_array(json_array({','.join(_cell(c) for c in cols)})) FROM _packed_rows",
++        params).fetchone()
++    return [tuple(_value(kind, value) for kind, value in row) for row in json.loads(packed[0])]
++
++
++def _cell(column):
++    # JSON numbers round doubles to 15 digits. Transport REAL as SQLite's
++    # round-trip decimal text and BLOB as hex, distinguished by storage type.
++    return (f"json_array(typeof({column}), CASE typeof({column}) "
++            f"WHEN 'real' THEN printf('%!.26g', {column}) "
++            f"WHEN 'blob' THEN hex({column}) ELSE {column} END)")
++
++
+ def _value(kind, value):
+     if kind == 'real':
+         return float(value)
+diff --git a/tests/hermes_cli/test_browse_probe_memo.py b/tests/hermes_cli/test_browse_probe_memo.py
+new file mode 100644
+index 00000000000..97f2b6526fb
+--- /dev/null
++++ b/tests/hermes_cli/test_browse_probe_memo.py
+@@ -0,0 +1,120 @@
++"""A read-only browse open probes the declared schema once per store schema, not once per open. [daveey]
++
++``/api/profiles/sessions`` opens a fresh read-only ``SessionDB`` for every profile whose ``state.db`` moved, and each
++open ran the ~25-statement declared-schema probe (#140315): most of ``_read_profile_db``'s statements, each a GIL
++release in the Desktop backend. The probe's answer is a function of the store's schema, which SQLite's
++``schema_version`` cookie (bumped by every DDL, from any process) and the file identity pin, so an unchanged store
++is not re-probed. These tests pin that drift, a replaced file and a new build's probe are still probed.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import web_server_sessions as wss
++from hermes_state import SessionDB
++
++
++class _Probes(tuple):
++    """The probe statements, counting how often an open runs them."""
++
++    runs = 0
++
++    def __iter__(self):
++        type(self).runs += 1
++        return super().__iter__()
++
++
++@pytest.fixture
++def probes(monkeypatch):
++    real = wss._session_db_read_probe_statements()
++    _Probes.runs = 0
++    counted = _Probes(real)
++    monkeypatch.setattr(wss, "_session_db_read_probe_statements", lambda: counted)
++    getattr(wss, "_PROBED_STORES", set()).clear()
++    yield _Probes
++    getattr(wss, "_PROBED_STORES", set()).clear()
++
++
++def _store(path):
++    """A settled store in an unowned profile home (the shape ``test_browse_schema_drift`` browses)."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    (path.parent / "config.yaml").write_text("{}\n", encoding="utf-8")
++    with SessionDB(db_path=path) as db:
++        db.create_session("kept", source="cli")
++    return path
++
++
++def _browse(path):
++    db = wss._open_session_db_at_path(path, read_only=True)
++    try:
++        return [s["id"] for s in db.list_sessions_rich(limit=5)]
++    finally:
++        db.close()
++
++
++def test_an_unchanged_store_is_probed_once(tmp_path, probes):
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    for _ in range(3):
++        assert _browse(path) == ["kept"]
++    assert probes.runs == 1
++
++
++def test_a_write_that_is_not_ddl_keeps_the_probe(tmp_path, probes):
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    _browse(path)
++    with SessionDB(db_path=path) as db:
++        db.create_session("more", source="cli")
++    assert sorted(_browse(path)) == ["kept", "more"]
++    assert probes.runs == 1
++
++
++def test_ddl_after_a_passed_probe_is_probed_and_drift_is_still_caught(tmp_path, probes):
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    _browse(path)
++    with closing(sqlite3.connect(path)) as conn:
++        conn.execute("DROP TRIGGER IF EXISTS sessions_runtime_ledger_delete_guard")
++        conn.execute("DROP TRIGGER IF EXISTS session_change_on_sessions_update")
++        conn.execute("ALTER TABLE sessions DROP COLUMN runtime_generation")
++        conn.commit()
++    assert _browse(path) == ["kept"]  # the probe found the drift and the unowned store was caught up (#140315)
++    with closing(sqlite3.connect(path)) as conn:
++        assert "runtime_generation" in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
++    assert probes.runs >= 2
++
++
++def test_a_replaced_store_is_probed_again(tmp_path, probes):
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    _browse(path)
++    other = _store(tmp_path / "profiles" / "other" / "state.db")
++    os.replace(other, path)
++    for suffix in ("-wal", "-shm"):
++        if os.path.exists(f"{path}{suffix}"):
++            os.remove(f"{path}{suffix}")
++    assert _browse(path) == ["kept"]
++    assert probes.runs == 2
++
++
++def test_a_different_probe_set_is_run(tmp_path, probes, monkeypatch):
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    _browse(path)
++    changed = _Probes(tuple.__add__(wss._session_db_read_probe_statements(), ("SELECT 1",)))  # not counted
++    monkeypatch.setattr(wss, "_session_db_read_probe_statements", lambda: changed)
++    _browse(path)
++    assert probes.runs == 2
++
++
++def test_a_failed_probe_is_not_remembered(tmp_path, probes, monkeypatch):
++    from fastapi import HTTPException
++
++    path = _store(tmp_path / "profiles" / "scribe" / "state.db")
++    broken = _Probes(("SELECT missing_column FROM sessions LIMIT 0",))
++    monkeypatch.setattr(wss, "_session_db_read_probe_statements", lambda: broken)
++    monkeypatch.setattr("hermes_state_reconcile.is_declarative_drift_error", lambda exc: False)
++    for _ in range(2):
++        with pytest.raises(HTTPException):
++            _browse(path)
++    assert probes.runs == 2 and not getattr(wss, "_PROBED_STORES", set())
+diff --git a/tests/hermes_cli/test_kanban_external_read_rows.py b/tests/hermes_cli/test_kanban_external_read_rows.py
+new file mode 100644
+index 00000000000..1c2aba98b9e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_read_rows.py
+@@ -0,0 +1,275 @@
++"""The session list's board read answers as before while handing Python O(1) SQLite rows per board. [daveey]
++
++``/api/profiles/sessions`` stamps external-wait cards from every board whose change signal moved
++(``kanban_external_activity.stamp_boards`` -> ``read_session_external``). On the hub's busy board that is most
++requests, and the read handed Python ~445 rows for ~140 parked cards: the parked rows and newest park events
++(``_local_wait_rows``), the scheduled statuses (``kanban_external_watch._card_states``), the titles, and a
++``PRAGMA table_info(tasks)`` (one row per column) in ``kanban_contained_wait.read``. Each row step releases the GIL;
++in the Desktop backend (~48k context switches/s) each re-acquire can wait out the 5 ms switch interval, which made
++this route's p95 ~3 s. Each test pins the old answer (a reference copy of the old per-row reader where the query
++changed) and the reduced work (rows handed out do not grow with the number of parked cards).
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_external_activity as kea
++from hermes_cli import kanban_wait_info as kwi
++from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_rows
++from tests.hermes_cli import test_kanban_external_watch as helpers
++
++kanban_home, gh, clock = helpers.kanban_home, helpers.gh, helpers.clock
++park, tick = helpers.park, helpers.tick
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    kea.reset_for_tests()
++    yield
++    kea.reset_for_tests()
++
++
++class _Cursor:
++    def __init__(self, cur, owner):
++        self._cur, self._owner = cur, owner
++
++    def __iter__(self):
++        for row in self._cur:
++            self._owner.rows += 1
++            yield row
++
++    def fetchall(self):
++        rows = self._cur.fetchall()
++        self._owner.rows += len(rows)
++        return rows
++
++    def fetchone(self):
++        row = self._cur.fetchone()
++        self._owner.rows += row is not None
++        return row
++
++    def __getattr__(self, name):
++        return getattr(self._cur, name)
++
++
++class Counting:
++    """Connection proxy counting statements and the result rows handed to Python."""
++
++    def __init__(self, conn):
++        self.conn, self.statements, self.rows = conn, 0, 0
++
++    def execute(self, sql, params=()):
++        self.statements += 1
++        return _Cursor(self.conn.execute(sql, params), self)
++
++    def __getattr__(self, name):
++        return getattr(self.conn, name)
++
++
++def _old_local_wait_rows(conn, task_ids):
++    """``_local_wait_rows`` before: one row per parked card, newest park event grouped over ``idx_events_task``."""
++    from hermes_cli.kanban_table_columns import table_columns
++
++    ids = [str(t) for t in dict.fromkeys(task_ids)]
++    cols = table_columns(conn, "tasks")
++    pick = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in ("id", "status", "block_kind", "human_request",
++                                                                          "awaiting"))
++    parked = {}
++    for tid, status, kind, request, awaiting in conn.execute(
++            f"SELECT {pick} FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) "
++            "AND t.status IN ('scheduled', 'blocked', 'triage')", (json.dumps(ids),)):
++        parked[str(tid)] = (status, kind, request, awaiting)
++    if not parked:
++        return {}, {}
++    events = {}
++    kph = ",".join("?" for _ in kwi.PARK_EVENT_KINDS)
++    for tid, kind, payload, at in conn.execute(
++            "SELECT e.task_id, e.kind, e.payload, e.created_at FROM task_events e WHERE e.id IN ("
++            "SELECT MAX(id) FROM task_events WHERE task_id IN (SELECT value FROM json_each(?)) "
++            f"AND kind IN ({kph}) GROUP BY task_id)", (json.dumps(list(parked)), *kwi.PARK_EVENT_KINDS)):
++        events[str(tid)] = (kind, payload, at)
++    return parked, events
++
++
++def _board(n: int) -> sqlite3.Connection:
++    """``n`` cards in every status, each with a mixed event history: several park kinds (the newest is not always
++    the last event), non-park noise, REAL / integer / NULL ``created_at``, NULL and BLOB payloads, a card with no
++    park event at all, and an id the board does not have."""
++    conn = sqlite3.connect(":memory:")
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, block_kind TEXT, human_request TEXT, "
++        "awaiting TEXT, session_id TEXT);"
++        "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER, "
++        "kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL);"
++        "CREATE INDEX idx_events_task ON task_events(task_id, created_at);"
++        "CREATE INDEX idx_events_kind_task_id ON task_events(kind, task_id, id);")
++    statuses = ("scheduled", "blocked", "triage", "running", "done", "todo")
++    park_kinds = kwi.PARK_EVENT_KINDS
++    for i in range(n):
++        tid = f"t{i:03d}"
++        conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)", (
++            tid, f"card {i}", statuses[i % len(statuses)], ("time", None, "needs_input", "dependency")[i % 4],
++            json.dumps({"ask": f"q{i}"}) if i % 5 == 0 else None,
++            json.dumps({"kind": ("ci", "deploy", "clock")[i % 3], "ref": f"r{i}", "why": "w"}) if i % 2 else None,
++            f"s{i % 3}"))
++        if i % 7 == 3:
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)",
++                         (tid,))
++            continue  # parked or not, no park event: the old GROUP BY emits nothing for it
++        for j in range(6 + i % 4):
++            kind = park_kinds[(i + j) % len(park_kinds)]
++            at = (1_700_000_000 + i * 100 + j + 0.123456789123) if (i + j) % 3 == 0 else 1_700_000_000 + i * 100 + j
++            payload: object = json.dumps({"reason": f"r{i}-{j}", "awaiting": {"kind": "ci", "ref": f"r{i}"}})
++            if j % 5 == 4:
++                payload = None
++            if (i, j) == (8, 5):  # t008's newest park event (triage)
++                payload = sqlite3.Binary(b'{"reason": "blob"}')
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                         (tid, kind, payload, at))
++            conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'comment', 'x', ?)",
++                         (tid, at))
++    conn.commit()
++    return conn
++
++
++def _ids(conn):
++    return [r[0] for r in conn.execute("SELECT id FROM tasks ORDER BY id DESC")] + ["missing"]
++
++
++@pytest.mark.parametrize("factory", [None, sqlite3.Row])
++def test_wait_rows_answer_exactly_as_before_order_and_types_included(factory):
++    conn = _board(60)
++    conn.row_factory = factory
++    ids = _ids(conn)
++    new, old = _local_wait_rows(conn, ids), _old_local_wait_rows(conn, ids)
++    assert new == old and repr(list(new[0].items())) == repr(list(old[0].items()))
++    assert repr(sorted(new[1].items())) == repr(sorted(old[1].items()))
++    assert any(isinstance(at, float) for _k, _p, at in new[1].values())
++    assert any(isinstance(p, bytes) for _k, p, _a in new[1].values())
++    now = 1_700_009_999.0
++    assert repr(_describe_waits(*new, now=now)) == repr(_describe_waits(*old, now=now))
++
++
++def test_wait_rows_hand_out_the_same_rows_for_any_number_of_parked_cards():
++    work = []
++    for n in (12, 120):
++        conn = Counting(_board(n))
++        parked, events = _local_wait_rows(conn, _ids(conn.conn))
++        assert len(parked) >= n // 2 and len(events) >= n // 3
++        work.append((conn.statements, conn.rows))
++    # Old reader: one row per parked card and one per newest park event (~180 rows for 120 cards).
++    assert work[0] == work[1] and work[1][1] <= 4, work
++
++
++def test_wait_rows_probe_the_newest_park_event_through_the_kind_index(monkeypatch):
++    import hermes_state_page_pack
++
++    conn = _board(30)
++    seen: list[tuple[str, tuple]] = []
++    real = hermes_state_page_pack.read_rows
++
++    def spy(c, sql, params, width):
++        seen.append((sql, tuple(params)))
++        return real(c, sql, params, width)
++
++    monkeypatch.setattr(hermes_state_page_pack, "read_rows", spy)
++    _local_wait_rows(conn, _ids(conn))
++    (sql, params), = [(s, p) for s, p in seen if "FROM task_events e" in s]
++    plan = " | ".join(r[3] for r in conn.execute("EXPLAIN QUERY PLAN " + sql, params))
++    # Not idx_events_task (task_id, created_at), which walked every event of each card.
++    assert "idx_events_kind_task_id" in plan and "idx_events_task " not in plan + " ", plan
++
++
++def test_a_board_without_task_events_keeps_status_only_rows():
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
++    conn.execute("INSERT INTO tasks VALUES ('a', 'blocked'), ('b', 'running')")
++    assert _local_wait_rows(conn, ["a", "b"]) == ({"a": ("blocked", None, None, None)}, {})
++
++
++def test_contained_read_needs_no_schema_probe():
++    from hermes_cli import kanban_contained_wait
++
++    conn = _board(10)
++    statements: list[str] = []
++    conn.set_trace_callback(statements.append)
++    assert kanban_contained_wait.read(conn, _ids(conn)) == {}  # a board without containment_episode
++    assert kanban_contained_wait.read(sqlite3.connect(":memory:"), ["a"]) == {}  # nor a tasks table
++    conn.execute("ALTER TABLE tasks ADD COLUMN containment_episode TEXT")
++    assert kanban_contained_wait.read(conn, _ids(conn)) == {}
++    # The old read probed ``PRAGMA table_info(tasks)``: one row per column, on every board read.
++    assert not [s for s in statements if "table_info" in s.lower()], statements
++
++
++def _external_board(conn, n):
++    tids = [park(conn, 9000 + i) for i in range(n)]
++    return [(f"s{i % 3}", t) for i, t in enumerate(tids)]
++
++
++def test_session_external_answers_as_before_and_hands_out_o1_rows(kanban_home, gh, clock, monkeypatch):
++    from hermes_state_page_pack import read_rows as packed
++
++    def unpacked(conn, sql, params, width):
++        """The transport before: the same statement, one Python row per result row."""
++        return [tuple(row) for row in conn.execute(sql, params)]
++
++    work = []
++    with kbc.connect_closing() as conn:
++        pairs = _external_board(conn, 4)
++        tick(conn, gh, clock, 0)
++        for extra in (0, 12):
++            if extra:
++                pairs += _external_board(conn, extra)
++                tick(conn, gh, clock)
++            now = clock.now + 1
++            counted = Counting(conn)
++            got = kea.read_session_external(counted, pairs, now, strict=False)
++            work.append(counted.rows)
++            monkeypatch.setattr("hermes_state_page_pack.read_rows", unpacked)
++            try:
++                assert json.dumps(kea.read_session_external(conn, pairs, now, strict=False)) == json.dumps(got)
++            finally:
++                monkeypatch.setattr("hermes_state_page_pack.read_rows", packed)
++            assert sum(slot["counts"][0] for slot in got.values()) == len(pairs)
++            assert all(card["title"].startswith("card ") for slot in got.values() for card in slot["cards"])
++    # 4 cards vs 16 cards: the same rows handed out (the old read grew by ~4 rows per card).
++    assert work[0] == work[1], work
++
++
++def test_card_states_keep_only_scheduled_cards(kanban_home, gh, clock):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_external_watch as kew
++
++    with kbc.connect_closing() as conn:
++        a, b = park(conn, 9101), park(conn, 9102)
++        tick(conn, gh, clock, 0)
++        other = kb.create_task(conn, title="plain", assignee="worker")
++        counted = Counting(conn)
++        got = kew.card_states(counted, [a, other, "missing", b], now=time.time())
++        assert set(got) == {a, b}
++
++
++def test_read_rows_is_fetchall_in_one_statement_and_one_row():
++    from hermes_state_page_pack import read_rows
++
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE v (a, b, c)")
++    values = [(1, "x", None), (2.5, b"\x00\xff", 0.1 + 0.2), (-7, "", 1_700_000_000.123456789),
++              (2**62, "é\"'\\", float("inf")), (3, None, 1e-300)]
++    conn.executemany("INSERT INTO v VALUES (?, ?, ?)", values)
++    sql, params = "SELECT a, b, c FROM v WHERE a != ? ORDER BY rowid DESC", (3,)
++    statements: list[str] = []
++    conn.set_trace_callback(statements.append)
++    got = read_rows(conn, sql, params, 3)
++    conn.set_trace_callback(None)
++    want = conn.execute(sql, params).fetchall()
++    assert got == want and [tuple(map(type, r)) for r in got] == [tuple(map(type, r)) for r in want]
++    assert len(statements) == 1
++    assert read_rows(conn, "SELECT a FROM v WHERE 0", (), 1) == []
++    with pytest.raises(sqlite3.Error):
++        read_rows(conn, sql, params, 2)  # a wrong width fails at prepare, never a silent reshape
+-- 
+2.43.0
+

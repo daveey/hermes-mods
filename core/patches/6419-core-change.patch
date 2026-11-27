@@ -1,0 +1,1063 @@
+From d1ef3b29dc7ce9289f914ec79d6e191662019327 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:22:26 +0000
+Subject: [PATCH 6419] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit d1ef3b29dc7ce9289f914ec79d6e191662019327.
+
+---
+diff --git a/hermes_cli/kanban_spend_caused_review.py b/hermes_cli/kanban_spend_caused_review.py
+new file mode 100644
+index 00000000000..076428da7fb
+--- /dev/null
++++ b/hermes_cli/kanban_spend_caused_review.py
+@@ -0,0 +1,242 @@
++"""Caused spend stops: advisory classification, canonical-only settlement. [daveey]
++
++No local scope renewal or human identity is minted here. Board revalidates all
++mutable premises; an authenticated receipt is historical settlement, not local
++execution clearance. Normal sync delivers the resulting lifecycle rows.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import uuid
++import time
++
++CAUSES = frozenset({"scope_stopped", "capability_unavailable"})
++PROMPT = """Review this stopped card against its original acceptance, not an agent's narrower run mandate.
++Return JSON only with decision release, wait_on, archive, or escalate and a nonempty reason.
++release: remaining work belongs to this card; quote at least 30 characters verbatim from evidence
++in remaining_quote. The canonical operation grants a fixed ten-run round, never a custom budget.
++wait_on: target is an explicitly named open prerequisite card. archive: target is an explicitly
++named done/archived replacement. Include target only for wait_on/archive. If uncertain, escalate.
++Safety restrictions cannot be reviewed or released. Capability availability is not inferred from prose.
++"""
++
++
++def record(raw):
++    try:
++        value = json.loads(raw or "{}") if isinstance(raw, str) else raw
++    except (ValueError, TypeError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def effective_cause(conn, task_id, stop):
++    """Annotations belong to the exact episode; safety dominates even ordinary roots."""
++    from hermes_cli.kanban_refusal_receipt import restricted
++    if restricted(conn, task_id):
++        return "safety_refusal"
++    episode = stop.get("uid") or str(stop["id"])
++    causes = [record(stop.get("payload")).get("cause")]
++    for kind, raw in conn.execute("SELECT kind,payload FROM task_events WHERE task_id=? AND kind IN "
++                                  "('decision_hold_restricted','decision_retained')", (task_id,)):
++        p = record(raw)
++        if kind == "decision_hold_restricted" and p.get("episode") == episode:
++            causes.append(p.get("cause"))
++        if kind == "decision_retained" and p.get("episode_uid") == episode:
++            causes.append("safety_refusal" if p.get("superseded_by_safety_stop") is True
++                          else record(p.get("disposition")).get("reason"))
++    for cause in ("safety_refusal", "capability_unavailable", "scope_stopped"):
++        if cause in causes:
++            return cause
++    return next((c for c in causes if c), None)
++
++
++def fenced(conn, task_id):
++    from hermes_cli.kanban_containment_guard import pending
++    from hermes_cli.kanban_stop_ended import stopped_at
++    from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
++    row = conn.execute("SELECT status,human_request,block_kind,current_run_id FROM tasks WHERE id=?",
++                       (task_id,)).fetchone()
++    return (row is None or row[0] != "triage" or bool(row[1]) or row[2] in HUMAN_BLOCK_KINDS
++            or row[3] is not None or pending(conn, task_id) or stopped_at(conn, task_id) is not None)
++
++
++def grant_count(conn, task_id):
++    """Conservative count: agent budget edits never reset caused-stop grants."""
++    episodes = set()
++    for kind, raw, uid in conn.execute("SELECT kind,payload,id FROM task_events WHERE task_id=? AND kind IN "
++                                       "('spend_review','spend_review_granted','spend_review_settled')", (task_id,)):
++        p = record(raw)
++        if kind == "spend_review_granted" or p.get("verdict") == "release":
++            episodes.add(p.get("episode") or str(uid))
++    return len(episodes)
++
++
++def enrich(conn, task_id, stop, ctx):
++    cause = effective_cause(conn, task_id, stop)
++    if cause is None:
++        return ctx
++    ctx["cause"] = cause
++    # Board is the definitive window validator. This bounded advisory corpus must
++    # never confer authority; an overinclusive old quote is refused there.
++    texts = [record(stop.get("payload")).get("reason") or ""]
++
++    texts += [c["body"] for c in ctx["comments"] if c["in_window"] and c["author"] not in
++              {"kanban-spend-reviewer", "kanban-spend-budget"}]
++    for raw, in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='decision_retained'",
++                             (task_id,)):
++        p = record(raw)
++        if p.get("episode_uid") == (stop.get("uid") or str(stop["id"])):
++            texts.append(str(record(p.get("disposition")).get("summary") or "")[:2000])
++    ctx["target_evidence"] = [text for text in texts if text]
++    ctx["evidence"] = ctx["target_evidence"] + [r["summary"] for r in ctx["runs"] if r["summary"]]
++    return ctx
++
++
++def validate(verdict, ctx):
++    """Return only bounded v1 wire fields, never model-supplied identity."""
++    choice = verdict.get("decision")
++    reason = verdict.get("reason")
++    if choice not in {"release", "wait_on", "archive", "escalate"}:
++        raise ValueError("invalid caused-stop decision")
++    if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 2000:
++        raise ValueError("missing or oversized reason")
++    fields = {"verdict": choice, "reason": reason.strip()}
++    if choice == "release":
++        # Board independently checks its trusted live registry and placement.
++        # Neither model prose nor a local machine snapshot attests capability.
++        quote = verdict.get("remaining_quote")
++        if (not isinstance(quote, str) or not 30 <= len(quote.strip()) <= 2000
++                or not any(quote.strip() in text for text in ctx.get("evidence", []))):
++            raise ValueError("no verbatim remaining-work quote")
++        fields["quote"] = quote.strip()
++    if choice in {"wait_on", "archive"}:
++        target = verdict.get("target")
++        if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,200}", target):
++            raise ValueError("invalid target")
++        if target == ctx["task_id"] or not any(re.search(
++                r"(?<![A-Za-z0-9._:-])" + re.escape(target) + r"(?![A-Za-z0-9._:-])", text)
++                for text in ctx.get("target_evidence", [])):
++            raise ValueError("target is not named in stop evidence")
++        fields["target"] = target
++    return fields
++
++
++class Refused(ValueError):
++    """An exact canonical response definitively refused this request."""
++
++
++class Unconfirmed(ValueError):
++    """The original request remains pending; never choose a replacement verdict."""
++
++
++def canonical(conn, task_id, episode, fields, max_grants, *, resend=True):
++    """Authenticated v1 operation and exact receipt readback; no local release fallback."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    state = sync.sync_state(conn)
++    if not state or sync.board_mode(conn) != "primary":
++        raise ValueError("caused-stop review needs the active canonical primary Board")
++    board = state["board_id"]
++    # Fixed per-episode identity: uncertain transport must not mint another grant.
++    uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"spend-review:{board}:{task_id}:{episode}"))
++    wire = {"client_op_id": uid, "op": "spend_review", "task": task_id, "event_uid": uid,
++            "episode": episode, "max_grants": min(max_grants, 2), **fields}
++    from hermes_cli import kanban_spend_review_request as journal
++    prior = journal.get(conn, task_id, episode)
++    if prior and "refused" in prior:
++        raise Refused(prior["refused"])
++    hub = client.Hub(client.load_identity(), deadline=time.monotonic() + 90)
++    try:
++        if prior:
++            if prior["board"] != board or prior["gateway"] != hub.ident.gateway:
++                raise Unconfirmed("frozen request belongs to another Board or gateway")
++            wire = prior["wire"]
++        else:
++            capability = hub.decision_retain_capability(board)
++            if not isinstance(capability, dict) or type(capability.get("spend_review")) is not int or capability["spend_review"] != 1:
++                raise ValueError("Board spend_review v1 unavailable")
++            wire = journal.freeze(conn, board, hub.ident.gateway, wire)["wire"]
++        uid = wire["event_uid"]
++        fields = wire
++        digest = hashlib.sha256(json.dumps(wire, sort_keys=True, separators=(",", ":"),
++                                         ensure_ascii=False).encode()).hexdigest()
++        proof = hub.row_evidence(board, "task_events", uid) if prior else None
++        if not isinstance(proof, dict) or proof.get("state") != "live":
++            if not resend:
++                raise Unconfirmed("frozen request readback pending; current holds prohibit resubmission")
++            client.push(conn, hub, board, hub.ident.gateway, primary=True)
++            reply = hub.ops(board, [wire])
++            results = reply.get("results") if isinstance(reply, dict) else None
++            if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
++                    or results[0].get("client_op_id") != uid):
++                raise Unconfirmed("unknown canonical reply")
++            if results[0].get("status") == "rejected":
++                reason = f"canonical spend review refused: {results[0].get('reason')}"
++                journal.refuse(conn, task_id, episode, reason)
++                raise Refused(reason)
++            if results[0].get("status") != "applied":
++                raise Unconfirmed("unknown canonical status")
++            proof = hub.row_evidence(board, "task_events", uid)
++        row = proof.get("row") if isinstance(proof, dict) and proof.get("state") == "live" else None
++        p = record(row.get("payload")) if isinstance(row, dict) else {}
++        expected = {"version": 1, "task": task_id, "episode": episode, "verdict": fields["verdict"],
++                    "runs": 10 if fields["verdict"] == "release" else None,
++                    "reason": fields["reason"], "quote": fields.get("quote"), "target": fields.get("target"),
++                    "max_grants": wire["max_grants"], "request_uid": uid, "request_sha256": digest,
++                    "actor_kind": "system", "actor_session": None, "actor_gateway": hub.ident.gateway,
++                    "authority_kind": "spend_reviewer", "authority_ref": "kanban-spend-reviewer"}
++        if (not isinstance(proof, dict) or proof.get("board") != board
++                or proof.get("table") != "task_events" or proof.get("uid") != uid
++                or not isinstance(row, dict) or row.get("uid") != uid or row.get("task_id") != task_id
++                or row.get("kind") != "spend_review" or row.get("version") != 1
++                or row.get("deleted_at") is not None or row.get("origin_gateway") != hub.ident.gateway
++                or any(k not in p or p[k] != value for k, value in expected.items())):
++            raise ValueError("canonical spend review receipt mismatch")
++        return p
++    finally:
++        hub.close()
++
++
++def review(conn, task_id, episode, verdict, ctx):
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli.kanban_wake_check import foreign_copy
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_spend_review_request as journal
++    frozen = journal.get(conn, task_id, episode)
++    try:
++        stop = decision.pending_episode(conn, task_id)
++        enabled, cap = reviewer.settings()
++        allowed = (stop is not None and reviewer.episode_of(stop) == episode and not fenced(conn, task_id)
++                   and not foreign_copy(conn, task_id) and not reviewer._disposed(conn, task_id, episode)
++                   and not reviewer._human_after_stop(conn, task_id, stop) and enabled
++                   and effective_cause(conn, task_id, stop) in CAUSES
++                   and grant_count(conn, task_id) < min(cap, 2))
++        if reviewer.state(conn, task_id, episode) != reviewer.STARTED:
++            return "moot"
++        if frozen:
++            receipt = canonical(conn, task_id, episode, {}, cap, resend=allowed)
++        else:
++            if not allowed or effective_cause(conn, task_id, stop) != ctx.get("cause"):
++                raise ValueError("stop changed or another hold is active")
++            fields = validate(verdict, ctx)
++            receipt = canonical(conn, task_id, episode, fields, cap)
++    except Refused as exc:
++        result = reviewer.escalate(conn, task_id, episode, str(exc))
++        if result == "moot":
++            with kb.write_txn(conn):
++                kb._append_event(conn, task_id, reviewer.ESCALATED, {"episode": episode, "reason": str(exc)})
++        return result
++    except (ValueError, OSError, RuntimeError) as exc:
++        if journal.get(conn, task_id, episode):
++            reviewer.logger.warning("kanban: frozen spend review %s awaits reconciliation: %s", task_id, exc)
++            return "pending"
++        return reviewer.escalate(conn, task_id, episode, f"caused-stop review not confirmed: {exc}")
++    if receipt["verdict"] == "escalate":
++        return reviewer.escalate(conn, task_id, episode, receipt["reason"])
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, reviewer.SETTLED, {"episode": episode,
++                         "receipt_uid": receipt["request_uid"], "verdict": receipt["verdict"]})
++    return "settled"  # canonical effect confirmed; normal sync, not this helper, projects clearance
+diff --git a/hermes_cli/kanban_spend_review_request.py b/hermes_cli/kanban_spend_review_request.py
+new file mode 100644
+index 00000000000..9aab0ce9627
+--- /dev/null
++++ b/hermes_cli/kanban_spend_review_request.py
+@@ -0,0 +1,53 @@
++"""Local durable outbox for a single immutable caused-stop decision. [daveey]
++
++This is not sync authority: only authenticated Board receipt readback settles it.
++Keep completed requests too, so no later invocation can replace their bytes.
++"""
++from __future__ import annotations
++
++import json
++
++TABLE = "spend_review_requests"
++
++
++def exists(conn):
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone() is not None
++
++
++def requests(conn):
++    if not exists(conn):
++        return []
++    return [json.loads(row[0]) for row in conn.execute(f"SELECT request FROM {TABLE}")]
++
++
++def get(conn, task, episode):
++    if not exists(conn):
++        return None
++    row = conn.execute(f"SELECT request FROM {TABLE} WHERE task=? AND episode=?", (task, episode)).fetchone()
++    return json.loads(row[0]) if row else None
++
++
++def freeze(conn, board, gateway, wire):
++    from hermes_cli import kanban_db as kb
++    # Network submission must never precede the outermost durable COMMIT.
++    if conn.in_transaction:
++        raise ValueError("cannot freeze a review inside another transaction")
++    with kb.write_txn(conn):
++        conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task TEXT NOT NULL, episode TEXT NOT NULL, "
++                     "request TEXT NOT NULL, PRIMARY KEY(task,episode))")
++        request = {"board": board, "gateway": gateway, "wire": wire}
++        conn.execute(f"INSERT OR IGNORE INTO {TABLE} VALUES (?,?,?)",
++                     (wire["task"], wire["episode"], json.dumps(request, ensure_ascii=False)))
++        frozen = get(conn, wire["task"], wire["episode"])
++        assert frozen is not None
++        return frozen
++
++
++def refuse(conn, task, episode, reason):
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        request = get(conn, task, episode)
++        assert request is not None
++        request["refused"] = reason
++        conn.execute(f"UPDATE {TABLE} SET request=? WHERE task=? AND episode=?",
++                     (json.dumps(request, ensure_ascii=False), task, episode))
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 72c30339130..7bab114fb0d 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -1,4 +1,10 @@
+-"""Immediate review of an ordinary spend stop, so a stopped card never waits for an idle chat. [daveey]
++"""Immediate ordinary-stop review and delayed canonical caused-stop review. [daveey]
++
++Scope/capability stops use ``kanban_spend_caused_review`` after the configured
++notice delay. Safety stops are excluded. Caused verdicts never use local grant
++or renewal: only the Board spend_review operation can settle them, with exact
++authenticated receipt readback. Lifecycle projection remains normal sync's job.
++The ordinary-stop behavior described below is unchanged.
+ 
+ Before this, a spend stop (``kanban_spend_budget.hold``) asked the creator chat to decide, or opened a
+ decision card when no chat was live. Representative observation: chats and
+@@ -52,7 +58,8 @@
+ STARTED = "spend_review_started"
+ GRANTED = "spend_review_granted"
+ ESCALATED = "spend_review_escalated"
+-KINDS = (QUEUED, STARTED, GRANTED, ESCALATED)
++SETTLED = "spend_review_settled"
++KINDS = (QUEUED, STARTED, GRANTED, ESCALATED, SETTLED)
+ AUTHOR = "kanban-spend-reviewer"
+ TIMEOUT = 90
+ LEASE_SECONDS = 300
+@@ -119,6 +126,11 @@
+ def holds(conn: sqlite3.Connection, task_id: str, episode: str) -> bool:
+     """While a review is queued or running the stop needs no other decision route. With the reviewer off, a
+     queued or running review holds nothing: the stop routes as usual."""
++    from hermes_cli.kanban_spend_caused_review import effective_cause
++    from hermes_cli.kanban_spend_decision import pending_episode
++    stop = pending_episode(conn, task_id)
++    if stop and effective_cause(conn, task_id, stop) == "safety_refusal":
++        return False
+     return state(conn, task_id, episode) in (QUEUED, STARTED) and settings()[0]
+ 
+ 
+@@ -150,16 +162,21 @@
+     from hermes_cli import kanban_spend_decision as decision
+     from hermes_cli.kanban_refusal_receipt import restricted
+     from hermes_cli.kanban_wake_check import foreign_copy
++    from hermes_cli import kanban_spend_caused_review as caused
+     enabled, max_grants = cfg or settings()
+     if not enabled or state(conn, task_id, episode) is not None or foreign_copy(conn, task_id):
+         return False
+-    if decision.execution_restricted(conn, task_id) or restricted(conn, task_id) or _disposed(conn, task_id, episode):
++    if restricted(conn, task_id) or _disposed(conn, task_id, episode):
+         return False
+     stop = decision.pending_episode(conn, task_id)
+     if stop is None or episode_of(stop) != episode or _human_after_stop(conn, task_id, stop):
+         return False
+-    if _payload(stop.get("payload")).get("cause"):
+-        return False  # e.g. capability_unavailable: more runs meet the same wall, so there is no budget to judge
++    cause = caused.effective_cause(conn, task_id, stop)
++    if cause in caused.CAUSES:
++        if caused.fenced(conn, task_id) or caused.grant_count(conn, task_id) >= min(max_grants, 2):
++            return False
++    elif cause or decision.execution_restricted(conn, task_id):
++        return False
+     row = conn.execute("SELECT created_by FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     if row is None or row[0] == "kanban-spend-budget" or conn.execute(
+             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'administrative_decision'", (task_id,)).fetchone():
+@@ -174,11 +191,18 @@
+ 
+ 
+ def queue(conn: sqlite3.Connection, task_id: str, episode: str, *, backlog: bool = False,
+-          cfg: Optional[tuple[bool, int]] = None) -> bool:
++          cfg: Optional[tuple[bool, int]] = None, now: Optional[int] = None) -> bool:
+     """Inside the caller's write transaction: queue one review of ``episode`` when eligible."""
+     from hermes_cli import kanban_db as kb
+     if not eligible(conn, task_id, episode, cfg):
+         return False
++    from hermes_cli import kanban_spend_caused_review as caused
++    from hermes_cli.kanban_spend_decision import pending_episode
++    if caused.effective_cause(conn, task_id, pending_episode(conn, task_id)) in caused.CAUSES:
++        noticed = _notice_at(conn, task_id, episode)
++        clock = int(time.time()) if now is None else now
++        if not backlog or noticed is None or noticed > clock - review_after_seconds():
++            return False  # caused stops first receive the ordinary owner route and delay
+     kb._append_event(conn, task_id, QUEUED, {"episode": episode, "backlog": backlog})
+     return True
+ 
+@@ -215,22 +239,33 @@
+     for (task_id,) in rows:
+         episode = None if task_id in skip else _current_episode(conn, task_id)
+         noticed = _notice_at(conn, task_id, episode) if episode else None
+-        if noticed is None or noticed > now - delay or not eligible(conn, task_id, episode, cfg):
++        if episode is None or noticed is None or noticed > now - delay or not eligible(conn, task_id, episode, cfg):
+             continue
+         with kb.write_txn(conn):
+-            if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True, cfg=cfg):
++            if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True, cfg=cfg, now=now):
+                 queued.append(task_id)
+     return queued
+ 
+ 
+ def _due(conn: sqlite3.Connection, now: int, skip) -> list[tuple[str, str, int]]:
++    from hermes_cli import kanban_spend_review_request as journal
++    frozen = journal.requests(conn)
+     rows = conn.execute("SELECT DISTINCT e.task_id FROM task_events e JOIN tasks t ON t.id = e.task_id "
+                         "WHERE e.kind = ? AND t.status = 'triage'", (QUEUED,)).fetchall()
++    candidates = {(task_id, _current_episode(conn, task_id)) for (task_id,) in rows}
++    candidates.update((r["wire"]["task"], r["wire"]["episode"]) for r in frozen)
+     due = []
+-    for (task_id,) in rows:
+-        episode = _current_episode(conn, task_id)
++    for task_id, episode in sorted(candidates, key=str):
+         if task_id in skip or episode is None:
+             continue
++        from hermes_cli import kanban_spend_caused_review as caused
++        from hermes_cli.kanban_spend_decision import pending_episode
++        stop = pending_episode(conn, task_id)
++        cause = caused.effective_cause(conn, task_id, stop) if stop else None
++        if cause and not journal.get(conn, task_id, episode):
++            noticed = _notice_at(conn, task_id, episode)
++            if cause not in caused.CAUSES or noticed is None or noticed > now - review_after_seconds():
++                continue  # an annotation cannot inherit an ordinary stop's immediate start
+         events = _review_events(conn, task_id, episode)
+         if not events or events[-1]["kind"] not in (QUEUED, STARTED):
+             continue
+@@ -245,6 +280,7 @@
+     """Queue the backlog and start every due review this process has room for. Returns started task ids."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_wake_check import foreign_ids
++    from hermes_cli import kanban_spend_review_request as journal
+     cfg = settings()
+     if not cfg[0]:
+         return []
+@@ -254,7 +290,7 @@
+     _THREADS[:] = [t for t in _THREADS if t.is_alive()]  # a long-lived dispatcher keeps only running reviews
+     db, started = _db_path(conn), []
+     for task_id, episode, attempts in _due(conn, now, skip):
+-        if attempts >= MAX_ATTEMPTS:
++        if attempts >= MAX_ATTEMPTS and not journal.get(conn, task_id, episode):
+             escalate(conn, task_id, episode, f"the spend reviewer did not finish after {attempts} attempts")
+             continue
+         with _LOCK:
+@@ -328,10 +364,11 @@
+     corpus = [r["summary"] for r in runs] + [c["body"] for c in comments
+                                                if c["in_window"] and c["author"] not in _SYSTEM_AUTHORS]
+     allowance = int((payload.get("limits") or {}).get("runs") or 0)
+-    return {"task_id": task_id, "title": task.title, "body": _clip(task.body, 4000),
++    from hermes_cli.kanban_spend_caused_review import enrich
++    return enrich(conn, task_id, stop, {"task_id": task_id, "title": task.title, "body": _clip(task.body, 4000),
+             "stop": {"limit": payload.get("limit"), "runs_spent": payload.get("runs"), "allowance": allowance,
+                      "reason": payload.get("reason")},
+-            "runs": runs, "comments": comments, "_corpus": _norm("\n".join(corpus)), "_cap": _cap(allowance)}
++            "runs": runs, "comments": comments, "_corpus": _norm("\n".join(corpus)), "_cap": _cap(allowance)})
+ 
+ 
+ def _cap(allowance: int) -> int:
+@@ -362,6 +399,8 @@
+     None when it is unavailable, late, routed outside subscription billing, or not JSON."""
+     from agent import auxiliary_client as aux
+     from hermes_cli.kanban_hub_admission import _bounded, _owner_scope
++    from hermes_cli.kanban_spend_caused_review import PROMPT as CAUSED_PROMPT
++    prompt = CAUSED_PROMPT if ctx.get("cause") else PROMPT
+     user = {k: v for k, v in ctx.items() if not k.startswith("_")}
+     route: dict = {}
+     deadline = time.monotonic() + TIMEOUT
+@@ -371,7 +410,7 @@
+             return aux.call_llm(
+                 task="kanban_spend_review", model="class:standard", timeout=TIMEOUT, max_tokens=800,
+                 temperature=0, route_info=route,
+-                messages=[{"role": "system", "content": PROMPT.replace("CAP", str(ctx["_cap"]))},
++                messages=[{"role": "system", "content": prompt.replace("CAP", str(ctx["_cap"]))},
+                           {"role": "user", "content": json.dumps(user, ensure_ascii=False)}])
+ 
+     with _owner_scope():
+@@ -388,7 +427,7 @@
+ def parse(content: Any) -> Optional[dict]:
+     match = re.search(r"\{[\s\S]*\}", str(content or ""))
+     data = _payload(match.group(0)) if match else {}
+-    return data if data.get("decision") in ("grant", "escalate") else None
++    return data if data.get("decision") in ("grant", "escalate", "release", "wait_on", "archive") else None
+ 
+ 
+ def check_grant(verdict: dict, ctx: dict) -> tuple[Optional[int], str]:
+@@ -406,9 +445,15 @@
+ 
+ def review(conn: sqlite3.Connection, task_id: str, episode: str) -> str:
+     """Judge one stop and apply the verdict. Returns ``granted``, ``escalated`` or ``moot``."""
++    from hermes_cli import kanban_spend_review_request as journal
++    if journal.get(conn, task_id, episode):
++        from hermes_cli.kanban_spend_caused_review import review as reconcile
++        return reconcile(conn, task_id, episode, None, None)
+     ctx = context(conn, task_id, episode)
+     if ctx is None or state(conn, task_id, episode) != STARTED:
+         return "moot"
++    if ctx.get("cause") == "safety_refusal":
++        return escalate(conn, task_id, episode, "safety stops are excluded from spend review")
+     try:
+         verdict = judge(ctx)
+     except Exception as exc:  # health: allow BLE001 -- an unavailable judge escalates, never grants
+@@ -416,6 +461,9 @@
+         verdict = None
+     if verdict is None:
+         return escalate(conn, task_id, episode, "the reviewer model was unavailable")
++    if ctx.get("cause"):
++        from hermes_cli.kanban_spend_caused_review import review as caused_review
++        return caused_review(conn, task_id, episode, verdict, ctx)
+     if verdict["decision"] == "grant":
+         runs, why = check_grant(verdict, ctx)
+         if runs is not None:
+@@ -459,7 +507,8 @@
+         return "the consecutive reviewer grant cap was reached"
+     if row[1] or row[2] in HUMAN_BLOCK_KINDS:
+         return "the card waits on a human"
+-    if decision.execution_restricted(conn, task_id) or decision.execution_refusal(conn, task_id):
++    from hermes_cli.kanban_spend_caused_review import effective_cause
++    if effective_cause(conn, task_id, stop) or decision.execution_restricted(conn, task_id) or decision.execution_refusal(conn, task_id):
+         return "the stop is a scope or safety stop"
+     if _disposed(conn, task_id, episode):
+         return "a closed decision card already disposed of the stop"
+diff --git a/tests/hermes_cli/test_kanban_spend_caused_review.py b/tests/hermes_cli/test_kanban_spend_caused_review.py
+new file mode 100644
+index 00000000000..af8f36f3e37
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_caused_review.py
+@@ -0,0 +1,251 @@
++"""Caused-stop integration; fake authenticated Board, never a live Board probe."""
++import hashlib
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_caused_review as caused
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++QUOTE = "Finish the remaining integration and verify the acceptance tests"
++
++
++def stop(conn, cause: str | None = "scope_stopped"):
++    tid = kb.create_task(conn, title="Finish acceptance", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, "spend_budget_triaged", {"cause": cause, "reason": QUOTE})
++    episode = reviewer._current_episode(conn, tid)
++    assert episode is not None
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, decision.NOTICE, {"episode": episode})
++    return tid, episode
++
++
++@pytest.mark.parametrize("cause", ["scope_stopped", "capability_unavailable"])
++@pytest.mark.parametrize("delay", [0, 300, 900])
++def test_caused_stop_delayed_queue(kanban_home, spend_reviewer, monkeypatch, cause, delay):
++    monkeypatch.setattr(reviewer, "review_after_seconds", lambda: delay)
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, cause)
++        noticed = reviewer._notice_at(conn, tid, ep)
++        with kb.write_txn(conn):
++            assert not reviewer.queue(conn, tid, ep)
++            assert not reviewer.queue(conn, tid, ep, backlog=True, now=noticed + delay - 1)
++        assert reviewer.queue_backlog(conn, now=noticed + delay - 1, cfg=(True, 2)) == []
++        assert reviewer.queue_backlog(conn, now=noticed + delay, cfg=(True, 2)) == [tid]
++        assert reviewer.queue_backlog(conn, now=noticed + delay, cfg=(True, 2)) == []
++
++
++@pytest.mark.parametrize("cause", ["scope_stopped", "capability_unavailable", "safety_refusal"])
++def test_late_annotation_cannot_inherit_immediate_start(kanban_home, spend_reviewer, cause):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, None)
++        noticed = reviewer._notice_at(conn, tid, ep)
++        with kb.write_txn(conn):
++            assert reviewer.queue(conn, tid, ep)
++            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": cause})
++        assert reviewer._due(conn, noticed + 299, set()) == []
++        if cause == "safety_refusal":
++            assert reviewer._due(conn, noticed + 300, set()) == []
++            assert not reviewer.holds(conn, tid, ep)
++        else:
++            assert reviewer._due(conn, noticed + 300, set()) == [(tid, ep, 0)]
++
++
++def test_annotation_on_ordinary_episode_and_safety_precedence(kanban_home, spend_reviewer):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, None)
++        root = decision.pending_episode(conn, tid)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": "other", "cause": "scope_stopped"})
++        assert caused.effective_cause(conn, tid, root) is None
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": "scope_stopped"})
++        assert caused.effective_cause(conn, tid, root) == "scope_stopped"
++        assert reviewer.eligible(conn, tid, ep)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": "safety_refusal"})
++        assert caused.effective_cause(conn, tid, root) == "safety_refusal"
++        assert not reviewer.eligible(conn, tid, ep)
++
++
++@pytest.mark.parametrize("fence", ["human", "foreign", "containment", "admin", "cap", "disabled"])
++def test_queue_fences(kanban_home, spend_reviewer, monkeypatch, fence):
++    from hermes_cli import kanban_wake_check, kanban_containment_guard, kanban_stop_ended
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        actions = {
++            "human": lambda: kb.add_comment(conn, tid, "operator", "Wait for me", writer_kind="human"),
++            "foreign": lambda: monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda *a: True),
++            "containment": lambda: monkeypatch.setattr(kanban_containment_guard, "pending", lambda *a: True),
++            "admin": lambda: monkeypatch.setattr(kanban_stop_ended, "stopped_at", lambda *a: 1),
++            "cap": lambda: monkeypatch.setattr(caused, "grant_count", lambda *a: 2),
++            "disabled": lambda: monkeypatch.setattr(reviewer, "settings", lambda: (False, 2)),
++        }
++        actions[fence]()
++        assert not reviewer.eligible(conn, tid, ep)
++
++
++@pytest.fixture
++def board(monkeypatch, kanban_home):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    calls = []
++    class Hub:
++        ident = SimpleNamespace(gateway="home")
++        capability = {"spend_review": 1}
++        mutate = staticmethod(lambda row: None)
++        def decision_retain_capability(self, board):
++            return self.capability
++        def ops(self, board, ops):
++            calls.append(ops[0])
++            return {"results": [{"client_op_id": ops[0]["event_uid"], "status": "applied"}]}
++        def row_evidence(self, board, table, uid):
++            op = calls[-1]
++            payload = {k: op[k] for k in ("task", "episode", "verdict", "reason", "max_grants")}
++            payload.update(version=1, runs=10 if op["verdict"] == "release" else None,
++                           quote=op.get("quote"), target=op.get("target"), request_uid=uid,
++                           request_sha256=hashlib.sha256(json.dumps(op, sort_keys=True, separators=(",", ":"),
++                                                                  ensure_ascii=False).encode()).hexdigest(),
++                           actor_kind="system", actor_session=None, actor_gateway="home",
++                           authority_kind="spend_reviewer", authority_ref="kanban-spend-reviewer")
++            row = dict(uid=uid, task_id=op["task"], kind="spend_review", version=1,
++                       origin_gateway="home", deleted_at=None, payload=json.dumps(payload))
++            self.mutate(row)
++            return {"board": board, "table": table, "uid": uid, "state": "live", "row": row}
++        def close(self):
++            pass
++    hub = Hub()
++    hub.conn = kbc.connect()
++    monkeypatch.setattr(sync, "sync_state", lambda c: {"board_id": "test"})
++    monkeypatch.setattr(sync, "board_mode", lambda c: "primary")
++    monkeypatch.setattr(client, "load_identity", lambda: None)
++    monkeypatch.setattr(client, "Hub", lambda ident, **kw: hub)
++    monkeypatch.setattr(client, "push", lambda *a, **kw: None)
++    yield hub, calls
++    hub.conn.close()
++
++
++@pytest.mark.parametrize("choice", ["release", "wait_on", "archive", "escalate"])
++def test_supported_wire_and_exact_receipt(board, choice):
++    hub, calls = board
++    fields = {"verdict": choice, "reason": "bounded decision"}
++    if choice == "release":
++        fields["quote"] = QUOTE
++    if choice in {"wait_on", "archive"}:
++        fields["target"] = "t_target"
++    receipt = caused.canonical(hub.conn, "t_source", "episode", fields, 9)
++    assert receipt["verdict"] == choice
++    assert calls[0]["max_grants"] == 2
++    assert not set(calls[0]) & {"actor_kind", "actor_session", "authority_kind", "payload"}
++    caused.canonical(hub.conn, "t_source", "episode", fields, 9)
++    assert len(calls) == 1  # receipt reconciles without another submission
++
++
++@pytest.mark.parametrize("field,value", [("origin_gateway", "foreign"), ("uid", "other"),
++                                         ("version", 2), ("task_id", "other"), ("kind", "scope_renewed"),
++                                         ("deleted_at", 1), ("payload", "{}")])
++def test_bad_readback_is_not_success(board, field, value):
++    hub, _calls = board
++    hub.mutate = lambda row: row.update({field: value})
++    with pytest.raises(ValueError, match="receipt mismatch"):
++        caused.canonical(hub.conn, "t_source", "episode", {"verdict": "release", "reason": "ok", "quote": QUOTE}, 2)
++
++
++@pytest.mark.parametrize("capability", [{}, {"spend_review": True}, {"spend_review": 0}, None])
++def test_unknown_capability_never_sends(board, capability):
++    hub, calls = board
++    hub.capability = capability
++    with pytest.raises(ValueError, match="unavailable"):
++        caused.canonical(hub.conn, "t_source", "episode", {"verdict": "escalate", "reason": "ok"}, 2)
++    assert calls == []
++
++
++def test_unsynced_has_no_local_fallback(monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(sync, "sync_state", lambda c: None)
++    with pytest.raises(ValueError, match="canonical"):
++        caused.canonical(None, "t_source", "episode", {}, 2)
++
++
++def test_capability_unknown_and_fabricated_quote_escalate():
++    ctx = {"task_id": "t_source", "cause": "scope_stopped", "evidence": [QUOTE]}
++    verdict = {"decision": "release", "reason": "Finish acceptance", "remaining_quote": QUOTE}
++    assert caused.validate(verdict, ctx)["quote"] == QUOTE
++    with pytest.raises(ValueError, match="verbatim"):
++        caused.validate({**verdict, "remaining_quote": QUOTE.lower()}, ctx)
++    assert caused.validate(verdict, {**ctx, "cause": "capability_unavailable"})["quote"] == QUOTE
++    with pytest.raises(ValueError, match="not named"):
++        caused.validate({"decision": "wait_on", "reason": "wait", "target": "t_other"}, ctx)
++
++
++def test_review_calls_canonical_without_local_renewal(kanban_home, spend_reviewer, board, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        noticed = reviewer._notice_at(conn, tid, ep)
++        assert reviewer.queue_backlog(conn, now=noticed + 300, cfg=(True, 2)) == [tid]
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++            "decision": "release", "reason": "Finish acceptance", "remaining_quote": QUOTE})
++        assert reviewer.review(conn, tid, ep) == "settled"
++        assert reviewer.state(conn, tid, ep) == reviewer.SETTLED
++        assert kb.get_task(conn, tid).status == "triage"  # canonical feed owns projection
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()
++        assert caused.grant_count(conn, tid) == 1
++
++
++@pytest.mark.parametrize("failure", ["unsupported", "unconfirmed", "human_during_judge", "capability"])
++def test_review_escalates_fail_closed(kanban_home, spend_reviewer, board, monkeypatch, failure):
++    hub, calls = board
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, "capability_unavailable" if failure == "capability" else "scope_stopped")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
++        if failure == "unsupported":
++            hub.capability = {}
++        if failure == "unconfirmed":
++            hub.mutate = lambda row: row.update(payload="{}")
++        if failure == "capability":
++            hub.ops = lambda board, ops: {"results": [{"client_op_id": ops[0]["client_op_id"],
++                                                     "status": "rejected", "reason": "capability_unattested"}]}
++        def judge(ctx):
++            if failure == "human_during_judge":
++                kb.add_comment(conn, tid, "operator", "Do not continue", writer_kind="human")
++            return {"decision": "release", "reason": "Finish acceptance", "remaining_quote": QUOTE}
++        monkeypatch.setattr(reviewer, "judge", judge)
++        monkeypatch.setattr(decision, "safe_ensure_producer", lambda *a: None)
++        assert reviewer.review(conn, tid, ep) == ("pending" if failure == "unconfirmed" else "escalated")
++        assert reviewer.state(conn, tid, ep) == (reviewer.STARTED if failure == "unconfirmed" else reviewer.ESCALATED)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()
++        if failure != "unconfirmed":
++            assert calls == []
++
++
++def test_safety_added_after_queue_never_calls_judge(kanban_home, spend_reviewer, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
++            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": "safety_refusal"})
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("safety must not reach judge"))
++        monkeypatch.setattr(decision, "safe_ensure_producer", lambda *a: None)
++        assert reviewer.review(conn, tid, ep) == "escalated"
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_ordinary_grant_cannot_clear_capability_stop(kanban_home, spend_reviewer):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, "capability_unavailable")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
++        assert reviewer.grant(conn, tid, ep, 10, "wrong route", QUOTE) is not None
++        assert kb.get_task(conn, tid).status == "triage"
+diff --git a/tests/hermes_cli/test_kanban_spend_review_http.py b/tests/hermes_cli/test_kanban_spend_review_http.py
+new file mode 100644
+index 00000000000..ba5d8574632
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_http.py
+@@ -0,0 +1,82 @@
++"""Real Hub HTTP boundary with a controlled Board-shaped server, not deployed Board."""
++import hashlib
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from types import SimpleNamespace
++from urllib.parse import parse_qs, urlsplit
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_spend_reviewer as reviewer
++from tests.hermes_cli import test_kanban_spend_review_reconcile as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_actual_http_lost_reply_then_readback(kanban_home, spend_reviewer, monkeypatch):
++    requests = []
++    receipt = {}
++    class Handler(BaseHTTPRequestHandler):
++        def log_message(self, *args):
++            pass
++
++        def respond(self, value):
++            data = json.dumps(value).encode()
++            self.send_response(200)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++        def do_GET(self):
++            assert self.headers["Authorization"] == "Bearer test-only"
++            if self.path.endswith("/decision-retain/capability"):
++                self.respond({"decision_retain": 1, "frozen_replay": 1, "spend_review": 1})
++            else:
++                query = parse_qs(urlsplit(self.path).query)
++                assert query == {"table": ["task_events"], "uid": [receipt["uid"]]}
++                self.respond({"board": "test", "table": "task_events", "uid": receipt["uid"],
++                              "state": "live", "row": receipt})
++
++        def do_POST(self):
++            assert self.path == "/v2/boards/test/ops"
++            op = json.loads(self.rfile.read(int(self.headers["Content-Length"])))["ops"][0]
++            requests.append(op)
++            payload = {k: op[k] for k in ("task", "episode", "verdict", "reason", "max_grants")}
++            payload.update(version=1, quote=op["quote"], target=None, runs=10, request_uid=op["event_uid"],
++                           request_sha256=hashlib.sha256(json.dumps(op, sort_keys=True, separators=(",", ":"),
++                                                                  ensure_ascii=False).encode()).hexdigest(),
++                           actor_kind="system", actor_session=None, actor_gateway="home",
++                           authority_kind="spend_reviewer", authority_ref="kanban-spend-reviewer")
++            receipt.update(uid=op["event_uid"], task_id=op["task"], version=1, kind="spend_review",
++                           origin_gateway="home", deleted_at=None, payload=json.dumps(payload))
++            # Canonical-shaped commit followed by EOF before the HTTP response.
++            self.close_connection = True
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    ident = SimpleNamespace(gateway="home", key="test-only", url=f"http://127.0.0.1:{server.server_port}")
++    monkeypatch.setattr(client, "load_identity", lambda: ident)
++    monkeypatch.setattr(client, "push", lambda *a, **kw: None)
++    monkeypatch.setattr(sync, "sync_state", lambda conn: {"board_id": "test"})
++    monkeypatch.setattr(sync, "board_mode", lambda conn: "primary")
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++        "decision": "release", "reason": "finish", "remaining_quote": helpers.helpers.QUOTE})
++    try:
++        with kbc.connect_closing() as conn:
++            tid, ep = helpers.started(conn)
++            assert reviewer.review(conn, tid, ep) == "pending"
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: (_ for _ in ()).throw(AssertionError("second judge")))
++        with kbc.connect_closing() as conn:
++            assert reviewer.review(conn, tid, ep) == "settled"
++            assert kb.get_task(conn, tid).status == "triage"
++        assert len(requests) == 1
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(5)
++        assert not thread.is_alive()
+diff --git a/tests/hermes_cli/test_kanban_spend_review_reconcile.py b/tests/hermes_cli/test_kanban_spend_review_reconcile.py
+new file mode 100644
+index 00000000000..d2dd6556fc2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_reconcile.py
+@@ -0,0 +1,179 @@
++"""Durable request recovery across connections; no live Board writes."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_caused_review as caused
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_spend_review_request as journal
++from tests.hermes_cli import test_kanban_spend_caused_review as helpers
++
++kanban_home = helpers.kanban_home
++board = helpers.board
++
++
++def started(conn):
++    tid, ep = helpers.stop(conn)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, reviewer.QUEUED, {"episode": ep})
++        kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep, "deadline": 0})
++    return tid, ep
++
++
++@pytest.mark.parametrize("failure", ["lost_reply", "malformed", "deferred", "bad_receipt", "lost_readback"])
++def test_restart_recovers_original_choice(kanban_home, spend_reviewer, board, monkeypatch, failure):
++    hub, calls = board
++    real_ops, real_read = hub.ops, hub.row_evidence
++    def uncertain(board_id, ops):
++        result = real_ops(board_id, ops)
++        if failure == "lost_reply":
++            raise OSError("reply lost after commit")
++        if failure == "malformed":
++            return {"results": [None]}
++        if failure == "deferred":
++            return {"results": [{"client_op_id": ops[0]["client_op_id"], "status": "deferred"}]}
++        return result
++    hub.ops = uncertain
++    if failure == "bad_receipt":
++        hub.mutate = lambda row: row.update(payload="{}")
++    if failure == "lost_readback":
++        def lost(*args):
++            raise OSError("readback unavailable")
++        hub.row_evidence = lost
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++        "decision": "release", "reason": "original decision", "remaining_quote": helpers.QUOTE})
++    with kbc.connect_closing() as conn:
++        tid, ep = started(conn)
++        assert reviewer.review(conn, tid, ep) == "pending"
++        frozen = journal.get(conn, tid, ep)
++        assert frozen["wire"] == calls[0]
++        assert not conn.in_transaction
++    # New connection simulates dispatcher restart; new config/context cannot choose again.
++    hub.ops, hub.row_evidence = real_ops, real_read
++    hub.mutate = lambda row: None
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("second judge choice"))
++    monkeypatch.setattr(reviewer, "settings", lambda: (True, 1))
++    with kbc.connect_closing() as conn:
++        assert reviewer.review(conn, tid, ep) == "settled"
++        assert journal.get(conn, tid, ep) == frozen
++        assert reviewer.review(conn, tid, ep) == "moot"
++        assert len(calls) == 1
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_unknown_absence_resubmits_exact_bytes_not_new_verdict(kanban_home, spend_reviewer, board, monkeypatch):
++    hub, calls = board
++    real_ops, real_read = hub.ops, hub.row_evidence
++    def not_received(board_id, ops):
++        calls.append(ops[0])
++        raise OSError("connection lost before receipt")
++    hub.ops = not_received
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++        "decision": "release", "reason": "frozen", "remaining_quote": helpers.QUOTE})
++    with kbc.connect_closing() as conn:
++        tid, ep = started(conn)
++        assert reviewer.review(conn, tid, ep) == "pending"
++        original = json.dumps(calls[0], sort_keys=True)
++        hub.ops = real_ops
++        reads = []
++        def read(*args):
++            reads.append(args)
++            return {"state": "unknown"} if len(reads) == 1 else real_read(*args)
++        hub.row_evidence = read
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("second judge"))
++        monkeypatch.setattr(reviewer, "settings", lambda: (True, 1))
++        assert reviewer.review(conn, tid, ep) == "settled"
++        assert len(calls) == 2
++        assert json.dumps(calls[1], sort_keys=True) == original
++
++
++@pytest.mark.parametrize("fence", ["safety", "human", "containment", "cap", "episode", "projected"])
++def test_unknown_with_new_fence_read_only(kanban_home, spend_reviewer, board, monkeypatch, fence):
++    hub, calls = board
++    def uncertain(board_id, ops):
++        calls.append(ops[0])
++        raise OSError("unknown")
++    hub.ops = uncertain
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++        "decision": "release", "reason": "frozen", "remaining_quote": helpers.QUOTE})
++    with kbc.connect_closing() as conn:
++        tid, ep = started(conn)
++        assert reviewer.review(conn, tid, ep) == "pending"
++        hub.row_evidence = lambda *a: {"state": "unknown"}
++        if fence == "human":
++            kb.add_comment(conn, tid, "operator", "Wait for me", writer_kind="human")
++        elif fence == "containment":
++            monkeypatch.setattr(caused, "fenced", lambda *a: True)
++        elif fence == "cap":
++            monkeypatch.setattr(caused, "grant_count", lambda *a: 2)
++        else:
++            with kb.write_txn(conn):
++                if fence == "safety":
++                    kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": "safety_refusal"})
++                elif fence == "projected":
++                    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++                else:
++                    kb._append_event(conn, tid, "spend_budget_triaged", {"cause": "scope_stopped"})
++        assert reviewer.review(conn, tid, ep) == "pending"
++        assert len(calls) == 1
++        assert reviewer.state(conn, tid, ep) == reviewer.STARTED
++        # Recovery remains schedulable even after the canonical feed moved the task.
++        assert (tid, ep, 1) in reviewer._due(conn, 9999999999, set())
++
++
++def test_journal_rejects_outer_transaction_and_keeps_first_request(kanban_home):
++    with kbc.connect_closing() as conn:
++        wire = {"task": "t", "episode": "e", "reason": "first"}
++        with kb.write_txn(conn), pytest.raises(ValueError, match="another transaction"):
++            journal.freeze(conn, "b", "g", wire)
++        assert journal.freeze(conn, "b", "g", wire)["wire"] == wire
++        assert journal.freeze(conn, "b", "g", {**wire, "reason": "replacement"})["wire"] == wire
++
++
++def test_refusal_survives_crash_before_escalation(kanban_home, spend_reviewer, board, monkeypatch):
++    hub, calls = board
++    def reject(board_id, ops):
++        calls.append(ops[0])
++        return {"results": [{"client_op_id": ops[0]["client_op_id"], "status": "rejected",
++                             "reason": "capability_unattested"}]}
++    hub.ops = reject
++    with kbc.connect_closing() as conn:
++        tid, ep = started(conn)
++        with pytest.raises(caused.Refused):
++            caused.canonical(conn, tid, ep, {"verdict": "release", "reason": "finish", "quote": helpers.QUOTE}, 2)
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("second choice"))
++    monkeypatch.setattr(helpers.decision, "safe_ensure_producer", lambda *a: None)
++    with kbc.connect_closing() as conn:
++        assert reviewer.review(conn, tid, ep) == "escalated"
++        assert reviewer.state(conn, tid, ep) == reviewer.ESCALATED
++        assert len(calls) == 1
++
++
++def test_frozen_recovery_survives_judge_attempt_cap(kanban_home, spend_reviewer, board, monkeypatch):
++    hub, calls = board
++    real_read = hub.row_evidence
++    hub.row_evidence = lambda *a: {"state": "unknown"}
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++        "decision": "release", "reason": "finish", "remaining_quote": helpers.QUOTE})
++    with kbc.connect_closing() as conn:
++        tid, ep = started(conn)
++        assert reviewer.review(conn, tid, ep) == "pending"
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep, "deadline": 0})
++        hub.row_evidence = real_read
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("second choice"))
++        assert reviewer.start_due(conn, now=9999999999) == [tid]
++        reviewer.wait_for_reviews()
++        assert reviewer.state(conn, tid, ep) == reviewer.SETTLED
++        assert len(calls) == 1
++
++
++def test_target_contract_excludes_run_only_names():
++    verdict = {"decision": "wait_on", "reason": "wait", "target": "t_other"}
++    ctx = {"task_id": "t_source", "evidence": ["run mentioned t_other"], "target_evidence": []}
++    with pytest.raises(ValueError, match="not named"):
++        caused.validate(verdict, ctx)
++    ctx["target_evidence"] = ["stop names t_other"]
++    assert caused.validate(verdict, ctx)["target"] == "t_other"
+-- 
+2.43.0
+

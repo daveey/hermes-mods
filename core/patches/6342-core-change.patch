@@ -1,0 +1,257 @@
+From 0b778b2223592b9ad5c5d460559e42cfd649d1f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:04:29 +0000
+Subject: [PATCH 6342] Recorded governor explanations and lightweight why startup
+
+Public mirror of source commit 0b778b2223592b9ad5c5d460559e42cfd649d1f4.
+
+---
+diff --git a/hermes_cli/kanban_governors.py b/hermes_cli/kanban_governors.py
+index 42e168861d4..330afa1cb82 100644
+--- a/hermes_cli/kanban_governors.py
++++ b/hermes_cli/kanban_governors.py
+@@ -48,7 +48,7 @@
+ from pathlib import Path
+ from typing import Any, Iterator, Optional
+ 
+-from hermes_cli.kanban_why_fast import STALE_SECONDS, SUFFIX, VERSION
++from hermes_cli.kanban_why_fast import STALE_SECONDS, SUFFIX, VERSION, completion_policy, freshness_bound
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -891,7 +891,7 @@
+ def _same(doc: dict[str, Any], previous: Optional[dict[str, Any]]) -> bool:
+     if previous is None:
+         return False
+-    strip = lambda d: {k: v for k, v in d.items() if k != "tick_at"}
++    strip = lambda d: {k: v for k, v in d.items() if k not in ("tick_at", "tick_completions", "tick_gap_p95_s")}
+     return strip(doc) == strip(previous)
+ 
+ 
+@@ -905,6 +905,9 @@
+         path = snapshot_path(conn)
+         previous = _read(path)
+         doc = build(conn, result, capture, board=_board(conn), update_drain=update_drain, previous=previous)
++        from hermes_cli.kanban_suspend_ledger import _configured_interval_seconds
++
++        doc.update(completion_policy(previous or {}, doc["tick_at"], _configured_interval_seconds()))
+         age = doc["tick_at"] - float(previous.get("tick_at") or 0) if previous else None
+         if not (_same(doc, previous) and age is not None and age < UNCHANGED_WRITE_SECONDS):
+             _write(path, doc)
+@@ -927,8 +930,9 @@
+         return {"version": VERSION, "board": board, "available": False, "stale": True, "age_s": None,
+                 "governors": _all_governors([]), "globals": None, "cards": {}, "idle_total": None,
+                 "charged_total": None}
+-    age = max(0.0, now - float(doc.get("tick_at") or 0))
+-    return {**doc, "available": True, "age_s": round(age, 1), "stale": age > STALE_SECONDS,
++    age = now - float(doc.get("tick_at") or 0)
++    return {**doc, "available": True, "age_s": round(age, 1), "freshness_bound_s": freshness_bound(doc),
++            "stale": not 0 <= age <= freshness_bound(doc),
+             "governors": _all_governors(doc.get("governors") or [])}
+ 
+ 
+@@ -946,10 +950,11 @@
+     now = time.time() if now is None else now
+     doc = _read(snapshot_path(conn))
+     found = (doc.get("cards") or {}).get(task_id) if doc else None
+-    if not isinstance(found, dict):
++    if doc is None or not isinstance(found, dict):
+         return None
+-    age = max(0.0, now - float(doc.get("tick_at") or 0))
++    age = now - float(doc.get("tick_at") or 0)
+     known = _BY_ID.get(found.get("governor"))
+     return {**found, "task_id": task_id, "board": doc.get("board"), "tick_at": doc.get("tick_at"),
+-            "age_s": round(age, 1), "stale": age > STALE_SECONDS, "label": known.label if known else None,
++            "age_s": round(age, 1), "freshness_bound_s": freshness_bound(doc),
++            "stale": not 0 <= age <= freshness_bound(doc), "label": known.label if known else None,
+             "source": known.source if known else None, "globals": (doc or {}).get("globals")}
+diff --git a/hermes_cli/kanban_governors_cli.py b/hermes_cli/kanban_governors_cli.py
+index 03c223fdcc4..60d93263ec0 100644
+--- a/hermes_cli/kanban_governors_cli.py
++++ b/hermes_cli/kanban_governors_cli.py
+@@ -127,7 +127,9 @@
+     else:
+         measure = f" {_measure(first)}" if _measure(first) else ""
+         print(f"{head}: stopped by {_name(first)}{measure}, since {_ago(first.get('since'), now)}")
+-        print(f"  source: {first.get('source')}  ({answer['source']}, {first.get('age_s')}s old)")
++        tolerance = f"; tolerance {answer.get('freshness_bound_s'):g}s; recorded decision, not live" \
++            if answer.get("source") == "snapshot" and answer.get("freshness_bound_s") is not None else ""
++        print(f"  source: {first.get('source')}  ({answer['source']}, {first.get('age_s')}s old{tolerance})")
+         if first.get("detail"):
+             print(f"  detail: {_value(first['detail'])}")
+     overlaps = answer.get("overlaps")
+diff --git a/hermes_cli/kanban_why_fast.py b/hermes_cli/kanban_why_fast.py
+index 7393bef9d1e..6fdabcb9107 100644
+--- a/hermes_cli/kanban_why_fast.py
++++ b/hermes_cli/kanban_why_fast.py
+@@ -6,6 +6,8 @@
+ from __future__ import annotations
+ 
+ import json
++from itertools import pairwise
++import math
+ import os
+ from pathlib import Path
+ import re
+@@ -15,6 +17,31 @@
+ VERSION = 1
+ STALE_SECONDS = 180
+ SUFFIX = ".governors.json"
++MAX_FRESHNESS_SECONDS = 600
++GAP_HEADROOM_SECONDS = 60
++RECENT_COMPLETIONS = 21  # twenty completed gaps; nearest-rank p95
++
++
++def freshness_bound(doc: dict) -> float:
++    """Legacy snapshots retain 180 s; malformed tolerances fail closed."""
++    value = doc.get("freshness_bound_s", STALE_SECONDS)
++    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
++        return 0.0
++    return min(float(value), MAX_FRESHNESS_SECONDS)
++
++
++def completion_policy(previous: dict, now: float, interval: float) -> dict:
++    """Only the real post-dispatch recorder may append a completion timestamp."""
++    raw = previous.get("tick_completions", [previous.get("tick_at")])
++    times = [v for v in raw[-RECENT_COMPLETIONS:] if isinstance(v, (int, float))
++             and not isinstance(v, bool) and math.isfinite(v) and 0 < v < now] if isinstance(raw, list) else []
++    times = sorted(set(times + [now]))[-RECENT_COMPLETIONS:]
++    gaps = sorted(b - a for a, b in pairwise(times))
++    p95 = gaps[math.ceil(.95 * len(gaps)) - 1] if gaps else 0.0
++    interval = interval if math.isfinite(interval) and interval > 0 else 60.0
++    bound = min(MAX_FRESHNESS_SECONDS, max(3 * interval, p95 + GAP_HEADROOM_SECONDS))
++    return {"tick_completions": times, "tick_gap_p95_s": p95, "dispatch_interval_s": interval,
++            "freshness_bound_s": bound}
+ 
+ 
+ def read_answer(path: Path, task_id: str, *, now: float | None = None) -> dict | None:
+@@ -30,7 +57,7 @@
+         if not isinstance(doc, dict) or doc.get("version") != VERSION:
+             return None
+         age = now - float(doc.get("tick_at") or 0)
+-        if not 0 <= age <= STALE_SECONDS:
++        if not 0 <= age <= freshness_bound(doc):
+             return None
+         saved = doc.get("cards", {}).get(task_id)
+         if not isinstance(saved, dict) or not saved.get("label") or not saved.get("source"):
+@@ -45,7 +72,8 @@
+         if row is None or row[0] != saved.get("status"):
+             return None
+         recorded = {**saved, "task_id": task_id, "board": doc.get("board"), "tick_at": doc["tick_at"],
+-                    "age_s": round(age, 1), "stale": False, "globals": doc.get("globals")}
++                    "age_s": round(age, 1), "freshness_bound_s": freshness_bound(doc),
++                    "stale": False, "globals": doc.get("globals")}
+         return answer(recorded, started=started)
+     except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+         return None
+@@ -54,9 +82,10 @@
+ def answer(recorded: dict, *, started: float) -> dict:
+     """Shared rendering shape for cached and connected consumers."""
+     first = {k: recorded.get(k) for k in ("governor", "label", "scope", "reading", "threshold", "since", "until",
+-                                         "detail", "source", "age_s")}
++                                         "detail", "source", "age_s", "freshness_bound_s")}
+     first["verdict"] = "stop"
+     return {"task_id": recorded["task_id"], "board": recorded.get("board"), "source": "snapshot",
++            "age_s": recorded.get("age_s"), "freshness_bound_s": recorded.get("freshness_bound_s"),
+             "status": recorded.get("status"), "first_stop": first, "overlaps": recorded.get("overlaps"),
+             "overlaps_unknown": recorded.get("overlaps_unknown"), "globals": recorded.get("globals"),
+             "chain": [first], "recorded": recorded, "elapsed_s": round(time.monotonic() - started, 3)}
+diff --git a/tests/hermes_cli/test_governor_freshness.py b/tests/hermes_cli/test_governor_freshness.py
+new file mode 100644
+index 00000000000..a148e8d9a96
+--- /dev/null
++++ b/tests/hermes_cli/test_governor_freshness.py
+@@ -0,0 +1,90 @@
++"""Truthful, bounded tolerance for slow real dispatcher completions. [daveey]"""
++from types import SimpleNamespace
++import json
++import os
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_governors as governors
++from hermes_cli import kanban_why_fast as fast
++from tests.hermes_cli import test_kanban_governors as helpers
++
++board = helpers.board
++clean = helpers.clean
++
++
++def test_real_ticks_derive_gap_tolerance_without_advancing_the_decision(board, monkeypatch):
++    helpers._usage(monkeypatch, [10.0])
++    cfg = json.loads((board / "config.yaml").read_text())
++    cfg.setdefault("kanban", {})["dispatch_interval_seconds"] = 30
++    (board / "config.yaml").write_text(json.dumps(cfg))
++    clock = [time.time()]
++    monkeypatch.setattr(governors, "time", SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="recorded idle card", assignee="default")
++        other = kb.create_task(conn, title="another idle card", assignee="default")
++        helpers._tick(conn, max_spawn=0)
++        clock[0] += 360
++        helpers._tick(conn, max_spawn=0)
++        snap = governors.snapshot(conn, now=clock[0])
++        assert snap["freshness_bound_s"] == 420
++        assert snap["tick_gap_p95_s"] == 360
++        tick_at = snap["tick_at"]
++        path = governors._db_path(conn)
++
++        def slow_spawn(task, workspace, board=None):
++            # The real dispatcher's spawn seam is occupied; no recorder has run.
++            waiting = other if task.id == tid else tid
++            clock[0] += 240
++            answer = fast.read_answer(path, waiting, now=clock[0])
++            assert answer is not None and answer["source"] == "snapshot"
++            assert answer["age_s"] == 240 and answer["freshness_bound_s"] == 420
++            assert answer["recorded"]["tick_at"] == tick_at
++            assert not governors.snapshot(conn, now=clock[0])["stale"]
++            assert fast.read_answer(path, waiting, now=tick_at + 421) is None
++            assert governors.snapshot(conn, now=tick_at + 421)["stale"]
++            stale_card = governors.card(conn, waiting, now=tick_at + 421)
++            assert stale_card is not None and stale_card["stale"]
++            clock[0] += 120
++            return os.getpid()
++
++        from hermes_cli import kanban_db_dispatch as kbd
++        result = kbd.dispatch_once(conn, spawn_fn=slow_spawn, max_spawn=1)
++        assert len(result.spawned) == 1, result
++        assert governors.snapshot(conn, now=clock[0])["tick_at"] == clock[0]
++
++
++@pytest.mark.parametrize("interval,gap,bound", [(30, 360, 420), (200, 30, 600), (30, 900, 600)])
++def test_tolerance_is_interval_or_measured_gap_with_a_hard_ceiling(interval, gap, bound):
++    policy = fast.completion_policy({"tick_at": 1000}, 1000 + gap, interval)
++    assert policy["freshness_bound_s"] == bound
++    assert policy["tick_gap_p95_s"] == gap
++    assert fast.freshness_bound(policy) == bound
++
++
++@pytest.mark.parametrize("value", [None, True, "600", -1, 0, float("nan"), float("inf")])
++def test_invalid_bound_fails_closed(value):
++    assert fast.freshness_bound({"freshness_bound_s": value}) == 0
++
++
++def test_gap_history_is_bounded_and_ages_out_outliers():
++    policy = {"tick_at": 1000}
++    for now in [1900, *range(1930, 2600, 30)]:
++        policy = fast.completion_policy(policy, now, 30)
++    assert len(policy["tick_completions"]) == 21
++    assert policy["tick_gap_p95_s"] == 30
++    assert policy["freshness_bound_s"] == 90
++    assert fast.freshness_bound({}) == 180
++    assert fast.freshness_bound({"freshness_bound_s": 9000}) == 600
++
++
++def test_snapshot_text_reports_tolerance_as_historical_not_current(capsys):
++    from hermes_cli import kanban_governors_cli as cli
++
++    cli._print_why({"task_id": "example", "status": "ready", "board": "default", "source": "snapshot",
++                    "first_stop": {"label": "Host slots", "age_s": 240, "freshness_bound_s": 420},
++                    "freshness_bound_s": 420, "age_s": 240})
++    assert "240s old; tolerance 420s; recorded decision, not live" in capsys.readouterr().out
+-- 
+2.43.0
+

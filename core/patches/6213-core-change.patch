@@ -1,0 +1,1107 @@
+From 370c9bf5c7137e0a76207a2c11932f0d63a7e3ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:39:47 +0000
+Subject: [PATCH 6213] Conditional terminal-run reservation and indexed wait history
+
+Public mirror of source commit 370c9bf5c7137e0a76207a2c11932f0d63a7e3ab.
+
+---
+diff --git a/docs/kanban-terminal-run-reservation.md b/docs/kanban-terminal-run-reservation.md
+new file mode 100644
+index 00000000000..a1295b04943
+--- /dev/null
++++ b/docs/kanban-terminal-run-reservation.md
+@@ -0,0 +1,60 @@
++# Terminal-run reservation and cooperative wake servicing
++
++## Problem and evidence
++
++A timed fallback could wake a conditional park while its terminal probe was false,
++using the final already-authorized spending run before the actual result arrived.
++The original incidents are recorded on t_6378f1d1fd2e607d (PR363/PR359 landers).
++
++## Evidenced five-whys
++
++1. Why could the lander not record its terminal outcome? Its spending cap had
++   already been reached; existing spend admission correctly refused another run.
++2. Why was the last run consumed early? `_wake_parks` admitted its generic timed
++   fallback even while the card retained its own false condition. Extracted
++   `test_last_budgeted_run_is_reserved_for_own_condition` fails twice on main
++   a2e0c77673f3 with an unexpected awakened task, not an import error.
++3. Why did the fallback win? No admission reservation distinguished the last
++   authorized conditional run from ordinary earlier runs. The new reservation is
++   subtractive: it creates no run, refunds no spend and releases no scope hold.
++4. Why could an overdue timer wait through another phase? Serial dispatch serviced
++   continuations once during reclaim. Injecting time advancement in reclaim,
++   maintenance and capacity yields three actual next-phase status failures on
++   main. Cooperative checkpoints now service existing timer guards between phases.
++5. Why did previous checks miss this? Timer deadline checks alone pass without
++   reproducing phase starvation or the final-run precondition. The new integrated
++   tests exercise the real dispatcher, original spending accounting, and a
++   foreign relayed probe; separate controls retain CI-unstartable repair.
++
++Root (happened): generic timer admission and serial wake service did not preserve
++conditional terminal settlement within the existing spending window.
++Root (not caught): timer-only and ordinary-budget tests omitted the last-run and
++inter-phase boundaries. Tests now cover both boundaries independently.
++Recurrence: this is the producer-side recurrence described by the original PR363
++and PR359 incidents, not a release of either historical card.
++
++## Contract
++
++Only generic `continuation_woken` admission is reserved, only on the canonical
++home, only with exactly one authorized spending run left and no exhausted token
++limit or pending spend decision. There must be a real local non-ask probe or a
++repairable explicitly timed relayed probe. Terminal, stale, broken, lost-probe and
++CI-unstartable outcomes retain their normal repair/settlement route. A reservation
++is deduplicated for its park and backs off expired timers by 120 seconds.
++
++Cooperative checkpoints run on the caller's existing serial connection, outside
++transactions, at most once per five seconds measured from scan completion. They
++never claim/spawn or enlarge capacity. They cannot preempt a blocking phase: this
++is bounded checkpoint frequency, **not** a hard wall-clock latency guarantee.
++The ready-floor diagnostic now reads only relevant events and released-run
++judgments, with equivalence and no-full-history regressions.
++
++## Scope boundaries
++
++No parent-held or wait-cycle producer/rendering modules are included. Those b1/b2
++slices were explicitly abandoned by the owning chat after their review stop rule.
++No guard cards, existing scope renewals, spending-limit increases, legacy releases,
++notification-derived authority, or changes to current flapping-wake recovery.
++
++Focused regression receipts and later exact-head CI/review/installed live proof
++belong to the implementation card; this document alone claims none of those gates.
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index ee07beae829..4f71068ae08 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -348,7 +348,10 @@
+             # Invariant: every scheduled card has a wake or becomes blocked. [daveey]
+             if not _enforce_wake_invariant(conn, tid, row[1], now, woken):
+                 info = missing_wake(conn, tid)
+-                pending.append(int(info["wake_at"]) if info and info.get("wake_at") is not None else now)
++                due = int(info["wake_at"]) if info and info.get("wake_at") is not None else now
++                if due <= now and _reserved_for(conn, tid, park):
++                    due = now + 120  # reserved final run: an expired implied timer must not stay hot
++                pending.append(due)
+             continue
+         from hermes_cli import kanban_passive_intake as passive
+         quiet_until = passive.quiet_until(conn, tid, park, now, policy=passive_policy)
+@@ -366,6 +369,10 @@
+                 continue  # the park moved or was spent since the read above: the next tick reads it again
+             if skip_wake(conn, tid, CONTINUATION_WOKEN_EVENT, wake_at=wake_at):
+                 continue  # a stale copy: the card completed after it parked (t_01a1c7b27ca3b496) [daveey]
++            from hermes_cli.kanban_terminal_run import reserve
++            if reserve(conn, tid, CONTINUATION_WOKEN_EVENT):
++                pending[-1] = now + 120  # do not keep an expired generic timer hot
++                continue
+             landing = kb._landing_status_after_parents(conn, tid)
+             new_status = "review" if landing == "ready" and resume == "review" else landing
+             cur = conn.execute(
+@@ -382,6 +389,17 @@
+ HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+ 
+ 
++def _reserved_for(conn: sqlite3.Connection, tid: str, park: dict) -> bool:
++    """True when this card is still ``scheduled`` and its park holds a ``terminal_run_reserved`` mark.
++    Any other still-due case (skipped wake, moved park) keeps its immediate retry."""
++    if park.get("event_id") is None or conn.execute(
++            "SELECT 1 FROM tasks WHERE id = ? AND status = 'scheduled'", (tid,)).fetchone() is None:
++        return False
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'terminal_run_reserved' "
++        "AND json_extract(payload, '$.park_event_id') IS ?", (tid, park["event_id"])).fetchone() is not None
++
++
+ def missing_wake(conn: sqlite3.Connection, task_id: str, *, park: Optional[dict] = None) -> Optional[dict]:
+     """For a ``scheduled`` card with no timed wake: ``{"parked_at", "wake_at", "reason"}`` with the
+     wake implied by ``kanban_timed_park.implied_wake`` (None when the card has a real wake).
+@@ -440,6 +458,9 @@
+             return False  # a park arrived (or was spent) since the read above: the next tick reads it
+         if skip_wake(conn, tid, CONTINUATION_WOKEN_EVENT, wake_at=info["wake_at"]):
+             return False
++        from hermes_cli.kanban_terminal_run import reserve
++        if reserve(conn, tid, CONTINUATION_WOKEN_EVENT):
++            return False
+         landing = kb._landing_status_after_parents(conn, tid)
+         cur = conn.execute(
+             "UPDATE tasks SET status = ?, current_run_id = NULL WHERE id = ? AND status = 'scheduled'",
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 8dbe1461194..866a6086db1 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -44,7 +44,7 @@
+ from hermes_cli.kanban_db_dispatch_queries import skip_reap
+ from hermes_cli.kanban_db_dispatch_quiet import QuietResultFields
+ from hermes_cli.kanban_admission_pools import host_remaining, lane_rows, pickup_budget, pool_admits, pool_take
+-from hermes_cli.kanban_db_dispatch_clock import record_clock_hold as _record_clock_hold
++from hermes_cli.kanban_db_dispatch_clock import record_clock_hold as _record_clock_hold, _env_seconds
+ from hermes_cli.kanban_db_dispatch_rerun import reopened_after
+ from hermes_cli import kanban_db_dispatch_custody as _custody
+ from hermes_cli.kanban_db_dispatch_pid import _pid_alive  # re-export
+@@ -111,12 +111,6 @@
+ _GUARD_HOLD_SHORT_CAP_REASONS = frozenset({"blocker_auth"})
+ _GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker", "model_provider_mismatch", "model_pin_not_in_routing_registry", "subscription_quota_reset"})
+ 
+-def _env_seconds(name: str, default: int) -> int:
+-    try:
+-        return max(0, int(os.environ.get(name, "") or default))
+-    except ValueError:
+-        return default
+-
+ 
+ def guard_hold_cap_seconds(reason: str) -> Optional[int]:
+     """Max seconds the respawn guard may hold a card for ``reason`` (None = no cap)."""
+@@ -1942,15 +1936,17 @@
+     failure_limit: int,
+     reconcile_orphans: bool,
+     board: Optional[str] = None, dry_run: bool = False,
++    wake_protection=None,
+ ) -> None:
+     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote. Each sweep is a ``dispatch.<sweep>`` pass."""
+-    _la.timed("dispatch.reap_worker_zombies", reap_worker_zombies)
+-    result.reaped_terminal_workers = _la.timed("dispatch.reap_terminal_workers", reap_terminal_workers, conn)
+-    result.stopped_run_scopes = _la.timed("dispatch.stopped_scope_units", _worker_scope.stopped_scope_units, conn, board=board)  # orphans of ended runs [daveey]
+-    _la.timed("dispatch.requeue_custody", _requeue_custody.sweep, conn)  # requeued runs' persisted jobs: release or bound
++    timed = wake_protection.timed if wake_protection is not None else _la.timed
++    timed("dispatch.reap_worker_zombies", reap_worker_zombies)
++    result.reaped_terminal_workers = timed("dispatch.reap_terminal_workers", reap_terminal_workers, conn)
++    result.stopped_run_scopes = timed("dispatch.stopped_scope_units", _worker_scope.stopped_scope_units, conn, board=board)  # orphans of ended runs [daveey]
++    timed("dispatch.requeue_custody", _requeue_custody.sweep, conn)  # requeued runs' persisted jobs: release or bound
+     # Stop requests and owner card archives other gateways sent (kanban_owner_archive_relay), before the reclaim sweeps. [daveey]
+     from hermes_cli.kanban_owner_archive_relay import apply_remote_archives
+-    result.remote_archived = _la.timed("dispatch.apply_remote_archives", apply_remote_archives, conn)
++    result.remote_archived = timed("dispatch.apply_remote_archives", apply_remote_archives, conn)
+     # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
+     # heartbeat backstop, the stale sweep and max_runtime must not count (``kanban_suspend_ledger``).
+     _record_dispatch_pass(conn, dry_run=dry_run)
+@@ -1958,29 +1954,30 @@
+     # a proven empty running set may skip these sweeps, never a prior no-op.
+     has_running = conn.execute("SELECT 1 FROM tasks WHERE status = 'running' LIMIT 1").fetchone() is not None
+     if has_running:
+-        result.reclaimed = _la.timed("dispatch.release_stale_claims", _kb.release_stale_claims, conn, failure_limit=failure_limit)
++        result.reclaimed = timed("dispatch.release_stale_claims", _kb.release_stale_claims, conn, failure_limit=failure_limit)
+         if reconcile_orphans:
+-            result.reconciled_orphans = _la.timed("dispatch.reconcile_orphaned_running", reconcile_orphaned_running, conn)
++            result.reconciled_orphans = timed("dispatch.reconcile_orphaned_running", reconcile_orphaned_running, conn)
+     if reconcile_orphans:
+-        _la.timed("dispatch.close_dangling_runs", close_dangling_runs, conn)  # ended/non-running tasks can still retain a running run
+-        result.released_leftover_claims = _la.timed("dispatch.release_leftover_local_claims", release_leftover_local_claims, conn)  # not gated: not running [daveey]
++        timed("dispatch.close_dangling_runs", close_dangling_runs, conn)  # ended/non-running tasks can still retain a running run
++        result.released_leftover_claims = timed("dispatch.release_leftover_local_claims", release_leftover_local_claims, conn)  # not gated: not running [daveey]
+     if has_running:
+-        result.stale = _la.timed("dispatch.detect_stale_running", detect_stale_running, conn, stale_timeout_seconds=stale_timeout_seconds)
++        result.stale = timed("dispatch.detect_stale_running", detect_stale_running, conn, stale_timeout_seconds=stale_timeout_seconds)
+     from hermes_cli.kanban_db_dispatch_claims import crash_sweep_due  # G2: runs while a local pid may have died
+     if crash_sweep_due(conn, has_running):
+-        result.crashed = _la.timed("dispatch.detect_crashed_workers", detect_crashed_workers, conn, board=board)
++        result.crashed = timed("dispatch.detect_crashed_workers", detect_crashed_workers, conn, board=board)
+         result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+         result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+         result.reclaimed += len(getattr(detect_crashed_workers, "_last_owner_restarted", []))
+     if has_running:
+-        result.timed_out = _la.timed("dispatch.enforce_max_runtime", enforce_max_runtime, conn)
++        result.timed_out = timed("dispatch.enforce_max_runtime", enforce_max_runtime, conn)
+     from hermes_cli.kanban_supervisor_requests import dispatcher_drain  # [daveey] non-worker executor
+-    result.supervisor_requests = [] if dry_run else _la.timed("dispatch.dispatcher_drain", dispatcher_drain, conn, board=board)
++    result.supervisor_requests = [] if dry_run else timed("dispatch.dispatcher_drain", dispatcher_drain, conn, board=board)
+     from hermes_cli.kanban_continuation import wake_due_continuations
+-    result.woken_continuations = _la.timed("dispatch.wake_due_continuations", wake_due_continuations, conn)
+-    result.promoted = _la.timed("dispatch.recompute_ready", _kb.recompute_ready, conn, failure_limit=failure_limit)
++    result.woken_continuations = [*getattr(result, "woken_continuations", []),
++                                  *_la.timed("dispatch.wake_due_continuations", wake_due_continuations, conn)]
++    result.promoted = timed("dispatch.recompute_ready", _kb.recompute_ready, conn, failure_limit=failure_limit)
+     from hermes_cli.kanban_decision_maintenance import run as decision_upkeep
+-    _la.timed("dispatch.decision_upkeep", decision_upkeep, conn, result, board=board, dry_run=dry_run)
++    timed("dispatch.decision_upkeep", decision_upkeep, conn, result, board=board, dry_run=dry_run)
+ 
+ 
+ def _tick_spawn_budget(
+@@ -2126,13 +2123,19 @@
+     the PID so later ticks catch crashes before the TTL. Cap semantics:
+     :func:`_tick_spawn_budget`."""
+     result = DispatchResult()
++    from hermes_cli.kanban_dispatch_wake_protection import WakeProtection
++    wake_protection = WakeProtection(conn, result, dry_run=dry_run)
++    timed = wake_protection.timed
++    wake_protection.checkpoint()
+     _run_reclaim_phase(
+         conn, result, stale_timeout_seconds=stale_timeout_seconds,
+         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board, dry_run=dry_run,
++        wake_protection=wake_protection,
+     )
+     if not dry_run:
+         from hermes_cli.kanban_dispatch_maintenance import sweep
+-        _la.timed("dispatch.maintenance", sweep, conn, result, _guard_notice, _parent_unclaimed)
++        timed("dispatch.maintenance", sweep, conn, result, _guard_notice, _parent_unclaimed,
++              checkpoint=wake_protection.checkpoint)
+     from hermes_cli.kanban_gateway_drain import dispatch_paused
+     if dispatch_paused():
+         _kb._log.info('kanban dispatcher: scheduling paused — gateway draining or restart requested')
+@@ -2140,7 +2143,7 @@
+     if not dry_run:
+         from hermes_cli.kanban_worker_placement import dispatch_tick
+         try:
+-            _la.timed("dispatch.worker_placement", dispatch_tick, conn)
++            timed("dispatch.worker_placement", dispatch_tick, conn)
+         except Exception:
+             logger = _kb._log
+             logger.warning("kanban worker placement failed; continuing local dispatch", exc_info=True)
+@@ -2152,7 +2155,7 @@
+         return result
+     from hermes_cli.kanban_dispatch_storage import finish_preclaim
+     finish_preclaim(conn)  # pickup can claim/import work; never cancel its custody writes
+-    may_spawn, spawn_budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
++    may_spawn, spawn_budget = timed("dispatch.spawn_budget", _tick_spawn_budget, conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress,
+                                                  board=board, spawn_quota=spawn_quota)
+     if not may_spawn:
+         from hermes_cli.kanban_candidate_receipts import global_hold
+@@ -2165,16 +2168,17 @@
+             sweep_stale_triage(conn, default_assignee=_resolve_default_assignee(default_assignee))
+         except Exception:
+             _kb._log.debug("kanban dispatch: triage sweep failed", exc_info=True)
+-    unjudged = _kb._sync.worker_pickup(conn, pickup_budget(result, spawn_budget), dry_run, _profile_exists_fn) or ()
++    unjudged = timed("dispatch.worker_pickup", _kb._sync.worker_pickup, conn, pickup_budget(result, spawn_budget), dry_run, _profile_exists_fn) or ()
+     # Placement filters executors, not home budget decisions; refused cards must still be checked below.
+     # Otherwise a worker-only card has no decision owner: workers correctly skip foreign-copy budgets.
+     from hermes_cli.kanban_hub_admission_claim import screened_lanes
+-    all_ready, all_review, unjudged = screened_lanes(conn, dry_run, review_dispatch_enabled(), unjudged)
++    all_ready, all_review, unjudged = timed("dispatch.screened_lanes", screened_lanes, conn, dry_run, review_dispatch_enabled(), unjudged)
+     result.admission_deferred = sorted(unjudged)
+     from hermes_cli.kanban_db_dispatch_preclaim import eligible_rows as _eligible_rows, hold_ineligible_budgets
+     ready_rows = _eligible_rows(conn, all_ready, "ready", result)
+     review_rows = _eligible_rows(conn, all_review, "review", result) if all_review else []
+     hold_ineligible_budgets(conn, result, dry_run=dry_run)
++    wake_protection.checkpoint()
+     result.lane_candidates = len(all_ready) + len(all_review)
+     # Per-profile cap: busy rows are deferred, not misclassified as unassigned.
+     # Resolve before lane reservation so it sees what the lane loop would refuse.
+@@ -2200,6 +2204,7 @@
+ 
+     lane_by_id = {row["id"]: "review" for row in review_rows}
+     rows = order_with_remote_waiters(conn, ready_rows + review_rows)
++    wake_protection.checkpoint()
+     lane_kwargs: dict[str, Any] = dict(
+         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
+         failure_limit=failure_limit, spawn_fn=spawn_fn,
+@@ -2209,6 +2214,7 @@
+     spawned = 0
+     from hermes_cli.kanban_candidate_receipts import note, lane_refused, capacity_tail
+     for index, row in enumerate(rows):
++        wake_protection.checkpoint()
+         if spawn_budget is not None and spawned >= spawn_budget:
+             capacity_tail(rows[index:], lane_by_id, "spawn budget exhausted")
+             break
+@@ -2226,7 +2232,7 @@
+             if not row_assignee:
+                 note(row["id"], "prefilter", "unassigned", stage="claim", status=lane)
+                 continue
+-        if _dispatch_lane_task(conn, row, row_assignee, result, lane=lane, **lane_kwargs):
++        if timed("dispatch.lane_task", _dispatch_lane_task, conn, row, row_assignee, result, lane=lane, **lane_kwargs):
+             spawned += pool_take(result, row)
+         else:
+             lane_refused(row["id"], result, status=lane)
+@@ -2265,13 +2271,7 @@
+     pin_hermes_tree_on_pythonpath(env, Path(_startup_fast.project_root_str()))
+ 
+ 
+-def _absolute_hermes_path(path: str) -> str:
+-    """Return an absolute filesystem path for a resolved Hermes shim."""
+-    expanded = os.path.expanduser(path)
+-    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
+-
+-
+-from hermes_cli.kanban_dispatch_paths import _looks_like_path, _is_windows_batch_shim
++from hermes_cli.kanban_dispatch_paths import _looks_like_path, _is_windows_batch_shim, _absolute_hermes_path
+ 
+ 
+ def _path_search_names(command: str) -> list[str]:
+diff --git a/hermes_cli/kanban_db_dispatch_clock.py b/hermes_cli/kanban_db_dispatch_clock.py
+index 2f7accfc6f1..9591810d86f 100644
+--- a/hermes_cli/kanban_db_dispatch_clock.py
++++ b/hermes_cli/kanban_db_dispatch_clock.py
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import sqlite3
+ import time
+ from datetime import UTC, datetime
+@@ -15,6 +16,13 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++def _env_seconds(name: str, default: int) -> int:
++    try:
++        return max(0, int(os.environ.get(name, "") or default))
++    except ValueError:
++        return default
++
+ # Guard reasons whose hold ends at a deadline the dispatcher can compute from the card's own runs.
+ CLOCK_REASONS = frozenset({
+     "subscription_quota_reset",  # typed reset in the latest attempt's receipt
+diff --git a/hermes_cli/kanban_dispatch_maintenance.py b/hermes_cli/kanban_dispatch_maintenance.py
+index 2326fbb6612..f8b6d672799 100644
+--- a/hermes_cli/kanban_dispatch_maintenance.py
++++ b/hermes_cli/kanban_dispatch_maintenance.py
+@@ -1,17 +1,24 @@
+ """Owner maintenance before the spawn cap, including worker quota evidence."""
+ 
+ 
+-def sweep(conn, result, guard_notice, parent_unclaimed):
++def sweep(conn, result, guard_notice, parent_unclaimed, *, checkpoint=lambda: None):
+     from hermes_cli.kanban_block_policy import sweep_blocked_cards
+     from hermes_cli.kanban_quota_detector import drain_owner
+     from hermes_cli.kanban_llm_pacing_dispatch import refresh_pools
+     refresh_pools(conn)
++    checkpoint()
+     sweep_blocked_cards(conn, result)
++    checkpoint()
+     guard_notice.sweep_remote_guard_holds(conn, result)
++    checkpoint()
+     drain_owner(conn)
++    checkpoint()
+     parent_unclaimed.safe_sweep(conn)  # A capped host is when a parent starves.
++    checkpoint()
+     _start_spend_reviews(conn)
++    checkpoint()
+     _own_ownerless_cards(conn)
++    checkpoint()
+ 
+ 
+ def _own_ownerless_cards(conn):
+diff --git a/hermes_cli/kanban_dispatch_paths.py b/hermes_cli/kanban_dispatch_paths.py
+index 903d2e05732..42b89705451 100644
+--- a/hermes_cli/kanban_dispatch_paths.py
++++ b/hermes_cli/kanban_dispatch_paths.py
+@@ -5,6 +5,12 @@
+ import re
+ 
+ 
++def _absolute_hermes_path(path: str) -> str:
++    """Return an absolute filesystem path for a resolved Hermes shim."""
++    expanded = os.path.expanduser(path)
++    return expanded if os.path.isabs(expanded) else os.path.abspath(expanded)
++
++
+ def _looks_like_path(value: str) -> bool:
+     """Return true when a command override is an explicit path, not a name."""
+     expanded = os.path.expanduser(value)
+diff --git a/hermes_cli/kanban_dispatch_wake_protection.py b/hermes_cli/kanban_dispatch_wake_protection.py
+new file mode 100644
+index 00000000000..74ee2bc1718
+--- /dev/null
++++ b/hermes_cli/kanban_dispatch_wake_protection.py
+@@ -0,0 +1,38 @@
++"""Cooperative timer service inside a serial, single-writer dispatch tick.
++
++Checkpoints do not preempt a slow call. The service interval bounds scan frequency,
++not wall-clock wake latency: a blocking phase (or the wake scan itself) can still
++run indefinitely. All writes use the caller's connection and existing wake guards;
++this does not claim, spawn, relax budgets, or start another writer/thread.
++"""
++import time
++
++from hermes_cli import loop_accounting
++
++SERVICE_INTERVAL_SECONDS = 5.0
++
++
++class WakeProtection:
++    def __init__(self, conn, result, *, dry_run=False):
++        self.conn = conn
++        self.result = result
++        self.dry_run = dry_run
++        self.next_check = 0.0
++
++    def checkpoint(self):
++        if self.dry_run or self.conn.in_transaction or time.monotonic() < self.next_check:
++            return
++        from hermes_cli.kanban_continuation import wake_due_continuations
++        woken = loop_accounting.timed(
++            'dispatch.cooperative_wake', wake_due_continuations, self.conn)
++        if woken:
++            self.result.woken_continuations.extend(woken)
++        # Rate-limit from completion, including an expensive scan's own cost.
++        self.next_check = time.monotonic() + SERVICE_INTERVAL_SECONDS
++
++    def timed(self, name, fn, *args, **kwargs):
++        self.checkpoint()
++        try:
++            return loop_accounting.timed(name, fn, *args, **kwargs)
++        finally:
++            self.checkpoint()
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index 8527520138f..b7c9dd82a08 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -33,11 +33,48 @@
+ def ready_since(conn, task_id: str, created_at: Optional[int] = None) -> int:
+     """When ``task_id`` last entered ``ready`` (the stranded-in-ready diagnostic's floor, its latest run's end
+     included), else its creation."""
++    return int(_ready_floor(conn, task_id) or created_at or 0)
++
++
++def _ready_floor(conn, task_id: str) -> int:
++    """``kanban_diagnostics._last_ready_entry_ts`` computed from only the rows that can move it, never the
++    whole event history (the hub's maintenance pass loaded every event/run of every parent here).
++
++    Same predicate: max of (latest floor-kind event, latest ``continued`` event whose payload says
++    status=ready, latest run end), after dropping unused Board grants' runs and their run-tagged events. An
++    unused grant needs ``outcome='released'`` and its judgement reads only that run's own events, so only
++    released runs are loaded whole (``idx_events_run``); other runs contribute just ``ended_at``. Event
++    reads use ``idx_events_kind_task_id``; ``heartbeat`` & co. are never touched."""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_diagnostics import _last_ready_entry_ts
+-    runs = conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
+-    since = _last_ready_entry_ts(kb.list_events(conn, task_id), [dict(r) for r in runs])
+-    return int(since or created_at or 0)
++    from hermes_cli.kanban_diagnostics import _event_ts, _parse_payload
++    from hermes_cli.kanban_ready_events import READY_WAIT_FLOOR_KINDS
++    from hermes_cli.kanban_unused_grant import unused_grant_run
++
++    unused: set = set()
++    ends: list = []
++    for run in conn.execute("SELECT * FROM task_runs WHERE task_id = ? AND outcome = 'released'", (task_id,)):
++        run = dict(run)
++        events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ?",
++                              (task_id, run["id"])).fetchall()
++        if unused_grant_run(run, events):
++            unused.add(run["id"])
++        else:
++            ends.append(run["ended_at"])
++    ends += [r[0] for r in conn.execute(
++        "SELECT ended_at FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
++        "AND (outcome IS NULL OR outcome != 'released')", (task_id,))]
++    floor = max([0, *(e for e in (kb._to_epoch(v) for v in ends) if e)])
++
++    kinds = sorted(READY_WAIT_FLOOR_KINDS | {"continued"})
++    marks = ",".join("?" * len(kinds))
++    for ev in conn.execute(f"SELECT kind, payload, created_at, run_id FROM task_events "
++                           f"WHERE task_id = ? AND kind IN ({marks})", (task_id, *kinds)):
++        if ev["run_id"] in unused:
++            continue
++        if ev["kind"] == "continued" and _parse_payload(ev).get("status") != "ready":
++            continue
++        floor = max(floor, _event_ts(ev))
++    return floor
+ 
+ 
+ def _place(conn, parent_id: str) -> dict[str, Any]:
+diff --git a/hermes_cli/kanban_terminal_run.py b/hermes_cli/kanban_terminal_run.py
+new file mode 100644
+index 00000000000..20f4b4e0a1d
+--- /dev/null
++++ b/hermes_cli/kanban_terminal_run.py
+@@ -0,0 +1,50 @@
++"""Reserve the last already-authorized spending run for a park's own condition. [daveey]
++
++This is subtractive admission, never a budget extension. Scope/safety holds still
++win at the existing claim/terminal guards. A clock-only wait is unaffected. No
++shell text is interpreted as either a terminal result or execution permission.
++"""
++from __future__ import annotations
++
++
++def reserve(conn, task_id: str, kind: str) -> bool:
++    """Defer generic wakes when a conditional park has exactly one budgeted run left."""
++    if kind != 'continuation_woken':
++        # Unstartable CI and broken/stale/lost probes must reach their repair path. They
++        # cannot produce the terminal condition and must not be reserved forever.
++        return False
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_spend_decision as decision
++    if decision.pending(conn, task_id):
++        return False  # the existing hold, not this reservation, controls release
++    from hermes_cli.kanban_continuation import park_state
++    from hermes_cli.kanban_wake_check import foreign_ids, own_gateway
++    if task_id in foreign_ids(conn):
++        # A worker node's copy has that node's default limits, not the home board's authority: only the
++        # canonical home reserves. Its generic wake replication is already gated by the home.
++        return False
++    park = park_state(conn, task_id)
++    payload = park.get('payload') or {}
++    # Probe rows are machine-local. A home card can carry an authenticated relayed park whose one live probe
++    # is on the parking worker, not this DB. Only a TIMED relayed park is reservable: restore_missing_checks
++    # repairs a lost remote probe only for parks with wake_at, so an implicit one could never be repaired.
++    relayed = (park.get('timed') and not park.get('superseded') and isinstance(payload.get('wake_check'), str)
++               and bool(payload['wake_check'].strip()) and isinstance(payload.get('probe_host'), str)
++               and bool(payload['probe_host']) and payload['probe_host'] != own_gateway(conn))
++    check = conn.execute("SELECT 1 FROM task_wake_checks WHERE task_id=? "
++                         "AND purpose IS NOT 'ask_resolved'", (task_id,)).fetchone()
++    if check is None and not relayed:
++        return False
++    limits = budget.card_limits(conn, task_id, budget.limits())
++    spent = budget.spend(conn, task_id)
++    if not limits.runs or limits.runs - spent.runs != 1 or budget.over(spent, limits):
++        return False
++    from hermes_cli import kanban_db as kb
++    park_id = park.get('event_id')
++    if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='terminal_run_reserved' "
++                        "AND json_extract(payload,'$.park_event_id') IS ?", (task_id, park_id)).fetchone():
++        kb._append_event(conn, task_id, 'terminal_run_reserved', {
++            'park_event_id': park_id, 'deferred_kind': kind, 'remaining_runs': 1,
++            'reason': 'Final authorized spending run reserved for the parked wake_check condition; '
++                      'generic status and timer wakes do not consume it. No extra run or scope release granted.'})
++    return True
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 1256870a735..7552f3c90bc 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -1012,6 +1012,9 @@
+         conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (task_id,))
+         episode.reset(conn, task_id)
+         return None
++    from hermes_cli.kanban_terminal_run import reserve
++    if reserve(conn, task_id, kind):
++        return None
+     park = pending_wake(conn, task_id) or {}
+     resume = park.get("resume_status") if park.get("resume_status") in ("ready", "review") else "ready"
+     landing = kb._landing_status_after_parents(conn, task_id)
+diff --git a/tests/hermes_cli/test_kanban_ci_wake_deadline.py b/tests/hermes_cli/test_kanban_ci_wake_deadline.py
+new file mode 100644
+index 00000000000..e278c9aa6d0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ci_wake_deadline.py
+@@ -0,0 +1,33 @@
++"""A CI awaiting label without a probe still has a timer deadline.
++
++This guards the timed/gated path from the observed late-wake payload. It does not
++reproduce historical dispatcher starvation or claim an external CI subscription.
++"""
++from hermes_cli import kanban_continuation as continuation
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_sweep_gate as helpers
++
++home = helpers.home
++
++
++def test_ci_timer_wakes_without_owner_comment_at_deadline(home):
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title='CI deadline', assignee='worker')
++        other = kb.create_task(conn, title='unrelated', assignee='worker')
++        kb.claim_task(conn, task)
++        continuation.continue_task(
++            conn, task, checkpoint='CI pending', resume_after_seconds=600,
++            awaiting={'kind': 'ci', 'ref': 'https://github.com/o/r/actions/runs/3',
++                      'why': 'pending checks'})
++        park = continuation.pending_wake(conn, task)
++        assert park is not None
++        wake_at = park['wake_at']
++        for now in (wake_at - 500, wake_at - 100, wake_at - 1):
++            assert continuation.wake_due_continuations(conn, now=now) == []
++        # A board-content revision before the deadline must retain the timer.
++        kb.add_comment(conn, other, 'test', 'unrelated revision')
++        assert continuation.wake_due_continuations(conn, now=wake_at - 1) == []
++        assert continuation.wake_due_continuations(conn, now=wake_at + 1) == [task]
++        assert conn.execute('SELECT status FROM tasks WHERE id=?', (task,)).fetchone()[0] == 'ready'
++        assert continuation.wake_due_continuations(conn, now=wake_at + 2) == []
+diff --git a/tests/hermes_cli/test_kanban_dispatch_wake_protection.py b/tests/hermes_cli/test_kanban_dispatch_wake_protection.py
+new file mode 100644
+index 00000000000..c6cefbf0b59
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dispatch_wake_protection.py
+@@ -0,0 +1,130 @@
++"""Real serial dispatch must service timers between slow phases, not next tick."""
++import time
++import pytest
++
++from hermes_cli import kanban_continuation as continuation
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from tests.hermes_cli import test_kanban_sweep_gate as helpers
++
++home = helpers.home
++
++
++@pytest.fixture(autouse=True)
++def timer_only_external_isolation(monkeypatch):
++    # Exercise the real timer path, not unrelated asynchronous GitHub probes or
++    # credential-backed pool refresh. Neither may touch the network in this test.
++    from hermes_cli import kanban_ci_progress as ci
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++    from hermes_cli import kanban_wake_check as checks
++    monkeypatch.setattr(ci, 'submit_sweep', lambda *a, **k: None)
++    monkeypatch.setattr(pacing, 'refresh_pools', lambda *a, **k: None)
++    yield
++    checks._shutdown_for_tests()
++
++
++@pytest.mark.parametrize('phase', ['maintenance', 'reclaim', 'capacity'])
++def test_wakes_between_slow_phases_even_at_capacity(home, monkeypatch, phase):
++    from hermes_cli import kanban_quota_detector as quota
++
++    clock = [time.time()]
++    monkeypatch.setattr(time, 'time', lambda: clock[0])
++    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title='CI timer', assignee='worker')
++        kb.claim_task(conn, task)
++        parked = continuation.continue_task(
++            conn, task, checkpoint='CI pending', resume_after_seconds=600,
++            awaiting={'kind': 'ci', 'ref': 'https://github.com/o/r/actions/runs/1',
++                      'why': 'pending checks'})
++        assert parked['ok']
++        assert continuation.pending_wake(conn, task)['wake_at'] == int(clock[0]) + 600
++        seen = []
++
++        def slow_guard(*args, **kwargs):
++            assert kb.get_task(conn, task).status == 'scheduled'
++            clock[0] += 601
++
++        def next_phase(*args, **kwargs):
++            seen.append(kb.get_task(conn, task).status)
++
++        if phase == 'maintenance':
++            monkeypatch.setattr(dispatch._guard_notice, 'sweep_remote_guard_holds', slow_guard)
++            monkeypatch.setattr(quota, 'drain_owner', next_phase)
++        elif phase == 'reclaim':
++            monkeypatch.setattr(dispatch, 'reap_worker_zombies', slow_guard)
++            monkeypatch.setattr(dispatch, 'reap_terminal_workers', lambda *a: next_phase() or [])
++        else:
++            budget = dispatch._tick_spawn_budget
++            def slow_budget(*args, **kwargs):
++                slow_guard()
++                return budget(*args, **kwargs)
++            monkeypatch.setattr(dispatch, '_tick_spawn_budget', slow_budget)
++            monkeypatch.setattr(dispatch._kb._sync, 'worker_pickup_capped',
++                                lambda conn, result, *a: next_phase() or result)
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
++        assert seen == ['ready'], 'the next serial phase must not postpone an overdue timer'
++        assert result.woken_continuations == [task]
++        assert result.spawned == []
++        assert len([e for e in kb.list_events(conn, task) if e.kind == 'continuation_woken']) == 1
++
++
++def test_wakes_before_next_candidate_without_spawning_or_resetting_budget(home, monkeypatch):
++    from hermes_cli import kanban_db_dispatch_preclaim as preclaim
++    from hermes_cli import kanban_hub_admission_claim as admission
++    from hermes_cli import kanban_dispatch_priority as priority
++
++    clock = [time.time()]
++    monkeypatch.setattr(time, 'time', lambda: clock[0])
++    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        parked = kb.create_task(conn, title='timer', assignee='worker')
++        kb.claim_task(conn, parked)
++        assert continuation.continue_task(
++            conn, parked, checkpoint='wait', resume_after_seconds=600,
++            awaiting={'kind': 'ci', 'ref': 'https://github.com/o/r/actions/runs/2',
++                      'why': 'pending'})['ok']
++        candidates = [kb.create_task(conn, title=f'candidate {n}', assignee='worker') for n in range(2)]
++        rows = [conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone() for tid in candidates]
++        monkeypatch.setattr(admission, 'screened_lanes', lambda *a: (rows, [], ()))
++        monkeypatch.setattr(preclaim, 'eligible_rows', lambda conn, rows, *a: rows)
++        monkeypatch.setattr(priority, 'order_with_remote_waiters', lambda conn, rows: rows)
++        seen = []
++
++        def slow_candidate(conn, row, *args, **kwargs):
++            seen.append((row['id'], kb.get_task(conn, parked).status))
++            if row['id'] == candidates[0]:
++                clock[0] += 601
++            return False
++
++        monkeypatch.setattr(dispatch, '_dispatch_lane_task', slow_candidate)
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=1)
++        assert seen == [(candidates[0], 'scheduled'), (candidates[1], 'ready')]
++        assert result.woken_continuations == [parked]
++        assert not result.spawned
++        assert conn.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 1
++
++
++def test_checkpoint_rate_limit_dry_run_and_transaction_boundary(home, monkeypatch):
++    from hermes_cli.kanban_dispatch_wake_protection import WakeProtection
++
++    clock = [100.0]
++    calls = []
++    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(continuation, 'wake_due_continuations', lambda conn: calls.append(clock[0]) or [])
++    with kbc.connect_closing() as conn:
++        guard = WakeProtection(conn, dispatch.DispatchResult())
++        guard.checkpoint()
++        for _ in range(100):
++            guard.checkpoint()
++        assert calls == [100.0]
++        clock[0] = 105.0
++        with kb.write_txn(conn):
++            guard.checkpoint()
++            assert calls == [100.0]
++        guard.checkpoint()
++        assert calls == [100.0, 105.0]
++        clock[0] = 200.0
++        WakeProtection(conn, dispatch.DispatchResult(), dry_run=True).checkpoint()
++        assert calls == [100.0, 105.0]
+diff --git a/tests/hermes_cli/test_kanban_parent_unclaimed_ready_since_bounded.py b/tests/hermes_cli/test_kanban_parent_unclaimed_ready_since_bounded.py
+new file mode 100644
+index 00000000000..1704f43a607
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parent_unclaimed_ready_since_bounded.py
+@@ -0,0 +1,118 @@
++"""``ready_since`` must equal the diagnostic's ready floor without loading a task's whole history.
++
++Representative observation (dispatch.maintenance -> parent_unclaimed.safe_sweep -> ready_since): every pass
++materialised ALL task events/runs per parent. This pins the old semantics (the oracle below is the
++previous implementation, verbatim) and forbids full-history reads. It does not claim to fix dispatcher
++starvation by itself.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_parent_unclaimed as pu
++
++
++def _oracle(conn, task_id, created_at=None):
++    from hermes_cli.kanban_diagnostics import _last_ready_entry_ts
++    runs = conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
++    since = _last_ready_entry_ts(kb.list_events(conn, task_id), [dict(r) for r in runs])
++    return int(since or created_at or 0)
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
++    kb.init_db()
++    with kbc.connect() as c:
++        yield c
++
++
++def _ev(c, task, kind, ts, payload=None, run=None):
++    c.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
++              (task, run, kind, json.dumps(payload) if payload is not None else None, ts))
++
++
++def _run(c, task, *, started=1, ended=None, status="done", outcome="completed", metadata=None):
++    return c.execute(
++        "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at, metadata) VALUES (?,?,?,?,?,?)",
++        (task, status, outcome, started, ended, json.dumps(metadata) if metadata is not None else None),
++    ).lastrowid
++
++
++def _unused_grant(c, task, ts):
++    r = _run(c, task, started=ts, ended=ts, status="released", outcome="released",
++             metadata={"unused_grant": True})
++    _ev(c, task, "claimed", ts, {"holder": "hub"}, r)
++    _ev(c, task, "released", ts, {"unused_grant": True}, r)
++    return r
++
++
++def _noise(c, task, n):
++    c.executemany("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
++                  [(task, None, "heartbeat", '{"x":1}', 5 + i % 7) for i in range(n)])
++    c.executemany("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?,?,?,?,?)",
++                  [(f"other{i % 50}", None, "claimed", None, 99999) for i in range(n)])
++
++
++def _scenarios():
++    def empty(c, t): pass
++    def created_only(c, t): _ev(c, t, "created", 100)
++    def latest_kind(c, t): _ev(c, t, "created", 100); _ev(c, t, "promoted", 500); _ev(c, t, "claimed", 300)
++    def run_end_wins(c, t): _ev(c, t, "created", 100); _run(c, t, ended=900)
++    def open_run_ignored(c, t): _ev(c, t, "created", 100); _run(c, t, ended=None, status="running", outcome=None)
++    def continued_ready(c, t): _ev(c, t, "created", 100); _ev(c, t, "continued", 700, {"status": "ready"})
++    def continued_other(c, t): _ev(c, t, "created", 100); _ev(c, t, "continued", 700, {"status": "blocked"})
++    def continued_badjson(c, t):
++        c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
++                  (t, "continued", "{not json", 800))
++    def unused_excluded(c, t): _ev(c, t, "created", 100); _unused_grant(c, t, 1000)
++    def unused_plus_real(c, t):
++        _ev(c, t, "created", 100); _unused_grant(c, t, 1000)
++        r = _run(c, t, ended=400); _ev(c, t, "spawned", 350, None, r)
++    def unused_with_evidence(c, t):
++        r = _unused_grant(c, t, 1000); _ev(c, t, "heartbeat", 1001, None, r)
++    def unused_continued_on_run(c, t):
++        r = _unused_grant(c, t, 1000); _ev(c, t, "continued", 1002, {"status": "ready"}, r)
++    def iso_run_end(c, t):
++        c.execute("INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) VALUES (?,?,?,?,?)",
++                  (t, "done", "completed", 1, "2026-05-10T15:00:00Z"))
++    def released_but_used(c, t):
++        r = _run(c, t, ended=600, status="released", outcome="released", metadata={"unused_grant": True, "x": 1})
++        _ev(c, t, "claimed", 590, {"holder": "hub"}, r)
++    return [v for k, v in list(locals().items()) if callable(v)]
++
++
++@pytest.mark.parametrize("scenario", _scenarios(), ids=lambda f: f.__name__)
++@pytest.mark.parametrize("created_at", [None, 42])
++def test_matches_previous_semantics_with_large_irrelevant_history(conn, scenario, created_at):
++    task = "t_target"
++    scenario(conn, task)
++    _noise(conn, task, 400)
++    conn.commit()
++    assert pu.ready_since(conn, task, created_at) == _oracle(conn, task, created_at)
++
++
++def test_does_not_materialise_full_history(conn, monkeypatch):
++    task = "t_target"
++    _ev(conn, task, "created", 100)
++    _unused_grant(conn, task, 1000)
++    _run(conn, task, ended=400)
++    _noise(conn, task, 3000)
++    conn.commit()
++    expected = _oracle(conn, task)
++
++    def boom(*a, **k):
++        raise AssertionError("full event history loaded")
++    monkeypatch.setattr(kb, "list_events", boom)
++    seen = []
++    conn.set_trace_callback(seen.append)
++    assert pu.ready_since(conn, task) == expected
++    conn.set_trace_callback(None)
++    # no unfiltered whole-history reads of either table
++    for sql in seen:
++        low = " ".join(sql.lower().split())
++        assert "select * from task_runs" not in low or "outcome" in low, sql
++        assert "from task_events where task_id" not in low or "kind in" in low or "run_id" in low, sql
+diff --git a/tests/hermes_cli/test_kanban_terminal_ci_repair.py b/tests/hermes_cli/test_kanban_terminal_ci_repair.py
+new file mode 100644
+index 00000000000..17df767e92d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_terminal_ci_repair.py
+@@ -0,0 +1,37 @@
++"""An impossible CI producer must reach repair, not reserve its last run. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_budget as budget
++from tests.hermes_cli import test_kanban_ci_progress_pr as helpers
++
++kanban_home = helpers.kanban_home
++api = helpers.api
++
++
++@pytest.mark.parametrize('cause', ['conflict', 'offline_runners'])
++@pytest.mark.parametrize('spent', [False, True])
++def test_last_authorized_run_reaches_ci_producer_repair(kanban_home, api, monkeypatch, cause, spent):
++    with kbc.connect_closing() as conn:
++        tid = helpers._parked(conn, monkeypatch)
++        if spent:
++            with kb.write_txn(conn):
++                conn.execute('UPDATE task_runs SET started_at=ended_at-120 WHERE task_id=?', (tid,))
++        budget.set_override(conn, tid, runs=2 if spent else 1, by='owner', reason='one repair run left')
++        before = budget.spend(conn, tid).runs
++        assert before == (1 if spent else 0)
++        if cause == 'conflict':
++            api.dirty()
++        else:
++            api.run('queued', age=20 * 60)
++        assert kcp.sweep(conn) == [tid]
++        assert kb.get_task(conn, tid).status == 'ready'
++        kinds = [e.kind for e in kb.list_events(conn, tid)]
++        assert 'ci_run_unstartable' in kinds
++        assert 'terminal_run_reserved' not in kinds
++        assert helpers._notes(conn, tid)
++        assert budget.spend(conn, tid).runs == before
++        assert budget.card_limits(conn, tid, budget.limits()).runs == (2 if spent else 1)
++        assert budget.hold(conn, tid) is None
+diff --git a/tests/hermes_cli/test_kanban_terminal_reservation_controls.py b/tests/hermes_cli/test_kanban_terminal_reservation_controls.py
+new file mode 100644
+index 00000000000..a56d102e3c2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_terminal_reservation_controls.py
+@@ -0,0 +1,107 @@
++"""Final-run reservation must use all budget limits and both timer paths."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_wake_check as helpers
++
++kanban_home = helpers.kanban_home
++_running, _probe, _events = helpers._running, helpers._probe, helpers._events
++
++
++def _park_one_run_left(conn, tmp_path, *, remote, timed):
++    tid = _running(conn)
++    budget.set_override(conn, tid, runs=1, by='owner', reason='terminal settlement')
++    cmd = _probe(tmp_path / 'terminal')
++    assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-01T00:00:00Z', wake_check=cmd)
++    with kb.write_txn(conn):
++        payload = {'wake_check': cmd, 'probe_host': 'away' if remote else None}
++        if timed:
++            payload['wake_at'] = 1000
++        kb._append_event(conn, tid, 'scheduled', payload)
++        if remote:
++            conn.execute('DELETE FROM task_wake_checks WHERE task_id=?', (tid,))
++    return tid
++
++
++def test_implied_local_timer_keeps_last_run_and_backs_off(kanban_home, tmp_path):
++    from hermes_cli.kanban_continuation import _wake_parks
++    now = 4070908801
++    with kbc.connect_closing() as conn:
++        tid = _park_one_run_left(conn, tmp_path, remote=False, timed=False)
++        woken, pending = _wake_parks(conn, now)
++        assert woken == [] and kb.get_task(conn, tid).status == 'scheduled'
++        assert len(_events(conn, tid, 'terminal_run_reserved')) == 1
++        assert pending == now + 120  # an expired implied timer must not stay hot
++
++
++def test_timed_relayed_park_keeps_last_run(kanban_home, tmp_path):
++    from hermes_cli.kanban_continuation import _wake_parks
++    with kbc.connect_closing() as conn:
++        tid = _park_one_run_left(conn, tmp_path, remote=True, timed=True)
++        woken, pending = _wake_parks(conn, 2000)
++        assert woken == [] and kb.get_task(conn, tid).status == 'scheduled'
++        assert len(_events(conn, tid, 'terminal_run_reserved')) == 1
++        assert pending == 2120
++
++
++def test_implicit_relayed_park_is_not_reserved(kanban_home, tmp_path):
++    # restore_missing_checks only repairs timed parks, so a reservation here could never be repaired.
++    from hermes_cli.kanban_continuation import _wake_parks
++    with kbc.connect_closing() as conn:
++        tid = _park_one_run_left(conn, tmp_path, remote=True, timed=False)
++        woken, _ = _wake_parks(conn, 4070908801)
++        assert woken == [tid] and kb.get_task(conn, tid).status != 'scheduled'
++        assert not _events(conn, tid, 'terminal_run_reserved')
++
++
++def test_foreign_copy_never_reserves_with_worker_defaults(kanban_home, tmp_path, monkeypatch):
++    from hermes_cli.kanban_terminal_run import reserve
++    with kbc.connect_closing() as conn:
++        tid = _park_one_run_left(conn, tmp_path, remote=False, timed=True)
++        # Partial override (cache only): the run limit comes from this node's default.
++        budget.set_override(conn, tid, cache_read_tokens=0, by='owner', reason='partial')
++        monkeypatch.setattr(budget, 'limits', lambda cfg=None: budget.Limits(1, 0))
++        with kb.write_txn(conn):
++            conn.execute('CREATE TABLE IF NOT EXISTS kanban_sync_state (board_id TEXT PRIMARY KEY, cursor INTEGER, '
++                         'gateway_id TEXT, hlc_last TEXT, mode TEXT, applying INTEGER, pending_run_uid TEXT)')
++            conn.execute("INSERT INTO kanban_sync_state VALUES ('b',0,'home','h','m',0,NULL)")
++            if 'created_on' not in [r[1] for r in conn.execute('PRAGMA table_info(tasks)')]:
++                conn.execute('ALTER TABLE tasks ADD COLUMN created_on TEXT')
++            conn.execute("UPDATE tasks SET created_on='home' WHERE id=?", (tid,))
++        with kb.write_txn(conn):
++            assert reserve(conn, tid, 'continuation_woken')  # canonical home: exactly one run left
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='terminal_run_reserved'", (tid,))
++            conn.execute("UPDATE tasks SET created_on='worker-node' WHERE id=?", (tid,))
++        with kb.write_txn(conn):
++            assert not reserve(conn, tid, 'continuation_woken')  # worker's copy: defaults are not authoritative
++        assert not _events(conn, tid, 'terminal_run_reserved')
++
++
++def test_cache_cap_exhaustion_is_not_a_reserved_authorized_run(kanban_home, tmp_path):
++    from hermes_cli.kanban_terminal_run import reserve
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        budget.set_override(conn, tid, runs=2, cache_read_tokens=10, by='owner', reason='bounded')
++        with kb.write_txn(conn):
++            conn.execute('UPDATE task_runs SET started_at=? WHERE task_id=?', (int(time.time()) - 120, tid))
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-01T00:00:00Z',
++                                wake_check=_probe(tmp_path / 'terminal'))
++        with kb.write_txn(conn):
++            rid = conn.execute('SELECT id FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0]
++            kb._append_event(conn, tid, 'worker_result', {'usage': {'cache_read_tokens': 10}}, run_id=rid)
++        # The existing closed spending run has attributable worker usage.
++        spent = budget.spend(conn, tid)
++        assert spent.runs == 1 and spent.tokens['cache_read_tokens'] == 10
++        with kb.write_txn(conn):
++            assert not reserve(conn, tid, 'ci_run_unstartable')
++            kwc._wake(conn, tid, 'ci_run_unstartable', {})
++        assert budget.hold(conn, tid) is not None
++        assert kb.get_task(conn, tid).status == 'triage'
++        assert not _events(conn, tid, 'terminal_run_reserved')
++        assert len(_events(conn, tid, 'spend_budget_decision_ready')) == 1
+diff --git a/tests/hermes_cli/test_kanban_wake_check.py b/tests/hermes_cli/test_kanban_wake_check.py
+index c4ce82057e0..fd660fe687e 100644
+--- a/tests/hermes_cli/test_kanban_wake_check.py
++++ b/tests/hermes_cli/test_kanban_wake_check.py
+@@ -81,6 +81,47 @@
+     assert "build 559 seen" in kb.build_worker_context(conn, tid)
+ 
+ 
++@pytest.mark.parametrize('spent', [False, True])
++def test_last_budgeted_run_is_reserved_for_own_condition(kanban_home, tmp_path, spent):
++    """A generic wake cannot spend the final run while the terminal log probe is false."""
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli.kanban_continuation import _wake_parks
++    flag = tmp_path / 'terminal-exit'
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        if spent:
++            with kb.write_txn(conn):
++                conn.execute('UPDATE task_runs SET started_at=? WHERE task_id=?', (int(time.time()) - 120, tid))
++        budget.set_override(conn, tid, runs=2 if spent else 1, by='owner', reason='one authorized settlement run')
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-01T00:00:00Z',
++                                wake_check=_probe(flag), check_every=120)
++        count = conn.execute('SELECT count(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0]
++        assert _wake_parks(conn, 4070908801)[0] == []
++        assert kb.get_task(conn, tid).status == 'scheduled'
++        assert kwc.get_state(conn, tid) is not None
++        assert len(_events(conn, tid, 'terminal_run_reserved')) == 1
++        flag.write_text('bb land: exit 0\n')
++        kwc.run_due_wake_checks(conn, now=int(time.time()) + 121, wait=True)
++        assert kb.get_task(conn, tid).status == 'ready'
++        assert _events(conn, tid, 'condition_met')[-1].payload['output'] == 'bb land: exit 0'
++        assert conn.execute('SELECT count(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == count
++        assert budget.hold(conn, tid) is None  # original limit remains, no extra grant
++
++
++@pytest.mark.parametrize('kind', ['wake_check_stale', 'wake_check_broken', 'wake_probe_lost', 'condition_met'])
++def test_terminal_reservation_never_swallows_probe_repair_or_terminal(kanban_home, tmp_path, kind):
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli.kanban_terminal_run import reserve
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        budget.set_override(conn, tid, runs=1, by='owner', reason='bounded')
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-01T00:00:00Z',
++                                wake_check=_probe(tmp_path / 'terminal'), check_every=120)
++        with kb.write_txn(conn):
++            assert not reserve(conn, tid, kind)
++        assert not _events(conn, tid, 'terminal_run_reserved')
++
++
+ def test_kanban_schedule_wake_check_wakes_when_probe_passes(kanban_home, tmp_path, monkeypatch) -> None:
+     from tools import kanban_tools as kt
+ 
+diff --git a/tests/hermes_cli/test_kanban_wake_check_home.py b/tests/hermes_cli/test_kanban_wake_check_home.py
+index 81117a0633a..067d6b34441 100644
+--- a/tests/hermes_cli/test_kanban_wake_check_home.py
++++ b/tests/hermes_cli/test_kanban_wake_check_home.py
+@@ -116,6 +116,29 @@
+     assert "build 559 seen" in _events(home.conn, tid, "condition_met")[-1].payload["output"]
+ 
+ 
++def test_home_timer_reserves_final_run_for_relayed_probe(gws, tmp_path):
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli.kanban_continuation import _wake_parks
++    home, worker = gws
++    flag = tmp_path / 'terminal'
++    tid = _relayed_park(home, worker, flag)
++    home.round()
++    home.enter()
++    budget.set_override(home.conn, tid, runs=1, by='owner', reason='one settlement run')
++    assert kwc.get_state(home.conn, tid) is None
++    assert _wake_parks(home.conn, 4070908801)[0] == []
++    assert _status(home.conn, tid) == 'scheduled'
++    assert len(_events(home.conn, tid, 'terminal_run_reserved')) == 1
++    flag.write_text('bb land: exit 0\n')
++    worker.enter()
++    kwc.run_due_wake_checks(worker.conn, now=int(time.time()) + 301, wait=True)
++    worker.round()
++    home.round()
++    assert _status(home.conn, tid) == 'ready'
++    assert _events(home.conn, tid, 'condition_met')[-1].payload['output'] == 'bb land: exit 0'
++    assert budget.hold(home.conn, tid) is None
++
++
+ def test_a_relayed_probe_reports_alive_to_the_home_board(gws, tmp_path):
+     home, worker = gws
+     tid = _relayed_park(home, worker, tmp_path / "flag")
+-- 
+2.43.0
+

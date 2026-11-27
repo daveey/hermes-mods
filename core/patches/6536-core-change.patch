@@ -1,0 +1,397 @@
+From be02a4c22c94e6c6ece2fddc7a4e4a2cde2ee919 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:28:50 +0000
+Subject: [PATCH 6536] Bounded owner reassessment
+
+Public mirror of source commit be02a4c22c94e6c6ece2fddc7a4e4a2cde2ee919.
+
+---
+diff --git a/hermes_cli/kanban_owner_reassessment_replica.py b/hermes_cli/kanban_owner_reassessment_replica.py
+index be7950f0440..0cec535851e 100644
+--- a/hermes_cli/kanban_owner_reassessment_replica.py
++++ b/hermes_cli/kanban_owner_reassessment_replica.py
+@@ -65,7 +65,6 @@
+         prior = conn.execute(f"SELECT event_uid,board,task_id,episode_uid,run_uid,gateway,evidence FROM {TABLE} "
+                              "WHERE event_uid=? OR episode_uid=?", (uid, receipt["episode_uid"])).fetchall()
+         if prior:
+-            import json
+             if (len(prior) != 1 or tuple(prior[0])[:6] != values[:6]
+                     or canonical.certified_identity(canonical.parse_evidence(prior[0][6])) != canonical.certified_identity(evidence)):
+                 raise ReassessmentConflict("canonical reassessment identity changed")
+@@ -100,7 +99,6 @@
+     Callers must still check :func:`canonical.event_matches` against their event row and
+     :func:`canonical.current_matches` against the current task before relying on it.
+     """
+-    import json
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone():
+         return None
+     row = conn.execute(f"SELECT board,task_id,episode_uid,run_uid,gateway,evidence FROM {TABLE} WHERE event_uid=?",
+@@ -161,7 +159,6 @@
+ 
+ 
+ def _is_candidate(ch) -> bool:
+-    import json
+     if ch.table != "task_events" or ch.op != "upsert" or ch.fields.get("kind") not in canonical.PARK_KINDS:
+         return False
+     try:
+@@ -195,7 +192,6 @@
+ 
+ def adopt_receipts(conn: sqlite3.Connection, source: sqlite3.Connection, changes) -> None:
+     """Offline pickup: carry already-recorded receipts from the pulled replica, re-certified."""
+-    import json
+     for ch in changes:
+         if not _is_candidate(ch):
+             continue
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 51053671de3..ab9d265df12 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -676,7 +676,8 @@
+             envelopes.prune_parents(conn)
+             rows, _wire, parents = _within_batch(conn, rows, [{} for _r in rows], gateway)
+             wire = [retain_transport.outbound(conn, r) if r["op"] in ("retain", "actionability_record") else envelopes.outbound(conn, r, lambda r=r: strip_stale_push(
+-                conn, wire_ops.translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway))), supported=bool(origin_cap)) for r in rows]
++                conn, wire_ops.translate(_full_row_if_unseen(conn, r), _next_hlc(conn, gateway))), supported=bool(origin_cap),
++                reassessment=type(origin_cap.get("owner_reassessment_v1")) is int and origin_cap["owner_reassessment_v1"] == 1) for r in rows]
+             parents = [(envelopes.parent(conn, tid, lambda op=op: op, supported=bool(origin_cap)), tid) for op, tid in parents]
+             wire = [op for op, _tid in parents] + wire
+         try:
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index 8018e923003..7908fab0855 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -78,7 +78,7 @@
+         return False  # keep the exact recovery refusal visible; never omit an approved recovery field
+     if result.get("reason") != "forbidden_field" or row["op"] not in ("upsert", "import"):
+         return False
+-    match = re.fullmatch(r"not writable on ([a-z_]+): ([a-z_]+(?:, [a-z_]+)*)", str(result.get("detail") or ""))
++    match = re.fullmatch(r"not writable on ([a-z0-9_]+): ([a-z0-9_]+(?:, [a-z0-9_]+)*)", str(result.get("detail") or ""))
+     if match is None or match[1] != row["table_name"]:
+         return False
+     fields = wire.get("fields", {})
+@@ -110,6 +110,7 @@
+ 
+ 
+ VIRTUAL_DROPPED = "virtual_dropped"
++_REASSESSMENT = ("owner_reassessment_v1", "owner_reassessment_fallback_status_origin")
+ # Real columns a new Board fences on custody/manifest cards (workspace_source v1, R4c): refused one per detail.
+ FENCED_FIELDS: dict[str, frozenset[str]] = {"tasks": frozenset({"workspace_kind", "branch_name"})}
+ 
+@@ -121,13 +122,19 @@
+     path), and retire the refused original: an omission row could never be delivered (``_queue_restore`` reads
+     real columns only, and a fenced column stays fenced while custody exists) and a retained rejected op would hold
+     the card from repair (``repair_holds``) forever."""
+-    reduced = {k: v for k, v in (row["fields"] if isinstance(row["fields"], dict)
+-                                 else json.loads(row["fields"])).items() if k not in dropped}
++    stored = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"])
++    origin = row.get("status_origin")
++    if any(k in dropped for k in _REASSESSMENT):  # the two optional fields travel and leave together
++        dropped = [*dropped, *(k for k in _REASSESSMENT if k not in dropped)]
++        saved = stored.get("owner_reassessment_fallback_status_origin")
++        if isinstance(saved, str):
++            origin = saved  # the park uid is not the ordinary lifecycle origin an old Board validates
++    reduced = {k: v for k, v in stored.items() if k not in dropped}
+     if reduced or row["op"] != "upsert":  # an upsert of only refused fields has nothing left to say
+         conn.execute(
+             "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at, status_origin) "
+             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (sync.uuid7(), row["table_name"], row["row_uid"], row["op"], json.dumps(reduced),
+-             row.get("base_version"), wire["hlc"], row["created_at"], row.get("status_origin")))
++             row.get("base_version"), wire["hlc"], row["created_at"], origin))
+     conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id = ?", (row["op_id"],))
+     return VIRTUAL_DROPPED
+diff --git a/hermes_cli/kanban_sync_envelope.py b/hermes_cli/kanban_sync_envelope.py
+index e63b6b9a246..a0ad8d216f6 100644
+--- a/hermes_cli/kanban_sync_envelope.py
++++ b/hermes_cli/kanban_sync_envelope.py
+@@ -11,7 +11,31 @@
+ from collections.abc import Callable
+ 
+ 
+-def outbound(conn: sqlite3.Connection, row: dict, build: Callable[[], dict], *, supported: bool = True) -> dict:
++REASSESSMENT_FIELDS = ("owner_reassessment_v1", "owner_reassessment_fallback_status_origin")
++
++
++def gate_reassessment(row: dict, wire: dict, ok: bool) -> dict:
++    """Serialization-time gate: the stored op keeps its captured binding; only the wire is downgraded.
++
++    A Board that does not advertise ``owner_reassessment_v1`` gets neither optional field and the saved
++    ordinary status origin, so the status still lands. Called before a wire is frozen.
++    """
++    fields = wire.get("fields")
++    if ok or not isinstance(fields, dict) or not any(k in fields for k in REASSESSMENT_FIELDS):
++        return wire
++    saved = row.get("fields", {})
++    saved = json.loads(saved) if isinstance(saved, str) else saved
++    fallback = fields.get("owner_reassessment_fallback_status_origin",
++                          saved.get("owner_reassessment_fallback_status_origin"))
++    for key in REASSESSMENT_FIELDS:
++        fields.pop(key, None)
++    if "status_origin" in wire and isinstance(fallback, str):
++        wire["status_origin"] = fallback
++    return wire
++
++
++def outbound(conn: sqlite3.Connection, row: dict, build: Callable[[], dict], *, supported: bool = True,
++             reassessment: bool = False) -> dict:
+     """Rebuild neither a transmitted payload nor its ordering clock on uncertain retry."""
+     saved = conn.execute("SELECT wire_json FROM kanban_sync_outbox WHERE op_id=?", (row["op_id"],)).fetchone()
+     if saved and saved[0] is not None:
+@@ -19,14 +43,16 @@
+         if wire["client_op_id"] == row["op_id"]:
+             if not supported:
+                 raise OSError("Board status-origin capability absent; immutable uncertain envelope held")
++            if not reassessment and any(k in wire.get("fields", {}) for k in REASSESSMENT_FIELDS):
++                raise OSError("Board reassessment capability absent; immutable uncertain envelope held")
+             return wire
+         # Explicit lifecycle/schema repair can replace an op's identity in place.
+         # Its former envelope belongs to the retired id, never the replacement.
+     wire = build()
+     if not supported:
+-        return wire  # old Worker: retain legacy per-attempt rebuild/strip behaviour
++        return gate_reassessment(row, wire, reassessment)  # old Worker: retain legacy per-attempt rebuild/strip
+     from hermes_cli.kanban_sync_status_origin import add_origin, freezeable
+-    wire = add_origin(conn, row, wire)
++    wire = gate_reassessment(row, add_origin(conn, row, wire), reassessment)
+     if not freezeable(row, wire):
+         return wire  # historical unbound status is not upgraded by inventing an origin
+     wire["frozen_replay"] = 1
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index b7daedf0b33..ab96f6ed4bb 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -240,8 +240,13 @@
+     from hermes_cli import kanban_containment_replica as replica
+     from hermes_cli import kanban_owner_reassessment_replica as reassessment
+     from hermes_cli.kanban_containment_lifecycle import ContainmentConflict
+-    reassessment.certify_page(conn, hub, board, changes)
+     for change in changes:
++        try:  # one card's contradicted reassessment receipt holds that card; siblings keep syncing
++            reassessment.certify_page(conn, hub, board, [change])
++        except reassessment.ReassessmentConflict as exc:
++            quarantine_change(conn, board, change,
++                              ContainmentConflict(str(exc), kind="reassessment_conflict", uid=change.uid))
++            continue
+         if not protected(change):
+             continue
+         try:
+@@ -260,6 +265,13 @@
+     cached = replica._cached(conn, change.uid)
+     if cached:
+         held_tasks.add(cached["row"]["task_id"])
++    if exc.kind == "reassessment_conflict":
++        from hermes_cli import kanban_owner_reassessment_replica as reassessment
++        if _exists(conn, reassessment.TABLE):
++            prior = conn.execute(f"SELECT task_id FROM {reassessment.TABLE} WHERE event_uid=?",
++                                 (change.uid,)).fetchone()
++            if prior:
++                held_tasks.add(prior[0])
+     if not held_tasks:
+         raise exc  # no task identity: fail the board round rather than skip uncertain history
+     reason = str(exc) if exc.uid in (None, change.uid) else f"{exc} (receipt {exc.uid})"
+diff --git a/hermes_cli/kanban_sync_status_origin.py b/hermes_cli/kanban_sync_status_origin.py
+index 4104a848165..0c674746841 100644
+--- a/hermes_cli/kanban_sync_status_origin.py
++++ b/hermes_cli/kanban_sync_status_origin.py
+@@ -82,9 +82,11 @@
+             origin = current_origin(conn, task) if known else None
+             if known:
+                 from hermes_cli.kanban_owner_reassessment_transport import captured_origin
++                ordinary = origin  # a synthesized parent never carries a park uid without its receipt
+                 origin = captured_origin(conn, op, origin)
+                 conn.execute("UPDATE kanban_sync_outbox SET status_origin=? WHERE op_id=? AND wire_json IS NULL",
+                              (origin, op))
++                origin = ordinary
+             conn.execute("INSERT INTO kanban_sync_status_origins(task_id, origin, status) "
+                          "SELECT id, ?, status FROM tasks WHERE id=? ON CONFLICT(task_id) "
+                          "DO UPDATE SET origin=excluded.origin, status=excluded.status", (origin, task))
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_board_compat.py b/tests/hermes_cli/test_kanban_owner_reassessment_board_compat.py
+new file mode 100644
+index 00000000000..62a1fbfa795
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_board_compat.py
+@@ -0,0 +1,121 @@
++"""An opt-in park reaches a Board by what it advertises; the stored capture binding is never lost."""
++from __future__ import annotations
++
++import copy
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_owner_reassessment_lifecycle as lifecycle
++
++worker = lifecycle.worker
++NEW = ("owner_reassessment_v1", "owner_reassessment_fallback_status_origin")
++BASE_CAP = {"status_origin": 1, "frozen_replay": 1, "hlc": "1795610000000-0001-server"}
++
++
++def _board(calls, accepted, *, advertise, refuse):
++    """``advertise``: capability key; ``refuse``: answer the new fields with hub main's exact rejection."""
++    def ops(board, batch):
++        calls.extend(copy.deepcopy(batch))
++        out = []
++        for op in batch:
++            bad = [k for k in op.get("fields", {}) if k in NEW]
++            if op.get("table") == "tasks" and bad and refuse:
++                out.append({"client_op_id": op["client_op_id"], "status": "rejected", "reason": "forbidden_field",
++                            "detail": "not writable on tasks: " + ", ".join(sorted(bad))})
++            else:
++                accepted.append(copy.deepcopy(op))
++                out.append({"client_op_id": op["client_op_id"], "status": "applied", "version": 9})
++        return {"results": out}
++    cap = {**BASE_CAP, **({"owner_reassessment_v1": 1} if advertise else {})}
++    return SimpleNamespace(ops=ops, status_origin_capability=lambda board: dict(cap), cap=cap)
++
++
++def _scenario(worker, monkeypatch, check, *, advertise, refuse, rounds=4):
++    def body(cap, ctx, agent, evidence):
++        tid = ctx["task_id"]
++        with kbc.connect_closing() as conn:
++            with kb.write_txn(conn):  # the Board already holds this running card
++                conn.execute("UPDATE tasks SET sync_version=5 WHERE id=?", (tid,))
++                conn.execute("DELETE FROM kanban_sync_outbox")
++            assert kb.schedule_task(conn, tid, reason=lifecycle._until(), expected_run_id=ctx["run_id"],
++                                    awaiting=lifecycle.PRODUCER,
++                                    owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120), owner_origin=cap)
++            park = conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()[0]
++            stored = conn.execute("SELECT fields,status_origin FROM kanban_sync_outbox WHERE table_name='tasks'").fetchall()
++            calls, accepted = [], []
++            hub = _board(calls, accepted, advertise=advertise, refuse=refuse)
++            for _ in range(rounds):
++                client.push(conn, hub, "default", "here", primary=True)
++            left = [tuple(r) for r in conn.execute(
++                "SELECT state,last_error,status_origin FROM kanban_sync_outbox WHERE table_name='tasks'")]
++            return check(conn, hub, park, stored, calls, accepted, left)
++    return lifecycle._turn(worker, monkeypatch, body)
++
++
++def _status_ops(ops):
++    return [op for op in ops if op.get("table") == "tasks" and op.get("fields", {}).get("status") == "scheduled"]
++
++
++@pytest.mark.parametrize("advertise", [False, True])
++def test_board_refusing_both_fields_still_receives_park_status_with_ordinary_origin(worker, monkeypatch, advertise):
++    """advertise=False: wire gate strips at serialization. advertise=True but refused (rolling deploy):
++    the definitive downgrade restores the saved ordinary origin and drops both fields together."""
++    def check(conn, hub, park, stored, calls, accepted, left):
++        got = _status_ops(accepted)
++        assert got, "the old Board never received the park's status"
++        assert all(not (set(op["fields"]) & set(NEW)) for op in got)
++        assert all(op.get("status_origin") != park for op in got)
++        assert [op["status_origin"] for op in got] == [""]  # the saved ordinary (no terminal/reopen event)
++        assert not [r for r in left if r[0] == "rejected"]
++        assert not left
++        # the captured local binding was stored on the exact op before any wire existed
++        assert any("owner_reassessment_v1" in f and so == park for f, so in stored)
++        return True
++    assert _scenario(worker, monkeypatch, check, advertise=advertise, refuse=True)
++
++
++def test_accepting_board_gets_receipt_on_the_exact_op(worker, monkeypatch):
++    def check(conn, hub, park, stored, calls, accepted, left):
++        got = _status_ops(accepted)
++        assert len(got) == 1 and set(NEW) <= set(got[0]["fields"])
++        assert got[0]["status_origin"] == park
++        assert got[0]["fields"]["owner_reassessment_v1"]["park_event"]["uid"] == park
++        assert got[0]["fields"]["owner_reassessment_fallback_status_origin"] == ""
++        assert not left
++        return True
++    assert _scenario(worker, monkeypatch, check, advertise=True, refuse=False)
++
++
++def test_frozen_receipt_envelope_is_not_rewritten_or_resent_after_capability_is_lost(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        tid = ctx["task_id"]
++        with kbc.connect_closing() as conn:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET sync_version=5 WHERE id=?", (tid,))
++                conn.execute("DELETE FROM kanban_sync_outbox")
++            assert kb.schedule_task(conn, tid, reason=lifecycle._until(), expected_run_id=ctx["run_id"],
++                                    awaiting=lifecycle.PRODUCER,
++                                    owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120), owner_origin=cap)
++            calls, accepted = [], []
++            lost = _board(calls, accepted, advertise=True, refuse=False)
++
++            def unknown(board, batch):  # the answer is lost after the Board saw it
++                calls.extend(copy.deepcopy(batch))
++                raise OSError("connection reset")
++            lost.ops = unknown
++            with pytest.raises(OSError):
++                client.push(conn, lost, "default", "here", primary=True)
++            sent = _status_ops(calls)
++            assert len(sent) == 1 and set(NEW) <= set(sent[0]["fields"])
++            old = _board(calls, accepted, advertise=False, refuse=False)
++            before = len(calls)
++            with pytest.raises(OSError):
++                client.push(conn, old, "default", "here", primary=True)
++            assert len(calls) == before, "an unknown-outcome envelope must not be rebuilt and resent"
++            assert conn.execute("SELECT wire_json IS NOT NULL FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0]
++            return True
++    assert lifecycle._turn(worker, monkeypatch, body)
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_pull_quarantine.py b/tests/hermes_cli/test_kanban_owner_reassessment_pull_quarantine.py
+new file mode 100644
+index 00000000000..759f091598f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_pull_quarantine.py
+@@ -0,0 +1,54 @@
++"""A contradicted reassessment receipt quarantines its own card in a real pull; siblings keep syncing."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_quarantine as quarantine
++from tests.hermes_cli import kanban_quarantine_support as support
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++from tests.hermes_cli import test_kanban_owner_reassessment_canonical as canon
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++def _feed(monkeypatch, changes):
++    page = {"changes": changes, "next": changes[-1].seq, "more": False}
++    monkeypatch.setattr(ksc.acw, "changes_page", lambda *args: page)
++    monkeypatch.setattr(ksc, "adapt", lambda change: change)
++
++
++def test_reassessment_conflict_quarantines_exact_card_and_healthy_sibling_syncs(synced_conn, monkeypatch):
++    conn = synced_conn
++    bad_task = kb.create_task(conn, title="contradicted", assignee="w")
++    sib_task = kb.create_task(conn, title="sibling", assignee="w")
++    receipt = canon.make()
++    receipt["task_id"] = bad_task
++    park = receipt["park_event"]["uid"]
++    hub = canon.Hub(canon.evidence_for(receipt))
++    board = sync.sync_state(conn)["board_id"] if sync.sync_state(conn).get("board_id") else "default"
++    receipt["board"] = board
++    hub = canon.Hub({**canon.evidence_for(receipt), "board": board})
++    # the feed row differs from the Board's attestation (created_at), for this one card only
++    shaped = canon.ch(receipt, created_at=5)
++    conflicting = sync.RemoteChange(1, "task_events", shaped.uid, "upsert", shaped.fields, 1, "", shaped.origin_gateway)
++    sib_uid = sync.uuid7()
++    sibling = sync.RemoteChange(2, "task_events", sib_uid, "upsert",
++                                {"task_id": sib_task, "kind": "commented", "payload": "{}", "created_at": 1}, 2, "", "worker")
++    _feed(monkeypatch, [conflicting, sibling])
++    ksc.pull(conn, hub, board, observers=False)  # does NOT abort the round
++    assert sync.sync_state(conn)["cursor"] == 2
++    assert quarantine.tasks(conn) == {bad_task}
++    assert support.count(conn, "containment_sync_quarantine") == 1
++    row = conn.execute("SELECT uid,task_id,kind FROM containment_sync_quarantine").fetchone()
++    assert tuple(row) == (park, bad_task, "reassessment_conflict")
++    # fail closed: the held card does not dispatch; the sibling applied
++    assert kb.claim_task(conn, bad_task) is None
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (sib_uid,)).fetchone() is not None
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (park,)).fetchone() is None  # withheld, not applied
++    # durable: a later round re-reads nothing and the hold stays
++    ksc.pull(conn, hub, board, observers=False)
++    assert quarantine.tasks(conn) == {bad_task}
+-- 
+2.43.0
+

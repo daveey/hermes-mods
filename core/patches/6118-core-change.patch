@@ -1,0 +1,82 @@
+From a6352212e110e217aa5ea7550c84269e07c0183f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:16:03 +0000
+Subject: [PATCH 6118] Isolated native sessions capture and bounded startup
+
+Public mirror of source commit a6352212e110e217aa5ea7550c84269e07c0183f.
+
+---
+diff --git a/agent/deadline.py b/agent/deadline.py
+index 33d8f03bed7..c528bbadf12 100644
+--- a/agent/deadline.py
++++ b/agent/deadline.py
+@@ -430,7 +430,12 @@
+                             if status != psutil.STATUS_STOPPED:
+                                 process.suspend()
+                                 stopped.append(process)
+-                            while process.status() != psutil.STATUS_STOPPED:
++                            # A target that exits after the first read is a zombie until
++                            # reaped, never STOPPED; it cannot fork, so it is as safe as
++                            # stopped. Waiting for STOPPED burned the whole stop budget.
++                            while (status := process.status()) != psutil.STATUS_STOPPED:
++                                if status in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
++                                    break
+                                 if time.monotonic() >= stop_deadline:
+                                     raise TimeoutError("process did not stop before snapshot deadline")
+                                 time.sleep(0.001)
+diff --git a/tests/agent/test_deadline_zombie_during_stop.py b/tests/agent/test_deadline_zombie_during_stop.py
+new file mode 100644
+index 00000000000..7f88bc00402
+--- /dev/null
++++ b/tests/agent/test_deadline_zombie_during_stop.py
+@@ -0,0 +1,47 @@
++"""A hard-kill target that exits during the stop handshake must not burn the stop budget.
++
++``_process_tree_snapshot`` read ``status()`` once, suspended a running target, then waited for
++``STOPPED``. A target that exits between those reads is a zombie until its parent reaps it, never
++``STOPPED``: the wait spun the whole ``_TREE_STOP_DEADLINE_S`` (5 s). That is what made
++``test_faults_are_typed_and_reaped[os._exit(7)]`` take 5.03 s on CI (PR #4233, shard 3/12).
++"""
++import subprocess
++import sys
++import time
++
++import pytest
++
++
++@pytest.mark.platforms("linux")
++def test_target_that_turns_zombie_after_the_first_status_read_is_not_waited_out(monkeypatch):
++    import psutil
++    from agent import deadline
++
++    proc = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL,
++                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    try:
++        target = psutil.Process(proc.pid)
++        stamp = deadline.process_create_time(proc.pid)
++        wait = time.monotonic() + 10
++        while target.status() != psutil.STATUS_ZOMBIE:  # exited, not reaped: the CI state
++            assert time.monotonic() < wait, "child never became a zombie"
++            time.sleep(0.01)
++
++        real_status = psutil.Process.status
++        lied = []
++
++        def status(self):
++            # The first read races the exit: the target was still running when sampled.
++            if self.pid == proc.pid and not lied:
++                lied.append(True)
++                return psutil.STATUS_RUNNING
++            return real_status(self)
++
++        monkeypatch.setattr(psutil.Process, "status", status)
++        started = time.monotonic()
++        deadline.kill_process_tree(proc.pid, create_time=stamp)
++        elapsed = time.monotonic() - started
++        assert lied, "the race window was not exercised"
++        assert elapsed < 1.0, f"stop handshake waited {elapsed:.2f}s on a zombie"
++    finally:
++        proc.wait(timeout=10)
+-- 
+2.43.0
+

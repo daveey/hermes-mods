@@ -1,0 +1,364 @@
+From 25335b39fddc72bf5cf793fec34b923fc43be349 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:15:24 +0000
+Subject: [PATCH 6262] Worker origin inheritance and durable forwarding refusals
+
+Public mirror of source commit 25335b39fddc72bf5cf793fec34b923fc43be349.
+
+---
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index b6a317aa0a7..6a61e5e05af 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -124,7 +124,8 @@
+     from hermes_cli.kanban_origin_ledger import validate_binding
+ 
+     try:
+-        if not isinstance(intent, dict) or set(intent) != {"request_id", "owner", "origin"}:
++        if (not isinstance(intent, dict) or
++                set(intent) not in ({"request_id", "owner", "origin"}, {"request_id", "owner", "origin", "creator"})):
+             raise ValueError
+         if not isinstance(intent["request_id"], str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", intent["request_id"]):
+             raise ValueError
+@@ -189,6 +190,15 @@
+             if held:
+                 raise OriginError("origin_idempotency_conflict",
+                                   f"idempotency_key {key!r} already names card {held['id']} on this board")
++        if "creator" in intent:
++            from hermes_cli.kanban_origin_native import _primary_scope, _receipt
++            creator = intent["creator"]
++            expected_creator = {**intent["owner"], "task_id": options.get("creator_task_id")}
++            primary = tuple(intent["owner"][k] for k in ("gateway", "profile", "board"))
++            binding = _receipt(conn, options.get("creator_task_id"))
++            if (creator != expected_creator or _primary_scope(conn) != primary or binding is None
++                    or binding["owner"] != creator or binding["origin"] != intent["origin"]):
++                raise OriginError("origin_creator_unproven", "creator lacks an owner-local native attestation")
+         task_id = kb.create_task(conn, **options, placement_checked=True,  # courier retains owner placement
+                                  settle_owner_chat=False)  # its origin chat is linked below, then required
+         marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
+diff --git a/hermes_cli/kanban_origin_forward_decision.py b/hermes_cli/kanban_origin_forward_decision.py
+index 903d1e7b856..5e97bc22fca 100644
+--- a/hermes_cli/kanban_origin_forward_decision.py
++++ b/hermes_cli/kanban_origin_forward_decision.py
+@@ -97,7 +97,7 @@
+                           "task_record_key": "/".join(str(creator.get(k, ""))
+                                                      for k in ("profile", "board", "task_id"))})
+         lease = lease_lookup(creator["board"], creator["task_id"])
+-        authorize(ledger=ledger, origin=args["origin"], creator=creator, gateway=gateway,
++        binding = authorize(ledger=ledger, origin=args["origin"], creator=creator, gateway=gateway,
+                   profile=profile, sender=request["from"], run_uid=args["run_uid"],
+                   lease=lease, now_ms=now_ms(), session_exists=session_exists, native_lookup=native_lookup)
+         destination = args["destination"]
+@@ -109,6 +109,11 @@
+                     "to_gw": destination["gateway"], "coll": "tasks", "action": "create",
+                     "key": f"{destination['profile']}/{destination['board']}",
+                     "args": {"origin": args["origin"], "create": args["create"]}}
++        # Only a native same-home creator can be independently attested by the
++        # receiving owner. Other routes retain authenticated chat ownership.
++        if (binding["binding_id"] == "native-" + creator["task_id"] and creator["gateway"] == gateway and
++                all(creator[k] == destination[k] for k in ("gateway", "profile", "board"))):
++            envelope["args"]["creator"] = creator
+         # Concurrent admissions may have raced the network read. Recheck while
+         # holding write custody, and return only after durable commit.
+         with db:
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index c98cf023f88..b3dda1818d3 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -15,7 +15,8 @@
+ from hermes_cli.kanban_origin_adapter import _gateway
+ 
+ 
+-def _dispatch_owner_tool(name, args, intent, selfwork_context=None, selfwork_exception=None):
++def _dispatch_owner_tool(name, args, intent, selfwork_context=None, selfwork_exception=None,
++                         origin_creator_task_id=None):
+     """The validated courier selects Kanban explicitly, independent of chat defaults.
+ 
+     Keep registry availability checks (including delegated-child fences) and the
+@@ -30,6 +31,8 @@
+         private = {'selfwork_intent': {**intent, **selfwork_context}} if selfwork_context else {}
+         if selfwork_exception is not None:  # its own keyword: never part of either intent or the intake journal
+             private['selfwork_exception'] = selfwork_exception
++        if origin_creator_task_id is not None:
++            private['origin_creator_task_id'] = origin_creator_task_id
+         return _dispatch_result(registry.dispatch(name, args, origin_intent=intent, **private))
+ 
+ 
+@@ -80,7 +83,7 @@
+                           'owner': intent['owner'], 'origin': origin, 'task_record_key': key})
+         return _dispatch_owner_tool('kanban_origin_adopt', {'task_id': task_id, 'board': board}, intent)
+     create = request['args'].get('create')
+-    if (set(request['args']) != {'origin', 'create'} or not isinstance(create, dict)
++    if (set(request['args']) not in ({'origin', 'create'}, {'origin', 'create', 'creator'}) or not isinstance(create, dict)
+             or not isinstance(create.get('session_id'), str)
+             or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}', create['session_id'])
+             or ('board' in create and create['board'] != board)):
+@@ -88,6 +91,18 @@
+     from hermes_cli.kanban_creation_contract import validate_received
+     validate_received({key: value for key, value in create.items() if key != 'board'})
+     args = {**create, 'board': board}
++    if 'creator' in request['args']:
++        creator = request['args']['creator']
++        validate_binding({'binding_id': 'validation', 'version': 1, 'publication_version': 1,
++                          'owner': creator, 'origin': origin,
++                          'task_record_key': '/'.join(str(creator.get(k, ''))
++                                                     for k in ('profile', 'board', 'task_id'))
++                          if isinstance(creator, dict) else ''})
++        if not all(creator[k] == intent['owner'][k] for k in ('gateway', 'profile', 'board')):
++            raise ValueError('origin_creator_unproven')
++        intent['creator'] = creator
++        return _dispatch_owner_tool('kanban_create', args, intent, selfwork_context, selfwork_exception,
++                                    origin_creator_task_id=creator['task_id'])
+     return _dispatch_owner_tool('kanban_create', args, intent, selfwork_context, selfwork_exception)
+ 
+ 
+@@ -106,7 +121,8 @@
+         # Dispatch catches exceptions itself. An untyped error may follow a
+         # committed write: keep the exact request retryable, never infer absence.
+         return {'status': 'pending', 'code': 'origin_dispatch_pending', 'handoff_complete': False}
+-    if result.get('code') in {'origin_creation_conflict', 'origin_already_bound', 'origin_idempotency_conflict'}:
++    if result.get('code') in {'origin_creation_conflict', 'origin_already_bound', 'origin_idempotency_conflict',
++                              'origin_creator_unproven'}:
+         # Replaying an immutable conflicting envelope cannot repair it. Reject
+         # this request only; the original intent and its receipt remain intact.
+         return {**result, 'status': 'rejected'}
+diff --git a/tests/hermes_cli/test_origin_forward_creator.py b/tests/hermes_cli/test_origin_forward_creator.py
+new file mode 100644
+index 00000000000..f3f60fdbe03
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_creator.py
+@@ -0,0 +1,93 @@
++"""Forwarded creator is private authenticated transport, never a public argument."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_origin_owner as support
++
++world = support.world
++
++
++@pytest.fixture
++def attested(world, monkeypatch):
++    from hermes_cli import kanban_origin_native as native
++    world['from'] = 'gw:owner'
++    world['args']['origin'] = {'gateway': 'owner', 'profile': 'default', 'session': 'original'}
++    monkeypatch.setattr(native, '_primary_scope', lambda conn: ('owner', 'default', 'default'))
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='Implementation', session_id='creator')
++        native._install_revocation(conn)
++        binding = {'binding_id': 'native-' + parent, 'version': 1, 'publication_version': 1,
++                   'origin': world['args']['origin'],
++                   'owner': {'gateway': 'owner', 'profile': 'default', 'board': 'default', 'task_id': parent},
++                   'task_record_key': 'default/default/' + parent}
++        conn.execute('INSERT INTO origin_native_receipts VALUES (?,?,NULL,1)', (parent, json.dumps(binding)))
++        conn.commit()
++    world['args']['creator'] = {'gateway': 'owner', 'profile': 'default',
++                                'board': 'default', 'task_id': parent}
++    world['args']['create']['parents'] = [parent]
++    return world, parent
++
++
++def test_forwarded_creator_stamped_and_replayed(attested, monkeypatch, capsys):
++    world, parent = attested
++    first = support.invoke(world, monkeypatch, capsys)
++    assert first.get('created') is True, first
++    with kbc.connect_closing() as conn:
++        conn.execute('DELETE FROM origin_native_receipts WHERE task_id=?', (parent,))
++        conn.commit()
++    second = support.invoke(world, monkeypatch, capsys)
++    assert second['task_id'] == first['task_id']
++    with kbc.connect_closing() as conn:
++        events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created'",
++                              (first['task_id'],)).fetchall()
++        assert len(events) == 1
++        assert json.loads(events[0][0])['creator_task_id'] == parent
++
++
++@pytest.mark.parametrize('damage', ['missing', 'origin', 'owner', 'primary', 'namespace'])
++def test_unproven_native_creator_is_refused_atomically(attested, monkeypatch, capsys, damage):
++    from hermes_cli import kanban_origin_native as native
++    world, parent = attested
++    if damage == 'primary':
++        monkeypatch.setattr(native, '_primary_scope', lambda conn: None)
++    elif damage == 'namespace':
++        world['args']['creator']['board'] = 'other'
++    else:
++        with kbc.connect_closing() as conn:
++            if damage == 'missing':
++                conn.execute('DELETE FROM origin_native_receipts WHERE task_id=?', (parent,))
++            else:
++                binding = json.loads(conn.execute('SELECT binding_json FROM origin_native_receipts WHERE task_id=?',
++                                                  (parent,)).fetchone()[0])
++                binding[damage]['profile'] = 'unrelated'
++                if damage == 'owner':
++                    binding['task_record_key'] = 'unrelated/default/' + parent
++                conn.execute('UPDATE origin_native_receipts SET binding_json=? WHERE task_id=?',
++                             (json.dumps(binding), parent))
++            conn.commit()
++    result = support.invoke(world, monkeypatch, capsys)
++    assert result.get('created') is not True, result
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone():
++            assert conn.execute('SELECT COUNT(*) FROM origin_creation_intents').fetchone()[0] == 0
++
++
++@pytest.mark.parametrize('damage', ['task', 'shape', 'sender', 'public'])
++def test_invalid_creator_cannot_mint_local_ownership(world, monkeypatch, capsys, damage):
++    creator = {'gateway': 'owner', 'profile': 'default', 'board': 'default', 'task_id': 'missing'}
++    world['args']['creator'] = creator
++    if damage == 'shape':
++        creator['extra'] = 'invalid'
++    elif damage == 'sender':
++        world['from'] = 'gw:worker'
++    elif damage == 'public':
++        world['args'].pop('creator')
++        world['args']['create']['creator_task_id'] = 'missing'
++    result = support.invoke(world, monkeypatch, capsys)
++    assert result.get('created') is not True, result
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_origin_forward_decision.py b/tests/hermes_cli/test_origin_forward_decision.py
+index 001234f9aca..a94b1c628a4 100644
+--- a/tests/hermes_cli/test_origin_forward_decision.py
++++ b/tests/hermes_cli/test_origin_forward_decision.py
+@@ -46,12 +46,26 @@
+     assert first["args"]["origin"]["gateway"] == "macbook"
+     assert "from" not in first  # courier authenticates the actual MacBook, never copied worker identity
+     assert first["args"]["create"] == forwarding[0]["args"]["create"]
++    assert 'creator' not in first['args']  # foreign-home route keeps chat ownership
+     assert decide(forwarding, now_ms=lambda: 99999) == first
+     assert forwarding[2] == [("default", "task-1")]
+     with sqlite3.connect(forwarding[1]["path"]) as db:
+         assert db.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
+ 
+ 
++def test_native_same_home_creator_is_frozen(forwarding):
++    request = copy.deepcopy(forwarding[0])
++    request['args']['destination']['gateway'] = 'macbook'
++    creator = request['args']['creator'] = {**request['args']['creator'], 'gateway': 'macbook'}
++    binding = {'binding_id': 'native-' + creator['task_id'], 'version': 1, 'publication_version': 1,
++               'owner': creator, 'origin': request['args']['origin'],
++               'task_record_key': 'default/default/' + creator['task_id']}
++    kwargs = {'native_lookup': lambda origin, owner: binding}
++    first = decide(forwarding, request, **kwargs)
++    assert first['args']['creator'] == creator
++    assert decide(forwarding, request, now_ms=lambda: 99999, **kwargs) == first
++
++
+ @pytest.mark.parametrize("field", ["create", "destination", "run_uid", "creator"])
+ def test_same_id_changed_payload_conflicts(forwarding, field):
+     decide(forwarding)
+diff --git a/tests/origin_transport/test_creator.py b/tests/origin_transport/test_creator.py
+new file mode 100644
+index 00000000000..c08f109f3e1
+--- /dev/null
++++ b/tests/origin_transport/test_creator.py
+@@ -0,0 +1,88 @@
++"""Real courier forwarding and owner creation retain native task ownership."""
++import json
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_origin_native as native
++from hermes_cli import kanban_placement as placement, kanban_sync_client
++from hermes_state import SessionDB
++from tests.origin_transport import test_forwarding as support
++
++network = support.network
++
++
++def test_worker_native_creator_survives_courier_and_owner(network, monkeypatch):
++    courier, dbs, service, host, runner, adapter, _ = network
++    with host('hub'):
++        from hermes_constants import get_hermes_home
++        sessions = SessionDB(db_path=get_hermes_home() / 'state.db')
++        sessions.create_session('chat-one', 'cli')
++        sessions.close()
++        with kbc.connect_closing() as conn:
++            from hermes_cli import kanban_db_sync as sync
++            sync.set_mode(conn, 'primary')
++            assert native._primary_scope(conn) == ('hub', 'default', 'default')
++            parent = kb.create_task(conn, title='Implementation', session_id='creator')
++            creator = {'gateway': 'hub', 'profile': 'default', 'board': 'default', 'task_id': parent}
++            origin = {'gateway': 'hub', 'profile': 'default', 'session': 'chat-one'}
++            binding = {'binding_id': 'native-' + parent, 'version': 1, 'publication_version': 1,
++                       'owner': creator, 'origin': origin, 'task_record_key': 'default/default/' + parent}
++            # Controlled durable native receipt, not a fabricated successful adapter response.
++            native._install_revocation(conn)
++            conn.execute('INSERT INTO origin_native_receipts VALUES (?,?,NULL,1)', (parent, json.dumps(binding)))
++            conn.commit()
++    monkeypatch.setattr(kanban_sync_client.Hub, 'machines', lambda self: {
++        'me': 'hub', 'machines': [{'name': name, 'state': 'active'} for name in ('hub', 'worker-7')]})
++    monkeypatch.setattr(kanban_sync_client.Hub, 'snapshot_page', lambda *a, **k: {
++        'table': 'leases', 'rows': [{'task_id': parent, 'holder': 'worker-7', 'run_uid': 'run-one',
++                                   'expires': 9999999999999}], 'more': False})
++    with host('worker-7'), monkeypatch.context() as patch:
++        patch.setattr(courier, 'load_config', lambda: {'gateway': 'worker-7', 'hub_url': 'https://example.com'})
++        patch.setattr(courier, 'send_queued', lambda db, api: len(service.deliver(db, 'worker-7')))
++        patch.setattr(placement, 'hub_carries_options', lambda cli: True)
++        patch.setattr(placement, 'remote_state', lambda rid: 'queued')
++        import contextlib
++        import io
++
++        def schema_runner(cfg, argv, stdin):
++            from hermes_cli import kanban_creation_contract
++            assert argv == ['--run-module', 'hermes_cli.kanban_creation_contract']
++            output = io.StringIO()
++            with monkeypatch.context() as schema_patch, contextlib.redirect_stdout(output):
++                schema_patch.setattr('sys.stdin', io.StringIO(stdin.decode()))
++                rc = kanban_creation_contract.main()
++            return rc, output.getvalue(), ''
++
++        def cli(argv):
++            output = io.StringIO()
++            with contextlib.redirect_stdout(output):
++                try:
++                    rc = courier.main(argv[1:], api=service, runner=schema_runner)
++                except SystemExit as exc:
++                    rc = exc.code
++            return rc, output.getvalue(), ''
++
++        patch.setattr(placement, 'hub_runner', cli)
++        result = placement.create_remote({'title': 'Independent review', 'assignee': 'default', 'parents': [parent]},
++            target='hub', self_gw='worker-7', origin_session='chat-one', origin_profile='default',
++            origin_gateway='hub', creator=creator, run_uid='run-one', canonical_home=True,
++            cfg={'creator_session': 'worker-session'})
++        assert result['ok'], result
++    request = next(iter(service.requests.values()))
++    with host('hub'):
++        courier.journal_request(dbs['hub'], request)
++        status, result = courier.advance_origin_forward(dbs['hub'], {}, request, runner, service)
++        assert status == 'pending', result
++        child = service.deliver(dbs['hub'], 'hub')[0]
++        child = service.requests[child['id']]
++        assert child['args']['creator'] == creator
++        forged = adapter('origin-create', {**child, 'from': 'gw:worker-7'})
++        assert forged['status'] == 'rejected'
++        courier.journal_request(dbs['hub'], child)
++        status, result = courier.advance_origin_create(dbs['hub'], {}, child, runner, service)
++        assert status == 'pending' and result.get('created') is True, result
++        task_id = result['task_id']
++        assert adapter('origin-create', child)['task_id'] == task_id
++        with kbc.connect_closing() as conn:
++            row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (task_id,)).fetchone()
++            assert json.loads(row[0])['creator_task_id'] == parent
++            task = kb.get_task(conn, task_id)
++            assert task is not None and task.status == 'todo'
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 9e4c9be6561..ed1c70239d2 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1661,7 +1661,7 @@
+                 # session's current board.
+                 board=args.get("board"),
+                 project_source_task_id=project_source_task_id, triage=triage,
+-                creator_task_id=self_tid,
++                creator_task_id=(kw.get("origin_creator_task_id") if origin_intent is not None else self_tid),
+                 idempotency_key=args.get("idempotency_key"),
+                 max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+                 requires=_effective_requires(marker_placement, args),
+-- 
+2.43.0
+

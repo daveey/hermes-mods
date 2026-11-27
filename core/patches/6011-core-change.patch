@@ -1,0 +1,537 @@
+From 86776a84274ea9b14f18560e90569a83da544850 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:07:10 +0000
+Subject: [PATCH 6011] Kanban admission and display read-cost reductions
+
+Public mirror of source commit 86776a84274ea9b14f18560e90569a83da544850.
+
+---
+diff --git a/hermes_cli/kanban_external_display.py b/hermes_cli/kanban_external_display.py
+new file mode 100644
+index 00000000000..b502567bbd4
+--- /dev/null
++++ b/hermes_cli/kanban_external_display.py
+@@ -0,0 +1,66 @@
++"""Selected external-watch inputs for one display invocation, never strict polling. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++
++class Capture:
++    def __init__(self, conn: sqlite3.Connection, ids):
++        from hermes_cli import kanban_external_watch as watch
++
++        self.conn = conn
++        self.own = watch.own_host(conn)
++        self.rows = {}
++        # One winning event per task/kind. No full histories or per-card cursors.
++        packed = conn.execute(
++            "SELECT json_group_array(json_array(task_id,kind,id,"
++            "CASE WHEN typeof(payload)='blob' THEN hex(payload) ELSE payload END,created_at,typeof(payload)='blob')) "
++            "FROM task_events WHERE id IN ("
++            "SELECT MAX(id) FROM task_events WHERE task_id IN (SELECT value FROM json_each(?)) "
++            "AND kind IN ('scheduled','continued','external_watch') GROUP BY task_id,kind)",
++            (json.dumps(ids),)).fetchone()[0]
++        for tid, kind, eid, payload, at, blob in json.loads(packed):
++            if blob:
++                payload = bytes.fromhex(payload)
++            self.rows[tid, kind] = (eid, payload, at)
++        self.wakes = {}
++        try:
++            self.wakes = {tid: (cmd, every) for tid, cmd, every in conn.execute(
++                "SELECT task_id,cmd,every FROM task_wake_checks "
++                "WHERE task_id IN (SELECT value FROM json_each(?))", (json.dumps(ids),))}
++        except sqlite3.Error:
++            pass  # optional machine-local table; same fallback as literal plan
++        self.last_at = {}
++        try:
++            self.last_at = dict(conn.execute(
++                "SELECT task_id,last_at FROM task_wake_checks WHERE task_id IN (SELECT value FROM json_each(?))",
++                (json.dumps(ids),)))
++        except sqlite3.Error:
++            pass  # independent compatibility/error boundary in literal _shell_seen
++        self._blockers = None
++
++    def context(self, tid):
++        from hermes_cli import kanban_external_watch as watch
++
++        parks = [row for kind in ('scheduled', 'continued') if (row := self.rows.get((tid, kind))) is not None]
++        if not parks:
++            return None
++        eid, raw, at = max(parks, key=lambda row: row[0])
++        payload = watch._json(raw)
++        awaiting = payload.get('awaiting') if isinstance(payload.get('awaiting'), dict) else None
++        return {'event_id': int(eid), 'since': float(at) if at is not None else None,
++                'payload': payload, 'awaiting': awaiting}
++
++    def record(self, tid, after):
++        from hermes_cli import kanban_external_watch as watch
++
++        row = self.rows.get((tid, 'external_watch'))
++        return watch._json(row[1]) if row is not None and row[0] > after else None
++
++    def blockers(self):
++        from hermes_cli import kanban_shared_blockers
++
++        if self._blockers is None:
++            self._blockers = kanban_shared_blockers.blocker_states(self.conn)
++        return self._blockers
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index 916e4370db6..30fa5d2a689 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -130,17 +130,19 @@
+     return own_gateway(conn) or "local"
+ 
+ 
+-def plan(conn: sqlite3.Connection, task_id: str, ctx: dict) -> Optional[dict]:
++def plan(conn: sqlite3.Connection, task_id: str, ctx: dict, *, _wake_row: Any = ...) -> Optional[dict]:
+     """How the card is watched: ``{adapter, ref, every, hint}`` or None when nothing watches it. A declared
+     ``watch`` on the park wins, then a GitHub run/PR ref of a ``ci`` park, then the park's shell probe."""
+     from hermes_cli.kanban_external_adapters import github
+     payload, awaiting = ctx["payload"], ctx["awaiting"] or {}
+     watch = payload.get("watch") if isinstance(payload.get("watch"), dict) else {}
+-    row = None
+-    try:
+-        row = conn.execute("SELECT cmd, every FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
+-    except sqlite3.Error:
+-        pass
++    row = _wake_row
++    if row is ...:
++        row = None
++        try:
++            row = conn.execute("SELECT cmd, every FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
++        except sqlite3.Error:
++            pass
+     cmd = (row[0] if row else None) or payload.get("wake_check") or ""
+     hint = " ".join(x for x in (cmd, str(payload.get("reason") or "")) if x)
+     ref = str(watch.get("ref") or awaiting.get("ref") or "")
+@@ -156,22 +158,25 @@
+     return {"adapter": adapter, "ref": ref, "hint": hint, "every": ks.clamp_every(watch.get("every"), default)}
+ 
+ 
+-def _shell_seen(conn: sqlite3.Connection, task_id: str, rec: dict, every: Any) -> tuple[dict, Any]:
++def _shell_seen(conn: sqlite3.Connection, task_id: str, rec: dict, every: Any, *, _last_at: Any = ...) -> tuple[dict, Any]:
+     """A shell probe THIS host runs: its freshness is the check's own machine-local ``last_at`` (an unsynced
+     board writes a record on change only). A probe another host runs is judged by its records alone: that host
+     writes one per interval (``record_poll``), so the 2-interval rule holds for it too."""
+     seen = float(rec.get("observed_at") or 0)
+-    try:
+-        row = conn.execute("SELECT last_at FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
+-        seen = max(seen, float(row[0] or 0) if row else 0.0)
+-    except sqlite3.Error:
+-        pass
++    if _last_at is ...:
++        try:
++            row = conn.execute("SELECT last_at FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
++            seen = max(seen, float(row[0] or 0) if row else 0.0)
++        except sqlite3.Error:
++            pass
++    else:
++        seen = max(seen, float(_last_at or 0))
+     every = ks.clamp_every(every, SHELL_DEFAULT_EVERY)
+     return dict(rec, observed_at=seen, next_due_at=seen + ks.clamp_every(rec.get("every"), SHELL_DEFAULT_EVERY)), every
+ 
+ 
+ def card_state(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] = None,
+-               hosts: Optional[dict[str, float]] = None, status: Optional[str] = None) -> Optional[dict]:
++               hosts: Optional[dict[str, float]] = None, status: Optional[str] = None, _capture=None) -> Optional[dict]:
+     """The derived external state of one card (see ``kanban_external_state.derive``), or None: not a scheduled
+     ci/deploy/external park, an old host's silence, or a deadline-only wait. Adds ``blocker_id`` / ``triage_card``
+     to ``external`` while a service-down blocker holds the card."""
+@@ -181,13 +186,15 @@
+         status = row[0] if row else None
+     if status != "scheduled":
+         return None
+-    ctx = park_context(conn, task_id)
++    ctx = park_context(conn, task_id) if _capture is None else _capture.context(task_id)
+     if ctx is None or (ctx["awaiting"] or {}).get("kind") not in ks.EXTERNAL_KINDS:
+         return None
+-    watch = plan(conn, task_id, ctx)
+-    rec = latest_record(conn, task_id, ctx["event_id"])
++    watch = (plan(conn, task_id, ctx) if _capture is None
++             else plan(conn, task_id, ctx, _wake_row=_capture.wakes.get(task_id)))
++    rec = (latest_record(conn, task_id, ctx["event_id"]) if _capture is None
++           else _capture.record(task_id, ctx["event_id"]))
+     probe_host = ctx["payload"].get("probe_host")
+-    own = own_host(conn)
++    own = own_host(conn) if _capture is None else _capture.own
+     hosts = hosts_seen(conn) if hosts is None else hosts
+     adapter = (rec or {}).get("adapter") or (watch or {}).get("adapter")
+     # A GitHub run/PR is polled by every gateway's own sweep; a shell probe only by its ``probe_host``.
+@@ -199,18 +206,24 @@
+     else:
+         every = (rec or {}).get("every") or (watch or {}).get("every")
+         if rec is not None and rec.get("adapter") == "shell" and local:
+-            rec, every = _shell_seen(conn, task_id, rec, every)
++            if _capture is None:
++                rec, every = _shell_seen(conn, task_id, rec, every)
++            else:
++                rec, every = _shell_seen(conn, task_id, rec, every, _last_at=_capture.last_at.get(task_id))
+         # This host polls the card and wrote some record within the interval: it is alive, only behind here.
+         alive = local and adapter != "shell" and now - hosts.get(own, 0.0) <= ks.clamp_every(every) + ks.GRACE
+         derived = ks.derive(rec, now=now, every=every, since=ctx["since"], advertises=advertises,
+                             adapter=adapter, service_name=(rec or {}).get("service_name"), host_alive=alive)
+     if derived is not None:
+         derived["adapter"] = derived["external"]["adapter"]
+-        _name_blocker(conn, derived, rec)
++        if _capture is None:
++            _name_blocker(conn, derived, rec)
++        else:
++            _name_blocker(conn, derived, rec, _states=_capture.blockers)
+     return derived
+ 
+ 
+-def _name_blocker(conn: sqlite3.Connection, derived: dict, rec: Optional[dict]) -> None:
++def _name_blocker(conn: sqlite3.Connection, derived: dict, rec: Optional[dict], *, _states=None) -> None:
+     if derived["state"] != ks.DOWN or not rec or not rec.get("adapter") or not rec.get("scope"):
+         return
+     if derived["health"] not in SERVICE_HEALTHS:
+@@ -218,7 +231,7 @@
+     bid = blocker_id(rec["adapter"], rec["scope"])
+     try:
+         from hermes_cli import kanban_shared_blockers as ksb
+-        st = ksb.blocker_states(conn).get(bid)
++        st = (ksb.blocker_states(conn) if _states is None else _states()).get(bid)
+     except (sqlite3.Error, ValueError):
+         return
+     if st is not None and st.is_open:
+@@ -228,16 +241,36 @@
+ 
+ def card_states(conn: sqlite3.Connection, task_ids: Iterable[str], *, now: Optional[float] = None) -> dict[str, dict]:
+     """``{task id: derived state}`` for the scheduled external cards among ``task_ids``. Never raises."""
++    owns = not conn.in_transaction
++    try:
++        if owns:
++            conn.execute('BEGIN')
++        return _card_states(conn, task_ids, now=now)
++    except sqlite3.Error:
++        logger.debug("external card states unavailable", exc_info=True)
++        return {}
++    finally:
++        if owns:
++            conn.rollback()
++
++
++def _card_states(conn, task_ids, *, now):
++    """All captured inputs and lazy blocker reads belong to the caller's snapshot."""
+     out: dict[str, dict] = {}
+     try:
+         hosts = hosts_seen(conn)
+         ids = list(dict.fromkeys(str(t) for t in task_ids))
+         statuses = dict(conn.execute("SELECT id,status FROM tasks WHERE id IN (SELECT value FROM json_each(?))",
+                                      (json.dumps(ids),)))
++        from hermes_cli.kanban_external_display import Capture
++        selected = [tid for tid in ids if statuses.get(tid) == 'scheduled']
++        if not selected:
++            return out
++        capture = Capture(conn, selected)
+         for tid in ids:
+             if statuses.get(tid) != 'scheduled':
+                 continue
+-            derived = card_state(conn, tid, now=now, hosts=hosts, status=statuses[tid])
++            derived = card_state(conn, tid, now=now, hosts=hosts, status=statuses[tid], _capture=capture)
+             if derived is not None:
+                 out[tid] = derived
+     except sqlite3.Error:
+diff --git a/hermes_cli/kanban_wait_history.py b/hermes_cli/kanban_wait_history.py
+index 04f2176ab7b..ec3de48705c 100644
+--- a/hermes_cli/kanban_wait_history.py
++++ b/hermes_cli/kanban_wait_history.py
+@@ -76,12 +76,20 @@
+ def overlay(conn: sqlite3.Connection, info: dict[str, dict[str, Any]], now: Optional[float] = None) -> None:
+     """Fill ``expected_s`` / ``estimate_source`` of the ci / deploy waits in ``info`` from the board's history, in
+     place. A wait without a comparable target keeps ``no history yet``. Never raises."""
++    from hermes_cli.kanban_wait_history_batch import capture
++
++    by_kind = {}
+     for wait in info.values():
+         kind = wait.get("wait_kind")
+         if kind not in ("ci", "deploy") or not wait.get("wait_target"):
+             continue
+         try:
+-            found = samples(conn, kind, wait["wait_target"], now=now)
++            if kind not in by_kind:
++                try:
++                    by_kind[kind] = capture(conn, kind)
++                except sqlite3.Error:  # legacy/missing history is captured once too
++                    by_kind[kind] = {}
++            found = by_kind[kind].get(wait["wait_target"], [])
+         except (sqlite3.Error, ValueError, TypeError):  # display-only: a board without history keeps "no history yet"
+             continue
+         wait.update(kwi.eta_fields(kind, wait.get("waited_since"), samples=found, target=wait["wait_target"]))
+diff --git a/hermes_cli/kanban_wait_history_batch.py b/hermes_cli/kanban_wait_history_batch.py
+new file mode 100644
+index 00000000000..48277783ff2
+--- /dev/null
++++ b/hermes_cli/kanban_wait_history_batch.py
+@@ -0,0 +1,46 @@
++"""Invocation-owned ETA history: one bounded capture per kind, shared by all targets.
++
++Display only. Literal ``samples`` and its callers keep their existing semantics.
++No connection or authority survives this capture. [daveey]
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from hermes_cli import kanban_wait_info as kwi
++
++
++def capture(conn: sqlite3.Connection, kind: str) -> dict[str, list[float]]:
++    from hermes_cli.kanban_wait_history import END_EVENTS, SCAN_CAP
++
++    # Probe each end kind through (kind, task_id, id), then choose the first id,
++    # NOT the smallest timestamp. The old ORDER BY id subquery could scan all
++    # later unrelated events for each unfinished park.
++    probes = ' UNION ALL '.join(
++        'SELECT MIN(n.id) AS next_id FROM task_events n '
++        'WHERE n.kind=? AND n.task_id=p.task_id AND n.id>p.id' for _ in END_EVENTS)
++    sql = (
++        "WITH parks AS MATERIALIZED (SELECT id,task_id,payload,created_at FROM task_events "
++        "WHERE kind IN ('scheduled','continued') AND json_extract(payload,'$.awaiting.kind')=? "
++        "ORDER BY id DESC LIMIT ?), ended AS ("
++        f"SELECT p.*, (SELECT MIN(next_id) FROM ({probes})) AS end_id FROM parks p) "
++        "SELECT json_group_array(json_array(CASE WHEN typeof(payload)='blob' THEN hex(payload) ELSE payload END,created_at,"
++        "(SELECT created_at FROM task_events WHERE id=end_id),typeof(payload)='blob')) "
++        "FROM (SELECT * FROM ended ORDER BY id DESC)")
++    packed = conn.execute(sql, (kind, SCAN_CAP, *END_EVENTS)).fetchone()[0]
++    out: dict[str, list[float]] = {}
++    for payload, parked_at, ended_at, blob in json.loads(packed):
++        if ended_at is None or parked_at is None or float(ended_at) <= float(parked_at):
++            continue
++        try:
++            if blob:
++                payload = bytes.fromhex(payload)
++            awaiting = json.loads(payload).get('awaiting') or {}
++        except (ValueError, AttributeError, TypeError):
++            continue
++        target = kwi.wait_target(kind, awaiting.get('ref'))
++        bucket = out.setdefault(target, [])
++        if len(bucket) < kwi.ETA_HISTORY:
++            bucket.append(float(ended_at) - float(parked_at))
++    return out
+diff --git a/tests/hermes_cli/test_kanban_wait_history_batch.py b/tests/hermes_cli/test_kanban_wait_history_batch.py
+new file mode 100644
+index 00000000000..5d017dfb84e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_history_batch.py
+@@ -0,0 +1,212 @@
++"""Request ETA history work is per board/kind, not per displayed target. [daveey]"""
++import sqlite3
++from contextlib import closing
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_external_activity as external
++from hermes_cli import kanban_wait_history as history
++from hermes_cli import kanban_wait_info as info
++from tests.hermes_cli import test_kanban_wait_eta as helpers
++
++
++@pytest.fixture(autouse=True)
++def clear():
++    history.reset_for_tests()
++    external.reset_for_tests()
++    yield
++    history.reset_for_tests()
++    external.reset_for_tests()
++
++
++def seed(conn, count):
++    conn.executescript("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, created_at REAL);"
++                       "CREATE INDEX idx_events_task ON task_events(task_id, created_at);"
++                       "CREATE INDEX idx_events_kind_task_id ON task_events(kind, task_id, id);"
++                       "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, block_kind TEXT, human_request TEXT, awaiting TEXT, title TEXT);")
++    for i in range(count):
++        for j in range(3):
++            helpers._finished(conn, f'h{i}-{j}', 'ci', f'https://github.com/acme/repo{i}/actions/runs/{j}', 600 + j * 300)
++        helpers._park(conn, f't_{i}', 'ci', f'https://github.com/acme/repo{i}/actions/runs/99')
++    # Unrelated newer events make the old id-ordered correlated next-end lookup expensive.
++    conn.executemany("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('noise','external_watch','{}',1)",
++                     [()] * 10_000)
++    conn.commit()
++
++
++@pytest.mark.parametrize('count', [1, 40])
++def test_profiles_http_many_eta_targets_have_bounded_queries_and_vm_work(tmp_path, monkeypatch, record_property, count):
++    from hermes_cli.web_routers import profiles
++    path = tmp_path / 'board.db'
++
++    with closing(sqlite3.connect(path)) as conn:
++        seed(conn, count)
++    pairs = [(f's{i}', f't_{i}') for i in range(count)]
++    statements = []
++    steps = [0]
++
++    def progress():
++        steps[0] += 100
++        return 0
++
++    def open_ro(_path):
++        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
++        conn.set_trace_callback(statements.append)
++        conn.set_progress_handler(progress, 100)
++        return conn
++
++    def annotate(rows, **kwargs):
++        external.stamp_boards(rows, lambda: [path], open_ro, lambda conn: pairs,
++                              lambda row: [row['id']], signature=None)
++
++    monkeypatch.setattr(profiles, '_profile_targets', lambda label: [('default', None)])
++    monkeypatch.setattr(profiles, '_read_serial_profile_db', lambda *args: (
++        [{'id': sid, 'source': 'cli', 'started_at': 100} for sid, _ in pairs], count))
++    monkeypatch.setattr(profiles, '_corrupt_profile_stores', lambda targets: {})
++    monkeypatch.setattr(profiles, 'annotate_kanban_activity', annotate)
++    for name in ('goal', 'cron', 'background', 'turn', 'subagent'):
++        monkeypatch.setattr(profiles, f'annotate_{name}_activity', lambda rows: None)
++    monkeypatch.setattr(profiles, 'annotate_review_wait', lambda rows: None)
++    app = FastAPI()
++    app.include_router(profiles.sessions_router)
++    with TestClient(app) as client:
++        response = client.get('/api/profiles/sessions?limit=50')
++    assert response.status_code == 200, response.text
++    sessions = response.json()['sessions']
++    assert len(sessions) == count
++    # Ensure the actual external/ETA path ran, not merely the HTTP wrapper.
++    assert all(row['kanban_external_cards'][0]['eta']['expected_s'] == 900 for row in sessions)
++    print(f'GET targets={count} queries={len(statements)} vm_steps={steps[0]}')
++    record_property('board_queries', len(statements))
++    record_property('vm_steps', steps[0])
++    assert len(statements) <= 30, len(statements)
++    assert steps[0] < 500_000, steps[0]
++
++
++def test_overlay_same_target_repeated_is_one_capture():
++    with closing(sqlite3.connect(':memory:')) as conn:
++        seed(conn, 1)
++        waits = {str(i): {'wait_kind': 'ci', 'wait_target': 'acme/repo0', 'waited_since': helpers.PARK}
++                 for i in range(600)}
++        queries = []
++        conn.set_trace_callback(queries.append)
++        history.overlay(conn, waits, now=helpers.NOW)
++        assert all(w['expected_s'] == 900 for w in waits.values())
++        assert len(queries) <= 3, len(queries)
++
++
++def test_overlay_matches_literal_for_both_kinds_and_first_end_order():
++    with closing(helpers._board()) as conn:
++        for n in range(25):
++            helpers._finished(conn, f't{n}', 'ci', helpers.REPO.format(n=n), 900 + n)
++        for n in range(3):
++            helpers._finished(conn, f'd{n}', 'deploy', 'hub/core#1', 300 + n, start_kind='continued')
++        # The next end is chosen by event id, not minimum timestamp.
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('t24','claimed','{}',1)")
++        waits = {kind: {'wait_kind': kind, 'wait_target': target, 'waited_since': helpers.PARK}
++                 for kind, target in [('ci', 'acme/widgets'), ('deploy', 'hub/core'), ('ci-empty', '')]}
++        expected = {}
++        for key, wait in waits.items():
++            if wait['wait_kind'] in ('ci', 'deploy'):
++                expected[key] = info.eta_fields(wait['wait_kind'], helpers.PARK,
++                    samples=history.samples(conn, wait['wait_kind'], wait['wait_target'], now=helpers.NOW),
++                    target=wait['wait_target'])
++        history.overlay(conn, waits, now=helpers.NOW)
++        for key, fields in expected.items():
++            assert all(waits[key][k] == v for k, v in fields.items())
++        assert 'expected_s' not in waits['ci-empty']
++
++
++@pytest.mark.parametrize('blob', [False, True])
++def test_display_watch_matches_literal_shell_freshness_and_repark(blob):
++    from hermes_cli import kanban_external_watch as watch
++    with closing(sqlite3.connect(':memory:')) as conn:
++        seed(conn, 2)
++        conn.executescript("CREATE TABLE task_wake_checks(task_id TEXT PRIMARY KEY,cmd TEXT,every INTEGER,last_at REAL);")
++        conn.execute("INSERT INTO task_wake_checks VALUES ('t_0','true',900,?)", (helpers.NOW,))
++        conn.execute("UPDATE task_events SET payload=? WHERE task_id='t_0' AND kind='scheduled'",
++                     ('{"awaiting":{"kind":"external","ref":"job"},"wake_check":"true"}',))
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('t_0','external_watch',?,?)",
++                     ('{"host":"local","adapter":"shell","job":"running","service":"ok","every":900,"observed_at":1}', helpers.PARK))
++        # An older record must not survive a later continued park.
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('t_1','external_watch','{}',1)")
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES ('t_1','continued',?,?)",
++                     ('{"awaiting":{"kind":"ci","ref":"https://github.com/acme/repo1/actions/runs/1"}}', helpers.PARK))
++        if blob:
++            conn.execute('UPDATE task_events SET payload=CAST(payload AS BLOB)')
++        conn.commit()
++        hosts = watch.hosts_seen(conn)
++        expected = {tid: watch.card_state(conn, tid, now=helpers.NOW, hosts=hosts) for tid in ('t_0', 't_1')}
++        assert expected['t_0']['external']['observed_at'] == helpers.NOW
++        assert watch.card_states(conn, expected, now=helpers.NOW) == expected
++        assert not conn.in_transaction
++        conn.execute('BEGIN')
++        assert watch.card_states(conn, expected, now=helpers.NOW) == expected
++        assert conn.in_transaction
++        conn.rollback()
++
++
++def test_blob_eta_history_matches_literal():
++    with closing(sqlite3.connect(':memory:')) as conn:
++        seed(conn, 1)
++        conn.execute('UPDATE task_events SET payload=CAST(payload AS BLOB)')
++        expected = history.samples(conn, 'ci', 'acme/repo0', now=helpers.NOW)
++        assert expected == [1200, 900, 600]
++        waits = {'x': {'wait_kind': 'ci', 'wait_target': 'acme/repo0', 'waited_since': helpers.PARK}}
++        history.overlay(conn, waits, now=helpers.NOW)
++        assert waits['x']['expected_s'] == 900
++
++
++def test_legacy_wake_table_without_last_at_keeps_literal_plan():
++    from hermes_cli import kanban_external_watch as watch
++    with closing(sqlite3.connect(':memory:')) as conn:
++        seed(conn, 1)
++        conn.execute('CREATE TABLE task_wake_checks(task_id TEXT PRIMARY KEY,cmd TEXT,every INTEGER)')
++        conn.execute("INSERT INTO task_wake_checks VALUES ('t_0','true',900)")
++        conn.execute("UPDATE task_events SET payload=? WHERE task_id='t_0' AND kind='scheduled'",
++                     ('{"awaiting":{"kind":"external","ref":"job"}}',))
++        conn.commit()
++        expected = watch.card_state(conn, 't_0', now=helpers.NOW, hosts={})
++        assert expected is not None
++        assert watch.card_states(conn, ['t_0'], now=helpers.NOW) == {'t_0': expected}
++
++
++@pytest.mark.parametrize('reverse', [False, True])
++def test_history_scan_cap_and_next_call_mutation_match_literal(reverse):
++    with closing(helpers._board()) as conn:
++        conn.execute(f'PRAGMA reverse_unordered_selects={int(reverse)}')
++        for i in range(history.SCAN_CAP + 20):
++            helpers._finished(conn, 'reused-card', 'ci', helpers.REPO.format(n=i), 600 if i < 20 else 900)
++        # Leave the newest park unfinished: it must not become a sample.
++        helpers._park(conn, 'open', 'ci', helpers.REPO.format(n=999))
++        expected = history.samples(conn, 'ci', 'acme/widgets', now=helpers.NOW)
++        waits = {'x': {'wait_kind': 'ci', 'wait_target': 'acme/widgets', 'waited_since': helpers.PARK}}
++        history.overlay(conn, waits, now=helpers.NOW)
++        assert waits['x']['expected_s'] == 900
++        assert expected == [900] * info.ETA_HISTORY
++        conn.execute('UPDATE task_events SET created_at=created_at+500 WHERE kind=\'condition_met\'')
++        history.overlay(conn, waits, now=helpers.NOW)
++        assert waits['x']['expected_s'] == 1400  # no process-global stale target memo
++
++
++def test_display_capture_snapshot_and_next_invocation(tmp_path, monkeypatch):
++    from hermes_cli import kanban_external_display as display
++    from hermes_cli import kanban_external_watch as watch
++    path = tmp_path / 'wal.db'
++    with closing(sqlite3.connect(path)) as reader, closing(sqlite3.connect(path)) as writer:
++        reader.execute('PRAGMA journal_mode=WAL')
++        seed(reader, 1)
++        expected = watch.card_state(reader, 't_0', now=helpers.NOW, hosts={})
++        original = display.Capture
++        def capture(conn, ids):
++            # Status/hosts have pinned the read snapshot already.
++            writer.execute("UPDATE tasks SET status='done'")
++            writer.execute("UPDATE task_events SET payload='{}' WHERE task_id='t_0'")
++            writer.commit()
++            return original(conn, ids)
++        monkeypatch.setattr(display, 'Capture', capture)
++        assert watch.card_states(reader, ['t_0'], now=helpers.NOW) == {'t_0': expected}
++        assert not reader.in_transaction
++        assert watch.card_states(reader, ['t_0'], now=helpers.NOW) == {}
+-- 
+2.43.0
+

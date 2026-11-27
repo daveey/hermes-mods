@@ -1,0 +1,191 @@
+From 8e345924c83933c8d28106c3ce2474d3a01026c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:12:49 +0000
+Subject: [PATCH 6291] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit 8e345924c83933c8d28106c3ce2474d3a01026c9.
+
+---
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 2ce68c09e31..6b87fd285c1 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -1283,7 +1283,11 @@
+ 
+ def escalated_owner(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+     """The owner card when this card's latest event is a re-park escalation."""
+-    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'parent_held' ORDER BY id DESC LIMIT 1",
++    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? "
++                       "AND kind NOT IN ('parent_held','hold_creator_notified') "
++                       "AND NOT (kind='commented' AND COALESCE(CASE WHEN json_valid(payload) "
++                       "THEN json_extract(payload,'$.author') END,'')='kanban-decision-notice') "
++                       "ORDER BY id DESC LIMIT 1",
+                        (task_id,)).fetchone()
+     if not row or row[0] != ESCALATED_EVENT:
+         return None
+@@ -1295,7 +1299,11 @@
+ 
+ def escalated_fired(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+     """``fired_reparks`` of this card's latest event when it is a fire-cap escalation, else None."""
+-    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? AND kind != 'parent_held' ORDER BY id DESC LIMIT 1",
++    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id = ? "
++                       "AND kind NOT IN ('parent_held','hold_creator_notified') "
++                       "AND NOT (kind='commented' AND COALESCE(CASE WHEN json_valid(payload) "
++                       "THEN json_extract(payload,'$.author') END,'')='kanban-decision-notice') "
++                       "ORDER BY id DESC LIMIT 1",
+                        (task_id,)).fetchone()
+     if not row or row[0] != ESCALATED_EVENT:
+         return None
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index e89ff425756..acdb83f348c 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -272,7 +272,11 @@
+         # ``continued`` event that carries its wake (t_00d7ca7eed7bf381). [daveey]
+         from hermes_cli.kanban_restore_chat_subs import restored_at
+         restored = restored_at(conn, task_id)
+-        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind != 'parent_held'", (task_id,)).fetchone()
++        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? "
++                            "AND kind NOT IN ('parent_held','hold_creator_notified') "
++                            "AND NOT (kind='commented' AND COALESCE(CASE WHEN json_valid(payload) "
++                            "THEN json_extract(payload,'$.author') END,'')='kanban-decision-notice')",
++                            (task_id,)).fetchone()
+         parked_at = max(int(last[0] or 0), restored or 0) if last else restored
+         parked_at = parked_at or int(time.time())
+         return {"payload": {}, "parked_at": parked_at, "timed": False, "event_id": None,
+diff --git a/hermes_cli/kanban_db_dispatch_guard_notice.py b/hermes_cli/kanban_db_dispatch_guard_notice.py
+index 0e293200860..fc1d6bf133d 100644
+--- a/hermes_cli/kanban_db_dispatch_guard_notice.py
++++ b/hermes_cli/kanban_db_dispatch_guard_notice.py
+@@ -30,9 +30,9 @@
+     from hermes_cli import kanban_db as _kb
+ 
+     comment_filter = (
+-        "NOT (kind = 'commented' AND json_extract(payload, '$.author') = 'kanban-dispatcher')"
++        "NOT (kind = 'commented' AND json_extract(payload, '$.author') IN ('kanban-dispatcher','kanban-decision-notice'))"
+         if include_replies else "kind != 'commented'"
+-    ) + " AND kind NOT IN ('dispatch_skipped', 'parent_held')"  # advisory publication does not change a guard
++    ) + " AND kind NOT IN ('dispatch_skipped', 'parent_held', 'hold_creator_notified')"  # advisory, not a guard change
+     events = sorted(
+         (stamp, row[0], row[1], row[2])
+         for row in conn.execute(
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 28a704e5131..f55f7f4bf34 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -51,7 +51,8 @@
+                  "superseded. The card's budget after this release: {budget}.")
+ # Events that can follow a recorded release without moving the card: only then is a triage card "still ours".
+ _QUIET = frozenset({"commented", RELEASED, "spend_budget_set", "spend_budget_decision_ready", "scope_renewed",
+-                    "user_steps_answer", "card_answer_released", "stranded_park_escalated", "parent_held"})
++                    "user_steps_answer", "card_answer_released", "stranded_park_escalated", "parent_held",
++                    "hold_creator_notified"})
+ ESCALATED = "stranded_park_escalated"  # kanban_stranded_park.EVENT: the home's own record of the ask it filed
+ REFILED = "stranded_park_refiled"  # the same record for an ask the sweep re-filed; no second desk notice
+ MANDATE = (MARK + " Budget: {runs} more runs. {limits} Stop only on: a provider safety refusal; a step that needs "
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 99b8eaae6d4..5230066c548 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -283,7 +283,9 @@
+         "SELECT t.id, t.title, t.body, t.assignee, t.human_request, t.tenant FROM tasks t "
+         "WHERE t.status = 'triage' " + _gate_exclusion() +
+         "AND COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id "
+-        "AND e.kind != 'parent_held'), t.created_at) <= ? "
++        "AND e.kind NOT IN ('parent_held','hold_creator_notified') "
++        "AND NOT (e.kind='commented' AND COALESCE(CASE WHEN json_valid(e.payload) "
++        "THEN json_extract(e.payload,'$.author') END,'')='kanban-decision-notice')), t.created_at) <= ? "
+         "AND " + _PENDING, (cutoff, *_PENDING_ARGS),
+     ).fetchall()
+     from hermes_cli.kanban_resume_requester import open_recovery_card
+diff --git a/tests/hermes_cli/test_kanban_parent_held_residual.py b/tests/hermes_cli/test_kanban_parent_held_residual.py
+index c0aea52eae4..47f229fd71f 100644
+--- a/tests/hermes_cli/test_kanban_parent_held_residual.py
++++ b/tests/hermes_cli/test_kanban_parent_held_residual.py
+@@ -1,5 +1,6 @@
+ """Held-parent publication is deduplicated and cannot invalidate a durable release."""
+ import json
++import pytest
+ 
+ from hermes_cli import kanban_db as kb
+ from tests.hermes_cli import test_kanban_release as helpers
+@@ -79,7 +80,37 @@
+     assert helpers.records(board, child) == 1 and helpers.mandates(board, child) == 1
+ 
+ 
+-def test_notice_keeps_guard_escalation_and_fallback_park_clocks(board):
++def test_creator_parent_notice_preserves_release_crash_resume(board, monkeypatch):
++    from hermes_cli import kanban_parent_held as held
++    grandparent = helpers.spend_stopped(board)
++    parent = helpers.spend_stopped(board)
++    kb.link_tasks(board, grandparent, parent)
++    child = kb.create_task(board, title='creator-owned child', assignee='default', creator_task_id=parent)
++    kb.link_tasks(board, parent, child)
++    real = kb.block_task
++    monkeypatch.setattr(kb, 'block_task', lambda *a, **kw: False)
++    assert helpers.run(board, parent)['refusal'] == 'dependency_wait_refused'
++    held.sweep(board)
++    assert board.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='hold_creator_notified'",
++                         (parent,)).fetchone()
++    monkeypatch.setattr(kb, 'block_task', real)
++    out = helpers.run(board, parent)
++    assert out['outcome'] == 'waiting_on_parents' and out['resumed'], out
++    assert helpers.records(board, parent) == 1 and helpers.mandates(board, parent) == 1
++    assert kb.parent_states(board, parent) == [(grandparent, 'triage')]
++
++
++def append_advisory(board, tid, advisory):
++    if advisory == 'hold_creator_notified':
++        from hermes_cli.kanban_hold_notices import creator
++        source = kb.create_task(board, title='notice source', assignee='default', creator_task_id=tid)
++        creator(board, source, 'clock-proof', 'Parent requires disposition; grants no scope.')
++    else:
++        kb._append_event(board, tid, advisory, {})
++
++
++@pytest.mark.parametrize('advisory', ['parent_held', 'hold_creator_notified'])
++def test_notice_keeps_guard_escalation_and_fallback_park_clocks(board, advisory):
+     from hermes_cli import kanban_db_dispatch_guard_notice as guard
+     from hermes_cli import kanban_awaiting as awaiting, kanban_continuation as continuation
+     tid = kb.create_task(board, title='guard clock', assignee='default')
+@@ -87,7 +118,7 @@
+         kb._append_event(board, tid, 'respawn_guarded', {'reason': 'active_pr'})
+     started = guard.guard_hold_started_at(board, tid)
+     with kb.write_txn(board):
+-        kb._append_event(board, tid, 'parent_held', {})
++        append_advisory(board, tid, advisory)
+     assert guard.guard_hold_started_at(board, tid) == started
+     assert guard.guard_hold_reason(board, tid) == 'active_pr'
+     with kb.write_txn(board):
+@@ -95,8 +126,8 @@
+                          {'owner_task_id': 'owner', 'awaiting': {'fired_reparks': 4}})
+     parked = continuation.park_state(board, tid)['parked_at']
+     with kb.write_txn(board):
+-        kb._append_event(board, tid, 'parent_held', {})
+-        board.execute("UPDATE task_events SET created_at=created_at+1000 WHERE task_id=? AND kind='parent_held'", (tid,))
++        append_advisory(board, tid, advisory)
++        board.execute("UPDATE task_events SET created_at=created_at+1000 WHERE task_id=? AND kind IN (?, 'commented')", (tid, advisory))
+     assert awaiting.escalated_owner(board, tid) == 'owner'
+     assert awaiting.escalated_fired(board, tid) == 4
+     assert continuation.park_state(board, tid)['parked_at'] == parked
+@@ -106,13 +137,14 @@
+     assert guard.guard_hold_started_at(board, tid) is None
+ 
+ 
+-def test_notice_does_not_postpone_stale_triage(board):
++@pytest.mark.parametrize('advisory', ['parent_held', 'hold_creator_notified'])
++def test_notice_does_not_postpone_stale_triage(board, advisory):
+     from hermes_cli.kanban_triage_sweep import sweep_stale_triage
+     tid = kb.create_task(board, title='old triage', assignee='default', triage=True)
+     with kb.write_txn(board):
+         board.execute('UPDATE task_events SET created_at=100 WHERE task_id=?', (tid,))
+-        kb._append_event(board, tid, 'parent_held', {})
+-        board.execute("UPDATE task_events SET created_at=9999 WHERE task_id=? AND kind='parent_held'", (tid,))
++        append_advisory(board, tid, advisory)
++        board.execute("UPDATE task_events SET created_at=9999 WHERE task_id=? AND kind IN (?, 'commented')", (tid, advisory))
+     assert tid in sweep_stale_triage(board, older_than=100, now=10000)
+ 
+ 
+-- 
+2.43.0
+

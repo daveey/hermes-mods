@@ -1,0 +1,158 @@
+From b216c1da55655d277621bff2d2ed950ae31dab09 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:55:51 +0000
+Subject: [PATCH 6018] Kanban sync: bounded feed apply, replica write guards and snapshot rebuild
+
+Public mirror of source commit b216c1da55655d277621bff2d2ed950ae31dab09.
+
+---
+diff --git a/docs/designs/kanban-feed-writer-budget.md b/docs/designs/kanban-feed-writer-budget.md
+index 0a39b790f16..5175e4b99ce 100644
+--- a/docs/designs/kanban-feed-writer-budget.md
++++ b/docs/designs/kanban-feed-writer-budget.md
+@@ -15,7 +15,8 @@
+ SQLite opcode, rollback I/O, or COMMIT/fsync. No network I/O runs in a feed writer
+ transaction. The atomic repair/snapshot API remains available unchanged.
+ 
+-Schema columns are captured outside the reservation and reused for its page.
++Schema columns are prepared outside each prefix reservation (landed page-writer
++cache) and reused for that reservation.
+ A 100 ms scheduling opportunity after each reservation avoids immediately retaking
+  the writer ahead of an already waiting dispatcher, including SQLite's busy-handler
+  backoff (a 5 ms gap can fall entirely between its retries). SQLite has no FIFO guarantee;
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 478ed96b65d..67e18800488 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1346,7 +1346,7 @@
+     from hermes_cli import kanban_containment_replica as containment
+     from hermes_cli.kanban_sync_apply_budget import check_budget, transaction_budget
+     containment.prepare_apply(conn, changes)
+-    with page_writer(conn, SYNCED_TABLES, cache=bool(changes) and keep is None), transaction_budget(conn):
++    with page_writer(conn, (*SYNCED_TABLES, "kanban_sync_outbox"), cache=bool(changes) and keep is None), transaction_budget(conn):
+         result.revision_before = _repair_revision(conn)
+         # Serialize with set_mode(off): a feed fetched before detach must not
+         # overwrite locally held custody after the detach transaction commits.
+diff --git a/hermes_cli/kanban_sync_apply_budget.py b/hermes_cli/kanban_sync_apply_budget.py
+index 575f4b06b86..0b106b9c971 100644
+--- a/hermes_cli/kanban_sync_apply_budget.py
++++ b/hermes_cli/kanban_sync_apply_budget.py
+@@ -19,7 +19,6 @@
+ MAX_TRANSACTION_S = 0.25
+ PUSH_INTERVAL_S = 5.0
+ WRITER_YIELD_S = 0.1
+-_SCHEMA: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_apply_schema", default=None)
+ _LIMIT: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_apply_limit", default=None)
+ _DEADLINE: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_apply_deadline", default=None)
+ _SERVICE: contextvars.ContextVar[Any] = contextvars.ContextVar("sync_pull_service", default=None)
+@@ -30,39 +29,12 @@
+     """A rolled-back feed batch exceeded its writer budget."""
+ 
+ 
+-def cached_columns(conn, table):
+-    cache = _SCHEMA.get()
+-    return cache[1].get(table) if cache is not None and cache[0] is conn else None
+-
+-
+-def columns(conn, table):
+-    cached = cached_columns(conn, table)
+-    if cached is not None:
+-        return cached
+-    from hermes_cli.kanban_table_columns import table_columns
+-    return table_columns(conn, table)
+-
+-
+ def check_budget():
+     deadline = _DEADLINE.get()
+     if deadline is not None and time.monotonic() >= deadline:
+         raise ApplyBudgetExceeded("feed transaction exceeded writer budget")
+ 
+ 
+-@contextlib.contextmanager
+-def schema_cache(conn):
+-    from hermes_cli import kanban_db_sync as sync
+-    if _SCHEMA.get() is not None and _SCHEMA.get()[0] is conn:
+-        yield
+-        return
+-    snapshot = {table: sync.table_columns(conn, table) for table in (*sync.SYNCED_TABLES, "kanban_sync_outbox")}
+-    token = _SCHEMA.set((conn, snapshot))
+-    try:
+-        yield
+-    finally:
+-        _SCHEMA.reset(token)
+-
+-
+ @contextlib.contextmanager
+ def transaction_budget(conn):
+     """Installed only after BEGIN, removed before rollback/COMMIT.
+@@ -127,8 +99,7 @@
+     # Establish conservative holds for every certified receipt before any prefix
+     # can publish readiness. Releases remain held until their event is applied.
+     containment.prepare_apply(conn, changes)
+-    with schema_cache(conn):
+-        return _apply_page(conn, changes, new_cursor=new_cursor, **kwargs)
++    return _apply_page(conn, changes, new_cursor=new_cursor, **kwargs)
+ 
+ 
+ def _apply_page(conn, changes, *, new_cursor, **kwargs):
+diff --git a/hermes_cli/kanban_sync_apply_schema.py b/hermes_cli/kanban_sync_apply_schema.py
+index 3e11122c13d..69f0ed9939a 100644
+--- a/hermes_cli/kanban_sync_apply_schema.py
++++ b/hermes_cli/kanban_sync_apply_schema.py
+@@ -40,14 +40,15 @@
+     """
+     from hermes_cli.kanban_db_connect import write_txn
+     prepared = _prepare(conn, tables) if cache else None
+-    with write_txn(conn):
+-        if prepared is not None and conn.execute('PRAGMA schema_version').fetchone()[0] != prepared.version:
+-            prepared = _prepare(conn, tables)
+-        token = _SCHEMA.set(prepared)
+-        try:
++    token = _SCHEMA.set(prepared)
++    try:
++        with write_txn(conn):
++            if prepared is not None and conn.execute('PRAGMA schema_version').fetchone()[0] != prepared.version:
++                prepared = _prepare(conn, tables)
++                _SCHEMA.set(prepared)
+             yield
+-        finally:
+-            _SCHEMA.reset(token)
++    finally:
++        _SCHEMA.reset(token)
+ 
+ 
+ def table_columns(conn, table):
+diff --git a/hermes_cli/kanban_sync_status_origin.py b/hermes_cli/kanban_sync_status_origin.py
+index de788202c0a..2406548bc96 100644
+--- a/hermes_cli/kanban_sync_status_origin.py
++++ b/hermes_cli/kanban_sync_status_origin.py
+@@ -27,8 +27,8 @@
+         # at CREATE time, then breaks an unrelated later mutation: check first.
+         required = {"tasks": {"id", "status"},
+                     "kanban_sync_outbox": {"op_id", "row_uid", "table_name", "op", "fields", "status_origin"}}
+-        from hermes_cli.kanban_sync_apply_budget import columns
+-        if any(not needed <= set(columns(conn, table)) for table, needed in required.items()):
++        from hermes_cli.kanban_sync_apply_schema import table_columns
++        if any(not needed <= set(table_columns(conn, table)) for table, needed in required.items()):
+             return False
+         conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_TABLE} (op_id TEXT PRIMARY KEY, task_id TEXT)")
+         conn.execute(f"DELETE FROM temp.{_TABLE}")
+diff --git a/tests/hermes_cli/test_kanban_sync_apply_budget.py b/tests/hermes_cli/test_kanban_sync_apply_budget.py
+index c6dce12480d..37ffa08337f 100644
+--- a/tests/hermes_cli/test_kanban_sync_apply_budget.py
++++ b/tests/hermes_cli/test_kanban_sync_apply_budget.py
+@@ -105,7 +105,10 @@
+         conn.set_trace_callback(None)
+     lookups = [(inside, sql) for inside, sql in statements if "TABLE_INFO" in sql.upper()]
+     assert lookups and not any(inside for inside, _ in lookups), "\n".join(stacks)
+-    assert len([sql for _, sql in lookups if not sql.lstrip().startswith("--")]) <= len(sync.SYNCED_TABLES) + 1
++    # One ordered aggregate per prefix reservation, not one probe per applied row.
++    prefixes = -(-len(page) // budget.MAX_ROWS)
++    real = [sql for _, sql in lookups if not sql.lstrip().startswith("--")]
++    assert len(real) <= prefixes + 1
+ 
+ 
+ def test_sql_deadline_rolls_back_single_row(conn, monkeypatch):
+-- 
+2.43.0
+

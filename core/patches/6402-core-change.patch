@@ -1,0 +1,168 @@
+From 1e7dc0b38e326319031ced2555fb90d135e7c5c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:18:22 +0000
+Subject: [PATCH 6402] Class-authorised credential staging for managed workers
+
+Public mirror of source commit 1e7dc0b38e326319031ced2555fb90d135e7c5c1.
+
+---
+diff --git a/gateway/session_worker_credentials.py b/gateway/session_worker_credentials.py
+index a912f2d8b55..8a2ccc06ca8 100644
+--- a/gateway/session_worker_credentials.py
++++ b/gateway/session_worker_credentials.py
+@@ -87,9 +87,25 @@
+             if isinstance(route, dict):
+                 routes.append({**main, **route} if not route.get('provider') and not route.get('base_url') else route)
+                 routes.extend(route.get('fallback_chain') or [])
++    from agent.model_routing import eligible_routes, is_class_selector, validate_policy
++    from hermes_cli.config import is_provider_enabled
+     names = set()
+     for route in routes:
+-        if isinstance(route, dict):
++        if not isinstance(route, dict):
++            continue
++        model = route.get('model') or route.get('default')
++        if is_class_selector(model):
++            # A class is not provider auto-detection. The adopted worker resolves
++            # it later, with its session identity; give it only this class's
++            # policy-authorized providers, never every registry/profile secret.
++            routing = config.get('model_routing', {})
++            validate_policy(routing)
++            if routing.get('enabled') and route.get('provider', 'auto') in (None, '', 'auto'):
++                for candidate in eligible_routes(routing, model.removeprefix('class:')):
++                    block = config.get('providers', {}).get(candidate['provider'], {})
++                    if is_provider_enabled(block):
++                        names.update(_route_names(candidate, config, values))
++        else:
+             names.update(_route_names(route, config, values))
+     return {name: values[name] for name in names if values.get(name) is not None}
+ 
+diff --git a/tests/gateway/test_managed_worker_class_credentials.py b/tests/gateway/test_managed_worker_class_credentials.py
+new file mode 100644
+index 00000000000..d35b9b1da6c
+--- /dev/null
++++ b/tests/gateway/test_managed_worker_class_credentials.py
+@@ -0,0 +1,120 @@
++"""Class-selected managed workers receive only policy-authorized inference keys."""
++from types import SimpleNamespace
++
++import pytest
++
++
++@pytest.fixture
++def class_config():
++    def route(provider, model, billing='subscription', **overrides):
++        return {'provider': provider, 'model': model, 'billing': billing, 'weight': 1,
++                'eligible': True, 'funding_verified': True,
++                'capabilities': {'tools': True, 'streaming': True, 'context_tokens': 1048576},
++                **overrides}
++    return {'model': {'default': 'class:carbon', 'provider': 'auto'}, 'model_routing': {
++        'enabled': True, 'allow_metered': False, 'enforce_subscription_only': True,
++        'routes': {'carbon': [route('gemini', 'gemini-4-carbon', 'metered')],
++                   'standard': [route('anthropic', 'claude-standard')],
++                   'deep': [route('anthropic', 'claude-deep')],
++                   'fast': [route('anthropic', 'claude-fast')]}}}
++
++
++@pytest.fixture
++def profile_values(monkeypatch):
++    from gateway import session_worker_credentials as credentials
++    values = {'GEMINI_API_KEY': 'synthetic-gemini', 'GOOGLE_API_KEY': 'synthetic-google',
++              'ANTHROPIC_API_KEY': 'synthetic-anthropic',
++              'OPENROUTER_API_KEY': 'synthetic-openrouter', 'UNDECLARED_SECRET': 'synthetic-unrelated'}
++    monkeypatch.setattr(credentials, '_profile_values', lambda *args: values)
++    return values
++
++
++def test_carbon_class_receives_its_existing_provider_key(tmp_path, monkeypatch):
++    from gateway import session_worker_credentials as credentials
++
++    monkeypatch.setattr(credentials, '_profile_values', lambda *args: {
++        'GEMINI_API_KEY': 'synthetic-gemini', 'OPENROUTER_API_KEY': 'synthetic-openrouter',
++        'UNDECLARED_SECRET': 'synthetic-unrelated'})
++    config = {'model': {'default': 'class:carbon', 'provider': 'auto'}, 'model_routing': {
++        'enabled': True, 'allow_metered': False, 'enforce_subscription_only': True,
++        'routes': {'carbon': [{'provider': 'gemini', 'model': 'gemini-4-carbon',
++            'billing': 'metered', 'weight': 1, 'eligible': True, 'funding_verified': True,
++            'capabilities': {'tools': True, 'streaming': True, 'context_tokens': 1048576}}]}}}
++    result = credentials.route_environment(SimpleNamespace(profile_id=str(tmp_path)),
++        SimpleNamespace(ignore_user_config=False), config)
++    assert result == {'GEMINI_API_KEY': 'synthetic-gemini'}
++
++
++@pytest.mark.parametrize('level', ['standard', 'deep', 'fast'])
++def test_automatic_classes_never_receive_carbon_keys(tmp_path, class_config, profile_values, level):
++    from gateway.session_worker_credentials import route_environment
++    class_config['model']['default'] = 'class:' + level
++    assert route_environment(SimpleNamespace(profile_id=str(tmp_path)),
++        SimpleNamespace(ignore_user_config=False), class_config) == {
++            'ANTHROPIC_API_KEY': 'synthetic-anthropic'}
++
++
++@pytest.mark.parametrize('path,value', [
++    (('model_routing', 'enabled'), False),
++    (('model_routing', 'routes', 'carbon', 0, 'funding_verified'), False),
++    (('model_routing', 'routes', 'carbon', 0, 'eligible'), False),
++    (('model_routing', 'routes', 'carbon'), []),
++    (('providers',), {'gemini': {'enabled': False}}),
++    (('model', 'provider'), 'openrouter'),
++])
++def test_unusable_class_does_not_fall_back_to_auto_keys(tmp_path, class_config, profile_values, path, value):
++    from gateway.session_worker_credentials import route_environment
++    target = class_config
++    for key in path[:-1]:
++        target = target[key]
++    target[path[-1]] = value
++    assert route_environment(SimpleNamespace(profile_id=str(tmp_path)),
++        SimpleNamespace(ignore_user_config=False), class_config) == {}
++
++
++@pytest.mark.parametrize('carrier', ['auxiliary', 'fallback_model', 'fallback_providers'])
++def test_selected_secondary_class_gets_its_key(tmp_path, class_config, profile_values, carrier):
++    from gateway.session_worker_credentials import route_environment
++    class_config['model']['default'] = 'class:standard'
++    route = {'model': 'class:carbon', 'provider': 'auto'}
++    class_config[carrier] = {'title': route} if carrier == 'auxiliary' else (
++        [route] if carrier == 'fallback_providers' else route)
++    assert route_environment(SimpleNamespace(profile_id=str(tmp_path)),
++        SimpleNamespace(ignore_user_config=False), class_config) == {
++            'ANTHROPIC_API_KEY': 'synthetic-anthropic',
++            'GEMINI_API_KEY': 'synthetic-gemini', 'GOOGLE_API_KEY': 'synthetic-google'}
++
++
++def test_auxiliary_model_overrides_inherited_main_default(tmp_path, class_config, profile_values):
++    from gateway.session_worker_credentials import route_environment
++    class_config['model'] = {'default': 'class:standard', 'provider': 'auto'}
++    class_config['auxiliary'] = {'title': {'model': 'class:carbon'}}
++    assert route_environment(SimpleNamespace(profile_id=str(tmp_path)),
++        SimpleNamespace(ignore_user_config=False), class_config) == {
++            'ANTHROPIC_API_KEY': 'synthetic-anthropic',
++            'GEMINI_API_KEY': 'synthetic-gemini', 'GOOGLE_API_KEY': 'synthetic-google'}
++
++
++def test_adopted_worker_hydrates_class_keys_privately(tmp_path, monkeypatch, class_config, profile_values):
++    import json
++    import os
++    from dataclasses import replace
++    from gateway.session_managed_worker import _bootstrap
++    from gateway.session_worker_credentials import hydrate_credentials, resolve_credentials
++    from tests.gateway.test_managed_turn_contract import assignment
++
++    _, (authority, ref, row, policy, scope) = assignment(tmp_path, monkeypatch)
++    config = {**json.loads(policy.config_json), **class_config,
++              'auxiliary': {}, 'fallback_model': None, 'fallback_providers': []}
++    policy = replace(policy, model='class:carbon', config_json=json.dumps(config))
++    frame = _bootstrap(authority, ref, row, policy, scope)
++    for value in profile_values.values():
++        assert value not in json.dumps(frame)
++    for name in profile_values:
++        monkeypatch.delenv(name, raising=False)
++    with pytest.raises(Exception, match='permission_denied'):
++        resolve_credentials(authority, {**scope, 'epoch': 2})
++    hydrate_credentials(frame, lambda method, **params: resolve_credentials(authority, params))
++    assert os.environ['GEMINI_API_KEY'] == 'synthetic-gemini'
++    assert os.environ['GOOGLE_API_KEY'] == 'synthetic-google'
++    assert all(name not in os.environ for name in ('OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'UNDECLARED_SECRET'))
+-- 
+2.43.0
+

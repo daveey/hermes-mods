@@ -1,0 +1,132 @@
+From 9768cbbd9305b95003e2ec0c2010e58de2305f2f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:44:21 +0000
+Subject: [PATCH 5993] Fact runtime: shared process owner, lazy scoped activation and watch rearm
+
+Public mirror of source commit 9768cbbd9305b95003e2ec0c2010e58de2305f2f.
+
+---
+diff --git a/hermes_cli/fact_inprocess.py b/hermes_cli/fact_inprocess.py
+index 4bc816f243e..de5115bb6f7 100644
+--- a/hermes_cli/fact_inprocess.py
++++ b/hermes_cli/fact_inprocess.py
+@@ -61,6 +61,11 @@
+             self._expiry.close()
+             raise
+ 
++    def check_running(self):
++        if (self._stopping or not self._thread.is_alive()
++                or not self._expiry.thread.is_alive()):
++            raise RuntimeError('local fact owner closed or worker unavailable')
++
+     def _next(self):
+         with self.store._condition:
+             while not self._stopping and any(not owner._stopping for owner in self.owners):
+@@ -131,9 +136,9 @@
+ 
+     def check_running(self):
+         workers = self._workers
+-        if (self._stopping or workers is None or workers._stopping
+-                or not workers._thread.is_alive() or not workers._expiry.thread.is_alive()):
++        if self._stopping or workers is None:
+             raise RuntimeError('local fact owner closed or worker unavailable')
++        workers.check_running()
+ 
+     def acquire(self, scope, *, lifecycle):
+         with self.store._condition:
+@@ -148,9 +153,11 @@
+                     # worker cannot observe an empty owner roster at startup.
+                     workers = _SharedDelivery(self.store)
+                     self.store._local_delivery = workers
+-                self._workers = workers
+-                self.check_running()
++                # Refused candidates retain their existing drain custody, but
++                # must not poison this dormant transport's next admission.
++                workers.check_running()
+                 workers.owners.add(self)
++                self._workers = workers
+             self.check_running()
+             reader = LocalReader(self, scope)
+             self._readers.add(reader)
+diff --git a/tests/hermes_cli/test_review_delivery_readmission.py b/tests/hermes_cli/test_review_delivery_readmission.py
+new file mode 100644
+index 00000000000..383a0e9ca39
+--- /dev/null
++++ b/tests/hermes_cli/test_review_delivery_readmission.py
+@@ -0,0 +1,73 @@
++"""A refused acquire must not bind a dormant transport to retired workers."""
++import threading
++import pytest
++from hermes_cli.fact_contract import Fact, FactKey, Scope
++from hermes_cli.fact_store import FactStore
++from hermes_cli.fact_inprocess import InProcessFacts, IncrementalLifecycle
++
++
++def test_acquire_retries_after_other_transport_finishes_draining(monkeypatch):
++    scope = Scope('review-fixture', 'p')
++    store = FactStore()
++    first = InProcessFacts(store, {scope}, demand=lambda *a: None)
++    dormant = InProcessFacts(store, {scope}, demand=lambda *a: None)
++    life = lambda: IncrementalLifecycle({(scope, 'board')})
++    handle = first.acquire(scope, lifecycle=life())
++    handle.close()
++    entered, release = threading.Event(), threading.Event()
++    original = first._expiry.close
++    errors = []
++    successor = None
++
++    def delayed_close():
++        entered.set()
++        assert release.wait(5)
++        original()
++
++    def close():
++        try:
++            first.close()
++        except BaseException as exc:
++            errors.append(exc)
++
++    monkeypatch.setattr(first._expiry, 'close', delayed_close)
++    thread = threading.Thread(target=close)
++    try:
++        thread.start()
++        assert entered.wait(3)
++        # Refusal while the old worker has custody is correct.
++        with pytest.raises(RuntimeError, match='worker unavailable'):
++            dormant.acquire(scope, lifecycle=life())
++        assert dormant._workers is None
++        assert dormant not in first._workers.owners
++        assert store._local_delivery is first._workers
++        release.set()
++        thread.join(3)
++        assert not thread.is_alive()
++        assert not errors
++        # Same consumer retries after a fully successful old-owner drain.
++        successor = dormant.acquire(scope, lifecycle=life())
++        assert dormant._thread.is_alive()
++        assert dormant._workers is not first._workers
++        delivered = threading.Event()
++        observed = []
++
++        def receive(delta):
++            if delta.upserts:
++                observed.extend(delta.upserts)
++                delivered.set()
++
++        sub = successor.v1.subscribe(scope, ('TaskFact',), None, None, receive)
++        try:
++            store.publish([Fact(FactKey(scope, 'TaskFact', 'successor'), value={'title': 'live'})])
++            assert delivered.wait(3)
++            assert observed[-1].value['title'] == 'live'
++        finally:
++            sub.close()
++    finally:
++        release.set()
++        thread.join(3)
++        if successor is not None:
++            successor.close()
++        first.close()
++        dormant.close()
+-- 
+2.43.0
+

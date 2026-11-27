@@ -1,0 +1,957 @@
+From 8c88efbca236abcaeb2d8e73578f1f958a8b3617 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:12:38 +0000
+Subject: [PATCH 6484] Usage-accounting gate and pool pickup budgets
+
+Public mirror of source commit 8c88efbca236abcaeb2d8e73578f1f958a8b3617.
+
+---
+diff --git a/gateway/session_kanban.py b/gateway/session_kanban.py
+index fe57d89fbfa..aa45ce8576f 100644
+--- a/gateway/session_kanban.py
++++ b/gateway/session_kanban.py
+@@ -382,7 +382,7 @@
+     else:
+         from hermes_cli.kanban_owner_unavailable import KANBAN_OWNER_UNAVAILABLE_EXIT_CODE as code
+     _record_worker_result(context, code, start_failure_line(booked), booked,
+-                          extra={PROOF_KEY: proof} if proof else None)
++                          extra={PROOF_KEY: proof} if proof else None, no_turn=True)
+     exc._kanban_failure_booked = True
+ 
+ 
+@@ -418,7 +418,7 @@
+     return failure_line(exc, 'Worker could not start')
+ 
+ 
+-def _record_worker_result(context, code, last_output, failure=None, extra=None, *, agent=None):
++def _record_worker_result(context, code, last_output, failure=None, extra=None, *, agent=None, no_turn=False):
+     _TURNS_DONE.set()
+     import os
+     from hermes_cli.kanban_db_connect import connect_closing
+@@ -451,13 +451,21 @@
+                                  {'error': observer_error}, run_id=context['run_id'])
+             from hermes_cli.kanban_failed_result_identity import result_identity_fields
+             identity_fields = result_identity_fields(conn, context) if strict_death_proof else {}
++            usage = usage_fields(agent)
++            from hermes_cli.kanban_usage_accounting import valid_counter
++            # An interrupted/failed request may have unreturned usage even when
++            # the agent's last counters are numeric. Retain those only as lower bounds.
++            final_usage = (code == 0 and not (extra or {}).get('continuable') and all(
++                valid_counter(usage.get('usage', {}).get(key)) for key in
++                ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens')))
+             # Closing a run clears its claim/PID and replaces metadata; keep the
+             # result in the immutable attempt event stream instead.
+             kb._append_event(conn, context['task_id'], 'worker_result',
+                 {'pid': os.getpid(), 'claim_lock': context['claim_lock'], 'exit_code': code,
+                  'last_output': last_output, **quota_fields(failure), **route_fields(failure, agent),
+-                 **usage_fields(agent),  # [daveey] the run's tokens, summed by kanban_spend_budget on the home board
++                 **usage,  # the event FK transports as immutable run_uid, never the payload's integer id
+                  **(extra or {}), **refusal_fields(failure), **identity_fields,
++                 'usage_final': final_usage, 'usage_no_turn': no_turn is True and agent is None,
+                  **({'death_proof_version': 1} if strict_death_proof else {})},
+                 run_id=context['run_id'])
+ 
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index 4363287e678..bd2b8d22fee 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -165,6 +165,12 @@
+            for res in results):
+         return (msg + " Local updater admission hold blocks claims before the Board lease; "
+                 "inspect core-update/holds/hermes-sync and its updater owner.")
++    if any(res is not None and any(reason == "usage_accounting_pending" for _, reason in res.claim_deferred)
++           for res in results):
++        return (msg + " Local usage accounting is pending before the Board lease: a prior admitted/released "
++                "run lacks a consistent final receipt or its canonical run closure. Recover the original bound "
++                "worker's usage and closure through its normal outbox/feed, keyed by run UID; unknown usage is not zero. Do not reset history, "
++                "renew spend or release other holds to bypass this debt.")
+     spend_holds = {"decision_pending", "spend_budget_exhausted", "spend_policy_unavailable"}
+     if any(res is not None and any(reason in spend_holds for _, reason in res.claim_deferred)
+            for res in results):
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index d22fdbce9f1..de4b372ef4d 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -11,11 +11,13 @@
+ person, ``writer_kind='human'``, or a chat's verified relay of one, ``relayed_human``: the no-progress budget's
+ rule, so answering a card that spent its budget while blocked gets it a run) or since this budget last sent it
+ to triage, and adds up
+-the tokens those runs reported. A spending run is a closed run that lasted at least ``MIN_RUN_SECONDS``:
+-quota walls, released claims and spawn failures end in seconds and spend nothing. Tokens come from the
+-run's own ``worker_result`` receipt (``usage``, written by the managed worker from its agent's session
+-counters on the host that ran it, so a card that ran on several workers is still summed on its home board);
+-a run with no usage receipt counts as a run only. ``Spend.excluded`` counts only ``owner_unavailable`` /
++the tokens those runs reported. Spending includes short admitted or usage-bearing runs as well as closed
++runs lasting at least ``MIN_RUN_SECONDS``; a short duration alone does not prove no consumption. Tokens
++come from the run's ``worker_result`` observations (``usage``, written by the original bound worker from
++its agent counters and transported with immutable run UID). Per-counter cumulative lower bounds prevent
++reordered/duplicate observations from subtracting or adding the same run twice. Missing usage remains
++unknown, and claim admission separately fences closed admitted/bound turns and ambiguous releases
++until their accounting settles, independently of the renewable spend window. ``Spend.excluded`` counts only ``owner_unavailable`` /
+ ``owner_down`` runs (or ``crashed`` with integer exit 69) with no owner admission, no usage receipt, and
+ no ``host_refusal`` proof except one whose phase is ``preadmission``. Admitted or interrupted turns count.
+ 
+@@ -301,9 +303,9 @@
+         return {}
+     usage: dict[str, Any] = {}
+     for key, attr in _AGENT_COUNTERS.items():
+-        value = getattr(agent, attr, 0)
+-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+-            usage[key] = int(value)
++        value = getattr(agent, attr, None)
++        if type(value) is int and value >= 0:
++            usage[key] = value
+     cost = getattr(agent, "session_estimated_cost_usd", 0)
+     if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0:
+         usage["cost_usd"] = round(float(cost), 4)
+@@ -339,22 +341,9 @@
+ 
+ 
+ def _run_usage(conn: sqlite3.Connection, task_id: str, run_ids: list[int]) -> dict[int, dict]:
+-    """``run_id -> usage`` from each run's newest ``worker_result`` that carried one."""
+-    out: dict[int, dict] = {}
+-    if not run_ids:
+-        return out
+-    marks = ",".join("?" for _ in run_ids)
+-    for run_id, raw in conn.execute(
+-            f"SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = 'worker_result' "
+-            f"AND run_id IN ({marks}) AND json_extract(payload, '$.usage') IS NOT NULL ORDER BY id",
+-            (task_id, *run_ids)):
+-        try:
+-            usage = (json.loads(raw or "{}") or {}).get("usage")
+-        except (ValueError, AttributeError):
+-            continue
+-        if isinstance(usage, dict):
+-            out[int(run_id)] = usage  # the newest receipt for a run wins
+-    return out
++    """Run-local cumulative lower bounds, never summed across duplicate deliveries."""
++    from hermes_cli.kanban_usage_accounting import receipts
++    return receipts(conn, task_id, run_ids)
+ 
+ 
+ def _refused(outcome: Any, raw_metadata: Any, has_usage: bool, admitted: bool) -> bool:
+@@ -379,13 +368,14 @@
+     """What the card spent since it last handed work on (or was last sent to triage by this budget)."""
+     cut = int(time.time()) + 1 if as_of is None else int(as_of)
+     since = _window_start(conn, task_id, cut)
+-    rows = conn.execute(
+-        "SELECT id, outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL AND ended_at < ? "
+-        "AND started_at >= ? AND ended_at - started_at >= ?", (task_id, cut, since, MIN_RUN_SECONDS)).fetchall()
+-    usage = _run_usage(conn, task_id, [int(r[0]) for r in rows])
++    candidates = conn.execute(
++        "SELECT id, outcome, metadata, ended_at-started_at FROM task_runs WHERE task_id = ? "
++        "AND ended_at IS NOT NULL AND ended_at < ? AND started_at >= ?", (task_id, cut, since)).fetchall()
++    usage = _run_usage(conn, task_id, [int(r[0]) for r in candidates])
+     admitted = {int(r[0]) for r in conn.execute(
+         "SELECT DISTINCT run_id FROM task_events WHERE task_id = ? AND kind = 'owner_admitted' "
+         "AND run_id IS NOT NULL", (task_id,))}
++    rows = [r for r in candidates if r[3] >= MIN_RUN_SECONDS or int(r[0]) in admitted or int(r[0]) in usage]
+     run_ids = [int(r[0]) for r in rows if not _refused(r[1], r[2], int(r[0]) in usage, int(r[0]) in admitted)]
+     excluded = len(rows) - len(run_ids)
+     tokens = {key: 0 for key in USAGE_KEYS}
+diff --git a/hermes_cli/kanban_spend_claim.py b/hermes_cli/kanban_spend_claim.py
+index 17dc220318b..438ef3cc325 100644
+--- a/hermes_cli/kanban_spend_claim.py
++++ b/hermes_cli/kanban_spend_claim.py
+@@ -35,6 +35,9 @@
+     def refused():
+         if decision.pending(conn, task_id):
+             return refuse("decision_pending")
++        from hermes_cli.kanban_usage_accounting import pending
++        if pending(conn, task_id):
++            return refuse("usage_accounting_pending")
+         lim = budget.card_limits(conn, task_id, board)
+         if budget.over(budget.spend(conn, task_id), lim) is None:
+             return False
+diff --git a/hermes_cli/kanban_usage_accounting.py b/hermes_cli/kanban_usage_accounting.py
+new file mode 100644
+index 00000000000..a3e7a695458
+--- /dev/null
++++ b/hermes_cli/kanban_usage_accounting.py
+@@ -0,0 +1,156 @@
++"""Run-scoped accounting debt is independent of lifecycle/spend-window resets. [daveey]
++
++The event's run_id is a LOCAL foreign key: sync transports it as immutable run_uid.
++Never join a remote payload's integer run id, or add session observations to receipts.
++A missing receipt is unknown, including a short interrupted admitted turn. Recovery is
++arrival of the original bound worker's receipt through the ordinary event outbox/feed;
++this gate neither writes history nor releases any independent decision.
++"""
++from __future__ import annotations
++
++import json
++import math
++
++
++def valid_counter(value):
++    return type(value) is int and value >= 0
++
++
++def receipts(conn, task_id, run_ids):
++    """Cumulative lower bounds per local FK, independent of receipt delivery order.
++
++    These are NOT invented finalized totals. Duplicate/older observations cannot
++    subtract consumption. Missing keys stay absent; only evidenced zero is zero.
++    """
++    if not run_ids:
++        return {}
++    marks = ','.join('?' for _ in run_ids)
++    rows = conn.execute(
++        f"SELECT run_id,payload FROM task_events WHERE task_id=? AND kind='worker_result' "
++        f"AND run_id IN ({marks})", (task_id, *run_ids))
++    result = {}
++    for run_id, raw in rows:
++        try:
++            payload = json.loads(raw or '{}')
++        except (ValueError, TypeError):
++            continue
++        usage = payload.get('usage') if isinstance(payload, dict) else None
++        if not isinstance(usage, dict):
++            continue
++        known = {k: v for k, v in usage.items() if k in (
++            'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens') and valid_counter(v)}
++        cost = usage.get('cost_usd')
++        if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
++            known['cost_usd'] = cost
++        if known:
++            dest = result.setdefault(int(run_id), {})
++            for key, value in known.items():
++                dest[key] = max(dest.get(key, value), value)
++    return result
++
++
++def no_turn(conn, task_id, run_id, usage):
++    """Source-interpreter proof that construction failed before any turn, not a zero estimate.
++
++    Never apply this to a missing receipt, a worker-loss/restart marker or a midrun
++    exception. Conflicting positive usage or another result without the proof wins.
++    """
++    if any(value > 0 for value in usage.values()):
++        return False
++    bound = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound' "
++        "ORDER BY id DESC LIMIT 1", (task_id, run_id)).fetchone()
++    try:
++        identity = json.loads(bound[0]) if bound else {}
++        results = [json.loads(row[0]) for row in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result'",
++            (task_id, run_id))]
++        return bool(identity.get('pid') and identity.get('claim_lock') and results and all(
++            result.get('usage_no_turn') is True and 'usage' not in result
++            and result.get('pid') == identity['pid']
++            and result.get('claim_lock') == identity['claim_lock'] for result in results))
++    except (ValueError, TypeError, AttributeError):
++        return False
++
++
++def settled(conn, task_id, run_ids, usages):
++    """Legacy numeric receipts retain compatibility; modern partials need a final.
++
++    Conflicting finals or a final below any observed lower bound remain pending.
++    Neither arrival order nor an unbound session snapshot resolves a conflict.
++    """
++    if not run_ids:
++        return set()
++    marks = ','.join('?' for _ in run_ids)
++    modern, finals, legacy = set(), {}, {}
++    keys = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens')
++    for rid, raw in conn.execute(
++            f"SELECT run_id,payload FROM task_events WHERE task_id=? AND kind='worker_result' "
++            f"AND run_id IN ({marks})", (task_id, *run_ids)):
++        try:
++            payload = json.loads(raw or '{}')
++        except (ValueError, TypeError):
++            continue
++        if not isinstance(payload, dict):
++            continue
++        usage = payload.get('usage')
++        if 'usage_final' not in payload:
++            # A failed/interrupted legacy request's last numeric snapshot is
++            # also not evidence that every request returned its usage.
++            if (payload.get('exit_code') in (None, 0) and not payload.get('continuable')
++                    and isinstance(usage, dict) and valid_counter(usage.get('cache_read_tokens'))):
++                legacy.setdefault(rid, set()).add(usage['cache_read_tokens'])
++            continue
++        modern.add(rid)
++        if (payload['usage_final'] is True and payload.get('exit_code') == 0
++                and not payload.get('continuable') and isinstance(usage, dict)
++                and all(valid_counter(usage.get(k)) for k in keys)):
++            finals.setdefault(rid, set()).add(tuple(usage[k] for k in keys))
++    good = {rid for rid, values in legacy.items() if rid not in modern and len(values) == 1
++            and next(iter(values)) >= usages.get(rid, {}).get('cache_read_tokens', 0)}
++    for rid, values in finals.items():
++        if len(values) != 1:
++            continue
++        final = next(iter(values))
++        if all(value >= usages.get(rid, {}).get(key, 0) for key, value in zip(keys, final)):
++            good.add(rid)
++    good.update(rid for rid in run_ids if rid not in good and no_turn(conn, task_id, rid, usages.get(rid, {})))
++    return good
++
++
++def pending(conn, task_id):
++    """Closed admitted/bound turns and ambiguous releases without cache accounting.
++
++    Do not use the renewable spend window or duration threshold here. A release
++    arriving before its admission event is still a debt unless explicitly unused.
++    Pre-admission owner refusals remain healthy; an admission always wins over an
++    unused marker. NULL ended_at closed outcomes are ambiguous, never proof of zero.
++    """
++    rows = conn.execute(
++        "SELECT r.id,r.outcome,r.ended_at FROM task_runs r JOIN tasks t ON t.id=r.task_id WHERE r.task_id=? "
++        "AND (r.ended_at IS NOT NULL OR r.status!='running' OR t.status!='running' "
++        "OR t.current_run_id IS NULL OR t.current_run_id!=r.id)",
++        (task_id,)).fetchall()
++    usages = receipts(conn, task_id, [r[0] for r in rows])
++    admitted = {r[0] for r in conn.execute(
++        "SELECT DISTINCT run_id FROM task_events WHERE task_id=? AND kind IN ('owner_admitted','worker_bound')",
++        (task_id,))}
++    unused, used, released_runs = set(), set(), set()
++    for run_id, raw in conn.execute(
++            "SELECT run_id,payload FROM task_events WHERE task_id=? AND kind='released'", (task_id,)):
++        released_runs.add(run_id)
++        try:
++            payload = json.loads(raw or '{}')
++        except (ValueError, TypeError):
++            continue
++        if isinstance(payload, dict) and payload.get('unused_grant') is True:
++            unused.add(run_id)
++        if isinstance(payload, dict) and payload.get('unused_grant') is False:
++            used.add(run_id)
++    unused.difference_update(used)
++    good = settled(conn, task_id, [r[0] for r in rows], usages)
++    # A final event alone cannot authorize while the run-row closure is still
++    # in flight: spend() excludes unclosed rows and would omit these known tokens.
++    return [rid for rid, outcome, ended in rows if (rid in admitted or (
++        (outcome == 'released' or rid in released_runs) and rid not in unused))
++        and (rid not in good or ended is None)]
+diff --git a/tests/agent/test_kanban_darkwake_recovery.py b/tests/agent/test_kanban_darkwake_recovery.py
+index d0c4bed24f7..f51098b905a 100644
+--- a/tests/agent/test_kanban_darkwake_recovery.py
++++ b/tests/agent/test_kanban_darkwake_recovery.py
+@@ -465,15 +465,17 @@
+ 
+ 
+ def _steal(n, conn, context):
+-    """Another holder takes the card while this worker waits: released, then claimed elsewhere."""
++    """Reclaim fences the old worker; missing accounting also fences another paid claim."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_sync import pop_claim_deferral
+ 
+     if n == 1:
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+                          "worker_pid=NULL, worker_started_at=NULL WHERE id=?", (context["task_id"],))
+             kb._end_run(conn, context["task_id"], outcome="reclaimed", status="reclaimed", error="stolen")
+-        assert kb.claim_task(conn, context["task_id"], claimer="other-gateway:4242") is not None
++        assert kb.claim_task(conn, context["task_id"], claimer="other-gateway:4242") is None
++        assert pop_claim_deferral(context['task_id']) == 'usage_accounting_pending'
+ 
+ 
+ def _relock_in_place(n, conn, context):
+@@ -486,7 +488,7 @@
+                          (int(time.time()) + 900, context["task_id"]))
+ 
+ 
+-@pytest.mark.parametrize("steal", [pytest.param(_steal, id="reclaimed-and-reclaimed-elsewhere"),
++@pytest.mark.parametrize("steal", [pytest.param(_steal, id="reclaimed-accounting-pending"),
+                                    pytest.param(_relock_in_place, id="renewed-under-another-lock")])
+ def test_stolen_lease_stays_fenced(slept_worker, steal):
+     """A lapse is only waited out for OUR lease: once anyone else holds the card the worker never
+@@ -498,7 +500,7 @@
+     assert run() == KANBAN_RATE_LIMIT_EXIT_CODE
+     assert len(entered) == 1  # no recovery turn under a lease that is no longer ours
+     task = kb.get_task(conn, context["task_id"])
+-    assert task.claim_lock == "other-gateway:4242"
++    assert task.claim_lock == (None if steal is _steal else "other-gateway:4242")
+ 
+ 
+ def test_lease_never_renewed_gives_up_after_the_awake_budget(slept_worker, monkeypatch):
+diff --git a/tests/gateway/test_session_kanban_restart_resume.py b/tests/gateway/test_session_kanban_restart_resume.py
+index d090a727924..8edd02cef53 100644
+--- a/tests/gateway/test_session_kanban_restart_resume.py
++++ b/tests/gateway/test_session_kanban_restart_resume.py
+@@ -7,6 +7,7 @@
+ import asyncio
+ from contextlib import closing
+ import json
++import os
+ import time
+ from types import SimpleNamespace
+ 
+@@ -70,7 +71,7 @@
+     ]
+ 
+ 
+-def _lose_run(task_id, *, code, state_db, session_id=PRIOR, pid=81001, monkeypatch):
++def _lose_run(task_id, *, code, state_db, session_id=PRIOR, pid=81001, monkeypatch, accounted=True):
+     """Claim a run, admit it to ``session_id`` in ``state_db`` like the owner, then let the real sweep book
+     its exit ``code`` (76 = the owner restarted under it)."""
+     with _connect() as conn:
+@@ -81,6 +82,8 @@
+         with kb.write_txn(conn):
+             conn.execute('UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?', (pid, int(time.time()) - 600, task_id))
+             conn.execute('UPDATE task_runs SET worker_pid=? WHERE id=?', (pid, task.current_run_id))
++            kb._append_event(conn, task_id, 'worker_bound',
++                             {'pid': os.getpid(), 'claim_lock': task.claim_lock}, run_id=task.current_run_id)
+             from hermes_cli.kanban_worker_recovery import _SCHEMA
+             conn.execute(_SCHEMA)  # the transcript-tail registry, so the fallback context is observable
+             conn.execute('INSERT OR REPLACE INTO worker_recovery_sessions VALUES (?,?,?,?,?,?)',
+@@ -104,9 +107,32 @@
+             kb._append_event(conn, task_id, 'owner_admitted', {'db': str(state_db), 'session_id': session_id,
+                              'request_id': 'kanban:old', 'pid': 1, 'birth': 1.0}, run_id=task.current_run_id)
+         row = conn.execute('SELECT outcome FROM task_runs WHERE id=?', (task.current_run_id,)).fetchone()
++    if accounted:
++        # Transcript-resume tests require independently settled spend, not an
++        # accounting bypass. The unknown-interruption case below starts without it.
++        from gateway.session_kanban import _record_worker_result
++        _record_worker_result({'db': str(kb.kanban_db_path(board='owned')), 'task_id': task_id,
++                               'run_id': task.current_run_id, 'claim_lock': task.claim_lock}, 0, '',
++                              agent=SimpleNamespace(session_input_tokens=10, session_output_tokens=2,
++                                                    session_cache_read_tokens=123, session_cache_write_tokens=0))
+     return task.current_run_id, row[0]
+ 
+ 
++def test_unknown_restart_accounting_blocks_transcript_readmission(env):
++    from hermes_cli.kanban_db_sync import pop_claim_deferral
++    tid = _task(env)
++    _prior_session(env.db)
++    run_id, outcome = _lose_run(tid, code=KANBAN_OWNER_RESTART_EXIT_CODE,
++                                state_db=env.db.db_path, monkeypatch=env.monkeypatch, accounted=False)
++    assert outcome == 'reclaimed'
++    with _connect() as conn:
++        assert kb.claim_task(conn, tid) is None
++        assert pop_claim_deferral(tid) == 'usage_accounting_pending'
++        assert conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++        assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 1
++        assert conn.execute('SELECT id FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == run_id
++
++
+ def _admit_next(env, task_id):
+     """Claim the requeued card's next run and admit it through the real ``run_task``."""
+     with _connect() as conn:
+diff --git a/tests/gateway/test_session_kanban_restart_resume_unused_grant.py b/tests/gateway/test_session_kanban_restart_resume_unused_grant.py
+index 7ae6138afef..c8dbf19407c 100644
+--- a/tests/gateway/test_session_kanban_restart_resume_unused_grant.py
++++ b/tests/gateway/test_session_kanban_restart_resume_unused_grant.py
+@@ -349,6 +349,13 @@
+             row = conn.execute("SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+         assert 'unused_grant' not in (row[0] or '')  # the imported ordinary release carries no unused flag
+     assert _candidate(tid) is None
++    if kind == 'ordinary_release':
++        # No explicit unused proof and no worker final: do not turn an
++        # ambiguous cross-gateway release into either a resume or new spend.
++        with base._connect() as conn:
++            assert kb.claim_task(conn, tid) is None
++            assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        return
+     run = base._admit_next(env, tid)
+     assert 'restart_resume' not in run.events and run.history == []
+ 
+diff --git a/tests/hermes_cli/test_kanban_decided_triage.py b/tests/hermes_cli/test_kanban_decided_triage.py
+index 655e1523e1c..ee6721f7d5c 100644
+--- a/tests/hermes_cli/test_kanban_decided_triage.py
++++ b/tests/hermes_cli/test_kanban_decided_triage.py
+@@ -252,7 +252,7 @@
+     assert decision.pending(board, tid)
+ 
+ 
+-def test_renewal_with_budget_waits_for_parent_then_claims(board, monkeypatch):
++def test_renewal_with_budget_waits_for_parent_then_accounting(board, monkeypatch):
+     from hermes_cli.kanban_spend_claim import claim_check
+     tid, _, episode = scope.stopped(board, monkeypatch)
+     support._runs(board, tid, 16)
+@@ -268,8 +268,12 @@
+         board.execute("UPDATE tasks SET status='done' WHERE id=?", (pid,))
+     kb.recompute_ready(board)
+     assert kb.get_task(board, tid).status == 'ready'
+-    assert not claim_check(board, tid)()
+-    assert kb.claim_task(board, tid) is not None
++    # Scope renewal and a new budget do not settle the retained run's unknown
++    # accounting. Parent placement may finish; subsequent spend remains fenced.
++    assert claim_check(board, tid)()
++    from hermes_cli.kanban_db_sync import pop_claim_deferral
++    assert pop_claim_deferral(tid) == 'usage_accounting_pending'
++    assert kb.claim_task(board, tid) is None
+ 
+ 
+ def _clear(conn, tid):
+diff --git a/tests/hermes_cli/test_kanban_spend_budget.py b/tests/hermes_cli/test_kanban_spend_budget.py
+index 3bcadad648c..30eda45dc0d 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget.py
++++ b/tests/hermes_cli/test_kanban_spend_budget.py
+@@ -288,7 +288,8 @@
+ 
+ def test_usage_fields_from_the_agent():
+     assert ksb.usage_fields(_Agent()) == {"usage": {"input_tokens": 1200, "output_tokens": 300,
+-                                                    "cache_read_tokens": 2_500_000, "cost_usd": 1.2346}}
++                                                    "cache_read_tokens": 2_500_000, "cache_write_tokens": 0,
++                                                    "cost_usd": 1.2346}}
+     assert ksb.usage_fields(None) == {}
+     assert ksb.usage_fields(object()) == {}
+ 
+diff --git a/tests/hermes_cli/test_kanban_usage_accounting.py b/tests/hermes_cli/test_kanban_usage_accounting.py
+new file mode 100644
+index 00000000000..5dc7e109bc0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_usage_accounting.py
+@@ -0,0 +1,330 @@
++"""Released turns owe accounting before the next ready/review claim. [daveey]"""
++import json
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import session_kanban
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_spend_budget as budget
++from tests.hermes_cli import test_kanban_spend_budget as spending
++
++kanban_home = spending.kanban_home
++
++
++def released(conn, *, lane='ready', admitted=True):
++    tid = kb.create_task(conn, title='isolated missing-result replay', assignee='default')
++    if lane == 'review':
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++    claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++    assert claim(conn, tid)
++    task = kb.get_task(conn, tid)
++    context = {'db': str(kb.kanban_db_path()), 'task_id': tid,
++               'run_id': task.current_run_id, 'claim_lock': task.claim_lock}
++    with kb.write_txn(conn):
++        if admitted:
++            kb._append_event(conn, tid, 'owner_admitted', {'session_id': 'fixture-session'}, run_id=task.current_run_id)
++            kb._append_event(conn, tid, 'worker_bound', {'pid': os.getpid(), 'claim_lock': task.claim_lock},
++                             run_id=task.current_run_id)
++    dispatch._record_task_failure(conn, tid, '', outcome='released', release_claim=True, end_run=True,
++                                  infrastructure=True,
++                                  event_payload_extra={'unused_grant': True} if not admitted else None)
++    if not admitted:
++        with kb.write_txn(conn):
++            # Board's explicit unused-grant carrier (the local failure helper
++            # intentionally does not forward arbitrary release extras).
++            kb._append_event(conn, tid, 'released', {'unused_grant': True}, run_id=task.current_run_id)
++    assert kb.get_task(conn, tid).status == lane
++    return tid, context
++
++
++def receipt(context, cache=123, *, partial=False):
++    agent = SimpleNamespace(session_input_tokens=10, session_output_tokens=2,
++                            session_cache_read_tokens=cache, session_cache_write_tokens=0)
++    session_kanban._record_worker_result(context, 0, '', agent=agent,
++                                         extra={'continuable': True} if partial else None)
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_released_missing_result_refuses_then_late_real_result_recovers(kanban_home, lane):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn, lane=lane)
++        claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        assert kb.get_task(conn, tid).status == lane  # not a new spend stop/reset
++        receipt(context)
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 123
++        assert claim(conn, tid) is not None
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_captured_missing_result_shape_never_admits_silently(kanban_home, lane):
++    # Exact release payload shape from the hash-verified historical raw bundle;
++    # all task/run/session identities below belong only to the disposable fixture.
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn, lane=lane)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'released', {'error': None, 'retry_status': 'ready'},
++                             run_id=context['run_id'])
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='worker_result'", (tid,)).fetchall()
++        claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        # A delayed authentic bound final, never a backfill from the historical
++        # partial source-session observation, is the supported recovery carrier.
++        receipt(context, 11034880)
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 11034880
++        assert claim(conn, tid) is not None
++
++
++def test_duplicate_and_reordered_results_never_reduce_or_double_count(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        receipt(context, 100)
++        receipt(context, 100)
++        receipt(context, 50, partial=True)  # reordered lower observation cannot erase finalized usage
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 100
++        assert kb.claim_task(conn, tid) is not None
++
++
++@pytest.mark.parametrize('usage', [None, {}, {'cache_read_tokens': True}, {'cache_read_tokens': -1},
++                                  {'cache_read_tokens': '123'}])
++def test_unknown_usage_is_not_zero(kanban_home, usage):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        with kb.write_txn(conn):
++            payload = {} if usage is None else {'usage': usage}
++            kb._append_event(conn, tid, 'worker_result', payload, run_id=context['run_id'])
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++def test_explicit_zero_is_a_real_receipt(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        receipt(context, 0)
++        row = conn.execute("SELECT payload FROM task_events WHERE kind='worker_result' AND run_id=?",
++                           (context['run_id'],)).fetchone()
++        assert json.loads(row[0])['usage']['cache_read_tokens'] == 0
++        assert kb.claim_task(conn, tid) is not None
++
++
++def test_restart_and_renewed_window_do_not_erase_accounting_debt(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'commented', {'writer_kind': 'human'})
++        budget.set_override(conn, tid, runs=0, cache_read_tokens=0, by='fixture', reason='disabled limits control')
++    with kbc.connect_closing() as conn:
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        receipt(context)
++        assert kb.claim_task(conn, tid) is not None
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_late_accounting_does_not_release_independent_decision(kanban_home, lane):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn, lane=lane)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'spend_budget_triaged', {'reason': 'independent retained decision'})
++        receipt(context)
++        claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'decision_pending'
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_settled_usage_retains_budget_hold_and_neighbor_progress(kanban_home, monkeypatch, lane):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn, lane=lane)
++        receipt(context)
++        monkeypatch.setattr(budget, 'limits', lambda: budget.Limits(runs=100, cache_read_tokens=10))
++        claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'spend_budget_exhausted'
++        neighbor = kb.create_task(conn, title='healthy isolated neighbor', assignee='default')
++        assert kb.claim_task(conn, neighbor) is not None
++
++
++@pytest.mark.parametrize('code', [1, 75, 76, 130])
++def test_interrupted_numeric_counters_are_only_lower_bounds(kanban_home, code):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        agent = SimpleNamespace(session_input_tokens=0, session_output_tokens=0,
++                                session_cache_read_tokens=123, session_cache_write_tokens=0)
++        session_kanban._record_worker_result(context, code, 'fixture request interrupted', agent=agent)
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 123
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++def test_bound_start_failure_proves_no_turn_without_inventing_usage(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        frame = {'policy': {'kanban_json': json.dumps(context)}}
++        session_kanban.record_start_failure(frame, RuntimeError('fixture construction failed before any turn'))
++        payload = json.loads(conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='worker_result' ORDER BY id DESC LIMIT 1",
++            (tid,)).fetchone()[0])
++        assert payload['usage_no_turn'] is True
++        assert 'usage' not in payload
++        assert kb.claim_task(conn, tid) is not None
++
++
++def test_bound_midrun_failure_is_not_no_turn_evidence(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        session_kanban.record_worker_failure({'policy': {'kanban_json': json.dumps(context)}},
++                                              RuntimeError('fixture interrupted after possible spend'))
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++def test_partial_requires_final_and_replaces_once(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        receipt(context, 50, partial=True)
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        receipt(context, 100)
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 100
++        assert kb.claim_task(conn, tid) is not None
++
++
++@pytest.mark.parametrize('first,second', [(100, 50), (50, 100)])
++def test_conflicting_finals_stay_pending_in_both_orders(kanban_home, first, second):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        receipt(context, first)
++        receipt(context, second)
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 100
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++def test_wrong_bound_claim_cannot_settle_debt(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        receipt({**context, 'claim_lock': 'wrong:claim'})
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='worker_result'", (tid,)).fetchall()
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++def test_interrupted_result_transaction_stays_pending_after_reopen(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++    original = kb._append_event
++
++    def interrupted(conn, task_id, kind, payload, **kwargs):
++        result = original(conn, task_id, kind, payload, **kwargs)
++        if kind == 'worker_result':
++            raise RuntimeError('fixture interruption before result transaction commit')
++        return result
++
++    with monkeypatch.context() as patch:
++        patch.setattr(kb, '_append_event', interrupted)
++        with pytest.raises(RuntimeError, match='before result transaction commit'):
++            receipt(context, 11034880)
++    with kbc.connect_closing() as conn:
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='worker_result'", (tid,)).fetchall()
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        receipt(context, 11034880)
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 11034880
++        assert kb.claim_task(conn, tid) is not None
++
++
++def test_admission_wins_over_an_unused_marker(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'released', {'unused_grant': True}, run_id=context['run_id'])
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_release_precedes_run_row_closure_publication(kanban_home, lane):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn, lane=lane)
++        with kb.write_txn(conn):
++            # Disposable partial-feed fixture: the task/release event arrived,
++            # but its ended_at/status/outcome run-row update has not arrived yet.
++            conn.execute("UPDATE task_runs SET status='running',outcome=NULL,ended_at=NULL WHERE id=?",
++                         (context['run_id'],))
++        claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++@pytest.mark.parametrize('lane', ['ready', 'review'])
++def test_final_arrives_before_run_closure_cannot_escape_spend(kanban_home, lane):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn, lane=lane)
++        ended = conn.execute('SELECT ended_at FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()[0]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET status='running',outcome=NULL,ended_at=NULL WHERE id=?",
++                         (context['run_id'],))
++        receipt(context, 123)
++        claim = kb.claim_task if lane == 'ready' else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET status='done',outcome='released',ended_at=? WHERE id=?",
++                         (ended, context['run_id']))
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 123
++        assert claim(conn, tid) is not None
++
++
++@pytest.mark.parametrize('code,continuable', [(75, False), (0, True)])
++def test_inconsistent_final_marker_does_not_settle(kanban_home, code, continuable):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'worker_result', {
++                'exit_code': code, 'continuable': continuable, 'usage_final': True,
++                'usage': dict(input_tokens=1, output_tokens=1, cache_read_tokens=123, cache_write_tokens=0)},
++                run_id=context['run_id'])
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++@pytest.mark.parametrize('code,allowed', [(0, True), (75, False), (130, False)])
++def test_legacy_failed_snapshot_is_not_a_final(kanban_home, code, allowed):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'worker_result', {'exit_code': code, 'usage': {'cache_read_tokens': 123}},
++                             run_id=context['run_id'])
++        assert (kb.claim_task(conn, tid) is not None) is allowed
++
++
++def test_no_turn_marker_cannot_be_injected_through_result_extras(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, context = released(conn)
++        session_kanban._record_worker_result(context, 1, 'fixture failure', extra={'usage_no_turn': True})
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++
++
++def test_pending_diagnostic_names_original_receipt_not_lease_reset(kanban_home):
++    from hermes_cli.kanban_db_dispatch_stuck import stuck_warning
++    result = kb.DispatchResult(claim_deferred=[('isolated', 'usage_accounting_pending')])
++    text = stuck_warning(6, [result])
++    assert 'before the Board lease' in text
++    assert 'run UID' in text and 'unknown usage is not zero' in text
++    assert 'Do not reset history' in text
++
++
++def test_unused_preturn_release_keeps_healthy_progress(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, _ = released(conn, admitted=False)
++        assert kb.claim_task(conn, tid) is not None
+diff --git a/tests/hermes_cli/test_kanban_usage_accounting_sync.py b/tests/hermes_cli/test_kanban_usage_accounting_sync.py
+new file mode 100644
+index 00000000000..7add059be73
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_usage_accounting_sync.py
+@@ -0,0 +1,83 @@
++"""Actual source outbox/feed remaps usage by UID after Board-primary release. [daveey]"""
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import session_kanban
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_spend_budget as budget
++from tests.hermes_cli import test_kanban_spend_budget as spending
++from tests.hermes_cli import test_kanban_worker_node as helpers
++
++kanban_home = spending.kanban_home
++svc = helpers.svc
++gws = helpers.gws
++
++
++@pytest.mark.parametrize('reverse', [False, True])
++def test_release_then_late_duplicate_receipt_through_real_sync(gws, monkeypatch, reverse):
++    hub, worker = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title='isolated accounting transport', assignee='default', runs_on=['linux'])
++    hub.round()
++    worker.round()
++    worker.enter()
++    unrelated = kb.create_task(worker.conn, title='unrelated local fixture history', assignee='default')
++    spending._run(worker.conn, unrelated, usage={'cache_read_tokens': 0})
++    from hermes_cli import kanban_worker_node as wn
++    assert wn.pickup(worker.conn, budget=1) == [tid]
++    assert kb.claim_task(worker.conn, tid)
++    task = kb.get_task(worker.conn, tid)
++    rid = task.current_run_id
++    uid = worker.conn.execute('SELECT uid FROM task_runs WHERE id=?', (rid,)).fetchone()[0]
++    context = {'db': str(worker.home/'kanban.db'), 'task_id': tid, 'run_id': rid, 'claim_lock': task.claim_lock}
++    with kb.write_txn(worker.conn):
++        kb._append_event(worker.conn, tid, 'owner_admitted', {'session_id': 'isolated-source'}, run_id=rid)
++        kb._append_event(worker.conn, tid, 'worker_bound', {'pid': os.getpid(), 'claim_lock': task.claim_lock}, run_id=rid)
++    worker.round()
++    dispatch._record_task_failure(worker.conn, tid, '', outcome='released', release_claim=True, end_run=True,
++                                  infrastructure=True)
++    worker.round()
++    hub.round()
++    hub.enter()
++    assert kb.get_task(hub.conn, tid).status == 'ready'
++    assert kb.claim_task(hub.conn, tid) is None
++    assert sync.pop_claim_deferral(tid) == 'usage_accounting_pending'
++    home_rid = hub.conn.execute('SELECT id FROM task_runs WHERE uid=?', (uid,)).fetchone()[0]
++    # IDs are gateway-local; equality would not prove the FK mapping boundary.
++    assert home_rid != rid
++    worker.enter()
++    agent = SimpleNamespace(session_input_tokens=10, session_output_tokens=2,
++                            session_cache_read_tokens=100, session_cache_write_tokens=0)
++    session_kanban._record_worker_result(context, 0, '', agent=agent, extra={'continuable': True})
++    agent.session_cache_read_tokens = 11034880
++    session_kanban._record_worker_result(context, 0, '', agent=agent)
++    session_kanban._record_worker_result(context, 0, '', agent=agent)
++    from tests.hermes_cli.kanban_sync_fake_board import FakeHub
++    original_ops = FakeHub.ops
++    deliveries = []
++
++    def wire(client, board, ops):
++        if client.gateway == worker.name:
++            assert len(ops) == 3 and all(op['table'] == 'task_events' for op in ops)
++            # Reorder real serialized source operations at the transport, not
++            # injected canonical totals. Retry those exact immutable op IDs too.
++            batch = list(reversed(ops)) if reverse else ops
++            result = original_ops(client, board, batch)
++            retry = original_ops(client, board, batch)
++            deliveries.append(retry)
++            return result
++        return original_ops(client, board, ops)
++
++    with monkeypatch.context() as patch:
++        patch.setattr(FakeHub, 'ops', wire)
++        worker.round()
++    assert len(deliveries) == 1
++    assert all(item['dup'] for item in deliveries[0]['results'])
++    hub.round()
++    hub.enter()
++    assert budget.spend(hub.conn, tid).tokens['cache_read_tokens'] == 11034880
++    assert kb.claim_task(hub.conn, tid) is not None
+diff --git a/tests/hermes_cli/test_kanban_worker_start_failure_cause.py b/tests/hermes_cli/test_kanban_worker_start_failure_cause.py
+index 13b813094c9..200a08ac300 100644
+--- a/tests/hermes_cli/test_kanban_worker_start_failure_cause.py
++++ b/tests/hermes_cli/test_kanban_worker_start_failure_cause.py
+@@ -12,10 +12,13 @@
+     from agent.model_routing import ModelRoutingError
+     from gateway import session_kanban
+     booked = []
+-    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda ctx, code, out, failure=None, extra=None: booked.append((code, out)))
++    monkeypatch.setattr(session_kanban, '_record_worker_result',
++                        lambda ctx, code, out, failure=None, extra=None, *, no_turn=False:
++                        booked.append((code, out, no_turn)))
+     frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
+     session_kanban.record_start_failure(frame, ModelRoutingError('Class selectors require provider auto;\nuse a concrete model'))
+-    (code, out), = booked
++    (code, out, no_turn), = booked
++    assert no_turn is True
+     assert code == 1
+     assert out == 'Worker could not start: ModelRoutingError: Class selectors require provider auto; use a concrete model'
+ 
+@@ -56,12 +59,14 @@
+     from agent.model_routing import ModelRoutingError
+     from gateway import session_kanban
+     booked = []
+-    monkeypatch.setattr(session_kanban, '_record_worker_result', lambda ctx, code, out, failure=None, extra=None: booked.append(out))
++    monkeypatch.setattr(session_kanban, '_record_worker_result',
++                        lambda ctx, code, out, failure=None, extra=None, *, no_turn=False:
++                        booked.append((out, no_turn)))
+     frame = {'policy': {'kanban_json': json.dumps({'db': '/nonexistent', 'task_id': 't', 'run_id': 1})}}
+     exc = ModelRoutingError('boom')
+     session_kanban.record_start_failure(frame, exc)
+     session_kanban.record_worker_failure(frame, exc)
+-    assert booked == ['Worker could not start: ModelRoutingError: boom']
++    assert booked == [('Worker could not start: ModelRoutingError: boom', True)]
+ 
+ 
+ def test_worker_failure_outside_kanban_books_nothing_and_never_raises(monkeypatch):
+-- 
+2.43.0
+

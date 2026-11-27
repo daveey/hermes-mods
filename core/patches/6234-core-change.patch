@@ -1,0 +1,193 @@
+From 441268f1e99207ab74d536022a2d57eb33f2a93d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:13:53 +0000
+Subject: [PATCH 6234] Recorded governor explanations and lightweight why startup
+
+Public mirror of source commit 441268f1e99207ab74d536022a2d57eb33f2a93d.
+
+---
+diff --git a/hermes_cli/kanban_governors_cli.py b/hermes_cli/kanban_governors_cli.py
+index e6e0dd778ed..5f4102cba8d 100644
+--- a/hermes_cli/kanban_governors_cli.py
++++ b/hermes_cli/kanban_governors_cli.py
+@@ -117,7 +117,11 @@
+         return
+     first = answer.get("first_stop")
+     head = f"{answer['task_id']} ({answer.get('status')}, board {answer.get('board')})"
+-    if first is None:
++    unknowns = [step for step in (answer.get("chain") or ()) if step.get("verdict") == "unknown"]
++    if first is None and unknowns:
++        note = f" ({answer['note']})" if answer.get("note") else ""
++        print(f"{head}: unknown whether anything holds it ({len(unknowns)} rules not evaluated){note}")
++    elif first is None:
+         print(f"{head}: nothing holds it" + (f" ({answer['note']})" if answer.get("note") else ""))
+     else:
+         measure = f" {_measure(first)}" if _measure(first) else ""
+diff --git a/hermes_cli/kanban_governors_explain.py b/hermes_cli/kanban_governors_explain.py
+index 07fc805b675..914d63a2fe3 100644
+--- a/hermes_cli/kanban_governors_explain.py
++++ b/hermes_cli/kanban_governors_explain.py
+@@ -113,7 +113,9 @@
+     named = [rec] + [o for o in (rec.get("overlaps") or []) if isinstance(o, dict)]
+     hit = next((entry for entry in named if entry.get("governor") == governor_id), None)
+     if hit is None:
+-        return {"verdict": PASS, "age_s": rec.get("age_s"), "detail": {"reason": "not charged by the last tick"}}
++        # Absence of a charge is not a pass: the tick may have stopped before this rule, or never recorded overlaps.
++        return {"verdict": UNKNOWN, "age_s": rec.get("age_s"),
++                "detail": {"reason": "not charged by the last tick; no recorded pass"}}
+     return _stop(scope=hit.get("scope"), reading=hit.get("reading"), threshold=hit.get("threshold"),
+                  detail=hit.get("detail"), age_s=rec.get("age_s"))
+ 
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 2d37bfafd2c..d30c8849a3e 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -393,10 +393,11 @@
+ 
+ 
+ def _pace_alternate(conn: sqlite3.Connection, task: Any, lane: str, cfg: lp.PacingConfig,
+-                    host: sqlite3.Connection, verdicts: list[dict]) -> Optional[tuple[str, str, str, tuple]]:
++                    host: sqlite3.Connection, verdicts: list[dict], *,
++                    refresh: bool = True) -> Optional[tuple[str, str, str, tuple]]:
+     """``(model, provider, paced, judged)``: a route of the card's own class on a pool that is NOT at reserve, for a
+     card a candidate pool holds (``verdicts``: the pools at reserve); ``judged`` is the ``(model, provider)`` route
+-    it moves from. None keeps the hold. [daveey]
++    it moves from. None keeps the hold. ``refresh=False`` judges stored pools only (no usage read, no write). [daveey]
+ 
+     The move uses the quota-episode probe (``alternate_route``: unpinned default or strong-class routes only, the
+     worker's own billing/capability eligibility, never a mandatory or ``require_model`` card, never a walled provider)
+@@ -418,13 +419,13 @@
+             if not model:
+                 return None
+             route = (model, provider, reason)
+-        return _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts)
++        return _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts, refresh=refresh)
+     except Exception as exc:  # health: allow BLE001 -- a failed probe keeps today's hold, never starts a paced card
+         _warn("alternate", "kanban pacing: pace alternate probe failed (%s: %s); holding", type(exc).__name__, exc)
+         return None
+ 
+ 
+-def _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts):
++def _pace_alternate_route(conn, task, route, lane, cfg, host, verdicts, *, refresh=True):
+     from hermes_cli import kanban_provider_walls as pw
+     from hermes_cli.kanban_quota_episode import alternate_route
+     if pw.requires_model(task):
+@@ -459,7 +460,9 @@
+             unusable[target] = now
+             continue
+         if target in cfg.providers:
+-            pace_for(host, target, cfg, now)
++            # refresh=False (a read-only why / overlap walk) judges the stored pool only: no usage read, no write.
++            if refresh:
++                pace_for(host, target, cfg, now)
+             held = reserve_hold(_hold_state(), target, now, cfg)
+             if held is not None:
+                 paced[target] = float(held["until"] or now + cfg.read_interval)
+@@ -550,7 +553,7 @@
+         verdicts = _verdicts(conn, task, providers, lane, cfg, refresh=refresh)
+         if verdicts is None:
+             return False
+-        moved = _pace_alternate(conn, task, lane, cfg, conn, verdicts)
++        moved = _pace_alternate(conn, task, lane, cfg, conn, verdicts, refresh=refresh)
+         if moved is not None:
+             # Start it on a pool with room instead of holding it; the applier moves the route after the claim.
+             from hermes_cli.kanban_pace_reroute import offer
+diff --git a/tests/hermes_cli/test_kanban_governors.py b/tests/hermes_cli/test_kanban_governors.py
+index a60f7e22df8..f145a9cbad5 100644
+--- a/tests/hermes_cli/test_kanban_governors.py
++++ b/tests/hermes_cli/test_kanban_governors.py
+@@ -326,3 +326,91 @@
+         waiting = tid if kb.get_task(conn, tid).status == "ready" else other
+         assert governors.card(conn, waiting)["governor"] == "host_slots"
+         assert governors.card(conn, waiting, now=time.time() + governors.STALE_SECONDS + 5)["stale"]
++
++
++def _chain_step(answer, governor):
++    return next(step for step in answer["chain"] if step["governor"] == governor)
++
++
++def _printed_verdict(text, label):
++    """The verdict token on the dry-run chain line for ``label``, or None."""
++    for line in text.splitlines():
++        parts = line.split()
++        if len(parts) >= 2 and parts[0] in {"pass", "stop", "throttle", "unknown"} and label in line:
++            return parts[0]
++    return None
++
++
++def test_never_ticked_unknown_does_not_say_nothing_holds_it(board, monkeypatch, capsys):
++    """A card no tick has judged is unknown, not 'nothing holds it'. Missing and stale text too."""
++    _usage(monkeypatch, [10.0])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="not yet observed", assignee="default")
++        answer = gcli.why(conn, tid)
++        gcli._print_why(answer)
++        text = capsys.readouterr().out
++        unknown = [step["governor"] for step in answer["chain"] if step["verdict"] == "unknown"]
++        assert {"board_share", "hub_claim_screen", "admission_pool", "board_lease"} <= set(unknown), unknown
++        assert "nothing holds it" not in text, text
++        assert "unknown whether anything holds it" in text, text
++        slash = kcli.run_slash(f"why {tid}")
++        assert "nothing holds it" not in slash, slash
++        assert "unknown whether anything holds it" in slash, slash
++
++        _tick(conn, max_in_progress=1)
++        other = kb.create_task(conn, title="second", assignee="default")
++        _tick(conn, max_in_progress=1)
++        first = kb.get_task(conn, tid)
++        waiting = tid if first is not None and first.status == "ready" else other
++        stale_at = time.time() + governors.STALE_SECONDS + 5
++        recorded = governors.card(conn, waiting, now=stale_at)
++        assert recorded is not None and recorded["stale"]
++        monkeypatch.setattr(time, "time", lambda: stale_at)
++        stale = gcli.why(conn, waiting)
++        stale_text = kcli.run_slash(f"why {waiting}")
++        assert stale["source"] == "dry_run"
++        lease = _chain_step(stale, "board_lease")
++        assert lease["verdict"] == "unknown", lease
++        assert _printed_verdict(stale_text, "Board lease") == "unknown", stale_text
++        if stale.get("first_stop") is None:
++            assert "nothing holds it" not in stale_text, stale_text
++            assert "unknown whether anything holds it" in stale_text, stale_text
++
++
++def test_unreached_tick_only_gate_is_unknown(board, monkeypatch):
++    """A tick that stops before claim did not pass the Board lease; absence is not a pass."""
++    _usage(monkeypatch, [10.0])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="globally stopped", assignee="default")
++        _tick(conn, max_spawn=0)
++        answer = gcli.why(conn, tid, live=True)
++        lease = _chain_step(answer, "board_lease")
++        assert lease["verdict"] == "unknown", lease
++        assert lease["verdict"] != "pass"
++
++
++def test_refresh_false_alternate_does_not_read_usage(board, monkeypatch):
++    """A read-only why must not refresh an alternate pool or rewrite pacing state."""
++    cfg = json.loads(board.joinpath("config.yaml").read_text())
++    for routes in cfg["model_routing"]["routes"].values():
++        routes.append({**routes[0], "model": "gpt-6-astra", "provider": "openai-codex"})
++    board.joinpath("config.yaml").write_text(json.dumps(cfg))
++    from hermes_cli import kanban_provider_walls as pw
++    monkeypatch.setattr(pw, "live_pool_serving", lambda *a: True)
++    monkeypatch.setattr(pw, "live_quota_wall", lambda *a: None)
++    reads = []
++
++    def read_pool(provider, now):
++        reads.append(provider)
++        used = 99.0 if provider == "anthropic" else 10.0
++        return [lp.Reading(now, provider + "-acct", lp.SEVEN_DAY, used, now + 86400)]
++
++    monkeypatch.setattr(pd, "read_pool", read_pool)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="two eligible pools", assignee="default")
++        pd.pace_for(conn, "anthropic", pd.load_config(), time.time())
++        reads.clear()
++        before = pd.state_path().read_bytes()
++        gcli.why(conn, tid, live=True)
++        after = pd.state_path().read_bytes()
++        assert reads == [] and after == before, {"reads": reads, "state_changed": after != before}
+-- 
+2.43.0
+

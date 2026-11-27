@@ -1,0 +1,329 @@
+From a21ae723079ed660b236c7b62cc758be48ce256b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:26:40 +0000
+Subject: [PATCH 6248] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit a21ae723079ed660b236c7b62cc758be48ce256b.
+
+---
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 19895722694..144730d4730 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -85,7 +85,7 @@
+ START_PROBE_GAP_S = 3.0      # between the start-up health probes of the active backend (Roller.start)
+ UNRESPONSIVE_REASON = "does not answer /api/health"
+ FAILED_ROLL_BACKOFF_S = 300.0
+-SUPERSEDED_GRACE_S = 900.0   # a superseded backend not retired by then is retired by the roller through its idle fence
++SUPERSEDED_GRACE_S = 30.0    # connection-drain cap (web_server_skew_exit.DRAIN_CAP_S); then try the idle fence
+ SUPERSEDED_HARD_S = 6 * 3600.0  # ... and stopped (SIGTERM, turns checkpoint) once this old, busy or not
+ SUPERSEDED_NAME = "superseded.json"
+ # Backends rolled away from because they stopped answering: never adopted again, and stopped after
+@@ -883,9 +883,10 @@
+         commit = self.post(port, "/api/health/retirement", {"action": "commit", "token": permit["token"]}) or {}
+         if commit.get("ok") is not True:
+             return False
+-        with contextlib.suppress(OSError, subprocess.SubprocessError):
+-            self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
+-        return True
++        try:
++            return self.systemctl("stop", "--no-block", backend_unit(port), timeout=15).returncode == 0
++        except (OSError, subprocess.SubprocessError):
++            return False  # keep the original superseded age so the next poll retries
+ 
+     def reap_superseded(self, grace_s: float = SUPERSEDED_GRACE_S, hard_s: float = SUPERSEDED_HARD_S) -> list[int]:
+         """Backstop for backends that are neither active nor warming and have not retired themselves (a core
+diff --git a/hermes_cli/fact_board_native.py b/hermes_cli/fact_board_native.py
+index ece1272d7c3..933b272688e 100644
+--- a/hermes_cli/fact_board_native.py
++++ b/hermes_cli/fact_board_native.py
+@@ -66,6 +66,35 @@
+     with _retained_lock:
+         for key in [key for key in _RETAINED if key[0] in paths]:
+             del _RETAINED[key]
++        for path in paths:
++            _COUNTS.pop(path, None)
++
++
++# path -> (st_dev, st_ino, (counts, state)): the last board_counts._query result, so the next catalog capture
++# reads only what moved. Taken out while refreshed (one owner of the mutable state), put back only on success.
++_COUNTS: OrderedDict = OrderedDict()
++_COUNTS_MAX = 64
++
++
++def _counts(api, path):
++    """Status counts of the board file, incrementally; errors propagate and leave nothing retained."""
++    key = str(path)
++    try:
++        stat = os.stat(path)
++        ident = (stat.st_dev, stat.st_ino)
++    except OSError:
++        ident = None  # no identity to vouch for retained state: full read, retain nothing
++    with _retained_lock:
++        hit = _COUNTS.pop(key, None)
++        prev = hit[2] if hit is not None and ident is not None and hit[:2] == ident else None
++        # _query mutates prev's status map; serialize refresh and retire so no older capture can overwrite a newer one.
++        counts, state = api.board_counts._query(path, prev)
++        if ident is not None and state is not None:
++            _COUNTS[key] = (*ident, (counts, state))
++            _COUNTS.move_to_end(key)
++            while len(_COUNTS) > _COUNTS_MAX:
++                _COUNTS.popitem(last=False)
++        return dict(counts)
+ 
+ 
+ def _board(api, board, selector):
+@@ -111,7 +140,7 @@
+     else:
+         boards = kanban_db.list_boards(include_archived=selector['include_archived'])
+         value = {'rows': boards, 'current': kanban_db.get_current_board(),
+-                 'counts': {b['slug']: api.board_counts._query(kanban_db.kanban_db_path(board=b['slug']))[0] for b in boards},
++                 'counts': {b['slug']: _counts(api, kanban_db.kanban_db_path(board=b['slug'])) for b in boards},
+                  'workspace_kinds': {b['slug']: api._default_workspace_kind(b) for b in boards},
+                  'project_names': {p['id']: p['name'] for p in rows}}
+     return {'value': value, 'observed_at': observed_at, 'observations': {'catalog': {'schema': schema}}}
+diff --git a/tests/hermes_cli/test_always_on_roller_drain.py b/tests/hermes_cli/test_always_on_roller_drain.py
+new file mode 100644
+index 00000000000..6ade8d6185b
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_roller_drain.py
+@@ -0,0 +1,61 @@
++"""The roller's idle-fenced backstop honors the connection drain window."""
++import subprocess
++
++import pytest
++
++from hermes_cli import always_on_rollover as ro
++from hermes_cli.web_server_skew_exit import DRAIN_CAP_S
++from tests.hermes_cli.test_always_on_rollover import FakeHost, FakeFence, make_reaper
++from tests.hermes_cli import test_always_on_rollover as helpers
++
++home = helpers.home
++
++
++@pytest.mark.parametrize('demoted', [False, True])
++def test_idle_backend_stopped_by_roller_at_drain_cap(home, demoted):
++    host, fence, wall = FakeHost(running={9148, 9149}), FakeFence(), [1000.0]
++    ro.write_active(9149)
++    roller = make_reaper(home, host, fence, wall)
++    if demoted:
++        roller.demote(9148)
++    assert roller.reap_superseded() == []
++    wall[0] += DRAIN_CAP_S - 1
++    assert roller.reap_superseded() == []
++    assert not fence.posts
++    wall[0] += 1
++    assert roller.reap_superseded() == [9148]
++    assert (9148, 'prepare') in fence.posts
++    assert (9148, 'commit') in fence.posts
++    assert ('stop', '--no-block', ro.backend_unit(9148)) in host.calls
++    assert not any(ro.backend_unit(9149) in call and call[0] == 'stop' for call in host.calls)
++
++
++def test_busy_turn_is_preserved_at_drain_cap_then_stopped_when_idle(home):
++    host, fence, wall = FakeHost(running={9148, 9149}), FakeFence(busy={9148}), [1000.0]
++    ro.write_active(9149)
++    roller = make_reaper(home, host, fence, wall)
++    assert roller.reap_superseded() == []
++    wall[0] += DRAIN_CAP_S
++    assert roller.reap_superseded() == []
++    assert (9148, 'prepare') in fence.posts
++    assert not any(c[0] == 'stop' for c in host.calls)
++    fence.busy.clear()
++    assert roller.reap_superseded() == [9148]
++
++
++def test_failed_stop_keeps_original_drain_age_for_retry(home):
++    host, fence, wall = FakeHost(running={9148, 9149}), FakeFence(), [1000.0]
++    ro.write_active(9149)
++    roller = make_reaper(home, host, fence, wall)
++    assert roller.reap_superseded() == []
++    real = roller.systemctl
++    def fail(*args, **kwargs):
++        if args[0] == 'stop':
++            return subprocess.CompletedProcess(args, 1, '', 'failed')
++        return real(*args, **kwargs)
++    roller.systemctl = fail
++    wall[0] += DRAIN_CAP_S
++    assert roller.reap_superseded() == []
++    assert roller._load_superseded()[9148] == 1000.0
++    roller.systemctl = real
++    assert roller.reap_superseded() == [9148]
+diff --git a/tests/plugins/test_board_native_counts_incremental.py b/tests/plugins/test_board_native_counts_incremental.py
+new file mode 100644
+index 00000000000..cd8a5d8ef56
+--- /dev/null
++++ b/tests/plugins/test_board_native_counts_incremental.py
+@@ -0,0 +1,169 @@
++"""Native catalog capture keeps each board's status counts and reads only what moved. [daveey]"""
++from contextlib import closing
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import fact_board_native as native
++from hermes_cli import kanban_db, kanban_db_connect
++from plugins.kanban.dashboard import board_fact_views
++from tests.plugins import test_kanban_board_shadow as helpers
++
++shadow_board = helpers.shadow_board
++
++
++@pytest.fixture
++def prevs(monkeypatch):
++    """Every board_counts._query call's ``prev`` argument; retained state is isolated per test."""
++    monkeypatch.setattr(native, '_COUNTS', type(native._COUNTS)())
++    seen = []
++    return seen
++
++
++def _record(api, monkeypatch, seen):
++    real = api.board_counts._query
++
++    def recording(path, prev=None):
++        seen.append(prev)
++        return real(path, prev)
++
++    monkeypatch.setattr(api.board_counts, '_query', recording)
++
++
++def _counts(api):
++    selector = board_fact_views.board_selector()
++    return native.capture(api, None, 'boards', selector)['value']['counts']
++
++
++def _add(title='written between captures'):
++    with closing(kanban_db_connect.connect(kanban_db.kanban_db_path())) as conn:
++        return kanban_db.create_task(conn, title=title, assignee='default')
++
++
++def test_repeated_capture_passes_the_prior_and_matches_a_full_read(shadow_board, prevs, monkeypatch):
++    api = shadow_board['mod']
++    _record(api, monkeypatch, prevs)
++    statements = []
++    real_open = api.board_counts.open_ro
++
++    def traced(path):
++        conn = real_open(path)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    monkeypatch.setattr(api.board_counts, 'open_ro', traced)
++    first = _counts(api)
++    assert any(sql == 'SELECT id, status FROM tasks' for sql in statements)
++    statements.clear()
++    second = _counts(api)
++    assert not any(sql == 'SELECT id, status FROM tasks' for sql in statements)
++    assert prevs[0] is None and all(p is not None for p in prevs[1:]) and len(prevs) >= 2
++    native._COUNTS.clear()
++    assert _counts(api) == first == second
++
++
++def test_a_write_between_captures_updates_the_counts(shadow_board, prevs, monkeypatch):
++    api = shadow_board['mod']
++    _record(api, monkeypatch, prevs)
++    before = _counts(api)
++    _add()
++    after = _counts(api)
++    assert prevs[-1] is not None  # read from retained state
++    slug = next(iter(before))
++    assert sum(after[slug].values()) == sum(before[slug].values()) + 1
++    native._COUNTS.clear()
++    assert _counts(api) == after
++
++
++def test_returned_counts_are_copies(shadow_board, prevs):
++    api = shadow_board['mod']
++    first = _counts(api)
++    slug = next(iter(first))
++    first[slug]['ready'] = 999
++    first[slug]['bogus'] = 1
++    assert _counts(api) == _counts(api)
++    assert 'bogus' not in _counts(api)[slug]
++    assert _counts(api)[slug].get('ready') != 999
++
++
++def test_a_failed_query_propagates_and_evicts(shadow_board, prevs, monkeypatch):
++    api = shadow_board['mod']
++    _counts(api)
++    assert native._COUNTS
++
++    def broken(*_a, **_k):
++        raise OSError('disk')
++
++    real = api.board_counts._query
++    monkeypatch.setattr(api.board_counts, '_query', broken)
++    with pytest.raises(OSError):
++        _counts(api)
++    assert not native._COUNTS
++    monkeypatch.setattr(api.board_counts, '_query', real)
++    _record(api, monkeypatch, prevs)
++    _counts(api)
++    assert prevs[0] is None  # the next read after a failure is full
++
++
++def test_a_replaced_board_file_starts_from_a_full_read(shadow_board, prevs, monkeypatch):
++    api = shadow_board['mod']
++    _counts(api)
++    _record(api, monkeypatch, prevs)
++    real = native.os.stat
++    board = str(kanban_db.kanban_db_path())
++
++    class Replaced:  # the same path, a new file: only its inode differs
++        def __init__(self, stat):
++            self._stat = stat
++
++        def __getattr__(self, name):
++            value = getattr(self._stat, name)
++            return value + 1 if name == 'st_ino' else value
++
++    monkeypatch.setattr(native.os, 'stat',
++                        lambda path, *a, **k: Replaced(real(path, *a, **k)) if str(path) == board else real(path, *a, **k))
++    _counts(api)
++    assert prevs[0] is None
++
++
++def test_retained_counts_are_bounded(tmp_path, monkeypatch):
++    monkeypatch.setattr(native, '_COUNTS', type(native._COUNTS)())
++    api = SimpleNamespace(board_counts=SimpleNamespace(_query=lambda path, prev=None: ({'ready': 1}, ('cursor', {'t': 'ready'}))))
++    for i in range(native._COUNTS_MAX + 5):
++        path = tmp_path / f'{i}.db'
++        path.write_bytes(b'')
++        native._counts(api, path)
++    assert len(native._COUNTS) == native._COUNTS_MAX
++    assert str(tmp_path / '0.db') not in native._COUNTS  # oldest evicted
++
++
++def test_unobservable_boards_retain_nothing(tmp_path, monkeypatch):
++    monkeypatch.setattr(native, '_COUNTS', type(native._COUNTS)())
++    api = SimpleNamespace(board_counts=SimpleNamespace(_query=lambda path, prev=None: ({'ready': 1}, None)))
++    path = tmp_path / 'legacy.db'
++    path.write_bytes(b'')
++    assert native._counts(api, path) == {'ready': 1}
++    assert not native._COUNTS
++    assert native._counts(api, tmp_path / 'missing.db') == {'ready': 1}
++    assert not native._COUNTS
++
++
++def test_retire_and_runtime_close_drop_retained_counts(shadow_board, prevs):
++    from hermes_cli.fact_board_startup import BoardRuntime
++    api = shadow_board['mod']
++    _counts(api)
++    assert native._COUNTS
++    runtime = BoardRuntime(api, boards=(kanban_db.get_current_board(),)).start()
++    runtime.close()
++    assert not native._COUNTS
++
++
++def test_retire_only_named_paths(tmp_path, monkeypatch):
++    monkeypatch.setattr(native, '_COUNTS', type(native._COUNTS)())
++    api = SimpleNamespace(board_counts=SimpleNamespace(_query=lambda path, prev=None: ({}, ('c', {}))))
++    a, b = tmp_path / 'a.db', tmp_path / 'b.db'
++    for p in (a, b):
++        p.write_bytes(b'')
++        native._counts(api, p)
++    native.retire([a])
++    assert list(native._COUNTS) == [str(b)]
+-- 
+2.43.0
+

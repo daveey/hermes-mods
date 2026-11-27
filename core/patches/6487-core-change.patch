@@ -1,0 +1,337 @@
+From 03677836945460dbc6544ce539aae458d4fdae9a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:09:51 +0000
+Subject: [PATCH 6487] Lane PR observations and CI park whole-commit wait
+
+Public mirror of source commit 03677836945460dbc6544ce539aae458d4fdae9a.
+
+---
+diff --git a/hermes_cli/kanban_lanes_flow_pr.py b/hermes_cli/kanban_lanes_flow_pr.py
+index 8c12edffe6d..3929a21b014 100644
+--- a/hermes_cli/kanban_lanes_flow_pr.py
++++ b/hermes_cli/kanban_lanes_flow_pr.py
+@@ -10,7 +10,7 @@
+ # Brokered gh calls measure 3-4.5 s each on the fleet, so the budget is wall-clock for the whole
+ # report and PRs are read concurrently (``prefetch``), not as one call chain after another.
+ BUDGET_S = 30
+-_VIEW = "state,headRefOid,reviewDecision,author,reviews"
++
+ 
+ 
+ def _login(person):
+@@ -90,12 +90,13 @@
+         if url in self.cache:
+             return self.cache[url]
+         self.cache[url] = {}
+-        with ThreadPoolExecutor(max_workers=2) as pool:
+-            view = pool.submit(self._read, ["pr", "view", url, "--json", _VIEW])
+-            checks = pool.submit(self._read, ["pr", "checks", url, "--required", "--json", "bucket"])
+-            data, checks = view.result(), checks.result()
+-        if not isinstance(data, dict):
++        from hermes_cli.kanban_lanes_flow_pr_snapshot import argv, parse
++
++        request = argv(url)
++        observed = parse(self._read(request)) if request else None
++        if observed is None:
+             return {}
++        data, checks = observed
+         state = data.get("state")
+         out = {"merged": state == "MERGED"} if state in ("OPEN", "MERGED") else {}
+         if state == "OPEN":
+diff --git a/hermes_cli/kanban_lanes_flow_pr_snapshot.py b/hermes_cli/kanban_lanes_flow_pr_snapshot.py
+new file mode 100644
+index 00000000000..efd45193cd8
+--- /dev/null
++++ b/hermes_cli/kanban_lanes_flow_pr_snapshot.py
+@@ -0,0 +1,87 @@
++"""One head-bound GraphQL observation, with no hidden pagination or retries. [daveey]"""
++import re
++
++QUERY = """query($owner:String!,$name:String!,$number:Int!) {
++  repository(owner:$owner,name:$name) { pullRequest(number:$number) {
++    state headRefOid reviewDecision author { login }
++    reviews(last:100) { pageInfo { hasPreviousPage }
++      nodes { state body author { login __typename } commit { oid } } }
++    commits(last:1) { nodes { commit { oid statusCheckRollup {
++      contexts(first:100) { pageInfo { hasNextPage } nodes { __typename
++        ... on CheckRun { isRequired(pullRequestNumber:$number) status conclusion }
++        ... on StatusContext { isRequired(pullRequestNumber:$number) state }
++      } }
++    } } } }
++  } }
++}"""
++
++
++def argv(url):
++    match = re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)", url)
++    if not match:
++        return None
++    owner, name, number = match.groups()
++    return ["api", "graphql", "-f", "query=" + QUERY, "-f", "owner=" + owner,
++            "-f", "name=" + name, "-F", "number=" + number]
++
++
++def bucket(node):
++    """Match gh pr checks buckets; unknown provider enums never establish green."""
++    if not isinstance(node, dict) or type(node.get("isRequired")) is not bool:
++        return None
++    if node.get("__typename") == "CheckRun":
++        status = node.get("status")
++        state = node.get("conclusion") if status == "COMPLETED" else status
++    elif node.get("__typename") == "StatusContext":
++        state = node.get("state")
++    else:
++        return None
++    if state in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
++        return "pass"
++    if state in {"ERROR", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}:
++        return "fail"
++    if state in {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED", "PENDING_DEPLOYMENT"}:
++        return "pending"
++    # Cancelled is not green (gh's separate cancel bucket is likewise not pass).
++    return "cancel" if state == "CANCELLED" else None
++
++
++def parse(payload):
++    """Reject partial errors, pagination and mismatched commit/check identities."""
++    if not isinstance(payload, dict) or payload.get("errors"):
++        return None
++    try:
++        data = dict(payload["data"]["repository"]["pullRequest"])
++        if data.get("state") in {"MERGED", "CLOSED"}:
++            return data, []
++        if data.get("state") != "OPEN" or not data.get("headRefOid"):
++            return None
++        # gh pr view represents GraphQL's null reviewDecision as an empty string.
++        if data.get("reviewDecision") is None:
++            data["reviewDecision"] = ""
++        reviews = data["reviews"]
++        if reviews["pageInfo"]["hasPreviousPage"] is not False or not isinstance(reviews["nodes"], list):
++            return None
++        if not all(isinstance(review, dict) for review in reviews["nodes"]):
++            return None
++        data["reviews"] = reviews["nodes"]
++        for review in data["reviews"]:
++            author = review.get("author")
++            if isinstance(author, dict) and author.get("__typename") == "Bot":
++                review["author"] = dict(author, is_bot=True)
++        commits = data["commits"]["nodes"]
++        if len(commits) != 1 or commits[0]["commit"]["oid"] != data["headRefOid"]:
++            return None
++        contexts = commits[0]["commit"]["statusCheckRollup"]["contexts"]
++        if contexts["pageInfo"]["hasNextPage"] is not False or not isinstance(contexts["nodes"], list):
++            return None
++        buckets = []
++        for node in contexts["nodes"]:
++            value = bucket(node)
++            if value is None:
++                return None
++            if node["isRequired"]:
++                buckets.append({"bucket": value})
++        return data, buckets
++    except (KeyError, TypeError, ValueError):
++        return None
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow_pr.py b/tests/hermes_cli/test_kanban_lanes_flow_pr.py
+index c25492961c3..933be064959 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow_pr.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow_pr.py
+@@ -6,6 +6,7 @@
+ 
+ from hermes_cli import kanban_db_dispatch_pr_state as shared
+ from hermes_cli.kanban_lanes_flow_pr import Reader
++from tests.hermes_cli.test_kanban_lanes_flow_pr_snapshot import snapshot
+ 
+ 
+ @pytest.mark.parametrize("state,decision,buckets,expected", [
+@@ -19,9 +20,9 @@
+ def test_real_executable_observations(tmp_path, monkeypatch, state, decision, buckets, expected):
+     script = tmp_path / "fixture_gh.py"
+     view = {"state": state, "reviewDecision": decision, "headRefOid": "a" * 40}
+-    checks = [{"bucket": b} for b in buckets]
++    payload = snapshot(view, buckets)
+     script.write_text("import json,sys\n" +
+-                      f"print(json.dumps({view!r} if 'view' in sys.argv else {checks!r}))\n")
++                      f"print(json.dumps({view!r} if 'view' in sys.argv else {payload!r}))\n")
+     monkeypatch.setattr(shared, "_gh_argv", lambda: [sys.executable, str(script)])
+     reader = Reader()
+     assert reader.get("https://github.com/example/repo/pull/1") == expected
+@@ -64,7 +65,8 @@
+     views = iter([first, last])
+ 
+     def read(self, argv):
+-        return [{"bucket": "pass"}] if "checks" in argv else next(views)
++        view = next(views)
++        return view if "view" in argv else snapshot(view)
+     monkeypatch.setattr(Reader, "_read", read)
+     assert Reader().get("https://github.com/example/repo/pull/1") == {}
+ 
+@@ -89,7 +91,7 @@
+     review = dict(_review("author", "COMMENTED", oid, bot), body=body)
+     view = {"state": "OPEN", "headRefOid": "a" * 40, "reviewDecision": "",
+             "author": {"login": "author"}, "reviews": [review]}
+-    monkeypatch.setattr(Reader, "_read", lambda self, argv: [{"bucket": "pass"}] if "checks" in argv else view)
++    monkeypatch.setattr(Reader, "_read", lambda self, argv: view if "view" in argv else snapshot(view))
+     from hermes_cli.kanban_lanes_flow import classify_step
+     observed = Reader().get("https://github.com/example/repo/pull/1")
+     assert observed["approved"] is expected
+@@ -102,7 +104,7 @@
+                for v in ("APPROVE", "REQUEST_CHANGES")]
+     view = {"state": "OPEN", "headRefOid": "a" * 40, "reviewDecision": "",
+             "author": {"login": "author"}, "reviews": reviews}
+-    monkeypatch.setattr(Reader, "_read", lambda self, argv: [{"bucket": "pass"}] if "checks" in argv else view)
++    monkeypatch.setattr(Reader, "_read", lambda self, argv: view if "view" in argv else snapshot(view))
+     assert Reader().get("https://github.com/example/repo/pull/1")["approved"] is False
+ 
+ 
+@@ -119,7 +121,7 @@
+ def test_empty_review_decision_still_reaches_merge_via_independent_approval(monkeypatch, reviews, approved):
+     view = {"state": "OPEN", "headRefOid": "a" * 40, "reviewDecision": "", "author": {"login": "author"},
+             "reviews": reviews}
+-    monkeypatch.setattr(Reader, "_read", lambda self, argv: [{"bucket": "pass"}] if "checks" in argv else view)
++    monkeypatch.setattr(Reader, "_read", lambda self, argv: view if "view" in argv else snapshot(view))
+     assert Reader().get("https://github.com/example/repo/pull/1")["approved"] is approved
+ 
+ 
+@@ -129,9 +131,9 @@
+     view = {"state": "OPEN", "reviewDecision": "", "headRefOid": "a" * 40, "author": {"login": "x"},
+             "reviews": [_review("rev", "APPROVED", "a" * 40)]}
+     script.write_text("import json,sys,time\ntime.sleep(1.2)\n"
+-                      f"print(json.dumps({view!r} if 'view' in sys.argv else [{{'bucket': 'pass'}}]))\n")
++                      f"print(json.dumps({view!r} if 'view' in sys.argv else {snapshot(view)!r}))\n")
+     monkeypatch.setattr(shared, "_gh_argv", lambda: [sys.executable, str(script)])
+-    urls = [f"https://github.com/example/repo/pull/{n}" for n in range(6)]
++    urls = [f"https://github.com/example/repo/pull/{n}" for n in range(1, 7)]
+     reader = Reader(budget=10)
+     start = time.monotonic()
+     reader.prefetch(urls)
+@@ -146,7 +148,7 @@
+     script.write_text(
+         "import os,json\n"
+         "assert os.environ['GH_SHIM_PARENT'] == 'lanes-flow'\n"
+-        "print(json.dumps({'state':'CLOSED'}))\n")
++        f"print(json.dumps({snapshot({'state': 'CLOSED'})!r}))\n")
+     monkeypatch.setenv('GH_SHIM_PARENT', 'unrelated-parent')
+     monkeypatch.setattr(shared, '_gh_argv', lambda: [sys.executable, str(script)])
+     reader = Reader()
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow_pr_snapshot.py b/tests/hermes_cli/test_kanban_lanes_flow_pr_snapshot.py
+new file mode 100644
+index 00000000000..2580991944a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes_flow_pr_snapshot.py
+@@ -0,0 +1,113 @@
++"""Head-bound snapshots retain confirmation while bounding fills to two calls."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli.kanban_lanes_flow_pr import Reader
++from hermes_cli.kanban_lanes_flow_pr_snapshot import QUERY, argv, bucket, parse
++
++URL = "https://github.com/example/repo/pull/1"
++HEAD = "a" * 40
++
++
++def snapshot(view=None, buckets=("pass",)):
++    data = dict(view or {"state": "OPEN", "headRefOid": HEAD, "reviewDecision": "APPROVED"})
++    reviews = data.get("reviews", [])
++    data["reviews"] = {"pageInfo": {"hasPreviousPage": False}, "nodes": reviews}
++    conclusions = {"pass": "SUCCESS", "fail": "FAILURE", "pending": "IN_PROGRESS"}
++    nodes = [{"__typename": "CheckRun", "isRequired": True,
++              "status": "IN_PROGRESS" if b == "pending" else "COMPLETED",
++              "conclusion": conclusions[b]} for b in buckets]
++    data["commits"] = {"nodes": [{"commit": {"oid": data.get("headRefOid"),
++        "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False}, "nodes": nodes}}}}]}
++    return {"data": {"repository": {"pullRequest": data}}}
++
++
++def test_two_call_fill_has_head_bound_checks_and_sequential_confirmation(monkeypatch):
++    calls = []
++
++    def read(self, args):
++        calls.append(args)
++        if args[:2] == ["api", "graphql"]:
++            assert "query=" + QUERY in args
++            return snapshot()
++        assert args[:3] == ["pr", "view", URL]
++        assert len(calls) == 2
++        return {"state": "OPEN", "headRefOid": HEAD, "reviewDecision": "APPROVED"}
++
++    monkeypatch.setattr(Reader, "_read", read)
++    reader = Reader()
++    assert reader.get(URL) == {"merged": False, "approved": True, "checks": "green"}
++    assert reader.get(URL)["checks"] == "green"
++    assert len(calls) == 2
++
++
++PR_PATH = ("data", "repository", "pullRequest")
++COMMIT_PATH = (*PR_PATH, "commits", "nodes", 0, "commit")
++CONTEXT_PATH = (*COMMIT_PATH, "statusCheckRollup", "contexts")
++
++
++@pytest.mark.parametrize("path,value", [
++    (("errors",), [{"message": "partial result"}]),
++    ((*PR_PATH, "reviews", "pageInfo", "hasPreviousPage"), True),
++    ((*CONTEXT_PATH, "pageInfo", "hasNextPage"), True),
++    ((*COMMIT_PATH, "oid"), "b" * 40),
++    ((*CONTEXT_PATH, "pageInfo"), {}),
++    ((*COMMIT_PATH, "statusCheckRollup"), None),
++])
++def test_incomplete_or_wrong_head_snapshot_never_reports_success(monkeypatch, path, value):
++    payload = snapshot()
++    target = payload
++    for key in path[:-1]:
++        target = target[key]
++    target[path[-1]] = value
++    monkeypatch.setattr(Reader, "_read", lambda self, args: payload)
++    reader = Reader()
++    assert reader.get(URL) == {}
++    assert reader.states == {}
++
++
++@pytest.mark.parametrize("state,expected", [("SUCCESS", "pass"), ("NEUTRAL", "pass"),
++    ("SKIPPED", "pass"), ("FAILURE", "fail"), ("CANCELLED", "cancel"), ("FUTURE_ENUM", None)])
++def test_completed_check_buckets(state, expected):
++    assert bucket({"__typename": "CheckRun", "isRequired": True,
++                   "status": "COMPLETED", "conclusion": state}) == expected
++
++
++def test_running_check_with_stale_success_is_pending():
++    assert bucket({"__typename": "CheckRun", "isRequired": True,
++                   "status": "IN_PROGRESS", "conclusion": "SUCCESS"}) == "pending"
++
++
++def test_graphql_null_review_matches_cli_empty_decision(monkeypatch):
++    view = {"state": "OPEN", "headRefOid": HEAD, "reviewDecision": None}
++    payload = snapshot(view)
++    monkeypatch.setattr(Reader, "_read", lambda self, args:
++        payload if args[:2] == ["api", "graphql"] else dict(view, reviewDecision=""))
++    assert Reader().get(URL) == {"merged": False, "approved": False, "checks": "green"}
++
++
++def test_graphql_bot_actor_cannot_supply_comment_approval(monkeypatch):
++    view = {"state": "OPEN", "headRefOid": HEAD, "reviewDecision": "", "author": {"login": "author"},
++            "reviews": [{"author": {"login": "automation", "__typename": "Bot"},
++                         "state": "COMMENTED", "body": "VERDICT: APPROVE", "commit": {"oid": HEAD}}]}
++    payload = snapshot(view)
++    monkeypatch.setattr(Reader, "_read", lambda self, args:
++        payload if args[:2] == ["api", "graphql"] else view)
++    assert Reader().get(URL)["approved"] is False
++
++
++def test_only_required_checks_and_no_empty_green():
++    payload = snapshot(buckets=())
++    assert parse(payload)[1] == []
++    changed = deepcopy(payload)
++    nodes = changed["data"]["repository"]["pullRequest"]["commits"]["nodes"]
++    nodes[0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = [
++        {"__typename": "StatusContext", "isRequired": False, "state": "FAILURE"},
++        {"__typename": "StatusContext", "isRequired": True, "state": "SUCCESS"}]
++    assert parse(changed)[1] == [{"bucket": "pass"}]
++
++
++@pytest.mark.parametrize("url", ["https://example.com/a/b/pull/1", URL + "?x=1", URL + "/files", URL[:-1] + "0"])
++def test_malformed_urls_issue_no_provider_query(url):
++    assert argv(url) is None
+-- 
+2.43.0
+

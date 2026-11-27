@@ -1,0 +1,208 @@
+From 2b8de73992f9f978356c6c8931dbd2d19bd59f70 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:19:58 +0000
+Subject: [PATCH 6236] Recorded governor explanations and lightweight why startup
+
+Public mirror of source commit 2b8de73992f9f978356c6c8931dbd2d19bd59f70.
+
+---
+diff --git a/hermes_cli/kanban_governors.py b/hermes_cli/kanban_governors.py
+index ee0a35f5eab..cf3c0f377b5 100644
+--- a/hermes_cli/kanban_governors.py
++++ b/hermes_cli/kanban_governors.py
+@@ -20,9 +20,10 @@
+ * :func:`snapshot` reads it back. A consumer reads what the dispatcher decided; it does not re-derive it.
+ 
+ The first stop always comes from the tick. Overlaps cannot: the dispatcher stops at the first refusal, so the rules
+-after it are asked afterwards (``kanban_governors_explain.card_chain``, the same predicate functions, read-only),
+-inside a small per-tick time budget; a card the budget did not reach has ``overlaps: null`` (not evaluated), never
+-an empty list.
++after it are asked afterwards (later global caps via ``global_chain``, then ``card_chain``; the same predicate
++functions, read-only), inside a small per-tick time budget. A card the budget did not reach has ``overlaps: null``
++(not evaluated), never an empty list. A predicate that raises, or a global cap this walk could not measure, is
++listed in ``overlaps_unknown`` and is not cached as a finished empty overlap list.
+ 
+ Advisory like every notice: nothing here is read by admission, and a fault never stops a tick.
+ """
+@@ -582,21 +583,44 @@
+     return entry
+ 
+ 
++# A tick-only rule the dispatcher did not reach stays out of this list: it is unknown by design, not a
++# measurement this walk failed to take. Only a predicate fault or an unmeasured global cap is incomplete.
++_UNMEASURED = ("memory pressure not measured", "host census not observed")
++_LAST_GLOBAL = "memory_pressure"
++
++
++def _overlap_fields(step: dict[str, Any], *, verdict: bool = False) -> dict[str, Any]:
++    keys = ("governor", "verdict", "scope", "reading", "threshold", "detail") if verdict else (
++        "governor", "scope", "reading", "threshold", "detail")
++    return {k: step[k] for k in keys if step.get(k) is not None}
++
++
++def _incomplete(step: dict[str, Any]) -> bool:
++    """A predicate fault or an unmeasured cap. Not a tick-only rule the dispatcher never asks twice."""
++    if step.get("verdict") != "unknown":
++        return False
++    detail = step.get("detail") or {}
++    return bool(detail.get("error")) or str(detail.get("reason") or "") in _UNMEASURED
++
++
+ def _overlaps(conn: Any, cards: dict[str, dict], previous: dict[str, Any], now: float) -> None:
+     """Ask the rules after each lane card's first stop what else holds it, inside the tick's budget."""
+     from hermes_cli import kanban_governors_explain as explain
+ 
+     deadline = time.monotonic() + OVERLAP_BUDGET_SECONDS
+     env = None
++    global_steps = None
+     asked = 0
+     for tid, card in cards.items():
+         if card["status"] not in ("ready", "review"):
+             card["overlaps"] = card["tick_overlaps"]
+             continue
+-        before = previous.get(tid) if isinstance(previous.get(tid), dict) else {}
++        prior = previous.get(tid)
++        before: dict[str, Any] = prior if isinstance(prior, dict) else {}
+         fresh = isinstance(before.get("overlaps_at"), (int, float)) and now - before["overlaps_at"] < OVERLAP_TTL_SECONDS
+         if fresh and before.get("governor") == card["governor"] and isinstance(before.get("overlaps"), list):
+             card["overlaps"], card["overlaps_at"] = before["overlaps"], before["overlaps_at"]
++            card["overlaps_unknown"] = list(before.get("overlaps_unknown") or [])
+             continue
+         if asked and time.monotonic() >= deadline:  # at least one card a tick, so a slow host still converges
+             card["overlaps"] = None  # not evaluated this tick: never read as "no overlap"
+@@ -604,16 +628,33 @@
+         asked += 1
+         try:
+             env = explain.environment(conn) if env is None else env
+-            chain = explain.card_chain(conn, tid, env, after=card["governor"])
++            # Globals sit before the card rules. A card stopped by one of them never sees the later caps in
++            # card_chain, so ask those caps once per tick and keep the ones after this card's first stop.
++            if global_steps is None and order_of(card["governor"]) < order_of(_LAST_GLOBAL):
++                global_steps = explain.global_chain(conn, env)
++            floor = order_of(card["governor"])
++            later = [step for step in (global_steps or ()) if order_of(step["governor"]) > floor]
++            chain = later + explain.card_chain(conn, tid, env, after=card["governor"])
+         except Exception:  # health: allow BLE001 -- overlaps are evidence; the first stop already stands
+             _log.debug("kanban governors: overlap check failed for %s", tid, exc_info=True)
+             card["overlaps"] = None
+             continue
+         seen = {(card["governor"], card.get("scope"))} | {(o["governor"], o.get("scope")) for o in card["tick_overlaps"]}
+-        extra = [{k: step[k] for k in ("governor", "scope", "reading", "threshold", "detail") if step.get(k) is not None}
+-                 for step in chain if step["verdict"] == "stop" and (step["governor"], step.get("scope")) not in seen
+-                 and step["governor"] != card["governor"]]
+-        card["overlaps"], card["overlaps_at"] = card["tick_overlaps"] + extra, int(now)
++        extra, unknowns = [], []
++        for step in chain:
++            key = (step["governor"], step.get("scope"))
++            if key in seen or step["governor"] == card["governor"]:
++                continue
++            if step.get("verdict") == "stop":
++                extra.append(_overlap_fields(step))
++                seen.add(key)
++            elif _incomplete(step):
++                unknowns.append(_overlap_fields(step, verdict=True))
++                seen.add(key)
++        card["overlaps"] = card["tick_overlaps"] + extra
++        card["overlaps_unknown"] = unknowns
++        if not unknowns:  # a fault is not a finished evaluation: the next tick asks again
++            card["overlaps_at"] = int(now)
+ 
+ 
+ def _gauges(conn: Any, capture: Optional[Tick], *, board: str, now: float) -> list[dict[str, Any]]:
+diff --git a/hermes_cli/kanban_governors_cli.py b/hermes_cli/kanban_governors_cli.py
+index 5f4102cba8d..f9eaee9a669 100644
+--- a/hermes_cli/kanban_governors_cli.py
++++ b/hermes_cli/kanban_governors_cli.py
+@@ -106,7 +106,8 @@
+                                           "detail", "source", "age_s")}
+     first["verdict"] = "stop"
+     return {"task_id": task_id, "board": recorded.get("board"), "source": "snapshot", "status": recorded.get("status"),
+-            "first_stop": first, "overlaps": recorded.get("overlaps"), "chain": [first], "recorded": recorded,
++            "first_stop": first, "overlaps": recorded.get("overlaps"),
++            "overlaps_unknown": recorded.get("overlaps_unknown"), "chain": [first], "recorded": recorded,
+             "elapsed_s": round(time.monotonic() - started, 3)}
+ 
+ 
+@@ -134,6 +135,10 @@
+         print("  also held by: not evaluated yet (run with --live)")
+     for other in overlaps or ():
+         print(f"  also held by: {_name({**other, 'label': other.get('label') or _label(other)})} {_measure(other)}".rstrip())
++    for other in answer.get("overlaps_unknown") or ():
++        detail = other.get("detail") or {}
++        note = detail.get("error") or detail.get("reason") or "unknown"
++        print(f"  also unknown: {_name({**other, 'label': other.get('label') or _label(other)})} ({note})")
+     if answer["source"] == "dry_run":
+         for step in answer.get("chain") or ():
+             print(f"    {step['verdict']:<8} {_name(step):<34} {_measure(step):<14} {_value(step.get('detail'))}".rstrip())
+diff --git a/tests/hermes_cli/test_kanban_governors.py b/tests/hermes_cli/test_kanban_governors.py
+index f145a9cbad5..f178a30c7d8 100644
+--- a/tests/hermes_cli/test_kanban_governors.py
++++ b/tests/hermes_cli/test_kanban_governors.py
+@@ -414,3 +414,64 @@
+         gcli.why(conn, tid, live=True)
+         after = pd.state_path().read_bytes()
+         assert reads == [] and after == before, {"reads": reads, "state_changed": after != before}
++
++
++def test_later_global_stop_is_an_overlap_on_the_snapshot_and_live(board, monkeypatch):
++    """A global rule after the tick's first stop is an overlap, not an evaluated empty list.
++
++    ``dispatch_once(max_spawn=0)`` returns before it reads memory. Critical pressure is still a
++    stop; snapshot ``why`` must name it, the same way ``why --live`` does.
++    """
++    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda sample=None: "critical")
++    monkeypatch.setattr(governors, "OVERLAP_BUDGET_SECONDS", 60.0)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="spawn cap and critical memory", assignee="default")
++        result = _tick(conn, max_spawn=0)
++        task = kb.get_task(conn, tid)
++        assert not result.spawned and task is not None and task.status == "ready"
++        card = governors.snapshot(conn)["cards"][tid]
++        assert card["governor"] == "max_spawn", card
++        snap = _why(tid)
++        live = _why(tid, "--live")
++        assert snap["source"] == "snapshot" and live["source"] == "dry_run"
++        assert snap["first_stop"]["governor"] == "max_spawn"
++        assert "memory_pressure" in [o["governor"] for o in live["overlaps"]], live["overlaps"]
++        assert "memory_pressure" in [o["governor"] for o in snap["overlaps"]], snap["overlaps"]
++        assert "memory_pressure" in [o["governor"] for o in card["overlaps"]], card
++
++
++def test_predicate_fault_is_unknown_not_a_cached_empty_overlap_list(board, monkeypatch):
++    """An overlap predicate that raises is unknown, and that incomplete result is not reused."""
++    from hermes_cli import kanban_disk_admission as disk
++
++    monkeypatch.setattr(governors, "OVERLAP_BUDGET_SECONDS", 60.0)
++
++    def boom():
++        raise OSError("probe")
++
++    monkeypatch.setattr(disk, "refusal_reason", boom)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="disk read fails", assignee="default")
++        _tick(conn, max_spawn=0)
++        card = governors.snapshot(conn)["cards"][tid]
++        assert card["governor"] == "max_spawn", card
++        unknowns = card.get("overlaps_unknown") or []
++        assert any(u["governor"] == "disk_floor" and u["verdict"] == "unknown" for u in unknowns), card
++        assert "overlaps_at" not in card  # a fault is not a finished evaluation to reuse for 300s
++        snap = _why(tid)
++        assert any(u["governor"] == "disk_floor" for u in (snap.get("overlaps_unknown") or [])), snap
++        text = kcli.run_slash(f"why {tid}")
++        assert "also unknown" in text and "Disk floor" in text, text
++        assert "not evaluated yet" not in text, text
++        live = _why(tid, "--live")
++        assert _chain_step(live, "disk_floor")["verdict"] == "unknown"
++
++        _tick(conn, max_spawn=0)  # still faulting: must not reuse a cached empty list
++        again = governors.snapshot(conn)["cards"][tid]
++        assert any(u["governor"] == "disk_floor" for u in (again.get("overlaps_unknown") or [])), again
++
++        monkeypatch.setattr(disk, "refusal_reason", lambda: None)
++        _tick(conn, max_spawn=0)
++        recovered = governors.snapshot(conn)["cards"][tid]
++        assert not any(u.get("governor") == "disk_floor" for u in (recovered.get("overlaps_unknown") or []))
++        assert "Disk floor" not in kcli.run_slash(f"why {tid}")
+-- 
+2.43.0
+

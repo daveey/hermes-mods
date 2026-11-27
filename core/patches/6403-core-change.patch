@@ -1,0 +1,350 @@
+From 086866825598fe4261d62081ae6acf027164aa8f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:47:04 +0000
+Subject: [PATCH 6403] Kanban sync refusal audits and diagnostic drift supersession
+
+Public mirror of source commit 086866825598fe4261d62081ae6acf027164aa8f.
+
+---
+diff --git a/hermes_cli/kanban_rejected_retain_retirement.py b/hermes_cli/kanban_rejected_retain_retirement.py
+index 03338c6fa94..aade5a1fdb9 100644
+--- a/hermes_cli/kanban_rejected_retain_retirement.py
++++ b/hermes_cli/kanban_rejected_retain_retirement.py
+@@ -47,7 +47,7 @@
+     """
+     report = dict(op_id=op['op_id'], table=op['table_name'], row_uid=op['row_uid'],
+                   classification='unresolved', action='retained', proof='retain custody not proven')
+-    if not audited_rejection(conn, conn, op):
++    if op.get('op') != 'retain' or not audited_rejection(conn, conn, op):
+         return report
+     wire = frozen_wire(op)
+     before = _snapshot(conn, op, wire)
+diff --git a/hermes_cli/kanban_sync_actionability_drift.py b/hermes_cli/kanban_sync_actionability_drift.py
+new file mode 100644
+index 00000000000..322fceeb099
+--- /dev/null
++++ b/hermes_cli/kanban_sync_actionability_drift.py
+@@ -0,0 +1,96 @@
++"""Read-only audit of superseded, definitively rejected diagnostics. [daveey]
++
++This is neither a delivery receipt nor permission to retire or replay transport.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_cli import kanban_actionability_transport as transport
++
++
++def _valid_facts(facts, *, portable_only=False):
++    if not isinstance(facts, dict) or set(facts) != {
++            'status', 'assignee', 'current_run_uid', 'root_episode', 'source_uids', 'dependencies'}:
++        return False
++    if not isinstance(facts['status'], str) or any(
++            value is not None and not isinstance(value, str)
++            for value in (facts['assignee'], facts['current_run_uid'], facts['root_episode'])):
++        return False
++    sources, deps = facts['source_uids'], facts['dependencies']
++    return (isinstance(sources, list) and len(sources) == 1
++            and isinstance(sources[0], dict)
++            and set(sources[0]) == ({'uid'} if portable_only else {'uid', 'version'})
++            and isinstance(sources[0]['uid'], str) and bool(sources[0]['uid'])
++            and (portable_only or type(sources[0]['version']) is int and sources[0]['version'] > 0)
++            and isinstance(deps, list) and len(deps) <= 128
++            and all(isinstance(d, dict) and set(d) == {'id', 'status'}
++                    and isinstance(d['id'], str) and bool(d['id'])
++                    and isinstance(d['status'], str) for d in deps)
++            and [d['id'] for d in deps] == sorted({d['id'] for d in deps}))
++
++
++def _source(conn, task_id):
++    from hermes_cli.kanban_actionability_selection import select
++
++    row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if row is None:
++        return None
++    task = dict(row)
++    if task.get('deleted_at') is not None:
++        return None
++    run_uid = None
++    if task['current_run_id'] is not None:
++        run = conn.execute('SELECT uid FROM task_runs WHERE id=? AND task_id=?',
++                           (task['current_run_id'], task_id)).fetchone()
++        if run is None or not run[0]:
++            return None
++        run_uid = run[0]
++    events = [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (task_id,))]
++    # SQLite event rows carry no canonical version column. Compare portable
++    # source identity, never invent a version or treat absent metadata as change.
++    if any(not e.get('uid') or e.get('deleted_at') is not None for e in events):
++        return None
++    event = select(task['status'], events, episode=task['containment_episode'],
++                   order_key=lambda e: (e['created_at'], e['id']))
++    if event is None:
++        return None
++    deps = []
++    for (pid,) in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,)):
++        parent = conn.execute('SELECT status,containment_episode FROM tasks WHERE id=?', (pid,)).fetchone()
++        if parent is None:
++            return None
++        status = 'triage' if parent[0] in ('done', 'archived') and parent[1] else parent[0]
++        deps.append({'id': pid, 'status': status})
++    return {'status': task['status'], 'assignee': task['assignee'], 'current_run_uid': run_uid,
++            'root_episode': task['containment_episode'],
++            'source_uids': [{'uid': event['uid']}], 'dependencies': deps}
++
++
++def audited_rejection(live, shadow, op):
++    """Require intact rejected command custody and agreeing, changed source facts."""
++    if (op.get('op') != transport.KIND or op.get('table_name') != 'tasks'
++            or op.get('state') != 'rejected' or op.get('last_error') != 'actionability_source_changed'):
++        return False
++    try:
++        wire = transport.frozen_wire(op)
++        owned = transport.command(live, op['op_id'])
++        text = transport.canonical(wire)
++        if (not owned or owned.get('delivery_state') != 'rejected'
++                or owned.get('canonical_receipt_json') is not None
++                or owned.get('op_id') != wire['client_op_id'] or owned.get('task_id') != wire['task']
++                or owned.get('contract_key') != wire['payload']['contract_key']
++                or owned.get('phase') != wire['phase'] or owned.get('request_json') != text
++                or owned.get('request_sha256') != transport.digest(text)
++                or owned.get('operation_kind', transport.KIND) != transport.KIND
++                or owned.get('request_uid', op['op_id']) != op['op_id']
++                or transport.envelope(wire['task'], wire['payload'], wire['phase']) != wire):
++            return False
++        frozen = wire['payload']['facts']
++        if not _valid_facts(frozen):
++            return False
++        comparable = {**frozen, 'source_uids': [{'uid': s['uid']} for s in frozen['source_uids']]}
++        current, replica = _source(live, wire['task']), _source(shadow, wire['task'])
++        return _valid_facts(current, portable_only=True) and current == replica and current != comparable
++    except (ValueError, TypeError, KeyError, sqlite3.Error):
++        return False  # Unknown schema, malformed custody or missing source stays dirty.
+diff --git a/hermes_cli/kanban_sync_retain_drift.py b/hermes_cli/kanban_sync_retain_drift.py
+index 1280698d31d..09112dcc43c 100644
+--- a/hermes_cli/kanban_sync_retain_drift.py
++++ b/hermes_cli/kanban_sync_retain_drift.py
+@@ -1,7 +1,8 @@
+-"""Read-only separation of rejected retain audit from replica drift. [daveey]
++"""Read-only separation of rejected command audit from replica drift. [daveey]
+ 
+ No transport retirement, retention confirmation, or custody/fence change occurs.
+-The original run must be closed on both copies; ordinary row diff still gates clean.
++Retain runs must be closed; diagnostics must be superseded on both copies.
++Ordinary row diff still gates clean.
+ """
+ from __future__ import annotations
+ 
+@@ -19,6 +20,10 @@
+     """Fail closed unless immutable custody attests this definitive rejection."""
+     from hermes_cli.kanban_retain_transport import canonical, command, frozen_wire
+ 
++    if op.get('op') == 'actionability_record':
++        from hermes_cli.kanban_sync_actionability_drift import audited_rejection as diagnostic_audit
++        return diagnostic_audit(live, shadow, op)
++
+     if (op.get('op') != 'retain' or op.get('table_name') != 'tasks'
+             or op.get('state') != 'rejected' or op.get('last_error') != 'missing_decision_episode'):
+         return False
+diff --git a/tests/hermes_cli/test_kanban_sync_actionability_drift.py b/tests/hermes_cli/test_kanban_sync_actionability_drift.py
+new file mode 100644
+index 00000000000..37e73341f0e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_actionability_drift.py
+@@ -0,0 +1,192 @@
++"""Superseded diagnostic rejection remains immutable audit, not drift. [daveey]"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_actionability_transport as transport
++from hermes_cli import kanban_sync_retain_drift as drift
++
++
++@pytest.fixture
++def stores():
++    live, shadow = (sqlite3.connect(':memory:') for _ in range(2))
++    for conn in (live, shadow):
++        conn.row_factory = sqlite3.Row
++        conn.executescript('''
++            CREATE TABLE tasks(id TEXT, current_run_id INTEGER, status TEXT, assignee TEXT,
++                containment_episode TEXT, deleted_at INTEGER, sync_version INTEGER, created_on TEXT);
++            CREATE TABLE task_runs(id INTEGER, uid TEXT, task_id TEXT);
++            CREATE TABLE task_events(id INTEGER, uid TEXT, task_id TEXT, kind TEXT,
++                created_at INTEGER, payload TEXT, deleted_at INTEGER);
++            CREATE TABLE task_links(parent_id TEXT, child_id TEXT);
++            CREATE TABLE task_comments(task_id TEXT, uid TEXT);
++            CREATE TABLE task_chat_links(task_id TEXT, uid TEXT, chat_gateway TEXT);
++            INSERT INTO tasks VALUES ('t_card',NULL,'todo','default',NULL,NULL,1,'macbook');
++            INSERT INTO tasks VALUES ('t_parent',NULL,'scheduled','default',NULL,NULL,1,'macbook');
++            INSERT INTO task_events VALUES (1,'source','t_card','created',123,'{}',NULL);
++            INSERT INTO task_links VALUES ('t_parent','t_card');
++        ''')
++    transport.ensure_schema(live)
++    live.execute('CREATE TABLE kanban_sync_outbox(op_id TEXT, row_uid TEXT, table_name TEXT, '
++                 'op TEXT, state TEXT, last_error TEXT, fields TEXT)')
++    facts = {'status': 'todo', 'assignee': 'default', 'current_run_uid': None, 'root_episode': None,
++             'source_uids': [{'uid': 'source', 'version': 1}],
++             'dependencies': [{'id': 't_parent', 'status': 'running'}]}
++    payload = {'facts': facts, 'owner': {'kind': 'assignee', 'refs': ['default']},
++               'blocker': {'prerequisite': 'parent', 'trigger': 'parent'}, 'action': 'satisfy_dependency'}
++    wire = transport.envelope('t_card', payload)
++    text = transport.canonical(wire)
++    live.execute('INSERT INTO kanban_actionability_commands '
++                 '(op_id,task_id,contract_key,phase,request_json,request_sha256,delivery_state) '
++                 "VALUES (?,?,?,?,?,?,'rejected')", (wire['client_op_id'], 't_card',
++                 wire['payload']['contract_key'], 'contract', text, transport.digest(text)))
++    op = dict(op_id=wire['client_op_id'], row_uid='t_card', table_name='tasks', op=transport.KIND,
++              state='rejected', last_error='actionability_source_changed', fields=text)
++    live.execute('INSERT INTO kanban_sync_outbox VALUES (?,?,?,?,?,?,?)',
++                 tuple(op[k] for k in ('op_id', 'row_uid', 'table_name', 'op', 'state', 'last_error', 'fields')))
++    yield live, shadow, op
++    live.close()
++    shadow.close()
++
++
++def test_exact_superseded_rejection_is_read_only(stores):
++    from hermes_cli.kanban_sync_client import diff
++
++    live, shadow, op = stores
++    before = [list(c.iterdump()) for c in (live, shadow)]
++    assert drift.audited_rejection(live, shadow, op)
++    report = diff(live, shadow, 'macbook')
++    assert report['clean'], report
++    assert report['rejected_ops'] == 1
++    assert report['audited_retain_rejections'] == [op['op_id']]
++    assert [list(c.iterdump()) for c in (live, shadow)] == before
++    shadow.execute("UPDATE tasks SET assignee='other' WHERE id='t_card'")
++    assert not diff(live, shadow, 'macbook')['clean']
++
++
++@pytest.mark.parametrize('column,value', [
++    ('op_id', 'other'), ('task_id', 'other'), ('contract_key', 'other'), ('phase', 'escalation'),
++    ('request_json', '{}'), ('request_sha256', 'bad'), ('delivery_state', 'unknown'),
++    ('canonical_receipt_json', '{}'),
++])
++def test_each_custody_mismatch_stays_dirty(stores, column, value):
++    live, shadow, op = stores
++    live.execute(f'UPDATE kanban_actionability_commands SET {column}=?', (value,))
++    assert not drift.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('change', [
++    'no_custody', 'table', 'operation', 'state', 'reason', 'bad_json', 'wire_id', 'wire_task',
++    'wire_op', 'envelope', 'missing_live', 'missing_shadow', 'live_unchanged', 'shadow_unchanged',
++    'both_unchanged', 'disagree', 'missing_parent', 'missing_source', 'bad_source_uid',
++    'missing_run', 'legacy_schema', 'bad_facts', 'optional_kind', 'optional_request',
++])
++def test_incomplete_supersession_or_custody_stays_dirty(stores, change):
++    live, shadow, op = stores
++    if change == 'no_custody':
++        live.execute('DROP TABLE kanban_actionability_commands')
++    elif change in ('table', 'operation', 'state', 'reason', 'bad_json'):
++        key, value = {'table': ('table_name', 'task_events'), 'operation': ('op', 'retain'),
++                      'state': ('state', 'pending'), 'reason': ('last_error', 'forbidden'),
++                      'bad_json': ('fields', '{')}[change]
++        op[key] = value
++    elif change.startswith('wire_') or change in ('envelope', 'bad_facts'):
++        wire = json.loads(op['fields'])
++        if change.startswith('wire_'):
++            wire[{'wire_id': 'client_op_id', 'wire_task': 'task', 'wire_op': 'op'}[change]] = 'other'
++        elif change == 'envelope':
++            wire['receipt_uid'] = 'other'
++        else:
++            wire['payload']['facts']['source_uids'] = None
++        op['fields'] = transport.canonical(wire)
++        live.execute('UPDATE kanban_actionability_commands SET request_json=?,request_sha256=?',
++                     (op['fields'], transport.digest(op['fields'])))
++    elif change.startswith('optional_'):
++        column = 'operation_kind' if change == 'optional_kind' else 'request_uid'
++        live.execute(f'ALTER TABLE kanban_actionability_commands ADD COLUMN {column} TEXT')
++        live.execute(f"UPDATE kanban_actionability_commands SET {column}='other'")
++    else:
++        targets = (live, shadow) if change == 'both_unchanged' else (shadow,) if change in (
++            'shadow_unchanged', 'missing_shadow') else (live,)
++        sql = {'missing_live': "DELETE FROM tasks WHERE id='t_card'",
++               'missing_shadow': "DELETE FROM tasks WHERE id='t_card'",
++               'live_unchanged': "UPDATE tasks SET status='running' WHERE id='t_parent'",
++               'shadow_unchanged': "UPDATE tasks SET status='running' WHERE id='t_parent'",
++               'both_unchanged': "UPDATE tasks SET status='running' WHERE id='t_parent'",
++               'disagree': "UPDATE tasks SET status='ready' WHERE id='t_parent'",
++               'missing_parent': "DELETE FROM tasks WHERE id='t_parent'",
++               'missing_source': 'DELETE FROM task_events',
++               'bad_source_uid': 'UPDATE task_events SET uid=NULL',
++               'missing_run': "UPDATE tasks SET current_run_id=9 WHERE id='t_card'",
++               'legacy_schema': 'DROP TABLE task_events'}[change]
++        for conn in targets:
++            conn.execute(sql)
++    assert not drift.audited_rejection(live, shadow, op)
++
++
++def test_retain_retirement_never_accepts_diagnostic(stores):
++    from hermes_cli.kanban_rejected_retain_retirement import retire
++
++    live, _, op = stores
++    before = list(live.iterdump())
++    assert retire(live, None, 'default', op)['action'] == 'retained'
++    assert list(live.iterdump()) == before
++
++
++def _refreeze(live, op, facts):
++    old = json.loads(op['fields'])
++    payload = old['payload']
++    payload.pop('contract_key')
++    payload['facts'] = facts
++    wire = transport.envelope(old['task'], payload)
++    text = transport.canonical(wire)
++    live.execute('UPDATE kanban_actionability_commands SET op_id=?,contract_key=?,request_json=?,request_sha256=?',
++                 (wire['client_op_id'], wire['payload']['contract_key'], text, transport.digest(text)))
++    op.update(op_id=wire['client_op_id'], fields=text)
++
++
++@pytest.mark.parametrize('key,value', [
++    ('status', None), ('assignee', []), ('current_run_uid', 1), ('root_episode', {}),
++    ('source_uids', None), ('source_uids', []), ('source_uids', ['source']),
++    ('source_uids', [{'uid': 'source'}]), ('source_uids', [{'uid': '', 'version': 1}]),
++    ('source_uids', [{'uid': 1, 'version': 1}]), ('source_uids', [{'uid': 'source', 'version': True}]),
++    ('source_uids', [{'uid': 'source', 'version': 0}]), ('dependencies', None),
++    ('dependencies', ['parent']), ('dependencies', [{'id': 't_parent'}]),
++    ('dependencies', [{'id': '', 'status': 'running'}]),
++    ('dependencies', [{'id': 't_parent', 'status': None}]),
++    ('dependencies', [{'id': 't_parent', 'status': 'running'}] * 2),
++], ids=lambda value: str(value)[:60])
++def test_malformed_frozen_facts_with_matching_digest_stay_dirty(stores, key, value):
++    live, shadow, op = stores
++    facts = json.loads(op['fields'])['payload']['facts']
++    facts[key] = value
++    _refreeze(live, op, facts)
++    assert not drift.audited_rejection(live, shadow, op)
++
++
++def test_version_only_difference_cannot_prove_supersession(stores):
++    live, shadow, op = stores
++    facts = json.loads(op['fields'])['payload']['facts']
++    facts['dependencies'][0]['status'] = 'scheduled'
++    facts['source_uids'][0]['version'] = 2
++    _refreeze(live, op, facts)
++    assert not drift.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('change', ['run', 'source', 'episode', 'parent_set', 'held_parent'])
++def test_positive_other_portable_source_changes(stores, change):
++    live, shadow, op = stores
++    for conn in (live, shadow):
++        conn.execute("UPDATE tasks SET status='running' WHERE id='t_parent'")
++        statements = {
++            'run': ["INSERT INTO task_runs VALUES (9,'new-run','t_card')",
++                    "UPDATE tasks SET current_run_id=9 WHERE id='t_card'"],
++            'source': ["INSERT INTO task_events VALUES (2,'new-source','t_card','linked',124,'{}',NULL)"],
++            'episode': ["UPDATE tasks SET containment_episode='source' WHERE id='t_card'"],
++            'parent_set': ['DELETE FROM task_links'],
++            'held_parent': ["UPDATE tasks SET status='done',containment_episode='held' WHERE id='t_parent'"],
++        }
++        for sql in statements[change]:
++            conn.execute(sql)
++    assert drift.audited_rejection(live, shadow, op)
+-- 
+2.43.0
+

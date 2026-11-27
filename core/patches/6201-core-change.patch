@@ -1,0 +1,440 @@
+From 305c1918d6b46db2f32c6a8c9f589d8855708e80 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:02:42 +0000
+Subject: [PATCH 6201] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit 305c1918d6b46db2f32c6a8c9f589d8855708e80.
+
+---
+diff --git a/hermes_cli/free_tier_bootstrap.py b/hermes_cli/free_tier_bootstrap.py
+index 92ab64e4ce2..92e4f8dff3b 100644
+--- a/hermes_cli/free_tier_bootstrap.py
++++ b/hermes_cli/free_tier_bootstrap.py
+@@ -274,8 +274,13 @@
+ 
+ def _broadcast(record: SetupRecord) -> None:
+     try:
+-        from tui_gateway.server import _broadcast_global_event
+-        _broadcast_global_event(SETUP_READY_EVENT, record.as_payload())
++        import sys
++        server = sys.modules.get('tui_gateway.server')
++        broadcast = getattr(server, '_broadcast_global_event', None)
++        if broadcast is not None:
++            broadcast(SETUP_READY_EVENT, record.as_payload())
++        # No imported server means no connected clients. Future clients read the
++        # retained setup record; publishing it must not initialize the gateway.
+     except Exception as exc:  # no serve process (plain CLI): nobody to tell
+         logger.debug("setup.ready not broadcast: %s", exc)
+ 
+diff --git a/hermes_cli/serve_bootstrap_listener.py b/hermes_cli/serve_bootstrap_listener.py
+index d8e0fcb98ca..dccb39c6999 100644
+--- a/hermes_cli/serve_bootstrap_listener.py
++++ b/hermes_cli/serve_bootstrap_listener.py
+@@ -7,17 +7,49 @@
+ """
+ from http.server import BaseHTTPRequestHandler, HTTPServer
+ import asyncio
+-import errno
+ import socket
++import sys
+ import threading
+ 
+ 
++class _BootstrapServer(HTTPServer):
++    request_queue_size = 2048  # match uvicorn during reconnect bursts
++
++    def server_bind(self):
++        if sys.platform == 'win32':
++            # SO_REUSEADDR on Windows can bind over another live listener.
++            self.allow_reuse_address = False
++            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
++        super().server_bind()
++
++    def handle_error(self, request, client_address):
++        pass  # disconnected clients have no application side effects
++
++
+ class _Handler(BaseHTTPRequestHandler):
+     protocol_version = 'HTTP/1.0'
+ 
+     def setup(self):
+         self.request.settimeout(0.1)
+         super().setup()
++        # A socket timeout alone is renewed by every dribbled byte. Bound the
++        # entire connection, including headers/writes, so even a pre-auth client
++        # cannot hold the single responder or the eventual shutdown/handoff.
++        self.deadline = threading.Timer(0.25, self.expire)
++        self.deadline.daemon = True
++        self.deadline.start()
++
++    def expire(self):
++        try:
++            self.request.shutdown(socket.SHUT_RDWR)
++        except OSError:
++            pass
++
++    def finish(self):
++        try:
++            super().finish()
++        finally:
++            self.deadline.cancel()
+ 
+     def do_GET(self):
+         if self.command in ('GET', 'HEAD') and self.path.split('?', 1)[0] == '/api/health':
+@@ -44,30 +76,50 @@
+ 
+ class BootstrapListener:
+     def __init__(self, host, port):
+-        class Server(HTTPServer):
+-            address_family = socket.AF_INET6 if ':' in host else socket.AF_INET
+-
+-            def handle_error(self, request, client_address):
+-                pass  # disconnected bootstrap clients have no application side effects
+-
++        self.servers = []
+         try:
+-            self.server = Server((host, port), _Handler)
++            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
++            seen = set()
++            for family, _, _, _, address in addresses:
++                if (family, address) in seen:
++                    continue
++                seen.add((family, address))
++
++                class Server(_BootstrapServer):
++                    address_family = family
++
++                # Hostnames may resolve to both loopbacks. Retain every socket,
++                # like uvicorn, instead of silently narrowing localhost to IPv4.
++                bound = (address[0], port, *address[2:])
++                server = Server(bound, _Handler)
++                self.servers.append(server)
++                if not port:
++                    port = server.server_address[1]
+         except OSError as exc:
+-            if exc.errno != errno.EADDRINUSE:
++            for server in self.servers:
++                server.server_close()
++            from hermes_cli.web_server_lifecycle import (
++                _is_addr_in_use_error, _report_port_in_use, PORT_IN_USE_EXIT_CODE,
++            )
++            if not _is_addr_in_use_error(exc):
+                 raise
+-            from hermes_cli.web_server_lifecycle import _report_port_in_use, PORT_IN_USE_EXIT_CODE
+             _report_port_in_use(host, port)
+             raise SystemExit(PORT_IN_USE_EXIT_CODE) from None
+-        self.port = self.server.server_address[1]
+-        self.thread = threading.Thread(target=self.server.serve_forever,
+-                                       kwargs={'poll_interval': 0.01}, name='serve-bootstrap-http', daemon=True)
+-        self.thread.start()
++        self.server = self.servers[0]
++        self.port = port
++        self.threads = [threading.Thread(target=server.serve_forever,
++                        kwargs={'poll_interval': 0.01}, name='serve-bootstrap-http', daemon=True)
++                        for server in self.servers]
++        self.thread = self.threads[0]
++        for thread in self.threads:
++            thread.start()
+         self.stopped = False
+ 
+     def handoff(self):
+         if not self.stopped:
+-            self.server.shutdown()
+-            self.thread.join()
++            for server, thread in zip(self.servers, self.threads):
++                server.shutdown()
++                thread.join()
+             self.stopped = True
+         return self.server.socket
+ 
+@@ -87,7 +139,7 @@
+         # active throughout that wait; stop it only at the actual accept handoff.
+         server.lifespan = HandoffLifespan()
+         try:
+-            await server.startup(sockets=[self.server.socket])
++            await server.startup(sockets=[item.socket for item in self.servers])
+         finally:
+             server.lifespan = original
+ 
+@@ -96,4 +148,5 @@
+ 
+     def __exit__(self, *exc):
+         self.handoff()
+-        self.server.server_close()
++        for server in self.servers:
++            server.server_close()
+diff --git a/hermes_cli/web_routers/chat_ws.py b/hermes_cli/web_routers/chat_ws.py
+index fc1bf403f7f..6653cee5aed 100644
+--- a/hermes_cli/web_routers/chat_ws.py
++++ b/hermes_cli/web_routers/chat_ws.py
+@@ -652,7 +652,10 @@
+     if not await _close_unless_sidecar_allowed(ws, allow_internal=True, socket=GATEWAY_SOCKET):
+         return
+     from hermes_cli.mcp_startup import start_deferred_mcp_discovery_now
+-    from tui_gateway.ws import handle_ws
++    import importlib
++
++    # First-use gateway assembly must not stall REST readiness on this loop.
++    handle_ws = (await asyncio.to_thread(importlib.import_module, 'tui_gateway.ws')).handle_ws
+ 
+     # First chat client of a standalone dashboard: fire the discovery armed at boot (no-op
+     # otherwise). Off-loop: the first act is a config read + the ~350 ms `mcp` SDK import.
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 909bf41576e..236c28a2d64 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1584,7 +1584,8 @@
+     if headless:
+         # Auth-gated JSON-RPC/WS only — announce the bind, not a URL. flush:
+         # a piped stdout otherwise surfaces this minutes after the sentinel.
+-        print(f"  Hermes backend listening on {host}:{actual_port}", flush=True)
++        # stdout belongs to the machine sentinels, even before gateway import.
++        print(f"  Hermes backend listening on {host}:{actual_port}", file=sys.stderr, flush=True)
+     else:
+         from hermes_cli.url_utils import format_url_host
+ 
+diff --git a/tests/hermes_cli/test_boot_lazy_consumers.py b/tests/hermes_cli/test_boot_lazy_consumers.py
+new file mode 100644
+index 00000000000..176099e6806
+--- /dev/null
++++ b/tests/hermes_cli/test_boot_lazy_consumers.py
+@@ -0,0 +1,63 @@
++"""Background setup cannot force a gateway import; first WS imports off-loop."""
++import builtins
++import sys
++import threading
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++
++def test_setup_broadcast_does_not_import_an_unloaded_gateway(monkeypatch):
++    from hermes_cli import free_tier_bootstrap as setup
++    original = builtins.__import__
++    attempts = []
++
++    def guarded(name, *args, **kwargs):
++        if name == 'tui_gateway.server':
++            attempts.append(name)
++            raise AssertionError('unexpected gateway import')
++        return original(name, *args, **kwargs)
++
++    with monkeypatch.context() as scoped:
++        scoped.delitem(sys.modules, 'tui_gateway.server', raising=False)
++        scoped.setattr(builtins, '__import__', guarded)
++        record = SimpleNamespace(as_payload=Mock(return_value={'ready': True}))
++        setup._broadcast(record)
++        assert attempts == []
++        assert 'tui_gateway.server' not in sys.modules
++        record.as_payload.assert_not_called()
++        broadcast = Mock()
++        scoped.setitem(sys.modules, 'tui_gateway.server', SimpleNamespace(_broadcast_global_event=broadcast))
++        setup._broadcast(record)
++        broadcast.assert_called_once_with(setup.SETUP_READY_EVENT, {'ready': True})
++
++
++@pytest.mark.asyncio
++async def test_ws_first_import_runs_off_the_event_loop_after_auth(monkeypatch):
++    import importlib
++    from hermes_cli import mcp_startup
++    from hermes_cli.web_routers import chat_ws
++    loop_thread = threading.get_ident()
++    order = []
++
++    async def allowed(*args, **kwargs):
++        order.append('auth')
++        return True
++
++    async def handle(ws, **kwargs):
++        order.append('handle')
++
++    def load(name):
++        assert name == 'tui_gateway.ws'
++        assert threading.get_ident() != loop_thread
++        assert order == ['auth']
++        order.append('import')
++        return SimpleNamespace(handle_ws=handle)
++
++    monkeypatch.setattr(chat_ws, '_close_unless_sidecar_allowed', allowed)
++    monkeypatch.setattr(mcp_startup, 'start_deferred_mcp_discovery_now', lambda: None)
++    monkeypatch.setattr(importlib, 'import_module', load)
++    ws = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
++    await chat_ws.gateway_ws(ws)
++    assert order == ['auth', 'import', 'handle']
+diff --git a/tests/hermes_cli/test_serve_bootstrap_limits.py b/tests/hermes_cli/test_serve_bootstrap_limits.py
+new file mode 100644
+index 00000000000..a080d7b9c9f
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_bootstrap_limits.py
+@@ -0,0 +1,120 @@
++"""Bootstrap clients cannot hold readiness or steal a Windows listener."""
++import http.client
++import socket
++import threading
++import time
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import serve_bootstrap_listener as bootstrap
++
++
++def test_dribbling_client_cannot_hold_health_or_handoff(monkeypatch):
++    accepted = threading.Event()
++    original = bootstrap._Handler.setup
++
++    def setup(handler):
++        original(handler)
++        accepted.set()
++
++    monkeypatch.setattr(bootstrap._Handler, 'setup', setup)
++    with bootstrap.BootstrapListener('127.0.0.1', 0) as listener:
++        stop = threading.Event()
++        with socket.create_connection(('127.0.0.1', listener.port), timeout=2) as client:
++            def dribble(target=client):
++                try:
++                    while not stop.wait(0.02):
++                        target.sendall(b'G')
++                except OSError:
++                    pass
++
++            sender = threading.Thread(target=dribble, daemon=True)
++            sender.start()
++            try:
++                assert accepted.wait(2)
++                from tests.hermes_cli.test_serve_bootstrap_listener import request
++                started = time.monotonic()
++                assert request(listener.port, '/api/health')[0] == 503
++                assert time.monotonic() - started < 1.5
++                # A second endless request must not block the socket transfer.
++                accepted.clear()
++                with socket.create_connection(('127.0.0.1', listener.port), timeout=2) as second:
++                    second.sendall(b'G')
++                    assert accepted.wait(2)
++                    second_sender = threading.Thread(target=dribble, args=(second,), daemon=True)
++                    second_sender.start()
++                    try:
++                        started = time.monotonic()
++                        assert listener.handoff().fileno() >= 0
++                        assert time.monotonic() - started < 1.5
++                    finally:
++                        stop.set()
++                        second_sender.join(2)
++                        assert not second_sender.is_alive()
++            finally:
++                stop.set()
++                sender.join(2)
++                assert not sender.is_alive()
++
++
++def test_windows_exclusive_bind_never_enables_reuseaddr(monkeypatch):
++    monkeypatch.setattr(bootstrap.sys, 'platform', 'win32')
++    monkeypatch.setattr(socket, 'SO_EXCLUSIVEADDRUSE', 123456, raising=False)
++    seen = []
++
++    class FakeSocket:
++        def setsockopt(self, level, option, value):
++            seen.append((option, value))
++
++        def bind(self, address):
++            seen.append(('bind', address))
++
++        def getsockname(self):
++            return ('127.0.0.1', 1234)
++
++    server = object.__new__(bootstrap._BootstrapServer)
++    server.socket = FakeSocket()
++    server.server_address = ('127.0.0.1', 1234)
++    server.server_bind()
++    assert seen == [(123456, 1), ('bind', ('127.0.0.1', 1234))]
++
++
++@pytest.mark.parametrize('error', [OSError(10048, 'address in use'), OSError(98, 'address in use')])
++def test_platform_bind_conflict_keeps_machine_sentinel(monkeypatch, error):
++    from hermes_cli import web_server_lifecycle as lifecycle
++    report = Mock()
++    monkeypatch.setattr(lifecycle, '_report_port_in_use', report)
++    monkeypatch.setattr(bootstrap._BootstrapServer, 'server_bind', Mock(side_effect=error))
++    with pytest.raises(SystemExit) as exited:
++        bootstrap.BootstrapListener('127.0.0.1', 9876)
++    assert exited.value.code == lifecycle.PORT_IN_USE_EXIT_CODE
++    report.assert_called_once_with('127.0.0.1', 9876)
++
++
++def test_localhost_retains_every_resolved_loopback():
++    addresses = socket.getaddrinfo('localhost', 0, type=socket.SOCK_STREAM)
++    with bootstrap.BootstrapListener('localhost', 0) as listener:
++        assert {server.address_family for server in listener.servers} == {row[0] for row in addresses}
++        assert listener.server.request_queue_size >= 2048
++        for _, _, _, _, address in addresses:
++            client = http.client.HTTPConnection(address[0], listener.port, timeout=2)
++            try:
++                client.request('GET', '/api/health')
++                response = client.getresponse()
++                assert response.status == 503
++                response.read()
++            finally:
++                client.close()
++        sockets = [server.socket for server in listener.servers]
++        listener.handoff()
++        assert all(sock.fileno() >= 0 for sock in sockets)
++    assert all(sock.fileno() == -1 for sock in sockets)
++
++
++def test_second_listener_cannot_share_live_port():
++    from hermes_cli.web_server_lifecycle import PORT_IN_USE_EXIT_CODE
++    with bootstrap.BootstrapListener('127.0.0.1', 0) as first:
++        with pytest.raises(SystemExit) as exited:
++            bootstrap.BootstrapListener('127.0.0.1', first.port)
++        assert exited.value.code == PORT_IN_USE_EXIT_CODE
+diff --git a/tests/hermes_cli/test_serve_bootstrap_listener.py b/tests/hermes_cli/test_serve_bootstrap_listener.py
+index a89cff4b2b2..77a8334d9ae 100644
+--- a/tests/hermes_cli/test_serve_bootstrap_listener.py
++++ b/tests/hermes_cli/test_serve_bootstrap_listener.py
+@@ -7,8 +7,8 @@
+ import pytest
+ 
+ 
+-def request(port, path):
+-    client = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
++def request(port, path, host='127.0.0.1'):
++    client = http.client.HTTPConnection(host, port, timeout=2)
+     try:
+         client.request('GET', path)
+         response = client.getresponse()
+@@ -45,7 +45,8 @@
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_handoff_keeps_answering_until_real_asgi_lifespan_is_ready():
++@pytest.mark.parametrize('host', ['127.0.0.1', 'localhost'])
++async def test_handoff_keeps_answering_until_real_asgi_lifespan_is_ready(host):
+     import uvicorn
+     from fastapi import FastAPI
+     from hermes_cli.serve_bootstrap_listener import BootstrapListener
+@@ -64,7 +65,7 @@
+     def health():
+         return {'ok': True}
+ 
+-    with BootstrapListener('127.0.0.1', 0) as listener:
++    with BootstrapListener(host, 0) as listener:
+         config = uvicorn.Config(app, log_config=None)
+         config.load()
+         server = uvicorn.Server(config)
+@@ -78,8 +79,10 @@
+             release.set()
+             await asyncio.wait_for(startup, 2)
+             assert listener.stopped
+-            status, body = await asyncio.to_thread(request, listener.port, '/api/health')
+-            assert status == 200 and b'"ok":true' in body
++            for bound in listener.servers:
++                status, body = await asyncio.to_thread(
++                    request, listener.port, '/api/health', bound.server_address[0])
++                assert status == 200 and b'"ok":true' in body
+         finally:
+             release.set()
+             await startup
+-- 
+2.43.0
+

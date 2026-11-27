@@ -1,0 +1,1032 @@
+From f83409cf1387846e6854265e247d1ec2fcf5356d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:52:13 +0000
+Subject: [PATCH 6053] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit f83409cf1387846e6854265e247d1ec2fcf5356d.
+
+---
+diff --git a/gateway/run.py b/gateway/run.py
+index ec57dc8c643..8a2a4ff0d41 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1,15 +1,15 @@
+-"""Gateway runner - entry point for messaging platform integrations.
+-
+-Provides ``start_gateway()`` (start all configured adapters) and ``GatewayRunner`` (lifecycle).
++"""Gateway runner: ``start_gateway()`` starts adapters; ``GatewayRunner`` owns lifecycle.
+ Run via ``python -m gateway.run`` or ``python cli.py --gateway``."""
+ 
+-# hermes_bootstrap must be the very first import (UTF-8 stdio on Windows; no-op on POSIX).
++# Before all agent imports; bootstrap repairs Windows stdio and activates PM.
+ try:
+     import hermes_bootstrap
+ except ModuleNotFoundError as exc:  # a partial ``hermes update`` can leave the bootstrap unregistered
+     if exc.name != "hermes_bootstrap" and not "hermes_bootstrap".startswith(f"{exc.name}."):
+         raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
+ 
++from hermes_cli.serve_producer_admission import supported_launch as _producer_launch
++_producer_launch('gateway')
+ import asyncio
+ import concurrent.futures
+ import dataclasses
+diff --git a/hermes_cli/gateway_runtime_start.py b/hermes_cli/gateway_runtime_start.py
+index d74ba878194..5b214e0d358 100644
+--- a/hermes_cli/gateway_runtime_start.py
++++ b/hermes_cli/gateway_runtime_start.py
+@@ -79,6 +79,8 @@
+     ``force``: a ``gateway restart --force --detach`` replacement keeps the ``--force`` its old owner
+     needed (a named profile under a multiplexer), or it exits on the run-side guard.
+     """
++    from hermes_cli.serve_producer_admission import supported_launch
++    supported_launch('gateway_spawner', timeout=min(10, remaining(deadline)))
+     from hermes_dir_acl import TOKEN_ELEVATION_TYPE_DEFAULT, process_elevation_type, process_is_elevated
+     # Only a split (UAC) token has a normal twin to lock out. With none (UAC off, the built-in
+     # Administrator) every window of this user is elevated and attaches to this gateway.
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index bfcafc1c50b..594532269ea 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2493,11 +2493,9 @@
+     _attach_to_host_backend(args, _headless_backend)
+     _route_named_profile_dashboard(args, _headless_backend, _ssh_owner_nonce, _token_file)
+ 
+-    # Apply the final process/profile policy after dashboard routing, but before
+-    # importing the web server or opening dashboard state. Applying it before a
+-    # named-profile re-exec could leak that profile's higher limit into the
+-    # machine/default dashboard, whose lower policy intentionally cannot undo it.
+-    # This also covers Desktop SSH's isolated `serve` child, which does not route.
++    # Apply final nofile policy after routing/re-exec, before web imports/state;
++    # this includes isolated Desktop SSH serves. A higher named-profile limit
++    # must not leak into the default dashboard, whose lower limit cannot undo it.
+     from hermes_cli.resource_limits import apply_nofile_soft_limit
+ 
+     apply_nofile_soft_limit()
+@@ -2513,6 +2511,8 @@
+         _before_wait = _update_gate.checkout_fingerprint()
+         _update_gate.reexec_if_checkout_moved(_update_gate.wait_for_update_clear(), _before_wait)
+ 
++    from hermes_cli.serve_producer_admission import supported_launch
++    supported_launch('serve' if _headless_backend else 'dashboard')
+     _ssh_session_token = _read_ssh_session_token_file(_token_file) if _token_file else None
+     _mcp_discovery_after_bind = _dashboard_prepare_runtime(args, _headless_backend)
+ 
+@@ -2700,11 +2700,8 @@
+ 
+ def _prepare_agent_startup(args) -> None:
+     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+-    # --yolo chokepoint: HERMES_YOLO_MODE must be set before any discovery
+-    # below imports tools.approval, which freezes _YOLO_MODE_FROZEN at import.
+-    # main() sets it earlier too, but other launchers (Termux fast-CLI) reach
+-    # here directly, so the guarantee lives where the import is triggered.
+-    # See #7994.
++    # Set YOLO before discovery freezes tools.approval; direct Termux launchers
++    # also reach this chokepoint without main(). See #7994.
+     if getattr(args, "yolo", False):
+         os.environ["HERMES_YOLO_MODE"] = "1"
+     if args.command in {None, "chat"} and _bypass_chat_launch(args):
+@@ -2719,6 +2716,8 @@
+     if not (args.command in _AGENT_COMMANDS or _agent_subcommand_selected(args)):
+         return
+ 
++    from hermes_cli.serve_producer_admission import supported_launch
++    supported_launch('gateway' if args.command == 'gateway' else 'agent_startup')
+     _accept_hooks = bool(getattr(args, "accept_hooks", False))
+     if not (_is_tui_chat_launch(args) or _chat_runs_at_gateway(args)):
+         # The TUI backend and the gateway (chat turns, plugin commands, pre_command) discover their own.
+diff --git a/hermes_cli/plugin_host_child.py b/hermes_cli/plugin_host_child.py
+index db1415a4b4e..df62a4e7d8c 100644
+--- a/hermes_cli/plugin_host_child.py
++++ b/hermes_cli/plugin_host_child.py
+@@ -29,6 +29,9 @@
+ from pathlib import Path
+ from typing import Any, Callable, Dict, List, Optional
+ 
++from hermes_cli.serve_producer_admission import supported_launch as _producer_launch
++_producer_launch('plugin_host')
++
+ from hermes_cli.plugin_host_wire import (
+     Channel, Opaque, PROTOCOL_VERSION, PluginHostUnsupported, bind_serving_request, declared_member, decode,
+     describe_signature, encode, is_async_callable, restore_arguments, serving_request,
+diff --git a/hermes_cli/serve_producer_admission.py b/hermes_cli/serve_producer_admission.py
+index 2f82f863c79..d5f71e45446 100644
+--- a/hermes_cli/serve_producer_admission.py
++++ b/hermes_cli/serve_producer_admission.py
+@@ -1,18 +1,263 @@
+-"""Fail-closed admission orchestration; deliberately not wired to serve yet.
++"""Fail-closed admission cuts and pre-import enrollment for supported launches.
+ 
+-The host supplies strict collectors and canonical process classification, never
+-client-supplied receipts. A COMPLETE cut is scoped to one held gate acquisition;
+-there is no persisted clean bit that a successor or boot may reuse. This module
+-provides no default permissive collector/classifier and does not start producers.
++Enrollment is positive launch-coverage evidence, NOT guarded readiness. Until a
++broker establishes family custody, enrolled processes remain legacy conflicts.
++A COMPLETE cut is scoped to one held gate acquisition; no persisted clean bit
++can authorize a successor or boot. This module starts no external producers.
+ """
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import os
+-from dataclasses import dataclass
++import stat
++import sys
++import tempfile
++import threading
++import time
++from dataclasses import asdict, dataclass
+ from pathlib import Path
+ 
+-from hermes_cli.serve_producer_census import CensusUnavailable, Incarnation, ProcessCensus
+-from hermes_cli.serve_producer_custody import FamilyCustody, _acquire_runtime
++from hermes_cli.serve_producer_census import (
++    MAX_PROCESSES, CensusUnavailable, Incarnation, LinuxProcessCensus, ProcessCensus,
++    _bounded_names, _read_bytes, read_ledger_strict,
++)
++from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody, _acquire_runtime
++
++SUPPORTED_LAUNCHES = frozenset(('serve', 'dashboard', 'gateway', 'agent_startup',
++                                'tui_gateway', 'gateway_spawner', 'plugin_host'))
++# Hash actual import boundaries, not a version string or inherited environment bit.
++LAUNCH_SOURCES = ('hermes_cli/main.py', 'gateway/run.py', 'tui_gateway/entry.py',
++                  'hermes_cli/gateway_runtime_start.py', 'hermes_cli/plugin_host_child.py',
++                  'hermes_cli/serve_producer_admission.py', 'hermes_cli/serve_producer_census.py')
++_MAX_PARTICIPANTS = 8192
++_MAX_RECEIPTS = 8 * 1024 * 1024
++
++
++@dataclass(frozen=True)
++class LaunchReceipt:
++    identity: Incarnation
++    installation: str
++    generation: str
++    role: str
++    observation: str
++    namespace: str
++    guarded: bool = False
++
++
++def observation_digest(record) -> str:
++    """Bind receipt to observed exec identity without persisting argv or environment."""
++    return hashlib.sha256(json.dumps(asdict(record), sort_keys=True,
++                                     ensure_ascii=True).encode('ascii')).hexdigest()
++
++
++def launcher_generation(installation: Path) -> str:
++    digest = hashlib.sha256()
++    for relative in LAUNCH_SOURCES:
++        digest.update(relative.encode('ascii') + b'\0')
++        digest.update(_read_bytes(installation / relative, 1024 * 1024))
++    return digest.hexdigest()
++
++
++def _receipt(value) -> LaunchReceipt:
++    if not isinstance(value, dict) or set(value) != {
++            'identity', 'installation', 'generation', 'role', 'observation', 'namespace', 'guarded'}:
++        raise CensusUnavailable('participant schema')
++    identity = value['identity']
++    if not isinstance(identity, dict) or set(identity) != {'boot_id', 'pid', 'start_ticks'}:
++        raise CensusUnavailable('participant identity')
++    if not isinstance(identity['boot_id'], str) or not identity['boot_id'] or any(
++            type(identity[key]) is not int or identity[key] <= 0 for key in ('pid', 'start_ticks')):
++        raise CensusUnavailable('participant birth')
++    if (not isinstance(value['role'], str) or value['role'] not in SUPPORTED_LAUNCHES
++            or value['guarded'] is not False):
++        # No custody bootstrap is installed yet. A persisted bit cannot mint it.
++        raise CensusUnavailable('unguarded participant required')
++    namespace = value['namespace']
++    if (not isinstance(namespace, str) or not namespace.startswith('pid:[')
++            or not namespace.endswith(']') or not namespace[5:-1].isascii()
++            or not namespace[5:-1].isdecimal()):
++        raise CensusUnavailable('participant namespace')
++    if not isinstance(value['installation'], str) or not Path(value['installation']).is_absolute():
++        raise CensusUnavailable('participant installation')
++    for key in ('generation', 'observation'):
++        text = value[key]
++        if not isinstance(text, str) or len(text) != 64 or any(c not in '0123456789abcdef' for c in text):
++            raise CensusUnavailable('participant digest')
++    return LaunchReceipt(Incarnation(**identity), **{key: item for key, item in value.items() if key != 'identity'})
++
++
++def read_participants_strict(runtime: Path) -> tuple[LaunchReceipt, ...]:
++    """Absent, unsafe or malformed enrollment is uncertainty, never an empty host."""
++    path = runtime / 'participants.json'
++    try:
++        info = path.lstat()
++        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
++                or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):  # windows-footgun: ok — Linux adapter
++            raise CensusUnavailable('unsafe participant ledger')
++        raw = _read_bytes(path, _MAX_RECEIPTS)
++        values = json.loads(raw)
++        if not isinstance(values, list) or len(values) > _MAX_PARTICIPANTS:
++            raise CensusUnavailable('participant ledger budget/schema')
++        receipts = tuple(_receipt(value) for value in values)
++        adapter = LinuxProcessCensus()
++        boot, namespace = adapter.boot_id(), adapter.namespace_id()
++        if any(row.identity.boot_id == boot and row.namespace != namespace for row in receipts):
++            raise CensusUnavailable('foreign pid namespace')
++        if len({receipt.identity for receipt in receipts}) != len(receipts):
++            raise CensusUnavailable('duplicate participant incarnation')
++        if _read_bytes(path, _MAX_RECEIPTS) != raw:
++            raise CensusUnavailable('participant ledger changed')
++        return receipts
++    except (OSError, ValueError, UnicodeError, RecursionError) as exc:
++        raise CensusUnavailable(f'participants:{type(exc).__name__}') from exc
++
++
++def incarnation_exited(adapter: LinuxProcessCensus, identity: Incarnation) -> bool:
++    """Positive retirement includes PID reuse, never permission failure or a new boot."""
++    if adapter.boot_id() != identity.boot_id:
++        raise CensusUnavailable('retirement boot changed')
++    try:
++        current = adapter.identity(identity.pid, identity.boot_id)
++    except FileNotFoundError:
++        current = None
++    if adapter.boot_id() != identity.boot_id:
++        raise CensusUnavailable('retirement boot changed')
++    return current != identity
++
++
++def _write_participants(runtime: Path, receipts):
++    raw = json.dumps([asdict(receipt) for receipt in receipts], ensure_ascii=True).encode('ascii')
++    if len(raw) > _MAX_RECEIPTS:
++        raise CensusUnavailable('participant byte budget')
++    # Random exclusive scratch names cannot collide with a killed predecessor's PID.
++    fd, name = tempfile.mkstemp(prefix='participants.', suffix='.pending', dir=runtime)
++    temporary = Path(name)
++    try:
++        with os.fdopen(fd, 'wb') as stream:
++            stream.write(raw)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, runtime / 'participants.json')
++        directory = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++        try:
++            os.fsync(directory)
++        finally:
++            os.close(directory)
++    finally:
++        temporary.unlink(missing_ok=True)
++
++
++def _wait_gate(runtime: Path, deadline: float):
++    waiter = threading.Event()
++    while True:
++        try:
++            return LaunchGate.acquire(runtime)
++        except CustodyConflict:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise AdmissionUnavailable('launch enrollment busy') from None
++            waiter.wait(min(remaining, 0.025))
++
++
++def enroll_launch(runtime: Path, role: str, *, installation: Path, timeout: float = 10) -> LaunchReceipt:
++    """Pre-import enrollment only: no guarded mode or COMPLETE claim is minted here.
++
++    Existing receipts survive until their exact incarnation is positively gone.
++    The ticket is intentionally unguarded until the separate broker bootstrap can
++    establish family custody. Enrollment cannot authorize external production.
++    """
++    if role not in SUPPORTED_LAUNCHES:
++        raise ValueError('unsupported launch role')
++    if not isinstance(timeout, (int, float)) or not 0 < timeout <= 60:
++        raise ValueError('invalid launch timeout')
++    installation = installation.resolve(strict=True)
++    adapter = LinuxProcessCensus()
++    with _wait_gate(runtime, time.monotonic() + timeout):
++        path = runtime / 'participants.json'
++        try:
++            path.lstat()
++        except FileNotFoundError:
++            receipts = ()  # first enrollment, NEVER used as host absence evidence
++        else:
++            receipts = read_participants_strict(runtime)
++        boot = adapter.boot_id()
++        record = adapter.read_process(os.getpid(), boot)
++        receipt = LaunchReceipt(record.identity, str(installation), launcher_generation(installation),
++                                role, observation_digest(record), adapter.namespace_id())
++        kept = [row for row in receipts if row.identity.boot_id == boot
++                and row.identity != record.identity and not incarnation_exited(adapter, row.identity)]
++        if len(kept) >= _MAX_PARTICIPANTS:
++            raise CensusUnavailable('participant count budget')
++        if adapter.read_process(os.getpid(), boot) != record or adapter.boot_id() != boot:
++            raise CensusUnavailable('enrolling process changed')
++        _write_participants(runtime, (*kept, receipt))
++        if receipt not in read_participants_strict(runtime):
++            raise CensusUnavailable('participant publication lost')
++        return receipt
++
++
++def supported_launch(role: str, *, timeout: float = 10) -> LaunchReceipt | None:
++    """Supported entrypoint pre-import gate; unsupported hosts cannot certify COMPLETE.
++
++    Non-Linux hosts retain existing in-process launches; no strict census adapter
++    exists there, so they cannot activate the external producer path.
++    """
++    if sys.platform != 'linux':
++        return None
++    from hermes_constants import get_default_hermes_root
++    from hermes_cli._startup_fast import project_root_str
++    runtime = Path(get_default_hermes_root()) / 'serve-producer-v1'
++    return enroll_launch(runtime, role, installation=Path(project_root_str()), timeout=timeout)
++
++
++_KNOWN_MODULES = frozenset(('hermes_cli.main', 'gateway.run', 'tui_gateway.entry',
++                            'hermes_cli.plugin_host_child'))
++_CONTROL_FILES = ('gateway.pid', 'gateway.lock', 'gateway_state.json', 'gateway.sock',
++                  'gateway.sock.path')
++_HOST_RECORDS = ('host-serve.json', 'host-gateway.json')
++_PROFILE_MARKERS = ('config.yaml', '.env', 'SOUL.md', 'profile.yaml', 'auth.json', 'state.db')
++
++
++def _inside(value: str, root: str) -> bool:
++    """Path-component containment; never a string-prefix or argv-substring test."""
++    if not value or not root or not value.startswith('/') or not root.startswith('/'):
++        return False
++    left, right = Path(value), Path(root)
++    return left == right or right in left.parents
++
++
++def _record_touches(record, *roots: str) -> bool:
++    values = (record.exe, record.cwd, *record.argv, *(value for _, value in record.environment))
++    return any(_inside(value, root) for value in values for root in roots if root)
++
++
++def _module_token(argv: tuple[str, ...]) -> str | None:
++    try:
++        index = argv.index('-m')
++    except ValueError:
++        return None
++    return argv[index + 1] if index + 1 < len(argv) else None
++
++
++def classify_process(record, participants: tuple[LaunchReceipt, ...], generation: str,
++                     *, installation: str, home: str = '') -> Classification:
++    """Exact enrollment is unguarded legacy; unrelated needs a path-free identity."""
++    namespace = LinuxProcessCensus().namespace_id()
++    matching = [row for row in participants if row.identity == record.identity and row.namespace == namespace
++                and row.installation == installation
++                and row.observation == observation_digest(record) and row.generation == generation]
++    if len(matching) == 1:
++        receipt = matching[0]
++        # No broker/custody hook exists yet, even an in-memory guarded bit is not authority.
++        return Classification(record.identity, 'legacy',
++                              f'enrollment:{receipt.generation}:{receipt.role}')
++    if not _record_touches(record, installation, home):
++        return Classification(record.identity, 'unrelated', f'exe:{record.exe}')
++    module = _module_token(record.argv)
++    if module in _KNOWN_MODULES:
++        return Classification(record.identity, 'legacy', f'launcher:{module}')
++    return Classification(record.identity, 'unknown', 'no exact guarded launch receipt')
+ 
+ # Each collector must enumerate its exact configured scope (including disabled or
+ # empty scope receipts), distinguish errors and return positive evidence refs.
+@@ -168,3 +413,204 @@
+             errors.append(f'pid:{record.identity.pid}:unproven_classification')
+     except (OSError, ValueError, CensusUnavailable) as exc:
+         errors.append(f'pid:{record.identity.pid}:{type(exc).__name__}')
++
++
++def _regular_owned(path: Path):
++    info = path.lstat()
++    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
++            or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):  # windows-footgun: ok — Linux adapter
++        raise CensusUnavailable(f'unsafe:{path.name}')
++    return info
++
++
++def configured_homes(root: Path) -> tuple[Path, ...]:
++    """Default home plus identity-bearing named profiles; unlistable dirs fail closed."""
++    info = root.lstat()
++    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():  # windows-footgun: ok — Linux adapter
++        raise CensusUnavailable('home ownership boundary')
++    homes = [root]
++    try:
++        names = _bounded_names(root / 'profiles', MAX_PROCESSES)
++    except FileNotFoundError:
++        return tuple(homes)
++    except OSError as exc:
++        raise CensusUnavailable(f'profiles:{type(exc).__name__}') from exc
++    for name in names:
++        if name.startswith('.'):
++            continue
++        home = root / 'profiles' / name
++        try:
++            info = home.lstat()
++        except FileNotFoundError:
++            continue
++        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():  # windows-footgun: ok — Linux adapter
++            raise CensusUnavailable(f'profile:{name}:ownership')
++        identified = False
++        for marker in _PROFILE_MARKERS:
++            try:
++                (home / marker).lstat()
++            except FileNotFoundError:
++                continue
++            identified = True
++            break
++        if identified:
++            homes.append(home)
++    return tuple(homes)
++
++
++def collect_raw_ledger(root: Path) -> CollectorEvidence:
++    path = root / 'spawn-ledger.json'
++    try:
++        path.lstat()
++    except FileNotFoundError as exc:
++        raise CensusUnavailable('ledger missing') from exc
++    rows = read_ledger_strict(path)
++    return CollectorEvidence((f'ledger:{path}:{len(rows)}',), ())
++
++
++def collect_profile_controls(root: Path) -> CollectorEvidence:
++    homes = configured_homes(root)
++    refs, conflicts = [f'homes:{len(homes)}'], []
++    for home in homes:
++        label = 'default' if home == root else home.name
++        for name in _CONTROL_FILES:
++            path = home / name
++            try:
++                info = path.lstat()
++            except FileNotFoundError:
++                refs.append(f'{label}/{name}:absent')
++                continue
++            except OSError as exc:
++                raise CensusUnavailable(f'{label}/{name}:{type(exc).__name__}') from exc
++            if stat.S_ISLNK(info.st_mode):
++                conflicts.append(f'{label}/{name}:symlink')
++                continue
++            refs.append(f'{label}/{name}:{info.st_ino}')
++    return CollectorEvidence(tuple(refs), tuple(conflicts))
++
++
++def _lock_dir() -> Path:
++    override = os.environ.get('HERMES_GATEWAY_LOCK_DIR', '').strip()
++    if override:
++        path = Path(override)
++        if not path.is_absolute():
++            raise CensusUnavailable('relative lock dir')
++        return path
++    xdg = os.environ.get('XDG_STATE_HOME', '')
++    state = Path(xdg) if os.path.isabs(xdg) else Path.home() / '.local' / 'state'
++    return state / 'hermes' / 'gateway-locks'
++
++
++def collect_supervisor_ports(root: Path) -> CollectorEvidence:
++    refs, conflicts = [], []
++    lock = _lock_dir()
++    try:
++        info = lock.lstat()
++    except FileNotFoundError:
++        refs.append('locks:absent')
++    else:
++        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():  # windows-footgun: ok — Linux adapter
++            raise CensusUnavailable('lock dir ownership')
++        refs.append(f'locks:{info.st_ino}')
++        for name in _HOST_RECORDS:
++            path = lock / name
++            try:
++                _regular_owned(path)
++            except FileNotFoundError:
++                refs.append(f'{name}:absent')
++                continue
++            raw = _read_bytes(path, 1024 * 1024)
++            if not isinstance(json.loads(raw), dict):
++                raise CensusUnavailable(f'{name}:schema')
++            refs.append(f'{name}:{hashlib.sha256(raw).hexdigest()}')
++    for home in configured_homes(root):
++        label = 'default' if home == root else home.name
++        sock, pid_path = home / 'gateway.sock', home / 'gateway.pid'
++        try:
++            info = sock.lstat()
++        except FileNotFoundError:
++            refs.append(f'{label}/gateway.sock:absent')
++            continue
++        if not stat.S_ISSOCK(info.st_mode):
++            conflicts.append(f'{label}/gateway.sock:not_socket')
++            continue
++        try:
++            _regular_owned(pid_path)
++            payload = json.loads(_read_bytes(pid_path, 1024 * 1024))
++            pid = payload.get('pid') if isinstance(payload, dict) else None
++            if type(pid) is not int or pid <= 0:
++                raise CensusUnavailable('gateway pid')
++            LinuxProcessCensus().identity(pid, LinuxProcessCensus().boot_id())
++            refs.append(f'{label}/gateway.sock:pid:{pid}')
++        except FileNotFoundError:
++            conflicts.append(f'{label}/gateway.sock:unresolved_owner')
++        except (OSError, ValueError, CensusUnavailable) as exc:
++            conflicts.append(f'{label}/gateway.sock:{type(exc).__name__}')
++    return CollectorEvidence(tuple(refs), tuple(conflicts))
++
++
++def collect_supported_launchers(installation: Path) -> CollectorEvidence:
++    generation = launcher_generation(installation)
++    refs = [f'generation:{generation}']
++    for relative in LAUNCH_SOURCES:
++        info = (installation / relative).lstat()
++        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():  # windows-footgun: ok — Linux adapter
++            raise CensusUnavailable(f'launcher:{relative}')
++        refs.append(f'{relative}:{info.st_size}')
++    return CollectorEvidence(tuple(refs), ())
++
++
++def collect_installation_access(installation: Path) -> CollectorEvidence:
++    info = installation.lstat()
++    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():  # windows-footgun: ok — Linux adapter
++        raise CensusUnavailable('installation ownership boundary')
++    fd = os.open(installation, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    os.close(fd)
++    return CollectorEvidence((f'install:{installation}:{info.st_ino}:{info.st_uid}',), ())
++
++
++def host_collectors(root: Path, installation: Path) -> dict:
++    return {
++        'raw_ledger': lambda: collect_raw_ledger(root),
++        'profile_controls': lambda: collect_profile_controls(root),
++        'supervisor_ports': lambda: collect_supervisor_ports(root),
++        'supported_launchers': lambda: collect_supported_launchers(installation),
++        'installation_access': lambda: collect_installation_access(installation),
++    }
++
++
++def launcher_coverage(installation: Path) -> dict:
++    evidence = collect_supported_launchers(installation)
++    return {
++        'status': 'COMPLETE',
++        'generation': evidence.refs[0].split(':', 1)[1],
++        'sources': list(LAUNCH_SOURCES),
++        'roles': sorted(SUPPORTED_LAUNCHES),
++        'refs': list(evidence.refs),
++    }
++
++
++def inspect_host(runtime: Path, installation: Path, *, root: Path, timeout: float = 10,
++                 legacy_candidates: tuple[Incarnation, ...] = ()) -> AdmissionCut:
++    """Gate-held strict cut. Enrollment remains unguarded; COMPLETE stays conservative."""
++    if sys.platform != 'linux':
++        raise AdmissionUnavailable('no linux census adapter')
++    installation = installation.resolve(strict=True)
++    root = Path(root)
++    generation = launcher_generation(installation)
++    adapter = LinuxProcessCensus()
++    with _wait_gate(runtime, time.monotonic() + timeout) as gate:
++        try:
++            (runtime / 'participants.json').lstat()
++        except FileNotFoundError:
++            participants = ()
++        else:
++            participants = read_participants_strict(runtime)
++        return gate.inspect(
++            boot_id=adapter.boot_id(), generation=generation, installation=str(installation),
++            census=adapter.collect,
++            collectors=host_collectors(root, installation),
++            classify=lambda record: classify_process(
++                record, participants, generation, installation=str(installation)),
++            legacy_candidates=legacy_candidates, exited=lambda identity: incarnation_exited(adapter, identity),
++        )
+diff --git a/hermes_cli/serve_producer_census.py b/hermes_cli/serve_producer_census.py
+index 575cde88782..e20762e44f9 100644
+--- a/hermes_cli/serve_producer_census.py
++++ b/hermes_cli/serve_producer_census.py
+@@ -107,6 +107,13 @@
+             raise CensusUnavailable('missing boot identity')
+         return value
+ 
++    def namespace_id(self) -> str:
++        """PID numbers are meaningful only inside the same kernel PID namespace."""
++        value = os.readlink(self.root / 'self/ns/pid')
++        if not value.startswith('pid:[') or not value.endswith(']') or not value[5:-1].isdecimal():
++            raise CensusUnavailable('invalid pid namespace')
++        return value
++
+     def pids(self) -> tuple[int, ...]:
+         return tuple(sorted(int(name) for name in _bounded_names(self.root, MAX_PROCESSES, numeric=True)))
+ 
+diff --git a/tests/hermes_cli/test_serve_producer_collectors.py b/tests/hermes_cli/test_serve_producer_collectors.py
+new file mode 100644
+index 00000000000..d284979c69b
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_collectors.py
+@@ -0,0 +1,126 @@
++"""Strict host collectors and canonical classification; no producer activation."""
++import json
++import os
++import socket
++import stat
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++from hermes_cli.serve_producer_census import Incarnation, LinuxProcessCensus, ProcessCensus, ProcessObservation
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def _home(tmp_path):
++    root = tmp_path / 'hermes'
++    root.mkdir()
++    (root / 'spawn-ledger.json').write_text('[]')
++    os.chmod(root / 'spawn-ledger.json', 0o600)
++    return root
++
++
++def test_missing_or_corrupt_ledger_is_not_empty_success(tmp_path):
++    root = tmp_path / 'hermes'
++    root.mkdir()
++    with pytest.raises(admission.CensusUnavailable, match='missing'):
++        admission.collect_raw_ledger(root)
++    (root / 'spawn-ledger.json').write_text('{')
++    os.chmod(root / 'spawn-ledger.json', 0o600)
++    with pytest.raises(admission.CensusUnavailable):
++        admission.collect_raw_ledger(root)
++
++
++def test_permission_refusal_on_ledger_is_not_absence(tmp_path):
++    root = _home(tmp_path)
++    os.chmod(root / 'spawn-ledger.json', 0)
++    try:
++        with pytest.raises(admission.CensusUnavailable):
++            admission.collect_raw_ledger(root)
++    finally:
++        os.chmod(root / 'spawn-ledger.json', 0o600)
++
++
++def test_explicit_empty_ledger_is_positive_evidence_not_host_absence(tmp_path):
++    evidence = admission.collect_raw_ledger(_home(tmp_path))
++    assert evidence.refs and evidence.conflicts == ()
++
++
++def test_socket_without_live_pid_is_unresolved_owner(tmp_path, monkeypatch):
++    root = Path('/tmp') / f'sp{os.getpid()}'
++    root.mkdir()
++    try:
++        (root / 'spawn-ledger.json').write_text('[]')
++        os.chmod(root / 'spawn-ledger.json', 0o600)
++        monkeypatch.setenv('HERMES_GATEWAY_LOCK_DIR', str(tmp_path / 'no-locks'))
++        sock = socket.socket(socket.AF_UNIX)
++        try:
++            sock.bind(str(root / 'gateway.sock'))
++            evidence = admission.collect_supervisor_ports(root)
++        finally:
++            sock.close()
++        assert any('unresolved_owner' in item for item in evidence.conflicts)
++    finally:
++        for child in root.rglob('*'):
++            if child.is_socket() or child.is_file():
++                child.unlink(missing_ok=True)
++        root.rmdir()
++
++
++def test_unrelated_requires_path_free_identity_not_missing_enrollment():
++    adapter = LinuxProcessCensus()
++    current = adapter.read_process(os.getpid(), adapter.boot_id())
++    foreign = replace(current, exe='/usr/bin/sleep', cwd='/tmp', argv=('/usr/bin/sleep', '1'), environment=())
++    assert admission.classify_process(foreign, (), 'generation', installation='/opt/hermes').kind == 'unrelated'
++
++
++def test_touching_python_without_enrollment_stays_unknown():
++    adapter = LinuxProcessCensus()
++    current = adapter.read_process(os.getpid(), adapter.boot_id())
++    installation = str(Path(__file__).parents[2])
++    assert admission.classify_process(current, (), 'generation', installation=installation).kind == 'unknown'
++
++
++def test_known_launcher_module_without_enrollment_is_legacy():
++    adapter = LinuxProcessCensus()
++    current = adapter.read_process(os.getpid(), adapter.boot_id())
++    installation = str(Path(__file__).parents[2])
++    launched = replace(current, argv=(current.exe, '-m', 'hermes_cli.main', 'serve'))
++    assert admission.classify_process(launched, (), 'generation', installation=installation).kind == 'legacy'
++
++
++def test_real_collectors_can_cut_complete_only_with_unrelated_census(tmp_path, monkeypatch):
++    root = _home(tmp_path)
++    monkeypatch.setenv('HERMES_GATEWAY_LOCK_DIR', str(tmp_path / 'locks-missing'))
++    installation = Path(__file__).parents[2]
++    identity = Incarnation('boot', 9, 1)
++    census = ProcessCensus('boot', 1, 2, (ProcessObservation(
++        identity, '/usr/bin/sleep', '/tmp', ('/usr/bin/sleep',), ()),), (), ())
++    with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++        cut = gate.inspect(
++            boot_id='boot', generation='generation', installation=str(installation),
++            census=lambda: census, collectors=admission.host_collectors(root, installation),
++            classify=lambda record: admission.Classification(record.identity, 'unrelated', 'exe'),
++            legacy_candidates=(), exited=lambda identity: False)
++        assert cut.complete
++        gate.require(cut, boot_id='boot', generation='generation', installation=str(installation))
++
++
++def test_launcher_coverage_is_complete_for_supported_sources():
++    coverage = admission.launcher_coverage(Path(__file__).parents[2])
++    assert coverage['status'] == 'COMPLETE'
++    assert set(coverage['sources']) == set(admission.LAUNCH_SOURCES)
++    assert set(coverage['roles']) == set(admission.SUPPORTED_LAUNCHES)
++
++
++def test_inspect_host_hub_shaped_does_not_treat_live_python_as_empty(tmp_path, monkeypatch):
++    root = _home(tmp_path)
++    monkeypatch.setenv('HERMES_GATEWAY_LOCK_DIR', str(tmp_path / 'no-locks'))
++    installation = Path(__file__).parents[2]
++    cut = admission.inspect_host(tmp_path / 'runtime', installation, root=root)
++    kinds = {row.kind for row in cut.classifications}
++    assert 'unknown' in kinds or 'legacy' in kinds
++    assert not cut.complete
++    assert cut.census is not None and cut.census.processes
+diff --git a/tests/hermes_cli/test_serve_producer_launch.py b/tests/hermes_cli/test_serve_producer_launch.py
+new file mode 100644
+index 00000000000..d39d1a8a245
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_launch.py
+@@ -0,0 +1,155 @@
++"""Host enrollment contracts; no external producer activation is performed here."""
++import os
++import json
++import select
++import subprocess
++import sys
++from dataclasses import asdict, replace
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++from hermes_cli.serve_producer_census import LinuxProcessCensus, CensusUnavailable
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def test_enrollment_is_exact_private_and_does_not_claim_guarded_readiness(tmp_path):
++    runtime = tmp_path / 'runtime'
++    receipt = admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
++    current = LinuxProcessCensus().read_process(os.getpid(), LinuxProcessCensus().boot_id())
++    assert receipt.identity == current.identity
++    assert receipt.observation == admission.observation_digest(current)
++    assert receipt.guarded is False
++    stored = admission.read_participants_strict(runtime)
++    assert stored == (receipt,)
++    assert (runtime / 'participants.json').stat().st_mode & 0o777 == 0o600
++    assert admission.classify_process(current, stored, receipt.generation,
++                                      installation=receipt.installation).kind == 'legacy'
++
++
++def test_missing_corrupt_or_incorrect_registry_never_becomes_empty(tmp_path):
++    with pytest.raises(CensusUnavailable):
++        admission.read_participants_strict(tmp_path)
++    ledger = tmp_path / 'participants.json'
++    for value in ('', '{}', '[null]', '[{"pid":42}]'):
++        ledger.write_text(value)
++        with pytest.raises(CensusUnavailable):
++            admission.read_participants_strict(tmp_path)
++
++
++def test_pid_reuse_exec_and_boot_change_cannot_reuse_participation(tmp_path):
++    receipt = admission.enroll_launch(tmp_path / 'runtime', 'gateway', installation=Path(__file__).parents[2])
++    adapter = LinuxProcessCensus()
++    current = adapter.read_process(os.getpid(), adapter.boot_id())
++    for identity in (replace(current.identity, start_ticks=current.identity.start_ticks + 1),
++                     replace(current.identity, boot_id='other-boot')):
++        changed = replace(current, identity=identity)
++        assert admission.classify_process(changed, (receipt,), receipt.generation,
++                                          installation=receipt.installation).kind == 'unknown'
++    changed = replace(current, argv=('python', '-m', 'unknown'))
++    assert admission.classify_process(changed, (receipt,), receipt.generation,
++                                      installation=receipt.installation).kind == 'unknown'
++
++
++def test_unknown_python_is_not_inferred_unrelated_from_foreign_cwd(tmp_path):
++    adapter = LinuxProcessCensus()
++    current = adapter.read_process(os.getpid(), adapter.boot_id())
++    assert admission.classify_process(replace(current, cwd='/other/project'), (), 'generation',
++                                      installation='/other/project').kind == 'unknown'
++
++
++def test_permission_refusal_is_not_absence(tmp_path, monkeypatch):
++    admission.enroll_launch(tmp_path / 'runtime', 'serve', installation=Path(__file__).parents[2])
++    def denied(*args, **kwargs):
++        raise PermissionError('denied')
++    monkeypatch.setattr(admission, '_read_bytes', denied)
++    with pytest.raises(CensusUnavailable):
++        admission.read_participants_strict(tmp_path / 'runtime')
++
++
++def test_concurrent_real_launches_keep_both_live_incarnations(tmp_path):
++    root = Path(__file__).parents[2]
++    runtime = tmp_path / 'runtime'
++    code = '''
++import sys
++from pathlib import Path
++from hermes_cli.serve_producer_admission import enroll_launch
++print('ready', flush=True)
++sys.stdin.readline()
++enroll_launch(Path(sys.argv[1]), 'serve', installation=Path.cwd())
++print('enrolled', flush=True)
++sys.stdin.readline()
++'''
++    children = []
++    try:
++        for _ in range(2):
++            children.append(subprocess.Popen([sys.executable, '-c', code, str(runtime)], cwd=root,
++                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
++                                              stderr=subprocess.PIPE, text=True))
++        for child in children:
++            assert select.select([child.stdout], [], [], 30)[0], 'child startup timeout'
++            assert child.stdout.readline().strip() == 'ready'
++        for child in children:
++            child.stdin.write('start\n')
++            child.stdin.flush()
++        for child in children:
++            assert select.select([child.stdout], [], [], 30)[0], 'enrollment timeout'
++            assert child.stdout.readline().strip() == 'enrolled', child.stderr.read()
++        receipts = admission.read_participants_strict(runtime)
++        assert {row.identity.pid for row in receipts} == {child.pid for child in children}
++        assert all(not row.guarded for row in receipts)
++    finally:
++        for child in children:
++            child.communicate(input='exit\n', timeout=30)
++            assert child.returncode == 0
++
++
++def test_retirement_requires_exact_incarnation_and_same_boot():
++    adapter = LinuxProcessCensus()
++    current = adapter.identity(os.getpid(), adapter.boot_id())
++    assert admission.incarnation_exited(adapter, current) is False
++    assert admission.incarnation_exited(adapter, replace(current, start_ticks=current.start_ticks + 1)) is True
++    with pytest.raises(CensusUnavailable, match='boot'):
++        admission.incarnation_exited(adapter, replace(current, boot_id='other-boot'))
++
++
++@pytest.mark.parametrize('field,value', [('guarded', True), ('guarded', 0), ('role', []),
++                                        ('namespace', 'pid:[wrong]')])
++def test_forged_readiness_and_malformed_fields_refused(tmp_path, field, value):
++    runtime = tmp_path / 'runtime'
++    receipt = admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
++    raw = asdict(receipt)
++    raw[field] = value
++    (runtime / 'participants.json').write_text(json.dumps([raw]))
++    with pytest.raises(CensusUnavailable):
++        admission.read_participants_strict(runtime)
++
++
++def test_foreign_namespace_refused_before_retirement(tmp_path):
++    runtime = tmp_path / 'runtime'
++    receipt = admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
++    foreign = replace(receipt, namespace='pid:[1]')
++    (runtime / 'participants.json').write_text(json.dumps([asdict(foreign)]))
++    with pytest.raises(CensusUnavailable, match='namespace'):
++        admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
++
++
++def test_new_boot_prunes_old_receipts_but_stale_pending_cannot_brick_reused_pid(tmp_path):
++    runtime = tmp_path / 'runtime'
++    root = Path(__file__).parents[2]
++    receipt = admission.enroll_launch(runtime, 'serve', installation=root)
++    old = replace(receipt, identity=replace(receipt.identity, boot_id='previous-boot'))
++    (runtime / 'participants.json').write_text(json.dumps([asdict(old)]))
++    (runtime / f'participants.{os.getpid()}.pending').write_text('interrupted old writer')
++    fresh = admission.enroll_launch(runtime, 'serve', installation=root)
++    assert admission.read_participants_strict(runtime) == (fresh,)
++
++
++def test_identical_generation_from_another_install_is_not_participation(tmp_path):
++    receipt = admission.enroll_launch(tmp_path / 'runtime', 'serve', installation=Path(__file__).parents[2])
++    adapter = LinuxProcessCensus()
++    record = adapter.read_process(os.getpid(), adapter.boot_id())
++    assert admission.classify_process(record, (receipt,), receipt.generation,
++                                      installation='/other-install').kind == 'unrelated'
+diff --git a/tests/hermes_cli/test_serve_producer_launch_boundaries.py b/tests/hermes_cli/test_serve_producer_launch_boundaries.py
+new file mode 100644
+index 00000000000..e6dd4d32283
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_launch_boundaries.py
+@@ -0,0 +1,107 @@
++"""Execute real launch boundaries, refusing before runtime/plugin imports."""
++import os
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++
++
++class BoundaryReached(RuntimeError):
++    pass
++
++
++@pytest.mark.parametrize('module,role,forbidden', [
++    ('gateway.run', 'gateway', 'agent.async_utils'),
++    ('tui_gateway.entry', 'tui_gateway', 'tui_gateway.server'),
++    ('hermes_cli.plugin_host_child', 'plugin_host', 'hermes_cli.plugin_host_wire'),
++])
++def test_direct_module_boundary_precedes_producer_imports(tmp_path, module, role, forbidden):
++    code = '''
++import importlib.abc, runpy, sys
++from hermes_cli import serve_producer_admission as admission
++class Stop(RuntimeError): pass
++class Tripwire(importlib.abc.MetaPathFinder):
++    def find_spec(self, name, path=None, target=None):
++        if name == sys.argv[3]: raise AssertionError('producer imported before admission')
++def gated(role):
++    assert role == sys.argv[2]
++    assert sys.argv[3] not in sys.modules
++    raise Stop()
++admission.supported_launch = gated
++sys.meta_path.insert(0, Tripwire())
++try: runpy.run_module(sys.argv[1], run_name='__main__')
++except Stop: print('pre-import gate reached')
++else: raise AssertionError('launch bypassed gate')
++'''
++    env = dict(os.environ, HERMES_HOME=str(tmp_path / 'home'), HERMES_RUNTIME_DIR=str(tmp_path / 'pm'))
++    result = subprocess.run([sys.executable, '-c', code, module, role, forbidden],
++                            cwd=Path(__file__).parents[2], env=env, capture_output=True, text=True, timeout=60, check=False)
++    assert result.returncode == 0, result.stderr
++    assert 'pre-import gate reached' in result.stdout
++
++
++@pytest.mark.parametrize('headless,fast', [(False, False), (True, False), (True, True)])
++def test_dashboard_and_serve_refuse_before_runtime_preparation(monkeypatch, headless, fast):
++    from hermes_cli import main
++    for name in ('_dashboard_lifecycle_flags', '_dashboard_sanitize_desktop_env',
++                 '_attach_to_host_backend', '_route_named_profile_dashboard'):
++        monkeypatch.setattr(main, name, lambda *a: None)
++    monkeypatch.setattr(main, '_dashboard_validate_serve_args', lambda *a: None)
++    from hermes_cli import resource_limits, serve_update_wait
++    monkeypatch.setattr(resource_limits, 'apply_nofile_soft_limit', lambda: None)
++    monkeypatch.setattr(serve_update_wait, 'checkout_fingerprint', lambda: None)
++    monkeypatch.setattr(serve_update_wait, 'wait_for_update_clear', lambda: None)
++    monkeypatch.setattr(serve_update_wait, 'reexec_if_checkout_moved', lambda *a: None)
++    observed = []
++    def stop(role):
++        observed.append(role)
++        raise BoundaryReached()
++    def forbidden(*a):
++        pytest.fail('runtime prepared before launch gate')
++    monkeypatch.setattr(admission, 'supported_launch', stop)
++    monkeypatch.setattr(main, '_dashboard_prepare_runtime', forbidden)
++    from hermes_cli import config
++    monkeypatch.setattr(config, 'get_container_exec_info', lambda: None)
++    monkeypatch.delenv('HERMES_DISABLE_FAST_SERVE_LAUNCH', raising=False)
++    monkeypatch.setattr(sys, 'argv', ['hermes', 'serve', '--no-open'])
++    with pytest.raises(BoundaryReached):
++        if fast:
++            main._try_fast_serve_launch()
++        else:
++            main.cmd_dashboard(SimpleNamespace(headless_backend=headless))
++    assert observed == ['serve' if headless else 'dashboard']
++
++
++def test_gateway_startup_refuses_before_discovery(monkeypatch):
++    from hermes_cli import main, plugins
++    for name in ('_apply_safe_mode', '_apply_user_config_bypass', '_guard_noninteractive_user_config'):
++        monkeypatch.setattr(main, name, lambda *a: None)
++    def stop(role):
++        assert role == 'gateway'
++        raise BoundaryReached()
++    def forbidden():
++        pytest.fail('plugin discovery started before launch gate')
++    monkeypatch.setattr(admission, 'supported_launch', stop)
++    monkeypatch.setattr(plugins, 'start_background_plugin_discovery', forbidden)
++    with pytest.raises(BoundaryReached):
++        main._prepare_agent_startup(SimpleNamespace(command='gateway', gateway_command='run'))
++
++
++def test_desktop_spawner_refuses_before_runtime_and_process_spawn(monkeypatch, tmp_path):
++    from hermes_cli import gateway_runtime_start
++    monkeypatch.setattr(gateway_runtime_start, 'remaining', lambda deadline: 2)
++    def stop(role, *, timeout):
++        assert role == 'gateway_spawner'
++        assert timeout == 2
++        raise BoundaryReached()
++    def forbidden(*a, **k):
++        pytest.fail('spawn attempted before launch gate')
++    monkeypatch.setattr(admission, 'supported_launch', stop)
++    monkeypatch.setattr(gateway_runtime_start.subprocess, 'Popen', forbidden)
++    monkeypatch.setattr(gateway_runtime_start, 'start_gateway_job', forbidden)
++    with pytest.raises(BoundaryReached):
++        gateway_runtime_start.spawn_unmanaged_gateway(tmp_path, deadline=0)
+diff --git a/tui_gateway/entry.py b/tui_gateway/entry.py
+index 2ab025c946f..eedfecd5fd1 100644
+--- a/tui_gateway/entry.py
++++ b/tui_gateway/entry.py
+@@ -7,6 +7,9 @@
+ 
+ hermes_bootstrap.harden_import_path()
+ 
++from hermes_cli.serve_producer_admission import supported_launch as _producer_launch
++_producer_launch('tui_gateway')
++
+ import json
+ import logging
+ import signal
+-- 
+2.43.0
+

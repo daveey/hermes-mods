@@ -1,0 +1,391 @@
+From 83680b79af205d2f65e191730960bbc62e307ab0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:19:03 +0000
+Subject: [PATCH 6110] Kanban spend-decision routing, ownerless stops and hold notices
+
+Public mirror of source commit 83680b79af205d2f65e191730960bbc62e307ab0.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 2be51740251..ddb3a7f8ffb 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -188,7 +188,9 @@
+         if all(d.get('administrative_owner', {}).get('kind') == 'unavailable' for d in deps):
+             row['violations'].append('dependency_recovery_unavailable')
+     if row['owner']['kind'] == 'unavailable':
+-        row['violations'].append('owner_missing')
++        # A stopped card whose human request is stored (the stranded-park ask) is owned by that ask.
++        if not (facts.get('stop') and facts.get('human_step')):
++            row['violations'].append('owner_missing')
+     elif row['owner']['kind'] == 'unknown' or not row['owner'].get('refs'):
+         row['evidence_state'] = 'unknown'
+     if not deadline:
+diff --git a/hermes_cli/kanban_retain.py b/hermes_cli/kanban_retain.py
+index b7c6f8da8b1..1ac8e91ec37 100644
+--- a/hermes_cli/kanban_retain.py
++++ b/hermes_cli/kanban_retain.py
+@@ -130,8 +130,10 @@
+                        "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1",
+                        (task, decision.NOTICE, episode)).fetchone()
+     route = json.loads(row[0]).get('producer') if row else None
++    # No producer, or the producer found nobody to route to: the stranded-park sweep is what escalates.
++    owned = isinstance(route, dict) and route.get('kind') != 'unavailable'
+     return {'version': 1, 'owner': route or {'kind': 'unavailable'}, 'instruction': data['next_step'],
+             'release': {'authority': 'unavailable', 'condition': data['release_condition']},
+             'blocker': {'prerequisite': data['release_condition'], 'evidence': data['evidence']},
+-            'escalation': {'at': int(time.time()) + 86400, 'route': route,
+-                           'state': 'pending' if route else 'unavailable'}}
++            'escalation': {'at': int(time.time()) + 86400, 'route': route if owned else None,
++                           'state': 'pending' if owned else 'unavailable'}}
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index dee737a78f5..51e9b65ce5b 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -16,7 +16,7 @@
+     if _producer_repair(conn, task_id) is None:
+         return
+     with kb.write_txn(conn, allow_nested=True):
+-        repair = _producer_repair(conn, task_id)
++        repair = _producer_repair(conn, task_id, paced=False)
+         if repair is None:
+             return
+         episode, payload, route, live = repair
+@@ -24,11 +24,13 @@
+         if not live and reviewer.queue(conn, task_id, episode):
+             return  # an immediate review decides first; it routes the stop here only if it escalates
+         if not live:
+-            route = producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
++            previous, route = route, producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
++            if route == previous:
++                return  # an ownerless stop re-checked for a returned chat (_chat_returned) and still ownerless
+         kb._append_event(conn, task_id, NOTICE, {**payload, "episode": episode, "producer": route})
+ 
+ 
+-def _producer_repair(conn, task_id):
++def _producer_repair(conn, task_id, *, paced=True):
+     """Read-only need check; never authorizes a repair outside its transaction."""
+     import json
+     stop = pending_episode(conn, task_id)
+@@ -50,6 +52,8 @@
+     prior_route = prior.get('producer') if isinstance(prior, dict) else None
+     route = episode_route(conn, task_id, episode) or prior_route
+     live = _live_route(conn, route)
++    if live and route == {'kind': 'unavailable'} and _chat_returned(conn, task_id, paced=paced):
++        live = False  # no owner could be reached at the stop; a chat that is live now takes the decision
+     if live and route == prior_route and (cause is None or prior.get('cause') == cause):
+         return None
+     if cause:
+@@ -96,6 +100,8 @@
+         return task is not None and task.status not in ('done', 'archived')
+     # Explicit administrative exhaustion is a terminal routing boundary, not
+     # permission to recurse into another decision owner or release the root hold.
++    # A bare ``unavailable`` (a stop with a cause and no live chat) holds only until
++    # a chat of the card is live again: ``_producer_repair`` re-checks it.
+     return route.get('kind') in ('chats', 'unavailable', 'dismissed')
+ 
+ 
+@@ -286,14 +292,43 @@
+                       lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own, liveness=liveness))
+ 
+ 
+-def _route(conn, task_id, task, own, active, bind, note, dead) -> dict:
+-    """``producer`` body after setup. ``dead``: a chat of this gateway that is archived/hidden/missing, or ended and
+-    idle, is no route for the decision: the notice would sit unread (kanban_stranded_park). One ``Liveness`` per
+-    call: each state.db is opened at most once."""
+-    from hermes_cli.kanban_model_neutral import forwarded_text, forwarded_title
++_RECHECK_SECONDS = 300  # kanban_stranded_park.DEFAULT_SWEEP_INTERVAL_SECONDS: the same state.db reads, as rarely
++_RECHECKED: dict[tuple[str, str], float] = {}
++
++
++def _chat_returned(conn, task_id: str, *, paced: bool) -> bool:
++    """Read-only: does an ownerless stop's card have a live owning chat now? ``paced`` (the dispatcher's unlocked
++    pre-check) asks at most once per ``_RECHECK_SECONDS`` per card: each answer may open a state.db."""
++    import time
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_stranded_park import Liveness, local_chat_dead, settings
++    from hermes_cli.profiles import get_active_profile_name
++    if paced:
++        key, now = (_main_db_file(conn) or f"conn:{id(conn)}", task_id), time.monotonic()
++        last = _RECHECKED.get(key)
++        if last is not None and now - last < _RECHECK_SECONDS:
++            return False
++        if len(_RECHECKED) > 4096:
++            _RECHECKED.clear()
++        _RECHECKED[key] = now
++    task = kb.get_task(conn, task_id)
++    if task is None:
++        return False
++    own, bound = gateway_names()[0], []
++    with Liveness(idle=settings()[1]) as liveness:
++        # ``bind`` only records: a chat ``producer`` would bind is live. ``producer`` itself decides the route.
++        return _chat_route(conn, task_id, task, own, get_active_profile_name(), lambda *chat: bound.append(chat),
++                           lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own,
++                                                                        liveness=liveness)) or bool(bound)
++
++
++def _chat_route(conn, task_id, task, own, active, bind, dead) -> bool:
++    """Bind the card's live chats; True when one owns the decision. ``dead``: a chat of this gateway that is
++    archived/hidden/missing, or ended and idle, is no route for the decision: the notice would sit unread
++    (kanban_stranded_park). One ``Liveness`` per call: each state.db is opened at most once."""
+     from hermes_cli.kanban_creator_chats import _chat_links
+     from hermes_cli.kanban_db_notify import is_headless_session
+-    from hermes_cli.kanban_triage_sweep import _supervisor_profile
+ 
+     # Bind legacy origin sessions before appending the notice so its cursor cannot skip this event.
+     if task.session_id and not is_headless_session(task.session_id) and not dead(own, active, task.session_id):
+@@ -322,6 +357,15 @@
+                 origin = None
+             if origin is not None and dead(origin.gateway, origin.profile, origin.session):
+                 continue
++        return True
++    return False
++
++
++def _route(conn, task_id, task, own, active, bind, note, dead) -> dict:
++    """``producer`` body after setup: the card's live chats (``_chat_route``), else the stop's decision card."""
++    from hermes_cli.kanban_model_neutral import forwarded_text, forwarded_title
++    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++    if _chat_route(conn, task_id, task, own, active, bind, dead):
+         return {"kind": "chats"}
+     stop = pending_episode(conn, task_id)
+     episode = (stop.get('uid') or str(stop['id'])) if stop else None
+@@ -331,14 +375,14 @@
+     from hermes_cli.kanban_refusal_receipt import restricted
+     safety = restricted(conn, task_id)
+     stopped = execution_restricted(conn, task_id)
+-    # A decision card's only power is ``spend_promote``, which releases an ordinary budget stop and nothing else.
+-    # A stop with a cause (capability_unavailable, scope_stopped, safety_refusal) gets no card: its worker could
+-    # only retain it, a second stop and no decision. The stranded-park escalation owns it (kanban_stranded_park),
+-    # so the card built below is always for an ordinary stop.
+-    import json
+-    if safety or stopped or (stop and json.loads(stop['payload'] or '{}').get('cause')):
+-        return {'kind': 'unavailable'}
+     import json as _json
++    # A stop with a cause (capability_unavailable, scope_stopped, safety_refusal) gets no decision card. The card's
++    # worker decides spend; it cannot restore a capability, renew a scope or clear a refusal, so it could only
++    # retain the card: a second stop and no decision. With no live chat nobody is routed, and the stranded-park
++    # sweep asks a human once the park is old enough (kanban_stranded_park), unless an open parent or a recorded
++    # wait explains it. #4245 edits the lines below; their restricted branches are unreachable and go after it.
++    if safety or stopped or (stop and _json.loads(stop['payload'] or '{}').get('cause')):
++        return {'kind': 'unavailable'}
+     stop = pending_episode(conn, task_id)
+     listed = _json.loads(stop['payload'] or '{}').get('refused_providers') if stop is not None and safety else None
+     guidance = notice({'reason': note, **({'cause': 'safety_refusal' if safety else 'scope_stopped'} if stopped else {}),
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 28f4576df78..18f9ac3d098 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -144,6 +144,9 @@
+         return False
+     if decision.execution_restricted(conn, task_id) or restricted(conn, task_id) or _disposed(conn, task_id, episode):
+         return False
++    stop = decision.pending_episode(conn, task_id)
++    if stop is not None and _payload(stop.get("payload")).get("cause"):
++        return False  # e.g. capability_unavailable: more runs meet the same wall, so there is no budget to judge
+     row = conn.execute("SELECT created_by FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     if row is None or row[0] == "kanban-spend-budget" or conn.execute(
+             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'administrative_decision'", (task_id,)).fetchone():
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_causes.py b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+index 41570d4af7f..1dea44a91f9 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision_causes.py
++++ b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+@@ -1,10 +1,10 @@
+ """Only an ordinary budget stop gets a decision card; a stop with a cause is left to the stranded park. [daveey]
+ 
+-A "Spend budget decision" card can do one thing: promote its source (``spend_promote``). That releases a plain
+-run/token budget stop and nothing else. For a ``capability_unavailable``, ``scope_stopped`` or ``safety_refusal``
+-stop the card's worker could only retain the card, creating another stop without a decision. With
+-no live owning chat such a stop now records the producer ``{"kind": "unavailable"}`` and the
+-stranded-park escalation is its owner.
++A "Spend budget decision" card's worker decides spend. It cannot restore a capability, renew a scope or clear a
++provider refusal, so for a ``capability_unavailable``, ``scope_stopped`` or ``safety_refusal`` stop it could only
++retain the card, creating another stop without a decision. With no live owning chat such
++a stop now records the producer ``{"kind": "unavailable"}``. From there: a chat of the card that is live again
++takes the decision, else the stranded-park sweep asks a human, unless an open parent explains the wait.
+ """
+ from __future__ import annotations
+ 
+@@ -15,6 +15,9 @@
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_spend_budget as budget
+ from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_stranded_park as stranded
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli.kanban_open_asks import card_is_open_human_ask
+ from tests.hermes_cli import test_kanban_containment_actor as support
+ from tests.hermes_cli import test_kanban_spend_budget as helpers
+ from tests.hermes_cli import test_kanban_spend_budget_hold as hold_helpers
+@@ -26,6 +29,32 @@
+ own_gateway = routing.own_gateway
+ 
+ CAUSES = ["capability_unavailable", "scope_stopped", "safety_refusal"]
++RETAIN = dict(summary="Cannot finish from here", next_step="Owner supplies the missing prerequisite",
++              release_condition="Prerequisite exists", evidence=["fixture"])
++
++
++@pytest.fixture(autouse=True)
++def _fresh_recheck_pacing():
++    decision._RECHECKED.clear()
++
++
++def _sweep(conn, hours):
++    """One working stranded-park pass ``hours`` from now (the per-board throttle is cleared first)."""
++    import time
++    stranded._LAST_RUN.clear()
++    return stranded.sweep_stranded_parks(conn, now=int(time.time()) + int(hours * 3600), cfg={"kanban": {}})
++
++
++def _asked(conn, tid):
++    row = conn.execute("SELECT status, block_kind, human_request FROM tasks WHERE id=?", (tid,)).fetchone()
++    return card_is_open_human_ask(row[0], row[1], row[2])
++
++
++def _retain(conn, monkeypatch, reason):
++    from hermes_cli import kanban_retain as retain
++    tid, _, session = support.bind(conn, monkeypatch)
++    with scoped_current_session_id(session):
++        return tid, retain.retain(conn, board="default", reason=reason, **RETAIN)
+ 
+ 
+ def _cards(conn):
+@@ -39,17 +68,49 @@
+ @pytest.mark.parametrize("reason", ["capability_unavailable", "scope_stopped"])
+ def test_retain_with_no_live_chat_is_unavailable_and_files_no_card(board, monkeypatch, reason):
+     """The worker's own ``kanban_retain`` is the entry path: its stop carries the cause and no card is made."""
+-    from hermes_cli import kanban_retain as retain
+-    tid, _, session = support.bind(board, monkeypatch)
+-    with scoped_current_session_id(session):
+-        result = retain.retain(board, board="default", summary="Cannot finish from here", reason=reason,
+-                               next_step="Owner supplies the missing prerequisite",
+-                               release_condition="Prerequisite exists", evidence=["fixture"])
++    tid, result = _retain(board, monkeypatch, reason)
+     (event,) = _notices(board, tid)
+     assert event.payload["producer"] == {"kind": "unavailable"}
+     assert result["next_action"]["owner"] == {"kind": "unavailable"}
++    # The receipt does not claim a pending escalation to a route nobody is on.
++    escalation = result["next_action"]["escalation"]
++    assert (escalation["route"], escalation["state"]) == (None, "unavailable")
+     assert _cards(board) == []
+     assert kb.get_task(board, tid).status == "triage" and decision.pending(board, tid)
++    # Handoff: nobody was routed, so the stranded-park sweep asks a human once the park is old enough.
++    assert _sweep(board, 1) == [] and not _asked(board, tid)
++    assert _sweep(board, 3) == [tid] and _asked(board, tid)
++    assert _cards(board) == [] and decision.pending(board, tid)
++
++
++def test_retain_receipt_still_names_a_live_decision_owner(board, monkeypatch):
++    """Control for the escalation state: a routed stop keeps ``pending`` and its route."""
++    tid, _, session = support.bind(board, monkeypatch)
++    with kb.write_txn(board):
++        kb._append_event(board, tid, decision.EVENT, {"reason": "budget stop"})
++    decision.ensure_producer(board, tid)
++    route = _route(board, tid)
++    assert route["kind"] == "supervisor"
++    from hermes_cli import kanban_retain as retain
++    with scoped_current_session_id(session):
++        result = retain.retain(board, board="default", reason="decision_pending", **RETAIN)
++    escalation = result["next_action"]["escalation"]
++    assert (escalation["route"], escalation["state"]) == (route, "pending")
++
++
++def test_retained_card_with_an_open_parent_is_asked_about_only_after_the_parent_closes(board, monkeypatch):
++    """Intended gap: an explained wait is not an ask (kanban_retained_wait). No card, no route, no request while
++    the parent is open; the sweep asks once it has closed."""
++    tid, _ = _retain(board, monkeypatch, "capability_unavailable")
++    parent = kb.create_task(board, title="Restores the capability", assignee="default")
++    with kb.write_txn(board):
++        board.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, tid))
++    assert _route(board, tid) == {"kind": "unavailable"} and _cards(board) == []
++    assert _sweep(board, 3) == [] and not _asked(board, tid)
++    assert _sweep(board, 30) == [] and not _asked(board, tid)
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++    assert _sweep(board, 30) == [tid] and _asked(board, tid)
+ 
+ 
+ @pytest.mark.parametrize("cause", CAUSES)
+@@ -65,6 +126,55 @@
+         decision.repair_triage_routes(conn, skip=set())
+         assert len(_notices(conn, tid)) == 1 and _cards(conn) == []
+         assert kb.get_task(conn, tid).status == "triage" and decision.pending(conn, tid)
++        # Handoff: the stranded-park sweep asks a human after kanban.stranded_park_seconds (default 2 h).
++        assert "owner_missing" in describe(conn, tid)["violations"]
++        assert _sweep(conn, 1) == [] and not _asked(conn, tid)
++        assert _sweep(conn, 3) == [tid] and _asked(conn, tid)
++        assert stranded.EVENT in [e.kind for e in kb.list_events(conn, tid)]
++        assert _sweep(conn, 4) == []  # once per park episode
++        # ``hermes kanban stranded`` reads the stored ask as the owner.
++        assert "owner_missing" not in describe(conn, tid)["violations"]
++        assert _cards(conn) == [] and decision.pending(conn, tid)
++
++
++@pytest.mark.parametrize("cause", CAUSES)
++def test_a_chat_that_is_live_again_takes_the_ownerless_stop_once(kanban_home, own_gateway, cause):
++    """Dead at the stop, live later: stranded-park counts the live link as an owner and stays quiet, so the
++    route repair must send that chat the notice."""
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        routing._state_session(kanban_home, "human-chat", archived=1)
++        routing._links(conn, tid, (routing.OWN, "default", "human-chat"))
++        decision.ensure_producer(conn, tid)
++        assert _route(conn, tid) == {"kind": "unavailable"} and routing._subs(conn, tid) == []
++        decision.repair_triage_routes(conn, skip=set())  # still dead: nothing new
++        assert len(_notices(conn, tid)) == 1
++        routing._state_session(kanban_home, "human-chat", archived=0)
++        decision.repair_triage_routes(conn, skip=set())  # paced: this card was checked a moment ago
++        assert len(_notices(conn, tid)) == 1
++        decision._RECHECKED.clear()
++        decision.repair_triage_routes(conn, skip=set())
++        assert [n.payload["producer"] for n in _notices(conn, tid)] == [{"kind": "unavailable"}, {"kind": "chats"}]
++        assert routing._subs(conn, tid) == [("tui", "human-chat")]
++        for _ in range(2):
++            decision._RECHECKED.clear()
++            decision.repair_triage_routes(conn, skip=set())
++            decision.ensure_producer(conn, tid)
++        assert len(_notices(conn, tid)) == 2 and _cards(conn) == []
++
++
++def test_capability_stop_is_not_sent_to_the_spend_reviewer(kanban_home, spend_reviewer):
++    """More runs meet the same wall: the reviewer must not grant them. Control: a plain stop is queued."""
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    with kbc.connect_closing() as conn:
++        tid, plain = _stop(conn, "capability_unavailable"), _stop(conn)
++        for card in (tid, plain):
++            decision.ensure_producer(conn, card)
++        episode = reviewer.episode_of(decision.pending_episode(conn, tid))
++        assert reviewer.state(conn, tid, episode) is None
++        assert _route(conn, tid) == {"kind": "unavailable"}
++        assert reviewer.state(conn, plain, reviewer.episode_of(decision.pending_episode(conn, plain))) == reviewer.QUEUED
++        assert _notices(conn, plain) == [] and _cards(conn) == []
+ 
+ 
+ def test_restriction_recorded_apart_from_the_stop_files_no_card(kanban_home):
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 65779432e2b..2bcb04a3715 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -769,10 +769,15 @@
+ A local owning chat that is archived, hidden or gone, or ended and idle longer
+ than `kanban.stranded_owner_idle_seconds` (default 86400), is not a route: the
+ decision then goes to the supervisor card.
+-Only an ordinary budget stop gets that card: its one power, a promote, releases
+-nothing else. A stop with a cause (`capability_unavailable`, `scope_stopped`,
+-`safety_refusal`) and no live chat records producer kind `unavailable`, files no
+-card and is left to the stranded-park escalation below.
++Only an ordinary budget stop gets that card. A stop with a cause
++(`capability_unavailable`, `scope_stopped`, `safety_refusal`) and no live chat
++records producer kind `unavailable` and files no card: the card's worker decides
++spend, and cannot restore a capability, renew a scope or clear a refusal. Such a
++stop is not sent to the spend reviewer either. If one of the card's chats is live
++again later, the next route repair sends that chat the notice, once. Otherwise
++the stranded-park escalation below asks a human. A retained card with an open
++parent, or a wait it recorded, is not asked about until that parent closes or
++the wait ends: an explained wait is not an ask.
+ 
+ **Stranded parked cards.** A parked card (`triage` or `blocked`) never stays
+ invisible. Every `kanban.stranded_sweep_interval_seconds` (default 300) the
+-- 
+2.43.0
+

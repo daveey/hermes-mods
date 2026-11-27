@@ -1,0 +1,825 @@
+From 27ad12138b7c91fa08e13775dafe2afe08a0ce0c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:17:39 +0000
+Subject: [PATCH 5974] Desktop startup-timeout recovery and gateway-drain retry
+
+Public mirror of source commit 27ad12138b7c91fa08e13775dafe2afe08a0ce0c.
+
+---
+diff --git a/apps/desktop/electron/backend-start-failure.test.ts b/apps/desktop/electron/backend-start-failure.test.ts
+index e23eca48be7..c66521bcf9e 100644
+--- a/apps/desktop/electron/backend-start-failure.test.ts
++++ b/apps/desktop/electron/backend-start-failure.test.ts
+@@ -22,6 +22,19 @@
+   assert.equal(shouldLatchBackendStartFailure({ attemptedRemote: false }), true)
+ })
+ 
++test('readiness timeout does not latch a local backend that may answer later', () => {
++  for (const message of [
++    'Timed out connecting to Hermes backend after 180000ms',
++    'Timed out waiting for Hermes backend port announcement (180000ms)'
++  ]) {
++    assert.equal(shouldLatchBackendStartFailure({ attemptedRemote: false, error: new Error(message) }), false)
++  }
++
++  for (const message of ['EACCES', 'install missing', 'Timed out minting the gateway WebSocket URL']) {
++    assert.equal(shouldLatchBackendStartFailure({ attemptedRemote: false, error: new Error(message) }), true)
++  }
++})
++
+ test('never latches a REMOTE failure so recovery stays retryable without a restart', () => {
+   // A lapsed OAuth session / mint timeout / host briefly unreachable across a
+   // laptop sleep must not wedge the app: the next connect has to re-attempt and
+diff --git a/apps/desktop/electron/backend-start-failure.ts b/apps/desktop/electron/backend-start-failure.ts
+index f41a9386a1e..9175cc3f47e 100644
+--- a/apps/desktop/electron/backend-start-failure.ts
++++ b/apps/desktop/electron/backend-start-failure.ts
+@@ -22,7 +22,10 @@
+  * without booting Electron or reading main.ts source text.
+  */
+ 
++import { isBackendReadinessTimeout } from '@hermes/shared'
++
+ export interface BackendStartFailureContext {
++  error?: unknown
+   /**
+    * True when the boot that just failed was resolving/dialing a REMOTE (or
+    * cloud) primary backend rather than spawning a local child.
+@@ -44,10 +47,11 @@
+  * A supervisor-owned respawn never latches either: it already has its own
+  * bounded crash-loop budget, so a pre-ready child exit must not become a
+  * permanent local boot latch before that budget can run. Initial and
+- * user-driven starts keep the fail-closed latch.
++ * user-driven starts keep the fail-closed latch except for readiness timeouts:
++ * a service that missed the startup deadline may still answer a later probe.
+  */
+ export function shouldLatchBackendStartFailure(context: BackendStartFailureContext): boolean {
+-  return !context.attemptedRemote && !context.supervisorRecovery
++  return !context.attemptedRemote && !context.supervisorRecovery && !isBackendReadinessTimeout(context.error)
+ }
+ 
+ export interface RemoteReauthFailureContext {
+diff --git a/apps/desktop/electron/bootstrap-reset-windows.test.ts b/apps/desktop/electron/bootstrap-reset-windows.test.ts
+new file mode 100644
+index 00000000000..3650b899774
+--- /dev/null
++++ b/apps/desktop/electron/bootstrap-reset-windows.test.ts
+@@ -0,0 +1,95 @@
++import { readFileSync } from 'node:fs'
++import { runInNewContext } from 'node:vm'
++
++import { describe, expect, it, vi } from 'vitest'
++
++import { BootTimeoutRecovery } from '../src/app/gateway/hooks/boot-timeout-recovery'
++
++import { broadcastBootstrapReset } from './bootstrap-reset-windows'
++
++function windowStub(destroyed = false, contentsDestroyed = false) {
++  return {
++    isDestroyed: () => destroyed,
++    webContents: { isDestroyed: () => contentsDestroyed, send: vi.fn() }
++  }
++}
++
++describe('bootstrap reset fanout', () => {
++  it('executes the registered main reset and clears a timed-out second window', async () => {
++    vi.useFakeTimers()
++    const recovery = new BootTimeoutRecovery()
++
++    try {
++      let secondError: string | null = 'Timed out connecting to Hermes backend'
++      recovery.schedule(() => {
++        secondError = null
++      })
++      const caller = windowStub()
++      const second = windowStub()
++      second.webContents.send.mockImplementation((_channel, payload) => {
++        if (payload.phase === 'bootstrap.reset') {
++          recovery.expedite()
++        }
++      })
++      const source = readFileSync(new URL('./main.ts', import.meta.url), 'utf8')
++      const start = source.indexOf("ipcMain.handle('hermes:bootstrap:reset'")
++      const end = source.indexOf("ipcMain.handle('hermes:bootstrap:repair'", start)
++      expect(start).toBeGreaterThan(0)
++      expect(end).toBeGreaterThan(start)
++      let reset: (() => Promise<unknown>) | undefined
++      const teardown = vi.fn(async () => undefined)
++      runInNewContext(source.slice(start, end), {
++        ipcMain: {
++          handle: (_channel: string, handler: () => Promise<unknown>) => {
++            reset = handler
++          }
++        },
++        rememberLog: vi.fn(),
++        remoteUpdatePause: { clear: vi.fn() },
++        teardownPrimaryBackendAndWait: teardown,
++        getFirstRunSetupGate: () => ({ resetForRetry: vi.fn() }),
++        resetBootstrapSnapshot: vi.fn(),
++        broadcastBootstrapReset,
++        BrowserWindow: { getAllWindows: () => [caller, second] },
++        bootProgressState: { phase: 'backend.error' }
++      })
++      await reset!()
++      expect(teardown).toHaveBeenCalledOnce()
++      expect(secondError).toBeNull()
++      expect(second.webContents.send).toHaveBeenCalledOnce()
++    } finally {
++      recovery.stop()
++      vi.useRealTimers()
++    }
++  })
++
++  it('delivers reset to the timed-out second window, not just the requesting window', () => {
++    const caller = windowStub()
++    const second = windowStub()
++    const closed = windowStub(true)
++    const closedContents = windowStub(false, true)
++
++    const progress = {
++      error: null,
++      fakeMode: false,
++      message: '',
++      phase: 'init',
++      progress: 0,
++      running: false,
++      timestamp: 1
++    }
++
++    broadcastBootstrapReset([caller, second, closed, closedContents], progress)
++
++    for (const window of [caller, second]) {
++      expect(window.webContents.send).toHaveBeenCalledExactlyOnceWith('hermes:boot-progress', {
++        ...progress,
++        phase: 'bootstrap.reset'
++      })
++    }
++
++    expect(closed.webContents.send).not.toHaveBeenCalled()
++    expect(closedContents.webContents.send).not.toHaveBeenCalled()
++    expect(progress.phase).toBe('init')
++  })
++})
+diff --git a/apps/desktop/electron/bootstrap-reset-windows.ts b/apps/desktop/electron/bootstrap-reset-windows.ts
+new file mode 100644
+index 00000000000..0b05b548581
+--- /dev/null
++++ b/apps/desktop/electron/bootstrap-reset-windows.ts
+@@ -0,0 +1,17 @@
++import type { DesktopBootProgress } from '../src/global'
++
++interface ResetWindow {
++  isDestroyed: () => boolean
++  webContents: { isDestroyed: () => boolean; send: (channel: string, payload: DesktopBootProgress) => void }
++}
++
++// Each renderer owns its timeout state. Broadcast the reset observation; only
++// timeout recovery listeners act on it. Healthy windows never reload or redial.
++export function broadcastBootstrapReset(windows: ResetWindow[], progress: DesktopBootProgress): void {
++  for (const window of windows) {
++    if (window.isDestroyed() || window.webContents.isDestroyed()) {
++      continue
++    }
++    window.webContents.send('hermes:boot-progress', { ...progress, phase: 'bootstrap.reset' })
++  }
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 1b325892234..5cc1fd47f62 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -105,6 +105,7 @@
+   resolveLinuxPasswordStore
+ } from './bootstrap-platform'
+ import { decideBootstrapRepair } from './bootstrap-repair-guard'
++import { broadcastBootstrapReset } from './bootstrap-reset-windows'
+ import { runBootstrap } from './bootstrap-runner'
+ import { bootstrapSnapshot } from './bootstrap-state'
+ import {
+@@ -11595,7 +11596,7 @@
+     // on "session expired" until a full restart, defeating reconnect, the
+     // "Sign out & sign in" reload, and the wake-recovery revalidate path.
+     // A supervisor-owned respawn never latches (see the predicate).
+-    if (shouldLatchBackendStartFailure({ attemptedRemote })) {
++    if (shouldLatchBackendStartFailure({ attemptedRemote, error })) {
+       backendStartFailure = error instanceof Error ? error : new Error(message)
+     }
+ 
+@@ -13992,9 +13993,7 @@
+   return { ok: true }
+ })
+ ipcMain.handle('hermes:bootstrap:reset', async () => {
+-  // Renderer's "Reload and retry" path. Clear the latched failure and
+-  // reset connection state so the next startHermes() call restarts the
+-  // full backend flow (including a fresh runBootstrap pass).
++  // Clear the shared latch; every timed-out renderer may resume in place.
+   rememberLog('[bootstrap] reset requested by renderer; clearing latched failure')
+   remoteUpdatePause.clear('reload and retry')
+   await teardownPrimaryBackendAndWait()
+@@ -14003,6 +14002,7 @@
+   remoteReauthFailure = null
+   getFirstRunSetupGate().resetForRetry()
+   resetBootstrapSnapshot()
++  broadcastBootstrapReset(BrowserWindow.getAllWindows(), bootProgressState)
+ 
+   return { ok: true }
+ })
+diff --git a/apps/desktop/src/app/gateway/hooks/boot-timeout-recovery.test.ts b/apps/desktop/src/app/gateway/hooks/boot-timeout-recovery.test.ts
+new file mode 100644
+index 00000000000..725b203742b
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/hooks/boot-timeout-recovery.test.ts
+@@ -0,0 +1,70 @@
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { BootTimeoutRecovery, isBackendReadinessTimeout } from './boot-timeout-recovery'
++
++afterEach(() => vi.useRealTimers())
++
++describe('boot timeout recovery', () => {
++  it('backs off from 2 seconds to 30 seconds without overlapping probes', async () => {
++    vi.useFakeTimers()
++    const recovery = new BootTimeoutRecovery()
++    const retry = vi.fn()
++
++    for (const delay of [2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
++      recovery.schedule(retry)
++      await vi.advanceTimersByTimeAsync(delay - 1)
++      expect(retry).not.toHaveBeenCalled()
++      await vi.advanceTimersByTimeAsync(1)
++      expect(retry).toHaveBeenCalledOnce()
++      retry.mockClear()
++      await vi.advanceTimersByTimeAsync(60_000)
++      expect(retry).not.toHaveBeenCalled()
++    }
++  })
++
++  it('expedites a pending retry once and cancels on teardown', async () => {
++    vi.useFakeTimers()
++    const recovery = new BootTimeoutRecovery()
++    const retry = vi.fn()
++    recovery.schedule(retry)
++    recovery.expedite()
++    recovery.expedite()
++    expect(retry).toHaveBeenCalledOnce()
++    recovery.schedule(retry)
++    recovery.stop()
++    recovery.expedite()
++    await vi.advanceTimersByTimeAsync(60_000)
++    expect(retry).toHaveBeenCalledOnce()
++    recovery.schedule(retry)
++    await vi.advanceTimersByTimeAsync(2_000)
++    expect(retry).toHaveBeenCalledTimes(2)
++  })
++
++  it('limits automatic recovery to readiness timeouts', () => {
++    expect(isBackendReadinessTimeout(new Error('Timed out connecting to Hermes backend'), 'connected')).toBe(false)
++    expect(isBackendReadinessTimeout(new Error('Timed out connecting to Hermes backend'))).toBe(true)
++    expect(
++      isBackendReadinessTimeout(new Error('Timed out waiting for Hermes backend port announcement (180000ms)'))
++    ).toBe(true)
++
++    for (const error of [
++      new Error('Sign in again'),
++      new Error('Timed out minting the gateway WebSocket URL'),
++      null,
++      'timeout'
++    ]) {
++      expect(isBackendReadinessTimeout(error)).toBe(false)
++    }
++  })
++
++  it('invalidates the old source revision and cancels its queued probe', async () => {
++    vi.useFakeTimers()
++    const recovery = new BootTimeoutRecovery()
++    const retry = vi.fn()
++    recovery.schedule(retry)
++    recovery.invalidate()
++    expect(recovery.revision).toBe(1)
++    await vi.advanceTimersByTimeAsync(60_000)
++    expect(retry).not.toHaveBeenCalled()
++  })
++})
+diff --git a/apps/desktop/src/app/gateway/hooks/boot-timeout-recovery.ts b/apps/desktop/src/app/gateway/hooks/boot-timeout-recovery.ts
+new file mode 100644
+index 00000000000..0f4cc6d624b
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/hooks/boot-timeout-recovery.ts
+@@ -0,0 +1,50 @@
++// Timeout is a recoverable observation, not a terminal boot outcome. Keep the
++// failure visible between probes; only a usable descriptor resumes normal boot.
++export class BootTimeoutRecovery {
++  revision = 0
++  private timer: ReturnType<typeof setTimeout> | null = null
++  private delay = 2_000
++  private retry: (() => void) | null = null
++
++  schedule(retry: () => void): void {
++    this.clearTimer()
++    this.retry = retry
++    this.timer = setTimeout(() => {
++      this.timer = null
++      this.retry = null
++      retry()
++    }, this.delay)
++    this.delay = Math.min(this.delay * 2, 30_000)
++  }
++
++  expedite(): void {
++    const retry = this.retry
++
++    if (!retry) {
++      return
++    }
++    this.clearTimer()
++    this.retry = null
++    retry()
++  }
++
++  stop(): void {
++    this.clearTimer()
++    this.retry = null
++    this.delay = 2_000
++  }
++
++  invalidate(): void {
++    this.stop()
++    this.revision += 1
++  }
++
++  private clearTimer(): void {
++    if (this.timer !== null) {
++      clearTimeout(this.timer)
++    }
++    this.timer = null
++  }
++}
++
++export { isBackendReadinessTimeout } from '@hermes/shared'
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot-timeout.test.tsx b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-timeout.test.tsx
+new file mode 100644
+index 00000000000..a12ff2121a6
+--- /dev/null
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot-timeout.test.tsx
+@@ -0,0 +1,211 @@
++import { act, cleanup, render, screen } from '@testing-library/react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++
++import { BootFailureOverlay } from '@/components/boot-failure-overlay'
++import { en } from '@/i18n/en'
++import { BACKEND_BOOT_WAIT_TIMEOUT_MS } from '@/lib/with-timeout'
++import { $desktopBoot } from '@/store/boot'
++import { closeSecondaryGateways } from '@/store/gateway'
++import { $activeGatewayProfile } from '@/store/profile'
++import { $connection, $gatewayState, $selectedStoredSessionId, setSelectedStoredSessionId } from '@/store/session'
++
++import { deferred } from '../../../test/deferred'
++import { FakeWebSocket } from '../../../test/fake-gateway-socket'
++
++import { takeGatewaySurvivor } from './gateway-hmr-survivor'
++import { useGatewayBoot } from './use-gateway-boot'
++
++// The blocked update-hold screen's renderer leg (R8 D3/M6): a hold the main
++// process publishes on boot progress lands in $desktopBoot even after boot.
++// Shares the fake socket with use-gateway-boot.test.tsx; the desktop bridge
++// here carries only what the boot hook touches.
++
++vi.mock(import('@/store/notifications'), async importOriginal => ({
++  ...(await importOriginal()),
++  notifyError: vi.fn()
++}))
++
++vi.mock(import('@/store/terminal-backend-warning'), () => ({
++  warnIfTerminalBackendUnavailable: vi.fn(async () => false)
++}))
++
++const primaryConn = {
++  authMode: 'token' as const,
++  baseUrl: 'https://vps.example.com',
++  connectionId: 'primary-vps',
++  profile: 'default',
++  token: 't',
++  wsUrl: 'wss://vps.example.com/api/ws?token=t'
++}
++
++function fakeDesktop() {
++  let bootProgressHandler: ((payload: Record<string, unknown>) => void) | null = null
++  const unsubscribe = () => () => undefined
++
++  return {
++    getConnection: vi.fn(async () => primaryConn),
++    getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primaryConn.wsUrl),
++    getBootProgress: vi.fn(async () => ({
++      error: null,
++      fakeMode: false,
++      message: '',
++      phase: 'init',
++      progress: 0,
++      retryable: false,
++      running: true,
++      timestamp: Date.now()
++    })),
++    onBootProgress: vi.fn(callback => {
++      bootProgressHandler = callback
++
++      return () => {
++        bootProgressHandler = null
++      }
++    }),
++    emitBootProgress(payload: Record<string, unknown>) {
++      bootProgressHandler?.(payload)
++    },
++    onBackendExit: vi.fn(unsubscribe),
++    onConnectionApplied: vi.fn(unsubscribe),
++    onPowerResume: vi.fn(unsubscribe),
++    revalidateConnection: vi.fn(async () => ({ ok: true, rebuilt: false })),
++    onWindowStateChanged: vi.fn(unsubscribe),
++    profile: { get: vi.fn(async () => ({ profile: 'default' })) }
++  }
++}
++
++function Harness({ refreshSessions = async () => undefined } = {}) {
++  useGatewayBoot({
++    beforeConnectionSwitch: () => undefined,
++    handleGatewayEvent: () => undefined,
++    handleServerRequest: () => false,
++    onConnectionReady: () => undefined,
++    onGatewayReady: () => undefined,
++    refreshHermesConfig: async () => undefined,
++    refreshSessions
++  })
++
++  return null
++}
++
++function closeSurvivor() {
++  try {
++    takeGatewaySurvivor()?.gateway.close()
++  } catch {
++    // ignore
++  }
++}
++
++const originalWebSocket = globalThis.WebSocket
++
++beforeEach(() => {
++  closeSurvivor()
++  closeSecondaryGateways()
++  $activeGatewayProfile.set('default')
++  $connection.set(null)
++  vi.useFakeTimers()
++  FakeWebSocket.mode = 'open'
++  FakeWebSocket.instances = []
++  FakeWebSocket.pingMode = 'pong'
++  ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
++  $gatewayState.set('idle')
++  $desktopBoot.set({
++    error: null,
++    fakeMode: false,
++    message: '',
++    phase: 'init',
++    progress: 0,
++    running: true,
++    timestamp: Date.now(),
++    visible: true
++  })
++})
++
++afterEach(() => {
++  cleanup()
++  closeSurvivor()
++  closeSecondaryGateways()
++  $connection.set(null)
++  vi.useRealTimers()
++  setSelectedStoredSessionId(null)
++  ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++async function flushAsync() {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(0)
++  })
++}
++
++it.each([false, true])('recovers timeout without reload (cross-window reset: %s)', async reset => {
++  const desktop = fakeDesktop()
++  const pending = deferred<typeof primaryConn>()
++  desktop.getConnection.mockImplementationOnce(() => pending.promise)
++  Object.assign(desktop, {
++    getRecentLogs: async () => ({ lines: [] }),
++    getBootstrapState: async () => null,
++    getConnectionConfig: async () => ({ mode: 'local' })
++  })
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++  const refreshSessions = vi.fn(async () => undefined)
++
++  const view = render(
++    <>
++      <Harness refreshSessions={refreshSessions} />
++      <BootFailureOverlay />
++    </>
++  )
++
++  await flushAsync()
++  setSelectedStoredSessionId('retained-session')
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS)
++  })
++  expect($desktopBoot.get().error).toMatch(/Timed out connecting/)
++  expect(screen.getByText(en.boot.failure.title)).toBeTruthy()
++  expect($desktopBoot.get().running).toBe(false)
++
++  if (reset) {
++    act(() => desktop.emitBootProgress({ phase: 'bootstrap.reset' }))
++  }
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(reset ? 1 : 2_001)
++  })
++  await flushAsync()
++  expect($desktopBoot.get().error).toBeNull()
++  expect($desktopBoot.get().progress).toBe(100)
++  expect(screen.queryByText(en.boot.failure.title)).toBeNull()
++  expect(refreshSessions).toHaveBeenCalledOnce()
++  expect($selectedStoredSessionId.get()).toBe('retained-session')
++  const connectionCalls = desktop.getConnection.mock.calls.length
++  act(() => desktop.emitBootProgress({ phase: 'bootstrap.reset' }))
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(30_000)
++  })
++  expect(desktop.getConnection).toHaveBeenCalledTimes(connectionCalls)
++  expect(refreshSessions).toHaveBeenCalledOnce()
++  view.unmount()
++})
++
++it('stops queued recovery on unmount and ignores a late original readiness reply', async () => {
++  const desktop = fakeDesktop()
++  const pending = deferred<typeof primaryConn>()
++  desktop.getConnection.mockImplementationOnce(() => pending.promise)
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++  const refreshSessions = vi.fn(async () => undefined)
++  const view = render(<Harness refreshSessions={refreshSessions} />)
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(BACKEND_BOOT_WAIT_TIMEOUT_MS)
++  })
++  expect($desktopBoot.get().error).toMatch(/Timed out connecting/)
++  view.unmount()
++  const calls = desktop.getConnection.mock.calls.length
++  pending.resolve(primaryConn)
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(60_000)
++  })
++  expect(desktop.getConnection).toHaveBeenCalledTimes(calls)
++  expect(refreshSessions).not.toHaveBeenCalled()
++  expect($desktopBoot.get().error).toMatch(/Timed out connecting/)
++})
+diff --git a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+index fac3bc3d71d..2072ee62539 100644
+--- a/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
++++ b/apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts
+@@ -113,6 +113,7 @@
+ 
+ import { isRemoteUpdatePausedBootError, RemoteUpdateWait } from '../remote-update-wait'
+ 
++import { BootTimeoutRecovery, isBackendReadinessTimeout } from './boot-timeout-recovery'
+ import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
+ import { notifyPrimaryReauth } from './primary-reauth-notice'
+ import { useConnectionsRegistry } from './use-connections-registry'
+@@ -150,8 +151,8 @@
+ // The renderer re-attempts the whole boot with the same full-jitter backoff the
+ // post-boot reconnect loop uses, up to this many attempts. Retries are bounded
+ // and end in the real recovery affordance (the boot-failure overlay with
+-// Retry / Settings), never an infinite spinner. Local failures and confirmed
+-// reauth rejections never enter this loop.
++// Retry / Settings), never an infinite spinner. Readiness timeouts instead keep
++// their recovery overlay visible while probing; reauth never retries.
+ const BOOT_RETRY_MAX_ATTEMPTS = 5
+ // Base delay for boot retries. Deliberately slower than the socket reconnect
+ // loop's 300ms: each attempt may rebuild an SSH master + remote dashboard.
+@@ -444,6 +445,7 @@
+     let bootRetryAttempt = 0
+     let bootRetryTimer: ReturnType<typeof setTimeout> | null = null
+     const remoteUpdateWait = new RemoteUpdateWait()
++    const timeoutRecovery = new BootTimeoutRecovery()
+ 
+     const clearBootRetryTimer = () => {
+       if (bootRetryTimer !== null) {
+@@ -893,6 +895,7 @@
+         // token is returned and must follow the normal boot-failure path.
+         switchToken = beginGatewaySwitch()
+         const ownsSwitch = () => !cancelled && switchToken !== null && isCurrentGatewaySwitch(switchToken)
++        timeoutRecovery.invalidate()
+         clearReconnectTimer()
+         clearBootRetryTimer()
+         clearLivenessReprobeTimer()
+@@ -1042,6 +1045,12 @@
+         return
+       }
+ 
++      if (payload.phase === 'bootstrap.reset') {
++        timeoutRecovery.expedite()
++
++        return
++      }
++
+       // Soft switch / post-boot startHermes re-emits progress — ignore so the
+       // cold-boot CONNECTING overlay stays down. A boot that ended in failure
+       // is concluded too: replaying its steps would take the recovery overlay
+@@ -1088,18 +1097,18 @@
+       })
+       .catch(() => undefined)
+ 
+-    setDesktopBootStep({
+-      phase: 'renderer.boot',
+-      message: translateNow('boot.steps.startingDesktopConnection'),
+-      progress: 6
+-    })
++    function startBootProgress() {
++      setDesktopBootStep({
++        phase: 'renderer.boot',
++        message: translateNow('boot.steps.startingDesktopConnection'),
++        progress: 6
++      })
++    }
++
++    startBootProgress()
+ 
+-    // HMR adoption: in a dev hot update, the previous effect instance parked its
+-    // still-open socket instead of closing it (see the cleanup below). Re-adopt
+-    // it so an edit doesn't drop the live agent session. A stale (closed) parked
+-    // socket is discarded and we boot fresh. No-op in production: import.meta.hot
+-    // is undefined there, so this folds to `null` and the whole survivor module
+-    // dead-code-eliminates out of the bundle.
++    // HMR reuses the parked open socket to preserve live sessions; stale sockets
++    // boot fresh. Production has no import.meta.hot and eliminates this module.
+     const survivor = import.meta.hot ? takeGatewaySurvivor() : null
+     const adoptedFromHmr = Boolean(survivor && !survivorIsStale(survivor))
+ 
+@@ -1600,7 +1609,36 @@
+       })
+     })
+ 
+-    async function boot() {
++    function ownsBoot(revision: number) {
++      return !cancelled && revision === timeoutRecovery.revision
++    }
++
++    async function resolveBootBackend(recovering: boolean, revision: number) {
++      const conn = await withTimeout(
++        getWindowBackend(true),
++        recovering ? RECONNECT_ATTEMPT_TIMEOUT_MS : BACKEND_BOOT_WAIT_TIMEOUT_MS,
++        'Timed out connecting to Hermes backend'
++      )
++
++      if (!ownsBoot(revision)) {
++        return null
++      }
++      timeoutRecovery.stop()
++
++      if (recovering) {
++        bootFailed = false
++        resumeDesktopBootForRetry(translateNow('boot.steps.connectingGateway'))
++      }
++
++      return conn
++    }
++
++    function remoteDial(conn: HermesConnection, wsUrl: string) {
++      return conn.mode === 'remote' && isGatewayWebSocketUrl(wsUrl)
++    }
++
++    async function boot(recoveringTimeout = false) {
++      const revision = timeoutRecovery.revision
+       const selectionRevision = currentProfileSelectionRevision()
+       // Where this boot attempt got to — a historical fact, not a late read of
+       // gateway.connectionState. A socket can close after a successful dial;
+@@ -1615,13 +1653,9 @@
+         // round-trip must not hang "Starting Hermes…" forever. Initial boot
+         // rides out a full backend cold spawn, so it gets the shared 45s
+         // backend-boot budget, not the 20s reconnect budget.
+-        const conn = await withTimeout(
+-          getWindowBackend(true),
+-          BACKEND_BOOT_WAIT_TIMEOUT_MS,
+-          'Timed out connecting to Hermes backend'
+-        )
++        const conn = await resolveBootBackend(recoveringTimeout, revision)
+ 
+-        if (cancelled) {
++        if (!conn) {
+           return
+         }
+ 
+@@ -1642,7 +1676,7 @@
+         const profileLookup = lookupPrimaryProfile(conn)
+         const primaryProfile = await profileLookup.catch(() => normalizeProfileKey(primaryProfileOverride(conn)))
+ 
+-        if (cancelled) {
++        if (!ownsBoot(revision)) {
+           return
+         }
+ 
+@@ -1680,7 +1714,7 @@
+         // Only a valid WebSocket dial against a remote descriptor counts as a
+         // transient renderer-side failure; URL and capability failures stay
+         // terminal at their own boundaries.
+-        if (conn.mode === 'remote' && isGatewayWebSocketUrl(wsUrl)) {
++        if (remoteDial(conn, wsUrl)) {
+           stage = 'dialing'
+         }
+ 
+@@ -1712,14 +1746,14 @@
+ 
+               await gateway.connect(url)
+             },
+-            isCancelled: () => cancelled,
++            isCancelled: () => !ownsBoot(revision),
+             initialUrl: wsUrl
+           })
+         }
+ 
+         stage = 'connected'
+ 
+-        if (cancelled) {
++        if (!ownsBoot(revision)) {
+           return
+         }
+ 
+@@ -1755,7 +1789,7 @@
+           })
+         ])
+ 
+-        if (cancelled) {
++        if (!ownsBoot(revision)) {
+           return
+         }
+ 
+@@ -1770,9 +1804,20 @@
+         // launch is the common path, so it must warn too, not only softSwitch.
+         void warnIfTerminalBackendUnavailable()
+       } catch (err) {
+-        if (!cancelled) {
++        if (ownsBoot(revision)) {
+           const message = err instanceof Error ? err.message : String(err)
+-          // [daveey] A remote's own update pauses SSH startup: poll past the bounded budget until it exits.
++
++          if (isBackendReadinessTimeout(err, stage)) {
++            bootFailed = true
++            failDesktopBoot(message)
++            setSessionsLoading(false)
++            timeoutRecovery.schedule(() => void boot(true))
++
++            return
++          }
++
++          timeoutRecovery.stop()
++          // A remote update pauses SSH startup: poll until it exits or its budget expires.
+           const updatePaused = isRemoteUpdatePausedBootError(err)
+           const updateDelay = updatePaused ? remoteUpdateWait.next() : null
+ 
+@@ -1868,14 +1913,19 @@
+       void boot()
+     }
+ 
++    function clearBootTimers() {
++      clearReconnectTimer()
++      clearBootRetryTimer()
++      clearLivenessReprobeTimer()
++      timeoutRecovery.stop()
++    }
++
+     return () => {
+       cancelled = true
+       offPrimaryRecovery()
+       offSwitchLifecycle()
+       endGatewaySwitch()
+-      clearReconnectTimer()
+-      clearBootRetryTimer()
+-      clearLivenessReprobeTimer()
++      clearBootTimers()
+       clearInterval(pruneTimer)
+       offWorking()
+       offAttention()
+diff --git a/apps/shared/src/backend-readiness-timeout.ts b/apps/shared/src/backend-readiness-timeout.ts
+new file mode 100644
+index 00000000000..1179c82ae33
+--- /dev/null
++++ b/apps/shared/src/backend-readiness-timeout.ts
+@@ -0,0 +1,6 @@
++/** Readiness timeouts are observations, not proof of a broken local install. */
++export function isBackendReadinessTimeout(error: unknown, stage = 'resolving'): boolean {
++  return (
++    stage === 'resolving' && error instanceof Error && /timed out.*(?:Hermes backend|backend port)/i.test(error.message)
++  )
++}
+diff --git a/apps/shared/src/index.ts b/apps/shared/src/index.ts
+index 287ea16be04..d1e3013db86 100644
+--- a/apps/shared/src/index.ts
++++ b/apps/shared/src/index.ts
+@@ -1,4 +1,5 @@
+ export { hasAnsi, sanitizeAnsiForRender, stripAnsi } from './ansi'
++export { isBackendReadinessTimeout } from './backend-readiness-timeout'
+ export { backendScopeKey, backendScopePrefix, LOCAL_CONNECTION_ID, registryBackendScopeKey } from './backend-scope'
+ export {
+   BILLING_REFUSAL_POLICY,
+-- 
+2.43.0
+

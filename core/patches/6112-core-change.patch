@@ -1,0 +1,344 @@
+From 8b92faee8a7b18372ad35289ab68d251f500e5e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:52:11 -0800
+Subject: [PATCH 6112] Kanban chat links, adoption provenance and rejected-retain archive
+
+Public mirror of source commit 8b92faee8a7b18372ad35289ab68d251f500e5e9.
+
+---
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 12289439eb2..545e1c6c8f7 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -402,18 +402,18 @@
+ 
+ def _profile_board_ids(board: str, gateway: str, cards: list[dict[str, Any]]) -> set[str]:
+     """Ids of this gateway's chats' ledger ``cards`` on ``board`` that live on a profile-own board
+-    (``_is_profile_board_card``) and that the board's replica has no task row for (``_present``, the readers' test:
++    (``_unwritable_profile_card``) and that the board's replica has no task row for (``_present``, the readers' test:
+     a profile the Board does carry keeps its links). An unreadable replica keeps every candidate: writing nothing
+     this pass is safe, a refused write is not. [daveey]
+ 
+     The Board has no row for such a card and refuses any write of its chat link (``not_found``). The MacBook's link
+-    to hub ci-sweeper card t_860160eb098edfa1 flipped between unreleased (a pass whose ledger projection listed the card) and
+-    released (a pass whose projection did not), and the Board refused every flip: 8 rejected ops in 3 h on
+-    a single day (drift card t_b4b71ee608c72ab6). Reconcile leaves such links as they are."""
++    to hub ci-sweeper card t_860160eb098edfa1 flipped between unreleased (a stale pass, ``_stale_uids``) and released (the
++    fresh pass after it), and the Board refused every flip: 8 rejected ops in 3 h on a single day (drift card
++    t_b4b71ee608c72ab6). Reconcile leaves such links as they are."""
+     from hermes_cli import kanban_sync_client as ksc
+     from hermes_cli.kanban_session_activity import cached_ro
+     ids = sorted({str(c["id"]) for c in cards if c.get("id") and c.get("session") and c.get("board") == board
+-                  and c.get("origin_gateway") in (None, gateway) and _is_profile_board_card(c)})
++                  and c.get("origin_gateway") in (None, gateway) and _unwritable_profile_card(c, gateway)})
+     if not ids:
+         return set()
+     path = ksc.shadow_path(board)
+@@ -427,22 +427,54 @@
+         return set(ids)
+ 
+ 
+-def _plan(conn: sqlite3.Connection, board: str, gateway: str, ledger: bool) -> tuple[dict, list, set[str]]:
+-    """``(want, rows, profile_board)``: the links this gateway wants in ``conn``, the rows it has (read-only), and
+-    the profile-board card ids whose links it leaves alone (``_profile_board_ids``), from ONE ledger read."""
++def _stale_uids(board: str, gateway: str, cards: list[dict[str, Any]]) -> set[str]:
++    """Uids of the ledger links (``_ledger_links``) on ``board`` that only stale ledger rows want. [daveey]
++
++    A stale row is no evidence that a closed card reopened: the projection marks every closed card whose completion
++    it cannot re-verify ``unknown``/unfinished while this gateway's hermes-hub replica is more than 180 s old
++    (``kanban_origin_ledger.project``, ``fresh``). Reconcile used to un-release those cards' links on such a pass
++    and release them again on the next fresh one, producing repeated
++    Board writes and refusals for cards absent from the Board.
++    Per link, not per card: a card can have a fresh legacy ``shepherd`` row while its ``origin`` row (the
++    ``created`` link) is stale. A link any fresh row names (released or
++    not) is not stale: reconcile then follows that fresh row. ``links_diff`` reports the same rows as
++    ``stale_held``, not as differences.
++
++    Origin-ledger rows only (``via: origin``), where ``stale`` means the projection did not observe the owner's
++    record. A legacy reader row's ``stale`` is the replica's sync age, and its terminal-carry reopen and release
++    paths keep their own rules (``kanban_terminal_carry``)."""
++    stale: set[str] = set()
++    fresh: set[str] = set()
++    for c in cards:
++        if not c.get("id") or not c.get("session") or c.get("board") != board \
++                or c.get("origin_gateway") not in (None, gateway):
++            continue
++        kind = "created" if c.get("via") == "origin" else "shepherd"
++        held = c.get("stale") and c.get("via") == "origin"
++        (stale if held else fresh).add(link_uid(c["id"], gateway, c.get("origin_profile"), c["session"], kind))
++    return stale - fresh
++
++
++def _plan(conn: sqlite3.Connection, board: str, gateway: str,
++          ledger: bool) -> tuple[dict, list, set[str], set[str]]:
++    """``(want, rows, profile_board, stale)``: the links this gateway wants in ``conn``, the rows it has
++    (read-only), the profile-board card ids whose links it leaves alone (``_profile_board_ids``) and
++    the link uids only stale ledger rows want (``_stale_uids``), from ONE ledger read."""
+     from hermes_cli import loop_accounting as la
+     from hermes_cli.kanban_session_activity import _remote_links
+     want = la.timed("sync.links.local", _local_links, conn, gateway)
+     profile_board: set[str] = set()
++    stale: set[str] = set()
+     if ledger:
+         cards = _remote_links()
++        stale = _stale_uids(board, gateway, cards)
+         profile_board = la.timed("sync.links.profile_board", _profile_board_ids, board, gateway, cards)
+         want.update(la.timed("sync.links.ledger", _ledger_links, board, gateway, cards, profile_board))
+     want.update(la.timed("sync.links.owner_releases", _owner_written_releases, board, gateway, want))
+     with la.pass_("sync.links.existing"):
+         rows = conn.execute("SELECT uid, released, chat_session, kind, task_id, chat_profile FROM task_chat_links "
+                             "WHERE chat_gateway = ?", (gateway,)).fetchall()
+-    return want, rows, profile_board
++    return want, rows, profile_board, stale
+ 
+ 
+ def _machine_releases(want: dict, rows: list, gateway: str,
+@@ -465,7 +497,7 @@
+ 
+ def machine_links(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: bool = True) -> list[dict[str, Any]]:
+     """Dry run: the links to this gateway's machine sessions the next :func:`reconcile` of ``board`` releases."""
+-    want, rows, profile_board = _plan(conn, board, gateway, ledger)
++    want, rows, profile_board, _stale = _plan(conn, board, gateway, ledger)
+     return _machine_releases(want, rows, gateway, profile_board)
+ 
+ 
+@@ -493,7 +525,7 @@
+     from hermes_cli.kanban_creator_chats import backfill
+     from hermes_cli import loop_accounting as la
+     la.timed("sync.links.backfill", backfill, conn)
+-    want, rows, profile_board = la.timed("sync.links.plan", _plan, conn, board, gateway, ledger)
++    want, rows, profile_board, stale = la.timed("sync.links.plan", _plan, conn, board, gateway, ledger)
+     machine = la.timed("sync.links.machine_releases", _machine_releases, want, rows, gateway, profile_board)
+     from hermes_cli.kanban_placement import is_placeholder_session
+     have = {r[0]: r[1] for r in rows}
+@@ -535,6 +567,8 @@
+                     ":created_at)", link)
+                 added += 1
+             elif have[uid] != link["released"]:
++                if have[uid] and not link["released"] and uid in stale:
++                    continue  # a stale observation never reopens a released link (``_stale_uids``)
+                 conn.execute("UPDATE task_chat_links SET released = ? WHERE uid = ?", (link["released"], uid))
+                 changed += 1
+         for uid, was_released in have.items():
+@@ -747,6 +781,18 @@
+     return card.get("ownership_state") == "qualified" and card.get("profile") not in (None, "", "default")
+ 
+ 
++def _unwritable_profile_card(card: dict[str, Any], gateway: str) -> bool:
++    """The writer's candidate test for ``_profile_board_ids``: a qualified profile-board card
++    (``_is_profile_board_card``), or another gateway's origin-ledger row (``via: origin``, which names its owner's
++    exact profile from the binding but carries no ``ownership_state``) of a non-default profile (hub ci-sweeper
++    t_860160eb098edfa1). A candidate the replica carries is still written. Readers keep their own rule: an
++    origin row of another profile stays an ordinary remote obligation there. [daveey]"""
++    if _is_profile_board_card(card):
++        return True
++    return (card.get("via") == "origin" and card.get("profile") not in (None, "", "default")
++            and card.get("gateway") not in (None, gateway))
++
++
+ def _profile_board_cards(cards: list[dict[str, Any]], gateway: str, profile: str, statuses: tuple[str, ...],
+                          replicas: list[tuple[str, Path]], read_ok: set[str],
+                          ids: Optional[set[str]] = None) -> list[dict[str, Any]]:
+@@ -1036,12 +1082,17 @@
+     from hermes_cli.kanban_session_activity import _remote_links
+     ledger: dict[str, set[tuple[str, str, str]]] = {}
+     profiles: dict[str, set[Any]] = {}
++    stale_rows: dict[str, set[tuple[str, str, str]]] = {}
++    fresh_rows: dict[str, set[tuple[str, str, str]]] = {}
+     for card in _remote_links():
+         if card.get("origin_gateway") not in (None, gateway) or not card.get("session"):
+             continue
+         if not _ledger_obligation(card, statuses):
+             continue
+-        ledger.setdefault(card["session"], set()).add((card["gateway"], card["board"], card["id"]))
++        ref = (card["gateway"], card["board"], card["id"])
++        held = card.get("stale") and card.get("via") == "origin"  # as ``_stale_uids``
++        (stale_rows if held else fresh_rows).setdefault(card["session"], set()).add(ref)
++        ledger.setdefault(card["session"], set()).add(ref)
+         profiles.setdefault(card["session"], set()).add(card.get("origin_profile"))
+     replica: dict[str, set[tuple[str, str, str]]] = {}
+     profile_board: dict[str, set[tuple[str, str, str]]] = {}
+@@ -1072,6 +1123,14 @@
+     sessions = set(ledger) | set(replica)
+     only_ledger = {s: sorted(ledger.get(s, set()) - replica.get(s, set())) for s in sessions}
+     only_replica = {s: sorted(replica.get(s, set()) - ledger.get(s, set())) for s in sessions}
++    # [daveey] A ledger obligation only stale rows name (owner or replica not observed recently) is unverifiable,
++    # and the writer keeps its released link released (``_stale_uids``): ``stale_held``, not a difference. It is a
++    # coarse bucket: a link genuinely missing for such a card is also listed here (the replica readers do not list
++    # released links, so the two cannot be told apart) until a fresh row decides it.
++    stale_held = {s: sorted(r for r in v if r in stale_rows.get(s, set()) and r not in fresh_rows.get(s, set()))
++                  for s, v in only_ledger.items()}
++    only_ledger = {s: [r for r in v if r not in stale_held[s]] for s, v in only_ledger.items()}
++    stale_held = {s: v for s, v in stale_held.items() if v}
+     only_ledger = {s: v for s, v in only_ledger.items() if v}
+     only_replica = {s: v for s, v in only_replica.items() if v}
+     # An unreadable replica answers nothing (see above).
+@@ -1079,5 +1138,6 @@
+             "ledger_links": sum(len(v) for v in ledger.values()), "replica_links": sum(len(v) for v in replica.values()),
+             "machine_links": machine_links, "profile_board_links": sum(len(v) for v in profile_board.values()),
+             "profile_board": {s: sorted(v) for s, v in profile_board.items() if v},
++            "stale_held_links": sum(len(v) for v in stale_held.values()), "stale_held": stale_held,
+             "only_in_ledger": only_ledger, "only_in_replica": only_replica,
+             "unreadable": unreadable}
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 09e5aa5f361..b6b1415ee56 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -157,10 +157,11 @@
+     if args.json:
+         print(json.dumps(report, indent=2, default=str))
+     else:
+-        for k in ("clean", "chats", "ledger_links", "replica_links", "machine_links", "profile_board_links"):
+-            print(f"{k:>16}: {report[k]}")
+-        for k in ("profile_board", "only_in_ledger", "only_in_replica"):
+-            items = [(s, c) for s, cards in report[k].items() for c in cards]
++        for k in ("clean", "chats", "ledger_links", "replica_links", "machine_links", "profile_board_links",
++                  "stale_held_links"):
++            print(f"{k:>16}: {report.get(k, 0)}")
++        for k in ("profile_board", "stale_held", "only_in_ledger", "only_in_replica"):
++            items = [(s, c) for s, cards in (report.get(k) or {}).items() for c in cards]
+             print(f"{k:>16}: {len(items)} {items[:8]}")
+         for k, diff in (report.get("in_flight") or {}).items():
+             items = [(s, c) for s, cards in diff.items() for c in cards]
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index fb86951c1a6..dd88d66e2ce 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -571,6 +571,134 @@
+     assert [o["task_id"] for o in links.machine_links(live, "default", ME)] == ["t_plain"]
+ 
+ 
++def _stale_row(task_id, session, profile="default"):
++    """An origin-ledger row as ``kanban_origin_ledger.project`` gives it while this gateway's hermes-hub replica is
++    more than 180 s old: every closed card it cannot re-verify reads ``unknown``, unfinished and stale."""
++    return {**_ledger_row(task_id, session, via="origin", status="unknown"), "stale": True, "released": None,
++            "profile": profile}
++
++
++def test_a_stale_ledger_pass_never_reopens_released_links(live, monkeypatch):
++    """[daveey] A stale hub replica can make the origin ledger list
++    closed cards as unknown/unfinished. Reconcile previously un-released their links, then released
++    them again on a fresh pass, generating redundant Board writes. A
++    stale observation now changes no released link regardless of board
++    or missing ownership_state; a fresh unfinished row still reopens one."""
++    carried = links.link_uid("t_closed", ME, "default", "s1", "created")
++    sweeper = links.link_uid("t_860160eb098edfa1", ME, "default", "s_old", "created")
++    with kbc.write_txn(live):
++        for uid, tid, sid in ((carried, "t_closed", "s1"), (sweeper, "t_860160eb098edfa1", "s_old")):
++            live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                         "released, created_at) VALUES (?, ?, ?, 'default', ?, 'created', 1, 1)", (uid, tid, ME, sid))
++        live.execute("DELETE FROM kanban_sync_outbox")
++    stale = [_stale_row("t_closed", "s1"), _stale_row("t_860160eb098edfa1", "s_old", profile="ci-sweeper")]
++    fresh: list = []  # a fresh projection drops a closed card (archived without a verified completion)
++    rows = stale
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: rows)
++    for rows in (stale, fresh, stale, fresh, stale):
++        links.reconcile(live, "default", ME)
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_chat_links'").fetchone()
++    assert {("t_closed", "s1", "created", 1), ("t_860160eb098edfa1", "s_old", "created", 1)} <= _links(live)
++    rows = [{**_ledger_row("t_closed", "s1", via="origin", status="running"), "stale": False}]  # really reopened
++    assert links.reconcile(live, "default", ME)["changed"] == 1
++    assert ("t_closed", "s1", "created", 0) in _links(live)
++
++
++def test_a_stale_legacy_row_still_reopens_its_link(live, monkeypatch):
++    """The hold is for origin-ledger rows only: a legacy reader row's ``stale`` is the replica's sync age, and its
++    terminal-carry reopen still un-releases the link, as before."""
++    uid = links.link_uid("t_legacy", ME, "default", "s1", "shepherd")
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES (?, 't_legacy', ?, 'default', 's1', 'shepherd', 1, 1)", (uid, ME))
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [
++        {**_ledger_row("t_legacy", "s1", status="ready"), "stale": True}])
++    assert links.reconcile(live, "default", ME)["changed"] == 1
++    assert ("t_legacy", "s1", "shepherd", 0) in _links(live)
++
++
++def test_only_a_link_that_only_stale_rows_want_is_held(live, monkeypatch):
++    """Held per link: a fresh unfinished row for the same link still reopens it, and a fresh legacy ``shepherd``
++    row of the same card does not un-hold the stale ``origin`` row's ``created`` link."""
++    uid = links.link_uid("t_both", ME, "default", "s1", "created")
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES (?, 't_both', ?, 'default', 's1', 'created', 1, 1)", (uid, ME))
++    held = links.link_uid("t_mixed", ME, "default", "s3", "created")
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_chat_links (uid, task_id, chat_gateway, chat_profile, chat_session, kind, "
++                     "released, created_at) VALUES (?, 't_mixed', ?, 'default', 's3', 'created', 1, 1)", (held, ME))
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [
++        _stale_row("t_both", "s1"), {**_ledger_row("t_both", "s1", via="origin"), "stale": False},
++        _stale_row("t_mixed", "s3"), {**_ledger_row("t_mixed", "s3", status="done", released=True), "stale": False}])
++    links.reconcile(live, "default", ME)
++    assert ("t_both", "s1", "created", 0) in _links(live)
++    assert ("t_mixed", "s3", "created", 1) in _links(live) and ("t_mixed", "s3", "shepherd", 1) in _links(live)
++
++
++def test_a_fresh_profile_board_row_without_ownership_state_writes_no_link(live, monkeypatch):
++    """An origin-ledger row names its owner's exact profile but carries no ``ownership_state``: a non-default
++    profile's card the replica lacks is a profile-own board card all the same, and its link is never written."""
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [
++        {**_ledger_row("t_sweep", "s1", via="origin"), "profile": "ci-sweeper", "stale": False}])
++    links.reconcile(live, "default", ME)
++    assert not any(t == "t_sweep" for t, *_ in _links(live))
++
++
++def test_links_diff_reports_stale_held_links_apart_from_differences(live, kanban_home, monkeypatch, tmp_path):
++    """The writer keeps a released link released while only stale ledger rows want it, so ``links_diff`` lists that
++    obligation as ``stale_held``, not ``only_in_ledger``. A fresh unfinished row the replica lacks is still a
++    difference."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_closed", "closed", "done", OTHER)], [("t_closed", ME, "s1", "created", 1)])
++    monkeypatch.setattr(ksc, "board_paths", lambda: [("default", kanban_home / "kanban.db")])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: rep)
++    rows = [_stale_row("t_closed", "s1")]
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: rows)
++    report = links.links_diff(ME, ksa.LISTED_STATUSES)
++    assert report["clean"], report
++    assert report["stale_held"] == {"s1": [(OTHER, "default", "t_closed")]} and report["stale_held_links"] == 1
++    rows.append({**_ledger_row("t_lost", "s1", via="origin"), "stale": False})
++    report = links.links_diff(ME, ksa.LISTED_STATUSES)
++    assert not report["clean"] and report["only_in_ledger"] == {"s1": [(OTHER, "default", "t_lost")]}
++
++
++def test_a_non_default_origin_row_the_replica_carries_keeps_its_link(live, monkeypatch, tmp_path):
++    """The widened profile-board test still asks the replica: an origin-ledger card of a non-default profile that
++    the Board carries is no profile-own board card, and its link is written."""
++    rep = tmp_path / "default.db"
++    _replica(rep, [("t_work", "work", "running", OTHER)], [])
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: rep)
++    monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [
++        {**_ledger_row("t_work", "s1", via="origin"), "profile": "work", "stale": False}])
++    links.reconcile(live, "default", ME)
++    assert _links(live) == {("t_work", "s1", "created", 0)}
++
++
++def test_the_writer_treats_another_gateways_non_default_origin_row_as_a_profile_card():
++    """``_unwritable_profile_card``: another gateway's origin-ledger row of a non-default profile is a candidate
++    even without ``ownership_state``; this gateway's own other-profile card and a default-profile card are not. The
++    readers' ``_is_profile_board_card`` is unchanged: such a row stays an ordinary remote obligation there."""
++    theirs = {**_ledger_row("t_x", "s1", via="origin"), "profile": "ci-sweeper"}
++    assert links._unwritable_profile_card(theirs, ME) and not links._is_profile_board_card(theirs)
++    assert not links._unwritable_profile_card({**theirs, "gateway": ME}, ME)
++    assert not links._unwritable_profile_card({**theirs, "profile": "default"}, ME)
++    assert links._unwritable_profile_card(_profile_board_row("t_q", "s1"), ME)
++
++
++def test_links_diff_cli_prints_the_stale_held_links(monkeypatch, capsys):
++    from hermes_cli import kanban_sync_cli
++    report = {"clean": True, "chats": 1, "ledger_links": 1, "replica_links": 0, "machine_links": 0,
++              "profile_board_links": 0, "profile_board": {}, "stale_held_links": 1,
++              "stale_held": {"s1": [(OTHER, "default", "t_closed")]}, "only_in_ledger": {}, "only_in_replica": {}}
++    monkeypatch.setattr(links, "links_diff", lambda *a, **k: report)
++    monkeypatch.setattr(ksc, "load_identity", lambda cfg=None: ksc.Identity("https://hub.test", "k", ME))
++    import argparse
++    assert kanban_sync_cli._links_diff(argparse.Namespace(json=False, settle=0)) == 0
++    out = capsys.readouterr().out
++    assert "stale_held_links: 1" in out and "stale_held: 1 [('s1', ('hub', 'default', 't_closed'))]" in out
++
++
+ def test_a_replica_that_carries_a_profile_owned_card_keeps_its_own_answer(tmp_path, monkeypatch):
+     """The ledger fallback is only for cards no readable replica carries: when the Board has the card (a profile
+     the ledger names on a synced board), the replica's links decide, released ones included. A board no replica
+-- 
+2.43.0
+

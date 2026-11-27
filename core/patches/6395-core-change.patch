@@ -1,0 +1,605 @@
+From 12163a4532f8daff2ee004ec1846f56723513e46 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:30:21 +0000
+Subject: [PATCH 6395] Kanban sync refusal audits and diagnostic drift supersession
+
+Public mirror of source commit 12163a4532f8daff2ee004ec1846f56723513e46.
+
+---
+diff --git a/hermes_cli/kanban_history_residue_board.py b/hermes_cli/kanban_history_residue_board.py
+index cb74aa6e83e..c4ca98da7b3 100644
+--- a/hermes_cli/kanban_history_residue_board.py
++++ b/hermes_cli/kanban_history_residue_board.py
+@@ -74,7 +74,8 @@
+     with ExitStack() as stack:
+         stack.callback(hub.close)
+         path = kanban_db_path(board=board)
+-        pulled = client._pull_replica(board, hub, ident.gateway, path, diagnostic=True)
++        from hermes_cli.kanban_sync_diagnostic import refresh
++        pulled = refresh(board, hub, ident.gateway, path)
+         _require(not pulled.busy and not pulled.more, 'diagnostic_refresh_incomplete')
+         stack.enter_context(board_sync_lock(path))
+         live = kbc.connect(path)
+@@ -106,8 +107,7 @@
+             cut._fresh(started)
+             first = custody.stage_once(ledger, identity, request_json)
+         if first:
+-            try:
+-                transport._request(hub, 'POST', transport._path(board), request_json.encode('utf-8'))
+-            except (OSError, client.HubError, Refused, ValueError):
+-                pass  # Only exact GET can reconcile an uncertain outcome; never POST again.
++            # Keep the immutable intent, but never replace the initial failure with
++            # a later observation_unconfirmed. A retry can reconcile by GET only.
++            transport._request(hub, 'POST', transport._path(board), request_json.encode('utf-8'))
+         return transport.reconcile(ledger, hub, board, op_id)
+diff --git a/hermes_cli/kanban_history_residue_http.py b/hermes_cli/kanban_history_residue_http.py
+index 991f3d71571..56d93a9dbc0 100644
+--- a/hermes_cli/kanban_history_residue_http.py
++++ b/hermes_cli/kanban_history_residue_http.py
+@@ -71,8 +71,20 @@
+     try:
+         return transfer.run(read)
+     except urllib.error.HTTPError as exc:
+-        exc.close()
+-        raise HubError(exc.code, 'history observation refused') from exc
++        try:
++            raw = transfer.run(lambda error=exc: error.read(MAX_RESPONSE + 1))
++            detail = 'history observation refused'
++            if len(raw) <= MAX_RESPONSE:
++                try:
++                    code = strict_object(raw.decode('utf-8', 'strict')).get('error')
++                    if isinstance(code, str) and code and len(code) <= 200 and all(
++                            c.isascii() and (c.isalnum() or c in '_.:-') for c in code):
++                        detail = code
++                except (ValueError, UnicodeError):
++                    pass  # Untrusted error text is never echoed; HTTP status is still preserved.
++        finally:
++            exc.close()
++        raise HubError(exc.code, detail) from exc
+     except http.client.HTTPException as exc:
+         raise OSError('incomplete history observation') from exc
+ 
+@@ -96,19 +108,14 @@
+     Even successful POST replies require a separate authenticated readback. A lost
+     reply or malformed answer cannot manufacture custody; missing GET stays open.
+     """
+-    from hermes_cli.kanban_sync_client import HubError
+-
+     identity = scope(hub, board)
+     _, source = custody._request(request_json)
+     op_id = source['op_id']
+     if not custody.stage_once(conn, identity, request_json):
+         return reconcile(conn, hub, board, op_id)
+-    try:
+-        # Send the exact durable request bytes, not a re-encoded Python object.
+-        _request(hub, 'POST', _path(board), request_json.encode('utf-8'))
+-    except (OSError, HubError, Refused, ValueError):
+-        # No replacement POST: only exact GET may resolve this uncertain outcome.
+-        pass
++    # Surface the original failure. The durable intent survives every error, so a
++    # later invocation is GET-only even when this POST's delivery is uncertain.
++    _request(hub, 'POST', _path(board), request_json.encode('utf-8'))
+     return reconcile(conn, hub, board, op_id)
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index a6e834926a8..99f41d9e006 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -103,7 +103,12 @@
+     refresh_error = None
+     pulled = ksc.Pulled()
+     try:
+-        pulled = ksc._pull_replica(slug, ksc.Hub(ident), ident.gateway, _path(slug), diagnostic=True)
++        from hermes_cli.kanban_sync_diagnostic import refresh
++        refresh_hub = ksc.Hub(ident)
++        try:
++            pulled = refresh(slug, refresh_hub, ident.gateway, _path(slug))
++        finally:
++            refresh_hub.close()
+     except (ksc.HubError, ksc.Resync, OSError) as exc:
+         refresh_error = str(exc)
+     else:
+@@ -117,10 +122,24 @@
+         if refresh_error is not None:
+             report.update(clean=False, unavailable=True, refresh_error=refresh_error)
+         elif pulled.busy:
+-            report["refresh_skipped"] = "a sync round holds the board; compared against its replica as it stands"
++            report.update(clean=False, refresh_skipped="a sync round holds the board; compared against its replica as it stands")
+         else:
+             from hermes_cli import kanban_history_residue_board as history
+-            if history.ledger_path(slug).exists():
++            if report['rejected_ops']:
++                from hermes_cli import kanban_sync_refusal_audit as refusal
++                from hermes_cli.kanban_sync_guard import board_sync_lock
++                hub = ksc.Hub(ident)
++                try:
++                    with board_sync_lock(_path(slug)):
++                        report = refusal.report(live, shadow, hub, slug, started=started)
++                except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
++                    report.update(clean=False, server_refusal_audit_error=str(exc))
++                finally:
++                    hub.close()
++            proven = set(report.get('audited_server_refusals', [])) | set(report['audited_retain_rejections'])
++            # An unconfirmed history intent must not turn a server-receipted
++            # refusal into unknown custody; it is retained unchanged, not used.
++            if history.ledger_path(slug).exists() and report['rejected_ops'] > len(proven):
+                 hub = ksc.Hub(ident)
+                 try:
+                     audit = history.audit_diff(live, shadow, hub, slug, pulled=pulled, started=started)
+diff --git a/hermes_cli/kanban_sync_diagnostic.py b/hermes_cli/kanban_sync_diagnostic.py
+new file mode 100644
+index 00000000000..4447be430d2
+--- /dev/null
++++ b/hermes_cli/kanban_sync_diagnostic.py
+@@ -0,0 +1,36 @@
++"""Bounded quiet-window diagnostic refresh; no lock bypass or replay. [daveey]"""
++from __future__ import annotations
++
++import threading
++import time
++
++MAX_ATTEMPTS = 12
++MAX_SECONDS = 8.0
++RETRY_SECONDS = 0.25
++
++
++def _wait(seconds):
++    threading.Event().wait(seconds)
++
++
++def refresh(board, hub, gateway, path):
++    """Retry busy/behind only, within both caps. Return incomplete on exhaustion.
++
++    Each pull owns/releases its normal lock. HTTP errors and resync refusals are
++    not quiet-window contention and propagate without retries. A pull already in
++    progress retains its existing network deadline; the window bounds new starts.
++    """
++    from hermes_cli.kanban_sync_client import _pull_replica
++
++    deadline = time.monotonic() + MAX_SECONDS
++    for attempt in range(MAX_ATTEMPTS):
++        result = _pull_replica(board, hub, gateway, path, diagnostic=True)
++        if not result.busy and not result.more:
++            return result
++        remaining = deadline - time.monotonic()
++        if attempt + 1 == MAX_ATTEMPTS or remaining <= 0:
++            return result
++        _wait(min(RETRY_SECONDS, remaining))
++        if time.monotonic() >= deadline:
++            return result
++    return result
+diff --git a/hermes_cli/kanban_sync_refusal_audit.py b/hermes_cli/kanban_sync_refusal_audit.py
+new file mode 100644
+index 00000000000..0348c190ed1
+--- /dev/null
++++ b/hermes_cli/kanban_sync_refusal_audit.py
+@@ -0,0 +1,101 @@
++"""Fresh read-only server-refusal classification; no cached exemptions. [daveey]
++
++A retained op-ID/gateway verdict proves refused transport intent, not historical
++payload/enrollment identity or execution authority. Row convergence is still
++checked independently by the ordinary diff on the final local cut.
++"""
++from __future__ import annotations
++
++from contextlib import ExitStack
++import time
++import urllib.parse
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_history_residue_cut as cut
++from hermes_cli import kanban_history_residue_http as transport
++from hermes_cli.kanban_history_residue_source import _require, strict_object
++
++POLICY_REFUSALS = frozenset({'containment_hold', 'spend_decision_pending', 'missing_decision_episode'})
++MAX_OPS = 20
++
++
++def _generation(conn):
++    return conn.execute('PRAGMA data_version').fetchone()[0], conn.total_changes
++
++
++def _rows(conn):
++    return [dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE state='rejected' ORDER BY op_id LIMIT ?", (MAX_OPS + 1,))]
++
++
++def _receipt(hub, board, op_id):
++    path = '/v2/boards/' + urllib.parse.quote(board, safe='') + '/operation-receipt?'
++    raw = transport._request(hub, 'GET', path + urllib.parse.urlencode({'op_id': op_id}), None)
++    return strict_object(raw.decode('utf-8', 'strict'), max_bytes=transport.MAX_RESPONSE)
++
++
++def _proven(data, board, gateway, row):
++    if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1
++            or data.get('board') != board or data.get('gateway') != gateway
++            or data.get('execution_authority') is not False
++            or data.get('historical_identity_certified') is not False):
++        return False
++    receipt = data.get('receipt')
++    if not isinstance(receipt, dict):
++        return False
++    reason = receipt.get('reason')
++    detail = receipt.get('detail')
++    if not isinstance(reason, str) or reason not in POLICY_REFUSALS or not (detail is None or isinstance(detail, str)):
++        return False
++    error = f'{reason}: {detail or ""}'.strip(': ')
++    return (receipt.get('client_op_id') == row['op_id'] and receipt.get('status') == 'rejected'
++            and error == row.get('last_error') and row.get('state') == 'rejected')
++
++
++def report(live, shadow, hub, board, *, started=None):
++    """Caller owns normal board sync lock after successful diagnostic refresh.
++
++    No SQLite reservation spans HTTP. Generation CAS covers every live/replica
++    change, not just rejected rows. Final zero-wait reservations build the actual
++    ordinary diff; a saved result is never an exemption in a later report.
++    """
++    from hermes_cli.kanban_sync_client import diff
++
++    started = time.monotonic() if started is None else started
++    identity = transport.scope(hub, board)
++    generations = [_generation(c) for c in (live, shadow)]
++    rows = _rows(live)
++    _require(len(rows) <= MAX_OPS, 'refusal_inventory_bound')
++    state = sync.sync_state(shadow) or {}
++    _require(state.get('board_id') == board and state.get('gateway_id') == identity[2], 'replica_identity_changed')
++    head = state.get('cursor')
++    _require(type(head) is int and head >= 0, 'replica_cursor_changed')
++    _require([_generation(c) for c in (live, shadow)] == generations, 'local_cut_inputs_changed')
++    cut._fresh(started)
++    begin = cut._empty(hub, board, head)
++    proofs = []
++    for row in rows:
++        error = row.get('last_error')
++        if not isinstance(error, str) or error.partition(':')[0] not in POLICY_REFUSALS:
++            continue  # Unknown/local/transport failures remain counted, never inferred settled.
++        cut._fresh(started)
++        proof = _receipt(hub, board, row['op_id'])
++        if _proven(proof, board, identity[2], row):
++            proofs.append({'op_id': row['op_id'], 'binding': 'op_id_gateway_verdict_only', 'proof': proof})
++    end = cut._empty(hub, board, head)
++    with ExitStack() as stack:
++        for conn in (live, shadow):
++            stack.enter_context(cut._transaction(conn, reserve=True))
++        cut._fresh(started)
++        _require([_generation(c) for c in (live, shadow)] == generations and _rows(live) == rows,
++                 'local_cut_inputs_changed')
++        result = diff(live, shadow, identity[2])
++        result['audited_server_refusals'] = [p['op_id'] for p in proofs]
++        audits = set(result['audited_server_refusals'])
++        result['clean'] = not (result['missing_in_shadow'] or result['extra_in_shadow']
++                               or result['field_mismatch'] or result['child_mismatch']
++                               or result['rejected_ops'] != len(audits))
++        result['server_refusal_evidence'] = {'head': head, 'begin': begin, 'end': end, 'rows': proofs,
++                                            'execution_authority': False, 'historical_identity_certified': False}
++        cut._fresh(started)
++        return result
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_window.py b/tests/hermes_cli/test_kanban_diagnostic_window.py
+new file mode 100644
+index 00000000000..355b3e9c97d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_diagnostic_window.py
+@@ -0,0 +1,51 @@
++"""Diagnostic pulls wait for a bounded quiet window, never bypass a busy pull."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_diagnostic as diagnostic
++
++
++def test_busy_and_more_retry_then_return_fresh(monkeypatch):
++    results = [client.Pulled(busy=True), client.Pulled(more=True), client.Pulled()]
++    calls = []
++    clock = [0.0]
++    monkeypatch.setattr(diagnostic.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(diagnostic, '_wait', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
++    def pull(*args, **kw):
++        calls.append(kw)
++        return results.pop(0)
++    monkeypatch.setattr(client, '_pull_replica', pull)
++    assert not diagnostic.refresh('default', SimpleNamespace(), 'home', None).busy
++    assert calls == [{'diagnostic': True}] * 3
++
++
++def test_attempt_cap_preserves_busy(monkeypatch):
++    calls = []
++    monkeypatch.setattr(diagnostic, '_wait', lambda seconds: None)
++    monkeypatch.setattr(client, '_pull_replica', lambda *a, **kw: calls.append(kw) or client.Pulled(busy=True))
++    result = diagnostic.refresh('default', None, 'home', None)
++    assert result.busy
++    assert len(calls) == diagnostic.MAX_ATTEMPTS
++
++
++def test_time_cap_does_not_start_another_pull(monkeypatch):
++    clock = [0.0]
++    calls = []
++    monkeypatch.setattr(diagnostic.time, 'monotonic', lambda: clock[0])
++    def pull(*a, **kw):
++        calls.append(kw)
++        clock[0] += diagnostic.MAX_SECONDS
++        return client.Pulled(more=True)
++    monkeypatch.setattr(client, '_pull_replica', pull)
++    assert diagnostic.refresh('default', None, 'home', None).more
++    assert len(calls) == 1
++
++
++def test_errors_are_not_busy_retries(monkeypatch):
++    def pull(*a, **kw):
++        raise OSError('offline')
++    monkeypatch.setattr(client, '_pull_replica', pull)
++    with pytest.raises(OSError, match='offline'):
++        diagnostic.refresh('default', None, 'home', None)
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cli.py b/tests/hermes_cli/test_kanban_history_residue_cli.py
+index 8208d2ef7a3..bed43064b66 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_cli.py
++++ b/tests/hermes_cli/test_kanban_history_residue_cli.py
+@@ -61,3 +61,34 @@
+     assert audit['evidence'][0]['op_id'] == 'op-original'
+     assert audit['execution_authority'] is False
+     assert json.loads(audit['evidence'][0]['proof_json'])['receipt']['source_json'] == audit['evidence'][0]['source_json']
++
++
++def test_known_refusal_bypasses_unconfirmed_history_intent_without_changing_it(configured, capsys, monkeypatch):
++    from hermes_cli import kanban_sync_refusal_audit as refusal
++    from hermes_cli.kanban_sync_client import HubError
++    _paths, _hub, calls, _state, connect = configured
++    original = board.transport._request
++    def failed_post(hub, method, path, body):
++        if method == 'POST':
++            calls.append((method,path,body))
++            raise HubError(409, 'history_residue_op_already_known')
++        return original(hub, method, path, body)
++    monkeypatch.setattr(board.transport, '_request', failed_post)
++    with pytest.raises(HubError, match='history_residue_op_already_known'):
++        board.observe_board('default','op-original','Keep history')
++    with board.closing(board._ledger('default')) as ledger:
++        before = list(ledger.iterdump())
++    live = connect(_paths[0])
++    row = dict(live.execute("SELECT * FROM kanban_sync_outbox WHERE op_id='op-original'").fetchone())
++    reason, _, detail = row['last_error'].partition(': ')
++    proof = dict(version=1, board='default', gateway='home', execution_authority=False,
++                 historical_identity_certified=False, receipt=dict(client_op_id='op-original',
++                 status='rejected',reason=reason,detail=detail or None))
++    monkeypatch.setattr(refusal, '_receipt', lambda *a: proof)
++    assert cli.cmd_sync(args('diff','--json')) == 0
++    result = json.loads(capsys.readouterr().out)
++    assert result['clean'] and result['audited_server_refusals'] == ['op-original']
++    assert not result.get('history_audit_error')
++    assert [c[0] for c in calls] == ['POST']
++    with board.closing(board._ledger('default')) as ledger:
++        assert list(ledger.iterdump()) == before
+diff --git a/tests/hermes_cli/test_kanban_history_residue_http.py b/tests/hermes_cli/test_kanban_history_residue_http.py
+index 3a47c7f6a97..472f45dad0c 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_http.py
++++ b/tests/hermes_cli/test_kanban_history_residue_http.py
+@@ -104,9 +104,27 @@
+     assert db.total_changes == before
+ 
+ 
++def test_definitive_post_error_surfaces_status_and_code_without_repost(db, server):
++    from hermes_cli.kanban_sync_client import HubError
++    hub, state, raw = server
++    state.update(status=409, reply=b'{"error":"history_residue_op_already_known"}')
++    with pytest.raises(HubError, match='history_residue_op_already_known') as raised:
++        transport.observe(db, hub, 'default', raw)
++    assert raised.value.status == 409
++    assert [c[0] for c in state['calls']] == ['POST']
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++    state['status'] = 200
++    state['receipt'] = None
++    with pytest.raises(Refused, match='observation_unconfirmed'):
++        transport.observe(db, hub, 'default', raw)
++    assert [c[0] for c in state['calls']] == ['POST', 'GET']
++
++
+ def test_dropped_post_answer_reconciles_without_repost(db, server):
+     hub, state, raw = server
+     state['post'] = 'drop'
++    with pytest.raises(OSError):
++        transport.observe(db, hub, 'default', raw)
+     assert transport.observe(db, hub, 'default', raw)['recorded']
+     assert [c[0] for c in state['calls']] == ['POST', 'GET']
+ 
+@@ -155,7 +173,7 @@
+         transport.observe(db, hub, 'default', raw)
+     assert str(status) in str(result.value)
+     assert all('/stolen' not in c[1] for c in state['calls'])
+-    assert [c[0] for c in state['calls']] == ['POST', 'GET']
++    assert [c[0] for c in state['calls']] == ['POST']
+     assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py b/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py
+index 1fa495d38b6..898f4b8d1dc 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py
++++ b/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py
+@@ -48,7 +48,7 @@
+     for _ in range(2):
+         with pytest.raises(Exception):
+             transport.observe(db, hub, 'default', raw)
+-    assert [c[0] for c in state['calls']] == ['POST', 'GET', 'GET']
++    assert [c[0] for c in state['calls']] == ['POST', 'GET']
+     assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_push_starvation.py b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+index 35a35e4f1a0..1c9a90004a4 100644
+--- a/tests/hermes_cli/test_kanban_sync_push_starvation.py
++++ b/tests/hermes_cli/test_kanban_sync_push_starvation.py
+@@ -380,7 +380,9 @@
+     before, _ = _replica_state()
+     _other_creates(svc, 4)
+     monkeypatch.setattr(ksc, "load_identity", lambda: svc.hub(ME).ident)
+-    monkeypatch.setattr(ksc, "Hub", lambda ident: svc.hub(ME))
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "close", lambda: None, raising=False)
++    monkeypatch.setattr(ksc, "Hub", lambda ident: hub)
+     with board_sync_lock(kanban_home / "kanban.db"):
+         kanban_sync_cli._diff(argparse.Namespace(board=BOARD, json=True))
+     report = json.loads(capsys.readouterr().out)
+diff --git a/tests/hermes_cli/test_kanban_sync_refusal_audit.py b/tests/hermes_cli/test_kanban_sync_refusal_audit.py
+new file mode 100644
+index 00000000000..ccd47594a5d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_refusal_audit.py
+@@ -0,0 +1,115 @@
++"""Server-receipted policy refusals stay visible without masquerading as drift."""
++import copy
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_refusal_audit as audit
++from hermes_cli.kanban_history_residue_source import Refused
++
++
++@pytest.fixture
++def case(tmp_path, monkeypatch):
++    conns = [sqlite3.connect(tmp_path / name, isolation_level=None) for name in ('live.db', 'shadow.db')]
++    for conn in conns:
++        conn.row_factory = sqlite3.Row
++        conn.executescript('''
++          CREATE TABLE tasks(id TEXT, current_run_id INTEGER, sync_version INTEGER, created_on TEXT, title TEXT);
++          INSERT INTO tasks VALUES ('t_card',NULL,1,'home','same');
++          CREATE TABLE task_runs(id INTEGER, uid TEXT, task_id TEXT, ended_at INTEGER);
++          CREATE TABLE task_links(parent_id TEXT, child_id TEXT);
++          CREATE TABLE task_comments(task_id TEXT, uid TEXT);
++          CREATE TABLE task_chat_links(task_id TEXT, uid TEXT, chat_gateway TEXT);
++          CREATE TABLE kanban_sync_state(board_id TEXT, gateway_id TEXT, cursor INTEGER);
++          INSERT INTO kanban_sync_state VALUES ('default','home',100);
++          CREATE TABLE kanban_sync_outbox(op_id TEXT, table_name TEXT, row_uid TEXT, op TEXT, fields TEXT,
++                                         state TEXT, last_error TEXT);
++        ''')
++    conns[0].execute("INSERT INTO kanban_sync_outbox VALUES ('rejected-op','task_events','event','upsert','{}','rejected','spend_decision_pending: stopped')")
++    proof = dict(version=1, board='default', gateway='home', execution_authority=False,
++                 historical_identity_certified=False, receipt=dict(client_op_id='rejected-op', status='rejected',
++                    reason='spend_decision_pending', detail='stopped', payload_sha256=None))
++    calls = []
++    def receipt(hub, board, op_id):
++        assert all(not c.in_transaction for c in conns)
++        calls.append(op_id)
++        return copy.deepcopy(proof)
++    monkeypatch.setattr(audit, '_receipt', receipt)
++    hub = SimpleNamespace(ident=SimpleNamespace(url='https://example.test', gateway='home', key='key'),
++                          changes=lambda *a: dict(changes=[],more=False,head=100,next=100))
++    yield conns, hub, proof, calls
++    for conn in conns:
++        conn.close()
++
++
++def test_retained_matching_refusal_preserves_rows_and_independent_drift(case):
++    (live, shadow), hub, _proof, calls = case
++    before = [list(c.iterdump()) for c in (live, shadow)]
++    report = audit.report(live, shadow, hub, 'default')
++    assert report['clean'] and report['rejected_ops'] == 1
++    assert report['audited_server_refusals'] == ['rejected-op']
++    assert calls == ['rejected-op']
++    assert [list(c.iterdump()) for c in (live, shadow)] == before
++    assert not report['server_refusal_evidence']['historical_identity_certified']
++    shadow.execute("UPDATE tasks SET title='actual drift'")
++    assert not audit.report(live, shadow, hub, 'default')['clean']
++    shadow.execute("UPDATE tasks SET title='same'")
++    live.execute("INSERT INTO kanban_sync_outbox VALUES ('new-op','task_events','event2','upsert','{}','rejected','conflict')")
++    assert not audit.report(live, shadow, hub, 'default')['clean']
++
++
++@pytest.mark.parametrize('fault', ['missing','applied','reason','detail','id','gateway','board','authority','identity','version'])
++def test_unknown_or_conflicting_receipt_is_not_audited(case, fault):
++    (live, shadow), hub, proof, _calls = case
++    changes = {
++        'missing': (proof, 'receipt', None), 'applied': (proof['receipt'], 'status', 'applied'),
++        'reason': (proof['receipt'], 'reason', 'storage_error'), 'detail': (proof['receipt'], 'detail', 'different'),
++        'id': (proof['receipt'], 'client_op_id', 'another-op'), 'gateway': (proof, 'gateway', 'other'),
++        'board': (proof, 'board', 'other'), 'authority': (proof, 'execution_authority', True),
++        'identity': (proof, 'historical_identity_certified', True), 'version': (proof, 'version', True),
++    }
++    target, key, value = changes[fault]
++    target[key] = value
++    result = audit.report(live, shadow, hub, 'default')
++    assert not result['clean'] and not result['audited_server_refusals']
++
++
++@pytest.mark.parametrize('fault', ['feed','outbox','other_writer','cursor','expired'])
++def test_fresh_cut_races_fail_closed(case, monkeypatch, fault):
++    (live, shadow), hub, _proof, _calls = case
++    original = audit._receipt
++    def external_write():
++        path = live.execute('PRAGMA database_list').fetchone()[2]
++        with sqlite3.connect(path) as writer:
++            writer.execute("UPDATE tasks SET title='new local edit'")
++    actions = {
++        'feed': lambda: setattr(hub, 'changes', lambda *a: dict(changes=[],more=False,head=101,next=101)),
++        'outbox': lambda: live.execute("UPDATE kanban_sync_outbox SET fields='changed'"),
++        'cursor': lambda: shadow.execute('UPDATE kanban_sync_state SET cursor=101'),
++        'expired': lambda: monkeypatch.setattr(audit.cut.time, 'monotonic', lambda: 100000000000.0),
++        'other_writer': external_write,
++    }
++    def receipt(*args):
++        result = original(*args)
++        actions[fault]()
++        return result
++    monkeypatch.setattr(audit, '_receipt', receipt)
++    with pytest.raises(Refused):
++        audit.report(live, shadow, hub, 'default')
++
++
++def test_read_path_is_get_only_and_exact_encoded_identity(case, monkeypatch):
++    (_live, _shadow), hub, proof, _calls = case
++    calls = []
++    def request(remote, method, path, body):
++        calls.append((method,path,body))
++        return json.dumps(proof).encode()
++    monkeypatch.setattr(audit.transport, '_request', request)
++    monkeypatch.undo()
++    # Exercise the real reader independently of the report fixture's replacement.
++    from hermes_cli.kanban_sync_refusal_audit import _receipt
++    monkeypatch.setattr(audit.transport, '_request', request)
++    assert _receipt(hub, 'space board', 'op:exact-id') == proof
++    assert calls == [('GET','/v2/boards/space%20board/operation-receipt?op_id=op%3Aexact-id',None)]
+diff --git a/tests/hermes_cli/test_kanban_sync_rejections.py b/tests/hermes_cli/test_kanban_sync_rejections.py
+index b256e773d29..ffa75637fa8 100644
+--- a/tests/hermes_cli/test_kanban_sync_rejections.py
++++ b/tests/hermes_cli/test_kanban_sync_rejections.py
+@@ -124,7 +124,9 @@
+     monkeypatch.setattr(cli, "_board", lambda args: BOARD)
+     monkeypatch.setattr(cli, "_path", lambda slug: kanban_home / "kanban.db")
+     monkeypatch.setattr(client, "load_identity", lambda: svc.hub(ME).ident)
+-    monkeypatch.setattr(client, "Hub", lambda ident: svc.hub(ME))
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "close", lambda: None, raising=False)
++    monkeypatch.setattr(client, "Hub", lambda ident: hub)
+     assert cli._diff(Namespace(json=True)) == 1
+     assert json.loads(capsys.readouterr().out)["clean"] is False
+     client.sync_board(BOARD, kanban_home / "kanban.db", svc.hub(ME), ME)
+@@ -181,7 +183,9 @@
+     monkeypatch.setattr(cli, "_board", lambda args: BOARD)
+     monkeypatch.setattr(cli, "_path", lambda slug: kanban_home / "kanban.db")
+     monkeypatch.setattr(client, "load_identity", lambda: svc.hub(ME).ident)
+-    monkeypatch.setattr(client, "Hub", lambda ident: svc.hub(ME))
++    hub = svc.hub(ME)
++    monkeypatch.setattr(hub, "close", lambda: None, raising=False)
++    monkeypatch.setattr(client, "Hub", lambda ident: hub)
+     svc.offline = offline
+     rc = cli._diff(Namespace(json=True))
+     report = json.loads(capsys.readouterr().out)
+diff --git a/tests/hermes_cli/test_kanban_sync_round_followups.py b/tests/hermes_cli/test_kanban_sync_round_followups.py
+index a0d39aa532d..9288d66f3de 100644
+--- a/tests/hermes_cli/test_kanban_sync_round_followups.py
++++ b/tests/hermes_cli/test_kanban_sync_round_followups.py
+@@ -354,6 +354,7 @@
+ def _diff(svc_, kanban_home_, monkeypatch, capsys, hub):
+     from hermes_cli import kanban_sync_cli
+     monkeypatch.setattr(ksc, "load_identity", lambda: svc_.hub(ME).ident)
++    monkeypatch.setattr(hub, "close", lambda: None, raising=False)
+     monkeypatch.setattr(ksc, "Hub", lambda ident: hub)
+     code = kanban_sync_cli._diff(argparse.Namespace(board=BOARD, json=True))
+     return code, json.loads(capsys.readouterr().out)
+-- 
+2.43.0
+

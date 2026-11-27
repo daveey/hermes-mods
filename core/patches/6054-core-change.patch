@@ -1,0 +1,378 @@
+From b74cf107b6242e88836b6291a2913461a6c577c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:09:12 +0000
+Subject: [PATCH 6054] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit b74cf107b6242e88836b6291a2913461a6c577c1.
+
+---
+diff --git a/hermes_cli/serve_producer_admission.py b/hermes_cli/serve_producer_admission.py
+index d5f71e45446..5427eb4f3e8 100644
+--- a/hermes_cli/serve_producer_admission.py
++++ b/hermes_cli/serve_producer_admission.py
+@@ -25,11 +25,12 @@
+ from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody, _acquire_runtime
+ 
+ SUPPORTED_LAUNCHES = frozenset(('serve', 'dashboard', 'gateway', 'agent_startup',
+-                                'tui_gateway', 'gateway_spawner', 'plugin_host'))
++                                'tui_gateway', 'gateway_spawner', 'plugin_host', 'producer_broker'))
+ # Hash actual import boundaries, not a version string or inherited environment bit.
+ LAUNCH_SOURCES = ('hermes_cli/main.py', 'gateway/run.py', 'tui_gateway/entry.py',
+                   'hermes_cli/gateway_runtime_start.py', 'hermes_cli/plugin_host_child.py',
+-                  'hermes_cli/serve_producer_admission.py', 'hermes_cli/serve_producer_census.py')
++                  'hermes_cli/serve_producer_admission.py', 'hermes_cli/serve_producer_census.py',
++                  'hermes_cli/serve_producer_process.py', 'hermes_cli/serve_producer_enrollment.py')
+ _MAX_PARTICIPANTS = 8192
+ _MAX_RECEIPTS = 8 * 1024 * 1024
+ 
+@@ -591,10 +592,12 @@
+ 
+ 
+ def inspect_host(runtime: Path, installation: Path, *, root: Path, timeout: float = 10,
+-                 legacy_candidates: tuple[Incarnation, ...] = ()) -> AdmissionCut:
++                  legacy_candidates: tuple[Incarnation, ...] = (), broker=None) -> AdmissionCut:
+     """Gate-held strict cut. Enrollment remains unguarded; COMPLETE stays conservative."""
+     if sys.platform != 'linux':
+         raise AdmissionUnavailable('no linux census adapter')
++    from hermes_cli.serve_producer_enrollment import classify_with_broker
++
+     installation = installation.resolve(strict=True)
+     root = Path(root)
+     generation = launcher_generation(installation)
+@@ -610,7 +613,8 @@
+             boot_id=adapter.boot_id(), generation=generation, installation=str(installation),
+             census=adapter.collect,
+             collectors=host_collectors(root, installation),
+-            classify=lambda record: classify_process(
+-                record, participants, generation, installation=str(installation)),
++            classify=lambda record: classify_with_broker(
++                record, participants, generation, installation=str(installation),
++                runtime=runtime, broker=broker, home=str(root)),
+             legacy_candidates=legacy_candidates, exited=lambda identity: incarnation_exited(adapter, identity),
+         )
+diff --git a/hermes_cli/serve_producer_enrollment.py b/hermes_cli/serve_producer_enrollment.py
+new file mode 100644
+index 00000000000..68922027735
+--- /dev/null
++++ b/hermes_cli/serve_producer_enrollment.py
+@@ -0,0 +1,92 @@
++"""Process-local broker custody evidence, never a persisted guarded boolean.
++
++Only the exec broker may promote its own enrollment ticket. This narrow adapter
++certifies the broker, not arbitrary serves or its children. Legacy serves remain
++conflicts and production startup is still unavailable in this preparatory slice.
++"""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++from hermes_cli.serve_producer_admission import (
++    AdmissionUnavailable, LaunchGate, classify_process, enroll_launch,
++    launcher_generation, observation_digest, read_participants_strict,
++)
++from hermes_cli.serve_producer_census import LinuxProcessCensus
++from hermes_cli.serve_producer_custody import FamilyCustody
++
++
++class BrokerEnrollment:
++    """Own actual panel custody before any provider import, under the launch gate.
++
++    No serialized form is accepted. The descriptor and exact self observation
++    must remain live on every classification. A successor must collect again.
++    """
++
++    def __init__(self, runtime, installation, ticket, owner):
++        self.runtime = runtime
++        self.installation = installation
++        self.ticket = ticket
++        self.owner = owner
++        self._inode = os.fstat(owner.fd)
++
++    @classmethod
++    def acquire(cls, runtime: Path, installation: Path):
++        runtime = runtime.resolve()
++        installation = installation.resolve(strict=True)
++        ticket = enroll_launch(runtime, 'producer_broker', installation=installation)
++        with LaunchGate.acquire(runtime):
++            adapter = LinuxProcessCensus()
++            record = adapter.read_process(os.getpid(), adapter.boot_id())
++            expected = str(installation / 'hermes_cli/serve_producer_process.py')
++            if len(record.argv) < 5 or record.argv[1:4] != ('-I', expected, 'broker'):
++                raise AdmissionUnavailable('only exec broker can claim custody enrollment')
++            if (ticket not in read_participants_strict(runtime)
++                    or ticket.identity != record.identity
++                    or ticket.observation != observation_digest(record)):
++                raise AdmissionUnavailable('broker enrollment changed')
++            owner = FamilyCustody.acquire(runtime, 'panel')
++            try:
++                return cls(runtime, installation, ticket, owner)
++            except BaseException:
++                owner.close()
++                raise
++
++    def matches(self, record, *, runtime, installation, generation):
++        """Read local custody, never trust ticket.guarded or a caller readiness bit."""
++        if (self.owner.fd is None or record.identity.pid != os.getpid()
++                or Path(runtime).resolve() != self.runtime
++                or str(self.installation) != installation
++                or self.ticket.identity != record.identity
++                or self.ticket.observation != observation_digest(record)
++                or self.ticket.generation != generation
++                or launcher_generation(self.installation) != generation):
++            return False
++        current = os.fstat(self.owner.fd)
++        path = (self.runtime / 'panel.lock').stat(follow_symlinks=False)
++        if (current.st_dev, current.st_ino) != (self._inode.st_dev, self._inode.st_ino):
++            return False
++        if (path.st_dev, path.st_ino) != (current.st_dev, current.st_ino):
++            return False
++        # fstat alone would accept a closed descriptor reused for the same inode.
++        # Linux fdinfo is the current kernel observation for this exact descriptor.
++        info = Path(f'/proc/self/fdinfo/{self.owner.fd}').read_text(encoding='ascii')
++        return any(line.startswith('lock:') and ' FLOCK ' in line
++                   and ' WRITE ' in line and f' {os.getpid()} ' in line
++                   for line in info.splitlines())
++
++    def close(self):
++        self.owner.close()
++
++
++def classify_with_broker(record, participants, generation, *, installation, runtime, broker=None, home=''):
++    """Only a live local BrokerEnrollment can promote its exact enrolled record."""
++    from hermes_cli.serve_producer_admission import Classification
++
++    baseline = classify_process(record, participants, generation, installation=installation, home=home)
++    if (baseline.kind == 'legacy' and type(broker) is BrokerEnrollment
++            and broker.ticket in participants
++            and broker.matches(record, runtime=runtime, installation=installation, generation=generation)):
++        return Classification(record.identity, 'participant', f'panel-broker-custody:{generation}')
++    return baseline
+diff --git a/hermes_cli/serve_producer_process.py b/hermes_cli/serve_producer_process.py
+index 72a7b2137e9..a354f76b389 100644
+--- a/hermes_cli/serve_producer_process.py
++++ b/hermes_cli/serve_producer_process.py
+@@ -110,11 +110,15 @@
+ 
+ 
+ def broker(channel, config):
++    from hermes_cli._startup_fast import project_root_str
++    from hermes_cli.serve_producer_enrollment import BrokerEnrollment
+     from hermes_cli.serve_producer_custody import FamilyCustody
+     from hermes_cli.serve_producer_protocol import ProtocolError
+     from hermes_cli.serve_producer_runtime import spawn
+ 
+-    owner = FamilyCustody.acquire(Path(config['runtime']), 'panel')
++    enrollment = (BrokerEnrollment.acquire(Path(config['runtime']), Path(project_root_str()))
++                  if sys.platform == 'linux' else None)
++    owner = enrollment.owner if enrollment else FamilyCustody.acquire(Path(config['runtime']), 'panel')
+     child, data = spawn('producer', config, custody_fd=owner.fd)
+     try:
+         hello = data.receive()
+@@ -175,7 +179,9 @@
+                 break
+             elif request.get('verb') == 'PING':
+                 control.send({'verb': 'PONG', 'child_pid': hello['pid'],
+-                              'child_exited': child.poll() is not None}, str(sequence))
++                              'child_exited': child.poll() is not None,
++                              'enrollment_pid': enrollment.ticket.identity.pid if enrollment else None,
++                              'custody_fd': owner.fd}, str(sequence))
+             else:
+                 control.send({'verb': 'REFUSED'}, str(sequence))
+     except (EOFError, OSError):
+diff --git a/tests/hermes_cli/test_serve_producer_enrollment.py b/tests/hermes_cli/test_serve_producer_enrollment.py
+new file mode 100644
+index 00000000000..3e789e77832
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_enrollment.py
+@@ -0,0 +1,99 @@
++"""Controlled hub-shaped census plus actual kernel family-custody observations."""
++import os
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++from hermes_cli import serve_producer_enrollment as enrollment
++from hermes_cli.serve_producer_census import LinuxProcessCensus, ProcessCensus
++from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody
++
++pytestmark = pytest.mark.platforms('linux')
++ROOT = Path(__file__).parents[2]
++
++
++def broker_record(monkeypatch):
++    adapter = LinuxProcessCensus()
++    record = adapter.read_process(os.getpid(), adapter.boot_id())
++    record = replace(record, argv=('python', '-I', str(ROOT / 'hermes_cli/serve_producer_process.py'), 'broker', '7'))
++    monkeypatch.setattr(LinuxProcessCensus, 'read_process', lambda *_: record)
++    return record
++
++
++def test_live_custody_promotes_only_exact_broker_and_close_revokes(tmp_path, monkeypatch):
++    record = broker_record(monkeypatch)
++    runtime = tmp_path / 'runtime'
++    broker = enrollment.BrokerEnrollment.acquire(runtime, ROOT)
++    ticket = broker.ticket
++    participants = admission.read_participants_strict(runtime)
++    def classify(value=record, **overrides):
++        options = dict(installation=str(ROOT), runtime=runtime, broker=broker)
++        options.update(overrides)
++        return enrollment.classify_with_broker(value, participants, ticket.generation, **options)
++    try:
++        assert not ticket.guarded  # persisted launch ticket never becomes authority
++        assert classify().kind == 'participant'
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire(runtime, 'panel')
++        assert classify(replace(record, identity=replace(record.identity, start_ticks=1))).kind != 'participant'
++        assert classify(replace(record, argv=('python',))).kind != 'participant'
++        assert classify(runtime=tmp_path / 'foreign').kind != 'participant'
++        assert classify(broker=replace(ticket, guarded=True)).kind != 'participant'
++        assert classify(installation='/foreign').kind != 'participant'
++        broker.close()
++        assert classify().kind == 'legacy'
++    finally:
++        broker.close()
++
++
++def test_complete_controlled_hub_shaped_cut_requires_guarded_broker_and_legacy_retirement(tmp_path, monkeypatch):
++    record = broker_record(monkeypatch)
++    runtime = tmp_path / 'runtime'
++    broker = enrollment.BrokerEnrollment.acquire(runtime, ROOT)
++    ticket = broker.ticket
++    participants = admission.read_participants_strict(runtime)
++    unrelated = replace(record, identity=replace(record.identity, pid=record.identity.pid + 100000),
++                        cwd='/other', exe='/usr/bin/other', argv=('other',), environment=())
++    observed = ProcessCensus(ticket.identity.boot_id, 0.0, 1.0, (record, unrelated), (), ())
++    collectors = {name: lambda: admission.CollectorEvidence(('positive scoped fixture',), ())
++                  for name in admission.REQUIRED_COLLECTORS}
++    def cut(gate, *, guarded, legacy=(), exited=lambda _: False):
++        return gate.inspect(boot_id=ticket.identity.boot_id, generation=ticket.generation,
++            installation=str(ROOT), census=lambda: observed, collectors=collectors,
++            classify=lambda row: enrollment.classify_with_broker(row, participants, ticket.generation,
++                installation=str(ROOT), runtime=runtime, broker=broker if guarded else None),
++            legacy_candidates=legacy, exited=exited)
++    try:
++        with admission.LaunchGate.acquire(runtime) as gate:
++            assert not cut(gate, guarded=False).complete
++            assert cut(gate, guarded=True).complete
++            assert not cut(gate, guarded=True, legacy=(unrelated.identity,)).complete
++            assert cut(gate, guarded=True, legacy=(unrelated.identity,), exited=lambda _: True).complete
++            broker.close()
++            assert not cut(gate, guarded=True).complete
++    finally:
++        broker.close()
++
++
++def test_ordinary_serve_cannot_promote_ticket(tmp_path):
++    with pytest.raises(admission.AdmissionUnavailable, match='exec broker'):
++        enrollment.BrokerEnrollment.acquire(tmp_path / 'runtime', ROOT)
++
++
++def test_closed_descriptor_reopened_without_flock_does_not_certify(tmp_path, monkeypatch):
++    record = broker_record(monkeypatch)
++    runtime = tmp_path / 'runtime'
++    broker = enrollment.BrokerEnrollment.acquire(runtime, ROOT)
++    fd = broker.owner.fd
++    os.close(fd)
++    replacement = os.open(runtime / 'panel.lock', os.O_RDWR)
++    try:
++        if replacement != fd:
++            os.dup2(replacement, fd)
++        assert not broker.matches(record, runtime=runtime, installation=str(ROOT), generation=broker.ticket.generation)
++    finally:
++        broker.close()
++        if replacement != fd:
++            os.close(replacement)
+diff --git a/tests/hermes_cli/test_serve_producer_runtime.py b/tests/hermes_cli/test_serve_producer_runtime.py
+index a181ca901f4..d1b2de78bcf 100644
+--- a/tests/hermes_cli/test_serve_producer_runtime.py
++++ b/tests/hermes_cli/test_serve_producer_runtime.py
+@@ -1,7 +1,9 @@
+ """Dormant exec slice: request callers never execute provider code."""
+ import hashlib
+ import json
++import os
+ import time
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -26,6 +28,16 @@
+         assert result['value'] == 'one'
+         assert result['pid'] not in (relay.broker_pid, __import__('os').getpid())
+         assert relay.ping(timeout=5)['child_pid'] == result['pid']
++        if __import__('sys').platform == 'linux':
++            from hermes_cli.serve_producer_admission import read_participants_strict
++            status = relay.ping()
++            assert status['enrollment_pid'] == relay.broker_pid
++            tickets = read_participants_strict(tmp_path / 'runtime')
++            assert any(row.identity.pid == relay.broker_pid and not row.guarded for row in tickets)
++            info = Path(f'/proc/{relay.broker_pid}/fdinfo/{status["custody_fd"]}').read_text()
++            assert ' FLOCK ' in info and ' WRITE ' in info
++            locked = os.stat(f'/proc/{relay.broker_pid}/fd/{status["custody_fd"]}')
++            assert locked.st_ino == (tmp_path / 'runtime/panel.lock').stat().st_ino
+         assert relay.acknowledged(key)
+     finally:
+         relay.close(timeout=10)
+diff --git a/website/docs/developer-guide/serve-producer-isolation.md b/website/docs/developer-guide/serve-producer-isolation.md
+new file mode 100644
+index 00000000000..284d54747a9
+--- /dev/null
++++ b/website/docs/developer-guide/serve-producer-isolation.md
+@@ -0,0 +1,51 @@
++# Dormant serve producer isolation
++
++This preparatory implementation is not a production activation path. It exercises
++one session-panel Feed/CoreReaders projection in an exec child, with an immutable
++prepared-wire relay serving POST `/changes`. Paired plugin changes live in the
++`serve-producer-panel` hermes-mods topic branch. Neither half should land alone.
++
++## Custody and admission
++
++Supported launch entrypoints enroll before producer imports. Enrollment is only a
++ticket: persisted `guarded=True` is rejected. The Linux fixture broker enrolls as
++`producer_broker`, then acquires the stable panel family flock under LaunchGate
++before importing a provider. Its child inherits the same open file description;
++closing the broker descriptor never unlocks a surviving child.
++
++`BrokerEnrollment` can classify only its own exact enrolled process as a
++participant. It rechecks boot/birth/exec observation, installation and source
++boundary generation, canonical runtime and live kernel flock on its descriptor.
++A closed/reused descriptor, a different PID, a boolean readiness claim, or an
++ordinary serve cannot promote a launch ticket. It does not certify remote serves
++or producer children. Those still need an explicit custody bootstrap before a
++future production admission cut can include them as participants.
++
++`inspect_host(..., broker=...)` composes this evidence with strict collectors.
++Legacy or unknown processes, inaccessible observations, corrupt or missing
++ledgers, and unresolved supervisors still keep the cut INCOMPLETE. A COMPLETE
++fixture cut is not a host activation receipt. Cuts are scoped to a held launch
++acquisition; future production authorization must revalidate custody through
++launch, not reuse a cached COMPLETE after custody closes.
++
++## Current boundary
++
++Only `ProjectionRelay.start_for_fixture` starts this skeleton, and it refuses
++non-pytest callers. No production startup method or release flag is introduced.
++Non-Linux fixtures retain POSIX family custody without claiming Linux enrollment.
++No rollout, serve restart, panel freshness bound, or CPU/latency acceptance is
++claimed here. Board, decision, service and websocket parity, public provider
++manifest, guarded serve/child admission, drain inventory and production launch
++remain subsequent gates. Links and annotation remain in-process.
++
++## Tests
++
++Run `scripts/run_tests.sh tests/hermes_cli/test_serve_producer_*.py` using explicit
++file expansion, plus the paired session-panel `test_exec_panel_projection.py`.
++The suites cover real exec production and endpoint bytes, request-side producer
++tripwires, crash restart, blocked-child control responsiveness, inherited family
++custody, rollback custody, bounded queues and browser 75/900-second durations
++anchored at HTTP acceptance. Enrollment tests combine actual kernel locks with a
++controlled hub-shaped census; the real broker fixture independently reads its
++published ticket and kernel descriptor. No test establishes COMPLETE on a live
++production host.
+-- 
+2.43.0
+

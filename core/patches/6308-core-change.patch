@@ -1,0 +1,995 @@
+From c1c6663a09ad881001a9de5d188dcfe9c657e943 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:55:16 +0000
+Subject: [PATCH 6308] Immutable historical rejection observations and fresh audit cuts
+
+Public mirror of source commit c1c6663a09ad881001a9de5d188dcfe9c657e943.
+
+---
+diff --git a/docs/history-residue-audit.md b/docs/history-residue-audit.md
+new file mode 100644
+index 00000000000..53e48858fdd
+--- /dev/null
++++ b/docs/history-residue-audit.md
+@@ -0,0 +1,45 @@
++# Historical rejected-event audit (not transport retirement)
++
++This diagnostic addresses only frozen `task_events` upserts refused with the exact
++containment/spend reasons accepted by `kanban_history_residue_source`. It does not
++execute, replay, remove, rewrite, settle or accept the rejected operation. Ambiguous
++historical identity remains ambiguous. Existing restrictions remain in force.
++
++After normal server/core review, CI, landing and deployment:
++
++```
++hermes kanban --board default sync history-residue OP_ID --reason 'Retain historical rejected intent without replay' --json
++hermes kanban --board default sync diff --history-evidence --json
++```
++
++The first command stores the complete exact local outbox source in a separate
++`sync-shadow/default.history-residue.db` sidecar. It stages immutable request
++custody under short local/replica reservations, releases SQLite reservations, then
++sends at most one authenticated POST and requires an authenticated GET readback.
++An existing intent is GET-only even if its first process exited before POST.
++A missing readback remains unresolved; there is no replacement identity or resend.
++The sidecar contains reported historical source bytes; keep it private and retain
++it with the original board/evidence. It is not a normal synced task table.
++
++`sync diff` never trusts that sidecar alone. A successful nonbusy diagnostic pull
++must precede a same-head empty feed / fresh current observation / empty feed cut.
++The consumer matches the full exact source, local event, sealed receipt and
++portable local/replica/canonical parent, and vetoes active workers, claims, leases,
++new local work, tombstones, omissions and quarantine. Existing containment/spend
++restrictions are retained, not released. All network reads occur without SQLite
++writer reservations. Final zero-wait reservations compare the original snapshots
++and build the actual diff before releasing them. The 30-second monotonic evidence
++budget includes refresh, local lock acquisition, HTTP and final comparisons.
++
++The raw `rejected_ops` count stays unchanged. `audited_history_rejections` names
++only exact IDs verified in that particular cut. Unknown rejections and unrelated
++row/child drift still prevent clean. Ordinary local `kanban_sync_client.diff`
++has no historical receipt exemption. No stored proof can be applied to a later
++diff. Busy, partial, stale, unavailable or conflicting proof fails closed.
++
++`--history-evidence` includes exact per-row source and current response bytes,
++plus both empty-feed brackets and their head. Treat this output as private audit
++evidence, not publication material. The output explicitly retains
++`historical_identity_certified=false` and `execution_authority=false`.
++`no_retained_op_receipt` is only a current cache observation; it is never a
++never-seen operation claim or historical admission proof.
+diff --git a/hermes_cli/kanban_history_residue_board.py b/hermes_cli/kanban_history_residue_board.py
+new file mode 100644
+index 00000000000..a45d3ec2022
+--- /dev/null
++++ b/hermes_cli/kanban_history_residue_board.py
+@@ -0,0 +1,112 @@
++"""Configured-board entry points for immutable historical audit custody. [daveey]"""
++from __future__ import annotations
++
++from contextlib import ExitStack, closing
++import json
++from pathlib import Path
++import sqlite3
++import time
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli import kanban_history_residue_cut as cut
++from hermes_cli import kanban_history_residue_http as transport
++from hermes_cli.kanban_history_residue_source import Refused, _require, decode_source, strict_object
++
++
++def ledger_path(board):
++    from hermes_cli.kanban_sync_client import shadow_path
++    return shadow_path(board).with_suffix('.history-residue.db')
++
++
++def _paths(live, shadow, board):
++    from hermes_cli.kanban_db import kanban_db_path
++    from hermes_cli.kanban_sync_client import shadow_path
++    paths = [Path(c.execute('PRAGMA database_list').fetchone()[2]).resolve() for c in (live, shadow)]
++    expected = [kanban_db_path(board=board).resolve(), shadow_path(board).resolve()]
++    _require(paths == expected and paths[0] != paths[1], 'configured_paths_required')
++    return paths
++
++
++def _ledger(board, *, create=False):
++    path = ledger_path(board)
++    _require(not path.is_symlink(), 'custody_symlink')
++    if create and not path.exists():
++        # Parent is the existing managed shadow directory. Never initialize a live board here.
++        try:
++            with path.open('xb'):
++                pass
++            path.chmod(0o600)
++        except FileExistsError:
++            pass
++    return sqlite3.connect(path.resolve().as_uri() + '?mode=rw', uri=True, isolation_level=None, timeout=0)
++
++
++def audit_diff(live, shadow, hub, board, *, pulled, started):
++    """Fresh nonbusy CLI diff only; report is built while final local reservations hold."""
++    from hermes_cli.kanban_sync_guard import board_sync_lock
++    paths = _paths(live, shadow, board)
++    _require(not pulled.busy and not pulled.more, 'diagnostic_refresh_incomplete')
++    with board_sync_lock(paths[0]), closing(_ledger(board)) as ledger:
++        identity = transport.scope(hub, board)
++        rows = ledger.execute(f'SELECT op_id FROM {custody.INTENTS} WHERE endpoint=? AND board=? AND gateway=? '
++                              'ORDER BY op_id LIMIT ?', (*identity, cut.MAX_OPS + 1)).fetchall()
++        _require(bool(rows) and len(rows) <= cut.MAX_OPS, 'cut_ops_bound')
++        return cut.verify(live, shadow, ledger, hub, board, [r[0] for r in rows], started=started)
++
++
++def observe_board(board, op_id, reason):
++    """Explicit historical observation, never retirement/replay or execution release.
++
++    Existing intent is GET-only. Stage while exact local inputs are reserved, then
++    release all SQLite reservations before HTTP. Uncertain delivery stays the same
++    immutable intent, even if a process exited before sending the first POST.
++    """
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_db import kanban_db_path
++    from hermes_cli.kanban_sync_guard import board_sync_lock
++
++    started = time.monotonic()
++    _require(isinstance(reason, str) and bool(reason.strip()), 'reason_required')
++    ident = client.load_identity()
++    hub = client.Hub(ident)
++    with ExitStack() as stack:
++        stack.callback(hub.close)
++        path = kanban_db_path(board=board)
++        pulled = client._pull_replica(board, hub, ident.gateway, path, diagnostic=True)
++        _require(not pulled.busy and not pulled.more, 'diagnostic_refresh_incomplete')
++        stack.enter_context(board_sync_lock(path))
++        live = kbc.connect(path)
++        shadow = client.open_shadow(board, ident.gateway)
++        stack.callback(live.close)
++        stack.callback(shadow.close)
++        _paths(live, shadow, board)
++        ledger = _ledger(board, create=True)
++        stack.callback(ledger.close)
++        identity = transport.scope(hub, board)
++        old = custody.lookup(ledger, identity, op_id)
++        if old is None:
++            rows = cut.local._rows(live, 'SELECT * FROM kanban_sync_outbox WHERE op_id=?', (op_id,))
++            _require(len(rows) == 1, 'source_missing')
++            source = json.dumps(rows[0], sort_keys=True, ensure_ascii=True)
++            decode_source(source)
++        else:
++            request, _ = custody._request(old['request_json'])
++            _require(request['reason'] == reason, 'intent_conflict')
++            source = request['source_json']
++        with ExitStack() as reservations:
++            for conn in (live, shadow):
++                reservations.enter_context(cut._transaction(conn, reserve=True))
++            snapshots = cut._capture(live, shadow, source, board, ident.gateway)
++            _require(snapshots[0]['portable'] == snapshots[1]['portable'], 'portable_parent_changed')
++            request_json = old['request_json'] if old else json.dumps(dict(version=1,
++                task=strict_object(decode_source(source)['fields'])['task_id'],
++                expected_version=snapshots[0]['portable']['version'], source_json=source, reason=reason))
++            cut._fresh(started)
++            first = custody.stage_once(ledger, identity, request_json)
++        if first:
++            try:
++                transport._request(hub, 'POST', transport._path(board), request_json.encode('utf-8'))
++            except (OSError, client.HubError, Refused, ValueError):
++                pass  # Only exact GET can reconcile an uncertain outcome; never POST again.
++        return transport.reconcile(ledger, hub, board, op_id)
+diff --git a/hermes_cli/kanban_history_residue_cut.py b/hermes_cli/kanban_history_residue_cut.py
+new file mode 100644
+index 00000000000..e601ab33fc1
+--- /dev/null
++++ b/hermes_cli/kanban_history_residue_cut.py
+@@ -0,0 +1,117 @@
++"""Ephemeral same-head history audit cut; no cached exemptions or source writes.
++
++Network happens without SQLite writer locks. Short final reservations then CAS
++both snapshots, so claims cannot race the report's construction. Board feed cuts
++are observations, not a distributed lock or past-identity certification. [daveey]
++"""
++from __future__ import annotations
++
++from contextlib import ExitStack, contextmanager
++import json
++import time
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli import kanban_history_residue_http as transport
++from hermes_cli import kanban_history_residue_local as local
++from hermes_cli.kanban_history_residue_source import _require, strict_object, validate_current
++
++MAX_AGE = 30.0
++MAX_OPS = 20
++
++
++def _fresh(started):
++    _require(0 <= time.monotonic() - started <= MAX_AGE, 'evidence_expired')
++
++
++@contextmanager
++def _transaction(conn, *, reserve=False):
++    _require(not conn.in_transaction, 'nested_cut_transaction')
++    old = conn.execute('PRAGMA busy_timeout').fetchone()[0]
++    try:
++        # Never stall an executor behind a diagnostic. No writes occur even when reserving.
++        conn.execute('PRAGMA busy_timeout=0')
++        conn.execute('BEGIN IMMEDIATE' if reserve else 'BEGIN')
++        yield
++    finally:
++        if conn.in_transaction:
++            conn.rollback()
++        conn.execute(f'PRAGMA busy_timeout={old}')
++
++
++def _empty(hub, board, head):
++    data = hub.changes(board, head)
++    _require(isinstance(data, dict) and data.get('changes') == [] and data.get('more') is False
++             and type(data.get('head')) is int and type(data.get('next')) is int
++             and data['head'] == head == data['next'], 'authoritative_feed_changed')
++    return data
++
++
++def _capture(live, shadow, raw, board, gateway):
++    return [local.snapshot(conn, raw, board=board, gateway=gateway, replica=replica)
++            for conn, replica in ((live, False), (shadow, True))]
++
++
++def verify(live, shadow, ledger, hub, board, op_ids, *, started):
++    """Internal cut assembly. Caller MUST own board lock after a nonbusy diagnostic refresh.
++
++    This function returns evidence only. Ordinary sync.diff cannot consume a saved
++    result as an exemption. A future diagnostic wrapper must build its report in
++    the final reservations, not apply this evidence to a later diff.
++    """
++    _require(all(not c.in_transaction for c in (live, shadow, ledger)), 'nested_cut_transaction')
++    _require(0 < len(op_ids) <= MAX_OPS and len(set(op_ids)) == len(op_ids), 'cut_ops_bound')
++    identity = transport.scope(hub, board)
++    _fresh(started)
++    records, snapshots = [], []
++    with ExitStack() as stack:
++        for conn in (live, shadow, ledger):
++            stack.enter_context(_transaction(conn))
++        for op_id in op_ids:
++            saved = custody.lookup(ledger, identity, op_id)
++            _require(saved is not None and saved['receipt_json'] is not None, 'sealed_custody_missing')
++            request, source = custody._request(saved['request_json'])
++            _require(source['op_id'] == op_id, 'custody_op_identity')
++            snaps = _capture(live, shadow, request['source_json'], board, identity[2])
++            _require(snaps[0]['portable'] == snaps[1]['portable'], 'portable_parent_changed')
++            records.append((op_id, saved, request))
++            snapshots.append(snaps)
++    head = snapshots[0][1]['state'][0]['cursor']
++    _require(type(head) is int and head >= 0
++             and all(s[1]['state'][0]['cursor'] == head for s in snapshots), 'replica_cursor_changed')
++    begin = _empty(hub, board, head)
++    evidence = []
++    for (op_id, saved, request), snaps in zip(records, snapshots):
++        _fresh(started)
++        raw = transport.current(hub, board, op_id)
++        current = validate_current(raw, request['source_json'], gateway=identity[2], board=board, head=head)
++        data = strict_object(raw, max_bytes=transport.MAX_RESPONSE)
++        # Exact immutable receipt bytes are retained; compare the parsed response
++        # structurally without Python bool/int equivalence.
++        _require(json.dumps(data['receipt'], sort_keys=True) ==
++                 json.dumps(strict_object(saved['receipt_json'], max_bytes=transport.MAX_RESPONSE), sort_keys=True),
++                 'current_receipt_conflict')
++        for key, value in snaps[1]['portable'].items():
++            _require(key in current['parent'] and json.dumps(current['parent'][key], sort_keys=True) ==
++                     json.dumps(value, sort_keys=True), 'canonical_parent_changed')
++        evidence.append({'op_id': op_id, 'source_json': request['source_json'], 'proof_json': raw})
++    end = _empty(hub, board, head)
++    with ExitStack() as stack:
++        for conn in (live, shadow, ledger):
++            stack.enter_context(_transaction(conn, reserve=True))
++        _fresh(started)
++        for (op_id, saved, request), old in zip(records, snapshots):
++            _require(custody.lookup(ledger, identity, op_id) == saved, 'custody_changed')
++            _require(_capture(live, shadow, request['source_json'], board, identity[2]) == old,
++                     'local_cut_inputs_changed')
++        _fresh(started)
++        from hermes_cli.kanban_sync_client import diff
++        report = diff(live, shadow, identity[2])
++        audits = set(report['audited_retain_rejections']) | set(op_ids)
++        report['audited_history_rejections'] = list(op_ids)
++        report['clean'] = not (report['missing_in_shadow'] or report['extra_in_shadow']
++                              or report['field_mismatch'] or report['child_mismatch']
++                              or report['rejected_ops'] != len(audits))
++        _fresh(started)
++        return {'head': head, 'audited_history_rejections': list(op_ids), 'evidence': evidence, 'diff': report,
++                'begin': begin, 'end': end, 'snapshot_only': True, 'execution_authority': False,
++                'historical_identity_certified': False}
+diff --git a/hermes_cli/kanban_history_residue_local.py b/hermes_cli/kanban_history_residue_local.py
+new file mode 100644
+index 00000000000..52f143d1757
+--- /dev/null
++++ b/hermes_cli/kanban_history_residue_local.py
+@@ -0,0 +1,103 @@
++"""Bounded read-only local inputs for a current historical audit, not a hold release.
++
++Containment/spend restrictions remain untouched and are not vetoed merely for
++existing: this classification authorizes no execution. Quarantine, omissions,
++new local work and any active executor do veto it. [daveey]
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_history_residue_source import _positive, _require, decode_source, strict_object
++
++MAX_ROWS = 100
++MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
++
++
++def _rows(conn, sql, args=()):
++    cursor = conn.execute(sql, args)
++    # Check encoded byte budget BEFORE materializing potentially large source cells.
++    names = [c[0] for c in cursor.description]
++    bound = '+'.join(f'6*COALESCE(length(CAST("{c}" AS BLOB)),4)' for c in names)
++    total = conn.execute(f'SELECT COALESCE(sum({bound}),0),count(*) FROM ({sql})', args).fetchone()
++    _require(total[0] <= MAX_SNAPSHOT_BYTES and total[1] <= MAX_ROWS, 'local_snapshot_bound')
++    result = []
++    size = 0
++    for row in cursor.fetchmany(MAX_ROWS + 1):
++        _require(len(result) < MAX_ROWS, 'local_rows_bound')
++        item = dict(zip(names, row))
++        size += len(json.dumps(item, ensure_ascii=True).encode())
++        _require(size <= MAX_SNAPSHOT_BYTES, 'local_bytes_bound')
++        result.append(item)
++    return result
++
++
++def _portable(task):
++    columns = sync.SYNCED_COLUMNS['tasks'] | sync.SERVER_COLUMNS['tasks']
++    _require(columns <= task.keys(), 'task_schema_incomplete')
++    out = {k: task[k] for k in sorted(columns - {'current_run_id'})}
++    for key in sync.JSON_SERVER_COLUMNS['tasks']:
++        if isinstance(out[key], str):
++            out[key] = strict_object(out[key], max_bytes=MAX_SNAPSHOT_BYTES)
++    out.update(id=task['id'], uid=task['id'], version=task['sync_version'], current_run_uid=None)
++    return out
++
++
++def snapshot(conn, exact_source, *, board, gateway, replica):
++    """Caller pins a read transaction; final cut rechecks under short writer reservations.
++
++    Missing schema/errors fail closed. Return complete relevant rows for equality
++    comparison; do not normalize source fields, frozen wire or local history IDs.
++    """
++    source = decode_source(exact_source)
++    fields = strict_object(source['fields'])
++    task_id, event = fields['task_id'], source['row_uid']
++    states = _rows(conn, 'SELECT * FROM kanban_sync_state')
++    _require(len(states) == 1 and states[0]['board_id'] == board and states[0]['gateway_id'] == gateway
++             and states[0]['mode'] == ('shadow' if replica else 'primary')
++             and states[0]['applying'] == 0, 'local_sync_identity')
++    tasks = _rows(conn, 'SELECT * FROM tasks WHERE id=?', (task_id,))
++    _require(len(tasks) == 1, 'local_task_missing')
++    task = tasks[0]
++    _require(task['status'] in ('triage', 'archived') and task['created_on'] == gateway
++             and _positive(task['sync_version']), 'local_task_identity')
++    for key in ('current_run_id', 'claim_lock', 'claim_expires', 'worker_pid', 'worker_started_at',
++                'lease_holder', 'lease_expires'):
++        _require(key in task and task[key] is None, 'local_executor_active')
++    runs = _rows(conn, 'SELECT * FROM task_runs WHERE task_id=? ORDER BY id', (task_id,))
++    _require(all(r['ended_at'] is not None and r['status'] != 'running' for r in runs), 'local_running_run')
++    events = _rows(conn, 'SELECT * FROM task_events WHERE uid=? ORDER BY id', (event,))
++    if replica:
++        _require(not events, 'replica_event_present')
++    else:
++        _require(len(events) == 1, 'local_event_missing')
++        e = events[0]
++        actual = {key: e[key] for key in ('task_id', 'kind', 'payload', 'created_at')}
++        actual['run_uid'] = None
++        _require(e['run_id'] is None and actual == fields, 'local_event_changed')
++    ops = _rows(conn, "SELECT * FROM kanban_sync_outbox WHERE (table_name='tasks' AND row_uid=?) "
++                "OR (table_name='task_events' AND row_uid=?) OR "
++                "(table_name='task_runs' AND row_uid IN (SELECT uid FROM task_runs WHERE task_id=?)) OR "
++                "CASE WHEN json_valid(fields) THEN json_extract(fields,'$.task_id')=? ELSE 0 END ORDER BY op_id",
++                (task_id, event, task_id, task_id))
++    if replica:
++        _require(not ops, 'replica_local_work')
++    else:
++        same = [o for o in ops if o['row_uid'] == event and o['table_name'] == 'task_events']
++        _require(len(same) == 1 and json.dumps(same[0], sort_keys=True, ensure_ascii=True) ==
++                 json.dumps(source, sort_keys=True, ensure_ascii=True), 'local_source_changed')
++        _require(all(o['table_name'] == 'task_events' and o['state'] == 'rejected' for o in ops), 'local_uncovered_work')
++    tombstones = _rows(conn, 'SELECT * FROM kanban_sync_tombstones WHERE '
++                       "(table_name='tasks' AND row_uid=?) OR (table_name='task_events' AND row_uid=?) OR "
++                       "(table_name='task_runs' AND row_uid IN (SELECT uid FROM task_runs WHERE task_id=?))",
++                       (task_id, event, task_id))
++    omissions = _rows(conn, "SELECT * FROM kanban_sync_omissions WHERE state!='delivered' AND "
++                     "((table_name='tasks' AND row_uid=?) OR (table_name='task_events' AND row_uid=?) OR "
++                     "(table_name='task_runs' AND row_uid IN (SELECT uid FROM task_runs WHERE task_id=?)))",
++                     (task_id, event, task_id))
++    _require(not tombstones and not omissions, 'local_repair_hold')
++    from hermes_cli.kanban_sync_quarantine import held
++    _require(not held(conn, task_id), 'local_quarantine')
++    return {'state': states, 'task': tasks, 'portable': _portable(task), 'runs': runs,
++            'event': events, 'ops': ops, 'tombstones': tombstones, 'omissions': omissions}
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 8c0c8007d90..8f19b262e85 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -869,7 +869,11 @@
+                                   "the source of truth; off: stop capturing")],
+              help="Bind the board to the central Board service under this gateway's hub name"),
+         _cmd("import", help="Queue every existing row of the board for upload (idempotent)"),
+-        _cmd("diff", [_json_flag()], help="Compare this gateway's live cards with the shadow copy (exit 1 if not clean)"),
++        _cmd("diff", [_json_flag(), _arg("--history-evidence", action="store_true",
++             help="Include exact per-row current history-audit evidence in the diagnostic report")],
++             help="Compare this gateway's live cards with the shadow copy (exit 1 if not clean)"),
++        _cmd("history-residue", [_json_flag(), _arg("op_id"), _arg("--reason", required=True)],
++             help="Record exact historical rejection custody without replay, deletion or execution release; retries are GET-only"),
+         _cmd("run", [_json_flag()], help="Run one sync round for every synced board now"),
+         _cmd("links", help="Reconcile this gateway's chat links (which chats each card belongs to) now"),
+         _cmd("links-diff", [_json_flag(), _arg("--settle", type=float, default=None, metavar="SECONDS",
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index b6b1415ee56..a6e834926a8 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -16,6 +16,8 @@
+ 
+ import argparse
+ import json
++import sqlite3
++import time
+ 
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+@@ -94,6 +96,7 @@
+ def _diff(args: argparse.Namespace) -> int:
+     slug = _board(args)
+     ident = ksc.load_identity()
++    started = time.monotonic()
+     # Refresh first, before opening the replica. Only when no sync round holds the board (one replica puller per
+     # board per host); a busy round's replica is compared as it stands. A diagnostic: it never rebuilds the replica
+     # (a Resync is reported as refresh_error) and never transfers attachments (t_01a1d41c2612ebc0).
+@@ -115,6 +118,19 @@
+             report.update(clean=False, unavailable=True, refresh_error=refresh_error)
+         elif pulled.busy:
+             report["refresh_skipped"] = "a sync round holds the board; compared against its replica as it stands"
++        else:
++            from hermes_cli import kanban_history_residue_board as history
++            if history.ledger_path(slug).exists():
++                hub = ksc.Hub(ident)
++                try:
++                    audit = history.audit_diff(live, shadow, hub, slug, pulled=pulled, started=started)
++                    report = {**audit['diff'], 'history_audit_head': audit['head']}
++                    if getattr(args, 'history_evidence', False):
++                        report['history_audit_evidence'] = audit
++                except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
++                    report.update(clean=False, history_audit_error=str(exc))
++                finally:
++                    hub.close()
+     finally:
+         live.close()
+         shadow.close()
+@@ -309,7 +325,19 @@
+     return 0 if report.get("eligible") or report.get("action") == "applied" else 1
+ 
+ 
++def _history_residue(args: argparse.Namespace) -> int:
++    from hermes_cli.kanban_history_residue_board import observe_board
++    try:
++        report = observe_board(_board(args), args.op_id, args.reason)
++    except (ValueError, OSError, sqlite3.Error, ksc.HubError, ksc.Resync, SyncRoundBusy) as exc:
++        _print({'recorded': False, 'reason': str(exc)}, args.json)
++        return 1
++    _print(report, args.json)
++    return 0
++
++
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
++            "history-residue": _history_residue,
+             "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links,
+             "refill-history": _refill_history, "reserved-key": _reserved_key, "dependency-delete": _dependency_delete,
+             "quarantine": _quarantine}
+diff --git a/tests/hermes_cli/test_kanban_history_residue_board.py b/tests/hermes_cli/test_kanban_history_residue_board.py
+new file mode 100644
+index 00000000000..58c76d9af72
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_board.py
+@@ -0,0 +1,117 @@
++"""Configured entry points compose real SQLite custody, local fences and cut reports."""
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_history_residue_board as board
++from hermes_cli import kanban_history_residue_local as local
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_history_residue_source import Refused
++from hermes_cli.kanban_sync_guard import board_sync_lock, SyncRoundBusy
++from tests.hermes_cli import test_kanban_history_residue_local as fixtures
++from tests.hermes_cli.test_kanban_history_residue_proof import proof
++
++stores = fixtures.stores
++
++
++@pytest.fixture
++def configured(stores, tmp_path, monkeypatch):
++    paths = [tmp_path / 'live.db', tmp_path / 'shadow.db']
++    for source, path in zip(stores[:2], paths):
++        with sqlite3.connect(path) as target:
++            source.backup(target)
++    connections = []
++
++    def connect(path):
++        conn = sqlite3.connect(path, isolation_level=None)
++        conn.row_factory = sqlite3.Row
++        connections.append(conn)
++        return conn
++
++    monkeypatch.setattr(kanban_db, 'kanban_db_path', lambda **kw: paths[0])
++    monkeypatch.setattr(client, 'shadow_path', lambda slug: paths[1])
++    monkeypatch.setattr(kbc, 'connect', connect)
++    monkeypatch.setattr(client, 'open_shadow', lambda *a: connect(paths[1]))
++    ident = client.Identity('https://board.example', 'key', 'home')
++    hub = SimpleNamespace(ident=ident, close=lambda: None,
++                          changes=lambda *a: dict(changes=[], more=False, head=100, next=100))
++    monkeypatch.setattr(client, 'load_identity', lambda: ident)
++    monkeypatch.setattr(client, 'Hub', lambda *a: hub)
++    calls = []
++    state = {}
++
++    def pull(slug, remote, gateway, path, **kw):
++        assert kw == {'diagnostic': True}
++        with board_sync_lock(path):  # proves refresh is not nested inside the same lock
++            return client.Pulled()
++
++    def request(remote, method, path, body):
++        for conn in connections:
++            try:
++                assert not conn.in_transaction
++            except sqlite3.ProgrammingError:
++                pass  # observe_board closed its owned handles before audit_diff opens new ones
++        calls.append((method, path, body))
++        if method == 'POST':
++            req = json.loads(body)
++            _, response = proof()
++            response['receipt']['source_json'] = req['source_json']
++            with sqlite3.connect(paths[0]) as conn:
++                conn.row_factory = sqlite3.Row
++                parent = local.snapshot(conn, req['source_json'], board='default', gateway='home', replica=False)['portable']
++            response['receipt']['parent'].update(parent)
++            response['current']['parent'].update(parent)
++            response['receipt']['reason'] = req['reason']
++            state['proof'] = response
++        response = state.get('proof')
++        return json.dumps(response if 'current=1' in path else response['receipt'] if response else None).encode()
++
++    monkeypatch.setattr(client, '_pull_replica', pull)
++    monkeypatch.setattr(board.transport, '_request', request)
++    yield paths, hub, calls, state, connect
++    for conn in connections:
++        conn.close()
++
++
++def test_observe_then_fresh_diff_preserves_all_original_bytes(configured):
++    paths, hub, calls, _state, connect = configured
++    live, shadow = (connect(path) for path in paths)
++    before = [list(conn.iterdump()) for conn in (live, shadow)]
++    assert board.observe_board('default', 'op-original', 'Keep history')['recorded'] is True
++    assert [c[0] for c in calls] == ['POST','GET']
++    assert board.observe_board('default', 'op-original', 'Keep history')['recorded'] is True
++    assert [c[0] for c in calls] == ['POST','GET','GET']
++    result = board.audit_diff(live, shadow, hub, 'default', pulled=client.Pulled(), started=board.time.monotonic())
++    assert result['diff']['clean'] is True and result['diff']['rejected_ops'] == 1
++    assert [list(conn.iterdump()) for conn in (live, shadow)] == before
++    assert board.ledger_path('default').stat().st_mode & 0o777 == 0o600
++
++
++@pytest.mark.parametrize('fault', ['busy','more','wrongpath','lock'])
++def test_audit_entry_refuses_wrong_refresh_or_paths_or_lock(configured, fault):
++    paths, hub, _calls, _state, connect = configured
++    board.observe_board('default', 'op-original', 'Keep history')
++    live, shadow = (connect(path) for path in paths)
++    pulled = client.Pulled()
++    if fault == 'busy': pulled.busy = True
++    if fault == 'more': pulled.more = True
++    if fault == 'wrongpath': live, shadow = shadow, live
++    with board_sync_lock(paths[0]) if fault == 'lock' else board.ExitStack():
++        with pytest.raises((Refused, SyncRoundBusy)):
++            board.audit_diff(live, shadow, hub, 'default', pulled=pulled, started=board.time.monotonic())
++
++
++def test_observe_cannot_change_source_or_replace_reason(configured):
++    paths, _hub, calls, _state, connect = configured
++    board.observe_board('default', 'op-original', 'Keep history')
++    with pytest.raises(Refused, match='intent_conflict'):
++        board.observe_board('default', 'op-original', 'different')
++    live = connect(paths[0])
++    live.execute('UPDATE kanban_sync_outbox SET attempts=3')
++    with pytest.raises(Refused, match='local_source_changed'):
++        board.observe_board('default', 'op-original', 'Keep history')
++    assert [c[0] for c in calls] == ['POST','GET']
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cli.py b/tests/hermes_cli/test_kanban_history_residue_cli.py
+new file mode 100644
+index 00000000000..8208d2ef7a3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_cli.py
+@@ -0,0 +1,63 @@
++"""Exercise actual parser/CLI paths: a persisted receipt alone never makes a diff clean."""
++import argparse
++import json
++
++import pytest
++
++from hermes_cli import kanban_parser, kanban_sync_cli as cli
++from hermes_cli import kanban_history_residue_board as board
++from tests.hermes_cli import test_kanban_history_residue_board as fixtures
++
++configured = fixtures.configured
++stores = fixtures.stores
++
++
++def args(*tail):
++    parser = argparse.ArgumentParser()
++    kanban_parser.build_parser(parser.add_subparsers())
++    return parser.parse_args(['kanban', '--board', 'default', 'sync', *tail])
++
++
++def test_real_parser_observe_then_cut_diff(configured, capsys):
++    assert cli.cmd_sync(args('history-residue','op-original','--reason','Keep history','--json')) == 0
++    assert json.loads(capsys.readouterr().out)['current_authority_verified'] is False
++    assert cli.cmd_sync(args('diff','--json')) == 0
++    report = json.loads(capsys.readouterr().out)
++    assert report['clean'] is True and report['rejected_ops'] == 1
++    assert report['audited_history_rejections'] == ['op-original']
++    assert report['history_audit_head'] == 100
++
++
++@pytest.mark.parametrize('fault', ['busy','more','offline','stale','wrong-parent'])
++def test_cli_cannot_hide_refresh_failure_with_saved_custody(configured, capsys, monkeypatch, fault):
++    _paths, _hub, _calls, state, _connect = configured
++    board.observe_board('default','op-original','Keep history')
++    if fault in ('busy','more'):
++        monkeypatch.setattr(cli.ksc, '_pull_replica', lambda *a, **k: cli.ksc.Pulled(**{fault: True}))
++    if fault == 'offline':
++        def offline(*a, **kw):
++            raise OSError('offline fixture')
++        monkeypatch.setattr(cli.ksc, '_pull_replica', offline)
++    if fault == 'stale': state['proof']['current']['observed_head'] = 99
++    if fault == 'wrong-parent': state['proof']['current']['parent']['title'] = 'other'
++    assert cli.cmd_sync(args('diff','--json')) == 1
++    report = json.loads(capsys.readouterr().out)
++    assert report['clean'] is False and report['rejected_ops'] == 1
++    assert not report.get('audited_history_rejections')
++
++
++def test_cli_observation_is_explicit_and_reason_is_not_replaceable(configured, capsys):
++    assert cli.cmd_sync(args('history-residue','op-original','--reason','Keep history','--json')) == 0
++    capsys.readouterr()
++    assert cli.cmd_sync(args('history-residue','op-original','--reason','different','--json')) == 1
++    assert json.loads(capsys.readouterr().out) == {'recorded': False, 'reason': 'intent_conflict'}
++
++
++def test_explicit_evidence_flag_keeps_exact_current_per_row_proof(configured, capsys):
++    board.observe_board('default','op-original','Keep history')
++    assert cli.cmd_sync(args('diff','--history-evidence','--json')) == 0
++    audit = json.loads(capsys.readouterr().out)['history_audit_evidence']
++    assert audit['begin']['head'] == audit['end']['head'] == audit['head'] == 100
++    assert audit['evidence'][0]['op_id'] == 'op-original'
++    assert audit['execution_authority'] is False
++    assert json.loads(audit['evidence'][0]['proof_json'])['receipt']['source_json'] == audit['evidence'][0]['source_json']
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cut.py b/tests/hermes_cli/test_kanban_history_residue_cut.py
+new file mode 100644
+index 00000000000..a09a16f56c4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_cut.py
+@@ -0,0 +1,165 @@
++"""Fresh same-head observations cannot be cached as sync-diff exemptions."""
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli import kanban_history_residue_cut as cut
++from hermes_cli import kanban_history_residue_local as local
++from hermes_cli.kanban_history_residue_source import Refused
++from tests.hermes_cli import test_kanban_history_residue_local as fixtures
++from tests.hermes_cli.test_kanban_history_residue_proof import proof
++
++stores = fixtures.stores
++
++
++@pytest.fixture
++def cut_inputs(stores, monkeypatch):
++    live, shadow, raw = stores
++    db = sqlite3.connect(':memory:', isolation_level=None)
++    _, data = proof()
++    parent = local.snapshot(live, raw, board='default', gateway='home', replica=False)['portable']
++    data['receipt']['source_json'] = raw
++    data['current']['parent'].update(parent)
++    request = json.dumps(dict(version=1, task='t_stopped', expected_version=7, source_json=raw, reason='Keep history'))
++    ident = SimpleNamespace(url='https://board.example', gateway='home', key='key')
++    hub = SimpleNamespace(ident=ident)
++    custody.stage(db, ('https://board.example','default','home'), request)
++    custody.seal(db, ('https://board.example','default','home'), 'op-original', json.dumps(data['receipt']))
++    calls = []
++
++    def changes(board, head):
++        assert not live.in_transaction and not shadow.in_transaction
++        calls.append('feed')
++        return dict(head=100, next=100, more=False, changes=[])
++
++    def current(*args):
++        assert not live.in_transaction and not shadow.in_transaction
++        calls.append('current')
++        return json.dumps(data)
++
++    hub.changes = changes
++    monkeypatch.setattr(cut.transport, 'current', current)
++    try:
++        yield live, shadow, db, hub, data, calls
++    finally:
++        db.close()
++
++
++def verify(cut_inputs):
++    live, shadow, db, hub, _, _ = cut_inputs
++    return cut.verify(live, shadow, db, hub, 'default', ['op-original'], started=cut.time.monotonic())
++
++
++def test_fresh_cut_readback_and_no_writes(cut_inputs):
++    live, shadow, db, _hub, data, calls = cut_inputs
++    before = [list(c.iterdump()) for c in (live, shadow, db)]
++    report = verify(cut_inputs)
++    assert calls == ['feed','current','feed']
++    assert report['head'] == 100 and report['audited_history_rejections'] == ['op-original']
++    assert report['diff']['clean'] is True and report['diff']['rejected_ops'] == 1
++    assert report['evidence'][0]['source_json'] == data['receipt']['source_json']
++    assert before == [list(c.iterdump()) for c in (live, shadow, db)]
++    assert not live.in_transaction and not shadow.in_transaction
++
++
++@pytest.mark.parametrize('fault', ['parent','head','receipt','missing','unsealed','busy','expired','local-race','replica-race','moving-head'])
++def test_invalid_proof_is_not_an_audit(cut_inputs, monkeypatch, fault):
++    live, shadow, db, hub, data, _calls = cut_inputs
++    if fault == 'parent': data['current']['parent']['title'] = 'other'
++    if fault == 'head': data['current']['observed_head'] = 101
++    if fault == 'receipt': data['receipt']['reason'] = 'different'
++    if fault == 'missing': db = sqlite3.connect(':memory:', isolation_level=None)
++    if fault == 'unsealed':
++        db = sqlite3.connect(':memory:', isolation_level=None)
++        custody.stage(db, ('https://board.example','default','home'), json.dumps(dict(version=1,
++            task='t_stopped', expected_version=7, source_json=data['receipt']['source_json'], reason='Keep history')))
++    if fault == 'busy': live.execute('BEGIN')
++    if fault == 'expired': monkeypatch.setattr(cut, 'MAX_AGE', -1)
++    old = cut.transport.current
++
++    def changed(*args):
++        value = old(*args)
++        if fault == 'local-race': live.execute("UPDATE tasks SET worker_pid=77")
++        if fault == 'replica-race': shadow.execute("UPDATE tasks SET title='race'")
++        if fault == 'moving-head': hub.changes = lambda *a: dict(head=101,next=101,more=False,changes=[])
++        return value
++
++    monkeypatch.setattr(cut.transport, 'current', changed)
++    try:
++        with pytest.raises(Refused):
++            cut.verify(live, shadow, db, hub, 'default', ['op-original'], started=cut.time.monotonic())
++        if fault != 'busy':
++            assert not live.in_transaction and not shadow.in_transaction
++    finally:
++        if fault == 'busy': live.rollback()
++        if fault in ('missing','unsealed'): db.close()
++
++
++def test_saved_cut_does_not_change_ordinary_diff(cut_inputs):
++    from hermes_cli.kanban_sync_client import diff
++    live, shadow, _db, _hub, _data, _calls = cut_inputs
++    assert verify(cut_inputs)['diff']['clean'] is True
++    assert diff(live, shadow, 'home')['clean'] is False
++    assert diff(live, shadow, 'home')['rejected_ops'] == 1
++
++
++def test_unrelated_rejection_is_not_subtracted(cut_inputs):
++    live, _shadow, _db, _hub, _data, _calls = cut_inputs
++    live.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,state) VALUES ('unknown','tasks','unrelated','rejected')")
++    report = verify(cut_inputs)['diff']
++    assert report['rejected_ops'] == 2 and report['clean'] is False
++
++
++def test_ordinary_row_drift_still_blocks_audited_cut(cut_inputs):
++    live, shadow, _db, _hub, _data, _calls = cut_inputs
++    for conn in (live, shadow):
++        conn.execute("INSERT INTO tasks(id,title,created_on,sync_version) VALUES ('unrelated','same','home',1)")
++    live.execute("UPDATE tasks SET title='different' WHERE id='unrelated'")
++    report = verify(cut_inputs)['diff']
++    assert report['rejected_ops'] == 1 and report['clean'] is False
++    assert report['field_mismatch'] == {'unrelated': ['title']}
++
++
++def test_expiry_during_final_snapshot_cannot_emit_report(cut_inputs, monkeypatch):
++    original = cut._capture
++    calls = []
++
++    def delayed(*args):
++        result = original(*args)
++        calls.append(1)
++        if len(calls) == 2:
++            monkeypatch.setattr(cut, 'MAX_AGE', -1)
++        return result
++
++    monkeypatch.setattr(cut, '_capture', delayed)
++    with pytest.raises(Refused, match='evidence_expired'):
++        verify(cut_inputs)
++
++
++def test_real_second_writer_refuses_cut_without_waiting(cut_inputs, tmp_path, monkeypatch):
++    live, shadow, ledger, hub, _data, _calls = cut_inputs
++    path = tmp_path / 'primary.db'
++    other = sqlite3.connect(path, isolation_level=None)
++    live.backup(other)
++    file_live = sqlite3.connect(path, isolation_level=None)
++    file_live.row_factory = sqlite3.Row
++    old = cut.transport.current
++
++    def writer(*args):
++        value = old(*args)
++        other.execute('BEGIN IMMEDIATE')
++        return value
++
++    monkeypatch.setattr(cut.transport, 'current', writer)
++    try:
++        with pytest.raises(sqlite3.OperationalError, match='locked'):
++            cut.verify(file_live, shadow, ledger, hub, 'default', ['op-original'], started=cut.time.monotonic())
++        assert not file_live.in_transaction and not shadow.in_transaction
++        assert file_live.execute('PRAGMA busy_timeout').fetchone()[0] == 5000
++    finally:
++        other.rollback()
++        other.close()
++        file_live.close()
+diff --git a/tests/hermes_cli/test_kanban_history_residue_local.py b/tests/hermes_cli/test_kanban_history_residue_local.py
+new file mode 100644
+index 00000000000..ae869365023
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_local.py
+@@ -0,0 +1,136 @@
++"""Local historical audit inputs must remain exact, inert and portable."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_history_residue_local as local
++from hermes_cli.kanban_history_residue_source import Refused
++from tests.hermes_cli.test_kanban_history_residue_source import specimen
++
++
++@pytest.fixture
++def stores():
++    source = specimen()
++    raw = json.dumps(source)
++    dbs = [sqlite3.connect(':memory:', isolation_level=None) for _ in range(2)]
++    for conn in dbs:
++        conn.row_factory = sqlite3.Row
++        cols = sync.SYNCED_COLUMNS['tasks'] | sync.SERVER_COLUMNS['tasks'] | sync.LOCAL_COLUMNS['tasks'] | {'id'}
++        conn.execute('CREATE TABLE tasks (' + ','.join(f'"{c}"' for c in sorted(cols)) + ')')
++        conn.executescript('''
++            CREATE TABLE task_events(id INTEGER,uid TEXT,task_id TEXT,run_id INTEGER,kind TEXT,payload TEXT,created_at INTEGER);
++            CREATE TABLE task_runs(id INTEGER,uid TEXT,task_id TEXT,status TEXT,ended_at INTEGER);
++            CREATE TABLE task_links(parent_id TEXT,child_id TEXT);
++            CREATE TABLE task_comments(task_id TEXT,uid TEXT);
++            CREATE TABLE task_chat_links(task_id TEXT,uid TEXT,chat_gateway TEXT);
++            CREATE TABLE kanban_sync_state(board_id TEXT,gateway_id TEXT,mode TEXT,cursor INTEGER,applying INTEGER);
++            INSERT INTO kanban_sync_state VALUES ('default','home','primary',100,0);
++            CREATE TABLE kanban_sync_tombstones(table_name TEXT,row_uid TEXT,deleted_at INTEGER);
++            CREATE TABLE kanban_sync_omissions(table_name TEXT,row_uid TEXT,field TEXT,state TEXT);
++        ''')
++        conn.execute('CREATE TABLE kanban_sync_outbox (' + ','.join(f'"{c}"' for c in source) + ')')
++        conn.execute("INSERT INTO tasks(id,title,status,created_on,sync_version) VALUES ('t_stopped','same','triage','home',7)")
++    live, shadow = dbs
++    live.execute('INSERT INTO kanban_sync_outbox VALUES (' + ','.join('?' for _ in source) + ')', tuple(source.values()))
++    fields = json.loads(source['fields'])
++    live.execute('INSERT INTO task_events VALUES (1,?,?,?,?,?,?)',
++                 (source['row_uid'], fields['task_id'], None, fields['kind'], fields['payload'], fields['created_at']))
++    shadow.execute("UPDATE kanban_sync_state SET mode='shadow'")
++    try:
++        yield live, shadow, raw
++    finally:
++        for conn in dbs:
++            conn.close()
++
++
++def test_snapshot_preserves_local_ids_and_exact_full_op_without_writes(stores):
++    live, shadow, raw = stores
++    before = [list(c.iterdump()) for c in (live, shadow)]
++    a = local.snapshot(live, raw, board='default', gateway='home', replica=False)
++    b = local.snapshot(shadow, raw, board='default', gateway='home', replica=True)
++    assert a['portable'] == b['portable']
++    assert a['portable']['current_run_uid'] is None
++    assert a['portable']['version'] == 7
++    assert a['event'][0]['id'] == 1 and b['event'] == []
++    assert before == [list(c.iterdump()) for c in (live, shadow)]
++
++
++@pytest.mark.parametrize('fault', ['op-bytes','attempts','event-bytes','event-run','missing-event','extra-op',
++    'pending-parent','tombstone','omission','claim','worker','lease','pointer','open-run','status','owner',
++    'version','applying','identity','missing-schema','uncovered-op'])
++def test_local_vetoes(stores, fault):
++    live, _shadow, raw = stores
++    changes = {
++        'op-bytes': "UPDATE kanban_sync_outbox SET wire_json=wire_json || ' '",
++        'attempts': 'UPDATE kanban_sync_outbox SET attempts=3',
++        'event-bytes': "UPDATE task_events SET payload='changed'",
++        'event-run': 'UPDATE task_events SET run_id=33',
++        'missing-event': 'DELETE FROM task_events',
++        'extra-op': "INSERT INTO kanban_sync_outbox SELECT 'other',table_name,row_uid,op,fields,wire_json,hlc,state,attempts,identity_state,last_error FROM kanban_sync_outbox",
++        'pending-parent': "INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,state) VALUES ('new','tasks','t_stopped','pending')",
++        'tombstone': "INSERT INTO kanban_sync_tombstones VALUES ('task_events','event-original',2)",
++        'omission': "INSERT INTO kanban_sync_omissions VALUES ('tasks','t_stopped','status','held')",
++        'claim': "UPDATE tasks SET claim_lock='worker'",
++        'worker': 'UPDATE tasks SET worker_pid=4',
++        'lease': "UPDATE tasks SET lease_holder='home'",
++        'pointer': 'UPDATE tasks SET current_run_id=1',
++        'open-run': "INSERT INTO task_runs VALUES (1,'run','t_stopped','running',NULL)",
++        'status': "UPDATE tasks SET status='ready'",
++        'owner': "UPDATE tasks SET created_on='other'",
++        'version': 'UPDATE tasks SET sync_version=NULL',
++        'applying': 'UPDATE kanban_sync_state SET applying=1',
++        'identity': "UPDATE kanban_sync_state SET board_id='other'",
++        'missing-schema': 'DROP TABLE kanban_sync_omissions',
++        'uncovered-op': "INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,fields,state) VALUES ('other','task_runs','run','{\"task_id\":\"t_stopped\"}','rejected')",
++    }
++    live.execute(changes[fault])
++    with pytest.raises((Refused, sqlite3.Error)):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
++
++
++@pytest.mark.parametrize('fault', ['event','op','tombstone','claim','run'])
++def test_replica_is_not_a_second_local_history_custodian(stores, fault):
++    _live, shadow, raw = stores
++    changes = {
++        'event': "INSERT INTO task_events VALUES (9,'event-original','t_stopped',NULL,'promoted_manual','{}',100)",
++        'op': "INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,state) VALUES ('other','tasks','t_stopped','pending')",
++        'tombstone': "INSERT INTO kanban_sync_tombstones VALUES ('tasks','t_stopped',2)",
++        'claim': "UPDATE tasks SET claim_lock='worker'",
++        'run': "INSERT INTO task_runs VALUES (1,'run','t_stopped','running',NULL)",
++    }
++    shadow.execute(changes[fault])
++    with pytest.raises(Refused):
++        local.snapshot(shadow, raw, board='default', gateway='home', replica=True)
++
++
++def test_large_cell_bound_precedes_source_materialization(stores, monkeypatch):
++    live, _shadow, raw = stores
++    live.execute("UPDATE tasks SET body=?", ('x' * 10000,))
++    monkeypatch.setattr(local, 'MAX_SNAPSHOT_BYTES', 1024)
++    with pytest.raises(Refused, match='local_snapshot_bound'):
++        local.snapshot(live, raw, board='default', gateway='home', replica=False)
++
++
++def test_recently_ended_run_still_part_of_snapshot(stores):
++    live, _shadow, raw = stores
++    first = local.snapshot(live, raw, board='default', gateway='home', replica=False)
++    live.execute("INSERT INTO task_runs VALUES (4,'closed','t_stopped','done',123)")
++    assert local.snapshot(live, raw, board='default', gateway='home', replica=False) != first
++
++
++@pytest.mark.parametrize('replica', [False, True])
++@pytest.mark.parametrize('fault', ['tombstone','omission','op'])
++def test_run_repair_custody_is_not_hidden_by_terminal_parent(stores, replica, fault):
++    live, shadow, raw = stores
++    conn = shadow if replica else live
++    conn.execute("INSERT INTO task_runs VALUES (4,'closed','t_stopped','done',123)")
++    statements = {
++        'tombstone': "INSERT INTO kanban_sync_tombstones VALUES ('task_runs','closed',99)",
++        'omission': "INSERT INTO kanban_sync_omissions VALUES ('task_runs','closed','ended_at','held')",
++        'op': "INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,state) VALUES ('run-delete','task_runs','closed','delete','{}','rejected')",
++    }
++    conn.execute(statements[fault])
++    with pytest.raises(Refused):
++        local.snapshot(conn, raw, board='default', gateway='home', replica=replica)
+-- 
+2.43.0
+

@@ -1,0 +1,551 @@
+From 79ba85625fd2d5cbb3702475521c1ac6185c2e38 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 23:13:12 +0000
+Subject: [PATCH 6557] Sync loop efficiency and write ordering
+
+Public mirror of source commit 79ba85625fd2d5cbb3702475521c1ac6185c2e38.
+
+---
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+index bc5b24caced..34cf1e006a8 100644
+--- a/hermes_cli/kanban_ask_resolved.py
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -233,15 +233,18 @@
+ 
+ def store_request(conn: sqlite3.Connection, task_id: str, human_request: Optional[dict]) -> None:
+     """Write the card's human_request and (re)register its resolved_check probe. Caller holds the write txn."""
+-    if human_request:
+-        human_request = dict(human_request)
+-        human_request.pop("resolved_check_dropped_at", None)
+-        human_request.pop("resolved_check_drop_reason", None)
+-    conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?",
+-                 (json.dumps(human_request) if human_request else None, task_id))
++    conn.execute("UPDATE tasks SET human_request = ? WHERE id = ?", (request_json(human_request), task_id))
+     sync_row(conn, task_id)
+ 
+ 
++def request_json(human_request: Optional[dict]) -> Optional[str]:
++    """The stored form of an ask (drop markers stripped); None for no ask."""
++    if not human_request:
++        return None
++    return json.dumps({k: v for k, v in human_request.items()
++                       if k not in ("resolved_check_dropped_at", "resolved_check_drop_reason")})
++
++
+ def sync_row(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None, due_now: bool = False) -> None:
+     """A ``blocked`` card whose ask has a resolved_check gets one ``ask_resolved`` probe row, first due one
+     interval after filing (filing just ran it; ``due_now`` for a restored probe, which nobody ran while it was
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e0b334c1d80..2bbb84bf652 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2789,7 +2789,7 @@
+     ``comment`` (``(author, body)``) is written in the same txn, before the transition event,
+     and only when the block lands (``kanban_reason_comment``).
+     """
+-    from hermes_cli.kanban_ask_resolved import filing_fields, store_request, sync_row
++    from hermes_cli.kanban_ask_resolved import filing_fields, request_json, sync_row
+     from hermes_cli.kanban_human_request import reject_timed_request
+     from hermes_cli.kanban_block_routing import clear_meta, validate_block_request
+     from hermes_cli.kanban_goal_recovery import record_block
+@@ -2924,11 +2924,11 @@
+                 payload.pop("limit", None)
+                 payload["shared_blocker_probe"] = True
+         from hermes_cli.kanban_dependency_review import apply_block_update
+-        if not apply_block_update(
+-            conn, task_id, expected_run_id, kind, new_status, set_sql, params, payload,
+-        ):
++        if not apply_block_update(  # one row op: a status and its ask never travel apart [daveey]
++                conn, task_id, expected_run_id, kind, new_status, set_sql + ", human_request = ?",
++                (*params, request_json(human_request)), payload):
+             return False
+-        store_request(conn, task_id, human_request)
++        sync_row(conn, task_id)
+         payload.update(status=new_status, human_request=human_request, **({"actor": actor} if actor else {}), **(filing_fields(conn, human_request) if new_status == "blocked" else {}))  # status: where it landed, read by the sync heal [daveey]
+         from hermes_cli.kanban_shared_blockers import CLEAR_FLAG
+         payload.update(run_meta)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 9881355e167..afedc03c35f 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -274,6 +274,8 @@
+     ("kanban_sync_outbox", "retry_after", "retry_after INTEGER"),
+     ("kanban_sync_outbox", "wire_json", "wire_json TEXT"),
+     ("kanban_sync_outbox", "status_origin", "status_origin TEXT"),
++    # Local only: the event uid this status op is sent after (kanban_sync_evidence_order). [daveey]
++    ("kanban_sync_outbox", "evidence_uid", "evidence_uid TEXT"),
+     ("kanban_sync_status_origins", "status", "status TEXT"),
+     # 1 once repair_ms_timestamps ran on this file (the one-time repair of rows applied before the guard).
+     ("kanban_sync_state", "seconds_repaired", "seconds_repaired INTEGER NOT NULL DEFAULT 0"),
+diff --git a/hermes_cli/kanban_sync_capture_sites.py b/hermes_cli/kanban_sync_capture_sites.py
+index fb0e40a3456..1918389a17a 100644
+--- a/hermes_cli/kanban_sync_capture_sites.py
++++ b/hermes_cli/kanban_sync_capture_sites.py
+@@ -52,6 +52,7 @@
+     ("kanban_actionability_transport.py", "record_result", "UPDATE", _O): STATE_ONLY,
+     ("kanban_retain_transport.py", "record_result", "UPDATE", _O): STATE_ONLY,
+     ("kanban_sync_status_origin.py", "bind", "UPDATE", _O): STATE_ONLY,
++    ("kanban_sync_evidence_order.py", "bind", "UPDATE", _O): STATE_ONLY,
+     ("kanban_actionability_transport.py", "confirm", "DELETE", _O): REMOVAL,
+     ("kanban_actionability_transport.py", "record_result", "DELETE", _O): REMOVAL,
+     ("kanban_containment_outbox.py", "strip_lifecycle", "DELETE", _O): REMOVAL,
+diff --git a/hermes_cli/kanban_sync_evidence_order.py b/hermes_cli/kanban_sync_evidence_order.py
+new file mode 100644
+index 00000000000..4d058342ba7
+--- /dev/null
++++ b/hermes_cli/kanban_sync_evidence_order.py
+@@ -0,0 +1,127 @@
++"""Send a card's park evidence ahead of the status change it explains. [daveey]
++
++One writer transaction leaves as separate row operations: the status row first,
++its event last. The Board applies each operation on its own and a replica applies
++a feed prefix, so a reader could see ``scheduled`` with no park event yet (census:
++``escalation_deadline_missing``), and the Board answered a bound status whose
++origin event it had not seen with a merged row that rolled the writer back.
++
++The capture transaction marks the status op and the ops that explain it with one
++group id, the uid of the transaction's last event for the card
++(``kanban_sync_outbox.evidence_uid``, local only, never sent). Selection then
++promotes the group's other members ahead of the status op, as ``parent_first``
++promotes an unacknowledged parent. No envelope, clock or FIFO timestamp is
++rewritten, and nothing is inferred after the transaction.
++
++Group members, all written after the status op in the same transaction, for the
++same card: its events, a run row born there, and task patches that touch no
++lifecycle column (a block's ``human_request``). Run ends and patches of
++``status``/``current_run_uid``/``result``/``started_at``/``completed_at`` keep
++their place: sending them early would show the old status half released.
++
++Left on the legacy order: a card the Board has not acknowledged (its full row
++must precede its children), terminal statuses (the Board's terminal ingress owns
++that pair), a claim (its event names a run born in the transaction that is still
++the card's current run; the lease order is untouched), and a transaction with
++more than one status capture for the card.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++
++_log = logging.getLogger(__name__)
++COLUMN = "evidence_uid"
++_OPS = "kanban_evidence_ops"
++_RUNS = "kanban_run_births"
++_NOT_APPLYING = "COALESCE((SELECT applying FROM main.kanban_sync_state LIMIT 1), 0) = 0"
++# Mirrors the Board's fenced task columns (hermes-hub worker/src/rows.ts FENCED), local names included.
++_LIFECYCLE = ("status", "current_run_uid", "current_run_id", "result", "started_at", "completed_at")
++
++
++def arm(conn: sqlite3.Connection) -> bool:
++    """Record this connection's card ops and run births; the caller holds the write transaction."""
++    from hermes_cli.kanban_sync_apply_schema import table_columns
++    try:
++        required = {"kanban_sync_outbox": {"op_id", "row_uid", "table_name", "op", "fields", COLUMN},
++                    "task_runs": {"id", "uid", "task_id"}, "kanban_sync_state": {"applying"}}
++        if any(not needed <= set(table_columns(conn, table)) for table, needed in required.items()):
++            return False
++        conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_OPS} "
++                     "(op_id TEXT PRIMARY KEY, tbl TEXT, task_id TEXT, uid TEXT, run TEXT)")
++        conn.execute(f"DELETE FROM temp.{_OPS}")
++        conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_RUNS} (id INTEGER PRIMARY KEY)")
++        conn.execute(f"DELETE FROM temp.{_RUNS}")
++        conn.execute(
++            "CREATE TEMP TRIGGER IF NOT EXISTS kanban_evidence_ops_trg AFTER INSERT ON main.kanban_sync_outbox "
++            "WHEN NEW.op='upsert' AND NEW.table_name IN ('tasks','task_events','task_runs') BEGIN "
++            f"INSERT OR REPLACE INTO {_OPS} VALUES (NEW.op_id, NEW.table_name, CASE NEW.table_name "
++            "WHEN 'tasks' THEN NEW.row_uid "
++            "WHEN 'task_runs' THEN (SELECT task_id FROM main.task_runs WHERE uid=NEW.row_uid) "
++            "ELSE json_extract(NEW.fields,'$.task_id') END, NEW.row_uid, json_extract(NEW.fields,'$.run_uid')); END")
++        conn.execute("CREATE TEMP TRIGGER IF NOT EXISTS kanban_run_birth_trg AFTER INSERT ON main.task_runs "
++                     f"WHEN {_NOT_APPLYING} BEGIN INSERT OR IGNORE INTO {_RUNS} VALUES (NEW.id); END")
++        return True
++    except sqlite3.Error:  # never fail the writer's transaction for an ordering hint
++        return False
++
++
++def bind(conn: sqlite3.Connection, status_ops: list) -> None:
++    """Before the outer COMMIT: mark each lone status op and the later ops of its card that explain it."""
++    from hermes_cli.kanban_terminal_guard import TERMINAL_STATUSES
++    try:
++        if not conn.execute(f"SELECT 1 FROM temp.{_OPS} WHERE tbl='task_events' LIMIT 1").fetchone():
++            return
++        born = {r[0]: r[1] for r in conn.execute(
++            f"SELECT r.uid, t.current_run_id=r.id FROM temp.{_RUNS} b JOIN task_runs r ON r.id=b.id "
++            "LEFT JOIN tasks t ON t.id=r.task_id")}
++        tasks = [task for _op, task in status_ops]
++        for op, task in status_ops:
++            if tasks.count(task) != 1:
++                continue
++            row = conn.execute(
++                "SELECT o.rowid, json_extract(o.fields,'$.status'), t.sync_version FROM kanban_sync_outbox o "
++                "JOIN tasks t ON t.id=o.row_uid WHERE o.op_id=? AND o.wire_json IS NULL", (op,)).fetchone()
++            if not row or row[2] is None or row[1] in TERMINAL_STATUSES:
++                continue
++            later = conn.execute(
++                f"SELECT c.op_id, c.tbl, c.uid, c.run, o.fields FROM temp.{_OPS} c "
++                "JOIN kanban_sync_outbox o ON o.op_id=c.op_id WHERE c.task_id=? AND o.rowid>? ORDER BY o.rowid",
++                (task, row[0])).fetchall()
++            events = [r for r in later if r[1] == "task_events"]
++            # A run born here that is still the card's current run is a claim: its lease order stays as it was.
++            if not events or any(born.get(r[3]) for r in events):
++                continue
++            group = [op] + [r[0] for r in later if r[1] == "task_events" or (r[1] == "task_runs" and r[2] in born)
++                            or (r[1] == "tasks" and not any(f'"{name}"' in (r[4] or "") for name in _LIFECYCLE))]
++            conn.executemany(f"UPDATE kanban_sync_outbox SET {COLUMN}=? WHERE op_id=? AND wire_json IS NULL",
++                             [(events[-1][2], member) for member in group])
++    except sqlite3.Error:  # an unmigrated or unsynced file keeps the legacy order
++        _log.warning("kanban evidence order unavailable; retaining FIFO order", exc_info=True)
++    finally:
++        try:
++            conn.execute(f"DELETE FROM temp.{_OPS}")
++            conn.execute(f"DELETE FROM temp.{_RUNS}")
++        except sqlite3.Error:
++            pass
++
++
++def firsts(conn: sqlite3.Connection, row: dict) -> list[dict]:
++    """Pending ops of this status op's group that go before it, in send order; [] keeps the legacy order.
++
++    Once the named event is acknowledged, rejected or gone the status op travels alone.
++    """
++    uid = row.get(COLUMN)
++    fields = row.get("fields")
++    if row.get("table_name") != "tasks" or not uid or not ("status" in fields if isinstance(fields, dict)
++                                                         else '"status"' in (fields or "")):
++        return []
++    seen = conn.execute("SELECT sync_version FROM tasks WHERE id=?", (row["row_uid"],)).fetchone()
++    if not seen or seen[0] is None:
++        return []
++    group = [dict(r) for r in conn.execute(
++        f"SELECT o.* FROM kanban_sync_outbox o WHERE o.{COLUMN}=? AND o.state='pending' AND o.op_id!=? "
++        "ORDER BY o.table_name='tasks', o.rowid", (uid, row["op_id"]))]
++    if not any(r["table_name"] == "task_events" and r["row_uid"] == uid for r in group):
++        return []
++    return group
+diff --git a/hermes_cli/kanban_sync_parent_order.py b/hermes_cli/kanban_sync_parent_order.py
+index 2d12b6c3a7e..50c042bbf37 100644
+--- a/hermes_cli/kanban_sync_parent_order.py
++++ b/hermes_cli/kanban_sync_parent_order.py
+@@ -57,6 +57,15 @@
+                 break
+             if parent['op_id'] not in included and all(p['op_id'] != parent['op_id'] for p in required):
+                 required.append(parent)
++        from hermes_cli.kanban_sync_evidence_order import firsts
++        for event in [] if blocked else firsts(conn, row):
++            # The status op waits behind its own event exactly as a child waits behind its parent.
++            if ((event['retry_after'] or 0) > now or not sendable(conn, [event])
++                    or (allowed is not None and event['op_id'] not in allowed)):
++                blocked = True
++                break
++            if event['op_id'] not in included:
++                required.append(event)
+         if blocked:
+             continue
+         # Keep both link parents together with their child when possible. If the
+diff --git a/hermes_cli/kanban_sync_status_origin.py b/hermes_cli/kanban_sync_status_origin.py
+index 0c674746841..9532c623acd 100644
+--- a/hermes_cli/kanban_sync_status_origin.py
++++ b/hermes_cli/kanban_sync_status_origin.py
+@@ -44,6 +44,8 @@
+                      "WHEN NEW.table_name='tasks' AND NEW.op='upsert' "
+                      "AND json_type(NEW.fields,'$.status') IS NOT NULL BEGIN "
+                      f"INSERT INTO {_TABLE} VALUES (NEW.op_id, NEW.row_uid); END")
++        from hermes_cli import kanban_sync_evidence_order
++        kanban_sync_evidence_order.arm(conn)
+         return True
+     except sqlite3.Error:  # unsynced/pre-schema connection: no new protocol assertion
+         return False
+@@ -70,6 +72,8 @@
+         if len(rows) > _LIMIT:
+             _log.warning("kanban status capture exceeds %d; retaining legacy envelopes", _LIMIT)
+             return
++        from hermes_cli import kanban_sync_evidence_order
++        kanban_sync_evidence_order.bind(conn, [tuple(r) for r in rows])
+         counts: dict[str, int] = {}
+         for _op, task in rows:
+             counts[task] = counts.get(task, 0) + 1
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_sites.py b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+index 4cc3fc133a4..718586e6c6e 100644
+--- a/tests/hermes_cli/test_kanban_sync_capture_sites.py
++++ b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+@@ -39,6 +39,7 @@
+ hermes_cli.kanban_actionability_transport.record_result|UPDATE|kanban_sync_outbox|state_only
+ hermes_cli.kanban_retain_transport.record_result|UPDATE|kanban_sync_outbox|state_only
+ hermes_cli.kanban_sync_status_origin.bind|UPDATE|kanban_sync_outbox|state_only
++hermes_cli.kanban_sync_evidence_order.bind|UPDATE|kanban_sync_outbox|state_only
+ hermes_cli.kanban_actionability_transport.confirm|DELETE|kanban_sync_outbox|removal
+ hermes_cli.kanban_actionability_transport.record_result|DELETE|kanban_sync_outbox|removal
+ hermes_cli.kanban_containment_outbox.strip_lifecycle|DELETE|kanban_sync_outbox|removal
+diff --git a/tests/hermes_cli/test_kanban_sync_evidence_order.py b/tests/hermes_cli/test_kanban_sync_evidence_order.py
+new file mode 100644
+index 00000000000..dc365f82138
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_evidence_order.py
+@@ -0,0 +1,264 @@
++"""A card's own lifecycle event is sent ahead of the status change it explains. [daveey]
++
++Observed (a cohort run): t_8b6a2bf6ec87d2d0 read ``scheduled`` with no park event for one sample because
++the status row left the writer before its ``continued`` event; t_3fe47832c4491544 read ``blocked`` with its ask
++cleared because the Board answered a ``ready`` whose ``unblocked`` origin it had not seen with a merged row.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli.kanban_sync_evidence_order import COLUMN
++from hermes_cli.kanban_sync_parent_order import parent_first
++from hermes_cli.kanban_sync_quarantine import pending_rows
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++ME, BOARD = 'worker', 'default'
++CLOCK = {'kind': 'clock', 'why': 'the release window opens then'}
++ASK = {'action': 'Reply A or B in this chat. Unblock = build the pick; archive = drop it.',
++       'why_human': 'only the owner knows the preference', 'interaction': 'reply', 'scope': 'one pick',
++       'evidence': 'both options pass the tests'}
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    path = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(path, True)
++    return path
++
++
++@pytest.fixture
++def conn(home):
++    db = kbc.connect(home / 'kanban.db')
++    ksc.ensure_identity(db, BOARD, ME)
++    yield db
++    db.close()
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++def _push(conn, svc):
++    """One drain; returns the ops in the order they left."""
++    before = len(svc.calls)
++    ksc.push(conn, svc.hub(ME), BOARD, ME, primary=True)
++    return [op for call in svc.calls[before:] if call[0] == 'ops' for op in call[2]]
++
++
++def _acked(conn, svc, title='card'):
++    tid = kb.create_task(conn, title=title, assignee='default')
++    _push(conn, svc)
++    assert conn.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] is not None
++    return tid
++
++
++def _running(conn, svc, tid):
++    assert kb.claim_task(conn, tid) is not None
++    _push(conn, svc)
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
++
++
++def _index(ops, tid, *, status=None, kind=None):
++    for i, op in enumerate(ops):
++        fields = op.get('fields') or {}
++        if status and op['table'] == 'tasks' and op['uid'] == tid and fields.get('status') == status:
++            return i
++        if kind and op['table'] == 'task_events' and fields.get('task_id') == tid and fields.get('kind') == kind:
++            return i
++    raise AssertionError(f'no {status or kind} op for {tid} in {[(o["table"], o.get("fields", {}).get("kind")) for o in ops]}')
++
++
++def _status_op(conn, tid, status):
++    return next(dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=? ORDER BY rowid", (tid,))
++        if json.loads(r['fields']).get('status') == status)
++
++
++def _event_uid(conn, tid, kind):
++    return conn.execute('SELECT uid FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                        (tid, kind)).fetchone()[0]
++
++
++def _park_by_continue(conn, svc):
++    tid = _acked(conn, svc)
++    _running(conn, svc, tid)
++    result = kc.continue_task(conn, tid, checkpoint='pushed; waiting for CI', resume_after_seconds=900, awaiting=CLOCK)
++    assert result['ok'] and kb.get_task(conn, tid).status == 'scheduled', result
++    return tid
++
++
++def _park_by_schedule(conn, svc):
++    tid = _acked(conn, svc)
++    assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-20T00:00:00Z release window', awaiting=CLOCK,
++                            clock_only=True)
++    return tid
++
++
++def _park_by_block(conn, svc):
++    tid = _acked(conn, svc)
++    assert kb.block_task(conn, tid, reason='pick one', kind='needs_input', human_request=ASK)
++    return tid
++
++
++PARKS = [(_park_by_continue, 'scheduled', 'continued'), (_park_by_schedule, 'scheduled', 'scheduled'),
++         (_park_by_block, 'blocked', 'blocked')]
++
++
++@pytest.mark.parametrize('park,status,kind', PARKS)
++def test_park_event_leaves_before_its_status(conn, svc, park, status, kind):
++    tid = park(conn, svc)
++    assert _status_op(conn, tid, status)[COLUMN] == _event_uid(conn, tid, kind)
++    ops = _push(conn, svc)
++    assert _index(ops, tid, kind=kind) < _index(ops, tid, status=status)
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
++
++
++@pytest.mark.parametrize('park,status,kind', PARKS)
++def test_no_feed_prefix_shows_a_parked_card_without_its_deadline(conn, svc, park, status, kind):
++    """A replica that has applied any prefix of the park's feed never reads the card as deadline-missing."""
++    tid = park(conn, svc)
++    start = len(svc.board(BOARD)['changes'])
++    _push(conn, svc)
++    replica = kbc.connect(ksc.shadow_path(BOARD))
++    try:
++        seen = []
++        for n, change in enumerate(svc.board(BOARD)['changes']):
++            adapted = ksc.adapt(change)
++            if adapted is None:
++                continue
++            sync.apply_remote_changes(replica, [adapted], new_cursor=change['seq'], board=BOARD, observers=False)
++            row = replica.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()
++            if row is None or n < start:  # before the park: creation and the claim have their own, older order
++                continue
++            read = describe(replica, tid)
++            seen.append((change['seq'], row[0], tuple(read['violations'])))
++        assert seen and seen[-1][1] == status and seen[-1][2] == ()
++        assert [s for s in seen if 'escalation_deadline_missing' in s[2]] == []
++    finally:
++        replica.close()
++
++
++def test_block_ask_travels_in_the_blocked_status_op_and_a_run_end_stays_behind_it(conn, svc):
++    tid = _park_by_block(conn, svc)
++    ops = _push(conn, svc)
++    patches = [op['fields'] for op in ops if op['table'] == 'tasks' and op['uid'] == tid]
++    assert [set(p) & {'status', 'human_request'} for p in patches] == [{'status', 'human_request'}]
++    assert patches[0]['status'] == 'blocked' and json.loads(patches[0]['human_request'])['action'] == ASK['action']
++    assert _index(ops, tid, kind='blocked') < _index(ops, tid, status='blocked')
++    tid = _park_by_continue(conn, svc)
++    ops = _push(conn, svc)
++    end = next(i for i, op in enumerate(ops) if op['table'] == 'task_runs' and op['fields'].get('ended_at'))
++    assert _index(ops, tid, kind='continued') < _index(ops, tid, status='scheduled') < end
++
++
++def test_unblock_event_leaves_before_the_ready_status_bound_to_it(conn, svc):
++    tid = _park_by_block(conn, svc)
++    _push(conn, svc)
++    assert kb.unblock_task(conn, tid)
++    event = _event_uid(conn, tid, 'unblocked')
++    op = _status_op(conn, tid, 'ready')
++    assert op['status_origin'] == event and op[COLUMN] == event
++    ops = _push(conn, svc)
++    assert _index(ops, tid, kind='unblocked') < _index(ops, tid, status='ready')
++
++
++def test_claim_and_completion_keep_the_legacy_order(conn, svc):
++    """The claim's event names a run born in its own transaction; a terminal pair belongs to terminal ingress."""
++    tid = _acked(conn, svc)
++    assert kb.claim_task(conn, tid) is not None
++    assert _status_op(conn, tid, 'running')[COLUMN] is None
++    ops = _push(conn, svc)
++    assert _index(ops, tid, status='running') < _index(ops, tid, kind='claimed')
++    assert kb.complete_task(conn, tid, summary='done')
++    assert _status_op(conn, tid, 'done')[COLUMN] is None
++    ops = _push(conn, svc)
++    assert _index(ops, tid, status='done') < _index(ops, tid, kind='completed')
++
++
++def test_unacknowledged_card_keeps_its_full_row_first(conn, svc):
++    tid = kb.create_task(conn, title='never pushed', assignee='default')
++    assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-20T00:00:00Z release window', awaiting=CLOCK,
++                            clock_only=True)
++    assert _status_op(conn, tid, 'scheduled')[COLUMN] is None
++    ops = _push(conn, svc)
++    first = next(i for i, op in enumerate(ops) if op['table'] == 'tasks' and op['uid'] == tid)
++    assert first < _index(ops, tid, kind='scheduled')
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
++
++
++def test_two_status_captures_in_one_transaction_stay_unbound(conn, svc):
++    tid = _acked(conn, svc)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'scheduled', {})
++    assert [r[0] for r in conn.execute(f"SELECT {COLUMN} FROM kanban_sync_outbox WHERE table_name='tasks'")] == [None, None]
++
++
++def test_rolled_back_park_binds_nothing_and_later_transactions_start_clean(conn, svc):
++    tid = _acked(conn, svc)
++    with pytest.raises(ValueError), kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'scheduled', {})
++        raise ValueError('rollback')
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++    assert _status_op(conn, tid, 'scheduled')[COLUMN] is None
++
++
++def _selected(conn):
++    now = int(ksc.time.time())
++    return parent_first(conn, pending_rows(conn, now), now, ksc.PUSH_BATCH)
++
++
++def test_status_waits_behind_its_event_in_backoff_without_holding_other_cards(conn, svc):
++    tid = _park_by_schedule(conn, svc)
++    other = _park_by_schedule(conn, svc)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_outbox SET retry_after=? WHERE table_name='task_events' AND row_uid=?",
++                     (int(ksc.time.time()) + 600, _event_uid(conn, tid, 'scheduled')))
++    selected = _selected(conn)
++    assert not [r for r in selected if r['table_name'] == 'tasks' and r['row_uid'] == tid]
++    assert [r for r in selected if r['table_name'] == 'tasks' and r['row_uid'] == other]
++    assert conn.execute('SELECT MAX(attempts) FROM kanban_sync_outbox').fetchone()[0] == 0
++
++
++def test_status_travels_alone_once_its_event_was_rejected(conn, svc):
++    tid = _park_by_schedule(conn, svc)
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_outbox SET state='rejected' WHERE table_name='task_events' AND row_uid=?",
++                     (_event_uid(conn, tid, 'scheduled'),))
++    assert [r['row_uid'] for r in _selected(conn) if r['table_name'] == 'tasks'] == [tid]
++
++
++def test_event_is_found_after_a_transient_retry_rotated_its_op_id(conn, svc):
++    tid = _park_by_schedule(conn, svc)
++    uid = _event_uid(conn, tid, 'scheduled')
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_outbox SET op_id=?, created_at=created_at+5000 "
++                     "WHERE table_name='task_events' AND row_uid=?", (sync.uuid7(), uid))
++    selected = _selected(conn)
++    order = [(r['table_name'], r['row_uid']) for r in selected]
++    assert order.index(('task_events', uid)) < order.index(('tasks', tid))
++    assert len({r['op_id'] for r in selected}) == len(selected)
++
++
++def test_promotion_rewrites_no_envelope_clock_or_fifo_timestamp(conn, svc):
++    tid = _park_by_schedule(conn, svc)
++    before = [tuple(r) for r in conn.execute(
++        'SELECT op_id, fields, hlc, created_at, wire_json, status_origin FROM kanban_sync_outbox ORDER BY rowid')]
++    _selected(conn)
++    assert before == [tuple(r) for r in conn.execute(
++        'SELECT op_id, fields, hlc, created_at, wire_json, status_origin FROM kanban_sync_outbox ORDER BY rowid')]
++    ops = _push(conn, svc)
++    assert all(COLUMN not in op and COLUMN not in (op.get('fields') or {}) for op in ops)
++    assert _index(ops, tid, kind='scheduled') < _index(ops, tid, status='scheduled')
+-- 
+2.43.0
+

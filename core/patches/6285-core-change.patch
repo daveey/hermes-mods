@@ -1,0 +1,610 @@
+From b84b3c813a247cfb02ee18f10615bbdae6a34083 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:37:27 +0000
+Subject: [PATCH 6285] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit b84b3c813a247cfb02ee18f10615bbdae6a34083.
+
+---
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index a610554d4df..869ef2679d1 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -825,9 +825,6 @@
+ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+ CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
+--- Opt-in predicate keeps this index out of existing readers' implicit tie ordering.
+-CREATE INDEX IF NOT EXISTS idx_messages_recency_candidates ON messages(timestamp, session_id)
+-    WHERE (timestamp+0 IS NULL OR timestamp+0 IS NOT NULL);
+ -- Partial index for the Insights assistant tool-call scan
+ -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
+ -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+index 98a88e2d578..8f25033b678 100644
+--- a/hermes_state_recency.py
++++ b/hermes_state_recency.py
+@@ -6,10 +6,11 @@
+ once a second because some session row changes that often. ``ranked_rows`` returns the same rows
+ while running that probe only on a small candidate set that provably contains the page:
+ 
+-* On current schemas, the timestamp-leading candidate index reads only messages at or above T.
++* On explicitly prepared stores, the timestamp-leading derived range reads only messages at or above T.
+   This needs no full-store maxima rebuild and is exact even after message rewrites/deletions.
+-  Its opt-in partial predicate keeps the new index out of unrelated readers' query plans.
+-* Legacy schemas without that index use the per-store maxima cache below.
++  Its separate table keeps the new index out of unrelated messages readers' query plans.
++  Preparation is bounded/resumable (hermes_state_recency_build), never an owner-open migration.
++* Legacy and incomplete stores use the per-store maxima cache below.
+ * A per-store cache keeps each session's in-window ``MAX(messages.timestamp)``, built once with
+   the same probe. Every read folds in the sessions of messages past the watermark, inside the
+   read's own snapshot (``messages.id`` is AUTOINCREMENT, so a new message always lands past it).
+@@ -240,10 +241,13 @@
+ 
+ def _candidates(conn, store, where_clauses, params, need) -> Optional[str]:
+     """The JSON array of session ids that contain the page (module doc), or None to read unrestricted."""
+-    # The timestamp-leading index avoids a full message-max rebuild in every fresh
+-    # capture child. Legacy schemas keep the existing watermark path below.
+-    indexed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' "
+-                           "AND name='idx_messages_recency_candidates'").fetchone() is not None
++    # Preparation is explicit and resumable, not an owner-open migration.
++    # Legacy and incomplete stores keep the exact watermark path below.
++    indexed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
++                           "AND name='message_recency_build'").fetchone() is not None
++    if indexed:
++        indexed = conn.execute('SELECT ready FROM message_recency_build WHERE singleton=1').fetchone()
++        indexed = indexed is not None and indexed[0] == 1
+     # Among rows with an in-window last_activity_at the index key IS last_activity_at. CASE keeps the
+     # admission filter (JSON markers) off every row that has none.
+     in_window = f"s.last_activity_at {_SQL_IN_WINDOW}"
+@@ -260,10 +264,9 @@
+         # Query that covering index range directly, including ancestors in the
+         # same snapshot; no retained maxima or AUTOINCREMENT assumption needed.
+         high_json = conn.execute(
+-            "SELECT json_group_array(DISTINCT session_id) FROM messages "
+-            "INDEXED BY idx_messages_recency_candidates "
+-            "WHERE (timestamp+0 IS NULL OR timestamp+0 IS NOT NULL) "
+-            "AND timestamp BETWEEN ? AND ?", (threshold, EPOCH_MAX)).fetchone()[0]
++            "SELECT json_group_array(DISTINCT session_id) FROM message_recency_candidates "
++            "INDEXED BY idx_message_recency_range "
++            "WHERE timestamp BETWEEN ? AND ?", (threshold, EPOCH_MAX)).fetchone()[0]
+         return conn.execute(_CANDIDATES_SQL, (threshold, threshold, high_json)).fetchone()[0]
+     if not store.refresh(conn):
+         return None
+diff --git a/hermes_state_recency_build.py b/hermes_state_recency_build.py
+new file mode 100644
+index 00000000000..5d03bdb723b
+--- /dev/null
++++ b/hermes_state_recency_build.py
+@@ -0,0 +1,113 @@
++"""Prepare the derived recency range in short transactions, never during DB open.
++
++Run explicitly after installation, before the natural sessions successor canary:
++``hermes --run-module hermes_state_recency_build PATH/TO/state.db``.
++Messages stay authoritative. Interrupted preparation resumes its durable cursor;
++readers retain the literal fallback until completion commits. No service stop,
++update-fence change, or unbounded CREATE INDEX over the messages table is needed.
++"""
++import argparse
++import math
++from pathlib import Path
++import sqlite3
++import time
++
++# Separate table: building its initially empty range index never scans messages.
++SCHEMA_SQL = """
++CREATE TABLE IF NOT EXISTS message_recency_candidates (
++    id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, timestamp
++);
++CREATE INDEX IF NOT EXISTS idx_message_recency_range
++    ON message_recency_candidates(timestamp, session_id);
++CREATE TABLE IF NOT EXISTS message_recency_build (
++    singleton INTEGER PRIMARY KEY CHECK(singleton=1), cursor INTEGER, ready INTEGER NOT NULL
++);
++CREATE TRIGGER IF NOT EXISTS message_recency_insert AFTER INSERT ON messages BEGIN
++    INSERT OR REPLACE INTO message_recency_candidates VALUES(new.id, new.session_id, new.timestamp);
++END;
++CREATE TRIGGER IF NOT EXISTS message_recency_update AFTER UPDATE OF id, session_id, timestamp ON messages BEGIN
++    DELETE FROM message_recency_candidates WHERE id=old.id;
++    INSERT OR REPLACE INTO message_recency_candidates VALUES(new.id, new.session_id, new.timestamp);
++END;
++CREATE TRIGGER IF NOT EXISTS message_recency_delete AFTER DELETE ON messages BEGIN
++    DELETE FROM message_recency_candidates WHERE id=old.id;
++END;
++INSERT OR IGNORE INTO message_recency_build VALUES(1, NULL, 0);
++"""
++
++
++def prepare_batch(db, *, batch_size=128, transaction_seconds=0.05):
++    """One resumable batch. False = more work (or interrupted), True = published.
++
++    Use the normal owner's guarded writer/rollback path. The callback's progress
++    handler caps SQLite VM work under the write lock; a busy writer is never
++    displaced. The caller yields at least the elapsed batch time between calls.
++    """
++    if db.read_only:
++        raise ValueError('recency preparation requires an owner, not a read-only browser')
++    if batch_size < 1 or not math.isfinite(transaction_seconds) or transaction_seconds <= 0:
++        raise ValueError('positive batch size and transaction budget required')
++
++    def write(conn):
++        deadline = time.monotonic() + transaction_seconds
++        conn.set_progress_handler(lambda: time.monotonic() >= deadline, 16)
++        try:
++            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='message_recency_build' AND type='table'").fetchone() is None:
++                from hermes_state_schema import SessionSchemaMixin
++                # All tables, triggers and cursor commit together. No partial
++                # trigger installation can leave an untracked concurrent write.
++                SessionSchemaMixin._execute_ddl_script_transactional(conn.cursor(), SCHEMA_SQL)
++            cursor, ready = conn.execute('SELECT cursor, ready FROM message_recency_build WHERE singleton=1').fetchone()
++            if ready == 1:
++                return True
++            rows = conn.execute(
++                'SELECT id, session_id, timestamp FROM messages WHERE id >= ? ORDER BY id LIMIT ?'
++                if cursor is None else
++                'SELECT id, session_id, timestamp FROM messages WHERE id > ? ORDER BY id LIMIT ?',
++                (-9223372036854775808 if cursor is None else cursor, batch_size)).fetchall()
++            conn.executemany('INSERT OR REPLACE INTO message_recency_candidates VALUES(?, ?, ?)', rows)
++            if rows:
++                conn.execute('UPDATE message_recency_build SET cursor=? WHERE singleton=1', (rows[-1][0],))
++            else:
++                # Same writer transaction as the final empty range: concurrent
++                # inserts/rewrites/deletes are covered by the installed triggers.
++                conn.execute('UPDATE message_recency_build SET ready=1 WHERE singleton=1')
++            return not rows
++        finally:
++            conn.set_progress_handler(None, 0)
++    try:
++        return db._execute_write(write, patience_s=0.1)
++    except sqlite3.OperationalError as exc:
++        if getattr(exc, 'sqlite_errorcode', None) == sqlite3.SQLITE_INTERRUPT:
++            return False  # the writer rolled back both candidate rows and cursor
++        raise
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('database')
++    parser.add_argument('--seconds', type=float, default=600.0)
++    args = parser.parse_args()
++    if not math.isfinite(args.seconds) or args.seconds <= 0:
++        parser.error('--seconds must be positive')
++    if not Path(args.database).is_file():
++        parser.error('database must be an existing state.db file')
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=args.database)
++    deadline = time.monotonic() + args.seconds
++    try:
++        while time.monotonic() < deadline:
++            started = time.monotonic()
++            if prepare_batch(db):
++                print('recency candidates ready')
++                return 0
++            # <=50% preparation duty; no change to sessions-capture duty policy.
++            time.sleep(max(0.01, time.monotonic() - started))
++        print('recency preparation incomplete; cursor retained, reader fallback unchanged')
++        return 1
++    finally:
++        db.close()
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_sessions_capture_scale.py b/tests/hermes_cli/test_sessions_capture_scale.py
+index fb4b239b6ba..f2bb4ffb31c 100644
+--- a/tests/hermes_cli/test_sessions_capture_scale.py
++++ b/tests/hermes_cli/test_sessions_capture_scale.py
+@@ -4,6 +4,7 @@
+ 
+ from hermes_cli.sessions_capture_process import CaptureProcess, CaptureUnavailable
+ from hermes_state import SessionDB
++from tests.hermes_state.test_recency_cold_index import prepare
+ from tests.hermes_state import test_recency_hot_rows as helpers
+ from tests.hermes_cli.test_sessions_native_startup import selected
+ 
+@@ -20,6 +21,7 @@
+         db = SessionDB(db_path=target / 'state.db')
+         try:
+             helpers._seed(db, 2500, prefix=f'p{number}-')
++            prepare(db)
+         finally:
+             db.close()
+     from hermes_cli import sessions_capture_process as module
+diff --git a/tests/hermes_state/test_recency_build_cli.py b/tests/hermes_state/test_recency_build_cli.py
+new file mode 100644
+index 00000000000..1f3ab688c89
+--- /dev/null
++++ b/tests/hermes_state/test_recency_build_cli.py
+@@ -0,0 +1,81 @@
++"""Exercise explicit recency preparation through its real module entry point."""
++import subprocess
++import sys
++import time
++from types import SimpleNamespace
++
++import pytest
++from hermes_state import SessionDB
++import hermes_state_recency_build as build
++from tests.hermes_state import test_recency_hot_rows as helpers
++from tests.hermes_state.test_recency_cold_index import prepare
++from tests.hermes_state.test_recency_preparation import state, assert_mirror
++
++
++def test_real_preparation_module_and_reopen(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    helpers._seed(db, 20)
++    db.close()
++    result = subprocess.run([sys.executable, '-m', 'hermes_state_recency_build', str(path)],
++                            text=True, capture_output=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    assert 'recency candidates ready' in result.stdout
++    reader = SessionDB(db_path=path, read_only=True)
++    try:
++        assert state(reader)[0][1] == 1
++        assert_mirror(reader)
++    finally:
++        reader.close()
++
++
++@pytest.mark.parametrize('seconds', ['0', '-1', 'nan', 'inf'])
++def test_main_rejects_invalid_deadline_before_owner_open(tmp_path, monkeypatch, seconds):
++    missing = tmp_path / 'missing.db'
++    monkeypatch.setattr(sys, 'argv', ['build', str(missing), '--seconds', seconds])
++    with pytest.raises(SystemExit) as exc:
++        build.main()
++    assert exc.value.code == 2
++    assert not missing.exists()
++
++
++def test_main_refuses_missing_database(tmp_path, monkeypatch):
++    missing = tmp_path / 'missing.db'
++    monkeypatch.setattr(sys, 'argv', ['build', str(missing)])
++    with pytest.raises(SystemExit) as exc:
++        build.main()
++    assert exc.value.code == 2
++    assert not missing.exists()
++
++
++def test_main_deadline_retains_incomplete_cursor_and_yields(tmp_path, monkeypatch, capsys):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    helpers._seed(db, 200)
++    db.close()
++    monkeypatch.setattr(sys, 'argv', ['build', str(path), '--seconds', '2'])
++    original = build.prepare_batch
++    calls, yields = [], []
++    ticks = iter([0, 0, 0, 0.1, 3])
++    fake_time = SimpleNamespace(monotonic=lambda: next(ticks), sleep=yields.append)
++    monkeypatch.setattr(build, 'time', fake_time)
++    def one_batch(owner):
++        calls.append(owner)
++        monkeypatch.setattr(build, 'time', time)
++        try:
++            return original(owner, batch_size=1)
++        finally:
++            monkeypatch.setattr(build, 'time', fake_time)
++    monkeypatch.setattr(build, 'prepare_batch', one_batch)
++    assert build.main() == 1
++    assert len(calls) == 1
++    assert yields == [0.1]
++    assert 'incomplete' in capsys.readouterr().out
++    monkeypatch.undo()
++    db = SessionDB(db_path=path)
++    try:
++        assert state(db) == [(1, 0)]
++        prepare(db)
++        assert_mirror(db)
++    finally:
++        db.close()
+diff --git a/tests/hermes_state/test_recency_cold_index.py b/tests/hermes_state/test_recency_cold_index.py
+index ea226cb458c..aa76119a0b0 100644
+--- a/tests/hermes_state/test_recency_cold_index.py
++++ b/tests/hermes_state/test_recency_cold_index.py
+@@ -1,4 +1,4 @@
+-"""Cold capture ranks bounded candidates without rebuilding every message maximum."""
++"""Prepared cold capture ranks bounded candidates without rebuilding every message maximum."""
+ import sqlite3
+ import time
+ 
+@@ -6,13 +6,22 @@
+ 
+ import hermes_state_recency as recency
+ from hermes_state import SessionDB
++from hermes_state_recency_build import prepare_batch
+ from tests.hermes_state import test_recency_hot_rows as helpers
+ 
+ 
++def prepare(db):
++    for _ in range(10_000):
++        if prepare_batch(db):
++            return
++    pytest.fail('recency preparation did not finish')
++
++
+ def test_cold_30k_page_avoids_rebuild_and_finishes_in_capture_budget(tmp_path, monkeypatch):
+     db = SessionDB(db_path=tmp_path / 'state.db')
+     try:
+         helpers._seed(db, 30_000, messages=10)
++        prepare(db)
+         recency.clear()
+         monkeypatch.setattr(recency, '_rebuilt_maxima', lambda conn: pytest.fail('cold full-store maxima scan'))
+         started = time.monotonic()
+@@ -30,7 +39,7 @@
+     db = SessionDB(db_path=tmp_path / 'state.db')
+     try:
+         helpers._seed(db, 200)
+-        # An old session with a new message must outrank the activity threshold.
++        prepare(db)
+         helpers._write(db, 'UPDATE messages SET timestamp=? WHERE session_id=?', (helpers._BASE + 500, 's00000'))
+         helpers._write(db, "UPDATE sessions SET end_reason='compression' WHERE id='s00001'")
+         helpers._write(db, "UPDATE sessions SET parent_session_id='s00001' WHERE id='s00002'")
+@@ -50,7 +59,6 @@
+     db = SessionDB(db_path=tmp_path / 'state.db')
+     try:
+         helpers._seed(db, 200)
+-        helpers._write(db, 'DROP INDEX idx_messages_recency_candidates')
+         recency.clear()
+         actual = helpers._page(db, limit=50)
+         assert actual == helpers._exact(db, monkeypatch, limit=50)
+@@ -63,9 +71,10 @@
+ def test_index_is_ineligible_for_unmodified_timestamp_readers(tmp_path):
+     db = SessionDB(db_path=tmp_path / 'state.db')
+     try:
++        prepare(db)
+         with db._read_ctx() as conn:
+-            with pytest.raises(sqlite3.OperationalError, match='no query solution'):
+-                conn.execute('SELECT id FROM messages INDEXED BY idx_messages_recency_candidates WHERE timestamp >= ?', (0,))
++            with pytest.raises(sqlite3.OperationalError, match='no such index'):
++                conn.execute('SELECT id FROM messages INDEXED BY idx_message_recency_range WHERE timestamp >= ?', (0,))
+     finally:
+         db.close()
+ 
+@@ -75,6 +84,7 @@
+     db = SessionDB(db_path=tmp_path / 'state.db')
+     try:
+         helpers._seed(db, 200)
++        prepare(db)
+         for sql, params in [
+             ('UPDATE messages SET timestamp=? WHERE session_id=?', (value, 's00000')),
+             ('UPDATE messages SET timestamp=? WHERE session_id=?', (helpers._BASE + 1000, 's00000')),
+@@ -85,12 +95,10 @@
+             assert actual == helpers._exact(db, monkeypatch, limit=25, offset=25, include_pinned=True)
+         with db._read_ctx() as conn:
+             plan = conn.execute(
+-                'EXPLAIN QUERY PLAN SELECT DISTINCT session_id FROM messages '
+-                'INDEXED BY idx_messages_recency_candidates '
+-                'WHERE (timestamp+0 IS NULL OR timestamp+0 IS NOT NULL) AND timestamp BETWEEN ? AND ?',
++                'EXPLAIN QUERY PLAN SELECT DISTINCT session_id FROM message_recency_candidates '
++                'INDEXED BY idx_message_recency_range WHERE timestamp BETWEEN ? AND ?',
+                 (helpers._BASE, recency.EPOCH_MAX)).fetchall()
+-            assert any('SEARCH' in row[3] and 'idx_messages_recency_candidates' in row[3] for row in plan)
++            assert any('SEARCH' in row[3] and 'idx_message_recency_range' in row[3] for row in plan)
+     finally:
+         db.close()
+         recency.clear()
+-
+diff --git a/tests/hermes_state/test_recency_hot_rows.py b/tests/hermes_state/test_recency_hot_rows.py
+index 6113b240afd..1db06d60dea 100644
+--- a/tests/hermes_state/test_recency_hot_rows.py
++++ b/tests/hermes_state/test_recency_hot_rows.py
+@@ -159,7 +159,6 @@
+ def test_reprobe_of_legitimately_high_sessions_steps_through_none(db, monkeypatch):
+     """Sessions outside the page's filter can hold most fresh messages: the re-probe finds them still high
+     and must not bring them back to Python one row each."""
+-    _write(db, 'DROP INDEX idx_messages_recency_candidates')  # legacy watermark/re-probe path
+     _seed(db, 100)
+     _seed(db, 600, source="cron", prefix="c")
+     _write(db, "UPDATE messages SET timestamp = timestamp + 100000 WHERE session_id LIKE 'c%'")
+diff --git a/tests/hermes_state/test_recency_preparation.py b/tests/hermes_state/test_recency_preparation.py
+new file mode 100644
+index 00000000000..d14e32aaf71
+--- /dev/null
++++ b/tests/hermes_state/test_recency_preparation.py
+@@ -0,0 +1,203 @@
++"""No owner-open migration; explicit preparation is bounded, resumable and atomic."""
++import sqlite3
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_state import SessionDB
++import hermes_state_recency as recency
++import hermes_state_recency_build as build
++import hermes_state_schema_memo as memo
++from tests.hermes_state import test_recency_hot_rows as helpers
++from tests.hermes_state.test_recency_cold_index import prepare
++
++
++def rows(db, sql):
++    with db._read_ctx() as conn:
++        return [tuple(row) for row in conn.execute(sql).fetchall()]
++
++
++def state(db):
++    return rows(db, 'SELECT cursor, ready FROM message_recency_build')
++
++
++def assert_mirror(db):
++    assert rows(db, 'SELECT id, session_id, timestamp, typeof(timestamp) FROM message_recency_candidates ORDER BY id') == rows(
++        db, 'SELECT id, session_id, timestamp, typeof(timestamp) FROM messages ORDER BY id')
++
++
++def test_owner_open_never_builds_messages_recency_index(tmp_path, monkeypatch):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    helpers._seed(db, 1000)
++    helpers._write(db, 'DROP INDEX IF EXISTS idx_messages_recency_candidates')
++    db.close()
++    memo.clear()
++    original = SessionDB._open_writer_conn
++    attempted = []
++    def connect(self):
++        conn = original(self)
++        def authorize(action, name, table, database, source):
++            if action == sqlite3.SQLITE_CREATE_INDEX and name == 'idx_messages_recency_candidates':
++                attempted.append(name)
++                return sqlite3.SQLITE_DENY
++            return sqlite3.SQLITE_OK
++        conn.set_authorizer(authorize)
++        return conn
++    monkeypatch.setattr(SessionDB, '_open_writer_conn', connect)
++    owner = SessionDB(db_path=path)
++    try:
++        assert not attempted
++        assert rows(owner, "SELECT name FROM sqlite_master WHERE name LIKE 'message_recency_%'") == []
++    finally:
++        owner.close()
++
++
++def test_batches_resume_across_owners_and_concurrent_changes(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    try:
++        helpers._seed(db, 200)
++        assert not build.prepare_batch(db, batch_size=3)
++        assert state(db) == [(3, 0)]
++        peer = SessionDB(db_path=path)
++        try:
++            helpers._write(peer, 'UPDATE messages SET timestamp=timestamp+1000 WHERE id=1')
++            helpers._write(peer, 'DELETE FROM messages WHERE id=2')
++            helpers._write(peer, 'UPDATE messages SET id=-9223372036854775808 WHERE id=3')
++            helpers._write(peer, "INSERT INTO messages(id, session_id, role, content, timestamp) VALUES(2, 's00000', 'user', 'new', 123)")
++            prepare(peer)
++            assert state(peer)[0][1] == 1
++            assert_mirror(peer)
++        finally:
++            peer.close()
++        # Raw SQL writes, not just facade calls, update the published table.
++        helpers._write(db, "UPDATE messages SET session_id='s00001', timestamp='bad' WHERE id=2")
++        helpers._write(db, 'DELETE FROM messages WHERE id=1')
++        assert_mirror(db)
++    finally:
++        db.close()
++
++
++def test_peer_owner_can_initialize_and_write_between_unfinished_batches(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    errors = []
++    done = threading.Event()
++
++    def peer_work():
++        try:
++            peer = SessionDB(db_path=path)
++            try:
++                helpers._write(peer, 'UPDATE messages SET timestamp=timestamp+1000 WHERE id=1')
++            finally:
++                peer.close()
++        except BaseException as exc:
++            errors.append(exc)
++        finally:
++            done.set()
++
++    peer = threading.Thread(target=peer_work)
++    try:
++        helpers._seed(db, 200)
++        assert not build.prepare_batch(db, batch_size=1)
++        # Preparation has not completed; a real other owner must not wait for
++        # the remaining table build before initialization and ordinary writes.
++        peer.start()
++        assert done.wait(5), 'unfinished preparation excluded another owner'
++        peer.join()
++        assert not errors, errors
++        assert state(db) == [(1, 0)]
++        prepare(db)
++        assert_mirror(db)
++    finally:
++        if peer.ident is not None:
++            peer.join(25)
++        db.close()
++
++
++def test_minimum_rowid_is_backfilled(tmp_path):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 2)
++        helpers._write(db, 'UPDATE messages SET id=-9223372036854775808 WHERE id=1')
++        prepare(db)
++        assert_mirror(db)
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('installed', [False, True])
++def test_interrupted_batch_rolls_back_install_rows_and_cursor(tmp_path, monkeypatch, installed):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 200)
++        if installed:
++            assert not build.prepare_batch(db, batch_size=1)
++            before = state(db), rows(db, 'SELECT * FROM message_recency_candidates')
++        ticks = iter(range(10000))
++        monkeypatch.setattr(build, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
++        assert not build.prepare_batch(db, transaction_seconds=0.01)
++        if installed:
++            assert (state(db), rows(db, 'SELECT * FROM message_recency_candidates')) == before
++        else:
++            assert rows(db, "SELECT name FROM sqlite_master WHERE name LIKE 'message_recency_%'") == []
++        monkeypatch.undo()
++        prepare(db)
++        assert_mirror(db)
++        # The connection's temporary progress handler was cleared, including on abort.
++        helpers._write(db, 'UPDATE messages SET timestamp=timestamp+1')
++        assert_mirror(db)
++    finally:
++        db.close()
++
++
++@pytest.mark.parametrize('marker_sql', [
++    'UPDATE message_recency_build SET ready=0',
++    'UPDATE message_recency_build SET ready=2',
++    'DELETE FROM message_recency_build',
++])
++def test_incomplete_table_is_never_used_as_complete(tmp_path, monkeypatch, marker_sql):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        helpers._seed(db, 200)
++        prepare(db)
++        helpers._write(db, marker_sql)
++        recency.clear()
++        actual = helpers._page(db, limit=50)
++        assert recency._store_for(str(db.db_path)).watermark is not None
++        assert actual == helpers._exact(db, monkeypatch, limit=50)
++    finally:
++        db.close()
++        recency.clear()
++
++
++def test_empty_store_and_repeated_preparation(tmp_path):
++    db = SessionDB(db_path=tmp_path / 'state.db')
++    try:
++        assert build.prepare_batch(db)
++        assert build.prepare_batch(db)
++        helpers._seed(db, 20)
++        assert_mirror(db)
++        assert state(db) == [(None, 1)]
++    finally:
++        db.close()
++
++
++def test_preparation_rejects_readonly_and_invalid_budgets(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    try:
++        with pytest.raises(ValueError, match='positive'):
++            build.prepare_batch(db, batch_size=0)
++        with pytest.raises(ValueError, match='positive'):
++            build.prepare_batch(db, transaction_seconds=0)
++        reader = SessionDB(db_path=path, read_only=True)
++        try:
++            with pytest.raises(ValueError, match='owner'):
++                build.prepare_batch(reader)
++        finally:
++            reader.close()
++    finally:
++        db.close()
+-- 
+2.43.0
+

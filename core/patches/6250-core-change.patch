@@ -1,0 +1,336 @@
+From 96fe946cce30ecf182b60ccec908dc3db5e0ce92 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:31:28 +0000
+Subject: [PATCH 6250] Recorded governor explanations and lightweight why startup
+
+Public mirror of source commit 96fe946cce30ecf182b60ccec908dc3db5e0ce92.
+
+---
+diff --git a/hermes_cli/_startup_fast.py b/hermes_cli/_startup_fast.py
+index 974cd546e4b..2cb6aaa7000 100644
+--- a/hermes_cli/_startup_fast.py
++++ b/hermes_cli/_startup_fast.py
+@@ -251,6 +251,18 @@
+         pass
+ 
+ 
++def try_fast_readonly(argv: list[str] | None = None) -> bool:
++    """Version and fresh snapshot diagnostics, without bypassing container routing."""
++    argv = sys.argv[1:] if argv is None else argv
++    if try_fast_version(argv):
++        return True
++    if argv[:2] != ["kanban", "why"] or "--json" not in argv or container_mode_may_be_active():
++        return False
++    from hermes_cli.kanban_why_fast import try_cli
++
++    return try_cli(argv)
++
++
+ def try_fast_version(argv: list[str] | None = None) -> bool:
+     """Handle ``hermes --version`` before the heavy import wall.
+ 
+diff --git a/hermes_cli/kanban_governors.py b/hermes_cli/kanban_governors.py
+index 58a528d887c..42e168861d4 100644
+--- a/hermes_cli/kanban_governors.py
++++ b/hermes_cli/kanban_governors.py
+@@ -48,16 +48,15 @@
+ from pathlib import Path
+ from typing import Any, Iterator, Optional
+ 
++from hermes_cli.kanban_why_fast import STALE_SECONDS, SUFFIX, VERSION
++
+ _log = logging.getLogger(__name__)
+ 
+-VERSION = 1
+-SUFFIX = ".governors.json"
+ MAX_CARDS = 2000  # per-card rows kept in one snapshot; counts stay complete past it
+ MAX_IDS = 25  # card ids listed on one governor row
+ OVERLAP_BUDGET_SECONDS = 0.3  # per tick, for asking the rules after each card's first stop
+ OVERLAP_TTL_SECONDS = 300  # a card's own last evaluation is shown this long while the budget has not reached it
+ UNCHANGED_WRITE_SECONDS = 10  # an unchanged snapshot is rewritten (fresh ``tick_at``) at most this often
+-STALE_SECONDS = 180  # a snapshot older than this is reported stale: no dispatcher is ticking this board
+ 
+ HOLD, THROTTLE, REORDER = "hold", "throttle", "reorder"
+ 
+@@ -878,6 +877,9 @@
+                                previous.get("governors") if isinstance(previous.get("governors"), list) else [], now)
+     for card in kept.values():
+         card.pop("tick_overlaps", None)
++        known = _BY_ID.get(card.get("governor"))
++        card["label"] = known.label if known else None
++        card["source"] = known.source if known else None
+     return {"version": VERSION, "board": board, "tick_at": now, "idle_total": idle_total,
+             "caps": dict(capture.caps) if capture is not None else {},  # the limits this tick ran with
+             "charged_total": sum(row["cards"] for row in governors), "truncated": len(cards) > len(kept),
+diff --git a/hermes_cli/kanban_governors_cli.py b/hermes_cli/kanban_governors_cli.py
+index ff1e6f1d486..03c223fdcc4 100644
+--- a/hermes_cli/kanban_governors_cli.py
++++ b/hermes_cli/kanban_governors_cli.py
+@@ -106,13 +106,9 @@
+         from hermes_cli.kanban_governors_explain import explain
+ 
+         return explain(conn, task_id)
+-    first = {k: recorded.get(k) for k in ("governor", "label", "scope", "reading", "threshold", "since", "until",
+-                                          "detail", "source", "age_s")}
+-    first["verdict"] = "stop"
+-    return {"task_id": task_id, "board": recorded.get("board"), "source": "snapshot", "status": recorded.get("status"),
+-            "first_stop": first, "overlaps": recorded.get("overlaps"),
+-            "overlaps_unknown": recorded.get("overlaps_unknown"), "globals": recorded.get("globals"),
+-            "chain": [first], "recorded": recorded, "elapsed_s": round(time.monotonic() - started, 3)}
++    from hermes_cli.kanban_why_fast import answer
++
++    return answer(recorded, started=started)
+ 
+ 
+ def _print_why(answer: dict[str, Any]) -> None:
+diff --git a/hermes_cli/kanban_why_fast.py b/hermes_cli/kanban_why_fast.py
+new file mode 100644
+index 00000000000..98834aa2647
+--- /dev/null
++++ b/hermes_cli/kanban_why_fast.py
+@@ -0,0 +1,98 @@
++"""Read a fresh dispatcher snapshot without initializing a board or importing dispatch.
++
++The early CLI path is deliberately narrow. Fenced executions and nonstandard
++selectors retain the canonical CLI's resolution and admission checks.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import re
++import sqlite3
++import time
++
++VERSION = 1
++STALE_SECONDS = 180
++SUFFIX = ".governors.json"
++
++
++def read_answer(path: Path, task_id: str, *, now: float | None = None) -> dict | None:
++    """Return saved evidence only; missing/stale/incompatible evidence falls back.
++
++    One indexed, read-only card lookup prevents a finished or changed card from
++    inheriting its old tick's hold. No schema initialization or integrity scans.
++    """
++    started = time.monotonic()
++    now = time.time() if now is None else now
++    try:
++        doc = json.loads(path.with_name(path.name + SUFFIX).read_text(encoding="utf-8-sig"))
++        if not isinstance(doc, dict) or doc.get("version") != VERSION:
++            return None
++        age = now - float(doc.get("tick_at") or 0)
++        if not 0 <= age <= STALE_SECONDS:
++            return None
++        saved = doc.get("cards", {}).get(task_id)
++        if not isinstance(saved, dict) or not saved.get("label") or not saved.get("source"):
++            return None
++        from hermes_cli.kanban_lockguard import connect
++
++        conn = connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.1)
++        try:
++            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        finally:
++            conn.close()
++        if row is None or row[0] != saved.get("status"):
++            return None
++        recorded = {**saved, "task_id": task_id, "board": doc.get("board"), "tick_at": doc["tick_at"],
++                    "age_s": round(age, 1), "stale": False, "globals": doc.get("globals")}
++        return answer(recorded, started=started)
++    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
++        return None
++
++
++def answer(recorded: dict, *, started: float) -> dict:
++    """Shared rendering shape for cached and connected consumers."""
++    first = {k: recorded.get(k) for k in ("governor", "label", "scope", "reading", "threshold", "since", "until",
++                                         "detail", "source", "age_s")}
++    first["verdict"] = "stop"
++    return {"task_id": recorded["task_id"], "board": recorded.get("board"), "source": "snapshot",
++            "status": recorded.get("status"), "first_stop": first, "overlaps": recorded.get("overlaps"),
++            "overlaps_unknown": recorded.get("overlaps_unknown"), "globals": recorded.get("globals"),
++            "chain": [first], "recorded": recorded, "elapsed_s": round(time.monotonic() - started, 3)}
++
++
++def try_cli(argv: list[str]) -> bool:
++    """Handle only unambiguous, unfenced snapshot JSON invocations."""
++    if argv[:2] != ["kanban", "why"] or len(argv) < 4 or "--json" not in argv:
++        return False
++    # Do not duplicate the canonical worker/delegation/profile board fences.
++    from agent.delegation_context import explicit_board_intent_is_pinned
++
++    if explicit_board_intent_is_pinned() or any(os.environ.get(k) for k in (
++            "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")):
++        return False
++    task_id, flags = argv[2], argv[3:]
++    board = "default"
++    if flags == ["--json"]:
++        pass
++    elif len(flags) == 3 and flags[0] == "--board" and flags[2] == "--json":
++        board = flags[1]
++    elif len(flags) == 3 and flags[0] == "--json" and flags[1] == "--board":
++        board = flags[2]
++    else:
++        return False
++    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", board):
++        return False
++    from hermes_constants import get_default_hermes_root
++
++    root = Path(os.environ["HERMES_KANBAN_HOME"]).expanduser() if os.environ.get("HERMES_KANBAN_HOME") \
++        else get_default_hermes_root()
++    if flags == ["--json"] and (root / "kanban" / "current").exists():
++        return False  # canonical resolver handles current-board metadata and tombstones
++    path = root / "kanban.db" if board == "default" else root / "kanban" / "boards" / board / "kanban.db"
++    result = read_answer(path, task_id)
++    if result is None or result.get("board") != board:
++        return False
++    print(json.dumps(result, ensure_ascii=False, default=str))
++    return True
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 6bb99c7ecfa..1f338fb3a09 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -249,8 +249,8 @@
+ 
+ _startup_fast.ensure_project_root_on_path()
+ from hermes_cli.stdio_pipe import quiet_stdout_pipe
+-# ``hermes --version`` is answered before config/logging imports.
+-if quiet_stdout_pipe(_startup_fast.try_fast_version)():
++# Read-only fast commands are answered before config/logging imports.
++if quiet_stdout_pipe(_startup_fast.try_fast_readonly)():
+     raise SystemExit(0)
+ 
+ import argparse
+diff --git a/tests/hermes_cli/test_kanban_why_fast.py b/tests/hermes_cli/test_kanban_why_fast.py
+new file mode 100644
+index 00000000000..fea60a5ed42
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_why_fast.py
+@@ -0,0 +1,123 @@
++"""Real snapshot CLI import budget, with a real dispatcher-produced snapshot."""
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_governors as governors
++from tests.hermes_cli import test_kanban_governors as helpers
++
++board = helpers.board
++clean = helpers.clean
++
++
++def test_snapshot_cli_does_not_import_dispatch(board, monkeypatch):
++    helpers._usage(monkeypatch, [helpers.RESERVE + 7])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="snapshot import guard", assignee="default")
++        helpers._tick(conn)
++        recorded = governors.card(conn, tid)
++        assert recorded and recorded["governor"] == "llm_pool"
++        from hermes_cli.kanban_why_fast import read_answer
++        path = governors._db_path(conn)
++        assert read_answer(path, tid), recorded
++    env = dict(os.environ)
++    env["HERMES_KANBAN_HOME"] = str(board)
++    for key in list(env):
++        if key.startswith("HERMES_KANBAN_") and key != "HERMES_KANBAN_HOME":
++            env.pop(key)
++    code = """import runpy, sys
++try:
++    runpy.run_module('hermes_cli.main', run_name='__main__')
++except SystemExit as exc:
++    assert exc.code in (None, 0), exc.code
++for name in ('hermes_cli.kanban', 'hermes_cli.kanban_db', 'hermes_cli.kanban_db_dispatch',
++             'hermes_cli.kanban_governors', 'hermes_cli.kanban_governors_explain'):
++    assert name not in sys.modules, name
++"""
++    result = subprocess.run([sys.executable, "-c", code, "kanban", "why", tid, "--board", "default", "--json"],
++                            cwd=Path(__file__).resolve().parents[2], env=env, text=True, capture_output=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    answer = json.loads(result.stdout)
++    assert answer["source"] == "snapshot"
++    assert answer["first_stop"]["governor"] == "llm_pool"
++    assert answer["first_stop"]["label"]
++    assert answer["first_stop"]["source"]
++
++
++def test_snapshot_reader_fallbacks_and_parity(board, monkeypatch):
++    from hermes_cli import kanban_why_fast as fast
++    from hermes_cli import kanban_governors_cli as cli
++
++    helpers._usage(monkeypatch, [helpers.RESERVE + 7])
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="reader parity", assignee="default")
++        helpers._tick(conn)
++        path = governors._db_path(conn)
++        snap_path = governors.snapshot_path(conn)
++        original = json.loads(snap_path.read_text())
++        expected = cli.why(conn, tid)
++        actual = fast.read_answer(path, tid)
++        assert actual is not None
++        for result in (expected, actual):
++            result.pop("elapsed_s")
++            result["first_stop"].pop("age_s")
++            result["recorded"].pop("age_s")
++        assert actual == expected
++        for update in ({"version": 999}, {"tick_at": 0}, {"tick_at": 1e20},
++                       {"cards": {}}, {"cards": []}, {"tick_at": "invalid"}):
++            snap_path.write_text(json.dumps({**original, **update}))
++            assert fast.read_answer(path, tid) is None, update
++        old = json.loads(json.dumps(original))
++        old["cards"][tid].pop("source")
++        snap_path.write_text(json.dumps(old))
++        assert fast.read_answer(path, tid) is None
++        snap_path.write_text("not json")
++        assert fast.read_answer(path, tid) is None
++        snap_path.unlink()
++        assert fast.read_answer(path, tid) is None
++        snap_path.write_text(json.dumps(original))
++        assert fast.read_answer(path, "missing") is None
++        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        conn.commit()
++        assert fast.read_answer(path, tid) is None
++
++
++def test_fast_cli_defers_fences_and_unsupported_flags(monkeypatch, tmp_path):
++    from hermes_cli import kanban_why_fast as fast
++
++    def unexpected(*args, **kwargs):
++        raise AssertionError("must defer before reading")
++
++    monkeypatch.setattr(fast, "read_answer", unexpected)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT",
++                "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
++        with monkeypatch.context() as m:
++            m.setenv(key, "fenced")
++            assert fast.try_cli(["kanban", "why", "task", "--json"]) is False
++    for args in (["kanban", "why", "task"], ["kanban", "why", "task", "--json", "--live"],
++                 ["kanban", "why", "task", "--json", "--unknown"],
++                 ["kanban", "why", "task", "--board", "../escape", "--json"]):
++        assert fast.try_cli(args) is False
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    (tmp_path / "kanban").mkdir()
++    (tmp_path / "kanban" / "current").write_text("other")
++    assert fast.try_cli(["kanban", "why", "task", "--json"]) is False
++
++
++def test_fast_entry_preserves_container_routing(monkeypatch):
++    from hermes_cli import _startup_fast as startup
++    from hermes_cli import kanban_why_fast as fast
++
++    calls = []
++    monkeypatch.setattr(fast, "try_cli", lambda args: calls.append(args) or True)
++    monkeypatch.setattr(startup, "container_mode_may_be_active", lambda: True)
++    args = ["kanban", "why", "task", "--json"]
++    assert startup.try_fast_readonly(args) is False
++    assert calls == []
++    monkeypatch.setattr(startup, "container_mode_may_be_active", lambda: False)
++    assert startup.try_fast_readonly(args) is True
++    assert calls == [args]
+-- 
+2.43.0
+

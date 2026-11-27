@@ -1,0 +1,277 @@
+From f4ded40bff5b6e22aedb5b20f6480315c6138d24 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:23:32 +0000
+Subject: [PATCH 6212] Owning-chat stop-only control for ended shadow work
+
+Public mirror of source commit f4ded40bff5b6e22aedb5b20f6480315c6138d24.
+
+---
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 227493e79fe..99d6b80fcf1 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1392,6 +1392,10 @@
+                          (ch.version, ch.uid))
+         result.skipped_echo += 1
+         return
++    from hermes_cli.kanban_stop_sync import frozen_change
++    if frozen_change(conn, ch):
++        result.skipped += 1
++        return
+     handler = _APPLY_HANDLERS[(ch.table == "tasks", ch.op)]
+     if handler(conn, ch, own, result):
+         result.applied += 1
+diff --git a/hermes_cli/kanban_stop_context.py b/hermes_cli/kanban_stop_context.py
+index 75462789511..22929054505 100644
+--- a/hermes_cli/kanban_stop_context.py
++++ b/hermes_cli/kanban_stop_context.py
+@@ -37,8 +37,9 @@
+ 
+ 
+ def _routing_context() -> bool:
++    from agent.delegation_context import is_delegated_child_context
+     from gateway.session_context import get_session_env
+-    return any(os.environ.get(k) or get_session_env(k, '') for k in _ROUTING)
++    return is_delegated_child_context() or any(os.environ.get(k) or get_session_env(k, '') for k in _ROUTING)
+ 
+ 
+ class OwnerToken:
+diff --git a/hermes_cli/kanban_stop_ended.py b/hermes_cli/kanban_stop_ended.py
+index 1abad5c4e5c..4153b23e72b 100644
+--- a/hermes_cli/kanban_stop_ended.py
++++ b/hermes_cli/kanban_stop_ended.py
+@@ -139,8 +139,11 @@
+     snap = snapshot(conn, task_id)
+     row, payload = _stored(conn, task_id)
+     if row is not None:
++        from hermes_cli.kanban_wake_check import get_state
+         return {'ok': True, 'mode': 'readback', 'receipt': payload['receipt'], 'event_uid': row['uid'],
+-                'status': snap['status'], 'execution_restricted': True}
++                'status': snap['status'], 'execution_restricted': True,
++                'clock_wake_eligible': snap['status'] == 'scheduled',
++                'wake_check_registered': get_state(conn, task_id) is not None}
+     _eligible(conn, state, snap)
+     return {'ok': True, 'mode': 'snapshot', 'board': board, 'gateway': state['gateway_id'], 'task_id': task_id,
+             'expected_digest': digest(snap), 'snapshot': snap, 'writes': 0}
+@@ -186,6 +189,10 @@
+                 'request': {'request_uid': uid, 'expected_digest': expected_digest, 'frozen': frozen, 'owner': who},
+                 'receipt': receipt})
+             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
++            # The clock selector only considers scheduled cards. Remove its probe now too,
++            # without deleting the historical parking event or changing any dependency.
++            from hermes_cli.kanban_wake_check import set_check
++            set_check(conn, task_id, None, None)
+             from hermes_cli.kanban_stop_guards import install
+             install(conn)
+             event_uid = conn.execute('SELECT uid FROM task_events WHERE task_id=? AND kind=?', (task_id, KIND)).fetchone()[0]
+diff --git a/hermes_cli/kanban_stop_guards.py b/hermes_cli/kanban_stop_guards.py
+index b9e62148938..5c477f9a362 100644
+--- a/hermes_cli/kanban_stop_guards.py
++++ b/hermes_cli/kanban_stop_guards.py
+@@ -18,8 +18,13 @@
+ 
+ def _uid_only(table: str, columns: set[str]) -> str:
+     # The NULL -> uid bootstrap, or an exact no-op rewrite (a sync echo of this gateway's own row).
+-    same = ' AND '.join(f'NEW.{c} IS OLD.{c}' for c in sorted(columns - {'uid'}))
+-    return f'(({same}) AND (NEW.uid IS OLD.uid OR (OLD.uid IS NULL AND NEW.uid IS NOT NULL)))'
++    # Transport acknowledgements may monotonically advance a run's server version,
++    # never its outcome, ownership, timestamps or any other lifecycle evidence.
++    metadata = {'sync_version'} if table == 'task_runs' else set()
++    same = ' AND '.join(f'NEW.{c} IS OLD.{c}' for c in sorted(columns - {'uid'} - metadata))
++    version = (' AND COALESCE(NEW.sync_version,0)>=COALESCE(OLD.sync_version,0)'
++               if 'sync_version' in columns and metadata else '')
++    return f'(({same}) AND (NEW.uid IS OLD.uid OR (OLD.uid IS NULL AND NEW.uid IS NOT NULL)){version})'
+ 
+ 
+ def _columns(conn, table):
+@@ -31,7 +36,7 @@
+     pinned = ["NEW.status IS NOT 'triage'", 'NEW.current_run_id IS NOT NULL', 'NEW.claim_lock IS NOT NULL',
+               'NEW.claim_expires IS NOT NULL']
+     pinned += [f'NEW.{c} IS NOT NULL' for c in ('worker_pid', 'worker_started_at') if c in task_cols]
+-    pinned += [f'NEW.{c} IS NOT OLD.{c}' for c in ('title', 'body', 'assignee', 'created_on', 'tenant') if c in task_cols]
++    pinned += [f'NEW.{c} IS NOT OLD.{c}' for c in ('id', 'title', 'body', 'assignee', 'created_on', 'tenant') if c in task_cols]
+     runs_uid = _uid_only('task_runs', run_cols) if 'uid' in run_cols else '0'
+     events_uid = _uid_only('task_events', event_cols) if 'uid' in event_cols else '0'
+     links = f'OLD.parent_id IN ({_STOPPED}) OR OLD.child_id IN ({_STOPPED})'
+@@ -47,6 +52,7 @@
+         # INSERT OR REPLACE fires INSERT (not DELETE) triggers with recursive_triggers OFF.
+         'task_replace': ('BEFORE INSERT ON tasks', f'NEW.id IN ({_STOPPED})'),
+         'run_insert': ('BEFORE INSERT ON task_runs', f'NEW.task_id IN ({_STOPPED})'),
++        'run_replace': ('BEFORE INSERT ON task_runs', evidence_replace.replace('task_events o', 'task_runs o')),
+         'run_update': ('BEFORE UPDATE ON task_runs', f'OLD.task_id IN ({_STOPPED}) AND NOT {runs_uid}'),
+         'run_delete': ('BEFORE DELETE ON task_runs', f'OLD.task_id IN ({_STOPPED})'),
+         'event_update': ('BEFORE UPDATE ON task_events', f'OLD.task_id IN ({_STOPPED}) AND NOT {events_uid}'),
+diff --git a/hermes_cli/kanban_stop_sync.py b/hermes_cli/kanban_stop_sync.py
+new file mode 100644
+index 00000000000..e9e1b08129a
+--- /dev/null
++++ b/hermes_cli/kanban_stop_sync.py
+@@ -0,0 +1,27 @@
++"""Preserve locally frozen stop state while consuming ordinary Board feed pages."""
++from hermes_cli.kanban_stop_ended import KIND
++
++
++def frozen_change(conn, change) -> bool:
++    """Ignore lifecycle rewrites of an already stopped local card, including old feed echoes.
++
++    The serving Board prevents future foreign writes after its marker arrives. Previously
++    accepted rows can still be in flight, so local fences must not turn their delivery into
++    a board-wide page rollback. Keep the frozen bytes; the caller still advances its cursor.
++    This is not authority to install a stop from an arbitrary remote event.
++    """
++    table = change.table
++    if table not in {'tasks', 'task_runs', 'task_events', 'task_links'}:
++        return False
++    ids = {change.uid} if table == 'tasks' else set()
++    fields = change.fields or {}
++    ids.update(fields.get(k) for k in ('task_id', 'parent_id', 'child_id') if fields.get(k))
++    if table in {'task_runs', 'task_events'}:
++        row = conn.execute(f'SELECT task_id FROM {table} WHERE uid=?', (change.uid,)).fetchone()
++        if row:
++            ids.add(row[0])
++    if table == 'task_links':
++        # Link deletes carry only the composite wire UID, with no fields.
++        ids.update(change.uid.split('>', 1))
++    return any(conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind=? LIMIT 1',
++                            (task_id, KIND)).fetchone() for task_id in ids)
+diff --git a/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json b/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json
+index 566ffd0fafb..855899b44cb 100644
+--- a/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json
++++ b/hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json
+@@ -4679,6 +4679,7 @@
+                 "kanban_resume_contained",
+                 "kanban_retain",
+                 "kanban_show",
++                "kanban_stop_ended",
+                 "kanban_unblock",
+                 "kanban_unlink",
+                 "manage_catalog",
+diff --git a/tests/hermes_cli/test_kanban_stop_ended.py b/tests/hermes_cli/test_kanban_stop_ended.py
+index e916a948ebb..d3e27ff7004 100644
+--- a/tests/hermes_cli/test_kanban_stop_ended.py
++++ b/tests/hermes_cli/test_kanban_stop_ended.py
+@@ -124,6 +124,23 @@
+     assert guards.installed(shadow)
+ 
+ 
++def test_stop_removes_probe_and_clock_backstop_immediately(shadow):
++    from hermes_cli import kanban_wake_check as wake
++    source, target, child = ended_card(shadow)
++    with kb.write_txn(shadow):
++        kb._append_event(shadow, target, 'scheduled', {'wake_at': int(time.time()) + 300, 'resume_status': 'ready'})
++        wake.set_check(shadow, target, 'false', 120)
++    before = state(shadow, target, source, child)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
++        stop.apply(shadow, owner=token, **args(shadow, target))
++    assert wake.get_state(shadow, target) is None
++    from hermes_cli.kanban_continuation import _wake_parks
++    assert target not in _wake_parks(shadow, int(time.time()) + 600)[0]
++    assert state(shadow, target, source, child)['links'] == before['links']
++    readback = stop.read(shadow, board=BOARD, task_id=target)
++    assert readback['clock_wake_eligible'] is False and readback['wake_check_registered'] is False
++
++
+ def test_stopped_card_cannot_be_claimed_reopened_relinked_or_replaced(shadow):
+     source, target, child = ended_card(shadow)
+     with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as token:
+@@ -134,6 +151,9 @@
+     assert not kb.claim_task(shadow, target, claimer='default')
+     writes = [
+         "UPDATE tasks SET status='ready' WHERE id=:t",
++        "UPDATE tasks SET id='renamed' WHERE id=:t",
++        "INSERT OR REPLACE INTO task_runs (id,task_id,profile,status,started_at) "
++        "SELECT id,:s,'default','running',0 FROM task_runs WHERE task_id=:t",
+         "UPDATE tasks SET status='done' WHERE id=:t",
+         "UPDATE tasks SET status='archived' WHERE id=:t",
+         "UPDATE tasks SET claim_lock='x' WHERE id=:t",
+@@ -269,11 +289,25 @@
+             stop.apply(shadow, owner=token, **a)
+ 
+ 
+-def test_existing_primary_off_retain_gate_is_unchanged():
+-    import inspect
++def test_existing_primary_off_retain_gate_is_unchanged(shadow, monkeypatch):
+     from hermes_cli import kanban_retain
+-    src = inspect.getsource(kanban_retain.retain)
+-    assert "raise ValueError('retain requires owning primary or genuinely local board')" in src
++    monkeypatch.setattr(kanban_retain.actors, 'bound_actor', lambda _conn: object())
++    with pytest.raises(ValueError, match='retain requires owning primary or genuinely local board'):
++        kanban_retain.retain(shadow, board=BOARD, summary='stop', reason='scope_stopped',
++                             next_step='owner review', release_condition='none', evidence=['ended'])
++
++
++def test_token_cannot_cross_live_contexts_or_delegate(shadow):
++    from agent.delegation_context import delegated_child_context
++    _source, target, _child = ended_card(shadow)
++    a = args(shadow, target)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE) as first:
++        with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=INTERACTIVE):
++            with pytest.raises(stop.StopRefused, match='owner_required'):
++                stop.apply(shadow, owner=first, **a)
++        with delegated_child_context('child'):
++            with pytest.raises(stop.StopRefused, match='owner_required'):
++                stop.apply(shadow, owner=first, **a)
+ 
+ 
+ def _tool():
+diff --git a/tests/hermes_cli/test_kanban_stop_sync.py b/tests/hermes_cli/test_kanban_stop_sync.py
+new file mode 100644
+index 00000000000..ea89230eddd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_stop_sync.py
+@@ -0,0 +1,52 @@
++"""Administrative stop must preserve the board's ordinary transport progress."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_stop_context as ctx
++from hermes_cli import kanban_stop_ended as stop
++from tests.hermes_cli import test_kanban_stop_ended as fixtures
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++shadow = fixtures.shadow
++ME, BOARD, SID = fixtures.ME, fixtures.BOARD, fixtures.SID
++
++
++@pytest.mark.parametrize('acked_before_stop', [True, False])
++def test_stop_push_ack_pull_preserves_rows_and_unrelated_progress(shadow, acked_before_stop):
++    service = FakeService()
++    hub = service.hub(ME)
++    source, target, child = fixtures.ended_card(shadow)
++    if acked_before_stop:
++        ksc.push(shadow, hub, BOARD, ME, primary=False)
++        ksc.pull(shadow, hub, BOARD, observers=False)
++    with ctx.bound(SID, gateway=ME, profile='default', source='desktop', source_reader=fixtures.INTERACTIVE) as token:
++        stop.apply(shadow, owner=token, **fixtures.args(shadow, target))
++    protected = fixtures.state(shadow, target, source, child)
++    ksc.push(shadow, hub, BOARD, ME, primary=False)
++    ksc.pull(shadow, hub, BOARD, observers=False)
++    assert shadow.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0] == 0
++    assert sync.sync_state(shadow)['cursor'] == service.board(BOARD)['seq']
++    assert kb.get_task(shadow, target).status == 'triage'
++    assert fixtures.state(shadow, target, source, child)['links'] == protected['links']
++    assert shadow.execute('SELECT outcome FROM task_runs WHERE task_id=?', (target,)).fetchone()[0] == 'crashed'
++    # A write already accepted before the marker arrived can still follow in a feed page.
++    # FakeService has no new hub barrier; this injects that historical ordering, not a claim
++    # that the deployed service accepts new foreign writes after the marker.
++    board = service.board(BOARD)
++    service._put(board, 'tasks', target, {'status': 'ready', 'title': 'late foreign'}, 'foreign', None, '9999999999999-0000-foreign')
++    service._put(board, 'tasks', source, {'title': 'unrelated progress'}, ME, None, '9999999999999-0001-hub')
++    run_uid = protected['runs'][0]['uid']
++    event_uid = shadow.execute('SELECT uid FROM task_events WHERE task_id=? AND kind=?', (target, stop.KIND)).fetchone()[0]
++    for table, uid in [('task_links', source + '>' + target), ('task_links', target + '>' + child),
++                       ('task_runs', run_uid), ('task_events', event_uid), ('tasks', target)]:
++        service._emit(board, table, uid, 'delete', None, 'foreign', None)
++    ksc.pull(shadow, hub, BOARD, observers=False)
++    assert fixtures.state(shadow, target, source, child)['links'] == protected['links']
++    assert shadow.execute('SELECT COUNT(*) FROM task_runs WHERE uid=?', (run_uid,)).fetchone()[0] == 1
++    assert shadow.execute('SELECT COUNT(*) FROM task_events WHERE uid=?', (event_uid,)).fetchone()[0] == 1
++    assert sync.sync_state(shadow)['cursor'] == board['seq']
++    assert kb.get_task(shadow, target).status == 'triage'
++    assert kb.get_task(shadow, target).title == 'M5'
++    assert kb.get_task(shadow, source).title == 'unrelated progress'
+-- 
+2.43.0
+

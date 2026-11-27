@@ -1,0 +1,180 @@
+From e7a2b42ca2f9f6bf2f9ba17fc08524d238d47adb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:35:12 -0800
+Subject: [PATCH 6495] Desktop Background section, stripes and bounded reports
+
+Public mirror of source commit e7a2b42ca2f9f6bf2f9ba17fc08524d238d47adb.
+
+---
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index 12323f5b88c..16f0492573c 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -6,6 +6,7 @@
+ import { Tip } from '@/components/ui/tooltip'
+ import { reportSessionCommittedStripeRemote, reportSessionStripeRemote, type SessionInfo } from '@/hermes'
+ import { useI18n } from '@/i18n'
++import { boundDiagnosticSender } from '@/lib/bounded-diagnostic-sender'
+ import { canonicalOutcomeStatus, outcomeHasCrons, outcomeHasWatches, outcomeTooltip } from '@/lib/session-outcome'
+ import { sessionStatusStripeColor } from '@/lib/session-status-stripe'
+ import { useExecutionObservationClock } from '@/lib/use-execution-observation-clock'
+@@ -26,8 +27,13 @@
+ import { externalClockOnly, sessionExternalStripeTip, unknownExternalCloud } from './session-row-stripe-external'
+ 
+ // [daveey] Every red edge (with its reasons) also goes to the session's own gateway, where the agent can read it.
++// Both reporters cap their in-flight POSTs: a wake/stall commits every row's paint at once (74 in one tick), and
++// unbounded they all time out together on a briefly half-open link.
++const sendStripeReason = boundDiagnosticSender(reportSessionStripeRemote)
++const sendCommittedStripe = boundDiagnosticSender(reportSessionCommittedStripeRemote)
++
+ setStripeReasonReporter((row, stripe, previous, reasons) =>
+-  reportSessionStripeRemote(
++  sendStripeReason(
+     { connection_id: row.connection_id, id: row.id, profile: row.profile },
+     stripe,
+     previous,
+@@ -37,7 +43,7 @@
+ 
+ // [daveey] Every committed paint of a row with a canonical envelope (any stripe, not red only) is reported with the
+ // revision it painted, so the gateway can compare it with what it published.
+-setCommittedStripeReporter(reportSessionCommittedStripeRemote)
++setCommittedStripeReporter(sendCommittedStripe)
+ 
+ /** What a row that is not `needs-input` subscribes to instead of `$stuckPromptInputsKey`: it never changes. */
+ const NO_PROMPT_INPUTS = atom('')
+diff --git a/apps/desktop/src/lib/bounded-diagnostic-sender.test.ts b/apps/desktop/src/lib/bounded-diagnostic-sender.test.ts
+new file mode 100644
+index 00000000000..f127492cfd8
+--- /dev/null
++++ b/apps/desktop/src/lib/bounded-diagnostic-sender.test.ts
+@@ -0,0 +1,73 @@
++import { describe, expect, it } from 'vitest'
++
++import { boundDiagnosticSender } from './bounded-diagnostic-sender'
++
++const deferred = () => {
++  let resolve!: (v: number) => void
++  const promise = new Promise<number>(a => (resolve = a))
++
++  return { promise, resolve }
++}
++
++describe('boundDiagnosticSender', () => {
++  it('never exceeds the in-flight limit and sends the rest in order as slots free', async () => {
++    const gates = Array.from({ length: 10 }, deferred)
++    const started: number[] = []
++    let active = 0
++    let peak = 0
++
++    const send = boundDiagnosticSender(
++      async (i: number) => {
++        started.push(i)
++        peak = Math.max(peak, ++active)
++
++        try {
++          return await gates[i]!.promise
++        } finally {
++          active -= 1
++        }
++      },
++      3
++    )
++
++    const results = gates.map((_, i) => send(i))
++    expect(started).toEqual([0, 1, 2])
++    gates[0]!.resolve(100)
++    await results[0]
++    await new Promise(r => setTimeout(r, 0))
++    expect(started).toEqual([0, 1, 2, 3])
++    gates.forEach((g, i) => g.resolve(i + 100))
++    expect(await Promise.all(results)).toEqual(gates.map((_, i) => i + 100))
++    expect(peak).toBe(3)
++    expect(started).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
++  })
++
++  it('frees the slot when a send rejects or throws synchronously', async () => {
++    let n = 0
++
++    const send = boundDiagnosticSender((): Promise<number> => {
++      n += 1
++
++      if (n === 1) {
++        throw new Error('sync')
++      }
++
++      return n === 2 ? Promise.reject(new Error('async')) : Promise.resolve(n)
++    }, 1)
++
++    const [a, b, c] = [send(), send(), send()]
++    await expect(a).rejects.toThrow('sync')
++    await expect(b).rejects.toThrow('async')
++    expect(await c).toBe(3)
++  })
++
++  it('rejects the oldest waiter when the queue overflows', async () => {
++    const gate = deferred()
++    const send = boundDiagnosticSender(() => gate.promise, 1, 2)
++    const p = [send(), send(), send(), send()]
++    await expect(p[1]).rejects.toThrow('diagnostic queue full')
++    gate.resolve(1)
++    expect(await p[0]).toBe(1)
++    expect(await p[3]).toBe(1)
++  })
++})
+diff --git a/apps/desktop/src/lib/bounded-diagnostic-sender.ts b/apps/desktop/src/lib/bounded-diagnostic-sender.ts
+new file mode 100644
+index 00000000000..6fdad7ccf69
+--- /dev/null
++++ b/apps/desktop/src/lib/bounded-diagnostic-sender.ts
+@@ -0,0 +1,48 @@
++/**
++ * [daveey] Diagnostic POSTs (stripe reports) are fire-and-forget, but a sidebar of N rows commits N paints at once
++ * (after a renderer stall or wake: 74 in one tick). Unbounded, they all ride one link together, all wait the same
++ * 30 s request timeout and all log "Timed out connecting to Hermes backend" when that link is briefly half-open.
++ * This keeps at most `limit` in flight; the rest wait in a FIFO (their timeout clock starts when they are sent).
++ * A queue beyond `maxQueued` rejects the oldest waiter so memory stays bounded; callers already retry/drop.
++ */
++export function boundDiagnosticSender<A extends unknown[], R>(
++  send: (...args: A) => Promise<R>,
++  limit = 4,
++  maxQueued = 512
++): (...args: A) => Promise<R> {
++  let active = 0
++  const waiting: { reject: (e: unknown) => void; run: () => void }[] = []
++
++  const pump = () => {
++    while (active < limit && waiting.length) {
++      waiting.shift()!.run()
++    }
++  }
++
++  return (...args: A) =>
++    new Promise<R>((resolve, reject) => {
++      const run = () => {
++        active += 1
++        let p: Promise<R>
++
++        try {
++          p = send(...args)
++        } catch (e) {
++          p = Promise.reject(e)
++        }
++
++        void p.then(resolve, reject).finally(() => {
++          active -= 1
++          pump()
++        })
++      }
++
++      waiting.push({ reject, run })
++
++      if (waiting.length > maxQueued) {
++        waiting.shift()!.reject(new Error('diagnostic queue full'))
++      }
++
++      pump()
++    })
++}
+-- 
+2.43.0
+

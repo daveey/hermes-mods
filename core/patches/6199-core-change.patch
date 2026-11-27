@@ -1,0 +1,596 @@
+From 459e28e57330b5a9834da900c403288c8e990d10 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:57:07 +0000
+Subject: [PATCH 6199] Fail-closed startup readiness and natural controller rollover
+
+Public mirror of source commit 459e28e57330b5a9834da900c403288c8e990d10.
+
+---
+diff --git a/hermes_cli/boot_warmup_gate.py b/hermes_cli/boot_warmup_gate.py
+index 565dfaeda33..6265aafde57 100644
+--- a/hermes_cli/boot_warmup_gate.py
++++ b/hermes_cli/boot_warmup_gate.py
+@@ -1,4 +1,4 @@
+-"""Hold the always-on dashboard's socket until its boot prewarms finish (bounded). [daveey]
++"""Hold the always-on dashboard's application readiness until prewarms finish (bounded). [daveey]
+ 
+ Every hub core update retires the always-on ``serve`` (code skew) and its supervisor starts a new one. The new
+ process starts the kanban board, session-list annotation and project-tree prewarms on daemon threads and binds its
+@@ -8,8 +8,8 @@
+ them, so ~4 s of warm-up CPU took 39 s of wall time on 2026-11-12 (``kanban board prewarm finished ...
+ elapsed_s=39.274``) and the Desktop's 6 s / 30 s request deadlines expired: a timeout burst on every core update.
+ 
+-uvicorn runs the lifespan startup before it binds, so waiting here keeps the port closed while the prewarms run
+-uncontended. Desktop's always-on attach treats a closed port as "waiting for its supervisor restart" and keeps
++uvicorn runs the lifespan startup before accepting app traffic. A headless bootstrap listener may already own
++the socket, but returns HTTP503 (including health) until this gate completes. Desktop treats this as not ready and keeps
+ failing fast for up to 20 s (``ALWAYS_ON_RESTART_WAIT_MS`` in ``apps/desktop/electron/remote-lifecycle.ts``), then
+ attaches to a warm backend. The wait is capped (at most 6 s, and it ends by 17 s after process start, since boot
+ alone takes 11-18 s on the hub; see ``ALWAYS_ON_BIND_DEADLINE_S`` for how that fits the window) so a slow warm-up
+@@ -17,7 +17,7 @@
+ owned backend.
+ 
+ Only the always-on backend waits: a Desktop-owned ``serve --isolated`` is dialled with a 10 s ready probe and must
+-bind at once (GH-73083).
++become ready promptly (GH-73083).
+ """
+ 
+ from __future__ import annotations
+diff --git a/hermes_cli/serve_bootstrap_listener.py b/hermes_cli/serve_bootstrap_listener.py
+index e996b5e02b4..d8e0fcb98ca 100644
+--- a/hermes_cli/serve_bootstrap_listener.py
++++ b/hermes_cli/serve_bootstrap_listener.py
+@@ -21,7 +21,7 @@
+ 
+     def do_GET(self):
+         if self.command in ('GET', 'HEAD') and self.path.split('?', 1)[0] == '/api/health':
+-            status, body = 200, b'{"status":"starting","ready":false,"ok":false}'
++            status, body = 503, b'{"status":"starting","ready":false,"ok":false}'
+         else:
+             status, body = 503, b'{"detail":"Application and authentication warming"}'
+         self.send_response(status)
+diff --git a/hermes_cli/serve_exit_flush.py b/hermes_cli/serve_exit_flush.py
+index 5666d311af1..2baf4b3d7a0 100644
+--- a/hermes_cli/serve_exit_flush.py
++++ b/hermes_cli/serve_exit_flush.py
+@@ -24,8 +24,11 @@
+     if callable(previous):
+         previous(signum, frame)
+     else:
+-        signal.signal(signum, signal.SIG_DFL)
+-        os.kill(os.getpid(), signum)
++        try:
++            signal.signal(signum, signal.SIG_DFL)
++            os.kill(os.getpid(), signum)
++        except (OSError, ValueError):
++            raise SystemExit(128 + int(signum)) from None
+ 
+ 
+ def _handle(signum, frame):
+@@ -35,7 +38,12 @@
+ def install():
+     if threading.current_thread() is not threading.main_thread():
+         return False
++    installed = False
+     for signum in (signal.SIGTERM, signal.SIGINT):
+-        if signal.getsignal(signum) is not _handle:
+-            _previous[signum] = signal.signal(signum, _handle)
+-    return True
++        try:
++            if signal.getsignal(signum) is not _handle:
++                _previous[signum] = signal.signal(signum, _handle)
++            installed = True
++        except (OSError, ValueError):
++            continue
++    return installed
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 370f07d3456..6c2be700ced 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -1,4 +1,4 @@
+-"""Pre-import native capture custody, after producer admission and plugin discovery."""
++"""Pre-import native capture custody, after producer admission, before app assembly."""
+ from contextlib import contextmanager
+ import os
+ import signal
+diff --git a/hermes_cli/web_gateway_lazy.py b/hermes_cli/web_gateway_lazy.py
+index cb51528fd80..823eb9e0138 100644
+--- a/hermes_cli/web_gateway_lazy.py
++++ b/hermes_cli/web_gateway_lazy.py
+@@ -1,7 +1,10 @@
+ """Publish delivery hooks without eagerly importing the agent/provider tree."""
+ import importlib
++import atexit
+ 
+-_OWNER = object()
++from tui_gateway.plugin_inject import _TUI_INJECT_OWNER as _OWNER
++
++_atexit_registered = False
+ 
+ 
+ def load_gateway():
+@@ -20,8 +23,12 @@
+ 
+ def install_message_host():
+     from hermes_cli.plugins import get_plugin_manager, publish_tui_message_host
++    global _atexit_registered
+     publish_tui_message_host(_OWNER, _inject)
+     get_plugin_manager().set_tui_message_injector(_OWNER, _inject)
++    if not _atexit_registered:
++        atexit.register(clear_message_host)
++        _atexit_registered = True
+ 
+ 
+ def clear_message_host():
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index 8853304fb32..b12c3e8c96f 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -223,7 +223,7 @@
+ 
+     start_background_bootstrap()
+ 
+-    # Always-on backend only: keep the port closed until the boot prewarms finish (bounded), so the Desktop's
++    # Always-on backend only: keep app traffic unavailable until prewarms finish (bounded), so the Desktop's
+     # reconnect burst after a core-update restart meets warm caches (hermes_cli/boot_warmup_gate.py). [daveey]
+     from hermes_cli.boot_warmup_gate import hold_bind_for_prewarm
+ 
+diff --git a/scripts/bench_serve_startup.py b/scripts/bench_serve_startup.py
+new file mode 100644
+index 00000000000..8f404f69c5c
+--- /dev/null
++++ b/scripts/bench_serve_startup.py
+@@ -0,0 +1,137 @@
++"""Measure real CLI startup in disposable homes (never restart an installed backend).
++
++Run: bash scripts/run-in-hermes-env python3 scripts/bench_serve_startup.py
++Timings start immediately before Popen, including managed launcher/bootstrap work.
++The BOARD/ANNOTATION hold and SESSIONS canary switches match the approved rollout.
++This is a synthetic SQLite inventory, not unit-start/direct+proxy live acceptance.
++"""
++from __future__ import annotations
++
++import argparse
++import http.client
++import json
++import os
++from pathlib import Path
++import socket
++import subprocess
++import tempfile
++import threading
++import time
++
++
++def request(port, path, authenticated, started):
++    client = http.client.HTTPConnection('127.0.0.1', port, timeout=.1)
++    try:
++        headers = {'X-Hermes-Session-Token': 'fixture-benchmark-token'} if authenticated else {}
++        client.request('GET', path, headers=headers)
++        response = client.getresponse()
++        body = response.read()
++        observation = {'path': path, 'authenticated': authenticated,
++                       'seconds': time.monotonic() - started, 'status': response.status}
++        return observation, json.loads(body) if response.status == 200 else None
++    except (OSError, http.client.HTTPException):
++        return None, None
++    finally:
++        client.close()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--rows', type=int, default=1000)
++    parser.add_argument('--deadline', type=float, default=20)
++    parser.add_argument('--assert-timings', action='store_true')
++    args = parser.parse_args()
++    root = Path(__file__).resolve().parents[1]
++    original_home = Path.home() / '.hermes'
++    fixture = Path(tempfile.mkdtemp(prefix='serve-startup-', dir=os.environ.get('TMPDIR')))
++    home = fixture / 'proof'
++    home.mkdir()
++    default_home = fixture / '.hermes'
++    default_home.mkdir()
++    # Borrow installed immutable tools/dependencies; all mutable app state is disposable.
++    for target in (home, default_home):
++        for name in ('installs', 'tools'):
++            (target / name).symlink_to(original_home / name, target_is_directory=True)
++    os.environ['HOME'] = str(fixture)
++    os.environ['HERMES_HOME'] = str(home)
++    (home / 'config.yaml').write_text('model:\n  default: fixture\nplugins:\n  enabled: []\n', encoding='utf-8')
++    from hermes_state import SessionDB
++    from hermes_cli._launchers import runtime_command
++
++    store = SessionDB(db_path=home / 'state.db')
++    try:
++        for i in range(args.rows):
++            sid = f'benchmark-row-{i}'
++            store.create_session(sid, source='cli')
++            store.append_message(session_id=sid, role='user', content='benchmark fixture')
++    finally:
++        store.close()
++    with socket.socket() as reservation:
++        reservation.bind(('127.0.0.1', 0))
++        port = reservation.getsockname()[1]
++    command = runtime_command(root, module='hermes_cli.main') + [
++        'serve', '--proof-home', str(home), '--isolated', '--port', str(port)]
++    env = dict(os.environ, HERMES_FACTS_SESSIONS='1', HERMES_FACTS_ANNOTATION='0',
++               HERMES_FACTS_BOARD='0', HERMES_FACTS_LINKS='0',
++               HERMES_DASHBOARD_SESSION_TOKEN='fixture-benchmark-token')
++    for key in tuple(env):
++        if key.startswith(('HERMES_KANBAN_', 'HERMES_WORKER_', 'HERMES_AGENT_OWNER_')):
++            env.pop(key)
++    # Do not disable recovery/sweep services: exercise the actual serve lifespan.
++    env.pop('HERMES_TEST_ISOLATION', None)
++    env.pop('PYTHONPROFILEIMPORTTIME', None)
++    paths = ['/api/health', '/api/profiles/sessions?limit=50&min_messages=1',
++             '/api/profiles/sessions/sidebar']
++    observations, first, errors = [], {}, []
++    first_response = None
++    auth_rejected = False
++    pause = threading.Event()
++    with (fixture / 'serve.log').open('wb') as log:
++        started = time.monotonic()
++        child = subprocess.Popen(command, env=env, cwd=root, stdout=log, stderr=log)
++        try:
++            while time.monotonic() - started < args.deadline and child.poll() is None:
++                for path, authenticated in [(p, True) for p in paths] + [(paths[1], False)]:
++                    observation, data = request(port, path, authenticated, started)
++                    if observation is None:
++                        continue
++                    elapsed, status = observation['seconds'], observation['status']
++                    first_response = elapsed if first_response is None else first_response
++                    observations.append(observation)
++                    if not authenticated:
++                        auth_rejected |= status in (401, 403)
++                        if status == 200:
++                            errors.append('unauthenticated sessions returned 200')
++                    elif status == 200:
++                        assert data is not None
++                        rows = data.get('sessions', []) if 'sidebar' not in path else data.get('recents', {}).get('sessions', [])
++                        if path == paths[0] or any(row['id'].startswith('benchmark-row-') for row in rows):
++                            first.setdefault(path, elapsed)
++                        else:
++                            errors.append('successful sessions read lacked seeded rows: ' + path)
++                if len(first) == len(paths) and auth_rejected:
++                    break
++                pause.wait(.02)
++        finally:
++            child.terminate()
++            try:
++                child.wait(timeout=15)
++            except subprocess.TimeoutExpired:
++                child.kill()
++                child.wait()
++    cold = {p: any(o['path'] == p and o['authenticated'] and o['status'] == 503 for o in observations)
++            for p in paths[1:]}
++    timing_pass = (first_response is not None and first_response < 1.5
++                   and all(first.get(p, float('inf')) < 5 for p in paths[1:]))
++    report = {'fixture': str(fixture), 'rows': args.rows, 'first_response': first_response,
++              'first_success': first, 'auth_rejected': auth_rejected, 'cold_503': cold,
++              'timing_pass': timing_pass, 'errors': errors, 'exit_code': child.returncode,
++              'observations': observations}
++    (fixture / 'result.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
++    print(json.dumps({k: v for k, v in report.items() if k != 'observations'}, indent=2))
++    valid = not errors and auth_rejected and all(cold.values()) and len(first) == len(paths)
++    return 0 if valid and (timing_pass or not args.assert_timings) else 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/tests/hermes_cli/test_serve_bootstrap_listener.py b/tests/hermes_cli/test_serve_bootstrap_listener.py
+index dd61b774d94..a89cff4b2b2 100644
+--- a/tests/hermes_cli/test_serve_bootstrap_listener.py
++++ b/tests/hermes_cli/test_serve_bootstrap_listener.py
+@@ -21,7 +21,9 @@
+     from hermes_cli.serve_bootstrap_listener import BootstrapListener
+ 
+     with BootstrapListener('127.0.0.1', 0) as listener:
+-        assert request(listener.port, '/api/health')[0] == 200
++        # Legacy Desktop probes accept any 2xx: starting health must be non-2xx.
++        status, body = request(listener.port, '/api/health')
++        assert status == 503 and b'"ready":false' in body
+         status, body = request(listener.port, '/api/profiles/sessions')
+         assert status == 503
+         assert b'sessions' not in body
+@@ -71,7 +73,7 @@
+         try:
+             await asyncio.wait_for(entered.wait(), 2)
+             status, body = await asyncio.to_thread(request, listener.port, '/api/health')
+-            assert status == 200 and b'false' in body
++            assert status == 503 and b'false' in body
+             assert not listener.stopped
+             release.set()
+             await asyncio.wait_for(startup, 2)
+@@ -82,3 +84,43 @@
+             release.set()
+             await startup
+             await server.shutdown()
++
++
++def test_capture_starts_before_runtime_and_failed_assembly_releases_socket(monkeypatch):
++    from contextlib import contextmanager
++    from types import SimpleNamespace
++    from hermes_cli import dashboard_server_start, sessions_early_boot
++
++    order, ports = [], []
++    from hermes_cli import serve_bootstrap_listener
++    real_listener = serve_bootstrap_listener.BootstrapListener
++
++    def listener(host, port):
++        owned = real_listener(host, port)
++        ports.append(owned.port)
++        return owned
++
++    @contextmanager
++    def capture(**kwargs):
++        assert request(ports[0], '/api/health')[0] == 503
++        order.append('capture-start')
++        try:
++            yield object()
++        finally:
++            order.append('capture-close')
++
++    def runtime(*args):
++        assert request(ports[0], '/api/profiles/sessions')[0] == 503
++        order.append('runtime')
++        raise RuntimeError('assembly failed')
++
++    monkeypatch.setattr(serve_bootstrap_listener, 'BootstrapListener', listener)
++    monkeypatch.setattr(sessions_early_boot, 'early_sessions', capture)
++    with pytest.raises(RuntimeError, match='assembly failed'):
++        dashboard_server_start.prepare_and_run_server(
++            SimpleNamespace(host='127.0.0.1', port=0), headless=True,
++            prepare_runtime=runtime, prepare_auth=lambda args: pytest.fail('auth reached'), bootstrap={})
++    assert order == ['capture-start', 'runtime', 'capture-close']
++    with socket.socket() as probe:
++        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        probe.bind(('127.0.0.1', ports[0]))
+diff --git a/tests/hermes_cli/test_serve_exit_flush.py b/tests/hermes_cli/test_serve_exit_flush.py
+index 4b88a968118..2ae477de894 100644
+--- a/tests/hermes_cli/test_serve_exit_flush.py
++++ b/tests/hermes_cli/test_serve_exit_flush.py
+@@ -21,7 +21,123 @@
+ def test_lazy_flush_respects_ignored_signal(monkeypatch):
+     from hermes_cli import serve_exit_flush as bridge
+     gateway = SimpleNamespace(__spec__=None,
+-                              _handle_exit_flush_signal=lambda *a: pytest.fail('ignored signal flushed'))
++                              _flush_sessions_before_exit=lambda *a: pytest.fail('ignored signal flushed'))
+     with monkeypatch.context() as scoped:
+         scoped.setitem(sys.modules, 'tui_gateway.server', gateway)
+         bridge.dispatch(signal.SIGINT, None, signal.SIG_IGN)
++
++
++def test_install_off_main_thread_is_inert(monkeypatch):
++    from hermes_cli import serve_exit_flush as bridge
++    monkeypatch.setattr(bridge.threading, 'current_thread', object)
++    monkeypatch.setattr(bridge.signal, 'signal', lambda *a: pytest.fail('off-main installation'))
++    assert bridge.install() is False
++
++
++def test_install_signal_failure_preserves_available_handler(monkeypatch):
++    from hermes_cli import serve_exit_flush as bridge
++    calls = []
++
++    def install(signum, callback):
++        calls.append(signum)
++        if signum == signal.SIGTERM:
++            raise OSError('unsupported')
++        return signal.SIG_IGN
++
++    monkeypatch.setattr(bridge, '_previous', {})
++    monkeypatch.setattr(bridge.signal, 'getsignal', lambda signum: signal.SIG_DFL)
++    monkeypatch.setattr(bridge.signal, 'signal', install)
++    assert bridge.install() is True
++    assert calls == [signal.SIGTERM, signal.SIGINT]
++    assert bridge._previous == {signal.SIGINT: signal.SIG_IGN}
++
++
++def test_default_disposition_falls_back_to_signal_exit_code(monkeypatch):
++    from hermes_cli import serve_exit_flush as bridge
++    monkeypatch.delitem(sys.modules, 'tui_gateway.server', raising=False)
++    monkeypatch.setattr(bridge.signal, 'signal', lambda *a: None)
++
++    def refused(*args):
++        raise OSError('signal unavailable')
++
++    monkeypatch.setattr(bridge.os, 'kill', refused)
++    with pytest.raises(SystemExit) as stopped:
++        bridge.dispatch(signal.SIGTERM, None, signal.SIG_DFL)
++    assert stopped.value.code == 128 + signal.SIGTERM
++
++
++@pytest.mark.platforms('posix')
++def test_installed_bridge_flushes_real_gateway_in_terminated_process(tmp_path):
++    import os
++    import subprocess
++    from pathlib import Path
++    from hermes_state import SessionDB
++
++    home = tmp_path / 'home'
++    home.mkdir()
++    code = r'''
++import os, signal, sys, faulthandler
++faulthandler.dump_traceback_later(15)
++from pathlib import Path
++from hermes_cli import serve_exit_flush
++assert 'tui_gateway.server' not in sys.modules
++home = Path(os.environ['HERMES_HOME'])
++def previous(signum, frame):
++    (home / 'previous').write_text('called')
++    raise SystemExit(0)
++signal.signal(signal.SIGTERM, previous)
++assert serve_exit_flush.install()
++assert serve_exit_flush.install()  # no self-chain
++assert 'tui_gateway.server' not in sys.modules
++from hermes_state import SessionDB
++from tui_gateway import server
++db = SessionDB(db_path=home / 'state.db')
++db.create_session('fixture-exit', source='tui')
++class Agent:
++    session_id = 'fixture-exit'
++    _session_messages = [{'role': 'user', 'content': 'survive actual termination'}]
++    def _persist_session(self, messages, conversation_history=None):
++        for message in messages:
++            if not message.get('_db_persisted'):
++                db.append_message(self.session_id, message['role'], message['content'])
++                message['_db_persisted'] = True
++server._sessions['fixture-exit'] = {'agent': Agent(), 'session_key': 'fixture-exit', 'running': False}
++faulthandler.cancel_dump_traceback_later()
++os.write(1, b'READY\n')
++signal.pause()
++'''
++    env = dict(os.environ, HOME=str(home), HERMES_HOME=str(home), HERMES_TEST_ISOLATION='1')
++    root = Path(__file__).resolve().parents[2]
++    diagnostics = (tmp_path / 'child.log').open('w+')
++    child = subprocess.Popen([sys.executable, '-c', code], cwd=root, env=env,
++                             stdout=subprocess.PIPE, stderr=diagnostics, text=True, encoding='utf-8')
++    try:
++        # A bounded reader thread avoids a hung test when child import fails.
++        import concurrent.futures
++        assert child.stdout is not None
++        with concurrent.futures.ThreadPoolExecutor() as reader:
++            ready = reader.submit(child.stdout.readline)
++            try:
++                assert ready.result(timeout=30).strip() == 'READY'
++            except BaseException as exc:
++                child.kill()
++                child.wait(timeout=10)
++                diagnostics.seek(0)
++                raise AssertionError(diagnostics.read()) from exc
++        child.send_signal(signal.SIGTERM)
++        out, _ = child.communicate(timeout=30)
++        diagnostics.seek(0)
++        err = diagnostics.read()
++        assert child.returncode == 0, (out, err)
++        assert 'Exception ignored' not in err and 'Traceback' not in err, err
++        assert (home / 'previous').read_text() == 'called'
++        db = SessionDB(db_path=home / 'state.db')
++        try:
++            assert any(row['content'] == 'survive actual termination' for row in db.get_messages('fixture-exit'))
++        finally:
++            db.close()
++    finally:
++        if child.poll() is None:
++            child.kill()
++        child.communicate(timeout=10)
++        diagnostics.close()
+diff --git a/tests/hermes_cli/test_web_gateway_lazy.py b/tests/hermes_cli/test_web_gateway_lazy.py
+index a6b7fcb4a88..07e6ba0a736 100644
+--- a/tests/hermes_cli/test_web_gateway_lazy.py
++++ b/tests/hermes_cli/test_web_gateway_lazy.py
+@@ -42,3 +42,9 @@
+     assert not calls
+     assert proxy._methods == {'x': 'handler'}
+     assert calls == ['load']
++
++
++def test_lazy_host_has_same_owner_as_loaded_gateway_host():
++    from hermes_cli import web_gateway_lazy as lazy
++    from tui_gateway import plugin_inject
++    assert lazy._OWNER is plugin_inject._TUI_INJECT_OWNER
+diff --git a/tests/tui_gateway/test_plugin_inject_host.py b/tests/tui_gateway/test_plugin_inject_host.py
+index 6444224b1c6..b357cb2f02a 100644
+--- a/tests/tui_gateway/test_plugin_inject_host.py
++++ b/tests/tui_gateway/test_plugin_inject_host.py
+@@ -146,6 +146,9 @@
+ 
+     monkeypatch.setattr(server, "_run_prompt_submit", fake_run_prompt_submit)
+     monkeypatch.setattr(server, "_session_uses_compute_host", lambda session: False)
++    # A real idle session has already opened its transcript DB. Keep admission
++    # real, but establish that prerequisite before the bounded async assertion.
++    server._get_db()
+     origin = _session("ses_idle", running=False)
+     monkeypatch.setattr(server, "_sessions", {"ui-idle": origin})
+     server.install_tui_message_injector(manager)
+diff --git a/tests/tui_gateway/test_startup_resume_observer_guards.py b/tests/tui_gateway/test_startup_resume_observer_guards.py
+index 2528030e67c..6ba8743e3c0 100644
+--- a/tests/tui_gateway/test_startup_resume_observer_guards.py
++++ b/tests/tui_gateway/test_startup_resume_observer_guards.py
+@@ -103,7 +103,8 @@
+ 
+     stop = threading.Event()
+     observed = []
+-    handler = lambda *a: None
++    resumed = []
++    handler = lambda *a: resumed.append(a)
+     monkeypatch.setattr(proof_home, "recovery_home_allowed", lambda *a: True)
+     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+     monkeypatch.setattr(config, "load_config", dict)
+@@ -119,4 +120,33 @@
+     assert thread is not None
+     thread.join(5)
+     assert not thread.is_alive()
+-    assert observed == [(handler, tmp_path, {}, stop)]
++    assert len(observed) == 1 and observed[0][1:] == (tmp_path, {}, stop)
++    observed[0][0]('late', {'session_id': 'fixture'})
++    assert resumed == [('late', {'session_id': 'fixture'})]
++
++
++def test_empty_boot_scan_does_not_import_gateway_but_observer_retains_lazy_resume(tmp_path, monkeypatch):
++    import builtins
++    from hermes_cli import config, proof_home
++    import hermes_constants
++
++    imports, observers = [], []
++    real_import = builtins.__import__
++
++    def observe_import(name, globals=None, locals=None, fromlist=(), level=0):
++        if name == 'tui_gateway' and 'server' in (fromlist or ()):
++            imports.append(name)
++        return real_import(name, globals, locals, fromlist, level)
++
++    monkeypatch.setattr(builtins, '__import__', observe_import)
++    monkeypatch.setattr(proof_home, 'recovery_home_allowed', lambda *a: True)
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
++    monkeypatch.setattr(config, 'load_config', dict)
++    monkeypatch.setattr(sr, 'time', SimpleNamespace(sleep=lambda *a: None))
++    monkeypatch.setattr(sr, '_observe_markers', lambda *a: observers.append(a))
++    thread = sr.start_startup_resume_sweep()
++    assert thread is not None
++    thread.join(5)
++    assert not thread.is_alive()
++    assert imports == []
++    assert len(observers) == 1 and callable(observers[0][0])
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index ddd2065d64b..a27d9091dc4 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -231,15 +231,18 @@
+ 
+     home = Path(get_hermes_home())
+ 
++    def handler(rid, params):
++        # Marker observation is not an agent consumer. Import only when an
++        # eligible interrupted turn actually reaches the resume boundary.
++        from tui_gateway import server
++        resume = server._methods.get("session.resume")
++        if resume is None:
++            raise RuntimeError("startup resume: session.resume handler not installed")
++        return resume(rid, params)
++
+     def _run() -> None:
+         time.sleep(delay)
+-        handler = None
+         try:
+-            from tui_gateway import server
+-            handler = server._methods.get("session.resume")
+-            if handler is None:
+-                logger.warning("startup resume: session.resume handler not installed")
+-                return
+             done = resume_interrupted_sessions(handler, home, cfg)
+             if done:
+                 logger.info("startup resume: %d interrupted session(s) processed", len(done))
+@@ -248,8 +251,7 @@
+             # Keep observing every eligible marker, including ordinary interrupted turns.
+         except Exception:
+             logger.exception("startup resume sweep failed")
+-        if handler is not None:
+-            _observe_markers(handler, home, cfg, stop or threading.Event())
++        _observe_markers(handler, home, cfg, stop or threading.Event())
+ 
+     from agent.memory_provider import spawn_context_thread
+     t = spawn_context_thread(_run, name="startup-resume-sweep", passive=True)
+-- 
+2.43.0
+

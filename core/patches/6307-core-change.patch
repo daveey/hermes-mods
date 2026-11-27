@@ -1,0 +1,511 @@
+From 9077abcc352cb545ed65bc531e7416feb0d42772 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:24:43 +0000
+Subject: [PATCH 6307] Immutable historical rejection observations and fresh audit cuts
+
+Public mirror of source commit 9077abcc352cb545ed65bc531e7416feb0d42772.
+
+---
+diff --git a/hermes_cli/kanban_history_residue_custody.py b/hermes_cli/kanban_history_residue_custody.py
+index 02255bc48d6..a16c1da47df 100644
+--- a/hermes_cli/kanban_history_residue_custody.py
++++ b/hermes_cli/kanban_history_residue_custody.py
+@@ -72,6 +72,12 @@
+ 
+ def stage(conn, scope, request_json):
+     """Commit exact intent before network I/O. Caller must separately prove live inputs."""
++    stage_once(conn, scope, request_json)
++    return _request(request_json)[1]['op_id']
++
++
++def stage_once(conn, scope, request_json):
++    """Return true only to the transaction that first commits this exact intent."""
+     scope = _scope(scope)
+     _, row = _request(request_json)
+     _require(not conn.in_transaction, 'custody_nested_transaction')
+@@ -82,7 +88,7 @@
+             _require(old['request_json'] == request_json, 'intent_conflict')
+         else:
+             conn.execute(f'INSERT INTO {INTENTS} VALUES(?,?,?,?,?,?)', (*scope, row['op_id'], row['row_uid'], request_json))
+-    return row['op_id']
++    return old is None
+ 
+ 
+ def seal(conn, scope, op_id, receipt_json):
+diff --git a/hermes_cli/kanban_history_residue_http.py b/hermes_cli/kanban_history_residue_http.py
+new file mode 100644
+index 00000000000..991f3d71571
+--- /dev/null
++++ b/hermes_cli/kanban_history_residue_http.py
+@@ -0,0 +1,122 @@
++"""Bounded authenticated historical observation I/O, never op settlement. [daveey]
++
++observe is a low-level producer, not a live-input authorization gate. Callers must
++validate local source/fences separately before creating an intent. Once any intent
++exists, retries are GET-only, including an intent left before the first send.
++Missing readback therefore remains unresolved; this API never replaces/replays it.
++"""
++from __future__ import annotations
++
++import http.client
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli.kanban_history_residue_source import Refused, _require, _text, strict_object
++
++MAX_RESPONSE = 2 * 1024 * 1024
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++def scope(hub, board):
++    """Bind custody to the actual credential-bearing Hub, never a caller-supplied scope."""
++    endpoint = hub.ident.url
++    parts = urllib.parse.urlsplit(endpoint)
++    _require(parts.scheme == 'https' or (parts.scheme == 'http' and parts.hostname in
++             ('localhost', '127.0.0.1', '::1')), 'endpoint_transport')
++    _require(bool(parts.hostname) and not parts.username and not parts.password
++             and not parts.query and not parts.fragment, 'endpoint_identity')
++    host = f'[{parts.hostname.lower()}]' if ':' in parts.hostname else parts.hostname.lower()
++    port = parts.port
++    default = 443 if parts.scheme == 'https' else 80
++    canonical = f'{parts.scheme}://{host}' + (f':{port}' if port is not None and port != default else '')
++    # Reject aliases rather than silently rewriting the operator's custody coordinates.
++    _require(endpoint == canonical, 'endpoint_noncanonical')
++    _require(_text(board) and _text(hub.ident.gateway) and _text(hub.ident.key)
++             and all(33 <= ord(c) <= 126 for c in hub.ident.key), 'endpoint_identity')
++    return endpoint, board, hub.ident.gateway
++
++
++def _path(board, op_id=None, *, current=False):
++    path = f'/v2/boards/{urllib.parse.quote(board, safe="")}/history-residue'
++    if op_id is not None:
++        path += '?' + urllib.parse.urlencode({'op_id': op_id, **({'current': '1'} if current else {})})
++    return path
++
++
++def _request(hub, method, path, body):
++    """No redirects, implicit retries or unbounded response decoding, even for errors."""
++    from hermes_cli.kanban_sync_attachment_deadline import Transfer
++    from hermes_cli.kanban_sync_client import HubError
++
++    budget = hub._remaining(min(5.0, hub.timeout))
++    transfer = Transfer(budget)
++    req = urllib.request.Request(hub.ident.url + path, method=method, data=body,
++                                 headers=hub._headers())
++
++    def read():
++        local = urllib.parse.urlsplit(hub.ident.url).hostname in ('localhost', '127.0.0.1', '::1')
++        proxies = (urllib.request.ProxyHandler({}),) if local else ()
++        opener = urllib.request.build_opener(_NoRedirect(), *proxies, *transfer.handlers())
++        with opener.open(req, timeout=budget) as response:
++            raw = response.read(MAX_RESPONSE + 1)
++            _require(len(raw) <= MAX_RESPONSE, 'response_size')
++            return raw
++
++    try:
++        return transfer.run(read)
++    except urllib.error.HTTPError as exc:
++        exc.close()
++        raise HubError(exc.code, 'history observation refused') from exc
++    except http.client.HTTPException as exc:
++        raise OSError('incomplete history observation') from exc
++
++
++def reconcile(conn, hub, board, op_id):
++    """Exact readback only. No POST, source mutation or current-authority claim."""
++    identity = scope(hub, board)
++    old = custody.lookup(conn, identity, op_id)
++    _require(old is not None, 'intent_missing')
++    raw = _request(hub, 'GET', _path(board, op_id), None)
++    _require(raw.strip() != b'null', 'observation_unconfirmed')
++    text = raw.decode('utf-8', 'strict')
++    # seal also checks exact source, reason, original parent version and false authority flags.
++    custody.seal(conn, identity, op_id, text)
++    return {'recorded': True, 'op_id': op_id, 'current_authority_verified': False}
++
++
++def observe(conn, hub, board, request_json):
++    """New intent sends at most once; existing intent can only reconcile by GET.
++
++    Even successful POST replies require a separate authenticated readback. A lost
++    reply or malformed answer cannot manufacture custody; missing GET stays open.
++    """
++    from hermes_cli.kanban_sync_client import HubError
++
++    identity = scope(hub, board)
++    _, source = custody._request(request_json)
++    op_id = source['op_id']
++    if not custody.stage_once(conn, identity, request_json):
++        return reconcile(conn, hub, board, op_id)
++    try:
++        # Send the exact durable request bytes, not a re-encoded Python object.
++        _request(hub, 'POST', _path(board), request_json.encode('utf-8'))
++    except (OSError, HubError, Refused, ValueError):
++        # No replacement POST: only exact GET may resolve this uncertain outcome.
++        pass
++    return reconcile(conn, hub, board, op_id)
++
++
++def current(hub, board, op_id):
++    """Raw fresh read for a future cut-bound consumer; this alone authorizes nothing."""
++    scope(hub, board)
++    _require(_text(op_id), 'op_id_invalid')
++    raw = _request(hub, 'GET', _path(board, op_id, current=True), None)
++    text = raw.decode('utf-8', 'strict')
++    strict_object(text, max_bytes=MAX_RESPONSE)
++    return text
+diff --git a/tests/hermes_cli/test_kanban_history_residue_http.py b/tests/hermes_cli/test_kanban_history_residue_http.py
+new file mode 100644
+index 00000000000..3a47c7f6a97
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_http.py
+@@ -0,0 +1,190 @@
++"""Real HTTP custody producer: uncertain delivery is GET-only after reopen."""
++import json
++import sqlite3
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli import kanban_history_residue_http as transport
++from hermes_cli.kanban_history_residue_source import Refused
++from hermes_cli.kanban_sync_client import Hub, Identity
++from tests.hermes_cli.test_kanban_history_residue_custody import SCOPE, request
++
++
++@pytest.fixture
++def server():
++    raw, receipt = request()
++    state = {'calls': [], 'receipt': None, 'reply': json.dumps(receipt).encode(), 'post': 'ok'}
++
++    class Handler(BaseHTTPRequestHandler):
++        def log_message(self, *args):
++            pass
++
++        def do_GET(self):
++            self.respond(False)
++
++        def do_POST(self):
++            self.respond(True)
++
++        def respond(self, post):
++            body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
++            state['calls'].append((self.command, self.path, self.headers.get('Authorization'), body))
++            if post:
++                state['receipt'] = state['reply']
++                if state['post'] == 'drop':
++                    self.close_connection = True
++                    return
++            response = state['receipt'] or b'null'
++            if state.get('truncated'):
++                self.send_response(200)
++                self.send_header('Transfer-Encoding', 'chunked')
++                self.end_headers()
++                self.wfile.write(b'10\r\nxx')
++                self.close_connection = True
++                return
++            if state.get('slow'):
++                self.send_response(200)
++                self.send_header('Content-Length', '100')
++                self.end_headers()
++                try:
++                    self.wfile.write(b'{')
++                    self.wfile.flush()
++                    state['release'].wait(2)
++                finally:
++                    state['peer_finished'].set()
++                return
++            self.send_response(state.get('status', 200))
++            if 'redirect' in state:
++                self.send_header('Location', state['redirect'])
++            self.send_header('Content-Length', str(len(response)))
++            self.end_headers()
++            self.wfile.write(response)
++
++    http = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    thread = threading.Thread(target=http.serve_forever, daemon=True)
++    thread.start()
++    hub = Hub(Identity(f'http://127.0.0.1:{http.server_port}', 'fixture-key', 'home'))
++    try:
++        yield hub, state, raw
++    finally:
++        http.shutdown()
++        http.server_close()
++        thread.join()
++        hub.close()
++
++
++@pytest.fixture
++def db(tmp_path):
++    conn = sqlite3.connect(tmp_path / 'history.db', isolation_level=None)
++    conn.row_factory = sqlite3.Row
++    yield conn
++    conn.close()
++
++
++def scope(hub):
++    return (hub.ident.url, 'default', 'home')
++
++
++def test_real_authenticated_post_exact_body_then_get_readback(db, server):
++    hub, state, raw = server
++    result = transport.observe(db, hub, 'default', raw)
++    assert result['recorded'] is True and result['current_authority_verified'] is False
++    assert [c[0] for c in state['calls']] == ['POST', 'GET']
++    assert state['calls'][0][3] == raw.encode()
++    assert state['calls'][0][1] == '/v2/boards/default/history-residue'
++    assert state['calls'][1][1] == '/v2/boards/default/history-residue?op_id=op-original'
++    assert state['calls'][1][3] == b''
++    assert all(c[2] == 'Bearer fixture-key' for c in state['calls'])
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] == state['reply'].decode()
++    before = db.total_changes
++    transport.observe(db, hub, 'default', raw)
++    assert state['calls'][-1][0] == 'GET' and len(state['calls']) == 3
++    assert db.total_changes == before
++
++
++def test_dropped_post_answer_reconciles_without_repost(db, server):
++    hub, state, raw = server
++    state['post'] = 'drop'
++    assert transport.observe(db, hub, 'default', raw)['recorded']
++    assert [c[0] for c in state['calls']] == ['POST', 'GET']
++
++
++def test_restart_unsealed_intent_only_gets_even_if_server_has_no_record(db, server):
++    hub, state, raw = server
++    custody.stage(db, scope(hub), raw)
++    path = db.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path, isolation_level=None) as reopened:
++        with pytest.raises(Refused, match='observation_unconfirmed'):
++            transport.observe(reopened, hub, 'default', raw)
++    assert [c[0] for c in state['calls']] == ['GET']
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++
++
++@pytest.mark.parametrize('change', ['source', 'reason', 'revision', 'duplicate', 'authority', 'utf8', 'large'])
++def test_bad_authenticated_readback_keeps_intent_unsealed(db, server, change):
++    hub, state, raw = server
++    obj = json.loads(state['reply'])
++    if change == 'source': obj['source_json'] += ' '
++    if change == 'reason': obj['reason'] = 'another reason'
++    if change == 'revision': obj['parent']['version'] += 1
++    if change == 'authority': obj['execution_authority'] = True
++    state['reply'] = json.dumps(obj).encode()
++    if change == 'duplicate': state['reply'] = state['reply'][:-1] + b',"version":1}'
++    if change == 'utf8': state['reply'] = b'\xff'
++    if change == 'large': state['reply'] = b' ' * (transport.MAX_RESPONSE + 1)
++    with pytest.raises((Refused, ValueError, UnicodeError)):
++        transport.observe(db, hub, 'default', raw)
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++
++
++def test_changed_retry_request_refused_without_network(db, server):
++    hub, state, raw = server
++    custody.stage(db, scope(hub), raw)
++    with pytest.raises(Refused, match='intent_conflict'):
++        transport.observe(db, hub, 'default', raw + ' ')
++    assert not state['calls']
++
++
++@pytest.mark.parametrize('status', [301, 302, 303, 307, 308])
++def test_redirect_never_forwards_credentials_or_reposts(db, server, status):
++    hub, state, raw = server
++    state.update(status=status, redirect=hub.ident.url + '/stolen')
++    with pytest.raises(Exception) as result:
++        transport.observe(db, hub, 'default', raw)
++    assert str(status) in str(result.value)
++    assert all('/stolen' not in c[1] for c in state['calls'])
++    assert [c[0] for c in state['calls']] == ['POST', 'GET']
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++
++
++def test_nonloopback_cleartext_refused_before_custody_or_io(db):
++    raw, _ = request()
++    hub = Hub(Identity('http://board.example', 'key', 'home'))
++    with pytest.raises(Refused, match='endpoint'):
++        transport.observe(db, hub, 'default', raw)
++    assert not db.execute('SELECT name FROM sqlite_master').fetchall()
++
++
++def test_missing_readback_cannot_turn_post_success_into_recorded(db, server, monkeypatch):
++    hub, _state, raw = server
++    original = transport._request
++
++    def missing(hub, method, path, body):
++        answer = original(hub, method, path, body)
++        return b'null' if method == 'GET' else answer
++
++    monkeypatch.setattr(transport, '_request', missing)
++    with pytest.raises(Refused, match='observation_unconfirmed'):
++        transport.observe(db, hub, 'default', raw)
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++
++
++def test_sealed_receipt_conflict_does_not_overwrite_custody(db, server):
++    hub, state, raw = server
++    transport.observe(db, hub, 'default', raw)
++    state['receipt'] += b' '
++    with pytest.raises(Refused, match='receipt_conflict'):
++        transport.observe(db, hub, 'default', raw)
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] == state['reply'].decode()
+diff --git a/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py b/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py
+new file mode 100644
+index 00000000000..1fa495d38b6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_history_residue_http_boundaries.py
+@@ -0,0 +1,144 @@
++"""Producer network/commit boundaries, not current-source authorization."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_history_residue_custody as custody
++from hermes_cli import kanban_history_residue_http as transport
++from hermes_cli.kanban_history_residue_source import Refused
++from hermes_cli.kanban_sync_client import Hub, Identity
++from tests.hermes_cli import test_kanban_history_residue_http as helpers
++from tests.hermes_cli.test_kanban_history_residue_custody import request
++
++server = helpers.server
++db = helpers.db
++scope = helpers.scope
++
++
++@pytest.mark.parametrize('endpoint', ['https://Board.example', 'https://board.example/',
++                                     'https://board.example:443', 'https://board.example/prefix'])
++def test_endpoint_alias_is_rejected_not_silently_given_new_custody(db, endpoint):
++    raw, _ = request()
++    hub = Hub(Identity(endpoint, 'key', 'home'))
++    with pytest.raises(Refused, match='endpoint_noncanonical'):
++        transport.observe(db, hub, 'default', raw)
++    assert not db.execute('SELECT name FROM sqlite_master').fetchall()
++
++
++@pytest.mark.parametrize('key', ['bad\r\nkey', 'bad key', '\u00e9key'])
++def test_invalid_bearer_fails_before_persisting_intent(db, key):
++    raw, _ = request()
++    hub = Hub(Identity('https://board.example', key, 'home'))
++    with pytest.raises(Refused, match='endpoint_identity'):
++        transport.observe(db, hub, 'default', raw)
++    assert not db.execute('SELECT name FROM sqlite_master').fetchall()
++
++
++def test_loopback_does_not_use_environment_proxy(db, server, monkeypatch):
++    hub, state, raw = server
++    monkeypatch.setattr(transport.urllib.request, 'getproxies', lambda: {'http': 'http://127.0.0.1:1'})
++    monkeypatch.setattr(transport.urllib.request, 'proxy_bypass', lambda host: False)
++    assert transport.observe(db, hub, 'default', raw)['recorded']
++    assert len(state['calls']) == 2
++
++
++def test_failed_post_and_get_remain_get_only_on_repeat(db, server):
++    hub, state, raw = server
++    state['status'] = 500
++    for _ in range(2):
++        with pytest.raises(Exception):
++            transport.observe(db, hub, 'default', raw)
++    assert [c[0] for c in state['calls']] == ['POST', 'GET', 'GET']
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++
++
++def test_current_is_inert_get_without_local_custody(db, server):
++    hub, state, _ = server
++    state['receipt'] = b'{"execution_authority":true}'
++    assert transport.current(hub, 'default', 'op-original') == state['receipt'].decode()
++    assert [c[0] for c in state['calls']] == ['GET']
++    assert state['calls'][0][1] == '/v2/boards/default/history-residue?op_id=op-original&current=1'
++    assert state['calls'][0][3] == b''
++    assert not db.execute('SELECT name FROM sqlite_master').fetchall()
++
++
++def test_real_reopen_after_successful_remote_commit_and_local_seal_failure(db, server, monkeypatch):
++    hub, state, raw = server
++    original = custody.seal
++
++    def fail(*args):
++        raise sqlite3.OperationalError('injected disk failure')
++
++    monkeypatch.setattr(custody, 'seal', fail)
++    with pytest.raises(sqlite3.OperationalError):
++        transport.observe(db, hub, 'default', raw)
++    monkeypatch.setattr(custody, 'seal', original)
++    path = db.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path, isolation_level=None) as other:
++        assert transport.observe(other, hub, 'default', raw)['recorded']
++    assert [c[0] for c in state['calls']] == ['POST', 'GET', 'GET']
++
++
++def test_only_one_transaction_gets_first_send_right(db, server):
++    hub, _, raw = server
++    assert custody.stage_once(db, scope(hub), raw) is True
++    path = db.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path, isolation_level=None) as other:
++        assert custody.stage_once(other, scope(hub), raw) is False
++
++
++def test_truncated_get_does_not_seal_or_replay(db, server):
++    hub, state, raw = server
++    custody.stage(db, scope(hub), raw)
++    state['truncated'] = True
++    with pytest.raises(OSError):
++        transport.observe(db, hub, 'default', raw)
++    assert [c[0] for c in state['calls']] == ['GET']
++    assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++
++
++def test_incomplete_body_deadline_joins_reader_and_does_not_seal(db, server, monkeypatch):
++    import threading
++    from hermes_cli.kanban_sync_attachment_deadline import Transfer
++
++    hub, state, raw = server
++    custody.stage(db, scope(hub), raw)
++    state.update(slow=True, release=threading.Event(), peer_finished=threading.Event())
++    hub.timeout = 0.2
++    readers = []
++    original = Transfer.run
++
++    def capture(self, operation):
++        def recorded():
++            readers.append(threading.current_thread())
++            return operation()
++        return original(self, recorded)
++
++    monkeypatch.setattr(Transfer, 'run', capture)
++    try:
++        with pytest.raises((TimeoutError, OSError)):
++            transport.observe(db, hub, 'default', raw)
++        readers[0].join(1)
++        assert not readers[0].is_alive()
++        assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++    finally:
++        state['release'].set()
++        assert state['peer_finished'].wait(2)
++
++
++def test_post_commit_failure_during_stage_never_sends_on_retry(db, server, monkeypatch):
++    hub, state, raw = server
++    original = custody.stage_once
++
++    def uncertain(*args):
++        original(*args)
++        raise OSError('lost local commit answer')
++
++    monkeypatch.setattr(custody, 'stage_once', uncertain)
++    with pytest.raises(OSError):
++        transport.observe(db, hub, 'default', raw)
++    assert state['calls'] == []
++    monkeypatch.setattr(custody, 'stage_once', original)
++    with pytest.raises(Refused, match='observation_unconfirmed'):
++        transport.observe(db, hub, 'default', raw)
++    assert [c[0] for c in state['calls']] == ['GET']
+-- 
+2.43.0
+

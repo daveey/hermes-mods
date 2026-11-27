@@ -1,0 +1,239 @@
+From 772bf5493831c420a851a19f44ee1d995e751232 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 06:02:38 +0000
+Subject: [PATCH 6430] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 772bf5493831c420a851a19f44ee1d995e751232.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 33d8452b2f7..7c6a40a9e4c 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -239,36 +239,51 @@
+                         (NOTICE, now - delay)).fetchall()
+     queued = []
+     for (task_id,) in rows:
+-        episode = None if task_id in skip else _current_episode(conn, task_id)
+-        noticed = _notice_at(conn, task_id, episode) if episode else None
+-        if episode is None or noticed is None or noticed > now - delay or not eligible(conn, task_id, episode, cfg):
+-            continue
+-        with kb.write_txn(conn):
+-            if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True, cfg=cfg, now=now):
+-                queued.append(task_id)
++        try:
++            episode = None if task_id in skip else _current_episode(conn, task_id)
++            noticed = _notice_at(conn, task_id, episode) if episode else None
++            if episode is None or noticed is None or noticed > now - delay or not eligible(conn, task_id, episode, cfg):
++                continue
++            with kb.write_txn(conn):
++                if _current_episode(conn, task_id) == episode and queue(conn, task_id, episode, backlog=True, cfg=cfg, now=now):
++                    queued.append(task_id)
++        except Exception:  # health: allow BLE001 -- per-card boundary; rollback retains this hold, siblings proceed
++            logger.exception("kanban: spend review backlog skipped %s; hold retained", task_id)
+     return queued
+ 
+ 
++def _episode_or_none(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
++    try:
++        return _current_episode(conn, task_id)
++    except Exception:  # health: allow BLE001 -- an unreadable stop is never started; its hold is retained
++        logger.exception("kanban: spend review skipped %s; hold retained", task_id)
++        return None
++
++
+ def _due(conn: sqlite3.Connection, now: int, skip) -> list[tuple[str, str, int]]:
+     from hermes_cli import kanban_spend_review_request as journal
+     frozen = journal.requests(conn)
+     rows = conn.execute("SELECT DISTINCT e.task_id FROM task_events e JOIN tasks t ON t.id = e.task_id "
+                         "WHERE e.kind = ? AND t.status = 'triage'", (QUEUED,)).fetchall()
+-    candidates = {(task_id, _current_episode(conn, task_id)) for (task_id,) in rows}
++    candidates = {(task_id, _episode_or_none(conn, task_id)) for (task_id,) in rows if task_id not in skip}
+     candidates.update((r["wire"]["task"], r["wire"]["episode"]) for r in frozen)
+     due = []
+     for task_id, episode in sorted(candidates, key=str):
+         if task_id in skip or episode is None:
+             continue
+-        from hermes_cli import kanban_spend_caused_review as caused
+-        from hermes_cli.kanban_spend_decision import pending_episode
+-        stop = pending_episode(conn, task_id)
+-        cause = caused.effective_cause(conn, task_id, stop) if stop else None
+-        if cause in caused.CAUSES and not journal.get(conn, task_id, episode):
+-            noticed = _notice_at(conn, task_id, episode)
+-            if noticed is None or noticed > now - review_after_seconds():
+-                continue  # an annotation cannot inherit an ordinary stop's immediate start
+-        events = _review_events(conn, task_id, episode)
++        try:
++            from hermes_cli import kanban_spend_caused_review as caused
++            from hermes_cli.kanban_spend_decision import pending_episode
++            stop = pending_episode(conn, task_id)
++            cause = caused.effective_cause(conn, task_id, stop) if stop else None
++            if cause in caused.CAUSES and not journal.get(conn, task_id, episode):
++                noticed = _notice_at(conn, task_id, episode)
++                if noticed is None or noticed > now - review_after_seconds():
++                    continue  # an annotation cannot inherit an ordinary stop's immediate start
++            events = _review_events(conn, task_id, episode)
++        except Exception:  # health: allow BLE001 -- per-card boundary; this hold is retained, siblings proceed
++            logger.exception("kanban: spend review skipped %s; hold retained", task_id)
++            continue
+         if not events or events[-1]["kind"] not in (QUEUED, STARTED):
+             continue
+         last = events[-1]
+@@ -294,15 +309,19 @@
+     for task_id, episode, attempts in _due(conn, now, skip):
+         from hermes_cli.kanban_spend_caused_review import CAUSES, effective_cause
+         from hermes_cli.kanban_spend_decision import pending_episode
+-        stop = pending_episode(conn, task_id)
+-        cause = effective_cause(conn, task_id, stop) if stop else None
+-        if cause and cause not in CAUSES and not journal.get(conn, task_id, episode):
+-            # Exclusions retire custody, never retry work. Frozen Board requests
+-            # still reconcile their exact receipt instead of losing custody.
+-            escalate(conn, task_id, episode, f"{cause} stops are excluded from spend review; hold retained")
+-            continue
+-        if attempts >= MAX_ATTEMPTS and not journal.get(conn, task_id, episode):
+-            escalate(conn, task_id, episode, f"the spend reviewer did not finish after {attempts} attempts")
++        try:
++            stop = pending_episode(conn, task_id)
++            cause = effective_cause(conn, task_id, stop) if stop else None
++            if cause and cause not in CAUSES and not journal.get(conn, task_id, episode):
++                # Exclusions retire custody, never retry work. Frozen Board requests
++                # still reconcile their exact receipt instead of losing custody.
++                escalate(conn, task_id, episode, f"{cause} stops are excluded from spend review; hold retained")
++                continue
++            if attempts >= MAX_ATTEMPTS and not journal.get(conn, task_id, episode):
++                escalate(conn, task_id, episode, f"the spend reviewer did not finish after {attempts} attempts")
++                continue
++        except Exception:  # health: allow BLE001 -- per-card boundary; this hold is retained, siblings proceed
++            logger.exception("kanban: spend review not started for %s; hold retained", task_id)
+             continue
+         with _LOCK:
+             if len(_INFLIGHT) >= MAX_CONCURRENT:
+diff --git a/hermes_cli/kanban_spend_stop_watch.py b/hermes_cli/kanban_spend_stop_watch.py
+index a4c1a4367dd..20490b80ac4 100644
+--- a/hermes_cli/kanban_spend_stop_watch.py
++++ b/hermes_cli/kanban_spend_stop_watch.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import logging
+ import sqlite3
+ import time
+ from typing import cast
+@@ -14,6 +15,7 @@
+ 
+ AUTHOR = "spend-stop-watch"
+ FILED = "spend_stop_watch_filed"
++logger = logging.getLogger(__name__)
+ 
+ 
+ def stale_stops(conn: sqlite3.Connection, *, now: float, older_than: int = 1800) -> list[dict]:
+@@ -24,16 +26,20 @@
+         tid = row['id']
+         if tid in copies or row['created_by'] in (AUTHOR, 'kanban-spend-budget'):
+             continue
+-        stop = decision.pending_episode(conn, tid)
+-        if stop is None or stop['created_at'] >= now - older_than:
+-            continue
+-        episode = cast(str, reviewer.episode_of(stop))
+-        if (reviewer.holds(conn, tid, episode)
+-                or reviewer.state(conn, tid, episode) in (reviewer.GRANTED, reviewer.SETTLED)
+-                or _routed(conn, tid, episode)):
+-            continue
+-        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
+-                        "AND json_extract(payload,'$.episode')=?", (tid, FILED, episode)).fetchone():
++        try:
++            stop = decision.pending_episode(conn, tid)
++            if stop is None or stop['created_at'] >= now - older_than:
++                continue
++            episode = cast(str, reviewer.episode_of(stop))
++            if (reviewer.holds(conn, tid, episode)
++                    or reviewer.state(conn, tid, episode) in (reviewer.GRANTED, reviewer.SETTLED)
++                    or _routed(conn, tid, episode)):
++                continue
++            if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
++                            "AND json_extract(payload,'$.episode')=?", (tid, FILED, episode)).fetchone():
++                continue
++        except Exception:  # health: allow BLE001 -- per-card boundary; an unreadable stop keeps its hold
++            logger.exception("spend stop watch skipped %s; hold retained", tid)
+             continue
+         result.append({**dict(row), 'episode': episode, 'stop': stop})
+     return result
+diff --git a/tests/hermes_cli/test_kanban_spend_reviewer.py b/tests/hermes_cli/test_kanban_spend_reviewer.py
+index 437c615e757..a742ef482f3 100644
+--- a/tests/hermes_cli/test_kanban_spend_reviewer.py
++++ b/tests/hermes_cli/test_kanban_spend_reviewer.py
+@@ -454,6 +454,31 @@
+         assert reviewer.state(conn, tid, episode) is None
+ 
+ 
++@pytest.mark.parametrize("cause", [1, True, ["scope_stopped"], {"safety_refusal": True}],
++                         ids=["int", "bool", "list", "dict"])
++def test_malformed_cause_does_not_block_healthy_reviews(kanban_home, spend_reviewer, inline, monkeypatch, caplog,
++                                                       cause):
++    # Three stopped cards per case: borrow the shared run clock so later tests keep their past-run budget.
++    monkeypatch.setitem(helpers._CLOCK, "t", 0)
++    with kbc.connect_closing() as conn:
++        bad, bad_episode = _stopped(conn)  # queued and noticed, then its stop cause is corrupted
++        with kb.write_txn(conn):
++            kb._append_event(conn, bad, decision.EVENT, {"cause": cause})
++        with pytest.raises(ValueError, match="cause"):
++            decision.pending_episode(conn, bad)
++        good, good_episode = _stopped(conn)
++        routed, routed_episode = _routed_with_reviewer_off(conn, monkeypatch)
++        now = int(time.time()) + reviewer.review_after_seconds() + 5
++        assert reviewer.queue_backlog(conn, now=now, cfg=(True, 2)) == [routed]
++        assert sorted(reviewer.start_due(conn, now=now)) == sorted([good, routed])
++        for tid, episode in ((good, good_episode), (routed, routed_episode)):
++            assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED  # judge unavailable: owner route
++        assert kb.get_task(conn, bad).status == "triage"
++        assert reviewer.state(conn, bad, bad_episode) == reviewer.QUEUED  # no lease, grant or release
++        assert bad in caplog.text
++        assert not conn.in_transaction
++
++
+ def test_a_grant_is_refused_once_the_reviewer_is_turned_off(kanban_home, spend_reviewer, inline, monkeypatch):
+     with kbc.connect_closing() as conn:
+         tid, episode = _stopped(conn)
+diff --git a/tests/hermes_cli/test_kanban_spend_stop_watch.py b/tests/hermes_cli/test_kanban_spend_stop_watch.py
+index f2eb7637478..a837b0f1636 100644
+--- a/tests/hermes_cli/test_kanban_spend_stop_watch.py
++++ b/tests/hermes_cli/test_kanban_spend_stop_watch.py
+@@ -217,3 +217,34 @@
+             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (closed,))
+         _notice(conn, tid, ep, {'kind': 'supervisor', 'task_id': closed})
+         assert len(watchdog.watch(conn, now=NOW)) == 1
++
++
++MALFORMED = [1, True, ['scope_stopped'], {'safety_refusal': True}]
++MALFORMED_IDS = ['int', 'bool', 'list', 'dict']
++
++
++def _malformed(conn, cause):
++    """A triage stop whose cause is not a string: the validator refuses to interpret it."""
++    tid = kb.create_task(conn, title='Malformed stop', assignee='default')
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT, {'cause': cause})
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=?", (NOW - 7200, tid))
++    with pytest.raises(ValueError, match='cause'):
++        decision.pending_episode(conn, tid)
++    return tid
++
++
++@pytest.mark.parametrize('cause', MALFORMED, ids=MALFORMED_IDS)
++def test_malformed_cause_is_isolated_and_healthy_neighbor_is_filed(kanban_home, caplog, cause):
++    with kbc.connect_closing() as conn:
++        bad = _malformed(conn, cause)
++        good, ep = stop(conn)
++        assert [c['id'] for c in watchdog.stale_stops(conn, now=NOW)] == [good]
++        new_id, = watchdog.watch(conn, now=NOW)
++        assert kb.get_task(conn, new_id).idempotency_key == f'spend-stop-watch:{good}:{ep}'
++        assert kb.get_task(conn, bad).status == 'triage'  # the malformed hold is retained, never released
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=?",
++                                (bad, watchdog.FILED)).fetchone()
++        assert bad in caplog.text
++        assert not conn.in_transaction
+-- 
+2.43.0
+

@@ -1,0 +1,171 @@
+From d178157b29b2d9695f6a6f155acb2932d960bb90 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:06:58 +0000
+Subject: [PATCH 6135] Kanban actionability: frozen obligations and administrative deadlines
+
+Public mirror of source commit d178157b29b2d9695f6a6f155acb2932d960bb90.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_actionability_creation_boundaries.py b/tests/hermes_cli/test_kanban_actionability_creation_boundaries.py
+new file mode 100644
+index 00000000000..9d75d16e8d9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_creation_boundaries.py
+@@ -0,0 +1,154 @@
++"""Unmasked pure creation-policy boundary controls. [daveey]"""
++import copy
++
++import pytest
++
++from hermes_cli.kanban_actionability import project
++from hermes_cli.kanban_actionability_creation import intent_for, stamp, validated_intent
++from hermes_cli.kanban_db_connect import connect
++
++NOW = 1_800_000_000
++TASK = {'id': 'fixture', 'status': 'scheduled', 'assignee': 'default', 'created_at': NOW}
++PAYLOAD = {'wake_at': NOW + 100, 'awaiting': {'kind': 'clock'}, 'actionability_parent_ids': []}
++
++
++def source(task=None, kind='scheduled', payload=None):
++    task = dict(TASK if task is None else task)
++    data = copy.deepcopy(PAYLOAD if payload is None else payload)
++    data['actionability_intent'] = intent_for(task, kind, data, now=NOW)
++    return task, {'kind': kind, 'created_at': NOW, 'data': data}
++
++
++@pytest.mark.parametrize('payload', [None, [], 'text', 1])
++def test_nonobject_payload_never_creates_intent(payload):
++    assert intent_for(TASK, 'scheduled', payload, now=NOW) is None
++
++
++@pytest.mark.parametrize('kind,status,payload', [
++    ('comment', 'blocked', {}), ('continued', 'ready', {'status': 'ready'}),
++    ('scheduled', 'ready', PAYLOAD), ('blocked', 'scheduled', {}),
++    ('continued', 'scheduled', {'status': 'ready'}),
++])
++def test_unsupported_or_status_mismatched_source(kind, status, payload):
++    assert intent_for({**TASK, 'status': status}, kind, payload, now=NOW) is None
++
++
++@pytest.mark.parametrize('parents', ['parent', [''], ['  '], [1], [None], {'id': 'parent'}])
++def test_malformed_dependency_identity_is_not_a_trigger(parents):
++    result = intent_for({**TASK, 'status': 'todo'}, 'dependency_wait',
++                        {'actionability_parent_ids': parents}, now=NOW)
++    assert result['invalid_reason'] == 'trigger_missing'
++    assert result['deadline_at'] is None
++
++
++@pytest.mark.parametrize('action', ['', '  ', None, 1, []])
++def test_blank_or_nontext_human_action_is_not_a_trigger(action):
++    result = intent_for({**TASK, 'status': 'blocked'}, 'blocked',
++                        {'human_request': {'action': action}}, now=NOW)
++    assert result['invalid_reason'] == 'trigger_missing'
++
++
++def test_assignment_and_probe_have_distinct_supported_policies():
++    assignment = intent_for({**TASK, 'status': 'todo'}, 'blocked',
++                            {'kind': 'assignment', 'actionability_parent_ids': ['parent']}, now=NOW)
++    assert assignment['deadline_at'] == NOW + 86400
++    assert assignment['status'] == 'todo'
++    assert assignment['invalid_reason'] is None
++    probe = intent_for(TASK, 'scheduled', {'wake_at': NOW + 100, 'wake_check': 'probe'}, now=NOW)
++    assert probe['invalid_reason'] is None
++    assert probe['deadline_at'] == NOW + 700
++
++
++def test_missing_task_and_nonobject_stamp_preserve_original(tmp_path):
++    with connect(tmp_path / 'kanban.db') as conn:
++        assert stamp(conn, 'absent', 'scheduled', PAYLOAD, now=NOW) is PAYLOAD
++        assert stamp(conn, 'absent', 'scheduled', None, now=NOW) is None
++        assert stamp(conn, 'absent', 'comment', PAYLOAD, now=NOW) is PAYLOAD
++
++
++@pytest.mark.parametrize('parent_ids,expected', [(None, True), ([], True), (['foreign'], False)])
++def test_parent_comparison_is_optional_but_exact(parent_ids, expected):
++    task, event = source()
++    assert (validated_intent(task, event, parent_ids=parent_ids) is not None) is expected
++
++
++@pytest.mark.parametrize('human,expected', [(None, True), ('null', True), ('{', False),
++                                          ({'action': 'changed'}, False)])
++def test_current_human_request_must_match_source(human, expected):
++    task, event = source()
++    task['human_request'] = human
++    assert (validated_intent(task, event) is not None) is expected
++
++
++def test_supported_serialized_human_request_is_decoded():
++    task = {**TASK, 'status': 'blocked', 'human_request': '{"action":"Choose"}'}
++    task, event = source(task, 'blocked', {'human_request': {'action': 'Choose'}})
++    assert validated_intent(task, event) is not None
++
++
++@pytest.mark.parametrize('change', ['unsupported', 'invalid', 'nonobject', 'float-version'])
++def test_validation_rejects_each_unmasked_invalid_boundary(change):
++    task, event = source()
++    mutations = {
++        'unsupported': lambda: event.update(kind='comment'),
++        'invalid': lambda: event['data'].update(wake_at=None),
++        'nonobject': lambda: event['data'].update(actionability_intent=[]),
++        'float-version': lambda: event['data']['actionability_intent'].update(version=1.0),
++    }
++    mutations[change]()
++    assert validated_intent(task, event) is None
++
++
++def test_unrelated_event_kind_performs_no_creation_sql(tmp_path):
++    with connect(tmp_path / 'kanban.db') as conn:
++        statements = []
++        conn.set_trace_callback(statements.append)
++        assert stamp(conn, 'absent', 'comment', PAYLOAD, now=NOW) is PAYLOAD
++        assert statements == []
++
++
++def test_self_consistent_invalid_intent_still_fails_closed():
++    task, event = source(payload={'wake_at': NOW + 100})
++    assert event['data']['actionability_intent']['invalid_reason'] == 'trigger_missing'
++    assert validated_intent(task, event) is None
++
++
++def test_untimed_human_source_ignores_stray_wake_and_status_fields():
++    task = {**TASK, 'status': 'blocked'}
++    result = intent_for(task, 'blocked', {'human_request': {'action': 'Choose'},
++                        'wake_at': NOW + 100, 'status': 'scheduled', 'awaiting': []}, now=NOW)
++    assert result['invalid_reason'] is None
++    assert result['wake_at'] is None
++    assert result['deadline_at'] == NOW + 86400
++
++
++@pytest.mark.parametrize('recorded,current', [({}, None), (None, '{}'), (None, 'false'), (None, '0')])
++def test_falsy_human_values_share_absent_semantics(recorded, current):
++    task, event = source(payload={**PAYLOAD, 'human_request': recorded})
++    task['human_request'] = current
++    assert validated_intent(task, event) is not None
++
++
++def test_stamp_retains_run_identity_from_lookup(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    calls = []
++
++    def lookup(conn, run_id):
++        calls.append(run_id)
++        return 'fixture-current-run'
++
++    monkeypatch.setattr('hermes_cli.kanban_db_sync.run_uid', lookup)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='run identity', assignee='default')
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        calls.clear()
++        result = stamp(conn, tid, 'scheduled', PAYLOAD, now=NOW)
++        assert calls == [None]
++        assert result['actionability_run_uid'] == 'fixture-current-run'
++
++
++def test_invalid_new_creation_cannot_derive_a_legacy_wake_deadline():
++    row = project({'task': TASK, 'wake_at': NOW + 100, 'invalid_creation_intent': True,
++                   'awaiting': {'kind': 'clock'}}, now=NOW)
++    assert row['escalation']['at'] is None
++    assert 'escalation_deadline_missing' in row['violations']
+-- 
+2.43.0
+

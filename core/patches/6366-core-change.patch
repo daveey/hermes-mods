@@ -1,0 +1,374 @@
+From f834c86472ab23f342e6cb355b50cbeb5c649979 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:42:04 -0800
+Subject: [PATCH 6366] Durable send outcomes and accurate composer recovery
+
+Public mirror of source commit f834c86472ab23f342e6cb355b50cbeb5c649979.
+
+---
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/prepared-submissions.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/prepared-submissions.ts
+index dd190784d0b..807e96f4b40 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/prepared-submissions.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/prepared-submissions.ts
+@@ -27,6 +27,8 @@
+   displayText?: string
+   params: Record<string, unknown>
+   legacyAttempted?: boolean
++  /** How the last attempt ended when it did not land (submission-outcome.ts); absent = unknown. */
++  outcome?: 'aborted' | 'refused' | 'unknown'
+ }
+ 
+ // Admitted entries whose durable removal failed (ENOSPC/EIO): journal key -> spent submission id.
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-outcome.test.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-outcome.test.ts
+new file mode 100644
+index 00000000000..bcf8086f7dc
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-outcome.test.ts
+@@ -0,0 +1,51 @@
++import { beforeEach, describe, expect, it } from 'vitest'
++
++import type { PreparedSubmission } from './prepared-submissions'
++import { clearStoredJournal, storedJournal } from './prepared-submissions-test-utils'
++import { sendUnconfirmed, submissionAborted, submissionFailed, writeInFlightSubmission } from './submission-outcome'
++
++const entry = (outcome?: PreparedSubmission['outcome']): PreparedSubmission => ({
++  id: 'sub-1',
++  owner: null as never,
++  attachments: [],
++  text: 'hello',
++  params: {},
++  ...(outcome ? { outcome } : {})
++})
++
++const refused = new Error('refused')
++const definite = (error: unknown) => error === refused
++
++beforeEach(() => clearStoredJournal())
++
++describe('the outcome a journaled send records', () => {
++  it('says "could not confirm" only for an unknown or unrecorded outcome', () => {
++    expect(sendUnconfirmed(undefined)).toBe(false)
++    expect(sendUnconfirmed(entry())).toBe(true)
++    expect(sendUnconfirmed(entry('unknown'))).toBe(true)
++    expect(sendUnconfirmed(entry('refused'))).toBe(false)
++    expect(sendUnconfirmed(entry('aborted'))).toBe(false)
++  })
++
++  it('a new attempt clears the earlier outcome while it is in flight', async () => {
++    const prepared = entry('refused')
++    await writeInFlightSubmission('k', prepared)
++    expect(storedJournal().k.outcome).toBeUndefined()
++  })
++
++  it.each([
++    ['a definite refusal is refused', refused, false, 'refused'],
++    ['a definite refusal after an unanswered try of the same submit is unknown', refused, true, 'unknown'],
++    ['any other failure is unknown', new Error('request timed out'), false, 'unknown']
++  ] as const)('%s', async (_label, error, replayUncertain, outcome) => {
++    const prepared = entry()
++    expect(await submissionFailed('k', prepared, error, { definite, replayUncertain })).toBe(error)
++    expect(storedJournal().k.outcome).toBe(outcome)
++  })
++
++  it('an abort before the submit left is aborted, and the abort still runs', async () => {
++    const prepared = entry()
++    expect(await submissionAborted('k', prepared, () => false)).toBe(false)
++    expect(storedJournal().k.outcome).toBe('aborted')
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-outcome.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-outcome.ts
+new file mode 100644
+index 00000000000..4876361765c
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submission-outcome.ts
+@@ -0,0 +1,51 @@
++import { type PreparedSubmission, writePreparedSubmission } from './prepared-submissions'
++
++/**
++ * What became of a journaled send that did not land, recorded on its journal entry so a later
++ * retry of the same words (the composer's restored draft, same identity) can say what it knows.
++ * Only `unknown` (or no record: a window that died mid-send, an earlier build) makes the retry
++ * say "Could not confirm the message was sent"; a definite refusal or an abort before the
++ * submit left means nothing was sent.
++ */
++export type SubmissionOutcome = 'aborted' | 'refused' | 'unknown'
++
++/** The retry's notice may claim nothing about the earlier attempt only when its outcome is unknown. */
++export function sendUnconfirmed(retained: PreparedSubmission | undefined): boolean {
++  return retained !== undefined && retained.outcome !== 'refused' && retained.outcome !== 'aborted'
++}
++
++/** Journal `entry` for the attempt about to start: until it ends, its outcome is unknown. */
++export function writeInFlightSubmission(key: string, entry: PreparedSubmission): Promise<void> {
++  delete entry.outcome
++
++  return writePreparedSubmission(key, entry)
++}
++
++async function recordOutcome(key: string, entry: PreparedSubmission, outcome: SubmissionOutcome): Promise<void> {
++  entry.outcome = outcome
++  // A failed save leaves the entry unknown, which only makes a later notice more careful.
++  await writePreparedSubmission(key, entry).catch(error => console.warn('[prepared-submission-outcome]', error))
++}
++
++/** The user switched chats after the entry was journaled and before the submit left: nothing was sent. */
++export async function submissionAborted<T>(key: string, entry: PreparedSubmission, abort: () => T): Promise<T> {
++  await recordOutcome(key, entry, 'aborted')
++
++  return abort()
++}
++
++/**
++ * The submit failed with `error`. A definite refusal (the owner answered that it admitted nothing)
++ * is `refused`, unless an earlier try of this same submit went unanswered (`replayUncertain`):
++ * then, like any other failure, it is `unknown`. Returns `error` for the caller to rethrow.
++ */
++export async function submissionFailed(
++  key: string,
++  entry: PreparedSubmission,
++  error: unknown,
++  { definite, replayUncertain }: { definite: (error: unknown) => boolean; replayUncertain: boolean }
++): Promise<unknown> {
++  await recordOutcome(key, entry, definite(error) && !replayUncertain ? 'refused' : 'unknown')
++
++  return error
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+index a953c96581d..ea6064b396e 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-legacy-identity.test.tsx
+@@ -202,10 +202,11 @@
+     const setItem = storage.setItem
+     let resetWrites = 0
+ 
+-    // Only the reset of `legacyAttempted` after the refusal fails to save.
++    // Every save after the refusal fails: the reset of `legacyAttempted`, then the refusal outcome
++    // (submission-outcome.ts) that is recorded on the same entry.
+     vi.spyOn(storage, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+       if (legacySends(submits) === 1 && JSON.parse(value)?.legacyAttempted === false) {
+-        resetWrites += 1
++        resetWrites += JSON.parse(value).outcome === undefined ? 1 : 0
+         throw storageError
+       }
+ 
+@@ -227,6 +228,7 @@
+     expect(errors.join('\n')).not.toContain('journal is full')
+     expect($notifications.get().map(n => n.message).join('\n')).not.toContain('journal is full')
+     expect(warn).toHaveBeenCalledWith('[prepared-submission-reset]', storageError)
++    expect(warn).toHaveBeenCalledWith('[prepared-submission-outcome]', storageError)
+   })
+ 
+   it('a legacy send refused session busy (4009) is retried by the busy loop instead of failing as unconfirmed', async () => {
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
+index 2b6ea83ae41..28e09c39a82 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
+@@ -1,3 +1,4 @@
++import { JsonRpcGatewayError } from '@hermes/shared'
+ import { act, cleanup, render, waitFor } from '@testing-library/react'
+ import type { MutableRefObject } from 'react'
+ import { useEffect } from 'react'
+@@ -24,7 +25,8 @@
+ import { resumeFailedToastId } from '../use-session-actions/resume-latches'
+ 
+ import { actRender, Harness, type HarnessHandle, RUNTIME_SESSION_ID } from './index-test-utils'
+-import { clearStoredJournal } from './prepared-submissions-test-utils'
++import { ENTRY_PREFIX } from './prepared-submissions'
++import { clearStoredJournal, storedJournal } from './prepared-submissions-test-utils'
+ import { resetRejectedOptimisticSendsForTests } from './rejected-optimistic-sends'
+ import { clearSingleFlightSessionResumeState } from './single-flight-resume'
+ import { resetSubmissionIdSupportForTests } from './submission-identity-support'
+@@ -319,6 +321,81 @@
+   return accepted
+ }
+ 
++interface FirstAttempt {
++  /** What the first attempt's prompt.submit does (it throws). */
++  submit?: () => never
++  /** The user switches chats right after the journal entry is written: the submit never leaves. */
++  driftOnJournalWrite?: boolean
++}
++
++const ownerRefusal = () =>
++  new JsonRpcGatewayError('This chat is active in another Hermes window/terminal.', {
++    code: 4090,
++    data: { reason: 'SESSION_NOT_OWNED' }
++  })
++
++/** A first attempt into the chat's live runtime that ends as `first` says, leaving its journal
++ *  entry; `retry` then sends the same words again (the composer's restored draft, same identity)
++ *  after the runtime binding is lost and the hub stops answering resumes. */
++async function failFirstAttempt(first: FirstAttempt) {
++  const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
++  const busyRef: MutableRefObject<boolean> = { current: false }
++  const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_ID }
++  const runtimeIdByStoredSessionIdRef = { current: new Map([[STORED_SESSION_ID, RUNTIME_SESSION_ID]]) }
++
++  const requestGateway = vi.fn(async (method: string) => {
++    if (method === 'prompt.submit' && first.submit) {
++      first.submit()
++    }
++
++    throw resumeTimeout()
++  })
++
++  const setItem = Storage.prototype.setItem
++  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
++    setItem.call(this, key, value)
++
++    if (first.driftOnJournalWrite && key.startsWith(ENTRY_PREFIX)) {
++      selectedStoredSessionIdRef.current = 'another-chat'
++    }
++  })
++
++  let prompt: HarnessHandle | null = null
++  await actRender(
++    <Harness
++      activeSessionIdRef={activeSessionIdRef}
++      busyRef={busyRef}
++      onReady={handle => (prompt = handle)}
++      refreshSessions={async () => undefined}
++      requestGateway={requestGateway}
++      runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
++      selectedStoredSessionIdRef={selectedStoredSessionIdRef}
++      storedSessionId={STORED_SESSION_ID}
++    />
++  )
++
++  expect(await prompt!.submitText(TEXT, COMPOSER_SEND)).toBe(false)
++  expect(requestGateway.mock.calls.some(([method]) => method === 'prompt.submit')).toBe(!first.driftOnJournalWrite)
++
++  return {
++    journalOutcomes: () => Object.values(storedJournal()).map(entry => entry.outcome ?? 'unknown'),
++    retry: async () => {
++      first.driftOnJournalWrite = false
++      // Back in the chat: a drift abort leaves the view it left to clear its own busy flag.
++      selectedStoredSessionIdRef.current = STORED_SESSION_ID
++      busyRef.current = false
++      activeSessionIdRef.current = null
++      runtimeIdByStoredSessionIdRef.current.clear()
++      clearNotifications()
++      const resumesBefore = resumeCalls(requestGateway)
++      const accepted = await prompt!.submitText(TEXT, COMPOSER_SEND)
++      expect(resumeCalls(requestGateway)).toBe(resumesBefore + 1)
++
++      return accepted
++    }
++  }
++}
++
+ beforeEach(() => {
+   clearSingleFlightSessionResumeState()
+   clearStoredJournal()
+@@ -466,40 +543,21 @@
+     expect(errorNotices().map(notice => notice.title)).toEqual(titles)
+   })
+ 
+-  it('a retry of a send whose earlier outcome is unknown does not claim it was not sent', async () => {
+-    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+-
+-    const runtimeIdByStoredSessionIdRef = { current: new Map([[STORED_SESSION_ID, RUNTIME_SESSION_ID]]) }
+-
+-    const requestGateway = vi.fn(async (method: string) => {
+-      // The first attempt reaches the backend and its answer never comes back; then the runtime
+-      // binding is lost and the hub stops answering resumes.
+-      throw method === 'prompt.submit' ? new Error('request timed out after 1800s: prompt.submit') : resumeTimeout()
+-    })
+-
+-    let prompt: HarnessHandle | null = null
+-    await actRender(
+-      <Harness
+-        activeSessionIdRef={activeSessionIdRef}
+-        onReady={handle => (prompt = handle)}
+-        refreshSessions={async () => undefined}
+-        requestGateway={requestGateway}
+-        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+-        storedSessionId={STORED_SESSION_ID}
+-      />
+-    )
+-
+-    expect(await prompt!.submitText(TEXT, COMPOSER_SEND)).toBe(false)
+-    activeSessionIdRef.current = null
+-    runtimeIdByStoredSessionIdRef.current.clear()
+-    clearNotifications()
+-    const resumesBefore = resumeCalls(requestGateway)
+-
+-    expect(await prompt!.submitText(TEXT, COMPOSER_SEND)).toBe(false)
+-
+-    expect(resumeCalls(requestGateway)).toBe(resumesBefore + 1)
+-    expect(errorNotices().map(notice => notice.title)).toEqual([
+-      `${copy.promptSendUnconfirmed} ${copy.promptBackInComposer}`
+-    ])
++  it.each<[string, FirstAttempt, string, string]>([
++    // The first attempt reaches the backend and its answer never comes back.
++    ['is unknown: the retry cannot say it was not sent', { submit: () => { throw new Error('request timed out after 1800s: prompt.submit') } },
++      'unknown', `${copy.promptSendUnconfirmed} ${copy.promptBackInComposer}`],
++    // The owner answered that it admitted nothing (another window holds the chat).
++    ['was a definite refusal: the retry says it was not sent', { submit: () => { throw ownerRefusal() } },
++      'refused', NOT_SENT_BACK_IN_COMPOSER],
++    // The user switched chats after the journal entry was written and before the submit left.
++    ['was aborted before the send: the retry says it was not sent', { driftOnJournalWrite: true },
++      'aborted', NOT_SENT_BACK_IN_COMPOSER]
++  ])('a retry of a send whose earlier attempt %s', async (_label, first, outcome, notice) => {
++    const { journalOutcomes, retry } = await failFirstAttempt(first)
++
++    expect(journalOutcomes()).toEqual([outcome])
++    expect(await retry()).toBe(false)
++    expect(errorNotices().map(n => n.title)).toEqual([notice])
+   })
+ })
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 1de714d7586..baf7fb4a130 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -69,6 +69,7 @@
+   noteSubmissionIdRefused,
+   submissionIdentityEpoch
+ } from './submission-identity-support'
++import { sendUnconfirmed, submissionAborted, submissionFailed, writeInFlightSubmission } from './submission-outcome'
+ import { submitAcrossGatewayRestart } from './submit-across-restart'
+ import {
+   acquireSubmitInFlight,
+@@ -872,7 +873,7 @@
+ 
+         if (failure) {
+           // Not sent: say so (a session switch stays silent), then drop the bubble.
+-          rejectSendOnFailedResume(failure.error, { copy, drift: sessionDriftReason(), optimisticId, options, uncertain: Boolean(retained) })
++          rejectSendOnFailedResume(failure.error, { copy, drift: sessionDriftReason(), optimisticId, options, uncertain: sendUnconfirmed(retained) })
+ 
+           return abortForSessionSwitch(null)
+         }
+@@ -995,7 +996,7 @@
+           // drain this abort is a no-op on foreground state (both helpers are
+           // targetIsCurrentView-guarded) and simply drops the queued send. A
+           // foreground send is not sent either: say so, then drop the bubble.
+-          rejectSendOnFailedResume(err, { copy, drift: sessionDriftReason(), optimisticId, options, uncertain: Boolean(retained) })
++          rejectSendOnFailedResume(err, { copy, drift: sessionDriftReason(), optimisticId, options, uncertain: sendUnconfirmed(retained) })
+ 
+           return abortForSessionSwitch(null)
+         }
+@@ -1210,10 +1211,10 @@
+         }
+ 
+         const retryKey = retainedKey ?? (await preparedSubmissionSlot(retryKeyForTarget()))
+-        await writePreparedSubmission(retryKey, prepared)
++        await writeInFlightSubmission(retryKey, prepared)
+ 
+         if (sessionDriftReason()) {
+-          return abortForSessionSwitch(liveSessionId)
++          return submissionAborted(retryKey, prepared, () => abortForSessionSwitch(liveSessionId))
+         }
+ 
+         // On sleep/wake the gateway's in-memory session may have been cleared
+@@ -1487,7 +1488,7 @@
+             return abortForSessionSwitch(sessionId)
+           }
+ 
+-          throw firstErr
++          throw await submissionFailed(retryKey, prepared, firstErr, { definite: isDefiniteSubmitRefusal, replayUncertain: restartReplayUncertain })
+         }
+ 
+         // The gateway admitted it: a failed journal retirement (ENOSPC/EIO) must not report a
+-- 
+2.43.0
+

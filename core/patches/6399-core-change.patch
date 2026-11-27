@@ -1,0 +1,161 @@
+From b518903943be9b73508f7e966e8f545b73879d2e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:57:57 +0000
+Subject: [PATCH 6399] Kanban sync refusal audits and diagnostic drift supersession
+
+Public mirror of source commit b518903943be9b73508f7e966e8f545b73879d2e.
+
+---
+diff --git a/hermes_cli/kanban_history_residue_cut.py b/hermes_cli/kanban_history_residue_cut.py
+index e601ab33fc1..c2913985d72 100644
+--- a/hermes_cli/kanban_history_residue_cut.py
++++ b/hermes_cli/kanban_history_residue_cut.py
+@@ -61,6 +61,8 @@
+     _require(all(not c.in_transaction for c in (live, shadow, ledger)), 'nested_cut_transaction')
+     _require(0 < len(op_ids) <= MAX_OPS and len(set(op_ids)) == len(op_ids), 'cut_ops_bound')
+     identity = transport.scope(hub, board)
++    from hermes_cli import kanban_sync_refusal_audit as refusal
++    generations = [refusal._generation(c) for c in (live, shadow)]
+     _fresh(started)
+     records, snapshots = [], []
+     with ExitStack() as stack:
+@@ -94,6 +96,12 @@
+             _require(key in current['parent'] and json.dumps(current['parent'][key], sort_keys=True) ==
+                      json.dumps(value, sort_keys=True), 'canonical_parent_changed')
+         evidence.append({'op_id': op_id, 'source_json': request['source_json'], 'proof_json': raw})
++    # Re-read server verdicts inside this cut, never union a saved earlier report.
++    server = None
++    if any(r['op_id'] not in op_ids and isinstance(r.get('last_error'), str)
++           and r['last_error'].partition(':')[0] in refusal.POLICY_REFUSALS for r in refusal._rows(live)):
++        server = refusal.report(live, shadow, hub, board, started=started)
++        _require(server['server_refusal_evidence']['head'] == head, 'replica_cursor_changed')
+     end = _empty(hub, board, head)
+     with ExitStack() as stack:
+         for conn in (live, shadow, ledger):
+@@ -103,10 +111,13 @@
+             _require(custody.lookup(ledger, identity, op_id) == saved, 'custody_changed')
+             _require(_capture(live, shadow, request['source_json'], board, identity[2]) == old,
+                      'local_cut_inputs_changed')
++        _require([refusal._generation(c) for c in (live, shadow)] == generations, 'local_cut_inputs_changed')
+         _fresh(started)
+         from hermes_cli.kanban_sync_client import diff
+         report = diff(live, shadow, identity[2])
+-        audits = set(report['audited_retain_rejections']) | set(op_ids)
++        if server is not None:
++            report.update({key: server[key] for key in ('audited_server_refusals', 'server_refusal_evidence')})
++        audits = set(report['audited_retain_rejections']) | set(op_ids) | set(report.get('audited_server_refusals', []))
+         report['audited_history_rejections'] = list(op_ids)
+         report['clean'] = not (report['missing_in_shadow'] or report['extra_in_shadow']
+                               or report['field_mismatch'] or report['child_mismatch']
+diff --git a/hermes_cli/kanban_history_residue_http.py b/hermes_cli/kanban_history_residue_http.py
+index 56d93a9dbc0..db3de96ea56 100644
+--- a/hermes_cli/kanban_history_residue_http.py
++++ b/hermes_cli/kanban_history_residue_http.py
+@@ -71,9 +71,9 @@
+     try:
+         return transfer.run(read)
+     except urllib.error.HTTPError as exc:
++        detail = 'history observation refused'
+         try:
+             raw = transfer.run(lambda error=exc: error.read(MAX_RESPONSE + 1))
+-            detail = 'history observation refused'
+             if len(raw) <= MAX_RESPONSE:
+                 try:
+                     code = strict_object(raw.decode('utf-8', 'strict')).get('error')
+@@ -82,6 +82,8 @@
+                         detail = code
+                 except (ValueError, UnicodeError):
+                     pass  # Untrusted error text is never echoed; HTTP status is still preserved.
++        except (OSError, http.client.HTTPException):
++            pass  # Headers already established a definitive status; body failure cannot erase it.
+         finally:
+             exc.close()
+         raise HubError(exc.code, detail) from exc
+diff --git a/tests/hermes_cli/test_kanban_history_residue_cli.py b/tests/hermes_cli/test_kanban_history_residue_cli.py
+index bed43064b66..bd41a7b97d0 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_cli.py
++++ b/tests/hermes_cli/test_kanban_history_residue_cli.py
+@@ -63,6 +63,41 @@
+     assert json.loads(audit['evidence'][0]['proof_json'])['receipt']['source_json'] == audit['evidence'][0]['source_json']
+ 
+ 
++@pytest.mark.parametrize('fault', [None, 'field', 'unproven', 'race'])
++def test_mixed_history_and_server_audits_share_a_fresh_unchanged_cut(configured, capsys, monkeypatch, fault):
++    from hermes_cli import kanban_sync_refusal_audit as refusal
++    paths, _hub, _calls, _state, connect = configured
++    board.observe_board('default', 'op-original', 'Keep history')
++    live = connect(paths[0])
++    row = dict(live.execute("SELECT * FROM kanban_sync_outbox WHERE op_id='op-original'").fetchone())
++    row['op_id'] = 'server-op'
++    row['row_uid'] = 'server-event'
++    live.execute(f"INSERT INTO kanban_sync_outbox ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
++                 tuple(row.values()))
++    reason, _, detail = row['last_error'].partition(': ')
++    proof = dict(version=1, board='default', gateway='home', execution_authority=False,
++                 historical_identity_certified=False, receipt=dict(client_op_id='server-op',
++                 status='rejected', reason=reason, detail=detail or None))
++    def receipt(*unused):
++        if fault == 'race':
++            other = connect(paths[0])
++            other.execute("UPDATE kanban_sync_outbox SET attempts=attempts+1 WHERE op_id='server-op'")
++        return None if fault == 'unproven' else proof
++    monkeypatch.setattr(refusal, '_receipt', receipt)
++    if fault == 'field':
++        live.execute("UPDATE tasks SET title='real drift'")
++    before = list(live.iterdump())
++    assert cli.cmd_sync(args('diff', '--json')) == (0 if fault is None else 1)
++    result = json.loads(capsys.readouterr().out)
++    if fault is None:
++        assert result['audited_server_refusals'] == ['server-op']
++        assert result['audited_history_rejections'] == ['op-original']
++        assert result['server_refusal_evidence']['head'] == result['history_audit_head'] == 100
++        assert list(live.iterdump()) == before
++    else:
++        assert result['clean'] is False
++
++
+ def test_known_refusal_bypasses_unconfirmed_history_intent_without_changing_it(configured, capsys, monkeypatch):
+     from hermes_cli import kanban_sync_refusal_audit as refusal
+     from hermes_cli.kanban_sync_client import HubError
+diff --git a/tests/hermes_cli/test_kanban_history_residue_http.py b/tests/hermes_cli/test_kanban_history_residue_http.py
+index 472f45dad0c..07054f80994 100644
+--- a/tests/hermes_cli/test_kanban_history_residue_http.py
++++ b/tests/hermes_cli/test_kanban_history_residue_http.py
+@@ -45,7 +45,7 @@
+                 self.close_connection = True
+                 return
+             if state.get('slow'):
+-                self.send_response(200)
++                self.send_response(state.get('status', 200))
+                 self.send_header('Content-Length', '100')
+                 self.end_headers()
+                 try:
+@@ -120,6 +120,25 @@
+     assert [c[0] for c in state['calls']] == ['POST', 'GET']
+ 
+ 
++def test_error_body_timeout_preserves_status_and_get_only_intent(db, server):
++    from hermes_cli.kanban_sync_client import HubError
++    hub, state, raw = server
++    hub.timeout = 0.15
++    state.update(status=409, slow=True, release=threading.Event(), peer_finished=threading.Event())
++    try:
++        with pytest.raises(HubError) as raised:
++            transport.observe(db, hub, 'default', raw)
++        assert raised.value.status == 409
++        assert custody.lookup(db, scope(hub), 'op-original')['receipt_json'] is None
++    finally:
++        state['release'].set()
++        assert state['peer_finished'].wait(2)
++    state.update(status=200, slow=False, receipt=None)
++    with pytest.raises(Refused, match='observation_unconfirmed'):
++        transport.observe(db, hub, 'default', raw)
++    assert [c[0] for c in state['calls']] == ['POST', 'GET']
++
++
+ def test_dropped_post_answer_reconciles_without_repost(db, server):
+     hub, state, raw = server
+     state['post'] = 'drop'
+-- 
+2.43.0
+

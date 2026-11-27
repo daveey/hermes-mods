@@ -1,0 +1,944 @@
+From 7c1ea5032f2909ca45dcdb4d7728a2bae68e281b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:09:10 -0800
+Subject: [PATCH 6102] Desktop startup-timeout recovery and gateway-drain retry
+
+Public mirror of source commit 7c1ea5032f2909ca45dcdb4d7728a2bae68e281b.
+
+---
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx
+index 325e744acc6..c13e26a7164 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.test.tsx
+@@ -128,7 +128,7 @@
+ 
+     try {
+       await act(async () => { await hook.result.current.queueCurrentDraft() })
+-      expect(onSubmit).toHaveBeenCalledWith('durable queue', expect.objectContaining({ fromQueue: true, storedSessionId: SESSION_KEY }))
++      expect(onSubmit).toHaveBeenCalledWith('durable queue', expect.objectContaining({ fromQueue: true, storedSessionId: SESSION_KEY, unsent: 'kept' }))
+       expect(draftRef.current).toBe('durable queue')
+       expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
+       onSubmit.mockResolvedValue(true)
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts
+index 5aa04a2a0d7..d97d0b633e8 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-queue.ts
+@@ -444,6 +444,7 @@
+           fromQueue: true,
+           sessionId: sessionId ?? null,
+           storedSessionId: activeQueueSessionKey,
++          unsent: 'kept',
+           ...(submissionId ? { submission_id: submissionId } : {})
+         })
+       )
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx
+index 4b1f7ab5de7..43159859980 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.test.tsx
+@@ -286,7 +286,11 @@
+         expect(requestComposerSubmit('continue', { target: 'main' })).toBe(true)
+       })
+ 
+-      expect(onSubmit).toHaveBeenCalledExactlyOnceWith('continue', expect.objectContaining({ attachments: [] }))
++      // `unsent: 'elsewhere'`: a refused request goes to the queue, so the notice must not say "back in the composer".
++      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(
++        'continue',
++        expect.objectContaining({ attachments: [], unsent: 'elsewhere' })
++      )
+       expect(clearDraft).not.toHaveBeenCalled()
+       expect(loadIntoComposer).not.toHaveBeenCalled()
+       expect(stashAt).not.toHaveBeenCalled()
+@@ -344,7 +348,8 @@
+       expect(visibleMain.onSubmit).toHaveBeenCalledWith('ship this branch', {
+         submission_id: expect.any(String),
+         attachments: [],
+-        composerScope: 'session-a'
++        composerScope: 'session-a',
++        unsent: 'elsewhere'
+       })
+     )
+     expect(visibleMain.onSubmit).toHaveBeenCalledTimes(1)
+@@ -363,7 +368,8 @@
+       expect(tile.onSubmit).toHaveBeenCalledWith('ship project B', {
+         submission_id: expect.any(String),
+         attachments: [],
+-        composerScope: 'tile-session'
++        composerScope: 'tile-session',
++        unsent: 'elsewhere'
+       })
+     )
+     expect(main.onSubmit).not.toHaveBeenCalled()
+@@ -379,7 +385,8 @@
+       expect(second.onSubmit).toHaveBeenCalledWith('ship exactly one session', {
+         submission_id: expect.any(String),
+         attachments: [],
+-        composerScope: 'session-second'
++        composerScope: 'session-second',
++        unsent: 'elsewhere'
+       })
+     )
+     expect(first.onSubmit).not.toHaveBeenCalled()
+@@ -399,7 +406,8 @@
+       expect(visibleB.onSubmit).toHaveBeenCalledWith('ship session B', {
+         submission_id: expect.any(String),
+         attachments: [],
+-        composerScope: 'session-b'
++        composerScope: 'session-b',
++        unsent: 'elsewhere'
+       })
+     )
+     expect(hiddenA.onSubmit).not.toHaveBeenCalled()
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
+index c5fa61169d2..e8fa092bd9c 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
+@@ -198,7 +198,7 @@
+           ...(attachments ? { attachments } : {}),
+           composerScope: submittedScope,
+           ...assignment,
+-          ...(displayKind ? { displayKind } : {})
++          ...(displayKind ? { displayKind } : onRejected ? { unsent: 'elsewhere' as const } : {})
+         })
+       )
+     )
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.test.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.test.ts
+new file mode 100644
+index 00000000000..9084b200dba
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.test.ts
+@@ -0,0 +1,57 @@
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { en } from '@/i18n/en'
++import { clearNotifications } from '@/store/notifications'
++
++import {
++  rejectSendOnFailedResume,
++  resetRejectedOptimisticSendsForTests,
++  startOptimisticSend,
++  withoutRejectedOptimisticSends
++} from './rejected-optimistic-sends'
++
++const reject = (optimisticId: string) =>
++  rejectSendOnFailedResume(new Error('request timed out after 30s: session.resume'), {
++    copy: en.desktop,
++    drift: null,
++    optimisticId,
++    // A queue drain: marks the bubble without a notice.
++    options: { fromQueue: true },
++    uncertain: false
++  })
++
++const shown = (...ids: string[]) => withoutRejectedOptimisticSends(ids.map(id => ({ id }))).map(row => row.id)
++
++afterEach(() => {
++  resetRejectedOptimisticSendsForTests()
++  clearNotifications()
++})
++
++describe('rejected optimistic sends', () => {
++  it('drops a rejected bubble from a snapshot and leaves the other rows alone', () => {
++    reject('user-a')
++
++    expect(shown('stored-1', 'user-a', 'user-b')).toEqual(['stored-1', 'user-b'])
++  })
++
++  it('a retry under the same submission id makes its bubble live again', () => {
++    reject('user-a')
++
++    expect(startOptimisticSend('a')).toBe('user-a')
++    expect(shown('user-a')).toEqual(['user-a'])
++  })
++
++  it('remembers the 64 newest rejections', () => {
++    for (let n = 0; n <= 64; n += 1) {
++      reject(`user-${n}`)
++    }
++
++    expect(shown('user-0', 'user-1', 'user-64')).toEqual(['user-0'])
++
++    // Rejecting a remembered id again makes it the newest, so the next new one evicts another.
++    reject('user-1')
++    reject('user-65')
++
++    expect(shown('user-1', 'user-2', 'user-3', 'user-65')).toEqual(['user-2'])
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts
+index cae66ca28d6..eef8d3df526 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts
+@@ -36,33 +36,59 @@
+   }
+ }
+ 
++interface UnsentCopy {
++  promptBackInComposer: string
++  promptFailed: string
++  promptNotQueued: string
++  promptNotSent: string
++  promptSendUnconfirmed: string
++  promptStillInComposer: string
++}
++
++interface UnsentSend {
++  copy: UnsentCopy
++  /** `sessionDriftReason()`: the user moved to another chat. */
++  drift: null | string
++  optimisticId: string
++  options: undefined | { displayKind?: 'hidden'; fromQueue?: boolean; unsent?: 'elsewhere' | 'kept' }
++  /** This identity was sent before and its outcome never came back. */
++  uncertain: boolean
++}
++
++/** What happened to the words, then where they are now (see `SubmitTextOptions.unsent`). */
++function unsentNotice({ copy, options, uncertain }: UnsentSend): string {
++  if (options?.displayKind === 'hidden') {
++    // Machine text: dropped, never restored anywhere.
++    return copy.promptFailed
++  }
++
++  const kept = options?.unsent === 'kept'
++  const what = uncertain ? copy.promptSendUnconfirmed : kept ? copy.promptNotQueued : copy.promptNotSent
++
++  if (options?.unsent === 'elsewhere') {
++    return what
++  }
++
++  return `${what} ${kept ? copy.promptStillInComposer : copy.promptBackInComposer}`
++}
++
+ /**
+  * The chat has no live runtime and rebinding one failed (a starved hub times
+- * `session.resume` out after 30s), so this send never left. The composer
++ * `session.resume` out after 30s), so this attempt never left. The composer
+  * restores the words into the draft when submit returns `false`; without a
+  * notice the user sees nothing and takes the message for delivered.
+  *
+  * Call before the abort drops the bubble. A deliberate session switch (`drift`)
+- * stays silent, and so does a queued entry (`quiet`): it stays in its queue, it
+- * is not "back in the composer". A `hidden` send is machine text that is
+- * dropped, never restored.
++ * stays silent, and so does a drain of an entry that stays in its queue
++ * (`fromQueue` without `unsent: 'kept'`): the queue shows it and retries it.
+  */
+-export function rejectSendOnFailedResume(
+-  err: unknown,
+-  send: {
+-    copy: { promptFailed: string; promptNotSent: string }
+-    drift: null | string
+-    hidden: boolean
+-    optimisticId: string
+-    quiet: boolean
+-  }
+-): void {
++export function rejectSendOnFailedResume(err: unknown, send: UnsentSend): void {
+   markOptimisticSendRejected(send.optimisticId)
+ 
+   if (send.drift) {
+     console.warn('[submit-drift-abort]', send.drift, { phase: 'resume-failed' })
+-  } else if (!send.quiet) {
+-    notifyError(err, send.hidden ? send.copy.promptFailed : send.copy.promptNotSent)
++  } else if (!send.options?.fromQueue || send.options.unsent === 'kept') {
++    notifyError(err, unsentNotice(send))
+   }
+ }
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
+index 58b40dd6d9d..e89cd7ca63e 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
+@@ -23,16 +23,20 @@
+ import { useSessionActions } from '../use-session-actions'
+ import { resumeFailedToastId } from '../use-session-actions/resume-latches'
+ 
+-import { actRender, Harness, type HarnessHandle } from './index-test-utils'
++import { actRender, Harness, type HarnessHandle, RUNTIME_SESSION_ID } from './index-test-utils'
+ import { clearStoredJournal } from './prepared-submissions-test-utils'
+ import { resetRejectedOptimisticSendsForTests } from './rejected-optimistic-sends'
+ import { clearSingleFlightSessionResumeState } from './single-flight-resume'
+ import { resetSubmissionIdSupportForTests } from './submission-identity-support'
++import type { SubmitTextOptions } from './utils'
+ 
+ // Representative observation: a starved hub timed out session.resume. A
+ // send without a live runtime silently returned to the composer
+ // draft, while the resume retry displayed the typed message from
+ // its start-of-resume snapshot. Messages appeared delivered without being sent.
++// In the app the routed resume is `resumeSession`, which swallows its own failure (it repaints,
++// toasts "Resume failed" and resolves), so the send then waited out a second 30s timeout on its
++// own `session.resume` before it gave up.
+ 
+ vi.mock('@/hermes', async importOriginal => ({
+   ...(await importOriginal<Record<string, unknown>>()),
+@@ -75,8 +79,25 @@
+ ]
+ 
+ type Gateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+-type ResumeSession = (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>
+ 
++type ResumeSession = (
++  storedSessionId: string,
++  replaceRoute?: boolean,
++  ownerRoute?: undefined,
++  options?: { authoritativeSnapshot?: boolean }
++) => Promise<unknown>
++
++const RESUMED = {
++  info: {},
++  message_count: STORED_MESSAGES.length,
++  messages: STORED_MESSAGES,
++  resumed: STORED_SESSION_ID,
++  session_id: 'runtime-1',
++  session_key: STORED_SESSION_ID
++}
++
++const copy = en.desktop
++const NOT_SENT_BACK_IN_COMPOSER = `${copy.promptNotSent} ${copy.promptBackInComposer}`
+ const resumeTimeout = () => new Error('request timed out after 30s: session.resume')
+ 
+ function deferred<T>() {
+@@ -91,8 +112,7 @@
+   return { promise, reject, resolve }
+ }
+ 
+-/** The chat's own resume (use-route-resume's retry): the real `resumeSession`, whose failed-resume
+- *  repaint carries the local pending turn it saw when it started. */
++/** One window surface running the real `resumeSession` for the chat. */
+ function ChatResume({ onReady, requestGateway }: { onReady: (resume: ResumeSession) => void; requestGateway: Gateway }) {
+   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+   const stateMapRef = ref(new Map<string, ClientSessionState>())
+@@ -124,33 +144,52 @@
+   })
+ 
+   useEffect(() => {
+-    onReady(actions.resumeSession)
++    onReady(actions.resumeSession as ResumeSession)
+   }, [actions.resumeSession, onReady])
+ 
+   return null
+ }
+ 
++async function mountChatResume(requestGateway: Gateway): Promise<ResumeSession> {
++  let resume: null | ResumeSession = null
++  render(<ChatResume onReady={r => (resume = r)} requestGateway={requestGateway} />)
++  await waitFor(() => expect(resume).not.toBeNull())
++
++  return resume!
++}
++
+ const messageIds = () => $messages.get().map(message => message.id)
+ 
+ const resumeCalls = (gateway: { mock: { calls: unknown[][] } }) =>
+   gateway.mock.calls.filter(([method]) => method === 'session.resume').length
+ 
+ const errorNotices = () => $notifications.get().filter(notice => notice.kind === 'error')
++/** Error notices other than `resumeSession`'s own "Resume failed" toast for the chat. */
++const noticesFromSend = () => errorNotices().filter(notice => notice.id !== resumeFailedToastId(STORED_SESSION_ID))
+ 
+ /** A foreground send into a chat whose runtime binding is gone, parked on the resume that must
+- *  rebind it. `routed` parks on the high-level route resume (`resumeStoredSession`); `direct` lets
+- *  that one return without a runtime and parks on submit's own `session.resume` RPC. */
++ *  rebind it.
++ *  `routed`: the route resume is the real `resumeSession` (as wired in the app); its
++ *  `session.resume` RPC is the one that times out.
++ *  `direct`: the route resume returned without publishing a runtime and without a failure, so
++ *  submit's own `session.resume` RPC is the one that times out. */
+ async function sendIntoUnboundChat(path: 'direct' | 'routed') {
+-  const routedResume = deferred<void>()
+-  const directResume = deferred<{ session_id: string }>()
++  const resumeRpc = deferred<never>()
+   const submits: Record<string, unknown>[] = []
+   const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_ID }
+-  // The first send parks on the deferred resumes; the retry meets a hub that answers again.
++  // The first send parks on the deferred RPC; the retry meets a hub that answers again.
+   let hubAnswers = false
+ 
++  // The route resume's own gateway (routed path only).
++  const routeGateway = vi.fn((method: string) =>
++    method === 'session.resume' && !hubAnswers ? resumeRpc.promise : Promise.resolve(RESUMED as never)
++  )
++
++  const routeResume = path === 'routed' ? await mountChatResume(routeGateway as unknown as Gateway) : null
++
+   const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+     if (method === 'session.resume') {
+-      return (hubAnswers ? { session_id: 'rt-rebound' } : directResume.promise) as never
++      return (hubAnswers ? { session_id: 'rt-rebound' } : resumeRpc.promise) as never
+     }
+ 
+     if (method === 'prompt.submit') {
+@@ -160,8 +199,6 @@
+     return {} as never
+   })
+ 
+-  const resumeStoredSession = vi.fn(async () => (hubAnswers ? undefined : routedResume.promise))
+-
+   let prompt: HarnessHandle | null = null
+   await actRender(
+     <Harness
+@@ -172,7 +209,7 @@
+       onReady={handle => (prompt = handle)}
+       refreshSessions={async () => undefined}
+       requestGateway={requestGateway}
+-      resumeStoredSession={resumeStoredSession}
++      resumeStoredSession={async id => void (await routeResume?.(id, true))}
+       selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+       storedSessionId={STORED_SESSION_ID}
+     />
+@@ -183,62 +220,97 @@
+     // The composer names every send; `false` is its signal to restore the draft under this id.
+     sent = prompt!.submitTextRaw(TEXT, { submission_id: SUBMISSION_ID })
+   })
+-  await waitFor(() => expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID))
++  await waitFor(() => expect(resumeCalls(path === 'routed' ? routeGateway : requestGateway)).toBe(1))
+   expect(messageIds()).toContain(BUBBLE_ID)
+ 
+-  if (path === 'direct') {
+-    await act(async () => routedResume.resolve())
+-    await waitFor(() => expect(resumeCalls(requestGateway)).toBe(1))
+-  }
+-
+-  const failResume = () =>
+-    act(async () => {
+-      ;(path === 'routed' ? routedResume : directResume).reject(resumeTimeout())
+-
+-      return sent
+-    })
++  return {
++    failResume: () =>
++      act(async () => {
++        resumeRpc.reject(resumeTimeout())
+ 
+-  const retry = () => {
+-    hubAnswers = true
++        return sent
++      }),
++    requestGateway,
++    retry: () => {
++      hubAnswers = true
+ 
+-    return prompt!.submitText(TEXT, { submission_id: SUBMISSION_ID })
++      return prompt!.submitText(TEXT, { submission_id: SUBMISSION_ID })
++    },
++    selectedStoredSessionIdRef,
++    submits
+   }
+-
+-  return { failResume, requestGateway, retry, selectedStoredSessionIdRef, submits }
+ }
+ 
+-/** Starts the chat's own resume while the bubble is on screen; its RPC never answers. */
+-async function startChatResume() {
+-  const chatResumeRpc = deferred<never>()
++/** Another surface's resume of the same chat (use-route-resume's retry), started while the typed
++ *  message is on screen, so its start-of-resume snapshot holds the bubble. `session.resume` is
++ *  single-flight per chat: `joins` shares the RPC already in flight and fails with it; otherwise
++ *  it asks for an authoritative snapshot, which queues its own RPC behind that one. */
++async function startConcurrentChatResume(joins: boolean) {
++  const ownRpc = deferred<typeof RESUMED>()
+ 
+   const requestGateway = vi.fn((method: string) =>
+-    method === 'session.resume' ? chatResumeRpc.promise : Promise.resolve({} as never)
+-  ) as unknown as Gateway & ReturnType<typeof vi.fn>
++    method === 'session.resume' ? ownRpc.promise : Promise.resolve({} as never)
++  )
+ 
+-  let resume: null | ResumeSession = null
+-  render(<ChatResume onReady={r => (resume = r)} requestGateway={requestGateway} />)
+-  await waitFor(() => expect(resume).not.toBeNull())
++  const resume = await mountChatResume(requestGateway as unknown as Gateway)
+ 
+   let settled!: Promise<unknown>
+   await act(async () => {
+-    settled = resume!(STORED_SESSION_ID, true)
++    settled = resume(STORED_SESSION_ID, true, undefined, joins ? undefined : { authoritativeSnapshot: true })
+   })
+ 
+-  return {
+-    /** The chat's resume fails too and repaints from the REST transcript. `session.resume` is
+-     *  single-flight per chat: on the routed path this resume sent its own RPC, which times out
+-     *  here; on the direct path it joined submit's RPC and failed with it. */
+-    failAndRepaint: () =>
+-      act(async () => {
+-        if (resumeCalls(requestGateway) > 0) {
+-          chatResumeRpc.reject(resumeTimeout())
+-        }
++  const settle = (answer: () => void) => async () => {
++    if (!joins) {
++      await waitFor(() => expect(resumeCalls(requestGateway)).toBe(1))
++    }
+ 
+-        await settled
+-      })
++    await act(async () => {
++      // A joined resume never sent an RPC of its own: it already failed with the shared one.
++      if (!joins) {
++        answer()
++      }
++
++      await settled
++    })
++  }
++
++  return {
++    /** It times out too and repaints from the REST transcript. */
++    failAndRepaint: settle(() => ownRpc.reject(resumeTimeout())),
++    /** The hub answers it and it repaints from the resumed runtime. */
++    succeedAndRepaint: settle(() => ownRpc.resolve(RESUMED))
+   }
+ }
+ 
++/** One send whose `session.resume` is refused at once, with the caller's options. */
++async function sendWithResumeDown(options: SubmitTextOptions) {
++  const requestGateway = vi.fn(async (method: string) => {
++    if (method === 'session.resume') {
++      throw resumeTimeout()
++    }
++
++    return {} as never
++  })
++
++  let prompt: HarnessHandle | null = null
++  await actRender(
++    <Harness
++      activeSessionId={null}
++      activeSessionIdRef={{ current: null }}
++      onReady={handle => (prompt = handle)}
++      refreshSessions={async () => undefined}
++      requestGateway={requestGateway}
++      storedSessionId={STORED_SESSION_ID}
++    />
++  )
++
++  const accepted = await prompt!.submitText(TEXT, options)
++
++  expect(resumeCalls(requestGateway)).toBe(1)
++
++  return accepted
++}
++
+ beforeEach(() => {
+   clearSingleFlightSessionResumeState()
+   clearStoredJournal()
+@@ -277,21 +349,20 @@
+     '%s resume: says the message was not sent, and a failed-resume repaint does not show it as a bubble',
+     async path => {
+       const send = await sendIntoUnboundChat(path)
+-      // Snapshots the transcript while the typed message is still an optimistic bubble.
+-      const chat = await startChatResume()
++      const chat = await startConcurrentChatResume(path === 'direct')
+       clearNotifications()
+ 
+       // `false` is what makes the composer put the words back into the draft under SUBMISSION_ID.
+       expect(await send.failResume()).toBe(false)
+ 
+-      // Exactly one notice from the send. (On the direct path the chat's resume shared the
+-      // failed RPC, so its own "Resume failed" toast may already be up beside it.)
+-      const fromSend = errorNotices().filter(notice => notice.id !== resumeFailedToastId(STORED_SESSION_ID))
+-      expect(fromSend).toHaveLength(1)
+-      expect(fromSend[0]).toMatchObject({ title: en.desktop.promptNotSent })
+-      expect(fromSend[0]?.message).toContain('timed out')
++      // Exactly one notice from the send, beside resumeSession's own "Resume failed" toast.
++      expect(noticesFromSend()).toHaveLength(1)
++      expect(noticesFromSend()[0]).toMatchObject({ title: NOT_SENT_BACK_IN_COMPOSER })
++      expect(noticesFromSend()[0]?.message).toContain('timed out')
+       expect(send.submits).toEqual([])
+       expect(messageIds()).not.toContain(BUBBLE_ID)
++      // One timeout, not two: a failed route resume is not followed by submit's own resume.
++      expect(resumeCalls(send.requestGateway)).toBe(path === 'routed' ? 0 : 1)
+ 
+       await chat.failAndRepaint()
+ 
+@@ -306,18 +377,92 @@
+     }
+   )
+ 
++  it('a resume that succeeds after the send was rejected does not show it as a bubble either', async () => {
++    const send = await sendIntoUnboundChat('routed')
++    const chat = await startConcurrentChatResume(false)
++
++    expect(await send.failResume()).toBe(false)
++    expect(messageIds()).not.toContain(BUBBLE_ID)
++
++    await chat.succeedAndRepaint()
++
++    expect(JSON.stringify($messages.get())).toContain('earlier answer')
++    expect(messageIds()).not.toContain(BUBBLE_ID)
++    expect(JSON.stringify($messages.get())).not.toContain(TEXT)
++  })
++
+   it.each(['routed', 'direct'] as const)(
+     '%s resume: a session switch during the resume still aborts without a notification',
+     async path => {
+       const send = await sendIntoUnboundChat(path)
++      clearNotifications()
+ 
+       // The user opened another chat while the resume was pending.
+       send.selectedStoredSessionIdRef.current = 'stored-other'
+ 
+       expect(await send.failResume()).toBe(false)
+ 
+-      expect($notifications.get()).toEqual([])
++      expect(noticesFromSend()).toEqual([])
+       expect(send.submits).toEqual([])
+     }
+   )
+ })
++
++describe('the notice says where the words are', () => {
++  const queued = { fromQueue: true, sessionId: null, storedSessionId: STORED_SESSION_ID } as const
++
++  it.each<[string, SubmitTextOptions, string[]]>([
++    ['a composer send is back in the draft', {}, [NOT_SENT_BACK_IN_COMPOSER]],
++    // use-composer-submit: a rejected external request goes to the queue, not into the draft.
++    ['an external request names no place', { unsent: 'elsewhere' }, [copy.promptNotSent]],
++    // use-composer-queue queueCurrentDraft: the draft was never cleared.
++    [
++      'a busy Enter the server queue did not take is still in the composer',
++      { ...queued, unsent: 'kept' },
++      [`${copy.promptNotQueued} ${copy.promptStillInComposer}`]
++    ],
++    ['a drain of a queued entry stays quiet: the entry stays in its queue', queued, []],
++    ['a hidden send is machine text', { displayKind: 'hidden' }, [copy.promptFailed]]
++  ])('%s', async (_label, options, titles) => {
++    expect(await sendWithResumeDown({ submission_id: SUBMISSION_ID, ...options })).toBe(false)
++
++    expect(errorNotices().map(notice => notice.title)).toEqual(titles)
++  })
++
++  it('a retry of a send whose earlier outcome is unknown does not claim it was not sent', async () => {
++    const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
++
++    const runtimeIdByStoredSessionIdRef = { current: new Map([[STORED_SESSION_ID, RUNTIME_SESSION_ID]]) }
++
++    const requestGateway = vi.fn(async (method: string) => {
++      // The first attempt reaches the backend and its answer never comes back; then the runtime
++      // binding is lost and the hub stops answering resumes.
++      throw method === 'prompt.submit' ? new Error('request timed out after 1800s: prompt.submit') : resumeTimeout()
++    })
++
++    let prompt: HarnessHandle | null = null
++    await actRender(
++      <Harness
++        activeSessionIdRef={activeSessionIdRef}
++        onReady={handle => (prompt = handle)}
++        refreshSessions={async () => undefined}
++        requestGateway={requestGateway}
++        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
++        storedSessionId={STORED_SESSION_ID}
++      />
++    )
++
++    expect(await prompt!.submitText(TEXT, { submission_id: SUBMISSION_ID })).toBe(false)
++    activeSessionIdRef.current = null
++    runtimeIdByStoredSessionIdRef.current.clear()
++    clearNotifications()
++    const resumesBefore = resumeCalls(requestGateway)
++
++    expect(await prompt!.submitText(TEXT, { submission_id: SUBMISSION_ID })).toBe(false)
++
++    expect(resumeCalls(requestGateway)).toBe(resumesBefore + 1)
++    expect(errorNotices().map(notice => notice.title)).toEqual([
++      `${copy.promptSendUnconfirmed} ${copy.promptBackInComposer}`
++    ])
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index e8e21363a3b..1de714d7586 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -49,6 +49,7 @@
+ import type { ClientSessionState } from '../../../types'
+ import { routeTargetFromToken, sessionContextDrift } from '../session-context-drift'
+ import type { CreateBackendSessionForSend } from '../use-session-actions/create-overrides'
++import { takeResumeFailure } from '../use-session-actions/resume-latches'
+ import { resolveSessionOwner, resolveSessionProfile } from '../use-session-actions/utils'
+ 
+ import {
+@@ -855,17 +856,23 @@
+       // Resolves to the adopted runtime id (null when not adopted yet), or
+       // false when the submit must stop.
+       const resumeRoutedStoredSession = async (routedId: string): Promise<false | null | string> => {
++        // The app's resume swallows its own failure (it toasts and resolves) and
++        // leaves the error for the caller: read it, or this send would wait out
++        // a second `session.resume` timeout below before saying anything.
++        let failure: undefined | { error: unknown }
++
++        takeResumeFailure(routedId)
++
+         try {
+           await resumeStoredSession(routedId)
+-        } catch (err) {
++          failure = getRuntimeIdForStoredSession(routedId) ? undefined : takeResumeFailure(routedId)
++        } catch (error) {
++          failure = { error }
++        }
++
++        if (failure) {
+           // Not sent: say so (a session switch stays silent), then drop the bubble.
+-          rejectSendOnFailedResume(err, {
+-            copy,
+-            drift: sessionDriftReason(),
+-            hidden: options?.displayKind === 'hidden',
+-            optimisticId,
+-            quiet: Boolean(queueAdmission || options?.fromQueue)
+-          })
++          rejectSendOnFailedResume(failure.error, { copy, drift: sessionDriftReason(), optimisticId, options, uncertain: Boolean(retained) })
+ 
+           return abortForSessionSwitch(null)
+         }
+@@ -988,13 +995,7 @@
+           // drain this abort is a no-op on foreground state (both helpers are
+           // targetIsCurrentView-guarded) and simply drops the queued send. A
+           // foreground send is not sent either: say so, then drop the bubble.
+-          rejectSendOnFailedResume(err, {
+-            copy,
+-            drift: sessionDriftReason(),
+-            hidden: options?.displayKind === 'hidden',
+-            optimisticId,
+-            quiet: Boolean(queueAdmission || options?.fromQueue)
+-          })
++          rejectSendOnFailedResume(err, { copy, drift: sessionDriftReason(), optimisticId, options, uncertain: Boolean(retained) })
+ 
+           return abortForSessionSwitch(null)
+         }
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+index b4ec9fb0f9b..97e7aa98257 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+@@ -840,6 +840,12 @@
+    *  renders anywhere — the off-screen path for widget intents. The agent
+    *  still receives the text as a normal user turn. */
+   displayKind?: 'hidden'
++  /** Where the words are when this send is refused before it leaves, which
++   *  picks the notice. Default: the composer restores them into the draft.
++   *  `kept`: they never left the composer (a busy Enter the server queue would
++   *  have taken). `elsewhere`: the caller re-homes them (an external request
++   *  goes to the queue), so the notice names no place. */
++  unsent?: 'elsewhere' | 'kept'
+   /** Per-turn client surface the gateway turns into a model-bound note. The
+    *  HUD sets `hud` from its own store; a GPT-Live delegation passes
+    *  `voice-live` (spoken transcript in, speakable prose out). */
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/resume-latches.ts b/apps/desktop/src/app/session/hooks/use-session-actions/resume-latches.ts
+index cb4c79065f7..e01b022fc4f 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/resume-latches.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/resume-latches.ts
+@@ -20,6 +20,21 @@
+   setResumeFailedSessionId(retire)
+   setResumeExhaustedSessionId(retire)
+   setResumeReattachSessionId(retire)
++  resumeFailureByStoredSessionId.delete(storedSessionId)
++}
++
++// resumeSession swallows its failure: it repaints what it can, toasts and
++// resolves. A caller that needed the runtime (a send into an unbound chat)
++// reads the error here instead of finding out from a second resume.
++const resumeFailureByStoredSessionId = new Map<string, { error: unknown }>()
++
++/** The error the latest resume attempt of this session ended on, once. */
++export function takeResumeFailure(storedSessionId: string): undefined | { error: unknown } {
++  const failure = resumeFailureByStoredSessionId.get(storedSessionId)
++
++  resumeFailureByStoredSessionId.delete(storedSessionId)
++
++  return failure
+ }
+ 
+ // One backoff for both resume self-heals (use-route-resume's stranded retry and
+@@ -57,6 +72,8 @@
+   storedSessionId: string,
+   options: ResumeAttemptOptions | undefined
+ ): void {
++  resumeFailureByStoredSessionId.set(storedSessionId, { error })
++
+   if (!options?.reattach) {
+     notifyError(error, fallback, { id: resumeFailedToastId(storedSessionId) })
+   }
+diff --git a/apps/desktop/src/i18n/ar_chat.ts b/apps/desktop/src/i18n/ar_chat.ts
+index 49822c73cf5..14e1ea475b0 100644
+--- a/apps/desktop/src/i18n/ar_chat.ts
++++ b/apps/desktop/src/i18n/ar_chat.ts
+@@ -392,7 +392,11 @@
+     sessionUnavailable: 'الجلسة غير متاحة',
+     createSessionFailed: 'فشل إنشاء الجلسة',
+     promptFailed: 'فشل إرسال الرسالة',
+-    promptNotSent: 'لم تُرسل الرسالة. أُعيدت إلى مربع الكتابة.',
++    promptNotSent: 'لم تُرسل الرسالة.',
++    promptNotQueued: 'لم تُضف الرسالة إلى قائمة الانتظار.',
++    promptSendUnconfirmed: 'تعذّر تأكيد إرسال الرسالة.',
++    promptBackInComposer: 'أُعيدت إلى مربع الكتابة.',
++    promptStillInComposer: 'ما زالت في مربع الكتابة.',
+     providerCredentialRequired: 'مطلوب اعتماد المزود',
+     emptySlashCommand: 'أمر slash فارغ',
+     slashCommandIgnoredTitle: 'لم يتم إرسال الأمر',
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index 8a88e70f263..711b671a0ae 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -5496,7 +5496,11 @@
+     sessionUnavailable: 'Session nicht verfügbar',
+     createSessionFailed: 'Neue Session konnte nicht erstellt werden',
+     promptFailed: 'Prompt fehlgeschlagen',
+-    promptNotSent: 'Nachricht nicht gesendet. Sie steht wieder im Eingabefeld.',
++    promptNotSent: 'Nachricht nicht gesendet.',
++    promptNotQueued: 'Nachricht nicht eingereiht.',
++    promptSendUnconfirmed: 'Es ließ sich nicht bestätigen, ob die Nachricht gesendet wurde.',
++    promptBackInComposer: 'Sie steht wieder im Eingabefeld.',
++    promptStillInComposer: 'Sie steht noch im Eingabefeld.',
+     providerCredentialRequired:
+       'Fügen Sie Anmeldedaten für einen Anbieter hinzu, bevor Sie Ihre erste Nachricht senden.',
+     emptySlashCommand: 'leerer Slash-Befehl',
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 3c881158ef1..1d280bb47a4 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -4814,7 +4814,11 @@
+     sessionUnavailable: 'Session unavailable',
+     createSessionFailed: 'Could not create a new session',
+     promptFailed: 'Prompt failed',
+-    promptNotSent: 'Message not sent. It is back in the composer.',
++    promptNotSent: 'Message not sent.',
++    promptNotQueued: 'Message not queued.',
++    promptSendUnconfirmed: 'Could not confirm the message was sent.',
++    promptBackInComposer: 'It is back in the composer.',
++    promptStillInComposer: 'It is still in the composer.',
+     providerCredentialRequired: 'Add a provider credential before sending your first message.',
+     emptySlashCommand: 'empty slash command',
+     slashCommandIgnoredTitle: 'Command not sent',
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index a13cfde6b9e..5a86e18c6e2 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -5480,7 +5480,11 @@
+     sessionUnavailable: 'Sesión no disponible',
+     createSessionFailed: 'No se pudo crear una sesión nueva',
+     promptFailed: 'Falló el prompt',
+-    promptNotSent: 'Mensaje no enviado. Vuelve a estar en el cuadro de texto.',
++    promptNotSent: 'Mensaje no enviado.',
++    promptNotQueued: 'Mensaje no puesto en cola.',
++    promptSendUnconfirmed: 'No se pudo confirmar que el mensaje se enviara.',
++    promptBackInComposer: 'Vuelve a estar en el cuadro de texto.',
++    promptStillInComposer: 'Sigue en el cuadro de texto.',
+     providerCredentialRequired: 'Añade una credencial de proveedor antes de enviar tu primer mensaje.',
+     emptySlashCommand: 'comando slash vacío',
+     desktopCommands: 'Comandos de escritorio',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index 45227030269..65df089d3c4 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -5506,7 +5506,11 @@
+     sessionUnavailable: 'Session indisponible',
+     createSessionFailed: 'Impossible de créer une nouvelle session',
+     promptFailed: "Échec de l'invite",
+-    promptNotSent: 'Message non envoyé. Il est de nouveau dans la zone de saisie.',
++    promptNotSent: 'Message non envoyé.',
++    promptNotQueued: 'Message non mis en file d’attente.',
++    promptSendUnconfirmed: 'Impossible de confirmer que le message a été envoyé.',
++    promptBackInComposer: 'Il est de nouveau dans la zone de saisie.',
++    promptStillInComposer: 'Il est toujours dans la zone de saisie.',
+     providerCredentialRequired: "Ajoutez un identifiant de fournisseur avant d'envoyer votre premier message.",
+     emptySlashCommand: 'commande slash vide',
+     desktopCommands: 'Commandes Desktop',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index c95cb7ebd45..904339e3444 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -3687,7 +3687,11 @@
+     sessionUnavailable: 'セッションが利用できません',
+     createSessionFailed: '新しいセッションを作成できませんでした',
+     promptFailed: 'プロンプトに失敗しました',
+-    promptNotSent: 'メッセージは送信されませんでした。入力欄に戻してあります。',
++    promptNotSent: 'メッセージは送信されませんでした。',
++    promptNotQueued: 'メッセージはキューに追加されませんでした。',
++    promptSendUnconfirmed: 'メッセージが送信されたか確認できませんでした。',
++    promptBackInComposer: '入力欄に戻してあります。',
++    promptStillInComposer: '入力欄に残っています。',
+     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
+     emptySlashCommand: '空のスラッシュコマンド',
+     slashCommandIgnoredTitle: 'コマンドが送信されませんでした',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index cea6d344199..82514a6451d 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -3849,7 +3849,11 @@
+     sessionUnavailable: 'Сеанс недоступен',
+     createSessionFailed: 'Не удалось создать новый сеанс',
+     promptFailed: 'Промпт не удался',
+-    promptNotSent: 'Сообщение не отправлено. Оно возвращено в поле ввода.',
++    promptNotSent: 'Сообщение не отправлено.',
++    promptNotQueued: 'Сообщение не поставлено в очередь.',
++    promptSendUnconfirmed: 'Не удалось подтвердить, что сообщение отправлено.',
++    promptBackInComposer: 'Оно возвращено в поле ввода.',
++    promptStillInComposer: 'Оно осталось в поле ввода.',
+     providerCredentialRequired: 'Добавьте учётные данные провайдера перед отправкой первого сообщения.',
+     emptySlashCommand: 'пустая слэш-команда',
+     desktopCommands: 'Команды desktop',
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 7eb3f032200..9612a121bc7 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -4251,6 +4251,10 @@
+     createSessionFailed: string
+     promptFailed: string
+     promptNotSent: string
++    promptNotQueued: string
++    promptSendUnconfirmed: string
++    promptBackInComposer: string
++    promptStillInComposer: string
+     providerCredentialRequired: string
+     emptySlashCommand: string
+     slashCommandIgnoredTitle: string
+diff --git a/apps/desktop/src/i18n/zh-hant_chat.ts b/apps/desktop/src/i18n/zh-hant_chat.ts
+index 4a170a02d63..c3ddac1905d 100644
+--- a/apps/desktop/src/i18n/zh-hant_chat.ts
++++ b/apps/desktop/src/i18n/zh-hant_chat.ts
+@@ -415,7 +415,11 @@
+     sessionUnavailable: '工作階段不可用',
+     createSessionFailed: '無法建立新工作階段',
+     promptFailed: '提示詞傳送失敗',
+-    promptNotSent: '訊息未傳送，已放回輸入框。',
++    promptNotSent: '訊息未傳送。',
++    promptNotQueued: '訊息未加入佇列。',
++    promptSendUnconfirmed: '無法確認訊息是否已傳送。',
++    promptBackInComposer: '已放回輸入框。',
++    promptStillInComposer: '仍在輸入框中。',
+     providerCredentialRequired: '傳送第一則訊息前請先新增提供方憑證。',
+     emptySlashCommand: '空的斜線指令',
+     slashCommandIgnoredTitle: '指令未傳送',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 4884a06a30d..3d87ed8829b 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -4629,7 +4629,11 @@
+     sessionUnavailable: '会话不可用',
+     createSessionFailed: '无法创建新会话',
+     promptFailed: '提示词发送失败',
+-    promptNotSent: '消息未发送，已放回输入框。',
++    promptNotSent: '消息未发送。',
++    promptNotQueued: '消息未加入队列。',
++    promptSendUnconfirmed: '无法确认消息是否已发送。',
++    promptBackInComposer: '已放回输入框。',
++    promptStillInComposer: '仍在输入框中。',
+     providerCredentialRequired: '发送第一条消息前请先添加提供方凭据。',
+     emptySlashCommand: '空 slash 命令',
+     slashCommandIgnoredTitle: '命令未发送',
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 91742a5e8cf..d27b730cbd7 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -1613,8 +1613,12 @@
+     "desktop.poolSlotTimeoutBody",
+     "desktop.poolSlotTimeoutOpenSettings",
+     "desktop.profileStatus",
++    "desktop.promptBackInComposer",
+     "desktop.promptFailed",
++    "desktop.promptNotQueued",
+     "desktop.promptNotSent",
++    "desktop.promptSendUnconfirmed",
++    "desktop.promptStillInComposer",
+     "desktop.providerCredentialRequired",
+     "desktop.readOnlyTranscriptBody",
+     "desktop.readOnlyTranscriptSendBlocked",
+-- 
+2.43.0
+

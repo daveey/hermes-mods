@@ -1,0 +1,208 @@
+From 7a8d7fcc4cd846f82645593082f812100e2f1be9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:51:19 +0000
+Subject: [PATCH 6229] Primary reconnect ownership and exact sidebar list batching
+
+Public mirror of source commit 7a8d7fcc4cd846f82645593082f812100e2f1be9.
+
+---
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 1c720c2a727..a8a2632c783 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -15550,8 +15550,8 @@
+ 
+   if (registrySources.length) {
+     const getRegistryJson = (descriptor, path) => getJsonForBackend(descriptor, path, { timeoutMs: 10_000 })
+-    // RT-42: count each backend (install_id) once; remote-override profiles are another backend.
+-    const identity = { primaryBackendId: await primaryBackendInstallId(), unknownPrimaryProfiles: remoteProfiles }
++    // RT-42: count each backend (install_id) once; `base` serves the reused SSH primary without a re-read.
++    const identity = { primaryBackendId: await primaryBackendInstallId(), unknownPrimaryProfiles: remoteProfiles, base }
+     total += await mergeRegistrySessionRows(registrySources, remoteParams, getRegistryJson, merged, profileTotals, identity)
+   }
+ 
+diff --git a/apps/desktop/electron/profile-session-routing.ts b/apps/desktop/electron/profile-session-routing.ts
+index 18fbae9d757..07e2acaf607 100644
+--- a/apps/desktop/electron/profile-session-routing.ts
++++ b/apps/desktop/electron/profile-session-routing.ts
+@@ -453,6 +453,18 @@
+   /** The connection's gateway install_id, when known. Sources sharing one are the same backend
+    *  and count their session totals once; a source without one is never summed with another. */
+   backendId?: string
++  /** True when `backends[0]` is the window's running primary descriptor reused
++   *  for this SSH connection (no pooled backend of its own): the primary
++   *  aggregate already read this exact backend, so a merge can reuse it. */
++  reusesPrimary?: boolean
++}
++
++/** The primary aggregate a unified merge already read: rows plus the first
++ *  page (for `total`/`profile_totals`). Only offered when that read had no
++ *  scan errors, so a degraded primary read is never reused as authoritative. */
++export interface PrimaryAggregateRead {
++  rows: unknown[]
++  first: unknown
+ }
+ 
+ type PinnedRegistrySessionSource = Pick<RegistrySessionSource, 'connectionId'> &
+@@ -639,7 +651,8 @@
+   sources: RegistrySessionSource[],
+   searchParams: URLSearchParams,
+   getJson: GetJsonForDescriptor,
+-  reportedTotals?: Map<string, number>
++  reportedTotals?: Map<string, number>,
++  primaryAggregate: PrimaryAggregateRead | null = null
+ ): Promise<unknown[]> {
+   const rows: unknown[] = []
+ 
+@@ -728,6 +741,22 @@
+         return
+       }
+ 
++      // The SSH primary reused as this registry source is the backend the
++      // primary aggregate just read with the same window and filters: reuse
++      // that read instead of re-scanning every profile on the remote again
++      // (five paged /api/profiles/sessions calls per refresh). Rows are copied
++      // because tagging stamps connection_id/profile in place.
++      if (source.reusesPrimary && primaryAggregate) {
++        recordTotals(primaryAggregate.first, source.connectionId, null)
++        tag(
++          primaryAggregate.rows.map(row => (row && typeof row === 'object' ? { ...(row as object) } : row)),
++          source.connectionId,
++          null
++        )
++
++        return
++      }
++
+       const params = new URLSearchParams(searchParams)
+       params.set('profile', 'all')
+       const getShared = (path: string) => getJson(shared.descriptor, path)
+@@ -933,10 +962,19 @@
+   getJson: GetJsonForDescriptor,
+   merged: unknown[],
+   profileTotals: Record<string, number>,
+-  identity: Omit<RegistryBackendIdentity, 'backendIds'> = {}
++  identity: Omit<RegistryBackendIdentity, 'backendIds'> & {
++    /** The primary aggregate response this merge already read. A clean one
++     *  (no scan errors) stands in for a `reusesPrimary` source's own read. */
++    base?: unknown
++  } = {}
+ ): Promise<number> {
++  const primaryAggregate: PrimaryAggregateRead | null =
++    identity.base && typeof identity.base === 'object' && !errorsOf(identity.base)?.length
++      ? { rows: rowsOf(identity.base), first: identity.base }
++      : null
++
+   const reportedTotals = new Map<string, number>()
+-  const registryRows = await fetchRegistrySessionRows(sources, searchParams, getJson, reportedTotals)
++  const registryRows = await fetchRegistrySessionRows(sources, searchParams, getJson, reportedTotals, primaryAggregate)
+   const before = merged.length
+   spliceRegistrySessionRows(merged, registryRows, profileTotals)
+ 
+diff --git a/apps/desktop/electron/registry-session-sources.test.ts b/apps/desktop/electron/registry-session-sources.test.ts
+index e425051b997..d8b1374f1ce 100644
+--- a/apps/desktop/electron/registry-session-sources.test.ts
++++ b/apps/desktop/electron/registry-session-sources.test.ts
+@@ -63,4 +63,64 @@
+ 
+     expect(scopes.sort()).toEqual(['box/box-default-1', 'box/box-gamma-1', 'lan/lan-eps-1'])
+   })
++
++  it('reuses the primary aggregate for the reused SSH primary instead of re-reading that backend', async () => {
++    const deps = {
++      connections: [
++        { id: 'box', kind: 'ssh' },
++        { id: 'lan', kind: 'remote' }
++      ],
++      pool: [['conn:lan::default', { connectionPromise: Promise.resolve(lan) }]] as Array<
++        [string, { connectionPromise: Promise<unknown> }]
++      >,
++      scopePrefix: (id: string) => `conn:${id}::`,
++      reusedPrimary: async (id: string) => (id === 'box' ? primary : null),
++      installId: async (id: string) => `install-${id}`,
++      sharedProfiles: sharedSshProfiles
++    }
++
++    const sources = await collectRegistrySessionSources(deps, false)
++    expect(sources.find(source => source.connectionId === 'box')?.reusesPrimary).toBe(true)
++    expect(sources.find(source => source.connectionId === 'lan')?.reusesPrimary).toBeUndefined()
++
++    const read = async (base: unknown) => {
++      const hosts: string[] = []
++
++      const counting = async (descriptor: unknown, path: string) => {
++        hosts.push((descriptor as { baseUrl: string }).baseUrl)
++
++        return JSON.parse(JSON.stringify(await getJson(descriptor, path)))
++      }
++
++      const merged: unknown[] = []
++      const totals: Record<string, number> = {}
++      await mergeRegistrySessionRows(sources, new URLSearchParams('limit=500'), counting, merged, totals, { base })
++
++      return { hosts, merged, totals }
++    }
++
++    const fetched = await read(null)
++    // Without the reuse the same backend is scanned again (five 100-row pages
++    // per 500-row refresh against a real history; one here, as it runs short).
++    expect(fetched.hosts.filter(host => host === primary.baseUrl).length).toBeGreaterThan(0)
++
++    const primaryRows: Array<Record<string, unknown>> = [
++      { id: 'box-default-1', profile: 'default', last_active: 3 },
++      { id: 'box-gamma-1', profile: 'gamma', last_active: 2 }
++    ]
++    const first = { sessions: primaryRows, total: 2, profile_totals: { default: 1, gamma: 1 } }
++    const reused = await read(first)
++
++    expect(reused.hosts).not.toContain(primary.baseUrl)
++    expect(reused.hosts).toContain(lan.baseUrl)
++    expect(reused.merged).toEqual(fetched.merged)
++    expect(reused.totals).toEqual(fetched.totals)
++    // The primary read is shared with the base list: tagging must not mutate it.
++    expect(primaryRows.every(row => !('connection_id' in row))).toBe(true)
++
++    // A degraded primary read (scan errors) is never reused as authoritative.
++    const degraded = await read({ ...first, errors: [{ profile: 'gamma', error: 'locked' }] })
++    expect(degraded.hosts).toContain(primary.baseUrl)
++    expect(degraded.merged).toEqual(fetched.merged)
++  })
+ })
+diff --git a/apps/desktop/electron/registry-session-sources.ts b/apps/desktop/electron/registry-session-sources.ts
+index 3670b0f3250..95650ffb720 100644
+--- a/apps/desktop/electron/registry-session-sources.ts
++++ b/apps/desktop/electron/registry-session-sources.ts
+@@ -51,12 +51,14 @@
+     const pooled = pool.filter(([key, entry]) => key.startsWith(prefix) && entry.connectionPromise)
+     const perProfile = connection.kind === 'ssh' || (includeLocal && connection.kind === 'local')
+     const backends: SessionBackend[] = []
++    let reusesPrimary = false
+ 
+     if (connection.kind === 'ssh' && !pooled.some(([key]) => (key.slice(prefix.length) || 'default') === 'default')) {
+       const primary = await deps.reusedPrimary(connection.id)
+ 
+       if (primary) {
+         backends.push({ descriptor: primary, profileLabel: 'default' })
++        reusesPrimary = true
+       }
+     }
+ 
+@@ -84,7 +86,14 @@
+     if (backends.length) {
+       const backendId = await deps.installId(connection.id, backends[0].descriptor)
+       const sharedProfiles = connection.kind === 'ssh' ? deps.sharedProfiles(connection.id, backends) : undefined
+-      sources.push({ backendId, backends, connectionId: connection.id, kind: connection.kind, sharedProfiles })
++      sources.push({
++        backendId,
++        backends,
++        connectionId: connection.id,
++        kind: connection.kind,
++        sharedProfiles,
++        ...(reusesPrimary ? { reusesPrimary } : {})
++      })
+     }
+   }
+ 
+-- 
+2.43.0
+

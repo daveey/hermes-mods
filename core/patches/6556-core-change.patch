@@ -1,0 +1,234 @@
+From 414d5ba4d0e2bcecf46314fca51eebf2adf0edeb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 07:43:27 +0000
+Subject: [PATCH 6556] Usage-accounting gate and pool pickup budgets
+
+Public mirror of source commit 414d5ba4d0e2bcecf46314fca51eebf2adf0edeb.
+
+---
+diff --git a/hermes_cli/kanban_spend_claim.py b/hermes_cli/kanban_spend_claim.py
+index 438ef3cc325..fef9b69ebe7 100644
+--- a/hermes_cli/kanban_spend_claim.py
++++ b/hermes_cli/kanban_spend_claim.py
+@@ -26,6 +26,9 @@
+     except ConfigBackendUnavailable:
+         # A missing policy cannot authorize spending; do not crash the dispatcher either.
+         return lambda: refuse("spend_policy_unavailable")
++    from hermes_cli.kanban_usage_accounting import gate_policy
++    mode, after = gate_policy()
++    accounting_cfg = {"kanban": {"usage_accounting": {"mode": mode, "enforce_after": after}}}
+     pr = None
+     if not decision.pending(conn, task_id):
+         lim = budget.card_limits(conn, task_id, board)
+@@ -35,8 +38,8 @@
+     def refused():
+         if decision.pending(conn, task_id):
+             return refuse("decision_pending")
+-        from hermes_cli.kanban_usage_accounting import pending
+-        if pending(conn, task_id):
++        from hermes_cli.kanban_usage_accounting import enforced
++        if enforced(conn, task_id, accounting_cfg):
+             return refuse("usage_accounting_pending")
+         lim = budget.card_limits(conn, task_id, board)
+         if budget.over(budget.spend(conn, task_id), lim) is None:
+diff --git a/hermes_cli/kanban_usage_accounting.py b/hermes_cli/kanban_usage_accounting.py
+index a3e7a695458..05944674be6 100644
+--- a/hermes_cli/kanban_usage_accounting.py
++++ b/hermes_cli/kanban_usage_accounting.py
+@@ -118,6 +118,51 @@
+     return good
+ 
+ 
++MODES = ('observe', 'enforce')
++DEFAULT_MODE = 'observe'
++
++
++def gate_policy(cfg=None):
++    """``(mode, enforce_after)`` from ``kanban.usage_accounting``; unreadable config fails closed.
++
++    ``observe`` (default until exits publish finals): debt stays visible through :func:`pending`
++    and spend reports but admission does not refuse on
++    it. Representative observation: missing final receipts for continue/block/schedule/retain/reclaim exits
++    left ready cards held indefinitely despite free worker slots.
++    ``enforce`` refuses on debt from runs closed at or after ``enforce_after`` (epoch seconds;
++    unset = every run). Budget and decision holds are independent and never relaxed here.
++    """
++    if cfg is None:
++        try:
++            from hermes_cli.config import load_config
++            cfg = load_config()
++        except Exception:  # health: allow BLE001 -- unreadable policy fails closed
++            return 'enforce', None
++    section = ((cfg or {}).get('kanban') or {}).get('usage_accounting') or {}
++    mode = section.get('mode', DEFAULT_MODE) if isinstance(section, dict) else DEFAULT_MODE
++    if mode not in MODES:
++        mode = 'enforce'
++    after = section.get('enforce_after') if isinstance(section, dict) else None
++    if isinstance(after, bool) or not isinstance(after, (int, float)) or not math.isfinite(after):
++        after = None
++    return mode, after
++
++
++def enforced(conn, task_id, cfg=None):
++    """The :func:`pending` runs admission refuses on under :func:`gate_policy`."""
++    mode, after = gate_policy(cfg)
++    if mode != 'enforce':
++        return []
++    runs = pending(conn, task_id)
++    if not runs or after is None:
++        return runs
++    marks = ','.join('?' for _ in runs)
++    ended = dict(conn.execute(
++        f"SELECT id,ended_at FROM task_runs WHERE task_id=? AND id IN ({marks})", (task_id, *runs)))
++    # An unclosed row has no end time yet: it is new by definition.
++    return [rid for rid in runs if ended.get(rid) is None or ended[rid] >= after]
++
++
+ def pending(conn, task_id):
+     """Closed admitted/bound turns and ambiguous releases without cache accounting.
+ 
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index c1b87f39a69..bdc75c64f8d 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -725,8 +725,8 @@
+     evicted and copied again each tick: 16 such cards filled every worker's window and hid the review of the accounting fix itself (t_88f5d46a072c9879). Any
+     failure copies as before: the claim check still decides after the copy."""
+     try:
+-        from hermes_cli.kanban_usage_accounting import pending
+-        runs = pending(replica, card["id"])
++        from hermes_cli.kanban_usage_accounting import enforced
++        runs = enforced(replica, card["id"])
+     except Exception:  # health: allow BLE001 -- pickup evidence must never stop a pickup
+         _log.warning("kanban worker node: usage accounting check failed for %s; copying", card["id"], exc_info=True)
+         return None
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 1fdd8b0eb48..9fb28de7e33 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -535,6 +535,12 @@
+         base._exit_fenced = False
+ 
+ 
++@pytest.fixture(autouse=True)
++def _usage_accounting_gate_enforced(monkeypatch):
++    """Tests assert enforced accounting refusals; production defaults to observe (gate_policy)."""
++    monkeypatch.setattr("hermes_cli.kanban_usage_accounting.DEFAULT_MODE", "enforce")
++
++
+ @pytest.fixture(autouse=True)
+ def _isolate_kanban_live_worker_procs():
+     """Give every test an empty ``kanban_db_dispatch._live_worker_procs`` and drop what it parked.
+diff --git a/tests/hermes_cli/test_kanban_usage_accounting_mode.py b/tests/hermes_cli/test_kanban_usage_accounting_mode.py
+new file mode 100644
+index 00000000000..e01b196c9fd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_usage_accounting_mode.py
+@@ -0,0 +1,104 @@
++"""Usage-accounting admission mode: observe by default, enforce opt-in with a cutoff. [daveey]
++
++Representative observation: the fail-closed gate held ready cards because some
++exits never wrote final receipts and nothing could settle them,
++leaving worker slots unused. Observe keeps the debt visible
++(``pending``) without refusing; enforce with ``enforce_after`` only fences new runs.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_usage_accounting as ua
++from tests.hermes_cli import test_kanban_usage_accounting as accounting
++
++kanban_home = accounting.kanban_home
++
++
++def _policy(monkeypatch, section):
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {"usage_accounting": section}})
++
++
++def _ended(conn, tid, at):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET ended_at=? WHERE task_id=?", (at, tid))
++
++
++def test_production_default_is_observe():
++    # The autouse test fixture pins enforce; the shipped constant is observe.
++    import ast
++    import inspect
++    tree = ast.parse(inspect.getsource(ua))
++    shipped = {n.targets[0].id: n.value.value for n in tree.body
++               if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
++               and isinstance(n.value, ast.Constant)}
++    assert shipped["DEFAULT_MODE"] == "observe"
++
++
++def test_observe_mode_admits_a_card_with_debt_and_keeps_it_visible(kanban_home, monkeypatch):
++    _policy(monkeypatch, {"mode": "observe"})
++    with kbc.connect_closing() as conn:
++        tid, _ = accounting.released(conn)
++        assert ua.pending(conn, tid)  # the debt is still reported
++        assert ua.enforced(conn, tid) == []
++        assert kb.claim_task(conn, tid) is not None
++        assert sync.pop_claim_deferral(tid) is None
++
++
++def test_missing_section_uses_default_mode(kanban_home, monkeypatch):
++    monkeypatch.setattr(ua, "DEFAULT_MODE", "observe")
++    monkeypatch.setattr("hermes_cli.config.load_config", dict)
++    with kbc.connect_closing() as conn:
++        tid, _ = accounting.released(conn)
++        assert kb.claim_task(conn, tid) is not None
++
++
++def test_enforce_mode_still_refuses(kanban_home, monkeypatch):
++    _policy(monkeypatch, {"mode": "enforce"})
++    with kbc.connect_closing() as conn:
++        tid, _ = accounting.released(conn)
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == "usage_accounting_pending"
++
++
++def test_enforce_after_fences_only_newer_runs(kanban_home, monkeypatch):
++    cutoff = time.time()
++    _policy(monkeypatch, {"mode": "enforce", "enforce_after": cutoff})
++    with kbc.connect_closing() as conn:
++        old, _ = accounting.released(conn)
++        _ended(conn, old, int(cutoff) - 3600)
++        new, _ = accounting.released(conn)
++        _ended(conn, new, int(cutoff) + 60)
++        assert kb.claim_task(conn, old) is not None
++        assert kb.claim_task(conn, new) is None
++        assert sync.pop_claim_deferral(new) == "usage_accounting_pending"
++
++
++@pytest.mark.parametrize("section", [{"mode": "bogus"}, {"mode": "enforce", "enforce_after": "soon"}])
++def test_malformed_policy_fails_closed(kanban_home, monkeypatch, section):
++    _policy(monkeypatch, section)
++    with kbc.connect_closing() as conn:
++        tid, _ = accounting.released(conn)
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == "usage_accounting_pending"
++
++
++def test_unreadable_config_fails_closed(monkeypatch):
++    def boom():
++        raise OSError("unreadable")
++    monkeypatch.setattr("hermes_cli.config.load_config", boom)
++    assert ua.gate_policy() == ("enforce", None)
++
++
++def test_observe_keeps_the_spend_budget_hold(kanban_home, monkeypatch):
++    _policy(monkeypatch, {"mode": "observe"})
++    monkeypatch.setattr(budget, "limits", lambda: budget.Limits(runs=100, cache_read_tokens=10))
++    with kbc.connect_closing() as conn:
++        tid, context = accounting.released(conn)
++        accounting.receipt(context)
++        assert kb.claim_task(conn, tid) is None
++        assert sync.pop_claim_deferral(tid) == "spend_budget_exhausted"
+-- 
+2.43.0
+

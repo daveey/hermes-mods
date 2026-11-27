@@ -1,0 +1,419 @@
+From 60a69259ecbb5bec924d959f7acd802f57c6dd1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:33:02 +0000
+Subject: [PATCH 6378] Read-first spend decisions and scope release fences
+
+Public mirror of source commit 60a69259ecbb5bec924d959f7acd802f57c6dd1c.
+
+---
+diff --git a/hermes_cli/kanban_create_authority.py b/hermes_cli/kanban_create_authority.py
+index 72f1a3bce12..45ac1c96187 100644
+--- a/hermes_cli/kanban_create_authority.py
++++ b/hermes_cli/kanban_create_authority.py
+@@ -25,27 +25,45 @@
+ 
+ 
+ def wait_reason(conn, task_id: str, creator_task_id) -> str | None:
+-    """Why a refused create may still succeed later on this board, as a reason code naming the wait, else None.
+-
+-    - ``origin_owner_unsynced``: the board never synced (no Board identity) or has no synced chat-link table,
+-      so it cannot hold the origin chat's ``created`` link yet;
++    """Why a refused create may still succeed later on this board, as a reason code naming the wait; None when no
++    sync can change the refusal (terminal). Definitive causes are checked first, so a create that is also
++    waiting on a sync is still terminal when something no sync can fix refuses it:
++
++    - terminal: sync is disabled on this gateway (``kanban.sync.enabled`` off: it will not sync on its own); the
++      card's creating chat is a placeholder or was released; the creator task is here but has no sessions (a
++      cron or system creator: nothing to sync);
++    - ``origin_owner_unsynced``: sync is on but the board has no Board identity or chat-link table yet;
+     - ``origin_gateway_unnamed``: this gateway has no name yet (before its first sync);
+-    - ``origin_creator_unsynced``: the creator task, or its sessions, have not reached this board yet;
++    - ``origin_creator_unsynced``: the creator task has not reached this board yet;
+     - ``origin_chat_provenance_unsynced``: a foreign chat link on the card whose provenance is not proven here
+       yet (the proving rows sync later).
+     """
+-    from hermes_cli.kanban_db_sync import sync_state
++    from hermes_cli.kanban_db_sync import sync_enabled, sync_state
++    from hermes_cli.kanban_placement import is_placeholder_session
++    from hermes_cli.kanban_scope_renewal_cli import _sessions
++    if not sync_enabled():
++        return None
+     links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone() is not None
++    row = conn.execute("SELECT session_id FROM tasks WHERE id=?", (task_id,)).fetchone()
++    sessions = [(row[0], 0)] if row and row[0] else []
++    if links:
++        sessions += [(r[0], r[1]) for r in conn.execute(
++            "SELECT chat_session, released FROM task_chat_links WHERE task_id=? AND kind='created'", (task_id,))]
++    for session, released in sessions:
++        if released or not str(session or "").strip() or is_placeholder_session(session) \
++                or _released_upstream(conn, task_id, session):
++            return None
++    creator = (conn.execute("SELECT 1 FROM tasks WHERE id=?", (creator_task_id,)).fetchone() is not None
++               if creator_task_id else None)
++    if creator and not _sessions(conn, creator_task_id):
++        return None
+     if not links or not (sync_state(conn) or {}).get("gateway_id"):
+         return "origin_owner_unsynced"
+     me = _gateway(conn)
+     if not me:
+         return "origin_gateway_unnamed"
+-    if creator_task_id:
+-        from hermes_cli.kanban_scope_renewal_cli import _sessions
+-        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (creator_task_id,)).fetchone() is None \
+-                or not _sessions(conn, creator_task_id):
+-            return "origin_creator_unsynced"
++    if creator is False:
++        return "origin_creator_unsynced"
+     from hermes_cli.kanban_creator_chats import _chat_links
+     from hermes_cli.kanban_db_notify import is_machine_session
+     from hermes_cli.kanban_session_provenance import proven_foreign_chats
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index b34ffa21718..d80cd98cb45 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -402,11 +402,13 @@
+     from datetime import UTC, datetime
+     from hermes_cli import kanban_release_comments as unread
+     from hermes_cli import kanban_spend_override_fence as fence
+-    items: dict = {item["id"]: dict(item) for item in extra}
++    # Keyed by kind and id: an ``extra`` item may be a budget event (``kind: event``), whose id is a task_events
++    # id and never stands for, or collides with, a comment id.
++    items: dict = {(item.get("kind", "comment"), item["id"]): dict(item) for item in extra}
+     for cid in _unread_human(conn, tid, stop, None):
+         row = conn.execute("SELECT author, created_at, body FROM task_comments WHERE id=?", (cid,)).fetchone()
+         if row is not None:
+-            items[cid] = {"id": cid, "who": f"{row[0]} (human)", "body": str(row[2] or "")[:600],
++            items[("comment", cid)] = {"id": cid, "who": f"{row[0]} (human)", "body": str(row[2] or "")[:600],
+                           "time": datetime.fromtimestamp(int(row[1] or 0), UTC).isoformat()}
+     checks = (lambda: fence.check(conn, tid, seen=None, board=board),
+               lambda: unread.check(conn, tid, session=writer[1], seen=None, verb=verb, board=board))
+@@ -415,38 +417,46 @@
+             check()
+         except unread.UnreadComments as exc:
+             for c in exc.comments:
+-                items.setdefault(c["id"], {"id": c["id"], "who": c["writer_session"], "time": c["time"],
++                items.setdefault(("comment", c["id"]), {"id": c["id"], "who": c["writer_session"], "time": c["time"],
+                                            "body": c["body"]})
+     return sorted(items.values(), key=lambda item: (item["id"] is None, item["id"] or 0))
+ 
+ 
+-def _shown(conn: sqlite3.Connection, tid: str, session: Optional[str], verb: str, ids: Sequence[int]) -> bool:
++def _shown(conn: sqlite3.Connection, tid: str, session: Optional[str], verb: str, ids: Sequence[int],
++           events: Sequence[int] = ()) -> bool:
+     """Every id in ``ids`` (what this verb's caller must read now) was printed to agent ``session`` by a read-first
+     refusal of the same ``verb`` on this board: ``ids`` is a subset of the union of ``comment_ids`` over this
+     board's own ``release_unread_shown`` events for that session and verb. Each verb prints its own required set
+     (``spend-budget`` prints the limit's own budget comment, ``release`` the comments after the stop), so one
+     verb's refusal never stands in for the other's. A row another gateway pushed proves nothing about what this
+     caller was shown (:func:`own_events`); a caller with no session has no identity to match."""
+-    if not session or not ids:
++    if not session or not (ids or events):
+         return False
+     printed: set = set()
++    printed_events: set = set()
+     for e in own_events(conn, tid, (SHOWN,)):
+         p = e["payload"]
+         if p.get("session") == session and p.get("verb", "release") == verb:
+             printed.update(c for c in (p.get("comment_ids") or []) if isinstance(c, int))
+-    return set(ids) <= printed
++            printed_events.update(c for c in (p.get("event_ids") or []) if isinstance(c, int))
++    return set(ids) <= printed and set(events) <= printed_events
+ 
+ 
+-def _record_shown(conn: sqlite3.Connection, tid: str, writer: tuple, ids: Sequence[int], verb: str) -> None:
+-    """Record what a read-first refusal printed: the agent session, the comment ids, the time."""
++def _record_shown(conn: sqlite3.Connection, tid: str, writer: tuple, ids: Sequence[int], verb: str,
++                  events: Sequence[dict] = ()) -> None:
++    """Record what a read-first refusal printed: the agent session, the comment ids, the budget events (local id
++    and uid) printed in place of a note that is not readable here, the time."""
+     import time
+     from hermes_cli import kanban_db as kb
+-    if not ids:
++    if not ids and not events:
+         return
++    record = {"version": 1, "verb": verb, "actor_kind": writer[0], "session": writer[1] or None,
++              "comment_ids": sorted(set(ids)), "time": int(time.time())}
++    if events:
++        record["event_ids"] = sorted({e["id"] for e in events})
++        record["event_uids"] = sorted({str(e["uid"]) for e in events if e.get("uid")})
+     with kb.write_txn(conn):
+-        kb._append_event(conn, tid, SHOWN, {"version": 1, "verb": verb, "actor_kind": writer[0],
+-                                            "session": writer[1] or None, "comment_ids": sorted(set(ids)),
+-                                            "time": int(time.time())})
++        kb._append_event(conn, tid, SHOWN, record)
+ 
+ 
+ def read_first(conn: sqlite3.Connection, tid: str, anchor: Optional[dict], writer: tuple, seen: Optional[int],
+@@ -469,11 +479,15 @@
+         if seen is not None:
+             raise _Refusal("seen_not_needed", f"nothing on {tid} needs --seen; rerun without it")
+         return None
+-    ids = [item["id"] for item in items if item["id"] is not None]
++    events = [item for item in items if item.get("kind") == "event"]
++    comments = [item["id"] for item in items if item.get("kind") != "event" and item["id"] is not None]
++    ids = comments + [item["id"] for item in events]
+     newest = max(ids) if len(ids) == len(items) else None
+-    if newest is not None and seen == newest and _shown(conn, tid, writer[1], verb, ids):
+-        return seen
+-    shown = "\n".join(f"Comment {item['id']} | {item['who']} | {item['time']}\n{item['body']}" for item in items)
++    if (newest is not None and seen == newest
++            and _shown(conn, tid, writer[1], verb, comments, [item["id"] for item in events])):
++        return max(comments, default=None)  # the comment watermark: an event id never acknowledges a comment
++    shown = "\n".join(f"{'Budget event' if item.get('kind') == 'event' else 'Comment'} {item['id']} | "
++                      f"{item['who']} | {item['time']}\n{item['body']}" for item in items)
+     command = rerun or f"hermes kanban {verb} {tid}"
+     how = (f"After reading: `{command} --seen {newest}`" if newest is not None else
+            "A comment's text has not synced here; wait for the sync and rerun")
+@@ -484,9 +498,10 @@
+     if seen is not None:
+         wrong = (f" (--seen {seen} is not the newest of them)" if seen != newest else
+                  f" (not everything here was printed to this session by an earlier {verb} refusal; it is now)")
+-    _record_shown(conn, tid, writer, ids, verb)
++    _record_shown(conn, tid, writer, comments, verb, events)
+     doing = {"release": "releasing", "spend-budget": "changing the spend budget of"}.get(verb, verb)
+-    raise _Refusal("budget_decision_unread", f"read these before {doing} {tid}{wrong}:\n{shown}\n{how}", unread=ids)
++    raise _Refusal("budget_decision_unread", f"read these before {doing} {tid}{wrong}:\n{shown}\n{how}",
++                   unread=comments, **({"unread_events": [item["id"] for item in events]} if events else {}))
+ 
+ 
+ def _read_first(conn: sqlite3.Connection, tid: str, stop: dict, writer: tuple, seen: Optional[int],
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index 51875dc4499..45dd4bc2632 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -74,15 +74,30 @@
+         row = conn.execute("SELECT id, author, created_at, body FROM task_comments WHERE task_id=? AND id=?",
+                            (tid, named)).fetchone()
+     if row is None:
++        at = int(event.get("created_at") or 0)  # written in the same transaction: never an older override's note
+         row = conn.execute("SELECT id, author, created_at, body FROM task_comments WHERE task_id=? AND author=? "
+-                           "AND body LIKE ? AND created_at <= ? ORDER BY id DESC LIMIT 1",
+-                           (tid, ksb.AUTHOR, _PERSON_NOTE + "%", int(event.get("created_at") or 0) + 1)).fetchone()
++                           "AND body LIKE ? AND created_at BETWEEN ? AND ? ORDER BY id DESC LIMIT 1",
++                           (tid, ksb.AUTHOR, _PERSON_NOTE + "%", at - 60, at + 1)).fetchone()
+     if row is None:
+         return None
+     return {"id": int(row[0]), "who": f"{row[1]} (the limit being changed)", "body": str(row[3] or "")[:600],
+             "time": datetime.fromtimestamp(int(row[2] or 0), UTC).isoformat()}
+ 
+ 
++def _event_item(event: dict) -> dict:
++    """The person's override event itself as a read item, when its note comment is not readable here (written
++    before notes, or not synced yet): who set it, why and the values, required in ``--seen`` like a comment and
++    recorded as shown by its event id and uid (``kanban_release.read_first``)."""
++    from datetime import UTC, datetime
++    payload = json.loads(event.get("payload") or "{}")
++    payload = payload if isinstance(payload, dict) else {}
++    return {"id": int(event["id"]), "kind": "event", "uid": event.get("uid"),
++            "who": f"{payload.get('by') or 'unknown'} (the limit being changed; its note is not readable here)",
++            "time": datetime.fromtimestamp(int(event.get("created_at") or 0), UTC).isoformat(),
++            "body": f"Spend budget: {ksb._override_text(payload)}, set by {payload.get('by') or 'unknown'}: "
++                    f"{payload.get('reason') or '(no reason recorded)'}"}
++
++
+ def _agent_gate(conn, tid: str, writer: tuple, runs, cache, seen, board, args):
+     """For a non-human caller: ``(seen for the budget fence, carried attribution fields)``, or a refusal text.
+ 
+@@ -98,14 +113,14 @@
+     row = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                        (tid, ksb.OVERRIDE_EVENT)).fetchone()
+     anchor = dict(row)
+-    note = _person_note(conn, tid, anchor)  # None: not readable here; the rest (and the fence's decision) still is
++    note = _person_note(conn, tid, anchor) or _event_item(anchor)  # no readable note: the budget event itself
+     flags = ("--exempt" if args.exempt else "--clear" if args.clear else
+              " ".join(f"--{name} {value}" for name, value in (("runs", runs), ("cache-read-tokens", cache))
+                       if value is not None))
+     rerun = f"hermes kanban {'--board ' + board + ' ' if board else ''}spend-budget {tid} {flags} --reason ..."
+     try:
+         seen = kr.read_first(conn, tid, anchor, writer, seen, board, verb="spend-budget",
+-                            extra=[note] if note else [], rerun=rerun)
++                            extra=[note], rerun=rerun)
+     except kr.Refusal as exc:
+         return (f"kanban spend-budget: {tid}: refused: {exc.code}: raising or removing a {' and '.join(loosened)} "
+                 f"limit a person may have set needs a read first. {exc}")
+diff --git a/tests/hermes_cli/test_kanban_create_authority_wait.py b/tests/hermes_cli/test_kanban_create_authority_wait.py
+index 07407e42acf..5111df3cfdc 100644
+--- a/tests/hermes_cli/test_kanban_create_authority_wait.py
++++ b/tests/hermes_cli/test_kanban_create_authority_wait.py
+@@ -14,17 +14,26 @@
+ kanban_home = helpers.kanban_home
+ 
+ 
++def _links(conn):
++    with kb.write_txn(conn):
++        conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, "
++                     "task_id TEXT NOT NULL, chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, "
++                     "kind TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
++
++
++def _enabled(home):
++    """``kanban.sync.enabled`` on, before the board's first sync (no Board identity yet)."""
++    from tests.hermes_cli import kanban_sync_support as support
++    support.write_sync_config(home, True)
++
++
+ def _synced(conn, home):
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_client as client
+-    from tests.hermes_cli import kanban_sync_support as support
+-    support.write_sync_config(home, True)
++    _enabled(home)
+     sync.install_or_remove(conn, str(home / 'kanban.db'))
+     client.ensure_identity(conn, 'default', 'fixture')
+-    with kb.write_txn(conn):
+-        conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, "
+-                     "task_id TEXT NOT NULL, chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, "
+-                     "kind TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
++    _links(conn)
+ 
+ 
+ def _refusal(conn, tid, creator=None):
+@@ -38,7 +47,15 @@
+     return owner._dispatch_result(owner.origin_refusal(exc, origin=True))
+ 
+ 
+-def test_a_never_synced_owner_waits(kanban_home):
++def test_an_owner_with_sync_disabled_is_terminal(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='orphan', assignee='default')
++        exc = _refusal(conn, tid)
++    assert exc.wait is None and _answer(exc)['status'] == 'rejected'
++
++
++def test_a_not_yet_synced_owner_waits(kanban_home):
++    _enabled(kanban_home)
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title='orphan', assignee='default')
+         exc = _refusal(conn, tid)
+@@ -72,3 +89,27 @@
+     exc = kca.CreateAuthorityRefused('no authority')
+     assert owner.origin_refusal(exc, origin=False) is None
+     assert json.loads(owner.origin_refusal(exc, origin=True))['created'] is False
++
++
++def test_a_released_creating_chat_is_terminal_even_while_unsynced(kanban_home, monkeypatch):
++    """Definitive causes first: no sync brings back a released chat, so the unsynced board does not make it wait."""
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    _enabled(kanban_home)
++    with kbc.connect_closing() as conn:
++        _links(conn)
++        tid = kb.create_task(conn, title='orphan', assignee='default')
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,"
++                         "created_at) VALUES ('u1',?,'macbook','default','chat-one','created',1,1)", (tid,))
++        exc = _refusal(conn, tid)
++    assert exc.wait is None and _answer(exc)['status'] == 'rejected'
++
++
++def test_a_local_creator_with_no_sessions_is_terminal(kanban_home, monkeypatch):
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    with kbc.connect_closing() as conn:
++        _synced(conn, kanban_home)
++        creator = kb.create_task(conn, title='cron creator', assignee='default')
++        tid = kb.create_task(conn, title='child', assignee='default')
++        exc = _refusal(conn, tid, creator=creator)
++    assert exc.wait is None and _answer(exc)['status'] == 'rejected'
+diff --git a/tests/hermes_cli/test_kanban_release.py b/tests/hermes_cli/test_kanban_release.py
+index 338244a5242..e1902b5497e 100644
+--- a/tests/hermes_cli/test_kanban_release.py
++++ b/tests/hermes_cli/test_kanban_release.py
+@@ -1096,3 +1096,28 @@
+     rc, err = spend_budget(board, monkeypatch, tid, '--runs', '0', '--cache-read-tokens', '5000000',
+                            '--reason', 'unlimited runs')
+     assert rc == 4 and 'budget_decision_unread' in err and newest_budget(board, tid) == before
++
++
++
++@pytest.mark.parametrize('shape', ['pre_attribution', 'note_not_synced'])
++def test_a_person_budget_without_a_readable_note_is_itself_a_required_read(board, monkeypatch, shape):
++    tid = kb.create_task(board, title='Budgeted work', assignee='default')
++    payload = {'runs': 3, 'cache_read_tokens': 5_000_000, 'by': 'david', 'reason': 'cheap'}
++    if shape == 'note_not_synced':
++        payload['writer_kind'] = 'human'
++    with kb.write_txn(board):  # the event alone: no note comment on this board
++        kb._append_event(board, tid, budget.OVERRIDE_EVENT, payload)
++    event_id = board.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind=?",
++                             (tid, budget.OVERRIDE_EVENT)).fetchone()[0]
++    rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--reason', 'lift')
++    assert rc == 4 and 'budget_decision_unread' in err
++    assert f'Budget event {event_id}' in err and 'set by david: cheap' in err and 'runs 3' in err
++    assert newest_budget(board, tid) == payload
++    (record,) = shown_events(board, tid)
++    assert record['event_ids'] == [event_id] and record['verb'] == 'spend-budget'
++    rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--seen', str(event_id), '--reason', 'lift',
++                           writer=('agent', 'another-session', '1:HERMES_SESSION_ID'))
++    assert rc == 4 and newest_budget(board, tid) == payload  # another session never saw it
++    rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--seen', str(event_id), '--reason', 'lift')
++    assert rc == 0, err
++    assert budget.card_limits(board, tid, budget.limits()) == budget.Limits(0, 0)
+diff --git a/tests/origin_transport/test_forwarding.py b/tests/origin_transport/test_forwarding.py
+index e64eaacbb47..5efa750cd67 100644
+--- a/tests/origin_transport/test_forwarding.py
++++ b/tests/origin_transport/test_forwarding.py
+@@ -50,8 +50,9 @@
+ 
+ @pytest.fixture
+ def network(request, courier, tmp_path, monkeypatch):
+-    """``request.param`` False: the owner (hub) board never synced. Default: a synced owner, as every courier
+-    owner on the fleet is; only there can the origin chat's ``created`` link exist and later renew scope."""
++    """``request.param`` False: the owner (hub) board has sync off and never synced. Default: a synced owner, as
++    every courier owner on the fleet is; only there can the origin chat's ``created`` link exist and later renew
++    scope."""
+     owner_synced = getattr(request, "param", True)
+     roots, dbs = {}, {}
+     for gateway in ("macbook", "worker-7", "hub"):
+@@ -175,39 +176,40 @@
+ 
+ 
+ @pytest.mark.parametrize("network", [False], indirect=True)
+-def test_a_waiting_owner_create_keeps_the_sender_pending(network, monkeypatch):
+-    """An owner that cannot create yet only because it never synced answers ``pending`` with the wait's reason:
+-    the sender's obligation stays open (never ``rejected``), nothing is queued twice and nothing is created."""
++def test_a_rejected_owner_create_stops_the_senders_retries(network, monkeypatch):
++    """The owner's terminal ``rejected`` (reported to the Board as the request's result) ends the forwarding
++    obligation on the sender: it answers ``rejected`` with the owner's reason and queues nothing again."""
+     courier, dbs, service, host, runner, _, _ = network
+     child = _owner_create(network, monkeypatch)
+     request = next(r for r in service.requests.values() if r["action"] == "origin-forward")
+     with host("hub"):
+         courier.journal_request(dbs["hub"], child)
+         status, creation = courier.advance_origin_create(dbs["hub"], {}, child, runner, service)
+-    assert status == "pending" and creation["code"] == "origin_owner_unsynced", creation
++    assert status == "rejected", creation
++    service.requests[child["id"]] = {**child, "state": status, "result": creation}  # the owner's POST .../result
+     with host("macbook"):
+         sent = dbs["macbook"].execute("SELECT count(*) FROM sent").fetchone()[0]
+         for _ in range(3):
+             status, result = courier.advance_origin_forward(dbs["macbook"], {}, request, runner, service)
+-            assert status == "pending" and result["code"] == "origin_forward_pending", result
++            assert status == "rejected" and result["code"] == "origin_forward_downstream_failed", result
++            assert result["downstream"]["code"] == "scope_authority_missing" and result["handoff_complete"] is False
+         assert dbs["macbook"].execute("SELECT count(*) FROM sent").fetchone()[0] == sent
+ 
+ 
+ @pytest.mark.parametrize("network", [False], indirect=True)
+ def test_forwarding_to_a_never_synced_owner_creates_nothing(network, monkeypatch):
+     """Creation authority (kanban_create_authority.require): a never-synced owner cannot hold the origin chat's
+-    ``created`` link yet, so nothing could renew the card's scope. The create is refused whole, every time,
+-    and kept: ``pending`` with ``origin_owner_unsynced`` naming the wait (the board may still sync), never the
+-    reasonless ``origin_dispatch_pending`` and never a terminal ``rejected`` that would drop the create."""
++    ``created`` link, and with sync off it never will, so nothing could renew the card's scope. The create is
++    refused whole, every time, and terminally: ``rejected`` with the reason, never a ``pending`` the sender would
++    retry forever."""
+     courier, dbs, service, host, runner, _, _ = network
+     child = _owner_create(network, monkeypatch)
+     with host("hub"):
+         courier.journal_request(dbs["hub"], child)
+         for _ in range(2):
+             status, creation = courier.advance_origin_create(dbs["hub"], {}, child, runner, service)
+-            assert status == "pending" and not creation.get("created"), creation
+-            assert creation["code"] == "origin_owner_unsynced" and creation["refusal"] == "scope_authority_missing"
+-            assert creation["handoff_complete"] is False
++            assert status == "rejected" and not creation.get("created"), creation
++            assert creation["code"] == "scope_authority_missing" and creation["handoff_complete"] is False
+         with kanban_db_connect.connect_closing() as board:
+             assert board.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+             assert board.execute("SELECT count(*) FROM kanban_notify_subs").fetchone()[0] == 0
+-- 
+2.43.0
+

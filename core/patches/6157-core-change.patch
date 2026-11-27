@@ -1,0 +1,1924 @@
+From bbdf6ba4e2c697e740be60b1623c30c0336586b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:20:20 +0000
+Subject: [PATCH 6157] Kanban spend-decision routing, ownerless stops and hold notices
+
+Public mirror of source commit bbdf6ba4e2c697e740be60b1623c30c0336586b7.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index e958ea5d083..8dbe1461194 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1979,14 +1979,8 @@
+     from hermes_cli.kanban_continuation import wake_due_continuations
+     result.woken_continuations = _la.timed("dispatch.wake_due_continuations", wake_due_continuations, conn)
+     result.promoted = _la.timed("dispatch.recompute_ready", _kb.recompute_ready, conn, failure_limit=failure_limit)
+-    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
+-    _la.timed("dispatch.sweep_shared_blockers", sweep_shared_blockers, conn, result)
+-    from hermes_cli.kanban_provider_walls import tick_upkeep
+-    _la.timed("dispatch.tick_upkeep", tick_upkeep, conn, board=board, dry_run=dry_run)
+-    try:
+-        result.quota_block_released = _la.timed("dispatch.release_recovered_quota_blocks", _kbq.release_recovered_quota_blocks, conn)
+-    except Exception:
+-        _kb._log.warning("kanban: releasing recovered quota-wall blocks failed", exc_info=True)
++    from hermes_cli.kanban_decision_maintenance import run as decision_upkeep
++    _la.timed("dispatch.decision_upkeep", decision_upkeep, conn, result, board=board, dry_run=dry_run)
+ 
+ 
+ def _tick_spawn_budget(
+diff --git a/hermes_cli/kanban_decision_maintenance.py b/hermes_cli/kanban_decision_maintenance.py
+new file mode 100644
+index 00000000000..07acebb5dfd
+--- /dev/null
++++ b/hermes_cli/kanban_decision_maintenance.py
+@@ -0,0 +1,18 @@
++"""Own-hold decision and provider upkeep before dispatcher capacity admission. [daveey]"""
++from hermes_cli import kanban_db as kb
++from hermes_cli import loop_accounting as la
++
++
++def run(conn, result, *, board, dry_run):
++    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
++    la.timed('dispatch.sweep_shared_blockers', sweep_shared_blockers, conn, result)
++    if not dry_run:
++        from hermes_cli.kanban_hold_notices import sweep as holds
++        la.timed('dispatch.hold_notices', holds, conn)
++    from hermes_cli.kanban_provider_walls import tick_upkeep
++    la.timed('dispatch.tick_upkeep', tick_upkeep, conn, board=board, dry_run=dry_run)
++    from hermes_cli import kanban_db_dispatch_quota as quota
++    try:
++        result.quota_block_released = la.timed('dispatch.release_recovered_quota_blocks', quota.release_recovered_quota_blocks, conn)
++    except Exception:  # health: allow BLE001 -- retain existing best-effort provider maintenance
++        kb._log.warning('kanban: releasing recovered quota-wall blocks failed', exc_info=True)
+diff --git a/hermes_cli/kanban_hold_audience.py b/hermes_cli/kanban_hold_audience.py
+new file mode 100644
+index 00000000000..8baf11449dc
+--- /dev/null
++++ b/hermes_cli/kanban_hold_audience.py
+@@ -0,0 +1,62 @@
++"""Read-only renewal authority for decision notices; subscriptions are not grants. [daveey]"""
++from __future__ import annotations
++
++
++def describe(conn, task_id: str) -> dict:
++    """Describe only stored candidates accepted by the real renewal actor reader.
++
++    This is routing evidence, not authentication or a release receipt. The eventual
++    caller must still prove its process ancestry and pass canonical revalidation.
++    Legacy observer-only cards remain owner-unavailable; never adopt them here.
++    """
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    from hermes_cli.kanban_create_authority import _accepts, _gateway
++    from hermes_cli.kanban_creator_chats import _chat_links
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_scope_renewal_cli import _sessions
++    from hermes_cli.profiles import get_active_profile_name
++    own, profile = _gateway(conn), get_active_profile_name()
++    candidates = []
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
++        candidates = [(r['chat_gateway'], r.get('chat_profile') or 'default', r['chat_session'])
++                      for r in _chat_links(conn, task_id) if r.get('kind', 'created') == 'created']
++    else:
++        candidates = [(own, profile, r[0]) for r in conn.execute(
++            "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? AND platform='tui'", (task_id,))]
++    from hermes_cli.kanban_session_provenance import proven_foreign_chats
++    chats, proven = [], None
++    for gateway, prof, session in dict.fromkeys(candidates):
++        if not session:
++            continue
++        if is_machine_session(gateway, session, local_gateway=own, profile=prof):
++            # A foreign Desktop's local-<hash> cannot be inspected in our state.db.
++            # Match creation's provenance exception, then still validate renewal.
++            proven = proven if proven is not None else proven_foreign_chats(conn, (task_id,), local_gateway=own)
++            if f'{gateway}/{prof}/{session}' not in proven:
++                continue
++        if _accepts(conn, task_id, session, gateway, prof):
++            chats.append({'gateway': gateway, 'profile': prof, 'session': session})
++    creator = _creator_task_id(conn, task_id)
++    active_creator = bool(creator and any(_accepts(conn, task_id, s, own, profile, creator)
++                                         for s in _sessions(conn, creator)))
++    return {'chats': chats, 'creator_task_id': creator, 'creator_active': active_creator}
++
++
++def chats(authority) -> list[dict]:
++    """Validate a replicated authority snapshot without accepting partial identities."""
++    values = authority.get('chats') if isinstance(authority, dict) else None
++    return [c for c in values if isinstance(c, dict)
++            and all(isinstance(c.get(k), str) and c[k].strip() for k in ('gateway', 'profile', 'session'))
++            ] if isinstance(values, list) else []
++
++
++def guidance(authority: dict) -> str:
++    """Never imply an observer can execute a renewal just because it got this notice."""
++    refs = [f"@session:{c['profile']}@{c['gateway']}/{c['session']}" for c in chats(authority)]
++    if isinstance(authority, dict) and authority.get('creator_active') is True and authority.get('creator_task_id'):
++        refs.append('running creator task ' + str(authority['creator_task_id']))
++    if refs:
++        return 'Recorded renewal authority: ' + ', '.join(refs) + '. Observer recipients have no renewal authority.'
++    return ('No recorded renewable agent authority. This legacy card remains held; an observer cannot renew it. '
++            'Ownership must be resolved through the supported operator authority path, not inferred from '
++            'notification delivery. No scope was renewed and no execution was authorized.')
+diff --git a/hermes_cli/kanban_hold_effective.py b/hermes_cli/kanban_hold_effective.py
+new file mode 100644
+index 00000000000..1bdd35edd2f
+--- /dev/null
++++ b/hermes_cli/kanban_hold_effective.py
+@@ -0,0 +1,57 @@
++"""Current guidance over a stable hold episode; notification revision is not clearance."""
++from __future__ import annotations
++
++
++def current(conn, task_id: str):
++    """Read actual fences, not the original spend payload that later fences annotate."""
++    import hashlib
++    import json
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli.kanban_hold_audience import describe
++    from hermes_cli.kanban_refusal_receipt import restricted
++    from hermes_cli.kanban_scope_renewal import covered, key
++    from hermes_cli.kanban_sync_divergence import _event_order
++    stop = decision.pending_episode(conn, task_id)
++    if stop is None:
++        return None
++    episode = stop.get('uid') or str(stop['id'])
++    payload = kb._json_dict(stop['payload'])
++    safety = restricted(conn, task_id)
++    cause = 'safety_refusal' if safety else 'scope_stopped' if decision.execution_restricted(conn, task_id) else None
++    source = stop
++    if cause:
++        renewed = covered(conn, task_id)
++        candidates = [dict(r) for r in conn.execute(
++            "SELECT * FROM task_events WHERE task_id=? AND kind IN "
++            "('spend_budget_triaged','decision_hold_restricted')", (task_id,))]
++        candidates = [e for e in candidates if kb._json_dict(e['payload']).get('cause') == cause
++                      and (safety or key(e) not in renewed)]
++        candidates.extend(e for e in decision.receipt_restrictions(conn, task_id, safety_only=safety)
++                          if safety or key(e) not in renewed)
++        if candidates:
++            source = max(candidates, key=_event_order)
++            payload.update(kb._json_dict(source['payload']))
++        payload['cause'] = cause
++    payload.update(task_id=task_id, episode=episode, authority=describe(conn, task_id))
++    # Producer routing is delivery bookkeeping, not a guidance change.
++    payload.pop('producer', None)
++    revision = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++    return source, {**payload, 'revision': revision}
++
++
++def previous(conn, task_id: str, payload: dict):
++    """A pre-revision notice counts only when it already carries identical safe guidance."""
++    import json
++    from hermes_cli import kanban_db as kb
++    rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_decision_ready' "
++                        "ORDER BY id DESC", (task_id,))
++    wanted = {k: v for k, v in payload.items() if k != 'revision'}
++    for row in rows:
++        prior = kb._json_dict(row['payload'])
++        if prior.get('revision') == payload['revision']:
++            return dict(row)
++        prior = {k: v for k, v in prior.items() if k not in ('revision', 'producer')}
++        if json.dumps(prior, sort_keys=True) == json.dumps(wanted, sort_keys=True):
++            return dict(row)
++    return None
+diff --git a/hermes_cli/kanban_hold_notices.py b/hermes_cli/kanban_hold_notices.py
+new file mode 100644
+index 00000000000..247962a2a20
+--- /dev/null
++++ b/hermes_cli/kanban_hold_notices.py
+@@ -0,0 +1,104 @@
++"""Every-tick decision delivery, independent of stale triage and spawn capacity. [daveey]
++
++Only the card home produces events. Foreign owning chats consume the existing
++replica envelope; a notification never renews scope or satisfies acceptance.
++"""
++from __future__ import annotations
++
++
++def destinations(conn, task_id: str):
++    """Actual authority addresses, shared by binding and idle missing-link detection."""
++    from hermes_cli.kanban_hold_audience import describe
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.profiles import get_active_profile_name
++    own, profile = gateway_names()[0], get_active_profile_name()
++    for link in describe(conn, task_id)['chats']:
++        gw, prof, session = link['gateway'], link['profile'], link['session']
++        local = gw == own and prof == profile
++        yield 'tui' if local else 'hub', session if local else f'{gw}/{prof}/{session}'
++
++
++def bind(conn, task_id: str, *, replay_event: int | None = None) -> None:
++    """Bind before publication, or replay an existing notice only for a new recipient."""
++    for platform, chat in destinations(conn, task_id):
++        conn.execute("INSERT OR IGNORE INTO kanban_notify_subs "
++                     "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++                     "VALUES (?,?,?,'','notify','{\"reason\":\"origin\"}',unixepoch(),"
++                     "COALESCE(?,(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?)))",
++                     (task_id, platform, chat, replay_event - 1 if replay_event else None, task_id))
++
++
++def creator_pending(conn, task_id: str, identity: str) -> bool:
++    """Read-only destination/dedup preflight; callers recheck under their writer."""
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    from hermes_cli.kanban_wake_check import foreign_ids
++    owner = _creator_task_id(conn, task_id)
++    return bool(owner and owner not in foreign_ids(conn) and conn.execute(
++        'SELECT 1 FROM tasks WHERE id=?', (owner,)).fetchone() and not conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id=? AND kind='hold_creator_notified' "
++        "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.identity') END=? "
++        "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.source_task_id') END=?",
++        (owner, identity, task_id)).fetchone())
++
++
++def creator(conn, task_id: str, identity: str, body: str) -> None:
++    """Same-transaction handoff to a recorded creator; no invented guard/decider card."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    if not creator_pending(conn, task_id, identity):
++        return
++    owner = _creator_task_id(conn, task_id)
++    kb.add_comment(conn, owner, 'kanban-decision-notice', f'{task_id}: {body}', system=True)
++    kb._append_event(conn, owner, 'hold_creator_notified',
++                     {'identity': identity, 'source_task_id': task_id, 'creator_task_id': owner})
++
++
++
++
++def publish(conn, task_id: str, *, with_producer: bool = False) -> None:
++    """Publish one guidance revision; bind authentic recipients before its event cursor."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli.kanban_hold_effective import current, previous
++    hold = current(conn, task_id)
++    if hold is None:
++        return
++    payload = hold[1]
++    prior = previous(conn, task_id, payload)
++    bind(conn, task_id, replay_event=prior['id'] if prior else None)
++    prior_prod = kb._json_dict(prior['payload']).get('producer') if prior else None
++    episode = payload.get('episode')
++    historical = decision.episode_route(conn, task_id, episode) if with_producer and isinstance(episode, str) else None
++    if historical is not None:
++        # Reuse a legacy wrapper, including a same-episode dismissal, without minting a guard.
++        if historical != prior_prod:
++            kb._append_event(conn, task_id, decision.NOTICE, {**payload, 'producer': historical})
++    elif prior is None:
++        if with_producer:
++            payload = {**payload, 'producer': decision.producer(conn, task_id, payload.get('reason') or 'Hold')}
++        kb._append_event(conn, task_id, decision.NOTICE, payload)
++    creator(conn, task_id, payload['revision'],
++            str(payload.get('reason') or 'Hold') + '. ' + decision.notice(payload))
++
++
++def sweep(conn) -> None:
++    """Repair fresh canonical retains in one dispatch tick, not hours later in the age sweep."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_hold_effective import current, previous
++    from hermes_cli.kanban_wake_check import foreign_ids
++    foreign = foreign_ids(conn)
++    for (tid,) in conn.execute("SELECT id FROM tasks WHERE status='triage'").fetchall():
++        if tid in foreign:
++            continue
++        hold = current(conn, tid)
++        if hold is None:
++            continue
++        # New recipients/restrictions are revisions even when the base episode
++        # was delivered. Unchanged polls remain read-only.
++        if previous(conn, tid, hold[1]) is not None and all(conn.execute(
++                'SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=?',
++                (tid, platform, chat)).fetchone() for platform, chat in destinations(conn, tid)):
++            continue
++        with kb.write_txn(conn):
++            if conn.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'triage':
++                publish(conn, tid)
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 7ac9762badb..ebe181a99c5 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -3,62 +3,62 @@
+ 
+ from hermes_cli import kanban_db as kb
+ 
+-
+ EVENT = "spend_budget_triaged"
+ NOTICE = "spend_budget_decision_ready"
+ 
+ 
+ def ensure_producer(conn, task_id: str) -> None:
+     """Repair pre-notice stops too; one durable producer receipt per spend-stop episode."""
++    from hermes_cli.kanban_hold_notices import publish
+     # Most sweeps are no-ops. Do not queue for the global SQLite writer just
+     # to discover a live route: this runs before ready-card admission while the
+     # dispatcher holds its tick lock. Every actual repair is re-read below.
+-    if _producer_repair(conn, task_id) is None:
++    if not _notice_repair(conn, task_id):
+         return
+     with kb.write_txn(conn, allow_nested=True):
+-        repair = _producer_repair(conn, task_id, paced=False)
+-        if repair is None:
++        if not _notice_repair(conn, task_id):
+             return
+-        episode, payload, route, live = repair
++        # Ordinary spend review stays eligible, but it is not a substitute for
++        # immediate owner visibility. A queued judge grants no execution here.
+         from hermes_cli import kanban_spend_reviewer as reviewer
+-        if not live and reviewer.queue(conn, task_id, episode):
+-            return  # an immediate review decides first; it routes the stop here only if it escalates
+-        if not live:
+-            previous, route = route, producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
+-            if route == previous:
+-                return  # an ownerless stop re-checked for a returned chat (_chat_returned) and still ownerless
+-        kb._append_event(conn, task_id, NOTICE, {**payload, "episode": episode, "producer": route})
++        stop = pending_episode(conn, task_id)
++        if stop is not None:
++            reviewer.queue(conn, task_id, stop.get('uid') or str(stop['id']))
++        publish(conn, task_id, with_producer=True)
+ 
+ 
+-def _producer_repair(conn, task_id, *, paced=True):
++def _notice_repair(conn, task_id: str) -> bool:
+     """Read-only need check; never authorizes a repair outside its transaction."""
+-    import json
+-    stop = pending_episode(conn, task_id)
+-    if stop is None:
+-        return None
+-    episode = stop.get("uid") or str(stop["id"])
+-    from hermes_cli import kanban_spend_reviewer as reviewer
+-    if reviewer.holds(conn, task_id, episode):
+-        return None
+-    previous = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+-                            "AND json_extract(payload,'$.episode')=? ORDER BY id DESC LIMIT 1",
+-                            (task_id, NOTICE, episode)).fetchone()
+-    payload = json.loads(stop["payload"] or "{}")
+-    from hermes_cli.kanban_refusal_receipt import restricted
+-    safety = restricted(conn, task_id)
+-    scope = execution_restricted(conn, task_id) and not safety
+-    prior = json.loads(previous[0]) if previous else None
+-    cause = 'safety_refusal' if safety else 'scope_stopped' if scope else None
+-    prior_route = prior.get('producer') if isinstance(prior, dict) else None
+-    route = episode_route(conn, task_id, episode) or prior_route
+-    live = _live_route(conn, route)
+-    if live and route == {'kind': 'unavailable'} and _chat_returned(conn, task_id, paced=paced):
+-        live = False  # no owner could be reached at the stop; a chat that is live now takes the decision
+-    if live and route == prior_route and (cause is None or prior.get('cause') == cause):
+-        return None
+-    if cause:
+-        payload['cause'] = cause
+-    return episode, payload, route, live
++    from hermes_cli.kanban_hold_effective import current, previous
++    from hermes_cli.kanban_hold_notices import destinations
++    hold = current(conn, task_id)
++    if hold is None:
++        return False
++    payload = hold[1]
++    prior = previous(conn, task_id, payload)
++    prior_prod = kb._json_dict(prior['payload']).get('producer') if prior else None
++    episode = payload.get('episode')
++    historical = episode_route(conn, task_id, episode) if isinstance(episode, str) else None
++    if historical is not None:
++        if historical != prior_prod:
++            return True
++    elif prior is None:
++        return True
++    if any(not conn.execute(
++            'SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=?',
++            (task_id, platform, chat)).fetchone() for platform, chat in destinations(conn, task_id)):
++        return True
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    from hermes_cli.kanban_wake_check import foreign_ids
++    owner = _creator_task_id(conn, task_id)
++    if not owner or owner in foreign_ids(conn) or not conn.execute(
++            'SELECT 1 FROM tasks WHERE id=?', (owner,)).fetchone():
++        return False
++    return not conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id=? AND kind='hold_creator_notified' "
++        "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.identity') END=? "
++        "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.source_task_id') END=?",
++        (owner, payload['revision'], task_id)).fetchone()
+ 
+ 
+ 
+@@ -254,11 +254,17 @@
+ def notice(payload: dict) -> str:
+     if payload.get('cause') == 'scope_stopped':
+         from hermes_cli.kanban_scope_renewal import ROUTE
++        from hermes_cli.kanban_hold_audience import chats, guidance
++        authority = payload.get('authority')
++        prefix = guidance(authority) + ' '
++        if not chats(authority) and not (isinstance(authority, dict) and authority.get('creator_active') is True):
++            return prefix + 'Promotion, comments, timers and review do not release this scope stop.'
+         return ('Scope stopped without execution authority. No generic promotion, comment, timer or review releases it. '
+-                'Only an explicit scope renewal does: ' + ROUTE.format(task=payload.get('task_id') or '<task>') + '. '
++                + prefix + 'Only an explicit scope renewal does: ' + ROUTE.format(task=payload.get('task_id') or '<task>') + '. '
+                 + _one_step(payload.get('task_id')) + '.')
+     if payload.get('cause') == 'safety_refusal':
+         retried = payload.get('refused_providers')
++        retried = retried if isinstance(retried, (list, tuple)) else []
+         head = ('Provider safety refusal retained' if not retried else
+                 'Provider safety refusal retained after the work was retried unchanged on other eligible providers '
+                 f'until every one refused ({", ".join(str(p) for p in retried)})')
+@@ -273,7 +279,7 @@
+ 
+ 
+ def producer(conn, task_id: str, note: str) -> dict:
+-    """Inside the stop transaction: one chat-notice route OR one supervisor, never both."""
++    """Inside the stop transaction: bind authentic owners without creating guard cards."""
+     from hermes_cli.profiles import get_active_profile_name
+     import json
+     role = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='administrative_decision' ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+@@ -290,130 +296,21 @@
+             "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
+             (task_id, platform, chat_id, task_id))
+     from hermes_cli.kanban_origin import gateway_names
+-    from hermes_cli.kanban_stranded_park import Liveness, local_chat_dead, settings
+-
+-    task = kb.get_task(conn, task_id)
+-    assert task is not None
+-    own = gateway_names()[0]
+-    active = get_active_profile_name()
+-    with Liveness(idle=settings()[1]) as liveness:
+-        return _route(conn, task_id, task, own, active, bind, note,
+-                      lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own, liveness=liveness))
+-
+-
+-_RECHECK_SECONDS = 300  # kanban_stranded_park.DEFAULT_SWEEP_INTERVAL_SECONDS: the same state.db reads, as rarely
+-_RECHECKED: dict[tuple[str, str], float] = {}
+-
+-
+-def _chat_returned(conn, task_id: str, *, paced: bool) -> bool:
+-    """Read-only: would ``producer`` route this ownerless stop to a chat now? Only an owning chat counts: an
+-    observer (the desk chat the stranded-park sweep binds as ``shepherd``, a ``touch``) is never the route, and
+-    saying yes for one would take the write lock every recheck to find the same ``unavailable``. ``paced`` (the
+-    dispatcher's unlocked pre-check) asks at most once per ``_RECHECK_SECONDS`` per card: each answer may open a
+-    state.db."""
+-    import time
+-    from hermes_cli.kanban_db_connect import _main_db_file
+-    from hermes_cli.kanban_origin import gateway_names
+-    from hermes_cli.kanban_stranded_park import Liveness, local_chat_dead, settings
+-    from hermes_cli.profiles import get_active_profile_name
+-    if paced:
+-        key, now = (_main_db_file(conn) or f"conn:{id(conn)}", task_id), time.monotonic()
+-        last = _RECHECKED.get(key)
+-        if last is not None and now - last < _RECHECK_SECONDS:
+-            return False
+-        if len(_RECHECKED) > 4096:
+-            _RECHECKED.clear()
+-        _RECHECKED[key] = now
+-    task = kb.get_task(conn, task_id)
+-    if task is None:
+-        return False
+-    own, bound = gateway_names()[0], []
+-    with Liveness(idle=settings()[1]) as liveness:
+-        # ``bind`` only records the live chats ``producer`` would subscribe; True is a live owning subscription.
+-        if _chat_route(conn, task_id, task, own, get_active_profile_name(), lambda *chat: bound.append(chat),
+-                       lambda gw, profile, session: local_chat_dead(gw, profile, session, own=own,
+-                                                                    liveness=liveness)):
+-            return True
+-    # ``producer`` binds with INSERT OR IGNORE: only a chat with no subscription yet becomes an owning one. An
+-    # existing row was judged above, and an observer's row (OBSERVER_SUB_REASONS) stays an observer's.
+-    return any(conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? "
+-                            "AND thread_id=''", (task_id, platform, chat_id)).fetchone() is None
+-               for platform, chat_id in bound)
+-
+-
+-def _chat_route(conn, task_id, task, own, active, bind, dead) -> bool:
+-    """Bind the card's live chats; True when one owns the decision. ``dead``: a chat of this gateway that is
+-    archived/hidden/missing, or ended and idle, is no route for the decision: the notice would sit unread
+-    (kanban_stranded_park). One ``Liveness`` per call: each state.db is opened at most once."""
+-    from hermes_cli.kanban_creator_chats import _chat_links
+-    from hermes_cli.kanban_db_notify import is_headless_session
+-
+-    # Bind legacy origin sessions before appending the notice so its cursor cannot skip this event.
+-    if task.session_id and not is_headless_session(task.session_id) and not dead(own, active, task.session_id):
+-        bind("tui", task.session_id)
+-    links = (_chat_links(conn, task_id) if conn.execute(
+-        "SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone() else [])
+-    for link in links:
+-        session = link["chat_session"]
+-        gw, profile = link["chat_gateway"], link["chat_profile"] or "default"
+-        chat_id = f"{gw}/{profile}/{session}"
+-        if not is_headless_session(chat_id) and not dead(gw, link["chat_profile"], session):
+-            local = gw == own and profile == active
+-            bind("tui" if local else "hub", session if local else chat_id)
+-    from hermes_cli.kanban_db_notify import _owning_sub_clause
+-    from hermes_cli.kanban_origin import OriginError, parse_origin
+-    for sub in conn.execute("SELECT s.platform, s.chat_id, s.notifier_profile FROM kanban_notify_subs s "
+-                            f"JOIN tasks p ON p.id=s.task_id WHERE s.task_id=? AND {_owning_sub_clause()}",
+-                            (task_id,)).fetchall():
+-        platform, chat_id, notifier = sub[0], sub[1], sub[2]
+-        if platform == "tui" and dead(own, notifier, chat_id):
+-            continue
+-        if platform == "hub":
+-            try:
+-                origin = parse_origin(chat_id)
+-            except OriginError:
+-                origin = None
+-            if origin is not None and dead(origin.gateway, origin.profile, origin.session):
+-                continue
+-        return True
+-    return False
+-
+-
+-def _route(conn, task_id, task, own, active, bind, note, dead) -> dict:
+-    """``producer`` body after setup: the card's live chats (``_chat_route``), else the stop's decision card."""
+-    from hermes_cli.kanban_model_neutral import forwarded_text, forwarded_title
+-    from hermes_cli.kanban_triage_sweep import _supervisor_profile
+-    if _chat_route(conn, task_id, task, own, active, bind, dead):
+-        return {"kind": "chats"}
+-    stop = pending_episode(conn, task_id)
+-    episode = (stop.get('uid') or str(stop['id'])) if stop else None
+-    existing = episode_route(conn, task_id, episode) if episode else None
+-    if existing:
+-        return existing
+-    from hermes_cli.kanban_refusal_receipt import restricted
+-    safety = restricted(conn, task_id)
+-    stopped = execution_restricted(conn, task_id)
+-    import json as _json
+-    # A stop with a cause (capability_unavailable, scope_stopped, safety_refusal) gets no decision card. The card's
+-    # worker decides spend; it cannot restore a capability, renew a scope or clear a refusal, so it could only
+-    # retain the card: a second stop and no decision. With no live chat nobody is routed, and the stranded-park
+-    # sweep asks a human once the park is old enough (kanban_stranded_park), unless an open parent or a recorded
+-    # wait explains it. Only an ordinary budget stop reaches the decision card below.
+-    if safety or stopped or (stop and _json.loads(stop['payload'] or '{}').get('cause')):
+-        return {'kind': 'unavailable'}
+-    guidance = notice({'reason': note, 'task_id': task_id, 'for_worker': True})
+-    action = (f"\n\nRecord the decision on {task_id}; use `hermes kanban promote {task_id} --reason '<what changed>'` "
+-              'only after re-scoping or justifying further spend, or archive it. Do not run the original work here.')
+-    sup = kb.create_task(
+-        conn, title=forwarded_title(f"Spend budget decision: {task.title}"[:200], f"Spend budget decision: {task_id}"),
+-        body=f"Card {task_id} has stopped. No chat owns its decision.\n\n"
+-             + "Source title and stop reason (historical evidence):\n" + forwarded_text(task.title) + "\n"
+-             + forwarded_text(note) + "\n\n" + guidance + action
+-             + "\n\nApply the disposition on the source before completing this decision card; a recommendation or "
+-             "completion alone does not change its hold. Never renew spend or bypass safety/scope gates implicitly.",
+-        assignee=_supervisor_profile(), created_by="kanban-spend-budget", workspace_kind="scratch",
+-        idempotency_key=f"spend-budget-decision:{task_id}:{episode}", tenant=task.tenant)
+-    stop = pending_episode(conn, task_id)
+-    kb._append_event(conn, sup, 'administrative_decision', {'role': 'administrative_decision',
+-                     'root_task': task_id, 'root_episode': (stop.get('uid') or str(stop['id'])) if stop else None})
+-    return {"kind": "supervisor", "task_id": sup}
++    return _route(conn, task_id, gateway_names()[0], get_active_profile_name(), bind)
++
++
++def _route(conn, task_id, own, active, bind) -> dict:
++    """Route only to genuine renewable authority, independent of chat idleness."""
++    from hermes_cli.kanban_hold_audience import describe
++    authority = describe(conn, task_id)
++    # Idleness is not a release of authentic ownership. Do not manufacture a
++    # supervisor card: it cannot repair missing historical authority either.
++    for chat in authority['chats']:
++        gateway, profile, session = chat['gateway'], chat['profile'], chat['session']
++        local = gateway == own and profile == active
++        bind('tui' if local else 'hub', session if local else f'{gateway}/{profile}/{session}')
++    if authority['chats']:
++        return {'kind': 'chats'}
++    if authority['creator_task_id']:
++        return {'kind': 'creator', 'task_id': authority['creator_task_id']}
++    return {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
+diff --git a/tests/hermes_cli/test_kanban_contained_spend_history.py b/tests/hermes_cli/test_kanban_contained_spend_history.py
+index 13a6850d2d1..c084e76a5f6 100644
+--- a/tests/hermes_cli/test_kanban_contained_spend_history.py
++++ b/tests/hermes_cli/test_kanban_contained_spend_history.py
+@@ -44,7 +44,7 @@
+ 
+ 
+ @pytest.mark.parametrize("title", TITLES)
+-def test_spend_stop_supervisor(kanban_home, monkeypatch, title):
++def test_spend_stop_keeps_history_without_manufacturing_a_supervisor(kanban_home, monkeypatch, title):
+     from hermes_cli import kanban_origin
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("own-gw", {"own-gw"}))
+     with kbc.connect_closing() as conn:
+@@ -53,11 +53,7 @@
+             _retitle(conn, tid, title)
+         assert budget.hold(conn, tid) == "triage"
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+-        assert event.payload["producer"]["kind"] == "supervisor"
+-        assert kb.get_task(conn, event.payload["producer"]["task_id"]) is not None
+-        child = kb.get_task(conn, event.payload['producer']['task_id'])
+-        from tests.hermes_cli.test_kanban_history_contract import decoded
+-        assert title is None or title in decoded(child.body)
+-        assert child.model_override is None and child.provider_override is None
++        assert event.payload["producer"]["kind"] == "unavailable"
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+         assert decision.pending(conn, tid)
+         assert title is None or kb.get_task(conn, tid).title == title
+diff --git a/tests/hermes_cli/test_kanban_hold_authority_audience.py b/tests/hermes_cli/test_kanban_hold_authority_audience.py
+new file mode 100644
+index 00000000000..9dec38a76c1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hold_authority_audience.py
+@@ -0,0 +1,59 @@
++"""A notice recipient must not be mistaken for a scope-renewal authority."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_hold_audience_uses_real_renewal_reader(kanban_home, monkeypatch):
++    from hermes_cli import kanban_origin
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_hold_audience import describe
++    from hermes_cli.kanban_scope_renewal_cli import resolve_actor
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('home',))
++    with kbc.connect_closing() as conn:
++        from tests.hermes_cli.test_kanban_create_scope_authority import _links_schema
++        _links_schema(conn)
++        tid = kb.create_task(conn, title='held', assignee='default')
++        with kb.write_txn(conn):
++            for sid, kind, released in [('owner', 'created', 0), ('observer', 'shepherd', 0),
++                                        ('released', 'created', 1)]:
++                conn.execute('INSERT INTO task_chat_links '
++                             '(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) '
++                             'VALUES (?,?,?,?,?,?,?,1)',
++                             (link_uid(tid, 'away', 'default', sid, kind), tid, 'away', 'default', sid, kind, released))
++        audience = describe(conn, tid)
++        assert audience['chats'] == [{'gateway': 'away', 'profile': 'default', 'session': 'owner'}]
++        for chat in audience['chats']:
++            actor = resolve_actor(conn, tid, writer=('agent', chat['session'], '1:HERMES_SESSION_ID'),
++                                  environs=[{'HERMES_SESSION_ID': chat['session']}],
++                                  gateway=chat['gateway'], profile=chat['profile'])
++            assert actor.authority == 'chat'
++
++
++
++
++
++
++def test_local_hold_payload_has_authority_and_no_synthetic_guard(kanban_home):
++    from hermes_cli import kanban_hold_notices
++    from hermes_cli.kanban_spend_decision import notice
++    with kbc.connect_closing() as conn:
++        from tests.hermes_cli.test_kanban_create_scope_authority import _links_schema
++        _links_schema(conn)
++        tid = kb.create_task(conn, title='orphan', assignee='default')
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'spend_budget_triaged', {'cause': 'scope_stopped'})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        before = conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++        kanban_hold_notices.sweep(conn)
++        payload = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? "
++                                          "AND kind='spend_budget_decision_ready'", (tid,)).fetchone()[0])
++        assert payload['authority']['chats'] == []
++        assert 'No recorded renewable agent authority' in notice(payload)
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
+diff --git a/tests/hermes_cli/test_kanban_hold_dispatch_tick.py b/tests/hermes_cli/test_kanban_hold_dispatch_tick.py
+new file mode 100644
+index 00000000000..78bf110a0cc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hold_dispatch_tick.py
+@@ -0,0 +1,27 @@
++"""Actual dispatcher reclaim publishes own hold notices in its first tick."""
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_reclaim_tick_publishes_own_hold_without_releasing(kanban_home):
++    with kbc.connect_closing() as conn:
++        chat = helpers._session()
++        source = kb.create_task(conn, title='source window stopped', assignee='default',
++                                session_id=chat, require_scope_authority=True)
++        child = kb.create_task(conn, title='dependent ladder', assignee='default',
++                               session_id=chat, parents=[source], require_scope_authority=True)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (source,))
++            kb._append_event(conn, source, 'spend_budget_triaged',
++                             {'cause': 'scope_stopped', 'reason': 'bounded window ended'})
++        dispatch._run_reclaim_phase(conn, dispatch.DispatchResult(), stale_timeout_seconds=0,
++                                    failure_limit=2, reconcile_orphans=False, dry_run=False)
++        assert [e for e in kb.list_events(conn, source) if e.kind == 'spend_budget_decision_ready']
++        assert kb.get_task(conn, source).status == 'triage'
++        assert kb.get_task(conn, child).status == 'todo'
++        assert conn.execute('SELECT parent_id FROM task_links WHERE child_id=?', (child,)).fetchone()[0] == source
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 2
+diff --git a/tests/hermes_cli/test_kanban_hold_notices.py b/tests/hermes_cli/test_kanban_hold_notices.py
+new file mode 100644
+index 00000000000..c39dc79fef2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hold_notices.py
+@@ -0,0 +1,87 @@
++"""Fresh holds must produce decisions before the stale-triage/capacity filters."""
++import contextlib
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize('cause', ['runs', 'scope_stopped'])
++def test_fresh_hold_notifies_chat_and_creator_once(kanban_home, cause, monkeypatch):
++    from hermes_cli import kanban_hold_notices as notices
++    with kbc.connect_closing() as conn:
++        chat = helpers._session()
++        creator = kb.create_task(conn, title='creator', assignee='default', session_id=chat,
++                                 require_scope_authority=True)
++        tid = kb.create_task(conn, title='lander', assignee='default', creator_task_id=creator)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'spend_budget_triaged', {'cause': cause, 'reason': 'window ended'})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        notices.sweep(conn)
++        notices.sweep(conn)
++        events = [e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready']
++        assert len(events) == 1
++        sub = conn.execute('SELECT * FROM kanban_notify_subs WHERE task_id=? AND chat_id=?', (tid, chat)).fetchone()
++        assert sub is not None and sub['last_event_id'] < events[0].id
++        comments = conn.execute('SELECT body FROM task_comments WHERE task_id=?', (creator,)).fetchall()
++        assert len(comments) == 1 and tid in comments[0][0] and 'window ended' in comments[0][0]
++        assert kb.get_task(conn, tid).status == 'triage'
++        from hermes_state import SessionDB
++        from tui_gateway import kanban_unloaded as ku
++        monkeypatch.setenv('HERMES_KANBAN_UNLOADED_WAKE', '0')
++        with SessionDB(kanban_home / 'state.db') as db:
++            @contextlib.contextmanager
++            def opener(sid):
++                yield db, sid
++            # Production grace must not delay a fresh decision notice.
++            delivered = ku.sweep_once(set(), session_db=opener)
++            assert tid in [item['task_id'] for item in delivered]
++            assert next(s for s in db.list_sessions_rich() if s['id'] == chat)['unread']
++            assert ku.sweep_once(set(), grace_s=0, session_db=opener) == []
++        # A new episode gets a new decision, not a once-per-card latch.
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'spend_budget_triaged', {'cause': cause, 'reason': 'next window'})
++        notices.sweep(conn)
++        assert len([e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready']) == 2
++
++
++def test_cap_one_spent_generic_wake_has_decision_before_late_terminal(kanban_home, tmp_path):
++    import time
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_hold_notices as notices
++    from hermes_cli import kanban_wake_check as wake
++    from tests.hermes_cli.test_kanban_wake_check import _running, _probe
++    flag = tmp_path / 'bb-land-terminal'
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        chat = helpers._session()
++        with kb.write_txn(conn):
++            conn.execute('UPDATE tasks SET session_id=? WHERE id=?', (chat, tid))
++            conn.execute('UPDATE task_runs SET started_at=? WHERE task_id=?', (int(time.time()) - 120, tid))
++        budget.set_override(conn, tid, runs=1, by='owner', reason='bounded lander')
++        assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2099-01-01T00:00:00Z',
++                                wake_check=_probe(flag), check_every=120)
++        # A real closed >=60-second run counts, not a short non-spending fixture run.
++        with kb.write_txn(conn):
++            conn.execute('UPDATE task_runs SET ended_at=? WHERE task_id=?', (int(time.time()) - 1, tid))
++            wake._wake(conn, tid, 'ci_run_unstartable', {'reason': 'generic status'})
++        assert budget.spend(conn, tid).runs == 1
++        assert budget.hold(conn, tid) is not None
++        notices.sweep(conn)
++        assert kb.get_task(conn, tid).status == 'triage'
++        signals = [e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready']
++        assert len(signals) == 1
++        flag.write_text('bb land: exit 0\n')
++        notices.sweep(conn)
++        assert len([e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready']) == 1
++        assert conn.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?', (tid,)).fetchone()[0] == 1
++        from hermes_cli.kanban_spend_decision import pending
++        assert pending(conn, tid)  # the existing stop, not a reset allowance, still gates admission
++
++
++
++
+diff --git a/tests/hermes_cli/test_kanban_hold_payload_controls.py b/tests/hermes_cli/test_kanban_hold_payload_controls.py
+new file mode 100644
+index 00000000000..0c540d5ecce
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hold_payload_controls.py
+@@ -0,0 +1,61 @@
++"""Historical malformed events must not abort unrelated decision delivery."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++
++kanban_home = helpers.kanban_home
++
++
++
++
++@pytest.mark.parametrize('raw', ['{broken', 'null', '[]', '"text"'])
++def test_malformed_stop_still_has_conservative_notice(kanban_home, raw):
++    from hermes_cli import kanban_hold_notices as notices
++    from hermes_cli import kanban_spend_decision as decision
++    with kbc.connect_closing() as conn:
++        chat = helpers._session()
++        tid = kb.create_task(conn, title='legacy hold', assignee='default', session_id=chat,
++                             require_scope_authority=True)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'spend_budget_triaged', {})
++            conn.execute('UPDATE task_events SET payload=? WHERE id=(SELECT MAX(id) FROM task_events)', (raw,))
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        notices.sweep(conn)
++        decision.ensure_producer(conn, tid)
++        events = conn.execute('SELECT payload FROM task_events WHERE task_id=? AND kind=?', (tid, decision.NOTICE)).fetchall()
++        assert len(events) == 1
++        assert json.loads(events[0][0])['episode']
++        assert kb.get_task(conn, tid).status == 'triage'
++
++
++def test_old_and_tick_producers_coexist_without_duplicate_episode(kanban_home):
++    from hermes_cli import kanban_hold_notices as notices
++    from hermes_cli import kanban_spend_decision as decision
++    with kbc.connect_closing() as conn:
++        chat = helpers._session()
++        tid = kb.create_task(conn, title='bounded', assignee='default', session_id=chat,
++                             require_scope_authority=True)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, decision.EVENT, {'reason': 'run limit'})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        notices.sweep(conn)
++        decision.ensure_producer(conn, tid)
++        notices.sweep(conn)
++        decision.ensure_producer(conn, tid)
++        assert len(conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind=?', (tid, decision.NOTICE)).fetchall()) == 1
++        assert len(kb.list_tasks(conn)) == 1  # no supervisor/guard fallback
++
++
++
++
++@pytest.mark.parametrize('providers', [1, True, {'wrong': 1}])
++def test_safety_notice_does_not_iterate_malformed_provider_collection(providers):
++    from hermes_cli.kanban_spend_decision import notice
++    result = notice({'cause': 'safety_refusal', 'refused_providers': providers})
++    assert 'no supported execution release' in result
++
++
+diff --git a/tests/hermes_cli/test_kanban_hold_revisions.py b/tests/hermes_cli/test_kanban_hold_revisions.py
+new file mode 100644
+index 00000000000..e4e2776c079
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hold_revisions.py
+@@ -0,0 +1,97 @@
++"""Guidance revisions cannot be hidden by a delivered base hold."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def _record_owner(conn, tid, chat):
++    from tests.hermes_cli.test_kanban_create_scope_authority import _links_schema
++    from hermes_cli.kanban_chat_links import link_uid
++    from hermes_cli.kanban_create_authority import _gateway
++    _links_schema(conn)
++    gateway = _gateway(conn)
++    with kb.write_txn(conn):
++        conn.execute('INSERT INTO task_chat_links '
++                     '(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) '
++                     'VALUES (?,?,?,?,?,?,0,1)',
++                     (link_uid(tid, gateway, 'default', chat, 'created'), tid, gateway, 'default', chat, 'created'))
++
++
++
++
++
++def test_legacy_notice_does_not_prevent_real_owner_binding(kanban_home):
++    from hermes_cli import kanban_hold_notices as notices
++    from hermes_cli import kanban_spend_decision as decision
++    with kbc.connect_closing() as conn:
++        chat = helpers._session()
++        tid = kb.create_task(conn, title='held', assignee='default', session_id=chat,
++                             require_scope_authority=True)
++        _record_owner(conn, tid, chat)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, decision.EVENT, {'cause': 'scope_stopped', 'reason': 'stop'})
++            stop = decision.pending_episode(conn, tid)
++            episode = stop.get('uid') or str(stop['id'])
++            kb._append_event(conn, tid, decision.NOTICE, {'cause': 'scope_stopped', 'episode': episode})
++            conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=?', (tid,))
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        notices.sweep(conn)
++        events = [e for e in kb.list_events(conn, tid) if e.kind == decision.NOTICE]
++        assert len(events) == 2
++        sub = conn.execute('SELECT * FROM kanban_notify_subs WHERE task_id=? AND chat_id=?', (tid, chat)).fetchone()
++        assert sub is not None and sub['last_event_id'] < events[-1].id
++        assert events[-1].payload['authority']['chats'][0]['session'] == chat
++        from hermes_cli.kanban_create_authority import _accepts, _gateway
++        assert _accepts(conn, tid, chat, _gateway(conn), 'default')
++        notices.sweep(conn)
++        assert len([e for e in kb.list_events(conn, tid) if e.kind == decision.NOTICE]) == 2
++        # Even a complete authority payload must not hide a missing subscription.
++        with kb.write_txn(conn):
++            conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=?', (tid,))
++        notices.sweep(conn)
++        sub = conn.execute('SELECT * FROM kanban_notify_subs WHERE task_id=? AND chat_id=?', (tid, chat)).fetchone()
++        assert sub is not None and sub['last_event_id'] < events[-1].id
++        assert len([e for e in kb.list_events(conn, tid) if e.kind == decision.NOTICE]) == 2
++
++
++def test_missing_authority_never_advertises_scope_renewal_command():
++    from hermes_cli.kanban_spend_decision import notice
++    text = notice({'cause': 'scope_stopped', 'task_id': 'legacy'})
++    assert 'No recorded renewable agent authority' in text
++    assert 'hermes kanban renew-scope' not in text
++
++
++@pytest.mark.parametrize('cause', ['scope_stopped', 'safety_refusal'])
++def test_restriction_revises_local_and_creator_guidance(kanban_home, cause):
++    from hermes_cli import kanban_hold_notices as notices
++    from hermes_cli import kanban_spend_decision as decision
++    with kbc.connect_closing() as conn:
++        chat = helpers._session()
++        owner = kb.create_task(conn, title='owner', assignee='default', session_id=chat,
++                               require_scope_authority=True)
++        tid = kb.create_task(conn, title='held', assignee='default', creator_task_id=owner)
++        _record_owner(conn, tid, chat)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, decision.EVENT, {'cause': 'runs', 'reason': 'cap'})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        notices.sweep(conn)
++        stop = decision.pending_episode(conn, tid)
++        episode = stop.get('uid') or str(stop['id'])
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'decision_hold_restricted',
++                             {'cause': cause, 'episode': episode, 'reason': 'new restriction'})
++        notices.sweep(conn)
++        events = [e for e in kb.list_events(conn, tid) if e.kind == decision.NOTICE]
++        assert len(events) == 2 and events[-1].payload['cause'] == cause
++        comments = conn.execute('SELECT body FROM task_comments WHERE task_id=? ORDER BY id', (owner,)).fetchall()
++        assert len(comments) == 2
++        assert ('scope' if cause == 'scope_stopped' else 'no supported execution release') in comments[-1][0]
++        assert 'then manually promote it' not in comments[-1][0]
++        notices.sweep(conn)
++        decision.ensure_producer(conn, tid)
++        assert len([e for e in kb.list_events(conn, tid) if e.kind == decision.NOTICE]) == 2
++        assert kb.get_task(conn, tid).status == 'triage'
+diff --git a/tests/hermes_cli/test_kanban_local_adoption.py b/tests/hermes_cli/test_kanban_local_adoption.py
+index 6753120715f..9c788bb1142 100644
+--- a/tests/hermes_cli/test_kanban_local_adoption.py
++++ b/tests/hermes_cli/test_kanban_local_adoption.py
+@@ -40,9 +40,10 @@
+ 
+ def test_shepherd_spend_stop_then_local_adoption(world, capsys):
+     conn, tid, _ = world
+-    before = spend.producer(conn, tid, 'budget stopped')
+-    assert before['kind'] == 'supervisor'
+     count = conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    before = spend.producer(conn, tid, 'budget stopped')
++    assert before == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
++    assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == count  # no synthetic guard
+     task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
+     result = adopt(tid, capsys)
+     assert result.get('adopted') is True, result
+diff --git a/tests/hermes_cli/test_kanban_own_hold_custody.py b/tests/hermes_cli/test_kanban_own_hold_custody.py
+new file mode 100644
+index 00000000000..fab6f368972
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_own_hold_custody.py
+@@ -0,0 +1,75 @@
++"""Own-hold polling keeps recipient arrival, writer and lifecycle custody separate."""
++import contextlib
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_hold_notices as notices
++from tests.hermes_cli import test_kanban_local_adoption as adoption
++
++world = adoption.world
++
++
++def _stop(conn, tid):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'spend_budget_triaged', {'cause': 'scope_stopped', 'reason': 'window ended'})
++
++
++def test_real_late_adoption_gets_existing_own_hold(world, capsys):
++    conn, tid, _ = world
++    with kb.write_txn(conn):
++        conn.execute('DELETE FROM kanban_notify_subs WHERE task_id=?', (tid,))
++    _stop(conn, tid)
++    notices.sweep(conn)
++    first = next(e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready')
++    assert adoption.adopt(tid, capsys)['adopted']
++    notices.sweep(conn)
++    from hermes_cli.kanban_db_notify import unseen_events_for_sub
++    _, pending = unseen_events_for_sub(conn, task_id=tid, platform='tui', chat_id='chat',
++                                       kinds=['spend_budget_decision_ready'])
++    assert pending and pending[-1].id > first.id
++    assert pending[-1].payload['authority']['chats']
++    assert kb.get_task(conn, tid).status == 'triage'
++
++
++def test_unchanged_own_hold_takes_no_writer_or_duplicate_handoff(world, capsys):
++    conn, tid, _ = world
++    assert adoption.adopt(tid, capsys)['adopted']
++    _stop(conn, tid)
++    notices.sweep(conn)
++    from hermes_cli import kanban_spend_decision as decisions
++    decisions.ensure_producer(conn, tid)
++    before = conn.total_changes
++    trace = []
++    conn.set_trace_callback(trace.append)
++    try:
++        notices.sweep(conn)
++        decisions.ensure_producer(conn, tid)
++    finally:
++        conn.set_trace_callback(None)
++    assert conn.total_changes == before
++    assert not [q for q in trace if q.upper().startswith(('BEGIN', 'UPDATE', 'INSERT', 'DELETE'))], trace
++    assert len([e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready']) == 1
++
++
++@pytest.mark.parametrize('terminal', ['ready', 'done', 'archived'])
++def test_released_during_writer_acquisition_never_publishes_stale_hold(world, monkeypatch, terminal):
++    conn, tid, _ = world
++    _stop(conn, tid)
++    original = kb.write_txn
++    entered = []
++
++    @contextlib.contextmanager
++    def changing(db, **kwargs):
++        entered.append(True)
++        with original(db):
++            db.execute('UPDATE tasks SET status=? WHERE id=?', (terminal, tid))
++        with original(db, **kwargs):
++            yield db
++
++    monkeypatch.setattr(kb, 'write_txn', changing)
++    notices.sweep(conn)
++    assert entered
++    assert not [e for e in kb.list_events(conn, tid) if e.kind == 'spend_budget_decision_ready']
++    assert kb.get_task(conn, tid).status == terminal
+diff --git a/tests/hermes_cli/test_kanban_pool_tenant.py b/tests/hermes_cli/test_kanban_pool_tenant.py
+index 25160e12176..a804b814460 100644
+--- a/tests/hermes_cli/test_kanban_pool_tenant.py
++++ b/tests/hermes_cli/test_kanban_pool_tenant.py
+@@ -25,19 +25,19 @@
+ 
+ 
+ @pytest.mark.parametrize("title,tenant", RECEIPTS)
+-def test_spend_producer_preserves_tenant_and_queues(hub, title, tenant):
++def test_spend_producer_preserves_tenant_without_a_guard_card(hub, title, tenant):
+     helpers._registry()
+     root = kb.create_task(hub.conn, title=title, assignee="default", tenant=tenant)
+     with kb.write_txn(hub.conn):
+         result = decision.producer(hub.conn, root, "Spend budget reached")
+-    assert result["kind"] == "supervisor"
+-    tid = result["task_id"]
+-    task = kb.get_task(hub.conn, tid)
++    assert result == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
++    task = kb.get_task(hub.conn, root)
+     assert task.tenant == tenant
+-    assert "Do not run the original work here" in task.body
+-    assert helpers._runs_on(hub.conn, tid) == [helpers.POOL]
++    assert task.title == title
++    assert hub.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++    assert helpers._runs_on(hub.conn, root) == [helpers.POOL]
+     payload = hub.conn.execute(
+-        "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()[0]
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (root,)).fetchone()[0]
+     assert json.loads(payload)["portable_reason"] != "uncarried option"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_release.py b/tests/hermes_cli/test_kanban_release.py
+index 41fabcc5193..68c44a9b847 100644
+--- a/tests/hermes_cli/test_kanban_release.py
++++ b/tests/hermes_cli/test_kanban_release.py
+@@ -73,6 +73,17 @@
+     assert release.MARK in kb.build_worker_context(board, tid)  # the next run reads the goal-level mandate
+ 
+ 
++def _legacy_decision(conn, tid):
++    """Replay existing administrative wrappers; publication must never create one."""
++    from tests.hermes_cli.test_kanban_spend_route_repair import _historical_wrapper
++    card = _historical_wrapper(conn, tid)
++    body = decision.notice({'task_id': tid, 'for_worker': True})
++    body += f"\n`hermes kanban promote {tid} --reason '<what changed>'`, or archive it"
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET body=? WHERE id=?', (body, card))
++    return card
++
++
+ def test_ordinary_spend_stop_released(board):
+     tid = spend_stopped(board)
+     out = run(board, tid, note='Desktop Unblock, operation op-1')
+@@ -87,8 +98,7 @@
+ 
+ def test_decision_card_id_resolves_to_its_root_and_is_archived(board):
+     tid = spend_stopped(board)
+-    decision.ensure_producer(board, tid)
+-    card = board.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
++    card = _legacy_decision(board, tid)
+     assert release.target(board, card) == tid and release.held(board, card) == tid
+     filed = board.execute('SELECT body FROM tasks WHERE id=?', (card,)).fetchone()[0]
+     # Its worker is fenced from the verb: the body says who can release, never "run release <root>" to the worker.
+@@ -234,7 +244,9 @@
+     plain = spend_stopped(board)
+     one_step = release.ONE_STEP.format(task=tid)
+     assert f'`hermes kanban release {tid}`' in one_step and 'goal-level mandate' in one_step
+-    assert one_step in decision.notice({'cause': 'scope_stopped', 'task_id': tid})
++    authority = {'chats': [{'gateway': 'own', 'profile': 'default', 'session': 'creator'}]}
++    assert one_step in decision.notice({'cause': 'scope_stopped', 'task_id': tid, 'authority': authority})
++    assert 'No recorded renewable agent authority' in decision.notice({'cause': 'scope_stopped', 'task_id': tid})
+     assert one_step in decision.execution_refusal(board, tid)
+     assert one_step in decision.unblock_refusal(board, tid)
+     assert release.ONE_STEP.format(task=plain) in decision.notice({'reason': 'Spend budget', 'task_id': plain})
+@@ -245,8 +257,8 @@
+ def test_brief_on_a_decision_card_says_unblock_releases_the_stopped_card(board):
+     from hermes_cli import kanban_stranded_brief as brief
+     tid = spend_stopped(board)
+-    decision.ensure_producer(board, tid)
+-    card = dict(board.execute("SELECT * FROM tasks WHERE created_by='kanban-spend-budget'").fetchone())
++    cid = _legacy_decision(board, tid)
++    card = dict(board.execute("SELECT * FROM tasks WHERE id=?", (cid,)).fetchone())
+     request = brief.request(board, card, None, 3 * 3600, 'events: spend_budget_triaged runs=15')
+     assert (f'Unblock = release it to finish with 10 more runs under a goal-level scope '
+             f'(`hermes kanban release {tid}`); safety holds still apply') in request['action']
+@@ -530,8 +542,7 @@
+ 
+ def test_only_the_released_stops_decision_cards_are_archived(board):
+     tid = spend_stopped(board)
+-    decision.ensure_producer(board, tid)
+-    mine = board.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget'").fetchone()[0]
++    mine = _legacy_decision(board, tid)
+     earlier = kb.create_task(board, title='Spend budget decision: earlier stop', assignee='default',
+                              created_by='kanban-spend-budget')
+     elsewhere = kb.create_task(board, title='Spend budget decision: another card', assignee='default',
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal.py b/tests/hermes_cli/test_kanban_scope_renewal.py
+index efd08d27661..965fbde0a3e 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal.py
+@@ -321,11 +321,21 @@
+     tid, _, _ = stopped(board, monkeypatch)
+     text = decision.unblock_refusal(board, tid)
+     assert f'hermes kanban renew-scope {tid} --episode' in text and f'hermes kanban promote {tid}' in text
+-    notice = decision.notice({'cause': 'scope_stopped', 'task_id': tid})
++    from hermes_cli.kanban_hold_audience import describe
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('own', {'own'}))
++    from hermes_state import SessionDB
++    from hermes_cli.config import get_hermes_home
++    with SessionDB(get_hermes_home() / 'state.db') as sessions:
++        sessions.create_session(CHAT, source='desktop')
++    link(board, tid, gateway='own')
++    authority = describe(board, tid)
++    assert authority['chats'] == [{'gateway': 'own', 'profile': 'default', 'session': CHAT}]
++    notice = decision.notice({'cause': 'scope_stopped', 'task_id': tid, 'authority': authority})
+     assert f'hermes kanban renew-scope {tid} --episode' in notice and 'owning chat' in notice
+     from types import SimpleNamespace
+     from tui_gateway.session_notifications import _kb_spend_budget
+-    assert f'renew-scope {tid} --episode' in _kb_spend_budget(SimpleNamespace(id=tid), {'cause': 'scope_stopped'}, '')
++    assert f'renew-scope {tid} --episode' in _kb_spend_budget(SimpleNamespace(id=tid), {'cause': 'scope_stopped', 'authority': authority}, '')
+     safety = decision.notice({'cause': 'safety_refusal', 'task_id': tid})
+     assert 'renew-scope' not in safety
+     kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'safety_refusal'})
+@@ -797,10 +807,11 @@
+ def test_h_gateway_notice_names_the_card_in_the_renewal_route():
+     from types import SimpleNamespace
+     from gateway.kanban_watchers_notifier import _fmt_spend_budget
+-    text, body, _ = _fmt_spend_budget(SimpleNamespace(payload={'cause': 'scope_stopped'}),
++    text, body, _ = _fmt_spend_budget(SimpleNamespace(payload={'cause': 'scope_stopped', 'authority': {
++        'chats': [{'gateway': 'own', 'profile': 'default', 'session': 'creator'}]}}),
+                                       SimpleNamespace(head='Kanban t_1', task_id='t_00000000deadbeef'))
+     assert 'renew-scope t_00000000deadbeef --episode' in text and 'renew-scope t_00000000deadbeef --episode' in body
+-    assert '<task>' in decision.notice({'cause': 'scope_stopped'})
++    assert 'No recorded renewable agent authority' in decision.notice({'cause': 'scope_stopped'})
+ 
+ 
+ def test_j_the_command_line_prints_the_next_step_in_text_mode(board, monkeypatch, capsys):
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_hardening.py b/tests/hermes_cli/test_kanban_shared_blocker_hardening.py
+index 825c65f97f0..c68a7651785 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_hardening.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_hardening.py
+@@ -31,7 +31,7 @@
+ 
+     def timed(name, handler, *args, **kwargs):
+         # Exercise real reclaim ordering, isolating unrelated process maintenance.
+-        if name == 'dispatch.sweep_shared_blockers':
++        if name in ('dispatch.sweep_shared_blockers', 'dispatch.decision_upkeep'):
+             return handler(*args, **kwargs)
+         if name == 'dispatch.tick_upkeep':
+             calls.append('upkeep')
+diff --git a/tests/hermes_cli/test_kanban_spend_budget.py b/tests/hermes_cli/test_kanban_spend_budget.py
+index b06af0d268e..1869db402df 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget.py
++++ b/tests/hermes_cli/test_kanban_spend_budget.py
+@@ -109,7 +109,8 @@
+         # Triage is a hold: the next tick spawns nothing and writes nothing.
+         assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == [] and tid not in spawns.ids
+         producer = _events(conn, tid, "spend_budget_decision_ready")[0].payload["producer"]
+-        assert spawns.ids == [producer["task_id"]]  # only the decision owner may run
++        assert producer == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
++        assert spawns.ids == []  # no manufactured decision/guard card
+         assert len(_events(conn, tid, ksb.EVENT)) == 1
+ 
+ 
+@@ -197,7 +198,7 @@
+         spawns = Spawns()
+         kbd.dispatch_once(conn, spawn_fn=spawns)
+         assert tid in spawns.ids
+-        assert set(spawns.ids) <= {tid, _events(conn, tid, "spend_budget_decision_ready")[0].payload["producer"]["task_id"]}
++        assert spawns.ids == [tid]  # only explicitly promoted original work runs
+ 
+ 
+ def test_live_claim_is_never_taken_off_the_lane(kanban_home):
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_hold.py b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+index 6dda58c345d..fc874913d1e 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget_hold.py
++++ b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+@@ -35,9 +35,12 @@
+ 
+ 
+ @pytest.mark.parametrize("origin", [False, True])
+-def test_owned_stop_has_one_chat_notice_and_no_supervisor(kanban_home, origin):
++def test_owned_stop_has_one_chat_notice_and_no_supervisor(kanban_home, monkeypatch, origin):
+     from gateway import kanban_watchers_notifier as watcher
+     from tui_gateway.session_notifications import _format_kanban_event_text
++    from tests.hermes_cli import test_kanban_spend_decision_routing as routing_helpers
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: (routing_helpers.OWN, {routing_helpers.OWN}))
+ 
+     with kbc.connect_closing() as conn:
+         tid = stopped(conn)
+@@ -46,6 +49,9 @@
+                 conn.execute("UPDATE tasks SET session_id='human-chat' WHERE id=?", (tid,))
+         else:
+             notify.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="human-chat")
++        # Delivery subscriptions alone are not renewal authority. Seed the genuine
++        # creating-chat evidence both legacy routes must preserve.
++        routing_helpers._links(conn, tid, (routing_helpers.OWN, 'default', 'human-chat'))
+         assert budget.hold(conn, tid) == "triage"
+         budget.hold(conn, tid)
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+@@ -62,7 +68,7 @@
+ 
+ 
+ @pytest.mark.parametrize("observer", [None, "touch", "shepherd"])
+-def test_unowned_stop_has_one_supervisor(kanban_home, observer):
++def test_unowned_stop_has_one_notice_and_no_guard(kanban_home, observer):
+     with kbc.connect_closing() as conn:
+         tid = stopped(conn)
+         if observer:
+@@ -72,12 +78,9 @@
+         budget.hold(conn, tid)
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+         producer = event.payload["producer"]
+-        assert producer["kind"] == "supervisor"
+-        supervisor = kb.get_task(conn, producer["task_id"])
+-        assert supervisor.assignee == "default"
+-        assert tid in supervisor.body and "15 runs" in supervisor.body
+-        assert "promote" in supervisor.body and "archive" in supervisor.body
+-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
++        assert producer == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
++        assert '15 runs' in event.payload['reason']
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchone()[0] == int(bool(observer))
+ 
+ 
+@@ -260,7 +263,7 @@
+         for _ in range(2):
+             assert tid not in sweep.sweep_stale_triage(conn, now=int(time.time()) + 7200)
+         assert len(helpers._events(conn, tid, decision.NOTICE)) == 1
+-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+ 
+ 
+ def test_repair_does_not_create_owner_after_decision(kanban_home):
+@@ -281,7 +284,7 @@
+                          (tid, int(released)))
+         budget.hold(conn, tid)
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+-        assert event.payload["producer"]["kind"] == ("supervisor" if released else "chats")
++        assert event.payload["producer"]["kind"] == ("unavailable" if released else "chats")
+         if not released:
+             _, events = notify.unseen_events_for_sub(conn, task_id=tid, platform="hub",
+                                                      chat_id="remote/named/human-chat", kinds=(decision.NOTICE,))
+@@ -312,7 +315,7 @@
+             conn.execute("UPDATE tasks SET session_id=? WHERE id=?", ("local-" + "a" * 64, tid))
+         budget.hold(conn, tid)
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+-        assert event.payload["producer"]["kind"] == "supervisor"
++        assert event.payload["producer"]["kind"] == "unavailable"
+ 
+ 
+ def test_archived_stop_needs_no_producer(kanban_home):
+diff --git a/tests/hermes_cli/test_kanban_spend_decision.py b/tests/hermes_cli/test_kanban_spend_decision.py
+index cbeefcc52c4..ae9183c2250 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision.py
++++ b/tests/hermes_cli/test_kanban_spend_decision.py
+@@ -7,7 +7,7 @@
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_spend_decision as decision
+ from hermes_cli.kanban_triage_sweep import sweep_stale_triage
+-from tests.hermes_cli.test_kanban_spend_route_repair import _carded_stop, _route, _stop
++from tests.hermes_cli.test_kanban_spend_route_repair import _historical_wrapper, _route, _stop
+ from tests.hermes_cli import test_kanban_spend_budget as helpers
+ 
+ kanban_home = helpers.kanban_home
+@@ -22,8 +22,9 @@
+ @pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
+ def test_archived_wrapper_not_refiled_same_episode(kanban_home, status, cause):
+     with kbc.connect_closing() as conn:
+-        tid = _carded_stop(conn, cause)
+-        sup = _route(conn, tid)["task_id"]
++        tid = _stop(conn, cause)
++        sup = _historical_wrapper(conn, tid)
++        decision.ensure_producer(conn, tid)
+         if status == "archived":
+             assert kb.archive_task(conn, sup)
+         else:
+@@ -42,8 +43,8 @@
+ def test_dismissal_receipt_survives_wrapper_removal(kanban_home):
+     with kbc.connect_closing() as conn:
+         tid = _stop(conn)
++        sup = _historical_wrapper(conn, tid)
+         decision.ensure_producer(conn, tid)
+-        sup = _route(conn, tid)["task_id"]
+         assert kb.archive_task(conn, sup)
+         decision.ensure_producer(conn, tid)
+         with kb.write_txn(conn):
+@@ -58,8 +59,8 @@
+ def test_new_episode_refiles_after_archive(kanban_home):
+     with kbc.connect_closing() as conn:
+         tid = _stop(conn)
++        first = _historical_wrapper(conn, tid)
+         decision.ensure_producer(conn, tid)
+-        first = _route(conn, tid)["task_id"]
+         assert kb.archive_task(conn, first)
+         decision.ensure_producer(conn, tid)
+         assert _route(conn, tid)["kind"] == "dismissed"
+@@ -67,9 +68,11 @@
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+             kb._append_event(conn, tid, decision.EVENT, {"reason": "second budget stop"})
++        second = _historical_wrapper(conn, tid)
+         decision.ensure_producer(conn, tid)
+         assert _route(conn, tid)["kind"] == "supervisor"
+-        assert _route(conn, tid)["task_id"] != first
++        assert _route(conn, tid)["task_id"] == second
++        assert second != first
+         assert len(_wrappers(conn, tid)) == 2
+ 
+ 
+@@ -79,9 +82,10 @@
+         episode = decision.pending_episode(conn, tid)
+         key = f"spend-budget-decision:{tid}:{episode.get('uid') or str(episode['id'])}"
+         kb.add_comment(conn, tid, "desk", "Context added before publication")
++        sup = _historical_wrapper(conn, tid)
+         decision.ensure_producer(conn, tid)
+         assert _wrappers(conn, tid)[0]["idempotency_key"] == key
+-        sup = _route(conn, tid)["task_id"]
++        assert _route(conn, tid)["task_id"] == sup
+         # Lost notice, including an old event-id key, must reuse the administrative identity.
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET idempotency_key=? WHERE id=?", (f"spend-budget-decision:{tid}:legacy", sup))
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_causes.py b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+index 8595e55631a..10838a41197 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision_causes.py
++++ b/tests/hermes_cli/test_kanban_spend_decision_causes.py
+@@ -1,10 +1,8 @@
+-"""Only an ordinary budget stop gets a decision card; a stop with a cause is left to the stranded park. [daveey]
++"""Holds notify authentic owners without manufacturing supervisor/guard cards. [daveey]
+ 
+-A "Spend budget decision" card's worker decides spend. It cannot restore a capability, renew a scope or clear a
+-provider refusal, so for a ``capability_unavailable``, ``scope_stopped`` or ``safety_refusal`` stop it could only
+-retain the card, creating another stop without a decision. With no live owning chat such
+-a stop now records the producer ``{"kind": "unavailable"}``. From there: a chat of the card that is live again
+-takes the decision, else the stranded-park sweep asks a human, unless an open parent explains the wait.
++Ordinary spend stops may also queue the existing immediate reviewer; owner visibility
++is independent of that queue. Capability, scope and safety restrictions retain their
++distinct grant gates. Missing authority stays unavailable, never observer authority.
+ """
+ from __future__ import annotations
+ 
+@@ -35,11 +33,6 @@
+               release_condition="Prerequisite exists", evidence=["fixture"])
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def _fresh_recheck_pacing():
+-    decision._RECHECKED.clear()
+-
+-
+ def _sweep(conn, hours):
+     """One working stranded-park pass ``hours`` from now (the per-board throttle is cleared first)."""
+     import time
+@@ -72,8 +65,8 @@
+     """The worker's own ``kanban_retain`` is the entry path: its stop carries the cause and no card is made."""
+     tid, result = _retain(board, monkeypatch, reason)
+     (event,) = _notices(board, tid)
+-    assert event.payload["producer"] == {"kind": "unavailable"}
+-    assert result["next_action"]["owner"] == {"kind": "unavailable"}
++    assert event.payload["producer"] == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
++    assert result["next_action"]["owner"] == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
+     # The receipt does not claim a pending escalation to a route nobody is on.
+     escalation = result["next_action"]["escalation"]
+     assert (escalation["route"], escalation["state"]) == (None, "unavailable")
+@@ -92,12 +85,12 @@
+         kb._append_event(board, tid, decision.EVENT, {"reason": "budget stop"})
+     decision.ensure_producer(board, tid)
+     route = _route(board, tid)
+-    assert route["kind"] == "supervisor"
++    assert route['kind'] == 'unavailable'
+     from hermes_cli import kanban_retain as retain
+     with scoped_current_session_id(session):
+         result = retain.retain(board, board="default", reason="decision_pending", **RETAIN)
+     escalation = result["next_action"]["escalation"]
+-    assert (escalation["route"], escalation["state"]) == (route, "pending")
++    assert escalation['state'] == 'unavailable'  # no manufactured decision owner
+ 
+ 
+ def test_retained_card_with_an_open_parent_is_asked_about_only_after_the_parent_closes(board, monkeypatch):
+@@ -107,7 +100,7 @@
+     parent = kb.create_task(board, title="Restores the capability", assignee="default")
+     with kb.write_txn(board):
+         board.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, tid))
+-    assert _route(board, tid) == {"kind": "unavailable"} and _cards(board) == []
++    assert _route(board, tid) == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'} and _cards(board) == []
+     assert _sweep(board, 3) == [] and not _asked(board, tid)
+     assert _sweep(board, 30) == [] and not _asked(board, tid)
+     with kb.write_txn(board):
+@@ -121,7 +114,7 @@
+     with kbc.connect_closing() as conn:
+         tid = _stop(conn, cause)
+         decision.ensure_producer(conn, tid)
+-        assert _route(conn, tid) == {"kind": "unavailable"}
++        assert _route(conn, tid) == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
+         assert _cards(conn) == []
+         # The route is terminal for the episode: later sweeps neither re-notify nor file a card.
+         decision.ensure_producer(conn, tid)
+@@ -167,37 +160,34 @@
+             pytest.fail("an observer chat must not make the route recheck take the write lock")
+         monkeypatch.setattr(kb, "write_txn", forbidden)
+         for _ in range(4):
+-            decision._RECHECKED.clear()
+-            assert decision._producer_repair(conn, tid) is None
++            assert not decision._notice_repair(conn, tid)
+             decision.repair_triage_routes(conn, skip=set())
+             decision.ensure_producer(conn, tid)
+-        assert [n.payload["producer"] for n in _notices(conn, tid)] == [{"kind": "unavailable"}]
++        assert [n.payload["producer"] for n in _notices(conn, tid)] == [{'kind': 'unavailable', 'error': 'scope_authority_unavailable'}]
+ 
+ 
+ @pytest.mark.parametrize("cause", CAUSES)
+-def test_a_chat_that_is_live_again_takes_the_ownerless_stop_once(kanban_home, own_gateway, cause):
+-    """Dead at the stop, live later: stranded-park counts the live link as an owner and stays quiet, so the
+-    route repair must send that chat the notice."""
++def test_authentic_owner_is_not_replaced_because_it_is_idle(kanban_home, own_gateway, cause):
++    """Liveness is not ownership release; archived/reopened chats get one stable notice."""
+     with kbc.connect_closing() as conn:
+         tid = _stop(conn, cause)
+         routing._state_session(kanban_home, "human-chat", archived=1)
+         routing._links(conn, tid, (routing.OWN, "default", "human-chat"))
+         decision.ensure_producer(conn, tid)
+-        assert _route(conn, tid) == {"kind": "unavailable"} and routing._subs(conn, tid) == []
+-        decision.repair_triage_routes(conn, skip=set())  # still dead: nothing new
++        assert _route(conn, tid) == {'kind': 'chats'}
++        assert routing._subs(conn, tid) == [('tui', 'human-chat')]
++        decision.repair_triage_routes(conn, skip=set())
+         assert len(_notices(conn, tid)) == 1
+         routing._state_session(kanban_home, "human-chat", archived=0)
+-        decision.repair_triage_routes(conn, skip=set())  # paced: this card was checked a moment ago
++        decision.repair_triage_routes(conn, skip=set())
+         assert len(_notices(conn, tid)) == 1
+-        decision._RECHECKED.clear()
+         decision.repair_triage_routes(conn, skip=set())
+-        assert [n.payload["producer"] for n in _notices(conn, tid)] == [{"kind": "unavailable"}, {"kind": "chats"}]
++        assert [n.payload['producer'] for n in _notices(conn, tid)] == [{'kind': 'chats'}]
+         assert routing._subs(conn, tid) == [("tui", "human-chat")]
+         for _ in range(2):
+-            decision._RECHECKED.clear()
+             decision.repair_triage_routes(conn, skip=set())
+             decision.ensure_producer(conn, tid)
+-        assert len(_notices(conn, tid)) == 2 and _cards(conn) == []
++        assert len(_notices(conn, tid)) == 1 and _cards(conn) == []
+ 
+ 
+ def test_capability_stop_is_not_sent_to_the_spend_reviewer(kanban_home, spend_reviewer):
+@@ -209,9 +199,9 @@
+             decision.ensure_producer(conn, card)
+         episode = reviewer.episode_of(decision.pending_episode(conn, tid))
+         assert reviewer.state(conn, tid, episode) is None
+-        assert _route(conn, tid) == {"kind": "unavailable"}
++        assert _route(conn, tid) == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
+         assert reviewer.state(conn, plain, reviewer.episode_of(decision.pending_episode(conn, plain))) == reviewer.QUEUED
+-        assert _notices(conn, plain) == [] and _cards(conn) == []
++        assert len(_notices(conn, plain)) == 1 and _cards(conn) == []
+ 
+ 
+ def test_restriction_recorded_apart_from_the_stop_files_no_card(kanban_home):
+@@ -223,23 +213,19 @@
+             kb._append_event(conn, tid, "decision_hold_restricted",
+                              {"cause": "scope_stopped", "episode": episode.get("uid") or str(episode["id"])})
+         decision.ensure_producer(conn, tid)
+-        assert _route(conn, tid) == {"kind": "unavailable"}
++        assert _route(conn, tid) == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
+         assert _cards(conn) == []
+ 
+ 
+-def test_plain_budget_stop_with_no_live_chat_still_gets_a_decision_card(kanban_home):
++def test_plain_budget_stop_with_no_owner_never_manufactures_a_guard(kanban_home):
+     with kbc.connect_closing() as conn:
+         tid = hold_helpers.stopped(conn)
+         assert budget.hold(conn, tid) == "triage"
+         (event,) = _notices(conn, tid)
+         producer = event.payload["producer"]
+-        assert producer["kind"] == "supervisor" and _cards(conn) == [producer["task_id"]]
+-        card = kb.get_task(conn, producer["task_id"])
+-        assert card.status not in ("done", "archived")
+-        assert f"hermes kanban promote {tid} --reason" in card.body and "or archive it" in card.body
+-        assert "split or re-scope" in card.body
+-        assert "retain this decision card" not in card.body and "non-executing owner" not in card.body
+-        assert "authority unavailable" not in card.body
++        assert producer == {'kind': 'unavailable', 'error': 'scope_authority_unavailable'}
++        assert _cards(conn) == [] and kb.get_task(conn, tid).status == 'triage'
++        assert decision.pending(conn, tid)
+ 
+ 
+ @pytest.mark.parametrize("cause", [None, *CAUSES])
+diff --git a/tests/hermes_cli/test_kanban_spend_decision_routing.py b/tests/hermes_cli/test_kanban_spend_decision_routing.py
+index a8d8dbfc9ff..096437a0b56 100644
+--- a/tests/hermes_cli/test_kanban_spend_decision_routing.py
++++ b/tests/hermes_cli/test_kanban_spend_decision_routing.py
+@@ -22,12 +22,13 @@
+ OWN = "own-gw"
+ 
+ 
+-def _links(conn, tid, *rows):
++def _links(conn, tid, *rows, kind='created'):
+     with kb.write_txn(conn):
+         conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (task_id TEXT, chat_gateway TEXT, "
+-                     "chat_profile TEXT, chat_session TEXT, released INTEGER, created_at INTEGER)")
++                     "chat_profile TEXT, chat_session TEXT, released INTEGER, created_at INTEGER, "
++                     "kind TEXT DEFAULT 'created')")
+         for gw, profile, session in rows:
+-            conn.execute("INSERT INTO task_chat_links VALUES (?, ?, ?, ?, 0, 0)", (tid, gw, profile, session))
++            conn.execute("INSERT INTO task_chat_links VALUES (?, ?, ?, ?, 0, 0, ?)", (tid, gw, profile, session, kind))
+ 
+ 
+ def _subs(conn, tid):
+@@ -41,16 +42,16 @@
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (OWN, {OWN, "remote"}))
+ 
+ 
+-def test_headless_chat_link_is_not_bound_and_a_supervisor_decides(kanban_home, own_gateway):
+-    """A worker transcript's chat link is no owner: binding it would send the decision to a machine session."""
++def test_headless_chat_link_is_not_bound_or_given_a_guard(kanban_home, own_gateway):
++    """An observer hash is not owning provenance; genuine foreign created hashes may be Desktop chats."""
+     with kbc.connect_closing() as conn:
+         tid = stopped(conn)
+-        _links(conn, tid, ("remote", "default", "local-" + "b" * 64))
++        _links(conn, tid, ("remote", "default", "local-" + "b" * 64), kind='observer')
+         assert budget.hold(conn, tid) == "triage"
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+         producer = event.payload["producer"]
+-        assert producer["kind"] == "supervisor"
+-        assert kb.get_task(conn, producer["task_id"]).assignee == "default"
++        assert producer['kind'] == 'unavailable'
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+         assert _subs(conn, tid) == []
+ 
+ 
+@@ -137,9 +138,9 @@
+ 
+ 
+ @pytest.mark.parametrize("dead", ["ended-idle", "archived", "missing"])
+-def test_dead_local_chat_is_no_route_and_a_supervisor_decides(kanban_home, own_gateway, dead):
+-    """A chat of this gateway that is ended and idle past kanban.stranded_owner_idle_seconds, archived, or absent
+-    from a readable state.db is not bound or counted: the decision goes to a supervisor card (kanban_stranded_park)."""
++def test_idle_local_owner_is_not_replaced_by_guard_card(kanban_home, own_gateway, dead):
++    """A stored authentic created link remains authority despite local liveness changes.
++    Delivery may need recovery, but a supervisor card would not acquire its authority."""
+     with kbc.connect_closing() as conn:
+         tid = stopped(conn)
+         if dead == "missing":
+@@ -154,8 +155,9 @@
+         assert budget.hold(conn, tid) == "triage"
+         (event,) = helpers._events(conn, tid, decision.NOTICE)
+         producer = event.payload["producer"]
+-        assert producer["kind"] == "supervisor"
+-        assert kb.get_task(conn, producer["task_id"]).status not in ("done", "archived")
++        assert producer['kind'] == 'chats'
++        assert _subs(conn, tid) == [('tui', 'human-chat')]
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+ 
+ 
+ @pytest.mark.parametrize("ended_ago", [None, 3600], ids=["open", "ended-recently"])
+diff --git a/tests/hermes_cli/test_kanban_spend_reviewer.py b/tests/hermes_cli/test_kanban_spend_reviewer.py
+index 6422f194391..e9976ce9af3 100644
+--- a/tests/hermes_cli/test_kanban_spend_reviewer.py
++++ b/tests/hermes_cli/test_kanban_spend_reviewer.py
+@@ -54,14 +54,14 @@
+     return {"decision": "grant", "runs": runs, "progress_quote": quote, "reason": "PR landed; sample is next."}
+ 
+ 
+-def test_a_stop_is_queued_for_review_instead_of_waking_a_chat_or_opening_a_decision_card(kanban_home, spend_reviewer):
++def test_a_stop_is_queued_for_review_and_visible_without_a_decision_card(kanban_home, spend_reviewer):
+     with kbc.connect_closing() as conn:
+         tid, episode = _stopped(conn)
+         assert reviewer.state(conn, tid, episode) == reviewer.QUEUED
+-        assert decision.NOTICE not in _kinds(conn, tid)
++        assert _kinds(conn, tid).count(decision.NOTICE) == 1
+         assert conn.execute("SELECT COUNT(*) FROM tasks WHERE created_by = 'kanban-spend-budget'").fetchone()[0] == 0
+-        decision.safe_ensure_producer(conn, tid)  # the route sweep leaves a queued review alone
+-        assert decision.NOTICE not in _kinds(conn, tid)
++        decision.safe_ensure_producer(conn, tid)  # queued review never suppresses/doubles owner visibility
++        assert _kinds(conn, tid).count(decision.NOTICE) == 1
+ 
+ 
+ def test_a_grant_with_quoted_progress_promotes_into_a_fresh_window_of_exactly_those_runs(
+@@ -135,6 +135,8 @@
+     monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
+     with kbc.connect_closing() as conn:
+         tid, episode = _stopped(conn)
++        from tests.hermes_cli.test_kanban_spend_route_repair import _historical_wrapper
++        _historical_wrapper(conn, tid)  # compatibility with an already-created legacy decider
+         route = decision.episode_route(conn, tid, episode)
+         assert route["kind"] == "supervisor"
+         monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 2))
+@@ -190,6 +192,8 @@
+ def test_a_stop_a_closed_decision_card_disposed_of_is_never_reviewed(kanban_home, spend_reviewer, monkeypatch):
+     with kbc.connect_closing() as conn:
+         tid, episode = _routed_with_reviewer_off(conn, monkeypatch)
++        from tests.hermes_cli.test_kanban_spend_route_repair import _historical_wrapper
++        _historical_wrapper(conn, tid)  # replay history, never create a production guard
+         card = decision.episode_route(conn, tid, episode)["task_id"]
+         kb.archive_task(conn, card)
+         assert decision.episode_route(conn, tid, episode)["kind"] == "dismissed"
+diff --git a/tests/hermes_cli/test_kanban_spend_route_repair.py b/tests/hermes_cli/test_kanban_spend_route_repair.py
+index 0c512c267ae..9cfcae5c356 100644
+--- a/tests/hermes_cli/test_kanban_spend_route_repair.py
++++ b/tests/hermes_cli/test_kanban_spend_route_repair.py
+@@ -10,6 +10,7 @@
+ from tests.hermes_cli import test_kanban_spend_budget as helpers
+ 
+ kanban_home = helpers.kanban_home
++UNAVAILABLE = {"kind": "unavailable", "error": "scope_authority_unavailable"}
+ 
+ 
+ def _stop(conn, cause=None):
+@@ -24,48 +25,48 @@
+     return helpers._events(conn, tid, decision.NOTICE)[-1].payload["producer"]
+ 
+ 
+-def _carded_stop(conn, cause=None):
+-    """A stop that already has its decision card. A stop with a cause gets none of its own
+-    (test_kanban_spend_decision_causes), so the cause arrives after the card, as a scope retain on a budget stop
+-    does."""
+-    tid = _stop(conn)
+-    decision.ensure_producer(conn, tid)
+-    if cause:
+-        episode = decision.pending_episode(conn, tid)
+-        with kb.write_txn(conn):
+-            kb._append_event(conn, tid, "decision_hold_restricted",
+-                             {"cause": cause, "episode": episode.get("uid") or str(episode["id"])})
+-        decision.ensure_producer(conn, tid)
+-    return tid
++def _historical_wrapper(conn, tid):
++    """Replay a legacy spend-decision wrapper; publication must not mint one."""
++    stop = decision.pending_episode(conn, tid)
++    assert stop is not None
++    episode = stop.get("uid") or str(stop["id"])
++    sup = kb.create_task(
++        conn, title="legacy supervisor receipt", assignee="default",
++        created_by="kanban-spend-budget",
++        idempotency_key=f"spend-budget-decision:{tid}:{episode}")
++    with kb.write_txn(conn):
++        kb._append_event(conn, sup, "administrative_decision", {
++            "role": "administrative_decision", "root_task": tid, "root_episode": episode})
++        kb._append_event(conn, tid, decision.NOTICE, {
++            "episode": episode, "producer": {"kind": "supervisor", "task_id": sup}})
++    return sup
+ 
+ 
+ @pytest.mark.parametrize("status", ["done", "archived", "missing", "null"])
+ @pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
+ def test_closed_or_null_producer_is_replaced_without_execution_release(kanban_home, status, cause):
+     with kbc.connect_closing() as conn:
+-        tid = _carded_stop(conn, cause)
+-        old = _route(conn, tid)["task_id"]
+-        with kb.write_txn(conn):
+-            if status == "null":
+-                episode = decision.pending_episode(conn, tid)
+-                kb._append_event(conn, tid, decision.NOTICE, {
+-                    "episode": episode.get("uid") or str(episode["id"]), "producer": None})
+-            elif status == "missing":
+-                conn.execute("DELETE FROM tasks WHERE id=?", (old,))
+-            else:
+-                conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, old))
++        tid = _stop(conn, cause)
+         decision.ensure_producer(conn, tid)
+-        route = _route(conn, tid)
+-        if status in ("done", "archived"):
+-            assert route == {"kind": "dismissed", "task_id": old}
+-        elif cause and status == "missing":
+-            assert route == {"kind": "unavailable"}  # a restricted stop is never given a new decision card
+-        else:
+-            assert route["kind"] == "supervisor"
+-            assert (route["task_id"] == old) == (status == "null")
+-            assert kb.get_task(conn, route["task_id"]).status not in ("done", "archived")
++        assert _route(conn, tid) == UNAVAILABLE  # no fallback guard card is ever created
++        # A historical receipt may still name a closed/missing supervisor card, or no producer at all.
++        legacy = kb.create_task(conn, title="legacy supervisor receipt", assignee="default")
++        with kb.write_txn(conn):
++            episode = decision.pending_episode(conn, tid)
++            producer = None if status == "null" else {"kind": "supervisor", "task_id": legacy}
++            kb._append_event(conn, tid, decision.NOTICE, {
++                "episode": episode.get("uid") or str(episode["id"]), "producer": producer})
++            if status == "missing":
++                conn.execute("DELETE FROM tasks WHERE id=?", (legacy,))
++            elif status != "null":
++                conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, legacy))
++        tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+         count = len(helpers._events(conn, tid, decision.NOTICE))
+         decision.ensure_producer(conn, tid)
++        # One durable receipt per episode: a closed/missing/null historical receipt is never repaired by
++        # minting a replacement guard card, and the hold is neither released nor changed.
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == tasks
++        decision.ensure_producer(conn, tid)
+         assert len(helpers._events(conn, tid, decision.NOTICE)) == count
+         assert kb.get_task(conn, tid).status == "triage"
+         assert decision.pending(conn, tid)
+@@ -73,12 +74,11 @@
+ 
+ 
+ @pytest.mark.parametrize("filter", ["fresh", "gated", "contained", "capped", "foreign"])
+-@pytest.mark.parametrize("cause", [None, "scope_stopped"])
+-def test_sweep_repairs_missing_routes_before_release_filters(kanban_home, monkeypatch, filter, cause):
++def test_sweep_repairs_missing_routes_before_release_filters(kanban_home, monkeypatch, filter):
+     from hermes_cli import kanban_containment_connections as containment
+     from hermes_cli import kanban_wake_check as wake
+     with kbc.connect_closing() as conn:
+-        tid = _stop(conn, cause)
++        tid = _stop(conn, "scope_stopped")
+         kb.add_comment(conn, tid, "diagnostic", "frequent fresh diagnostic does not defer decision ownership")
+         if filter == "gated":
+             monkeypatch.setattr(sweep, "_gate_exclusion", lambda: "AND 0 ")
+@@ -92,12 +92,11 @@
+         assert sweep.sweep_stale_triage(conn) == []
+         notices = helpers._events(conn, tid, decision.NOTICE)
+         assert bool(notices) == (filter != "foreign")
+-        if notices and cause:
+-            assert _route(conn, tid) == {"kind": "unavailable"}
+-        elif notices:
+-            assert kb.get_task(conn, _route(conn, tid)["task_id"]).status == "ready"
++        if notices:
++            assert _route(conn, tid) == UNAVAILABLE
++            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+         assert kb.get_task(conn, tid).status == "triage"
+-        assert decision.execution_restricted(conn, tid) == bool(cause)
++        assert decision.execution_restricted(conn, tid)
+ 
+ 
+ def test_failed_publication_retries_and_does_not_starve_other_stops(kanban_home, monkeypatch):
+@@ -111,13 +110,11 @@
+         monkeypatch.setattr(decision, "producer", fail_one)
+         sweep.sweep_stale_triage(conn)
+         assert not helpers._events(conn, first, decision.NOTICE)
+-        assert _route(conn, second)["kind"] == "supervisor"
++        assert _route(conn, second) == UNAVAILABLE
+         monkeypatch.setattr(decision, "producer", real)
+         sweep.sweep_stale_triage(conn)
+-        owner = kb.get_task(conn, _route(conn, first)["task_id"])
+-        assert f"hermes kanban promote {first} --reason" in owner.body and "or archive it" in owner.body
+-        # Retaining the card would be a second stop with no decision.
+-        assert "retain this decision card" not in owner.body and "non-executing owner" not in owner.body
++        assert _route(conn, first) == UNAVAILABLE
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2  # only the two stopped roots
+         assert kb.get_task(conn, first).status == "triage"
+ 
+ 
+@@ -192,8 +189,7 @@
+     with kbc.connect_closing() as conn:
+         tid = _stop(conn)
+         decision.ensure_producer(conn, tid)
+-        with kb.write_txn(conn):
+-            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (_route(conn, tid)["task_id"],))
++        assert _route(conn, tid) == UNAVAILABLE
+         assert kb.promote_task(conn, tid, actor="operator", reason="bounded new phase")[0]
+         count = len(helpers._events(conn, tid, decision.NOTICE))
+         decision.ensure_producer(conn, tid)
+diff --git a/tests/hermes_cli/test_kanban_stranded_park.py b/tests/hermes_cli/test_kanban_stranded_park.py
+index 0e8bf5db1a8..692d4c85ce1 100644
+--- a/tests/hermes_cli/test_kanban_stranded_park.py
++++ b/tests/hermes_cli/test_kanban_stranded_park.py
+@@ -24,6 +24,14 @@
+ kanban_home = helpers.kanban_home
+ stopped = hold_helpers.stopped
+ 
++
++def _legacy_wrapper(conn, tid):
++    """Explicit historical fixture: production no longer creates supervisor cards."""
++    from tests.hermes_cli.test_kanban_spend_route_repair import _historical_wrapper
++    sup = _historical_wrapper(conn, tid)
++    decision.ensure_producer(conn, tid)
++    return sup
++
+ OWN = "own-gw"
+ HOUR = 3600
+ DESK = f"{OWN}/default/desk-chat"
+@@ -157,7 +165,7 @@
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET body=? WHERE id=?", ("Fix the frozen sidebar in the Mac app.\nImplementation detail", source))
+         assert budget.hold(conn, source) == "triage"
+-        sup = _events(conn, source, decision.NOTICE)[-1]["producer"]["task_id"]
++        sup = _legacy_wrapper(conn, source)
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (sup,))
+             kb._append_event(conn, sup, "decision_retained", {"disposition": {"summary": detail}})
+@@ -180,7 +188,7 @@
+     with kbc.connect_closing() as conn:
+         source = stopped(conn)
+         assert budget.hold(conn, source) == "triage"
+-        sup = _events(conn, source, decision.NOTICE)[-1]["producer"]["task_id"]
++        sup = _legacy_wrapper(conn, source)
+         assert kb.archive_task(conn, sup)
+         # Even before producer reconciliation, archive is already a disposition.
+         assert _sweep(conn, now=_later(3), cfg={}) == []
+@@ -242,8 +250,7 @@
+     with kbc.connect_closing() as conn:
+         tid = stopped(conn)
+         assert budget.hold(conn, tid) == "triage"
+-        (notice,) = _events(conn, tid, decision.NOTICE)
+-        sup = notice["producer"]["task_id"]
++        sup = _legacy_wrapper(conn, tid)
+         assert stranded.open_decision_card(conn, tid) == sup
+         assert _sweep(conn, now=_later(3), cfg={}) == []
+         with kb.write_txn(conn):
+@@ -257,12 +264,11 @@
+     a new supervisor opened for the same episode, which itself parks with no owner."""
+     tid = stopped(conn)
+     assert budget.hold(conn, tid) == "triage"
+-    (notice,) = _events(conn, tid, decision.NOTICE)
++    first = _legacy_wrapper(conn, tid)
+     with kb.write_txn(conn):
+-        conn.execute("DELETE FROM tasks WHERE id=?", (notice["producer"]["task_id"],))
++        conn.execute("DELETE FROM tasks WHERE id=?", (first,))
+     assert _sweep(conn, now=_later(3), cfg={}) == [tid]
+-    decision.ensure_producer(conn, tid)
+-    sup = _events(conn, tid, decision.NOTICE)[-1]["producer"]["task_id"]
++    sup = _legacy_wrapper(conn, tid)
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET status='triage', block_kind='transient' WHERE id=?", (sup,))
+         kb._append_event(conn, sup, "agent_block_escalated", {"reason": "decision retained"})
+@@ -813,8 +819,7 @@
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (root,))
+         kb._append_event(conn, root, decision.EVENT, {"reason": "Spend budget: 15 runs"})
+-    decision.ensure_producer(conn, root)
+-    card = conn.execute("SELECT id FROM tasks WHERE created_by='kanban-spend-budget' ORDER BY rowid DESC").fetchone()[0]
++    card = _legacy_wrapper(conn, root)  # historical release compatibility, not new supervisor generation
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=?", (card,))
+         row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (card,)).fetchone())
+@@ -956,7 +961,7 @@
+         with kb.write_txn(conn):
+             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (root,))
+             kb._append_event(conn, root, decision.EVENT, {"reason": "Spend budget: 15 runs"})
+-        decision.ensure_producer(conn, root)  # an agent route owns the decision: an open decision card
++        _legacy_wrapper(conn, root)  # historical open decision card, not newly generated recovery work
+         forged = _forge(conn, root, episode=_true_stamp(conn, root))
+         for hours in (3, 3.2):
+             assert root not in _sweep(conn, now=_later(hours), cfg={})
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index c61cde01fd8..3776a647327 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -416,7 +416,10 @@
+         _clear_stall(key)  # delivered (by us or a live poller): a later stall starts its own clock
+         return None
+     oldest = min(float(getattr(e, "created_at", 0) or 0) for e in events)
+-    if oldest > now - grace_s:
++    # Decision holds must become unread on the first consumer pass. Keep the
++    # normal live-poller grace for completion traffic and all custody checks below.
++    urgent = any(getattr(e, 'kind', '') == 'spend_budget_decision_ready' for e in events)
++    if oldest > now - grace_s and not urgent:
+         return None  # a live poller still has time to take it
+     done = None
+     from gateway.kanban_wake_sibling import tui_defer, tui_formatter
+@@ -511,7 +514,8 @@
+             logger.info("kanban ask for %s/%s to chat %s deferred (%s); retrying next pass",
+                         slug, ident["task_id"], tip, verdict)
+         return None
+-    if verdict == "skipped:slots" and _slots_may_wait(claimed, now):
++    urgent = any(getattr(e, 'kind', '') == 'spend_budget_decision_ready' for e in claimed)
++    if verdict == "skipped:slots" and not urgent and _slots_may_wait(claimed, now):
+         # Every wake slot is busy: hand the range back so the next pass wakes the chat, instead of a passive row
+         # that no turn reads (design t_01a1d45d75851804 R4). An OVERDUE_S-old notice gets its row as before.
+         with contextlib.suppress(Exception):
+-- 
+2.43.0
+

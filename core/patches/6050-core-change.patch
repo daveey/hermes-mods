@@ -1,0 +1,636 @@
+From 222e8b779734e45b34a4eb93323f1cdd171f9ab9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:30:18 +0000
+Subject: [PATCH 6050] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit 222e8b779734e45b34a4eb93323f1cdd171f9ab9.
+
+---
+diff --git a/hermes_cli/serve_producer_custody.py b/hermes_cli/serve_producer_custody.py
+new file mode 100644
+index 00000000000..64ec5f8d316
+--- /dev/null
++++ b/hermes_cli/serve_producer_custody.py
+@@ -0,0 +1,82 @@
++"""Stable POSIX family fences shared by broker and exec producer child.
++
++This is a custody primitive, NOT a legacy-process admission proof. Admission must
++hold the launch gate and supply a strict COMPLETE census before acquiring it.
++Never unlink the files and never LOCK_UN: an inherited child owns the same open
++file description and must keep fencing successors after its broker disappears.
++"""
++from __future__ import annotations
++
++import os
++import stat
++from dataclasses import dataclass
++from pathlib import Path
++
++_FAMILIES = frozenset(('panel', 'links', 'annotation'))
++
++
++class CustodyConflict(RuntimeError):
++    """Another producer still holds actual kernel custody; expiry cannot steal it."""
++
++
++class CustodyUnsafe(RuntimeError):
++    """Runtime paths cannot establish private, stable lock custody."""
++
++
++@dataclass
++class FamilyCustody:
++    fd: int | None
++
++    @classmethod
++    def acquire(cls, runtime: Path, family: str) -> FamilyCustody:
++        """Nonblocking acquisition; caller deliberately pass_fds=(owner.fd,)."""
++        if family not in _FAMILIES:
++            raise ValueError('unknown producer family')
++        try:
++            import fcntl
++        except ImportError as exc:
++            raise CustodyUnsafe('no strict custody adapter for this platform') from exc
++        runtime = Path(runtime)
++        runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
++        try:
++            directory = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++        except OSError as exc:
++            raise CustodyUnsafe('private directory required') from exc
++        try:
++            _private(os.fstat(directory), directory=True)
++            return cls(_acquire_file(directory, family, fcntl))
++        finally:
++            os.close(directory)
++
++    def close(self) -> None:
++        """Close only this process's descriptor, preserving inherited custody."""
++        if self.fd is not None:
++            fd, self.fd = self.fd, None
++            os.close(fd)
++
++
++def _private(info: os.stat_result, *, directory: bool) -> None:
++    expected = 0o700 if directory else 0o600
++    kind_ok = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
++    links_ok = directory or info.st_nlink == 1
++    uid = os.getuid()  # windows-footgun: ok — reached only after acquire imports the POSIX fcntl adapter
++    if not kind_ok or not links_ok or info.st_uid != uid or stat.S_IMODE(info.st_mode) != expected:
++        raise CustodyUnsafe('private directory required' if directory else 'private stable lock file required')
++
++
++def _acquire_file(directory: int, family: str, fcntl) -> int:
++    try:
++        fd = os.open(f'{family}.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
++                     0o600, dir_fd=directory)
++    except OSError as exc:
++        raise CustodyUnsafe('private stable lock file required') from exc
++    try:
++        _private(os.fstat(fd), directory=False)
++        try:
++            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError as exc:
++            raise CustodyConflict(f'{family} producer has not released custody') from exc
++        return fd
++    except BaseException:
++        os.close(fd)
++        raise
+diff --git a/hermes_cli/serve_producer_leases.py b/hermes_cli/serve_producer_leases.py
+new file mode 100644
+index 00000000000..d17df6a3690
+--- /dev/null
++++ b/hermes_cli/serve_producer_leases.py
+@@ -0,0 +1,60 @@
++"""Pure same-boot deadlines; browser interest is never a transport retainer.
++
++All times are absolute CLOCK_MONOTONIC values sampled at HTTP acceptance. A relay
++transfers them unchanged; neither dequeue nor reconnect grants another lifetime.
++These durations preserve Desktop renewal compatibility, not legacy dequeue delay.
++"""
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++
++VISIBILITY_S = 75.0
++WATCH_S = 900.0
++RETAINER_S = 15.0
++
++
++def _clock(now: float) -> None:
++    if type(now) not in (int, float) or not math.isfinite(now) or now < 0:
++        raise ValueError('invalid monotonic clock')
++
++
++@dataclass(frozen=True)
++class BrowserInterest:
++    boot_id: str
++    accepted_at: float
++    visibility_until: float
++    watch_until: float
++
++    @classmethod
++    def accepted(cls, boot_id: str, *, now: float, visible: bool) -> BrowserInterest:
++        _clock(now)
++        return cls(boot_id, now, now + VISIBILITY_S if visible else now, now + WATCH_S)
++
++    def remaining(self, boot_id: str, *, now: float) -> tuple[float, float]:
++        _clock(now)
++        if boot_id != self.boot_id or now < self.accepted_at:
++            return 0.0, 0.0
++        return max(0.0, self.visibility_until - now), max(0.0, self.watch_until - now)
++
++
++class Retainer:
++    """Expiry requests drain; it is NEVER proof the producer has terminated."""
++
++    def __init__(self, boot_id: str, *, now: float):
++        _clock(now)
++        self.boot_id = boot_id
++        self.renewed_at = now
++        self.expires_at = now + RETAINER_S
++
++    def renew(self, boot_id: str, *, now: float) -> bool:
++        _clock(now)
++        if not self.live(boot_id, now=now):
++            return False
++        self.renewed_at = now
++        self.expires_at = now + RETAINER_S
++        return True
++
++    def live(self, boot_id: str, *, now: float) -> bool:
++        _clock(now)
++        return boot_id == self.boot_id and self.renewed_at <= now < self.expires_at
+diff --git a/hermes_cli/serve_producer_protocol.py b/hermes_cli/serve_producer_protocol.py
+new file mode 100644
+index 00000000000..d69f442916b
+--- /dev/null
++++ b/hermes_cli/serve_producer_protocol.py
+@@ -0,0 +1,251 @@
++"""Bounded data framing for serve producer relays; no producer imports or I/O.
++
++The caller owns authentication, scope generation and aggregate installation budgets.
++A request is not visible to its consumer until its final COMMIT. JSON escapes retain
++Python strings including lone surrogates, without changing public panel validators.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import struct
++from collections import OrderedDict
++from dataclasses import dataclass
++from typing import Any
++
++MAX_FRAME = 64 * 1024
++MAX_REQUEST = 1024 * 1024
++_CHUNK = 24 * 1024
++_HEADER = struct.Struct('!I')
++
++
++class ProtocolError(ValueError):
++    """Malformed internal transport; disconnect rather than accepting partial work."""
++
++
++class ResourceExhausted(ValueError):
++    """Retryable overload, not invalid public input."""
++
++
++def _reject_constant(value):
++    raise ValueError(f'nonfinite JSON value: {value}')
++
++
++class _Frame(dict):
++    def __init__(self, value: dict, wire_bytes: int):
++        super().__init__(value)
++        self.wire_bytes = wire_bytes
++
++
++def _json_parts(value: Any, depth: int = 0):
++    if depth > 32:
++        raise ProtocolError('JSON nesting limit')
++    if isinstance(value, str):
++        yield b'"'
++        for offset in range(0, len(value), 1024):
++            yield json.dumps(value[offset:offset + 1024], ensure_ascii=True)[1:-1].encode('ascii')
++        yield b'"'
++    elif isinstance(value, (list, tuple)):
++        yield b'['
++        for index, item in enumerate(value):
++            if index:
++                yield b','
++            yield from _json_parts(item, depth + 1)
++        yield b']'
++    elif isinstance(value, dict):
++        yield b'{'
++        for index, (key, item) in enumerate(value.items()):
++            if not isinstance(key, str):
++                raise ProtocolError('JSON object key must be a string')
++            if index:
++                yield b','
++            yield from _json_parts(key, depth + 1)
++            yield b':'
++            yield from _json_parts(item, depth + 1)
++        yield b'}'
++    else:
++        yield json.dumps(value, allow_nan=False, separators=(',', ':')).encode('ascii')
++
++
++def _bounded_json(value: Any, limit: int) -> bytes:
++    output = bytearray()
++    for part in _json_parts(value):
++        if len(output) + len(part) > limit:
++            raise ResourceExhausted('encoded request budget')
++        output.extend(part)
++    return bytes(output)
++
++
++def _frame(value: dict) -> bytes:
++    wire = _bounded_json(value, MAX_FRAME)
++    return _HEADER.pack(len(wire)) + wire
++
++
++def encode_request(request_id: str, payload: dict) -> tuple[bytes, ...]:
++    """Prepare the entire bounded transaction before enqueue/HTTP acceptance.
++
++    Chunk contents are already escaped ASCII JSON, but enclosing frame escaping
++    still counts toward the frame limit. A caller reserves the returned wire bytes
++    in its mailbox before acknowledging; this function has no partial side effects.
++    """
++    if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
++        raise ProtocolError('request id limit')
++    body = _bounded_json(payload, MAX_REQUEST)
++    frames = [_frame({'verb': 'BEGIN', 'id': request_id, 'total': len(body)})]
++    for offset in range(0, len(body), _CHUNK):
++        frames.append(_frame({'verb': 'CHUNK', 'id': request_id, 'offset': offset,
++                              'data': body[offset:offset + _CHUNK].decode('ascii')}))
++    frames.append(_frame({'verb': 'COMMIT', 'id': request_id}))
++    if sum(map(len, frames)) > MAX_REQUEST:
++        raise ResourceExhausted('framed request budget')
++    return tuple(frames)
++
++
++class FrameDecoder:
++    """Incremental length-prefixed stream parser with bounded retained state."""
++
++    def __init__(self, *, control: bool = False):
++        self._buffer = bytearray()
++        self._expected = None
++        self._limit = 8192 if control else MAX_FRAME
++        self._closed = False
++
++    def feed(self, data: bytes) -> list[dict]:
++        if self._closed:
++            raise ProtocolError('decoder closed')
++        try:
++            return self._feed(data)
++        except ProtocolError:
++            self._closed = True
++            self._buffer.clear()
++            raise
++
++    def _feed(self, data: bytes) -> list[dict]:
++        messages = []
++        cursor = 0
++        while cursor < len(data):
++            need = (4 if self._expected is None else self._expected) - len(self._buffer)
++            take = min(need, len(data) - cursor)
++            self._buffer.extend(data[cursor:cursor + take])
++            cursor += take
++            if len(self._buffer) < (4 if self._expected is None else self._expected):
++                continue
++            if self._expected is None:
++                self._expected = _HEADER.unpack(self._buffer)[0]
++                self._buffer.clear()
++                if not 1 <= self._expected <= self._limit:
++                    raise ProtocolError('frame limit')
++            else:
++                try:
++                    message = json.loads(self._buffer.decode('utf-8'), parse_constant=_reject_constant)
++                except (UnicodeDecodeError, ValueError, RecursionError) as exc:
++                    raise ProtocolError('invalid frame JSON') from exc
++                wire_bytes = self._expected + 4
++                self._buffer.clear()
++                self._expected = None
++                if not isinstance(message, dict):
++                    raise ProtocolError('frame must be an object')
++                messages.append(_Frame(message, wire_bytes))
++        return messages
++
++
++@dataclass
++class _Pending:
++    request_id: str
++    total: int
++    body: bytearray
++    framed_bytes: int
++
++
++class RequestAssembly:
++    """One authenticated client's atomic reassembly, bounded before allocation.
++
++    Admission/control code aborts on revocation, expiry or disconnect. No callback
++    runs here: only a completed object can enter the producer's demand mailbox.
++    """
++
++    def __init__(self):
++        self._pending: _Pending | None = None
++        self._completed: OrderedDict[str, tuple[int, bytes]] = OrderedDict()
++
++    @property
++    def reserved_bytes(self) -> int:
++        return self._pending.total if self._pending is not None else 0
++
++    def abort(self) -> None:
++        self._pending = None
++
++    def accept(self, message: dict) -> tuple[str, dict] | None:
++        try:
++            return self._accept(message)
++        except (ProtocolError, ResourceExhausted):
++            self.abort()
++            raise
++
++    def _accept(self, message: dict) -> tuple[str, dict] | None:
++        verb = message.get('verb')
++        request_id = message.get('id')
++        wire_bytes = message.wire_bytes if isinstance(message, _Frame) else len(_frame(message))
++        if not isinstance(request_id, str) or not 1 <= len(request_id) <= 128:
++            raise ProtocolError('request id limit')
++        if verb == 'BEGIN':
++            return self._begin(request_id, message.get('total'), wire_bytes)
++        pending = self._pending
++        if pending is None and verb == 'COMMIT' and request_id in self._completed:
++            return None
++        if pending is None or pending.request_id != request_id:
++            raise ProtocolError('request not begun')
++        pending.framed_bytes += wire_bytes
++        if pending.framed_bytes > MAX_REQUEST:
++            raise ResourceExhausted('framed request budget')
++        if verb == 'CHUNK':
++            self._chunk(pending, message)
++            return None
++        if verb != 'COMMIT':
++            raise ProtocolError('unknown data verb')
++        if len(pending.body) != pending.total:
++            self.abort()
++            raise ProtocolError('incomplete request')
++        try:
++            digest = hashlib.sha256(pending.body).digest()
++            previous = self._completed.get(request_id)
++            if previous is not None:
++                if previous != (pending.total, digest):
++                    raise ProtocolError('conflicting replay')
++                return None
++            payload = json.loads(pending.body.decode('ascii'), parse_constant=_reject_constant)
++            if not isinstance(payload, dict):
++                raise ProtocolError('request must be an object')
++            self._completed[request_id] = (pending.total, digest)
++            if len(self._completed) > 4096:
++                self._completed.popitem(last=False)
++            return request_id, payload
++        except ProtocolError:
++            raise
++        except (ValueError, RecursionError) as exc:
++            raise ProtocolError('invalid request JSON') from exc
++        finally:
++            self.abort()
++
++    def _begin(self, request_id: str, total: Any, wire_bytes: int) -> None:
++        if type(total) is not int or not 1 <= total <= MAX_REQUEST:
++            raise ResourceExhausted('reassembly budget')
++        previous = self._completed.get(request_id)
++        if previous is not None and previous[0] != total:
++            raise ProtocolError('conflicting replay')
++        if self._pending is not None:
++            raise ProtocolError('request already begun')
++        self._pending = _Pending(request_id, total, bytearray(), wire_bytes)
++
++    def _chunk(self, pending: _Pending, message: dict) -> None:
++        offset, text = message.get('offset'), message.get('data')
++        if type(offset) is not int or not isinstance(text, str) or not text.isascii():
++            raise ProtocolError('invalid chunk')
++        data = text.encode('ascii')
++        if len(data) > _CHUNK or offset < 0 or offset + len(data) > pending.total:
++            raise ProtocolError('chunk limit')
++        if offset < len(pending.body) and pending.body[offset:offset + len(data)] == data:
++            return  # exact retransmission is idempotent before COMMIT
++        if offset != len(pending.body):
++            raise ProtocolError('chunk gap or conflicting replay')
++        pending.body.extend(data)
+diff --git a/tests/hermes_cli/test_serve_producer_custody.py b/tests/hermes_cli/test_serve_producer_custody.py
+new file mode 100644
+index 00000000000..4a1275f8273
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_custody.py
+@@ -0,0 +1,64 @@
++"""Real inherited lock custody survives broker close until its child exits."""
++import os
++import select
++import subprocess
++import sys
++
++import pytest
++
++from tools.environments.local import build_subprocess_env
++
++
++@pytest.mark.platforms('posix')
++def test_child_keeps_fence_after_broker_closes_its_descriptor(tmp_path):
++    from hermes_cli import serve_producer_custody as custody
++
++    runtime = tmp_path / 'producer-runtime'
++    owner = custody.FamilyCustody.acquire(runtime, 'panel')
++    identity = (runtime / 'panel.lock').stat().st_ino
++    script = tmp_path / 'holder.py'
++    script.write_text('import os, sys\nos.write(int(sys.argv[1]), b"R")\nsys.stdin.buffer.read(1)\n')
++    ready_read, ready_write = os.pipe()
++    child = None
++    try:
++        child = subprocess.Popen(
++            [sys.executable, '-I', str(script), str(ready_write)],
++            pass_fds=(owner.fd, ready_write), stdin=subprocess.PIPE,
++            env=build_subprocess_env(),
++        )
++        os.close(ready_write)
++        ready_write = -1
++        assert select.select([ready_read], [], [], 10)[0], 'holder did not become ready'
++        assert os.read(ready_read, 1) == b'R'
++        owner.close()
++        with pytest.raises(custody.CustodyConflict):
++            custody.FamilyCustody.acquire(runtime, 'panel')
++        child.communicate(b'X', timeout=10)
++        assert child.returncode == 0
++        successor = custody.FamilyCustody.acquire(runtime, 'panel')
++        successor.close()
++        assert (runtime / 'panel.lock').stat().st_ino == identity
++    finally:
++        owner.close()
++        if child is not None and child.poll() is None:
++            child.communicate(b'X', timeout=10)
++        os.close(ready_read)
++        if ready_write >= 0:
++            os.close(ready_write)
++
++
++@pytest.mark.platforms('posix')
++def test_rejects_unsafe_runtime_and_symlink_lock_without_touching_target(tmp_path):
++    from hermes_cli import serve_producer_custody as custody
++
++    runtime = tmp_path / 'producer-runtime'
++    runtime.mkdir(mode=0o755)
++    with pytest.raises(custody.CustodyUnsafe, match='private directory'):
++        custody.FamilyCustody.acquire(runtime, 'panel')
++    runtime.chmod(0o700)
++    target = tmp_path / 'untouched'
++    target.write_bytes(b'original')
++    (runtime / 'panel.lock').symlink_to(target)
++    with pytest.raises(custody.CustodyUnsafe, match='lock file'):
++        custody.FamilyCustody.acquire(runtime, 'panel')
++    assert target.read_bytes() == b'original'
+diff --git a/tests/hermes_cli/test_serve_producer_leases.py b/tests/hermes_cli/test_serve_producer_leases.py
+new file mode 100644
+index 00000000000..398f540a7e9
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_leases.py
+@@ -0,0 +1,30 @@
++"""Browser deadlines survive queuing/reconnect without becoming process leases."""
++import pytest
++
++
++def test_browser_durations_never_renew_from_transport_or_delayed_delivery():
++    from hermes_cli import serve_producer_leases as leases
++
++    original = leases.BrowserInterest.accepted('boot-a', now=10, visible=True)
++    assert original.visibility_until == 85
++    assert original.watch_until == 910
++    for now in (40, 70, 84):
++        assert original.remaining('boot-a', now=now) == (85 - now, 910 - now)
++    assert original.remaining('boot-a', now=85) == (0, 825)
++    assert original.remaining('boot-a', now=909) == (0, 1)
++    assert original.remaining('boot-a', now=910) == (0, 0)
++    assert original.remaining('boot-b', now=10) == (0, 0)
++    # A transport retainer does not modify the independently accepted browser lease.
++    retainer = leases.Retainer('boot-a', now=10)
++    retainer.renew('boot-a', now=14)
++    assert retainer.live('boot-a', now=28)
++    assert not retainer.live('boot-a', now=29)
++    assert original.remaining('boot-a', now=910) == (0, 0)
++
++
++@pytest.mark.parametrize('bad', [float('nan'), float('inf'), -1, True, '1', None])
++def test_invalid_clock_cannot_create_or_renew_a_lease(bad):
++    from hermes_cli import serve_producer_leases as leases
++
++    with pytest.raises(ValueError, match='clock'):
++        leases.BrowserInterest.accepted('boot-a', now=bad, visible=True)
+diff --git a/tests/hermes_cli/test_serve_producer_protocol.py b/tests/hermes_cli/test_serve_producer_protocol.py
+new file mode 100644
+index 00000000000..7bc7c6c00e6
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_protocol.py
+@@ -0,0 +1,102 @@
++"""Bounded helper transport preserves the panel's existing Python-string domain."""
++import json
++import struct
++
++import pytest
++
++from hermes_cli import serve_producer_protocol as protocol
++
++
++@pytest.mark.parametrize('session', ['a' * 300, 'a' * 512, '\U0001f600' * 512, '\ud800' * 512, '\x00' * 512])
++def test_chunked_request_roundtrips_exact_python_strings(session):
++    request = {'sessions': [session, 'x' * 70000], 'subscriber': 's' * 128}
++    frames = protocol.encode_request('request-1', request)
++    assert all(len(frame) <= protocol.MAX_FRAME + 4 for frame in frames)
++    decoder = protocol.FrameDecoder()
++    assembly = protocol.RequestAssembly()
++    accepted = []
++    for frame in frames:
++        # Real stream fragmentation: a frame header and body need not arrive together.
++        for offset in range(0, len(frame), 137):
++            for message in decoder.feed(frame[offset:offset + 137]):
++                result = assembly.accept(message)
++                if result is not None:
++                    accepted.append(result)
++    assert accepted == [('request-1', request)]
++    assert assembly.reserved_bytes == 0
++
++
++def test_control_decoder_rejects_data_sized_frame_at_header():
++    decoder = protocol.FrameDecoder(control=True)
++    with pytest.raises(protocol.ProtocolError, match='frame limit'):
++        decoder.feed(struct.pack('!I', 8193))
++
++
++def test_atomic_commit_replay_cannot_publish_twice():
++    messages = [json.loads(frame[4:]) for frame in protocol.encode_request('same', {'sessions': ['a']})]
++    assembly = protocol.RequestAssembly()
++    completed = []
++    for message in messages + messages:
++        result = assembly.accept(message)
++        if result is not None:
++            completed.append(result)
++    assert completed == [('same', {'sessions': ['a']})]
++    with pytest.raises(protocol.ProtocolError, match='conflicting replay'):
++        assembly.accept({'verb': 'BEGIN', 'id': 'same', 'total': 3})
++        assembly.accept({'verb': 'CHUNK', 'id': 'same', 'offset': 0, 'data': '{} '})
++        assembly.accept({'verb': 'COMMIT', 'id': 'same'})
++
++
++def test_same_length_conflicting_commit_is_rejected_without_delivery():
++    assembly = protocol.RequestAssembly()
++    for frame in protocol.encode_request('same', {'a': 1}):
++        assembly.accept(json.loads(frame[4:]))
++    messages = [json.loads(frame[4:]) for frame in protocol.encode_request('same', {'a': 2})]
++    for message in messages[:-1]:
++        assert assembly.accept(message) is None
++    with pytest.raises(protocol.ProtocolError, match='conflicting replay'):
++        assembly.accept(messages[-1])
++    assert assembly.reserved_bytes == 0
++
++
++def test_decoder_stays_failed_after_bad_header():
++    decoder = protocol.FrameDecoder()
++    with pytest.raises(protocol.ProtocolError):
++        decoder.feed(struct.pack('!I', 0))
++    with pytest.raises(protocol.ProtocolError, match='closed'):
++        decoder.feed(protocol.encode_request('valid', {})[0])
++
++
++@pytest.mark.parametrize('wire', [b'{"value":NaN}', b'{"value":Infinity}', '{"value":1}'.encode('utf-16')])
++def test_frames_refuse_nonstandard_json_and_encoding(wire):
++    with pytest.raises(protocol.ProtocolError, match='frame JSON'):
++        protocol.FrameDecoder().feed(struct.pack('!I', len(wire)) + wire)
++
++
++def test_receiver_bounds_actual_framed_bytes_not_only_body_reservation():
++    assembly = protocol.RequestAssembly()
++    assembly.accept({'verb': 'BEGIN', 'id': 'a', 'total': 10})
++    for _ in range(32):
++        assembly.accept({'verb': 'CHUNK', 'id': 'a', 'offset': 0, 'data': '{}', 'padding': 'x' * 32000})
++    with pytest.raises(protocol.ResourceExhausted, match='framed request budget'):
++        assembly.accept({'verb': 'CHUNK', 'id': 'a', 'offset': 0, 'data': '{}', 'padding': 'x' * 32000})
++    assert assembly.reserved_bytes == 0
++
++
++def test_header_refuses_oversize_before_body_arrives():
++    decoder = protocol.FrameDecoder()
++    with pytest.raises(protocol.ProtocolError, match='frame limit'):
++        decoder.feed(struct.pack('!I', protocol.MAX_FRAME + 1))
++
++
++def test_request_overload_is_atomic_and_uses_actual_escaped_wire_size():
++    with pytest.raises(protocol.ResourceExhausted):
++        protocol.encode_request('large', {'sessions': ['\U0001f600' * 100000]})
++    frames = protocol.encode_request('fits', {'sessions': ['x' * 70000]})
++    messages = [json.loads(frame[4:]) for frame in frames]
++    assembly = protocol.RequestAssembly()
++    for message in messages[:-1]:
++        assert assembly.accept(message) is None
++    assert assembly.reserved_bytes > 0
++    assert assembly.accept(messages[-1]) == ('fits', {'sessions': ['x' * 70000]})
++    assert assembly.reserved_bytes == 0
+-- 
+2.43.0
+

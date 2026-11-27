@@ -1,0 +1,293 @@
+From b55200614516d9b0040034ebee910d4791213c3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:39:52 +0000
+Subject: [PATCH 6191] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit b55200614516d9b0040034ebee910d4791213c3d.
+
+---
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 20f2cb30970..038f0f457af 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -15,6 +15,12 @@
+ version reinstalls its unconditional insert trigger on init (``ensure_revision`` repairs any SQL mismatch, bumping):
+ heartbeats then bump again, a superset, and readers of either version only check the trigger names.
+ 
++``projection_revision`` is the key the links and annotation caches compare. It bumps with ``revision`` except on
++``task_events`` inserts whose kind is not in ``PROJECTION_EVENT_KINDS`` (the kinds a cached activity reader selects).
++A comment, claim or worker-lifecycle event still moves ``revision``, so the notify gate and the host change feed
++still wake; it does not move the projection key, so those caches do not re-project thousands of rows for an event
++they do not read. A file whose triggers predate the column falls back to ``revision`` (never a hidden change).
++
+ Readers (``content_key``) only trust the counter when every table they read that exists in the file carries all three
+ of its triggers; otherwise (older writer, dropped trigger, rebuilt file) they fall back to the file's stat plus a
+ connection-scoped SQLite data_version. Equal timestamps alone never prove an absence of commits. The key also
+@@ -72,11 +78,15 @@
+ # no longer re-reads every board's counts, the links projection and the attention pass (t_01a1cee98aaa8db1). Every
+ # other kind, and any update or delete of an event row, still bumps.
+ UNREAD_EVENT_KINDS = ("heartbeat",)
++# Kinds a cached activity reader selects from task_events (session-activity UNSEEN_KINDS). An insert of any
++# other kind still bumps ``revision`` (notify reads it) but not ``projection_revision``.
++PROJECTION_EVENT_KINDS = ("blocked", "completed", "crashed", "gave_up", "status", "timed_out")
+ _BUMP = f"UPDATE {REVISION_TABLE} SET revision = revision + 1 WHERE id = 1;"
++_BUMP_PROJECTION = (f"UPDATE {REVISION_TABLE} SET projection_revision = projection_revision + 1 WHERE id = 1;")
+ # [daveey] P2 per-task change cursor (t_01a1d59d3ef805c4): which tasks each bump touched.
+ CHANGE_TABLE = "kanban_task_change"
+ FULL_MARK = ""  # a bump no task explains (trigger (re)install): cursors older than its rev read in full
+-EPOCH = 2  # 1 = the bump-only triggers (no marker); 2 = bump + kanban_task_change upsert
++EPOCH = 3  # 1 = bump-only; 2 = bump + kanban_task_change; 3 = projection_revision beside revision
+ EPOCH_MARK = f"/* kanban-activity-epoch:{EPOCH} */"
+ _EPOCH_RE = re.compile(r"/\* kanban-activity-epoch:(\d+) \*/")
+ # The task(s) a row belongs to. Every other watched table names it in ``task_id``.
+@@ -144,6 +154,15 @@
+     return '"' + name.replace('"', '""') + '"'
+ 
+ 
++def _projection_bump(table: str, op: str, columns: list[str]) -> str:
++    """Bump ``projection_revision``. Event inserts bump it only for kinds a cached reader selects."""
++    if op == "INSERT" and table == "task_events" and "kind" in columns:
++        kinds = ", ".join(f"'{k}'" for k in PROJECTION_EVENT_KINDS)
++        return (f"UPDATE {REVISION_TABLE} SET projection_revision = projection_revision + 1 WHERE id = 1 "
++                f"AND COALESCE(NEW.kind, '') IN ({kinds});")
++    return _BUMP_PROJECTION
++
++
+ def wanted_triggers(conn: sqlite3.Connection, tables: Iterable[str]) -> dict[str, str]:
+     """Trigger name -> CREATE statement for the ``tables`` present in ``conn``, from their live columns."""
+     out: dict[str, str] = {}
+@@ -158,12 +177,12 @@
+             if op == "INSERT" and table == "task_events" and "kind" in columns:
+                 when = " WHEN COALESCE(NEW.kind, '') NOT IN ({})".format(", ".join(f"'{k}'" for k in UNREAD_EVENT_KINDS))
+             out[name] = (f"CREATE TRIGGER {name} AFTER {op} ON {_quote(table)}{when} BEGIN {EPOCH_MARK} {_BUMP} "
+-                         f"{_marks(op, keys)} END")
++                         f"{_projection_bump(table, op, columns)} {_marks(op, keys)} END")
+         read = [c for c in columns if c not in BOOKKEEPING_COLUMNS.get(table, frozenset())]
+         changed = " OR ".join(_moved(table, c) for c in read)
+         name = f"{PREFIX}{table}_update"
+         out[name] = (f"CREATE TRIGGER {name} AFTER UPDATE ON {_quote(table)} WHEN {changed} BEGIN {EPOCH_MARK} "
+-                     f"{_BUMP} {_marks('UPDATE', keys)} END")
++                     f"{_BUMP} {_projection_bump(table, 'UPDATE', columns)} {_marks('UPDATE', keys)} END")
+     return out
+ 
+ 
+@@ -182,16 +201,24 @@
+                                           (REVISION_TABLE, CHANGE_TABLE, CHANGE_INDEX))}
+     has_row = present == {REVISION_TABLE, CHANGE_TABLE, CHANGE_INDEX} and conn.execute(
+         f"SELECT 1 FROM {REVISION_TABLE} WHERE id = 1").fetchone()
+-    if has_row and found == wanted:
++    has_projection = False
++    if REVISION_TABLE in present:
++        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_quote(REVISION_TABLE)})")}
++        has_projection = "projection_revision" in cols
++    if has_row and has_projection and found == wanted:
+         return
+     from hermes_cli.kanban_db_connect import write_txn
+     with write_txn(conn):
+         conn.execute(f"CREATE TABLE IF NOT EXISTS {REVISION_TABLE} "
+                      "(id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL)")
+-        conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} VALUES (1, 0)")
++        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_quote(REVISION_TABLE)})")}
++        if "projection_revision" not in cols:
++            conn.execute(f"ALTER TABLE {REVISION_TABLE} ADD COLUMN projection_revision INTEGER NOT NULL DEFAULT 0")
++        conn.execute(f"INSERT OR IGNORE INTO {REVISION_TABLE} (id, revision) VALUES (1, 0)")
+         for ddl in _CHANGE_DDL:
+             conn.execute(ddl)
+         conn.execute(_BUMP)
++        conn.execute(_BUMP_PROJECTION)
+         conn.execute(_mark("NULL"))  # whatever changed while the triggers were absent or older is unknown
+         for name in set(found) - set(wanted):
+             conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+@@ -327,8 +354,63 @@
+     return ("revision", db[0], db[1], *revision)
+ 
+ 
++def read_projection_key(conn: sqlite3.Connection, tables: Iterable[str]) -> tuple | None:
++    """``(projection_revision, schema_version)`` when epoch-3 triggers cover ``tables``, else None.
++
++    None means the caller must use ``revision`` (the notify counter). Never treat a missing column as
++    "unchanged": an older file has no projection counter, and hiding its writes would drop a real change.
++    """
++    tables = tuple(tables)
++    conn.execute("BEGIN")
++    try:
++        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({_quote(REVISION_TABLE)})")}
++        if "projection_revision" not in cols:
++            return None
++        trigger = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
++                                (f"{PREFIX}task_events_insert",)).fetchone()
++        if trigger is None or "projection_revision" not in (trigger[0] or ""):
++            return None
++        watched = (*tables, REVISION_TABLE)
++        names = {r[0] for r in conn.execute(
++            "SELECT name FROM sqlite_master WHERE (type = 'trigger' AND name GLOB ?) "
++            f"OR (type = 'table' AND name IN ({','.join('?' * len(watched))}))", (PREFIX + "*", *watched))}
++        row = conn.execute(
++            f"SELECT projection_revision, (SELECT schema_version FROM pragma_schema_version) "
++            f"FROM {REVISION_TABLE} WHERE id = 1").fetchone()
++    finally:
++        conn.execute("COMMIT")
++    if row is None:
++        return None
++    for table in tables:
++        if table in names and not all(f"{PREFIX}{table}_{op}" in names for op in ("insert", "update", "delete")):
++            return None
++    return (int(row[0]), int(row[1]))
++
++
++def projection_content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple | None:
++    """The links/annotation key, or None when this file has no projection counter (caller uses ``content_key``)."""
++    lock = probe_lock(path)
++    if not lock.acquire(timeout=0.05):
++        return None
++    try:
++        db = file_stat(path)[0]
++        if db is None:
++            return None
++        try:
++            with open_ro(path) as conn:
++                row = read_projection_key(conn, tables)
++        except sqlite3.Error:
++            return None
++        if row is None:
++            return None
++        return ("projection", db[0], db[1], *row)
++    finally:
++        lock.release()
++
++
+ def is_revision(key: tuple) -> bool:
+-    return bool(key) and key[0] == "revision"
++    """True for a trigger-backed key (the notify counter or the links/annotation projection counter)."""
++    return bool(key) and key[0] in ("revision", "projection")
+ 
+ 
+ def covered_revision(conn: sqlite3.Connection, path: Path, ident: tuple, tables: Iterable[str]) -> tuple | None:
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index f50198828e7..c23f0bcc1f1 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -97,7 +97,7 @@
+     paths -= {str(p) for p in ksa._board_db_paths()}
+     shadow_dir = _replica_dir()
+     replicas = sorted(p for p in paths if p.endswith(".db") and os.path.dirname(p) == shadow_dir)
+-    content = tuple((p, ksa._board_content_key(Path(p), ksa._revision.SHADOW_TABLES)) for p in replicas)
++    content = tuple((p, ksa._projection_content_key(Path(p), ksa._revision.SHADOW_TABLES)) for p in replicas)
+     if not ksa._revalidate.revalidatable(content, wall):
+         return object()
+     return (tuple(sorted(ksa._done_checks)), content, _signature(scope, paths - set(replicas)))
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 20bf314ac92..b2e06f1fba6 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -818,6 +818,15 @@
+         return []
+ 
+ 
++def _projection_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
++    """Links/annotation key: ignores task_events inserts those caches do not read. Falls back to the notify
++    counter when the file has no projection column, so an older board never hides a write."""
++    key = _revision.projection_content_key(path, tables, lambda p: cached_ro(p, busy_budget=0))
++    if key is not None:
++        return key
++    return _board_content_key(path, tables)
++
++
+ def _activity_fingerprint(*, include_shadows: bool = True) -> tuple:
+     """Count inputs include sync shadows; the origin-ledger projection never reads them."""
+     pinned = getattr(_revalidate.inputs_pin, "fingerprints", None)
+@@ -827,7 +836,7 @@
+     signature = [_hub_content_signature(hub)] if hub is not None else []
+     # [daveey] Each board's content revision (``kanban_activity_revision``), not its stat: bookkeeping writes
+     # (sync stamps, dispatch stamps, a replica's pull stamp) rewrite the files ~61x/min with no task change.
+-    signature.extend((str(db), _board_content_key(db)) for db in _board_db_paths())
++    signature.extend((str(db), _projection_content_key(db)) for db in _board_db_paths())
+     if include_shadows:
+         signature.extend(_shadow_fingerprint())
+         signature.extend(_origin_ledger_fingerprint())
+@@ -836,7 +845,7 @@
+ 
+ def _shadow_fingerprint() -> tuple:
+     """What ``_activity_fingerprint()`` appends to the local one: each sync shadow's content key."""
+-    return tuple((str(db), _board_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
++    return tuple((str(db), _projection_content_key(db, _revision.SHADOW_TABLES)) for db in _replica_paths())
+ 
+ 
+ def _board_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index f99de097ec0..6a6f6373395 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -108,6 +108,51 @@
+     assert ksa._board_content_key(ksa._board_db_paths()[0]) != before
+ 
+ 
++def test_projection_kinds_match_the_unseen_reader():
++    assert set(rev.PROJECTION_EVENT_KINDS) == set(ksa.UNSEEN_KINDS)
++
++
++def test_an_unread_event_wakes_notify_but_not_the_links_or_annotation_key(board):
++    """A comment or claim event still moves the notify counter, and does not move the links or annotation key.
++    An unseen kind and a task-status write move both. This is the notification-loss guard: dropping the
++    notify bump would hide the event from the gate.
++    """
++    tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
++    path = ksa._board_db_paths()[0]
++
++    def notify_key():
++        return rev.content_key(path, rev.LOCAL_TABLES, lambda p: ksa.cached_ro(p, busy_budget=0))
++
++    before_notify = notify_key()
++    before_fp = ksa._activity_fingerprint()
++    before_links = ksa._links_fingerprint()
++    assert before_fp and rev.is_revision(before_notify)
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'commented', 1)", (tid,))
++    assert notify_key() != before_notify  # notification-loss: the gate key must move
++    assert ksa._board_content_key(path) != before_notify
++    assert ksa._activity_fingerprint() == before_fp
++    assert ksa._links_fingerprint() == before_links
++
++    before_fp = ksa._activity_fingerprint()
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'claimed', 2)", (tid,))
++    assert ksa._activity_fingerprint() == before_fp
++    assert notify_key() != before_notify
++
++    before_fp = ksa._activity_fingerprint()
++    before_notify = notify_key()
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'completed', 3)", (tid,))
++    assert ksa._activity_fingerprint() != before_fp
++    assert notify_key() != before_notify
++
++    before_fp = ksa._activity_fingerprint()
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
++    assert ksa._activity_fingerprint() != before_fp
++
++
+ def test_claim_and_heartbeat_columns_are_bookkeeping(board):
+     tid = kb.create_task(board, title="work", assignee="worker", session_id="s_chat")
+     path = ksa._board_db_paths()[0]
+diff --git a/tests/hermes_cli/test_kanban_task_change.py b/tests/hermes_cli/test_kanban_task_change.py
+index 10d77ba6a92..25b28022869 100644
+--- a/tests/hermes_cli/test_kanban_task_change.py
++++ b/tests/hermes_cli/test_kanban_task_change.py
+@@ -294,9 +294,11 @@
+     """A newer writer's triggers (and its extra ones) survive this writer's init instead of being dropped."""
+     names = dict(board.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
+                                (rev.PREFIX + "*",)))
+-    newer = names[f"{rev.PREFIX}tasks_update"].replace(rev.EPOCH_MARK, "/* kanban-activity-epoch:3 */")
++    newer_epoch = rev.EPOCH + 1
++    mark = f"/* kanban-activity-epoch:{newer_epoch} */"
++    newer = names[f"{rev.PREFIX}tasks_update"].replace(rev.EPOCH_MARK, mark)
+     extra = (f"CREATE TRIGGER {rev.PREFIX}future_table_insert AFTER INSERT ON tasks "
+-             f"BEGIN /* kanban-activity-epoch:3 */ {rev._BUMP} END")
++             f"BEGIN {mark} {rev._BUMP} END")
+     with kbc.write_txn(board):
+         board.execute(f"DROP TRIGGER {rev.PREFIX}tasks_update")
+         board.execute(newer)
+-- 
+2.43.0
+

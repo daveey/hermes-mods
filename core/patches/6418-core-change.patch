@@ -1,0 +1,131 @@
+From 2981a56204f4a74dd81903304f5d9c48aa577ed0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:46:07 +0000
+Subject: [PATCH 6418] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 2981a56204f4a74dd81903304f5d9c48aa577ed0.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index c9cad9b533a..72c30339130 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -156,7 +156,9 @@
+     if decision.execution_restricted(conn, task_id) or restricted(conn, task_id) or _disposed(conn, task_id, episode):
+         return False
+     stop = decision.pending_episode(conn, task_id)
+-    if stop is not None and _payload(stop.get("payload")).get("cause"):
++    if stop is None or episode_of(stop) != episode or _human_after_stop(conn, task_id, stop):
++        return False
++    if _payload(stop.get("payload")).get("cause"):
+         return False  # e.g. capability_unavailable: more runs meet the same wall, so there is no budget to judge
+     row = conn.execute("SELECT created_by FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     if row is None or row[0] == "kanban-spend-budget" or conn.execute(
+@@ -427,18 +429,34 @@
+     return escalate(conn, task_id, episode, str(verdict.get("reason") or "the reviewer escalated"))
+ 
+ 
++def _human_after_stop(conn: sqlite3.Connection, task_id: str, stop: dict) -> bool:
++    """Use portable event ordering for both queue admission and the final writer fence."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    after = _event_order(stop)
++    return any(_event_order(dict(ev)) > after for ev in conn.execute(
++        "SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND json_valid(payload) "
++        "AND (json_extract(payload, '$.writer_kind') = 'human' "
++        "OR json_extract(payload, '$.relayed_human') IS NOT NULL)", (task_id,)))
++
++
+ def _refusal(conn: sqlite3.Connection, task_id: str, episode: str) -> Optional[str]:
+     """Inside the write transaction: why this stop can no longer be granted by the reviewer."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_spend_decision as decision
+     from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
+     from hermes_cli.kanban_sync_divergence import _event_order
++    from hermes_cli.kanban_wake_check import foreign_copy
+     row = conn.execute("SELECT status, human_request, block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     stop = decision.pending_episode(conn, task_id)
+-    if row is None or row[0] != "triage" or episode_of(stop) != episode or state(conn, task_id, episode) != STARTED:
++    if row is None or stop is None or row[0] != "triage" or episode_of(stop) != episode or state(conn, task_id, episode) != STARTED:
+         return "the stop was decided or changed while the reviewer read it"
+-    if not settings()[0]:
++    enabled, max_grants = settings()
++    if not enabled:
+         return "the reviewer was turned off while it read the stop"
++    if foreign_copy(conn, task_id):
++        return "the card is no longer owned by this gateway"
++    if consecutive_grants(conn, task_id) >= max_grants:
++        return "the consecutive reviewer grant cap was reached"
+     if row[1] or row[2] in HUMAN_BLOCK_KINDS:
+         return "the card waits on a human"
+     if decision.execution_restricted(conn, task_id) or decision.execution_refusal(conn, task_id):
+@@ -459,11 +477,8 @@
+         if not conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? AND started_at > ? AND started_at <= ? "
+                             "LIMIT 1", (task_id, promoted["created_at"], stop["created_at"])).fetchone():
+             return "the card returned to triage after promotion with zero new runs; the owner must reconcile it"
+-    for ev in conn.execute("SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND json_valid(payload) "
+-                           "AND (json_extract(payload, '$.writer_kind') = 'human' "
+-                           "OR json_extract(payload, '$.relayed_human') IS NOT NULL)", (task_id,)):
+-        if _event_order(dict(ev)) > after:
+-            return "a human commented after the stop"
++    if _human_after_stop(conn, task_id, stop):
++        return "a human commented after the stop"
+     if [p for p, st in kb.parent_states(conn, task_id) if st not in ("done", "archived")]:
+         return "the card has open parents"
+     return None
+diff --git a/tests/hermes_cli/test_kanban_spend_review_fences.py b/tests/hermes_cli/test_kanban_spend_review_fences.py
+new file mode 100644
+index 00000000000..010ad73e0bc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_fences.py
+@@ -0,0 +1,48 @@
++"""Recheck reviewer authority at queue and decision time, not only before the model call."""
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_reviewer as reviewer
++from tests.hermes_cli import test_kanban_spend_reviewer as helpers
++
++kanban_home = helpers.kanban_home
++inline = helpers.inline
++
++
++def test_human_comment_prevents_backlog_queue(kanban_home, spend_reviewer, monkeypatch):
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    with kbc.connect_closing() as conn:
++        tid, episode = helpers._stopped(conn)
++        kb.add_comment(conn, tid, "owner", "Leave this held until I decide.", writer_kind="human")
++        monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 2))
++        assert not reviewer.eligible(conn, tid, episode)
++        assert not reviewer.queue(conn, tid, episode, backlog=True)
++        assert reviewer.state(conn, tid, episode) is None
++
++
++def test_cap_rechecked_after_judge(kanban_home, spend_reviewer, inline, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, episode = helpers._stopped(conn)
++
++        def judge(ctx):
++            monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 0))
++            return helpers._grant()
++
++        monkeypatch.setattr(reviewer, "judge", judge)
++        reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED
++
++
++def test_foreign_copy_rechecked_after_judge(kanban_home, spend_reviewer, inline, monkeypatch):
++    from hermes_cli import kanban_wake_check
++    with kbc.connect_closing() as conn:
++        tid, episode = helpers._stopped(conn)
++
++        def judge(ctx):
++            monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda conn, task_id: True)
++            return helpers._grant()
++
++        monkeypatch.setattr(reviewer, "judge", judge)
++        reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED
+-- 
+2.43.0
+

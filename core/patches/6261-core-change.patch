@@ -1,0 +1,291 @@
+From acbc9a24fabb4b5f814abb3ea0b6892d7b3bb9c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:56:26 +0000
+Subject: [PATCH 6261] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit acbc9a24fabb4b5f814abb3ea0b6892d7b3bb9c1.
+
+---
+diff --git a/hermes_cli/fact_board_inputs.py b/hermes_cli/fact_board_inputs.py
+index 74a6653ae0c..622393eb453 100644
+--- a/hermes_cli/fact_board_inputs.py
++++ b/hermes_cli/fact_board_inputs.py
+@@ -35,7 +35,7 @@
+ from hermes_cli.fact_contract import Fact, FactKey, evolve, freeze
+ from hermes_cli.fact_store import view_key
+ from hermes_cli.fact_source_watch import NativeSourceWatch
+-from hermes_cli.fact_capture_queue import submit
++from hermes_cli.fact_capture_queue import DEFAULT_LANE, submit
+ 
+ 
+ @dataclass(frozen=True)
+@@ -59,7 +59,7 @@
+ class BoardInputSource:
+     """One bounded round-robin evidence source per authenticated board scope."""
+     def __init__(self, engine, source, capture, *, paths=(), max_selectors=128, refresh_seconds=30, valid_seconds=60,
+-                 min_gap_seconds=5, max_capture_seconds=30):
++                 min_gap_seconds=5, max_capture_seconds=30, capture_lane=DEFAULT_LANE):
+         if source.scope != engine.scope or source.kind != 'board.input':
+             raise ValueError('invalid board input source')
+         if (max_selectors <= 0 or not 0 < refresh_seconds < valid_seconds or not 0 <= min_gap_seconds < refresh_seconds
+@@ -68,6 +68,7 @@
+         self.engine, self.source, self._capture = engine, source, capture
+         self.key = FactKey(source.scope, 'BoardInput', '')  # one operational input namespace per scope
+         self._maximum, self._refresh, self._valid = max_selectors, refresh_seconds, valid_seconds
++        self._lane = capture_lane  # fact_capture_queue lane: the tree captures on its own worker, not the boards'
+         self._capture_seconds = max_capture_seconds  # replaces the owner budget's max_seconds; max_bytes still applies
+         self._gap, self._last_start = min_gap_seconds, {}  # key -> monotonic start of its last capture
+         self._began = None  # monotonic start of the running capture; its deadline (self._deadline) runs from here
+@@ -139,11 +140,12 @@
+                         self._last_start[pending] + self._gap for pending in self._pending))
+                 self._active, self._last_start[key], self._began, self._deadline = key, now, None, None
+                 view, selector = self._wanted[key]
+-                self._worker = submit(lambda: self._context.run(self._build, key, view, selector, budget))
++                self._worker = submit(lambda: self._context.run(self._build, key, view, selector, budget),
++                                      lane=self._lane)
+             if self._deadline is not None and time.monotonic() >= self._deadline:
+                 self._deadline = None
+                 return BoardCapture(key=self._active, after=cursor, failed=True, observed_at=time.time())
+-            if self._began is None:  # queued behind other boards on the shared worker: its budget has not started
++            if self._began is None:  # queued behind other jobs in this source's capture lane: no budget spent yet
+                 return BoardCapture(after=cursor, next_deadline=time.monotonic() + 1)
+             return BoardCapture(after=cursor, next_deadline=self._deadline)
+ 
+diff --git a/hermes_cli/fact_capture_queue.py b/hermes_cli/fact_capture_queue.py
+index 6941bd966d3..0dac557836e 100644
+--- a/hermes_cli/fact_capture_queue.py
++++ b/hermes_cli/fact_capture_queue.py
+@@ -1,10 +1,19 @@
+-"""One bounded board-capture worker, with independently drainable jobs. [daveey]"""
++"""Bounded capture workers, one per lane, with independently drainable jobs. [daveey]
++
++Every board's and the project tree's native input captures used to queue on the one ``fact-board-capture`` worker.
++Representative observation: project-tree selectors walked profiles behind board-view captures. A capture cycle
++could exceed even extended input validity, making the projects tree answer 503
++``dependency_unavailable``. A lane is a separate worker: the default lane keeps the board captures serialized as
++before, and the tree has its own (``fact_tree_startup``), so neither waits behind the other. Captures inside one lane
++stay serialized; a lane's worker exits when its queue is empty and restarts on the next submission.
++"""
+ from collections import deque
+ import threading
+ 
++DEFAULT_LANE = 'board'
+ _lock = threading.Lock()
+-_pending = deque()
+-_worker = None
++_pending: dict[str, deque] = {}
++_workers: dict[str, threading.Thread] = {}
+ 
+ 
+ class CaptureJob:
+@@ -26,36 +35,55 @@
+         self.done.wait(timeout)
+ 
+ 
+-def submit(callback):
+-    global _worker
++def submit(callback, lane=DEFAULT_LANE):
+     job = CaptureJob(callback)
+     with _lock:
+-        _pending.append(job)
+-        if _worker is None:
+-            # health: allow HX012 -- each queued callback enters its own saved scope, never the first caller's context
+-            _worker = threading.Thread(target=_run, name='fact-board-capture', daemon=True)
++        pending = _pending.setdefault(lane, deque())
++        pending.append(job)
++        if lane not in _workers:
+             try:
+-                _worker.start()
++                _start(lane)
+             except BaseException:
+-                _worker = None
+-                _pending.remove(job)
++                pending.remove(job)
+                 raise
+     return job
+ 
+ 
+-def _run():
+-    global _worker
+-    while True:
++def _start(lane):
++    """Start ``lane``'s worker (caller holds ``_lock``); on failure nothing stays registered."""
++    # health: allow HX012 -- each queued callback enters its own saved scope, never the first caller's context
++    worker = threading.Thread(target=_run, args=(lane,), name=f'fact-{lane}-capture', daemon=True)
++    _workers[lane] = worker
++    try:
++        worker.start()
++    except BaseException:
++        del _workers[lane]
++        raise
++
++
++def _run(lane):
++    try:
++        while True:
++            with _lock:
++                pending = _pending.get(lane)
++                if not pending:
++                    _workers.pop(lane, None)
++                    return
++                job = pending.popleft()
++                if job.cancelled:
++                    continue
++                job.started = True
++            try:
++                job.callback()
++            finally:
++                job.callback = None
++                job.done.set()
++    except BaseException:
++        # A callback that escapes with a non-Exception (SystemExit, KeyboardInterrupt) ends this worker: release
++        # the lane so the next submission starts a fresh one, instead of leaving it registered and dead forever.
+         with _lock:
+-            if not _pending:
+-                _worker = None
+-                return
+-            job = _pending.popleft()
+-            if job.cancelled:
+-                continue
+-            job.started = True
+-        try:
+-            job.callback()
+-        finally:
+-            job.callback = None
+-            job.done.set()
++            if _workers.get(lane) is threading.current_thread():
++                del _workers[lane]
++                if _pending.get(lane):  # jobs queued behind the failed one still get a worker
++                    _start(lane)
++        raise
+diff --git a/hermes_cli/fact_tree_startup.py b/hermes_cli/fact_tree_startup.py
+index 30eeb6a88c1..04e6d828e8b 100644
+--- a/hermes_cli/fact_tree_startup.py
++++ b/hermes_cli/fact_tree_startup.py
+@@ -41,6 +41,9 @@
+ # single capture may take up to TREE_CAPTURE_SECONDS. A failed capture still marks its input stale at once.
+ TREE_INPUT_VALID_SECONDS = 300
+ TREE_CAPTURE_SECONDS = 60
++# With the 300 s validity live, the tree still 503'd in the loaded backend (169 Desktop errors in 12 min, 23:02-23:22
++# UTC) because its captures queued behind the board views' on the one shared worker: it gets its own capture lane.
++TREE_CAPTURE_LANE = 'tree'
+ 
+ 
+ class TreeRuntime:
+@@ -64,7 +67,8 @@
+         paths = [path for _name, home in self.targets for path in (home, home / 'state.db', home / 'projects.db')]
+         self.owner = ViewOwner(self.scope, partial(fact_tree_inputs.capture, self.targets, self.source_id),
+             fact_tree_inputs.project, ('tree', 'project_sessions'), paths=paths, bindings=bindings, consumer='projects',
+-            input_options={'valid_seconds': TREE_INPUT_VALID_SECONDS, 'max_capture_seconds': TREE_CAPTURE_SECONDS})
++            input_options={'valid_seconds': TREE_INPUT_VALID_SECONDS, 'max_capture_seconds': TREE_CAPTURE_SECONDS,
++                           'capture_lane': TREE_CAPTURE_LANE})
+ 
+     def start(self):
+         self.handle = self.owner.start()
+diff --git a/tests/hermes_cli/test_fact_capture_lanes.py b/tests/hermes_cli/test_fact_capture_lanes.py
+new file mode 100644
+index 00000000000..1bfa8563c57
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_capture_lanes.py
+@@ -0,0 +1,98 @@
++"""A capture lane is its own worker: the project tree never waits behind the board views (fact_capture_queue). [daveey]
++
++Representative observation: tree captures queued behind board views on
++one shared worker. Even extended input validity expired before
++recapture, making GET /api/profiles/projects/tree return 503 dependency_unavailable repeatedly.
++"""
++import threading
++import time
++
++from hermes_cli.fact_board_inputs import BoardInputSource, CapturedInput
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_capture_queue import submit
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++from hermes_cli.fact_tree_startup import TreeRuntime
++
++
++def test_a_blocked_board_lane_does_not_hold_up_the_tree_lane():
++    release, ran = threading.Event(), threading.Event()
++    names = []
++    board = submit(lambda: release.wait(5))  # a slow board capture holds the board lane
++    try:
++        tree = submit(lambda: (names.append(threading.current_thread().name), ran.set()), lane='tree')
++        assert ran.wait(5), 'tree capture waited behind the board lane'
++        tree.join(5)
++        assert names == ['fact-tree-capture']
++        assert board.is_alive()
++    finally:
++        release.set()
++        board.join(5)
++
++
++def test_captures_in_one_lane_stay_serialized():
++    release, ran = threading.Event(), threading.Event()
++    order = []
++    first = submit(lambda: (order.append('first'), release.wait(5)), lane='tree')
++    second = submit(lambda: (order.append('second'), ran.set()), lane='tree')
++    try:
++        assert not second.done.wait(0.2)  # health: allow HX013 -- the lane must NOT run it while first holds it
++        assert order == ['first']
++    finally:
++        release.set()
++    assert ran.wait(5)  # join() cancels a job that has not started yet: wait for it to run first
++    first.join(5)
++    second.join(5)
++    assert order == ['first', 'second']
++
++
++def test_a_lane_whose_worker_died_runs_the_next_capture(monkeypatch):
++    """A callback escaping with a non-Exception ends its worker; the lane must not stay registered and dead."""
++    monkeypatch.setattr(threading, 'excepthook', lambda args: None)  # the dying worker's SystemExit is expected
++    dying = submit(lambda: (_ for _ in ()).throw(SystemExit('stop')), lane='tree')
++    assert dying.done.wait(5)
++    ran = threading.Event()
++    after = submit(ran.set, lane='tree')
++    assert ran.wait(5), 'the lane stayed registered to a dead worker'
++    after.join(5)
++
++
++def test_the_board_lane_keeps_its_worker_name():
++    names, ran = [], threading.Event()
++    job = submit(lambda: (names.append(threading.current_thread().name), ran.set()))
++    assert ran.wait(5)  # join() cancels a job that has not started yet: wait for it to run first
++    job.join(5)
++    assert names == ['fact-board-capture']
++
++
++def test_a_tree_input_source_captures_on_the_tree_lane_while_the_board_lane_is_busy():
++    release = threading.Event()
++    board = submit(lambda: release.wait(10))
++    scope = Scope('installation', 'default', 'tree')
++    engine = ReducerEngine(FactStore(), scope)
++    names, woke = [], threading.Event()
++
++    def capture(view, selector, budget):
++        names.append(threading.current_thread().name)
++        return CapturedInput({'rows': []}, (), time.time())
++
++    source = BoardInputSource(engine, SourceId(scope, 'board.input', 'native'), capture, capture_lane='tree')
++    source.watch(woke.set)
++    try:
++        source.want('tree', {'n': 1})
++        woke.clear()
++        source.capture(None, CaptureBudget(max_seconds=5))
++        assert woke.wait(5), 'tree input capture waited behind the board lane'
++        assert names == ['fact-tree-capture']
++    finally:
++        release.set()
++        board.join(5)
++        source.close()
++
++
++def test_the_tree_runtime_uses_its_own_lane_and_the_board_the_default():
++    from hermes_cli.fact_view_owner import ViewOwner
++    assert TreeRuntime(targets=()).owner.source._lane == 'tree'
++    board = ViewOwner(Scope('installation', 'default', 'board'), lambda *a: None, lambda *a: None, ('board',))
++    assert board.source._lane == 'board'
+-- 
+2.43.0
+

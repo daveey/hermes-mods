@@ -1,0 +1,876 @@
+From 8115da02b4e6e0b166d43a76afc9787bccb96948 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:55:50 +0000
+Subject: [PATCH 6052] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit 8115da02b4e6e0b166d43a76afc9787bccb96948.
+
+---
+diff --git a/hermes_cli/serve_producer_process.py b/hermes_cli/serve_producer_process.py
+new file mode 100644
+index 00000000000..72a7b2137e9
+--- /dev/null
++++ b/hermes_cli/serve_producer_process.py
+@@ -0,0 +1,215 @@
++"""Exec-only fixture broker/producer. Not a supported production launcher yet."""
++from __future__ import annotations
++
++import array
++import hashlib
++import hmac
++import importlib.util
++import json
++import os
++from pathlib import Path
++import select
++import socket
++import sqlite3
++import sys
++import threading
++import uuid
++
++
++def authorized(request, config):
++    token = request.get('capability')
++    return (isinstance(token, str) and token.isascii() and hmac.compare_digest(token, config['capability'])
++            and request.get('generation') == config['generation'])
++
++
++def load_provider(config):
++    from hermes_cli.serve_producer_protocol import ProtocolError
++
++    spec = config['provider']
++    path = Path(spec['path'])
++    source = path.read_bytes()
++    if len(source) > 1024 * 1024 or hashlib.sha256(source).hexdigest() != spec['sha256']:
++        raise ProtocolError('provider bytes changed')
++    name = '_hermes_scoped_producer_v1'
++    module_spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(module_spec)
++    sys.modules[name] = module
++    # Execute the bytes just authenticated, not a second path read or stale pyc.
++    exec(compile(source, str(path), 'exec'), module.__dict__)
++    return module
++
++
++def producer(channel, config):
++    from hermes_cli.serve_producer_protocol import ProtocolError, ResourceExhausted, encode_request
++
++    module = load_provider(config)
++    target = module.open_provider(config) if hasattr(module, 'open_provider') else module.produce
++    db_path = Path(config['runtime']) / 'projection.sqlite3'
++    fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
++    os.close(fd)
++    db = sqlite3.connect(db_path)
++    db.execute('PRAGMA journal_mode=WAL')
++    db.execute('PRAGMA max_page_count=4096')
++    db.execute('PRAGMA journal_size_limit=1048576')
++    db.execute('CREATE TABLE IF NOT EXISTS projection (id INTEGER PRIMARY KEY CHECK(id=1), generation TEXT, wire BLOB)')
++    channel.send({'verb': 'READY', 'pid': os.getpid()}, 'ready')
++    try:
++        while True:
++            request = channel.receive()
++            if request.get('verb') == 'STOP':
++                return
++            if not authorized(request, config):
++                raise ProtocolError('producer authorization failed')
++            key = request['key']
++            try:
++                result = target(request['payload'])
++                wire = result if isinstance(result, bytes) else json.dumps(result, ensure_ascii=True, separators=(',', ':')).encode()
++                if len(wire) > 512 * 1024:
++                    raise ResourceExhausted('projection size')
++                wal = Path(str(db_path) + '-wal')
++                if wal.exists() and wal.stat().st_size > 32 * 1024 * 1024:
++                    raise ResourceExhausted('pinned projection WAL')
++                response = {'verb': 'PUBLISHED', 'key': key, 'generation': config['generation'],
++                            'wire': wire.decode('utf-8')}
++                frames = encode_request(uuid.uuid4().hex, response)
++                with db:
++                    db.execute('INSERT OR REPLACE INTO projection VALUES (1,?,?)', (config['generation'], wire))
++                db.execute('PRAGMA wal_checkpoint(PASSIVE)')
++            except (ValueError, RuntimeError, sqlite3.Error) as exc:
++                response = {'verb': 'UNAVAILABLE', 'key': key, 'generation': config['generation'],
++                            'error': type(exc).__name__}
++                frames = encode_request(uuid.uuid4().hex, response)
++            for frame in frames:
++                channel.sock.sendall(frame)
++    except (EOFError, BrokenPipeError, ConnectionResetError):
++        return
++    finally:
++        db.close()
++        closer = getattr(target, 'close', None)
++        if closer is not None:
++            closer()
++
++
++def receive_control(channel):
++    from hermes_cli.serve_producer_protocol import ProtocolError
++    from hermes_cli.serve_producer_runtime import Channel
++
++    message, ancillary, flags, _ = channel.sock.recvmsg(1, socket.CMSG_SPACE(array.array('i').itemsize))
++    if message != b'C' or flags & socket.MSG_CTRUNC or len(ancillary) != 1:
++        raise ProtocolError('missing inherited control channel')
++    level, kind, data = ancillary[0]
++    if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
++        raise ProtocolError('invalid inherited control channel')
++    fds = array.array('i')
++    fds.frombytes(data)
++    if len(fds) != 1:
++        for fd in fds:
++            os.close(fd)
++        raise ProtocolError('control descriptor count')
++    return Channel(socket.socket(fileno=fds[0]))
++
++
++def broker(channel, config):
++    from hermes_cli.serve_producer_custody import FamilyCustody
++    from hermes_cli.serve_producer_protocol import ProtocolError
++    from hermes_cli.serve_producer_runtime import spawn
++
++    owner = FamilyCustody.acquire(Path(config['runtime']), 'panel')
++    child, data = spawn('producer', config, custody_fd=owner.fd)
++    try:
++        hello = data.receive()
++        channel.send({'verb': 'READY'}, 'ready')
++        control = receive_control(channel)
++    except (OSError, EOFError, ValueError):
++        data.close()
++        child.wait()
++        owner.close()
++        return
++    stop = threading.Event()
++    data_error = []
++
++    def forward():
++        nonlocal child, data, hello
++        try:
++            while not stop.is_set():
++                request = channel.receive()
++                if not authorized(request, config) or request.get('verb') != 'PRODUCE':
++                    raise ProtocolError('broker authorization failed')
++                for attempt in range(3):
++                    try:
++                        data.send(request, uuid.uuid4().hex)
++                        response = data.receive()
++                        break
++                    except (EOFError, BrokenPipeError, ConnectionResetError):
++                        # EOF is not death: actual waitpid must confirm exit
++                        # before another child can inherit producer custody.
++                        child.wait()
++                        data.close()
++                        if attempt == 2 or stop.wait(1 << attempt):
++                            raise EOFError('producer restart budget')
++                        child, data = spawn('producer', config, custody_fd=owner.fd)
++                        hello = data.receive()
++                        if stop.is_set():
++                            raise EOFError('broker draining')
++                channel.send(response, uuid.uuid4().hex)
++        except (EOFError, OSError, ValueError) as exc:
++            data_error.append(type(exc).__name__)
++            stop.set()
++        finally:
++            data.sock.shutdown(socket.SHUT_RDWR)
++            data.close()
++            child.wait()
++
++    worker = threading.Thread(target=forward, name='producer-forward', daemon=True)
++    worker.start()
++    sequence = 0
++    try:
++        while not stop.is_set():
++            if not select.select([control.sock], [], [], 0.1)[0]:
++                continue
++            request = control.receive()
++            sequence += 1
++            if not authorized(request, config):
++                control.send({'verb': 'REFUSED'}, str(sequence))
++            elif request.get('verb') == 'STOP':
++                break
++            elif request.get('verb') == 'PING':
++                control.send({'verb': 'PONG', 'child_pid': hello['pid'],
++                              'child_exited': child.poll() is not None}, str(sequence))
++            else:
++                control.send({'verb': 'REFUSED'}, str(sequence))
++    except (EOFError, OSError):
++        pass
++    finally:
++        stop.set()
++        # EOF requests child shutdown when it finishes its current call. An
++        # unresponsive child keeps the inherited family fence, even if we exit.
++        data.sock.shutdown(socket.SHUT_RDWR)
++        channel.sock.shutdown(socket.SHUT_RDWR)
++        channel.close()
++        control.close()
++        worker.join()  # deliberately no timeout-triggered kill or custody release
++        owner.close()
++
++
++def main():
++    from hermes_cli.serve_producer_protocol import ProtocolError
++    from hermes_cli.serve_producer_runtime import Channel
++
++    role, descriptor = sys.argv[1:3]
++    channel = Channel(socket.socket(fileno=int(descriptor)))
++    config = channel.receive()
++    if role == 'broker':
++        broker(channel, config)
++    elif role == 'producer':
++        producer(channel, config)
++    else:
++        raise ProtocolError('unknown fixture role')
++
++
++if __name__ == '__main__':
++    root = sys.argv[3] if len(sys.argv) > 3 else ''
++    if not os.path.isdir(os.path.join(root, 'hermes_cli')):
++        raise SystemExit('producer root missing')
++    sys.path.insert(0, root)
++    main()
+diff --git a/hermes_cli/serve_producer_runtime.py b/hermes_cli/serve_producer_runtime.py
+new file mode 100644
+index 00000000000..717666e25d7
+--- /dev/null
++++ b/hermes_cli/serve_producer_runtime.py
+@@ -0,0 +1,269 @@
++"""Dormant walking skeleton for exec producers, with an in-memory HTTP relay.
++
++No production launch entrypoint exists here. Fixture startup is deliberately
++separate from future strict COMPLETE admission. One client and one family are
++exercised before shared broker enrollment and the public provider API are added.
++"""
++from __future__ import annotations
++
++import hashlib
++import copy
++import array
++import json
++import os
++import secrets
++import socket
++import subprocess
++import sys
++import threading
++import time
++from collections import OrderedDict
++from pathlib import Path
++
++from hermes_cli.serve_producer_protocol import (
++    FrameDecoder, ProtocolError, RequestAssembly, ResourceExhausted, encode_request,
++)
++
++MAX_KEYS = 256
++MAX_BYTES = 1024 * 1024
++
++
++def projection_response(relay, body):
++    """Shared prepared-wire adapter; no source capture or IPC on HTTP threads."""
++    from starlette.responses import Response
++
++    try:
++        key = relay.submit({'body': body, 'accepted': time.monotonic()})
++        wire = relay.read(key)
++    except ResourceExhausted:
++        wire = None
++    if wire is None:
++        return Response(b'{"detail":"Producer projection unavailable"}', status_code=503,
++                        media_type='application/json', headers={'Retry-After': '1'})
++    return Response(wire, media_type='application/json')
++
++
++class Channel:
++    """Private inherited Unix stream: bounded messages, never pickle."""
++
++    def __init__(self, sock):
++        self.sock = sock
++        self.decoder = FrameDecoder()
++        self.assembly = RequestAssembly()
++        self.ready = []
++
++    def send(self, value, request_id='message'):
++        for frame in encode_request(request_id, value):
++            self.sock.sendall(frame)
++
++    def receive(self):
++        while not self.ready:
++            data = self.sock.recv(65536)  # also bounds allocations per decoder call
++            if not data:
++                raise EOFError('producer channel closed')
++            for frame in self.decoder.feed(data):
++                item = self.assembly.accept(frame)
++                if item is not None:
++                    self.ready.append(item[1])
++        return self.ready.pop(0)
++
++    def close(self):
++        self.sock.close()
++
++
++def spawn(role, config, *, custody_fd=None):
++    """Fixture exec path; no generic Hermes/plugin/model bootstrap in a child."""
++    from hermes_cli._startup_fast import project_root_str
++    from tools.environments.local import build_subprocess_env
++
++    parent, child = socket.socketpair()
++    script = Path(__file__).with_name('serve_producer_process.py')
++    inherited = (child.fileno(),) + (() if custody_fd is None else (custody_fd,))
++    command = [sys.executable, '-I', str(script), role, str(child.fileno()), project_root_str()]
++    if custody_fd is not None:
++        command.append(str(custody_fd))
++    try:
++        process = subprocess.Popen(command, pass_fds=inherited,
++            env=build_subprocess_env(extra={'HERMES_HOME': config['home']}),
++            stdin=subprocess.DEVNULL)
++    except BaseException:
++        parent.close()
++        raise
++    finally:
++        child.close()
++    channel = Channel(parent)
++    channel.send(config, 'init')  # capability only travels over the inherited private FD
++    return process, channel
++
++
++class ProjectionRelay:
++    """HTTP calls only bounded memory operations; all IPC uses the relay thread.
++
++    The fixture has one in-flight producer operation, plus an atomic 256-key /
++    1MiB mailbox. An ACK is visible only after a child publication was received.
++    Generation changes revoke all cached bytes and pending work locally.
++    """
++
++    def __init__(self, provider, *, home, runtime, generation):
++        self.config = {'provider': provider, 'home': str(home), 'runtime': str(runtime),
++                       'generation': generation, 'capability': secrets.token_hex(32)}
++        self._lock = threading.Lock()
++        self._pending = OrderedDict()
++        self._outputs = OrderedDict()
++        self._bytes = 0
++        self._wake = threading.Event()
++        self._stop = threading.Event()
++        self._thread = None
++        self._process = None
++        self._channel = None
++        self._control = None
++        self._control_lock = threading.Lock()
++        self._sequence = 0
++        self.error = None
++
++    @property
++    def broker_pid(self):
++        return self._process.pid if self._process else None
++
++    @property
++    def pending_count(self):
++        with self._lock:
++            return len(self._pending)
++
++    def start_for_fixture(self, *, ready_timeout=10):
++        # Until launch enrollment is wired there is NO production activation API.
++        if 'PYTEST_CURRENT_TEST' not in os.environ:
++            raise RuntimeError('strict production admission not integrated')
++        if self._process is not None:
++            raise RuntimeError('relay already started')
++        self._process, self._channel = spawn('broker', self.config)
++        self._channel.sock.settimeout(ready_timeout)
++        try:
++            hello = self._channel.receive()
++        except (OSError, EOFError, ValueError):
++            self._channel.close()
++            raise
++        if hello.get('verb') != 'READY':
++            raise ProtocolError('broker did not start')
++        self._channel.sock.settimeout(None)
++        # A second private socket is inherited via SCM_RIGHTS, not a public listener.
++        control, broker_control = socket.socketpair()
++        self._channel.sock.sendmsg([b'C'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
++                                           array.array('i', [broker_control.fileno()]))])
++        broker_control.close()
++        self._control = Channel(control)
++        self._thread = threading.Thread(target=self._run, name='producer-projection-relay', daemon=True)
++        self._thread.start()
++
++    def submit(self, payload):
++        identity = payload.get('body', payload)
++        key = hashlib.sha256(b''.join(encode_request('budget', identity))).hexdigest()
++        encoded = b''.join(encode_request('x' * 32, self._envelope('PRODUCE', key=key, payload=payload)))
++        payload = copy.deepcopy(payload)  # bounded/JSON-validated before retention
++        size = len(encoded)
++        with self._lock:
++            if self._stop.is_set():
++                raise ResourceExhausted('relay draining')
++            if key not in self._pending:
++                if len(self._pending) >= MAX_KEYS or self._bytes + size > MAX_BYTES:
++                    raise ResourceExhausted('relay mailbox full')
++                self._pending[key] = (payload, size)
++                self._bytes += size
++        self._wake.set()
++        return key
++
++    def read(self, key):
++        with self._lock:
++            if self._stop.is_set():
++                return None
++            value = self._outputs.get(key)
++            return value[0] if value and value[1] > time.monotonic() else None
++
++    def acknowledged(self, key):
++        with self._lock:
++            return not self._stop.is_set() and key in self._outputs and key not in self._pending
++
++    def _envelope(self, verb, **extra):
++        return dict(capability=self.config['capability'], generation=self.config['generation'], verb=verb, **extra)
++
++    def _run(self):
++        try:
++            while not self._stop.is_set():
++                self._wake.wait()
++                self._wake.clear()
++                while not self._stop.is_set():
++                    with self._lock:
++                        item = next(iter(self._pending.items()), None)
++                    if item is None:
++                        break
++                    key, (payload, size) = item
++                    self._sequence += 1
++                    self._channel.send(self._envelope('PRODUCE', key=key, payload=payload), str(self._sequence))
++                    result = self._channel.receive()
++                    if result.get('key') != key or result.get('generation') != self.config['generation']:
++                        raise ProtocolError('projection generation mismatch')
++                    with self._lock:
++                        if self._stop.is_set():
++                            return
++                        self._pending.pop(key)
++                        self._bytes -= size
++                        if result.get('verb') == 'PUBLISHED':
++                            wire = result['wire'].encode('utf-8')
++                            self._outputs[key] = (wire, time.monotonic() + 5)
++                            while len(self._outputs) > MAX_KEYS or sum(len(v[0]) for v in self._outputs.values()) > MAX_BYTES:
++                                self._outputs.popitem(last=False)
++                        else:
++                            self.error = result.get('error', 'producer unavailable')
++        except (OSError, EOFError, ValueError) as exc:
++            self.error = type(exc).__name__
++            self._stop.set()
++            with self._lock:
++                self._pending.clear()
++                self._outputs.clear()
++                self._bytes = 0
++
++    def ping(self, *, timeout=5, capability=None, generation=None):
++        with self._control_lock:
++            if self._control is None:
++                raise RuntimeError('control channel unavailable')
++            self._control.sock.settimeout(timeout)
++            request = self._envelope('PING')
++            if capability is not None:
++                request['capability'] = capability
++            if generation is not None:
++                request['generation'] = generation
++            try:
++                self._control.send(request, secrets.token_hex(8))
++                return self._control.receive()
++            except (OSError, EOFError, ValueError):
++                self._control.close()
++                self._control = None
++                raise
++
++    def close(self, *, timeout: float = 10):
++        self._stop.set()
++        self._wake.set()
++        with self._lock:
++            self._outputs.clear()
++        if self._control is not None:
++            with self._control_lock:
++                self._control.send(self._envelope('STOP'), secrets.token_hex(8))
++                self._control.close()
++                self._control = None
++        elif self._channel is not None:
++            self._channel.close()
++        if self._process is not None:
++            try:
++                self._process.wait(timeout=timeout)
++            except subprocess.TimeoutExpired:
++                return False  # actual producer retains custody; never terminate or steal
++        if self._channel is not None:
++            self._channel.close()
++        if self._thread is not None:
++            self._thread.join(timeout)
++            if self._thread.is_alive():
++                return False
++        return True
++
++    def is_alive(self):
++        return self._process is not None and self._process.poll() is None
+diff --git a/hermes_cli/worker_drain_spawn_inventory.json b/hermes_cli/worker_drain_spawn_inventory.json
+index 1eeb8f0ac25..756dd173e30 100644
+--- a/hermes_cli/worker_drain_spawn_inventory.json
++++ b/hermes_cli/worker_drain_spawn_inventory.json
+@@ -220,6 +220,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "hermes_cli/serve_producer_runtime.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
+   "hermes_cli/_subprocess_compat.py": {
+    "direct": 3,
+    "routed": 0,
+diff --git a/tests/hermes_cli/test_serve_producer_runtime.py b/tests/hermes_cli/test_serve_producer_runtime.py
+new file mode 100644
+index 00000000000..a181ca901f4
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_runtime.py
+@@ -0,0 +1,220 @@
++"""Dormant exec slice: request callers never execute provider code."""
++import hashlib
++import json
++import time
++
++import pytest
++
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('posix')
++def test_exec_projection_and_control_stay_off_the_request_thread(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    provider = tmp_path / 'provider.py'
++    provider.write_text('import os\n'
++                        'def produce(payload):\n'
++                        '    return {"pid": os.getpid(), "value": payload["value"]}\n', encoding='utf-8')
++    spec = {'path': str(provider), 'sha256': hashlib.sha256(provider.read_bytes()).hexdigest()}
++    relay = ProjectionRelay(spec, home=tmp_path, runtime=tmp_path / 'runtime', generation='g1')
++    try:
++        relay.start_for_fixture()
++        key = relay.submit({'value': 'one'})
++        wait_until(lambda: relay.read(key) is not None, timeout=15)
++        result = json.loads(relay.read(key))
++        assert result['value'] == 'one'
++        assert result['pid'] not in (relay.broker_pid, __import__('os').getpid())
++        assert relay.ping(timeout=5)['child_pid'] == result['pid']
++        assert relay.acknowledged(key)
++    finally:
++        relay.close(timeout=10)
++    assert not relay.is_alive()
++
++
++def test_submit_overload_is_atomic_without_starting_any_process(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++    from hermes_cli.serve_producer_protocol import ResourceExhausted
++
++    relay = ProjectionRelay({}, home=tmp_path, runtime=tmp_path / 'runtime', generation='g')
++    with pytest.raises(ResourceExhausted):
++        relay.submit({'value': 'x' * (2 * 1024 * 1024)})
++    assert relay.pending_count == 0
++    assert relay.broker_pid is None
++
++
++@pytest.mark.platforms('posix')
++def test_wrong_capability_and_generation_are_refused(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    path = tmp_path / 'auth.py'
++    path.write_text('def produce(payload):\n    return payload\n', encoding='utf-8')
++    relay = ProjectionRelay({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
++                            home=tmp_path, runtime=tmp_path / 'runtime', generation='g1')
++    try:
++        relay.start_for_fixture()
++        assert relay.ping(capability='wrong')['verb'] == 'REFUSED'
++        assert relay.ping(capability='☃')['verb'] == 'REFUSED'
++        assert relay.ping(generation='old')['verb'] == 'REFUSED'
++        assert relay.ping()['verb'] == 'PONG'
++    finally:
++        assert relay.close()
++
++
++@pytest.mark.platforms('posix')
++def test_blocked_child_keeps_off_custody_but_does_not_block_http_or_control(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay, projection_response
++    from hermes_cli.serve_producer_custody import FamilyCustody, CustodyConflict
++
++    gate = tmp_path / 'unblock'
++    started = tmp_path / 'started'
++    path = tmp_path / 'blocked.py'
++    path.write_text('from pathlib import Path\nimport select\n'
++                    'def produce(payload):\n'
++                    '    Path(payload["started"]).touch()\n'
++                    '    while not Path(payload["gate"]).exists():\n'
++                    '        select.select([], [], [], 0.02)\n'
++                    '    return payload\n', encoding='utf-8')
++    runtime = tmp_path / 'runtime'
++    relay = ProjectionRelay({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
++                            home=tmp_path, runtime=runtime, generation='g1')
++    relay.start_for_fixture()
++    try:
++        relay.submit({'gate': str(gate), 'started': str(started)})
++        wait_until(started.exists, timeout=10)
++        # Actual blocked producer, not a mocked thread or an idle child.
++        assert relay.ping(timeout=2)['verb'] == 'PONG'
++        response = projection_response(relay, {'sessions': ['new-chat']})
++        assert response.status_code == 503
++        assert relay.close(timeout=0.05) is False
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire(runtime, 'panel')
++    finally:
++        gate.touch()
++        assert relay.close(timeout=10)
++    successor = FamilyCustody.acquire(runtime, 'panel')
++    successor.close()
++
++
++@pytest.mark.platforms('posix')
++def test_actual_crash_restarts_child_before_acknowledging(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    path = tmp_path / 'crash.py'
++    path.write_text('from pathlib import Path\nimport os\n'
++                    'def produce(payload):\n'
++                    '    marker = Path(payload["marker"])\n'
++                    '    if not marker.exists():\n'
++                    '        marker.touch()\n'
++                    '        os._exit(7)\n'
++                    '    return {"pid":os.getpid()}\n', encoding='utf-8')
++    relay = ProjectionRelay({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
++                            home=tmp_path, runtime=tmp_path / 'runtime', generation='g1')
++    try:
++        relay.start_for_fixture()
++        old = relay.ping()['child_pid']
++        key = relay.submit({'marker': str(tmp_path / 'crashed')})
++        wait_until(lambda: relay.acknowledged(key), timeout=15)
++        assert json.loads(relay.read(key))['pid'] != old
++        assert relay.ping()['child_pid'] != old
++    finally:
++        assert relay.close()
++
++
++def test_mailbox_has_hard_count_bound_and_no_partial_overload(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++    from hermes_cli.serve_producer_protocol import ResourceExhausted
++
++    relay = ProjectionRelay({}, home=tmp_path, runtime=tmp_path / 'runtime', generation='g')
++    for value in range(256):
++        relay.submit({'value': value})
++    with pytest.raises(ResourceExhausted):
++        relay.submit({'value': 'overflow'})
++    assert relay.pending_count == 256
++    relay.submit({'value': 0})
++    assert relay.pending_count == 256
++
++
++def test_production_start_is_unavailable_without_real_admission(tmp_path, monkeypatch):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    monkeypatch.delenv('PYTEST_CURRENT_TEST')
++    relay = ProjectionRelay({}, home=tmp_path, runtime=tmp_path / 'runtime', generation='g')
++    with pytest.raises(RuntimeError, match='admission not integrated'):
++        relay.start_for_fixture()
++    assert relay.broker_pid is None
++
++
++@pytest.mark.platforms('posix')
++def test_off_in_process_custody_blocks_isolated_start_until_drain(tmp_path):
++    from hermes_cli.serve_producer_custody import CustodyConflict, FamilyCustody
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    runtime = tmp_path / 'runtime'
++    path = tmp_path / 'off.py'
++    path.write_text('def produce(payload):\n    return payload\n', encoding='utf-8')
++    holder = FamilyCustody.acquire(runtime, 'panel')
++    relay = ProjectionRelay({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
++                            home=tmp_path, runtime=runtime, generation='g1')
++    try:
++        with pytest.raises((TimeoutError, EOFError, OSError, ValueError)):
++            relay.start_for_fixture(ready_timeout=1)
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire(runtime, 'panel')
++    finally:
++        relay.close(timeout=10)
++        holder.close()
++    successor = FamilyCustody.acquire(runtime, 'panel')
++    successor.close()
++    isolated = ProjectionRelay({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
++                               home=tmp_path, runtime=runtime, generation='g1')
++    try:
++        isolated.start_for_fixture()
++        assert isolated.ping()['verb'] == 'PONG'
++        with pytest.raises(CustodyConflict):
++            FamilyCustody.acquire(runtime, 'panel')
++    finally:
++        assert isolated.close(timeout=10)
++    released = FamilyCustody.acquire(runtime, 'panel')
++    released.close()
++
++
++@pytest.mark.platforms('posix')
++def test_http_acceptance_deadlines_are_not_extended_by_child_delay(tmp_path):
++    from hermes_cli.serve_producer_runtime import ProjectionRelay
++
++    started = tmp_path / 'started'
++    gate = tmp_path / 'gate'
++    path = tmp_path / 'deadlines.py'
++    path.write_text(
++        'import time\nfrom pathlib import Path\nimport select\n'
++        'def produce(payload):\n'
++        '    Path(payload["started"]).touch()\n'
++        '    while not Path(payload["gate"]).exists():\n'
++        '        select.select([], [], [], 0.02)\n'
++        '    now = time.monotonic()\n'
++        '    accepted = payload["accepted"]\n'
++        '    if now < accepted or accepted + 900 <= now:\n'
++        '        raise RuntimeError("expired browser interest")\n'
++        '    return {"interest": accepted + 900 - now, "visibility": accepted + 75 - now}\n',
++        encoding='utf-8')
++    relay = ProjectionRelay({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
++                            home=tmp_path, runtime=tmp_path / 'runtime', generation='g1')
++    try:
++        relay.start_for_fixture()
++        accepted = time.monotonic()
++        key = relay.submit({'accepted': accepted, 'started': str(started), 'gate': str(gate)})
++        wait_until(started.exists, timeout=10)
++        delay_until = time.monotonic() + 1
++        wait_until(lambda: time.monotonic() >= delay_until, timeout=5)
++        gate.touch()
++        wait_until(lambda: relay.acknowledged(key), timeout=15)
++        result = json.loads(relay.read(key))
++        assert 0 < result['interest'] < 899.5
++        assert 0 < result['visibility'] < 74.5
++        expired = relay.submit({'accepted': accepted - 901, 'started': str(tmp_path / 'x'), 'gate': str(gate)})
++        wait_until(lambda: relay.pending_count == 0, timeout=15)
++        assert relay.read(expired) is None
++        assert relay.error == 'RuntimeError'
++    finally:
++        assert relay.close(timeout=10)
+diff --git a/tests/hermes_cli/test_serve_producer_runtime_failures.py b/tests/hermes_cli/test_serve_producer_runtime_failures.py
+new file mode 100644
+index 00000000000..723b9552a4a
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_runtime_failures.py
+@@ -0,0 +1,121 @@
++"""Failure interleavings for the dormant exec walking skeleton."""
++import hashlib
++import json
++import socket
++import threading
++
++import pytest
++
++from hermes_cli.serve_producer_protocol import ResourceExhausted, encode_request
++from hermes_cli.serve_producer_runtime import Channel, ProjectionRelay
++from tests.waiting import wait_until
++
++
++def relay_for(tmp_path, code):
++    provider = tmp_path / 'provider.py'
++    provider.write_text(code, encoding='utf-8')
++    return ProjectionRelay({'path': str(provider), 'sha256': hashlib.sha256(provider.read_bytes()).hexdigest()},
++                           home=tmp_path, runtime=tmp_path / 'runtime', generation='g')
++
++
++def test_actual_envelope_is_reserved_before_http_acceptance(tmp_path):
++    low, high = 1, 1024 * 1024
++    while low + 1 < high:
++        mid = (low + high) // 2
++        try:
++            encode_request('budget', {'value': 'x' * mid})
++            low = mid
++        except ResourceExhausted:
++            high = mid
++    relay = relay_for(tmp_path, 'def produce(p): return p\n')
++    with pytest.raises(ResourceExhausted):
++        relay.submit({'value': 'x' * low})
++    assert relay.pending_count == 0
++    relay.submit({'value': 'small'})
++    assert relay.pending_count == 1
++
++
++def test_late_publication_cannot_resurrect_output_after_drain(tmp_path):
++    relay = relay_for(tmp_path, 'def produce(p): return p\n')
++    key = relay.submit({'value': 1})
++    arrived, release = threading.Event(), threading.Event()
++
++    class Transport:
++        def send(self, *args):
++            pass
++
++        def receive(self):
++            arrived.set()
++            assert release.wait(10)
++            return {'key': key, 'generation': 'g', 'verb': 'PUBLISHED', 'wire': '{}'}
++
++        def close(self):
++            pass
++
++    relay._channel = Transport()
++    relay._thread = threading.Thread(target=relay._run)
++    relay._thread.start()
++    try:
++        assert arrived.wait(10)
++        assert relay.close(timeout=0.01) is False
++        assert relay.read(key) is None
++    finally:
++        release.set()
++        assert relay.close()
++    assert relay.read(key) is None and not relay.acknowledged(key)
++
++
++@pytest.mark.platforms('posix')
++def test_uncertain_ping_retires_channel_before_next_authorization_reply(tmp_path):
++    relay = relay_for(tmp_path, 'def produce(p): return p\n')
++    local, remote = socket.socketpair()
++    relay._control = Channel(local)
++    try:
++        with pytest.raises(TimeoutError):
++            relay.ping(timeout=0.01)
++        assert relay._control is None
++        with pytest.raises(RuntimeError, match='unavailable'):
++            relay.ping(capability='wrong')
++    finally:
++        remote.close()
++        relay.close()
++
++
++@pytest.mark.platforms('posix')
++def test_late_ready_after_start_timeout_drains_without_a_missing_control_deadlock(tmp_path):
++    from hermes_cli.serve_producer_custody import FamilyCustody
++
++    gate = tmp_path / 'release-init'
++    code = ('from pathlib import Path\nimport select\n'
++            'def open_provider(config):\n'
++            '    gate = Path(config["home"]) / "release-init"\n'
++            '    while not gate.exists(): select.select([], [], [], 0.02)\n'
++            '    return lambda payload: payload\n')
++    relay = relay_for(tmp_path, code)
++    try:
++        with pytest.raises(TimeoutError):
++            relay.start_for_fixture(ready_timeout=0.05)
++    finally:
++        gate.touch()
++        assert relay.close(timeout=15)
++    owner = FamilyCustody.acquire(tmp_path / 'runtime', 'panel')
++    owner.close()
++
++
++@pytest.mark.platforms('posix')
++def test_quote_heavy_projection_is_bounded_without_crashing_child(tmp_path):
++    relay = relay_for(tmp_path, 'import json\ndef produce(payload):\n'
++                                '    return json.dumps({"value": "\\\"" * 200000}).encode() if payload["large"] else b"{}"\n')
++    try:
++        relay.start_for_fixture()
++        child = relay.ping()['child_pid']
++        key = relay.submit({'large': True})
++        wait_until(lambda: relay.pending_count == 0, timeout=15)
++        assert relay.read(key) is None
++        assert relay.error == 'ResourceExhausted'
++        small = relay.submit({'large': False})
++        wait_until(lambda: relay.acknowledged(small), timeout=15)
++        assert relay.read(small) == b'{}'
++        assert relay.ping()['child_pid'] == child
++    finally:
++        assert relay.close()
+-- 
+2.43.0
+

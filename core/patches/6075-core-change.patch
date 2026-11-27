@@ -1,0 +1,328 @@
+From 73bca70a6e591d2554c03101433eb3d90b3782eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:06:55 -0800
+Subject: [PATCH 6075] TUI RPC method lanes, projects tree caching and GC budget
+
+Public mirror of source commit 73bca70a6e591d2554c03101433eb3d90b3782eb.
+
+---
+diff --git a/gateway/gc_budget.py b/gateway/gc_budget.py
+new file mode 100644
+index 00000000000..bdd8ed108f9
+--- /dev/null
++++ b/gateway/gc_budget.py
+@@ -0,0 +1,88 @@
++"""[daveey] Garbage-collector budget for long-lived gateway and serve processes.
++
++A full (oldest generation) collection walks every tracked object while holding the GIL, so every
++thread in the process stops for its whole length. Representative
++observation: repeated full collections on a loaded Desktop backend paused
++the API loop and every chat. Collection work held the
++GIL while other requests waited, motivating bounded collection scheduling.
++
++Raising the young threshold makes every generation proportionally rarer: at 20,000 the same process
++runs a full collection about every five minutes. The cost is memory: cyclic garbage waits ten times
++as many allocations for its collection (about 60k objects per full pass at the old rate, so some
++tens of MB in a multi-GB process). Reference-counted garbage, which is nearly all of it, is still
++freed at once.
++
++``HERMES_GATEWAY_GC_THRESHOLD0`` overrides the young threshold (0 or unparsable keeps the interpreter's).
++
++Collections are timed from ``gc.callbacks`` and reported under ``gc`` in the loop-accounting
++snapshot. The callback takes no lock and calls nothing that does: a collection can start inside
++any allocation, including one made while the accounting lock is held.
++"""
++from __future__ import annotations
++
++import gc
++import logging
++import os
++import time
++
++GATEWAY_GC_THRESHOLD0 = 20_000
++ENV = "HERMES_GATEWAY_GC_THRESHOLD0"
++
++log = logging.getLogger(__name__)
++
++# One collection runs at a time (the collector is not re-entrant), so one slot is enough.
++_started: list = [0.0, 0.0]  # thread CPU, wall
++_totals: dict[int, list] = {}  # generation -> [runs, cpu_s, wall_s, longest wall_s, collected]
++
++
++def gateway_gc_threshold0(environ=None) -> int | None:
++    """Young-generation threshold to set, or None to keep the interpreter's."""
++    raw = (environ if environ is not None else os.environ).get(ENV)
++    if raw is None or not str(raw).strip():
++        return GATEWAY_GC_THRESHOLD0
++    try:
++        value = int(float(raw))
++    except (ValueError, OverflowError):
++        return None
++    return value if value > 0 else None
++
++
++def _on_gc(phase: str, info: dict) -> None:
++    if phase == "start":
++        _started[0], _started[1] = time.thread_time(), time.perf_counter()
++        return
++    cpu, wall = time.thread_time() - _started[0], time.perf_counter() - _started[1]
++    row = _totals.get(info.get("generation", -1))
++    if row is None:
++        row = _totals.setdefault(info.get("generation", -1), [0, 0.0, 0.0, 0.0, 0])
++    row[0] += 1
++    row[1] += cpu
++    row[2] += wall
++    if wall > row[3]:
++        row[3] = wall
++    row[4] += info.get("collected", 0)
++
++
++def apply_gateway_gc_budget(environ=None) -> tuple:
++    """Set the process's collection thresholds and start timing collections; returns the thresholds in effect."""
++    target = gateway_gc_threshold0(environ)
++    if target is not None:
++        _, middle, old = gc.get_threshold()
++        try:
++            gc.set_threshold(target, middle, old)
++        except (ValueError, OverflowError) as exc:  # pragma: no cover - defensive
++            log.warning("gateway gc threshold %r refused: %s", target, exc)
++    if _on_gc not in gc.callbacks:
++        gc.callbacks.append(_on_gc)
++    return gc.get_threshold()
++
++
++def snapshot() -> dict:
++    """``{threshold, generations: {n: {runs, cpu_s, wall_s, max_wall_s, collected}}}`` since :func:`apply`."""
++    return {
++        "threshold": list(gc.get_threshold()),
++        "timed": _on_gc in gc.callbacks,
++        "generations": {str(gen): {"runs": row[0], "cpu_s": round(row[1], 4), "wall_s": round(row[2], 4),
++                                   "max_wall_s": round(row[3], 4), "collected": row[4]}
++                        for gen, row in sorted(_totals.items())},
++    }
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 3eb370bd162..16ba5d78965 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -903,6 +903,8 @@
+     # GIL handoffs to the API loop wait out the switch interval behind CPU-bound threads (gil_budget.py).
+     from gateway.gil_budget import apply_gateway_switch_interval
+     apply_gateway_switch_interval()
++    from gateway.gc_budget import apply_gateway_gc_budget
++    apply_gateway_gc_budget()  # a full collection stops every thread for its length (gc_budget.py)
+ 
+     # Snapshot the revision while sys.modules matches disk so a later `git pull` is detected safely.
+     from gateway.code_skew import install_boot_pinned_imports, record_boot_fingerprint
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 0c0a5327cda..7332954a245 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -624,9 +624,19 @@
+         "open_accounting_complete": _open_intervals.complete(threads),
+         "residual": _residual(threads, process_cpu, accounted_total, procfs),
+         "loops": counters(),
++        "gc": _gc_snapshot(),
+     }
+ 
+ 
++def _gc_snapshot() -> Optional[dict[str, Any]]:
++    """Collection counts and stop-the-world time (``gateway.gc_budget``), None when unavailable."""
++    try:
++        from gateway.gc_budget import snapshot as gc_snapshot
++        return gc_snapshot()
++    except Exception:
++        return None
++
++
+ def _residual(threads: list[dict[str, Any]], process_cpu: float, accounted_total: float,
+               have_cpu: bool) -> dict[str, Any]:
+     """CPU no accounting scope owns, per thread-name family. ``families[f].unaccounted_cpu_s`` is that family's
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index b314cd60c1d..486dd240a45 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1692,9 +1692,11 @@
+ 
+ def start_server(*args, **kwargs):
+     """Run the dashboard/serve backend; no lazy install may prompt on an inherited TTY (#125607)."""
++    from gateway.gc_budget import apply_gateway_gc_budget
+     from gateway.gil_budget import apply_gateway_switch_interval
+     from pm.extras import suppress_interactive_install_prompts
+     apply_gateway_switch_interval()
++    apply_gateway_gc_budget()  # a full collection stops every thread for its length (gc_budget.py)
+     with suppress_interactive_install_prompts():
+         return _start_server_runtime(*args, **kwargs)
+ 
+diff --git a/tests/gateway/test_gc_budget.py b/tests/gateway/test_gc_budget.py
+new file mode 100644
+index 00000000000..0ca002a6022
+--- /dev/null
++++ b/tests/gateway/test_gc_budget.py
+@@ -0,0 +1,74 @@
++"""Gateway and serve processes collect garbage less often and time every collection. [daveey]"""
++from __future__ import annotations
++
++import gc
++
++import pytest
++
++from gateway import gc_budget
++
++
++@pytest.fixture
++def restore_gc():
++    before = gc.get_threshold()
++    callbacks = list(gc.callbacks)
++    totals = {k: list(v) for k, v in gc_budget._totals.items()}
++    yield before
++    gc.set_threshold(*before)
++    gc.callbacks[:] = callbacks
++    gc_budget._totals.clear()
++    gc_budget._totals.update(totals)
++
++
++@pytest.mark.parametrize(("raw", "expected"), [
++    (None, gc_budget.GATEWAY_GC_THRESHOLD0), ("", gc_budget.GATEWAY_GC_THRESHOLD0),
++    ("50000", 50000), ("7000.9", 7000), ("0", None), ("-5", None), ("many", None), ("inf", None)])
++def test_threshold_from_environment(raw, expected):
++    environ = {} if raw is None else {gc_budget.ENV: raw}
++    assert gc_budget.gateway_gc_threshold0(environ) == expected
++
++
++def test_apply_raises_only_the_young_threshold(restore_gc):
++    gc.set_threshold(2000, 10, 10)
++    assert gc_budget.apply_gateway_gc_budget({}) == (gc_budget.GATEWAY_GC_THRESHOLD0, 10, 10)
++    assert gc_budget.apply_gateway_gc_budget({gc_budget.ENV: "0"}) == (gc_budget.GATEWAY_GC_THRESHOLD0, 10, 10)
++    gc.set_threshold(2000, 10, 10)
++    assert gc_budget.apply_gateway_gc_budget({gc_budget.ENV: "0"}) == (2000, 10, 10)  # opt-out keeps the default
++
++
++def test_apply_installs_one_timer_and_times_collections(restore_gc):
++    gc_budget.apply_gateway_gc_budget({})
++    gc_budget.apply_gateway_gc_budget({})
++    assert gc.callbacks.count(gc_budget._on_gc) == 1
++    gc_budget._totals.clear()
++    cycle = []
++    cycle.append(cycle)
++    del cycle
++    gc.collect()
++    gc.collect(0)
++    snap = gc_budget.snapshot()
++    assert snap["timed"] is True and snap["threshold"][0] == gc_budget.GATEWAY_GC_THRESHOLD0
++    full, young = snap["generations"]["2"], snap["generations"]["0"]
++    assert full["runs"] == 1 and young["runs"] == 1
++    assert full["collected"] >= 1
++    assert full["wall_s"] >= full["max_wall_s"] > 0
++    assert full["cpu_s"] >= 0
++
++
++def test_timer_survives_a_collection_started_while_the_accounting_lock_is_held(restore_gc):
++    from hermes_cli import loop_accounting
++
++    gc_budget.apply_gateway_gc_budget({})
++    with loop_accounting._lock:  # a collection can begin inside any allocation, this one included
++        gc.collect()
++    assert gc_budget.snapshot()["generations"]["2"]["runs"] >= 1
++
++
++def test_accounting_snapshot_reports_gc(restore_gc):
++    from hermes_cli import loop_accounting
++
++    gc_budget.apply_gateway_gc_budget({})
++    gc.collect()
++    snap = loop_accounting.snapshot()
++    assert snap["gc"]["generations"]["2"]["runs"] >= 1
++    assert snap["gc"]["threshold"][0] == gc_budget.GATEWAY_GC_THRESHOLD0
+diff --git a/tests/tui_gateway/test_non_workspace_policy_cache.py b/tests/tui_gateway/test_non_workspace_policy_cache.py
+index 173d0c0e897..c3b08f7d5db 100644
+--- a/tests/tui_gateway/test_non_workspace_policy_cache.py
++++ b/tests/tui_gateway/test_non_workspace_policy_cache.py
+@@ -84,3 +84,52 @@
+     monkeypatch.setattr(server.time, "monotonic", lambda: now + server._NON_WORKSPACE_TTL_S + 1)
+     assert server._is_non_workspace_path(str(second / "x"))
+     assert not server._is_non_workspace_path(str(first / "x"))
++
++
++def _count_realpath(monkeypatch):
++    import os
++
++    calls = []
++    real = os.path.realpath
++    monkeypatch.setattr(server.os.path, "realpath", lambda p, *a, **k: calls.append(str(p)) or real(p, *a, **k))
++    return calls
++
++
++def test_canonical_path_is_resolved_once_per_ttl(homes, monkeypatch):
++    home, _, _ = homes
++    target = home / "repo"
++    target.mkdir()
++    monkeypatch.setattr(server, "_canonical_memo", {})
++    calls = _count_realpath(monkeypatch)
++    first = server._canonical_workspace_path(str(target))
++    resolved = len(calls)
++    assert resolved >= 1
++    assert [server._canonical_workspace_path(str(target)) for _ in range(50)] == [first] * 50
++    assert len(calls) == resolved  # the repeats made no filesystem call at all
++    assert server._canonical_workspace_path("") == ""
++
++
++def test_canonical_path_sees_a_relinked_alias_after_the_ttl(homes, monkeypatch):
++    import os
++
++    home, _, _ = homes
++    one, two, alias = home / "one", home / "two", home / "alias"
++    one.mkdir()
++    two.mkdir()
++    alias.symlink_to(one, target_is_directory=True)
++    monkeypatch.setattr(server, "_canonical_memo", {})
++    assert server._canonical_workspace_path(str(alias)) == os.path.normcase(os.path.realpath(one))
++    alias.unlink()
++    alias.symlink_to(two, target_is_directory=True)
++    assert server._canonical_workspace_path(str(alias)) == os.path.normcase(os.path.realpath(one))  # inside the TTL
++    now = server.time.monotonic()
++    monkeypatch.setattr(server.time, "monotonic", lambda: now + server._CANONICAL_TTL_S + 1)
++    assert server._canonical_workspace_path(str(alias)) == os.path.normcase(os.path.realpath(two))
++
++
++def test_canonical_memo_is_bounded(homes, monkeypatch):
++    monkeypatch.setattr(server, "_canonical_memo", {})
++    monkeypatch.setattr(server, "_CANONICAL_MAX", 10)
++    for i in range(35):
++        server._canonical_workspace_path(f"/nonexistent-hhp/{i}")
++    assert len(server._canonical_memo) <= 10
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index c77a4b48e42..dbe9fe77c37 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -139,9 +139,27 @@
+     return {os.path.normcase(os.path.realpath(path)) for path in candidates if path}
+ 
+ 
++# ``realpath`` is one ``lstat`` per path component, and each releases the GIL. A tree build resolves
++# every session cwd several times; overlapping builds repeat syscall-heavy work
++# and GIL handoffs. A re-pointed symlink is seen after the TTL.
++_CANONICAL_TTL_S = 30.0
++_CANONICAL_MAX = 20000
++_canonical_memo: dict[str, tuple[float, str]] = {}
++
++
+ def _canonical_workspace_path(path: str) -> str:
+     """Resolve local aliases before policy checks and project/repo/lane keying."""
+-    return os.path.normcase(os.path.realpath(path)) if path else ""
++    if not path:
++        return ""
++    now = time.monotonic()
++    hit = _canonical_memo.get(path)
++    if hit is not None and now < hit[0]:
++        return hit[1]
++    real = os.path.normcase(os.path.realpath(path))
++    if len(_canonical_memo) >= _CANONICAL_MAX:
++        _canonical_memo.clear()
++    _canonical_memo[path] = (now + _CANONICAL_TTL_S, real)
++    return real
+ 
+ 
+ # The policy's resolved roots, kept while every input they are derived from is unchanged. One tree
+-- 
+2.43.0
+

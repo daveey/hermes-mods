@@ -1,0 +1,166 @@
+From d0455972553cb85100b7151a2348da62bd3b848f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 06:02:24 +0000
+Subject: [PATCH 6336] Conservative sync repair, lease custody and UDF budgets
+
+Public mirror of source commit d0455972553cb85100b7151a2348da62bd3b848f.
+
+---
+diff --git a/hermes_cli/kanban_remote_stop.py b/hermes_cli/kanban_remote_stop.py
+index 0ea199e9c6a..b94a85b9b09 100644
+--- a/hermes_cli/kanban_remote_stop.py
++++ b/hermes_cli/kanban_remote_stop.py
+@@ -21,7 +21,6 @@
+ import json
+ import logging
+ import sqlite3
+-import time
+ from typing import Any, Callable, Optional
+ 
+ from hermes_cli import kanban_db_sync as sync
+@@ -47,7 +46,8 @@
+ def remote_holder(conn: sqlite3.Connection, task_id: str, now_ms: Optional[int] = None) -> Optional[str]:
+     """The other gateway whose live Board lease covers ``task_id`` (no local claim), else None.
+ 
+-    Only primary boards mirror leases; an expired lease is not a holder (the Board accepts writes again)."""
++    Only primary boards mirror leases. Timestamp expiry does not release a lease: the Board may retain it
++    for a dark holder (up to 12h) until renewal, operator reset, or canonical expiry clears the row."""
+     if sync.board_mode(conn) != "primary":
+         return None
+     row = conn.execute("SELECT status, claim_lock, lease_holder, lease_expires FROM tasks WHERE id = ?",
+@@ -55,8 +55,8 @@
+     if row is None or not row["lease_holder"] or row["lease_expires"] is None or row["claim_lock"] is not None:
+         return None
+     own = str(sync._state(conn)["gateway_id"])
+-    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+-    if row["lease_holder"] == own or int(row["lease_expires"]) <= now_ms:
++    # Keep now_ms as a compatibility argument; only a canonical clear releases remote custody.
++    if row["lease_holder"] == own:
+         return None
+     return str(row["lease_holder"])
+ 
+diff --git a/tests/hermes_cli/test_kanban_remote_lease_dashboard.py b/tests/hermes_cli/test_kanban_remote_lease_dashboard.py
+index 71f42a6e581..7d9ed1aa88f 100644
+--- a/tests/hermes_cli/test_kanban_remote_lease_dashboard.py
++++ b/tests/hermes_cli/test_kanban_remote_lease_dashboard.py
+@@ -9,7 +9,6 @@
+ 
+ from __future__ import annotations
+ 
+-import time
+ 
+ import pytest
+ 
+@@ -137,9 +136,10 @@
+ 
+ # --- regressions: no live remote lease, no refusal -------------------------------------------------------------
+ 
+-def _expire(hub, tid):
++def _cleared(hub, tid):
++    # Model canonical lease release, not merely passage of its timestamp.
+     with kb.write_txn(hub.conn):
+-        hub.conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int(time.time() * 1000) - 1000, tid))
++        hub.conn.execute("UPDATE tasks SET lease_holder = NULL, lease_expires = NULL WHERE id = ?", (tid,))
+ 
+ 
+ def _own(hub, tid):
+@@ -147,7 +147,7 @@
+         hub.conn.execute("UPDATE tasks SET lease_holder = ? WHERE id = ?", (str(sync._state(hub.conn)["gateway_id"]), tid))
+ 
+ 
+-@pytest.mark.parametrize("lease", [_expire, _own], ids=["expired", "own-gateway"])
++@pytest.mark.parametrize("lease", [_cleared, _own], ids=["board-cleared", "own-gateway"])
+ def test_patch_done_without_a_live_remote_lease_completes_as_before(gws, svc, kills, lease):
+     hub, tid = _remote(gws, svc)
+     lease(hub, tid)
+@@ -156,7 +156,7 @@
+     assert kb.get_task(hub.conn, tid).status == "done"
+ 
+ 
+-@pytest.mark.parametrize("lease", [_expire, _own], ids=["expired", "own-gateway"])
++@pytest.mark.parametrize("lease", [_cleared, _own], ids=["board-cleared", "own-gateway"])
+ def test_bulk_ready_without_a_live_remote_lease_moves_as_before(gws, svc, kills, lease):
+     hub, tid = _remote(gws, svc)
+     lease(hub, tid)
+diff --git a/tests/hermes_cli/test_kanban_remote_lease_dashboard_assignee.py b/tests/hermes_cli/test_kanban_remote_lease_dashboard_assignee.py
+index 8cabe7f1735..cc1f253d63f 100644
+--- a/tests/hermes_cli/test_kanban_remote_lease_dashboard_assignee.py
++++ b/tests/hermes_cli/test_kanban_remote_lease_dashboard_assignee.py
+@@ -18,7 +18,7 @@
+ from tests.hermes_cli.test_kanban_worker_node import WORKER
+ 
+ svc, gws, kills, _snapshot, _run_row = _dash.svc, _dash.gws, _dash.kills, _dash._snapshot, _dash._run_row
+-API, _client, _remote, _expire, _own = _dash.API, _dash._client, _dash._remote, _dash._expire, _dash._own
++API, _client, _remote, _cleared, _own = _dash.API, _dash._client, _dash._remote, _dash._cleared, _dash._own
+ 
+ 
+ def _board_assignee(hub, tid):
+@@ -67,7 +67,7 @@
+ 
+ # --- regressions: no live remote lease, no refusal -------------------------------------------------------------
+ 
+-@pytest.mark.parametrize("lease", [_expire, _own], ids=["expired", "own-gateway"])
++@pytest.mark.parametrize("lease", [_cleared, _own], ids=["board-cleared", "own-gateway"])
+ def test_patch_assignee_without_a_live_remote_lease_assigns_as_before(gws, svc, kills, lease):
+     hub, tid = _remote(gws, svc)
+     lease(hub, tid)
+@@ -77,7 +77,7 @@
+     assert kb.get_task(hub.conn, tid).assignee == "other"
+ 
+ 
+-@pytest.mark.parametrize("lease", [_expire, _own], ids=["expired", "own-gateway"])
++@pytest.mark.parametrize("lease", [_cleared, _own], ids=["board-cleared", "own-gateway"])
+ def test_bulk_assignee_without_a_live_remote_lease_assigns_as_before(gws, svc, kills, lease):
+     hub, tid = _remote(gws, svc)
+     lease(hub, tid)
+diff --git a/tests/hermes_cli/test_kanban_remote_lease_status_writes.py b/tests/hermes_cli/test_kanban_remote_lease_status_writes.py
+index cf02a1021e7..bb7db4e75cb 100644
+--- a/tests/hermes_cli/test_kanban_remote_lease_status_writes.py
++++ b/tests/hermes_cli/test_kanban_remote_lease_status_writes.py
+@@ -191,12 +191,27 @@
+ 
+ # --- regressions: no live remote lease, no refusal -------------------------------------------------------------
+ 
+-def test_cli_complete_after_the_remote_lease_expired_completes_as_before(gws, svc, kills):
++@pytest.mark.parametrize("line,verb", [("reclaim {tid}", "reclaim"), ("complete {tid} --summary x", "complete"), ("assign {tid} other", "assign")])
++def test_cli_lapsed_remote_lease_still_fences_until_board_clears_it(gws, svc, kills, line, verb):
++    # Board retains a dark holder's expired lease for up to 12h; timestamp expiry is not release.
+     hub, worker = gws
+     tid = _running_on_worker(hub, worker, svc)
+     hub.enter()
+     with kb.write_txn(hub.conn):
+         hub.conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int(time.time() * 1000) - 1000, tid))
++    before, run_before = _snapshot(hub.conn), _run_row(hub.conn, tid)
++    rc, out = _cli(line.format(tid=tid))
++    _assert_refused(hub.conn, tid, before, run_before, rc, out, verb)
++    assert "Reclaimed" not in out and "Completed" not in out
++    assert kills == []
++
++
++def test_cli_complete_after_board_clears_remote_lease_completes_as_before(gws, svc, kills):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET lease_holder = NULL, lease_expires = NULL WHERE id = ?", (tid,))
+     rc, out = _cli(f"complete {tid} --summary x")
+     assert rc == 0 and f"Completed {tid}" in out, out
+     assert kb.get_task(hub.conn, tid).status == "done"
+@@ -214,12 +229,12 @@
+     assert kb.get_task(hub.conn, tid).status == "done"
+ 
+ 
+-def test_cli_assign_after_the_remote_lease_expired_assigns_as_before(gws, svc, kills):
++def test_cli_assign_after_board_clears_remote_lease_assigns_as_before(gws, svc, kills):
+     hub, worker = gws
+     tid = _running_on_worker(hub, worker, svc)
+     hub.enter()
+     with kb.write_txn(hub.conn):
+-        hub.conn.execute("UPDATE tasks SET lease_expires = ? WHERE id = ?", (int(time.time() * 1000) - 1000, tid))
++        hub.conn.execute("UPDATE tasks SET lease_holder = NULL, lease_expires = NULL WHERE id = ?", (tid,))
+     rc, out = _cli(f"assign {tid} other")
+     assert rc == 0 and f"Assigned {tid} to other" in out, out
+     assert kb.get_task(hub.conn, tid).assignee == "other"
+-- 
+2.43.0
+

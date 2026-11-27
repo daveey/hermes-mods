@@ -1,0 +1,771 @@
+From f1773c9eadcdb8096cc95a724f5f8e4bd13a3d5c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:19:43 +0000
+Subject: [PATCH 6438] Local answer recovery and authority contract tests
+
+Public mirror of source commit f1773c9eadcdb8096cc95a724f5f8e4bd13a3d5c.
+
+---
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index c5fc23542a9..349760ea4f2 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3245,7 +3245,7 @@
+     now = int(time.time())
+     # ``held`` is decided in the write txn, before ``precondition`` and the comment savepoint (its rollback drops notes).
+     with write_txn(conn):
+-        held = unblock_held(conn, task_id)
++        held = unblock_held(conn, task_id, event_extra=event_extra)
+         with reason_comment(conn, task_id, None if held else comment) as noted:
+             if held or precondition is not None and precondition(conn):
+                 return False
+diff --git a/hermes_cli/kanban_reason_comment.py b/hermes_cli/kanban_reason_comment.py
+index d86b25ce520..5037fb31099 100644
+--- a/hermes_cli/kanban_reason_comment.py
++++ b/hermes_cli/kanban_reason_comment.py
+@@ -31,7 +31,15 @@
+     before_insert: Optional[Callable[[sqlite3.Connection], None]] = None
+ 
+ 
+-Comment = Optional[tuple[str, str] | RecordedDecisionComment]  # legacy (author, body) remains valid
++@dataclass(frozen=True)
++class FencedReasonComment:
++    """Internal pre-insert fence with an ordinary comment, not remote decision provenance."""
++    author: str
++    body: str
++    before_insert: Callable[[sqlite3.Connection], None]
++
++
++Comment = Optional[tuple[str, str] | RecordedDecisionComment | FencedReasonComment]
+ 
+ 
+ class _ReasonComment:
+@@ -56,9 +64,10 @@
+ 
+     state = _ReasonComment()
+     decision = comment if isinstance(comment, RecordedDecisionComment) else None
+-    if decision is not None and decision.before_insert is not None:
+-        decision.before_insert(conn)  # lock held; no tentative duplicate comment yet
+-    if isinstance(comment, RecordedDecisionComment):
++    fenced = comment if isinstance(comment, (RecordedDecisionComment, FencedReasonComment)) else None
++    if fenced is not None and fenced.before_insert is not None:
++        fenced.before_insert(conn)  # lock held; no tentative duplicate comment yet
++    if fenced is not None:
+         author, body = comment.author, comment.body
+     else:
+         author, body = comment or ("", "")
+diff --git a/hermes_cli/kanban_selfwork_exception.py b/hermes_cli/kanban_selfwork_exception.py
+index dbb94543ac5..6fa17438d96 100644
+--- a/hermes_cli/kanban_selfwork_exception.py
++++ b/hermes_cli/kanban_selfwork_exception.py
+@@ -199,7 +199,8 @@
+                 and all(isinstance(v, str) for v in request.values())
+                 and ca._valid_receipt(conn, TARGET.owner_task, request, ca.digest(request), "unblocked", receipt)):
+             return grant
+-    return None
++    from hermes_cli.kanban_selfwork_local import recorded
++    return recorded(conn, offer_uid)
+ 
+ 
+ def granting(conn, task: str, ask, *, now: Optional[int] = None) -> Optional[dict]:
+@@ -226,6 +227,16 @@
+     return stamp
+ 
+ 
++def missing_local_adapter(conn, task, extra) -> bool:
++    """Old local plugins must not silently consume a stamped ask without issuance."""
++    if task != TARGET.owner_task or not isinstance(extra, dict) or 'user_steps_projection' not in extra:
++        return False
++    row = conn.execute('SELECT human_request FROM tasks WHERE id=?', (task,)).fetchone()
++    ask = json.loads(row[0] or 'null') if row else None
++    return (isinstance(ask, dict) and STAMP in ask
++            and (not isinstance(extra.get(GRANT), dict) or extra[GRANT].get('local_version') != 1))
++
++
+ def same_offer(conn, fresh, current, stamp) -> bool:
+     """card-answer's fence, under the write lock: the ask is the one answered and, when the click grants, its
+     offer is still this board's own, live and unanswered."""
+@@ -255,6 +266,9 @@
+         raise Refused("exception grant expired")
+     if _spent(conn, grant["offer_uid"]):
+         raise Refused("exception grant already used")
++    if grant.get('local_version') is not None:
++        from hermes_cli.kanban_selfwork_local import validate
++        validate(conn, grant, now=now)
+     return grant
+ 
+ 
+@@ -359,7 +373,14 @@
+     grant = _live_grant(conn)
+     if grant is None:
+         raise Refused("no verified Desktop grant for this request")
+-    result, _ = _receive(original(records), grant)
++    envelope = original(records)
++    if grant.get('local_version') is not None:
++        from hermes_cli.kanban_selfwork_local_source import custody
++        # Retain source evidence custody through the intake transaction commit.
++        with custody(grant['operationId'], delivered=True):
++            result, _ = _receive(envelope, grant)
++    else:
++        result, _ = _receive(envelope, grant)
+     return result
+ 
+ 
+@@ -371,7 +392,16 @@
+     if conn.execute("SELECT 1 FROM sqlite_master WHERE name='self_work_intake' AND type='table'").fetchone():
+         row = conn.execute("SELECT receipt_json FROM self_work_intake WHERE request_id=?",
+                            (TARGET.request_id,)).fetchone()
++    authority = None
++    if grant is not None and grant.get('local_version') is not None:
++        from hermes_cli.kanban_selfwork_local import validate
++        try:
++            validate(conn, grant, now=int(time.time()))
++            authority = {'usable': True, 'reason': None}
++        except (Refused, OSError) as exc:
++            authority = {'usable': False, 'reason': str(exc)}
+     return {"request_id": TARGET.request_id, "owner_task": TARGET.owner_task,
++            "local_authority": authority,
+             "offer": offers[0] if offers else None,
+             "grant": grant and {"offer_uid": grant["offer_uid"], "operationId": grant["operationId"]},
+             "spent": [e["payload"] for e in _own(conn, SPENT)],
+@@ -384,13 +414,18 @@
+     from hermes_cli.kanban_card_answer_transport import Records
+     from hermes_cli.kanban_db_connect import connect_closing
+     argv = list(sys.argv[1:] if argv is None else argv)
+-    if len(argv) != 1 or argv[0] not in ("offer", "reconsider", "status"):
++    recovering = len(argv) == 2 and argv[0] == 'recover-local'
++    if not recovering and (len(argv) != 1 or argv[0] not in ("offer", "reconsider", "status")):
+         print(json.dumps({"ok": False, "error": "usage"}))
+         return 64
+     try:
+         with connect_closing(_board_db("default")) as conn:
+-            result = (status(conn) if argv[0] == "status" else
+-                      offer(conn, Records()) if argv[0] == "offer" else reconsider(conn, Records()))
++            if recovering:
++                from hermes_cli.kanban_selfwork_local import recover
++                result = recover(conn, Records(), argv[1])
++            else:
++                result = (status(conn) if argv[0] == "status" else
++                          offer(conn, Records()) if argv[0] == "offer" else reconsider(conn, Records()))
+         out, code = {"ok": True, "result": result}, 0
+     except (AnswerRefused, policy.SelfWorkError) as exc:
+         out, code = {"ok": False, "refused": str(exc) or "refused"}, 2
+@@ -401,4 +436,7 @@
+ 
+ 
+ if __name__ == "__main__":
+-    raise SystemExit(main())
++    # The receiver imports the canonical Capability; do not instantiate __main__'s
++    # distinct type when this file is executed with python -m.
++    from hermes_cli.kanban_selfwork_exception import main as canonical_main
++    raise SystemExit(canonical_main())
+diff --git a/hermes_cli/kanban_selfwork_local.py b/hermes_cli/kanban_selfwork_local.py
+new file mode 100644
+index 00000000000..27fbc29c517
+--- /dev/null
++++ b/hermes_cli/kanban_selfwork_local.py
+@@ -0,0 +1,207 @@
++"""Exact home-local answer issuance and append-only recovery. [daveey]
++
++Never relabel a local operation as a remote proof. The old receipt is immutable;
++usable authority is independently revalidated at intake, not inferred from replay.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_selfwork_exception as sx
++from hermes_cli import kanban_selfwork_local_source as source
++
++VERSION = 1
++RECOVERED = 'selfwork_exception_local_recovered'
++RECOVERY_OPERATION = 'e1a8285c-af5e-4c02-b332-414e1faf86b3'
++
++
++def _uid(conn, event):
++    row = conn.execute('SELECT uid FROM task_events WHERE id=?', (event['id'],)).fetchone()
++    if row is None or not row[0]:
++        raise sx.Refused('local_event_identity_missing')
++    return row[0]
++
++
++def _offer(conn, evidence):
++    ask = evidence['snapshot']['ask']
++    stamp = ask.get(sx.STAMP)
++    offers = sx._own(conn, sx.OFFERED)
++    if (not sx._bound(stamp) or stamp.get('scope') != 'accounting-recovery-only' or not offers
++            or offers[0]['payload'].get(sx.STAMP) != stamp
++            or offers[0]['payload'].get('ask_sha256') != source.digest(ask)):
++        raise sx.Refused('local_offer_replaced_or_invalid')
++    return offers[0], stamp
++
++
++def eligible(conn, evidence, *, now=None):
++    """Re-run under the board writer at both issuance and consumption."""
++    from hermes_cli.kanban_containment_guard import pending as contained
++    from hermes_cli.kanban_spend_decision import pending
++    from hermes_cli.kanban_refusal_receipt import restricted
++    sx._home(conn)
++    offer, stamp = _offer(conn, evidence)
++    now = int(time.time()) if now is None else now
++    row = conn.execute('SELECT status,human_request FROM tasks WHERE id=?', (sx.TARGET.owner_task,)).fetchone()
++    if (row is None or row['status'] in ('archived', 'done') or pending(conn, sx.TARGET.owner_task)
++            or contained(conn, sx.TARGET.owner_task) or restricted(conn, sx.TARGET.owner_task)):
++        raise sx.Refused('local_owner_held_or_closed')
++    if now >= stamp['expires_at'] or sx._spent(conn, stamp['offer_uid']):
++        raise sx.Refused('local_offer_expired_or_spent')
++    if any(e['id'] > offer['id'] for e in sx._own(conn, 'archived')):
++        raise sx.Refused('local_offer_declined')
++    ask = json.loads(row['human_request'] or 'null')
++    if ask is not None and ask != evidence['snapshot']['ask']:
++        raise sx.Refused('local_ask_replaced')
++    return stamp
++
++
++def _prior_unblock(conn, evidence, offer=None):
++    if offer is None:
++        offer, _ = _offer(conn, evidence)
++    oid = evidence['operation']['operationId']
++    matches = [e for e in sx._own(conn, 'unblocked')
++               if e['payload'].get('user_steps_projection', {}).get('operationId') == oid]
++    if len(matches) != 1 or matches[0]['id'] <= offer['id']:
++        raise sx.Refused('local_unblock_missing_or_ambiguous')
++    event = matches[0]
++    if event['payload'].get('user_steps_projection') != evidence['receipt']:
++        raise sx.Refused('local_unblock_receipt_changed')
++    body = 'Choice recorded in Desktop: ' + source.encoded(dict(label='Unblock', value='unblock')) + '\nOperation: ' + oid
++    comments = conn.execute('SELECT id FROM task_comments WHERE task_id=? AND author=? AND body=?',
++                            (sx.TARGET.owner_task, 'user-steps', body)).fetchall()
++    if len(comments) != 1:
++        raise sx.Refused('local_decision_comment_missing_or_ambiguous')
++    # Require a home-owned comment event linking the actual immutable decision.
++    comment_events = [e for e in sx._own(conn, 'commented')
++                      if e['payload'].get('comment_id') == comments[0][0]]
++    if (len(comment_events) != 1 or not offer['id'] < comment_events[0]['id'] < event['id']):
++        raise sx.Refused('local_comment_event_invalid')
++    return event
++
++
++def _grant(evidence, stamp, event_uid):
++    return dict(offer_uid=stamp['offer_uid'], stamp=stamp,
++                operationId=evidence['operation']['operationId'], local_version=VERSION,
++                binding_sha256=evidence['binding_sha256'], source=evidence['source'],
++                fingerprint=evidence['receipt']['fingerprint'], unblock_event_uid=event_uid)
++
++
++def recorded(conn, offer_uid):
++    """Validated historical receipt, not permission to consume it again."""
++    events = [e for kind in (RECOVERED, 'unblocked') for e in sx._own(conn, kind)
++              if e['payload'].get(sx.GRANT, {}).get('offer_uid') == offer_uid
++              and e['payload'][sx.GRANT].get('local_version') == VERSION]
++    if not events:
++        return None
++    if len(events) != 1:
++        raise sx.Refused('local_grant_ambiguous')
++    grant = events[0]['payload'][sx.GRANT]
++    recovered = events[0]['kind'] == RECOVERED
++    with source.custody(grant.get('operationId'), delivered=recovered) as evidence:
++        # Historical receipt validation does not make expired/spent authority usable.
++        old_offer = [e for e in sx._own(conn, sx.OFFERED)
++                     if e['payload'].get(sx.STAMP) == grant.get('stamp')
++                     and e['payload'].get('ask_sha256') == source.digest(evidence['snapshot']['ask'])]
++        if len(old_offer) != 1 or not sx._bound(grant.get('stamp')):
++            raise sx.Refused('local_grant_offer_invalid')
++        prior = _prior_unblock(conn, evidence, old_offer[0])
++        uid = _uid(conn, prior) if recovered else None
++        if (events[0]['id'] < prior['id'] or (not recovered and events[0]['id'] != prior['id'])
++                or grant != _grant(evidence, grant['stamp'], uid)):
++            raise sx.Refused('local_grant_evidence_changed')
++        return grant
++
++
++def deliver(operation_id):
++    """Plugin call point v1: authenticate canonical source, then core owns transition."""
++    from hermes_cli.kanban_card_answer_runtime import _board_db
++    from hermes_cli.kanban_card_answer_transport import Records
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing(_board_db('default')) as conn:
++        sx._home(conn)
++        sx.original(Records())
++        with source.custody(operation_id) as evidence:
++            return _deliver(conn, evidence)
++
++
++def _deliver(conn, evidence):
++    from hermes_cli.kanban_card_answer import _AlreadyRecorded
++    from hermes_cli.kanban_reason_comment import FencedReasonComment
++    stamp = evidence['snapshot']['ask'].get(sx.STAMP)
++    if not sx._bound(stamp):
++        raise sx.Refused('local_stamp_invalid')
++    old = recorded(conn, stamp['offer_uid'])
++    if old is not None:
++        if old['operationId'] != evidence['operation']['operationId']:
++            raise sx.Refused('local_operation_conflict')
++        return evidence['receipt']
++    if evidence['operation']['dispatchState'] == 'delivered':
++        raise sx.Refused('local_delivered_requires_recovery')
++    stamp = eligible(conn, evidence)
++    grant = _grant(evidence, stamp, None)
++
++    def before_insert(c):
++        existing = recorded(c, stamp['offer_uid'])
++        if existing is not None:
++            if existing != grant:
++                raise sx.Refused('local_operation_conflict')
++            raise _AlreadyRecorded(evidence['receipt'])
++        eligible(c, evidence)
++        if sx._grant(c, stamp['offer_uid']) is not None:
++            raise sx.Refused('local_offer_already_granted')
++        row = c.execute('SELECT status,human_request FROM tasks WHERE id=?', (sx.TARGET.owner_task,)).fetchone()
++        generation = c.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind IN "
++                               "('created','blocked','block_loop_detected','unblocked','archived','completed')",
++                               (sx.TARGET.owner_task,)).fetchone()[0]
++        if (row['status'] not in ('blocked', 'triage') or json.loads(row['human_request'] or 'null') != evidence['snapshot']['ask']
++                or generation != evidence['snapshot']['generation']):
++            raise sx.Refused('local_ask_changed')
++
++    def fence(c):
++        before_insert(c)
++
++    body = ('Choice recorded in Desktop: ' + source.encoded(dict(label='Unblock', value='unblock'))
++            + '\nOperation: ' + evidence['operation']['operationId'])
++    comment = FencedReasonComment('user-steps', body, before_insert)
++    try:
++        changed = kb.unblock_task(conn, sx.TARGET.owner_task, precondition=fence, comment=comment,
++                                  event_extra={'user_steps_projection': evidence['receipt'], sx.GRANT: grant})
++    except _AlreadyRecorded as done:
++        return done.receipt
++    if not changed:
++        raise sx.Refused('local_transition_refused')
++    return evidence['receipt']
++
++
++def validate(conn, grant, *, now):
++    with source.custody(grant['operationId'], delivered=True) as evidence:
++        if grant != recorded(conn, grant['offer_uid']):
++            raise sx.Refused('local_grant_changed')
++        eligible(conn, evidence, now=now)
++
++
++def recover(conn, records, operation_id):
++    """Append authority for exactly the delivered historical operation; no lifecycle mutation."""
++    if operation_id != RECOVERY_OPERATION:
++        raise sx.Refused('local_recovery_operation_mismatch')
++    sx._home(conn)
++    sx.original(records)
++    with source.custody(operation_id, delivered=True) as evidence, kb.write_txn(conn):
++        stamp = evidence['snapshot']['ask'].get(sx.STAMP)
++        if not sx._bound(stamp):
++            raise sx.Refused('local_recovery_stamp_invalid')
++        previous = recorded(conn, stamp['offer_uid'])
++        if previous is not None:
++            # Immutable replay can return even after consumption; it grants nothing new.
++            if previous['operationId'] != operation_id:
++                raise sx.Refused('local_grant_operation_conflict')
++            return previous
++        stamp = eligible(conn, evidence)
++        if sx._grant(conn, stamp['offer_uid']) is not None:
++            raise sx.Refused('local_offer_already_granted')
++        prior = _prior_unblock(conn, evidence)
++        grant = _grant(evidence, stamp, _uid(conn, prior))
++        kb._append_event(conn, sx.TARGET.owner_task, RECOVERED, {sx.GRANT: grant})
++        return grant
+diff --git a/hermes_cli/kanban_selfwork_local_source.py b/hermes_cli/kanban_selfwork_local_source.py
+new file mode 100644
+index 00000000000..302d23831ad
+--- /dev/null
++++ b/hermes_cli/kanban_selfwork_local_source.py
+@@ -0,0 +1,120 @@
++"""Read-only custody of an exact home-local Desktop operation. [daveey]
++
++The operation ID is a lookup hint, never proof. Resolve source from the runtime,
++keep its read transaction alive through issuance/consumption, and bind immutable
++producer fields. Same-user filesystem compromise remains outside this boundary.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import hashlib
++import json
++import re
++import sqlite3
++
++from hermes_cli import kanban_selfwork_exception as sx
++
++
++def encoded(value):
++    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
++
++
++def digest(value):
++    return hashlib.sha256(encoded(value).encode()).hexdigest()
++
++
++@contextmanager
++def custody(operation_id, *, delivered=False):
++    """No path, profile, session or proof is accepted from the invoking caller."""
++    from hermes_cli.kanban_card_answer_runtime import _profile
++    from hermes_cli.install_identity import get_install_id
++    if not isinstance(operation_id, str) or not re.fullmatch(r'[A-Za-z0-9._:-]{1,200}', operation_id):
++        raise sx.Refused('local_operation_id_invalid')
++    profile, home = _profile()
++    install = get_install_id()
++    if not install:
++        raise sx.Refused('local_install_unavailable')
++    namespace = json.dumps(['install:' + install, profile], separators=(',', ':'), ensure_ascii=False)
++    path = home / 'user-steps/actions.sqlite3'
++    source = None
++    try:
++        source = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)  # noqa: kanban-lockguard
++        source.row_factory = sqlite3.Row
++        source.execute('BEGIN')
++        evidence = _read(source, namespace, operation_id, profile, install, delivered)
++    except sx.Refused:
++        if source is not None:
++            source.close()
++        raise
++    except sqlite3.OperationalError as exc:
++        if source is not None:
++            source.close()
++        if any(word in str(exc).lower() for word in ('locked', 'busy')):
++            raise OSError('local_source_busy') from None
++        raise sx.Refused('local_source_unavailable') from None
++    except (sqlite3.DatabaseError, KeyError, TypeError, ValueError, AttributeError, IndexError, UnicodeError):
++        if source is not None:
++            source.close()
++        raise sx.Refused('local_source_malformed') from None
++    try:
++        yield evidence
++    finally:
++        source.close()
++
++
++def _read(source, namespace, oid, profile, install, delivered):
++    rows = source.execute('SELECT * FROM operations WHERE namespace=? AND id=?', (namespace, oid)).fetchall()
++    if len(rows) != 1:
++        raise sx.Refused('local_operation_missing_or_ambiguous')
++    row = rows[0]
++    op = sx._strict(row['body'].encode())
++    owner = dict(gatewayId='install:' + install, profile=profile, storedSessionId=row['session'])
++    if (op.get('owner') != owner or op.get('operationId') != oid or not row['session']
++            or not isinstance(op.get('recordedAt'), str) or not op['recordedAt']
++            or op.get('dispatchState') not in ('pending', 'failed', 'delivered') or op.get('retired')
++            or (delivered and op.get('dispatchState') != 'delivered')):
++        raise sx.Refused('local_operation_mismatch')
++    bound = source.execute('SELECT * FROM kanban_projections WHERE namespace=? AND session=? AND request_id=?',
++                           (namespace, row['session'], op['requestId'])).fetchall()
++    if len(bound) != 1:
++        raise sx.Refused('local_projection_missing_or_ambiguous')
++    binding = dict(bound[0])
++    snapshot = sx._strict(binding['snapshot'].encode())
++    frozen = sx._strict(binding['request'].encode())
++    intent, decision = op['intent'], op['decision']
++    if (binding['board'] != 'default' or binding['task'] != sx.TARGET.owner_task
++            or snapshot.get('task') != sx.TARGET.owner_task or snapshot.get('session') != row['session']
++            or set(snapshot) - {'task', 'session', 'generation', 'ask', 'title'}
++            or type(snapshot.get('generation')) is not int or not isinstance(snapshot.get('ask'), dict)
++            or snapshot['ask'].get('choices') or 'release_target' in snapshot['ask']):
++        raise sx.Refused('local_projection_target_mismatch')
++    choices = [dict(effect='answer', id='card-0', label='Unblock'),
++               dict(effect='answer', id='card-1', label='Archive')]
++    if (intent.get('request') != frozen or frozen.get('owner') != owner or frozen.get('choices') != choices
++            or type(frozen.get('revision')) is not int or frozen['revision'] < 1
++            or op.get('revision') != frozen['revision'] or decision.get('expectedRevision') != frozen['revision']
++            or op['requestId'] != frozen.get('requestId') or decision.get('requestId') != frozen['requestId']
++            or decision.get('choiceId') != 'card-0' or intent.get('effect') != 'answer'
++            or intent.get('revisionText') != 'Unblock' or decision.get('revisionText') != 'Unblock'
++            or intent.get('executionAuthorized') is not False or intent.get('permissionGrants') != []
++            or op.get('idempotencyKey') != decision.get('idempotencyKey') or op.get('provenance')):
++        raise sx.Refused('local_operation_intent_mismatch')
++    current = source.execute('SELECT * FROM requests WHERE namespace=? AND session=? AND id=?',
++                             (namespace, row['session'], op['requestId'])).fetchone()
++    revision = source.execute('SELECT body FROM revisions WHERE namespace=? AND id=? AND revision=?',
++                              (namespace, op['requestId'], op['revision'])).fetchone()
++    resolution = dict(choiceId='card-0', operationId=oid, revision=op['revision'], recordedAt=op['recordedAt'])
++    if (current is None or current['revision'] != op['revision'] or current['state'] == 'withdrawn'
++            or sx._strict((current['resolution'] or 'null').encode()) != resolution
++            or revision is None or sx._strict(revision[0].encode()) != frozen):
++        raise sx.Refused('local_request_revision_changed')
++    receipt = dict(destination='kanban_ask', board='default', task=sx.TARGET.owner_task, operationId=oid,
++                   value='unblock', executionStarted=False, fingerprint=digest([intent, decision]))
++    if delivered and op.get('receipt') != receipt:
++        raise sx.Refused('local_operation_receipt_mismatch')
++    immutable = {k: op.get(k) for k in ('operationId', 'owner', 'requestId', 'revision', 'idempotencyKey',
++                                       'decision', 'recordedAt', 'intent', 'provenance')}
++    return dict(operation=op, snapshot=snapshot, receipt=receipt,
++                binding_sha256=digest({'operation': immutable, 'projection': binding}),
++                source=dict(install=install, profile=profile, session=row['session'],
++                            requestId=op['requestId'], revision=op['revision']))
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index 9f3b7937505..83db7029e8d 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -140,16 +140,18 @@
+ _UNBLOCKABLE = ("blocked", "scheduled", "triage")
+ 
+ 
+-def unblock_held(conn: sqlite3.Connection, task_id: str) -> bool:
++def unblock_held(conn: sqlite3.Connection, task_id: str, *, event_extra=None) -> bool:
+     """``kanban_db.unblock_task``, first inside its write txn: True (refuse) when the row reads blocked/scheduled/
+     triage but the card is held terminal. ``unblocked`` is an explicit reopen (``REOPEN_KINDS``, and on the Board),
+     so an automated caller acting on a stale copy (shared-blocker clear/probe, quota release, ``resolved_check``)
+     would otherwise reopen a done card. Spend stops also require a recorded promote/archive decision.
+     A card that is not unblockable anyway leaves no note."""
+     from hermes_cli.kanban_spend_decision import pending as spend_pending
++    from hermes_cli.kanban_selfwork_exception import missing_local_adapter
+     row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     return row is not None and row[0] in _UNBLOCKABLE and (
+-        skip_wake(conn, task_id, "unblocked") or spend_pending(conn, task_id))
++        skip_wake(conn, task_id, "unblocked") or spend_pending(conn, task_id)
++        or missing_local_adapter(conn, task_id, event_extra))
+ 
+ 
+ def stale_hold(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+diff --git a/tests/hermes_cli/test_kanban_selfwork_local.py b/tests/hermes_cli/test_kanban_selfwork_local.py
+new file mode 100644
+index 00000000000..e399542087d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_local.py
+@@ -0,0 +1,212 @@
++"""Local source SQL and actual receiver/intake integration, using synthetic source rows."""
++import copy
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_selfwork_exception as sx
++from hermes_cli import kanban_selfwork_local as local
++from hermes_cli import kanban_selfwork_local_source as source
++from tests.hermes_cli import test_kanban_selfwork_exception as helpers
++
++world = helpers.world
++nochat_envelope = helpers.nochat_envelope
++request_envelope = helpers.request_envelope
++home = helpers.home
++
++
++@pytest.fixture
++def operation(home, monkeypatch):
++    from hermes_cli import install_identity
++    monkeypatch.setattr(install_identity, 'get_install_id', lambda: 'test-install')
++    helpers.offer(home)
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, home['task'])
++        ask = json.loads(task.human_request) if isinstance(task.human_request, str) else task.human_request
++        generation = conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (home['task'],)).fetchone()[0]
++    owner = dict(gatewayId='install:test-install', profile='default', storedSessionId='creator')
++    request = dict(requestId='local-request', revision=1, owner=owner, choices=[
++        dict(id='card-0', effect='answer', label='Unblock'), dict(id='card-1', effect='answer', label='Archive')])
++    decision = dict(requestId=request['requestId'], expectedRevision=1, choiceId='card-0',
++                    revisionText='Unblock', idempotencyKey='local-key')
++    op = dict(operationId=local.RECOVERY_OPERATION, owner=owner, requestId=request['requestId'], revision=1,
++              idempotencyKey='local-key', recordedAt='2026-01-01T00:00:00+00:00', dispatchState='delivered',
++              intent=dict(request=request, effect='answer', revisionText='Unblock', executionAuthorized=False,
++                          permissionGrants=[]), decision=decision)
++    receipt = dict(destination='kanban_ask', board='default', task=home['task'], operationId=op['operationId'],
++                   value='unblock', executionStarted=False, fingerprint=source.digest([op['intent'], decision]))
++    op['receipt'] = receipt
++    snapshot = dict(task=home['task'], session='creator', generation=generation, ask=ask, title=task.title)
++    namespace = json.dumps(['install:test-install', 'default'], separators=(',', ':'))
++    path = home['dir'] / 'user-steps/actions.sqlite3'
++    path.parent.mkdir()
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE requests(namespace TEXT,session TEXT,id TEXT,revision INTEGER,state TEXT,resolution TEXT)')
++        conn.execute('CREATE TABLE revisions(namespace TEXT,id TEXT,revision INTEGER,body TEXT)')
++        resolution = dict(choiceId='card-0', operationId=op['operationId'], revision=1, recordedAt=op['recordedAt'])
++        conn.execute('INSERT INTO requests VALUES(?,?,?,?,?,?)',
++                     (namespace, 'creator', request['requestId'], 1, 'open', json.dumps(resolution)))
++        conn.execute('INSERT INTO revisions VALUES(?,?,?,?)', (namespace, request['requestId'], 1, json.dumps(request)))
++        conn.execute('CREATE TABLE operations(namespace TEXT,session TEXT,id TEXT,body TEXT)')
++        conn.execute('CREATE TABLE kanban_projections(namespace TEXT,session TEXT,request_id TEXT,board TEXT,task TEXT,request TEXT,snapshot TEXT)')
++        conn.execute('INSERT INTO operations VALUES(?,?,?,?)', (namespace, 'creator', op['operationId'], json.dumps(op)))
++        conn.execute('INSERT INTO kanban_projections VALUES(?,?,?,?,?,?,?)',
++                     (namespace, 'creator', request['requestId'], 'default', home['task'], json.dumps(request), json.dumps(snapshot)))
++    # Seed the historical old-plugin/old-core plain unblock; new core refuses it.
++    with monkeypatch.context() as old_core, kbc.connect_closing() as conn:
++        old_core.setattr(sx, 'missing_local_adapter', lambda *a: False)
++        kb.unblock_task(conn, home['task'], comment=('user-steps', 'Choice recorded in Desktop: '
++                        + source.encoded(dict(label='Unblock', value='unblock')) + '\nOperation: ' + op['operationId']),
++                        event_extra={'user_steps_projection': receipt})
++    return dict(path=path, op=op, snapshot=snapshot)
++
++
++def recover(home):
++    with kbc.connect_closing() as conn:
++        return local.recover(conn, home['hub'], local.RECOVERY_OPERATION)
++
++
++def test_recover_then_admit_once_preserves_history(home, operation):
++    original_bytes = operation['path'].read_bytes()
++    with kbc.connect_closing() as conn:
++        task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (home['task'],)).fetchone())
++        events = [tuple(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (home['task'],))]
++    grant = recover(home)
++    assert recover(home) == grant
++    assert operation['path'].read_bytes() == original_bytes
++    with kbc.connect_closing() as conn:
++        assert dict(conn.execute('SELECT * FROM tasks WHERE id=?', (home['task'],)).fetchone()) == task
++        after = [tuple(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (home['task'],))]
++        assert after[:len(events)] == events and len(after) == len(events) + 1
++    result = helpers.reconsider(home)
++    assert result['created'] is True, result
++    assert helpers.reconsider(home)['replayed'] is True
++    assert recover(home) == grant  # receipt replay is not renewed authority
++    assert len(helpers.state(home)['status']['spent']) == 1
++    assert helpers.state(home)['status']['local_authority']['usable'] is False
++
++
++def test_recovery_rollback_and_concurrent_exact_replay(home, operation, monkeypatch):
++    from concurrent.futures import ThreadPoolExecutor
++    from threading import Barrier
++    append = kb._append_event
++
++    def fail(conn, task, kind, *args, **kwargs):
++        value = append(conn, task, kind, *args, **kwargs)
++        if kind == local.RECOVERED:
++            raise RuntimeError('crash before commit')
++        return value
++    with monkeypatch.context() as patch:
++        patch.setattr(kb, '_append_event', fail)
++        with pytest.raises(RuntimeError, match='crash before commit'):
++            recover(home)
++    with kbc.connect_closing() as conn:
++        assert sx._own(conn, local.RECOVERED) == []
++    barrier = Barrier(2)
++
++    def concurrent():
++        barrier.wait(timeout=10)
++        return recover(home)
++    with ThreadPoolExecutor(max_workers=2) as pool:
++        futures = [pool.submit(concurrent) for _ in range(2)]
++        results = [f.result(timeout=30) for f in futures]
++    assert results[0] == results[1]
++    with kbc.connect_closing() as conn:
++        assert len(sx._own(conn, local.RECOVERED)) == 1
++
++
++@pytest.mark.parametrize('mutation', ['board', 'task', 'session', 'remote', 'custom', 'ask', 'generation',
++                                     'revision', 'resolution', 'withdrawn', 'frozen', 'foreign_event', 'comment', 'expiry'])
++def test_changed_projection_or_owner_evidence_refuses(home, operation, monkeypatch, mutation):
++    if mutation in ('board', 'task', 'session', 'remote', 'custom', 'ask', 'generation'):
++        with sqlite3.connect(operation['path']) as conn:
++            snapshot = copy.deepcopy(operation['snapshot'])
++            if mutation in ('board', 'task'):
++                conn.execute('UPDATE kanban_projections SET ' + mutation + '=?', ('wrong',))
++            else:
++                targets = {
++                    'session': (snapshot, 'session', 'other'),
++                    'remote': (snapshot, 'remote', {}),
++                    'custom': (snapshot['ask'], 'choices', [{'label': 'Unblock', 'value': 'unblock'}]),
++                    'ask': (snapshot['ask'], 'action', snapshot['ask']['action'] + ' changed'),
++                    'generation': (snapshot, 'generation', 'not-an-integer'),
++                }
++                target, key, value = targets[mutation]
++                target[key] = value
++                conn.execute('UPDATE kanban_projections SET snapshot=?', (json.dumps(snapshot),))
++    elif mutation in ('revision', 'resolution', 'withdrawn', 'frozen'):
++        with sqlite3.connect(operation['path']) as conn:
++            conn.execute({
++                'revision': 'UPDATE requests SET revision=2',
++                'resolution': "UPDATE requests SET resolution='{}'",
++                'withdrawn': "UPDATE requests SET state='withdrawn'",
++                'frozen': "UPDATE revisions SET body='{}'",
++            }[mutation])
++    elif mutation == 'expiry':
++        monkeypatch.setattr(local.time, 'time', lambda: operation['snapshot']['ask'][sx.STAMP]['expires_at'])
++    else:
++        with kbc.connect_closing() as conn, kb.write_txn(conn):
++            if mutation == 'comment':
++                conn.execute("UPDATE task_comments SET body='changed' WHERE task_id=? AND author='user-steps'", (home['task'],))
++            else:
++                cols = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++                if 'origin_gateway' not in cols:
++                    conn.execute('ALTER TABLE task_events ADD COLUMN origin_gateway TEXT')
++                conn.execute("UPDATE task_events SET origin_gateway='foreign' WHERE task_id=? AND kind='unblocked'", (home['task'],))
++    with pytest.raises(sx.Refused):
++        recover(home)
++    with kbc.connect_closing() as conn:
++        assert sx._own(conn, local.RECOVERED) == []
++
++
++@pytest.mark.parametrize('mutation', ['owner', 'revision', 'intent', 'decision', 'cancelled', 'pending', 'receipt'])
++def test_source_mutation_refuses_without_writes(home, operation, mutation):
++    op = copy.deepcopy(operation['op'])
++    targets = {
++        'owner': (op['owner'], 'profile', 'other'),
++        'revision': (op, 'revision', 2),
++        'intent': (op['intent'], 'permissionGrants', ['forged']),
++        'decision': (op['decision'], 'choiceId', 'card-1'),
++        'cancelled': (op, 'dispatchState', 'cancelled'),
++        'pending': (op, 'dispatchState', 'pending'),
++        'receipt': (op['receipt'], 'value', 'archive'),
++    }
++    target, key, value = targets[mutation]
++    target[key] = value
++    with sqlite3.connect(operation['path']) as conn:
++        conn.execute('UPDATE operations SET body=?', (json.dumps(op),))
++    with pytest.raises(sx.Refused):
++        recover(home)
++    with kbc.connect_closing() as conn:
++        assert sx._own(conn, local.RECOVERED) == []
++
++
++@pytest.mark.parametrize('mutation', ['replacement', 'decline', 'hold', 'source'])
++def test_revalidate_after_issuance_before_consumption(home, operation, monkeypatch, mutation):
++    recover(home)
++    if mutation == 'source':
++        with sqlite3.connect(operation['path']) as conn:
++            op = copy.deepcopy(operation['op'])
++            op['intent']['revisionText'] = 'changed'
++            conn.execute('UPDATE operations SET body=?', (json.dumps(op),))
++    elif mutation == 'hold':
++        from hermes_cli import kanban_containment_guard
++        monkeypatch.setattr(kanban_containment_guard, 'pending', lambda *a: True)
++    else:
++        with kbc.connect_closing() as conn, kb.write_txn(conn):
++            if mutation == 'decline':
++                kb._append_event(conn, home['task'], 'archived', {})
++            else:
++                prior = sx._own(conn, sx.OFFERED)[0]['payload']
++                newer = copy.deepcopy(prior)
++                newer[sx.STAMP]['offer_uid'] = 'replacement'
++                kb._append_event(conn, home['task'], sx.OFFERED, newer)
++    try:
++        result = helpers.reconsider(home)
++    except sx.Refused:
++        result = {'created': False}
++    assert result.get('created') is not True
++    with kbc.connect_closing() as conn:
++        assert sx._own(conn, sx.SPENT) == []
+diff --git a/tests/hermes_cli/test_kanban_selfwork_module.py b/tests/hermes_cli/test_kanban_selfwork_module.py
+new file mode 100644
+index 00000000000..5404a53394e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_module.py
+@@ -0,0 +1,19 @@
++"""The module entry must invoke canonical code, not a second Capability type."""
++import os
++import subprocess
++import sys
++
++
++def test_module_uses_canonical_main(tmp_path):
++    # runpy executes the real __main__ guard in a fresh interpreter. Only canonical
++    # main is replaced: calling a duplicate module's main fails this sentinel.
++    probe = tmp_path / 'probe.py'
++    probe.write_text(
++        "import runpy\n"
++        "from hermes_cli import kanban_selfwork_exception as sx\n"
++        "sx.main = lambda: 37\n"
++        "runpy.run_module('hermes_cli.kanban_selfwork_exception', run_name='__main__')\n"
++    )
++    result = subprocess.run([sys.executable, str(probe)], env={**os.environ, 'PYTHONPATH': os.getcwd()},
++                            capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 37, (result.stdout, result.stderr)
+-- 
+2.43.0
+

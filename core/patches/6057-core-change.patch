@@ -1,0 +1,165 @@
+From 34c447c4593a3c994250ad9c26b31d3c99a886b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:06:09 +0000
+Subject: [PATCH 6057] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit 34c447c4593a3c994250ad9c26b31d3c99a886b1.
+
+---
+diff --git a/hermes_cli/serve_producer_admission.py b/hermes_cli/serve_producer_admission.py
+index c0633f3c06e..d042f8f13e8 100644
+--- a/hermes_cli/serve_producer_admission.py
++++ b/hermes_cli/serve_producer_admission.py
+@@ -88,8 +88,13 @@
+     return LaunchReceipt(Incarnation(**identity), **{key: item for key, item in value.items() if key != 'identity'})
+ 
+ 
+-def read_participants_strict(runtime: Path) -> tuple[LaunchReceipt, ...]:
+-    """Absent, unsafe or malformed enrollment is uncertainty, never an empty host."""
++def read_participants_strict(runtime: Path, *, allow_foreign_namespace: bool = False) -> tuple[LaunchReceipt, ...]:
++    """Absent, unsafe or malformed enrollment is uncertainty, never an empty host.
++
++    Same-boot receipts from another PID namespace (shared-home containers) refuse the
++    CENSUS, whose cut they leave incomplete. Launch enrollment passes
++    ``allow_foreign_namespace`` so ordinary startup keeps working; it retains them verbatim.
++    """
+     path = runtime / 'participants.json'
+     try:
+         info = path.lstat()
+@@ -103,7 +108,8 @@
+         receipts = tuple(_receipt(value) for value in values)
+         adapter = LinuxProcessCensus()
+         boot, namespace = adapter.boot_id(), adapter.namespace_id()
+-        if any(row.identity.boot_id == boot and row.namespace != namespace for row in receipts):
++        if not allow_foreign_namespace and any(
++                row.identity.boot_id == boot and row.namespace != namespace for row in receipts):
+             raise CensusUnavailable('foreign pid namespace')
+         if len({receipt.identity for receipt in receipts}) != len(receipts):
+             raise CensusUnavailable('duplicate participant incarnation')
+@@ -181,19 +187,23 @@
+         except FileNotFoundError:
+             receipts = ()  # first enrollment, NEVER used as host absence evidence
+         else:
+-            receipts = read_participants_strict(runtime)
++            receipts = read_participants_strict(runtime, allow_foreign_namespace=True)
+         boot = adapter.boot_id()
+         record = adapter.read_process(os.getpid(), boot)
+         receipt = LaunchReceipt(record.identity, str(installation), launcher_generation(installation),
+                                 role, observation_digest(record), adapter.namespace_id())
++        namespace = adapter.namespace_id()
++        # Foreign-namespace rows cannot be probed from here: keep them (never proof of absence);
++        # the census refuses them, so the cut stays INCOMPLETE until their namespace retires them.
+         kept = [row for row in receipts if row.identity.boot_id == boot
+-                and row.identity != record.identity and not incarnation_exited(adapter, row.identity)]
++                and row.identity != record.identity
++                and (row.namespace != namespace or not incarnation_exited(adapter, row.identity))]
+         if len(kept) >= _MAX_PARTICIPANTS:
+             raise CensusUnavailable('participant count budget')
+         if adapter.read_process(os.getpid(), boot) != record or adapter.boot_id() != boot:
+             raise CensusUnavailable('enrolling process changed')
+         _write_participants(runtime, (*kept, receipt))
+-        if receipt not in read_participants_strict(runtime):
++        if receipt not in read_participants_strict(runtime, allow_foreign_namespace=True):
+             raise CensusUnavailable('participant publication lost')
+         return receipt
+ 
+@@ -321,11 +331,13 @@
+         # No broker/custody hook exists yet, even an in-memory guarded bit is not authority.
+         return Classification(record.identity, 'legacy',
+                               f'enrollment:{receipt.generation}:{receipt.role}')
+-    if not _record_touches(record, installation, home):
+-        return Classification(record.identity, 'unrelated', f'exe:{record.exe}')
+     module = _module_token(record.argv)
+     if module in _KNOWN_MODULES:
++        # Explicit Hermes launcher: a separate install sharing the default home, or an
++        # editable/.pth import, leaves no path evidence, so it is never positively unrelated.
+         return Classification(record.identity, 'legacy', f'launcher:{module}')
++    if not _record_touches(record, installation, home):
++        return Classification(record.identity, 'unrelated', f'exe:{record.exe}')
+     return Classification(record.identity, 'unknown', 'no exact guarded launch receipt')
+ 
+ # Each collector must enumerate its exact configured scope (including disabled or
+diff --git a/tests/hermes_cli/test_serve_producer_launch.py b/tests/hermes_cli/test_serve_producer_launch.py
+index 073d9513542..79268e6ca0a 100644
+--- a/tests/hermes_cli/test_serve_producer_launch.py
++++ b/tests/hermes_cli/test_serve_producer_launch.py
+@@ -127,13 +127,29 @@
+         admission.read_participants_strict(runtime)
+ 
+ 
+-def test_foreign_namespace_refused_before_retirement(tmp_path):
++def test_foreign_namespace_survives_enrollment_but_refuses_census(tmp_path):
+     runtime = tmp_path / 'runtime'
+-    receipt = admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
+-    foreign = replace(receipt, namespace='pid:[1]')
++    root = Path(__file__).parents[2]
++    receipt = admission.enroll_launch(runtime, 'serve', installation=root)
++    foreign = replace(receipt, identity=replace(receipt.identity, pid=receipt.identity.pid + 1_000_000),
++                      namespace='pid:[1]')
+     (runtime / 'participants.json').write_text(json.dumps([asdict(foreign)]))
+-    with pytest.raises(CensusUnavailable, match='namespace'):
+-        admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
++    fresh = admission.enroll_launch(runtime, 'serve', installation=root)  # ordinary startup keeps working
++    with pytest.raises(CensusUnavailable, match='namespace'):  # but never proves an empty/safe host
++        admission.read_participants_strict(runtime)
++    rows = admission.read_participants_strict(runtime, allow_foreign_namespace=True)
++    assert foreign in rows and fresh in rows
++    again = admission.enroll_launch(runtime, 'serve', installation=root)  # replacement namespace row kept
++    assert foreign in admission.read_participants_strict(runtime, allow_foreign_namespace=True) and again.namespace != 'pid:[1]'
++
++
++def test_explicit_hermes_module_is_never_positive_unrelated():
++    from hermes_cli.serve_producer_census import Incarnation, ProcessObservation
++    record = ProcessObservation(Incarnation('boot', 123, 456), '/opt/other-venv/bin/python', '/tmp',
++                                ('/opt/other-venv/bin/python', '-m', 'hermes_cli.main', 'serve'), ())
++    verdict = admission.classify_process(record, (), 'generation',
++                                         installation='/opt/current-hermes', home='/home/test/.hermes')
++    assert verdict.kind == 'legacy'
+ 
+ 
+ def test_new_boot_prunes_old_receipts_but_stale_pending_cannot_brick_reused_pid(tmp_path):
+diff --git a/tests/hermes_cli/test_serve_producer_shared_home_startup.py b/tests/hermes_cli/test_serve_producer_shared_home_startup.py
+new file mode 100644
+index 00000000000..3f8819fca74
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_shared_home_startup.py
+@@ -0,0 +1,36 @@
++"""Ordinary launch survives a shared-home foreign PID-namespace receipt (container topology)."""
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def test_ordinary_gateway_launch_survives_shared_home_namespace(tmp_path, monkeypatch):
++    from hermes_cli import main, plugins
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: tmp_path)
++    runtime = tmp_path / 'serve-producer-v1'
++    runtime.mkdir(mode=0o700)
++    foreign = dict(identity=dict(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
++                                pid=123, start_ticks=456),
++                   installation='/opt/hermes', generation='a' * 64, role='gateway',
++                   observation='b' * 64, namespace='pid:[1]', guarded=False)
++    ledger = runtime / 'participants.json'
++    ledger.write_text(json.dumps([foreign]))
++    ledger.chmod(0o600)
++    for name in ('_apply_safe_mode', '_apply_user_config_bypass', '_guard_noninteractive_user_config'):
++        monkeypatch.setattr(main, name, lambda *a: None)
++
++    class DiscoveryReached(BaseException):
++        pass
++
++    def reached():
++        raise DiscoveryReached()
++
++    monkeypatch.setattr(plugins, 'start_background_plugin_discovery', reached)
++    with pytest.raises(DiscoveryReached):
++        main._prepare_agent_startup(SimpleNamespace(command='gateway', gateway_command='run'))
+-- 
+2.43.0
+

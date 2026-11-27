@@ -1,0 +1,597 @@
+From 2094214fdc1c8582a6aa548d6b353bb9eae3c196 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:59:53 +0000
+Subject: [PATCH 6126] Sessions request path: transport packing, scoped enrichment and coalesced polls
+
+Public mirror of source commit 2094214fdc1c8582a6aa548d6b353bb9eae3c196.
+
+---
+diff --git a/hermes_cli/kanban_links_refresh.py b/hermes_cli/kanban_links_refresh.py
+index ed2138356ca..0bc42abb68d 100644
+--- a/hermes_cli/kanban_links_refresh.py
++++ b/hermes_cli/kanban_links_refresh.py
+@@ -2,6 +2,7 @@
+ from contextvars import Context, copy_context
+ import logging
+ import threading
++import time
+ from collections.abc import Callable
+ 
+ _log = logging.getLogger(__name__)
+@@ -56,13 +57,21 @@
+ 
+     No projection IO runs under the condition. Each job owns its captured context,
+     which is released before the worker goes idle. Repeated polls of an active or
+-    queued scope coalesce. A full queue leaves last-good data intact; a later poll
+-    retries admission. Cold and strict reads do not use this worker.
++    queued scope coalesce. Starts of each scope are at least three seconds apart;
++    a trailing queued check wakes at its deadline without further display polls.
++    Both the queue and cooldown history are capacity-bounded. If cooldown history
++    is full, new scopes wait for its earliest expiry rather than evicting a live
++    cooldown (which would let scope churn bypass the floor). A full queue leaves
++    last-good data intact; a later poll retries admission. Cold and strict reads
++    do not use this worker.
+     """
+ 
+-    def __init__(self, refresh: Callable[[tuple], None], capacity: int):
++    def __init__(self, refresh: Callable[[tuple], None], capacity: int, *,
++                 clock: Callable[[], float] = time.monotonic):
+         self._refresh = refresh
+         self._capacity = capacity
++        self._clock = clock
++        self._next_start: dict[tuple, float] = {}
+         self._ready = threading.Condition()
+         self._pending: dict[tuple, Context] = {}
+         self._worker: threading.Thread | None = None
+@@ -79,6 +88,7 @@
+             self._fenced.add(scope)
+             if self._active != scope:
+                 self._pending.pop(scope, None)
++                self._ready.notify_all()
+                 return
+             if not self._ready.wait_for(lambda: self._active != scope, timeout):
+                 raise TimeoutError('remote links scope is still refreshing')
+@@ -114,9 +124,18 @@
+     def _run(self) -> None:
+         while True:
+             with self._ready:
+-                while not self._pending:
+-                    self._ready.wait()
+-                scope = next(iter(self._pending))
++                while True:
++                    now = self._clock()
++                    self._next_start = {key: due for key, due in self._next_start.items() if due > now}
++                    scope = next((key for key in self._pending
++                                  if key not in self._next_start and len(self._next_start) < self._capacity), None)
++                    if scope is not None:
++                        break
++                    # One deadline wait, not periodic polling. Empty workers retain
++                    # no context and need no wake until a new submission arrives.
++                    delay = min(self._next_start.values()) - now if self._pending else None
++                    self._ready.wait(delay)
++                self._next_start[scope] = now + 3.0
+                 self._active = scope
+                 context = self._pending[scope]
+             try:
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 0991d52332f..465ac5a333f 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -206,11 +206,20 @@
+     return {"tasks": session_kanban_tasks(wanted, stale_ok=True)}
+ 
+ 
++# Identical in-flight ``ids`` share one kanban-lane read (a Desktop poll burst). Distinct ``ids`` still
++# reach the lane so its size and queue deadline stay the bottleneck, not a second coalescer cap. [daveey]
++_session_kanban_tasks_admitted = coalesced_read(
++    _session_kanban_tasks_read, admission_key=lambda args: args["ids"], max_concurrent=64,
++    thread_runner=lane_runner("kanban"))
++
++
+ @list_router.get("/api/session-kanban-tasks")
+ async def get_session_kanban_tasks(request: Request, ids: str = Query(..., max_length=4000)):
+     # Reads every board's linked cards: the kanban lane, so a slow board holds neither the shared pool nor the
+-    # threads of the session lists. [daveey]
+-    return await run_in_lane("kanban", _session_kanban_tasks_read, ids, request=request)
++    # threads of the session lists. Coalesced waiters share one worker; disconnect of one must not cancel it
++    # (``coalesced_read`` shields). Lane queue deadline still applies inside ``lane_runner``. [daveey]
++    _ = request
++    return await _session_kanban_tasks_admitted(ids)
+ 
+ 
+ # ``le=100`` on limit: an unbounded limit lets one request drag every session
+@@ -669,8 +678,7 @@
+     return await asyncio.to_thread(_with_db, profile, _stats, read_only=True)
+ 
+ 
+-@manage_router.get("/api/sessions/{session_id}")
+-async def get_session_detail(session_id: str, profile: Optional[str] = None):
++def _session_detail_read(session_id: str, profile: Optional[str] = None):
+     def _detail(db):
+         sid = _resolve_session_id(db, session_id)
+         session = db.get_session(sid) if sid else None
+@@ -681,9 +689,10 @@
+         session["profile"] = _serving_profile(profile)
+         session["is_default_profile"] = session["profile"] == "default"
+         # Older/open sidebar rows can be restored from detail rather than a
+-        # recency page. They need fresh task evidence over the same lineage.
++        # recency page. They need the same display annotation as list rows over
++        # the same lineage, not a strict global re-read on every poll. [daveey]
+         session["_lineage_ids"] = db.get_compression_chain(sid)
+-        annotate_kanban_activity([session])
++        annotate_kanban_activity([session], display=True)
+         # A cron run's liveness is scheduler ownership, not the 300s activity
+         # window (#88443): a run inside a long tool call is still owned. A
+         # unified-runtime run's local id names no job, so stamp its identity first.
+@@ -696,7 +705,19 @@
+             session["scheduler_owned"] = owned
+         return session
+ 
+-    return await asyncio.to_thread(_with_db, profile, _detail, read_only=True)
++    return _with_db(profile, _detail, read_only=True)
++
++
++# Identical in-flight session_id+profile polls share one AnyIO worker. Distinct ids still
++# enter the pool; the cap is only so a burst of different chats is not serialized. [daveey]
++_session_detail_admitted = coalesced_read(
++    _session_detail_read, admission_key=lambda args: (args["session_id"], args["profile"]),
++    max_concurrent=32)
++
++
++@manage_router.get("/api/sessions/{session_id}")
++async def get_session_detail(session_id: str, profile: Optional[str] = None):
++    return await _session_detail_admitted(session_id, profile)
+ 
+ 
+ @manage_router.get("/api/sessions/{session_id}/mutation-snapshot")
+diff --git a/tests/hermes_cli/test_kanban_links_refresh_coalesce.py b/tests/hermes_cli/test_kanban_links_refresh_coalesce.py
+new file mode 100644
+index 00000000000..188d9768ee9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_refresh_coalesce.py
+@@ -0,0 +1,163 @@
++"""Deadline-driven refresh admission, with no wall-clock sleeps."""
++from contextvars import ContextVar
++import threading
++
++from hermes_cli.kanban_links_refresh import ScopeRefresher
++from tests.waiting import wait_until
++
++
++class ClockCondition(threading.Condition):
++    """Expose timed waits; tests advance the clock instead of waiting three seconds."""
++
++    def __init__(self):
++        super().__init__()
++        self.now = 100.0
++        self.waits = []
++        self.waiting = threading.Event()
++
++    def wait(self, timeout=None):
++        self.waits.append(timeout)
++        self.waiting.set()
++        return super().wait()  # advance() delivers the deadline wake deterministically
++
++    def advance(self, seconds):
++        with self:
++            self.now += seconds
++            self.waiting.clear()
++            self.notify_all()
++        assert self.waiting.wait(5)
++
++
++def owner_for(refresh, capacity=4):
++    condition = ClockCondition()
++    owner = ScopeRefresher(refresh, capacity, clock=lambda: condition.now)
++    owner._ready = condition
++    return owner, condition
++
++
++def settle(owner, condition):
++    wait_until(lambda: not owner.busy, timeout=5)
++    assert condition.waiting.wait(5)
++
++
++def test_completed_polls_coalesce_until_floor_with_first_context_and_no_poll_to_wake():
++    origin = ContextVar('coalescing_origin', default='outside')
++    calls = []
++    owner, condition = owner_for(lambda scope: calls.append((scope, condition.now, origin.get())))
++    scope = ('A',)
++    owner.submit(scope)
++    settle(owner, condition)
++    origin.set('trailing')
++    owner.submit(scope)
++    with owner._ready:
++        for _ in range(50):
++            origin.set('later')
++            owner.submit(scope)
++    condition.advance(2.999)
++    assert len(calls) == 1
++    assert owner.busy
++    assert 0 < condition.waits[-1] < 0.002
++    condition.advance(0.001)
++    settle(owner, condition)
++    assert calls == [(scope, 100.0, 'outside'), (scope, 103.0, 'trailing')]
++    assert condition.waits[-1] is None
++
++
++def test_unrelated_scope_is_not_blocked_behind_cooling_scope():
++    calls = []
++    owner, condition = owner_for(calls.append)
++    owner.submit(('A',))
++    settle(owner, condition)
++    owner.submit(('A',))
++    owner.submit(('B',))
++    wait_until(lambda: len(calls) == 2, timeout=5)
++    assert calls == [('A',), ('B',)]
++    owner.drain(('A',), timeout=0)
++    settle(owner, condition)
++
++
++def test_cooldown_state_is_bounded_without_eviction_bypassing_floor():
++    calls = []
++    owner, condition = owner_for(calls.append, capacity=2)
++    for scope in [('A',), ('B',)]:
++        owner.submit(scope)
++        settle(owner, condition)
++    owner.submit(('C',))
++    owner.submit(('A',))
++    owner.submit(('overflow',))
++    condition.advance(2)
++    assert calls == [('A',), ('B',)]
++    assert len(owner._next_start) == len(owner._pending) == 2
++    condition.advance(1)
++    settle(owner, condition)
++    assert calls == [('A',), ('B',), ('C',), ('A',)]
++    assert len(owner._next_start) <= 2
++    condition.advance(3)
++    assert owner._next_start == {}
++
++
++def test_drain_cancels_trailing_context_and_resume_preserves_cooldown():
++    calls = []
++    owner, condition = owner_for(calls.append)
++    scope = ('A',)
++    owner.submit(scope)
++    settle(owner, condition)
++    owner.submit(scope)
++    owner.drain(scope, timeout=0)
++    owner.submit(scope)
++    assert not owner.busy
++    owner.resume(scope)
++    owner.submit(scope)
++    condition.advance(2)
++    assert calls == [scope]
++    condition.advance(1)
++    settle(owner, condition)
++    assert calls == [scope, scope]
++
++
++def test_failure_retries_only_at_floor_and_worker_survives():
++    calls = []
++
++    def refresh(scope):
++        calls.append(scope)
++        if len(calls) == 1:
++            raise RuntimeError('controlled refresh failure')
++
++    owner, condition = owner_for(refresh)
++    owner.submit(('A',))
++    settle(owner, condition)
++    worker = owner._worker
++    owner.submit(('A',))
++    condition.advance(2)
++    assert calls == [('A',)]
++    condition.advance(1)
++    settle(owner, condition)
++    assert calls == [('A',), ('A',)]
++    assert owner._worker is worker
++
++
++def test_floor_is_from_start_not_completion_and_active_polls_still_coalesce():
++    entered, release = threading.Event(), threading.Event()
++    calls = []
++
++    def refresh(scope):
++        calls.append(scope)
++        if len(calls) == 1:
++            entered.set()
++            assert release.wait(5)
++
++    owner, condition = owner_for(refresh)
++    owner.submit(('A',))
++    assert entered.wait(5)
++    try:
++        for _ in range(20):
++            owner.submit(('A',))
++        with condition:
++            condition.now += 4
++    finally:
++        release.set()
++    settle(owner, condition)
++    assert calls == [('A',)]
++    owner.submit(('A',))
++    settle(owner, condition)
++    assert calls == [('A',), ('A',)]
+diff --git a/tests/hermes_cli/test_kanban_links_stale_scopes.py b/tests/hermes_cli/test_kanban_links_stale_scopes.py
+index d2c1f2294ba..4c4c5f6f172 100644
+--- a/tests/hermes_cli/test_kanban_links_stale_scopes.py
++++ b/tests/hermes_cli/test_kanban_links_stale_scopes.py
+@@ -1,10 +1,23 @@
+ """Warm linked-card reads must not enter blocking fingerprint/projection work."""
+ import threading
+ 
++import pytest
++
+ from hermes_cli import kanban_session_activity as activity
++from hermes_cli.kanban_links_refresh import ScopeRefresher
+ from tests.waiting import wait_until
+ 
+ 
++@pytest.fixture(autouse=True)
++def isolated_refresher(monkeypatch):
++    # Cache reset does not reset process-lifetime admission cooldowns. Each test
++    # needs an independent owner, not a two-second wait against a prior test's floor.
++    owner = ScopeRefresher(lambda scope: activity._refresh_links_scope(scope), 16)
++    monkeypatch.setattr(activity, '_links_refresher', owner)
++    yield
++    wait_until(lambda: not owner.busy, what='isolated refresh cleanup')
++
++
+ def test_scope_a_survives_scope_b_projection_lock(monkeypatch):
+     from contextvars import ContextVar
+ 
+diff --git a/tests/hermes_cli/test_session_detail_kanban.py b/tests/hermes_cli/test_session_detail_kanban.py
+index a816dcc9e43..f67334f02ef 100644
+--- a/tests/hermes_cli/test_session_detail_kanban.py
++++ b/tests/hermes_cli/test_session_detail_kanban.py
+@@ -26,7 +26,8 @@
+     from hermes_cli.web_routers import cron
+     monkeypatch.setattr(cron, "cron_run_scheduler_owned", lambda *a: None)
+ 
+-    def annotate(rows):
++    def annotate(rows, *, display=False):
++        assert display is True  # detail is a sidebar restore, not a strict lifecycle read
+         assert rows[0]["_lineage_ids"] == ["root", "tip"]
+         rows[0]["kanban_observed_at"] = 1234
+         if count:
+diff --git a/tests/hermes_cli/test_session_route_coalesce.py b/tests/hermes_cli/test_session_route_coalesce.py
+new file mode 100644
+index 00000000000..1d05a0e321c
+--- /dev/null
++++ b/tests/hermes_cli/test_session_route_coalesce.py
+@@ -0,0 +1,189 @@
++"""Concurrent session-kanban-tasks and session-detail polls share one in-flight read."""
++import asyncio
++import threading
++
++import httpx
++import pytest
++from fastapi import FastAPI, HTTPException
++
++from hermes_cli.web_routers import sessions
++from tests.waiting import async_wait_until
++
++
++async def _until(predicate):
++    await async_wait_until(predicate, timeout=5)
++
++
++def _kanban_app():
++    app = FastAPI()
++    app.include_router(sessions.list_router)
++    return app
++
++
++def _detail_app():
++    app = FastAPI()
++    app.include_router(sessions.manage_router)
++    return app
++
++
++@pytest.mark.asyncio
++async def test_identical_kanban_task_ids_share_one_lane_read(monkeypatch):
++    release = threading.Event()
++    calls = []
++
++    def slow_tasks(wanted, stale_ok=False):
++        calls.append((tuple(wanted), stale_ok))
++        assert release.wait(5)
++        return [{"id": "t1", "status": "running"}]
++
++    monkeypatch.setattr(sessions, "session_kanban_tasks", slow_tasks)
++    app = _kanban_app()
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++        tasks = [asyncio.create_task(client.get("/api/session-kanban-tasks", params={"ids": "s1,s2"}))
++                 for _ in range(8)]
++        try:
++            await _until(lambda: calls)
++            await asyncio.sleep(0)  # let every request enter the in-flight wrapper
++            assert calls == [(("s1", "s2"), True)]
++        finally:
++            release.set()
++            responses = await asyncio.gather(*tasks)
++    assert all(r.status_code == 200 for r in responses)
++    bodies = [r.json() for r in responses]
++    assert all(body == {"tasks": [{"id": "t1", "status": "running"}]} for body in bodies)
++
++
++@pytest.mark.asyncio
++async def test_distinct_kanban_task_ids_do_not_share_a_read(monkeypatch):
++    gates = {key: threading.Event() for key in ("a", "b")}
++    started = {key: threading.Event() for key in ("a", "b")}
++    calls = []
++
++    def gated_tasks(wanted, stale_ok=False):
++        key = wanted[0]
++        calls.append(key)
++        started[key].set()
++        assert gates[key].wait(5)
++        return [{"id": key}]
++
++    monkeypatch.setattr(sessions, "session_kanban_tasks", gated_tasks)
++    app = _kanban_app()
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++        first = asyncio.create_task(client.get("/api/session-kanban-tasks", params={"ids": "a"}))
++        second = asyncio.create_task(client.get("/api/session-kanban-tasks", params={"ids": "b"}))
++        try:
++            await _until(lambda: started["a"].is_set() and started["b"].is_set())
++            assert sorted(calls) == ["a", "b"]
++        finally:
++            gates["a"].set()
++            gates["b"].set()
++            responses = await asyncio.gather(first, second)
++    assert {r.json()["tasks"][0]["id"] for r in responses} == {"a", "b"}
++
++
++@pytest.mark.asyncio
++async def test_kanban_tasks_missing_ids_is_422():
++    app = _kanban_app()
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++        response = await client.get("/api/session-kanban-tasks")
++    assert response.status_code == 422
++
++
++@pytest.mark.asyncio
++async def test_identical_detail_polls_share_one_display_annotation(monkeypatch):
++    from hermes_cli.web_routers import cron
++
++    release = threading.Event()
++    started = threading.Event()
++    calls = []
++
++    class DB:
++        def resolve_session_id(self, sid):
++            return sid
++
++        def get_session(self, sid):
++            return {"id": sid}
++
++        def get_compression_chain(self, sid):
++            return [sid]
++
++        def close(self):
++            pass
++
++    def annotate(rows, *, display=False):
++        calls.append(display)
++        started.set()
++        assert release.wait(5)
++        rows[0]["kanban_active"] = 3
++        return rows
++
++    monkeypatch.setattr(sessions, "_open_session_db_for_profile", lambda *a, **kw: DB())
++    monkeypatch.setattr(sessions, "_serving_profile", lambda p: p or "default")
++    monkeypatch.setattr(cron, "cron_run_scheduler_owned", lambda *a: None)
++    monkeypatch.setattr(sessions, "annotate_kanban_activity", annotate)
++
++    first = asyncio.create_task(sessions.get_session_detail("s1", "default"))
++    await _until(started.is_set)
++    second = asyncio.create_task(sessions.get_session_detail("s1", "default"))
++    await _until(lambda: len(asyncio.all_tasks()) >= 2)
++    await asyncio.sleep(0)  # let every request enter the in-flight wrapper
++    assert calls == [True]
++    release.set()
++    rows = await asyncio.gather(first, second)
++    assert all(row["id"] == "s1" and row["kanban_active"] == 3 and row["profile"] == "default" for row in rows)
++
++
++@pytest.mark.asyncio
++async def test_detail_deleted_session_is_still_404(monkeypatch):
++    class DB:
++        def resolve_session_id(self, sid):
++            return sid
++
++        def get_session(self, sid):
++            return None
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr(sessions, "_open_session_db_for_profile", lambda *a, **kw: DB())
++    with pytest.raises(HTTPException) as error:
++        await sessions.get_session_detail("gone")
++    assert error.value.status_code == 404
++    assert error.value.detail == sessions._NOT_FOUND
++
++
++@pytest.mark.asyncio
++async def test_detail_http_shape_keeps_display_annotation(monkeypatch):
++    from hermes_cli.web_routers import cron
++
++    class DB:
++        def resolve_session_id(self, sid):
++            return sid
++
++        def get_session(self, sid):
++            return {"id": sid, "source": "cli"}
++
++        def get_compression_chain(self, sid):
++            return ["root", sid]
++
++        def close(self):
++            pass
++
++    def annotate(rows, *, display=False):
++        assert display is True
++        rows[0]["kanban_blocked"] = 1
++        return rows
++
++    monkeypatch.setattr(sessions, "_open_session_db_for_profile", lambda *a, **kw: DB())
++    monkeypatch.setattr(sessions, "_serving_profile", lambda p: "default")
++    monkeypatch.setattr(cron, "cron_run_scheduler_owned", lambda *a: None)
++    monkeypatch.setattr(sessions, "annotate_kanban_activity", annotate)
++    app = _detail_app()
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
++        response = await client.get("/api/sessions/tip")
++    assert response.status_code == 200
++    body = response.json()
++    assert body["id"] == "tip"
++    assert body["profile"] == "default"
++    assert body["kanban_blocked"] == 1
++    assert body["_lineage_ids"] == ["root", "tip"]
+diff --git a/tests/hermes_cli/test_web_links_stale.py b/tests/hermes_cli/test_web_links_stale.py
+index 2313016fed0..4fe6a7fd6e8 100644
+--- a/tests/hermes_cli/test_web_links_stale.py
++++ b/tests/hermes_cli/test_web_links_stale.py
+@@ -4,6 +4,7 @@
+ from pathlib import Path
+ import sqlite3
+ import threading
++import time
+ from unittest.mock import AsyncMock
+ 
+ import pytest
+@@ -11,6 +12,7 @@
+ from fastapi.testclient import TestClient
+ 
+ from hermes_cli import kanban_session_activity as activity
++from hermes_cli.kanban_links_refresh import ScopeRefresher
+ from tests.waiting import wait_until
+ 
+ 
+@@ -21,6 +23,9 @@
+ 
+ @pytest.fixture(params=['core', 'user-steps'])
+ def linked_client(request, monkeypatch, tmp_path, reader_mode):
++    # A fresh process-lifetime owner keeps parametrizations from sharing cooldowns.
++    monkeypatch.setattr(activity, '_links_refresher',
++                        ScopeRefresher(lambda scope: activity._refresh_links_scope(scope), 16))
+     from hermes_cli import web_server as ws
+     from hermes_cli import web_server_dashboard as dashboard
+     from hermes_cli import kanban_db_sync
+@@ -77,6 +82,11 @@
+     first = client.get(endpoint, params={'ids': 's-chat'})
+     assert first.status_code == 200, first.text
+     assert first.json()['tasks'][0]['id'] == 'prior'
++    # A handler may request links more than once while warming (cards + rows),
++    # already starting a refresh. Exercise the *next eligible* stale read rather
++    # than requiring a second start inside the new three-second floor.
++    wait_until(lambda: not activity._links_refresher.busy, what='HTTP warm refresh')
++    monkeypatch.setattr(activity._links_refresher, '_clock', lambda: time.monotonic() + 3)
+     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+     responses = []
+ 
+-- 
+2.43.0
+

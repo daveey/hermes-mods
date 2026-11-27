@@ -1,0 +1,210 @@
+From dd34e9d8184d0fa24f20c1e19a089ad374f607a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 09:19:53 -0800
+Subject: [PATCH 6182] Standing producer owner chats and local origin custody
+
+Public mirror of source commit dd34e9d8184d0fa24f20c1e19a089ad374f607a4.
+
+---
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index 8a52f21692b..eacc063c44f 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -116,7 +116,8 @@
+             proofs[task_id] = proven_foreign_chats(conn, (task_id,), local_gateway=me)
+         return f"{row['chat_gateway']}/{row['chat_profile']}/{row['chat_session']}" in proofs[task_id]
+ 
+-    frontier, seen = [creator_task_id], set()
++    from hermes_cli.kanban_owner_chat import PREFIX
++    frontier, seen, fallback = [creator_task_id], set(), []
+     for _depth in range(MAX_DEPTH):
+         owners, following = {}, []
+         for task_id in frontier:
+@@ -138,12 +139,16 @@
+                 following.append(payload["creator_task_id"])
+             following.extend(r[0] for r in conn.execute(
+                 "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id", (task_id,)))
+-        if owners:
+-            return list(owners.values())
++        # A producer's standing owner chat (kanban_owner_chat) is the last resort: the walk goes on for a real
++        # chat further up, and only the nearest owner chats are returned when there is none.
++        real = [v for k, v in owners.items() if not str(k[2] or "").startswith(PREFIX)]
++        if real:
++            return real
++        fallback = fallback or list(owners.values())
+         frontier = list(dict.fromkeys(t for t in following if t not in seen))
+         if not frontier:
+             break
+-    return []
++    return fallback
+ 
+ 
+ def _copy_delivery(conn: sqlite3.Connection, task_id: str, owner: dict) -> None:
+@@ -268,11 +273,14 @@
+     from hermes_cli.kanban_db import _append_event
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone():
+         return
++    from hermes_cli.kanban_owner_chat import PREFIX
+     owners, source = resolve_chats(conn, creator_task_id, verdicts=verdicts), None
+-    if not owners:
+-        owners = (replica_reader.resolve(creator_task_id, verdicts=verdicts) if replica_reader is not None
+-                  else _replica_chats(conn, creator_task_id))
+-        source = "replica" if owners else None
++    if all(str(o["chat_session"] or "").startswith(PREFIX) for o in owners):
++        # None, or only a producer's owner chat: a real chat on the replica (another gateway's) wins over it.
++        replica = (replica_reader.resolve(creator_task_id, verdicts=verdicts) if replica_reader is not None
++                   else _replica_chats(conn, creator_task_id))
++        if replica and (not owners or not all(str(o["chat_session"] or "").startswith(PREFIX) for o in replica)):
++            owners, source = replica, "replica"
+     if not owners:
+         if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='creator_chats_unresolved'",
+                             (task_id,)).fetchone():
+diff --git a/hermes_cli/kanban_owner_chat.py b/hermes_cli/kanban_owner_chat.py
+index 1f58100d4a9..96d89b74984 100644
+--- a/hermes_cli/kanban_owner_chat.py
++++ b/hermes_cli/kanban_owner_chat.py
+@@ -40,6 +40,7 @@
+ BACKFILL_EVERY_S = 3600.0
+ BACKFILL_CATCHUP_S = 600.0
+ BACKFILL_BATCH = 100
++CREATOR_GRACE_S = 6 * 3600.0
+ _ENSURED: dict[tuple[str, str], tuple[str, float]] = {}
+ _LOCK = threading.Lock()
+ _NEXT_BACKFILL: dict[str, float] = {}
+@@ -214,6 +215,13 @@
+     kca._anchor_registered_session(conn, task_id)
+     if kca.has_authority(conn, task_id, creator_task_id, durable=True):
+         return
++    if creator_task_id:
++        # A worker's card is owned through its creator chain, whose chat may resolve after create (from another
++        # gateway's replica). An owner chat here would sit beside that real chat and, being local and verified,
++        # be preferred over it; the hourly backfill covers a chain that never resolves.
++        if strict:
++            kca.require(conn, task_id, creator_task_id)
++        return
+     name = (producer or "").strip() or (None if strict else (created_by or "").strip() or "unattributed")
+     if not name:
+         kca.require(conn, task_id, creator_task_id)  # raises: no chat, no creator, no declared producer
+@@ -259,13 +267,29 @@
+                               (task_id,)).fetchone():
+         return None  # its owner let go on purpose; re-owning it would undo that
+     mine, other = _owner_refs(conn, task_id, links)
+-    if mine and not other and not any(live(ref) for ref in mine):
++    if other:
++        return None  # a real creating chat (possibly another gateway's) owns it: never put an owner chat beside it
++    if mine and not any(live(ref) for ref in mine):
+         return mine  # owned only by owner chats the user deleted or archived: delivery would go nowhere
+     if kca.has_authority(conn, task_id, None, durable=True):
+         return None
++    if _creator_chain_pending(conn, task_id):
++        return None
+     return []
+ 
+ 
++def _creator_chain_pending(conn, task_id: str) -> bool:
++    """A worker's card younger than ``CREATOR_GRACE_S`` may still get its creator's chat by link resolution."""
++    import time
++
++    from hermes_cli.kanban_archive_scope import _creator_task_id
++    if not _creator_task_id(conn, task_id):
++        return False
++    created = conn.execute("SELECT created_at FROM tasks WHERE id=?", (task_id,)).fetchone()[0] or 0
++    created = created / 1000 if created > 1e11 else created
++    return time.time() - created < CREATOR_GRACE_S
++
++
+ def _liveness():
+     from hermes_constants import get_hermes_home
+     db = _open_store(str(get_hermes_home() / "state.db"))
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ee5a515f09f..1fdd8b0eb48 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -578,6 +578,26 @@
+     monkeypatch.setattr(_kbd_mod, "_system_memory_sample", dict, raising=False)
+ 
+ 
++@pytest.fixture(autouse=True)
++def _owner_chats_off(request, monkeypatch):
++    """Cards are created ownerless, as before standing owner chats (``hermes_cli.kanban_owner_chat``), unless a
++    test requests the ``owner_chats`` fixture. Suites across kanban, notify and the TUI gateway pin exact links,
++    subscriptions, routes and hand-built state.db schemas for chat-less fixture cards; owner-chat behaviour is
++    tested where it is opted in (tests/hermes_cli/test_kanban_owner_chat.py). [daveey]"""
++    if "owner_chats" in request.fixturenames:
++        return
++    try:
++        from hermes_cli import kanban_owner_chat as _owner
++    except Exception:
++        return
++    monkeypatch.setattr(_owner, "enabled", lambda: False)
++
++
++@pytest.fixture
++def owner_chats():
++    """Standing owner chats on (the production default): an ownerless card gets its producer's owner chat."""
++
++
+ _GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                       "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+ # Entries a test must never change in a live checkout's shared config: identity (later commits get
+diff --git a/tests/hermes_cli/test_kanban_owner_chat.py b/tests/hermes_cli/test_kanban_owner_chat.py
+index f866bb9de0c..6ca51d2f0dd 100644
+--- a/tests/hermes_cli/test_kanban_owner_chat.py
++++ b/tests/hermes_cli/test_kanban_owner_chat.py
+@@ -17,7 +17,7 @@
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _fresh_cache(monkeypatch):
++def _fresh_cache(monkeypatch, owner_chats):
+     monkeypatch.setattr(owner, "_ENSURED", {})
+ 
+ 
+@@ -547,3 +547,44 @@
+         assert result["eligible"] == 0 and result["linked"] == 0
+         assert owner._NEXT_BACKFILL[next(iter(owner._NEXT_BACKFILL))] == owner.BACKFILL_EVERY_S  # hourly, not 10 min
+         assert owner._UNLINKABLE == set()  # retried on the next hourly pass
++
++
++def test_a_worker_child_is_owned_through_its_creator_chain_not_an_owner_chat(synced, monkeypatch):
++    creator = kb.create_task(synced, title="creator", assignee="default", created_by="ci-main-watch")
++    child = kb.create_task(synced, title="child", assignee="default", created_by="default", creator_task_id=creator)
++    sid = owner.session_id("default")
++    assert not any(r[0] == sid for r in synced.execute(
++        "SELECT chat_session FROM task_chat_links WHERE task_id=?", (child,)))
++    assert owner.backfill(synced, apply=False)["by_producer"].get("default") is None  # within the creator grace
++
++
++def test_a_card_owned_by_another_gateways_real_chat_never_gets_an_owner_chat(synced, monkeypatch):
++    monkeypatch.setattr(owner, "enabled", lambda: False)
++    tid = kb.create_task(synced, title="Foreign owner", assignee="default", created_by="self-heal")
++    with kb.write_txn(synced):
++        synced.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,"
++                       "released,created_at) VALUES ('u3',?,'macbook',NULL,'20261124_120000_human','created',0,0)",
++                       (tid,))
++    monkeypatch.setattr(owner, "enabled", lambda: True)
++    assert owner.backfill(synced, apply=True)["linked"] == 0
++    assert [r[0] for r in synced.execute("SELECT chat_session FROM task_chat_links WHERE task_id=?", (tid,))] == \
++        ["20261124_120000_human"]
++
++
++def test_inheritance_prefers_a_real_chat_further_up_over_a_nearer_owner_chat(synced):
++    from hermes_cli import kanban_creator_chats as creators
++    ancestor = kb.create_task(synced, title="ancestor", assignee="default", created_by="ci-main-watch")
++    with kb.write_txn(synced):
++        synced.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_profile,chat_session,kind,"
++                       "released,created_at) VALUES ('u4',?,'away','default','20261124_120000_human','created',0,0)",
++                       (ancestor,))
++    creator = kb.create_task(synced, title="creator", assignee="default", created_by="ci-main-watch",
++                             parents=[ancestor])
++    chats = [o["chat_session"] for o in creators.resolve_chats(synced, creator)]
++    assert chats == ["20261124_120000_human"]
++
++
++def test_inheritance_falls_back_to_the_nearest_owner_chat(synced):
++    from hermes_cli import kanban_creator_chats as creators
++    creator = kb.create_task(synced, title="creator", assignee="default", created_by="ci-main-watch")
++    assert [o["chat_session"] for o in creators.resolve_chats(synced, creator)] == [owner.session_id("ci-main-watch")]
+-- 
+2.43.0
+

@@ -1,0 +1,278 @@
+From 6a5701e72cfa174dbae4f157ee6d4a8c9cbb721a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:46:06 +0000
+Subject: [PATCH 6280] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 6a5701e72cfa174dbae4f157ee6d4a8c9cbb721a.
+
+---
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 0c204c3ca81..a9325b39030 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -363,7 +363,7 @@
+     snapshot = _parts.measured(_parts.COUNTS, lambda: _ksa._all_counts(include_snapshot=True))
+     active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys = snapshot[:9]
+     execution = getattr(snapshot, "execution", {})
+-    extra = _parts.measured("waiting", _ksa._extra_waiting)
++    extra = _parts.measured(_parts.WAITING, lambda: _parts.waiting(_ksa._extra_waiting))
+     try:
+         attention = _parts.measured(_parts.ATTENTION, _ksa.attention_task_counts)
+     except Exception:
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index 0ee0505e185..7a51a8f4c19 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -28,8 +28,8 @@
+ 
+ Every part is forced when no key can vouch for the inputs: a provider clock deadline came due (wall-time verdicts
+ move without any write), a board has no content revision and its file stat is not settled, a done check declared no
+-watch paths, a key could not be read, or the scope has no completed holder read yet. Waiting sources are not gated
+-here: they are called on every refresh and own their input memo.
++watch paths, a key could not be read, or the scope has no completed holder read yet. Waiting sources are gated
++as a group by their exact declared inputs, with detached holder-only output; ordinary request reads are unchanged.
+ """
+ 
+ from __future__ import annotations
+@@ -41,12 +41,44 @@
+ 
+ log = logging.getLogger(__name__)
+ 
+-COUNTS, LINKS, ATTENTION = "counts", "links", "attention"
+-ALL = frozenset({COUNTS, LINKS, ATTENTION})
++COUNTS, LINKS, ATTENTION, WAITING = "counts", "links", "attention", "waiting"
++ALL = frozenset({COUNTS, LINKS, ATTENTION, WAITING})
+ _MAX_SCOPES = 64
+ 
+ # Per scope, the part keys the last completed holder read answered. Holder thread only.
+ _seen: dict[tuple[str, ...], dict[str, object]] = {}
++_waiting: dict[tuple[str, ...], tuple[tuple[str, frozenset[str]], ...]] = {}
++
++
++def _waiting_key() -> object:
++    """Only complete, portable declarations can certify a waiting answer."""
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_session_activity as ksa
++
++    sources = dict(ksa._waiting_sources)
++    values, complete = host._waiting_inputs(sources)
++    # Code identity alone does not distinguish two closures registered from the same source.
++    return (tuple(sorted(sources.items())), values) if complete else object()
++
++
++def waiting(read):
++    """Reuse detached waiting output only in the serialized holder pass.
++
++    Requests keep their existing literal behavior. A holder clock, unknown key,
++    replacement or failed projection forces the source again through plan().
++    """
++    from hermes_cli import kanban_session_activity as ksa
++
++    scope = ksa._origin_scope()
++    if getattr(ksa._revalidate.force_read, "scope", None) != scope:
++        return read()
++    if ksa._revalidate.forced(scope, WAITING) or scope not in _waiting:
++        value = read()
++        frozen = tuple((sid, frozenset(ids)) for sid, ids in value.items())
++        while len(_waiting) >= _MAX_SCOPES:
++            del _waiting[next(iter(_waiting))]
++        _waiting[scope] = frozen
++    return {sid: set(ids) for sid, ids in _waiting[scope]}
+ 
+ 
+ def _signature(scope: tuple[str, ...], paths) -> str:
+@@ -118,7 +150,7 @@
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+     return {COUNTS: (counts_local, shadows, ledger, plain), LINKS: (links_local, ledger),
+-            ATTENTION: (counts_local, _done_key(scope, wall))}
++            ATTENTION: (counts_local, _done_key(scope, wall)), WAITING: _waiting_key()}
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+@@ -150,13 +182,14 @@
+ def failed(scope: tuple[str, ...]) -> None:
+     """A holder read of ``scope`` raised: nothing is vouched for."""
+     _seen.pop(scope, None)
++    _waiting.pop(scope, None)
+ 
+ 
+ def measured(part: str, read):
+     """Account inclusive part CPU without changing its cache policy or exception behavior.
+ 
+     ``served`` means cache-eligible, NOT a cache hit: TTL expiry can still read. Counts includes its nested
+-    links work; do not add those counters together. Waiting sources have no force gate yet.
++    links work; do not add those counters together. Waiting uses its declared holder key.
+     """
+     from hermes_cli import kanban_session_activity as ksa
+     from hermes_cli import loop_accounting as la
+@@ -168,3 +201,4 @@
+ 
+ def reset() -> None:
+     _seen.clear()
++    _waiting.clear()
+diff --git a/tests/hermes_cli/test_kanban_annotation_waiting_gate.py b/tests/hermes_cli/test_kanban_annotation_waiting_gate.py
+new file mode 100644
+index 00000000000..abf41bb502b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_waiting_gate.py
+@@ -0,0 +1,156 @@
++"""Holder-only waiting reuse; declaration keys never suppress strict request reads."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_annotation_parts as helpers
++
++world = helpers.world
++
++
++def refresh():
++    host._event_refresh(SimpleNamespace(replace=lambda *a, **kw: None, control_only=False))
++
++
++@pytest.fixture
++def waiting(world, monkeypatch):
++    state = SimpleNamespace(reads=0, key=0, ids={'t1'}, fail=False)
++
++    def source():
++        state.reads += 1
++        if state.fail:
++            raise RuntimeError('source failed')
++        return {'s1': set(state.ids)}
++
++    monkeypatch.setattr(ksa, '_waiting_sources', {'fixture': source})
++    monkeypatch.setattr(host, '_declared', {'fixture': (source, lambda: state.key)})
++    monkeypatch.setattr(host, '_event_sources', {'fixture': (source, list, lambda: None)})
++    return state
++
++
++def test_declared_waiting_skips_unchanged_wakes_but_not_requests(waiting):
++    refresh()
++    assert waiting.reads == 1
++    refresh()
++    refresh()
++    assert waiting.reads == 1
++    assert ksa._extra_waiting() == {'s1': {'t1'}}
++    assert waiting.reads == 2, 'ordinary callers must retain their literal read'
++    waiting.key += 1
++    waiting.ids = {'t2'}
++    refresh()
++    assert waiting.reads == 3
++    assert ksa._last_annotation[helpers.SCOPE][9]['s1'] == frozenset({'t2'})
++
++
++def test_clock_and_failed_scope_invalidate_waiting(waiting):
++    refresh()
++    host._clock_deadlines[helpers.SCOPE] = [0.0]
++    refresh()
++    assert waiting.reads == 2
++    parts.failed(helpers.SCOPE)
++    refresh()
++    assert waiting.reads == 3
++
++
++def test_undeclared_and_unreadable_keys_always_read(waiting, monkeypatch):
++    refresh()
++    monkeypatch.setattr(host, '_declared', {})
++    refresh()
++    refresh()
++    assert waiting.reads == 3
++
++    def broken():
++        raise RuntimeError('key unavailable')
++
++    fn = ksa._waiting_sources['fixture']
++    monkeypatch.setattr(host, '_declared', {'fixture': (fn, broken)})
++    refresh()
++    refresh()
++    assert waiting.reads == 5
++
++
++def test_source_replacement_with_same_code_and_key_reads(waiting, monkeypatch):
++    refresh()
++    old = ksa._waiting_sources['fixture']
++
++    def replacement():
++        waiting.reads += 1
++        return {'s2': {'other'}}
++
++    monkeypatch.setattr(host, '_code_id', lambda fn: 'same-code')
++    refresh()
++    before = waiting.reads
++    ksa._waiting_sources['fixture'] = replacement
++    host._declared['fixture'] = (replacement, lambda: waiting.key)
++    host._event_sources['fixture'] = (replacement, list, lambda: None)
++    refresh()
++    assert waiting.reads == before + 1
++    assert old is not replacement
++
++
++def test_waiting_failure_cannot_certify_or_reuse_previous_output(waiting):
++    refresh()
++    waiting.key += 1
++    waiting.fail = True
++    refresh()
++    assert waiting.reads == 2
++    waiting.fail = False
++    waiting.ids = {'recovered'}
++    refresh()
++    assert waiting.reads == 3
++    refresh()
++    assert waiting.reads == 3
++
++
++def test_holder_waiting_output_is_detached_scoped_and_bounded(world, monkeypatch):
++    monkeypatch.setattr(parts, '_MAX_SCOPES', 2)
++    context = ksa._revalidate.force_read
++    monkeypatch.setattr(context, 'parts', frozenset(), raising=False)
++    value = {'s': {'original'}}
++    reads = []
++
++    def read():
++        reads.append(True)
++        return value
++
++    def get(scope):
++        monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++        monkeypatch.setattr(context, 'scope', scope, raising=False)
++        return parts.waiting(read)
++
++    a, b, c = ('a',), ('b',), ('c',)
++    answer = get(a)
++    answer['s'].add('caller')
++    value['s'].add('provider')
++    assert get(a) == {'s': {'original'}}
++    assert get(b) == value
++    assert get(a) == {'s': {'original'}}
++    assert len(reads) == 2
++    get(c)
++    assert len(parts._waiting) == 2
++    get(a)  # A was evicted; absence cannot certify an empty answer.
++    assert len(reads) == 4
++    parts.reset()
++    assert not parts._waiting
++
++
++def test_key_captured_before_read_does_not_absorb_a_racing_change(waiting, monkeypatch):
++    original = ksa._waiting_sources['fixture']
++
++    def racing():
++        result = original()
++        waiting.key += 1
++        waiting.ids = {'next'}
++        return result
++
++    monkeypatch.setattr(ksa, '_waiting_sources', {'fixture': racing})
++    monkeypatch.setattr(host, '_declared', {'fixture': (racing, lambda: waiting.key)})
++    monkeypatch.setattr(host, '_event_sources', {'fixture': (racing, list, lambda: None)})
++    refresh()
++    refresh()
++    assert waiting.reads == 2
++    assert ksa._last_annotation[helpers.SCOPE][9] == {'s1': frozenset({'next'})}
+-- 
+2.43.0
+

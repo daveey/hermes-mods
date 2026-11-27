@@ -1,0 +1,180 @@
+From cfa58e1fb5246ed95715d93acdf2f416e9bb7e2a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:51:30 +0000
+Subject: [PATCH 6593] Bounded private code-provenance diagnostic snapshots
+
+Public mirror of source commit cfa58e1fb5246ed95715d93acdf2f416e9bb7e2a.
+
+---
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index ff6816b51bc..6862bb23a70 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -75,6 +75,10 @@
+ MAX_DISTS = 4096
+ MAX_RECORD_BYTES = 64 * 1024 * 1024
+ MAX_DEP_REPORT = 4096
++# Large receipted Python environments can exhaust a distribution-sized
++# ledger cap. Bound unit retention separately from ancillary reports
++# so ordinary SDK imports retain their dependency units.
++MAX_DEP_UNITS = 32768
+ DEPENDENCY_TRUST = "installer-receipt: trusted, not audited, no coverage"
+ FORWARDREF_TRUST = (
+     "R5-2 interpreter trust class: exactly this annotation expression text, evaluated by the "
+@@ -845,7 +849,9 @@
+     def _owner(self, filename):
+         if not filename or filename.startswith("<"):
+             return None
+-        path = Path(filename).resolve()
++        return self._owner_path(Path(filename).resolve())
++
++    def _owner_path(self, path):
+         for component, (root, kind, digests) in self._components.items():
+             if path.is_relative_to(root):
+                 return component, kind, path, path.relative_to(root).as_posix(), digests
+@@ -854,7 +860,9 @@
+     def _trusted_stdlib(self, filename):
+         if not filename or filename.startswith("<"):
+             return False
+-        path = Path(filename).resolve()
++        return self._trusted_stdlib_path(Path(filename).resolve())
++
++    def _trusted_stdlib_path(self, path):
+         return (path.is_relative_to(self._stdlib) and
+                 "site-packages" not in path.parts and "dist-packages" not in path.parts)
+ 
+@@ -1035,9 +1043,12 @@
+     def _module_file(self, name, filename):
+         if not filename:
+             return
+-        owner = self._owner(filename)
+-        if owner is not None or not self._trusted_stdlib(filename):
+-            if owner is None and self._dependency_module(name, filename):
++        # Resolve once per observation, not once per classifier. Never retain this
++        # view across inventories: module filenames and symlink targets can change.
++        path = None if filename.startswith("<") else Path(filename).resolve()
++        owner = self._owner_path(path) if path is not None else None
++        if owner is not None or path is None or not self._trusted_stdlib_path(path):
++            if owner is None and path is not None and self._dependency_module_path(name, path):
+                 return
+             if not str(filename).endswith(".py"):
+                 self.mark_unknown("non-source-module:" + name)
+@@ -1098,7 +1109,7 @@
+         key = (str(filename), kind, extra.get("generator"))
+         if key in self._dep_units:
+             return
+-        if len(self._dep_units) >= MAX_DEP_REPORT:
++        if len(self._dep_units) >= MAX_DEP_UNITS:
+             self.mark_unknown("dependency-report-limit")
+             return
+         self._generation += 1
+@@ -1196,6 +1207,9 @@
+             path = Path(filename).resolve()
+         except (OSError, ValueError):
+             return False
++        return self._dependency_module_path(name, path)
++
++    def _dependency_module_path(self, name, path):
+         if not self._deps.indexed(path) or not self._dep_ready():
+             return False
+         if path.suffix == ".py":
+diff --git a/tests/hermes_cli/test_attestation_module_resolution.py b/tests/hermes_cli/test_attestation_module_resolution.py
+new file mode 100644
+index 00000000000..d247e61a5fb
+--- /dev/null
++++ b/tests/hermes_cli/test_attestation_module_resolution.py
+@@ -0,0 +1,91 @@
++"""Fresh per-module path custody without repeatedly traversing the same path."""
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++
++from hermes_cli import code_attestation as ca
++
++
++def ledger(tmp_path):
++    a = object.__new__(ca.Attestation)
++    a._lock = threading.RLock()
++    a._unknown = set()
++    a._blocking_unknowns = set()
++    a._extension_unknowns = set()
++    a._generation = 0
++    a._modules = {}
++    a._dep_units = {}
++    a.core_root = tmp_path / 'core'
++    a._components = {'core': (a.core_root, 'core', {})}
++    a._stdlib = tmp_path / 'stdlib'
++    a._deps = ca._DependencyIndex(tmp_path, [])
++    return a
++
++
++def test_module_classification_resolves_filename_once(tmp_path, monkeypatch):
++    a = ledger(tmp_path)
++    path = tmp_path / 'outside' / 'module.py'
++    module = SimpleNamespace(__file__=str(path))
++    monkeypatch.setattr(a, '_module_snapshot', lambda: [('fixture', module)])
++    original = Path.resolve
++    calls = []
++
++    def resolve(self, *args, **kwargs):
++        calls.append(str(self))
++        return original(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, 'resolve', resolve)
++    a._inventory_modules()
++    # One classification resolution plus the independent extension-emission check.
++    assert calls.count(str(path)) == 2
++    assert a.latched_unknowns() == ('unrooted-module:fixture',)
++
++
++def test_inventory_rechecks_symlink_even_for_same_module(tmp_path, monkeypatch):
++    a = ledger(tmp_path)
++    a.core_root.mkdir()
++    outside = tmp_path / 'outside'
++    outside.mkdir()
++    link = tmp_path / 'module.py'
++    link.symlink_to(a.core_root / 'module.py')
++    module = SimpleNamespace(__file__=str(link))
++    monkeypatch.setattr(a, '_module_snapshot', lambda: [('fixture', module)])
++    a._inventory_modules()
++    assert a.latched_unknowns() == ()
++    link.unlink()
++    link.symlink_to(outside / 'module.py')
++    a._inventory_modules()
++    assert a.latched_unknowns() == ('unrooted-module:fixture',)
++
++
++def test_inventory_rechecks_changed_module_filename(tmp_path, monkeypatch):
++    a = ledger(tmp_path)
++    module = SimpleNamespace(__file__=str(a.core_root / 'module.py'))
++    monkeypatch.setattr(a, '_module_snapshot', lambda: [('fixture', module)])
++    a._inventory_modules()
++    assert a.latched_unknowns() == ()
++    module.__file__ = str(tmp_path / 'outside' / 'module.py')
++    a._inventory_modules()
++    assert a.latched_unknowns() == ('unrooted-module:fixture',)
++
++
++def test_report_retains_measured_mac_dependency_cardinality(tmp_path):
++    a = ledger(tmp_path)
++    # Synthetic receipted-source stress workload. Its cardinality is a test
++    # constant, not an operational measurement or fresh benchmark result.
++    measured_sources = 23655
++    for index in range(measured_sources):
++        a._dep_unit(f'/receipted/source{index}.py', 'dependency:fixture-1', 'a' * 64, 'source')
++    assert len(a._dep_units) == measured_sources
++    assert 'dependency-report-limit' not in a.latched_unknowns()
++
++
++def test_report_overflow_remains_bounded_and_sticky(tmp_path, monkeypatch):
++    a = ledger(tmp_path)
++    monkeypatch.setattr(ca, 'MAX_DEP_UNITS', 2)
++    for index in range(3):
++        a._dep_unit(f'/receipted/source{index}.py', 'dependency:fixture-1', 'a' * 64, 'source')
++    assert len(a._dep_units) == 2
++    assert a.latched_unknowns() == ('dependency-report-limit',)
++    a._dep_units.clear()
++    assert a.latched_unknowns() == ('dependency-report-limit',)
+-- 
+2.43.0
+

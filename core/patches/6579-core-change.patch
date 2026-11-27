@@ -1,0 +1,481 @@
+From 1ce4abda7eee5675c3b088562e16ca2077edca46 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:28:46 +0000
+Subject: [PATCH 6579] Desktop kanban model-requirement and recovery transport test harnesses
+
+Public mirror of source commit 1ce4abda7eee5675c3b088562e16ca2077edca46.
+
+---
+diff --git a/apps/desktop/electron/primary-recovery-wire.test.ts b/apps/desktop/electron/primary-recovery-wire.test.ts
+new file mode 100644
+index 00000000000..8f02f8fc78e
+--- /dev/null
++++ b/apps/desktop/electron/primary-recovery-wire.test.ts
+@@ -0,0 +1,464 @@
++import { execFileSync, spawn } from 'node:child_process'
++import { once } from 'node:events'
++import fs from 'node:fs'
++import http from 'node:http'
++import net from 'node:net'
++import os from 'node:os'
++import path from 'node:path'
++
++import ts from 'typescript'
++import { afterAll, beforeAll, expect, test, vi } from 'vitest'
++import { WebSocket, WebSocketServer } from 'ws'
++
++import { destroyKeepaliveAgents, jsonAgentFor, PLUGIN_POOL_MAX_SOCKETS } from './api-transport'
++import { resolveProfileBackendRoute } from './connection-config'
++import { fetchJsonWith } from './json-fetch'
++import { joinPrimaryBoot, primaryBootRequest } from './primary-boot-join'
++import { dispatchThroughRemoteDownGate, RemoteDownGate } from './remote-down-gate'
++import { RemoteLivenessTracker, RemoteRevalidationCoordinator, revalidateRemoteConnection } from './remote-liveness'
++import { pickLocalPort, SshConnection } from './ssh-connection'
++
++// Real loopback sshd, ControlMaster, forwarded TCP, HTTP Agent and WS; no owner-device access.
++// Only authentication policy/config is fixture-owned. No SSH command or response is mocked.
++const deps = { remoteHeaders: () => ({}), nativeHeaders: async () => null }
++const wireTest = test.skipIf(process.platform !== 'linux' || !fs.existsSync('/usr/sbin/sshd'))
++let journalHome: string
++
++beforeAll(() => {
++  journalHome = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 't01a205c8-journal-'))
++  vi.stubEnv('HERMES_HOME', journalHome)
++})
++
++afterAll(() => {
++  vi.unstubAllEnvs()
++  fs.rmSync(journalHome, { recursive: true, force: true })
++})
++const read = (base: string, url: string, options = {}) => fetchJsonWith(deps, base + url, 'fixture', options)
++
++const main = ts.createSourceFile(
++  'main.ts',
++  fs.readFileSync(new URL('./main.ts', import.meta.url), 'utf8'),
++  ts.ScriptTarget.Latest,
++  true
++)
++
++function primaryRouter(start: () => Promise<any>) {
++  const declaration = main.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'ensureBackend')!
++
++  const bindings = {
++    primaryBootRequest,
++    joinPrimaryBoot,
++    resolveProfileBackendRoute,
++    primaryProfileKey: () => 'default',
++    profileDeletionGate: { assertCanStart() {} },
++    profileRouteOptions: () => ({ primaryProfile: 'default', primaryRemoteActive: true }),
++    startHermes: start,
++    setWslBridgeProfileState() {},
++    backendPool: new Map(),
++    assertNotPassiveSpawn() {
++      throw Error('unexpected pool')
++    },
++    newPoolEntry() {},
++    dialPoolBackend() {},
++    logPoolSpawnFailure() {},
++    forgetFailedPoolEntry() {}
++  }
++
++  const fresh = main.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'freshGatewayWsUrl')!
++  const wsBindings = { rememberRemoteWsHeaders() {} }
++
++  const js = ts.transpileModule(
++    declaration.getText(main) +
++      '\n' +
++      fresh.getText(main) +
++      '\nreturn { ensure: ensureBackend, wsUrl: freshGatewayWsUrl }',
++    { compilerOptions: { target: ts.ScriptTarget.ES2022 } }
++  ).outputText
++
++  return new Function(...Object.keys(bindings), ...Object.keys(wsBindings), js)(
++    ...Object.values(bindings),
++    ...Object.values(wsBindings)
++  )
++}
++
++async function listen(server: net.Server | http.Server) {
++  server.listen(0, '127.0.0.1')
++  await once(server, 'listening')
++
++  return (server.address() as net.AddressInfo).port
++}
++
++async function fixture() {
++  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 't01a205c8-wire-'))
++  const connections: SshConnection[] = []
++  const sockets = new Set<net.Socket>()
++  const children: ReturnType<typeof spawn>[] = []
++  let stalled = false
++  let mutations = 0
++  let slow = false
++  const held: http.ServerResponse[] = []
++
++  let notifySaturated: () => void = () => {}
++
++  const saturated = new Promise<void>(resolve => {
++    notifySaturated = resolve
++  })
++
++  const seen: string[] = []
++
++  const backend = http.createServer((req, res) => {
++    seen.push(req.url!)
++    req.resume()
++    req.on('end', () => {
++      if (req.url === '/mutation') {
++        mutations++
++        req.socket.destroy()
++
++        return
++      }
++
++      if (req.url?.startsWith('/api/plugins/slow/') && slow) {
++        held.push(res)
++
++        if (held.length === PLUGIN_POOL_MAX_SOCKETS) {notifySaturated()}
++
++        return
++      }
++
++      res.setHeader('Content-Type', 'application/json')
++      res.end(JSON.stringify({ ok: true, route: req.url }))
++    })
++  })
++
++  const ws = new WebSocketServer({ server: backend })
++  ws.on('connection', socket => socket.send('wire-ready'))
++
++  const watch = (server: net.Server | http.Server) =>
++    server.on('connection', s => {
++      sockets.add(s)
++      s.on('close', () => sockets.delete(s))
++    })
++
++  watch(backend)
++  const backendPort = await listen(backend)
++
++  const proxy = net.createServer(client => {
++    const upstream = net.connect(sshdPort, '127.0.0.1')
++    sockets.add(upstream)
++    upstream.on('close', () => sockets.delete(upstream))
++    client.on('error', () => upstream.destroy())
++    upstream.on('error', () => client.destroy())
++    client.on('close', () => upstream.destroy())
++    upstream.on('close', () => client.destroy())
++    client.on('data', data => {
++      if (!stalled) {upstream.write(data)}
++    })
++    upstream.on('data', data => {
++      if (!stalled) {client.write(data)}
++    })
++  })
++
++  watch(proxy)
++  const sshdPort = Number(await pickLocalPort())
++  const proxyPort = await listen(proxy)
++  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', path.join(dir, 'key')])
++  fs.copyFileSync(path.join(dir, 'key.pub'), path.join(dir, 'authorized'))
++  const config = path.join(dir, 'sshd_config')
++  fs.writeFileSync(
++    config,
++    [
++      `Port ${sshdPort}`,
++      'ListenAddress 127.0.0.1',
++      `HostKey ${dir}/key`,
++      `PidFile ${dir}/sshd.pid`,
++      `AuthorizedKeysFile ${dir}/authorized`,
++      'StrictModes no',
++      'UsePAM no',
++      'PasswordAuthentication no',
++      'KbdInteractiveAuthentication no',
++      'PermitUserRC no',
++      'AllowTcpForwarding local',
++      'LogLevel VERBOSE'
++    ].join('\n')
++  )
++  const sshd = spawn('/usr/sbin/sshd', ['-D', '-e', '-f', config], { stdio: ['ignore', 'ignore', 'pipe'] })
++  children.push(sshd)
++  let stderr = ''
++
++  try {
++    await new Promise<void>((resolve, reject) => {
++      const timer = setTimeout(() => reject(Error('sshd readiness: ' + stderr)), 3000)
++      sshd.stderr!.on('data', chunk => {
++        stderr += chunk
++
++        if (stderr.includes('Server listening')) {
++          clearTimeout(timer)
++          resolve()
++        }
++      })
++      sshd.once('exit', code => {
++        clearTimeout(timer)
++        reject(Error(`sshd exit ${code}: ${stderr}`))
++      })
++    })
++  } catch (error) {
++    proxy.close()
++    backend.close()
++    sshd.kill()
++    fs.rmSync(dir, { recursive: true, force: true })
++    throw error
++  }
++
++  const dial = async (alternative = false) => {
++    const ssh = new SshConnection(
++      {
++        host: '127.0.0.1',
++        user: os.userInfo().username,
++        port: alternative ? sshdPort : proxyPort,
++        keyPath: dir + '/key'
++      },
++      {
++        controlDir: dir + '/mux',
++        connectTimeoutMs: 3000,
++        forwardTimeoutMs: 3000,
++        spawnFn: (command: string, args: string[], options: any) =>
++          spawn(
++            command,
++            [
++              '-F',
++              '/dev/null',
++              '-o',
++              `UserKnownHostsFile=${dir}/known_hosts`,
++              '-o',
++              'StrictHostKeyChecking=no',
++              ...args
++            ],
++            options
++          )
++      }
++    )
++
++    connections.push(ssh)
++    await ssh.open()
++    const port = Number(await pickLocalPort())
++    await ssh.forward(port, backendPort)
++
++    return { mode: 'remote', baseUrl: `http://127.0.0.1:${port}`, wsUrl: `ws://127.0.0.1:${port}/api/ws`, ssh }
++  }
++
++  return {
++    dial,
++    seen,
++    held,
++    saturated,
++    mutations: () => mutations,
++    stall: () => {
++      stalled = true
++    },
++    slow: () => {
++      slow = true
++    },
++    release: () => {
++      slow = false
++
++      for (const res of held) {
++        res.setHeader('Content-Type', 'application/json')
++        res.end('{"ok":true}')
++      }
++    },
++    close: async () => {
++      destroyKeepaliveAgents()
++
++      for (const ssh of connections) {await ssh.close()}
++
++      for (const client of ws.clients) {client.terminate()}
++
++      for (const socket of sockets) {socket.destroy()}
++      await Promise.all([
++        new Promise<void>(r => backend.close(() => r())),
++        new Promise<void>(r => proxy.close(() => r()))
++      ])
++
++      for (const child of children) {
++        child.kill()
++
++        if (child.exitCode === null) {await once(child, 'exit')}
++      }
++
++      fs.rmSync(dir, { recursive: true, force: true })
++    }
++  }
++}
++
++async function wsRead(url: string) {
++  const socket = new WebSocket(url, { handshakeTimeout: 2000 })
++
++  try {
++    return String((await once(socket, 'message'))[0])
++  } finally {
++    socket.terminate()
++  }
++}
++
++wireTest(
++  'real shared-primary SSH master stall is retired; replacement serves HTTP and WS without replaying mutations',
++  async () => {
++    const f = await fixture()
++
++    try {
++      let current = f.dial()
++      let resets = 0
++      const router = primaryRouter(() => current)
++      const ensure = router.ensure
++      let now = 0
++      const gate = new RemoteDownGate(() => now)
++
++      const get = (url: string, options = {}) =>
++        dispatchThroughRemoteDownGate({
++          gate,
++          key: 'primary',
++          connect: () => ensure('served'),
++          request: c => read(c.baseUrl, url, options)
++        })
++
++      const old = await current
++      expect((await ensure('served')).sharedPrimary).toBe(true)
++      expect(await get('/ready')).toEqual({ ok: true, route: '/ready' })
++      expect(await wsRead(await router.wsUrl('served'))).toBe('wire-ready')
++      await expect(get('/mutation', { method: 'POST', body: { value: 1 } })).rejects.toThrow()
++      expect(f.mutations()).toBe(1)
++      expect(gate.isDown('primary')).toBe(true)
++      await expect(get('/blocked')).rejects.toMatchObject({ code: 'REMOTE_BACKEND_DOWN' })
++      f.stall()
++      expect(await old.ssh.isAlive()).toBe(true) // mux check is not remote HTTP liveness.
++      const tracker = new RemoteLivenessTracker()
++      const coordinator = new RemoteRevalidationCoordinator()
++
++      const probe = async (c: any, url: string, opts: { timeoutMs: number }) => {
++        expect(opts.timeoutMs).toBe(10_000)
++
++        return read(c.baseUrl, url, { timeoutMs: 100 }) // bounded fixture, production policy unchanged.
++      }
++
++      const cycle = () =>
++        coordinator.run(current, () =>
++          revalidateRemoteConnection({
++            connectionPromise: current,
++            currentConnectionPromise: () => current,
++            probe,
++            tracker,
++            log() {},
++            resetConnection: () => {
++              resets++
++              current = old.ssh.close().then(() => f.dial(true))
++            }
++          })
++        )
++
++      for (let i = 0; i < 2; i++) {
++        const answers = await Promise.all(Array.from({ length: 12 }, cycle))
++        expect(answers.every(a => !a.rebuilt)).toBe(true)
++        expect(resets).toBe(0)
++      }
++
++      await cycle()
++      expect(resets).toBe(1)
++      const replacement = await current
++      expect(replacement.ssh.controlPath).not.toBe(old.ssh.controlPath)
++      expect(await old.ssh.isAlive()).toBe(false)
++      expect(fs.existsSync(old.ssh.controlPath)).toBe(false)
++      now += 2000 // Only gate backoff is injected; socket/deadline clocks remain real.
++
++      const recovered = () =>
++        dispatchThroughRemoteDownGate({
++          gate,
++          key: 'primary',
++          connect: () => ensure('served'),
++          request: c => read(c.baseUrl, '/later')
++        })
++
++      expect(await recovered()).toEqual({ ok: true, route: '/later' })
++      expect(await wsRead(await router.wsUrl('served'))).toBe('wire-ready')
++      expect(f.mutations()).toBe(1)
++      expect(gate.isDown('primary')).toBe(false)
++    } finally {
++      await f.close()
++    }
++  },
++  20_000
++)
++
++wireTest(
++  'slow plugin sockets do not starve core/health/WS or cause reconnect, and ambiguous POST is sent once',
++  async () => {
++    const f = await fixture()
++
++    try {
++      const current = f.dial()
++      const router = primaryRouter(() => current)
++      const ensure = router.ensure
++      const gate = new RemoteDownGate()
++      const c = await current
++      f.slow()
++
++      const requests = Array.from({ length: 12 }, (_, i) =>
++        dispatchThroughRemoteDownGate({
++          gate,
++          key: 'primary',
++          connect: () => ensure('served'),
++          request: d => read(d.baseUrl, `/api/plugins/slow/${i}`, { timeoutMs: 2000 })
++        })
++      )
++
++      await f.saturated
++      expect(f.held).toHaveLength(PLUGIN_POOL_MAX_SOCKETS)
++      await expect(
++        dispatchThroughRemoteDownGate({
++          gate,
++          key: 'primary',
++          connect: () => ensure('served'),
++          request: (d: { baseUrl: string }) => read(d.baseUrl, '/api/plugins/slow/queued', { timeoutMs: 80 })
++        })
++      ).rejects.toThrow('Timed out connecting')
++      expect(f.seen).not.toContain('/api/plugins/slow/queued')
++      const agent = jsonAgentFor('http:', 'json', '/api/plugins/slow/0')
++      expect(agent.maxSockets).toBe(PLUGIN_POOL_MAX_SOCKETS)
++      expect(await read(c.baseUrl, '/api/health', { pool: 'probe', timeoutMs: 1000 })).toEqual({
++        ok: true,
++        route: '/api/health'
++      })
++      expect(await read(c.baseUrl, '/api/plugins/kanban/board', { timeoutMs: 1000 })).toEqual({
++        ok: true,
++        route: '/api/plugins/kanban/board'
++      })
++      expect(await wsRead(await router.wsUrl('served'))).toBe('wire-ready')
++      expect(gate.isDown('primary')).toBe(false)
++      expect(await c.ssh.isAlive()).toBe(true)
++      const tracker = new RemoteLivenessTracker()
++
++      for (let i = 0; i < 4; i++) {
++        expect(
++          await revalidateRemoteConnection({
++            connectionPromise: current,
++            currentConnectionPromise: () => current,
++            tracker,
++            log() {},
++            probe: d => read(d.baseUrl, '/api/status', { timeoutMs: 1000 }),
++            resetConnection() {
++              throw Error('slow endpoint caused reconnect')
++            }
++          })
++        ).toEqual({ ok: true, rebuilt: false })
++      }
++
++      f.release()
++      expect(await Promise.all(requests)).toHaveLength(12)
++      expect(f.seen.filter(url => url.startsWith('/api/plugins/slow/'))).toHaveLength(12)
++      await expect(read(c.baseUrl, '/mutation', { method: 'POST', body: { value: 1 } })).rejects.toThrow()
++      expect(f.mutations()).toBe(1)
++    } finally {
++      await f.close()
++    }
++  },
++  20_000
++)
+-- 
+2.43.0
+

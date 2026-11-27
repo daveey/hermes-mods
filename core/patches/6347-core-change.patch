@@ -1,0 +1,163 @@
+From f247c80c34b9a1fd356637bce08baa1a249ef16f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:08:43 +0000
+Subject: [PATCH 6347] Conservative sync repair, lease custody and UDF budgets
+
+Public mirror of source commit f247c80c34b9a1fd356637bce08baa1a249ef16f.
+
+---
+diff --git a/hermes_cli/kanban_containment_functions.py b/hermes_cli/kanban_containment_functions.py
+index 358e22d59a9..824806c16f0 100644
+--- a/hermes_cli/kanban_containment_functions.py
++++ b/hermes_cli/kanban_containment_functions.py
+@@ -4,15 +4,40 @@
+ import sqlite3
+ import weakref
+ from collections.abc import Callable
++from contextvars import ContextVar
++
++
++# Strings only: never retain an exception traceback (and its connection).
++_INNER: ContextVar[tuple[str, str, str] | None] = ContextVar("containment_udf_error", default=None)
++
++
++def clear_error() -> None:
++    """Start a sync board round without a diagnostic from an earlier round."""
++    _INNER.set(None)
++
++
++def error_suffix(exc: BaseException) -> str:
++    """Consume callback evidence only for SQLite's opaque UDF error."""
++    inner = _INNER.get()
++    clear_error()
++    if inner is None or "user-defined function raised exception" not in str(exc):
++        return ""
++    kind, message, name = inner
++    return f"; inner: {kind}: {message} in {name}"
+ 
+ 
+ class _Function:
+-    def __init__(self, conn: sqlite3.Connection, callback: Callable) -> None:
++    def __init__(self, conn: sqlite3.Connection, callback: Callable, name: str) -> None:
+         self.conn = conn
+         self.callback = callback
++        self.name = name
+ 
+     def __call__(self, *args):
+-        return self.callback(*args)
++        try:
++            return self.callback(*args)
++        except BaseException as exc:
++            _INNER.set((type(exc).__name__, str(exc).replace("\n", "\\n").replace("\r", "\\r")[:2048], self.name))
++            raise
+ 
+ 
+ # sqlite3.Connection itself is not weak-referenceable. SQLite owns the callable
+@@ -32,6 +57,6 @@
+     if function is not None:
+         function.callback = callback
+         return
+-    function = _Function(conn, callback)
++    function = _Function(conn, callback, name)
+     conn.create_function(name, arity, function)
+     _FUNCTIONS[key] = function
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index f39e8f050d5..08d104acf61 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1123,6 +1123,7 @@
+ def sync_all_once(hub: Optional[Hub] = None, *,
+                   boards: Optional[list[tuple[str, Path]]] = None) -> list[RoundResult]:
+     from hermes_cli.kanban_sync_guard import SyncRoundBusy
++    from hermes_cli import kanban_containment_functions as udf_errors
+ 
+     ident = load_identity() if hub is None else hub.ident
+     hub = hub or Hub(ident)
+@@ -1137,6 +1138,7 @@
+             results.append(RoundResult(board=slug, mode="?", error=held))
+             sync_timing.board_end(mark, results)
+             continue
++        udf_errors.clear_error()
+         try:
+             results.append(sync_board(slug, path, hub, ident.gateway))
+             refusal.cleared(slug)
+@@ -1152,7 +1154,8 @@
+             _log.debug("kanban sync: round for %s skipped (%s)", slug, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"SyncRoundBusy: {exc}", skipped=True))
+         except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable) as exc:
+-            _log.warning("kanban sync: round for %s failed (%s: %s)", slug, type(exc).__name__, exc)
++            _log.warning("kanban sync: round for %s failed (%s: %s)%s", slug, type(exc).__name__, exc,
++                         udf_errors.error_suffix(exc))
+             from hermes_cli.kanban_sync_host_outage import classify  # one host card, not one per board [daveey]
+             results.append(RoundResult(board=slug, mode="?", error=f"{type(exc).__name__}: {exc}", cause=classify(exc)))
+         finally:
+diff --git a/tests/hermes_cli/test_kanban_sync_udf_budget.py b/tests/hermes_cli/test_kanban_sync_udf_budget.py
+index 9c3105a6ea9..70ab8ff4c76 100644
+--- a/tests/hermes_cli/test_kanban_sync_udf_budget.py
++++ b/tests/hermes_cli/test_kanban_sync_udf_budget.py
+@@ -2,6 +2,10 @@
+ from __future__ import annotations
+ 
+ import sqlite3
++from types import SimpleNamespace
++
++from hermes_cli import kanban_containment_functions as functions
++from hermes_cli import kanban_sync_client as client
+ 
+ import pytest
+ 
+@@ -130,3 +134,51 @@
+     assert not conn.in_transaction
+     assert conn.execute("SELECT count(*) FROM tasks WHERE id LIKE 't_udfpage%'").fetchone()[0] == 39
+     assert conn.execute("SELECT status FROM tasks WHERE id=?", (task,)).fetchone()[0] == "todo"
++
++
++def test_round_warning_names_inner_trigger_exception(conn, tmp_path, monkeypatch, caplog):
++    task = seed(conn)
++    original = ValueError("containment diagnostic fixture")
++
++    def broken():
++        raise original
++
++    functions.register(conn, "kanban_containment_diagnostic", 0, broken)
++    conn.execute("CREATE TRIGGER diagnostic_update BEFORE UPDATE ON tasks "
++                 "BEGIN SELECT kanban_containment_diagnostic(); END")
++    monkeypatch.setattr(client, "publish_pickup_if_changed", lambda hub: None)
++    from hermes_cli import kanban_source_clones
++    monkeypatch.setattr(kanban_source_clones, "attest_if_due", lambda hub: None)
++
++    def round_(*args):
++        conn.execute("UPDATE tasks SET title='changed' WHERE id=?", (task,))
++
++    monkeypatch.setattr(client, "sync_board", round_)
++    hub = SimpleNamespace(ident=SimpleNamespace(gateway="fixture"))
++    with caplog.at_level("WARNING", logger=client.__name__):
++        result = client.sync_all_once(hub, boards=[("diagnostic", tmp_path / "board.db")])
++    assert result[0].error == "OperationalError: user-defined function raised exception"
++    assert "inner: ValueError: containment diagnostic fixture in kanban_containment_diagnostic" in caplog.text
++    # A different, non-UDF failure must not reuse the callback diagnostic.
++    caplog.clear()
++
++    def other(*args):
++        raise sqlite3.OperationalError("unrelated failure")
++
++    monkeypatch.setattr(client, "sync_board", other)
++    client.sync_all_once(hub, boards=[("diagnostic", tmp_path / "board.db")])
++    assert "inner:" not in caplog.text
++    caplog.clear()
++
++    def opaque(*args):
++        raise sqlite3.OperationalError("user-defined function raised exception")
++
++    monkeypatch.setattr(client, "sync_board", opaque)
++    client.sync_all_once(hub, boards=[("diagnostic", tmp_path / "board.db")])
++    assert "inner:" not in caplog.text
++    # The wrapper itself must re-raise the original exception, not a replacement.
++    callback = functions._FUNCTIONS[(id(conn), "kanban_containment_diagnostic", 0)]
++    with pytest.raises(ValueError) as caught:
++        callback()
++    assert caught.value is original
++    functions.clear_error()
+-- 
+2.43.0
+

@@ -1,0 +1,1089 @@
+From 1620eb7bf126c58d25096cd3a63659d6e7f226fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 05:17:57 +0000
+Subject: [PATCH 6132] Kanban actionability: frozen obligations and administrative deadlines
+
+Public mirror of source commit 1620eb7bf126c58d25096cd3a63659d6e7f226fa.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index b7255b309d8..42bc7d5896d 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -165,7 +165,8 @@
+     first = positive_time(facts.get('source_at')) or positive_time(task.get('created_at'))
+     deadline = positive_time(facts.get('deadline_at'))
+     wake = positive_time(facts.get('wake_at'))
+-    if task['status'] == 'scheduled' and wake and not any(
++    invalid_creation = facts.get('invalid_creation_intent')
++    if task['status'] == 'scheduled' and wake and not invalid_creation and not any(
+             facts.get(k) for k in ('pending_command', 'stop', 'containment', 'human_step', 'dependencies')):
+         deadline = max(deadline or 0, wake + 600)
+     row = {'version': 1, 'task_id': task['id'], 'status': task['status'], 'contract_key': key,
+@@ -194,6 +195,9 @@
+             row['violations'].append('owner_missing')
+     elif row['owner']['kind'] == 'unknown' or not row['owner'].get('refs'):
+         row['evidence_state'] = 'unknown'
++    if invalid_creation:
++        row['violations'].append('creation_intent_invalid')
++        row['evidence_state'] = 'unknown'
+     if not deadline:
+         row['violations'].append('escalation_deadline_missing')
+         row['escalation']['state'] = 'unavailable'
+diff --git a/hermes_cli/kanban_actionability_creation.py b/hermes_cli/kanban_actionability_creation.py
+new file mode 100644
+index 00000000000..d8b89a07f93
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_creation.py
+@@ -0,0 +1,88 @@
++"""Creation-time administrative policy, never execution or release authority. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli.kanban_actionability import owner, positive_time, project, valid_awaiting
++
++
++def _text(value):
++    return value if isinstance(value, str) and value.strip() else None
++
++
++def intent_for(task, kind, payload, *, now):
++    """Derive once from source clocks; the same pure function verifies recorded intent."""
++    if not isinstance(payload, dict):
++        return None
++    timed = kind == 'scheduled' or (kind == 'continued' and payload.get('status') == 'scheduled')
++    if not timed and kind not in ('blocked', 'dependency_wait'):
++        return None
++    status = 'scheduled' if timed else ('todo' if kind == 'dependency_wait' or payload.get('kind') == 'assignment' else 'blocked')
++    if task.get('status') != status:
++        return None
++    wake = positive_time(payload.get('wake_at')) if timed else None
++    deadline = wake + 600 if wake else (now + 86400 if not timed else None)
++    human = payload.get('human_request')
++    human = _text(human.get('action')) if isinstance(human, dict) else None
++    parents = payload.get('actionability_parent_ids') or []
++    dependencies = [{'task_id': pid, 'status': None, 'trigger': f'Observe the existing dependency {pid} through authenticated lifecycle gates'}
++                    for pid in parents] if isinstance(parents, list) and all(_text(pid) for pid in parents) else []
++    reason = None
++    if owner(task.get('assignee'))['kind'] == 'unavailable':
++        reason = 'owner_missing'
++    elif timed and not wake:
++        reason = 'wake_invalid'
++    elif timed and not valid_awaiting(payload.get('awaiting')):
++        reason = 'producer_malformed'
++    elif deadline is None or deadline <= now:
++        reason = 'deadline_not_future'
++    elif (timed and not (payload.get('awaiting') or _text(payload.get('wake_check')))) or (not timed and not human and not dependencies):
++        reason = 'trigger_missing'
++    row = project({'task': task, 'source_at': now, 'wake_at': wake,
++                   'deadline_at': deadline, 'human_step': human, 'dependencies': dependencies,
++                   'awaiting': payload.get('awaiting'), 'probe': _text(payload.get('wake_check'))}, now=now)
++    return {'version': 1, 'policy': 'scheduled-wake-grace-v1' if timed else 'blocked-admin-review-v1',
++            'status': status, 'source_kind': kind, 'owner': row['owner'],
++            'action': row['action'], 'instruction': row['instruction'], 'blocker': row['blocker'],
++            'first_observed': now, 'wake_at': wake, 'deadline_at': None if reason else deadline,
++            'invalid_reason': reason, 'execution_authority': False}
++
++
++def stamp(conn, task_id, kind, payload, *, now):
++    """Freeze ordinary administrative policy with the actual source event clock."""
++    if kind not in ('scheduled', 'blocked', 'continued', 'dependency_wait'):
++        return payload
++    original = payload
++    row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
++    if isinstance(payload, dict):
++        from hermes_cli.kanban_db_sync import run_uid
++        from hermes_cli.kanban_actionability_parents import snapshot
++        parents = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (task_id,))]
++        payload = {**payload, 'actionability_parent_ids': parents,
++                   'actionability_parent_states': snapshot(conn, parents),
++                   'actionability_run_uid': run_uid(conn, row['current_run_id']) if row else None}
++    intent = intent_for(dict(row), kind, payload, now=now) if row else None
++    return {**payload, 'actionability_intent': intent} if intent is not None else original
++
++
++def validated_intent(task, source, *, parent_ids=None):
++    """Return exactly supported source-bound bytes, not coercively equal malformed data."""
++    data = source['data']
++    if parent_ids is not None and data.get('actionability_parent_ids') != parent_ids:
++        return None
++    human = task.get('human_request')
++    if isinstance(human, str):
++        try:
++            human = json.loads(human)
++        except ValueError:
++            return None
++    if (data.get('human_request') or None) != (human or None):
++        return None
++    intent = data.get('actionability_intent')
++    expected = intent_for(task, source['kind'], data, now=source['created_at'])
++    # JSON comparison distinguishes True/1 and 1/1.0; unknown fields/policies fail closed.
++    if expected is None or expected['invalid_reason'] or not isinstance(intent, dict):
++        return None
++    if json.dumps(intent, sort_keys=True) != json.dumps(expected, sort_keys=True):
++        return None
++    return intent
+diff --git a/hermes_cli/kanban_actionability_intents.py b/hermes_cli/kanban_actionability_intents.py
+new file mode 100644
+index 00000000000..e5e7dd351be
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_intents.py
+@@ -0,0 +1,61 @@
++"""Local original-source custody; metadata grants no execution authority. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db_sync as sync
++
++
++def materialize(conn, hub, board):
++    """Defer canonical work until the successful home sync round, outside writers."""
++    from hermes_cli.kanban_actionability_materialize import run
++    run(conn, hub, board)
++
++
++def ensure_schema(conn):
++    conn.execute('CREATE TABLE IF NOT EXISTS kanban_actionability_intents ('
++                 'event_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL, source_json TEXT NOT NULL, '
++                 'source_kind TEXT NOT NULL, source_at INTEGER NOT NULL, deadline_at INTEGER, '
++                 "state TEXT NOT NULL DEFAULT 'pending', reason TEXT, op_id TEXT, last_checked_at INTEGER NOT NULL DEFAULT 0)")
++
++
++def capture(conn, event_uid):
++    """Insert only new stamped home events, atomically with append/import; no network."""
++    if sync.board_mode(conn) != 'primary' or not event_uid:
++        return
++    state = sync.sync_state(conn) or {}
++    source = conn.execute('SELECT e.*, t.created_on, t.sync_version FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.uid=?',
++                          (event_uid,)).fetchone()
++    if source is None:
++        return
++    gateway = state.get('gateway_id')
++    local_insert = (source['created_on'] is None and source['sync_version'] in (None, 0)
++                    and not state.get('applying') and isinstance(gateway, str) and bool(gateway.strip())
++                    and conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_events' AND row_uid=? "
++                                     "AND op='upsert' AND state='pending'", (event_uid,)).fetchone() is not None)
++    # Local pre-ACK custody is not proof of home: canonical observation still owns that check.
++    if not local_insert and (not source['created_on'] or source['created_on'] != gateway):
++        return
++    try:
++        data = json.loads(source['payload'] or '{}')
++    except (ValueError, TypeError):
++        return
++    intent = data.get('actionability_intent') if isinstance(data, dict) else None
++    if not isinstance(intent, dict) or type(intent.get('version')) is not int or intent['version'] != 1:
++        return
++    from hermes_cli.kanban_actionability_creation import intent_for
++    recorded_owner = intent.get('owner')
++    refs = recorded_owner.get('refs') if isinstance(recorded_owner, dict) else None
++    assignee = refs[0] if isinstance(refs, list) and len(refs) == 1 else None
++    expected = intent_for({'id': source['task_id'], 'status': intent.get('status'), 'assignee': assignee}, source['kind'],
++                          data, now=source['created_at'])
++    valid = expected is not None and json.dumps(expected, sort_keys=True) == json.dumps(intent, sort_keys=True)
++    reason = expected.get('invalid_reason') if valid else 'creation_intent_invalid'
++    deadline = expected['deadline_at'] if valid and not reason else None
++    if not conn.in_transaction:
++        raise ValueError('source intent capture requires source write transaction')
++    ensure_schema(conn)
++    conn.execute('INSERT OR IGNORE INTO kanban_actionability_intents '
++                 '(event_uid,task_id,source_json,source_kind,source_at,deadline_at,state,reason) VALUES (?,?,?,?,?,?,?,?)',
++                 (event_uid, source['task_id'], source['payload'], source['kind'], source['created_at'],
++                  deadline, 'invalid' if reason else 'pending', reason))
+diff --git a/hermes_cli/kanban_actionability_materialize.py b/hermes_cli/kanban_actionability_materialize.py
+new file mode 100644
+index 00000000000..bc1a1e2916f
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_materialize.py
+@@ -0,0 +1,97 @@
++"""Bounded home-only original-intent delivery; no escalation or lifecycle authority. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_actionability_creation as creation
++from hermes_cli import kanban_actionability_observation as observation
++from hermes_cli import kanban_actionability_recovery as recovery
++from hermes_cli import kanban_actionability_transport as transport
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_db_connect import write_txn
++
++
++class StaleIntent(ValueError):
++    """A positively observed source mismatch, not an unavailable observation."""
++
++
++def _payload(conn, hub, board, row):
++    if not callable(getattr(hub, '_call', None)):
++        raise ValueError('canonical execution inventory transport unavailable')
++    source = observation.observe(hub, board, row['task_id'], include_source=True)
++    event, task = source['source_event'], source['source_task']
++    if not isinstance(event.get('payload'), str):
++        raise ValueError('canonical original source payload unavailable')
++    if event['uid'] != row['event_uid'] and row['source_kind'] == 'dependency_wait':
++        raise ValueError('canonical dependency source unavailable')
++    if (task['containment_episode'] or event['uid'] != row['event_uid']
++            or event['kind'] != row['source_kind'] or event['created_at'] != row['source_at']
++            or event.get('payload') != row['source_json'] or event['version'] != 1):
++        raise StaleIntent('original source identity/status/run changed')
++    data = json.loads(row['source_json'])
++    if 'actionability_run_uid' not in data or data['actionability_run_uid'] != task['current_run_uid']:
++        raise StaleIntent('original source run changed')
++    from hermes_cli.kanban_actionability_sources import Reader
++    if Reader(conn).pending(row['task_id']):
++        raise ValueError('unresolved retain custody; administrative obligation remains pending')
++    parents = [p['id'] for p in source['facts']['dependencies']]
++    intent = creation.validated_intent(task, {'kind': event['kind'], 'created_at': event['created_at'], 'data': data},
++                                       parent_ids=parents)
++    if intent is None or intent['deadline_at'] != row['deadline_at']:
++        raise StaleIntent('original owner/trigger/deadline/graph changed')
++    from hermes_cli.kanban_actionability_parents import check
++    check(data.get('actionability_parent_states'), source['raw_parent_states'])
++    cap = transport.capability(hub, board)
++    return recovery._payload(source, owner=intent['owner'], action=intent['action'],
++                             instruction=intent['instruction'], prerequisite=intent['blocker']['prerequisite'],
++                             trigger=intent['blocker']['trigger'], evidence=[row['event_uid']],
++                             deadline_at=intent['deadline_at'], now=int(cap['hlc'][:13]) // 1000)
++
++
++def _set(conn, row, state, reason=None):
++    with write_txn(conn):
++        conn.execute('UPDATE kanban_actionability_intents SET state=?,reason=? WHERE event_uid=? AND state=? AND op_id IS ?',
++                     (state, reason, row['event_uid'], row['state'], row['op_id']))
++
++
++def run(conn, hub, board):
++    """One rotating eight-source window; uncertain reservations never rederive."""
++    from hermes_cli.kanban_sync_client import HubError
++    if conn.in_transaction or sync.board_mode(conn) != 'primary':
++        return
++    state = sync.sync_state(conn) or {}
++    if state.get('board_id') != board or state.get('gateway_id') != hub.ident.gateway:
++        return
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_actionability_intents'").fetchone():
++        return
++    with write_txn(conn):
++        rows = [dict(r) for r in conn.execute('SELECT * FROM kanban_actionability_intents '
++                "WHERE state IN ('pending','reserved') ORDER BY last_checked_at,event_uid LIMIT 8")]
++        conn.executemany(f'UPDATE kanban_actionability_intents SET last_checked_at={sync._NOW_MS_SQL} WHERE event_uid=?',
++                         [(r['event_uid'],) for r in rows])
++    for row in rows:
++        uid = row['event_uid']
++        try:
++            if row['state'] == 'pending':
++                payload = _payload(conn, hub, board, row)
++                with write_txn(conn):
++                    current = conn.execute('SELECT * FROM kanban_actionability_intents WHERE event_uid=?', (uid,)).fetchone()
++                    if (current['state'] != 'pending' or current['source_json'] != row['source_json']
++                            or current['deadline_at'] != row['deadline_at']):
++                        raise ValueError('intent custody changed during canonical observation')
++                    command = transport.reserve(conn, row['task_id'], payload)
++                    conn.execute("UPDATE kanban_actionability_intents SET state='reserved',op_id=?,reason=NULL WHERE event_uid=?",
++                                 (command['op_id'], uid))
++                    row['op_id'] = command['op_id']
++                    row['state'] = 'reserved'
++            command = transport.command(conn, row['op_id'])
++            if command and command['delivery_state'] == 'rejected':
++                _set(conn, row, 'rejected', 'canonical request rejected')
++                continue
++            if not command or command['delivery_state'] != 'confirmed':
++                transport.confirm(conn, hub, board, row['op_id'])
++            _set(conn, row, 'confirmed')
++        except StaleIntent as exc:
++            _set(conn, row, 'stale', str(exc))
++        except (ValueError, KeyError, TypeError, OSError, HubError) as exc:
++            _set(conn, row, row['state'], str(exc)[:500])
+diff --git a/hermes_cli/kanban_actionability_observation.py b/hermes_cli/kanban_actionability_observation.py
+index 8906b07901c..d0c3ef41d2a 100644
+--- a/hermes_cli/kanban_actionability_observation.py
++++ b/hermes_cli/kanban_actionability_observation.py
+@@ -10,7 +10,7 @@
+ 
+ from hermes_cli.kanban_actionability import NONTERMINAL
+ 
+-KINDS = {'todo': ('created', 'linked'), 'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
++KINDS = {'todo': ('created', 'linked', 'dependency_wait'), 'ready': ('created', 'promoted_manual', 'unblocked', 'reclaimed'),
+          'review': ('review_requested', 'created'), 'blocked': ('blocked',),
+          'scheduled': ('scheduled', 'continued'),
+          'triage': ('failure_finalized', 'spend_budget_decision_ready', 'created'), 'running': ('claimed',)}
+@@ -77,7 +77,7 @@
+     raise _invalid()
+ 
+ 
+-def observe(hub, board, task_id):
++def observe(hub, board, task_id, *, include_source=False):
+     """Bounded canonical observation; unavailable authority remains unavailable.
+ 
+     Every inventory/page shares one head. Busy boards may require a later explicit
+@@ -98,19 +98,23 @@
+     parent_ids = sorted(l['parent_id'] for l in links if l['child_id'] == task_id)
+     if len(parent_ids) > 128 or len(set(parent_ids)) != len(parent_ids):
+         raise _invalid()
+-    dependencies, owner_task_refs = [], []
++    dependencies, owner_task_refs, raw_parent_states = [], [], []
+     for pid in parent_ids:
+         parent = _inventory(hub, board, pid)
+         if parent['head'] != head:
+             raise _invalid()
+         p = parent['task']
++        raw_parent_states.append({'id': pid, 'status': p['status'], 'containment_episode': p['containment_episode']})
+         if pid != task_id and p['status'] in NONTERMINAL:
+             owner_task_refs.append(pid)
+         status = 'triage' if p['status'] in ('done', 'archived') and p['containment_episode'] else p['status']
+         dependencies.append({'id': pid, 'status': status})
+-    return {'home_gateway': task['created_on'], 'first_observed': event['created_at'],
++    result = {'home_gateway': task['created_on'], 'first_observed': event['created_at'],
+             'owner_task_refs': owner_task_refs,
+             'facts': {'status': task['status'], 'assignee': task['assignee'],
+                       'current_run_uid': task['current_run_uid'], 'root_episode': episode,
+                       'source_uids': [{'uid': event['uid'], 'version': event['version']}],
+                       'dependencies': dependencies}}
++    if include_source:
++        result.update(source_event=event, source_task=task, raw_parent_states=raw_parent_states)
++    return result
+diff --git a/hermes_cli/kanban_actionability_parents.py b/hermes_cli/kanban_actionability_parents.py
+new file mode 100644
+index 00000000000..9e7328358ca
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_parents.py
+@@ -0,0 +1,33 @@
++"""Raw local parent testimony; never dependency satisfaction or release. [daveey]"""
++from hermes_cli.kanban_actionability import NONTERMINAL
++
++
++def snapshot(conn, parent_ids):
++    result = []
++    for pid in parent_ids:
++        row = conn.execute('SELECT status,containment_episode FROM tasks WHERE id=?', (pid,)).fetchone()
++        result.append({'id': pid, 'status': row['status'] if row else None,
++                       'containment_episode': row['containment_episode'] if row else None})
++    return result
++
++
++def check(recorded, canonical):
++    from hermes_cli.kanban_actionability_materialize import StaleIntent
++    if not canonical and recorded is None:
++        return  # pre-amendment parent-free source
++    if not isinstance(recorded, list) or len(recorded) != len(canonical):
++        raise ValueError('original raw parent testimony unavailable')
++    for old, current in zip(recorded, canonical):
++        if (not isinstance(old, dict) or set(old) != {'id', 'status', 'containment_episode'}
++                or old['id'] != current['id']
++                or old['status'] is not None and old['status'] not in (*NONTERMINAL, 'done', 'archived')
++                or old['containment_episode'] is not None and (
++                    not isinstance(old['containment_episode'], str) or not old['containment_episode'].strip())
++                or old['status'] is None and old['containment_episode'] is not None):
++            raise ValueError('original raw parent testimony malformed')
++        if old['status'] is None:
++            if current['status'] in ('done', 'archived') or current['containment_episode']:
++                raise StaleIntent('unknown original parent is now terminal or contained')
++            raise ValueError('original raw parent status unavailable')
++        if old != current:
++            raise StaleIntent('original raw parent status or containment changed')
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 657897bb794..221c31e4b97 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -8,7 +8,7 @@
+ from hermes_cli.kanban_actionability import owner, project, valid_awaiting
+ from hermes_cli.kanban_actionability_evidence import EVIDENCE_ERRORS, effective
+ 
+-KINDS = ('created', 'blocked', 'scheduled', 'continued', 'spend_budget_triaged',
++KINDS = ('created', 'blocked', 'dependency_wait', 'scheduled', 'continued', 'spend_budget_triaged',
+          'decision_hold_restricted', 'decision_retained', 'decision_protected_stopped',
+          'spend_budget_decision_ready', 'promoted_manual', 'archived', 'contained')
+ 
+@@ -252,6 +252,15 @@
+              'human_step': _human_step(task.get('human_request')),
+              'unknown': reader.synced or reader.partial or missing or bool(receipt_only) or bool(source and not reader.uid(source))
+                         or bool(task.get('human_request') and not _human_step(task['human_request']))}
++    if source and not any((stop, facts['containment'], facts['pending_command'])):
++        from hermes_cli.kanban_actionability_creation import validated_intent
++        parent_ids = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (tid,))]
++        intent = validated_intent(task, source, parent_ids=parent_ids)
++        if intent:
++            facts['deadline_at'] = intent['deadline_at']
++        elif 'actionability_intent' in source['data']:
++            facts['invalid_creation_intent'] = True
++            facts['unknown'] = True
+     if schedule:
+         facts.update(wake_at=schedule['data'].get('wake_at'), awaiting=schedule['data'].get('awaiting'))
+     wake_columns = reader.columns('task_wake_checks')
+diff --git a/hermes_cli/kanban_db_events.py b/hermes_cli/kanban_db_events.py
+index 1ebcaabc793..73211f40bdf 100644
+--- a/hermes_cli/kanban_db_events.py
++++ b/hermes_cli/kanban_db_events.py
+@@ -33,9 +33,18 @@
+             task_id, run_id, episode.EVIDENCE_EVENT, json.dumps(evidence), int(time.time())))
+         assert cur.lastrowid is not None
+         episode.consumed(conn, task_id, cur.lastrowid)
++    from hermes_cli.kanban_actionability_creation import stamp as stamp_actionability
++    now = int(time.time())
++    payload = stamp_actionability(conn, task_id, kind, payload, now=now)
+     stamped = stamp(conn, task_id, kind, payload, run_id)
+     cur = conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)", (
+-        task_id, run_id, kind, json.dumps(stamped, ensure_ascii=False) if stamped else None, int(time.time())))
++        task_id, run_id, kind, json.dumps(stamped, ensure_ascii=False) if stamped else None, now))
++    if isinstance(payload, dict) and 'actionability_intent' in payload:
++        from hermes_cli.kanban_actionability_intents import capture
++        from hermes_cli import kanban_db_sync as sync
++        if sync.board_mode(conn) == 'primary':
++            event = conn.execute('SELECT uid FROM task_events WHERE id=?', (cur.lastrowid,)).fetchone()
++            capture(conn, event[0])
+     if payload is not None and "_wake_episode_v1" in payload:
+         assert cur.lastrowid is not None
+         episode.consumed(conn, task_id, cur.lastrowid)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 67e18800488..227493e79fe 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1565,6 +1565,8 @@
+     conn.execute(f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+                  (ch.uid, *cols.values()))
+     if table == "task_events" and task_id:
++        from hermes_cli.kanban_actionability_intents import capture
++        capture(conn, ch.uid)
+         from hermes_cli.kanban_terminal_guard import is_reopen
+         if is_reopen({"kind": cols.get("kind"), "payload": cols.get("payload")}):
+             result.reopened.add(str(task_id))
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 92b82be06ea..ab5e4088746 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1108,6 +1108,8 @@
+             backlog.note(path, result.behind)  # the pulls landed: a board still behind reruns at once
+             raise
+         if mode == "primary":
++            from hermes_cli.kanban_actionability_intents import materialize
++            materialize(live, hub, slug)
+             from hermes_cli.kanban_worker_placement import reevaluate
+             with credited(live):  # reservation observations and the feed pull after them
+                 reevaluate(live, hub, slug, gateway)
+diff --git a/tests/hermes_cli/test_kanban_actionability_creation.py b/tests/hermes_cli/test_kanban_actionability_creation.py
+new file mode 100644
+index 00000000000..1c56a68abc5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_creation.py
+@@ -0,0 +1,158 @@
++"""New lifecycle sources persist administrative deadlines, never release authority. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_db_connect import connect
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli.kanban_actionability_creation import stamp
++
++
++@pytest.mark.parametrize('wake,reason', [
++    (None, 'wake_invalid'), (True, 'wake_invalid'), ('1800001000', 'wake_invalid'),
++    (float('inf'), 'wake_invalid'), (float('nan'), 'wake_invalid'),
++    (1_799_999_400, 'deadline_not_future'), (1_799_999_399, 'deadline_not_future'),
++])
++def test_invalid_source_never_fabricates_deadline(tmp_path, wake, reason):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='invalid new park', assignee='default')
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        data = stamp(conn, tid, 'scheduled', {'wake_at': wake, 'awaiting': {'kind': 'clock'}}, now=1_800_000_000)
++        intent = data['actionability_intent']
++        assert intent['invalid_reason'] == reason
++        assert intent['deadline_at'] is None
++        assert intent['execution_authority'] is False
++
++
++@pytest.mark.parametrize('assignee,awaiting,reason', [
++    ('', {'kind': 'clock'}, 'owner_missing'),
++    ('default', None, 'trigger_missing'),
++    ('default', {'kind': 'ci'}, 'producer_malformed'),
++    ('default', ['clock'], 'producer_malformed'),
++])
++def test_incomplete_source_stays_invalid(tmp_path, assignee, awaiting, reason):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='incomplete park', assignee='default')
++        conn.execute("UPDATE tasks SET status='scheduled',assignee=? WHERE id=?", (assignee, tid))
++        data = stamp(conn, tid, 'scheduled', {'wake_at': 1_800_000_100, 'awaiting': awaiting}, now=1_800_000_000)
++        assert data['actionability_intent']['invalid_reason'] == reason
++        assert data['actionability_intent']['deadline_at'] is None
++
++
++@pytest.mark.parametrize('field,value', [
++    ('version', True), ('version', 2), ('policy', 'unknown'), ('execution_authority', True),
++    ('first_observed', True), ('deadline_at', 1_900_000_000), ('action', 'execute_current_scope'),
++    ('instruction', 'replacement'), ('owner', {'kind': 'assignee', 'refs': ['foreign']}),
++    ('blocker', {'prerequisite': 'invented', 'trigger': 'invented', 'evidence': []}),
++])
++def test_reader_rejects_corrupt_intent(tmp_path, monkeypatch, field, value):
++    monkeypatch.setattr('time.time', lambda: 1_800_000_000)
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='human wait', assignee='default')
++        request = {'action': 'Reply A or B. Unblock = build; archive = drop.',
++                   'why_human': 'Only owner chooses.', 'interaction': 'reply',
++                   'scope': 'fixture', 'evidence': 'Equivalent options'}
++        assert kb.block_task(conn, tid, kind='needs_input', reason='Choose', human_request=request)
++        source = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()
++        payload = json.loads(source['payload'])
++        payload['actionability_intent'][field] = value
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), source['id']))
++        row = describe(conn, tid)
++        assert row['escalation']['at'] is None
++        assert row['evidence_state'] == 'unknown'
++        assert 'creation_intent_invalid' in row['violations']
++
++
++def test_delayed_continue_is_supported_but_immediate_is_not(tmp_path):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='continuation stamp', assignee='default')
++        conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        data = {'status': 'scheduled', 'wake_at': 1_800_000_100, 'awaiting': {'kind': 'clock'}}
++        intent = stamp(conn, tid, 'continued', data, now=1_800_000_000)['actionability_intent']
++        assert intent['deadline_at'] == 1_800_000_700
++        assert intent['policy'] == 'scheduled-wake-grace-v1'
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        immediate = {'status': 'ready'}
++        assert stamp(conn, tid, 'continued', immediate, now=1_800_000_000) == immediate
++
++
++def test_new_dependency_sources_freeze_admin_deadline(tmp_path, monkeypatch):
++    monkeypatch.setattr('time.time', lambda: 1_800_000_000)
++    with connect(tmp_path / 'kanban.db') as conn:
++        parent = kb.create_task(conn, title='dependency owner', assignee='default')
++        tid = kb.create_task(conn, title='new dependency wait', assignee='default', parents=[parent])
++        source = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='dependency_wait'", (tid,)).fetchone()
++        payload = json.loads(source['payload'])
++        intent = payload['actionability_intent']
++        assert intent['policy'] == 'blocked-admin-review-v1'
++        assert intent['deadline_at'] == source['created_at'] + 86400
++        assert parent in intent['blocker']['trigger']
++        assert describe(conn, tid)['escalation']['at'] == intent['deadline_at']
++        assert kb.get_task(conn, tid).status == 'todo'
++        tid = kb.create_task(conn, title='ready task acquires a dependency', assignee='default')
++        # Prepare the already-recorded graph; block_task owns the ready -> todo transition.
++        kb._link(conn, parent, tid)
++        assert kb.block_task(conn, tid, kind='dependency', reason='Wait for the existing dependency')
++        source = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='dependency_wait' ORDER BY id DESC", (tid,)).fetchone()
++        assert json.loads(source['payload'])['actionability_intent']['deadline_at'] == 1_800_086_400
++
++
++@pytest.mark.parametrize('operation', ['schedule', 'timed-block'])
++def test_schedule_freezes_final_wake_policy_and_owner(tmp_path, monkeypatch, operation):
++    monkeypatch.setattr('time.time', lambda: 1_800_000_000)
++    conn = connect(tmp_path / 'kanban.db')
++    try:
++        tid = kb.create_task(conn, title='new source obligation', assignee='default')
++        park = kb.schedule_task if operation == 'schedule' else kb.block_task
++        extra = {} if operation == 'schedule' else {'kind': 'time'}
++        assert park(conn, tid, reason='SCHEDULED_UNTIL=2027-01-15T08:01:40+00:00',
++                    clock_only=True, awaiting={'kind': 'clock', 'why': 'bounded observation window'}, **extra)
++        source = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
++        payload = json.loads(source['payload'])
++        assert 'actionability_intent' in payload
++        intent = payload['actionability_intent']
++        assert intent['version'] == 1
++        assert intent['policy'] == 'scheduled-wake-grace-v1'
++        assert intent['owner'] == {'kind': 'assignee', 'refs': ['default']}
++        assert intent['deadline_at'] == payload['wake_at'] + 600
++        assert intent['first_observed'] == source['created_at']
++        assert intent['action'] == 'wait_for_named_producer'
++        assert str(payload['wake_at']) in intent['blocker']['trigger']
++        assert intent['execution_authority'] is False
++        before = dict(source)
++        kb.add_comment(conn, tid, 'default', 'An annotation cannot renew the obligation')
++        monkeypatch.setattr('time.time', lambda: 1_800_001_000)
++        assert dict(conn.execute('SELECT * FROM task_events WHERE id=?', (source['id'],)).fetchone()) == before
++        assert describe(conn, tid)['escalation']['at'] == intent['deadline_at']
++    finally:
++        conn.close()
++
++
++def test_block_freezes_assignee_admin_review_not_human_release(tmp_path, monkeypatch):
++    monkeypatch.setattr('time.time', lambda: 1_800_000_000)
++    conn = connect(tmp_path / 'kanban.db')
++    try:
++        tid = kb.create_task(conn, title='new human wait', assignee='default')
++        request = {'action': 'Reply A or B. Unblock = implement the choice; archive = drop scope.',
++                   'why_human': 'Only the owner can choose the scope.', 'interaction': 'reply',
++                   'scope': 'This isolated fixture only', 'evidence': 'Two equally supported scope options'}
++        assert kb.block_task(conn, tid, kind='needs_input', reason='Choose the scope', human_request=request)
++        source = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()
++        payload = json.loads(source['payload'])
++        assert 'actionability_intent' in payload
++        intent = payload['actionability_intent']
++        assert intent['policy'] == 'blocked-admin-review-v1'
++        assert intent['deadline_at'] == source['created_at'] + 86400
++        assert intent['owner'] == {'kind': 'assignee', 'refs': ['default']}
++        assert intent['execution_authority'] is False
++        assert request['action'] in intent['blocker']['trigger']
++        row = describe(conn, tid)
++        assert row['escalation']['at'] == intent['deadline_at']
++        assert row['action'] == 'supply_recorded_human_step'
++        assert row['release']['authority'] == 'existing_lifecycle_gates'
++        assert 'escalation_deadline_missing' not in row['violations']
++        assert kb.get_task(conn, tid).status == 'blocked'
++        assert kb.recompute_ready(conn) == 0
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_actionability_intents.py b/tests/hermes_cli/test_kanban_actionability_intents.py
+new file mode 100644
+index 00000000000..2fab47a3943
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_intents.py
+@@ -0,0 +1,165 @@
++"""Source-event custody is atomic, immutable, local and home-only. [daveey]"""
++import json
++import socket
++
++from hermes_cli import kanban_db_sync as sync
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_failure_transport as support
++
++live = support.live
++
++
++def new_park(conn):
++    tid = kb.create_task(conn, title='creation intent journal', assignee='default')
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_on='fixture' WHERE id=?", (tid,))
++    assert kb.schedule_task(conn, tid, reason='finite window', clock_only=True,
++                            awaiting={'kind': 'clock', 'why': 'bounded journal proof'})
++    return conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
++
++
++def test_new_local_source_before_first_board_ack_is_journaled(live):
++    tid = kb.create_task(live, title='pre-ack source custody', assignee='default')
++    assert live.execute('SELECT created_on FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++    assert kb.schedule_task(live, tid, reason='finite window', clock_only=True,
++                            awaiting={'kind': 'clock', 'why': 'pre-ack creation proof'})
++    source = live.execute("SELECT * FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
++    saved = dict(live.execute('SELECT * FROM kanban_actionability_intents WHERE event_uid=?', (source['uid'],)).fetchone())
++    assert saved['source_json'] == source['payload']
++    assert saved['state'] == 'pending'
++    assert live.execute('SELECT created_on FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++
++
++@pytest.mark.parametrize('mutation', ['applying', 'gateway', 'empty_home', 'version', 'outbox_missing', 'outbox_delete', 'outbox_state'])
++def test_unconfirmed_local_home_requires_all_original_insert_pins(live, mutation):
++    from hermes_cli import kanban_actionability_intents as intents
++    source = new_park(live)
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_actionability_intents')
++        live.execute('UPDATE tasks SET created_on=NULL WHERE id=?', (source['task_id'],))
++        mutations = {
++            'applying': ('UPDATE kanban_sync_state SET applying=1', ()),
++            'gateway': ("UPDATE kanban_sync_state SET gateway_id=' '", ()),
++            'empty_home': ("UPDATE tasks SET created_on='' WHERE id=?", (source['task_id'],)),
++            'version': ('UPDATE tasks SET sync_version=1 WHERE id=?', (source['task_id'],)),
++            'outbox_missing': ('DELETE FROM kanban_sync_outbox WHERE row_uid=?', (source['uid'],)),
++            'outbox_delete': ("UPDATE kanban_sync_outbox SET op='delete' WHERE row_uid=?", (source['uid'],)),
++            'outbox_state': ("UPDATE kanban_sync_outbox SET state='rejected' WHERE row_uid=?", (source['uid'],)),
++        }
++        live.execute(*mutations[mutation])
++        intents.capture(live, source['uid'])
++    assert not live.execute('SELECT 1 FROM kanban_actionability_intents').fetchone()
++
++
++def test_append_captures_exact_uid_and_bytes_and_replay_does_not_renew(live):
++    from hermes_cli import kanban_actionability_intents as intents
++    source = new_park(live)
++    assert source['uid']
++    saved = dict(live.execute('SELECT * FROM kanban_actionability_intents WHERE event_uid=?', (source['uid'],)).fetchone())
++    assert saved['source_json'] == source['payload']
++    assert saved['deadline_at'] == json.loads(source['payload'])['actionability_intent']['deadline_at']
++    assert saved['state'] == 'pending'
++    with kbc.write_txn(live):
++        intents.capture(live, source['uid'])
++    assert dict(live.execute('SELECT * FROM kanban_actionability_intents WHERE event_uid=?', (source['uid'],)).fetchone()) == saved
++
++
++def test_journal_failure_rolls_back_lifecycle_and_source(live, monkeypatch):
++    from hermes_cli import kanban_actionability_intents as intents
++    tid = kb.create_task(live, title='rollback park', assignee='default')
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET created_on='fixture' WHERE id=?", (tid,))
++    def fail(*args):
++        raise RuntimeError('journal insert refused')
++    monkeypatch.setattr(intents, 'capture', fail)
++    with pytest.raises(RuntimeError, match='journal insert refused'):
++        kb.schedule_task(live, tid, reason='finite window', clock_only=True,
++                         awaiting={'kind': 'clock', 'why': 'atomicity proof'})
++    assert live.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'ready'
++    assert not live.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
++
++
++def imported_source(conn, *, uid='imported-intent', mutate=None):
++    source = dict(new_park(conn))
++    with kbc.write_txn(conn):
++        conn.execute('DELETE FROM kanban_actionability_intents')
++    payload = json.loads(source['payload'])
++    if mutate:
++        mutate(payload)
++    raw = json.dumps(payload)
++    change = sync.RemoteChange(seq=100, table='task_events', uid=uid, op='upsert', version=1,
++                               hlc='1795480000000-0000-server', origin_gateway='fixture',
++                               fields={'task_id': source['task_id'], 'kind': 'scheduled',
++                                       'payload': raw, 'created_at': source['created_at'] * 1000})
++    return change, raw
++
++
++def test_real_import_captures_original_bytes_without_network_and_replay_is_stable(live, monkeypatch):
++    def network(*args, **kwargs):
++        pytest.fail('source capture attempted network')
++    monkeypatch.setattr(socket, 'create_connection', network)
++    change, raw = imported_source(live)
++    sync.apply_remote_changes(live, [change], new_cursor=100, observers=False)
++    saved = dict(live.execute('SELECT * FROM kanban_actionability_intents').fetchone())
++    assert saved['event_uid'] == change.uid
++    assert saved['source_json'] == raw
++    assert saved['state'] == 'pending'
++    sync.apply_remote_changes(live, [change], new_cursor=101, observers=False)
++    assert dict(live.execute('SELECT * FROM kanban_actionability_intents').fetchone()) == saved
++
++
++@pytest.mark.parametrize('mode', ['shadow', 'off'])
++def test_nonprimary_import_cannot_capture(live, mode):
++    change, _ = imported_source(live)
++    sync.set_mode(live, mode)
++    if mode == 'off':
++        with pytest.raises(RuntimeError, match='not enabled'):
++            sync.apply_remote_changes(live, [change], new_cursor=100, observers=False)
++    else:
++        sync.apply_remote_changes(live, [change], new_cursor=100, observers=False)
++    assert not live.execute('SELECT 1 FROM kanban_actionability_intents').fetchone()
++
++
++@pytest.mark.parametrize('deadline', [{}, [], True, 1.5, 'soon'])
++def test_malformed_import_is_retained_invalid_not_a_replication_failure(live, deadline):
++    change, raw = imported_source(live, mutate=lambda p: p['actionability_intent'].update(deadline_at=deadline))
++    sync.apply_remote_changes(live, [change], new_cursor=100, observers=False)
++    row = dict(live.execute('SELECT * FROM kanban_actionability_intents').fetchone())
++    assert row['source_json'] == raw
++    assert row['state'] == 'invalid'
++    assert row['deadline_at'] is None
++    assert row['reason'] == 'creation_intent_invalid'
++    assert live.execute('SELECT payload FROM task_events WHERE uid=?', (change.uid,)).fetchone()[0] == raw
++
++
++def test_import_journal_failure_rolls_back_page_and_cursor(live, monkeypatch):
++    from hermes_cli import kanban_actionability_intents as intents
++    change, _ = imported_source(live)
++    before = sync.sync_state(live)['cursor']
++    def fail(*args):
++        raise RuntimeError('intent capture fault')
++    monkeypatch.setattr(intents, 'capture', fail)
++    with pytest.raises(RuntimeError, match='intent capture fault'):
++        sync.apply_remote_changes(live, [change], new_cursor=100, observers=False)
++    assert sync.sync_state(live)['cursor'] == before
++    assert not live.execute('SELECT 1 FROM task_events WHERE uid=?', (change.uid,)).fetchone()
++
++
++def test_foreign_and_legacy_sources_never_enter_queue(live):
++    from hermes_cli import kanban_actionability_intents as intents
++    source = new_park(live)
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_actionability_intents')
++        live.execute("UPDATE tasks SET created_on='foreign' WHERE id=?", (source['task_id'],))
++        intents.capture(live, source['uid'])
++    assert not live.execute('SELECT 1 FROM kanban_actionability_intents').fetchone()
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET created_on='fixture' WHERE id=?", (source['task_id'],))
++        payload = json.loads(source['payload'])
++        del payload['actionability_intent']
++        live.execute('UPDATE task_events SET payload=? WHERE uid=?', (json.dumps(payload), source['uid']))
++        intents.capture(live, source['uid'])
++    assert not live.execute('SELECT 1 FROM kanban_actionability_intents').fetchone()
+diff --git a/tests/hermes_cli/test_kanban_actionability_materialize.py b/tests/hermes_cli/test_kanban_actionability_materialize.py
+new file mode 100644
+index 00000000000..fb03337855f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_materialize.py
+@@ -0,0 +1,193 @@
++"""Automatic intent delivery: bounded home custody, not execution authority. [daveey]"""
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_actionability_intents as intents
++from hermes_cli import kanban_actionability_transport as transport
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_actionability_intents as journal
++from tests.hermes_cli import test_kanban_actionability_recovery as recovery
++
++live = journal.live
++
++
++def setup(conn):
++    event = dict(journal.new_park(conn))
++    tid = event['task_id']
++    hub = recovery.Hub(conn, tid)
++    task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    task.update(uid=tid, deleted_at=None, current_run_uid=None, containment_episode=None)
++    hub.data[tid]['task'] = task
++    hub.data[tid]['events'] = [{**event, 'ord': 10, 'version': 1, 'deleted_at': None}]
++    hub.now = event['created_at'] + 10
++    return event, hub
++
++
++def test_materialize_confirms_exact_source_deadline_without_lifecycle_write(live):
++    event, hub = setup(live)
++    before = dict(live.execute('SELECT * FROM tasks WHERE id=?', (event['task_id'],)).fetchone())
++    intents.materialize(live, hub, 'default')
++    saved = dict(live.execute('SELECT * FROM kanban_actionability_intents').fetchone())
++    assert saved['state'] == 'confirmed'
++    wire = hub.sent[0]
++    assert wire['payload']['deadline_at'] == json.loads(event['payload'])['actionability_intent']['deadline_at']
++    assert wire['payload']['facts']['source_uids'] == [{'uid': event['uid'], 'version': 1}]
++    assert transport.command(live, saved['op_id'])['delivery_state'] == 'confirmed'
++    assert dict(live.execute('SELECT * FROM tasks WHERE id=?', (event['task_id'],)).fetchone()) == before
++    intents.materialize(live, hub, 'default')
++    assert len(hub.sent) == 1
++
++
++@pytest.mark.parametrize('mutation', ['owner', 'payload', 'source', 'parents', 'run', 'stop'])
++def test_changed_premise_stales_never_rebinds(live, mutation):
++    event, hub = setup(live)
++    data = hub.data[event['task_id']]
++    mutations = {
++        'owner': (data['task'], 'assignee', 'foreign'),
++        'payload': (data['events'][0], 'payload', data['events'][0]['payload'] + ' '),
++        'source': (data['events'][0], 'uid', 'successor'),
++        'run': (data['task'], 'current_run_uid', 'new-run'),
++        'stop': (data['task'], 'containment_episode', event['uid']),
++    }
++    if mutation == 'parents':
++        hub.pages[0].update(rows=[{'uid': 'link', 'child_id': event['task_id'], 'parent_id': 'parent', 'deleted_at': None}], next='link')
++        hub.data['parent'] = copy.deepcopy(data)
++        hub.data['parent']['task'].update(id='parent', uid='parent')
++        hub.data['parent']['task_id'] = 'parent'
++        hub.data['parent']['events'][0]['task_id'] = 'parent'
++    else:
++        target, key, value = mutations[mutation]
++        target[key] = value
++    intents.materialize(live, hub, 'default')
++    saved = dict(live.execute('SELECT * FROM kanban_actionability_intents').fetchone())
++    assert saved['state'] == 'stale'
++    assert not hub.sent
++    assert saved['op_id'] is None
++
++
++def test_unavailable_inventory_transport_preserves_pending_custody(live):
++    _, hub = setup(live)
++    hub._call = None
++    intents.materialize(live, hub, 'default')
++    row = live.execute('SELECT state,reason FROM kanban_actionability_intents').fetchone()
++    assert row['state'] == 'pending'
++    assert row['reason'] == 'canonical execution inventory transport unavailable'
++    assert not hub.sent
++
++
++def test_local_replica_run_lag_cannot_stale_original_canonical_source(live):
++    event, hub = setup(live)
++    with kbc.write_txn(live):
++        rid = live.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at) VALUES (?,'default','scheduled',1,2)",
++                           (event['task_id'],)).lastrowid
++        live.execute('UPDATE tasks SET current_run_id=? WHERE id=?', (rid, event['task_id']))
++    intents.materialize(live, hub, 'default')
++    assert live.execute('SELECT state FROM kanban_actionability_intents').fetchone()[0] == 'confirmed'
++    assert len(hub.sent) == 1
++
++
++def test_unknown_delivery_replays_original_bytes_after_restart_without_observing(live, monkeypatch):
++    _, hub = setup(live)
++    hub.answer = 'lost'
++    intents.materialize(live, hub, 'default')
++    saved = dict(live.execute('SELECT * FROM kanban_actionability_intents').fetchone())
++    assert saved['state'] == 'reserved'
++    frozen = transport.command(live, saved['op_id'])['request_json']
++    from hermes_cli import kanban_actionability_observation as observation
++    monkeypatch.setattr(observation, 'observe', lambda *a, **kw: pytest.fail('rebound uncertain source'))
++    hub.answer = 'applied'
++    hub.now += 100
++    intents.materialize(live, hub, 'default')
++    assert hub.sent[0] == hub.sent[1]
++    assert transport.command(live, saved['op_id'])['request_json'] == frozen
++    assert live.execute('SELECT state FROM kanban_actionability_intents').fetchone()[0] == 'confirmed'
++
++
++def test_unavailable_rotates_bounded_window_and_preserves_deadline(live, monkeypatch):
++    event, hub = setup(live)
++    with kbc.write_txn(live):
++        for i in range(10):
++            live.execute('INSERT INTO kanban_actionability_intents SELECT ?,task_id,source_json,source_kind,source_at,'
++                         'deadline_at,state,reason,op_id,last_checked_at FROM kanban_actionability_intents WHERE event_uid=?',
++                         (f'copy-{i}', event['uid']))
++    from hermes_cli import kanban_actionability_observation as observation
++    calls = []
++    def unavailable(*a, **kw):
++        assert not live.in_transaction
++        calls.append(1)
++        raise OSError('inventory unavailable')
++    monkeypatch.setattr(observation, 'observe', unavailable)
++    intents.materialize(live, hub, 'default')
++    assert len(calls) == 8
++    assert live.execute('SELECT COUNT(*) FROM kanban_actionability_intents WHERE last_checked_at>0').fetchone()[0] == 8
++    intents.materialize(live, hub, 'default')
++    assert live.execute('SELECT COUNT(*) FROM kanban_actionability_intents WHERE last_checked_at>0').fetchone()[0] == 11
++    assert not hub.sent
++    assert {r[0] for r in live.execute('SELECT deadline_at FROM kanban_actionability_intents')} == {
++        json.loads(event['payload'])['actionability_intent']['deadline_at']}
++
++
++@pytest.mark.parametrize('payload', [None, {}, []])
++def test_missing_source_bytes_remain_pending_not_stale(live, payload):
++    event, hub = setup(live)
++    hub.data[event['task_id']]['events'][0]['payload'] = payload
++    intents.materialize(live, hub, 'default')
++    assert live.execute('SELECT state FROM kanban_actionability_intents').fetchone()[0] == 'pending'
++    assert not hub.sent
++
++
++def test_changed_journal_custody_is_not_rolled_back_by_error_handler(live, monkeypatch):
++    event, hub = setup(live)
++    from hermes_cli import kanban_actionability_observation as observation
++    original = observation.observe
++    def concurrent(*args, **kwargs):
++        result = original(*args, **kwargs)
++        with kbc.write_txn(live):
++            live.execute("UPDATE kanban_actionability_intents SET state='confirmed',op_id='other-writer' WHERE event_uid=?",
++                         (event['uid'],))
++        return result
++    monkeypatch.setattr(observation, 'observe', concurrent)
++    intents.materialize(live, hub, 'default')
++    row = live.execute('SELECT state,op_id FROM kanban_actionability_intents').fetchone()
++    assert tuple(row) == ('confirmed', 'other-writer')
++    assert not hub.sent
++
++
++def test_reservation_and_journal_state_roll_back_together(live, monkeypatch):
++    _, hub = setup(live)
++    original = transport.reserve
++    def crash(*args, **kwargs):
++        original(*args, **kwargs)
++        raise RuntimeError('atomic reservation crash')
++    monkeypatch.setattr(transport, 'reserve', crash)
++    with pytest.raises(RuntimeError, match='atomic reservation crash'):
++        intents.materialize(live, hub, 'default')
++    assert live.execute('SELECT state FROM kanban_actionability_intents').fetchone()[0] == 'pending'
++    assert not hub.sent
++    assert not live.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_actionability_commands'").fetchone()
++
++
++@pytest.mark.parametrize('canonical_status,expected', [('ready', 'confirmed'), ('done', 'stale')])
++def test_real_materializer_checks_raw_parent_completion(live, canonical_status, expected):
++    event, hub = setup(live)
++    tid = event['task_id']
++    data = json.loads(event['payload'])
++    data['actionability_parent_ids'] = ['parent']
++    data['actionability_parent_states'] = [{'id': 'parent', 'status': 'ready', 'containment_episode': None}]
++    from hermes_cli.kanban_actionability_creation import intent_for
++    data['actionability_intent'] = intent_for(hub.data[tid]['task'], event['kind'], data, now=event['created_at'])
++    payload = json.dumps(data)
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_actionability_intents SET source_json=? WHERE event_uid=?', (payload, event['uid']))
++    hub.data[tid]['events'][0]['payload'] = payload
++    hub.pages[0].update(rows=[{'uid': 'link', 'child_id': tid, 'parent_id': 'parent', 'deleted_at': None}], next='link')
++    parent = copy.deepcopy(hub.data[tid])
++    parent.update(task_id='parent')
++    parent['task'].update(id='parent', uid='parent', status=canonical_status)
++    parent['events'][0]['task_id'] = 'parent'
++    hub.data['parent'] = parent
++    intents.materialize(live, hub, 'default')
++    assert live.execute('SELECT state FROM kanban_actionability_intents').fetchone()[0] == expected
++    assert len(hub.sent) == (1 if expected == 'confirmed' else 0)
+diff --git a/tests/hermes_cli/test_kanban_actionability_parent_snapshot.py b/tests/hermes_cli/test_kanban_actionability_parent_snapshot.py
+new file mode 100644
+index 00000000000..4705616e230
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_parent_snapshot.py
+@@ -0,0 +1,43 @@
++"""Raw parent testimony must not become effective lifecycle clearance. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_actionability_parents as parents
++from hermes_cli.kanban_actionability_materialize import StaleIntent
++
++
++def test_known_parent_completion_stales():
++    with pytest.raises(StaleIntent):
++        parents.check([{'id': 'p', 'status': 'ready', 'containment_episode': None}],
++                      [{'id': 'p', 'status': 'done', 'containment_episode': None}])
++
++
++def test_mixed_satisfied_and_live_parents_are_not_invalid():
++    snapshot = [{'id': 'a', 'status': 'done', 'containment_episode': None},
++                {'id': 'b', 'status': 'ready', 'containment_episode': None}]
++    parents.check(snapshot, snapshot)
++
++
++@pytest.mark.parametrize('status,episode,exception', [('ready', None, ValueError), ('done', None, StaleIntent),
++                                                   ('triage', 'hold', StaleIntent)])
++def test_unknown_never_filled_from_canonical(status, episode, exception):
++    with pytest.raises(exception):
++        parents.check([{'id': 'p', 'status': None, 'containment_episode': None}],
++                      [{'id': 'p', 'status': status, 'containment_episode': episode}])
++
++
++@pytest.mark.parametrize('bad', [None, {}, [], [{'id': 'p', 'status': 'ready'}],
++                                [{'id': 'p', 'status': 'bogus', 'containment_episode': None}],
++                                [{'id': 'p', 'status': None, 'containment_episode': 'hold'}]])
++def test_missing_or_malformed_testimony_stays_unavailable(bad):
++    with pytest.raises(ValueError):
++        parents.check(bad, [{'id': 'p', 'status': 'ready', 'containment_episode': None}])
++
++
++def test_parent_free_compatibility():
++    parents.check(None, [])
++
++
++def test_containment_identity_change_is_stale():
++    with pytest.raises(StaleIntent):
++        parents.check([{'id': 'p', 'status': 'triage', 'containment_episode': 'old'}],
++                      [{'id': 'p', 'status': 'triage', 'containment_episode': 'new'}])
+diff --git a/tests/hermes_cli/test_kanban_actionability_sync_delivery.py b/tests/hermes_cli/test_kanban_actionability_sync_delivery.py
+new file mode 100644
+index 00000000000..0ee59c7469b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_sync_delivery.py
+@@ -0,0 +1,35 @@
++"""The real sync round gates intent delivery on its successful second send. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_actionability_intents as intents
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_sync_terminal_regress as base
++
++kanban_home = base.kanban_home
++svc = base.svc
++live = base.live
++
++
++@pytest.mark.parametrize('failure', [None, 'first', 'second'])
++def test_delivery_after_second_success_only(live, kanban_home, svc, monkeypatch, failure):
++    trace = []
++    original = client._send
++    def send(*args, **kwargs):
++        phase = 'second' if kwargs['after_pull'] else 'first'
++        trace.append(phase)
++        if failure == phase:
++            raise OSError('controlled send failure')
++        return original(*args, **kwargs)
++    def materialize(conn, hub, board):
++        assert not conn.in_transaction
++        assert board == base.BOARD
++        trace.append('materialize')
++    monkeypatch.setattr(client, '_send', send)
++    monkeypatch.setattr(intents, 'materialize', materialize)
++    if failure == 'second':
++        with pytest.raises(OSError, match='controlled send failure'):
++            base._round(kanban_home, svc)
++        assert trace == ['first', 'second']
++    else:
++        base._round(kanban_home, svc)
++        assert trace == ['first', 'second', 'materialize']
+-- 
+2.43.0
+

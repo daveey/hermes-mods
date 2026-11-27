@@ -1,0 +1,484 @@
+From 3a5fb29e139432d2e02566ef271bc3199286a772 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:53:14 +0000
+Subject: [PATCH 6301] Primary reconnect ownership and exact sidebar list batching
+
+Public mirror of source commit 3a5fb29e139432d2e02566ef271bc3199286a772.
+
+---
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index a8a2632c783..6015bff22db 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -4,6 +4,7 @@
+ import { configurePythonGatewayTicketClient, createLocalGatewayDials, createStaleGatewayRestarter, ensureLocalGateway, formatGatewayRestartLog, gatewayOwnerProfile, localGatewayDial, nativeGatewayHttpHeaders, redialLocalGateway, runGatewayEnsure, runGatewayOwnerRestart } from './local-gateway'
+ import { closeGatewayTicketBridges, createGatewayTicketResolver } from './local-gateway-python'
+ import { createPluginWsUrlHandler } from './plugin-ws-url'
++import { fetchSidebarPrimaryListBatch } from './sidebar-primary-list-batch'
+ const localGatewayDials = createLocalGatewayDials()
+ configurePythonGatewayTicketClient(createGatewayTicketResolver(
+   async () => ensureRuntime(await resolveHermesBackend([]), () => undefined), resolveHermesCwd))
+@@ -7365,6 +7366,7 @@
+ 
+   if (connection.gatewayEndpoint) {
+     const dialProfile = opts.inheritsPrimary ? connection.profile : String(profile ?? '')
++
+     return localGatewayDial({ ensure, forget: () => forgetLocalGatewayDescriptor(dialProfile), launchHome: HERMES_HOME,
+       prepare: (baseUrl, ticket) => localGatewayDials.prepare(baseUrl, ticket, webContentsId), profile: dialProfile })
+   }
+@@ -15297,10 +15299,7 @@
+     )
+   }
+ 
+-  // Batched sidebar slices. With no remote profiles the local batched endpoint
+-  // (one DB open per profile) serves it directly — take the fast path. When
+-  // remotes exist, a concrete local profile still reads the primary's batched
+-  // route once; otherwise fan the slices out to /api/profiles/sessions.
++  // Native sidebar for concrete local scope; exact request-local list batches for merged scopes.
+   if (method === 'GET' && pathname === '/api/profiles/sessions/sidebar') {
+     const remoteProfiles = configuredRemoteProfileNames()
+ 
+@@ -15321,7 +15320,12 @@
+     const ownerTag = primaryRowsOwnerTag(registryConnectionId, readDesktopConnectionsRegistry().primary)
+ 
+     const readSlice = sp => fetchProfilesSessionSlice(sp, remoteProfiles, registrySources, ownerTag, registryConnectionId)
+-    const fanOut = () => fanOutSidebarSessionSlices(searchParams, readSlice)
++
++    const fanOut = () => fetchSidebarPrimaryListBatch(searchParams, {
++      fetch: path => fetchJsonForProfile(null, path), ownerTag,
++      merge: (sp, base) => mergeRemoteProfileSessions(sp, remoteProfiles, registrySources, ownerTag, registryConnectionId, base),
++      fallback: () => fanOutSidebarSessionSlices(searchParams, readSlice)
++    })
+ 
+     // [daveey] A concrete local profile: one batched primary read, the slices only on its failure.
+     return fetchSidebarSessionsBatchedOrSliced(searchParams, {
+@@ -15458,11 +15462,8 @@
+   return owner
+ }
+ 
+-// Resolve one /api/profiles/sessions slice with remote profiles spliced in —
+-// the same branch logic as the GET /api/profiles/sessions intercept, but always
+-// returns data (never `undefined`) so a batched caller can compose slices. A
+-// specific local profile reads from the local primary; a remote-override profile
+-// reads from its remote; 'all' merges every remote into the primary aggregate.
++// Resolve one slice: local primary, profile override, or all-gateway merge.
++// Always returns data so batched callers can compose slices.
+ async function fetchProfilesSessionSlice(
+   searchParams,
+   remoteProfiles,
+@@ -15495,15 +15496,16 @@
+ async function mergeRemoteProfileSessions(
+   searchParams,
+   remoteProfiles,
+-  registrySourcesOverride = null,
++  registrySourcesOverride: RegistrySessionSource[] | null = null,
+   ownerTag: null | string = null,
+-  pinned = null
++  pinned = null,
++  primaryBase: unknown = undefined
+ ) {
+   const limit = Math.max(1, Number(searchParams.get('limit')) || 20)
+   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
+   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
+ 
+-  const base = (await fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile, { prefixForMerge: true, ownerTag })) as any
++  const base = (primaryBase ?? await fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile, { prefixForMerge: true, ownerTag })) as any
+ 
+   if (pinned) {
+     await tagPrimaryAggregateRows(base, () => ensureBackend(null, { passive: true }), pinned)
+diff --git a/apps/desktop/electron/sidebar-primary-list-batch.test.ts b/apps/desktop/electron/sidebar-primary-list-batch.test.ts
+new file mode 100644
+index 00000000000..f58ce51ac8a
+--- /dev/null
++++ b/apps/desktop/electron/sidebar-primary-list-batch.test.ts
+@@ -0,0 +1,75 @@
++import assert from 'node:assert/strict'
++
++import { test } from 'vitest'
++
++import { fetchSidebarPrimaryListBatch } from './sidebar-primary-list-batch'
++
++const response = (n: number) => ({ list_slices_version: 1, ...Object.fromEntries(
++  ['recents', 'cron', 'messaging'].map(key => [key, {
++    sessions: [{ id: `${key}-${n}`, profile: 'work' }], total: 731, profile_totals: { work: 731 }
++  }])
++) })
++
++test('whole all-profile refresh reads primary once, retains exact bases and rereads without notification', async () => {
++  let reads = 0
++  const merged: any[] = []
++  const query = new URLSearchParams('recents_profile=all&recents_limit=50&cron_limit=50&messaging_limit=100&recents_exclude=cron')
++
++  const deps = {
++    fetch: async (path: string) => {
++      assert.equal(new URL(path, 'http://x').searchParams.get('list_slices'), 'true')
++
++      return response(++reads)
++    },
++    merge: async (sp: URLSearchParams, base: any) => {
++      merged.push({ sp, base })
++      assert.equal(base.total, 731)
++      assert.equal(base.profile_totals.work, 731)
++      assert.equal(base.sessions[0].connection_id, 'hub')
++
++      return base
++    },
++    ownerTag: 'hub', fallback: async () => assert.fail('unexpected legacy read')
++  }
++
++  const first: any = await fetchSidebarPrimaryListBatch(query, deps)
++  const second: any = await fetchSidebarPrimaryListBatch(query, deps)
++  assert.equal(reads, 2)
++  assert.equal(merged.length, 6)
++  assert.equal(first.recents.sessions[0].id, 'recents-1')
++  assert.equal(second.recents.sessions[0].id, 'recents-2')
++  assert.equal(merged[0].sp.get('exclude_sources'), 'cron')
++  assert.equal(merged[1].sp.get('source'), 'cron')
++})
++
++test('old, malformed and failed batches fall back, and the next refresh retries', async () => {
++  for (const answer of [null, {}, { ...response(1), cron: {} }, new Error('404')]) {
++    let fallbacks = 0
++    let reads = 0
++
++    const deps = {
++      fetch: async () => { reads++;
++
++ if (answer instanceof Error) {throw answer;}
++
++ return answer },
++      merge: async () => assert.fail('incomplete base merged'), ownerTag: null,
++      fallback: async () => { fallbacks++;
++
++ return 'legacy' }
++    }
++
++    for (let i = 0; i < 2; i++) {assert.equal(await fetchSidebarPrimaryListBatch(new URLSearchParams(), deps), 'legacy')}
++    assert.equal(reads, 2)
++    assert.equal(fallbacks, 2)
++  }
++})
++
++test('concrete profiles and large windows retain paginated legacy reads', async () => {
++  for (const query of ['recents_profile=work', 'recents_limit=501']) {
++    assert.equal(await fetchSidebarPrimaryListBatch(new URLSearchParams(query), {
++      fetch: async () => assert.fail('batch must not truncate'), merge: async () => assert.fail('merge'),
++      fallback: async () => 'legacy', ownerTag: null
++    }), 'legacy')
++  }
++})
+diff --git a/apps/desktop/electron/sidebar-primary-list-batch.ts b/apps/desktop/electron/sidebar-primary-list-batch.ts
+new file mode 100644
+index 00000000000..5d251fb008e
+--- /dev/null
++++ b/apps/desktop/electron/sidebar-primary-list-batch.ts
+@@ -0,0 +1,48 @@
++import { assembleSidebarSessionSlices, buildSidebarSessionSliceParams, tagSidebarSlicesOwner } from './profile-session-routing'
++
++/** Request-owned exact list bases; never retain a response across refreshes. */
++export async function fetchSidebarPrimaryListBatch(
++  params: URLSearchParams,
++  deps: {
++    fetch: (path: string) => Promise<unknown>
++    merge: (params: URLSearchParams, base: unknown) => Promise<unknown>
++    fallback: () => Promise<unknown>
++    ownerTag: string | null
++  }
++): Promise<unknown> {
++  const slices = buildSidebarSessionSliceParams(params)
++
++  if (slices.recents.get('profile') !== 'all' || Object.values(slices).some(sp => {
++    const limit = Number(sp.get('limit'))
++
++    return !Number.isInteger(limit) || limit < 1 || limit > 500
++  })) {
++    return deps.fallback()
++  }
++
++  const query = new URLSearchParams(params)
++  query.set('list_slices', 'true')
++  let batch: Record<string, any>
++
++  try {
++    batch = await deps.fetch(`/api/profiles/sessions/sidebar?${query}`) as Record<string, any>
++
++    if (batch?.list_slices_version !== 1 || ['recents', 'cron', 'messaging'].some(key => {
++      const slice = batch[key]
++
++      return !Array.isArray(slice?.sessions) || !Number.isFinite(slice?.total) || !slice?.profile_totals
++    })) {
++      return deps.fallback()
++    }
++  } catch {
++    return deps.fallback()
++  }
++
++  batch = tagSidebarSlicesOwner(batch, deps.ownerTag) as Record<string, any>
++
++  const [recents, cron, messaging] = await Promise.all(
++    (['recents', 'cron', 'messaging'] as const).map(key => deps.merge(slices[key], batch[key]))
++  )
++
++  return assembleSidebarSessionSlices(recents, cron, messaging)
++}
+diff --git a/apps/desktop/electron/sidebar-primary-list-integration.test.ts b/apps/desktop/electron/sidebar-primary-list-integration.test.ts
+new file mode 100644
+index 00000000000..2c63cebd23a
+--- /dev/null
++++ b/apps/desktop/electron/sidebar-primary-list-integration.test.ts
+@@ -0,0 +1,59 @@
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import vm from 'node:vm'
++
++import ts from 'typescript'
++import { test } from 'vitest'
++
++import * as routing from './profile-session-routing'
++import * as ownerRoute from './session-owner-list-route'
++import { fetchSidebarPrimaryListBatch } from './sidebar-primary-list-batch'
++
++// Execute the production main-process handlers without booting Electron.
++const source = ts.createSourceFile('main.ts', readFileSync(new URL('./main.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
++const names = ['interceptSessionRequestForRemote', 'fetchProfilesSessionSlice', 'mergeRemoteProfileSessions']
++const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text ?? ''))
++assert.equal(functions.length, names.length)
++const code = ts.transpileModule(functions.map(n => n.getText(source)).join('\n'), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
++
++test('production sidebar intercept and merge retain parity while eliminating primary slice reads', async () => {
++  const query = 'recents_profile=all&recents_limit=2&cron_limit=2&messaging_limit=2&recents_exclude=cron&messaging_exclude=cli,cron'
++  const slice = (kind: string) => ({ sessions: [{ id: kind, profile: 'default', last_active: 10 }], total: 1, profile_totals: { default: 1 }, errors: [] })
++  const bases = { recents: slice('chat'), cron: slice('cron'), messaging: slice('telegram') }
++
++  const run = async (batchSupported: boolean) => {
++    const reads: string[] = []
++
++    const context = vm.createContext({
++      ...routing, ...ownerRoute, fetchSidebarPrimaryListBatch, URLSearchParams,
++      configuredRemoteProfileNames: () => [],
++      pooledRegistrySessionSources: async () => [{ connectionId: 'hub', reusesPrimary: true, kind: 'ssh', backends: [{ descriptor: {}, profile: 'default' }], installId: 'primary' }],
++      globalRemoteActive: () => true,
++      readDesktopConnectionsRegistry: () => ({ primary: 'hub' }),
++      profileHasRemoteOverride: () => false,
++      primaryBackendInstallId: async () => 'primary',
++      rowsOf: (value: any) => value.sessions || [],
++      getJsonForBackend: async () => assert.fail('reused primary must not read registry'),
++      fetchJsonForProfile: async (_profile: unknown, path: string) => {
++        reads.push(path)
++
++        if (path.includes('/sidebar?')) {return batchSupported ? { list_slices_version: 1, ...structuredClone(bases) } : {}}
++        const sp = new URL(path, 'http://test').searchParams
++
++        return structuredClone(sp.get('source') === 'cron' ? bases.cron : sp.get('exclude_sources') === 'cli,cron' ? bases.messaging : bases.recents)
++      }
++    })
++
++    vm.runInContext(code, context)
++    const result = await vm.runInContext(`interceptSessionRequestForRemote({path: '/api/profiles/sessions/sidebar?${query}'})`, context)
++
++    return { result: JSON.parse(JSON.stringify(result)), reads }
++  }
++
++  const batched = await run(true)
++  const legacy = await run(false)
++  assert.deepEqual(batched.result, legacy.result)
++  assert.equal(batched.reads.length, 1)
++  assert.equal(legacy.reads.length, 4) // unsupported batch followed by the three original slices
++  assert.equal(batched.result.recents.sessions[0].connection_id, undefined) // unpinned primary stays bare
++})
+diff --git a/hermes_cli/profile_session_list_slices.py b/hermes_cli/profile_session_list_slices.py
+new file mode 100644
+index 00000000000..1e92165a467
+--- /dev/null
++++ b/hermes_cli/profile_session_list_slices.py
+@@ -0,0 +1,18 @@
++"""Exact list-shaped sidebar slices for Desktop's cross-gateway merge.
++
++Unlike the native sidebar, these retain exact totals and list source policy.
++The caller supplies a request-local annotation snapshot; no results outlive it.
++"""
++
++
++def read_list_slices(reader, snapshot, *, profile, recents_limit, cron_limit,
++                     messaging_limit, recents_exclude, messaging_exclude):
++    common = dict(profile=(profile or "all").strip() or "all", offset=0,
++                  min_messages=1, archived="exclude", order="recent")
++    with snapshot():
++        return {
++            "list_slices_version": 1,
++            "recents": reader(**common, limit=recents_limit, exclude_sources=recents_exclude),
++            "cron": reader(**common, limit=cron_limit, source="cron"),
++            "messaging": reader(**common, limit=messaging_limit, exclude_sources=messaging_exclude),
++        }
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index f54e1b27d4c..bab6f233245 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -348,11 +348,11 @@
+     @functools.wraps(func)
+     def wrapped(*args, **kwargs):
+         ttl = _SIDEBAR_CACHE_TTL_SECONDS
+-        if ttl <= 0:
+-            return func(*args, **kwargs)
+-
+         bound = signature.bind(*args, **kwargs)
+         bound.apply_defaults()
++        if ttl <= 0 or bound.arguments.get("list_slices") is True:
++            return func(*args, **kwargs)
++
+         key = tuple(bound.arguments.items())
+         cached = _lookup(key)
+         if cached is not miss:
+@@ -583,7 +583,8 @@
+ @_la.accounted("route/profiles.sessions.sidebar")
+ def get_profiles_sessions_sidebar(
+     recents_profile: str = "all", recents_limit: int = 20, recents_exclude: str | None = None,
+-    cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str | None = None):
++    cron_limit: int = 50, messaging_limit: int = 100, messaging_exclude: str | None = None,
++    list_slices: bool = False):
+     """Batched sidebar session slices (recents / cron / messaging) — one profile-DB open per
+     refresh instead of three ``/api/profiles/sessions`` calls. Same row projection and 300s
+     active heuristic as the per-slice endpoint; all slices use ``min_messages=1`` /
+@@ -595,6 +596,13 @@
+ 
+     See #42651, #65710, #70629.
+     """
++    if list_slices:
++        from hermes_cli.profile_session_list_slices import read_list_slices
++        return read_list_slices(
++            get_profiles_sessions, one_annotation_snapshot, profile=recents_profile,
++            recents_limit=min(max(recents_limit, 1), 500), cron_limit=min(max(cron_limit, 1), 500),
++            messaging_limit=min(max(messaging_limit, 1), 500),
++            recents_exclude=recents_exclude, messaging_exclude=messaging_exclude)
+     targets = _profile_targets("GET /api/profiles/sessions/sidebar")
+ 
+     recents_scope = (recents_profile or "all").strip() or "all"
+diff --git a/tests/hermes_cli/test_profile_session_list_slices.py b/tests/hermes_cli/test_profile_session_list_slices.py
+new file mode 100644
+index 00000000000..ff19d0a9213
+--- /dev/null
++++ b/tests/hermes_cli/test_profile_session_list_slices.py
+@@ -0,0 +1,120 @@
++"""Request-local list batching keeps exact merge inputs and fresh reads."""
++import contextlib
++
++from hermes_cli.profile_session_list_slices import read_list_slices
++from tests.hermes_cli import test_profiles_sidebar_scope as scope_helpers
++
++profiles_on_disk = scope_helpers.profiles_on_disk
++client = scope_helpers.client
++
++
++def test_exact_slices_share_one_snapshot_and_keep_counts():
++    active = []
++    calls = []
++
++    @contextlib.contextmanager
++    def snapshot():
++        active.append(True)
++        try:
++            yield
++        finally:
++            active.pop()
++
++    def reader(**kwargs):
++        assert active == [True]
++        calls.append(kwargs)
++        return {"sessions": [], "total": 731, "profile_totals": {"work": 731},
++                "errors": [{"profile": "other", "error": "unavailable"}]}
++
++    for revision in range(2):
++        result = read_list_slices(reader, snapshot, profile=" all ", recents_limit=50,
++                                 cron_limit=50, messaging_limit=100,
++                                 recents_exclude="cron", messaging_exclude="tui,cli")
++        assert len(calls) == (revision + 1) * 3  # no notification required to reread
++        assert result["list_slices_version"] == 1
++        for key in ("recents", "cron", "messaging"):
++            assert result[key]["total"] == 731
++            assert result[key]["profile_totals"] == {"work": 731}
++            assert result[key]["errors"]
++    assert not active
++    common = dict(profile="all", offset=0, min_messages=1, archived="exclude", order="recent")
++    assert calls[:3] == [dict(common, limit=50, exclude_sources="cron"),
++                         dict(common, limit=50, source="cron"),
++                         dict(common, limit=100, exclude_sources="tui,cli")]
++
++
++def test_http_sidebar_explicit_mode_uses_exact_lists(monkeypatch):
++    from hermes_cli.web_routers import profiles
++
++    calls = []
++
++    def read(**kwargs):
++        calls.append(kwargs)
++        return {"sessions": [], "total": 42, "profile_totals": {"default": 42}}
++
++    monkeypatch.setattr(profiles, "get_profiles_sessions", read)
++    monkeypatch.setattr(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 60)
++    result = profiles.get_profiles_sessions_sidebar(list_slices=True)
++    assert result["list_slices_version"] == 1
++    assert len(calls) == 3
++    profiles.get_profiles_sessions_sidebar(list_slices=True)
++    assert len(calls) == 6  # ordinary sidebar TTL must not cache exact-list mode
++    assert result["recents"]["total"] == 42
++
++
++def test_real_http_lists_match_and_sql_write_without_notification_is_fresh(client, profiles_on_disk, monkeypatch):
++    import sqlite3
++    from hermes_cli.web_routers import profiles
++
++    monkeypatch.setattr(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 60)
++    for name, home in profiles_on_disk.items():
++        for source in ("cli", "cron", "telegram"):
++            scope_helpers._seed_session(home, f"{name}-{source}", source=source)
++    query = dict(list_slices="true", recents_profile="all", recents_limit=1,
++                 cron_limit=1, messaging_limit=1, recents_exclude="cron,telegram",
++                 messaging_exclude="cli,cron")
++    response = client.get("/api/profiles/sessions/sidebar", params=query)
++    assert response.status_code == 200, response.text
++    batch = response.json()
++    assert batch["list_slices_version"] == 1
++    for key, filters in (("recents", {"exclude_sources": "cron,telegram"}),
++                         ("cron", {"source": "cron"}),
++                         ("messaging", {"exclude_sources": "cli,cron"})):
++        single = client.get("/api/profiles/sessions", params=dict(
++            limit=1, offset=0, min_messages=1, archived="exclude", order="recent",
++            profile="all", **filters)).json()
++        assert batch[key]["total"] == single["total"] == 2
++        assert batch[key]["profile_totals"] == single["profile_totals"]
++        assert [r["id"] for r in batch[key]["sessions"]] == [r["id"] for r in single["sessions"]]
++    # Bypass every notification producer: independent SQLite commit only.
++    with sqlite3.connect(profiles_on_disk["worker"] / "state.db") as db:
++        db.execute("UPDATE sessions SET source='cron' WHERE id='worker-cli'")
++    updated = client.get("/api/profiles/sessions/sidebar", params=query).json()
++    assert updated["recents"]["total"] == 1
++    assert updated["cron"]["total"] == 3
++    assert updated["messaging"]["total"] == 2
++
++
++def test_real_annotation_reader_is_captured_once_per_batch(monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++
++    captures = []
++    original = activity._annotation_snapshot
++
++    def capture(*args, **kwargs):
++        captures.append(True)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(activity, "_annotation_snapshot", capture)
++
++    def reader(**kwargs):
++        rows = [{"id": "batch-proof", "profile": "default"}]
++        activity.annotate_kanban_activity(rows, display=True)
++        return {"sessions": rows}
++
++    for _ in range(2):
++        before = len(captures)
++        read_list_slices(reader, activity.one_annotation_snapshot, profile="all",
++                         recents_limit=1, cron_limit=1, messaging_limit=1,
++                         recents_exclude=None, messaging_exclude=None)
++        assert len(captures) - before == 1
+-- 
+2.43.0
+

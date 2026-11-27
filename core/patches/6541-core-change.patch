@@ -1,0 +1,112 @@
+From 19bdb081cfeeb080a0f8406be4265f300a859c48 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 03:18:39 +0000
+Subject: [PATCH 6541] Usage-accounting gate and pool pickup budgets
+
+Public mirror of source commit 19bdb081cfeeb080a0f8406be4265f300a859c48.
+
+---
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index eca1a8e27a8..51a9d6e3ff2 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -647,19 +647,24 @@
+             reason = _review_walled(replica, card)
+         if reason is None:
+             reason = _paced(conn, replica, card)
+-        if reason is None:
+-            reason = _usage_pending(replica, card)
+         if reason is None:
+             from hermes_cli.kanban_class_walls import pickup_refusal
+             reason = pickup_refusal(replica, card)
+         hold = kph.board_hold(replica, card) if reason is None else None
++        debt = _usage_pending(replica, card) if reason is None and hold is None else None
++        if debt is not None:  # the claim defers it: copy it like a guard hold, outside the budget
++            hold = debt
+         if hold is not None:
+-            if held is not None and free < kph.FREE_PER_TICK and not kph.recently_copied(card["id"], hold[1]):
+-                held[card["id"]] = hold[1]
++            # A debt copy is not kept by evict (no guard holds it), so it is re-copied each tick, never
++            # remembered: the recheck window would evict it and leave its local guards unrun.
++            if held is not None and free < kph.FREE_PER_TICK and (
++                    debt is not None or not kph.recently_copied(card["id"], hold[1])):
++                if debt is None:
++                    held[card["id"]] = hold[1]
+                 picked.append(card["id"])
+                 free += 1
+                 continue
+-            reason = ("guard_held", f"respawn_guarded: {hold[0]}")
++            reason = ("other", hold[0]) if debt is not None else ("guard_held", f"respawn_guarded: {hold[0]}")
+         if reason is None and full:
+             reason = ("budget_exhausted", full_detail)
+         if reason is None:
+@@ -705,13 +710,14 @@
+     return None if gated is None else ("other", f"{gated} (local dispatch would hold it)")
+ 
+ 
+-def _usage_pending(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
+-    """[daveey] ``("other", detail)`` when the local claim would defer ``card`` on ``usage_accounting_pending``
+-    (``kanban_spend_claim``): a closed run of it still lacks its usage receipt. Judged on the replica (a copy
+-    carries exactly those runs/events) before the copy, so such a card takes no pickup budget. Copied, it was
+-    deferred, evicted and copied again each tick: 16 such cards filled every worker's window and hid the review
+-    of the accounting fix itself (t_88f5d46a072c9879). Any failure copies as before: the claim
+-    check still decides after the copy."""
++def _usage_pending(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, tuple]]:
++    """[daveey] ``(detail, hold signature)`` when the local claim would defer ``card`` on
++    ``usage_accounting_pending`` (``kanban_spend_claim``): a closed run of it still lacks its usage receipt.
++    Judged on the replica (a copy carries exactly those runs/events) before the copy. Such a card is copied like
++    a respawn-guard hold (``kanban_pickup_held``): outside the budget, sharing its ``FREE_PER_TICK`` slots, so
++    its local guards and receipts still run but it never takes the window. Taking budget, it was deferred,
++    evicted and copied again each tick: 16 such cards filled every worker's window and hid the review of the accounting fix itself (t_88f5d46a072c9879). Any
++    failure copies as before: the claim check still decides after the copy."""
+     try:
+         from hermes_cli.kanban_usage_accounting import pending
+         runs = pending(replica, card["id"])
+@@ -720,7 +726,8 @@
+         return None
+     if not runs:
+         return None
+-    return "other", f"usage_accounting_pending: runs {sorted(runs)} (local claim would defer it)"
++    return (f"usage_accounting_pending: runs {sorted(runs)} (local claim would defer it)",
++            ("usage_accounting_pending", tuple(sorted(runs))))
+ 
+ 
+ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
+diff --git a/tests/hermes_cli/test_kanban_pickup_usage_pending.py b/tests/hermes_cli/test_kanban_pickup_usage_pending.py
+index 567174a0b22..959da71f743 100644
+--- a/tests/hermes_cli/test_kanban_pickup_usage_pending.py
++++ b/tests/hermes_cli/test_kanban_pickup_usage_pending.py
+@@ -54,14 +54,15 @@
+     clean = support._hub_card(hub, title="clean, eligible", priority=0, runs_on=PIN)
+     worker.round()
+     worker.enter()
+-    # Budget 2 < 3 indebted cards ahead of the clean one: the first pass copies the clean card only.
+-    assert wn.pickup(worker.conn, budget=2) == [clean]
+-    for _ in range(2):
++    # Budget 1 < 3 indebted cards ahead of the clean one. The debts ride the guard-hold slots outside the
++    # budget (their local guards still run); the one budget slot goes to the clean card.
++    picked = wn.pickup(worker.conn, budget=1)
++    assert clean in picked
++    assert set(picked) - {clean} <= set(indebted)
++    for _ in range(2):  # every tick: the clean card is never displaced by a debt
+         worker.round()
+         worker.enter()
+-        wn.pickup(worker.conn, budget=3)
+-    assert set(imports) == {clean}  # an unstarted copy is evicted and copied again; never a debt card
+-    assert all(kb.get_task(worker.conn, tid) is None for tid in indebted)
++        assert clean in wn.pickup(worker.conn, budget=1) or kb.get_task(worker.conn, clean) is not None
+ 
+ 
+ def test_a_failed_accounting_check_does_not_refuse(gws, monkeypatch):
+@@ -74,7 +75,7 @@
+     assert replica is not None
+     try:
+         card = replica.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+-        assert wn._usage_pending(replica, card)[1].startswith("usage_accounting_pending: runs ")
++        assert wn._usage_pending(replica, card)[0].startswith("usage_accounting_pending: runs ")
+ 
+         def boom(*a, **kw):
+             raise RuntimeError("replica unreadable")
+-- 
+2.43.0
+

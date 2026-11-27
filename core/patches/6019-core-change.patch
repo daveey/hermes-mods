@@ -1,0 +1,250 @@
+From 21db771496235bf2c18f0b111f65b0bb64ead834 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:23:08 +0000
+Subject: [PATCH 6019] Kanban spend budget: window semantics, input checks and immediate reviewer
+
+Public mirror of source commit 21db771496235bf2c18f0b111f65b0bb64ead834.
+
+---
+diff --git a/hermes_cli/kanban_db_promote.py b/hermes_cli/kanban_db_promote.py
+index eff391ad97f..2ecb1df887d 100644
+--- a/hermes_cli/kanban_db_promote.py
++++ b/hermes_cli/kanban_db_promote.py
+@@ -54,9 +54,15 @@
+         )
+         if upd.rowcount != 1:
+             return False, f"task {task_id} status changed during promotion"
++        from hermes_cli import kanban_spend_budget as budget
++        # Match the operator courier's explicit window boundary. Keep restricted
++        # history cumulative even after an authorized scope renewal.
++        window = ({"spend_budget": budget.card_limits(conn, task_id, budget.limits())._asdict()}
++                  if budget.limit_window(conn, task_id) == 'next_promote' else {})
+         _kb._append_event(conn, task_id, "promoted_manual", {
+             "actor": actor, "reason": reason,
+             **({"from_status": cur_status} if cur_status != "todo" else {}),
++            **window,
+         })
+     return True, None
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 4ed6939fc28..e3028ccd799 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -670,13 +670,16 @@
+     _cmd("spend-budget", [
+         _TASK_ID,
+         _arg("--seen", dest="seen_comment_id", type=int, help="Newest decision comment read; refuse replacing an unread spend-stop budget decision."),
+-        _arg("--runs", type=_nonnegative_int, help="This card's spending-run limit (0 = no limit)"),
+-        _arg("--cache-read-tokens", type=_nonnegative_int, help="This card's cache-read token limit (0 = no limit)"),
++        _arg("--runs", type=_nonnegative_int, help="Spending-run limit (0 = no limit): fresh window starting at promote "
++             "for an ordinary spend stop; otherwise current window including recorded spend"),
++        _arg("--cache-read-tokens", type=_nonnegative_int, help="Cache-read token limit (0 = no limit): same window as --runs; "
++             "restricted history never resets"),
+         _arg("--exempt", action="store_true", help="No spend budget for this card (standing cards)"),
+         _arg("--clear", action="store_true", help="Back to the board's kanban.spend_budget_* limits"),
+         _reason("Why (required for a change; recorded on the spend_budget_set event)"),
+         _json_flag(),
+-    ], help="Show or set one card's own spend budget (kanban_spend_budget)"),
++    ], help="Show or set one card's own spend budget: an ordinary spend stop uses a fresh window starting at promote; "
++            "otherwise limits count the current window, including recorded spend (restricted history never resets)"),
+     _cmd("archive", [
+         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
+         _arg("--rm", dest="purge_ids", nargs="+",
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index a7d5d7ecdf8..5955209a3ad 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -128,6 +128,18 @@
+     return override_set(card_override(conn, task_id))
+ 
+ 
++def limit_window(conn: sqlite3.Connection, task_id: str) -> str:
++    """A pending ordinary stop needs promotion; restricted accounting never resets."""
++    from hermes_cli import kanban_spend_decision as decision
++    return ('next_promote' if decision.pending(conn, task_id)
++            and decision.restricted_floor(conn, task_id) is None else 'current')
++
++
++def window_text(window: str) -> str:
++    return ('this limit applies to a fresh window starting at promote; setting it does not release the stop'
++            if window == 'next_promote' else 'this limit counts the current window, including spend already recorded')
++
++
+ def set_override(conn: sqlite3.Connection, task_id: str, *, runs: Optional[int] = None,
+                  cache_read_tokens: Optional[int] = None, by: str, reason: str,
+                  seen: Optional[int] = None, board: Optional[str] = None) -> dict:
+@@ -150,8 +162,10 @@
+         from hermes_cli.kanban_spend_override_fence import check
+         if episode := check(conn, task_id, seen=seen, board=board):
+             payload['episode'] = episode
++        window = limit_window(conn, task_id)
+         cid = kb.add_comment(conn, task_id, AUTHOR,
+-                             f"Spend budget for this card: {_override_text(payload)}, set by {by}: {reason}.", system=True)
++                             f"Spend budget for this card: {_override_text(payload)}, set by {by}: {reason}. "
++                             f"{window_text(window)}.", system=True)
+         if episode:
+             note = conn.execute("SELECT * FROM task_comments WHERE id=?", (cid,)).fetchone()
+             payload['decision_comment'] = {'comment_id': cid, 'author': AUTHOR}
+@@ -210,8 +224,8 @@
+         "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'commented' AND created_at < ? "
+         "AND (json_extract(payload, '$.writer_kind') = 'human' OR json_extract(payload, '$.relayed_human') IS NOT NULL)",
+         (task_id, cut)).fetchone()[0]
+-    # A spend decision applied through the operator courier (``kanban_spend_promote``) opens the new window at the
+-    # promotion itself, so its run budget counts exactly the runs after it. A plain manual promote does not.
++    # Ordinary spend-stop promotions (manual or operator courier) explicitly open a new
++    # window. Unrelated promotions and restricted accounting do not renew spending.
+     promoted = conn.execute(
+         "SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = 'promoted_manual' AND created_at < ? "
+         "AND json_valid(payload) AND json_extract(payload, '$.spend_budget.runs') IS NOT NULL",
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index 7bb71f9ff3c..400a6ffdeb2 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -6,7 +6,10 @@
+ are fenced from this verb like every other board write, so a looping card cannot exempt itself.
+ For a spend-stop episode, an existing budget decision must be read before replacement (``--seen COMMENT_ID``).
+ This acknowledgment is checked under the writer lock, survives promotion, and is not a retry instruction:
+-keep the first decision unless an explicit reconciliation is warranted. Read-only display is unchanged.
++keep the first decision unless an explicit reconciliation is warranted. Historical spend values are retained.
++An ordinary pending spend stop uses a fresh window starting at promote. Until then
++the printed spend is historical, not deducted from that fresh allowance. Other
++limits include recorded spend in the current window; restricted history never resets.
+ """
+ from __future__ import annotations
+ 
+@@ -52,7 +55,8 @@
+         lim = ksb.card_limits(conn, tid, ksb.limits())
+         override = ksb.card_override(conn, tid)
+         spent = ksb.spend(conn, tid)
+-    out = {"task_id": tid, "limits": lim._asdict(), "override": override,
++        window = ksb.limit_window(conn, tid)
++    out = {"task_id": tid, "limits": lim._asdict(), "override": override, "window": window,
+            "spent": {"runs": spent.runs, "since": spent.since, "tokens": spent.tokens, "excluded": spent.excluded}}
+     if getattr(args, "json", False):
+         print(json.dumps(out, sort_keys=True))
+@@ -64,6 +68,8 @@
+         print(f"{tid}: spend budget {shown}")
+     if override is not None and ksb.override_set(override):
+         print(f"  override set by {override.get('by')}: {override.get('reason')}")
++    print(f"  {ksb.window_text(window)}")
+     skipped = f" ({spent.excluded} owner-refusal runs excluded)" if spent.excluded else ""
+-    print(f"  spent: {spent.runs} runs{skipped}, {spent.tokens['cache_read_tokens']} cache-read tokens in this window")
++    label = 'historical spend' if window == 'next_promote' else 'spent'
++    print(f"  {label}: {spent.runs} runs{skipped}, {spent.tokens['cache_read_tokens']} cache-read tokens in this window")
+     return 0
+diff --git a/tests/hermes_cli/test_kanban_spend_window.py b/tests/hermes_cli/test_kanban_spend_window.py
+new file mode 100644
+index 00000000000..068bd0d1da5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_window.py
+@@ -0,0 +1,107 @@
++"""A pre-promote limit promises a fresh allowance, not a cumulative old-window cap."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_budget as budget
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize('token_limited', [False, True])
++def test_set_before_promote_reports_and_enforces_fresh_allowance(kanban_home, monkeypatch, token_limited):
++    now = 2_000_000_000
++    monkeypatch.setattr(budget.time, 'time', lambda: now)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Bounded retry', assignee='default')
++        helpers._runs(conn, tid, 8, usage={'cache_read_tokens': 100})
++        # Historical stops can retain the spent window until promotion (the synced incident shape).
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.EVENT, {'reason': 'eight spent', 'accounting_boundary': False})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        assert budget.spend(conn, tid).runs == 8
++    args = '--runs 0 --cache-read-tokens 200' if token_limited else '--runs 2 --cache-read-tokens 0'
++    shown = cli.run_slash(f'spend-budget {tid} {args} --reason bounded')
++    assert 'this limit applies to a fresh window starting at promote' in shown
++    assert 'historical spend: 8 runs' in shown
++    before = json.loads(cli.run_slash(f'spend-budget {tid} --json'))
++    assert before['window'] == 'next_promote'
++    assert before['spent']['runs'] == 8  # never fabricate zero historical spend
++    with kbc.connect_closing() as conn:
++        budget.hold(conn, tid, lim=helpers.LIMITS)
++        counts = {kind: len(helpers._events(conn, tid, kind)) for kind in (budget.EVENT, 'spend_budget_decision_ready')}
++        budget.hold(conn, tid, lim=helpers.LIMITS)
++        assert counts == {kind: len(helpers._events(conn, tid, kind)) for kind in counts}
++        assert counts[budget.EVENT] == 1  # no new hold against the old window/limit
++        assert kb.get_task(conn, tid).status == 'triage'  # setting is not release
++        assert 'fresh window starting at promote' in kb.list_comments(conn, tid)[0].body
++        now += 10
++        assert kb.promote_task(conn, tid, actor='operator', reason='bounded retry') == (True, None)
++        assert budget.spend(conn, tid).runs == 0
++        assert budget.spend(conn, tid).tokens['cache_read_tokens'] == 0
++        assert budget.spend(conn, tid).since == now
++        for i in range(2):
++            assert budget.hold(conn, tid, lim=helpers.LIMITS) is None
++            now += 100
++            with kb.write_txn(conn):
++                rid = conn.execute("INSERT INTO task_runs (task_id,profile,status,started_at,ended_at,outcome) "
++                                   "VALUES (?,'default','continued',?,?,'continued')",
++                                   (tid, now - 90, now)).lastrowid
++                kb._append_event(conn, tid, 'worker_result', {'usage': {'cache_read_tokens': 100}}, run_id=rid)
++        assert budget.hold(conn, tid, lim=helpers.LIMITS) == 'triage'
++        last = helpers._events(conn, tid, budget.EVENT)[-1].payload
++        assert last['runs'] == 2 and last['tokens']['cache_read_tokens'] == 200
++    assert json.loads(cli.run_slash(f'spend-budget {tid} --json'))['window'] == 'next_promote'
++
++
++def test_ordinary_limit_counts_current_window_and_help_explains_both(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Ordinary', assignee='default')
++        helpers._runs(conn, tid, 1)
++    out = cli.run_slash(f'spend-budget {tid} --runs 2 --reason bounded')
++    assert 'limit counts the current window' in out
++    assert 'spent: 1 runs' in out
++    assert json.loads(cli.run_slash(f'spend-budget {tid} --json'))['window'] == 'current'
++    help_text = cli.run_slash('spend-budget --help')
++    assert 'fresh window starting at promote' in ' '.join(help_text.split())
++    assert 'current window' in ' '.join(help_text.split())
++
++
++@pytest.mark.parametrize('cause', ['scope_stopped', 'safety_refusal'])
++def test_restricted_stop_does_not_promise_or_open_fresh_window(kanban_home, cause):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Restricted', assignee='default')
++        helpers._runs(conn, tid, 8)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.EVENT, {'cause': cause, 'accounting_boundary': False})
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++    out = cli.run_slash(f'spend-budget {tid} --runs 10 --reason bounded')
++    assert 'limit counts the current window' in out
++    assert 'fresh window' not in out
++    with kbc.connect_closing() as conn:
++        assert budget.spend(conn, tid).runs == 8
++        assert not kb.promote_task(conn, tid, actor='operator', reason='budget only')[0]
++        assert not helpers._events(conn, tid, 'promoted_manual')
++
++
++def test_real_spend_stop_keeps_notice_until_promote(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='Eight-run stop', assignee='default')
++        helpers._runs(conn, tid, 8)
++        assert budget.hold(conn, tid, lim=budget.Limits(8, 0)) == 'triage'
++        before = {kind: len(helpers._events(conn, tid, kind))
++                  for kind in (budget.EVENT, 'spend_budget_decision_ready')}
++    out = cli.run_slash(f'spend-budget {tid} --runs 2 --reason bounded')
++    assert 'fresh window starting at promote' in out
++    with kbc.connect_closing() as conn:
++        assert budget.hold(conn, tid, lim=helpers.LIMITS) == 'triage'
++        assert before == {kind: len(helpers._events(conn, tid, kind)) for kind in before}
++        assert kb.promote_task(conn, tid, actor='operator', reason='bounded retry')[0]
++        assert budget.card_limits(conn, tid, helpers.LIMITS).runs == 2
++        assert budget.spend(conn, tid).runs == 0
+-- 
+2.43.0
+

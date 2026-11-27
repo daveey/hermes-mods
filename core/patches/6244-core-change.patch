@@ -1,0 +1,550 @@
+From d929c5f0064c8477a48d7f49f15d240771af547f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:43:13 -0800
+Subject: [PATCH 6244] Conservative sync repair, lease custody and UDF budgets
+
+Public mirror of source commit d929c5f0064c8477a48d7f49f15d240771af547f.
+
+---
+diff --git a/hermes_cli/kanban_human_request_migration.py b/hermes_cli/kanban_human_request_migration.py
+index b5caf812595..381a52e3cea 100644
+--- a/hermes_cli/kanban_human_request_migration.py
++++ b/hermes_cli/kanban_human_request_migration.py
+@@ -31,6 +31,11 @@
+         ).fetchone()
+         if row is None or row["status"] not in ("blocked", "triage") or row["current_run_id"] is not None:
+             return False
++        # A contained card's lifecycle belongs to its containment authority: the Board refuses this generic
++        # write (containment_hold), which used to leave a never-applicable rejected upload behind.
++        from hermes_cli.kanban_containment_guard import pending as contained
++        if contained(conn, task_id):
++            return False
+         request = validate_human_request(human_request, kind=row["block_kind"])
+         from hermes_cli.kanban_ask_resolved import filing_fields, store_request
+         store_request(conn, task_id, request)  # adds, changes or removes the resolved_check probe [daveey]
+@@ -57,7 +62,7 @@
+             lambda tid: classify_parked_request(conn, tid, human_request=request,
+                                                actor=cli_actor(), reason=reason),
+             lambda tid: f"Classified {tid} (metadata only; remains parked)",
+-            lambda tid: f"cannot classify {tid} (requires parked card without a current run)")
++            lambda tid: f"cannot classify {tid} (requires a parked, uncontained card without a current run)")
+ 
+ 
+ def reclassify_cli_request(args, reason):
+diff --git a/hermes_cli/kanban_rejected_containment_event.py b/hermes_cli/kanban_rejected_containment_event.py
+new file mode 100644
+index 00000000000..07623e59011
+--- /dev/null
++++ b/hermes_cli/kanban_rejected_containment_event.py
+@@ -0,0 +1,121 @@
++"""Retire a containment-refused metadata classification without replaying it. [daveey]
++
++``classify_parked_request`` (``hermes kanban block --metadata-only``, dashboard) used to append a ``blocked``
++human_request event to a contained card. The Board refuses every generic write while a containment episode holds
++(``containment_hold``), so that upload can never apply inside the episode, and replaying historical intent after the
++episode ends is forbidden. Before this module the rejection stayed in the outbox forever and kept
++``hermes kanban sync diff`` dirty.
++
++The rejected upload is moot only when all of this holds on fresh evidence, revalidated in the deleting transaction:
++
++- the op is the exact refused generic ``task_events`` upsert, and the local event still equals its frozen fields;
++- the event is the producer's metadata-only, classified-in-place ``blocked`` event: no run, no lifecycle;
++- authoritative row evidence says the Board never stored that event uid (``never_existed``, floor 0, no tombstone),
++  under any client op id, so an ambiguous frozen replay identity does not matter: nothing is replayed;
++- the card is parked (triage/blocked) with no run, claim or human_request locally and canonically, at the same
++  settled version and status: the request the event documents was applied nowhere;
++- the same containment episode is still the card's marker locally and canonically, began before the event, has no
++  release or closure, and the local containment guard still holds the card.
++
++The original outbox row is copied into an immutable local receipt before its exact rejected queue entry is removed.
++The local event row, task row, containment history, audits and fences are untouched; nothing is sent to the Board.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++
++from hermes_cli.kanban_release import CONTAINMENT
++
++CLASSIFICATION = "containment_refused_classification"
++PROOF = ("the Board never stored this metadata-only classification refused by a containment episode that still "
++         "holds; canonical and local cards carry no request; original op archived, never replayed")
++_FIELDS = frozenset({"task_id", "run_uid", "kind", "payload", "created_at"})
++_EPISODE_KINDS = ("contained", "containment_released", "containment_closed")
++
++
++def _object(text):
++    try:
++        value = json.loads(text)
++    except (TypeError, ValueError):
++        return None
++    return value if isinstance(value, dict) else None
++
++
++def snapshot(conn: sqlite3.Connection, op: dict, task) -> dict | None:
++    """Containment history and the local hold, part of the resolver's compare-and-delete snapshot."""
++    if (op["table_name"] != "task_events" or op["op"] != "upsert" or op.get("last_error") != CONTAINMENT
++            or not task):
++        return None
++    from hermes_cli.kanban_containment_guard import pending
++    events = [dict(r) for r in conn.execute(
++        "SELECT uid, kind, payload, created_at FROM task_events WHERE task_id=? AND kind IN (?,?,?) ORDER BY id",
++        (task, *_EPISODE_KINDS))]
++    return {"events": events, "held": bool(pending(conn, task))}
++
++
++def moot(op: dict, before: dict, evidence: dict, parent_evidence: dict | None) -> bool:
++    stamp = before.get("containment_event")
++    if (not stamp or op["table_name"] != "task_events" or op["op"] != "upsert" or op.get("state") != "rejected"
++            or op.get("last_error") != CONTAINMENT or before["pending"] or before["tombstones"]
++            or before["receipt"] or before["parent_ops"] or stamp.get("held") is not True):
++        return False
++    fields = _object(op["fields"])
++    if fields is None or fields.keys() != _FIELDS or before["fields"] != fields:
++        return False
++    payload = _object(fields["payload"])
++    if (fields["kind"] != "blocked" or fields["run_uid"] is not None or fields["task_id"] != before["task"]
++            or type(fields["created_at"]) is not int or payload is None
++            or payload.get("metadata_only") is not True or payload.get("classified_in_place") is not True
++            or not isinstance(payload.get("human_request"), dict)):
++        return False
++    row, parent = before["row"], before["parent"]
++    if not row or row.get("uid") != op["row_uid"] or not parent or parent.get("id") != before["task"]:
++        return False
++    episode, status, version = parent.get("containment_episode"), parent.get("status"), parent.get("sync_version")
++    if (status not in ("triage", "blocked") or not isinstance(episode, str) or not episode
++            or type(version) is not int or parent.get("human_request") is not None
++            or any(parent.get(k) is not None for k in ("current_run_id", "claim_lock", "worker_pid"))):
++        return False
++    if not (evidence.get("state") == "never_existed" and evidence.get("floor") == 0
++            and evidence.get("row") is None and evidence.get("tombstone") is None):
++        return False
++    canonical = (parent_evidence or {}).get("row")
++    if (not parent_evidence or parent_evidence.get("state") != "live" or parent_evidence.get("tombstone") is not None
++            or not isinstance(canonical, dict) or canonical.get("uid") != before["task"]
++            or canonical.get("version") != version or canonical.get("status") != status
++            or canonical.get("containment_episode") != episode or canonical.get("human_request") is not None
++            or canonical.get("current_run_uid") is not None or canonical.get("lease_holder") is not None):
++        return False
++    starts = [e for e in stamp["events"] if e["kind"] == "contained" and e["uid"] == episode]
++    ends = [e for e in stamp["events"] if e["kind"] != "contained"
++            and (_object(e["payload"]) or {}).get("episode") in (episode, None)]
++    return (len(starts) == 1 and type(starts[0]["created_at"]) is int
++            and starts[0]["created_at"] <= fields["created_at"] and not ends)
++
++
++def archive(conn: sqlite3.Connection, op: dict, before: dict, evidence: dict, parent_evidence: dict) -> bool:
++    """Insert the immutable receipt inside the caller's deleting transaction; never replace an existing one."""
++    conn.execute("""CREATE TABLE IF NOT EXISTS kanban_rejected_containment_event_receipts (
++        op_id TEXT PRIMARY KEY, snapshot_json TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL,
++        evidence_json TEXT NOT NULL)""")
++    for verb in ("UPDATE", "DELETE"):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS rejected_containment_event_{verb.lower()} BEFORE {verb} "
++                     "ON kanban_rejected_containment_event_receipts BEGIN "
++                     "SELECT RAISE(ABORT,'rejected_containment_event_immutable'); END")
++    conn.execute("CREATE TRIGGER IF NOT EXISTS rejected_containment_event_insert BEFORE INSERT "
++                 "ON kanban_rejected_containment_event_receipts WHEN EXISTS (SELECT 1 FROM "
++                 "kanban_rejected_containment_event_receipts WHERE op_id=NEW.op_id) BEGIN "
++                 "SELECT RAISE(ABORT,'rejected_containment_event_immutable'); END")
++    if conn.execute("SELECT 1 FROM kanban_rejected_containment_event_receipts WHERE op_id=?",
++                    (op["op_id"],)).fetchone():
++        return False
++    text = json.dumps({"operation": op, "event": before["row"], "task": before["parent"],
++                       "containment": before["containment_event"], "lifecycle_authority": False},
++                      sort_keys=True, separators=(",", ":"), default=str)
++    conn.execute("INSERT INTO kanban_rejected_containment_event_receipts VALUES (?,?,?,?)",
++                 (op["op_id"], text, hashlib.sha256(text.encode("utf-8")).hexdigest(),
++                  json.dumps({"event": evidence, "task": parent_evidence}, sort_keys=True,
++                             separators=(",", ":"), default=str)))
++    return True
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+index 27d1a7cde63..37686926047 100644
+--- a/hermes_cli/kanban_sync_rejections.py
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -57,8 +57,10 @@
+     parent_ops = [tuple(r) for r in conn.execute(
+         "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (task,))] if task else []
+     from hermes_cli.kanban_sync_rejected_event import snapshot
++    from hermes_cli import kanban_rejected_containment_event as containment_event
+     return {"row": dict(row) if row else None, "fields": fields, "task": task,
+             "fenced_event": snapshot(conn, rejected, task),
++            "containment_event": containment_event.snapshot(conn, rejected, task),
+             "parent": dict(parent) if parent else None, "parent_ops": parent_ops,
+             "pending": pending, "tombstones": tombs, "run": dict(run_row) if run_row else None,
+             "receipt": reserved_key.receipt_for_op(conn, rejected["op_id"])}
+@@ -97,6 +99,9 @@
+         return "moot", "live-claim fenced phantom event/run remains tombstoned with its rejection audit; never stored by Board"
+     if before["pending"] or before["tombstones"]:
+         return "unresolved", "pending local work or local tombstone"
++    from hermes_cli import kanban_rejected_containment_event as containment_event
++    if containment_event.moot(op, before, evidence, parent_evidence):
++        return containment_event.CLASSIFICATION, containment_event.PROOF
+     gate = reserved_key.receipt_resolution(op, before, evidence, parent_evidence)
+     if gate and gate[0] != "conservative":  # a receipt names this op: it retires through the receipt or not at all
+         return gate
+@@ -174,7 +179,8 @@
+             evidence = _evidence(hub, board, op["table_name"], op["row_uid"])
+             parent = _evidence(hub, board, "tasks", before["task"]) if (
+                 before["task"] and op["table_name"] != "tasks"
+-                and (op["table_name"] == "task_chat_links" or before["receipt"])) else None
++                and (op["table_name"] == "task_chat_links" or before["receipt"]
++                     or before["containment_event"] is not None)) else None
+             run_uid = _release_run(op)
+             run = _evidence(hub, board, "task_runs", run_uid) if run_uid else None
+         except (HubError, SyncUnavailable, OSError, AttributeError, ValueError) as exc:
+@@ -194,6 +200,11 @@
+             if current is None or dict(current) != op or _inputs(conn, op) != before:
+                 report.update(classification="unresolved", proof="local state changed during evidence read")
+                 continue
++            from hermes_cli import kanban_rejected_containment_event as containment_event
++            if (classification == containment_event.CLASSIFICATION
++                    and not containment_event.archive(conn, op, before, evidence, parent)):
++                report.update(classification="unresolved", proof="an immutable receipt already names this op")
++                continue
+             conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id=? AND state='rejected'", (op["op_id"],))
+             report["action"] = "retired"
+     return reports
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 47bcb9b1d8e..f7b57394d8d 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -820,7 +820,7 @@
+         if payload.metadata_only:
+             with _value_error_400():
+                 if not classify_request(conn, task_id, payload, actor):
+-                    raise _conflict("classification requires parked card without a current run")
++                    raise _conflict("classification requires a parked, uncontained card without a current run")
+         # For a combined assignee+review patch, request_review must capture the
+         # current implementer before the task is routed to the reviewer.
+         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
+@@ -966,7 +966,7 @@
+         return entry.update(ok=False, holder=lease["holder"], error=lease["message"])
+     if payload.metadata_only:
+         if not classify_request(conn, tid, payload, actor):
+-            entry.update(ok=False, error="classification requires parked card without a current run")
++            entry.update(ok=False, error="classification requires a parked, uncontained card without a current run")
+         return
+     if payload.archive:
+         try:
+diff --git a/tests/hermes_cli/test_kanban_rejected_containment_event.py b/tests/hermes_cli/test_kanban_rejected_containment_event.py
+new file mode 100644
+index 00000000000..5603ee49aa1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_rejected_containment_event.py
+@@ -0,0 +1,312 @@
++"""A containment-refused metadata classification retires through normal sync; nothing is replayed. [daveey]
++
++Shape of a live op: a ``blocked`` metadata-only human_request event
++on a triage card held by containment, refused ``containment_hold``, frozen identity ambiguous, no tombstone, no
++sync_rejected audit, Board ``never_existed``/floor 0, task row already back at the canonical (request-free) state.
++"""
++import copy
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_release import CONTAINMENT
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++BOARD, ME = "default", "macbook"
++REQUEST_UID = "01a20000-0000-7000-8000-000000000001"
++AUTHORITY = {"board": BOARD, "gateway": "hub", "task_id": "t_287b180255786ad5"}
++REQUEST = {"action": "Keep this contained card parked, or archive it?", "why_human": "Only the origin may release",
++           "interaction": "approval", "scope": "This card only", "evidence": "The containment episode still holds",
++           "choices": [{"label": "Keep", "value": "keep"}, {"label": "Archive", "value": "archive"}]}
++
++
++@pytest.fixture
++def svc(monkeypatch):
++    # The real Board's /evidence names its board; containment certification on pull checks it.
++    from tests.hermes_cli.kanban_sync_fake_board import FakeHub
++    original = FakeHub.row_evidence
++
++    def evidence(self, board, table, uid):
++        value = {**original(self, board, table, uid), "board": board}
++        row = value.get("row") or {}
++        if table == "task_events" and row.get("kind") == "contained":  # the Board's stop attestation
++            from hermes_cli.kanban_containment_state import _stop, fingerprint
++            value["containment_v1"] = {"version": 1, "episode": uid, "request": REQUEST_UID,
++                                       "gateway": row.get("origin_gateway"),
++                                       "containment_sha256": fingerprint(_stop(row))}
++        return value
++
++    monkeypatch.setattr(FakeHub, "row_evidence", evidence)
++    return FakeService()
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / "kanban.db")
++    client.ensure_identity(conn, BOARD, ME)
++    conn.home = home
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _contained(live, svc):
++    tid = kb.create_task(live, title="contained", assignee="worker")
++    client.push(live, svc.hub(ME), BOARD, ME, primary=False)
++    sync.set_mode(live, "primary")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(live, tid, "contained", {
++            "policy": {"authority": AUTHORITY, "version": 1}, "producer_baseline": None,
++            "target": {"board": BOARD, "gateway": ME, "task_id": tid}, "version": 1})
++        episode = live.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='contained'", (tid,)).fetchone()[0]
++        live.execute("UPDATE tasks SET containment_episode=? WHERE id=?", (episode, tid))
++    client.push(live, svc.hub(ME), BOARD, ME, primary=True)
++    assert client.status(live)["rejected"] == 0 and client.status(live)["pending"] == 0
++    # The real Board derives the marker from the accepted stop; the fake stores rows verbatim.
++    svc.board(BOARD)["rows"]["tasks"][tid]["containment_episode"] = episode
++    return tid, episode
++
++
++def _old_producer_refused(live, tid):
++    """What classify_parked_request wrote before it refused contained cards, as the Board then refused it."""
++    with kbc.write_txn(live):
++        kb._append_event(live, tid, "blocked", {
++            "human_request": REQUEST, "kind": None, "reason": "Parked in triage with no human request",
++            "actor": "user", "classified_in_place": True, "metadata_only": True})
++        uid = live.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()[0]
++        live.execute("UPDATE kanban_sync_outbox SET state='rejected', last_error=?, attempts=2, "
++                     "identity_state='ambiguous' WHERE table_name='task_events' AND row_uid=?", (CONTAINMENT, uid))
++    op = dict(live.execute("SELECT * FROM kanban_sync_outbox WHERE row_uid=?", (uid,)).fetchone())
++    assert op["state"] == "rejected" and client.status(live)["rejected"] == 1
++    return op
++
++
++@pytest.fixture
++def refused(live, svc):
++    tid, episode = _contained(live, svc)
++    return live, tid, episode, _old_producer_refused(live, tid)
++
++
++def test_normal_sync_retires_with_immutable_receipt_and_touches_nothing_else(refused, svc):
++    live, tid, episode, op = refused
++    event_before = dict(live.execute("SELECT * FROM task_events WHERE uid=?", (op["row_uid"],)).fetchone())
++    task_before = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    canonical_before = copy.deepcopy(svc.board(BOARD)["rows"]["tasks"][tid])
++
++    result = client.sync_board(BOARD, live.home / "kanban.db", svc.hub(ME), ME)
++
++    report, = [r for r in result.rejection_resolutions if r["op_id"] == op["op_id"]]
++    assert (report["classification"], report["action"]) == ("containment_refused_classification", "retired")
++    assert client.status(live)["rejected"] == 0
++    assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE op_id=?", (op["op_id"],)).fetchone() is None
++    # The local history, the card and the containment are exactly as they were; the Board never got the event.
++    assert dict(live.execute("SELECT * FROM task_events WHERE uid=?", (op["row_uid"],)).fetchone()) == event_before
++    task_after = dict(live.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert {k: task_after[k] for k in ("status", "containment_episode", "human_request", "sync_version")} == {
++        k: task_before[k] for k in ("status", "containment_episode", "human_request", "sync_version")}
++    assert task_after["containment_episode"] == episode
++    assert op["row_uid"] not in svc.board(BOARD)["rows"]["task_events"]
++    assert svc.board(BOARD)["rows"]["tasks"][tid] == canonical_before
++    receipt = dict(live.execute("SELECT * FROM kanban_rejected_containment_event_receipts").fetchone())
++    snapshot = json.loads(receipt["snapshot_json"])
++    assert receipt["op_id"] == op["op_id"] and snapshot["operation"] == op
++    assert snapshot["lifecycle_authority"] is False
++    for sql in ("DELETE FROM kanban_rejected_containment_event_receipts",
++                "UPDATE kanban_rejected_containment_event_receipts SET snapshot_sha256='bad'",
++                "INSERT OR REPLACE INTO kanban_rejected_containment_event_receipts "
++                "SELECT * FROM kanban_rejected_containment_event_receipts"):
++        with pytest.raises(sqlite3.IntegrityError, match="rejected_containment_event_immutable"):
++            live.execute(sql)
++    # Idempotent: a second round has nothing left to resolve and the diff is clean.
++    again = client.sync_board(BOARD, live.home / "kanban.db", svc.hub(ME), ME)
++    assert not [r for r in again.rejection_resolutions if r["op_id"] == op["op_id"]]
++    shadow = client.open_shadow(BOARD, ME)
++    try:
++        assert client.diff(live, shadow, ME)["clean"]
++    finally:
++        shadow.close()
++
++
++def test_existing_receipt_keeps_the_rejection(refused, svc):
++    from hermes_cli import kanban_rejected_containment_event as ce
++    from hermes_cli.kanban_sync_rejections import _inputs, resolve_rejections
++    live, _, _, op = refused
++    with kbc.write_txn(live):
++        assert ce.archive(live, op, _inputs(live, op), {}, {})
++    report, = resolve_rejections(live, svc.hub(ME), BOARD)
++    assert (report["classification"], report["action"]) == ("unresolved", "retained")
++    assert client.status(live)["rejected"] == 1
++
++
++@pytest.fixture
++def inputs(refused, svc):
++    from hermes_cli import kanban_rejected_containment_event as ce
++    from hermes_cli.kanban_sync_rejections import _inputs
++    live, tid, _episode, op = refused
++    hub = svc.hub(ME)
++    before = _inputs(live, op)
++    evidence = hub.row_evidence(BOARD, "task_events", op["row_uid"])
++    parent = hub.row_evidence(BOARD, "tasks", tid)
++    assert ce.moot(op, before, evidence, parent)
++    return op, before, evidence, parent
++
++
++def _fields(op, **changes):
++    fields = json.loads(op["fields"])
++    fields.update(changes)
++    op["fields"] = json.dumps(fields)
++    return fields
++
++
++def _payload(op, before, **changes):
++    fields = json.loads(op["fields"])
++    payload = json.loads(fields["payload"])
++    payload.update(changes)
++    payload = {k: v for k, v in payload.items() if v is not ...}
++    fields["payload"] = json.dumps(payload)
++    op["fields"] = json.dumps(fields)
++    before["fields"] = fields
++
++
++VETOES = [
++    "table", "operation", "state", "reason", "pending", "tombstone", "receipt", "parent_ops", "not_held", "no_stamp",
++    "local_differs", "extra_field", "kind", "run_uid", "task_id", "created_at_type", "payload_not_json",
++    "not_metadata_only", "not_classified", "no_human_request", "no_row", "row_uid", "no_parent", "parent_status",
++    "no_episode", "local_request", "local_run", "local_claim", "version_type",
++    "remote_live", "remote_floor", "remote_row", "remote_tomb",
++    "parent_missing", "parent_not_live", "parent_tomb", "parent_uid", "parent_version", "parent_status_differs",
++    "parent_episode", "parent_request", "parent_run", "parent_lease",
++    "no_start", "two_starts", "start_after_event", "released", "closed", "unattributed_end",
++]
++
++
++@pytest.mark.parametrize("veto", VETOES)
++def test_every_predicate_fails_closed(inputs, veto):
++    from hermes_cli import kanban_rejected_containment_event as ce
++    op, before, evidence, parent = copy.deepcopy(inputs)
++    stamp, local, remote = before["containment_event"], before["parent"], parent.get("row")
++    episode = local["containment_episode"]
++    start = next(e for e in stamp["events"] if e["kind"] == "contained")
++    simple = {
++        "table": lambda: op.update(table_name="task_runs"), "operation": lambda: op.update(op="compat"),
++        "state": lambda: op.update(state="pending"), "reason": lambda: op.update(last_error="containment_hold: other"),
++        "pending": lambda: before.update(pending=[("x",)]), "tombstone": lambda: before.update(tombstones=[("x",)]),
++        "receipt": lambda: before.update(receipt={"op": "x"}), "parent_ops": lambda: before.update(parent_ops=[("x",)]),
++        "not_held": lambda: stamp.update(held=False), "no_stamp": lambda: before.update(containment_event=None),
++        "local_differs": lambda: before["fields"].update(created_at=1),
++        "extra_field": lambda: before.update(fields=_fields(op, extra=1)),
++        "kind": lambda: before.update(fields=_fields(op, kind="completed")),
++        "run_uid": lambda: before.update(fields=_fields(op, run_uid="run")),
++        "task_id": lambda: before.update(fields=_fields(op, task_id="t_other")),
++        "created_at_type": lambda: before.update(fields=_fields(op, created_at="1")),
++        "payload_not_json": lambda: before.update(fields=_fields(op, payload="not json")),
++        "not_metadata_only": lambda: _payload(op, before, metadata_only=...),
++        "not_classified": lambda: _payload(op, before, classified_in_place=False),
++        "no_human_request": lambda: _payload(op, before, human_request=None),
++        "no_row": lambda: before.update(row=None), "row_uid": lambda: before["row"].update(uid="other"),
++        "no_parent": lambda: before.update(parent=None), "parent_status": lambda: local.update(status="todo"),
++        "no_episode": lambda: local.update(containment_episode=None),
++        "local_request": lambda: local.update(human_request=json.dumps(REQUEST)),
++        "local_run": lambda: local.update(current_run_id=7), "local_claim": lambda: local.update(claim_lock="c"),
++        "version_type": lambda: local.update(sync_version=str(local["sync_version"])),
++        "remote_live": lambda: evidence.update(state="live"), "remote_floor": lambda: evidence.update(floor=3),
++        "remote_row": lambda: evidence.update(row={}), "remote_tomb": lambda: evidence.update(tombstone={}),
++        "parent_missing": lambda: None, "parent_not_live": lambda: parent.update(state="tombstoned"),
++        "parent_tomb": lambda: parent.update(tombstone={}), "parent_uid": lambda: remote.update(uid="t_other"),
++        "parent_version": lambda: remote.update(version=remote["version"] + 1),
++        "parent_status_differs": lambda: remote.update(status="blocked"),
++        "parent_episode": lambda: remote.update(containment_episode="another"),
++        "parent_request": lambda: remote.update(human_request=json.dumps(REQUEST)),
++        "parent_run": lambda: remote.update(current_run_uid="run"),
++        "parent_lease": lambda: remote.update(lease_holder="mini"),
++        "no_start": lambda: start.update(uid="another"), "two_starts": lambda: stamp["events"].append(dict(start)),
++        "start_after_event": lambda: start.update(created_at=json.loads(op["fields"])["created_at"] + 1),
++        "released": lambda: stamp["events"].append({"uid": "r", "kind": "containment_released", "created_at": 1,
++                                                     "payload": json.dumps({"episode": episode})}),
++        "closed": lambda: stamp["events"].append({"uid": "c", "kind": "containment_closed", "created_at": 1,
++                                                   "payload": json.dumps({"episode": episode})}),
++        "unattributed_end": lambda: stamp["events"].append({"uid": "u", "kind": "containment_released",
++                                                             "created_at": 1, "payload": "{}"}),
++    }
++    simple[veto]()
++    if veto == "parent_missing":
++        parent = None
++    assert not ce.moot(op, before, evidence, parent), veto
++
++
++def test_an_unrelated_episode_end_does_not_veto(inputs):
++    from hermes_cli import kanban_rejected_containment_event as ce
++    op, before, evidence, parent = copy.deepcopy(inputs)
++    before["containment_event"]["events"].append({"uid": "r", "kind": "containment_released", "created_at": 1,
++                                                  "payload": json.dumps({"episode": "an-earlier-episode"})})
++    assert ce.moot(op, before, evidence, parent)
++
++
++@pytest.mark.parametrize("race", ["event", "task", "containment", "outbox"])
++def test_local_change_during_evidence_read_keeps_the_rejection(refused, svc, monkeypatch, race):
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, tid, _episode, op = refused
++    hub = svc.hub(ME)
++    original = hub.row_evidence
++
++    def read(board, table, uid):
++        evidence = original(board, table, uid)
++        if table == "task_events":
++            with kbc.write_txn(live):
++                live.execute(*{
++                    "event": ("UPDATE task_events SET created_at=created_at+1 WHERE uid=?", (op["row_uid"],)),
++                    "task": ("UPDATE tasks SET priority=priority+1 WHERE id=?", (tid,)),
++                    "containment": ("INSERT INTO task_events(task_id,kind,payload,created_at,uid) "
++                                    "VALUES (?,'containment_released',?,1,'x')", (tid, json.dumps({"episode": "e"}))),
++                    "outbox": ("UPDATE kanban_sync_outbox SET attempts=attempts+1 WHERE op_id=?", (op["op_id"],)),
++                }[race])
++        return evidence
++
++    monkeypatch.setattr(hub, "row_evidence", read)
++    report, = [r for r in resolve_rejections(live, hub, BOARD) if r["op_id"] == op["op_id"]]
++    assert report["classification"] == "unresolved" and report["action"] == "retained"
++    assert live.execute("SELECT state FROM kanban_sync_outbox WHERE op_id=?", (op["op_id"],)).fetchone()[0] == "rejected"
++    assert not live.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_rejected_containment_event_receipts'"
++                            ).fetchone() or not live.execute(
++        "SELECT 1 FROM kanban_rejected_containment_event_receipts").fetchone()
++
++
++def test_released_containment_keeps_the_rejection_end_to_end(refused, svc):
++    """After the episode ends the refusal reason is gone; retirement needs a different proof, never a replay."""
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, tid, episode, op = refused
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO task_events(task_id,kind,payload,created_at,uid) "
++                     "VALUES (?,'containment_released',?,?,?)",
++                     (tid, json.dumps({"episode": episode}), 2_000_000_000, sync.uuid7()))
++    report, = [r for r in resolve_rejections(live, svc.hub(ME), BOARD) if r["op_id"] == op["op_id"]]
++    assert report["classification"] == "unresolved" and client.status(live)["rejected"] >= 1
++
++
++def test_producer_refuses_to_classify_a_contained_card(live, svc):
++    from hermes_cli.kanban_human_request_migration import classify_parked_request
++    tid, _ = _contained(live, svc)
++    events = live.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++    assert classify_parked_request(live, tid, human_request=REQUEST, actor="user", reason="needs a decision") is False
++    assert live.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0] == events
++    assert live.execute("SELECT human_request FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
++    assert client.status(live)["pending"] == 0
++
++
++def test_producer_still_classifies_an_uncontained_parked_card(live):
++    from hermes_cli.kanban_human_request_migration import classify_parked_request
++    tid = kb.create_task(live, title="parked", assignee="worker")
++    with kbc.write_txn(live):
++        live.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++    assert classify_parked_request(live, tid, human_request=REQUEST, actor="user", reason="needs a decision") is True
++    assert live.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='blocked'", (tid,)).fetchone()
+-- 
+2.43.0
+

@@ -1,0 +1,362 @@
+From 79e8386b6473f136b2c92e280e779d33b39f1381 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:03:48 +0000
+Subject: [PATCH 6432] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 79e8386b6473f136b2c92e280e779d33b39f1381.
+
+---
+diff --git a/hermes_cli/kanban_spend_review_request.py b/hermes_cli/kanban_spend_review_request.py
+index 9aab0ce9627..cda36d04932 100644
+--- a/hermes_cli/kanban_spend_review_request.py
++++ b/hermes_cli/kanban_spend_review_request.py
+@@ -8,6 +8,9 @@
+ import json
+ 
+ TABLE = "spend_review_requests"
++# Separate from judge retries: allow receipt recovery after the model budget ends,
++# but never monopolize reviewer custody indefinitely when no receipt is reachable.
++MAX_RECONCILE_ATTEMPTS = 4
+ 
+ 
+ def exists(conn):
+@@ -43,6 +46,41 @@
+         return frozen
+ 
+ 
++def escalate_unconfirmed(conn, task, episode):
++    """Transfer exhausted automation to an administrative owner, never cancel it.
++
++    Keep the frozen bytes and all execution holds. This also covers terminal or
++    superseded source cards, for which ordinary stop escalation is a no-op.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    with kb.write_txn(conn):
++        request = get(conn, task, episode)
++        if request is None or reviewer.state(conn, task, episode) not in (reviewer.QUEUED, reviewer.STARTED):
++            return
++        uid = request["wire"]["event_uid"]
++        source = kb.get_task(conn, task)
++        reason = "Frozen spend review remains unconfirmed after bounded reconciliation"
++        body = (f"{reason}. Source card: {task}; stop: {episode}; request: {uid}; "
++                f"Board: {request['board']}; gateway: {request['gateway']}.\n\n"
++                "Automation has stopped; this is not cancellation or proof that the request was never submitted. "
++                "An absent receipt can still race an in-flight operation. The immutable request journal is retained.\n"
++                "Reconcile the exact authenticated Board receipt and report its disposition to the owner. "
++                "Do not resubmit, choose a replacement verdict, grant runs, or promote the source card. "
++                "Preserve human, terminal, scope and safety holds; safety refusals must never be retried. "
++                "If no authoritative receipt is reachable, escalate to the Board administrator; do not infer clearance.")
++        notice = kb.create_task(conn, title=f"Reconcile unconfirmed spend review on {task}", body=body,
++                                assignee="default", created_by=reviewer.AUTHOR, workspace_kind="scratch",
++                                tenant=source.tenant if source else None,
++                                idempotency_key=f"spend-review-unconfirmed:{task}:{episode}")
++        kb._append_event(conn, task, reviewer.ESCALATED,
++                         {"episode": episode, "reason": reason, "task_id": notice,
++                          "request_uid": uid, "unconfirmed": True})
++        kb.add_comment(conn, task, reviewer.AUTHOR,
++                       f"{reason}; administrative reconciliation: {notice}. "
++                       "Request custody and execution holds retained; no cancellation or release inferred.", system=True)
++
++
+ def refuse(conn, task, episode, reason):
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 7c6a40a9e4c..b9171c0db59 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -317,7 +317,11 @@
+                 # still reconcile their exact receipt instead of losing custody.
+                 escalate(conn, task_id, episode, f"{cause} stops are excluded from spend review; hold retained")
+                 continue
+-            if attempts >= MAX_ATTEMPTS and not journal.get(conn, task_id, episode):
++            frozen = journal.get(conn, task_id, episode)
++            if frozen and attempts >= journal.MAX_RECONCILE_ATTEMPTS:
++                journal.escalate_unconfirmed(conn, task_id, episode)
++                continue
++            if attempts >= MAX_ATTEMPTS and not frozen:
+                 escalate(conn, task_id, episode, f"the spend reviewer did not finish after {attempts} attempts")
+                 continue
+         except Exception:  # health: allow BLE001 -- per-card boundary; this hold is retained, siblings proceed
+diff --git a/hermes_cli/kanban_stranded_park.py b/hermes_cli/kanban_stranded_park.py
+index 22b5bd6263e..2edabc62330 100644
+--- a/hermes_cli/kanban_stranded_park.py
++++ b/hermes_cli/kanban_stranded_park.py
+@@ -663,10 +663,10 @@
+                 except Exception:  # health: allow BLE001 -- one card's failure must not stop the backstop for the rest
+                     logger.warning("kanban: stranded-park re-file failed for %s", tid, exc_info=True)
+                 continue
+-            if (age < park_s or _shared_blocker(entry) or _escalated(conn, tid, entry)
+-                    or _excluded(conn, _gated(conn, row), now, age=age, defer=defer_s)):
+-                continue
+             try:
++                if (age < park_s or _shared_blocker(entry) or _escalated(conn, tid, entry)
++                        or _excluded(conn, _gated(conn, row), now, age=age, defer=defer_s)):
++                    continue
+                 if live_owner(conn, tid, own=own, liveness=liveness):
+                     continue
+                 if _escalate(conn, row, entry, now=now, age=age, defer=defer_s, desk=desk,
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 1030f6b8800..00fa7206f2e 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -290,13 +290,11 @@
+         "THEN json_extract(e.payload,'$.author') END,'')='kanban-decision-notice')), t.created_at) <= ? "
+         "AND " + _PENDING, (cutoff, *_PENDING_ARGS),
+     ).fetchall()
+-    from hermes_cli.kanban_resume_requester import open_recovery_card
+-    from hermes_cli.kanban_goal_recovery import current_park
+     from hermes_cli.kanban_wake_check import foreign_ids
+ 
+     # Retained executor copies have no triage policy authority. Local cap keys cannot
+     # arbitrate supervisor creation across gateways, even when neither has synced yet.
+-    from hermes_cli.kanban_spend_decision import pending as spend_decision_pending, repair_triage_routes
++    from hermes_cli.kanban_spend_decision import repair_triage_routes
+     copies = foreign_ids(conn)
+     # Decision ownership needs repair even while execution is gated, fresh, capped
+     # or contained. Only the home board may publish its replacement route.
+@@ -306,39 +304,49 @@
+         escalate_stranded_contained(conn, now=now, skip=copies)
+     except Exception:
+         logger.exception("kanban: containment strand escalation failed")
+-    from hermes_cli.kanban_containment_connections import held as containment_held
+     for row in rows:
+-        if row["id"] in copies or containment_held(conn, row["id"]):
+-            continue
+-        if spend_decision_pending(conn, row["id"]):
+-            continue
+-        if row["human_request"] or open_recovery_card(conn, row["id"]) or current_park(conn, row['id']):
+-            continue  # a human owns it, or its kernel recovery card is its producer
+-        from hermes_cli.kanban_triage_cleanup import archive_requested_fixture
+-        if archive_requested_fixture(conn, row["id"]):
+-            continue
+-        recent = conn.execute(
+-            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'triage_swept' AND created_at > ?",
+-            (row["id"], now - TRIAGE_SWEEP_CAP_WINDOW),
+-        ).fetchone()[0]
+-        if recent >= TRIAGE_SWEEP_CAP:
+-            try:
+-                _cap(conn, row, now)
+-            except Exception:
+-                logger.exception("kanban: triage sweep cap failed for %s", row["id"])
+-            continue
+-        assignee = (row["assignee"] or "").strip() or default_assignee or "default"
+-        body = row["body"] or ""
+-        if _TRIAGE_BRIEF.strip() not in body:
+-            body += _TRIAGE_BRIEF
+-        with _kb.write_txn(conn):
+-            if spend_decision_pending(conn, row["id"]) or containment_held(conn, row["id"]):
+-                continue
+-            cur = conn.execute(
+-                "UPDATE tasks SET status = 'ready', assignee = ?, body = ? WHERE id = ? AND status = 'triage'",
+-                (assignee, body, row["id"]),
+-            )
+-            if cur.rowcount:
+-                _kb._append_event(conn, row["id"], "triage_swept", {"assignee": assignee, "older_than": older_than})
+-                swept.append(row["id"])
++        try:
++            _sweep_stale_card(conn, row, copies, now, older_than, default_assignee, swept)
++        except (ValueError, TypeError):
++            logger.exception("kanban: triage sweep skipped %s; hold retained", row["id"])
+     return swept
++
++
++def _sweep_stale_card(conn, row, copies, now, older_than, default_assignee, swept):
++    from hermes_cli.kanban_spend_decision import pending as spend_decision_pending
++    from hermes_cli.kanban_containment_connections import held as containment_held
++    from hermes_cli.kanban_resume_requester import open_recovery_card
++    from hermes_cli.kanban_goal_recovery import current_park
++    if row["id"] in copies or containment_held(conn, row["id"]):
++        return
++    if spend_decision_pending(conn, row["id"]):
++        return
++    if row["human_request"] or open_recovery_card(conn, row["id"]) or current_park(conn, row['id']):
++        return  # a human owns it, or its kernel recovery card is its producer
++    from hermes_cli.kanban_triage_cleanup import archive_requested_fixture
++    if archive_requested_fixture(conn, row["id"]):
++        return
++    recent = conn.execute(
++        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'triage_swept' AND created_at > ?",
++        (row["id"], now - TRIAGE_SWEEP_CAP_WINDOW),
++    ).fetchone()[0]
++    if recent >= TRIAGE_SWEEP_CAP:
++        try:
++            _cap(conn, row, now)
++        except Exception:
++            logger.exception("kanban: triage sweep cap failed for %s", row["id"])
++        return
++    assignee = (row["assignee"] or "").strip() or default_assignee or "default"
++    body = row["body"] or ""
++    if _TRIAGE_BRIEF.strip() not in body:
++        body += _TRIAGE_BRIEF
++    with _kb.write_txn(conn):
++        if spend_decision_pending(conn, row["id"]) or containment_held(conn, row["id"]):
++            return
++        cur = conn.execute(
++            "UPDATE tasks SET status = 'ready', assignee = ?, body = ? WHERE id = ? AND status = 'triage'",
++            (assignee, body, row["id"]),
++        )
++        if cur.rowcount:
++            _kb._append_event(conn, row["id"], "triage_swept", {"assignee": assignee, "older_than": older_than})
++            swept.append(row["id"])
+diff --git a/tests/hermes_cli/test_kanban_spend_maintenance_isolation.py b/tests/hermes_cli/test_kanban_spend_maintenance_isolation.py
+new file mode 100644
+index 00000000000..36818812838
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_maintenance_isolation.py
+@@ -0,0 +1,31 @@
++"""Malformed stop evidence cannot abort healthy maintenance neighbors."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as connect
++from tests.hermes_cli import test_kanban_stranded_park as helpers
++
++kanban_home = helpers.kanban_home
++own_gateway = helpers.own_gateway
++
++
++@pytest.mark.parametrize("cause", [1, True, 1.5, [], {}])
++@pytest.mark.parametrize("consumer", ["stale", "stranded"])
++def test_malformed_stop_isolated_from_stale_neighbor(kanban_home, own_gateway, cause, consumer):
++    from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++    with connect.connect_closing() as conn:
++        bad = helpers._parked(conn, capped=consumer == "stranded")
++        good = helpers._parked(conn, capped=consumer == "stranded")
++        with kb.write_txn(conn):
++            kb._append_event(conn, bad, "spend_budget_triaged", {"cause": cause})
++        if consumer == "stale":
++            result = sweep_stale_triage(conn, older_than=1, now=int(time.time()) + 100)
++            assert good in result
++            assert kb.get_task(conn, good).status == "ready"
++        else:
++            assert helpers._sweep(conn, now=helpers._later(3)) == [good]
++            assert kb.get_task(conn, good).human_request
++        assert kb.get_task(conn, bad).status == "triage"
++        assert not kb.get_task(conn, bad).human_request
+diff --git a/tests/hermes_cli/test_kanban_spend_reconcile_bound.py b/tests/hermes_cli/test_kanban_spend_reconcile_bound.py
+new file mode 100644
+index 00000000000..f017b4fa101
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_reconcile_bound.py
+@@ -0,0 +1,87 @@
++"""Unconfirmed immutable requests retire automation, not execution holds."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_spend_review_request as journal
++from hermes_cli import kanban_spend_stop_watch as watch
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_spend_caused_review as helpers
++from tests.hermes_cli.test_kanban_spend_review_reconcile import started
++
++kanban_home = helpers.kanban_home
++board = helpers.board
++
++
++@pytest.mark.parametrize("failure", ["before_submit", "uncertain"])
++@pytest.mark.parametrize("fence", ["done", "archived", "human", "safety"])
++def test_unconfirmed_request_has_bounded_administrative_handoff(
++        kanban_home, spend_reviewer, board, monkeypatch, failure, fence):
++    hub, calls = board
++    if failure == "before_submit":
++        def push_down(*args, **kwargs):
++            raise client.HubError(503, "push unavailable")
++        monkeypatch.setattr(client, "push", push_down)
++    else:
++        real_ops = hub.ops
++        def uncertain(board_id, ops):
++            real_ops(board_id, ops)
++            raise OSError("reply lost after canonical application")
++        hub.ops = uncertain
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++        "decision": "release", "reason": "frozen", "remaining_quote": helpers.QUOTE})
++    with kbc.connect_closing() as conn:
++        tid, ep = started(conn)
++        assert reviewer.review(conn, tid, ep) == "pending"
++        original = journal.get(conn, tid, ep)
++        submitted = list(calls)
++        if fence == "human":
++            kb.add_comment(conn, tid, "operator", "Wait for me", writer_kind="human")
++        else:
++            with kb.write_txn(conn):
++                if fence == "safety":
++                    kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": "safety_refusal"})
++                else:
++                    conn.execute("UPDATE tasks SET status=? WHERE id=?", (fence, tid))
++        reads = []
++        def absent(*args):
++            reads.append(args)
++            return {"state": "absent"}
++        hub.row_evidence = absent
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("second judge"))
++        reviewer.start_due(conn, now=10**10)
++        reviewer.wait_for_reviews()
++        # One absence is not cancellation, settlement, or authority to release.
++        assert reviewer.state(conn, tid, ep) == reviewer.STARTED
++        assert journal.get(conn, tid, ep) == original
++    # Restarted connection must retain the same bounded reconciliation history.
++    with kbc.connect_closing() as conn:
++        for i in range(1, 20):
++            reviewer.start_due(conn, now=10**10 + i * (reviewer.LEASE_SECONDS + 1))
++            reviewer.wait_for_reviews()
++        assert reviewer.state(conn, tid, ep) == reviewer.ESCALATED
++        assert not reviewer.holds(conn, tid, ep)
++        assert journal.get(conn, tid, ep) == original
++        assert calls == submitted
++        assert len(reads) == journal.MAX_RECONCILE_ATTEMPTS - 1
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
++                            (tid, reviewer.STARTED)).fetchone()[0] == journal.MAX_RECONCILE_ATTEMPTS
++        assert reviewer.review(conn, tid, ep) == "moot"
++        assert len(reads) == journal.MAX_RECONCILE_ATTEMPTS - 1
++        assert not any(t == tid and e == ep for t, e, _ in reviewer._due(conn, 10**12, set()))
++        assert kb.get_task(conn, tid).status == (fence if fence in {"done", "archived"} else "triage")
++        events = [json.loads(r[0]) for r in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, reviewer.ESCALATED))]
++        assert len(events) == 1
++        notice = kb.get_task(conn, events[0]["task_id"])
++        assert notice is not None and notice.status not in {"done", "archived"}
++        assert original["wire"]["event_uid"] in notice.body
++        assert "not cancellation" in notice.body
++        assert "Do not resubmit" in notice.body
++        if fence in {"human", "safety"}:
++            assert tid in [c["id"] for c in watch.stale_stops(conn, now=10**12)]
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
++                                "('spend_review_granted','spend_review_settled','promoted_manual')", (tid,)).fetchone()
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 141b8e51d30..4bc276ac9d5 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -749,9 +749,19 @@
+ routed to the creator chat or a decision card as before. A stop already routed
+ there but undecided after five minutes gets the same single review. The delay
+ is configurable as `kanban.spend_review_after_seconds` (default 300; a nonnegative
+-integer). New ordinary stops still queue immediately. Scope and
+-safety stops are never reviewed; `kanban.spend_review: false` turns the
+-reviewer off.
++integer). New ordinary stops still queue immediately. Scope and capability
++stops receive delayed canonical-only review; safety stops are never queued,
++granted or retried. `kanban.spend_review: false` turns the reviewer off.
++
++A frozen canonical request keeps its original bytes across transport failures.
++Human intervention, terminal transitions and safety holds prohibit resubmission;
++receipt readback alone may still settle the original request. After four total
++started attempts without confirmation, automation stops and files an administrative
++reconciliation card, including for terminal source cards. This is **not cancellation**
++or proof that no operation was submitted: the immutable journal and all execution
++holds remain. The administrator must reconcile the exact Board receipt, not choose
++a replacement verdict or infer clearance from an absent receipt. The reviewer no
++longer suppresses the stale-stop backstop while administrative reconciliation is pending.
+ 
+ Every card has an owning chat. A card created from a chat is owned by that
+ chat, and a worker's card by its creator's. Any other card gets its producer's
+-- 
+2.43.0
+

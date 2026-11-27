@@ -1,0 +1,113 @@
+From 0a8164d30ce1250dde9d4802b6287ad6bdbba6fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:26:03 +0000
+Subject: [PATCH 6384] Test isolation, fixture lifecycle and CI case partitioning
+
+Public mirror of source commit 0a8164d30ce1250dde9d4802b6287ad6bdbba6fc.
+
+---
+diff --git a/tests/gateway/test_plugin_idle_task_housekeeping.py b/tests/gateway/test_plugin_idle_task_housekeeping.py
+index be9980de75a..65f26402a3b 100644
+--- a/tests/gateway/test_plugin_idle_task_housekeeping.py
++++ b/tests/gateway/test_plugin_idle_task_housekeeping.py
+@@ -14,6 +14,7 @@
+ 
+ from __future__ import annotations
+ 
++import sys
+ import threading
+ import time
+ 
+@@ -198,6 +199,33 @@
+     assert not loop.is_alive() and not gw.lock.exists()
+ 
+ 
++@pytest.mark.parametrize("failed_start", [1, 2])
++def test_restart_fixture_reaps_workers_when_startup_assertions_fail(gw, monkeypatch, failed_start):
++    stop_class = _Stop
++    stops = []
++
++    def stop_with_failure(n):
++        stop = stop_class(n)
++        stops.append(stop)
++        if len(stops) == failed_start:
++            wait = stop.held.wait
++
++            def fail_after_tick(timeout=None):
++                assert wait(timeout), "housekeeping did not reach the injected boundary"
++                raise AssertionError("injected startup failure")
++
++            monkeypatch.setattr(stop.held, "wait", fail_after_tick)
++        return stop
++
++    monkeypatch.setattr(sys.modules[__name__], "_Stop", stop_with_failure)
++    with pytest.raises(AssertionError, match="injected startup failure"):
++        test_after_an_in_process_restart_only_the_new_housekeeping_records(gw, monkeypatch)
++    assert gw.fences
++    assert all(not worker.is_alive() for fence in gw.fences for worker in fence._workers)
++    assert str(gw.lock) not in plugins_idle_tasks._in_flight
++    assert not gw.lock.exists()
++
++
+ def test_after_an_in_process_restart_only_the_new_housekeeping_records(gw, monkeypatch):
+     from agent import idle_schedule
+ 
+@@ -205,27 +233,30 @@
+     # Force that gap instead of depending on which thread gets the next timeslice.
+     claim_released, retire = threading.Event(), threading.Event()
+     release_run = idle_schedule.release_run
++    old_worker = None
+ 
+     def release_before_retirement(lock):
+         release_run(lock)
+         if threading.current_thread() is old_worker:
+             claim_released.set()
+-            assert retire.wait(10)
++            # The scenario's finally always opens this gate, including startup failures.
++            # Never raise here: production still has to remove its _in_flight entry.
++            retire.wait()
+ 
+     monkeypatch.setattr(idle_schedule, "release_run", release_before_retirement)
+     entered, release, calls = _register_blocking(gw)
+-    old_stop = _Stop(61)
+-    old = _serve(old_stop)
+-    assert old_stop.held.wait(10) and entered.wait(5)
+-    (old_fence,) = gw.fences
+-    (old_worker,) = old_fence._workers
+-    old_stop.set()
+-    old.join(BUDGET + 10)
+-    assert not old.is_alive()
+-
+-    new_stop = _Stop(61)
+-    new = _serve(new_stop)  # the multiplexer restarted in this process; the old run is still going
++    old_stop, new_stop = _Stop(61), _Stop(61)
++    old = new = None
+     try:
++        old = _serve(old_stop)
++        assert old_stop.held.wait(10) and entered.wait(5)
++        (old_fence,) = gw.fences
++        (old_worker,) = old_fence._workers
++        old_stop.set()
++        old.join(BUDGET + 10)
++        assert not old.is_alive()
++
++        new = _serve(new_stop)  # restart while the old plugin run is still going
+         assert new_stop.held.wait(10)
+         assert calls == [0]  # its curator tick did not start a second run beside the old one
+         release.set()
+@@ -245,6 +276,10 @@
+     finally:
+         release.set()
+         retire.set()
+-        old_fence.close(timeout=10)
++        old_stop.set()
+         new_stop.set()
+-        new.join(BUDGET + 10)
++        for loop in (old, new):
++            if loop is not None:
++                loop.join(BUDGET + 10)
++        for fence in gw.fences:
++            assert fence.close(timeout=10), "fixture left an idle worker running"
+-- 
+2.43.0
+

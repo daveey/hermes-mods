@@ -1,0 +1,993 @@
+From 239f69dd88faa23635a82f34c41db12a78fead49 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:46:11 +0000
+Subject: [PATCH 6468] Bounded private code-provenance diagnostic snapshots
+
+Public mirror of source commit 239f69dd88faa23635a82f34c41db12a78fead49.
+
+---
+diff --git a/gateway/code_provenance_control.py b/gateway/code_provenance_control.py
+index f619e6290d9..a70d9e01377 100644
+--- a/gateway/code_provenance_control.py
++++ b/gateway/code_provenance_control.py
+@@ -13,6 +13,7 @@
+ import time
+ 
+ from hermes_cli.code_attestation_snapshot import SECTIONS
++from hermes_cli.code_provenance_progress import CaptureProgress, unavailable
+ 
+ 
+ CAPTURE_SECONDS = 2.0
+@@ -26,6 +27,14 @@
+     return {'purpose': 'diagnostic_only', 'complete': False, 'error': code}
+ 
+ 
++def _settle(result, progress):
++    try:
++        diagnostics = progress.snapshot()
++    except Exception:  # health: allow BLE001 -- private recorder failures must not expose exception text or publish partial success
++        return {**_error('capture_failed'), 'diagnostics': unavailable()}
++    return {**result, 'diagnostics': diagnostics}
++
++
+ def _integer(value, minimum, maximum):
+     return type(value) is int and minimum <= value <= maximum
+ 
+@@ -101,13 +110,19 @@
+             return _error('identity_mismatch')
+         if not _FLIGHT.acquire(blocking=False):
+             return _error('capture_busy')
++        deadline = time.monotonic() + CAPTURE_SECONDS
++        try:
++            progress = CaptureProgress()
++        except Exception:  # health: allow BLE001 -- sanitized private startup failure; no exception text
++            _FLIGHT.release()
++            return {**_error('capture_failed'), 'diagnostics': unavailable()}
+         done, box = threading.Event(), {}
+         custody = threading.Lock()
+         abandoned = False
+-        deadline = time.monotonic() + CAPTURE_SECONDS
+ 
+         def work():
+             try:
++                progress.set_phase('worker_start')
+                 ledger = ca._installed
+                 if not isinstance(ledger, ca.Attestation):
+                     box['error'] = 'ledger_unavailable_or_unsupported'
+@@ -115,7 +130,7 @@
+                 if ledger._pid != identity['pid']:
+                     box['error'] = 'ledger_process_mismatch'
+                     return
+-                snapshot = ca.diagnostic_snapshot(deadline=deadline)
++                snapshot = ca.diagnostic_snapshot(deadline=deadline, progress=progress)
+                 disk = dict(snapshot.disk)
+                 box['value'] = (snapshot, disk, ledger)
+             except (OSError, RuntimeError, ValueError, TypeError, AttributeError, TimeoutError) as exc:
+@@ -137,21 +152,25 @@
+             worker.start()
+         except RuntimeError:
+             _FLIGHT.release()
+-            return _error('worker_unavailable')
++            return _settle(_error('worker_unavailable'), progress)
+         completed = done.wait(max(0.0, deadline - time.monotonic()))
+         with custody:
+             if not completed or time.monotonic() >= deadline:
+                 abandoned = True
+                 if done.is_set():
+                     _FLIGHT.release()
+-                return _error('capture_timeout')
++                return _settle(_error('capture_timeout'), progress)
+         try:
+             if 'error' in box:
+-                return _error(box['error'])
++                return _settle(_error(box['error']), progress)
+             snapshot, disk, ledger = box['value']
+             if self.identity() != identity or ca._installed is not ledger:
+-                return _error('identity_changed')
+-            return self._publish(peer, identity, snapshot, disk, ledger)
++                return _settle(_error('identity_changed'), progress)
++            # Sample before publication: observer failure cannot replace old pages.
++            result = _settle({}, progress)
++            if 'error' in result:
++                return result
++            return {**self._publish(peer, identity, snapshot, disk, ledger), **result}
+         finally:
+             _FLIGHT.release()
+ 
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index 952c0da7ced..ff6816b51bc 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -1671,10 +1671,12 @@
+         raise TimeoutError('code attestation inventory budget exhausted')
+ 
+ 
+-def diagnostic_snapshot(*, deadline: float) -> 'DiagnosticSnapshot':
++def diagnostic_snapshot(*, deadline: float, progress=None) -> 'DiagnosticSnapshot':
+     """Bounded metadata-only read of the already installed ledger; never authorizes code."""
+     from hermes_cli.code_attestation_snapshot import snapshot
+-    return snapshot(_ledger(), deadline=deadline)
++    if progress is None:
++        return snapshot(_ledger(), deadline=deadline)
++    return snapshot(_ledger(), deadline=deadline, progress=progress)
+ 
+ 
+ def integrity_observation(*, deadline=None):
+diff --git a/hermes_cli/code_attestation_snapshot.py b/hermes_cli/code_attestation_snapshot.py
+index a664fe1f9bc..a7fd5135690 100644
+--- a/hermes_cli/code_attestation_snapshot.py
++++ b/hermes_cli/code_attestation_snapshot.py
+@@ -175,7 +175,7 @@
+             builder.add('producers', {'kind': 'unknown_producer', 'reason': reason, 'producer': producer})
+ 
+ 
+-def snapshot(ledger, *, deadline: float) -> DiagnosticSnapshot:
++def snapshot(ledger, *, deadline: float, progress=None) -> DiagnosticSnapshot:
+     """One locked view. Inventory is monotone; a filesystem syscall cannot be cancelled.
+ 
+     The caller owns single-flight custody until this function actually returns.
+@@ -184,16 +184,26 @@
+     begin = time.monotonic()
+     if begin >= deadline:
+         raise TimeoutError('snapshot_deadline')
++    if progress is not None:
++        progress.set_phase('disk')
+     disk = disk_identity(ledger.core_root, deadline)
++    if progress is not None:
++        progress.set_phase('ledger_lock')
+     if not ledger._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+         raise TimeoutError('snapshot_lock_timeout')
+     try:
++        if progress is not None:
++            progress.set_phase('inventory')
+         ledger._inventory_modules(deadline=deadline)
+         if time.monotonic() >= deadline:
+             raise TimeoutError('snapshot_deadline')
+         if getattr(ledger, '_reviewed_plugins', None):
+             from hermes_cli.plugin_review_records import verify_registered
++            if progress is not None:
++                progress.set_phase('registry')
+             verify_registered(ledger)
++        if progress is not None:
++            progress.set_phase('projection')
+         builder = _Builder(deadline)
+         for reason in ledger._unknown:
+             builder.add('unknowns', reason)
+@@ -203,6 +213,11 @@
+         builder.add('metadata', {'kind': 'disk', **disk})
+         _roots(ledger, builder)
+         _execution(ledger, builder)
+-        return builder.finish(ledger._generation, begin, disk, boot)
++        if progress is not None:
++            progress.set_phase('finalize')
++        result = builder.finish(ledger._generation, begin, disk, boot)
++        if progress is not None:
++            progress.set_phase('complete')
++        return result
+     finally:
+         ledger._lock.release()
+diff --git a/hermes_cli/code_provenance_progress.py b/hermes_cli/code_provenance_progress.py
+new file mode 100644
+index 00000000000..3856d3c6287
+--- /dev/null
++++ b/hermes_cli/code_provenance_progress.py
+@@ -0,0 +1,55 @@
++"""Fixed-size private capture progress, not an authorization or completion receipt.
++
++Only the owning worker samples CPU at phase boundaries. Elapsed/CPU values are
++last samples, not timeout measurements; in-flight CPU remains unknown. No ledger
++or custody locks, clock reads, callbacks or serialization under the recorder lock.
++"""
++from __future__ import annotations
++
++import threading
++import time
++
++PHASES = frozenset(('worker_start', 'disk', 'ledger_lock', 'inventory', 'registry',
++                    'projection', 'finalize', 'complete', 'unavailable'))
++MAX_COUNTER_MS = 2**31 - 1
++MAX_TRANSITIONS = 9
++
++
++def unavailable():
++    """Fresh fixed scalar fallback; never borrow another flight's observation."""
++    return {'schema': 1, 'phase': 'unavailable', 'sampled_elapsed_ms': 0,
++            'worker_cpu_ms': 0, 'cpu_is_lower_bound': True}
++
++
++class CaptureProgress:
++    __slots__ = ('_begin_ns', '_cpu_begin_ns', '_lock', '_sample', '_transitions')
++
++    def __init__(self):
++        self._begin_ns = time.monotonic_ns()
++        self._cpu_begin_ns = None
++        self._lock = threading.Lock()
++        self._sample = unavailable()
++        self._transitions = 0
++
++    def set_phase(self, phase):
++        if type(phase) is not str or phase not in PHASES:
++            raise ValueError('invalid_capture_phase')
++        elapsed_ns, cpu_ns = time.monotonic_ns(), time.thread_time_ns()
++        with self._lock:
++            if self._transitions >= MAX_TRANSITIONS:
++                raise ValueError('capture_phase_limit')
++            if self._cpu_begin_ns is None:
++                self._cpu_begin_ns = cpu_ns
++            self._transitions += 1
++            self._sample = {'schema': 1, 'phase': phase,
++                'sampled_elapsed_ms': min(MAX_COUNTER_MS, max(0, (elapsed_ns - self._begin_ns) // 1000000)),
++                'worker_cpu_ms': min(MAX_COUNTER_MS, max(0, (cpu_ns - self._cpu_begin_ns) // 1000000)),
++                'cpu_is_lower_bound': True}
++
++    def snapshot(self):
++        if not self._lock.acquire(blocking=False):
++            return unavailable()
++        try:
++            return dict(self._sample)
++        finally:
++            self._lock.release()
+diff --git a/tests/gateway/test_code_provenance_control.py b/tests/gateway/test_code_provenance_control.py
+index effd449909f..b3b858c384d 100644
+--- a/tests/gateway/test_code_provenance_control.py
++++ b/tests/gateway/test_code_provenance_control.py
+@@ -65,6 +65,19 @@
+             'section': 'unknowns', 'offset': 0, 'limit': 128, **over}
+ 
+ 
++def capture_result(result):
++    """Check the additive private scalar schema; preserve exact legacy error assertions."""
++    from hermes_cli.code_provenance_progress import PHASES, MAX_COUNTER_MS
++    d = result['diagnostics']
++    assert set(d) == {'schema', 'phase', 'sampled_elapsed_ms', 'worker_cpu_ms', 'cpu_is_lower_bound'}
++    assert type(d['schema']) is int and d['schema'] == 1
++    assert d['phase'] in PHASES and d['cpu_is_lower_bound'] is True
++    for key in ('sampled_elapsed_ms', 'worker_cpu_ms'):
++        assert type(d[key]) is int and 0 <= d[key] <= MAX_COUNTER_MS
++    assert len(json.dumps(d).encode()) <= 4096
++    return {key: value for key, value in result.items() if key != 'diagnostics'}
++
++
+ def test_actual_bootstrap_authenticated_passive_round_trip(runtime):
+     async def scenario():
+         server, _control, params = await start(runtime)
+@@ -161,7 +174,7 @@
+             assert len(workers) == 1
+             await asyncio.to_thread(workers[0].join, 2)
+             assert not workers[0].is_alive()
+-            assert reply == {'protocol': 1, 'id': 1, 'ok': True,
++            assert {**reply, 'result': capture_result(reply['result'])} == {'protocol': 1, 'id': 1, 'ok': True,
+                              'result': pc._error('capture_failed')}
+             assert 'snapshot_id' not in reply['result']
+             assert not hooks
+@@ -196,7 +209,7 @@
+             monkeypatch.setattr(runtime[2], '_inventory_modules', blocked)
+             pending = asyncio.create_task(ask(runtime, params))
+             assert await asyncio.to_thread(entered.wait, 2)
+-            assert (await pending)['result'] == pc._error('capture_timeout')
++            assert capture_result((await pending)['result']) == pc._error('capture_timeout')
+             assert (await ask(runtime, params))['result'] == pc._error('capture_busy')
+             assert (await ask(runtime, page_params(summary)))['result']['complete']
+             assert pc._FLIGHT.locked()
+@@ -221,7 +234,7 @@
+         server, _control, params = await start(runtime)
+         try:
+             result = (await ask(runtime, params))['result']
+-            assert result == pc._error('ledger_unavailable_or_unsupported')
++            assert capture_result(result) == pc._error('ledger_unavailable_or_unsupported')
+             assert ca._installed is None
+         finally:
+             await server.stop()
+@@ -317,7 +330,7 @@
+             assert identified['result']['pid'] == os.getpid()
+             assert identified['result']['instance_id'] == params['expected']['instance_id']
+             reply = await pending  # real client default timeout, production 2s capture budget
+-            assert reply['result'] == pc._error('capture_timeout')
++            assert capture_result(reply['result']) == pc._error('capture_timeout')
+             for _ in range(10):
+                 assert (await ask(runtime, params))['result'] == pc._error('capture_busy')
+             workers = [t for t in threading.enumerate() if t.name == 'gateway-code-provenance']
+diff --git a/tests/gateway/test_code_provenance_custody_guards.py b/tests/gateway/test_code_provenance_custody_guards.py
+index d9cede2f5ae..bb51d475873 100644
+--- a/tests/gateway/test_code_provenance_custody_guards.py
++++ b/tests/gateway/test_code_provenance_custody_guards.py
+@@ -54,7 +54,7 @@
+         runtime[1].session_runtime_descriptor['instance_id'] = 'new-instance'
+         return result
+     monkeypatch.setattr(ca, 'diagnostic_snapshot', changed)
+-    assert control.handle(params, 'peer') == pc._error('identity_changed')
++    assert helpers.capture_result(control.handle(params, 'peer')) == pc._error('identity_changed')
+     assert not control._snapshots
+ 
+ 
+@@ -67,8 +67,8 @@
+     def fail(**kwargs):
+         raise exception
+     monkeypatch.setattr(ca, 'diagnostic_snapshot', fail)
+-    assert control.handle({'schema': 1, 'op': 'capture', 'expected': control.identity(),
+-                           'refresh_inventory': True}, 'peer') == pc._error(expected)
++    assert helpers.capture_result(control.handle({'schema': 1, 'op': 'capture', 'expected': control.identity(),
++                           'refresh_inventory': True}, 'peer')) == pc._error(expected)
+ 
+ 
+ def test_publish_prunes_only_expired_other_peer_snapshots(runtime, monkeypatch):
+@@ -112,7 +112,7 @@
+     monkeypatch.setattr(pc.threading, 'Event', event)
+     monkeypatch.setattr(ca, 'diagnostic_snapshot', blocked)
+     try:
+-        assert control.handle(params, 'peer') == pc._error('capture_timeout')
++        assert helpers.capture_result(control.handle(params, 'peer')) == pc._error('capture_timeout')
+         assert pc._FLIGHT.locked()
+     finally:
+         release.set()
+diff --git a/tests/gateway/test_code_provenance_guards.py b/tests/gateway/test_code_provenance_guards.py
+index 6dcbffd99cd..5868229dea9 100644
+--- a/tests/gateway/test_code_provenance_guards.py
++++ b/tests/gateway/test_code_provenance_guards.py
+@@ -56,7 +56,7 @@
+     with pytest.raises(PermissionError, match='authenticated_peer_required'):
+         control.handle(params, None)
+     runtime[2]._pid += 1
+-    assert control.handle(params, 'peer') == pc._error('ledger_process_mismatch')
++    assert helpers.capture_result(control.handle(params, 'peer')) == pc._error('ledger_process_mismatch')
+     runtime[2]._pid -= 1
+     monkeypatch.setattr(pc.os, 'getpid', lambda: control.pid + 1)
+     assert control.handle(params, 'peer') == pc._error('process_identity_unavailable')
+@@ -76,7 +76,7 @@
+     def fail(thread):
+         raise RuntimeError('SECRET_SENTINEL')
+     monkeypatch.setattr(pc.threading.Thread, 'start', fail)
+-    assert control.handle(params, 'peer') == pc._error('worker_unavailable')
++    assert helpers.capture_result(control.handle(params, 'peer')) == pc._error('worker_unavailable')
+     assert not pc._FLIGHT.locked()
+     monkeypatch.setattr(pc.threading.Thread, 'start', original)
+     assert control.handle(params, 'peer')['complete']
+@@ -91,7 +91,7 @@
+         monkeypatch.setattr(ca, '_installed', None)
+         return snapshot
+     monkeypatch.setattr(ca, 'diagnostic_snapshot', replace)
+-    assert control.handle(params, 'peer') == pc._error('identity_changed')
++    assert helpers.capture_result(control.handle(params, 'peer')) == pc._error('identity_changed')
+     assert not control._snapshots
+ 
+ 
+@@ -159,7 +159,7 @@
+ 
+     # Zero budget is only a deterministic boundary control, not a production override.
+     monkeypatch.setattr(pc, 'CAPTURE_SECONDS', 0)
+-    assert control.handle(params, 'peer') == pc._error('capture_timeout')
++    assert helpers.capture_result(control.handle(params, 'peer')) == pc._error('capture_timeout')
+     # Join the actual worker before restoring mocks or starting a new request.
+     for thread in threading.enumerate():
+         if thread.name == 'gateway-code-provenance':
+diff --git a/tests/gateway/test_code_provenance_large_inventory.py b/tests/gateway/test_code_provenance_large_inventory.py
+new file mode 100644
+index 00000000000..6790275f742
+--- /dev/null
++++ b/tests/gateway/test_code_provenance_large_inventory.py
+@@ -0,0 +1,57 @@
++"""Real large module traversal isolated from the separate 16384-unit projection."""
++import asyncio
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import code_provenance_control as pc
++from hermes_cli import code_attestation as ca
++from tests.gateway import test_code_provenance_control as helpers
++
++ledger = helpers.ledger
++runtime = helpers.runtime
++pytestmark = pytest.mark.platforms('linux', 'macos')
++
++
++def test_large_real_inventory_is_not_masked_by_large_projection(runtime, monkeypatch):
++    a = runtime[2]
++    a._modules = {}
++    modules = [(f'fixture_{n}', SimpleNamespace(__file__=str(a.core_root / 'plugin' / 'a.py')))
++               for n in range(16384)]
++    monkeypatch.setattr(a, '_inventory_modules', ca.Attestation._inventory_modules.__get__(a))
++    monkeypatch.setattr(a, '_module_snapshot', lambda: modules)
++    original = a._module_file
++    entered = threading.Event()
++    seen, workers = [], []
++    def inspect(name, filename):
++        if not workers:
++            workers.append(threading.current_thread())
++            entered.set()
++        original(name, filename)
++        seen.append(name)
++    monkeypatch.setattr(a, '_module_file', inspect)
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            pending = asyncio.create_task(helpers.ask(runtime, params))
++            assert await asyncio.to_thread(entered.wait, 2)
++            result = (await pending)['result']
++            helpers.capture_result(result)
++            if result['complete']:
++                assert result['diagnostics']['phase'] == 'complete'
++                assert len(seen) == len(a._modules) == 16384
++            else:
++                assert result['error'] == 'capture_timeout'
++                assert result['diagnostics']['phase'] == 'inventory'
++                assert not control._snapshots
++            # Host speed is not a production timing oracle. Forced inventory timeout
++            # is separately Event-gated; this case proves real capped graph traversal.
++            assert seen and len(a._units) == 1
++        finally:
++            for worker in workers:
++                await asyncio.to_thread(worker.join, 2)
++                assert not worker.is_alive()
++            assert not pc._FLIGHT.locked()
++            await server.stop()
++    asyncio.run(scenario())
+diff --git a/tests/gateway/test_code_provenance_phase_boundaries.py b/tests/gateway/test_code_provenance_phase_boundaries.py
+new file mode 100644
+index 00000000000..c5b481b99f5
+--- /dev/null
++++ b/tests/gateway/test_code_provenance_phase_boundaries.py
+@@ -0,0 +1,197 @@
++"""Production phase boundaries through authenticated Unix sockets; no live state."""
++import asyncio
++import json
++import threading
++
++import pytest
++
++from gateway import code_provenance_control as pc
++from hermes_cli import code_attestation as ca
++from hermes_cli import code_attestation_snapshot as projection
++from hermes_cli import code_provenance_progress as pp
++from tests.gateway import test_code_provenance_control as helpers
++
++ledger = helpers.ledger
++runtime = helpers.runtime
++pytestmark = pytest.mark.platforms('linux', 'macos')
++
++
++@pytest.mark.parametrize('phase', ['worker_start', 'disk', 'ledger_lock', 'inventory',
++                                  'registry', 'projection', 'finalize', 'complete'])
++def test_real_boundary_timeout_old_pages_busy_join_and_recovery(runtime, monkeypatch, phase):
++    entered, release = threading.Event(), threading.Event()
++    workers, holders = [], []
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            previous = (await helpers.ask(runtime, params))['result']
++            original = ca.diagnostic_snapshot
++            def gate():
++                workers.append(threading.current_thread())
++                entered.set()
++                assert release.wait(8)
++            with monkeypatch.context() as patch:
++                if phase == 'worker_start':  # health: allow HX011 -- distinct production seams require different fixture signatures and cleanup; keep each causal gate explicit
++                    def start_gate(**kwargs):
++                        gate()
++                        return original(**kwargs)
++                    patch.setattr(ca, 'diagnostic_snapshot', start_gate)
++                elif phase == 'disk':
++                    disk = projection.disk_identity
++                    def disk_gate(*args):
++                        gate()
++                        return disk(*args)
++                    patch.setattr(projection, 'disk_identity', disk_gate)
++                elif phase == 'ledger_lock':
++                    def hold():
++                        with runtime[2]._lock:
++                            entered.set()
++                            assert release.wait(8)
++                    holder = threading.Thread(target=hold)
++                    holders.append(holder)
++                    holder.start()
++                    assert await asyncio.to_thread(entered.wait, 2)
++                    entered.clear()
++                    disk = projection.disk_identity
++                    def signal_disk(*args):
++                        result = disk(*args)
++                        workers.append(threading.current_thread())
++                        entered.set()
++                        return result
++                    patch.setattr(projection, 'disk_identity', signal_disk)
++                elif phase == 'inventory':
++                    patch.setattr(runtime[2], '_inventory_modules', lambda **kw: gate())
++                elif phase == 'registry':
++                    from hermes_cli import plugin_review_records
++                    runtime[2]._reviewed_plugins = {'fixture': True}
++                    patch.setattr(plugin_review_records, 'verify_registered', lambda ledger: gate())
++                elif phase == 'projection':
++                    metadata = projection._metadata
++                    def metadata_gate(*args):
++                        gate()
++                        return metadata(*args)
++                    patch.setattr(projection, '_metadata', metadata_gate)
++                elif phase == 'finalize':
++                    finish = projection._Builder.finish
++                    def finish_gate(*args):
++                        gate()
++                        return finish(*args)
++                    patch.setattr(projection._Builder, 'finish', finish_gate)
++                else:
++                    sample = pp.CaptureProgress.set_phase
++                    def complete_gate(self, value):
++                        sample(self, value)
++                        if value == 'complete':
++                            gate()
++                    patch.setattr(pp.CaptureProgress, 'set_phase', complete_gate)
++                pending = asyncio.create_task(helpers.ask(runtime, params))
++                assert await asyncio.to_thread(entered.wait, 2)
++                busy = (await helpers.ask(runtime, params))['result']
++                assert busy == pc._error('capture_busy') and 'diagnostics' not in busy
++                assert (await helpers.ask(runtime, helpers.page_params(previous)))['result']['complete']
++                result = (await pending)['result']
++                assert helpers.capture_result(result) == pc._error('capture_timeout')
++                assert result['diagnostics']['phase'] == phase
++                frozen = json.dumps(result, sort_keys=True)
++                assert 'snapshot_id' not in result
++                assert next(iter(control._snapshots.values()))['token'] == previous['snapshot_id']
++                release.set()
++                for worker in workers + holders:
++                    await asyncio.to_thread(worker.join, 2)
++                    assert not worker.is_alive()
++                assert not pc._FLIGHT.locked()
++                assert json.dumps(result, sort_keys=True) == frozen
++                assert next(iter(control._snapshots.values()))['token'] == previous['snapshot_id']
++            runtime[2]._reviewed_plugins = {}
++            fresh = (await helpers.ask(runtime, params))['result']
++            assert fresh['complete'] and fresh['diagnostics']['phase'] == 'complete'
++        finally:
++            release.set()
++            for worker in workers + holders:
++                await asyncio.to_thread(worker.join, 2)
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_recorder_lock_cannot_extend_socket_timeout(runtime, monkeypatch):
++    entered, release = threading.Event(), threading.Event()
++    workers, recorders = [], []
++    original = ca.diagnostic_snapshot
++    def locked(*, deadline, progress):
++        workers.append(threading.current_thread())
++        recorders.append(progress)
++        with progress._lock:
++            entered.set()
++            assert release.wait(8)
++        return original(deadline=deadline, progress=progress)
++    monkeypatch.setattr(ca, 'diagnostic_snapshot', locked)
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            pending = asyncio.create_task(helpers.ask(runtime, params))
++            assert await asyncio.to_thread(entered.wait, 2)
++            result = (await asyncio.wait_for(pending, 4))['result']
++            assert helpers.capture_result(result) == pc._error('capture_timeout')
++            assert result['diagnostics'] == pp.unavailable()
++            assert pc._FLIGHT.locked() and not control._snapshots
++        finally:
++            release.set()
++            for worker in workers:
++                await asyncio.to_thread(worker.join, 2)
++                assert not worker.is_alive()
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('stage', ['startup', 'observer', 'snapshot'])
++@pytest.mark.parametrize('failure', [LookupError, ArithmeticError])
++def test_recorder_failure_sanitized_no_publication_or_hook_leak(runtime, monkeypatch, stage, failure):
++    hooks, workers = [], []
++    monkeypatch.setattr(threading, 'excepthook', hooks.append)
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            old = (await helpers.ask(runtime, params))['result']
++            with monkeypatch.context() as patch:
++                def fail(*args, **kwargs):
++                    if threading.current_thread().name == 'gateway-code-provenance':
++                        workers.append(threading.current_thread())
++                    raise failure('RECORDER_SECRET_SENTINEL')
++                if stage == 'startup':
++                    patch.setattr(pc, 'CaptureProgress', fail)
++                elif stage == 'observer':
++                    patch.setattr(pp.CaptureProgress, 'set_phase', fail)
++                else:
++                    patch.setattr(pp.CaptureProgress, 'snapshot', fail)
++                result = (await helpers.ask(runtime, params))['result']
++                assert helpers.capture_result(result) == pc._error('capture_failed')
++                assert 'RECORDER_SECRET_SENTINEL' not in json.dumps(result)
++                assert not pc._FLIGHT.locked()
++                for worker in workers:
++                    await asyncio.to_thread(worker.join, 2)
++                    assert not worker.is_alive()
++                assert not hooks
++                assert next(iter(control._snapshots.values()))['token'] == old['snapshot_id']
++                assert (await helpers.ask(runtime, helpers.page_params(old)))['result']['complete']
++            assert (await helpers.ask(runtime, params))['result']['complete']
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_unadmitted_requests_never_allocate_recorder(runtime, monkeypatch):
++    def forbidden():
++        pytest.fail('unadmitted capture allocated recorder')
++    monkeypatch.setattr(pc, 'CaptureProgress', forbidden)
++    control = pc.CodeProvenanceControl(runtime[1])
++    params = {'schema': 1, 'op': 'capture', 'expected': control.identity(), 'refresh_inventory': True}
++    assert control.handle({**params, 'expected': {**params['expected'], 'pid': 1}}, 'peer') == pc._error('identity_mismatch')
++    with pytest.raises(PermissionError):
++        control.handle(params, None)
++    with pytest.raises(ValueError):
++        control.handle({**params, 'schema': 2}, 'peer')
++    pc._FLIGHT.acquire()
++    try:
++        assert control.handle(params, 'peer') == pc._error('capture_busy')
++    finally:
++        pc._FLIGHT.release()
+diff --git a/tests/gateway/test_code_provenance_progress.py b/tests/gateway/test_code_provenance_progress.py
+new file mode 100644
+index 00000000000..a2c65b49c64
+--- /dev/null
++++ b/tests/gateway/test_code_provenance_progress.py
+@@ -0,0 +1,162 @@
++"""Designer acceptance specification, exercised and extended against real transport."""
++import asyncio
++import json
++import threading
++
++
++import pytest
++from hermes_cli import code_attestation as ca
++from tests.gateway import test_code_provenance_control as helpers
++
++ledger = helpers.ledger
++runtime = helpers.runtime
++pytestmark = pytest.mark.platforms('linux', 'macos')
++
++
++def diagnostic(result):
++    helpers.capture_result(result)
++    d = result['diagnostics']
++    assert d['schema'] == 1
++    assert d['phase'] in {'worker_start', 'disk', 'ledger_lock', 'inventory', 'registry', 'projection', 'finalize', 'complete', 'unavailable'}
++    assert type(d['sampled_elapsed_ms']) is int and d['sampled_elapsed_ms'] >= 0
++    assert type(d['worker_cpu_ms']) is int and d['worker_cpu_ms'] >= 0
++    assert d['cpu_is_lower_bound'] is True
++    assert len(json.dumps(d).encode()) <= 4096
++    return d
++
++
++def test_authenticated_complete_has_bounded_diagnostic_only_telemetry(runtime):
++    async def scenario():
++        server, _control, params = await helpers.start(runtime)
++        try:
++            result = (await helpers.ask(runtime, params))['result']
++            assert result['complete'] is True
++            assert result['full_provenance'] is False
++            assert diagnostic(result)['phase'] == 'complete'
++            assert (await helpers.ask(runtime, helpers.page_params(result)))['result']['snapshot_id'] == result['snapshot_id']
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('phase', ['disk', 'inventory', 'registry', 'projection', 'finalize'])
++def test_timeout_phase_is_frozen_and_late_result_unpublishable(runtime, monkeypatch, phase):
++    # Proposed Progress interface from the report: set_phase(enum), snapshot().
++    # Force the non-cooperative point only in the disposable snapshot function.
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    workers = []
++    original = ca.diagnostic_snapshot
++    def delayed(*, deadline, progress=None):
++        workers.append(threading.current_thread())
++        assert progress is not None
++        progress.set_phase(phase)
++        entered.set()
++        assert release.wait(8)
++        try:
++            # The actual expired original must not mint a successful snapshot.
++            return original(deadline=deadline)
++        finally:
++            progress.set_phase('unavailable')
++            finished.set()
++    monkeypatch.setattr(ca, 'diagnostic_snapshot', delayed)
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            pending = asyncio.create_task(helpers.ask(runtime, params))
++            assert await asyncio.to_thread(entered.wait, 2)
++            result = (await pending)['result']
++            assert result['complete'] is False and result['error'] == 'capture_timeout'
++            frozen = json.dumps(result, sort_keys=True)
++            assert diagnostic(result)['phase'] == phase
++            busy = (await helpers.ask(runtime, params))['result']
++            assert busy['error'] == 'capture_busy'
++            assert 'diagnostics' not in busy  # Never disclose another flight's telemetry.
++            assert not control._snapshots
++            release.set()
++            assert await asyncio.to_thread(finished.wait, 2)
++            await asyncio.to_thread(workers[0].join, 2)
++            assert not workers[0].is_alive()
++            # Worker terminal custody must also finish before testing recovery.
++            from gateway import code_provenance_control as pc
++            def wait_flight():
++                assert pc._FLIGHT.acquire(timeout=2)
++                pc._FLIGHT.release()
++            await asyncio.to_thread(wait_flight)
++            assert json.dumps(result, sort_keys=True) == frozen
++            assert not control._snapshots
++            monkeypatch.setattr(ca, 'diagnostic_snapshot', original)
++            recovered = (await helpers.ask(runtime, params))['result']
++            assert recovered['complete'] is True
++        finally:
++            release.set()
++            for worker in workers:
++                await asyncio.to_thread(worker.join, 2)
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('failure', [LookupError('SECRET_SENTINEL'), ArithmeticError('SECRET_SENTINEL')])
++def test_ordinary_failure_keeps_reviewed_sanitized_settlement(runtime, monkeypatch, failure):
++    def failed(**kwargs):
++        raise failure
++    monkeypatch.setattr(ca, 'diagnostic_snapshot', failed)
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            result = (await helpers.ask(runtime, params))['result']
++            assert result['error'] == 'capture_failed' and result['complete'] is False
++            diagnostic(result)
++            assert 'SECRET_SENTINEL' not in json.dumps(result)
++            assert not control._snapshots
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
++
++
++@pytest.mark.parametrize('change', ['instance', 'ledger'])
++def test_identity_change_between_snapshot_and_publication_never_mints_token(runtime, monkeypatch, change):
++    entered, release = threading.Event(), threading.Event()
++    original = ca.diagnostic_snapshot
++    def gated(*, deadline, progress=None):
++        snapshot = original(deadline=deadline)
++        entered.set()
++        assert release.wait(4)
++        return snapshot
++    monkeypatch.setattr(ca, 'diagnostic_snapshot', gated)
++    async def scenario():
++        server, control, params = await helpers.start(runtime)
++        try:
++            pending = asyncio.create_task(helpers.ask(runtime, params))
++            assert await asyncio.to_thread(entered.wait, 1)
++            if change == 'instance':
++                runtime[1].session_runtime_descriptor['instance_id'] = 'replacement-instance'
++            else:
++                monkeypatch.setattr(ca, '_installed', object())
++            release.set()
++            result = (await pending)['result']
++            assert result['error'] == 'identity_changed'
++            assert result['complete'] is False and 'snapshot_id' not in result
++            diagnostic(result)
++            assert not control._snapshots
++        finally:
++            release.set()
++            await server.stop()
++    asyncio.run(scenario())
++
++
++def test_large_projection_through_authenticated_client_retains_every_row(runtime):
++    from hermes_cli.code_provenance_client import collect
++    runtime[2]._units = [{'component': 'core', 'source_sha256': 'f' * 64,
++                          'generation': n} for n in range(16384)]
++    async def scenario():
++        server, control, _params = await helpers.start(runtime)
++        try:
++            document = await asyncio.to_thread(collect, runtime[0], control.identity())
++            assert diagnostic(document['summary'])['phase'] == 'complete'
++            assert document['summary']['full_provenance'] is False
++            assert len(document['sections']['executed_units']) == 16384
++            assert document['summary']['sections']['executed_units']['count'] == 16384
++            assert set(document['sections']['unknowns']) == runtime[2]._unknown
++        finally:
++            await server.stop()
++    asyncio.run(scenario())
+diff --git a/tests/hermes_cli/test_code_attestation_snapshot.py b/tests/hermes_cli/test_code_attestation_snapshot.py
+index 53070a4490f..3f5d7e72e0c 100644
+--- a/tests/hermes_cli/test_code_attestation_snapshot.py
++++ b/tests/hermes_cli/test_code_attestation_snapshot.py
+@@ -166,7 +166,11 @@
+         ca._installed = a
+         assert 'hermes_cli.code_attestation_snapshot' not in sys.modules
+         a.mark_unknown('unsupported-route:diagnostic-control')
+-        s = ca.diagnostic_snapshot(deadline=time.monotonic() + 2)
++        from hermes_cli.code_provenance_progress import CaptureProgress
++        progress = CaptureProgress()
++        progress.set_phase('worker_start')
++        s = ca.diagnostic_snapshot(deadline=time.monotonic() + 2, progress=progress)
++        assert progress.snapshot()['phase'] == 'complete'
+         raw = [json.loads(r) for r in s.sections['unknowns']]
+         after = sorted(a._unknown)
+         generation = a._generation
+diff --git a/tests/hermes_cli/test_code_provenance_progress.py b/tests/hermes_cli/test_code_provenance_progress.py
+new file mode 100644
+index 00000000000..a7ea70656d9
+--- /dev/null
++++ b/tests/hermes_cli/test_code_provenance_progress.py
+@@ -0,0 +1,136 @@
++"""Finite private scalar recorder and legacy snapshot-call compatibility."""
++import json
++import threading
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import code_attestation as ca
++from hermes_cli import code_attestation_snapshot as projection
++from hermes_cli import code_provenance_progress as pp
++from tests.hermes_cli import test_code_attestation_snapshot as helpers
++
++ledger = helpers.ledger
++
++
++def test_fixed_scalar_detached_samples_and_finite_transition_limit(monkeypatch):
++    clocks = SimpleNamespace(mono=0, cpu=100)
++    monkeypatch.setattr(pp, 'time', SimpleNamespace(monotonic_ns=lambda: clocks.mono,
++                                                 thread_time_ns=lambda: clocks.cpu))
++    progress = pp.CaptureProgress()
++    progress.set_phase('worker_start')
++    first = progress.snapshot()
++    clocks.mono, clocks.cpu = 5000000, 7100100
++    progress.set_phase('disk')
++    sample = progress.snapshot()
++    assert sample == {'schema': 1, 'phase': 'disk', 'sampled_elapsed_ms': 5,
++                      'worker_cpu_ms': 7, 'cpu_is_lower_bound': True}
++    sample['phase'] = 'unavailable'
++    assert progress.snapshot()['phase'] == 'disk'
++    assert first['phase'] == 'worker_start' and first['worker_cpu_ms'] == 0
++    for _ in range(7):
++        progress.set_phase('inventory')
++    with pytest.raises(ValueError, match='capture_phase_limit'):
++        progress.set_phase('complete')
++    assert not hasattr(progress, '__dict__')
++    assert len(json.dumps(progress.snapshot()).encode()) < 4096
++
++
++@pytest.mark.parametrize('phase', ['SECRET_SENTINEL', ['disk'], 1, None])
++def test_phase_validation(phase):
++    with pytest.raises(ValueError, match='invalid_capture_phase'):
++        pp.CaptureProgress().set_phase(phase)
++
++
++def test_phase_subclass_rejected_even_with_valid_enum_value():
++    class Phase(str):
++        pass
++    with pytest.raises(ValueError, match='invalid_capture_phase'):
++        pp.CaptureProgress().set_phase(Phase('disk'))
++
++
++@pytest.mark.parametrize('negative', [False, True])
++def test_counters_clamp_without_duration_dependent_encoding(monkeypatch, negative):
++    clocks = SimpleNamespace(mono=0, cpu=0)
++    monkeypatch.setattr(pp, 'time', SimpleNamespace(monotonic_ns=lambda: clocks.mono,
++                                                 thread_time_ns=lambda: clocks.cpu))
++    progress = pp.CaptureProgress()
++    progress.set_phase('worker_start')
++    clocks.mono = clocks.cpu = -10**100 if negative else 10**100
++    progress.set_phase('complete')
++    expected = 0 if negative else pp.MAX_COUNTER_MS
++    assert progress.snapshot()['sampled_elapsed_ms'] == expected
++    assert progress.snapshot()['worker_cpu_ms'] == expected
++    assert len(json.dumps(progress.snapshot()).encode()) < 4096
++
++
++def test_snapshot_is_nonblocking_and_never_reads_clocks_under_lock(monkeypatch):
++    progress = pp.CaptureProgress()
++    def mono():
++        assert not progress._lock.locked()
++        return 1
++    monkeypatch.setattr(pp, 'time', SimpleNamespace(monotonic_ns=mono, thread_time_ns=mono))
++    progress.set_phase('worker_start')
++    progress._lock.acquire()
++    results = []
++    reader = threading.Thread(target=lambda: results.append(progress.snapshot()))
++    reader.start()
++    reader.join(1)
++    was_alive = reader.is_alive()
++    progress._lock.release()
++    reader.join(2)
++    assert not was_alive, 'snapshot waited on recorder lock'
++    assert results == [pp.unavailable()]
++    results[0]['phase'] = 'disk'
++    assert pp.unavailable()['phase'] == 'unavailable'
++
++
++def test_facade_preserves_old_replacement_signature_and_forwards_optional(ledger, monkeypatch):
++    sentinel = object()
++    def old(ledger_arg, *, deadline):
++        assert ledger_arg is ledger and deadline == 12
++        return sentinel
++    monkeypatch.setattr(projection, 'snapshot', old)
++    assert ca.diagnostic_snapshot(deadline=12) is sentinel
++    progress = pp.CaptureProgress()
++    def new(ledger_arg, *, deadline, progress):
++        assert ledger_arg is ledger and deadline == 12 and progress is recorder
++        return sentinel
++    recorder = progress
++    monkeypatch.setattr(projection, 'snapshot', new)
++    assert ca.diagnostic_snapshot(deadline=12, progress=progress) is sentinel
++
++
++def test_all_real_boundaries_and_none_preserve_canonical_snapshot(ledger, monkeypatch):
++    fixed_time = time.monotonic()
++    monkeypatch.setattr(projection, 'time', SimpleNamespace(monotonic=lambda: fixed_time))
++    ledger._reviewed_plugins = {'fixture': True}
++    from hermes_cli import plugin_review_records
++    monkeypatch.setattr(plugin_review_records, 'verify_registered', lambda ledger: None)
++    class Observer:
++        def __init__(self):
++            self.phases = []
++        def set_phase(self, phase):
++            self.phases.append(phase)
++    observer = Observer()
++    plain = projection.snapshot(ledger, deadline=fixed_time + 2)
++    instrumented = projection.snapshot(ledger, deadline=fixed_time + 2, progress=observer)
++    assert plain == instrumented
++    assert observer.phases == ['disk', 'ledger_lock', 'inventory', 'registry', 'projection', 'finalize', 'complete']
++    ledger._reviewed_plugins.clear()
++    observer.phases.clear()
++    projection.snapshot(ledger, deadline=fixed_time + 2, progress=observer)
++    assert observer.phases == ['disk', 'ledger_lock', 'inventory', 'projection', 'finalize', 'complete']
++
++
++def test_complete_is_not_sampled_if_final_deadline_fails(ledger, monkeypatch):
++    progress = pp.CaptureProgress()
++    original = projection._Builder.finish
++    def expired(builder, *args):
++        builder.deadline = 0
++        return original(builder, *args)
++    monkeypatch.setattr(projection._Builder, 'finish', expired)
++    with pytest.raises(TimeoutError):
++        ca.diagnostic_snapshot(deadline=time.monotonic() + 2, progress=progress)
++    assert progress.snapshot()['phase'] == 'finalize'
+diff --git a/website/docs/developer-guide/code-provenance-control.md b/website/docs/developer-guide/code-provenance-control.md
+index 57ed82da359..3d55399dcaf 100644
+--- a/website/docs/developer-guide/code-provenance-control.md
++++ b/website/docs/developer-guide/code-provenance-control.md
+@@ -42,6 +42,30 @@
+ 
+ ## Sections and provenance
+ 
++### Private capture progress
++
++Only an admitted capture response adds a detached `diagnostics` object (including
++sanitized incomplete/timeout results). Invalid, foreign-identity and busy requests
++receive no recorder or another flight's telemetry; page responses are unchanged.
++The fixed keys are `schema: 1`, `phase`, `sampled_elapsed_ms`, `worker_cpu_ms`, and
++`cpu_is_lower_bound: true`. Phases are `worker_start`, `disk`, `ledger_lock`,
++`inventory`, `registry` (only for fresh reviewed-plugin verification), `projection`,
++`finalize`, `complete`, and `unavailable`. Complete is sampled only after the final
++snapshot deadline check; even that phase cannot override capture timeout or identity
++refusal. Recorder failures return sanitized incomplete and do not replace old pages.
++
++Elapsed is wall time through the **last worker sample**, not exact timeout elapsed.
++CPU is cumulative worker `thread_time_ns` since its first sample, a lower bound;
++CPU spent inside a still-running phase is unknown, and zero does not mean no work.
++Counters are integers clamped to 0 through 2147483647 milliseconds. At most nine
++fixed transitions are retained in O(1) storage, with no histories, names, paths,
++exceptions, callbacks, polling, files, timers, extra threads or persistent store.
++The encoded object stays below 4096 bytes and consumes no page-envelope headroom.
++Snapshot uses a nonblocking recorder lock; contention returns a fresh fixed
++`unavailable` sample with zero counters. Clock reads precede the lock. Returned
++scalar dictionaries cannot be mutated by late worker writes. This does not add a
++hard physical worker/ledger-lock bound, change trust or relax any existing limit.
++
+ - `unknowns`: every raw sticky reason, unfiltered.
+ - `quiet_blocking`, `quiet_extension`: partitions derived from that same locked view.
+ - `components`: registered canonical roots, one row per reviewed relative SHA256
+-- 
+2.43.0
+

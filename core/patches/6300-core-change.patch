@@ -1,0 +1,126 @@
+From 522993bccda6a83d61ca09fea16cd40f9764f156 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:25:23 +0000
+Subject: [PATCH 6300] Advisory maintenance, helper edges and human containment closure
+
+Public mirror of source commit 522993bccda6a83d61ca09fea16cd40f9764f156.
+
+---
+diff --git a/hermes_cli/kanban_hold_notices.py b/hermes_cli/kanban_hold_notices.py
+index 727fa8bbc69..60ed4ac7539 100644
+--- a/hermes_cli/kanban_hold_notices.py
++++ b/hermes_cli/kanban_hold_notices.py
+@@ -84,6 +84,7 @@
+ def sweep(conn) -> None:
+     """Repair fresh canonical retains in one dispatch tick, not hours later in the age sweep."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+     from hermes_cli.kanban_hold_effective import current, previous
+     from hermes_cli.kanban_wake_check import foreign_ids
+     foreign = foreign_ids(conn)
+@@ -104,5 +105,7 @@
+                 row = conn.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()
+                 if row is not None and row[0] == 'triage':
+                     publish(conn, tid)
++        except DispatchWriteContended:
++            raise  # Stop the pass, rather than retrying every hold against the same busy writer.
+         except Exception:  # health: allow BLE001 -- rollback this publication, retain its hold and retry next tick
+             kb._log.warning('kanban: hold notice failed for %s; hold retained', tid, exc_info=True)
+diff --git a/hermes_cli/kanban_suspend_ledger.py b/hermes_cli/kanban_suspend_ledger.py
+index 7e75df1c4ef..28531cb30c9 100644
+--- a/hermes_cli/kanban_suspend_ledger.py
++++ b/hermes_cli/kanban_suspend_ledger.py
+@@ -64,13 +64,14 @@
+ ) -> Optional[tuple[int, int]]:
+     """Stamp this pass; record ``[previous, now]`` as suspended when the gap is over the threshold.
+ 
+-    Returns the recorded span, else ``None``. Never raises: a failure leaves the checks on wall-clock
+-    time, which is the pre-ledger behaviour. A dry run (``dispatch_once(dry_run=True)``) is not a pass:
++    Returns the recorded span, else ``None``. Ordinary failures leave checks on wall-clock
++    time; pass-wide storage cancellation propagates. A dry run (``dispatch_once(dry_run=True)``) is not a pass:
+     it writes nothing, and its stamp would hide a real suspend gap from the next pass.
+     """
+     if dry_run:
+         return None
+     from hermes_cli.kanban_db import write_txn
++    from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
+ 
+     now = int(time.time()) if now is None else int(now)
+     threshold = gap_threshold_seconds(interval_seconds)
+@@ -89,6 +90,8 @@
+                 "ON CONFLICT(id) DO UPDATE SET at = excluded.at "
+                 "WHERE kanban_dispatch_stamp.at IS NOT excluded.at", (now,))
+             conn.execute("DELETE FROM kanban_suspend_ledger WHERE end < ?", (now - RETENTION_SECONDS,))
++    except DispatchWriteContended:
++        raise  # The dispatcher owns this pass-wide skip, not a ledger failure.
+     except (sqlite3.Error, RuntimeError):
+         _log.warning("kanban: recording the dispatcher pass stamp failed", exc_info=True)
+         return None
+diff --git a/tests/hermes_cli/test_kanban_maintenance_contention.py b/tests/hermes_cli/test_kanban_maintenance_contention.py
+new file mode 100644
+index 00000000000..edf21e22816
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_maintenance_contention.py
+@@ -0,0 +1,59 @@
++"""Pass-wide storage cancellation must not become per-item maintenance failures."""
++from contextlib import closing
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_storage as storage
++from hermes_cli import kanban_hold_notices as notices
++from hermes_cli import kanban_suspend_ledger as ledger
++from hermes_cli.kanban_db_dispatch import DispatchResult
++from tests.hermes_cli import test_kanban_hold_failure_isolation as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.mark.parametrize('operation', ['stamp', 'holds'])
++def test_maintenance_stops_on_real_writer_contention(kanban_home, caplog, operation):
++    with kbc.connect_closing() as conn:
++        first = helpers._held(conn, 'runs')
++        second = helpers._held(conn, 'runs')
++        before = [kb.list_events(conn, tid) for tid in (first, second)]
++        path = conn.execute('PRAGMA database_list').fetchone()[2]
++        timeout = conn.execute('PRAGMA busy_timeout').fetchone()[0]
++        after = []
++
++        def tick():
++            if operation == 'stamp':
++                ledger.record_dispatch_pass(conn, now=1000)
++            else:
++                notices.sweep(conn)
++            after.append('continued after exhausted storage budget')
++            return DispatchResult()
++
++        with closing(sqlite3.connect(path, isolation_level=None)) as blocker:
++            blocker.execute('BEGIN IMMEDIATE')
++            try:
++                result = storage.run(conn, tick, board='default')
++                assert result.storage_skip_reason == storage.REASON
++                assert after == []
++                assert [kb.list_events(conn, tid) for tid in (first, second)] == before
++                assert not conn.in_transaction
++                assert conn.execute('PRAGMA busy_timeout').fetchone()[0] == timeout
++                warnings = [r for r in caplog.records if r.levelname == 'WARNING']
++                assert len(warnings) == 1
++                assert 'reason=storage_write_contended' in warnings[0].getMessage()
++                assert warnings[0].exc_info is None
++            finally:
++                blocker.rollback()
++        caplog.clear()
++        recovered = storage.run(conn, tick, board='default')
++        assert recovered.storage_skip_reason is None
++        assert after == ['continued after exhausted storage budget']
++        if operation == 'stamp':
++            assert conn.execute('SELECT at FROM kanban_dispatch_stamp').fetchone()[0] == 1000
++        else:
++            assert len(helpers._decisions(conn, first)) == len(helpers._decisions(conn, second)) == 1
++        assert not caplog.records
+-- 
+2.43.0
+

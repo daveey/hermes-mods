@@ -1,0 +1,268 @@
+From 8304afbbc8d90b1c8463d91ed09226f2485ff8bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:21:42 +0000
+Subject: [PATCH 6464] Sessions facts-mode CPU accounting, capture timing and collect attribution
+
+Public mirror of source commit 8304afbbc8d90b1c8463d91ed09226f2485ff8bd.
+
+---
+diff --git a/hermes_cli/sessions_capture_process.py b/hermes_cli/sessions_capture_process.py
+index 5446ef8abd7..e3eb9e2e0f1 100644
+--- a/hermes_cli/sessions_capture_process.py
++++ b/hermes_cli/sessions_capture_process.py
+@@ -11,6 +11,7 @@
+ import threading
+ import time
+ 
++from hermes_cli import loop_accounting as _la
+ from hermes_cli._launchers import runtime_command
+ from hermes_cli._startup_fast import project_root_str
+ from hermes_cli._subprocess_compat import kill_process_tree
+@@ -103,6 +104,7 @@
+             except OSError as exc:
+                 raise CaptureUnavailable('spawn') from exc
+             self._child = child
++        cpu_s, completed = None, False
+         try:
+             # Small request fits the pipe; a non-reading child must not block the owner.
+             os.set_blocking(child.stdin.fileno(), False)
+@@ -119,6 +121,7 @@
+             # Require exactly one frame and a successful child exit, within the SAME budget.
+             if _read_trailer(child, deadline):
+                 raise CaptureUnavailable('trailing_frame')
++            cpu_s = _child_cpu(child.pid)  # before the wait reaps it and its counters
+             if child.wait(timeout=max(0, deadline - time.monotonic())) != 0:
+                 raise CaptureUnavailable('crash')
+             if time.monotonic() > deadline:
+@@ -126,10 +129,17 @@
+             result = json.loads(body)
+             if not isinstance(result, dict):
+                 raise CaptureUnavailable('invalid_body')
++            completed = True
+             return body
+         except (OSError, ValueError, subprocess.SubprocessError) as exc:
+             raise CaptureUnavailable('transport') from exc
+         finally:
++            if cpu_s is None:
++                cpu_s = _child_cpu(child.pid)  # a failed or cancelled child spent CPU too
++            # The child's CPU is outside this process: no thread here may claim it (outer=False).
++            _la.record('sessions.capture.child', cpu_s=cpu_s or 0.0, wall_s=time.monotonic() - started,
++                       fallback=cpu_s is None, error=not completed,
++                       error_kind=None if completed else 'CaptureUnavailable', outer=False)
+             if child.poll() is None:
+                 kill_process_tree(child)
+             child.wait(timeout=1)
+@@ -159,3 +169,17 @@
+ def _read_trailer(child, deadline):
+     _wait(child.stdout, selectors.EVENT_READ, deadline)
+     return os.read(child.stdout.fileno(), 1)
++
++
++def _child_cpu(pid):
++    """CPU seconds of a live or not-yet-reaped child plus the descendants it has reaped, else None.
++
++    Linux procfs only, like the native capture itself. Sampled when the response frame ends, so
++    it leaves out the child's interpreter teardown: a lower bound, never an estimate.
++    """
++    try:
++        with open(f'/proc/{pid}/stat', encoding='ascii', errors='replace') as stat:
++            fields = stat.read().rpartition(')')[2].split()
++        return sum(int(fields[index]) for index in (11, 12, 13, 14)) / os.sysconf('SC_CLK_TCK')
++    except (OSError, ValueError, IndexError):
++        return None
+diff --git a/hermes_cli/sessions_fact_routes.py b/hermes_cli/sessions_fact_routes.py
+index bfc0ab881dd..2f24f9ffbd2 100644
+--- a/hermes_cli/sessions_fact_routes.py
++++ b/hermes_cli/sessions_fact_routes.py
+@@ -17,6 +17,8 @@
+ from fastapi.params import Param
+ from starlette.responses import Response
+ 
++from hermes_cli import loop_accounting as _la
++
+ 
+ _UNBOUND = object()
+ PENDING_NATIVE = object()  # Installed native owner, not ready; NEVER select legacy.
+@@ -148,14 +150,18 @@
+             self._condition.notify_all()
+ 
+     def response(self, name, selector):
+-        touch = getattr(self._handle, 'touch', None)
+-        if touch is not None:
+-            touch(name, selector)  # Optional owner-memory LRU hint, never source I/O.
+-        result = self._handle.v1.snapshot(self._scope).view(name, selector)
+-        if isinstance(result, self._ready_type):
+-            return Response(content=result.encoded, media_type="application/json")
+-        if isinstance(result, self._pending_type):
+-            self._handle.demand(name, selector)
++        # The legacy reader's own span never runs in facts mode. Account the read that
++        # replaced it, or a facts-served route looks like zero requests and zero CPU.
++        with _la.pass_(f"route/profiles.{name}.facts") as accounted:
++            touch = getattr(self._handle, 'touch', None)
++            if touch is not None:
++                touch(name, selector)  # Optional owner-memory LRU hint, never source I/O.
++            result = self._handle.v1.snapshot(self._scope).view(name, selector)
++            if isinstance(result, self._ready_type):
++                return Response(content=result.encoded, media_type="application/json")
++            accounted.fallback()  # A designed 503, not an error of the pass.
++            if isinstance(result, self._pending_type):
++                self._handle.demand(name, selector)
+         raise HTTPException(503, "sessions projection unavailable", headers={"Retry-After": "1"})
+ 
+     async def first_response(self, name, selector):
+diff --git a/tests/hermes_cli/test_sessions_capture_process.py b/tests/hermes_cli/test_sessions_capture_process.py
+index 615dca38550..b13ff23ca06 100644
+--- a/tests/hermes_cli/test_sessions_capture_process.py
++++ b/tests/hermes_cli/test_sessions_capture_process.py
+@@ -122,6 +122,54 @@
+         CaptureProcess(command=['/nonexistent/capture-worker'])('sessions', {})
+ 
+ 
++def _burn(seconds, then):
++    # Burn child CPU (process_time, so a loaded host cannot make it sleep through the budget).
++    return (f'import sys, time\nsys.stdin.buffer.read()\nend = time.process_time() + {seconds!r}\n'
++            f'while time.process_time() < end:\n    pass\n{then}')
++
++
++def _capture_child_stat():
++    from hermes_cli import loop_accounting
++    return loop_accounting.counters().get('sessions.capture.child', {})
++
++
++def test_child_cpu_is_accounted_outside_the_owner_thread():
++    import threading as _threading
++    from hermes_cli import loop_accounting
++
++    def owner_accounted():
++        own = _threading.get_native_id()
++        return sum(t['accounted_cpu_s'] for t in loop_accounting.thread_cpu() if t['tid'] == own)
++
++    before, owner_before = _capture_child_stat(), owner_accounted()
++    capture = CaptureProcess(command=command(_burn(.3, frame())))
++    try:
++        assert json.loads(capture('sessions', {}))['sessions'][0]['id'] == 'real-row'
++    finally:
++        capture.close()
++    after = _capture_child_stat()
++    assert after['runs'] == before.get('runs', 0) + 1
++    assert after['errors'] == before.get('errors', 0)
++    assert after['fallbacks'] == before.get('fallbacks', 0)  # the CPU was readable, not assumed 0
++    assert after['cpu_s'] - before.get('cpu_s', 0) >= .25
++    # The CPU belongs to another process: the owner thread must not count it as its own.
++    assert owner_accounted() - owner_before < .1
++
++
++def test_failed_child_cpu_is_accounted_as_an_error():
++    before = _capture_child_stat()
++    capture = CaptureProcess(seconds=.5, command=command(_burn(30, '')))
++    with pytest.raises(CaptureUnavailable) as error:
++        capture('sessions', {})
++    assert error.value.reason == 'timeout'
++    after = _capture_child_stat()
++    assert after['runs'] == before.get('runs', 0) + 1
++    assert after['errors'] == before.get('errors', 0) + 1
++    assert after['error_kinds'].get('CaptureUnavailable', 0) == before.get('error_kinds', {}).get(
++        'CaptureUnavailable', 0) + 1
++    assert after['cpu_s'] - before.get('cpu_s', 0) >= .1
++
++
+ def test_high_descriptor_frame_read():
+     import fcntl
+     import os
+diff --git a/tests/hermes_cli/test_sessions_fact_accounting.py b/tests/hermes_cli/test_sessions_fact_accounting.py
+new file mode 100644
+index 00000000000..5cba2dd0d98
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_fact_accounting.py
+@@ -0,0 +1,88 @@
++"""Facts-mode sessions serving stays visible to loop accounting. [daveey]
++
++In facts mode the mounted route answers from owner memory and never calls the legacy
++reader, so the legacy ``route/profiles.sessions*`` spans stop. Without a span of its own a
++facts-served route reads as zero requests and zero CPU, which is how a canary's cost went
++unseen. These tests drive the real mounted routes in both modes.
++"""
++import asyncio
++import inspect
++
++import httpx
++import pytest
++from fastapi import HTTPException
++
++from hermes_cli import loop_accounting as la
++from hermes_cli.fact_contract import Ready
++from hermes_cli.sessions_fact_routes import ScopedSessionsRoutes, selector_for, use
++from hermes_cli.web_routers import profiles
++from tests.hermes_cli import test_sessions_fact_scope as scope_helpers
++from tests.hermes_cli import test_sessions_native_startup as native_helpers
++from tests.waiting import wait_until
++
++native = native_helpers.native
++profiles_on_disk = native_helpers.profiles_on_disk
++
++
++def stat(name):
++    return la.counters().get(name, {})
++
++
++def runs(name):
++    return stat(name).get('runs', 0)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('path,params,name,reader,legacy', [
++    ('/api/profiles/sessions', {'limit': 2, 'profile': 'worker'}, 'sessions',
++     'get_profiles_sessions', 'route/profiles.sessions'),
++    ('/api/profiles/sessions/sidebar', {'recents_profile': 'worker'}, 'sessions_sidebar',
++     'get_profiles_sessions_sidebar', 'route/profiles.sessions.sidebar'),
++])
++async def test_mounted_route_emits_a_span_in_each_mode(native, path, params, name, reader, legacy):
++    selector = selector_for(inspect.signature(getattr(profiles, reader)), (), params)
++    native.demand(native.scope, name, selector)
++
++    def ready():
++        return isinstance(native.store.snapshot(native.scope).view(name, selector), Ready)
++    assert await asyncio.to_thread(wait_until, ready, timeout=10)
++    facts = f'route/profiles.{name}.facts'
++    transport = httpx.ASGITransport(app=native_helpers.app_for(native))
++    async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
++        before = runs(facts), runs(legacy)
++        assert (await client.get(path, params=params)).status_code == 200
++        # Served from owner memory: the facts span counts it, the legacy reader did not run.
++        assert (runs(facts), runs(legacy)) == (before[0] + 1, before[1])
++        assert stat(facts)['errors'] == 0
++
++        native.lifecycle.transition('sessions', native.scope, 'legacy', 10)
++        native.generation = 10
++        native.binding.on_mode('legacy', 10)
++        before = runs(facts), runs(legacy)
++        assert (await client.get(path, params=params)).status_code == 200
++        assert runs(facts) == before[0]
++        assert runs(legacy) >= before[1] + 1
++
++
++@pytest.mark.asyncio
++async def test_unavailable_projection_is_a_fallback_not_an_error():
++    router = ScopedSessionsRoutes()
++
++    async def legacy():
++        raise AssertionError('facts mode must not reach the legacy reader')
++
++    endpoint = router.wrap('sessions_stamps', legacy)
++    item = scope_helpers.installed(router, 'a')  # publishes only the sidebar view
++    name = 'route/profiles.sessions_stamps.facts'
++    before = stat(name)
++    try:
++        with use(item[2]):
++            with pytest.raises(HTTPException) as error:
++                await endpoint()
++        assert error.value.status_code == 503
++    finally:
++        scope_helpers.close(item)
++    after = stat(name)
++    assert after['runs'] == before.get('runs', 0) + 1
++    assert after['fallbacks'] == before.get('fallbacks', 0) + 1
++    assert after['errors'] == before.get('errors', 0)
+-- 
+2.43.0
+

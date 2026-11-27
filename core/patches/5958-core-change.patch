@@ -1,0 +1,436 @@
+From 9d081bcb58f193e2dbdd339bcbb6d71c92dc25b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:26:31 +0000
+Subject: [PATCH 5958] Isolated native sessions capture and bounded startup
+
+Public mirror of source commit 9d081bcb58f193e2dbdd339bcbb6d71c92dc25b2.
+
+---
+diff --git a/hermes_cli/sessions_fact_routes.py b/hermes_cli/sessions_fact_routes.py
+index 51298d7aa8c..870b7715f38 100644
+--- a/hermes_cli/sessions_fact_routes.py
++++ b/hermes_cli/sessions_fact_routes.py
+@@ -19,6 +19,7 @@
+ 
+ 
+ _UNBOUND = object()
++PENDING_NATIVE = object()  # Installed native owner, not ready; NEVER select legacy.
+ _current = ContextVar("sessions_fact_binding", default=_UNBOUND)
+ 
+ 
+@@ -210,6 +211,8 @@
+     def _begin(self):
+         with self._legacy._condition:
+             binding = _current.get()
++            if binding is PENDING_NATIVE:
++                raise HTTPException(503, "sessions projection unavailable", headers={"Retry-After": "1"})
+             if binding is None:
+                 return self._legacy, self._legacy._begin()  # Explicit legacy scope.
+             if binding is _UNBOUND:
+diff --git a/hermes_cli/sessions_native_startup.py b/hermes_cli/sessions_native_startup.py
+index 60859832a06..f02388eaf67 100644
+--- a/hermes_cli/sessions_native_startup.py
++++ b/hermes_cli/sessions_native_startup.py
+@@ -5,9 +5,12 @@
+ """
+ import asyncio
+ from contextlib import asynccontextmanager
++from contextvars import copy_context
+ import inspect
++import logging
+ import os
+ import sys
++import threading
+ from types import SimpleNamespace
+ 
+ from fastapi import HTTPException
+@@ -17,7 +20,7 @@
+ from hermes_cli.fact_feed import ChangeFeed
+ from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
+ from hermes_cli.fact_store import FactStore
+-from hermes_cli.sessions_fact_routes import use
++from hermes_cli.sessions_fact_routes import PENDING_NATIVE, use
+ from hermes_cli.sessions_native_source import SessionsSource
+ 
+ 
+@@ -34,6 +37,23 @@
+         self.source = SessionsSource(self.store, SourceId(self.scope, 'sessions.display', 'canonical'),
+                                      paths, self.capture, reconcile=self.reconcile)
+         self.generation = 0
++        self.ready = False
++        self._stopping = False
++        self._bootstrap = None
++
++    def start_background(self):
++        context = copy_context()
++
++        def bootstrap():
++            try:
++                self.start()
++            except Exception:  # health: allow BLE001 -- isolate surface startup; retain owner for shutdown drain
++                logging.getLogger(__name__).exception('sessions bootstrap unavailable; custody retained')
++
++        # health: allow HX012 -- explicit copy_context keeps profile scope without importing the agent facade
++        self._bootstrap = threading.Thread(target=lambda: context.run(bootstrap),
++                                           name='sessions-bootstrap', daemon=True)
++        self._bootstrap.start()
+ 
+     def reconcile(self):
+         # Profiles introduced after boot use 30s reconciliation until next boot
+@@ -84,18 +104,31 @@
+             selector = selector_for(inspect.signature(self.profiles.get_profiles_sessions), (), {})
+             self.demand(self.scope, 'sessions', selector)
+             with self.store._condition:
+-                if not self.store._condition.wait_for(
+-                        lambda: isinstance(self.store.snapshot(self.scope).view('sessions', selector), Ready), timeout=15):
+-                    raise TimeoutError('sessions bootstrap unavailable; activation refused')
+-            self.lifecycle.report_ready('sessions', self.scope)
+-            self.generation += 1
+-            self.lifecycle.transition('sessions', self.scope, 'facts', self.generation)
++                # Readiness gates this surface, not the server socket. An over-
++                # budget cold capture remains unavailable and retries normally.
++                self.store._condition.wait_for(lambda: self._stopping or isinstance(
++                    self.store.snapshot(self.scope).view('sessions', selector), Ready))
++                if self._stopping:
++                    return self
++                self.lifecycle.report_ready('sessions', self.scope)
++                self.generation += 1
++                self.lifecycle.transition('sessions', self.scope, 'facts', self.generation)
++                self.ready = True
+         except BaseException:
+-            self.close()
++            if self._bootstrap is None:
++                self.close()
+             raise
+         return self
+ 
+     def close(self):
++        with self.store._condition:
++            self.ready = False
++            self._stopping = True
++            self.store._condition.notify_all()
++        if self._bootstrap is not None:
++            self._bootstrap.join(5)
++            if self._bootstrap.is_alive():
++                raise TimeoutError('sessions bootstrap did not stop; custody retained')
+         if self.binding is not None:
+             self.generation += 1
+             self.lifecycle.transition('sessions', self.scope, 'legacy', self.generation)
+@@ -121,7 +154,8 @@
+         if scope['type'] != 'http':
+             return await self.app(scope, receive, send)
+         runtime = getattr(scope['app'].state, 'sessions_facts', None)
+-        with use(runtime.binding if runtime is not None else None):
++        binding = None if runtime is None else (runtime.binding if runtime.ready else PENDING_NATIVE)
++        with use(binding):
+             await self.app(scope, receive, send)
+ 
+ 
+@@ -141,7 +175,7 @@
+     runtime = SessionsRuntime(profiles, targets)
+     app.state.sessions_facts = runtime  # custody survives a failed startup/unwind
+     try:
+-        await asyncio.to_thread(runtime.start)
++        runtime.start_background()
+         yield
+     finally:
+         await asyncio.to_thread(runtime.close)
+diff --git a/tests/hermes_cli/test_annotation_prepare_lifespan.py b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+index a58ad267db3..72b14f99e7f 100644
+--- a/tests/hermes_cli/test_annotation_prepare_lifespan.py
++++ b/tests/hermes_cli/test_annotation_prepare_lifespan.py
+@@ -7,6 +7,7 @@
+ from hermes_cli.fact_annotation_startup import binding_for
+ from tests.hermes_cli import test_kanban_session_activity as helpers
+ from tests.hermes_cli.annotation_fact_processes import request_guard
++from tests.waiting import wait_until
+ 
+ kanban_root = helpers.kanban_root
+ 
+@@ -96,6 +97,7 @@
+         with TestClient(web_server.app) as client:
+             client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+             assert binding_for() is not None
++            assert wait_until(lambda: web_server.app.state.sessions_facts.ready, timeout=10)
+             assert web_server.app.state.sessions_facts.binding._mode == 'facts'
+             response = client.get('/api/profiles/sessions')
+             assert response.status_code == 200
+diff --git a/tests/hermes_cli/test_sessions_cold_bootstrap.py b/tests/hermes_cli/test_sessions_cold_bootstrap.py
+new file mode 100644
+index 00000000000..c713e6562e1
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_cold_bootstrap.py
+@@ -0,0 +1,250 @@
++"""Cold canonical enrichment must not gate the entire HTTP lifespan. [daveey]"""
++import asyncio
++from contextlib import asynccontextmanager
++import threading
++
++import httpx
++import pytest
++
++from hermes_cli.web_routers import profiles
++from hermes_cli.sessions_native_startup import lifespan
++from tests.hermes_cli import test_profiles_sidebar_scope as helpers
++from tests.waiting import wait_until
++
++profiles_on_disk = helpers.profiles_on_disk
++_seed_session = helpers._seed_session
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.mark.asyncio
++async def test_real_lifespan_serves_while_canonical_annotation_is_cold(profiles_on_disk, monkeypatch):
++    from hermes_cli import web_server, web_server_app
++
++    entered, release = threading.Event(), threading.Event()
++    original = profiles.annotate_kanban_activity
++
++    def delayed(rows, *args, **kwargs):
++        entered.set()
++        assert release.wait(10), 'test must release canonical annotation'
++        return original(rows, *args, **kwargs)
++
++    @asynccontextmanager
++    async def quiet_services(app):
++        yield
++
++    monkeypatch.setattr(profiles, 'annotate_kanban_activity', delayed)
++    monkeypatch.setattr(web_server_app, 'standalone_lifespan', quiet_services)
++    monkeypatch.setenv('HERMES_FACTS_LINKS', '0')
++    monkeypatch.setenv('HERMES_FACTS_ANNOTATION', '0')
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    _seed_session(profiles_on_disk['default'], 'cold-entry', source='cli')
++    app = web_server.app
++    context = app.router.lifespan_context(app)
++    opening = asyncio.create_task(context.__aenter__())
++    started = False
++    try:
++        assert await asyncio.to_thread(entered.wait, 5)
++        done, _ = await asyncio.wait({opening}, timeout=2)
++        assert opening in done, 'cold annotation blocked the entire serve lifespan'
++        await opening
++        started = True
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test',
++                headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN}) as client:
++            assert (await client.get('/api/health')).status_code == 200
++            for path in ('/api/profiles/sessions', '/api/profiles/sessions/sidebar',
++                         '/api/profiles/sessions/stamps?profile=default&ids=cold-entry'):
++                pending = await client.get(path)
++                assert pending.status_code == 503
++                assert pending.headers['retry-after'] == '1'
++                assert 'unavailable' in pending.text
++            release.set()
++            from tests.waiting import wait_until
++            assert await asyncio.to_thread(wait_until,
++                lambda: app.state.sessions_facts.binding is not None
++                and app.state.sessions_facts.binding._mode == 'facts', timeout=8)
++            response = await client.get('/api/profiles/sessions')
++            assert response.status_code == 200
++            assert any(row['id'] == 'cold-entry' for row in response.json()['sessions'])
++            assert (await client.get('/api/profiles/sessions?profile=foreign')).status_code == 404
++    finally:
++        release.set()
++        if not started:
++            await opening
++        await context.__aexit__(None, None, None)
++    assert app.state.sessions_facts is None
++
++
++@pytest.mark.asyncio
++async def test_cold_shutdown_retains_real_capture_custody(profiles_on_disk, monkeypatch):
++    from fastapi import FastAPI
++    from tests.waiting import wait_until
++
++    entered, release = threading.Event(), threading.Event()
++    original = profiles.annotate_kanban_activity
++
++    def delayed(rows, *args, **kwargs):
++        entered.set()
++        assert release.wait(15)
++        return original(rows, *args, **kwargs)
++
++    monkeypatch.setattr(profiles, 'annotate_kanban_activity', delayed)
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    _seed_session(profiles_on_disk['default'], 'shutdown-entry', source='cli')
++    app = FastAPI()
++    context = lifespan(app)
++    await context.__aenter__()
++    runtime = app.state.sessions_facts
++    try:
++        assert await asyncio.to_thread(entered.wait, 5)
++        with pytest.raises(TimeoutError, match='source capture did not stop'):
++            await context.__aexit__(None, None, None)
++        assert app.state.sessions_facts is runtime
++        assert not runtime.ready
++        assert not runtime._bootstrap.is_alive()
++        assert runtime.feed._thread.is_alive()
++        assert runtime.binding is not None
++        with pytest.raises(RuntimeError, match='custody retained'):
++            async with lifespan(app):
++                pytest.fail('retained native owner was replaced')
++    finally:
++        release.set()
++        assert await asyncio.to_thread(wait_until, lambda: not runtime.feed._thread.is_alive(), timeout=5)
++        await asyncio.to_thread(runtime.close)
++    assert runtime.binding is None
++    assert not runtime.ready  # late canonical completion cannot activate after stop
++
++
++@pytest.mark.asyncio
++async def test_unavailable_capture_retries_without_replacing_owner(profiles_on_disk, monkeypatch):
++    from fastapi import FastAPI
++    from hermes_cli.sessions_native_startup import SessionsMiddleware
++    from hermes_cli.fact_contract import Unavailable
++    from tests.hermes_cli.test_sessions_native_startup import selected
++
++    failed = threading.Event()
++    original = profiles.annotate_kanban_activity
++
++    def first_unavailable(rows, *args, **kwargs):
++        if not failed.is_set():
++            failed.set()
++            raise OSError('cold optional enrichment unavailable')
++        return original(rows, *args, **kwargs)
++
++    monkeypatch.setattr(profiles, 'annotate_kanban_activity', first_unavailable)
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    _seed_session(profiles_on_disk['default'], 'retry-entry', source='cli')
++    app = FastAPI()
++    app.add_middleware(SessionsMiddleware)
++    app.include_router(profiles.sessions_router)
++    async with lifespan(app):
++        runtime = app.state.sessions_facts
++        assert await asyncio.to_thread(wait_until, lambda: isinstance(
++            runtime.store.snapshot(runtime.scope).view('sessions', selected()), Unavailable), timeout=5)
++        assert runtime.feed._budget.max_seconds == 5
++        assert not runtime.ready
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
++            assert (await client.get('/api/profiles/sessions')).status_code == 503
++            assert await asyncio.to_thread(wait_until, lambda: runtime.ready, timeout=10)
++            response = await client.get('/api/profiles/sessions')
++            assert response.status_code == 200
++            assert any(row['id'] == 'retry-entry' for row in response.json()['sessions'])
++        assert app.state.sessions_facts is runtime
++    assert not runtime._bootstrap.is_alive()
++    assert not runtime.feed._thread.is_alive()
++
++
++@pytest.mark.asyncio
++async def test_failed_bootstrap_before_binding_never_admits_legacy(profiles_on_disk, monkeypatch):
++    from fastapi import FastAPI
++    from hermes_cli.sessions_native_startup import SessionsMiddleware, SessionsRuntime
++
++    def fail(self):
++        raise OSError('native initialization failed before binding')
++
++    monkeypatch.setattr(SessionsRuntime, 'start', fail)
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    app = FastAPI()
++    app.add_middleware(SessionsMiddleware)
++    app.include_router(profiles.sessions_router)
++    async with lifespan(app):
++        runtime = app.state.sessions_facts
++        assert await asyncio.to_thread(wait_until, lambda: not runtime._bootstrap.is_alive(), timeout=5)
++        assert runtime.binding is None
++        monkeypatch.setattr(profiles, '_profile_targets', lambda *a: pytest.fail('legacy request I/O'))
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
++            for path in ('sessions', 'sessions/sidebar', 'sessions/stamps?profile=default&ids=missing'):
++                response = await client.get('/api/profiles/' + path)
++                assert response.status_code == 503
++                assert 'unavailable' in response.text
++    assert app.state.sessions_facts is None
++
++
++@pytest.mark.asyncio
++async def test_cold_capture_beyond_old_bootstrap_deadline_eventually_ready(profiles_on_disk, monkeypatch):
++    from fastapi import FastAPI
++
++    entered, release = threading.Event(), threading.Event()
++    original = profiles.annotate_kanban_activity
++
++    def delayed(rows, *args, **kwargs):
++        if not entered.is_set():
++            entered.set()
++            assert release.wait(25)
++        return original(rows, *args, **kwargs)
++
++    monkeypatch.setattr(profiles, 'annotate_kanban_activity', delayed)
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    _seed_session(profiles_on_disk['default'], 'slow-entry', source='cli')
++    app = FastAPI()
++    async with lifespan(app):
++        runtime = app.state.sessions_facts
++        try:
++            assert await asyncio.to_thread(entered.wait, 5)
++            # Real elapsed time crosses capture5s and old bootstrap15s without
++            # replacing clocks or relaxing the source's capture budget.
++            await asyncio.to_thread(threading.Event().wait, 16)
++            assert runtime._bootstrap.is_alive()
++            assert not runtime.ready
++            release.set()
++            assert await asyncio.to_thread(wait_until, lambda: runtime.ready, timeout=40)
++            assert runtime.feed._budget.max_seconds == 5
++        finally:
++            release.set()
++    assert app.state.sessions_facts is None
++
++
++@pytest.mark.asyncio
++async def test_bootstrap_initialization_join_failure_retains_custody(profiles_on_disk, monkeypatch):
++    from fastapi import FastAPI
++    from hermes_cli.sessions_native_startup import SessionsRuntime
++
++    entered, release = threading.Event(), threading.Event()
++    original = SessionsRuntime.start
++
++    def delayed(self):
++        entered.set()
++        assert release.wait(15)
++        return original(self)
++
++    monkeypatch.setattr(SessionsRuntime, 'start', delayed)
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    _seed_session(profiles_on_disk['default'], 'initializing-entry', source='cli')
++    app = FastAPI()
++    context = lifespan(app)
++    await context.__aenter__()
++    runtime = app.state.sessions_facts
++    try:
++        assert await asyncio.to_thread(entered.wait, 5)
++        with pytest.raises(TimeoutError, match='sessions bootstrap did not stop'):
++            await context.__aexit__(None, None, None)
++        assert app.state.sessions_facts is runtime
++        assert runtime._bootstrap.is_alive()
++        assert runtime.feed is None
++    finally:
++        release.set()
++        assert await asyncio.to_thread(wait_until, lambda: not runtime._bootstrap.is_alive(), timeout=5)
++        await asyncio.to_thread(runtime.close)
++    assert not runtime.ready
++    assert runtime.binding is None
++    assert runtime.feed is not None
++    assert not runtime.feed._thread.is_alive()
+diff --git a/tests/hermes_cli/test_sessions_native_startup.py b/tests/hermes_cli/test_sessions_native_startup.py
+index 67e071fc723..0e5a34dd9c3 100644
+--- a/tests/hermes_cli/test_sessions_native_startup.py
++++ b/tests/hermes_cli/test_sessions_native_startup.py
+@@ -152,6 +152,7 @@
+     monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
+     for _ in range(2):
+         async with lifespan(app):
++            assert await asyncio.to_thread(wait_until, lambda: app.state.sessions_facts.ready, timeout=10)
+             assert app.state.sessions_facts.binding._mode == 'facts'
+         assert app.state.sessions_facts is None
+ 
+@@ -172,6 +173,7 @@
+     helpers._seed_session(profiles_on_disk['default'], 'app-entry', source='cli')
+     with TestClient(web_server.app) as client:
+         client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
++        assert wait_until(lambda: web_server.app.state.sessions_facts.ready, timeout=10)
+         assert web_server.app.state.sessions_facts.binding._mode == 'facts'
+         response = client.get('/api/profiles/sessions')
+         assert response.status_code == 200
+-- 
+2.43.0
+

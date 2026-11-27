@@ -1,0 +1,275 @@
+From bc920521a8cace459c3e4371bc8d555a17013951 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:55:01 -0800
+Subject: [PATCH 5995] Kanban admission and display read-cost reductions
+
+Public mirror of source commit bc920521a8cace459c3e4371bc8d555a17013951.
+
+---
+diff --git a/hermes_cli/kanban_links_associations.py b/hermes_cli/kanban_links_associations.py
+index 4467924f0ab..622836d8678 100644
+--- a/hermes_cli/kanban_links_associations.py
++++ b/hermes_cli/kanban_links_associations.py
+@@ -15,3 +15,19 @@
+     with closing(_open_ro(path, timeout=0.5)) as conn, _execution_transaction(conn):
+         conn.row_factory = sqlite3.Row
+         return list(select_listed_local_tasks(conn, ids, statuses).values())
++
++
++def pairs(path, ids, statuses):
++    """Every listed ``(session, task)`` association of ``ids`` on ``path`` in one read: ``[{"session", "id"}]``.
++
++    [daveey] The receipt dedup asked ``read(path, [sid])`` once per alias, each through its own guarded connection:
++    substantial repeated work under ``_links_lock``. A session is
++    associated with a task here exactly when ``read(path, [session])`` would list it (creator or counted
++    subscriber, listed status, not a watch). Same connection ownership and optional-subscriptions boundary."""
++    from hermes_cli.kanban_session_activity import _execution_transaction, _open_ro
++    from hermes_cli.kanban_session_outcome_tasks import select_listed_local_task_set
++
++    with closing(_open_ro(path, timeout=0.5)) as conn, _execution_transaction(conn):
++        conn.row_factory = sqlite3.Row
++        _found, members = select_listed_local_task_set(conn, ids, statuses, strict=False)
++        return [{"session": sid, "id": tid} for sid, tid in members]
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index c58fc73e598..8ebdb573711 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -62,6 +62,7 @@
+ import os
+ import sqlite3
+ import threading
++from collections import OrderedDict
+ import time
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Iterator
+@@ -844,6 +845,45 @@
+     return _revision.content_key(path, tables, lambda p: cached_ro(p, busy_budget=0))
+ 
+ 
++# [daveey] Last good association task ids per (board, alias) for the links dedup. The batched read's busy memo is
++# keyed by the whole alias set, which moves whenever a receipt is added or released; this per-alias memo keeps the
++# old tolerance: a busy board is answered stale when every alias it is asked about has been read before.
++_ASSOCIATION_MEMO_MAX = 4096
++_association_memo: OrderedDict[tuple[str, str], frozenset[str]] = OrderedDict()
++_association_memo_lock = threading.Lock()
++
++
++def _association_pairs(path: Path, sids: set[str]) -> set[tuple[str, str]]:
++    """Every listed ``(alias, task)`` association of ``sids`` on ``path``: one read per board. On a busy board with
++    no memo for this exact alias set, answered from each alias's last good read (stale) when every alias has one;
++    otherwise the busy error propagates (fail fast: the caller holds ``_links_lock``, failures are not cached)."""
++    from hermes_cli.kanban_links_associations import pairs
++    ordered = sorted(sids)
++    try:
++        # no deadline: never wait out a busy board while the caller holds _links_lock
++        found = {(p['session'], p['id']) for p in _busy.session_tasks(
++            path, ordered, LISTED_STATUSES, pairs, memo_namespace="links")}
++    except sqlite3.OperationalError as exc:
++        if not _busy.is_busy(exc):
++            raise
++        with _association_memo_lock:
++            last = [_association_memo.get((str(path), sid)) for sid in ordered]
++        if any(entry is None for entry in last):
++            raise
++        return {(sid, tid) for sid, tids in zip(ordered, last) for tid in tids}
++    by_sid: dict[str, set[str]] = {sid: set() for sid in ordered}
++    for sid, tid in found:
++        by_sid.setdefault(sid, set()).add(tid)
++    with _association_memo_lock:
++        for sid, tids in by_sid.items():
++            key = (str(path), sid)
++            _association_memo.pop(key, None)
++            _association_memo[key] = frozenset(tids)
++        while len(_association_memo) > _ASSOCIATION_MEMO_MAX:
++            _association_memo.popitem(last=False)
++    return found
++
++
+ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+                                    profile: str) -> list[dict[str, Any]]:
+     """Prefer exact local open associations, without inferring receipt release.
+@@ -856,17 +896,15 @@
+         return rows
+     boards = {_board_slug(p): p for p in _board_db_paths()}
+     represented = set()
+-    # Receipt fan-out often repeats the same board/session. Read each alias once
+-    # per projection, without extending freshness or sharing across profiles.
+-    task_ids: dict[tuple[Path, str], set[str]] = {}
+-
+-    def contains(path: Path, sid: str, task_id: str) -> bool:
+-        key = (path, sid)
+-        if key not in task_ids:  # no deadline: never wait out a busy board while the caller holds _links_lock
+-            from hermes_cli.kanban_links_associations import read
+-            task_ids[key] = {t['id'] for t in _busy.session_tasks(
+-                path, [sid], LISTED_STATUSES, read, memo_namespace="links")}
+-        return task_id in task_ids[key]
++    # [daveey] One association read per board for every alias the local receipts name (it was one guarded
++    # connection per board/alias: a third of each projection, under _links_lock). Request-local: never extends
++    # freshness or shares evidence across profiles.
++    wanted: dict[Path, set[str]] = {}
++    for row in local:
++        path = boards.get(row['board'])
++        if path is not None:
++            wanted.setdefault(path, set()).update((row['session'], row['origin_session']))
++    members = {path: _association_pairs(path, sids) for path, sids in wanted.items()}
+ 
+     for row in local:
+         path = boards.get(row['board'])
+@@ -874,7 +912,7 @@
+             continue
+         aliases = {row['session'], row['origin_session']}
+         # Require coverage of every receipt alias, not just a matching task id.
+-        if all(contains(path, sid, row['id']) for sid in aliases):
++        if all((sid, row['id']) in members[path] for sid in aliases):
+             represented.add((row['key'], row['session'], row['origin_session']))
+     return [row for row in rows
+             if (row['key'], row['session'], row['origin_session']) not in represented]
+@@ -1908,6 +1946,8 @@
+     with _pairs_lock:
+         _board_memo.clear()
+     _busy.reset()
++    with _association_memo_lock:
++        _association_memo.clear()
+     with _links_lock:
+         _links_cache.clear()
+         _links_tickets.reset()
+diff --git a/tests/hermes_cli/test_kanban_links_association_reader.py b/tests/hermes_cli/test_kanban_links_association_reader.py
+index bb96a73983c..70c41433047 100644
+--- a/tests/hermes_cli/test_kanban_links_association_reader.py
++++ b/tests/hermes_cli/test_kanban_links_association_reader.py
+@@ -103,3 +103,89 @@
+             busy.session_tasks(board, ['tip'], ('running',), unavailable, memo_namespace='links')
+     finally:
+         busy.reset()
++
++
++def test_pairs_match_the_per_session_read_for_every_alias(tmp_path):
++    """One batched read answers exactly what ``read(path, [sid])`` answers for each sid: creator and counted
++    subscriber per session, listed statuses only."""
++    from hermes_cli.kanban_links_associations import pairs, read
++
++    board = tmp_path / 'kanban.db'
++    conn = fixtures._connect(board)
++    for tid, status, sid in [('open', 'running', 'tip'), ('done', 'done', 'tip'), ('sub', 'blocked', 'elsewhere'),
++                             ('other', 'ready', 'elsewhere'), ('third', 'ready', 'old'),
++                             ('watch', 'scheduled', 'tip'), ('sched', 'scheduled', 'tip')]:
++        fixtures._insert_task(conn, tid, status, sid)
++    fixtures._sub(conn, 'sub', 'tip', 'created')
++    fixtures._sub(conn, 'open', 'old', 'created')
++    fixtures._sub(conn, 'other', 'tip', 'touch')  # notice-only provenance: not the chat's work
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES "
++                 "('watch', 'scheduled', '{\"watch\": 1}', 1.0), ('sched', 'scheduled', '{}', 1.0)")
++    conn.commit()
++    conn.close()
++    sids = ['tip', 'elsewhere', 'old', 'nobody']
++    got = {(p['session'], p['id']) for p in pairs(board, sids, activity.LISTED_STATUSES)}
++    expected = {(sid, t['id']) for sid in sids for t in read(board, [sid], activity.LISTED_STATUSES)}
++    assert got == expected
++    assert ('tip', 'sub') in got and ('old', 'open') in got and ('tip', 'done') not in got
++    assert ('tip', 'other') not in got, 'an uncounted (touch) subscription was listed'
++    if 'scheduled' in activity.LISTED_STATUSES:
++        assert ('tip', 'sched') in got and ('tip', 'watch') not in got, 'a watch park was listed'
++
++
++def test_pairs_reader_closes_its_connection_even_on_failure(tmp_path, monkeypatch):
++    from hermes_cli import kanban_links_associations as associations
++    from hermes_cli import kanban_session_outcome_tasks as selection
++
++    board = tmp_path / 'kanban.db'
++    fixtures._connect(board).close()
++    readers = []
++    real_open = activity._open_ro
++
++    def capture(*args, **kwargs):
++        conn = real_open(*args, **kwargs)
++        readers.append(conn)
++        return conn
++
++    monkeypatch.setattr(activity, '_open_ro', capture)
++    assert associations.pairs(board, ['tip'], activity.LISTED_STATUSES) == []
++
++    def fail(*args, **kwargs):
++        raise ValueError('selection failed')
++
++    monkeypatch.setattr(selection, 'select_listed_local_task_set', fail)
++    with pytest.raises(ValueError, match='selection failed'):
++        associations.pairs(board, ['tip'], activity.LISTED_STATUSES)
++    assert len(readers) == 2
++    for conn in readers:
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            conn.execute('SELECT 1')
++
++
++def test_busy_board_answers_a_new_alias_set_from_each_aliases_last_read(tmp_path, monkeypatch):
++    """The batched read's memo is keyed by the whole alias set; a receipt released (smaller set) on a busy board
++    must still be answered from the per-alias last reads, as the per-alias reader was. An alias never read raises."""
++    from hermes_cli import kanban_links_associations as associations
++    from hermes_cli import kanban_generation as gen
++
++    board = tmp_path / 'kanban.db'
++    monkeypatch.setattr(activity, '_board_db_paths', lambda: [board])
++    activity._reset_cache_for_tests()
++    try:
++        monkeypatch.setattr(associations, 'pairs', lambda path, ids, statuses: [
++            {'session': 'tip', 'id': 'open'}, {'session': 'old', 'id': 'open'}])
++        row = dict(gateway='gw', profile='default', board='default', id='open',
++                   key='gw/default/default/open', session='tip', origin_session='old')
++        assert activity._without_local_open_duplicates([row], gateway='gw', profile='default') == []
++
++        def busy(*args):
++            raise gen.BoardLifecycleBusy()
++
++        monkeypatch.setattr(associations, 'pairs', busy)
++        released = {**row, 'origin_session': 'tip'}  # alias set {'tip'}: no memo for this exact key
++        assert activity._without_local_open_duplicates([released], gateway='gw', profile='default') == []
++        unseen = {**row, 'origin_session': 'never-read'}
++        with pytest.raises(sqlite3.OperationalError):
++            activity._without_local_open_duplicates([unseen], gateway='gw', profile='default')
++    finally:
++        activity._reset_cache_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_local_dedup_cost.py b/tests/hermes_cli/test_kanban_local_dedup_cost.py
+index 9ea392e6859..e2098144638 100644
+--- a/tests/hermes_cli/test_kanban_local_dedup_cost.py
++++ b/tests/hermes_cli/test_kanban_local_dedup_cost.py
+@@ -3,24 +3,28 @@
+ from hermes_cli import kanban_links_associations as associations
+ 
+ 
+-def test_repeated_receipts_read_each_board_alias_once(monkeypatch, tmp_path):
+-    board = tmp_path / 'kanban.db'
++def test_repeated_receipts_read_each_board_once_for_all_aliases(monkeypatch, tmp_path):
++    """One guarded connection per board/alias repeated projection work under _links_lock.
++    Every alias on a board is now one read; membership stays per alias."""
++    board, other = tmp_path / 'kanban.db', tmp_path / 'boards' / 'b2' / 'kanban.db'
+     calls = []
+-    monkeypatch.setattr(activity, '_board_db_paths', lambda: [board])
++    monkeypatch.setattr(activity, '_board_db_paths', lambda: [board, other])
++    monkeypatch.setattr(activity, '_board_slug', lambda p: 'default' if p == board else 'b2')
+ 
+-    def read(path, ids, statuses):
++    def pairs(path, ids, statuses):
+         calls.append((path, tuple(ids)))
+-        return [{'id': 'open'}] if ids == ['tip'] else []
++        return [{'session': 'tip', 'id': 'open'}] if path == board else []
+ 
+-    monkeypatch.setattr(associations, 'read', read)
++    monkeypatch.setattr(associations, 'pairs', pairs)
+     rows = [dict(gateway='gw', profile='default', board='default', id='open',
+                  key='gw/default/default/open', session='tip', origin_session='tip')
+             for _ in range(20)]
+-    # An unrepresented receipt alias and a foreign profile must survive.
+-    retained = [{**rows[0], 'origin_session': 'old'}, {**rows[0], 'profile': 'other', 'key': 'gw/other/default/open'}]
++    # An unrepresented receipt alias, a foreign profile and another board's unlisted receipt must survive.
++    retained = [{**rows[0], 'origin_session': 'old'}, {**rows[0], 'profile': 'other', 'key': 'gw/other/default/open'},
++                {**rows[0], 'board': 'b2', 'key': 'gw/default/b2/open'}]
+     result = activity._without_local_open_duplicates(rows + retained, gateway='gw', profile='default')
+     assert result == retained
+-    assert len(calls) == 2
++    assert sorted(calls) == sorted([(board, ('old', 'tip')), (other, ('tip',))]), 'not one read per board'
+     # Request-local only: changed board state must be consulted on the next call.
+-    monkeypatch.setattr(associations, 'read', lambda *args: [])
++    monkeypatch.setattr(associations, 'pairs', lambda *args: [])
+     assert activity._without_local_open_duplicates(rows, gateway='gw', profile='default') == rows
+-- 
+2.43.0
+

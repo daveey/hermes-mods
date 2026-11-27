@@ -1,0 +1,1071 @@
+From 683685c9fd4b6cbec079e34aa39c10e04d76823f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 02:40:58 +0000
+Subject: [PATCH 6330] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit 683685c9fd4b6cbec079e34aa39c10e04d76823f.
+
+---
+diff --git a/hermes_cli/kanban_annotation_done_inputs.py b/hermes_cli/kanban_annotation_done_inputs.py
+new file mode 100644
+index 00000000000..1131631855f
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_done_inputs.py
+@@ -0,0 +1,67 @@
++"""Explicit semantic inputs for registered done checks (same contract as waiting-source ``inputs``). [daveey]
++
++``register_done_check(..., inputs=callable)`` declares that ``inputs()`` returns a JSON-portable value that changes
++whenever ``fn(card)`` could answer differently for an unchanged card: every database, clock and other dependency
++must be in it. ``[]`` / ``{}`` are valid and mean "no dependency beyond the card". The callback may read databases
++in the native holder but never waits on events. A check without a declaration, or whose callback raises, returns
++None or yields a non-portable value, makes the whole key a fresh unequal ``object()``: callers must then recompute
++(or fall back to raw signatures). A declaration is bound to the exact ``fn`` it was registered with, so a replacement
++closure under the same name is undeclared until it declares itself.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++_log = logging.getLogger("hermes_cli.kanban_session_activity")
++_UNDECLARED = "undeclared"
++# name -> (fn, inputs)
++_declared: dict[str, tuple[Any, Any]] = {}
++
++
++def declaration(name: str, fn, inputs) -> None:
++    """Bind ``inputs`` to exactly ``fn``; ``fn`` or ``inputs`` None (or not callable) removes the declaration."""
++    if fn is None or inputs is None or not callable(inputs):
++        _declared.pop(name, None)
++    else:
++        _declared[name] = (fn, inputs)
++
++
++def dispose(name: str, fn) -> None:
++    """Remove ``name``'s declaration only while it still belongs to ``fn`` (replacement-safe)."""
++    current = _declared.get(name)
++    if current is not None and current[0] is fn:
++        _declared.pop(name, None)
++
++
++def inputs(checks: dict[str, Any]) -> tuple[list, bool]:
++    """``([[name, code id, inputs or "undeclared"]...], complete)``; never raises."""
++    from hermes_cli import kanban_annotation_host as host
++
++    out: list = []
++    complete = True
++    for name in sorted(checks):
++        fn = checks[name]
++        declared = _declared.get(name)
++        if declared is None or declared[0] is not fn:
++            out.append([name, host._code_id(fn), _UNDECLARED])
++            complete = False
++            continue
++        try:
++            value = declared[1]()
++            if value is None:
++                raise ValueError("None is not an explicit declaration")
++            out.append([name, host._code_id(fn), host._portable(value)])
++        except Exception:  # health: allow BLE001 -- a provider callback may raise anything; the key is then unknown
++            _log.debug("done check inputs failed for %s", name, exc_info=True)
++            out.append([name, host._code_id(fn), _UNDECLARED])
++            complete = False
++    return out, complete
++
++
++def key(checks: dict[str, Any]) -> object:
++    """Comparable key when every check is explicitly declared and portable, else a fresh unequal object."""
++    values, complete = inputs(dict(checks))
++    # Code identity alone does not distinguish two closures from the same source: keep the fn objects too.
++    return (tuple(sorted(checks.items(), key=lambda kv: kv[0])), values) if complete else object()
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index 2a64c3e045b..e0557e2282a 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -16,10 +16,9 @@
+   seconds and that cache bounds them by its TTL instead. Keying links on them forced a
+   full ledger projection under ``_links_lock`` on nearly every wake,
+   delaying strict links readers including the Desktop action queue;
+-- ``attention``: the boards' notify revisions (``revision``, not the projection counter) and the files the
+-  done checks declared (a declared board or sync replica by that same notify revision, never its stat and never
+-  the projection counter). A done check is plugin code and may select any event kind, so this key cannot be the
+-  projection counter.
++- ``attention``: an independent revision over its selected board tables plus complete semantic done-check
++  declarations. Path-only database dependencies, missing declarations and provider errors force a fresh read;
++  arbitrary plugin event or comment dependencies cannot be inferred from the built-in attention table set.
+ 
+ Plain inputs are everything else the holder watches for the scope (state.db, the hub database, config files, the
+ mutation cue), keyed by ``kanban_annotation_watch.signature`` (stat, header change counter, WAL-index header). A
+@@ -116,30 +115,41 @@
+ 
+ 
+ def _done_key(scope: tuple[str, ...], wall: float) -> object:
+-    """The done checks' declared inputs; unequal to everything while any check is undeclared.
+-
+-    A declared board is left out: the attention key carries every board's notify revision. A declared sync
+-    replica is keyed by that same counter (``revision``), not the projection counter: a done check is plugin
+-    code and may select any event kind. Both files are rewritten several times a second by bookkeeping (claims,
+-    heartbeats, pull stamps) that moves no row a reader selects, and a stat key over them would rerun every done
+-    check on each of those writes. A replica whose revision cannot vouch (no counter and a stat not yet settled,
+-    or unreadable) makes the key unequal to everything. Any other declared file is keyed by its change signature."""
++    """Complete semantic declarations, or fresh fallback for unknown database inputs.
++
++    File-only legacy declarations retain their literal change signatures; a path alone cannot certify which
++    database columns an arbitrary plugin reads. Complete ``inputs`` callbacks take precedence over paths.
++    """
+     from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_annotation_done_inputs as declared_inputs
+     from hermes_cli import kanban_session_activity as ksa
+ 
++    checks = dict(ksa._done_checks)
++    if any(name in declared_inputs._declared for name in checks):
++        # Explicit complete dependencies supersede broad path signatures. A mixed,
++        # missing, malformed or failed declaration cannot certify suppression.
++        return declared_inputs.key(checks)
+     paths: set[str] = set()
+-    for name, fn in sorted(ksa._done_checks.items()):
++    for name, fn in sorted(checks.items()):
+         declared = host._done_event_sources.get(name)
+         if declared is None or declared[0] is not fn:
+             return object()
+         paths.update(str(p) for p in declared[1]())
+-    paths -= {str(p) for p in ksa._board_db_paths()}
+-    shadow_dir = _replica_dir()
+-    replicas = sorted(p for p in paths if p.endswith(".db") and os.path.dirname(p) == shadow_dir)
+-    content = tuple((p, ksa._board_content_key(Path(p), ksa._revision.SHADOW_TABLES)) for p in replicas)
+-    if not ksa._revalidate.revalidatable(content, wall):
+-        return object()
+-    return (tuple(sorted(ksa._done_checks.items())), content, _signature(scope, paths - set(replicas)))
++    # Path-only providers may select arbitrary comments, heartbeat events or
++    # uncovered tables. Only literal signatures cover that contract.
++    if any(p.endswith('.db') for p in paths):
++        return object()  # no complete semantic declaration: never suppress a DB-dependent check
++    return (tuple(sorted(checks.items())), _signature(scope, paths))
++
++
++def _part_fingerprint(part: str, *, shadows: bool = False) -> tuple:
++    from hermes_cli import kanban_annotation_revision as revision
++    from hermes_cli import kanban_session_activity as ksa
++
++    paths = ksa._replica_paths() if shadows else ksa._board_db_paths()
++    values = tuple((str(p), revision.content_key(p, part)) for p in paths)
++    hub = None if shadows else ksa._hub_db_path()
++    return values + ((ksa._hub_content_signature(hub),) if hub is not None else ())
+ 
+ 
+ def keys(scope: tuple[str, ...]) -> dict[str, object] | None:
+@@ -147,15 +157,13 @@
+     from hermes_cli import kanban_session_activity as ksa
+ 
+     wall = time.time()
+-    counts_local = ksa._activity_fingerprint(include_shadows=False)
+-    links_local = ksa._activity_fingerprint(include_shadows=False, projection=True)
+-    shadows = ksa._shadow_fingerprint()
+-    if not ksa._revalidate.revalidatable(counts_local + shadows, wall):
+-        return None
++    counts_local = _part_fingerprint(COUNTS)
++    links_local = _part_fingerprint(LINKS)
++    shadows = _part_fingerprint(COUNTS, shadows=True)
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+     return {COUNTS: (counts_local, shadows, ledger, plain), LINKS: (links_local, ledger),
+-            ATTENTION: (counts_local, _done_key(scope, wall)), WAITING: _waiting_key()}
++            ATTENTION: (_part_fingerprint(ATTENTION), _done_key(scope, wall)), WAITING: _waiting_key()}
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+diff --git a/hermes_cli/kanban_annotation_revision.py b/hermes_cli/kanban_annotation_revision.py
+new file mode 100644
+index 00000000000..28a5a349ae0
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_revision.py
+@@ -0,0 +1,253 @@
++"""Independent per-part revisions for the session-list kanban annotation.
++
++Two one-row counters, each bumped only by triggers generated from the *actual* columns of the
++tables its part reads (``PRAGMA table_xinfo``), so a column added later is covered by the next
++writable init and, until then, makes the reader refuse (fail-fresh):
++
++* COUNTS    -- everything the board counts/projection reads: ``tasks`` (all columns but the task's
++  ``last_heartbeat_at``), ``task_runs`` (ALL columns, heartbeat included), ``task_events`` (every
++  kind, every column, so a heartbeat event bumps), links, notify subscriptions, chat links, remote
++  parents, ``kanban_sync_state`` (``board_id``/``gateway_id``/``mode`` only) and the containment
++  evidence inputs the contained display reads. Comment rows do not bump it.
++* ATTENTION -- ``tasks`` (same exclusion), ``task_runs`` (all columns), ``kanban_notify_subs`` (all).
++
++Installation is ``ensure_revisions`` and belongs to writable board initialization only. Readers
++(``read_counts_revision`` / ``read_attention_revision``) never write or repair: inside one snapshot
++they compare ``sqlite_master`` byte-for-byte with the SQL regenerated from the live columns, and
++return ``None`` for anything else (missing/partial/foreign counter or trigger, a required table
++absent or malformed, a view posing as a table, a ``containment_*`` table this module does not
++know). ``None`` means "read literally"; a revision is ``(*identity, counter, schema_version)``.
++
++A lost counter is repaired with a bump *and* trigger re-creation, which changes the schema version,
++so a restarted counter value cannot match a cached key. Restoring a file's identity is the
++caller's concern.
++"""
++from __future__ import annotations
++
++import sqlite3
++from dataclasses import dataclass
++
++# --- table specs -------------------------------------------------------------------------------
++# mode: "all" = every column; ("except", cols); ("only", cols)
++_ALL = "all"
++TASK_HEARTBEAT = ("except", frozenset({"last_heartbeat_at"}))
++SYNC_STATE_COLUMNS = ("only", frozenset({"board_id", "gateway_id", "mode"}))
++
++COUNTS_TABLES: dict[str, object] = {
++    "tasks": TASK_HEARTBEAT,
++    "task_runs": _ALL,
++    "task_events": _ALL,
++    "task_links": _ALL,
++    "kanban_notify_subs": _ALL,
++    "task_chat_links": _ALL,
++    "kanban_sync_remote_parents": _ALL,
++    "kanban_sync_state": SYNC_STATE_COLUMNS,
++    # Containment evidence the contained display reads (kanban_contained_display). The attestation
++    # ledger is ``containment_attestations``; ``containment_local_attestations`` is accepted as the
++    # alternate name should a board carry it.
++    "containment_canonical_receipts": _ALL,
++    "containment_sync_acceptances": _ALL,
++    "containment_attestations": _ALL,
++    "containment_local_attestations": _ALL,
++}
++ATTENTION_TABLES: dict[str, object] = {
++    "tasks": TASK_HEARTBEAT,
++    "task_runs": _ALL,
++    "kanban_notify_subs": _ALL,
++}
++REQUIRED = {
++    # Absent optional tables are certified absent by the schema cookie, not silently ignored.
++    # Their later creation invalidates the key before any new rows can be reused.
++    "counts": frozenset({"tasks"}),
++    "attention": frozenset({"tasks"}),
++}
++# containment_* tables that exist in current writers but feed no annotation read.
++KNOWN_UNREAD_CONTAINMENT = frozenset({
++    "containment_observations", "containment_delivery", "containment_local_stops",
++    "containment_closure_backfill_retry", "containment_sync_withheld", "containment_sync_quarantine",
++    "containment_sync_quarantine_tasks", "containment_sync_delete_owner",
++})
++
++
++@dataclass(frozen=True)
++class Kind:
++    name: str
++    table: str
++    prefix: str
++    tables: dict
++
++    @property
++    def ddl(self) -> str:
++        return f"CREATE TABLE {self.table} (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)"
++
++    @property
++    def bump(self) -> str:
++        return f"UPDATE {self.table} SET revision = revision + 1 WHERE id = 1;"
++
++
++COUNTS = Kind("counts", "kanban_annotation_counts_revision", "kanban_annotation_counts_", COUNTS_TABLES)
++ATTENTION = Kind("attention", "kanban_annotation_attention_revision", "kanban_annotation_attention_",
++                 ATTENTION_TABLES)
++LINKS = Kind("links", "kanban_annotation_links_revision", "kanban_annotation_links_", COUNTS_TABLES)
++KINDS = (COUNTS, ATTENTION, LINKS)
++REQUIRED['links'] = REQUIRED['counts']
++
++
++def _q(name: str) -> str:
++    return '"' + name.replace('"', '""') + '"'
++
++
++def _master(conn):
++    return {name: (typ, sql) for name, typ, sql in conn.execute("SELECT name, type, sql FROM sqlite_master")}
++
++
++def _columns(conn, table: str) -> list[str]:
++    # hidden 0 = ordinary, 2/3 = generated; 1 = virtual-table hidden (not a stored column)
++    return [r[1] for r in conn.execute(f"PRAGMA table_xinfo({_q(table)})") if r[6] in (0, 2, 3)]
++
++
++def _selected(spec, columns: list[str]) -> list[str]:
++    if spec == _ALL:
++        return list(columns)
++    mode, names = spec
++    return [c for c in columns if (c not in names if mode == "except" else c in names)]
++
++
++def _expected(conn, kind: Kind, master: dict):
++    """Exact ``{name: sql}`` the schema must hold, or ``None`` when coverage cannot be certified.
++
++    Containment ``containment_*`` tables outside the enumerated sets are refused here, and so is any
++    required table that is missing, not a real table, or lacks a selectable column.
++    """
++    wanted = {kind.table: kind.ddl}
++    for name, spec in kind.tables.items():
++        entry = master.get(name)
++        if entry is None:
++            if name in REQUIRED[kind.name]:
++                return None
++            continue
++        if entry[0] != "table":
++            return None
++        cols = _selected(spec, _columns(conn, name))
++        if not cols or (spec != _ALL and spec[0] == "only" and set(cols) != set(spec[1])):
++            return None
++        for op in ("INSERT", "DELETE", "UPDATE"):
++            when = ""
++            if kind is LINKS and name == 'task_events' and op == 'INSERT':
++                from hermes_cli.kanban_activity_revision import PROJECTION_EVENT_KINDS
++                kinds = ','.join("'" + v + "'" for v in PROJECTION_EVENT_KINDS)
++                when = f' WHEN NEW.kind IN ({kinds})'
++            if op == "UPDATE":
++                when = " WHEN " + " OR ".join(f"OLD.{_q(c)} IS NOT NEW.{_q(c)}" for c in cols)
++            trig = f"{kind.prefix}{name}_{op.lower()}"
++            wanted[trig] = (f"CREATE TRIGGER {trig} AFTER {op} ON {_q(name)}{when} BEGIN {kind.bump} END")
++    return wanted
++
++
++def _foreign_containment(master: dict) -> bool:
++    known = set(COUNTS_TABLES) | KNOWN_UNREAD_CONTAINMENT
++    return any(n.startswith("containment_") and t in ("table", "view") and n not in known
++               for n, (t, _s) in master.items())
++
++
++def _ours(master: dict, kind: Kind) -> dict:
++    return {n: s for n, (t, s) in master.items()
++            if (n == kind.table and t == "table") or (t == "trigger" and n.startswith(kind.prefix))}
++
++
++def _intact(conn, kind: Kind, master: dict) -> bool:
++    wanted = _expected(conn, kind, master)
++    if wanted is None or _ours(master, kind) != wanted:
++        return False
++    return conn.execute(f"SELECT 1 FROM {kind.table} WHERE id = 1").fetchone() is not None
++
++
++def ensure_revisions(conn: sqlite3.Connection) -> None:
++    """Writable-init installer. Intact schemas cost no write; repair is one atomic ``write_txn`` that
++    bumps and re-creates triggers (so the schema version moves). Never call from a reader."""
++    master = _master(conn)
++    if all(_expected(conn, k, master) is None or _intact(conn, k, master) for k in KINDS):
++        return
++    from hermes_cli.kanban_db_connect import write_txn
++    with write_txn(conn):
++        master = _master(conn)
++        for kind in KINDS:
++            wanted = _expected(conn, kind, master)
++            if wanted is None:
++                continue  # older/malformed schema: readers stay literal
++            found = _ours(master, kind)
++            if kind.table in found and found[kind.table] != kind.ddl:
++                continue  # foreign counter: never replace or certify
++            if kind.table not in found:
++                conn.execute(kind.ddl)
++            had_row = conn.execute(f"SELECT 1 FROM {kind.table} WHERE id = 1").fetchone() is not None
++            if found == wanted and had_row:
++                continue
++            conn.execute(f"INSERT OR IGNORE INTO {kind.table} VALUES (1, 0)")
++            conn.execute(kind.bump)
++            for name in set(found) - {kind.table} - set(wanted):
++                conn.execute(f"DROP TRIGGER {_q(name)}")
++            for name, sql in wanted.items():
++                if name == kind.table:
++                    continue
++                if found.get(name) != sql or not had_row:
++                    # A lost counter may restart at a cached value: re-creating triggers moves the
++                    # schema version so an unseen gap cannot certify older rows.
++                    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++                    conn.execute(sql)
++
++
++def _read(conn: sqlite3.Connection, identity: tuple, kind: Kind):
++    opened = not conn.in_transaction
++    try:
++        if opened:
++            conn.execute("BEGIN")
++        schema = int(conn.execute("PRAGMA schema_version").fetchone()[0])
++        master = _master(conn)
++        if (kind in (COUNTS, LINKS) and _foreign_containment(master)) or not _intact_readonly(conn, kind, master):
++            return None
++        row = conn.execute(f"SELECT revision FROM {kind.table} WHERE id = 1").fetchone()
++        return None if row is None else (*identity, int(row[0]), schema)
++    except sqlite3.Error:
++        return None
++    finally:
++        if opened and conn.in_transaction:
++            conn.execute("ROLLBACK")
++
++
++def _intact_readonly(conn, kind: Kind, master: dict) -> bool:
++    wanted = _expected(conn, kind, master)
++    return wanted is not None and _ours(master, kind) == wanted
++
++
++def read_counts_revision(conn: sqlite3.Connection, identity: tuple) -> tuple | None:
++    """Counts revision in the caller's snapshot (or its own read-only one); ``None`` = read literally."""
++    return _read(conn, identity, COUNTS)
++
++
++def read_attention_revision(conn: sqlite3.Connection, identity: tuple) -> tuple | None:
++    """Attention revision, independent of the counts counter; ``None`` = read literally."""
++    return _read(conn, identity, ATTENTION)
++
++
++def content_key(path, part: str) -> tuple:
++    """Fresh coverage/restore-aware holder key. Unknown never compares equal, and never writes."""
++    from hermes_cli import kanban_activity_revision as revision
++    from hermes_cli import kanban_session_activity as activity
++
++    kind = {'counts': COUNTS, 'attention': ATTENTION, 'links': LINKS}[part]
++    unknown = ('unknown', object())
++    lock = revision.probe_lock(path)
++    if not lock.acquire(timeout=0.05):
++        return unknown
++    try:
++        before = revision.file_stat(path)[0]
++        if before is None:
++            return unknown
++        with activity.cached_ro(path, busy_budget=0) as conn:
++            value = _read(conn, (conn, before), kind)
++        return unknown if value is None or revision.file_stat(path)[0] != before else ('part', part, *value)
++    except (OSError, sqlite3.Error):
++        return unknown
++    finally:
++        lock.release()
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index e03899647b7..81782819ea8 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -907,6 +907,12 @@
+     except sqlite3.Error as exc:
+         _kb._log.warning("kanban notify revision not installed on %s (%s); notification reads stay literal",
+                          resolved, exc)
++    from hermes_cli import kanban_annotation_revision as annotation_rev
++    try:
++        annotation_rev.ensure_revisions(conn)
++    except sqlite3.Error as exc:
++        _kb._log.warning("kanban annotation part revisions not installed on %s (%s); holder reads stay fresh",
++                         resolved, exc)
+ 
+ 
+ def _db_file_identity(path: Path) -> Optional[tuple[int, int]]:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index fcc8a6ddca4..491710ffd73 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1733,10 +1733,10 @@
+ 
+ 
+ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool], *,
+-                        watch_paths=None, next_deadline=None) -> Callable[[], None]:
+-    """Register a done check with optional no-DB watch/deadline declarations."""
++                        watch_paths=None, next_deadline=None, inputs=None) -> Callable[[], None]:
++    """Register a done check with optional no-DB watch/deadline declarations and explicit semantic ``inputs``."""
+     from hermes_cli.kanban_session_activity_attention import register_done_check as register
+-    return register(name, fn, watch_paths=watch_paths, next_deadline=next_deadline)
++    return register(name, fn, watch_paths=watch_paths, next_deadline=next_deadline, inputs=inputs)
+ 
+ 
+ def _read_recent_done(path: Path, since: float) -> list[tuple[str, dict[str, Any]]]:
+diff --git a/hermes_cli/kanban_session_activity_attention.py b/hermes_cli/kanban_session_activity_attention.py
+index 48ea2c93ab7..f15084a2e76 100644
+--- a/hermes_cli/kanban_session_activity_attention.py
++++ b/hermes_cli/kanban_session_activity_attention.py
+@@ -107,18 +107,22 @@
+ 
+ 
+ def register_done_check(name: str, fn: Callable[[dict[str, Any]], bool], *,
+-                        watch_paths=None, next_deadline=None) -> Callable[[], None]:
++                        watch_paths=None, next_deadline=None, inputs=None) -> Callable[[], None]:
+     """Register ``fn(card) -> bool`` (True = this completed card needs attention). ``card`` has ``id``, ``title``,
+     ``summary`` (latest run summary, else ``result``), ``completed_at``, ``board`` and ``board_path``. Re-registering a
+     name replaces it; the returned callable unregisters. Optional event callbacks
+     have the same no-DB-read contract as ``register_waiting_source``; undeclared
+     checks retain bounded fallback rather than silently missing external inputs.
+-    A declared board or sync replica is keyed by its notify revision (``revision``, not the projection counter;
+-    ``kanban_activity_revision.LOCAL_TABLES`` / ``SHADOW_TABLES``), not by its file: a done check is plugin code
+-    and may select any event kind. A check that reads a table outside those lists does not rerun on a write to it
+-    until the attention cache's own bound. Other declared files are keyed by their stat."""
++    A database path is event coverage, not a complete semantic declaration: the holder rereads undeclared
++    database-dependent checks, since plugin code may select arbitrary events, comments or tables. File-only
++    legacy declarations retain literal change signatures.
++
++    ``inputs()`` optionally declares the complete portable semantic key (see ``kanban_annotation_done_inputs``); it
++    is bound to this ``fn`` and, when absent or failing, callers recompute fresh."""
++    from hermes_cli import kanban_annotation_done_inputs as done_inputs
+     from hermes_cli import kanban_session_activity as activity
+     activity._host_copy.declare_events(name, fn, watch_paths, next_deadline, done_check=True)
++    done_inputs.declaration(name, fn, inputs)
+     activity._done_checks[name] = fn
+     activity._attention.clear()
+     activity._host_copy.wake_holder()
+@@ -126,6 +130,7 @@
+     def _dispose() -> None:
+         if activity._done_checks.get(name) is fn:
+             activity._done_checks.pop(name, None)
++            done_inputs.dispose(name, fn)
+             activity._host_copy.declare_events(name, None, None, None, done_check=True)
+             activity._attention.clear()
+             activity._host_copy.wake_holder()
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index 2065a6edaf2..6d1bf462d6f 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -57,6 +57,10 @@
+     from hermes_cli import kanban_session_activity as _ksa
+ 
+     key = _ksa._board_content_key(path)
++    if forced(_ksa._origin_scope(), 'counts'):
++        # The holder's independent counts counter includes run liveness and
++        # receipt selection that the legacy notify counter excludes.
++        return key, object()
+     if key[:1] == ("stat",):
+         # data_version is connection-local: retain identity to reject a replacement reader.
+         try:
+diff --git a/tests/hermes_cli/test_kanban_annotation_done_inputs.py b/tests/hermes_cli/test_kanban_annotation_done_inputs.py
+new file mode 100644
+index 00000000000..41f5ff6d2d5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_done_inputs.py
+@@ -0,0 +1,113 @@
++"""Explicit semantic done-check inputs: complete, portable, bound to the registered fn."""
++import pytest
++
++from hermes_cli import kanban_annotation_done_inputs as di
++from hermes_cli import kanban_session_activity as ksa
++
++
++def _check(card):
++    return False
++
++
++@pytest.fixture(autouse=True)
++def _clean():
++    saved = (dict(ksa._done_checks), dict(di._declared))
++    ksa._done_checks.clear()
++    di._declared.clear()
++    yield
++    ksa._done_checks.clear()
++    ksa._done_checks.update(saved[0])
++    di._declared.clear()
++    di._declared.update(saved[1])
++
++
++def test_stable_complete_callback_is_equal_and_changes_with_value():
++    box = [1]
++    d = ksa.register_done_check('c', _check, inputs=lambda: {'v': box[0]})
++    try:
++        k1, k2 = di.key(dict(ksa._done_checks)), di.key(dict(ksa._done_checks))
++        assert k1 == k2
++        box[0] = 2
++        assert di.key(dict(ksa._done_checks)) != k1
++    finally:
++        d()
++
++
++@pytest.mark.parametrize('value', [{}, [], 0, ''])
++def test_empty_values_are_explicit_complete(value):
++    d = ksa.register_done_check('c', _check, inputs=lambda: value)
++    try:
++        assert di.inputs(dict(ksa._done_checks))[1] is True
++        assert di.key(dict(ksa._done_checks)) == di.key(dict(ksa._done_checks))
++    finally:
++        d()
++
++
++def test_no_checks_is_complete():
++    assert di.inputs({}) == ([], True)
++    assert di.key({}) == di.key({})
++
++
++def _boom():
++    raise RuntimeError('x')
++
++
++@pytest.mark.parametrize('cb', [None, lambda: None, _boom, lambda: object(), lambda: {'a': {1, 2}}, 'notcallable'])
++def test_missing_none_error_nonportable_is_fresh(cb):
++    d = ksa.register_done_check('c', _check, inputs=cb)
++    try:
++        checks = dict(ksa._done_checks)
++        assert di.inputs(checks)[1] is False
++        assert di.key(checks) != di.key(checks)
++    finally:
++        d()
++
++
++def test_one_undeclared_check_makes_all_fresh():
++    d1 = ksa.register_done_check('a', _check, inputs=list)
++    d2 = ksa.register_done_check('b', lambda card: True)
++    try:
++        checks = dict(ksa._done_checks)
++        assert di.key(checks) != di.key(checks)
++    finally:
++        d1()
++        d2()
++
++
++def test_replacement_closure_without_inputs_is_undeclared_and_old_dispose_is_safe():
++    d_old = ksa.register_done_check('c', _check, inputs=list)
++    new = lambda card: True
++    d_new = ksa.register_done_check('c', new)
++    checks = dict(ksa._done_checks)
++    assert di.key(checks) != di.key(checks)
++    d_old()  # stale dispose must not remove the replacement
++    assert ksa._done_checks['c'] is new
++    d_new()
++    assert 'c' not in ksa._done_checks
++
++
++def test_replacement_with_inputs_keeps_new_declaration_after_old_dispose():
++    d_old = ksa.register_done_check('c', _check, inputs=lambda: ['old'])
++    new = lambda card: True
++    d_new = ksa.register_done_check('c', new, inputs=lambda: ['new'])
++    d_old()
++    assert di._declared['c'][0] is new
++    assert di.key(dict(ksa._done_checks)) == di.key(dict(ksa._done_checks))
++    d_new()
++    assert 'c' not in di._declared
++
++
++def test_dispose_removes_declaration():
++    d = ksa.register_done_check('c', _check, inputs=list)
++    assert 'c' in di._declared
++    d()
++    assert 'c' not in di._declared and 'c' not in ksa._done_checks
++
++
++def test_closure_identity_distinguishes_same_code():
++    def make():
++        return lambda card: False
++    a, b = make(), make()
++    di.declaration('c', a, list)
++    assert di.key({'c': a}) == di.key({'c': a})
++    assert di.key({'c': b}) != di.key({'c': b})  # undeclared fn b
+diff --git a/tests/hermes_cli/test_kanban_annotation_host.py b/tests/hermes_cli/test_kanban_annotation_host.py
+index c395bf28344..4c5721c0ef6 100644
+--- a/tests/hermes_cli/test_kanban_annotation_host.py
++++ b/tests/hermes_cli/test_kanban_annotation_host.py
+@@ -60,6 +60,8 @@
+     conn = sqlite3.connect(path, isolation_level=None)
+     conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
+     revision.ensure_revision(conn, revision.LOCAL_TABLES)
++    from hermes_cli import kanban_annotation_revision
++    kanban_annotation_revision.ensure_revisions(conn)
+     conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
+     return conn
+ 
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index 14015265ae8..5f9bab2bb7c 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -31,6 +31,7 @@
+     """One board, one plain input (state.db's stand-in) and a done check with one declared file."""
+     board = tmp_path / 'kanban.db'
+     conn = helpers._board(board, [('t1', 'running', 's1')])
++    conn.execute('PRAGMA journal_mode=WAL')
+     from hermes_state import SessionDB
+     plain, declared = tmp_path / 'state.db', tmp_path / 'done-check.json'
+     state = SessionDB(db_path=plain)
+@@ -44,6 +45,8 @@
+     monkeypatch.setattr(ksa, '_hub_db_path', lambda: None)
+     monkeypatch.setattr(ksa, '_replica_paths', list)
+     monkeypatch.setattr(ksa, '_waiting_sources', {})
++    from hermes_cli import kanban_annotation_done_inputs as done_inputs
++    monkeypatch.setattr(done_inputs, '_declared', {})
+     monkeypatch.setattr(host, 'core_sha', lambda: 'a' * 40)
+     monkeypatch.setattr(host, '_watch_paths', lambda scope: ([str(board), str(plain)], []))
+     monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
+@@ -313,6 +316,10 @@
+         check = ksa._done_checks['fixture']
+         monkeypatch.setattr(host, '_done_event_sources', {
+             'fixture': (check, lambda: [world.board, shadow / 'b.db', world.declared], lambda: None)})
++        from hermes_cli import kanban_annotation_done_inputs as done_inputs
++        done_inputs.declaration('fixture', check, lambda: (
++            list(world.conn.execute('SELECT * FROM tasks')),
++            list(replica.execute('SELECT * FROM tasks')), world.declared.read_text()))
+         for conn in (world.conn, replica):
+             conn.execute('CREATE TABLE IF NOT EXISTS bookkeeping_stamp (at REAL)')
+         _refresh()
+@@ -507,6 +514,8 @@
+         "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT, "
+         "created_at INTEGER)")
+     revision.ensure_revision(world.conn, revision.LOCAL_TABLES)
++    from hermes_cli import kanban_annotation_revision
++    kanban_annotation_revision.ensure_revisions(world.conn)
+ 
+     def honest(card):
+         world.checks += 1
+@@ -519,6 +528,9 @@
+     # The host ignores a declared source whose function is not the registered check.
+     ksa._done_checks["fixture"] = honest
+     host._done_event_sources["fixture"] = (honest, lambda: [world.board], lambda: None)
++    from hermes_cli import kanban_annotation_done_inputs as done_inputs
++    done_inputs.declaration('fixture', honest, lambda: list(world.conn.execute(
++        "SELECT task_id,kind,payload FROM task_events WHERE kind='created' ORDER BY id")))
+     _refresh()
+     assert world.checks == 1 and _published()[10] == {"s1": 1}
+     _refresh()
+diff --git a/tests/hermes_cli/test_kanban_annotation_revision.py b/tests/hermes_cli/test_kanban_annotation_revision.py
+new file mode 100644
+index 00000000000..d206004a0ea
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_revision.py
+@@ -0,0 +1,276 @@
++"""Per-part annotation revisions: exact coverage, semantic noise suppression, fail-fresh readers."""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_annotation_revision as rev
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import kanban_sync_support as support
++
++ID = ("dev", 1)
++CONTAINMENT = (
++    "CREATE TABLE containment_canonical_receipts (uid TEXT PRIMARY KEY,board TEXT NOT NULL,task_id TEXT NOT NULL,"
++    "kind TEXT NOT NULL,payload TEXT NOT NULL,origin TEXT NOT NULL,evidence TEXT NOT NULL)",
++    "CREATE TABLE containment_sync_acceptances (receipt_uid TEXT NOT NULL,sha256 TEXT NOT NULL,evidence TEXT NOT NULL,"
++    "reason TEXT NOT NULL,operator TEXT NOT NULL,accepted_at INTEGER NOT NULL,PRIMARY KEY(receipt_uid,sha256,accepted_at))",
++    "CREATE TABLE containment_attestations (task_id TEXT NOT NULL, receipt_uid TEXT PRIMARY KEY, episode_uid TEXT NOT NULL,"
++    " receipt_sha256 TEXT NOT NULL, episode_sha256 TEXT NOT NULL)",
++)
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    home = support.kanban_home(tmp_path, monkeypatch)
++    c = kbc.connect(home / "kanban.db")
++    c.row_factory = None
++    kb.create_task(c, title="card", assignee="default")
++    c.execute("INSERT INTO task_runs(task_id, profile, status, started_at) SELECT id,'default','running',1 FROM tasks")
++    c.execute("INSERT INTO kanban_notify_subs(task_id, chat_id, platform, thread_id, last_event_id, created_at) "
++              "SELECT id,'chat','tg','',0,1 FROM tasks")
++    c.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state (board_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0,"
++              " gateway_id TEXT NOT NULL, hlc_last TEXT NOT NULL, mode TEXT NOT NULL, applying INTEGER NOT NULL DEFAULT 0,"
++              " pending_run_uid TEXT)")
++    c.execute("CREATE TABLE IF NOT EXISTS kanban_sync_remote_parents (parent_id TEXT PRIMARY KEY, status TEXT NOT NULL,"
++              " refreshed_at INTEGER NOT NULL)")
++    c.execute("INSERT INTO kanban_sync_state(board_id,cursor,gateway_id,hlc_last,mode) VALUES ('b',0,'g','h','m')")
++    for ddl in CONTAINMENT:
++        c.execute(ddl)
++    c.commit()
++    rev.ensure_revisions(c)
++    yield c
++    c.close()
++    kbc._INITIALIZED_PATHS.discard(str((home / "kanban.db").resolve()))
++
++
++def both(conn):
++    return rev.read_counts_revision(conn, ID), rev.read_attention_revision(conn, ID)
++
++
++def task(conn):
++    return conn.execute("SELECT id FROM tasks").fetchone()[0]
++
++
++def moved(conn, sql, args=()):
++    before = both(conn)
++    assert None not in before
++    conn.execute(sql, args)
++    conn.commit()
++    after = both(conn)
++    assert None not in after
++    return after[0] != before[0], after[1] != before[1]
++
++
++# (sql, counts moves, attention moves)
++CASES = {
++    "task title": ("UPDATE tasks SET title = 'x'", True, True),
++    "task heartbeat only": ("UPDATE tasks SET last_heartbeat_at = 99", False, False),
++    "task row insert": ("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_new','n','ready',1)", True, True),
++    "comment row": ("INSERT INTO task_comments(task_id,author,body,created_at) SELECT id,'a','b',1 FROM tasks", False, False),
++    "heartbeat event": ("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT id,'heartbeat','{}',1 FROM tasks",
++                        True, False),
++    "claimed event": ("INSERT INTO task_events(task_id,kind,payload,created_at) SELECT id,'claimed','{}',1 FROM tasks",
++                      True, False),
++    "run heartbeat": ("UPDATE task_runs SET last_heartbeat_at = 5", True, True),
++    "run metadata": ("UPDATE task_runs SET status = 'done'", True, True),
++    "notify inflight": ("UPDATE kanban_notify_subs SET inflight_from = 7", True, True),
++    "sync cursor": ("UPDATE kanban_sync_state SET cursor = 9, hlc_last = 'z', applying = 1", False, False),
++    "sync mode": ("UPDATE kanban_sync_state SET mode = 'other'", True, False),
++    "sync gateway": ("UPDATE kanban_sync_state SET gateway_id = 'g2'", True, False),
++    "acceptance insert": ("INSERT INTO containment_sync_acceptances VALUES ('u','s','e','r','o',1)", True, False),
++    "attestation insert": ("INSERT INTO containment_attestations VALUES ('t','u','e','a','b')", True, False),
++    "receipt insert": ("INSERT INTO containment_canonical_receipts VALUES ('u','b','t','k','p','o','e')", True, False),
++}
++
++
++@pytest.mark.parametrize("name", sorted(CASES))
++def test_semantic_bumps(conn, name):
++    sql, counts, attention = CASES[name]
++    assert moved(conn, sql) == (counts, attention)
++
++
++def test_event_delete_and_link_bump_counts_only(conn):
++    t = task(conn)
++    conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'x','{}',1)", (t,))
++    conn.commit()
++    assert moved(conn, "DELETE FROM task_events") == (True, False)
++    assert moved(conn, "INSERT INTO task_links(parent_id,child_id) VALUES ('a','b')") == (True, False)
++
++
++def test_trigger_sql_covers_live_columns_exactly(conn):
++    master = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'"))
++    cols = [r[1] for r in conn.execute("PRAGMA table_xinfo(tasks)")]
++    sql = master["kanban_annotation_counts_tasks_update"]
++    assert "last_heartbeat_at" not in sql
++    assert all(f'OLD."{c}" IS NOT NEW."{c}"' in sql for c in cols if c != "last_heartbeat_at")
++    runs = master["kanban_annotation_attention_task_runs_update"]
++    assert all(f'OLD."{r[1]}" IS NOT NEW."{r[1]}"' in runs for r in conn.execute("PRAGMA table_xinfo(task_runs)"))
++    assert "last_heartbeat_at" in runs
++    sync = master["kanban_annotation_counts_kanban_sync_state_update"]
++    assert sync.count("IS NOT NEW") == 3
++    assert not any(n.startswith("kanban_annotation_attention_task_events") for n in master)
++
++
++def test_new_column_refused_until_installer_covers_it(conn):
++    assert None not in both(conn)
++    conn.execute("ALTER TABLE tasks ADD COLUMN brand_new TEXT")
++    conn.commit()
++    assert both(conn) == (None, None)  # stale triggers do not cover the new column
++    rev.ensure_revisions(conn)
++    assert None not in both(conn)
++    assert moved(conn, "UPDATE tasks SET brand_new = 'v'") == (True, True)
++
++
++def test_tasks_and_events_unknown_schema_none(conn):
++    conn.execute("DROP TRIGGER kanban_annotation_counts_task_events_insert")
++    conn.commit()
++    assert both(conn)[0] is None and both(conn)[1] is not None  # attention does not read events
++
++
++@pytest.mark.parametrize("mutate", [
++    "DROP TRIGGER kanban_annotation_counts_tasks_delete",
++    "DROP TRIGGER kanban_annotation_attention_kanban_notify_subs_update",
++    "DROP TRIGGER kanban_annotation_counts_containment_attestations_insert",
++    "CREATE TRIGGER kanban_annotation_counts_rogue AFTER INSERT ON tasks BEGIN SELECT 1; END",
++    "DROP TABLE kanban_annotation_counts_revision",
++    "DELETE FROM kanban_annotation_counts_revision",
++    "CREATE TABLE containment_future_input (x TEXT)",
++])
++def test_unknown_schema_or_triggers_return_none_without_repair(conn, mutate):
++    conn.execute(mutate)
++    conn.commit()
++    schema = conn.execute("PRAGMA schema_version").fetchone()[0]
++    master = conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()
++    changes = conn.total_changes
++    results = both(conn)
++    assert None in results
++    assert conn.total_changes == changes
++    assert conn.execute("PRAGMA schema_version").fetchone()[0] == schema
++    assert conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name").fetchall() == master
++    assert not conn.in_transaction
++
++
++def test_dropping_optional_table_makes_old_triggers_foreign(conn):
++    conn.execute("DROP TABLE containment_attestations")
++    conn.commit()
++    # its triggers were dropped with it, so coverage is exact again without the table
++    assert None not in both(conn)
++
++
++def test_absent_optional_table_is_certified_by_schema(conn):
++    before = rev.read_counts_revision(conn, ID)
++    conn.execute("DROP TABLE task_links")
++    conn.commit()
++    after = rev.read_counts_revision(conn, ID)
++    assert after is not None and after != before
++    rev.ensure_revisions(conn)
++    assert rev.read_counts_revision(conn, ID) == after
++
++
++def test_missing_required_table_is_none_and_installer_skips(conn):
++    conn.execute("DROP TABLE tasks")
++    conn.commit()
++    assert rev.read_counts_revision(conn, ID) is None
++    rev.ensure_revisions(conn)
++    assert rev.read_counts_revision(conn, ID) is None
++    assert rev.read_attention_revision(conn, ID) is None
++
++
++def test_view_posing_as_table_or_empty_selection_refused(conn):
++    conn.execute("DROP TABLE kanban_sync_state")
++    conn.execute("CREATE VIEW kanban_sync_state AS SELECT 1 AS board_id")
++    conn.commit()
++    assert rev.read_counts_revision(conn, ID) is None
++    rev.ensure_revisions(conn)
++    assert rev.read_counts_revision(conn, ID) is None
++
++
++def test_sync_state_missing_selected_column_refused(conn):
++    conn.execute("DROP TABLE kanban_sync_state")
++    conn.execute("CREATE TABLE kanban_sync_state (board_id TEXT, mode TEXT)")
++    conn.commit()
++    rev.ensure_revisions(conn)
++    assert rev.read_counts_revision(conn, ID) is None
++
++
++def test_intact_installer_writes_nothing(conn):
++    schema = conn.execute("PRAGMA schema_version").fetchone()[0]
++    before = both(conn)
++    changes = conn.total_changes
++    rev.ensure_revisions(conn)
++    assert conn.total_changes == changes and both(conn) == before
++    assert conn.execute("PRAGMA schema_version").fetchone()[0] == schema
++
++
++@pytest.mark.parametrize("lost", ["DELETE FROM kanban_annotation_counts_revision",
++                                  "DROP TABLE kanban_annotation_counts_revision"])
++def test_repair_after_lost_counter_bumps_and_changes_schema(conn, lost):
++    moved(conn, "UPDATE tasks SET title = 'x'")
++    attention = rev.read_attention_revision(conn, ID)
++    old = rev.read_counts_revision(conn, ID)
++    conn.execute(lost)
++    conn.commit()
++    assert rev.read_counts_revision(conn, ID) is None
++    rev.ensure_revisions(conn)
++    new = rev.read_counts_revision(conn, ID)
++    assert new is not None and new[:2] == old[:2]
++    assert new[-1] != old[-1]  # schema generation moved: restarted counter cannot alias a cached key
++    assert new != old
++    assert rev.read_attention_revision(conn, ID)[2] == attention[2]  # untouched counter stays put
++
++
++def test_repair_replaces_tampered_trigger_and_drops_rogue(conn):
++    conn.execute("DROP TRIGGER kanban_annotation_attention_tasks_update")
++    conn.execute("CREATE TRIGGER kanban_annotation_attention_tasks_update AFTER UPDATE ON tasks BEGIN SELECT 1; END")
++    conn.execute("CREATE TRIGGER kanban_annotation_counts_rogue AFTER INSERT ON tasks BEGIN SELECT 1; END")
++    conn.commit()
++    assert rev.read_attention_revision(conn, ID) is None and rev.read_counts_revision(conn, ID) is None
++    before = both(conn)
++    rev.ensure_revisions(conn)
++    after = both(conn)
++    assert None not in after
++    assert moved(conn, "UPDATE tasks SET title = 'again'") == (True, True)
++    assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_annotation_counts_rogue'").fetchone() is None
++    assert before == (None, None)
++
++
++def test_foreign_counter_table_is_never_replaced(conn):
++    conn.execute("DROP TABLE kanban_annotation_counts_revision")
++    conn.execute("CREATE TABLE kanban_annotation_counts_revision (id INTEGER, revision INTEGER, extra TEXT)")
++    conn.execute("INSERT INTO kanban_annotation_counts_revision VALUES (1, 5, 'mine')")
++    conn.commit()
++    rev.ensure_revisions(conn)
++    assert rev.read_counts_revision(conn, ID) is None
++    assert conn.execute("SELECT extra FROM kanban_annotation_counts_revision").fetchone() == ("mine",)
++
++
++def test_reader_uses_one_snapshot(conn, tmp_path):
++    path = conn.execute("PRAGMA database_list").fetchone()[2]
++    other = sqlite3.connect(path)
++    conn.execute("BEGIN")
++    first = rev.read_counts_revision(conn, ID)
++    other.execute("UPDATE tasks SET title = 'concurrent'")
++    other.commit()
++    assert rev.read_counts_revision(conn, ID) == first  # same snapshot: concurrent commit invisible
++    conn.rollback()
++    assert rev.read_counts_revision(conn, ID) != first
++    other.close()
++
++
++def test_identity_is_carried(conn):
++    assert rev.read_counts_revision(conn, ("x", 2))[:2] == ("x", 2)
++    assert rev.read_attention_revision(conn, ("x", 2))[:2] == ("x", 2)
++
++
++def test_failed_query_returns_none(conn):
++    class Boom:
++        in_transaction = True
++
++        def execute(self, *_a):
++            raise sqlite3.OperationalError("locked")
++
++    assert rev.read_counts_revision(Boom(), ID) is None
+diff --git a/tests/hermes_cli/test_kanban_annotation_semantic_parts.py b/tests/hermes_cli/test_kanban_annotation_semantic_parts.py
+new file mode 100644
+index 00000000000..dd52ef5e433
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_semantic_parts.py
+@@ -0,0 +1,71 @@
++"""Real holder part reads, not only equality of counter values."""
++from hermes_cli import kanban_annotation_revision as revision
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_annotation_parts as helpers
++
++world = helpers.world
++
++
++def _install(world):
++    world.conn.execute('PRAGMA journal_mode=WAL')
++    world.conn.execute('ALTER TABLE tasks ADD COLUMN last_heartbeat_at REAL')
++    world.conn.execute('CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT)')
++    revision.ensure_revisions(world.conn)
++
++
++def test_irrelevant_board_storm_reads_no_part(world):
++    _install(world)
++    # Complete declaration: this check reads only its card and the explicit file.
++    dispose = ksa.register_done_check('fixture', ksa._done_checks['fixture'],
++        watch_paths=lambda: [world.declared], next_deadline=lambda: None,
++        inputs=lambda: world.declared.read_text())
++    try:
++        helpers._refresh()
++        before = helpers._reads(world)
++        for n in range(12):
++            world.conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id='t1'", (n,))
++            world.conn.execute("INSERT INTO task_comments(task_id,body) VALUES('t1',?)", (str(n),))
++            helpers._refresh()
++        assert helpers._reads(world) == before
++        # No source notification: the confirmation/control probe still discovers a relevant commit.
++        world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++        host._clock_deadlines[helpers.SCOPE] = [0.0]
++        host._settle_deadlines[helpers.SCOPE] = (0.0,)
++        helpers._refresh(source=False)
++        assert helpers._reads(world)[0] == before[0] + 1
++        assert helpers._published()[0] == {}
++    finally:
++        dispose()
++
++
++def test_undeclared_comment_reader_is_never_certified(world):
++    _install(world)
++    def check(card):
++        world.checks += 1
++        return bool(world.conn.execute('SELECT 1 FROM task_comments').fetchone())
++    dispose = ksa.register_done_check('fixture', check,
++        watch_paths=lambda: [world.board], next_deadline=lambda: None)
++    try:
++        helpers._refresh()
++        before = world.checks
++        world.conn.execute("INSERT INTO task_comments(task_id,body) VALUES('t1','new')")
++        helpers._refresh()
++        assert world.checks > before
++        assert helpers._published()[10] == {'s1': 1}
++    finally:
++        dispose()
++
++
++def test_missing_revision_forces_fresh_read(world):
++    _install(world)
++    helpers._refresh()
++    before = world.counts
++    world.conn.execute('DROP TRIGGER kanban_annotation_counts_tasks_update')
++    helpers._refresh()
++    assert world.counts == before + 1
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    host._clock_deadlines[helpers.SCOPE] = [0.0]
++    host._settle_deadlines[helpers.SCOPE] = (0.0,)
++    helpers._refresh(source=False)
++    assert helpers._published()[0] == {}
+-- 
+2.43.0
+

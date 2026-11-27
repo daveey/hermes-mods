@@ -1,0 +1,135 @@
+From 68da7497670db04be1c6cd6e5d9cc861d954784b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:36:26 +0000
+Subject: [PATCH 6445] Test isolation, fixture lifecycle and CI case partitioning
+
+Public mirror of source commit 68da7497670db04be1c6cd6e5d9cc861d954784b.
+
+---
+diff --git a/tests/gateway/test_stream_consumer_wecom_native.py b/tests/gateway/test_stream_consumer_wecom_native.py
+index 1c0d5df9956..faaba4a6f37 100644
+--- a/tests/gateway/test_stream_consumer_wecom_native.py
++++ b/tests/gateway/test_stream_consumer_wecom_native.py
+@@ -988,7 +988,8 @@
+     # === ROUND 2, POINT 3: 双 clarify 边界链路自洽、无残留误判 ===
+ 
+     @pytest.mark.asyncio
+-    async def test_double_clarify_boundary_reseed_chain(self):
++    @pytest.mark.parametrize("expired_second_drain", [False, True])
++    async def test_double_clarify_boundary_reseed_chain(self, monkeypatch, expired_second_drain):
+         """eager seed → 内容 → 第二轮 clarify boundary → 第二轮 eager seed。
+ 
+         验证多边界链路自洽：第二轮 boundary 后回到 reopen-pending 状态
+@@ -1004,53 +1005,66 @@
+         consumer = GatewayStreamConsumer(adapter, "chat-1", cfg)
+ 
+         # 第一轮：boundary → eager seed → 内容。
++        expired_drains = []
++        if expired_second_drain:
++            original_drain = self._drain
++
++            async def drain(consumer, seconds=0.15):
++                if consumer._awaiting_reopen_after_boundary and consumer._reopen_seeded_eagerly:
++                    # A descheduled waiter can return from _drain after its wall
++                    # deadline without giving the consumer another poll. Force that order.
++                    expired_drains.append(True)
++                    return
++                await original_drain(consumer, seconds)
++
++            monkeypatch.setattr(self, "_drain", drain)
+         task = await self._to_reopen_pending(consumer, adapter)
+-        consumer.request_reopen_seed()
+-        await self._drain(consumer, 0.05)
+-        assert await self._wait_until(lambda: consumer._native_stream_opened)
+-        assert consumer._reopen_seeded_eagerly is True
+-
+-        consumer.on_delta("根据你的选择，这是后续的完整回答内容，足够长以触发一次流式刷新的补充。")
+-        await self._drain(consumer, 0.05)
++        try:
++            consumer.request_reopen_seed()
++            await self._drain(consumer, 0.05)
++            assert await self._wait_until(lambda: consumer._native_stream_opened)
++            assert consumer._reopen_seeded_eagerly is True
+ 
+-        seeds_before_second_boundary = len(
+-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+-        )
+-
+-        # 第二轮 clarify boundary（reopen=True）。
+-        boundary = consumer.close_for_approval_prompt(
+-            "💬 等待你的选择...", reason="Clarify", reopen=True,
+-        )
+-        fut = boundary[0] if isinstance(boundary, tuple) else boundary
+-        await asyncio.wait_for(fut, timeout=1.0)
+-
+-        # 第二轮 boundary 后：回到 reopen-pending，stream 已关。
+-        assert consumer._awaiting_reopen_after_boundary is True
+-        assert consumer._native_stream_opened is False
+-        assert consumer._use_native_streaming is True
+-        # NOTE: 与 task 预期不同 —— 产品代码在 boundary 处理里并不重置
+-        # _reopen_seeded_eagerly（见 code-review 观察点 O2：consumer 每 turn 新建，
+-        # 残留无害）。这里断言真实行为（残留 True），并在下方证明该残留不会
+-        # 导致第二轮 eager seed 误判 —— 链路仍自洽。
+-        assert consumer._reopen_seeded_eagerly is True
++            consumer.on_delta("根据你的选择，这是后续的完整回答内容，足够长以触发一次流式刷新的补充。")
++            await self._drain(consumer, 0.05)
+ 
+-        # 第二轮 eager seed：即便标志有残留，仍能正确再次开流。
+-        consumer.request_reopen_seed()
+-        await self._drain(consumer, 0.05)
+-
+-        seeds_after = len(
+-            [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
+-        )
+-        assert seeds_after == seeds_before_second_boundary + 1, (
+-            "第二轮 eager seed 必须再发一个新的空 seed 帧 "
+-            f"(before={seeds_before_second_boundary}, after={seeds_after})"
+-        )
+-        assert await self._wait_until(lambda: consumer._native_stream_opened)
+-        assert consumer._reopen_seeded_eagerly is True
+-        assert consumer._awaiting_reopen_after_boundary is False
++            seeds_before_second_boundary = len(
++                [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
++            )
+ 
+-        consumer.finish()
+-        await task
++            # 第二轮 clarify boundary（reopen=True）。
++            boundary = consumer.close_for_approval_prompt(
++                "💬 等待你的选择...", reason="Clarify", reopen=True,
++            )
++            fut = boundary[0] if isinstance(boundary, tuple) else boundary
++            await asyncio.wait_for(fut, timeout=1.0)
++
++            # 第二轮 boundary 后：回到 reopen-pending，stream 已关。
++            assert consumer._awaiting_reopen_after_boundary is True
++            assert consumer._native_stream_opened is False
++            assert consumer._use_native_streaming is True
++            # Boundary leaves the eager flag set; prove that this does not prevent
++            # a second seed, rather than assuming another fixed drain delivered it.
++            assert consumer._reopen_seeded_eagerly is True
++
++            consumer.request_reopen_seed()
++            await self._drain(consumer, 0.05)
++            # The consumer also polls every 50ms. An elapsed drain is not a delivery
++            # acknowledgement; opening is published only after send_stream_frame.
++            assert await self._wait_until(lambda: consumer._native_stream_opened)
++            seeds_after = len(
++                [f for f in adapter.frames if f["text"] == "" and not f["finalize"]]
++            )
++            assert seeds_after == seeds_before_second_boundary + 1, (
++                "第二轮 eager seed 必须再发一个新的空 seed 帧 "
++                f"(before={seeds_before_second_boundary}, after={seeds_after})"
++            )
++            assert consumer._reopen_seeded_eagerly is True
++            assert consumer._awaiting_reopen_after_boundary is False
++            assert len(expired_drains) == int(expired_second_drain)
++        finally:
++            consumer.finish()
++            await asyncio.wait_for(task, timeout=2.0)
+ 
+ 
+ class TestNativeCommentaryPreservesAccumulated:
+-- 
+2.43.0
+

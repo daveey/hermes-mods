@@ -1,0 +1,92 @@
+From 27b7624abccbac777bf76b2e8e3fbda30631a78b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:58:31 -0800
+Subject: [PATCH 6066] Backup snapshot pruning and settled-result compaction
+
+Public mirror of source commit 27b7624abccbac777bf76b2e8e3fbda30631a78b.
+
+---
+diff --git a/hermes_state_result_horizon.py b/hermes_state_result_horizon.py
+index 25b6cfa6be0..00f6a7a8981 100644
+--- a/hermes_state_result_horizon.py
++++ b/hermes_state_result_horizon.py
+@@ -7,7 +7,8 @@
+ 
+ The promise is byte-exact replay within ``RETRY_HORIZON_S``. Past it, a terminal admission's result gets the same
+ compaction retirement applies (``_compact_result``): the final response, flags and usage stay, the transcript
+-copies go. ``session_admissions.settled_at`` is stamped by trigger when a row turns terminal; a row settled before
++copies go. A result with no final response is left whole. It runs in every ``prune_sessions`` pass (auto-prune,
++per-source retention, ``hermes sessions prune``, the web prune endpoint); a store that never prunes never compacts. ``session_admissions.settled_at`` is stamped by trigger when a row turns terminal; a row settled before
+ the column existed is stamped by the first pass here and ages from that pass.
+ """
+ import time
+@@ -22,7 +23,10 @@
+     "SELECT a.admission_id FROM session_admissions a JOIN state_meta m ON m.key = ? || a.admission_id "
+     "WHERE a.status = 'terminal' AND a.settled_at < ? AND json_valid(m.value) "
+     "AND json_type(m.value, '$.result.messages') = 'array' "
+-    "AND json_array_length(m.value, '$.result.messages') > 0 ORDER BY a.seq LIMIT ?")
++    "AND json_array_length(m.value, '$.result.messages') > 0 "
++    # A turn that ended with no final reply keeps its messages: Bot Chat rebuilds the "no final reply; their
++    # last message this turn" text from them whenever it re-projects a receipt (session_bot_outcome).
++    "AND COALESCE(json_extract(m.value, '$.result.final_response'), '') <> '' ORDER BY a.seq LIMIT ?")
+ 
+ 
+ def compact_settled_results(conn, older_than=RETRY_HORIZON_S, limit=COMPACT_LIMIT, now=None):
+diff --git a/tests/hermes_state/test_result_horizon.py b/tests/hermes_state/test_result_horizon.py
+index 4dbf4f714ea..8920f9efd9c 100644
+--- a/tests/hermes_state/test_result_horizon.py
++++ b/tests/hermes_state/test_result_horizon.py
+@@ -14,11 +14,11 @@
+         {'role': 'assistant', 'content': 'the reply'}]
+ 
+ 
+-def _settle(db, epoch, request, session='chat'):
++def _settle(db, epoch, request, session='chat', reply='the reply'):
+     rt.admit_session_input(db, epoch=epoch, principal_id='api', session_id=session, request_id=request,
+                            payload={'text': 'question ' + request})
+     row = rt.claim_session_input(db, epoch=epoch, session_id=session)
+-    result = {'result': {'final_response': 'the reply', 'messages': [dict(m) for m in TURN], 'completed': True,
++    result = {'result': {'final_response': reply, 'messages': [dict(m) for m in TURN], 'completed': True,
+                          'last_reasoning': 'thinking ' * 50},
+               'usage': {'input_tokens': 7, 'output_tokens': 3}}
+     retain_result(db, epoch=epoch, row=row, result=result)
+@@ -114,9 +114,34 @@
+                                                   {'result': {'messages': [{'role': 'assistant', 'content': 'x'}]}}))))
+         db._execute_write(lambda c: c.execute('UPDATE session_admissions SET settled_at=1.0'))
+         assert db._execute_write(compact_settled_results) == 0  # started, not terminal
+-        db._execute_write(lambda c: c.execute('UPDATE state_meta SET value=? WHERE key=?',
+-                                              ('not json', RESULT_PREFIX + row['admission_id'])))
++        db.create_session('other', source='api_server')  # 'chat' still has its running turn
++        settled, _ = _settle(db, epoch, 'bad-row', session='other')
++        _age(db, settled, RETRY_HORIZON_S + 60)
++        for value in ('not json', '[1, 2]', '{"result": "flat"}', '{"result": {"messages": "text"}}'):
++            db._execute_write(lambda c, value=value: c.execute('UPDATE state_meta SET value=? WHERE key=?',
++                                                               (value, RESULT_PREFIX + settled)))
++            assert db._execute_write(compact_settled_results) == 0, value  # terminal and aged, but not a turn result
++            assert _size(db, settled) == len(value)
++
++
++def test_a_turn_that_ended_without_a_final_reply_keeps_its_messages(tmp_path):
++    db, epoch = _db(tmp_path)
++    with db:
++        silent, _ = _settle(db, epoch, 'silent', reply='')
++        _age(db, silent, RETRY_HORIZON_S + 60)
++        stored = admission_result(db, silent)
+         assert db._execute_write(compact_settled_results) == 0
++        assert admission_result(db, silent) == stored and len(stored['result']['messages']) == 3
++
++
++def test_a_row_inserted_already_terminal_is_stamped(tmp_path):
++    db, _ = _db(tmp_path)
++    with db:
++        db._execute_write(lambda c: c.execute(
++            "INSERT INTO session_admissions(admission_id,request_id,principal_id,target_session_id,lineage_json,"
++            "payload_json,payload_digest,intent,status,outcome) VALUES('imported','r','api','chat','[]','{}','d',"
++            "'queue','terminal','completed')"))
++        assert abs(_settled_at(db, 'imported') - time.time()) < 5
+ 
+ 
+ def test_the_prune_pass_runs_it(tmp_path):
+-- 
+2.43.0
+

@@ -1,0 +1,295 @@
+From 11f04e3da7ba23d2d2d811bbb302897452cacf27 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:33:14 +0000
+Subject: [PATCH 6436] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit 11f04e3da7ba23d2d2d811bbb302897452cacf27.
+
+---
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index cb5a21c28b3..d22fdbce9f1 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -228,7 +228,8 @@
+ 
+ 
+ def window_text(window: str) -> str:
+-    return ('this limit applies to a fresh window starting at promote; setting it does not release the stop'
++    return ('this limit applies to a fresh window starting at promote; an agent setting it does not release the stop, '
++            'and a limit a person sets on an ordinary budget stop is promoted by the next dispatcher maintenance pass'
+             if window == 'next_promote' else 'this limit counts the current window, including spend already recorded')
+ 
+ 
+diff --git a/hermes_cli/kanban_spend_review_request.py b/hermes_cli/kanban_spend_review_request.py
+index cda36d04932..1a9bd7c34ba 100644
+--- a/hermes_cli/kanban_spend_review_request.py
++++ b/hermes_cli/kanban_spend_review_request.py
+@@ -11,6 +11,7 @@
+ # Separate from judge retries: allow receipt recovery after the model budget ends,
+ # but never monopolize reviewer custody indefinitely when no receipt is reachable.
+ MAX_RECONCILE_ATTEMPTS = 4
++OPEN_INDEX = f"CREATE INDEX IF NOT EXISTS {TABLE}_open ON {TABLE}(task, episode) WHERE closed = 0"
+ 
+ 
+ def exists(conn):
+@@ -23,6 +24,33 @@
+     return [json.loads(row[0]) for row in conn.execute(f"SELECT request FROM {TABLE}")]
+ 
+ 
++def _has_closed(conn):
++    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone()
++    return None if row is None else "closed INTEGER" in (row[0] or "")
++
++
++def open_keys(conn):
++    """(task, episode) of requests whose review is not yet known terminal. One indexed read whose cost does not
++    grow with closed history; a table from before the marker reads as all open until the first close."""
++    marked = _has_closed(conn)
++    if marked is None:
++        return []
++    where = " WHERE closed = 0" if marked else ""
++    return [(row[0], row[1]) for row in conn.execute(f"SELECT task, episode FROM {TABLE}{where}")]
++
++
++def close(conn, keys):
++    """Mark requests whose review ended so later ticks skip them. The frozen bytes are kept unchanged."""
++    from hermes_cli import kanban_db as kb
++    if not keys:
++        return
++    with kb.write_txn(conn):
++        if _has_closed(conn) is False:
++            conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
++            conn.execute(OPEN_INDEX)
++        conn.executemany(f"UPDATE {TABLE} SET closed = 1 WHERE task = ? AND episode = ?", list(keys))
++
++
+ def get(conn, task, episode):
+     if not exists(conn):
+         return None
+@@ -37,9 +65,11 @@
+         raise ValueError("cannot freeze a review inside another transaction")
+     with kb.write_txn(conn):
+         conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task TEXT NOT NULL, episode TEXT NOT NULL, "
+-                     "request TEXT NOT NULL, PRIMARY KEY(task,episode))")
++                     "request TEXT NOT NULL, closed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task,episode))")
++        if _has_closed(conn):
++            conn.execute(OPEN_INDEX)
+         request = {"board": board, "gateway": gateway, "wire": wire}
+-        conn.execute(f"INSERT OR IGNORE INTO {TABLE} VALUES (?,?,?)",
++        conn.execute(f"INSERT OR IGNORE INTO {TABLE} (task, episode, request) VALUES (?,?,?)",
+                      (wire["task"], wire["episode"], json.dumps(request, ensure_ascii=False)))
+         frozen = get(conn, wire["task"], wire["episode"])
+         assert frozen is not None
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index ff18219bcf0..721946f0f02 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -268,12 +268,14 @@
+ 
+ def _due(conn: sqlite3.Connection, now: int, skip) -> list[tuple[str, str, int]]:
+     from hermes_cli import kanban_spend_review_request as journal
+-    frozen = journal.requests(conn)
++    # Only requests whose review is not known to have ended: the journal keeps every request for good, so
++    # reading all of it here would grow each dispatcher tick with history.
++    frozen = set(journal.open_keys(conn))
+     rows = conn.execute("SELECT DISTINCT e.task_id FROM task_events e JOIN tasks t ON t.id = e.task_id "
+                         "WHERE e.kind = ? AND t.status = 'triage'", (QUEUED,)).fetchall()
+     candidates = {(task_id, _episode_or_none(conn, task_id)) for (task_id,) in rows if task_id not in skip}
+-    candidates.update((r["wire"]["task"], r["wire"]["episode"]) for r in frozen)
+-    due = []
++    candidates.update(frozen)
++    due, ended = [], []
+     for task_id, episode in sorted(candidates, key=str):
+         if task_id in skip or episode is None:
+             continue
+@@ -291,11 +293,18 @@
+             logger.exception("kanban: spend review skipped %s; hold retained", task_id)
+             continue
+         if not events or events[-1]["kind"] not in (QUEUED, STARTED):
++            if events and (task_id, episode) in frozen:
++                ended.append((task_id, episode))
+             continue
+         last = events[-1]
+         if last["kind"] == STARTED and int(last["payload"].get("deadline") or 0) > now:
+             continue
+         due.append((task_id, episode, sum(1 for e in events if e["kind"] == STARTED)))
++    if ended and not conn.in_transaction:
++        try:
++            journal.close(conn, ended)
++        except Exception:  # health: allow BLE001 -- bookkeeping only; an unmarked request is read again next tick
++            logger.exception("kanban: could not mark %d ended spend review requests", len(ended))
+     return due
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_spend_review_due_cost.py b/tests/hermes_cli/test_kanban_spend_review_due_cost.py
+new file mode 100644
+index 00000000000..fdb5d241797
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_due_cost.py
+@@ -0,0 +1,143 @@
++"""The per-tick due scan must not re-read spend reviews that already ended. [daveey]"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_spend_review_request as journal
++from tests.hermes_cli import test_kanban_spend_caused_review as helpers
++
++kanban_home = helpers.kanban_home
++TERMINAL = [reviewer.SETTLED, reviewer.ESCALATED, reviewer.GRANTED]
++
++
++def _ended(conn, terminal, *, status="done"):
++    """A source card whose frozen request went QUEUED -> STARTED -> terminal, then left triage."""
++    tid, ep = helpers.stop(conn)
++    journal.freeze(conn, "b", "gw", {"task": tid, "episode": ep, "event_uid": "u" + tid, "verdict": "release"})
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, reviewer.QUEUED, {"episode": ep, "backlog": True})
++        kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep, "attempt": 1, "deadline": 1})
++        if terminal:
++            kb._append_event(conn, tid, terminal, {"episode": ep})
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++    return tid, ep
++
++
++def _count_reads(monkeypatch):
++    seen = {"stop": 0, "events": 0}
++    real_stop, real_events = decision.strict_episode, reviewer._review_events
++    def stop(conn, task_id):
++        seen["stop"] += 1
++        return real_stop(conn, task_id)
++    def events(conn, task_id, episode):
++        seen["events"] += 1
++        return real_events(conn, task_id, episode)
++    monkeypatch.setattr(decision, "strict_episode", stop)
++    monkeypatch.setattr(reviewer, "_review_events", events)
++    return seen
++
++
++@pytest.mark.parametrize("terminal", TERMINAL)
++def test_ended_requests_cost_no_per_request_reads(kanban_home, monkeypatch, terminal):
++    with kbc.connect_closing() as conn:
++        keys = [_ended(conn, terminal) for _ in range(12)]
++        assert reviewer._due(conn, 10**10, set()) == []  # the one pass that notices each review ended
++        seen = _count_reads(monkeypatch)
++        statements = []
++        conn.set_trace_callback(statements.append)
++        assert reviewer._due(conn, 10**10, set()) == []
++        conn.set_trace_callback(None)
++        assert seen == {"stop": 0, "events": 0}
++        assert len(statements) <= 4, statements  # a constant number, whatever the journal holds
++        assert journal.open_keys(conn) == []
++        # History is kept byte for byte: only the marker changed.
++        assert len(journal.requests(conn)) == 12
++        assert all(journal.get(conn, tid, ep)["wire"]["event_uid"] == "u" + tid for tid, ep in keys)
++
++
++def test_statement_count_does_not_grow_with_ended_history(kanban_home):
++    def statements(conn):
++        out = []
++        conn.set_trace_callback(out.append)
++        reviewer._due(conn, 10**10, set())
++        conn.set_trace_callback(None)
++        return len(out)
++    with kbc.connect_closing() as conn:
++        for _ in range(3):
++            _ended(conn, reviewer.SETTLED)
++        reviewer._due(conn, 10**10, set())
++        few = statements(conn)
++        for _ in range(30):
++            _ended(conn, reviewer.SETTLED)
++        reviewer._due(conn, 10**10, set())
++        assert statements(conn) == few
++
++
++@pytest.mark.parametrize("status", ["done", "archived", "ready"])
++def test_unconfirmed_request_on_ended_card_is_still_due(kanban_home, status):
++    with kbc.connect_closing() as conn:
++        for _ in range(5):
++            _ended(conn, reviewer.SETTLED)
++        tid, ep = _ended(conn, None, status=status)
++        for _ in range(3):  # stays due on every tick until its review ends; ended neighbours never hide it
++            assert reviewer._due(conn, 10**10, set()) == [(tid, ep, 1)]
++        assert journal.open_keys(conn) == [(tid, ep)]
++
++
++def test_unconfirmed_request_still_reaches_reconcile_bound(kanban_home, monkeypatch):
++    monkeypatch.setattr(reviewer, "settings", lambda: (True, 2))
++    with kbc.connect_closing() as conn:
++        _ended(conn, reviewer.SETTLED)
++        tid, ep = _ended(conn, None)
++        with kb.write_txn(conn):
++            for attempt in range(2, journal.MAX_RECONCILE_ATTEMPTS + 1):
++                kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep, "attempt": attempt, "deadline": 1})
++        assert reviewer._due(conn, 10**10, set()) == [(tid, ep, journal.MAX_RECONCILE_ATTEMPTS)]
++        assert reviewer.start_due(conn, now=10**10) == []
++        assert reviewer.state(conn, tid, ep) == reviewer.ESCALATED
++        assert reviewer._due(conn, 10**10, set()) == []
++        assert journal.open_keys(conn) == []
++
++
++def test_requeued_triage_stop_is_due_after_its_request_closed(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, ep = _ended(conn, reviewer.ESCALATED, status="triage")
++        assert reviewer._due(conn, 10**10, set()) == []
++        assert journal.open_keys(conn) == []
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.QUEUED, {"episode": ep})
++        assert reviewer._due(conn, 10**10, set()) == [(tid, ep, 1)]
++
++
++def test_close_failure_keeps_request_open_and_scan_working(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid, ep = _ended(conn, reviewer.SETTLED)
++        def broken(conn, keys):
++            raise sqlite3.OperationalError("database is locked")
++        monkeypatch.setattr(journal, "close", broken)
++        assert reviewer._due(conn, 10**10, set()) == []
++        assert journal.open_keys(conn) == [(tid, ep)]
++
++
++def test_table_from_before_the_marker_is_read_then_marked(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid, ep = helpers.stop(conn)
++        with kb.write_txn(conn):
++            conn.execute(f"CREATE TABLE {journal.TABLE} (task TEXT NOT NULL, episode TEXT NOT NULL, "
++                         "request TEXT NOT NULL, PRIMARY KEY(task,episode))")
++            conn.execute(f"INSERT INTO {journal.TABLE} VALUES (?,?,?)",
++                         (tid, ep, json.dumps({"board": "b", "gateway": "gw",
++                                               "wire": {"task": tid, "episode": ep, "event_uid": "u"}})))
++            kb._append_event(conn, tid, reviewer.QUEUED, {"episode": ep})
++            kb._append_event(conn, tid, reviewer.SETTLED, {"episode": ep})
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        assert journal.open_keys(conn) == [(tid, ep)]
++        assert reviewer._due(conn, 10**10, set()) == []
++        assert journal.open_keys(conn) == []
++        other, ep2 = _ended(conn, None)  # freeze still works on the migrated table
++        assert journal.open_keys(conn) == [(other, ep2)]
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 4bc276ac9d5..23d5ca93b26 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -762,6 +762,15 @@
+ holds remain. The administrator must reconcile the exact Board receipt, not choose
+ a replacement verdict or infer clearance from an absent receipt. The reviewer no
+ longer suppresses the stale-stop backstop while administrative reconciliation is pending.
++The journal keeps every request; once a request's review has ended it is marked closed, and the
++per-tick due scan reads only open requests, so its cost does not grow with history.
++
++Dispatcher maintenance also finishes a stop decision that was recorded but never promoted
++(`hermes_cli/kanban_decided_triage.py`): a triage card whose current stop has a later scope renewal,
++or an ordinary budget stop on which a person then set a limit that is still in force, is promoted,
++or parked in `todo` while a parent is open. An agent-written limit, a cleared override, and any
++budget edit on a scope, capability or safety stop release nothing; an agent's renewal still waits
++for that session's unread comments.
+ 
+ Every card has an owning chat. A card created from a chat is owned by that
+ chat, and a worker's card by its creator's. Any other card gets its producer's
+-- 
+2.43.0
+

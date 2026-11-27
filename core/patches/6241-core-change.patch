@@ -1,0 +1,521 @@
+From 7d557cc0c163af0389798956a5cbcdd7fc730e11 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:24:10 +0000
+Subject: [PATCH 6241] Bounded fact capture, degradation and prepared recency
+
+Public mirror of source commit 7d557cc0c163af0389798956a5cbcdd7fc730e11.
+
+---
+diff --git a/hermes_cli/fact_annotation_sources.py b/hermes_cli/fact_annotation_sources.py
+index d082b43cbb7..39e5eb5c322 100644
+--- a/hermes_cli/fact_annotation_sources.py
++++ b/hermes_cli/fact_annotation_sources.py
+@@ -11,6 +11,13 @@
+ from hermes_cli.fact_source_watch import NativeSourceWatch
+ from hermes_cli.fact_wire import encode
+ 
++# [daveey] Hub undated representative observation: every annotation family watches state.db, processes, config and the kanban directory, and
++# the kanban family's capture is a complete multi-board read plus links publication. Unpaced, each unrelated write
++# (every turn message, every board write) ran it again on the shared ``fact-change-feed`` thread, adding repeated
++# work. A paced source coalesces a burst of hints into one trailing pass, exactly as the
++# clock-only content sources do. Other families are cheap and stay on the leading edge; review demand must be prompt.
++KANBAN_CAPTURE_INTERVAL = 5.0
++
+ 
+ class NativeAnnotationOwner(ContentOwner):
+     def __init__(self, engines, bindings, *, budget, operational=()):
+@@ -62,6 +69,8 @@
+         self._lock = threading.Lock()
+         self._unsubscribe = None
+         self._next_wall = 0
++        # Paced by the shared feed (``ChangeFeed.register`` reads it); 0 = every wake is a pass.
++        self.min_interval = KANBAN_CAPTURE_INTERVAL if family == 'kanban' else 0
+ 
+     def watch(self, wake):
+         if self._watch is not None:
+diff --git a/hermes_cli/fact_demand_source.py b/hermes_cli/fact_demand_source.py
+index a5fd921ee49..952138ff694 100644
+--- a/hermes_cli/fact_demand_source.py
++++ b/hermes_cli/fact_demand_source.py
+@@ -1,22 +1,28 @@
+ """Bounded view demand mailbox executed by the existing ChangeFeed. [daveey]
+ 
+-No SQLite capture, extra thread or polling. Demands remain resident until owner
+-shutdown (bounded by admission); reference-counted eviction is not implemented.
+-Only the feed thread binds/reduces. Failed publication retains the queue head.
++No SQLite capture, extra thread or polling. Accepted demands are an LRU set bounded by ``max_keys``: a new demand
++at capacity evicts the least recently demanded key that has already been bound. The eviction is queued here and
++unbound on the feed thread (``commit``), so the reducer's bound set -- and with it per-publish CPU -- stays
++bounded for the life of the owner instead of growing with every distinct session page the UI ever asked for.
++An evicted view keeps its last fact (it expires normally); demanding it again simply re-accepts and re-binds it.
++Only the feed thread binds/unbinds/reduces. Failed publication retains the queue head.
+ """
+-from collections import deque
++from collections import OrderedDict, deque
+ from dataclasses import dataclass
+ import threading
+ import time
+ 
+ from hermes_cli.fact_store import view_key
+ 
++EVICT_BATCH = 256
++
+ 
+ @dataclass(frozen=True)
+ class DemandCapture:
+     key: object
+     after: int
+     more: bool
++    evict: tuple = ()
+ 
+     @property
+     def next_deadline(self):
+@@ -31,8 +37,10 @@
+         self.engine = engine
+         self.max_keys, self.max_selector_bytes = max_keys, max_selector_bytes
+         self._lock = threading.Lock()
+-        self._accepted = set()
++        self._accepted = OrderedDict()  # key -> None, least recently demanded first
+         self._pending = deque()
++        self._pending_keys = set()
++        self._evicted = deque()
+         self._wake = None
+         self._closed = False
+ 
+@@ -57,11 +65,18 @@
+             if self._closed or self._wake is None:
+                 raise RuntimeError('demand mailbox closed')
+             if key in self._accepted:
++                self._accepted.move_to_end(key)
+                 return
+             if len(self._accepted) >= self.max_keys:
+-                raise ValueError('demand capacity exceeded')
+-            self._accepted.add(key)
++                # Never evict a demand the feed has not bound yet: that would drop it unserved.
++                victim = next((k for k in self._accepted if k not in self._pending_keys), None)
++                if victim is None:
++                    raise ValueError('demand capacity exceeded')
++                del self._accepted[victim]
++                self._evicted.append(victim)
++            self._accepted[key] = None
+             self._pending.append(key)
++            self._pending_keys.add(key)
+             wake = self._wake
+         wake()
+ 
+@@ -69,9 +84,17 @@
+         with self._lock:
+             # Registration boot and redundant hints may arrive with no demand.
+             key = self._pending[0] if self._pending else None
+-            return DemandCapture(key, (cursor or 0) + 1, len(self._pending) > 1)
++            evict = tuple(list(self._evicted)[:EVICT_BATCH])
++            more = len(self._pending) > 1 or len(self._evicted) > len(evict)
++            return DemandCapture(key, (cursor or 0) + 1, more, evict)
+ 
+     def commit(self, capture):
++        for victim in capture.evict:
++            # Unbinding withdraws the reducer demand only; the last published fact stays and expires normally.
++            self.engine.unbind(victim)
++            with self._lock:
++                if self._evicted and self._evicted[0] == victim:
++                    self._evicted.popleft()
+         if capture.key is None:
+             return
+         newly_bound = capture.key not in self.engine._bound
+@@ -87,6 +110,7 @@
+             if not self._pending or self._pending[0] != capture.key:
+                 raise RuntimeError('demand publication order mismatch')
+             self._pending.popleft()
++            self._pending_keys.discard(capture.key)
+ 
+     def failure(self):
+         # Retry remains bounded by ChangeFeed. Rotate a refused demand so other
+diff --git a/hermes_cli/kanban_annotation_facts.py b/hermes_cli/kanban_annotation_facts.py
+index 9d37dc37a0a..bcbf27c35d7 100644
+--- a/hermes_cli/kanban_annotation_facts.py
++++ b/hermes_cli/kanban_annotation_facts.py
+@@ -11,9 +11,12 @@
+ from contextvars import ContextVar
+ from copy import deepcopy
+ from functools import wraps
++import logging
+ import threading
+ import time
+ 
++_log = logging.getLogger(__name__)
++
+ FIELDS = {
+     'kanban': frozenset(('kanban_active', 'kanban_blocked', 'kanban_unseen',
+         'kanban_attention', 'kanban_remote_stale', 'kanban_parked', 'kanban_held',
+@@ -161,7 +164,13 @@
+                 if self._needs_restart:
+                     raise AnnotationUnavailable('legacy annotation rollback incomplete')
+                 return _legacy_call(rows, legacy, **kwargs)
+-            return self._apply(family, rows, **kwargs)
++            try:
++                return self._apply(family, rows, **kwargs)
++            except AnnotationUnavailable:
++                raise
++            except Exception as exc:  # health: allow BLE001 -- any fact-subsystem fault is "unavailable", never a request fault
++                _log.warning("annotation facts failed for %s", family, exc_info=True)
++                raise AnnotationUnavailable('annotation facts failed') from exc
+ 
+     def _apply(self, family, rows, **kwargs):
+         from hermes_cli.fact_annotation_views import selector_for
+@@ -316,3 +325,24 @@
+             return annotate(family, rows, legacy, **kwargs)
+         return wrapped
+     return decorate
++
++
++def best_effort(annotator, family):
++    """Request-boundary wrapper: an unavailable annotation never fails the list it decorates. [daveey]
++
++    Annotations are optional enrichment of rows the session DB already served. A missing/expired/overflowed
++    fact projection leaves the rows as read (kanban rows are marked ``kanban_unknown`` so no client renders
++    "no work"). It never re-opens a legacy reader behind an active owner fence: ``annotate`` already refused
++    that, and a refusal publishes no partial mutation, so the rows are exactly as the caller built them.
++    ``annotate`` itself stays fail-closed for its own callers and tests."""
++    @wraps(annotator)
++    def wrapped(rows, **kwargs):
++        try:
++            return annotator(rows, **kwargs)
++        except AnnotationUnavailable as exc:
++            _log.warning("%s annotation unavailable (%s); serving rows without it", family, exc)
++            if family == 'kanban':
++                from hermes_cli.kanban_activity_projection import project_kanban_unknown
++                return project_kanban_unknown(rows, now=time.time())
++            return rows
++    return wrapped
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 3e320884715..f54e1b27d4c 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -41,13 +41,22 @@
+ from hermes_cli.config import get_process_hermes_home
+ from hermes_cli.isolated_scope import scope_to_launch_profile
+ from hermes_cli.profiles import ProfileIdentitySettlementPending
+-from hermes_cli.kanban_session_activity import annotate_kanban_activity, one_annotation_snapshot
+-from hermes_cli.cron_session_activity import annotate_cron_activity
+-from hermes_cli.goal_session_activity import annotate_goal_activity
+-from hermes_cli.process_session_activity import annotate_background_activity
+-from hermes_cli.subagent_session_activity import annotate_subagent_activity
+-from hermes_cli.turn_session_activity import annotate_turn_activity
+-from hermes_cli.review_session_activity import annotate_review_wait
++from hermes_cli.kanban_session_activity import annotate_kanban_activity as _raw_annotate_kanban_activity, one_annotation_snapshot
++from hermes_cli.cron_session_activity import annotate_cron_activity as _raw_annotate_cron_activity
++from hermes_cli.goal_session_activity import annotate_goal_activity as _raw_annotate_goal_activity
++from hermes_cli.process_session_activity import annotate_background_activity as _raw_annotate_background_activity
++from hermes_cli.subagent_session_activity import annotate_subagent_activity as _raw_annotate_subagent_activity
++from hermes_cli.turn_session_activity import annotate_turn_activity as _raw_annotate_turn_activity
++from hermes_cli.review_session_activity import annotate_review_wait as _raw_annotate_review_wait
++from hermes_cli.kanban_annotation_facts import best_effort as _best_effort
++# [daveey] Optional enrichment: an unavailable fact projection never fails the list/sidebar (see best_effort).
++annotate_kanban_activity = _best_effort(_raw_annotate_kanban_activity, "kanban")
++annotate_cron_activity = _best_effort(_raw_annotate_cron_activity, "cron")
++annotate_goal_activity = _best_effort(_raw_annotate_goal_activity, "goal")
++annotate_background_activity = _best_effort(_raw_annotate_background_activity, "background")
++annotate_subagent_activity = _best_effort(_raw_annotate_subagent_activity, "subagent")
++annotate_turn_activity = _best_effort(_raw_annotate_turn_activity, "turn")
++annotate_review_wait = _best_effort(_raw_annotate_review_wait, "review")
+ from hermes_cli.web_server_profiles import (
+     _fallback_profile_dicts, _hub_action_name,
+ )
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 3d91f3d19c8..6629af55e4a 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -27,13 +27,22 @@
+ from hermes_cli.web_thread_lanes import lane_runner, run_in_lane
+ from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_json_response import encoded_in_thread, native_json_response, per_request_response
+-from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+-from hermes_cli.cron_session_activity import annotate_cron_activity
+-from hermes_cli.goal_session_activity import annotate_goal_activity
+-from hermes_cli.process_session_activity import annotate_background_activity, stop_session_process
+-from hermes_cli.subagent_session_activity import annotate_subagent_activity
+-from hermes_cli.turn_session_activity import annotate_turn_activity
+-from hermes_cli.review_session_activity import annotate_review_wait
++from hermes_cli.kanban_session_activity import annotate_kanban_activity as _raw_annotate_kanban_activity, session_tasks as session_kanban_tasks
++from hermes_cli.cron_session_activity import annotate_cron_activity as _raw_annotate_cron_activity
++from hermes_cli.goal_session_activity import annotate_goal_activity as _raw_annotate_goal_activity
++from hermes_cli.process_session_activity import annotate_background_activity as _raw_annotate_background_activity, stop_session_process
++from hermes_cli.subagent_session_activity import annotate_subagent_activity as _raw_annotate_subagent_activity
++from hermes_cli.turn_session_activity import annotate_turn_activity as _raw_annotate_turn_activity
++from hermes_cli.review_session_activity import annotate_review_wait as _raw_annotate_review_wait
++from hermes_cli.kanban_annotation_facts import best_effort as _best_effort
++# [daveey] Optional enrichment: an unavailable fact projection never fails the list/sidebar (see best_effort).
++annotate_kanban_activity = _best_effort(_raw_annotate_kanban_activity, "kanban")
++annotate_cron_activity = _best_effort(_raw_annotate_cron_activity, "cron")
++annotate_goal_activity = _best_effort(_raw_annotate_goal_activity, "goal")
++annotate_background_activity = _best_effort(_raw_annotate_background_activity, "background")
++annotate_subagent_activity = _best_effort(_raw_annotate_subagent_activity, "subagent")
++annotate_turn_activity = _best_effort(_raw_annotate_turn_activity, "turn")
++annotate_review_wait = _best_effort(_raw_annotate_review_wait, "review")
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _session_latest_descendant
+ from hermes_cli.web_models import (
+@@ -203,7 +212,13 @@
+     list them for the open chat without loading the whole board. [daveey]"""
+     wanted = [s.strip() for s in ids.split(",") if s.strip()][:50]
+     # The Desktop linked-card strip: serve the last remote-links projection rather than wait on a rebuild.
+-    return {"tasks": session_kanban_tasks(wanted, stale_ok=True)}
++    from hermes_cli.fact_remote_links import LinksUnavailable
++    try:
++        return {"tasks": session_kanban_tasks(wanted, stale_ok=True)}
++    except LinksUnavailable as exc:
++        # [daveey] An unavailable links projection is a retryable dependency outage, not a server fault and
++        # never a successful empty list: honest 503 (the strip keeps its last cards), not a 500 traceback.
++        raise HTTPException(status_code=503, detail="remote links unavailable", headers={"Retry-After": "5"}) from exc
+ 
+ 
+ # Identical in-flight ``ids`` share one kanban-lane read (a Desktop poll burst). Distinct ``ids`` still
+diff --git a/tests/hermes_cli/test_annotation_capture_pacing.py b/tests/hermes_cli/test_annotation_capture_pacing.py
+new file mode 100644
+index 00000000000..35af3adc262
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_capture_pacing.py
+@@ -0,0 +1,54 @@
++"""The kanban annotation capture is paced on the shared change feed. [daveey]
++
++Hub undated representative observation: the kanban family re-read every board (and published links) on each unrelated write to state.db,
++the process registry, config or the kanban directory, on the shared ``fact-change-feed`` thread.
++"""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.fact_annotation_sources import KANBAN_CAPTURE_INTERVAL, NativeAnnotationSource
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_process import _Adapter
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++from tests.waiting import wait_until
++
++
++def _source(tmp_path, family, calls):
++    scope = Scope('install', 'profile')
++    engine = ReducerEngine(FactStore(), scope)
++    def read(budget, wall, ids):
++        calls.append(family)
++        return {'n': len(calls)}, wall + 30
++    return NativeAnnotationSource(engine, SourceId(scope, 'annotations.' + family, 'local'),
++                                  (tmp_path / 'state.db',), read)
++
++
++@pytest.mark.parametrize('family,paced', [('kanban', True), ('background', False), ('turn', False),
++                                          ('subagent', False), ('review', False)])
++def test_only_the_expensive_kanban_family_is_paced(tmp_path, family, paced):
++    source = _source(tmp_path, family, [])
++    assert source.min_interval == (KANBAN_CAPTURE_INTERVAL if paced else 0)
++    # The shared feed reads pacing through the owner's wrapper, which must forward it.
++    assert _Adapter(source, SimpleNamespace(budget=None)).min_interval == source.min_interval
++
++
++def test_a_burst_of_wakes_is_one_kanban_capture_not_one_per_hint(tmp_path):
++    calls = []
++    source = _source(tmp_path, 'kanban', calls)
++    source.min_interval = 0.4  # same mechanism, test-sized interval
++    feed = ChangeFeed(lambda *a: None, lambda *a: None)
++    try:
++        feed.register(source)
++        assert wait_until(lambda: len(calls) == 1, timeout=5)  # registration's own pass
++        for _ in range(200):
++            source._wake()
++        assert wait_until(lambda: len(calls) == 2, timeout=5)
++        # health: allow HX013 -- the quiet interval after the trailing pass IS the behaviour under test
++        threading.Event().wait(0.6)
++        assert len(calls) == 2  # 200 hints cost one trailing pass
++    finally:
++        feed.close()
+diff --git a/tests/hermes_cli/test_fact_content_demand.py b/tests/hermes_cli/test_fact_content_demand.py
+index ce422d85059..15abc2c92fe 100644
+--- a/tests/hermes_cli/test_fact_content_demand.py
++++ b/tests/hermes_cli/test_fact_content_demand.py
+@@ -179,3 +179,50 @@
+     engine.publish([Fact(key, {}, health='fresh')], now=2)
+     assert isinstance(engine.store.snapshot(scope).view('title', {}), Ready)
+     source.close()
++
++
++def test_demand_lru_evicts_bound_views_and_never_exceeds_the_bound():
++    """[daveey] Demand retention is an LRU, not a ratchet: the owner's bound set stays at ``max_keys`` however many
++    distinct selectors are ever asked for, and the live working set keeps being served."""
++    from hermes_cli.fact_demand_source import DemandSource
++    scope = Scope('install', 'profile')
++    facts = FactStore()
++    engine = ReducerEngine(facts, scope)
++    engine.register(view_reducer([Projection('title', (), lambda *args: (), lambda *args: {'ok': True})]))
++    source = DemandSource(engine, max_keys=3, max_selector_bytes=128)
++    source.watch(lambda: None)
++
++    def drain():
++        cursor = None
++        while True:
++            capture = source.capture(cursor, None)
++            source.commit(capture)
++            cursor = capture.after
++            if capture.key is None and not capture.more:
++                return
++
++    keys = {n: view_key(scope, 'title', {'n': n}) for n in range(8)}
++    for n in range(3):
++        source.demand('title', {'n': n})
++    drain()
++    assert engine._bound == {keys[0], keys[1], keys[2]}
++    source.demand('title', {'n': 0})  # touch: 1 is now the least recently demanded
++    source.demand('title', {'n': 3})
++    drain()
++    assert engine._bound == {keys[0], keys[2], keys[3]}
++    for n in range(4, 8):
++        source.demand('title', {'n': n})
++        drain()
++        assert len(engine._bound) <= 3 and len(source._accepted) == 3 and not source._evicted
++    assert engine._bound == {keys[5], keys[6], keys[7]}
++    # An evicted selector is simply demanded again and re-bound; its fact was never deleted.
++    source.demand('title', {'n': 0})
++    drain()
++    assert keys[0] in engine._bound and isinstance(facts.snapshot(scope).view('title', {'n': 0}), Ready)
++    # Unserved demands are never evicted to make room: that would drop them silently.
++    unserved = DemandSource(engine, max_keys=2, max_selector_bytes=128)
++    unserved.watch(lambda: None)
++    unserved.demand('title', {'u': 1})
++    unserved.demand('title', {'u': 2})
++    with pytest.raises(ValueError, match='capacity'):
++        unserved.demand('title', {'u': 3})
+diff --git a/tests/hermes_cli/test_sessions_annotation_degradation.py b/tests/hermes_cli/test_sessions_annotation_degradation.py
+new file mode 100644
+index 00000000000..d7eb6c1a4ad
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_annotation_degradation.py
+@@ -0,0 +1,125 @@
++"""A fact-subsystem failure must never break the session lists. [daveey]
++
++Annotations (kanban/goal/cron/...) are optional enrichment of rows the session DB already served. With the
++fact owner active but a projection unavailable (demand capacity, cold/expired fact, owner transfer) or the
++facts path raising, ``/api/profiles/sessions`` and the sidebar answer 200 with the legacy DB rows; kanban rows
++are marked ``kanban_unknown`` so no client renders them as "no work". Legacy annotation readers are never
++re-opened behind the active owner fence. The session-kanban-tasks strip stays an honest 503, never a 500.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_annotation_facts as annotations
++
++from tests.hermes_cli import test_profiles_sidebar_failed_load as _base
++
++# Reuse the real-route fixtures by name (assignment, not import, so pytest resolves them in this module).
++_uncached_sidebar = _base._uncached_sidebar
++profiles_on_disk = _base.profiles_on_disk
++client = _base.client
++_seed_session = _base._seed_session
++
++
++class _Failing:
++    def __init__(self, error):
++        self.error = error
++        self.calls = []
++
++    def annotate(self, family, rows, legacy, **kwargs):
++        self.calls.append(family)
++        raise self.error
++
++
++ERRORS = [
++    annotations.AnnotationUnavailable('annotation demand unavailable'),
++    annotations.AnnotationUnavailable('annotation projection unavailable'),
++    annotations.AnnotationUnavailable('annotation owner transfer active or binding missing'),
++]
++
++
++@pytest.fixture
++def facts_unavailable(monkeypatch):
++    def install(error):
++        failing = _Failing(error)
++        monkeypatch.setattr(annotations, '_native_lookup', lambda profile: failing)
++        # The legacy readers must not run behind the (simulated) active owner fence.
++        monkeypatch.setattr(annotations, '_legacy_call', lambda *a, **k: pytest.fail('legacy annotation reader ran'))
++        return failing
++    return install
++
++
++@pytest.mark.parametrize('error', ERRORS, ids=lambda e: str(e))
++def test_sessions_list_and_sidebar_stay_200_when_annotations_unavailable(
++        client, profiles_on_disk, facts_unavailable, error):
++    _seed_session(profiles_on_disk['default'], 'chat-one')
++    failing = facts_unavailable(error)
++
++    listing = client.get('/api/profiles/sessions', params={'profile': 'all'})
++    assert listing.status_code == 200, listing.text
++    rows = listing.json()['sessions']
++    assert [row['id'] for row in rows] == ['chat-one']
++    assert rows[0].get('kanban_unknown') is True
++    assert 'kanban' in failing.calls
++
++    sidebar = client.get('/api/profiles/sessions/sidebar', params={'recents_profile': 'default'})
++    assert sidebar.status_code == 200, sidebar.text
++    recents = sidebar.json()['recents']
++    assert [row['id'] for row in recents['sessions']] == ['chat-one']
++    assert recents['sessions'][0].get('kanban_unknown') is True
++    assert not recents.get('failed')
++
++
++def test_single_profile_session_routes_stay_200(client, profiles_on_disk, facts_unavailable):
++    _seed_session(profiles_on_disk['default'], 'chat-one')
++    facts_unavailable(ERRORS[0])
++    listing = client.get('/api/sessions')
++    assert listing.status_code == 200, listing.text
++    assert [row['id'] for row in listing.json()['sessions']] == ['chat-one']
++
++
++def test_best_effort_leaves_rows_unmutated_and_passes_other_errors_through():
++    rows = [{'id': 'a'}]
++
++    def unavailable(rows, **kwargs):
++        raise annotations.AnnotationUnavailable('annotation demand unavailable')
++
++    assert annotations.best_effort(unavailable, 'goal')(rows) is rows
++    assert rows == [{'id': 'a'}]
++    marked = annotations.best_effort(unavailable, 'kanban')(rows, display=True)
++    assert marked[0]['id'] == 'a' and marked[0].get('kanban_unknown') is True
++
++    def broken(rows, **kwargs):
++        raise KeyError('a programming error is not an unavailable projection')
++
++    with pytest.raises(KeyError):
++        annotations.best_effort(broken, 'goal')(rows)
++
++
++def test_facts_path_exception_becomes_unavailable_not_a_request_fault():
++    from hermes_cli.fact_contract import Scope
++
++    class Boom(annotations.AnnotationFacts):
++        def __init__(self):
++            self._lock = __import__('threading').RLock()
++            self._closed, self._mode, self._needs_restart = False, 'facts', False
++
++        def _apply(self, family, rows, **kwargs):
++            raise RuntimeError('reducer exploded')
++
++    with pytest.raises(annotations.AnnotationUnavailable, match='facts failed'):
++        Boom().annotate('kanban', [{'id': 'a'}], None)
++    assert Scope  # fixture import kept explicit for readers
++
++
++def test_session_kanban_tasks_links_outage_is_503_not_500(client, monkeypatch):
++    from hermes_cli.fact_remote_links import LinksUnavailable
++    from hermes_cli.web_routers import sessions as sessions_routes
++
++    def unavailable(*args, **kwargs):
++        raise LinksUnavailable('remote links projection unavailable', error_code='links_capture_pending')
++
++    monkeypatch.setattr(sessions_routes, 'session_kanban_tasks', unavailable)
++    response = client.get('/api/session-kanban-tasks', params={'ids': 'chat-one'})
++    assert response.status_code == 503, response.text
++    assert response.headers.get('retry-after') == '5'
+-- 
+2.43.0
+

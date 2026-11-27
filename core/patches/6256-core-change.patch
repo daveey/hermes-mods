@@ -1,0 +1,457 @@
+From e1f6e2594d820f096fef0068068da0f623936e6a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:18:07 +0000
+Subject: [PATCH 6256] Durable notice fanout and opt-in native scheduling
+
+Public mirror of source commit e1f6e2594d820f096fef0068068da0f623936e6a.
+
+---
+diff --git a/gateway/kanban_notification_schedule.py b/gateway/kanban_notification_schedule.py
+index 4fba4ed7f04..3e337883307 100644
+--- a/gateway/kanban_notification_schedule.py
++++ b/gateway/kanban_notification_schedule.py
+@@ -30,7 +30,8 @@
+ 
+     @property
+     def legacy(self):
+-        return not self.was_bound or (self.native and not self.facts_bound and self.native_action is None)
++        return not self.was_bound or (self.native and not self.facts_bound and
++                                      (self.native_action is None or not self.native_action.owner.policy.enabled))
+ 
+     def _native_due(self, now, legacy_due):
+         from tui_gateway.notification_gateway_sources import enabled
+@@ -47,6 +48,8 @@
+         self.was_bound = True
+         if self.retry_floor and now < self.retry_at:
+             return False
++        if not self.native_action.owner.policy.enabled:
++            return legacy_due or now >= self.retry_at
+         return self.native_action.due(legacy_due=legacy_due) or now >= self.retry_at
+ 
+     def due(self, now: float, *, legacy_due: bool) -> bool:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 29a6ecc0bbd..d023f6fab02 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -915,12 +915,12 @@
+             "first_lines": 2,
+             "last_lines": 2,
+         },
+-        # Gateway: natural mid-turn assistant status messages. Desktop: keep mid-turn narration
+-        # between tool calls instead of collapsing to the final message.
++        # Gateway interim status messages; Desktop keeps mid-turn narration between tool calls.
+         "interim_assistant_messages": True,
+         # Warnings stay visible unless opted out; task results, manual commands and logs are unaffected.
+         "suppress_warning_notifications": False,
+         "loaded_notification_f": False,  # incident containment: legacy until shared source cost is corrected
++        "gateway_notification_f": True,  # native host notifications; live OFF preserves legacy custody
+         # Codex Responses commentary channel: true delivers completed commentary as mid-turn interim
+         # updates; false routes it to reasoning (visible only with show_reasoning).
+         "show_commentary": True,
+diff --git a/tests/tui_gateway/test_gateway_live_rollback.py b/tests/tui_gateway/test_gateway_live_rollback.py
+new file mode 100644
+index 00000000000..c0f17584189
+--- /dev/null
++++ b/tests/tui_gateway/test_gateway_live_rollback.py
+@@ -0,0 +1,216 @@
++"""A live f2 rollback is configuration publication, never remote env injection."""
++import builtins
++import sqlite3
++import threading
++
++from gateway.kanban_notification_schedule import BoundActions, PassReport
++from tui_gateway import notification_gateway_sources as sources, notification_loaded_f as loaded
++
++
++def test_config_rollback_reenable_preserves_custody_and_quiet_gate(monkeypatch, tmp_path):
++    from hermes_cli import config, fact_source_watch
++    from tests.tui_gateway.test_gateway_native_source_lifecycle import Watch
++
++    state = {'display': {'gateway_notification_f': True}}
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: state)
++    monkeypatch.setattr(config, 'get_config_path', lambda: tmp_path / 'config.yaml')
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((tmp_path / 'board.db',), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    scheduler = loaded.Scheduler(clock=lambda: 0)
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    gate = BoundActions(lambda: None, native=True)
++    try:
++        assert not gate.due(0, legacy_due=True)
++        scheduler.step()
++        assert gate.due(0, legacy_due=False)
++        gate.settled(PassReport(pending=True, deadline=4), 0, 5)
++        owner = scheduler.gateway_sources
++        source_watch = owner.watch
++        state['display']['gateway_notification_f'] = False
++        owner.policy.changed()
++        owner.step(1, reconcile=False)
++        assert source_watch.closed
++        assert owner.watch is None
++        assert gate.legacy
++        assert not gate.due(1, legacy_due=True)  # refusal floor/custody unchanged
++        assert gate.due(4, legacy_due=False)
++        gate.settled(PassReport(), 4, 5)
++        assert gate.due(5, legacy_due=True)
++        assert not gate.due(5, legacy_due=False)
++        assert owner.policy.watch is not None  # native control survives rollback
++        state['display']['gateway_notification_f'] = True
++        owner.policy.changed()
++        owner.step(6, reconcile=False)
++        assert owner.ready
++        assert owner.watch is not source_watch
++        assert gate.due(6, legacy_due=False)
++        gate.settled(PassReport(), 6, 5)
++
++        def forbidden(*args, **kwargs):
++            raise AssertionError('quiet admission did source I/O')
++
++        with monkeypatch.context() as patch:
++            patch.setattr(builtins, 'open', forbidden)
++            patch.setattr(sqlite3, 'connect', forbidden)
++            patch.setattr(config, 'load_config_readonly', forbidden)
++            assert not gate.due(7, legacy_due=True)
++        control = owner.policy.watch
++        gate.close()
++        owner.step(8, reconcile=False)
++        assert control.closed
++    finally:
++        gate.close()
++        scheduler.close()
++
++
++def test_config_only_hint_does_not_admit_collection(monkeypatch, tmp_path):
++    from hermes_cli import config, fact_source_watch
++    from tests.tui_gateway.test_gateway_native_source_lifecycle import Watch
++
++    reads = []
++    monkeypatch.setattr(config, 'get_config_path', lambda: tmp_path / 'config.yaml')
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: reads.append(1) or {})
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((), ()))
++    owner = sources.Sources(threading.Event())
++    action = owner.add(lambda: None)
++    try:
++        owner.step(0, reconcile=True)
++        assert action.due(legacy_due=False)
++        owner.policy.changed()
++        owner.step(1, reconcile=False)
++        assert len(reads) == 2
++        assert not action.due(legacy_due=False)
++        owner.step(30, reconcile=True)  # one existing census repairs missed config hints
++        assert len(reads) == 3
++    finally:
++        owner.close()
++
++
++def test_real_canonical_config_write_is_a_native_live_rollback(monkeypatch, tmp_path):
++    from hermes_cli import config
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setattr(config, 'get_config_path', lambda: tmp_path / 'config.yaml')
++    monkeypatch.setattr(sources, 'inventory', lambda: ((tmp_path / 'board.db',), ()))
++    initial = config.load_config()
++    initial.setdefault('display', {})['gateway_notification_f'] = True
++    config.save_config(initial)
++    owner = sources.Sources(threading.Event())
++    action = owner.add(lambda: None)
++    try:
++        owner.step(0, reconcile=True)
++        assert owner.ready
++        assert owner.policy.enabled
++        assert action.due(legacy_due=False)
++        owner.event.clear()
++        updated = config.load_config()
++        updated['display']['gateway_notification_f'] = False
++        config.save_config(updated)
++        assert owner.event.wait(5)  # actual native commit hint, no process injection or polling
++        owner.step(1, reconcile=False)
++        assert not owner.policy.enabled
++        assert owner.watch is None
++        assert not action.due(legacy_due=False)
++    finally:
++        owner.close()
++
++
++def test_policy_failure_quiet_retry_and_unsupported_census(monkeypatch, tmp_path):
++    from hermes_cli import config, fact_source_watch
++    from tui_gateway.notification_gateway_policy import Policy
++    from tests.tui_gateway.test_gateway_native_source_lifecycle import Watch
++
++    monkeypatch.setattr(config, 'get_config_path', lambda: tmp_path / 'config.yaml')
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    fail = [True]
++    reads = []
++
++    def capture():
++        reads.append(1)
++        if fail[0]:
++            raise ValueError('config unavailable')
++        return {}
++
++    monkeypatch.setattr(config, 'load_config_readonly', capture)
++    policy = Policy(threading.Event())
++    try:
++        assert policy.step(0, reconcile=False)
++        assert not policy.enabled
++        assert policy.retry_at == 1
++        assert not policy.step(0.5, reconcile=False)
++        assert reads == [1]
++        fail[0] = False
++        assert policy.step(1, reconcile=False)
++        assert policy.enabled
++        assert policy.retry_at == float('inf')
++        old = policy.watch
++        policy.close()
++        assert old.closed
++        policy.close()
++
++        def unsupported(*args, **kwargs):
++            raise NotImplementedError
++
++        monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', unsupported)
++        assert not policy.step(2, reconcile=False)
++        assert policy.enabled
++        assert policy.watch is None
++        assert not policy.step(3, reconcile=False)
++        assert reads == [1, 1, 1]
++        assert not policy.step(30, reconcile=True)
++        assert reads == [1, 1, 1, 1]
++    finally:
++        policy.close()
++
++
++def test_failed_config_envelope_cannot_authorize_native_work(monkeypatch, tmp_path):
++    from hermes_cli import config, fact_source_watch
++    from tui_gateway.notification_gateway_policy import Policy
++    from tests.tui_gateway.test_gateway_native_source_lifecycle import Watch
++
++    monkeypatch.setattr(config, 'get_config_path', lambda: tmp_path / 'config.yaml')
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: config.FailedConfigRead(
++        {'display': {'gateway_notification_f': True}}, error=OSError('unreadable')))
++    policy = Policy(threading.Event())
++    try:
++        policy.step(0, reconcile=True)
++        assert not policy.enabled
++        assert policy.retry_at == 1
++    finally:
++        policy.close()
++
++
++def test_native_live_off_role_transfer_catches_up_before_legacy_timer(monkeypatch, tmp_path):
++    from hermes_cli import config, fact_source_watch
++    from tui_gateway import kanban_unloaded_schedule as unloaded
++    from tests.tui_gateway.test_gateway_native_source_lifecycle import Watch
++
++    state = {'display': {'gateway_notification_f': True}}
++    monkeypatch.setattr(config, 'get_config_path', lambda: tmp_path / 'config.yaml')
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: state)
++    monkeypatch.setattr(fact_source_watch, 'NativeSourceWatch', Watch)
++    monkeypatch.setattr(sources, 'inventory', lambda: ((), ()))
++    monkeypatch.setenv('HERMES_FACTS_GATEWAY', '1')
++    now = [0]
++    monkeypatch.setattr(unloaded.time, 'monotonic', lambda: now[0])
++    scheduler = loaded.Scheduler(clock=lambda: now[0])
++    monkeypatch.setattr(loaded, '_owner', scheduler)
++    schedule = unloaded.UnloadedSchedule(lambda: None, 30, native=True)
++    calls = []
++    try:
++        schedule.run('standby', lambda: calls.append('initial'))
++        scheduler.step()
++        schedule.run('standby', lambda: calls.append('native'))
++        assert calls == ['native']
++        now[0] = 1
++        state['display']['gateway_notification_f'] = False
++        scheduler.gateway_sources.policy.changed()
++        scheduler.step()
++        schedule.run('owner', lambda: calls.append('transferred'))
++        assert calls == ['native', 'transferred']
++    finally:
++        schedule.close()
++        scheduler.close()
+diff --git a/tests/tui_gateway/test_gateway_native_source_lifecycle.py b/tests/tui_gateway/test_gateway_native_source_lifecycle.py
+index 840f20fd663..867c3dd4794 100644
+--- a/tests/tui_gateway/test_gateway_native_source_lifecycle.py
++++ b/tests/tui_gateway/test_gateway_native_source_lifecycle.py
+@@ -133,10 +133,10 @@
+     owner.add(lambda: None)
+     owner.step(0, reconcile=True)
+     owner.step(1, reconcile=False)
+-    assert attempts == [1]
++    assert attempts == [1, 1]  # one config control and one data watch, neither retried at 1s
+     assert not owner.ready
+     owner.step(30, reconcile=True)
+-    assert attempts == [1, 1]
++    assert attempts == [1, 1, 1, 1]  # both retry on the same unchanged census
+ 
+ 
+ def test_roster_census_arms_successor_before_closing_predecessor(owner, monkeypatch, tmp_path):
+diff --git a/tui_gateway/kanban_unloaded_schedule.py b/tui_gateway/kanban_unloaded_schedule.py
+index b7f0653909e..e3ba2a047ad 100644
+--- a/tui_gateway/kanban_unloaded_schedule.py
++++ b/tui_gateway/kanban_unloaded_schedule.py
+@@ -26,7 +26,7 @@
+         # never permission to resume scans using the launch profile instead.
+         native = self.gate.native_action
+         ready = native is not None and native.owner.ready
+-        if not due and not (changed and (self.gate.actions or ready or not self.gate.was_bound)):
++        if not due and not (changed and (self.gate.actions or ready or self.gate.legacy)):
+             return
+         report = PassReport()
+         try:
+diff --git a/tui_gateway/notification_gateway_policy.py b/tui_gateway/notification_gateway_policy.py
+new file mode 100644
+index 00000000000..d438fd6d549
+--- /dev/null
++++ b/tui_gateway/notification_gateway_policy.py
+@@ -0,0 +1,56 @@
++"""One native control lease for live f2 rollback; never a consumer-side config read."""
++from __future__ import annotations
++
++import logging
++import threading
++
++log = logging.getLogger(__name__)
++
++
++class Policy:
++    def __init__(self, event):
++        self.event = event
++        self.lock = threading.Lock()
++        self.dirty = True
++        self.enabled = True
++        self.watch = None
++        self.retry_at = float('inf')
++
++    def changed(self):
++        with self.lock:
++            self.dirty = True
++        self.event.set()
++
++    def step(self, now, *, reconcile):
++        with self.lock:
++            dirty, self.dirty = self.dirty, False
++        if not (dirty or reconcile or now >= self.retry_at):
++            return False
++        previous = self.enabled
++        try:
++            from hermes_cli.config import FailedConfigRead, get_config_path, load_config_readonly
++            from hermes_cli.fact_source_watch import NativeSourceWatch
++            if self.watch is None:
++                try:
++                    self.watch = NativeSourceWatch((get_config_path(),), self.changed)
++                except NotImplementedError:
++                    pass  # unsupported platforms sample policy on the existing census
++            if self.watch is not None:
++                self.watch.check()
++            config = load_config_readonly()
++            if isinstance(config, FailedConfigRead):
++                raise ValueError('configuration read failed') from config.read_error
++            self.enabled = config.get('display', {}).get('gateway_notification_f', True) is True
++            self.retry_at = float('inf')
++        except (OSError, ValueError, RuntimeError) as exc:
++            # Unknown policy cannot authorize native work. Legacy custody remains.
++            self.enabled = False
++            self.retry_at = now + 1.0
++            log.warning('gateway notification policy unavailable; legacy recovery: %s', exc)
++        return previous != self.enabled
++
++    def close(self):
++        if self.watch is not None:
++            self.watch.close()
++            self.watch = None
++        self.dirty = True
+diff --git a/tui_gateway/notification_gateway_sources.py b/tui_gateway/notification_gateway_sources.py
+index 4f74d8da941..5c83c146e02 100644
+--- a/tui_gateway/notification_gateway_sources.py
++++ b/tui_gateway/notification_gateway_sources.py
+@@ -57,7 +57,9 @@
+ 
+ class Sources:
+     def __init__(self, event):
++        from tui_gateway.notification_gateway_policy import Policy
+         self.event = event
++        self.policy = Policy(event)
+         self.context = copy_context()
+         self.lock = threading.Lock()
+         self.actions = set()
+@@ -95,7 +97,21 @@
+         if old is not None:
+             old.close()
+         if not active:
++            self.policy.close()
+             return
++        policy_changed = self.context.run(self.policy.step, now, reconcile=reconcile)
++        if not self.policy.enabled:
++            if self.watch is not None:
++                self.watch.close()
++                self.watch = None
++            self.signature = None
++            self.ready = False
++            self.retry_at = self.policy.retry_at
++            # Existing executor housekeeping observes rollback without an extra collection.
++            return
++        if policy_changed:
++            self.retry_at = 0.0
++            dirty = True
+         refresh = reconcile or now >= self.retry_at
+         if refresh or (dirty and self.watch is not None):
+             try:
+@@ -139,6 +155,7 @@
+                     action.close()
+ 
+     def close(self):
++        self.policy.close()
+         if self.watch is not None:
+             self.watch.close()
+         with self.lock:
+diff --git a/website/docs/developer-guide/gateway-notification-scheduling.md b/website/docs/developer-guide/gateway-notification-scheduling.md
+index 7250fada913..66eb270ed04 100644
+--- a/website/docs/developer-guide/gateway-notification-scheduling.md
++++ b/website/docs/developer-guide/gateway-notification-scheduling.md
+@@ -12,6 +12,19 @@
+ an in-flight delivery. Pending action deadlines/refusal floors survive rollback.
+ This narrowly scoped emergency switch is not a secrets setting.
+ 
++For no-restart control, the registered `display.gateway_notification_f` key defaults
++to true and is ANDed with that environment switch. Its one native config lease is
++separate from data invalidations: an unrelated config write does not wake collectors.
++`hermes config set display.gateway_notification_f false` on the running profile
++withdraws data watches and restores legacy cadence on the next executor iteration.
++The config lease remains while executors are registered, so setting true rearms
++the sources and catches up from the same durable state. Only the shared owner reads
++config, on a native control hint, failed-read retry or the existing 30s census.
++Unsupported native platforms and managed/nonlocal config updates use that census.
++Unknown policy fails to legacy with a one-second shared retry, not native admission.
++No environment mutation RPC or serve signal is used. A service drop-in is only a
++future-start override; daemon-reload does not alter the current process environment.
++
+ ## Sources and readiness
+ 
+ The shared owner captures the canonical board inventory and profile-store paths,
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index e6cdc6bfb49..09be79320d1 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -2595,6 +2595,17 @@
+ 
+ ## Display Settings
+ 
++`display.gateway_notification_f` defaults to `true`. It enables native wake admission for the existing
++gateway and unloaded notification executors, independently of the loaded-chat switch below. Use
++`hermes config set display.gateway_notification_f false` in the running server's profile home to restore
++legacy cadence without restarting it; set `true` to rearm. A single process-owned native config observer
++publishes the policy to memory; executor iterations do not read config. Local config hints normally apply
++at the next housekeeping iteration; missed hints and nonlocal/managed config changes are repaired by the
++existing 30-second census. This is not a subsecond upstream-freshness guarantee. Config failure selects
++legacy recovery and retries after one second. `HERMES_FACTS_GATEWAY=0` remains an overriding emergency
++OFF for that process; changing a systemd drop-in alone affects only a natural successor, not a running
++process. Rollback preserves notification cursors, in-flight custody and refusal deadlines.
++
+ `display.loaded_notification_f` defaults to `false` for incident containment. Explicit `true` enables the shared
+ loaded-session notification consumer, which uses changefeed hints and bounded
+ background discovery rather than a separate polling loop for each loaded chat. Keep it off until the shared
+-- 
+2.43.0
+

@@ -1,0 +1,478 @@
+From 92abc543ba0ceb6216248bda28220fe02fcfb64c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 08:02:37 +0000
+Subject: [PATCH 6441] Local answer recovery and authority contract tests
+
+Public mirror of source commit 92abc543ba0ceb6216248bda28220fe02fcfb64c.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_reason_fence.py b/tests/hermes_cli/test_kanban_reason_fence.py
+new file mode 100644
+index 00000000000..e93529c5655
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_reason_fence.py
+@@ -0,0 +1,67 @@
++"""Pre-insert fence contracts with fixture-owned SQLite, not live board state."""
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_reason_comment import (
++    FencedReasonComment,
++    RecordedDecisionComment,
++    reason_comment,
++)
++
++
++@pytest.mark.parametrize("kind", ["none", "tuple", "recorded", "fenced"])
++def test_reason_fence_runs_before_comment_and_can_be_absent(monkeypatch, kind):
++    calls = []
++    with closing(sqlite3.connect(":memory:")) as conn:
++        conn.execute("CREATE TABLE tasks(id TEXT)")
++        conn.execute("INSERT INTO tasks VALUES ('fixture')")
++
++        def before(actual):
++            assert actual is conn
++            assert calls == []
++            calls.append("fence")
++
++        def add(actual, task, author, body, **extra):
++            assert actual is conn
++            assert task == "fixture"
++            assert (author, body) == ("fixture-author", "fixture-body")
++            assert calls == (["fence"] if kind == "fenced" else [])
++            assert extra == ({"recorded_decision": {"fixture": True}, "writer_kind": "agent"}
++                             if kind == "recorded" else {})
++            calls.append("comment")
++            return 71
++
++        monkeypatch.setattr(kb, "add_comment", add)
++        comments = {
++            "none": None,
++            "tuple": ("fixture-author", "fixture-body"),
++            "recorded": RecordedDecisionComment("fixture-author", "fixture-body", {"fixture": True}),
++            "fenced": FencedReasonComment("fixture-author", "fixture-body", before),
++        }
++        with reason_comment(conn, "fixture", comments[kind]) as state:
++            assert state.comment_id == (None if kind == "none" else 71)
++            state.keep()
++        assert calls == ([] if kind == "none" else
++                         ["fence", "comment"] if kind == "fenced" else ["comment"])
++
++
++def test_refusing_fence_prevents_comment_and_context_entry(monkeypatch):
++    calls = []
++    with closing(sqlite3.connect(":memory:")) as conn:
++        def refuse(actual):
++            assert actual is conn
++            raise ValueError("fixture fence refusal")
++
++        def add(*args, **kwargs):
++            calls.append("comment")
++            pytest.fail("comment was inserted before refusing fence")
++
++        monkeypatch.setattr(kb, "add_comment", add)
++        comment = FencedReasonComment("fixture-author", "fixture-body", refuse)
++        with pytest.raises(ValueError, match="fixture fence refusal"):
++            with reason_comment(conn, "fixture", comment):
++                pytest.fail("context entered after refusal")
++        assert calls == []
+diff --git a/tests/hermes_cli/test_kanban_selfwork_callback_contract.py b/tests/hermes_cli/test_kanban_selfwork_callback_contract.py
+new file mode 100644
+index 00000000000..80b4b197429
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_callback_contract.py
+@@ -0,0 +1,108 @@
++"""Callback race contracts; mocked transition seams, not live authorization proof."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_selfwork_exception as sx
++from hermes_cli import kanban_selfwork_local as local
++from hermes_cli import kanban_selfwork_local_source as source
++from tests.hermes_cli import test_kanban_selfwork_local as h
++
++world = h.world
++nochat_envelope = h.nochat_envelope
++request_envelope = h.request_envelope
++home = h.home
++operation = h.operation
++
++
++@pytest.mark.parametrize('case', ['invalid_stamp', 'conflict', 'replay', 'delivered', 'transition_refused'])
++def test_delivery_entry_contract(home, operation, monkeypatch, case):
++    with source.custody(local.RECOVERY_OPERATION) as actual, kbc.connect_closing() as conn:
++        evidence = copy.deepcopy(actual)
++        stamp = evidence['snapshot']['ask'][sx.STAMP]
++        grant = local._grant(evidence, stamp, None)
++        old = None
++        if case == 'invalid_stamp':
++            evidence['snapshot']['ask'][sx.STAMP] = {}
++        elif case in ('conflict', 'replay'):
++            old = dict(grant, operationId='different') if case == 'conflict' else grant
++        elif case == 'transition_refused':
++            evidence['operation']['dispatchState'] = 'recorded'
++        monkeypatch.setattr(local, 'recorded', lambda *_: old)
++        monkeypatch.setattr(local, 'eligible', lambda *_: stamp)
++        calls = []
++        monkeypatch.setattr(h.kb, 'unblock_task', lambda *a, **kw: calls.append(kw) or False)
++        if case == 'replay':
++            assert local._deliver(conn, evidence) == evidence['receipt']
++        else:
++            reason = {'invalid_stamp': 'local_stamp_invalid', 'conflict': 'local_operation_conflict',
++                      'delivered': 'local_delivered_requires_recovery',
++                      'transition_refused': 'local_transition_refused'}[case]
++            with pytest.raises(sx.Refused, match='^' + reason + '$'):
++                local._deliver(conn, evidence)
++        assert len(calls) == (1 if case == 'transition_refused' else 0)
++
++
++@pytest.mark.parametrize('case', ['conflict', 'replay', 'already_granted', 'status', 'ask', 'null_ask', 'generation', 'valid'])
++def test_before_insert_rechecks_race_contract(home, operation, monkeypatch, case):
++    with source.custody(local.RECOVERY_OPERATION) as actual, kbc.connect_closing() as conn:
++        evidence = copy.deepcopy(actual)
++        evidence['operation']['dispatchState'] = 'recorded'
++        stamp = evidence['snapshot']['ask'][sx.STAMP]
++        grant = local._grant(evidence, stamp, None)
++        states = iter([None, dict(grant, fingerprint='conflict') if case == 'conflict'
++                       else grant if case == 'replay' else None])
++        monkeypatch.setattr(local, 'recorded', lambda *_: next(states))
++        checks = []
++        monkeypatch.setattr(local, 'eligible', lambda *_: checks.append(True) or stamp)
++        monkeypatch.setattr(sx, '_grant', lambda *_: grant if case == 'already_granted' else None)
++        generation = conn.execute('SELECT MAX(id) FROM task_events WHERE task_id=? AND kind IN '
++                                  "('created','blocked','block_loop_detected','unblocked','archived','completed')",
++                                  (home['task'],)).fetchone()[0]
++        evidence['snapshot']['generation'] = generation + (1 if case == 'generation' else 0)
++        conn.execute('UPDATE tasks SET status=?,human_request=? WHERE id=?',
++                     ('ready' if case == 'status' else 'blocked',
++                      None if case == 'null_ask' else source.encoded({} if case == 'ask' else evidence['snapshot']['ask']), home['task']))
++        def transition(c, task, **kwargs):
++            kwargs['precondition'](c)
++            return True
++        monkeypatch.setattr(h.kb, 'unblock_task', transition)
++        if case in ('replay', 'valid'):
++            assert local._deliver(conn, evidence) == evidence['receipt']
++        else:
++            reason = ('local_operation_conflict' if case == 'conflict' else
++                      'local_offer_already_granted' if case == 'already_granted' else 'local_ask_changed')
++            with pytest.raises(sx.Refused, match='^' + reason + '$'):
++                local._deliver(conn, evidence)
++        assert len(checks) == (1 if case in ('conflict', 'replay') else 2)
++
++
++@pytest.mark.parametrize('case', ['invalid_stamp', 'conflict', 'replay', 'already_granted'])
++def test_recovery_entry_contract(home, operation, monkeypatch, case):
++    from contextlib import contextmanager
++    with source.custody(local.RECOVERY_OPERATION) as actual:
++        evidence = copy.deepcopy(actual)
++    stamp = evidence['snapshot']['ask'][sx.STAMP]
++    grant = local._grant(evidence, stamp, None)
++    if case == 'invalid_stamp':
++        evidence['snapshot']['ask'][sx.STAMP] = {}
++    @contextmanager
++    def custody(oid, *, delivered):
++        assert oid == local.RECOVERY_OPERATION and delivered is True
++        yield evidence
++    monkeypatch.setattr(source, 'custody', custody)
++    old = dict(grant, operationId='different') if case == 'conflict' else grant if case == 'replay' else None
++    monkeypatch.setattr(local, 'recorded', lambda *_: old)
++    monkeypatch.setattr(local, 'eligible', lambda *_: stamp)
++    monkeypatch.setattr(sx, '_grant', lambda *_: grant)
++    with kbc.connect_closing() as conn:
++        before = sx._own(conn, local.RECOVERED)
++        if case == 'replay':
++            assert local.recover(conn, home['hub'], local.RECOVERY_OPERATION) == grant
++        else:
++            reason = {'invalid_stamp': 'local_recovery_stamp_invalid', 'conflict': 'local_grant_operation_conflict',
++                      'already_granted': 'local_offer_already_granted'}[case]
++            with pytest.raises(sx.Refused, match='^' + reason + '$'):
++                local.recover(conn, home['hub'], local.RECOVERY_OPERATION)
++        assert sx._own(conn, local.RECOVERED) == before
+diff --git a/tests/hermes_cli/test_kanban_selfwork_entry_contract.py b/tests/hermes_cli/test_kanban_selfwork_entry_contract.py
+new file mode 100644
+index 00000000000..88a722e0adf
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_entry_contract.py
+@@ -0,0 +1,116 @@
++"""Isolated entry contracts; no live receiver or board calls."""
++import json
++import sqlite3
++from contextlib import closing, contextmanager
++
++import pytest
++
++from hermes_cli import kanban_selfwork_exception as sx
++
++
++@pytest.mark.parametrize("case", ["wrong_task", "extra_type", "missing_row", "null_ask", "list_ask", "empty_ask", "old_version", "valid"])
++def test_missing_local_adapter_contract(case):
++    with closing(sqlite3.connect(":memory:")) as conn:
++        conn.execute("CREATE TABLE tasks(id TEXT, human_request TEXT)")
++        ask = {sx.STAMP: {}}
++        if case == "list_ask":
++            ask = []
++        if case == "empty_ask":
++            ask = {}
++        if case != "missing_row":
++            conn.execute("INSERT INTO tasks VALUES (?,?)", (sx.TARGET.owner_task,
++                         None if case == "null_ask" else json.dumps(ask)))
++        extra = {"user_steps_projection": {}, sx.GRANT: {"local_version": 1}}
++        if case in ("old_version", "empty_ask"):
++            # Keep the version predicate true to isolate stamp presence.
++            extra[sx.GRANT]["local_version"] = 0
++        if case == "extra_type":
++            extra = ["user_steps_projection"]
++        if case == "wrong_task":
++            conn.execute("INSERT INTO tasks VALUES (?,?)", ("fixture-other", json.dumps(ask)))
++            extra.pop(sx.GRANT)
++        task = "fixture-other" if case == "wrong_task" else sx.TARGET.owner_task
++        assert sx.missing_local_adapter(conn, task, extra) is (case == "old_version")
++
++
++@pytest.mark.parametrize("argv", [[], ["unknown"], ["recover-local"], ["recover-local", "fixture", "extra"], ["status", "extra"]])
++def test_invalid_cli_never_opens_board(monkeypatch, capsys, argv):
++    from hermes_cli import kanban_card_answer_runtime as runtime
++
++    def forbidden(*args, **kwargs):
++        pytest.fail("invalid argv reached board lookup")
++
++    monkeypatch.setattr(runtime, "_board_db", forbidden)
++    assert sx.main(argv) == 64
++    assert json.loads(capsys.readouterr().out) == {"ok": False, "error": "usage"}
++
++
++def test_recovery_cli_dispatches_exact_operation(monkeypatch, capsys):
++    from hermes_cli import kanban_card_answer_runtime as runtime
++    from hermes_cli import kanban_card_answer_transport as transport
++    from hermes_cli import kanban_db_connect as db
++    from hermes_cli import kanban_selfwork_local as local
++
++    sentinel, records = object(), object()
++    calls = []
++
++    @contextmanager
++    def connect(path):
++        assert path == "fixture-only"
++        yield sentinel
++
++    def recover(conn, source, operation):
++        assert conn is sentinel and source is records
++        calls.append(operation)
++        return {"fixture": operation}
++
++    monkeypatch.setattr(runtime, "_board_db", lambda board: "fixture-only")
++    monkeypatch.setattr(db, "connect_closing", connect)
++    monkeypatch.setattr(transport, "Records", lambda: records)
++    monkeypatch.setattr(local, "recover", recover)
++    assert sx.main(["recover-local", "fixture-operation"]) == 0
++    assert calls == ["fixture-operation"]
++    assert json.loads(capsys.readouterr().out) == {"ok": True, "result": {"fixture": "fixture-operation"}}
++
++
++def test_reconsider_keeps_source_custody_during_receive(monkeypatch):
++    from hermes_cli import kanban_selfwork_local_source as source
++
++    grant = {"local_version": 1, "operationId": "fixture-operation"}
++    held = []
++
++    @contextmanager
++    def custody(operation, *, delivered):
++        assert operation == "fixture-operation" and delivered is True
++        held.append(operation)
++        try:
++            yield
++        finally:
++            held.clear()
++
++    def receive(envelope, actual_grant):
++        assert held == ["fixture-operation"]
++        assert actual_grant is grant and envelope == {"fixture": True}
++        return {"accepted": True}, None
++
++    monkeypatch.setattr(sx, "_home", lambda conn: None)
++    monkeypatch.setattr(sx, "_live_grant", lambda conn: grant)
++    monkeypatch.setattr(sx, "original", lambda records: {"fixture": True})
++    monkeypatch.setattr(source, "custody", custody)
++    monkeypatch.setattr(sx, "_receive", receive)
++    assert sx.reconsider(None, None) == {"accepted": True}
++    assert held == []
++
++
++def test_remote_status_does_not_validate_local_authority(monkeypatch):
++    from hermes_cli import kanban_selfwork_local as local
++
++    def forbidden(*args, **kwargs):
++        pytest.fail("remote grant entered local verifier")
++
++    grant = {"offer_uid": "fixture-offer", "operationId": "fixture-operation"}
++    monkeypatch.setattr(sx, "_live_grant", lambda conn: grant)
++    monkeypatch.setattr(sx, "_own", lambda conn, kind: [])
++    monkeypatch.setattr(local, "validate", forbidden)
++    with closing(sqlite3.connect(":memory:")) as conn:
++        assert sx.status(conn)["local_authority"] is None
+diff --git a/tests/hermes_cli/test_kanban_selfwork_receipt_contract.py b/tests/hermes_cli/test_kanban_selfwork_receipt_contract.py
+new file mode 100644
+index 00000000000..5bf6ab0137d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_receipt_contract.py
+@@ -0,0 +1,152 @@
++"""Historical receipt contracts on disposable fixture databases only."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_selfwork_exception as sx
++from hermes_cli import kanban_selfwork_local as local
++from hermes_cli import kanban_selfwork_local_source as source
++from tests.hermes_cli import test_kanban_selfwork_local as h
++
++world = h.world
++nochat_envelope = h.nochat_envelope
++request_envelope = h.request_envelope
++home = h.home
++operation = h.operation
++
++
++@pytest.mark.parametrize('case', ['missing', 'empty', 'valid'])
++def test_event_uid_requires_present_nonempty_identity(home, operation, case):
++    with kbc.connect_closing() as conn:
++        event = sx._own(conn, 'unblocked')[0]
++        expected = local._uid(conn, event)
++        if case == 'missing':
++            event = dict(event, id=-1)
++        elif case == 'empty':
++            with h.kb.write_txn(conn):
++                conn.execute("UPDATE task_events SET uid='' WHERE id=?", (event['id'],))
++        if case == 'valid':
++            assert local._uid(conn, event) == expected
++        else:
++            with pytest.raises(sx.Refused, match='^local_event_identity_missing$'):
++                local._uid(conn, event)
++
++
++@pytest.mark.parametrize('case', ['missing', 'duplicate', 'before_offer', 'wrong_comment_id', 'foreign_operation', 'unblock_before_offer'])
++def test_prior_unblock_requires_exact_comment_order(home, operation, monkeypatch, case):
++    with source.custody(local.RECOVERY_OPERATION) as evidence, kbc.connect_closing() as conn:
++        own = sx._own
++        offer = own(conn, sx.OFFERED)[0]
++        comments = copy.deepcopy(own(conn, 'commented'))
++        unblocks = copy.deepcopy(own(conn, 'unblocked'))
++        # Preserve unrelated comments; alter only the event that authenticates this decision.
++        decision = conn.execute("SELECT id FROM task_comments WHERE task_id=? AND author='user-steps'", (home['task'],)).fetchone()[0]
++        matching = [e for e in comments if e['payload'].get('comment_id') == decision]
++        assert len(matching) == 1
++        # unblock_before_offer checks an early refusal reason; the later
++        # comment-order guard independently refuses, so it is not a bypass kill.
++        mutations = {
++            'missing': lambda: comments.remove(matching[0]),
++            'duplicate': lambda: comments.append(copy.deepcopy(matching[0])),
++            'before_offer': lambda: matching[0].update(id=offer['id']),
++            'unblock_before_offer': lambda: unblocks[0].update(id=offer['id']),
++            'wrong_comment_id': lambda: matching[0]['payload'].update(comment_id=-1),
++            'foreign_operation': lambda: unblocks[0]['payload']['user_steps_projection'].update(operationId='foreign'),
++        }
++        mutations[case]()
++        def filtered(c, kind):
++            return comments if kind == 'commented' else unblocks if kind == 'unblocked' else own(c, kind)
++        monkeypatch.setattr(sx, '_own', filtered)
++        reason = 'local_unblock_missing_or_ambiguous' if case in ('foreign_operation', 'unblock_before_offer') else 'local_comment_event_invalid'
++        with pytest.raises(sx.Refused, match='^' + reason + '$'):
++            local._prior_unblock(conn, evidence)
++
++
++@pytest.mark.parametrize('case', ['duplicate', 'missing_offer', 'wrong_ask_hash', 'wrong_stamp', 'unbound_stamp', 'grant_changed', 'before_unblock', 'wrong_version'])
++def test_recorded_receipt_requires_unique_bound_history(home, operation, monkeypatch, case):
++    grant = h.recover(home)
++    with kbc.connect_closing() as conn:
++        own = sx._own
++        recovered = copy.deepcopy(own(conn, local.RECOVERED))
++        offers = copy.deepcopy(own(conn, sx.OFFERED))
++        def unbound_stamp():
++            offers[0]['payload'][sx.STAMP]['request_id'] = 'wrong'
++            recovered[0]['payload'][sx.GRANT]['stamp'] = copy.deepcopy(offers[0]['payload'][sx.STAMP])
++        mutations = {
++            'duplicate': lambda: recovered.append(copy.deepcopy(recovered[0])),
++            'missing_offer': offers.clear,
++            'wrong_ask_hash': lambda: offers[0]['payload'].update(ask_sha256='wrong'),
++            'wrong_stamp': lambda: offers[0]['payload'][sx.STAMP].update(offer_uid='other'),
++            'unbound_stamp': unbound_stamp,
++            'grant_changed': lambda: recovered[0]['payload'][sx.GRANT].update(fingerprint='wrong'),
++            'before_unblock': lambda: recovered[0].update(id=own(conn, 'unblocked')[0]['id'] - 1),
++            'wrong_version': lambda: recovered[0]['payload'][sx.GRANT].update(local_version=0),
++        }
++        mutations[case]()
++        def filtered(c, kind):
++            return recovered if kind == local.RECOVERED else offers if kind == sx.OFFERED else own(c, kind)
++        monkeypatch.setattr(sx, '_own', filtered)
++        if case == 'wrong_version':
++            assert local.recorded(conn, grant['offer_uid']) is None
++        else:
++            reason = ('local_grant_ambiguous' if case == 'duplicate' else
++                      'local_grant_evidence_changed' if case in ('grant_changed', 'before_unblock') else
++                      'local_grant_offer_invalid')
++            with pytest.raises(sx.Refused, match='^' + reason + '$'):
++                local.recorded(conn, grant['offer_uid'])
++
++
++@pytest.mark.parametrize('case', ['no_offer', 'no_owner'])
++def test_missing_offer_or_owner_has_typed_refusal(home, operation, monkeypatch, case):
++    with source.custody(local.RECOVERY_OPERATION) as evidence, kbc.connect_closing() as conn:
++        if case == 'no_offer':
++            own = sx._own
++            monkeypatch.setattr(sx, '_own', lambda c, kind: [] if kind == sx.OFFERED else own(c, kind))
++            with pytest.raises(sx.Refused, match='^local_offer_replaced_or_invalid$'):
++                local._offer(conn, evidence)
++        else:
++            # Isolate the second lookup after home validation, modeling disappearance.
++            # This is a defensive seam test, not a demonstrated authorization bypass.
++            sx._home(conn)
++            monkeypatch.setattr(sx, '_home', lambda c: None)
++            conn.execute('DELETE FROM tasks WHERE id=?', (home['task'],))
++            with pytest.raises(sx.Refused, match='^local_owner_held_or_closed$'):
++                local.eligible(conn, evidence)
++
++
++@pytest.mark.parametrize('case', ['valid', 'different_event'])
++def test_ordinary_grant_is_bound_to_its_own_unblock(home, operation, monkeypatch, case):
++    with source.custody(local.RECOVERY_OPERATION) as evidence, kbc.connect_closing() as conn:
++        own = sx._own
++        prior = copy.deepcopy(own(conn, 'unblocked')[0])
++        stamp = evidence['snapshot']['ask'][sx.STAMP]
++        grant = local._grant(evidence, stamp, None)
++        event = copy.deepcopy(prior)
++        event['payload'][sx.GRANT] = grant
++        if case == 'different_event':
++            # The grant event cannot borrow a different earlier plain-unblock receipt.
++            event['id'] += 1
++            event['payload'].pop('user_steps_projection')
++            events = [event, prior]
++        else:
++            events = [event]
++        monkeypatch.setattr(sx, '_own', lambda c, kind: events if kind == 'unblocked' else own(c, kind))
++        if case == 'valid':
++            assert local.recorded(conn, stamp['offer_uid']) == grant
++        else:
++            with pytest.raises(sx.Refused, match='^local_grant_evidence_changed$'):
++                local.recorded(conn, stamp['offer_uid'])
++
++
++def test_explicit_eligibility_time_and_absent_current_ask(home, operation):
++    with source.custody(local.RECOVERY_OPERATION) as evidence, kbc.connect_closing() as conn:
++        stamp = evidence['snapshot']['ask'][sx.STAMP]
++        # A plain unblock clears the ask; historical authority may still be evaluated.
++        conn.execute('UPDATE tasks SET human_request=? WHERE id=?', (source.encoded({'replacement': True}), home['task']))
++        with pytest.raises(sx.Refused, match='^local_ask_replaced$'):
++            local.eligible(conn, evidence, now=stamp['expires_at'] - 1)
++        conn.execute('UPDATE tasks SET human_request=NULL WHERE id=?', (home['task'],))
++        assert local.eligible(conn, evidence, now=stamp['expires_at'] - 1) == stamp
++        with pytest.raises(sx.Refused, match='^local_offer_expired_or_spent$'):
++            local.eligible(conn, evidence, now=stamp['expires_at'])
+-- 
+2.43.0
+

@@ -1,0 +1,139 @@
+From 35318f6d2d359c94052377af6e91a3b7dbf7166c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 02:57:15 +0000
+Subject: [PATCH 6540] Usage-accounting gate and pool pickup budgets
+
+Public mirror of source commit 35318f6d2d359c94052377af6e91a3b7dbf7166c.
+
+---
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index b8acb42b919..eca1a8e27a8 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -647,6 +647,8 @@
+             reason = _review_walled(replica, card)
+         if reason is None:
+             reason = _paced(conn, replica, card)
++        if reason is None:
++            reason = _usage_pending(replica, card)
+         if reason is None:
+             from hermes_cli.kanban_class_walls import pickup_refusal
+             reason = pickup_refusal(replica, card)
+@@ -703,6 +705,24 @@
+     return None if gated is None else ("other", f"{gated} (local dispatch would hold it)")
+ 
+ 
++def _usage_pending(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
++    """[daveey] ``("other", detail)`` when the local claim would defer ``card`` on ``usage_accounting_pending``
++    (``kanban_spend_claim``): a closed run of it still lacks its usage receipt. Judged on the replica (a copy
++    carries exactly those runs/events) before the copy, so such a card takes no pickup budget. Copied, it was
++    deferred, evicted and copied again each tick: 16 such cards filled every worker's window and hid the review
++    of the accounting fix itself (t_88f5d46a072c9879). Any failure copies as before: the claim
++    check still decides after the copy."""
++    try:
++        from hermes_cli.kanban_usage_accounting import pending
++        runs = pending(replica, card["id"])
++    except Exception:  # health: allow BLE001 -- pickup evidence must never stop a pickup
++        _log.warning("kanban worker node: usage accounting check failed for %s; copying", card["id"], exc_info=True)
++        return None
++    if not runs:
++        return None
++    return "other", f"usage_accounting_pending: runs {sorted(runs)} (local claim would defer it)"
++
++
+ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
+     """[daveey] ``("quota_hold", detail)`` when the local dispatcher would hold ``card`` on its quota episode, judged
+     before the copy: the same read-only :func:`kanban_quota_episode.decision` ``check_respawn_guard`` returns for a
+diff --git a/tests/hermes_cli/test_kanban_pickup_usage_pending.py b/tests/hermes_cli/test_kanban_pickup_usage_pending.py
+new file mode 100644
+index 00000000000..567174a0b22
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_usage_pending.py
+@@ -0,0 +1,84 @@
++"""Pickup spends no budget on a card whose claim would defer on ``usage_accounting_pending``.
++
++A pickup (t_88f5d46a072c9879): 30 of 51 pool candidates had a closed run without a usage receipt (pre-turn
++429s). Every tick copied the oldest of them, the local claim deferred them (``kanban_spend_claim``), and the
++batch never reached the design review of the accounting fix itself, ready at priority 900.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_usage_accounting as ua
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++
++
++@pytest.fixture
++def imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++def _indebted(hub, *, title, priority, runs_on):
++    """A hub card whose bound run closed without any usage receipt (a real accounting debt, synced)."""
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=title, assignee="default", priority=priority, runs_on=runs_on)
++    now = int(time.time())
++    with kb.write_txn(hub.conn):
++        run = hub.conn.execute(
++            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
++            "VALUES (?, 'default', 'released', ?, ?, 'released')", (tid, now - 120, now - 60)).lastrowid
++        kb._append_event(hub.conn, tid, "worker_bound", {"pid": 1}, run_id=run)
++        kb._append_event(hub.conn, tid, "worker_result", {"exit_code": 0},
++                         run_id=run)
++    assert ua.pending(hub.conn, tid) == [run]
++    hub.round()
++    return tid
++
++
++def test_usage_pending_cards_do_not_starve_a_clean_card(gws, imports):
++    hub, worker = gws
++    indebted = [_indebted(hub, title=f"debt {i}", priority=1000 - i, runs_on=PIN) for i in range(3)]
++    clean = support._hub_card(hub, title="clean, eligible", priority=0, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    # Budget 2 < 3 indebted cards ahead of the clean one: the first pass copies the clean card only.
++    assert wn.pickup(worker.conn, budget=2) == [clean]
++    for _ in range(2):
++        worker.round()
++        worker.enter()
++        wn.pickup(worker.conn, budget=3)
++    assert set(imports) == {clean}  # an unstarted copy is evicted and copied again; never a debt card
++    assert all(kb.get_task(worker.conn, tid) is None for tid in indebted)
++
++
++def test_a_failed_accounting_check_does_not_refuse(gws, monkeypatch):
++    """A failed read refuses nothing at pickup: the claim check still decides after the copy."""
++    hub, worker = gws
++    tid = _indebted(hub, title="debt", priority=10, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    try:
++        card = replica.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++        assert wn._usage_pending(replica, card)[1].startswith("usage_accounting_pending: runs ")
++
++        def boom(*a, **kw):
++            raise RuntimeError("replica unreadable")
++        monkeypatch.setattr(ua, "pending", boom)
++        assert wn._usage_pending(replica, card) is None
++    finally:
++        replica.close()
+-- 
+2.43.0
+

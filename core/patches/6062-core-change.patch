@@ -1,0 +1,270 @@
+From 3cac12cb354a988b3e15fa75d901f6d1a3ec64b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:43:32 +0000
+Subject: [PATCH 6062] Sessions request path: transport packing, scoped enrichment and coalesced polls
+
+Public mirror of source commit 3cac12cb354a988b3e15fa75d901f6d1a3ec64b1.
+
+---
+diff --git a/hermes_state_page_pack.py b/hermes_state_page_pack.py
+index 1f9ef0c6801..54508f2ceda 100644
+--- a/hermes_state_page_pack.py
++++ b/hermes_state_page_pack.py
+@@ -14,6 +14,19 @@
+ 
+ def read_page(conn, sql, params):
+     """Return dict rows with SQLite types, order and binary64 values preserved."""
++    return _read(conn, sql, params, None)
++
++
++def read_chunks(conn, sql, params):
++    """Hydrate an unbounded pin set in 64-row transport cells, without truncation.
++
++    The original query still executes once; unlike LIMIT/OFFSET batching this
++    does not repeat its sort or change snapshots between chunks.
++    """
++    return _read(conn, sql, params, 64)
++
++
++def _read(conn, sql, params, chunk):
+     # Prepare only: LIMIT 0 never steps the projection or its correlated probes.
+     names = [column[0] for column in conn.execute(f'SELECT * FROM ({sql}) LIMIT 0', params).description]
+     cells = []
+@@ -24,11 +37,20 @@
+         cells.append(f"json_array(typeof({column}), CASE typeof({column}) "
+                      f"WHEN 'real' THEN printf('%!.26g', {column}) "
+                      f"WHEN 'blob' THEN hex({column}) ELSE {column} END)")
+-    packed = conn.execute(f"WITH _packed_rows AS MATERIALIZED ({sql}) "
+-                          f"SELECT json_group_array(json_array({','.join(cells)})) "
+-                          "FROM _packed_rows", params).fetchone()[0]
++    prefix = f"WITH _packed_rows AS MATERIALIZED ({sql}) "
++    source, suffix = '_packed_rows', ''
++    if chunk:
++        # Number the materialized, already ordered rows before grouping; never
++        # serialize the entire pin history into one JSON value.
++        prefix += (", _numbered AS MATERIALIZED (SELECT *, "
++                   "row_number() OVER () - 1 AS _pack_ordinal FROM _packed_rows) ")
++        source = '_numbered'
++        suffix = f' GROUP BY _pack_ordinal / {chunk} ORDER BY MIN(_pack_ordinal)'
++    cursor = conn.execute(prefix + f"SELECT json_group_array(json_array({','.join(cells)})) "
++                          f"FROM {source}" + suffix, params)
++    packed_rows = cursor.fetchall() if chunk else [cursor.fetchone()]
+     return [dict(zip(names, (_value(kind, value) for kind, value in row)))
+-            for row in json.loads(packed)]
++            for packed in packed_rows for row in json.loads(packed[0])]
+ 
+ 
+ def _value(kind, value):
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+index 8119e5b9997..9b8bc5f2b25 100644
+--- a/hermes_state_recency.py
++++ b/hermes_state_recency.py
+@@ -321,11 +321,17 @@
+     ids_head = rank_memo._IDS_HEAD
+     key = (where_sql, repr(tuple(params)), seed_from, need)
+ 
++    def read_ids(sql, values):
++        # Same snapshot and exact ordering, one SQLite/Python handoff instead
++        # of four column conversions per ranked candidate under the store lock.
++        from hermes_state_page_pack import read_page
++        return [tuple(row.values()) for row in read_page(conn, sql, values)]
++
+     def restricted(ids_json: str, limit):
+         narrowed = _where_sql([*where_clauses, "s.id IN (SELECT value FROM json_each(?))"])
+         narrowed_params = [*params, ids_json]
+-        return conn.execute(ranked_query(narrowed, narrowed, seed_from, ids_head, ""),
+-                            narrowed_params + narrowed_params + [limit, 0]).fetchall()
++        return read_ids(ranked_query(narrowed, narrowed, seed_from, ids_head, ""),
++                        narrowed_params + narrowed_params + [limit, 0])
+ 
+     def exact_ids(*, invalidate_candidates=False):
+         if invalidate_candidates:
+@@ -333,8 +339,8 @@
+             store.stale = True
+         picked = _candidates(conn, store, where_clauses, params, need)
+         if picked is None:
+-            return conn.execute(ranked_query(where_sql, outer_where, seed_from, ids_head, ""),
+-                                params + params + id_params + [need, 0]).fetchall()
++            return read_ids(ranked_query(where_sql, outer_where, seed_from, ids_head, ""),
++                            params + params + id_params + [need, 0])
+         return restricted(picked, need)
+ 
+     with db._read_ctx() as conn:
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index 46fb3ca62c8..03c79692bdf 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -1419,7 +1419,9 @@
+                 {pinned_where}
+                 ORDER BY s.started_at DESC
+             """
+-            for row in self._read_all(pinned_query, pinned_params):
++            from hermes_state_page_pack import read_chunks
++            pinned_rows = self._read_retrying_ioerr(lambda conn: read_chunks(conn, pinned_query, pinned_params))
++            for row in pinned_rows:
+                 s = self._list_row(row)
+                 if s["id"] not in seen_ids:
+                     seen_ids.add(s["id"])
+diff --git a/tests/hermes_state/test_pinned_transport.py b/tests/hermes_state/test_pinned_transport.py
+new file mode 100644
+index 00000000000..ebf3a8b724b
+--- /dev/null
++++ b/tests/hermes_state/test_pinned_transport.py
+@@ -0,0 +1,32 @@
++"""Pinned hydration is indexed and transports bounded chunks, not wide rows."""
++import pytest
++
++pytest_plugins = ["tests.hermes_state.test_recency_hot_rows"]
++
++from tests.hermes_state.test_recency_hot_rows import _page, _seed, _stepped, _write
++
++
++@pytest.mark.parametrize('pins', [0, 4, 200])
++@pytest.mark.parametrize('history', [3000, 10000])
++def test_pinned_hydration_handoffs_and_vm(db, pins, history):
++    _seed(db, history)
++    _write(db, 'UPDATE sessions SET pinned=1, archived=1 WHERE id < ?', (f's{pins:05d}',))
++    _page(db, limit=10)  # warm unrelated discovery/schema paths
++    with _stepped(db) as log:
++        actual = _page(db, limit=10, include_pinned=True)
++    queries = [(sql, n) for sql, n in log if '_pin_id' in sql]
++    assert sum(n for _, n in queries) <= (pins + 63) // 64
++    assert len(queries) <= 2
++    assert len(actual) == 10 + pins
++    assert [r['id'] for r in actual[10:]] == [f's{i:05d}' for i in reversed(range(pins))]
++    with db._read_ctx() as conn:
++        steps = [0]
++        conn.set_progress_handler(lambda: steps.__setitem__(0, steps[0] + 100) or 0, 100)
++        try:
++            for sql, _ in queries:
++                conn.execute(sql, (1,)).fetchall()
++        finally:
++            conn.set_progress_handler(None, 0)
++    # Wide compact rows and chunk ordinals add ~1157 VM instructions per pin;
++    # the same bound at both history sizes rejects a sessions scan.
++    assert steps[0] <= 1500 * pins + 1000, steps
+diff --git a/tests/hermes_state/test_rank_projection_transport.py b/tests/hermes_state/test_rank_projection_transport.py
+index c96cc472224..f63be0c7e12 100644
+--- a/tests/hermes_state/test_rank_projection_transport.py
++++ b/tests/hermes_state/test_rank_projection_transport.py
+@@ -58,8 +58,10 @@
+         conn.close()
+ 
+ 
+-def test_packed_page_preserves_values_and_column_names():
+-    from hermes_state_page_pack import read_page
++@pytest.mark.parametrize('reader', ['read_page', 'read_chunks'])
++def test_packed_page_preserves_values_and_column_names(reader):
++    import hermes_state_page_pack
++    read_page = getattr(hermes_state_page_pack, reader)
+     conn = sqlite3.connect(':memory:')
+     conn.row_factory = sqlite3.Row
+     conn.execute('CREATE TABLE cells(value)')
+diff --git a/tests/hermes_state/test_recency_hot_rows.py b/tests/hermes_state/test_recency_hot_rows.py
+index 62cf00923c0..1db06d60dea 100644
+--- a/tests/hermes_state/test_recency_hot_rows.py
++++ b/tests/hermes_state/test_recency_hot_rows.py
+@@ -146,14 +146,13 @@
+     with _stepped(db) as log:
+         cold = _page(db, limit=50)
+     assert cold == _exact(db, monkeypatch, limit=50)
+-    # No statement steps more than the page (the ranked ids, then the projection); the rebuild alone
+-    # stepped 3000 rows and the candidate list ~100 before. (A cold read also opens and probes the store.)
+-    assert max(n for _, n in log) == 50
++    # Both ranked IDs and the projection now cross as one packed row.
++    assert max(n for _, n in log) <= 1
+     _write(db, "DELETE FROM messages WHERE session_id = 's02999'")  # bumps the lowered counter
+     with _stepped(db) as log:
+         lowered = _page(db, limit=50)
+     assert lowered == _exact(db, monkeypatch, limit=50)
+-    assert max(n for _, n in log) == 50 and _rows(log) <= 50 + 50 + 20, _rows(log)
++    assert max(n for _, n in log) <= 1 and _rows(log) <= 20, _rows(log)
+     assert memo.OUTCOMES["fallback/lowered"] == 1
+ 
+ 
+diff --git a/tests/hermes_state/test_request_rank_transport.py b/tests/hermes_state/test_request_rank_transport.py
+new file mode 100644
+index 00000000000..e6aaa08b29f
+--- /dev/null
++++ b/tests/hermes_state/test_request_rank_transport.py
+@@ -0,0 +1,46 @@
++"""Request ranking must not hand every ranked ID back through sqlite3."""
++from contextlib import contextmanager
++
++import pytest
++
++pytest_plugins = ["tests.hermes_state.test_recency_hot_rows"]
++
++import hermes_state_recency as recency
++from tests.hermes_state.test_recency_hot_rows import (
++    _exact, _page, _seed, _stepped, _write,
++)
++
++
++@pytest.mark.parametrize('count', [1, 200, 2000])
++@pytest.mark.parametrize('full', [False, True])
++def test_rank_id_transport_bound(db, monkeypatch, count, full):
++    _seed(db, count + 25)
++    if full:
++        monkeypatch.setattr(recency, '_candidates', lambda *args: None)
++    borrow = db._read_ctx
++    steps = [0]
++
++    @contextmanager
++    def measured():
++        with borrow() as conn:
++            conn.set_progress_handler(lambda: steps.__setitem__(0, steps[0] + 100) or 0, 100)
++            try:
++                yield conn
++            finally:
++                conn.set_progress_handler(None, 0)
++
++    monkeypatch.setattr(db, '_read_ctx', measured)
++    for change in ('cold', 'raised', 'lowered'):
++        if change == 'raised':
++            _write(db, "UPDATE sessions SET last_activity_at = 1800000000 WHERE id = 's00000'")
++        if change == 'lowered':
++            _write(db, "DELETE FROM messages WHERE session_id = 's00001'")
++        steps[0] = 0
++        with _stepped(db) as log:
++            actual = _page(db, limit=count)
++        work = steps[0]
++        assert actual == _exact(db, monkeypatch, limit=count)
++        ranked = [(sql, n) for sql, n in log if 'chain_max AS' in sql]
++        assert len(ranked) <= 4, (change, len(ranked))
++        assert work <= 3000 * (count + 25) + 30000, (change, work)
++        assert ranked and max(n for _, n in ranked) <= 1, (change, [(n, sql[:80]) for sql, n in ranked])
+diff --git a/tests/hermes_state/test_session_filter_clause_order.py b/tests/hermes_state/test_session_filter_clause_order.py
+index b19e0f1a076..048a338c12b 100644
+--- a/tests/hermes_state/test_session_filter_clause_order.py
++++ b/tests/hermes_state/test_session_filter_clause_order.py
+@@ -66,20 +66,21 @@
+ 
+ 
+ def _pinned_plan(db):
++    import hermes_state_page_pack as page_pack
+     seen = []
+-    read_all = db._read_all
++    read_chunks = page_pack.read_chunks
+ 
+-    def spy(sql, params=()):
++    def spy(conn, sql, params=()):
+         if "_pin_id" in sql:
+             seen.append((sql, list(params)))
+-        return read_all(sql, params)
++        return read_chunks(conn, sql, params)
+ 
+-    db._read_all = spy
++    page_pack.read_chunks = spy
+     try:
+         db.list_sessions_rich(source=None, exclude_sources=["kanban"], limit=5, min_message_count=1,
+                               order_by_last_active=True, compact_rows=True, include_pinned=True)
+     finally:
+-        db._read_all = read_all
++        page_pack.read_chunks = read_chunks
+     assert len(seen) == 1, seen
+     sql, params = seen[0]
+     with db._read_ctx() as conn:
+-- 
+2.43.0
+

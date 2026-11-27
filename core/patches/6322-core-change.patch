@@ -1,0 +1,145 @@
+From 95ae9561e2b0268f48adcd484da6661814ccc063 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 03:02:32 +0000
+Subject: [PATCH 6322] Read-first spend decisions and scope release fences
+
+Public mirror of source commit 95ae9561e2b0268f48adcd484da6661814ccc063.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 88b866ed965..d14619e4880 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -24,8 +24,9 @@
+ * **Grant** only when code also checks: N is at most the allowance that just ran out (and
+   ``kanban_spend_promote.MAX_RUNS``); the judge quoted at least ``QUOTE_MIN`` characters verbatim from that
+   window's run summaries or non-system comments as progress; and, again under the write lock, the stop is still
+-  the card's current, ordinary, pending, undisposed stop, still in triage, with no human comment since and no
+-  open parent. The grant is the decision card's promotion (``kanban_spend_promote.apply``):
++  the card's current, ordinary, pending, undisposed stop, still in triage, with no human comment or budget
++  decision since and no open parent. A promotion followed by triage with zero new runs cannot earn another
++  grant: the owner must reconcile it. The grant is the decision card's promotion (``kanban_spend_promote.apply``):
+   status ready, a ``spend_budget_set`` of exactly N runs, a ``promoted_manual`` that opens a fresh window,
+   and a comment. An open decision card for the same stop is archived as decided.
+ * **Escalate** otherwise (``spend_review_escalated`` plus a comment with the reason): the stop is routed the
+@@ -434,6 +435,17 @@
+     if _disposed(conn, task_id, episode):
+         return "a closed decision card already disposed of the stop"
+     after = _event_order(stop)
++    history = [dict(ev) for ev in conn.execute(
++        "SELECT * FROM task_events WHERE task_id = ? AND kind IN ('spend_budget_set', 'promoted_manual')",
++        (task_id,))]
++    if any(ev["kind"] == 'spend_budget_set' and _event_order(ev) > after for ev in history):
++        return "a budget decision was recorded after the stop; the owner decides its promotion"
++    promotions = [ev for ev in history if ev["kind"] == 'promoted_manual' and _event_order(ev) < after]
++    if promotions:
++        promoted = max(promotions, key=_event_order)
++        if not conn.execute("SELECT 1 FROM task_runs WHERE task_id = ? AND started_at >= ? AND started_at <= ? "
++                            "LIMIT 1", (task_id, promoted["created_at"], stop["created_at"])).fetchone():
++            return "the card returned to triage after promotion with zero new runs; the owner must reconcile it"
+     for ev in conn.execute("SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND json_valid(payload) "
+                            "AND (json_extract(payload, '$.writer_kind') = 'human' "
+                            "OR json_extract(payload, '$.relayed_human') IS NOT NULL)", (task_id,)):
+diff --git a/tests/hermes_cli/test_kanban_spend_reviewer.py b/tests/hermes_cli/test_kanban_spend_reviewer.py
+index f4933b3f7f2..759748dde7b 100644
+--- a/tests/hermes_cli/test_kanban_spend_reviewer.py
++++ b/tests/hermes_cli/test_kanban_spend_reviewer.py
+@@ -121,10 +121,11 @@
+         assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED
+ 
+ 
+-def test_grants_are_capped_until_someone_else_decides(kanban_home, spend_reviewer, inline):
++def test_grants_are_capped_until_someone_else_decides(kanban_home, spend_reviewer, inline, monkeypatch):
++    clock = int(time.time())
++    monkeypatch.setattr(ksb.time, "time", lambda: clock)
+     with kbc.connect_closing() as conn:
+         tid, _ = _stopped(conn)
+-        clock = int(time.time())
+         for _ in range(reviewer.DEFAULT_MAX_GRANTS):
+             spend_reviewer.append(_grant(runs=2))
+             reviewer.start_due(conn, now=clock)
+@@ -376,6 +377,81 @@
+         reviewer._THREADS.clear()
+ 
+ 
++def test_three_spent_runs_buy_exactly_two_more(kanban_home, spend_reviewer, inline, monkeypatch):
++    clock = int(time.time())
++    monkeypatch.setattr(ksb.time, "time", lambda: clock)
++    spend_reviewer.append(_grant(runs=2))
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Bounded progress", assignee="default")
++        ksb.set_override(conn, tid, runs=3, by="owner", reason="initial allowance")
++        helpers._runs(conn, tid, 3)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET summary=? WHERE task_id=?", (PROGRESS, tid))
++        assert ksb.spend(conn, tid).runs == 3
++        assert ksb.hold(conn, tid, lim=helpers.LIMITS) == "triage"
++        reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "ready"
++        assert ksb.hold(conn, tid, lim=helpers.LIMITS) is None
++        for count in (1, 2):
++            clock += 100
++            with kb.write_txn(conn):
++                conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
++                             "VALUES (?, 'default', 'done', ?, ?, 'continued', ?)",
++                             (tid, clock - 90, clock, PROGRESS))
++            assert ksb.spend(conn, tid).runs == count
++            assert ksb.hold(conn, tid, lim=helpers.LIMITS) == (None if count == 1 else "triage")
++
++
++@pytest.mark.parametrize("during_judge", [False, True])
++@pytest.mark.parametrize("writer_kind", ["human", "agent"])
++def test_a_post_stop_override_is_never_overwritten(kanban_home, spend_reviewer, inline, monkeypatch,
++                                                  during_judge, writer_kind):
++    with kbc.connect_closing() as conn:
++        tid, episode = _stopped(conn)
++
++        def decide():
++            ksb.set_override(conn, tid, runs=15, by="owner", reason="owner decision", writer_kind=writer_kind)
++
++        def judge(ctx):
++            if during_judge:
++                decide()
++            return _grant(runs=2)
++
++        if not during_judge:
++            decide()
++        monkeypatch.setattr(reviewer, "judge", judge)
++        reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert ksb.card_override(conn, tid)["by"] == "owner"
++        assert ksb.card_override(conn, tid)["runs"] == 15
++        assert reviewer.state(conn, tid, episode) == reviewer.ESCALATED
++        assert _kinds(conn, tid).count(ksb.OVERRIDE_EVENT) == 1
++
++
++@pytest.mark.parametrize("legacy", [False, True])
++def test_zero_run_retriage_never_grants_again(kanban_home, spend_reviewer, inline, legacy):
++    spend_reviewer.append(_grant(runs=2))
++    with kbc.connect_closing() as conn:
++        tid, _ = _stopped(conn)
++        reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "ready"
++        with kb.write_txn(conn):
++            if legacy:  # historical grants lacked a fresh-window marker
++                conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='promoted_manual'",
++                             ('{"actor":"kanban-spend-reviewer"}', tid))
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, ksb.EVENT, {"limit": "runs", "runs": 3, "since": 0,
++                                                  "limits": {"runs": 2}})
++        episode = reviewer.episode_of(decision.pending_episode(conn, tid))
++        spend_reviewer.append(_grant(runs=2))
++        reviewer.queue(conn, tid, episode)
++        for _ in range(3):
++            reviewer.start_due(conn)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert _kinds(conn, tid).count(reviewer.GRANTED) == 1
++        assert _kinds(conn, tid).count("promoted_manual") == 1
++
++
+ def test_the_one_shot_dispatch_command_waits_for_its_reviews(kanban_home, monkeypatch):
+     from hermes_cli import kanban as kc
+     waited = []
+-- 
+2.43.0
+

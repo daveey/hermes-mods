@@ -1,0 +1,160 @@
+From 1c320f87f432d0b6225f4a068696910833513647 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:45:06 +0000
+Subject: [PATCH 6288] Explicit Carbon routing and model-neutral obligations
+
+Public mirror of source commit 1c320f87f432d0b6225f4a068696910833513647.
+
+---
+diff --git a/agent/model_routing_managed.py b/agent/model_routing_managed.py
+index 4661b6f436e..a0e3344c12d 100644
+--- a/agent/model_routing_managed.py
++++ b/agent/model_routing_managed.py
+@@ -70,7 +70,8 @@
+     """Sorted model names an exact pin may name under ``config``'s managed policy."""
+     policy = config["model_routing"]
+     return sorted({route["model"] for level in policy.get("routes", {})
+-                   for route in eligible_routes(policy, level) if route["billing"] == "subscription"})
++                   for route in eligible_routes(policy, level)
++                   if route["billing"] == "subscription" or level == "carbon"})
+ 
+ 
+ def pin_policy(model, provider, config):
+@@ -78,7 +79,7 @@
+     policy = config["model_routing"]
+     matches = [(level, route) for level in policy.get("routes", {})
+                for route in eligible_routes(policy, level)
+-               if route["billing"] == "subscription" and route["model"] == model
++               if (route["billing"] == "subscription" or level == "carbon") and route["model"] == model
+                and provider in (None, "", "auto", route["provider"])]
+     if len(matches) != 1:
+         raise ManagedPinRejectedError(model, provider, allowed_pins(config))
+diff --git a/tests/hermes_cli/test_carbon_picker.py b/tests/hermes_cli/test_carbon_picker.py
+new file mode 100644
+index 00000000000..79218d74aa8
+--- /dev/null
++++ b/tests/hermes_cli/test_carbon_picker.py
+@@ -0,0 +1,120 @@
++"""Explicit Carbon pins are offered without opening ordinary metered pins. [daveey]"""
++import copy
++
++import pytest
++
++from agent.model_routing_managed import ManagedPinRejectedError, allowed_pins, pin_policy
++from hermes_cli.config import atomic_config_write
++from hermes_cli.model_options_managed import drop_refused_managed_pins
++from tests.agent.test_model_routing import policy
++from tests.tui_gateway import test_session_create_managed_pin_guard as create_helpers
++
++_create = create_helpers._create
++MODEL = "gemini-4-carbon"
++
++
++def carbon_config(level="carbon", billing="metered"):
++    cfg = policy()
++    cfg["model"] = {"default": "anthropic-deep", "provider": "anthropic"}
++    cfg["model_routing"]["enforce_subscription_only"] = True
++    cfg["model_routing"]["routes"][level] = [{
++        **cfg["model_routing"]["routes"]["deep"][0],
++        "provider": "gemini", "model": MODEL, "billing": billing,
++    }]
++    return cfg
++
++
++@pytest.mark.parametrize("billing", ["metered", "credit-funded", "subscription"])
++def test_carbon_pin_is_allowed_and_restricted(billing):
++    cfg = carbon_config(billing=billing)
++    before = copy.deepcopy(cfg)
++    assert MODEL in allowed_pins(cfg)
++    level, restricted = pin_policy(MODEL, "gemini", cfg)
++    assert level == "carbon"
++    assert restricted["model_routing"]["routes"] == {"carbon": cfg["model_routing"]["routes"]["carbon"]}
++    assert restricted["model_routing"]["allow_metered"] is False
++    assert cfg == before
++    with pytest.raises(ManagedPinRejectedError):
++        pin_policy(MODEL, "anthropic", cfg)
++    with pytest.raises(ManagedPinRejectedError):
++        pin_policy("unregistered-carbon", "gemini", cfg)
++
++
++@pytest.mark.parametrize("level", ["deep", "standard", "fast"])
++@pytest.mark.parametrize("billing", ["metered", "credit-funded"])
++@pytest.mark.parametrize("allow_metered", [False, True])
++def test_other_classes_never_offer_funded_pins(level, billing, allow_metered):
++    cfg = carbon_config(level, billing)
++    cfg["model_routing"]["allow_metered"] = allow_metered
++    assert MODEL not in allowed_pins(cfg)
++    with pytest.raises(ManagedPinRejectedError):
++        pin_policy(MODEL, "gemini", cfg)
++    rows = [{"slug": "gemini", "models": [MODEL]}]
++    drop_refused_managed_pins(rows, cfg)
++    assert rows[0]["models"] == []
++
++
++@pytest.mark.parametrize("level", ["deep", "standard", "fast"])
++def test_pin_apis_reject_other_eligible_metered_routes(level):
++    """Exercise the pin billing fence independently of eligible_routes' managed fence."""
++    from agent.model_routing import eligible_routes
++
++    cfg = carbon_config(level)
++    cfg["model_routing"].update(allow_metered=True, enforce_subscription_only=False)
++    route = cfg["model_routing"]["routes"][level][0]
++    route["model"] = "ordinary-paid-model"
++    assert route in eligible_routes(cfg["model_routing"], level)
++    assert route["model"] not in allowed_pins(cfg)
++    with pytest.raises(ManagedPinRejectedError):
++        pin_policy(route["model"], "gemini", cfg)
++
++
++@pytest.mark.parametrize("field", ["eligible", "funding_verified"])
++def test_ineligible_carbon_is_not_a_pin(field):
++    cfg = carbon_config()
++    cfg["model_routing"]["routes"]["carbon"][0][field] = False
++    assert MODEL not in allowed_pins(cfg)
++    with pytest.raises(ManagedPinRejectedError):
++        pin_policy(MODEL, "gemini", cfg)
++
++
++def test_picker_keeps_carbon_on_its_provider_only():
++    rows = [{"slug": slug, "models": [MODEL], "featured_models": [MODEL], "total_models": 1}
++            for slug in ("gemini", "anthropic", "openai-codex", "openai")]
++    drop_refused_managed_pins(rows, carbon_config())
++    assert rows[0]["models"] == rows[0]["featured_models"] == [MODEL]
++    assert rows[0]["total_models"] == 1
++    assert all(row["models"] == row["featured_models"] == [] and row["total_models"] == 0
++               for row in rows[1:])
++
++
++def test_session_create_accepts_carbon_pin(_create, tmp_path):
++    atomic_config_write(tmp_path / "config.yaml", carbon_config())
++    response, sessions = _create({"model": MODEL, "provider": "gemini"})
++    assert "error" not in response, response
++    session = sessions[response["result"]["session_id"]]
++    assert session["model_override"] == {"model": MODEL, "provider": "gemini"}
++
++
++@pytest.mark.parametrize("authenticated", [False, True])
++def test_model_options_rpc_offers_only_authenticated_carbon(monkeypatch, authenticated):
++    from hermes_constants import get_hermes_home
++    from hermes_cli import inventory
++    from tui_gateway import server
++
++    atomic_config_write(get_hermes_home() / "config.yaml", carbon_config())
++    rows = [{"slug": "anthropic", "name": "Anthropic", "models": [MODEL], "total_models": 1}]
++    if authenticated:
++        rows.append({"slug": "gemini", "name": "Gemini", "models": [MODEL], "total_models": 1})
++    monkeypatch.setattr(server, "_model_picker_context", lambda agent: inventory.load_picker_context())
++    monkeypatch.setattr("hermes_cli.model_switch.list_authenticated_providers", lambda **kw: copy.deepcopy(rows))
++    for name in ("_apply_pricing", "_apply_capabilities", "_apply_featured"):
++        monkeypatch.setattr(inventory, name, lambda *a, **kw: None)
++    inventory.reset_model_options_memo()
++    try:
++        response = server._methods["model.options"](1, {"refresh": True})
++        assert "error" not in response, response
++        offered = [row["slug"] for row in response["result"]["providers"] if MODEL in row["models"]]
++        assert offered == (["gemini"] if authenticated else [])
++    finally:
++        inventory.reset_model_options_memo()
+-- 
+2.43.0
+

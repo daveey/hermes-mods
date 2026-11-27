@@ -1,0 +1,136 @@
+From acf59a1e9de6920823953e6ea0de2b71243dd745 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:25:36 +0000
+Subject: [PATCH 6517] Frozen administrative deadlines for parks, links, landings and review queues
+
+Public mirror of source commit acf59a1e9de6920823953e6ea0de2b71243dd745.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 6c2eb3fd5b2..8a45bae0d2f 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -236,10 +236,12 @@
+         row['evidence_state'] = 'unknown'
+     elif (not deadline and not invalid_creation and not row['blocker']
+           and row['owner']['kind'] == 'assignee' and row['owner'].get('refs')
+-          and (task['status'], row['action']) in (('ready', 'execute_current_scope'), ('running', 'execute_current_scope'),
+-                                                  ('review', 'review_current_scope'))):
+-        # A runnable card (queued for admission, a live executor, or queued for its reviewer's admission)
+-        # is not an administrative wait: it needs no deadline. UNKNOWN eligibility and every hold above still show, and an
++          and ((task['status'] in ('ready', 'running') and row['action'] == 'execute_current_scope')
++               or (task['status'] == 'review' and row['action'] == 'review_current_scope'
++                   and facts.get('review_dispatch') is True))):
++        # A runnable card (queued for admission, a live executor, or queued for a reviewer the board dispatches)
++        # is not an administrative wait: it needs no deadline. `review_dispatch` defaults to not established, and a
++        # review row then keeps its missing deadline. UNKNOWN eligibility and every hold above still show, and an
+         # exact confirmed contract deadline still composes onto it (kanban_actionability_confirmed).
+         row['escalation']['state'] = 'not_required'
+     elif not deadline:
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index e9c94451c2f..2a6b14684b9 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -233,6 +233,15 @@
+     return admin, {**(contracts[0] if contracts else {}), 'escalate_at': min(deadlines) if deadlines else None}
+ 
+ 
++def _review_dispatch() -> bool:
++    """True only when the board's config was read and says reviewers are dispatched; anything else is not established."""
++    try:
++        from hermes_cli.config import load_config
++        return load_config()['kanban']['review_dispatch'] is True
++    except Exception:  # health: allow BLE001 -- any config read failure means dispatch is not established; the row stays flagged
++        return False
++
++
+ def describe(conn: sqlite3.Connection, tid: str, *, now: int | None = None, reader: Reader | None = None) -> dict:
+     """One task and its immediate parents only; malformed optional evidence stays UNKNOWN."""
+     reader = reader or Reader(conn)
+@@ -393,6 +402,8 @@
+         runs = reader.rows('SELECT * FROM task_runs WHERE id=? AND task_id=?', (task['current_run_id'], tid))
+         facts['run'] = runs[0] if runs else None
+     facts['unknown'] |= bool(stop and not episode)
++    if task['status'] == 'review':
++        facts['review_dispatch'] = _review_dispatch()
+     from hermes_cli.kanban_actionability_confirmed import compose
+     observed_at = int(time.time()) if now is None else now
+     row = compose(reader, task, facts, project(facts, now=observed_at), now=observed_at)
+diff --git a/tests/hermes_cli/test_kanban_actionability_review_queue.py b/tests/hermes_cli/test_kanban_actionability_review_queue.py
+index 485e2f25204..7d460b4b0fd 100644
+--- a/tests/hermes_cli/test_kanban_actionability_review_queue.py
++++ b/tests/hermes_cli/test_kanban_actionability_review_queue.py
+@@ -9,7 +9,18 @@
+ 
+ 
+ def _review(**extra):
+-    return project({'task': {'id': 'handoff', 'status': 'review', 'assignee': 'default'}, **extra}, now=1000)
++    return project({'task': {'id': 'handoff', 'status': 'review', 'assignee': 'default'},
++                    'review_dispatch': True, **extra}, now=1000)
++
++
++@pytest.mark.parametrize('fact', [{}, {'review_dispatch': False}, {'review_dispatch': None}, {'review_dispatch': 1},
++                                  {'review_dispatch': 'true'}])
++def test_review_row_without_established_dispatch_keeps_its_missing_deadline(fact):
++    """Pure project default: no reviewer admission is assumed unless the caller supplies exactly True."""
++    row = project({'task': {'id': 'handoff', 'status': 'review', 'assignee': 'default'}, **fact}, now=1000)
++    assert row['action'] == 'review_current_scope' and row['blocker'] is None
++    assert row['escalation']['state'] == 'unavailable'
++    assert row['violations'] == ['escalation_deadline_missing']
+ 
+ 
+ def test_review_queue_needs_no_administrative_deadline():
+@@ -59,9 +70,49 @@
+     assert row['escalation']['state'] == 'pending'
+ 
+ 
+-def test_real_review_handoff_reaches_describe_and_report(tmp_path):
++def _config(monkeypatch, value):
++    from hermes_cli import config
++
++    def load():
++        if isinstance(value, Exception):
++            raise value
++        return value
++    monkeypatch.setattr(config, 'load_config', load)
++
++
++@pytest.mark.parametrize('config', [
++    {'kanban': {'review_dispatch': False}},
++    {'kanban': {'review_dispatch': 'yes'}},
++    {'kanban': {}},
++    {'kanban': None},
++    {},
++    None,
++    RuntimeError('config unreadable'),
++])
++def test_review_handoff_on_a_board_without_review_dispatch_stays_flagged(tmp_path, monkeypatch, config):
++    """Human-only review, or a setting that cannot be read: no dispatcher admits a reviewer, so the wait has no clock."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_actionability_cli import report
++    from hermes_cli.kanban_actionability_sources import describe
++    from hermes_cli.kanban_db_connect import connect
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = kb.create_task(conn, title='implemented work', assignee='default')
++        claimed = kb.claim_task(conn, tid)
++        assert claimed is not None
++        assert kb.request_review(conn, tid, summary='implemented; please review',
++                                 expected_run_id=claimed.current_run_id) is True
++        _config(monkeypatch, config)
++        listed = {r['task_id']: r for r in report(conn)['rows']}
++        for row in (describe(conn, tid), listed[tid]):
++            assert row['status'] == 'review' and row['action'] == 'review_current_scope'
++            assert row['escalation']['state'] == 'unavailable'
++            assert row['violations'] == ['escalation_deadline_missing']
++
++
++def test_real_review_handoff_reaches_describe_and_report(tmp_path, monkeypatch):
+     """The census path: review_requested from a live run, read before any reviewer claims it."""
+     from hermes_cli import kanban_db as kb
++    _config(monkeypatch, {'kanban': {'review_dispatch': True}})
+     from hermes_cli.kanban_actionability_cli import report
+     from hermes_cli.kanban_actionability_sources import describe
+     from hermes_cli.kanban_db_connect import connect
+-- 
+2.43.0
+

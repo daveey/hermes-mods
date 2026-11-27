@@ -1,0 +1,3441 @@
+From dcf4886c46548c1f57180f6cd6d6ecfbbf5b305d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:49:34 +0000
+Subject: [PATCH 6533] Bounded owner reassessment
+
+Public mirror of source commit dcf4886c46548c1f57180f6cd6d6ecfbbf5b305d.
+
+---
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index acdb83f348c..418621d0d44 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -92,6 +92,7 @@
+     awaiting: Any = None, in_txn: Optional[Callable[[sqlite3.Connection, int], None]] = None,
+     blocker_id: Optional[str] = None, blocker_provider: Optional[str] = None,
+     blocker_model: Optional[str] = None, blocker_lane: Optional[str] = None,
++    owner_reassessment: Optional[dict] = None, owner_origin: Any = None,
+ ) -> dict[str, Any]:
+     """End the running run as ``continued`` and re-queue the card.
+ 
+@@ -102,6 +103,9 @@
+     ``in_txn(conn, run_id)`` runs inside the same write transaction once the run has ended
+     (:mod:`hermes_cli.kanban_move` rewrites ``runs_on`` there), so the re-queued card is never
+     visible with its old placement. [daveey]
++    ``owner_reassessment`` + privately captured ``owner_origin``: delayed continues only; shortens the
++    final admitted wake and journals an internal pending receipt (``kanban_owner_reassessment``) in this
++    txn, else ``{"ok": False, "reason_code": "owner_reassessment_refused"}``. No scanner effect.
+     """
+     from hermes_cli import kanban_db as kb
+ 
+@@ -148,38 +152,16 @@
+         source_status = kb._retry_status_for_run(conn, task_id)
+         new_status = "scheduled" if resume_after > 0 else source_status
+         wake_at = now + resume_after if resume_after > 0 else None
+-        from hermes_cli import kanban_wake_check as kwc
+-        record = None
+-        if wake_at is not None:
+-            from hermes_cli import kanban_awaiting as kaw
+-            try:
+-                record = kaw.gate(conn, task_id, awaiting=awaiting, reason=checkpoint, wake_check=wake_check,
+-                                  clock_only=clock_only, op="continue", wake_in=resume_after,
+-                                  blocker_id=blocker_id or (metadata or {}).get("blocker_id"))
+-            except kaw.AwaitingError as exc:
+-                return {"ok": False, "error": str(exc), "reason_code": exc.code}
+-            except kaw.RepeatedPark as rp:
+-                owner = kaw.escalate(conn, task_id, record=rp.record, reason=checkpoint,
+-                                     expected_run_id=int(row["current_run_id"]))
+-                if owner is None:
+-                    return {"ok": False, "error": "task changed state concurrently"}
+-                return {"ok": True, "status": "todo", "run_id": None, "continuation": streak,
+-                        "wake_at": None, "escalated_to": owner}
+-            from hermes_cli import kanban_deploy_window as kdw
+-            wake_at, noted = kdw.apply(record, wake_at, checkpoint, now=now)
+-            checkpoint = noted or checkpoint
+-            noted, check_every = kaw.resource_apply(record, checkpoint, check_every)
+-            checkpoint = noted or checkpoint
+-            wake_check, clock_only = kaw.park_probe(conn, task_id, record, wake_check, clock_only)
+-            why = kaw.park_cycle_error(conn, task_id, record, wake_check)
+-            if why:
+-                return {"ok": False, "error": why, "reason_code": kaw.INVALID_AWAITING}
+-        try:
+-            wake_check, check_every = kwc.validate_park(
+-                wake_at=wake_at, wake_check=wake_check,
+-                check_every=check_every, clock_only=clock_only)
+-        except ValueError as exc:
+-            return {"ok": False, "error": str(exc)}
++        from hermes_cli import kanban_owner_reassessment as kor
++        park, terminal = kor.continuation_park(
++            conn, task_id, checkpoint=checkpoint, wake_at=wake_at, resume_after=resume_after,
++            wake_check=wake_check, check_every=check_every, clock_only=clock_only, awaiting=awaiting,
++            blocker_id=blocker_id, metadata=metadata, owner_reassessment=owner_reassessment,
++            owner_origin=owner_origin, expected_run_id=expected_run_id,
++            current_run_id=row["current_run_id"], streak=streak, now=now)
++        if terminal is not None:
++            return terminal
++        record, checkpoint, wake_at, wake_check, check_every, clock_only, reassess, resume_after = park
+         # A successful checkpoint supersedes stale auth/quota diagnostics, not counters.
+         from hermes_cli.kanban_source_receipt import with_source_receipt
+         cur = with_source_receipt(conn, task_id, lambda: conn.execute(
+@@ -222,7 +204,11 @@
+             payload["wake_at"] = wake_at
+             payload.update(kwc.park_fields(wake_check, check_every, clock_only, conn=conn, probe_host=host))
+             payload["awaiting"] = record
++        if reassess is not None:
++            payload["owner_reassessment_episode_uid"] = reassess["episode_uid"]
+         kb._append_event(conn, task_id, CONTINUED_OUTCOME, payload, run_id=run_id)
++        if reassess is not None:
++            kor.commit(conn, reassess, kind=CONTINUED_OUTCOME, run_id=run_id)
+         from hermes_cli import kanban_decision_ask  # record is None for a continue that does not park
+         kanban_decision_ask.post_notice(conn, task_id, reason=checkpoint, awaiting=record, run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check if wake_at is not None else None, check_every, now=now,
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 883df77f3fd..604d7b4175f 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -20,7 +20,7 @@
+     clear_blocker: bool = False, comment: Optional[tuple[str, str]] = None,
+     blocker_id: Optional[str] = None, blocker_provider: Optional[str] = None,
+     blocker_model: Optional[str] = None, blocker_lane: Optional[str] = None, watch: bool = False,
+-    count_repeats: bool = False,
++    count_repeats: bool = False, owner_reassessment: Optional[dict] = None, owner_origin: Any = None,
+ ) -> bool:
+     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+     (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+@@ -36,7 +36,12 @@
+     ``count_repeats`` (system re-park loops only): a declared clock still escalates on its third identical park
+     (``kanban_awaiting.gate``).
+     Triage parks reset the dispatcher failure streak without an intermediate dispatchable
+-    status; block-loop recurrence evidence is retained, as on unblock."""
++    status; block-loop recurrence evidence is retained, as on unblock.
++
++    ``owner_reassessment`` (``kanban_owner_reassessment.request``) with the privately captured
++    ``owner_origin`` shortens the final admitted wake and journals an internal pending receipt in
++    this txn; an invalid opt-in raises ``ReassessmentRefused`` rather than being dropped, and
++    grants no health, release or scanner authority."""
+     from hermes_cli.kanban_reason_comment import reason_comment
+     from hermes_cli import kanban_park_pin as kpp
+     pin = kpp.plan(conn, task_id, reason)  # git reads stay outside the write txn
+@@ -75,6 +80,16 @@
+         wake_check, check_every = kwc.validate_park(
+             wake_at=payload["wake_at"], wake_check=wake_check,
+             check_every=check_every, clock_only=clock_only)
++        from hermes_cli import kanban_owner_reassessment as kor
++        reassess = None
++        if owner_reassessment is not None:
++            # Every ordinary gate above judged the ORIGINAL admitted wake; only now is it shortened.
++            reassess = kor.prepare(
++                conn, task_id, owner_reassessment, captured=owner_origin, record=record, op="schedule",
++                expected_run_id=expected_run_id, now=int(_time.time()), final_backstop=payload["wake_at"],
++                clock_only=clock_only, blocker_id=blocker_id, declared=bool(awaiting))  # BEFORE claims clear
++            payload["wake_at"] = reassess["wake_at"]
++            payload["owner_reassessment_episode_uid"] = reassess["episode_uid"]
+         params: list[Any] = [task_id]
+         sql = """
+             UPDATE tasks
+@@ -112,6 +127,8 @@
+             **payload, **kwc.park_fields(wake_check, check_every, clock_only, conn=conn, probe_host=host),
+             "awaiting": record, **meta,
+         }, run_id=run_id)
++        if reassess is not None:
++            kor.commit(conn, reassess, kind="scheduled", run_id=run_id)
+         kwc.set_check(conn, task_id, wake_check, check_every, register_here=kwc.probe_here(conn, host))
+         from hermes_cli.kanban_done_tail import post_notice
+         post_notice(conn, task_id, reason=reason, watch=watch, awaiting=record, run_id=run_id)
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 99d6b80fcf1..9881355e167 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -120,7 +120,7 @@
+ # Wire-only fields: carried by an outbox op and sent, never a column (so never in ``SYNCED_COLUMNS``, which
+ # ``undeclared_columns``, ``_row_fields`` and the import path read as real columns). ``source_receipt`` rides
+ # the status-leaving tasks op (``kanban_source_receipt``); an old Board's refusal drops it with no omission.
+-VIRTUAL_WIRE_FIELDS: dict[str, frozenset[str]] = {"tasks": frozenset({"source_receipt"})}
++VIRTUAL_WIRE_FIELDS: dict[str, frozenset[str]] = {"tasks": frozenset({"source_receipt", "owner_reassessment_v1", "owner_reassessment_fallback_status_origin"})}
+ # Synced columns core keeps in Unix SECONDS (``int(time.time())``). The service's own clocks (leases, HLCs, the feed,
+ # tombstones) are milliseconds; a millisecond value in one of these columns makes every ``now - started_at`` reader
+ # wrong by 1000x (2026-10-27: the Board's lease grants wrote ``task_runs.started_at`` in ms and
+diff --git a/hermes_cli/kanban_owner_reassessment.py b/hermes_cli/kanban_owner_reassessment.py
+new file mode 100644
+index 00000000000..2b82bf2ee18
+--- /dev/null
++++ b/hermes_cli/kanban_owner_reassessment.py
+@@ -0,0 +1,294 @@
++"""Opt-in bounded owner reassessment; never evidence of producer health.
++
++The schedule/continue lifecycle creates a pending journal record here, but no
++scanner path reads it as an exemption until canonical proof is installed.
++Shape validation alone grants no authority; the record has execution_authority false.
++"""
++from __future__ import annotations
++
++from copy import deepcopy
++import json
++import re
++import sqlite3
++import time
++
++_UID = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}')
++_REQUEST = {'version', 'reassess_at', 'target', 'evidence_refs'}
++
++
++class ReassessmentRefused(ValueError):
++    """No effective deferral may be recorded for this request."""
++
++
++def _keys(value, required, optional=()):
++    return isinstance(value, dict) and required <= value.keys() <= required | set(optional)
++
++
++def _text(value, maximum):
++    return isinstance(value, str) and bool(value.strip()) and len(value) <= maximum
++
++
++def _uid(value):
++    return isinstance(value, str) and _UID.fullmatch(value) is not None
++
++
++def request(value):
++    """Validate opt-in input without accepting caller-supplied authority fields."""
++    if not _keys(value, _REQUEST) or type(value['version']) is not int or value['version'] != 1:
++        raise ReassessmentRefused('invalid owner reassessment request')
++    target, refs = value['target'], value['evidence_refs']
++    if (type(value['reassess_at']) is not int or value['reassess_at'] <= 0
++            or not _keys(target, {'kind', 'identity', 'revision'})
++            or target['kind'] not in ('queue', 'update', 'external')
++            or not _text(target['identity'], 512) or not _text(target['revision'], 256)
++            or not isinstance(refs, list) or not 1 <= len(refs) <= 16
++            or not all(_keys(r, {'table', 'uid'}) and r['table'] == 'task_events' and _uid(r['uid']) for r in refs)
++            or len({r['uid'] for r in refs}) != len(refs)):
++        raise ReassessmentRefused('invalid target, deadline or portable evidence')
++    return deepcopy(value)
++
++
++def issuer(captured, conn, task_id):
++    """Revalidate actual private owner custody in the caller's park transaction.
++
++    Environment pins, dictionaries and injected projection objects are not issuers.
++    The portable event references must already exist; legacy prose is not upgraded.
++    """
++    from agent.origin_worker_custody import CapturedWorkerOrigin
++
++    if not conn.in_transaction or type(captured) is not CapturedWorkerOrigin:
++        raise ReassessmentRefused('reassessment requires private admitted owner custody')
++    # The capability rechecks both task/run claims and the actual facade turn lease.
++    if captured.validated(conn) != {'creator': task_id}:
++        raise ReassessmentRefused('owner custody is no longer current')
++    capability = captured._capability
++    run = conn.execute('SELECT uid FROM task_runs WHERE id=? AND task_id=?',
++                       (capability.run_id, task_id)).fetchone()
++    events = {}
++    for kind in ('owner_admitted', 'worker_bound'):
++        row = conn.execute('SELECT uid,payload FROM task_events WHERE task_id=? AND run_id=? '
++                           'AND kind=? ORDER BY id DESC LIMIT 1', (task_id, capability.run_id, kind)).fetchone()
++        if row is None or not _uid(row[0]):
++            raise ReassessmentRefused('portable owner admission evidence is missing')
++        try:
++            payload = json.loads(row[1])
++        except (TypeError, ValueError) as exc:
++            raise ReassessmentRefused('owner admission evidence is malformed') from exc
++        if not isinstance(payload, dict):
++            raise ReassessmentRefused('owner admission evidence is malformed')
++        events[kind] = (row[0], payload)
++    if (run is None or not _uid(run[0])
++            or events['owner_admitted'][1].get('session_id') != capability.session_id
++            or events['worker_bound'][1].get('pid') != capability.pid
++            or events['worker_bound'][1].get('claim_lock') != capability.claim_lock
++            or captured.validated(conn) != {'creator': task_id}):
++        raise ReassessmentRefused('owner admission identity changed')
++    return {'task_id': task_id, 'session_id': capability.session_id, 'profile': capability.profile, 'run_uid': run[0],
++            'owner_admitted_uid': events['owner_admitted'][0], 'worker_bound_uid': events['worker_bound'][0]}
++
++
++def plan(value, *, now, final_backstop, awaiting, payload):
++    """Shorten, never extend, the admitted wake; preserve the original backstop.
++
++    Called only after ordinary awaiting/deploy-window/probe gates. This pure plan
++    neither authenticates an owner nor writes a receipt. Expiry uses the existing
++    dispatcher deadline, rather than an additional polling service.
++    """
++    value = request(value)
++    if (type(now) is not int or type(final_backstop) is not int
++            or not now < value['reassess_at'] <= final_backstop):
++        raise ReassessmentRefused('reassessment must precede the admitted backstop')
++    if (not _keys(awaiting, {'kind', 'ref'}, ('gateway', 'board', 'why'))
++            or awaiting['kind'] not in ('card', 'ci', 'deploy', 'external')
++            or not _text(awaiting['ref'], 512)
++            or ('gateway' in awaiting and not _text(awaiting['gateway'], 200))
++            or ('board' in awaiting and not _text(awaiting['board'], 200))
++            or ('why' in awaiting and not _text(awaiting['why'], 2000))):
++        raise ReassessmentRefused('an exact structured producer is required')
++    if not isinstance(payload, dict) or payload.get('wake_at') != final_backstop:
++        raise ReassessmentRefused('final admitted park plan changed')
++    return {**deepcopy(payload), 'wake_at': value['reassess_at'], 'awaiting': deepcopy(awaiting)}, final_backstop
++
++
++PENDING_TABLE = 'kanban_owner_reassessment_pending'
++_PRODUCER_KEYS = ('kind', 'ref', 'gateway', 'board', 'why')
++
++
++def producer(record):
++    """Project the admitted normalized identity, not gate/probe diagnostic fields.
++
++    Preserve board as well as gateway: the same task ref on a different board is
++    not the same producer. Inferred and shared-blocker waits are never opt-ins.
++    """
++    if not isinstance(record, dict) or record.get('shared_blocker') or record.get('inferred'):
++        return None
++    return {k: deepcopy(record[k]) for k in _PRODUCER_KEYS if k in record}
++
++
++def _refuse(message):
++    raise ReassessmentRefused(message)
++
++
++def ensure_schema(conn):
++    """Internal immutable journal; created inside the caller's park transaction."""
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {PENDING_TABLE} (event_uid TEXT PRIMARY KEY, '
++                 'task_id TEXT NOT NULL, episode_uid TEXT NOT NULL UNIQUE, '
++                 'receipt TEXT NOT NULL, created_at INTEGER NOT NULL)')
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {PENDING_TABLE}_immutable BEFORE UPDATE ON {PENDING_TABLE} '
++                 "BEGIN SELECT RAISE(ABORT, 'owner reassessment receipt is immutable'); END")
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {PENDING_TABLE}_no_delete BEFORE DELETE ON {PENDING_TABLE} '
++                 "BEGIN SELECT RAISE(ABORT, 'owner reassessment receipt is immutable'); END")
++    # REPLACE may delete without firing DELETE triggers (recursive_triggers OFF).
++    # Intercept unique-key AND explicit rowid conflicts before conflict handling.
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {PENDING_TABLE}_no_replace BEFORE INSERT ON {PENDING_TABLE} '
++                 f'WHEN EXISTS (SELECT 1 FROM {PENDING_TABLE} WHERE event_uid=NEW.event_uid '
++                 'OR episode_uid=NEW.episode_uid OR rowid=NEW.rowid) '
++                 "BEGIN SELECT RAISE(ABORT, 'owner reassessment receipt is immutable'); END")
++
++
++def pending(conn, task_id=None):
++    """Parent accessor: exact journal rows ``{event_uid, task_id, episode_uid, receipt}`` (receipt is
++    the stored JSON string, byte-for-byte). An absent table means nothing was ever recorded."""
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (PENDING_TABLE,)).fetchone() is None:
++        return []
++    sql, args = f'SELECT event_uid,task_id,episode_uid,receipt FROM {PENDING_TABLE}', ()
++    if task_id is not None:
++        sql, args = sql + ' WHERE task_id=?', (task_id,)
++    return [dict(zip(('event_uid', 'task_id', 'episode_uid', 'receipt'), row))
++            for row in conn.execute(sql + ' ORDER BY rowid', args).fetchall()]
++
++
++def prepare(conn, task_id, value, *, captured, record, op, expected_run_id, now, final_backstop,
++            immediate=False, clock_only=False, blocker_id=None, declared=False):
++    """Validate an opt-in against the FINAL admitted park, before claims are cleared.
++
++    Call after every ordinary awaiting/deploy-window/probe/escalation gate and before the
++    task/run UPDATE. Raises without private captured authority, a structured supported
++    producer, an admitted future wake, or evidence that already exists on this card.
++    Writes nothing.
++    """
++    if immediate or clock_only or blocker_id or not declared:
++        _refuse('reassessment needs a timed park on an exact producer')
++    request(value)
++    if isinstance(final_backstop, float) and final_backstop.is_integer():
++        final_backstop = int(final_backstop)
++    normalized = producer(record)
++    result, backstop = plan(value, now=now, final_backstop=final_backstop, awaiting=normalized,
++                            payload={'wake_at': final_backstop})
++    try:
++        who = issuer(captured, conn, task_id)
++        capability = captured._capability
++        for ref in request(value)['evidence_refs']:
++            if conn.execute('SELECT 1 FROM task_events WHERE uid=? AND task_id=? AND run_id=?',
++                            (ref['uid'], task_id, capability.run_id)).fetchone() is None:
++                _refuse('portable evidence is not on this owner run')
++    except sqlite3.OperationalError as exc:  # a board without portable uids cannot carry a receipt
++        raise ReassessmentRefused('board has no portable event identities') from exc
++    capability = captured._capability
++    if expected_run_id is None or int(expected_run_id) != capability.run_id:
++        _refuse('reassessment must come from the admitted owner run')
++    from hermes_cli.kanban_db_sync import uuid7
++    return {'request': request(value), 'issuer': who, 'producer': normalized, 'op': op,
++            'wake_at': result['wake_at'], 'backstop_at': backstop, 'issued_at': now,
++            'episode_uid': uuid7(), 'board': capability.board, 'gateway': capability.gateway,
++            'run_id': capability.run_id}
++
++
++def continuation_park(conn, task_id, *, checkpoint, wake_at, resume_after, wake_check, check_every,
++                      clock_only, awaiting, blocker_id, metadata, owner_reassessment, owner_origin,
++                      expected_run_id, current_run_id, streak, now):
++    """Admit the ordinary continue park before shortening it for owner reassessment.
++
++    Return (plan, terminal_result); refusals and repeated-park escalations terminate
++    the caller unchanged. All gates run in its existing write transaction, before
++    claims clear. Only reassessment refusals are converted at the prepare boundary.
++    """
++    from hermes_cli import kanban_wake_check as kwc
++
++    record = None
++    reassess = None
++    if wake_at is None and owner_reassessment is not None:
++        return None, {"ok": False, "reason_code": "owner_reassessment_refused",
++                      "error": "owner reassessment needs a delayed continue"}
++    if wake_at is not None:
++        from hermes_cli import kanban_awaiting as kaw
++        try:
++            record = kaw.gate(conn, task_id, awaiting=awaiting, reason=checkpoint, wake_check=wake_check,
++                              clock_only=clock_only, op="continue", wake_in=resume_after,
++                              blocker_id=blocker_id or (metadata or {}).get("blocker_id"))
++        except kaw.AwaitingError as exc:
++            return None, {"ok": False, "error": str(exc), "reason_code": exc.code}
++        except kaw.RepeatedPark as rp:
++            owner = kaw.escalate(conn, task_id, record=rp.record, reason=checkpoint,
++                                 expected_run_id=int(current_run_id))
++            if owner is None:
++                return None, {"ok": False, "error": "task changed state concurrently"}
++            return None, {"ok": True, "status": "todo", "run_id": None, "continuation": streak,
++                          "wake_at": None, "escalated_to": owner}
++        from hermes_cli import kanban_deploy_window as kdw
++        wake_at, noted = kdw.apply(record, wake_at, checkpoint, now=now)
++        checkpoint = noted or checkpoint
++        noted, check_every = kaw.resource_apply(record, checkpoint, check_every)
++        checkpoint = noted or checkpoint
++        wake_check, clock_only = kaw.park_probe(conn, task_id, record, wake_check, clock_only)
++        why = kaw.park_cycle_error(conn, task_id, record, wake_check)
++        if why:
++            return None, {"ok": False, "error": why, "reason_code": kaw.INVALID_AWAITING}
++    try:
++        wake_check, check_every = kwc.validate_park(
++            wake_at=wake_at, wake_check=wake_check,
++            check_every=check_every, clock_only=clock_only)
++    except ValueError as exc:
++        return None, {"ok": False, "error": str(exc)}
++    if owner_reassessment is not None and wake_at is not None:
++        # Every ordinary gate above judged the ORIGINAL admitted wake; only now is it shortened.
++        try:
++            reassess = prepare(
++                conn, task_id, owner_reassessment, captured=owner_origin, record=record, op="continue",
++                expected_run_id=expected_run_id, now=now, final_backstop=wake_at, clock_only=clock_only,
++                blocker_id=blocker_id or (metadata or {}).get("blocker_id"),
++                declared=bool(awaiting))
++        except ReassessmentRefused as exc:
++            return None, {"ok": False, "error": str(exc), "reason_code": "owner_reassessment_refused"}
++        wake_at = reassess["wake_at"]
++        resume_after = wake_at - now
++    return (record, checkpoint, wake_at, wake_check, check_every, clock_only, reassess, resume_after), None
++
++
++def commit(conn, prepared, *, kind, run_id):
++    """After the park event is appended in the same txn: record the exact immutable receipt."""
++    if run_id != prepared['run_id']:
++        _refuse('park did not end the admitted owner run')
++    task_id = prepared['issuer']['task_id']
++    row = conn.execute('SELECT id,uid,payload,created_at,run_id FROM task_events WHERE task_id=? '
++                       'AND kind=? ORDER BY id DESC LIMIT 1', (task_id, kind)).fetchone()
++    try:
++        data = json.loads(row[2]) if row else None
++    except (TypeError, ValueError):
++        data = None
++    awaiting = data.get('awaiting') if isinstance(data, dict) else None
++    if (row is None or not _uid(row[1]) or row[4] != run_id or not isinstance(awaiting, dict)
++            or data.get('owner_reassessment_episode_uid') != prepared['episode_uid']
++            or data.get('wake_at') != prepared['wake_at']
++            or producer(awaiting) != prepared['producer']):
++        _refuse('park event does not carry the planned reassessment')
++    run = conn.execute('SELECT uid FROM task_runs WHERE id=?', (run_id,)).fetchone()
++    if run is None or run[0] != prepared['issuer']['run_uid']:
++        _refuse('park run identity changed')
++    req = prepared['request']
++    receipt = {'version': 1, 'board': prepared['board'], 'task_id': task_id,
++               'gateway': prepared['gateway'], 'episode_uid': prepared['episode_uid'],
++               'park_event': {'uid': row[1], 'run_uid': run[0], 'kind': kind,
++                              'created_at': row[3], 'payload': row[2]},
++               'issuer': {k: v for k, v in prepared['issuer'].items() if k != 'task_id'},
++               'producer': prepared['producer'], 'target': req['target'],
++               'issued_at': prepared['issued_at'], 'reassess_at': prepared['wake_at'],
++               'backstop_at': prepared['backstop_at'], 'evidence_refs': req['evidence_refs'],
++               'suppresses': ['too_long'], 'execution_authority': False}
++    ensure_schema(conn)
++    conn.execute(f'INSERT INTO {PENDING_TABLE} (event_uid,task_id,episode_uid,receipt,created_at) VALUES (?,?,?,?,?)',
++                 (row[1], task_id, receipt['episode_uid'],
++                  json.dumps(receipt, sort_keys=True, separators=(',', ':'), ensure_ascii=False), int(time.time())))
++    from hermes_cli.kanban_owner_reassessment_transport import capture
++    capture(conn, receipt)
++    return receipt
+diff --git a/hermes_cli/kanban_owner_reassessment_canonical.py b/hermes_cli/kanban_owner_reassessment_canonical.py
+new file mode 100644
+index 00000000000..b8e03d4f7f4
+--- /dev/null
++++ b/hermes_cli/kanban_owner_reassessment_canonical.py
+@@ -0,0 +1,162 @@
++"""Canonical Board certification of an owner reassessment receipt.
++
++Pure verifier over an authenticated Board ``/evidence?table=task_events`` response
++(``Hub.row_evidence``). Neither the sender's pending journal, a replica event, nor any
++self-asserted JSON grants anything: the Board's own ``owner_reassessment_v1``
++attestation must agree, field by field, with the canonical park event row it carries.
++Unknown, missing or unavailable proof is a refusal. The receipt always has
++``execution_authority`` false; this module installs no suppression or capability.
++"""
++from __future__ import annotations
++
++import json
++from collections.abc import Mapping
++from copy import deepcopy
++from typing import Any
++
++from hermes_cli.kanban_owner_reassessment import ReassessmentRefused, _uid, producer, request
++
++MAX_EVIDENCE_BYTES = 256 * 1024
++PARK_KINDS = ("scheduled", "continued")
++_RECEIPT = {"version", "board", "task_id", "gateway", "episode_uid", "park_event", "issuer", "producer",
++            "target", "issued_at", "reassess_at", "backstop_at", "evidence_refs", "suppresses",
++            "execution_authority"}
++_PARK = {"uid", "run_uid", "kind", "created_at", "payload"}
++_ISSUER = {"owner_admitted_uid", "profile", "run_uid", "session_id", "worker_bound_uid"}
++# Board re-stamps these on an unchanged row; they are not certified identity.
++ROW_BOOKKEEPING = frozenset({"seq", "hlc", "updated_at", "version"})
++
++
++def _int(v: Any) -> bool:
++    return type(v) is int and v > 0
++
++
++def _str(v: Any) -> bool:
++    return isinstance(v, str) and bool(v)
++
++
++def _no_dupes(pairs):
++    out = {}
++    for k, v in pairs:
++        if k in out:
++            raise ValueError("duplicate JSON key")
++        out[k] = v
++    return out
++
++
++def _refuse_const(name):
++    raise ValueError(f"non-finite JSON constant {name}")
++
++
++def parse_evidence(raw: str | bytes) -> Any:
++    """Bounded parse of serialized evidence: size is checked *before* json parsing.
++
++    Duplicate keys and NaN/Infinity are refused. This bounds stored/pickup text only; the Hub
++    transport's own raw-response read is a separate seam (see ``Hub._call``).
++    """
++    if not isinstance(raw, (str, bytes)) or len(raw) > MAX_EVIDENCE_BYTES:  # chars <= bytes
++        raise ReassessmentRefused("canonical reassessment evidence is too large or not text")
++    if isinstance(raw, str) and len(raw.encode()) > MAX_EVIDENCE_BYTES:
++        raise ReassessmentRefused("canonical reassessment evidence is too large")
++    try:
++        return json.loads(raw, object_pairs_hook=_no_dupes, parse_constant=_refuse_const)
++    except (ValueError, RecursionError) as exc:
++        raise ReassessmentRefused("canonical reassessment evidence is not valid JSON") from exc
++
++
++def canonical_bytes(evidence: Any) -> str:
++    """Serialized evidence, bounded; raises before any storage on oversize/non-finite."""
++    try:
++        raw = json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
++    except (TypeError, ValueError) as exc:
++        raise ReassessmentRefused("canonical reassessment evidence is not JSON") from exc
++    if len(raw.encode()) > MAX_EVIDENCE_BYTES:
++        raise ReassessmentRefused("canonical reassessment evidence is too large")
++    return raw
++
++
++def certified_receipt(evidence: Any, *, board: str, task: str, uid: str, sender: Mapping | None = None) -> dict:
++    """Return the Board-attested receipt for park event ``uid`` or raise ReassessmentRefused.
++
++    ``sender`` (optional) is the sending side's receipt; it must equal the Board's
++    attestation exactly, so a sender can never widen what the Board attested.
++    """
++    canonical_bytes(evidence)
++    bad = ReassessmentRefused
++    if (not isinstance(evidence, Mapping) or evidence.get("board") != board or evidence.get("table") != "task_events"
++            or evidence.get("uid") != uid or evidence.get("state") != "live" or not _uid(uid)):
++        raise bad("canonical reassessment event identity is unproven")
++    row, r = evidence.get("row"), evidence.get("owner_reassessment_v1")
++    if not isinstance(row, Mapping) or not isinstance(r, Mapping) or set(r) != _RECEIPT:
++        raise bad("canonical reassessment attestation is missing or malformed")
++    park, issuer = r["park_event"], r["issuer"]
++    if (not isinstance(park, Mapping) or set(park) != _PARK or not isinstance(issuer, Mapping)
++            or set(issuer) != _ISSUER):
++        raise bad("canonical reassessment attestation is malformed")
++    try:
++        payload = parse_evidence(park["payload"]) if isinstance(park["payload"], str) else None
++    except ReassessmentRefused:
++        payload = None
++    try:  # exact target / deadline / evidence refs: the same validator the sender used
++        request({"version": 1, "reassess_at": r["reassess_at"], "target": r["target"],
++                 "evidence_refs": r["evidence_refs"]})
++    except ReassessmentRefused as exc:
++        raise bad("canonical reassessment target, deadline or evidence refs are invalid") from exc
++    awaiting = payload.get("awaiting") if isinstance(payload, dict) else None
++    ok = (
++        type(r["version"]) is int and r["version"] == 1 and r["board"] == board and r["task_id"] == task
++        and _str(r["gateway"]) and _uid(r["episode_uid"]) and r["episode_uid"] != uid
++        and _str(issuer["profile"]) and _str(issuer["session_id"]) and r["execution_authority"] is False
++        and r["suppresses"] == ["too_long"]
++        and park["uid"] == uid and _uid(park["run_uid"]) and park["kind"] in PARK_KINDS
++        and _int(park["created_at"]) and isinstance(park["payload"], str)
++        and issuer["run_uid"] == park["run_uid"] and _uid(issuer["owner_admitted_uid"])
++        and _uid(issuer["worker_bound_uid"])
++        and all(_int(r[k]) for k in ("issued_at", "reassess_at", "backstop_at"))
++        and r["issued_at"] < r["reassess_at"] <= r["backstop_at"]
++        and isinstance(payload, dict) and payload.get("owner_reassessment_episode_uid") == r["episode_uid"]
++        and payload.get("wake_at") == r["reassess_at"]
++        and (park["kind"] == "scheduled" or payload.get("status") == "scheduled")
++        and isinstance(awaiting, dict) and r["producer"] is not None and producer(awaiting) == r["producer"]
++        and producer(r["producer"]) == r["producer"]
++        # the canonical row, not the attestation, must carry the same bytes and identity
++        and row.get("uid") == uid and row.get("task_id") == task and row.get("kind") == park["kind"]
++        and row.get("payload") == park["payload"] and row.get("run_uid") == park["run_uid"]
++        and row.get("created_at") == park["created_at"] and row.get("origin_gateway") == r["gateway"]
++        and row.get("deleted_at") is None
++    )
++    if not ok:
++        raise bad("canonical reassessment attestation does not match the canonical park event")
++    if sender is not None and dict(sender) != dict(r):
++        raise bad("sender receipt differs from the Board attestation")
++    return deepcopy(dict(r))
++
++
++def certified_identity(evidence: Mapping) -> str:
++    """Certified fields only: the row without server bookkeeping, plus the attestation."""
++    row = {k: v for k, v in evidence["row"].items() if k not in ROW_BOOKKEEPING}
++    return json.dumps([row, evidence["owner_reassessment_v1"]], sort_keys=True, separators=(",", ":"))
++
++
++def event_matches(event: Mapping, receipt: Mapping) -> bool:
++    """Does a local/replica event row equal the attested park event?"""
++    p = receipt["park_event"]
++    return (event.get("uid") == p["uid"] and event.get("task_id") == receipt["task_id"]
++            and event.get("kind") == p["kind"] and event.get("payload") == p["payload"]
++            and event.get("created_at") == p["created_at"]
++            and (event.get("origin_gateway") in (None, receipt["gateway"])))
++
++
++def current_matches(receipt: Mapping, task: Mapping, *, latest_park_uid: str | None, now: int) -> bool:
++    """Is *this* receipt still the live park? Historical receipts for the same card never match.
++
++    ``latest_park_uid`` is the uid of the card's newest park event (see
++    ``replica.latest_park_uid``); a later park/continue, however similar, supersedes the receipt.
++    ``now`` must be before the receipt's own backstop. A task ``wake_at``, when supplied, must equal
++    the attested ``reassess_at``.
++    """
++    return (task.get("id") == receipt["task_id"] and task.get("status") == "scheduled"
++            and task.get("current_run_id") is None
++            and latest_park_uid == receipt["park_event"]["uid"]
++            and type(now) is int and now < receipt["backstop_at"]
++            and ("wake_at" not in task or task["wake_at"] == receipt["reassess_at"]))
+diff --git a/hermes_cli/kanban_owner_reassessment_replica.py b/hermes_cli/kanban_owner_reassessment_replica.py
+new file mode 100644
+index 00000000000..be7950f0440
+--- /dev/null
++++ b/hermes_cli/kanban_owner_reassessment_replica.py
+@@ -0,0 +1,214 @@
++"""Durable, append-only replica of Board-certified owner reassessment receipts.
++
++Host-local, never synced. Only a ``Hub.row_evidence`` read performed *here* (or, for
++offline pickup copies, an already-certified row re-certified from the source replica)
++is stored; payload projections, sender journals and request JSON are never inputs.
++A stored receipt is re-certified from its own evidence on every read. Nothing here
++suppresses a detector or advertises a capability.
++"""
++from __future__ import annotations
++
++import contextvars
++import sqlite3
++
++from hermes_cli import kanban_owner_reassessment_canonical as canonical
++from hermes_cli.kanban_containment_functions import register as register_function
++from hermes_cli.kanban_owner_reassessment import ReassessmentRefused
++
++TABLE = "owner_reassessment_canonical_receipts"
++_PERMIT: contextvars.ContextVar[sqlite3.Connection | None] = contextvars.ContextVar("owner_reassessment_cache_write", default=None)
++
++
++class ReassessmentConflict(ReassessmentRefused):
++    """A different canonical identity arrived for an already-recorded receipt."""
++
++
++def register(conn: sqlite3.Connection) -> None:
++    register_function(conn, "kanban_owner_reassessment_cache_write", 0,
++                      lambda: int(_PERMIT.get() is conn and conn.in_transaction))
++
++
++def install(conn: sqlite3.Connection) -> None:
++    register(conn)
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (event_uid TEXT PRIMARY KEY, board TEXT NOT NULL, "
++                 "task_id TEXT NOT NULL, episode_uid TEXT NOT NULL UNIQUE, run_uid TEXT NOT NULL, "
++                 "gateway TEXT NOT NULL, evidence TEXT NOT NULL)")
++    abort = "BEGIN SELECT RAISE(ABORT,'owner reassessment canonical receipt is immutable'); END"
++    for op in ("UPDATE", "DELETE"):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {TABLE}_{op.lower()} BEFORE {op} ON {TABLE} {abort}")
++    conn.execute(f"CREATE TRIGGER IF NOT EXISTS {TABLE}_insert BEFORE INSERT ON {TABLE} "
++                 f"WHEN NOT kanban_owner_reassessment_cache_write() {abort}")
++    # REPLACE deletes without DELETE triggers: refuse every key/rowid conflict before it resolves.
++    conn.execute(f"CREATE TRIGGER IF NOT EXISTS {TABLE}_no_replace BEFORE INSERT ON {TABLE} "
++                 f"WHEN EXISTS (SELECT 1 FROM {TABLE} WHERE event_uid=NEW.event_uid "
++                 f"OR episode_uid=NEW.episode_uid OR rowid=NEW.rowid) {abort}")
++
++
++def _board(conn: sqlite3.Connection) -> str | None:
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone():
++        return None
++    row = conn.execute("SELECT board_id FROM kanban_sync_state LIMIT 1").fetchone()
++    return row[0] if row else None
++
++
++def _store(conn: sqlite3.Connection, evidence: dict, receipt: dict) -> None:
++    """Insert exact evidence. Private: callers certify first (see :func:`certify`)."""
++    if _board(conn) != receipt["board"]:
++        raise ReassessmentRefused("canonical reassessment receipt belongs to a different board")
++    raw = canonical.canonical_bytes(evidence)
++    install(conn)
++    from hermes_cli import kanban_db as kb
++    uid = receipt["park_event"]["uid"]
++    values = (uid, receipt["board"], receipt["task_id"], receipt["episode_uid"],
++              receipt["park_event"]["run_uid"], receipt["gateway"], raw)
++    with kb.write_txn(conn, allow_nested=True):
++        prior = conn.execute(f"SELECT event_uid,board,task_id,episode_uid,run_uid,gateway,evidence FROM {TABLE} "
++                             "WHERE event_uid=? OR episode_uid=?", (uid, receipt["episode_uid"])).fetchall()
++        if prior:
++            import json
++            if (len(prior) != 1 or tuple(prior[0])[:6] != values[:6]
++                    or canonical.certified_identity(canonical.parse_evidence(prior[0][6])) != canonical.certified_identity(evidence)):
++                raise ReassessmentConflict("canonical reassessment identity changed")
++            return  # append-only: the first observation is kept
++        token = _PERMIT.set(conn)
++        try:
++            conn.execute(f"INSERT INTO {TABLE} VALUES (?,?,?,?,?,?,?)", values)
++        finally:
++            _PERMIT.reset(token)
++
++
++def certify(conn: sqlite3.Connection, hub, board: str, *, task: str, uid: str, sender=None) -> dict:
++    """Fetch the Board's own evidence (outside any writer transaction), certify, then record.
++
++    Any transport error propagates and records nothing: unavailable proof never authorizes.
++    ``sender`` is the sender's receipt; direct delivery certification passes it so the Board's
++    attestation must equal it exactly and the enrolled sender gateway must be the original one.
++    """
++    if conn.in_transaction:
++        raise ReassessmentRefused("canonical reassessment fetch cannot run inside a writer transaction")
++    evidence = hub.row_evidence(board, "task_events", uid, max_response_bytes=canonical.MAX_EVIDENCE_BYTES)
++    receipt = canonical.certified_receipt(evidence, board=board, task=task, uid=uid, sender=sender)
++    if sender is not None and getattr(getattr(hub, "ident", None), "gateway", None) != receipt["gateway"]:
++        raise ReassessmentRefused("receipt was not originally admitted through this enrolled gateway")
++    _store(conn, evidence, receipt)
++    return receipt
++
++
++def verified_receipt(conn: sqlite3.Connection, event_uid: str | None) -> dict | None:
++    """Reopened durable proof, re-certified from stored evidence; None when absent or invalid.
++
++    Callers must still check :func:`canonical.event_matches` against their event row and
++    :func:`canonical.current_matches` against the current task before relying on it.
++    """
++    import json
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone():
++        return None
++    row = conn.execute(f"SELECT board,task_id,episode_uid,run_uid,gateway,evidence FROM {TABLE} WHERE event_uid=?",
++                       (event_uid,)).fetchone()
++    if row is None or row[0] != _board(conn):
++        return None
++    try:
++        receipt = canonical.certified_receipt(canonical.parse_evidence(row[5]), board=row[0], task=row[1], uid=event_uid)
++    except ReassessmentRefused:
++        return None
++    if (row[2], row[3], row[4]) != (receipt["episode_uid"], receipt["park_event"]["run_uid"], receipt["gateway"]):
++        return None
++    return receipt
++
++
++def latest_park_uid(conn: sqlite3.Connection, task_id: str) -> str | None:
++    """Newest live park event uid of the card in this replica; None when unreadable (fail closed)."""
++    try:
++        # Local execution DBs physically remove tombstones and have no deleted_at;
++        # shadow replicas may retain that column. Never require one schema's shape.
++        columns = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++        live = ' AND deleted_at IS NULL' if 'deleted_at' in columns else ''
++        rows = conn.execute('SELECT uid,created_at,id FROM task_events WHERE task_id=? '
++                            'AND kind IN (?,?)' + live + ' ORDER BY created_at DESC LIMIT 129',
++                            (task_id, *canonical.PARK_KINDS)).fetchall()
++        if not rows:
++            return None
++        newest_second = rows[0][1]
++        candidates = [dict(zip(('uid', 'created_at', 'id'), r)) for r in rows if r[1] == newest_second]
++        if len(candidates) > 128:
++            return None  # ambiguous over-bound tie, never guess from arrival order
++        from hermes_cli.kanban_sync_divergence import _event_order
++        # Local ids are arrival order, not portable authority. Even v7 events
++        # can share one millisecond: ambiguity must never select an old park.
++        ordered = [(_event_order(row)[:2], row['uid']) for row in candidates]
++        top = max(key for key, _uid in ordered)
++        winners = [uid for key, uid in ordered if key == top]
++        return winners[0] if len(winners) == 1 else None
++    except (sqlite3.Error, TypeError, ValueError):
++        return None
++
++
++def verified_for_event(conn: sqlite3.Connection, event: dict, task: dict | None = None,
++                       *, now: int | None = None) -> dict | None:
++    """Accessor for the scanner: receipt only if the event matches it.
++
++    With ``task`` (and ``now``) the receipt must also be the card's *current* park: newest park
++    event in this replica, scheduled without a run, before its backstop. Without ``task`` the
++    result is historical proof only and must not suppress anything.
++    """
++    receipt = verified_receipt(conn, event.get("uid")) if isinstance(event, dict) else None
++    if receipt is None or not canonical.event_matches(event, receipt):
++        return None
++    if task is not None and not canonical.current_matches(
++            receipt, task, latest_park_uid=latest_park_uid(conn, receipt["task_id"]), now=now):
++        return None
++    return receipt
++
++
++def _is_candidate(ch) -> bool:
++    import json
++    if ch.table != "task_events" or ch.op != "upsert" or ch.fields.get("kind") not in canonical.PARK_KINDS:
++        return False
++    try:
++        payload = canonical.parse_evidence(ch.fields.get("payload") or "")
++    except ReassessmentRefused:
++        return False
++    return isinstance(payload, dict) and "owner_reassessment_episode_uid" in payload
++
++
++def certify_page(conn: sqlite3.Connection, hub, board: str, changes) -> None:
++    """Prewriter seam (same signature as containment's). Fetch before the writer transaction.
++
++    A park event merely *claiming* an episode is ordinary history: if the Board attests nothing
++    for it, nothing is recorded and nothing is authorized (page still applies). Transport errors
++    abort the page; an attestation that contradicts the feed row or a recorded receipt raises.
++    """
++    for ch in changes:
++        if not _is_candidate(ch):
++            continue
++        evidence = hub.row_evidence(board, "task_events", ch.uid, max_response_bytes=canonical.MAX_EVIDENCE_BYTES)
++        if not isinstance(evidence, dict) or "owner_reassessment_v1" not in evidence:
++            continue
++        try:
++            receipt = canonical.certified_receipt(evidence, board=board, task=ch.fields.get("task_id"), uid=ch.uid)
++        except ReassessmentRefused:
++            continue  # malformed/lookalike attestation: no proof, no authority
++        if not canonical.event_matches({**ch.fields, "uid": ch.uid, "origin_gateway": ch.origin_gateway}, receipt):
++            raise ReassessmentConflict("replica event differs from its canonical reassessment receipt")
++        _store(conn, evidence, receipt)
++
++
++def adopt_receipts(conn: sqlite3.Connection, source: sqlite3.Connection, changes) -> None:
++    """Offline pickup: carry already-recorded receipts from the pulled replica, re-certified."""
++    import json
++    for ch in changes:
++        if not _is_candidate(ch):
++            continue
++        row = source.execute(f"SELECT evidence FROM {TABLE} WHERE event_uid=?", (ch.uid,)).fetchone() \
++            if source.execute("SELECT 1 FROM sqlite_master WHERE name=?", (TABLE,)).fetchone() else None
++        if row is None:
++            continue
++        try:
++            evidence = canonical.parse_evidence(row[0])
++            receipt = canonical.certified_receipt(evidence, board=evidence.get("board"), task=ch.fields.get("task_id"),
++                                                  uid=ch.uid)
++        except (ReassessmentRefused, AttributeError):
++            continue  # corrupt/foreign source row: carry nothing
++        if not canonical.event_matches({**ch.fields, "uid": ch.uid, "origin_gateway": ch.origin_gateway}, receipt):
++            raise ReassessmentConflict("replica event differs from its canonical reassessment receipt")
++        _store(conn, evidence, receipt)
+diff --git a/hermes_cli/kanban_owner_reassessment_transport.py b/hermes_cli/kanban_owner_reassessment_transport.py
+new file mode 100644
+index 00000000000..288b9d79d19
+--- /dev/null
++++ b/hermes_cli/kanban_owner_reassessment_transport.py
+@@ -0,0 +1,77 @@
++"""Bind opt-in reassessment to its exact captured park op, never latest at send."""
++from __future__ import annotations
++
++import json
++
++from hermes_cli.kanban_owner_reassessment import PENDING_TABLE, ReassessmentRefused
++
++
++def capture(conn, receipt):
++    """Bind while the park transaction and its single status capture are live."""
++    task = receipt['task_id']
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_outbox'").fetchone():
++        return
++    changed = conn.execute('SELECT status,n FROM temp.kanban_status_changes WHERE task_id=?', (task,)).fetchone()
++    rows = conn.execute('SELECT op_id FROM temp.kanban_status_capture WHERE task_id=?', (task,)).fetchall()
++    if changed is None or tuple(changed) != ('scheduled', 1) or len(rows) != 1:
++        raise ReassessmentRefused('reassessment needs one exact status capture')
++    op_id = rows[0][0]
++    from hermes_cli.kanban_sync_status_origin import current_origin
++    ordinary_origin = current_origin(conn, task)
++    if ordinary_origin is None:
++        raise ReassessmentRefused('reassessment ordinary capture origin unavailable')
++    original = conn.execute('SELECT fields,wire_json FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++    if original is None or original[1] is not None:
++        raise ReassessmentRefused('reassessment ordinary capture already frozen')
++    fields = json.loads(original[0])
++    fields['owner_reassessment_fallback_status_origin'] = ordinary_origin
++    conn.execute('UPDATE kanban_sync_outbox SET fields=? WHERE op_id=? AND wire_json IS NULL',
++                 (json.dumps(fields, ensure_ascii=False, separators=(',', ':')), op_id))
++    conn.execute('UPDATE kanban_sync_outbox SET status_origin=? WHERE op_id=? AND wire_json IS NULL',
++                 (receipt['park_event']['uid'], op_id))
++    bind(conn, op_id=op_id, task_id=task, event_uid=receipt['park_event']['uid'])
++
++
++def captured_origin(conn, op_id, fallback):
++    """Read only this op's transaction-captured binding; never search latest task."""
++    row = conn.execute('SELECT fields,status_origin FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++    if row is None:
++        return fallback
++    fields = json.loads(row[0])
++    receipt = fields.get('owner_reassessment_v1')
++    if receipt is None:
++        return fallback
++    saved = conn.execute(f'SELECT receipt FROM {PENDING_TABLE} WHERE event_uid=? AND task_id=?',
++                         (row[1], receipt['task_id'])).fetchone()
++    if saved is None or json.loads(saved[0]) != receipt or receipt['park_event']['uid'] != row[1]:
++        raise ReassessmentRefused('reassessment exact capture changed')
++    return row[1]
++
++
++def bind(conn, *, op_id, task_id, event_uid):
++    """Called only for a transaction's single unambiguous status transition.
++
++    An absent journal is the legacy case. A recorded receipt cannot be silently
++    attached to a synthesized parent, another transition, or a frozen envelope.
++    Board still requires the matching live lease at actual delivery.
++    """
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (PENDING_TABLE,)).fetchone():
++        return
++    saved = conn.execute(f'SELECT receipt FROM {PENDING_TABLE} WHERE task_id=? AND event_uid=?',
++                         (task_id, event_uid)).fetchone()
++    if saved is None:
++        return
++    receipt = json.loads(saved[0])
++    row = conn.execute('SELECT fields,wire_json,status_origin FROM kanban_sync_outbox '
++                       "WHERE op_id=? AND row_uid=? AND table_name='tasks' AND op='upsert'",
++                       (op_id, task_id)).fetchone()
++    if row is None or row[1] is not None or row[2] != event_uid:
++        raise ReassessmentRefused('reassessment capture is not the exact unfrozen park op')
++    fields = json.loads(row[0])
++    if fields.get('status') != 'scheduled' or receipt['park_event']['uid'] != event_uid:
++        raise ReassessmentRefused('reassessment capture does not carry the park transition')
++    if 'owner_reassessment_v1' in fields and fields['owner_reassessment_v1'] != receipt:
++        raise ReassessmentRefused('reassessment capture identity changed')
++    fields['owner_reassessment_v1'] = receipt
++    conn.execute('UPDATE kanban_sync_outbox SET fields=? WHERE op_id=? AND wire_json IS NULL',
++                 (json.dumps(fields, ensure_ascii=False, separators=(',', ':')), op_id))
+diff --git a/hermes_cli/kanban_owner_target.py b/hermes_cli/kanban_owner_target.py
+new file mode 100644
+index 00000000000..fb3919335be
+--- /dev/null
++++ b/hermes_cli/kanban_owner_target.py
+@@ -0,0 +1,286 @@
++"""Read-only source-host observations, never health attestations or receipts.
++
++The local administrator owns session-repair/target-sources.json under Hermes home.
++Selectors cannot provide paths, commands or identity overrides. Queue sources require
++kind, queue_path, repository, pr, observation_path, train_path and pause_path. Update
++sources require kind, repo_path, repository (origin URL), channel, remote_ref,
++target_ref, observation_path, stamp_path and stamp_sha_key
++(commit/core_sha/full_sha/serves_sha/sha). The current producer supports main only.
++Desktop's installed Contents/Resources/install-stamp.json uses commit. A stamp
++must describe the *installed* build, not core-update state.json's prebuild offer.
++hermes-sync publishes cache/core-update/target-observation.json around its own
++successful origin fetch. A scanner or generic file touch cannot renew that fact.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import selectors
++import socket
++import stat
++import subprocess
++import time
++
++_SELECTOR = re.compile(r"owner-target:([A-Za-z0-9_.-]{1,64})/([A-Za-z0-9_.-]{1,64})\Z")
++_SHA = re.compile(r"[0-9a-f]{40}\Z")
++_LABEL = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
++MAX_BYTES = 1024 * 1024
++MAX_AGE = 1200
++GIT_TIMEOUT = 3
++
++
++class Unavailable(ValueError):
++    """The trusted source cannot currently prove a disposition."""
++
++
++def _pairs(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise Unavailable("duplicate JSON key")
++        result[key] = value
++    return result
++
++
++def _constant(value):
++    raise Unavailable('nonfinite JSON constant')
++
++
++def _path(value):
++    if not isinstance(value, str) or not value or len(value) > 4096:
++        raise Unavailable("invalid configured path")
++    path = Path(value).expanduser()
++    if not path.is_absolute():
++        raise Unavailable("configured path must be absolute")
++    return path
++
++
++def _fresh(info, now):
++    if not stat.S_ISREG(info.st_mode) or not 0 <= now - info.st_mtime <= MAX_AGE:
++        raise Unavailable("stale, future or nonregular source")
++
++
++def _json(path, now=None, max_bytes=MAX_BYTES):
++    # Nonblocking open also prevents a misconfigured FIFO from hanging this CLI.
++    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
++    with os.fdopen(fd, "rb") as stream:
++        before = os.fstat(stream.fileno())
++        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
++            raise Unavailable("not a bounded regular source")
++        if now is not None:
++            _fresh(before, now)
++        raw = stream.read(max_bytes + 1)
++        after = os.fstat(stream.fileno())
++        if len(raw) > max_bytes or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
++            raise Unavailable("source changed or exceeded bound")
++    value = json.loads(raw, object_pairs_hook=_pairs, parse_constant=_constant)
++    if not isinstance(value, dict):
++        raise Unavailable("expected JSON object")
++    return value
++
++
++def _git(repo, *args):
++    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
++    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
++               GIT_NO_REPLACE_OBJECTS="1", GIT_OPTIONAL_LOCKS="0",
++               GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0")
++    proc = subprocess.Popen(["git", "--no-pager", "-C", str(repo), *args],
++                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
++    assert proc.stdout is not None  # stdout=PIPE above is invariant.
++    output = bytearray()
++    deadline = time.monotonic() + GIT_TIMEOUT
++    try:
++        with selectors.DefaultSelector() as poll:
++            poll.register(proc.stdout, selectors.EVENT_READ)
++            while True:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0 or not poll.select(remaining):
++                    raise Unavailable("git timeout")
++                block = os.read(proc.stdout.fileno(), 1025 - len(output))
++                if not block:
++                    break
++                output.extend(block)
++                if len(output) > 1024:
++                    raise Unavailable("git output exceeded bound")
++        code = proc.wait(timeout=max(0.001, deadline - time.monotonic()))
++        return code, output.decode("ascii").strip()
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++        try:
++            proc.wait(timeout=GIT_TIMEOUT)
++        finally:
++            proc.stdout.close()
++
++
++def _ref(repo, ref):
++    if not isinstance(ref, str) or not ref.startswith("refs/") or len(ref) > 256:
++        raise Unavailable("explicit git ref required")
++    code, _ = _git(repo, "check-ref-format", ref)
++    if code:
++        raise Unavailable("invalid git ref")
++    code, head = _git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
++    if code or not _SHA.fullmatch(head):
++        raise Unavailable("missing full commit")
++    return head
++
++
++def _ancestry(repo, older, newer):
++    code, _ = _git(repo, "merge-base", "--is-ancestor", older, newer)
++    if code not in (0, 1):
++        raise Unavailable("ancestry unavailable")
++    return code == 0
++
++
++def _queue(config, now):
++    required = {"kind", "queue_path", "repository", "pr", "observation_path", "pause_path", "train_path"}
++    if (set(config) != required or type(config["pr"]) is not int or config["pr"] <= 0
++            or not isinstance(config["repository"], str)
++            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", config["repository"])):
++        raise Unavailable("invalid queue config")
++    queue = _json(_path(config["queue_path"]), now)
++    entries = queue.get("entries")
++    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
++        raise Unavailable("invalid queue entries")
++    matches = [e for e in entries if type(e.get("pr")) is int and e["pr"] == config["pr"]]
++    # Historical terminal entries may coexist with the one live enqueue generation.
++    live = [e for e in matches if e.get("state") == "queued"]
++    if len(live) != 1:
++        raise Unavailable("missing or ambiguous live queue entry")
++    entry = live[0]
++    ident = entry.get("id")
++    vet = entry.get("vet")
++    if not isinstance(ident, str) or not _LABEL.fullmatch(ident) or not isinstance(vet, dict):
++        raise Unavailable("missing queue generation or vet")
++    head = vet.get("head")
++    if not isinstance(head, str) or not _SHA.fullmatch(head) or entry.get("judged_head", head) != head:
++        raise Unavailable("missing or inconsistent reviewed head")
++    revision = ident + ":" + head
++    observation = _json(_path(config["observation_path"]), now, max_bytes=4096)
++    if (set(observation) != {"version", "repository", "pr", "enqueue_generation", "head", "observed_at", "state"}
++            or type(observation["version"]) is not int or observation["version"] != 1
++            or observation["repository"] != config["repository"]
++            or type(observation["pr"]) is not int or observation["pr"] != config["pr"]
++            or observation["enqueue_generation"] != ident or observation["head"] != head
++            or observation["state"] != "current"
++            or type(observation["observed_at"]) not in (int, float)
++            or not 0 <= now - observation["observed_at"] <= MAX_AGE):
++        raise Unavailable("missing, stale or mismatched authenticated PR observation")
++    pause = _path(config["pause_path"])
++    # lstat distinguishes an absent marker from unreadability or broken symlinks.
++    try:
++        pause.lstat()
++        paused = True
++    except FileNotFoundError:
++        paused = False
++    train = _json(_path(config['train_path']), now)
++    skip = train.get('skip') or {}
++    if not isinstance(skip, dict):
++        raise Unavailable('invalid train skip state')
++    skip_until = skip.get(ident, 0)
++    if type(skip_until) not in (int, float) or not 0 <= skip_until < float('inf'):
++        raise Unavailable('invalid train skip deadline')
++    alone = any(isinstance(text,str) and re.search(
++        r'validate failed on train candidate [0-9a-f]{7,40} with this PR alone on main', text)
++        for text in (entry.get('hold_noted'), entry.get('hold_reason')))
++    adverse = (paused or queue.get("paused", False) is not False
++               or entry.get("paused", False) is not False
++               or entry.get("hold_reason") or entry.get("vet_reason")
++               or entry.get('hold_candidate') or alone or skip_until > now
++               or vet.get("state") != "ready")
++    return revision, "failed" if adverse else "pending"
++
++
++def _update(config, now):
++    required = {"kind", "repo_path", "repository", "channel", "remote_ref", "target_ref",
++                "observation_path", "stamp_path", "stamp_sha_key"}
++    if (set(config) != required or config["stamp_sha_key"] not in {"commit", "core_sha", "full_sha", "serves_sha", "sha"}
++            or config["channel"] != "main" or config["remote_ref"] != "refs/heads/main"
++            or config["target_ref"] != "refs/remotes/origin/main"
++            or not isinstance(config["repository"], str) or not config["repository"]):
++        raise Unavailable("invalid update config")
++    repo = _path(config["repo_path"])
++    fact = _json(_path(config["observation_path"]), now, max_bytes=16384)
++    if (set(fact) != {"version", "host", "repo_path", "repository", "channel", "remote_ref",
++                      "target_ref", "head", "observed_at", "state"}
++            or type(fact["version"]) is not int or fact["version"] != 1
++            or fact["host"] != socket.gethostname() or fact["repo_path"] != str(repo.resolve())
++            or any(fact[key] != config[key] for key in ("repository", "channel", "remote_ref", "target_ref"))
++            or fact["state"] != "current" or type(fact["observed_at"]) not in (int, float)
++            or not 0 <= now - fact["observed_at"] <= MAX_AGE
++            or not isinstance(fact["head"], str) or not _SHA.fullmatch(fact["head"])):
++        raise Unavailable("missing, stale or mismatched updater fetch observation")
++    code, origin = _git(repo, "remote", "get-url", "origin")
++    target = _ref(repo, config["target_ref"])
++    if code or origin != config["repository"] or target != fact["head"]:
++        raise Unavailable("updater target changed since fetch")
++    stamp = _json(_path(config["stamp_path"]))
++    installed = stamp.get(config["stamp_sha_key"])
++    if not isinstance(installed, str) or not _SHA.fullmatch(installed):
++        raise Unavailable("missing installed full SHA")
++    if _ancestry(repo, target, installed):
++        disposition = "satisfied"
++    elif _ancestry(repo, installed, target):
++        disposition = "pending"
++    else:
++        disposition = "failed"
++    final_code, final_origin = _git(repo, "remote", "get-url", "origin")
++    if (final_code or final_origin != origin
++            or _json(_path(config["stamp_path"])) != stamp
++            or _ref(repo, config["target_ref"]) != target
++            or _json(_path(config["observation_path"]), now, max_bytes=16384) != fact):
++        raise Unavailable("updater observation changed during read")
++    return target, disposition
++
++
++def observe(selector: str, *, registry_path: Path | None = None, now: float | None = None) -> dict:
++    """Observe one registered target; registry_path is a local-admin/test API only."""
++    now = time.time() if now is None else now
++    result = {"version": 1, "observed_at": now, "selector": selector,
++              "target": {"kind": "unavailable", "identity": selector, "revision": ""},
++              "disposition": "unavailable"}
++    try:
++        match = _SELECTOR.fullmatch(selector)
++        if not match:
++            raise Unavailable("invalid selector")
++        if registry_path is None:
++            from hermes_constants import get_hermes_home
++            registry_path = get_hermes_home() / "session-repair" / "target-sources.json"
++        registry = _json(registry_path)
++        if (set(registry) != {"version", "authority", "sources"}
++                or type(registry["version"]) is not int or registry["version"] != 1
++                or registry["authority"] != match[1] or not isinstance(registry["sources"], dict)):
++            raise Unavailable("registry authority/schema mismatch")
++        config = registry["sources"].get(match[2])
++        if not isinstance(config, dict) or config.get("kind") not in {"queue", "update"}:
++            raise Unavailable("unknown source")
++        # Bind actual host and configured component/channel/paths into the target
++        # identity. Reusing a registry key for another scope must invalidate old
++        # receipts even when both sources happen to offer the same commit.
++        scope = json.dumps([socket.gethostname(), config], sort_keys=True, separators=(',', ':'), allow_nan=False)
++        result['target']['identity'] = selector + '@' + hashlib.sha256(scope.encode()).hexdigest()
++        result["target"]["kind"] = config["kind"]
++        reader = _queue if config["kind"] == "queue" else _update
++        revision, disposition = reader(config, now)
++        result["target"]["revision"] = revision
++        result["disposition"] = disposition
++    except (OSError, ValueError, TypeError, RecursionError, subprocess.SubprocessError):
++        pass  # No source details/paths or arbitrary exception text cross the boundary.
++    return result
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("action", choices=["observe"])
++    parser.add_argument("--selector", required=True)
++    args = parser.parse_args(argv)
++    print(json.dumps(observe(args.selector), allow_nan=False, separators=(",", ":")))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 91b152a2ad0..51053671de3 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -57,6 +57,7 @@
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+ from hermes_cli.kanban_sync_compat import TRANSIENT_REASONS, transient_rejection  # re-exported compatibility seam
+ from hermes_cli.kanban_sync_hub_transport import peer_closed as _peer_closed
++from hermes_cli.kanban_sync_hub_transport import BoundedRedirects, BoundedResponseError, read_response
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+ from hermes_cli.kanban_sync_bounded_probe import DeadlineRequests as _DeadlineRequests, schedstat, watch_written
+ from hermes_cli.kanban_sync_repair_window import (  # shared per-board repair-window state, re-exported
+@@ -280,42 +281,23 @@
+         return timeout
+ 
+     @sync_cpu.board_call
+-    def _call(self, method: str, path: str, body: Optional[dict] = None, *, replay_safe: bool = False) -> dict:
++    def _call(self, method: str, path: str, body: Optional[dict] = None, *, replay_safe: bool = False,
++              max_response_bytes: Optional[int] = None) -> dict:
++        if max_response_bytes is not None and (type(max_response_bytes) is not int or max_response_bytes <= 0):
++            raise ValueError("max_response_bytes must be a positive integer")
+         timeout = self._remaining()
+         data = None if body is None else json.dumps(body).encode()
+         parts = urllib.parse.urlsplit(self.ident.url)
++        bounded: dict[str, Any] = {} if max_response_bytes is None else {"max_response_bytes": max_response_bytes}
+         if parts.scheme not in ("http", "https") or not parts.hostname or self._proxied(parts):
+-            return self._call_urlopen(method, path, data, timeout)
+-        return self._call_kept_alive(parts, method, path, data, timeout, replay_safe=replay_safe)
++            return self._call_urlopen(method, path, data, timeout, **bounded)
++        return self._call_kept_alive(parts, method, path, data, timeout, replay_safe=replay_safe, **bounded)
+ 
+-    def _call_urlopen(self, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None) -> dict:
+-        import http.client
++    def _call_urlopen(self, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None, *,
++                      max_response_bytes: Optional[int] = None) -> dict:
++        from hermes_cli.kanban_sync_hub_urlopen import call
+ 
+-        timeout = self._remaining(timeout)
+-        req = urllib.request.Request(self.ident.url + path, data=data, method=method, headers=self._headers())
+-        # A per-call opener leaves global urllib users alone. Its processor also caps
+-        # urllib's internal redirect follows, not merely the initial fallback send.
+-        open_request = (urllib.request.build_opener(_DeadlineRequests(self._remaining)).open
+-                        if self.deadline is not None else urllib.request.urlopen)
+-        started = time.monotonic()
+-        try:
+-            try:
+-                with open_request(req, timeout=timeout) as resp:
+-                    return json.loads(resp.read() or b"{}")
+-            except urllib.error.HTTPError as exc:
+-                text = exc.read().decode("utf-8", "replace")[:500]
+-                if exc.code == 410:
+-                    raise Resync(text) from exc
+-                raise HubError(exc.code, text) from exc
+-        except http.client.HTTPException as exc:
+-            # urllib does not wrap malformed status lines or truncated bodies,
+-            # including failures while reading an HTTPError's response body.
+-            error = urllib.error.URLError(exc)
+-            note_attempt(error, self.deadline, started, time.monotonic())
+-            raise error from exc
+-        except Exception as exc:  # health: allow BLE001 -- stamps diagnostics, then re-raises the same error
+-            note_attempt(exc, self.deadline, started, time.monotonic())
+-            raise
++        return call(self, method, path, data, timeout, max_response_bytes=max_response_bytes)
+ 
+     @staticmethod
+     def _proxied(parts: urllib.parse.SplitResult) -> bool:
+@@ -371,7 +353,8 @@
+         return conn, False
+ 
+     def _call_kept_alive(self, parts: urllib.parse.SplitResult, method: str, path: str, data: Optional[bytes],
+-                         timeout: Optional[float] = None, *, replay_safe: bool = False) -> dict:
++                         timeout: Optional[float] = None, *, replay_safe: bool = False,
++                         max_response_bytes: Optional[int] = None) -> dict:
+         import http.client
+         target = (parts.path or "") + path
+         headers = self._headers()
+@@ -404,7 +387,10 @@
+                         continue
+                     raise urllib.error.URLError(exc) from exc
+                 try:
+-                    raw = resp.read()
++                    raw = read_response(resp, max_response_bytes)
++                except BoundedResponseError:
++                    self._drop()  # unread bytes must never become the next response; never replay this refusal
++                    raise
+                 except (OSError, http.client.HTTPException) as exc:
+                     self._drop()
+                     if replay_after_timeout(exc, attempt, replay_safe, self.deadline, time.monotonic()):
+@@ -416,7 +402,8 @@
+                     self._local.used = _hub_monotonic()
+                 status = resp.status
+                 if 300 <= status < 400 and method == "GET":  # the Board service sends none; urlopen follows them
+-                    return self._call_urlopen(method, path, data, timeout)
++                    bounded: dict[str, Any] = {} if max_response_bytes is None else {"max_response_bytes": max_response_bytes}
++                    return self._call_urlopen(method, path, data, timeout, **bounded)
+                 if 300 <= status < 400:  # never resend a POST the server may have applied
+                     raise HubError(status, raw.decode("utf-8", "replace")[:500])
+                 if not 200 <= status < 300:
+@@ -444,10 +431,11 @@
+         query = urllib.parse.urlencode({"task": task, **({"producer": producer} if producer is not None else {})})
+         return self._call("GET", f"/v2/boards/{urllib.parse.quote(board, safe='')}/containment/context?{query}")
+ 
+-    def row_evidence(self, board: str, table: str, uid: str) -> dict:
+-        """Exact authoritative row/deletion/history evidence, never a replica lookup."""
++    def row_evidence(self, board: str, table: str, uid: str, *, max_response_bytes: Optional[int] = None) -> dict:
++        """Exact authoritative evidence; optional wire/decoded cap is enforced before JSON parsing."""
+         from urllib.parse import urlencode
+-        return self._call("GET", f"/v2/boards/{board}/evidence?" + urlencode({"table": table, "uid": uid}))
++        bounded: dict[str, Any] = {} if max_response_bytes is None else {"max_response_bytes": max_response_bytes}
++        return self._call("GET", f"/v2/boards/{board}/evidence?" + urlencode({"table": table, "uid": uid}), **bounded)
+ 
+     def sessions(self, board: str, body: dict) -> dict:
+         """Session owners (session handover, :mod:`hermes_cli.session_owner`): ``get`` / ``move``. A 409 refusal
+diff --git a/hermes_cli/kanban_sync_hub_transport.py b/hermes_cli/kanban_sync_hub_transport.py
+index 476759eda57..88ca9ec827b 100644
+--- a/hermes_cli/kanban_sync_hub_transport.py
++++ b/hermes_cli/kanban_sync_hub_transport.py
+@@ -1,5 +1,71 @@
+ """Socket observation for the Board's kept-alive HTTP transport. [daveey]"""
+ 
++import urllib.request
++
++
++class BoundedResponseError(ValueError):
++    """A capped evidence response is too large or cannot be decoded safely."""
++
++
++class BoundedRedirects(urllib.request.HTTPRedirectHandler):
++    """Cap urllib's internal redirect-body drain as well as the final response."""
++
++    def __init__(self, max_response_bytes):
++        self.max_response_bytes = max_response_bytes
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        if req.get_method() not in ("GET", "HEAD"):
++            return None  # never follow an uncertain write, even by changing its method
++        return super().redirect_request(req, fp, code, msg, headers, newurl)
++
++    def http_error_302(self, req, fp, code, msg, headers):
++        try:
++            read_response(fp, self.max_response_bytes)
++        except (ValueError, OSError, EOFError):
++            fp.close()
++            raise
++        return super().http_error_302(req, fp, code, msg, headers)
++
++    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
++
++
++def read_response(resp, max_response_bytes=None) -> bytes:
++    """Bound wire bytes before parsing, and decoded bytes for gzip/deflate replies.
++
++    Uncapped callers retain the historical transport behavior. A capped caller must
++    discard the connection on failure: the response may not have been drained.
++    Content-Length is deliberately not trusted, including for compressed replies.
++    """
++    if max_response_bytes is None:
++        return resp.read()
++    if type(max_response_bytes) is not int or max_response_bytes <= 0:
++        raise ValueError("max_response_bytes must be a positive integer")
++    raw = resp.read(max_response_bytes + 1)
++    if len(raw) > max_response_bytes:
++        raise BoundedResponseError("Board response exceeds wire byte limit")
++    encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
++    if encoding in ("", "identity"):
++        return raw
++    import gzip
++    import io
++    import zlib
++    try:
++        if encoding == "gzip":
++            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
++                decoded = stream.read(max_response_bytes + 1)
++        elif encoding == "deflate":
++            decoder = zlib.decompressobj()
++            decoded = decoder.decompress(raw, max_response_bytes + 1)
++            if len(decoded) <= max_response_bytes and (not decoder.eof or decoder.unused_data):
++                raise BoundedResponseError("Invalid deflate Board response")
++        else:
++            raise BoundedResponseError("Unsupported Board response content encoding")
++    except (OSError, EOFError, zlib.error) as exc:
++        raise BoundedResponseError("Invalid compressed Board response") from exc
++    if len(decoded) > max_response_bytes:
++        raise BoundedResponseError("Board response exceeds decoded byte limit")
++    return decoded
++
+ 
+ def peer_closed(conn) -> bool:
+     """True when an idle kept-alive socket is readable (the server sent FIN) or already gone."""
+diff --git a/hermes_cli/kanban_sync_hub_urlopen.py b/hermes_cli/kanban_sync_hub_urlopen.py
+new file mode 100644
+index 00000000000..28f61abf82b
+--- /dev/null
++++ b/hermes_cli/kanban_sync_hub_urlopen.py
+@@ -0,0 +1,42 @@
++"""Board urllib fallback, with bounded reads and the client's patch seams."""
++from __future__ import annotations
++
++import http.client
++from typing import Optional
++
++
++def call(hub, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None, *,
++         max_response_bytes: Optional[int] = None) -> dict:
++    from hermes_cli import kanban_sync_client as client
++
++    timeout = hub._remaining(timeout)
++    req = client.urllib.request.Request(hub.ident.url + path, data=data, method=method, headers=hub._headers())
++    # Keep facade lookups late-bound: deadline, urllib, clock and read seams are
++    # shared with kept-alive callers and existing transport monkeypatches.
++    open_request = (client.urllib.request.build_opener(client._DeadlineRequests(hub._remaining)).open
++                    if hub.deadline is not None else client.urllib.request.urlopen)
++    if max_response_bytes is not None:
++        handlers: list[client.urllib.request.BaseHandler] = [client.BoundedRedirects(max_response_bytes)]
++        if hub.deadline is not None:
++            handlers.append(client._DeadlineRequests(hub._remaining))
++        open_request = client.urllib.request.build_opener(*handlers).open
++    started = client.time.monotonic()
++    try:
++        try:
++            with open_request(req, timeout=timeout) as resp:
++                return client.json.loads(client.read_response(resp, max_response_bytes) or b"{}")
++        except client.urllib.error.HTTPError as exc:
++            with exc:
++                text = client.read_response(exc, max_response_bytes).decode("utf-8", "replace")[:500]
++            if exc.code == 410:
++                raise client.Resync(text) from exc
++            raise client.HubError(exc.code, text) from exc
++    except http.client.HTTPException as exc:
++        # urllib leaves malformed status lines and truncated bodies unwrapped,
++        # including failures while reading an HTTPError's response body.
++        error = client.urllib.error.URLError(exc)
++        client.note_attempt(error, hub.deadline, started, client.time.monotonic())
++        raise error from exc
++    except Exception as exc:  # health: allow BLE001 -- stamps diagnostics, then re-raises the same error
++        client.note_attempt(exc, hub.deadline, started, client.time.monotonic())
++        raise
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index 84dbfb43e8b..b7daedf0b33 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -238,7 +238,9 @@
+     cursor advances. A later apply failure may conservatively retain a quarantine, never lose one.
+     """
+     from hermes_cli import kanban_containment_replica as replica
++    from hermes_cli import kanban_owner_reassessment_replica as reassessment
+     from hermes_cli.kanban_containment_lifecycle import ContainmentConflict
++    reassessment.certify_page(conn, hub, board, changes)
+     for change in changes:
+         if not protected(change):
+             continue
+diff --git a/hermes_cli/kanban_sync_status_origin.py b/hermes_cli/kanban_sync_status_origin.py
+index 2406548bc96..4104a848165 100644
+--- a/hermes_cli/kanban_sync_status_origin.py
++++ b/hermes_cli/kanban_sync_status_origin.py
+@@ -81,6 +81,8 @@
+             known = counts[task] == 1 and change[1] == 1 and captured and captured[0] == change[0]
+             origin = current_origin(conn, task) if known else None
+             if known:
++                from hermes_cli.kanban_owner_reassessment_transport import captured_origin
++                origin = captured_origin(conn, op, origin)
+                 conn.execute("UPDATE kanban_sync_outbox SET status_origin=? WHERE op_id=? AND wire_json IS NULL",
+                              (origin, op))
+             conn.execute("INSERT INTO kanban_sync_status_origins(task_id, origin, status) "
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index d3ea3ccfcb7..b8acb42b919 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -547,6 +547,8 @@
+         card_changes = _changes_for(replica, tid, card)
+         try:
+             containment.adopt_receipts(conn, replica, card_changes)
++            from hermes_cli import kanban_owner_reassessment_replica as reassessment
++            reassessment.adopt_receipts(conn, replica, card_changes)
+         except (ContainmentRefused, KeyError, ValueError, TypeError) as exc:  # malformed evidence refuses too
+             why = f"containment receipts not certified for task_events: {exc}"
+             _log.warning("kanban worker node: not importing %s (table task_events): %s", tid, why)
+diff --git a/tests/hermes_cli/fixtures/board_emitted_owner_reassessment_evidence.json b/tests/hermes_cli/fixtures/board_emitted_owner_reassessment_evidence.json
+new file mode 100644
+index 00000000000..9ebc98681f4
+--- /dev/null
++++ b/tests/hermes_cli/fixtures/board_emitted_owner_reassessment_evidence.json
+@@ -0,0 +1,69 @@
++{
++  "board": "default",
++  "table": "task_events",
++  "uid": "018bf763-cc4d-7aeb-a482-ef0f2dcdcded",
++  "state": "live",
++  "row": {
++    "uid": "018bf763-cc4d-7aeb-a482-ef0f2dcdcded",
++    "ord": 6,
++    "task_id": "t_f78b1f2c1497ee8e",
++    "run_uid": "018bf763-caaa-7ed3-9201-ed68dd306c57",
++    "kind": "scheduled",
++    "payload": "{\"reason\": \"waiting on example queue SCHEDULED_UNTIL=2023-11-22T14:46:34Z\", \"wake_at\": 1700662714, \"owner_reassessment_episode_uid\": \"018bf763-cc4a-750e-ac44-666e4c826dd7\", \"awaiting\": {\"kind\": \"external\", \"ref\": \"executor:example\", \"why\": \"queue reassessment of the example executor\", \"premise\": \"a37d69f262743f95\"}, \"actionability_parent_ids\": [], \"actionability_parent_states\": [], \"actionability_run_uid\": null, \"actionability_intent\": {\"version\": 1, \"policy\": \"scheduled-wake-grace-v1\", \"status\": \"scheduled\", \"source_kind\": \"scheduled\", \"owner\": {\"kind\": \"assignee\", \"refs\": [\"default\"]}, \"action\": \"wait_for_named_producer\", \"instruction\": \"Recorded external producer executor:example\", \"blocker\": {\"prerequisite\": \"Recorded external producer executor:example\", \"trigger\": \"Recorded external producer executor:example\", \"evidence\": []}, \"first_observed\": 1700662594, \"wake_at\": 1700662714, \"deadline_at\": 1700663314, \"invalid_reason\": null, \"execution_authority\": false}, \"_recovery_history_v1\": {\"identity\": \"ddd59d65-c8f3-4f32-9fa6-e5abfa3cc3b4\", \"predecessors\": [\"08225d9d-a09b-4264-ab2a-7fd6324cfa5f\"]}}",
++    "created_at": 1700662594,
++    "seq": 14,
++    "version": 1,
++    "updated_at": 1700662599000,
++    "hlc": "1700662599009-0001-server",
++    "origin_gateway": "here",
++    "deleted_at": null
++  },
++  "tombstone": null,
++  "floor": 0,
++  "feed_floor": 0,
++  "head": 21,
++  "owner_reassessment_v1": {
++    "backstop_at": 1700664394,
++    "board": "default",
++    "episode_uid": "018bf763-cc4a-750e-ac44-666e4c826dd7",
++    "evidence_refs": [
++      {
++        "table": "task_events",
++        "uid": "018bf763-cbad-7554-93ce-fb65b7f9f5b5"
++      }
++    ],
++    "execution_authority": false,
++    "gateway": "here",
++    "issued_at": 1700662594,
++    "issuer": {
++      "owner_admitted_uid": "018bf763-cc07-7079-bad5-5c260b169b46",
++      "profile": "default",
++      "run_uid": "018bf763-caaa-7ed3-9201-ed68dd306c57",
++      "session_id": "local-abababababababababababababababababababababababababababababababab",
++      "worker_bound_uid": "018bf763-cbad-7554-93ce-fb65b7f9f5b5"
++    },
++    "park_event": {
++      "created_at": 1700662594,
++      "kind": "scheduled",
++      "payload": "{\"reason\": \"waiting on example queue SCHEDULED_UNTIL=2023-11-22T14:46:34Z\", \"wake_at\": 1700662714, \"owner_reassessment_episode_uid\": \"018bf763-cc4a-750e-ac44-666e4c826dd7\", \"awaiting\": {\"kind\": \"external\", \"ref\": \"executor:example\", \"why\": \"queue reassessment of the example executor\", \"premise\": \"a37d69f262743f95\"}, \"actionability_parent_ids\": [], \"actionability_parent_states\": [], \"actionability_run_uid\": null, \"actionability_intent\": {\"version\": 1, \"policy\": \"scheduled-wake-grace-v1\", \"status\": \"scheduled\", \"source_kind\": \"scheduled\", \"owner\": {\"kind\": \"assignee\", \"refs\": [\"default\"]}, \"action\": \"wait_for_named_producer\", \"instruction\": \"Recorded external producer executor:example\", \"blocker\": {\"prerequisite\": \"Recorded external producer executor:example\", \"trigger\": \"Recorded external producer executor:example\", \"evidence\": []}, \"first_observed\": 1700662594, \"wake_at\": 1700662714, \"deadline_at\": 1700663314, \"invalid_reason\": null, \"execution_authority\": false}, \"_recovery_history_v1\": {\"identity\": \"ddd59d65-c8f3-4f32-9fa6-e5abfa3cc3b4\", \"predecessors\": [\"08225d9d-a09b-4264-ab2a-7fd6324cfa5f\"]}}",
++      "run_uid": "018bf763-caaa-7ed3-9201-ed68dd306c57",
++      "uid": "018bf763-cc4d-7aeb-a482-ef0f2dcdcded"
++    },
++    "producer": {
++      "kind": "external",
++      "ref": "executor:example",
++      "why": "queue reassessment of the example executor"
++    },
++    "reassess_at": 1700662714,
++    "suppresses": [
++      "too_long"
++    ],
++    "target": {
++      "identity": "executor:example",
++      "kind": "queue",
++      "revision": "queue-cut:42"
++    },
++    "task_id": "t_f78b1f2c1497ee8e",
++    "version": 1
++  }
++}
+\ No newline at end of file
+diff --git a/tests/hermes_cli/fixtures/core_emitted_owner_reassessment_receipt.json b/tests/hermes_cli/fixtures/core_emitted_owner_reassessment_receipt.json
+new file mode 100644
+index 00000000000..e17985ecac7
+--- /dev/null
++++ b/tests/hermes_cli/fixtures/core_emitted_owner_reassessment_receipt.json
+@@ -0,0 +1 @@
++{"backstop_at":1700661773,"board":"default","episode_uid":"018bf73b-cedb-7bdb-a3f2-ae7898c1b001","evidence_refs":[{"table":"task_events","uid":"018bf73b-ce04-723c-92bc-78f2083fdbb4"}],"execution_authority":false,"gateway":"here","issued_at":1700659973,"issuer":{"owner_admitted_uid":"018bf73b-ce84-7432-85ac-20a79431c538","profile":"default","run_uid":"018bf73b-ccbe-75de-b0ce-7d8d0cb336c1","session_id":"local-abababababababababababababababababababababababababababababababab","worker_bound_uid":"018bf73b-ce04-723c-92bc-78f2083fdbb4"},"park_event":{"created_at":1700659973,"kind":"scheduled","payload":"{\"reason\": \"waiting on example queue SCHEDULED_UNTIL=2023-11-22T14:02:53Z\", \"wake_at\": 1700660093, \"owner_reassessment_episode_uid\": \"018bf73b-cedb-7bdb-a3f2-ae7898c1b001\", \"awaiting\": {\"kind\": \"external\", \"ref\": \"executor:example\", \"why\": \"queue reassessment of the example executor\", \"premise\": \"a37d69f262743f95\"}, \"actionability_parent_ids\": [], \"actionability_parent_states\": [], \"actionability_run_uid\": null, \"actionability_intent\": {\"version\": 1, \"policy\": \"scheduled-wake-grace-v1\", \"status\": \"scheduled\", \"source_kind\": \"scheduled\", \"owner\": {\"kind\": \"assignee\", \"refs\": [\"default\"]}, \"action\": \"wait_for_named_producer\", \"instruction\": \"Recorded external producer executor:example\", \"blocker\": {\"prerequisite\": \"Recorded external producer executor:example\", \"trigger\": \"Recorded external producer executor:example\", \"evidence\": []}, \"first_observed\": 1700659973, \"wake_at\": 1700660093, \"deadline_at\": 1700660693, \"invalid_reason\": null, \"execution_authority\": false}, \"_recovery_history_v1\": {\"identity\": \"65732d33-a700-4660-b699-c7e34409a1f5\", \"predecessors\": [\"ac6abc32-03ec-47f2-a506-adf24933ae5a\"]}}","run_uid":"018bf73b-ccbe-75de-b0ce-7d8d0cb336c1","uid":"018bf73b-cedf-727d-8653-954a576a912a"},"producer":{"kind":"external","ref":"executor:example","why":"queue reassessment of the example executor"},"reassess_at":1700660093,"suppresses":["too_long"],"target":{"identity":"executor:example","kind":"queue","revision":"queue-cut:42"},"task_id":"t_cb3bd5a0ba763d92","version":1}
+diff --git a/tests/hermes_cli/test_kanban_evidence_response_bounds.py b/tests/hermes_cli/test_kanban_evidence_response_bounds.py
+new file mode 100644
+index 00000000000..60851e17ed9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_evidence_response_bounds.py
+@@ -0,0 +1,196 @@
++"""Opt-in evidence transport limits, exercised through both real HTTP paths."""
++import gzip
++import io
++import json
++import threading
++import zlib
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_sync_hub_transport import BoundedResponseError, read_response
++
++
++@pytest.fixture
++def endpoint():
++    state = SimpleNamespace(body=b'{}', redirect_body=b"", encoding=None, status=200, framing="length", requests=[])
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = "HTTP/1.1"
++
++        def do_GET(self):
++            state.requests.append((self.command, self.path))
++            status = 200 if self.path == "/final" else state.status
++            body = state.redirect_body if status == 302 else state.body
++            self.send_response(status)
++            if status == 302:
++                self.send_header("Location", "/final")
++            if state.encoding:
++                self.send_header("Content-Encoding", state.encoding)
++            if state.framing == "length":
++                self.send_header("Content-Length", str(len(body)))
++            elif state.framing == "chunked":
++                self.send_header("Transfer-Encoding", "chunked")
++            else:
++                self.send_header("Connection", "close")
++                self.close_connection = True
++            self.end_headers()
++            try:
++                if state.framing == "chunked":
++                    self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
++                else:
++                    self.wfile.write(body)
++            except (BrokenPipeError, ConnectionResetError):
++                pass  # the cap deliberately closes an incompletely drained reply
++
++        do_POST = do_GET
++
++        def log_message(self, format, *args):
++            pass
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    server.daemon_threads = True
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    state.url = f"http://127.0.0.1:{server.server_port}"
++    try:
++        yield state
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(3)
++        assert not thread.is_alive()
++
++
++@pytest.fixture(params=[False, True], ids=["keepalive", "urlopen"])
++def hub(request, endpoint, monkeypatch):
++    monkeypatch.setattr(client.Hub, "_proxied", staticmethod(lambda parts: request.param))
++    instance = client.Hub(client.Identity(endpoint.url, "test-key", "test-gateway"), timeout=2)
++    try:
++        yield instance
++    finally:
++        instance.close()
++
++
++@pytest.mark.parametrize("framing", ["length", "chunked", "close"])
++def test_wire_cap_precedes_json_and_never_replays(hub, endpoint, monkeypatch, framing):
++    endpoint.framing = framing
++    endpoint.body = b'x' * 10000
++    def forbidden(*args, **kwargs):
++        pytest.fail("oversize response reached JSON parsing")
++    with monkeypatch.context() as patch:
++        patch.setattr(client.json, "loads", forbidden)
++        with pytest.raises(BoundedResponseError, match="wire byte"):
++            hub.row_evidence("board", "task_events", "event", max_response_bytes=256)
++    assert len(endpoint.requests) == 1
++    assert getattr(hub._local, "conn", None) is None
++    endpoint.body = b'{"ok":true}'
++    assert hub.row_evidence("board", "task_events", "next", max_response_bytes=256) == {"ok": True}
++    assert len(endpoint.requests) == 2
++
++
++@pytest.mark.parametrize("encoding", [None, "gzip", "deflate"])
++def test_valid_boundary_including_compressed_response(hub, endpoint, encoding):
++    raw = json.dumps({"payload": "x" * 4000}).encode()
++    endpoint.encoding = encoding
++    endpoint.body = gzip.compress(raw) if encoding == "gzip" else zlib.compress(raw) if encoding else raw
++    assert hub.row_evidence("board", "task_events", "event", max_response_bytes=len(raw)) == json.loads(raw)
++    assert len(endpoint.requests) == 1
++
++
++@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
++def test_compressed_expansion_cap_precedes_json(hub, endpoint, monkeypatch, encoding):
++    raw = b'{"payload":"' + b'x' * 100000 + b'"}'
++    endpoint.encoding = encoding
++    endpoint.body = gzip.compress(raw) if encoding == "gzip" else zlib.compress(raw)
++    assert len(endpoint.body) < 1024
++    with monkeypatch.context() as patch:
++        patch.setattr(client.json, "loads", lambda *a, **kw: pytest.fail("decoded oversize parsed"))
++        with pytest.raises(BoundedResponseError, match="decoded byte"):
++            hub.row_evidence("board", "task_events", "event", max_response_bytes=1024)
++    assert len(endpoint.requests) == 1
++    assert getattr(hub._local, "conn", None) is None
++
++
++@pytest.mark.parametrize("status", [410, 500])
++def test_error_body_is_bounded_too(hub, endpoint, status):
++    endpoint.status = status
++    endpoint.body = b'x' * 10000
++    with pytest.raises(BoundedResponseError):
++        hub.row_evidence("board", "task_events", "event", max_response_bytes=256)
++    assert len(endpoint.requests) == 1
++
++
++def test_existing_uncapped_caller_unchanged(hub, endpoint):
++    endpoint.body = json.dumps({"large": "x" * 10000}).encode()
++    assert hub.row_evidence("board", "task_events", "event") == json.loads(endpoint.body)
++
++
++@pytest.mark.parametrize("cap", [0, -1, True, "256", 1.5])
++def test_invalid_cap_refuses_before_request(hub, endpoint, cap):
++    with pytest.raises(ValueError, match="positive integer"):
++        hub.row_evidence("board", "task_events", "event", max_response_bytes=cap)
++    assert endpoint.requests == []
++
++
++def test_capped_post_is_not_resent(hub, endpoint):
++    endpoint.body = b'x' * 10000
++    with pytest.raises(BoundedResponseError):
++        hub._call("POST", "/write", max_response_bytes=256, replay_safe=True)
++    assert endpoint.requests == [("POST", "/write")]
++
++
++def test_get_redirect_retains_cap(hub, endpoint):
++    endpoint.status = 302
++    endpoint.body = b'x' * 10000
++    with pytest.raises(BoundedResponseError):
++        hub.row_evidence("board", "task_events", "event", max_response_bytes=256)
++    assert endpoint.requests[-1] == ("GET", "/final")
++    assert sum(path == "/final" for _, path in endpoint.requests) == 1
++
++
++def test_redirect_body_itself_is_bounded(hub, endpoint):
++    endpoint.status = 302
++    endpoint.redirect_body = b'x' * 10000
++    with pytest.raises(BoundedResponseError):
++        hub.row_evidence("board", "task_events", "event", max_response_bytes=256)
++    assert len(endpoint.requests) == 1
++
++
++def test_capped_post_redirect_never_resends(hub, endpoint):
++    endpoint.status = 302
++    with pytest.raises(client.HubError):
++        hub._call("POST", "/write", max_response_bytes=256)
++    assert endpoint.requests == [("POST", "/write")]
++
++
++@pytest.mark.parametrize("encoding,body", [("gzip", b"bad"), ("deflate", b"bad"), ("br", b"bad")])
++def test_invalid_encoding_drops_without_retry(hub, endpoint, encoding, body):
++    endpoint.encoding, endpoint.body = encoding, body
++    with pytest.raises(BoundedResponseError):
++        hub.row_evidence("board", "task_events", "event", max_response_bytes=256)
++    assert len(endpoint.requests) == 1
++    assert getattr(hub._local, "conn", None) is None
++
++
++def test_reader_uses_explicit_cap_even_without_length_header():
++    class Response:
++        headers = {}
++        def read(self, size):
++            assert size == 257
++            return b'x' * size
++    with pytest.raises(BoundedResponseError):
++        read_response(Response(), 256)
++
++
++def test_multimember_gzip_and_truncated_deflate():
++    data = b'{"ok":true}'
++    wire = gzip.compress(data[:5]) + gzip.compress(data[5:])
++    response = SimpleNamespace(headers={"Content-Encoding": "gzip"}, read=io.BytesIO(wire).read)
++    assert read_response(response, 256) == data
++    wire = zlib.compress(data)[:-1]
++    response = SimpleNamespace(headers={"Content-Encoding": "deflate"}, read=io.BytesIO(wire).read)
++    with pytest.raises(BoundedResponseError):
++        read_response(response, 256)
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment.py b/tests/hermes_cli/test_kanban_owner_reassessment.py
+new file mode 100644
+index 00000000000..5515bc6ec8b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment.py
+@@ -0,0 +1,114 @@
++"""The staged planner grants no scanner exemption or execution permission."""
++import pytest
++
++from hermes_cli import kanban_owner_reassessment as r, kanban_db as kb, kanban_db_connect as kbc
++from tests.hermes_cli import test_origin_worker_custody as custody
++
++worker = custody.worker
++UID = '018f051a-657d-7001-8001-000000000001'
++
++
++def optin():
++    return {'version': 1, 'reassess_at': 150,
++            'target': {'kind': 'queue', 'identity': 'executor:example', 'revision': 'queue-cut:42'},
++            'evidence_refs': [{'table': 'task_events', 'uid': UID}]}
++
++
++def test_request_copies_without_normalizing_exact_identities():
++    value = optin()
++    parsed = r.request(value)
++    parsed['target']['revision'] = 'different'
++    assert value == optin()
++    assert r.request(value)['target']['identity'] == 'executor:example'
++
++
++@pytest.mark.parametrize('change', [
++    lambda v: v.update(issuer={'session_id': 'forged'}),
++    lambda v: v.update(version=True), lambda v: v.update(reassess_at=True),
++    lambda v: v.update(reassess_at=float('nan')), lambda v: v.update(reassess_at=float('inf')),
++    lambda v: v.update(reassess_at=0), lambda v: v['target'].update(revision=''),
++    lambda v: v['target'].update(kind='clock'), lambda v: v['target'].update(identity=' '),
++    lambda v: v['target'].update(authority=True), lambda v: v.update(evidence_refs=[]),
++    lambda v: v['evidence_refs'].append(v['evidence_refs'][0]),
++    lambda v: v['evidence_refs'][0].update(uid='legacy:1'),
++    lambda v: v['evidence_refs'][0].update(table='comments'),
++    lambda v: v['evidence_refs'][0].update(issuer='forged'),
++])
++def test_reject_caller_authority_and_malformed_input(change):
++    value = optin()
++    change(value)
++    with pytest.raises(r.ReassessmentRefused):
++        r.request(value)
++
++
++def test_plan_shortens_dispatcher_wake_and_retains_original_backstop():
++    payload = {'wake_at': 200, 'reason': 'queue bounded by existing backstop'}
++    producer = {'kind': 'external', 'ref': 'executor:example', 'why': 'queue reassessment'}
++    result, backstop = r.plan(optin(), now=100, final_backstop=200, awaiting=producer, payload=payload)
++    assert result == {**payload, 'wake_at': 150, 'awaiting': producer}
++    assert backstop == 200
++    assert payload['wake_at'] == 200
++    # An expired absolute reassessment never slides after a restart.
++    with pytest.raises(r.ReassessmentRefused):
++        r.plan(optin(), now=150, final_backstop=200, awaiting=producer, payload=payload)
++
++
++@pytest.mark.parametrize('now,backstop', [(150, 200), (151, 200), (100, 149), (True, 200), (100, float('inf'))])
++def test_plan_refuses_expired_extended_or_noninteger_deadline(now, backstop):
++    with pytest.raises(r.ReassessmentRefused):
++        r.plan(optin(), now=now, final_backstop=backstop,
++               awaiting={'kind': 'ci', 'ref': 'job:42'}, payload={'wake_at': backstop})
++
++
++@pytest.mark.parametrize('producer', [None, {}, {'kind': 'clock', 'ref': 'later'},
++    {'kind': 'human', 'ref': 'owner'}, {'kind': 'ci', 'ref': ''},
++    {'kind': 'deploy', 'ref': 'release:42', 'health': 'healthy'}])
++def test_exact_producer_required_not_future_wake_or_prose(producer):
++    with pytest.raises(r.ReassessmentRefused):
++        r.plan(optin(), now=100, final_backstop=200, awaiting=producer, payload={'wake_at': 200})
++
++
++def test_changed_final_wake_refuses():
++    with pytest.raises(r.ReassessmentRefused):
++        r.plan(optin(), now=100, final_backstop=200, awaiting={'kind': 'ci', 'ref': 'job:42'},
++               payload={'wake_at': 201})
++
++
++def test_issuer_refuses_environment_or_shape_only_authority(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_0000000000000001')
++    with kbc.connect_closing(tmp_path / 'fixture.db') as conn, kb.write_txn(conn):
++        for candidate in (None, {}, {'creator': 't_0000000000000001'}):
++            with pytest.raises(r.ReassessmentRefused, match='private admitted'):
++                r.issuer(candidate, conn, 't_0000000000000001')
++
++
++@pytest.mark.parametrize('change', ['none', 'missing_admission', 'wrong_session', 'wrong_task', 'ended_run'])
++def test_issuer_uses_real_facade_and_current_claim(worker, monkeypatch, change):
++    from agent.origin_worker_custody import capture
++
++    agent, _, _, context, _ = worker
++    observed = []
++    def loop(*args, **kwargs):
++        cap = capture(context['task_id'])
++        assert cap is not None
++        with kbc.connect_closing() as conn, kb.write_txn(conn):
++            if change != 'missing_admission':
++                kb._append_event(conn, context['task_id'], 'owner_admitted',
++                    {'session_id': 'wrong-session' if change == 'wrong_session' else agent.session_id},
++                    run_id=context['run_id'])
++            if change == 'ended_run':
++                conn.execute("UPDATE task_runs SET status='scheduled',ended_at=1 WHERE id=?", (context['run_id'],))
++            tid = 't_0000000000000001' if change == 'wrong_task' else context['task_id']
++            if change == 'none':
++                observed.append(r.issuer(cap, conn, tid))
++            else:
++                with pytest.raises(r.ReassessmentRefused):
++                    r.issuer(cap, conn, tid)
++        return dict(final_response='ok', messages=[], failed=False)
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('bounded owner reassessment fixture')
++    if change == 'none':
++        assert len(observed) == 1
++        assert observed[0]['session_id'] == agent.session_id
++        assert observed[0]['profile'] == 'default'
++        assert all(r._uid(observed[0][key]) for key in ('run_uid', 'owner_admitted_uid', 'worker_bound_uid'))
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_canonical.py b/tests/hermes_cli/test_kanban_owner_reassessment_canonical.py
+new file mode 100644
+index 00000000000..bd51306b69f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_canonical.py
+@@ -0,0 +1,449 @@
++"""Canonical certification + durable replica of owner reassessment receipts (no suppression)."""
++from __future__ import annotations
++
++import copy
++import json
++import os
++import sqlite3
++from types import SimpleNamespace
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_owner_reassessment_canonical as canonical
++from hermes_cli import kanban_owner_reassessment_replica as replica
++from hermes_cli.kanban_db_sync import uuid7
++from hermes_cli.kanban_owner_reassessment import ReassessmentRefused
++
++BOARD, TASK, GW = "default", "t_0123456789abcdef", "here"
++
++
++def test_actual_board_evidence_close_reopen_remapped_local_ids(path):
++    evidence = json.loads((Path(__file__).parent / 'fixtures' /
++                           'board_emitted_owner_reassessment_evidence.json').read_text())
++    receipt = evidence['owner_reassessment_v1']
++    event = evidence['row']
++    c = connect(path)
++    replica.certify(c, Hub(evidence), BOARD, task=receipt['task_id'], uid=event['uid'], sender=receipt)
++    # Execution DB shape: no deleted_at; deliberately unrelated local integer ids.
++    c.execute('CREATE TABLE task_events(id INTEGER PRIMARY KEY,uid TEXT,task_id TEXT,kind TEXT,created_at INTEGER)')
++    c.execute('INSERT INTO task_events VALUES (?,?,?,?,?)',
++              (9001, event['uid'], event['task_id'], event['kind'], event['created_at']))
++    c.close()
++    c = sqlite3.connect(path, isolation_level=None)
++    task = {'id': receipt['task_id'], 'status': 'scheduled', 'current_run_id': None}
++    assert replica.verified_for_event(c, {**event, 'id': 9001, 'run_id': 777}, task,
++                                      now=receipt['issued_at']+10) == receipt
++    assert replica.verified_for_event(c, event, task, now=receipt['backstop_at']) is None
++    c.close()
++
++
++@pytest.mark.parametrize('tombstones', [True, False])
++def test_latest_park_portable_order_not_remapped_arrival_id(path, tombstones):
++    c = connect(path)
++    c.execute('CREATE TABLE task_events(id INTEGER PRIMARY KEY,uid TEXT,task_id TEXT,kind TEXT,created_at INTEGER'
++              + (',deleted_at INTEGER' if tombstones else '') + ')')
++    second = 1700662594
++    # UUIDv7 milliseconds both inside the same created_at second.
++    earlier = '018bf763-ca50-7000-8000-000000000001'
++    later = '018bf763-cd00-7000-8000-000000000002'
++    from hermes_cli.kanban_sync_divergence import _event_order
++    assert _event_order({'uid': later, 'created_at': second, 'id': 1}) > _event_order(
++        {'uid': earlier, 'created_at': second, 'id': 999})
++    for ident, uid in [(999, earlier), (1, later)]:
++        c.execute('INSERT INTO task_events(id,uid,task_id,kind,created_at) VALUES (?,?,?,?,?)',
++                  (ident, uid, TASK, 'scheduled', second))
++    assert replica.latest_park_uid(c, TASK) == later
++    if tombstones:
++        c.execute('UPDATE task_events SET deleted_at=1 WHERE uid=?', (later,))
++        assert replica.latest_park_uid(c, TASK) == earlier
++    c.close()
++
++
++@pytest.mark.parametrize('ids', [(1, 999), (999, 1)])
++def test_latest_park_same_millisecond_never_uses_remapped_ids(path, ids):
++    c = connect(path)
++    c.execute('CREATE TABLE task_events(id INTEGER PRIMARY KEY,uid TEXT,task_id TEXT,kind TEXT,created_at INTEGER)')
++    for ident, uid in zip(ids, ['018bf763-ca50-7000-8000-000000000001',
++                               '018bf763-ca50-7000-8000-000000000002']):
++        c.execute('INSERT INTO task_events VALUES (?,?,?,?,?)', (ident, uid, TASK, 'scheduled', 1700662594))
++    assert replica.latest_park_uid(c, TASK) is None
++    c.close()
++
++
++def make(kind="scheduled"):
++    ep, park, run = uuid7(), uuid7(), uuid7()
++    payload = json.dumps({"reason": "w", "wake_at": 1700660093, "owner_reassessment_episode_uid": ep,
++                          **({"status": "scheduled"} if kind == "continued" else {}),
++                          "awaiting": {"kind": "external", "ref": "executor:example", "why": "q", "premise": "x"}})
++    receipt = {"version": 1, "board": BOARD, "task_id": TASK, "gateway": GW, "episode_uid": ep,
++               "park_event": {"uid": park, "run_uid": run, "kind": kind, "created_at": 1700659973, "payload": payload},
++               "issuer": {"owner_admitted_uid": uuid7(), "profile": "default", "run_uid": run,
++                          "session_id": "s", "worker_bound_uid": uuid7()},
++               "producer": {"kind": "external", "ref": "executor:example", "why": "q"},
++               "target": {"kind": "queue", "identity": "executor:example", "revision": "r"},
++               "issued_at": 1700659973, "reassess_at": 1700660093, "backstop_at": 1700661773,
++               "evidence_refs": [{"table": "task_events", "uid": uuid7()}], "suppresses": ["too_long"],
++               "execution_authority": False}
++    return receipt
++
++
++def evidence_for(r):
++    p = r["park_event"]
++    return {"board": BOARD, "table": "task_events", "uid": p["uid"], "state": "live", "head": 5,
++            "row": {"uid": p["uid"], "task_id": r["task_id"], "kind": p["kind"], "payload": p["payload"],
++                    "created_at": p["created_at"], "run_uid": p["run_uid"], "origin_gateway": r["gateway"],
++                    "deleted_at": None, "seq": 1, "version": 1, "hlc": "a", "updated_at": 1},
++            "owner_reassessment_v1": copy.deepcopy(r)}
++
++
++class Hub:
++    def __init__(self, ev, gateway=GW):
++        self.ev, self.ident, self.calls = ev, SimpleNamespace(gateway=gateway), 0
++
++    def row_evidence(self, board, table, uid, *, max_response_bytes):
++        assert max_response_bytes == canonical.MAX_EVIDENCE_BYTES
++        self.calls += 1
++        if isinstance(self.ev, Exception):
++            raise self.ev
++        return copy.deepcopy(self.ev)
++
++
++@pytest.fixture
++def path(tmp_path):
++    return str(tmp_path / "k.db")
++
++
++def connect(path):
++    c = sqlite3.connect(path, isolation_level=None)
++    c.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state(board_id TEXT)")
++    if not c.execute("SELECT 1 FROM kanban_sync_state").fetchone():
++        c.execute("INSERT INTO kanban_sync_state VALUES (?)", (BOARD,))
++    return c
++
++
++def ch(r, **over):
++    p = r["park_event"]
++    return SimpleNamespace(table="task_events", op="upsert", uid=p["uid"], origin_gateway=r["gateway"],
++                           fields={"task_id": r["task_id"], "kind": p["kind"], "payload": p["payload"],
++                                   "created_at": p["created_at"], **over})
++
++
++def park(c, uid, kind, created_at, deleted_at=None):
++    c.execute("CREATE TABLE IF NOT EXISTS task_events(id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, kind TEXT, "
++              "created_at INTEGER, deleted_at INTEGER)")
++    c.execute("INSERT INTO task_events(uid,task_id,kind,created_at,deleted_at) VALUES (?,?,?,?,?)",
++              (uid, TASK, kind, created_at, deleted_at))
++
++
++@pytest.mark.parametrize("kind", ["scheduled", "continued"])
++def test_sender_certification_close_reopen(path, kind):
++    r = make(kind)
++    c = connect(path)
++    got = replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"], sender=r)
++    assert got == r and got["execution_authority"] is False
++    c.close()
++    c = connect(path)  # reopened: no registration, no memory, proof is durable
++    replica.install(c)
++    uid = r["park_event"]["uid"]
++    assert replica.verified_receipt(c, uid) == r
++    event = {"uid": uid, "task_id": TASK, "kind": kind, "payload": r["park_event"]["payload"],
++             "created_at": 1700659973}
++    park(c, uid, kind, r["park_event"]["created_at"])
++    sched = {"id": TASK, "status": "scheduled", "current_run_id": None}
++    now = r["issued_at"] + 1
++    assert replica.verified_for_event(c, event, sched, now=now) == r
++    assert replica.verified_for_event(c, {**event, "payload": event["payload"] + " "}) is None
++    assert replica.verified_for_event(c, event, {**sched, "status": "running"}, now=now) is None
++    assert replica.verified_for_event(c, {**event, "uid": uuid7()}) is None
++
++
++def test_remapped_local_run_ids_irrelevant(path):
++    r = make()
++    ev = evidence_for(r)
++    ev["row"]["run_id"] = 999  # a local integer id on the Board row is never identity
++    c = connect(path)
++    assert replica.certify(c, Hub(ev), BOARD, task=TASK, uid=r["park_event"]["uid"]) == r
++
++
++@pytest.mark.parametrize("mutate", [
++    lambda e: e.pop("owner_reassessment_v1"),
++    lambda e: e["owner_reassessment_v1"].update(execution_authority=True),
++    lambda e: e["owner_reassessment_v1"].update(extra=1),
++    lambda e: e["owner_reassessment_v1"].update(gateway="other"),
++    lambda e: e["owner_reassessment_v1"].update(board="b2"),
++    lambda e: e["owner_reassessment_v1"].update(task_id="t_1123456789abcdef"),
++    lambda e: e["owner_reassessment_v1"].update(episode_uid=uuid7()),
++    lambda e: e["owner_reassessment_v1"].update(reassess_at=1700659974),
++    lambda e: e["owner_reassessment_v1"]["producer"].update(ref="other"),
++    lambda e: e["owner_reassessment_v1"]["park_event"].update(run_uid=uuid7()),
++    lambda e: e["owner_reassessment_v1"]["park_event"].update(created_at=1),
++    lambda e: e["owner_reassessment_v1"]["park_event"].update(kind="blocked"),
++    lambda e: e["row"].update(payload="{}"),
++    lambda e: e["row"].update(run_uid=uuid7()),
++    lambda e: e["row"].update(created_at=1),
++    lambda e: e["row"].update(origin_gateway="spoof"),
++    lambda e: e["row"].update(origin_gateway=None),
++    lambda e: e["row"].update(deleted_at=1),
++    lambda e: e["row"].update(task_id="t_1123456789abcdef"),
++    lambda e: e.update(state="deleted"),
++    lambda e: e.update(state="unknown"),
++    lambda e: e.update(uid=uuid7()),
++    lambda e: e.update(board="x"),
++])
++def test_spoofed_missing_changed_identity_refused(path, mutate):
++    r = make()
++    ev = evidence_for(r)
++    mutate(ev)
++    c = connect(path)
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(ev), BOARD, task=TASK, uid=r["park_event"]["uid"])
++    assert replica.verified_receipt(c, r["park_event"]["uid"]) is None
++
++
++def test_sender_must_equal_board_and_original_gateway(path):
++    r = make()
++    c = connect(path)
++    forged = {**r, "reassess_at": r["reassess_at"] - 1}
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"], sender=forged)
++    with pytest.raises(ReassessmentRefused):  # a different enrolled gateway is not the original sender
++        replica.certify(c, Hub(evidence_for(r), gateway="other"), BOARD, task=TASK, uid=r["park_event"]["uid"], sender=r)
++
++
++def test_unavailable_and_postcommit_uncertainty_record_nothing_then_retry(path):
++    r = make()
++    uid = r["park_event"]["uid"]
++    c = connect(path)
++    with pytest.raises(OSError):
++        replica.certify(c, Hub(OSError("timeout after send")), BOARD, task=TASK, uid=uid, sender=r)
++    assert replica.verified_receipt(c, uid) is None  # unknown never authorizes
++    assert replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=uid, sender=r) == r
++    assert replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=uid, sender=r) == r  # idempotent
++    assert c.execute(f"SELECT COUNT(*) FROM {replica.TABLE}").fetchone()[0] == 1
++
++
++def test_bookkeeping_restamp_is_same_receipt_but_real_change_conflicts(path):
++    r = make()
++    uid = r["park_event"]["uid"]
++    c = connect(path)
++    replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=uid)
++    ev = evidence_for(r)
++    ev["row"].update(seq=9, version=2, hlc="z", updated_at=7)
++    replica.certify(c, Hub(ev), BOARD, task=TASK, uid=uid)
++    ev["row"]["created_at"] = 1700659974
++    ev["owner_reassessment_v1"]["park_event"]["created_at"] = 1700659974
++    with pytest.raises(replica.ReassessmentConflict):
++        replica.certify(c, Hub(ev), BOARD, task=TASK, uid=uid)
++
++
++def test_append_only_direct_sql_protection(path):
++    r = make()
++    uid = r["park_event"]["uid"]
++    c = connect(path)
++    replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=uid)
++    row = c.execute(f"SELECT * FROM {replica.TABLE}").fetchone()
++    for sql, args in (
++        (f"UPDATE {replica.TABLE} SET gateway='x'", ()),
++        (f"DELETE FROM {replica.TABLE}", ()),
++        (f"INSERT OR REPLACE INTO {replica.TABLE} VALUES (?,?,?,?,?,?,?)", row),
++        (f"INSERT OR REPLACE INTO {replica.TABLE}(rowid,event_uid,board,task_id,episode_uid,run_uid,gateway,evidence) "
++         "VALUES (1,?,?,?,?,?,?,?)", (uuid7(), *row[1:3], uuid7(), *row[4:])),
++        (f"INSERT INTO {replica.TABLE} VALUES (?,?,?,?,?,?,?)", (uuid7(), *row[1:3], uuid7(), *row[4:])),
++    ):
++        with pytest.raises(sqlite3.DatabaseError):
++            c.execute(sql, args)
++    # a connection that never registered the permit cannot write at all
++    c2 = sqlite3.connect(path, isolation_level=None)
++    with pytest.raises(sqlite3.DatabaseError):
++        c2.execute(f"DELETE FROM {replica.TABLE}")
++    assert c.execute(f"SELECT COUNT(*) FROM {replica.TABLE}").fetchone()[0] == 1
++    # even a registered connection outside the private permit refuses a forged insert
++    with pytest.raises(sqlite3.DatabaseError):
++        c.execute(f"INSERT INTO {replica.TABLE} VALUES (?,?,?,?,?,?,?)", (uuid7(), *row[1:3], uuid7(), *row[4:]))
++
++
++def test_tampered_stored_evidence_is_not_trusted_on_read(path):
++    r = make()
++    uid = r["park_event"]["uid"]
++    c = connect(path)
++    replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=uid)
++    c.execute(f"DROP TRIGGER {replica.TABLE}_update")  # an attacker with raw schema access
++    ev = evidence_for(r)
++    ev["owner_reassessment_v1"]["execution_authority"] = True
++    c.execute(f"UPDATE {replica.TABLE} SET evidence=?", (json.dumps(ev),))
++    assert replica.verified_receipt(c, uid) is None
++    other = connect(path + "2")
++    other.execute("UPDATE kanban_sync_state SET board_id='b2'")
++    other.close()
++
++
++def test_board_mismatch_and_oversize(path):
++    r = make()
++    c = connect(path)
++    c.execute("UPDATE kanban_sync_state SET board_id='b2'")
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"])
++    big = evidence_for(r)
++    big["pad"] = "x" * canonical.MAX_EVIDENCE_BYTES
++    c.execute("UPDATE kanban_sync_state SET board_id=?", (BOARD,))
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(big), BOARD, task=TASK, uid=r["park_event"]["uid"])
++
++
++def test_certify_refused_inside_writer_txn(path):
++    r = make()
++    c = connect(path)
++    c.execute("BEGIN IMMEDIATE")
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"])
++    c.execute("ROLLBACK")
++
++
++def test_page_handling_and_pickup_adoption(path):
++    r, plain = make(), make()
++    c = connect(path)
++    # lookalike: a park event claiming an episode with no Board attestation records nothing
++    lookalike = evidence_for(plain)
++    lookalike.pop("owner_reassessment_v1")
++    replica.certify_page(c, Hub(lookalike), BOARD, [ch(plain)])
++    assert replica.verified_receipt(c, plain["park_event"]["uid"]) is None
++    # an unrelated event is never fetched
++    hub = Hub(evidence_for(r))
++    replica.certify_page(c, hub, BOARD, [SimpleNamespace(table="task_events", op="upsert", uid=uuid7(),
++                                                          origin_gateway=None, fields={"kind": "created", "payload": "{}"})])
++    assert hub.calls == 0
++    # a feed row that differs from the canonical attestation refuses the page
++    with pytest.raises(replica.ReassessmentConflict):
++        replica.certify_page(c, hub, BOARD, [ch(r, created_at=5)])
++    # transport failure aborts
++    with pytest.raises(OSError):
++        replica.certify_page(c, Hub(OSError("down")), BOARD, [ch(r)])
++    replica.certify_page(c, hub, BOARD, [ch(r)])
++    assert replica.verified_receipt(c, r["park_event"]["uid"]) == r
++    # offline pickup copy re-certifies from the source replica
++    live = connect(path + ".live")
++    replica.adopt_receipts(live, c, [ch(r)])
++    assert replica.verified_receipt(live, r["park_event"]["uid"]) == r
++    empty = connect(path + ".empty")
++    replica.adopt_receipts(empty, c, [ch(plain)])  # nothing carried -> nothing authorized
++    assert replica.verified_receipt(empty, plain["park_event"]["uid"]) is None
++
++
++def test_actual_core_emitted_receipt_shape(path):
++    """Synthetic privacy-normalized core receipt (pending.receipt), Board-shaped around it."""
++    r = json.load(open(os.path.join(os.path.dirname(__file__), "fixtures",
++                                    "core_emitted_owner_reassessment_receipt.json")))
++    ev = evidence_for(r)
++    c = connect(path)
++    assert replica.certify(c, Hub(ev), BOARD, task=r["task_id"], uid=r["park_event"]["uid"], sender=r) == r
++    ev["board"] = r["board"]
++    assert canonical.certified_receipt(ev, board=r["board"], task=r["task_id"], uid=r["park_event"]["uid"],
++                                       sender=r) == r
++
++
++def certified(path, r=None):
++    r = r or make()
++    c = connect(path)
++    replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"])
++    return c, r, {"uid": r["park_event"]["uid"], "task_id": TASK, "kind": r["park_event"]["kind"],
++                  "payload": r["park_event"]["payload"], "created_at": r["park_event"]["created_at"]}
++
++
++def test_current_matches_rejects_historical_superseded_and_expired(path):
++    c, r, event = certified(path)
++    uid = event["uid"]
++    sched = {"id": TASK, "status": "scheduled", "current_run_id": None}
++    now = r["issued_at"] + 1
++    # no park row in the replica / unreadable: fail closed
++    assert replica.verified_for_event(c, event, sched, now=now) is None
++    park(c, uid, "scheduled", event["created_at"])
++    assert replica.verified_for_event(c, event, sched, now=now) == r
++    # deadline: backstop passed, wake_at disagreement, missing now
++    assert replica.verified_for_event(c, event, sched, now=r["backstop_at"]) is None
++    assert replica.verified_for_event(c, event, {**sched, "wake_at": r["reassess_at"]}, now=now) == r
++    assert replica.verified_for_event(c, event, {**sched, "wake_at": r["backstop_at"]}, now=now) is None
++    assert replica.verified_for_event(c, event, sched) is None
++    # wrong card
++    assert replica.verified_for_event(c, event, {**sched, "id": "t_1123456789abcdef"}, now=now) is None
++    # a later, similar park of the same card supersedes (never reuses) the historical receipt
++    park(c, uuid7(), "scheduled", event["created_at"] + 5)
++    assert replica.verified_for_event(c, event, sched, now=now) is None
++    assert replica.verified_receipt(c, uid) == r  # still historical proof, never current authority
++
++
++def test_deleted_newer_park_does_not_supersede_and_run_blocks(path):
++    c, r, event = certified(path)
++    park(c, event["uid"], "scheduled", event["created_at"])
++    park(c, uuid7(), "scheduled", event["created_at"] + 5, deleted_at=9)
++    sched = {"id": TASK, "status": "scheduled", "current_run_id": None}
++    assert replica.verified_for_event(c, event, sched, now=r["issued_at"] + 1) == r
++    assert replica.verified_for_event(c, event, {**sched, "current_run_id": 3}, now=r["issued_at"] + 1) is None
++
++
++@pytest.mark.parametrize("mutate", [
++    lambda r: r["target"].update(kind="bogus"),
++    lambda r: r["target"].update(revision=""),
++    lambda r: r["target"].update(extra=1),
++    lambda r: r.update(target=None),
++    lambda r: r.update(evidence_refs=[]),
++    lambda r: r.update(evidence_refs=[{"table": "tasks", "uid": uuid7()}]),
++    lambda r: r.update(evidence_refs=[{"table": "task_events", "uid": "nope"}]),
++    lambda r: r["issuer"].update(profile=""),
++    lambda r: r.update(episode_uid=r["park_event"]["uid"]),
++])
++def test_target_deadline_refs_are_validated_exactly(path, mutate):
++    r = make()
++    mutate(r)
++    c = connect(path)
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"])
++
++
++def test_duplicate_key_and_nonfinite_payload_refused(path):
++    r = make()
++    r["park_event"]["payload"] = r["park_event"]["payload"][:-1] + ', "wake_at": 1}'
++    c = connect(path)
++    with pytest.raises(ReassessmentRefused):
++        replica.certify(c, Hub(evidence_for(r)), BOARD, task=TASK, uid=r["park_event"]["uid"])
++    with pytest.raises(ReassessmentRefused):
++        canonical.parse_evidence('{"a": NaN}')
++    with pytest.raises(ReassessmentRefused):
++        canonical.parse_evidence("x" * (canonical.MAX_EVIDENCE_BYTES + 1))
++
++
++def test_oversize_stored_or_pickup_text_is_not_parsed(path):
++    c, r, event = certified(path)
++    c.execute(f"DROP TRIGGER {replica.TABLE}_update")
++    c.execute(f"UPDATE {replica.TABLE} SET evidence=?", ("[" * (canonical.MAX_EVIDENCE_BYTES + 5),))
++    assert replica.verified_receipt(c, event["uid"]) is None
++    live = connect(path + ".live")
++    replica.adopt_receipts(live, c, [ch(r)])  # corrupt source row: nothing carried, no crash
++    assert replica.verified_receipt(live, event["uid"]) is None
++
++
++def test_foreign_board_receipts_not_adopted_or_read(path):
++    c, r, event = certified(path)
++    other = connect(path + ".b2")
++    other.execute("UPDATE kanban_sync_state SET board_id='b2'")
++    with pytest.raises(ReassessmentRefused):
++        replica.adopt_receipts(other, c, [ch(r)])
++    assert replica.verified_receipt(other, event["uid"]) is None
++    c.execute("UPDATE kanban_sync_state SET board_id='b2'")  # same file re-labelled: stored proof unusable
++    assert replica.verified_receipt(c, event["uid"]) is None
++
++
++def test_permit_is_connection_private(path):
++    c, _r, _event = certified(path)
++    row = c.execute(f"SELECT * FROM {replica.TABLE}").fetchone()
++    c2 = connect(path)
++    replica.install(c2)  # registers its own permit; it is never granted for c2's writes
++    forged = (uuid7(), *row[1:3], uuid7(), *row[4:])
++    c2.execute("BEGIN IMMEDIATE")
++    token = replica._PERMIT.set(c)  # another connection's permit does not open c2
++    try:
++        with pytest.raises(sqlite3.DatabaseError):
++            c2.execute(f"INSERT INTO {replica.TABLE} VALUES (?,?,?,?,?,?,?)", forged)
++    finally:
++        replica._PERMIT.reset(token)
++        c2.execute("ROLLBACK")
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_hardening.py b/tests/hermes_cli/test_kanban_owner_reassessment_hardening.py
+new file mode 100644
+index 00000000000..b4e3f862bc4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_hardening.py
+@@ -0,0 +1,161 @@
++"""Append-only, exact-identity and pre-termination custody regressions."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_owner_reassessment as r
++from tests.hermes_cli import test_kanban_owner_reassessment_lifecycle as lifecycle
++
++worker = lifecycle.worker
++
++
++@pytest.mark.parametrize('recursive', [0, 1])
++@pytest.mark.parametrize('operation', ['update', 'delete', 'replace_event', 'replace_episode', 'replace_rowid', 'upsert'])
++def test_journal_is_append_only_even_without_recursive_triggers(recursive, operation):
++    with sqlite3.connect(':memory:') as conn:
++        conn.execute(f'PRAGMA recursive_triggers={recursive}')
++        r.ensure_schema(conn)
++        original = ('event', 'task', 'episode', '{"original":true}', 123)
++        conn.execute(f'INSERT INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?)', original)
++        r.ensure_schema(conn)  # repeated bootstrap retains protection
++        insert = f'INSERT OR REPLACE INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?)'
++        statements = {
++            'update': (f'UPDATE {r.PENDING_TABLE} SET receipt=\'{{}}\'', ()),
++            'delete': (f'DELETE FROM {r.PENDING_TABLE}', ()),
++            'upsert': (f'INSERT INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?) '
++                       'ON CONFLICT(event_uid) DO UPDATE SET receipt=excluded.receipt', original),
++            'replace_rowid': (f'INSERT OR REPLACE INTO {r.PENDING_TABLE} '
++                              '(rowid,event_uid,task_id,episode_uid,receipt,created_at) VALUES (1,?,?,?,?,?)',
++                              ('new-event', 'other', 'new-episode', '{}', 456)),
++            'replace_event': (insert, ('event', 'other', 'new-episode', '{}', 456)),
++            'replace_episode': (insert, ('new-event', 'other', 'episode', '{}', 456)),
++        }
++        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
++            conn.execute(*statements[operation])
++        assert conn.execute(f'SELECT * FROM {r.PENDING_TABLE}').fetchall() == [original]
++        conn.execute(f'INSERT INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?)', ('event2', 'task', 'episode2', '{}', 124))
++        assert len(r.pending(conn)) == 2
++
++
++def test_same_card_other_run_evidence_is_refused(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            with kb.write_txn(conn):
++                # Existing same-card event, but not emitted by this run.
++                kb._append_event(conn, ctx['task_id'], 'commented', {'text': 'old evidence'}, run_id=None)
++                uid = conn.execute("SELECT uid FROM task_events WHERE kind='commented' ORDER BY id DESC LIMIT 1").fetchone()[0]
++            with pytest.raises(r.ReassessmentRefused, match='owner run'):
++                kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), expected_run_id=ctx['run_id'],
++                                 awaiting=lifecycle.PRODUCER, owner_reassessment=lifecycle._opt(uid, int(time.time()) + 120),
++                                 owner_origin=cap)
++            assert r.pending(conn) == []
++            assert kb.get_task(conn, ctx['task_id']).status == 'running'
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize('field', ['kind', 'ref', 'gateway', 'board', 'why', 'inferred', 'shared_blocker'])
++def test_commit_rejects_changed_normalized_producer_and_rolls_back(worker, monkeypatch, field):
++    original_commit = r.commit
++    def changed(conn, prepared, **kwargs):
++        event = conn.execute("SELECT id,payload FROM task_events WHERE kind='scheduled' ORDER BY id DESC LIMIT 1").fetchone()
++        payload = json.loads(event[1])
++        payload['awaiting'][field] = 'different'
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), event[0]))
++        return original_commit(conn, prepared, **kwargs)
++    monkeypatch.setattr(r, 'commit', changed)
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            with pytest.raises(r.ReassessmentRefused, match='planned reassessment'):
++                kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), expected_run_id=ctx['run_id'],
++                                 awaiting=lifecycle.PRODUCER, owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120),
++                                 owner_origin=cap)
++            assert kb.get_task(conn, ctx['task_id']).status == 'running'
++            assert r.pending(conn) == []
++            assert conn.execute("SELECT 1 FROM task_events WHERE kind='scheduled'").fetchone() is None
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++def test_normalized_producer_preserves_board_but_not_internal_gate_diagnostics():
++    exact = {'kind': 'card', 'ref': 't_0000000000000001', 'gateway': 'remote', 'board': 'alternate', 'why': 'producer'}
++    assert r.producer({**exact, 'auto_card_probe': True, 'premise': 'hash', 'probe': 'hash',
++                       'deploy_window': {'status': 'healthy'}, 'observed': 'diagnostic'}) == exact
++    result, _ = r.plan(lifecycle._opt('018f051a-657d-7001-8001-000000000001', 150), now=100,
++                       final_backstop=200, awaiting=exact, payload={'wake_at': 200})
++    assert result['awaiting'] == exact
++    with pytest.raises(r.ReassessmentRefused):
++        r.plan(lifecycle._opt('018f051a-657d-7001-8001-000000000001', 150), now=100,
++               final_backstop=200, awaiting={**exact, 'board': ''}, payload={'wake_at': 200})
++
++
++def test_real_gate_normalization_is_the_receipts_exact_producer(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        declared = {'kind': ' EXTERNAL ', 'ref': ' executor:example ', 'why': ' example queue ',
++                    'gateway': 'local', 'board': 'alternate'}
++        with kbc.connect_closing() as conn:
++            assert kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), expected_run_id=ctx['run_id'],
++                                    awaiting=declared, owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120),
++                                    owner_origin=cap)
++            receipt = json.loads(r.pending(conn)[0]['receipt'])
++            stored = json.loads(receipt['park_event']['payload'])['awaiting']
++            assert receipt['producer'] == {'kind': 'external', 'ref': 'executor:example',
++                                           'why': 'example queue', 'board': 'alternate'}
++            assert receipt['producer'] == r.producer(stored)
++            assert 'premise' in stored and 'premise' not in receipt['producer']
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++def test_actual_custody_rechecked_in_park_transaction_before_termination(worker, monkeypatch):
++    from agent.origin_worker_custody import CapturedWorkerOrigin
++    original = CapturedWorkerOrigin.validated
++    observed = []
++    def body(cap, ctx, agent, evidence):
++        def losing(self, conn=None):
++            if conn is not None:
++                state = conn.execute('SELECT status,current_run_id FROM tasks WHERE id=?', (ctx['task_id'],)).fetchone()
++                observed.append((conn.in_transaction, tuple(state)))
++                if len(observed) == 2:
++                    return None
++            return original(self, conn)
++        monkeypatch.setattr(CapturedWorkerOrigin, 'validated', losing)
++        with kbc.connect_closing() as conn:
++            with pytest.raises(r.ReassessmentRefused):
++                kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), expected_run_id=ctx['run_id'],
++                                 awaiting=lifecycle.PRODUCER, owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120),
++                                 owner_origin=cap)
++            assert kb.get_task(conn, ctx['task_id']).status == 'running'
++            assert r.pending(conn) == []
++    lifecycle._turn(worker, monkeypatch, body)
++    assert len(observed) == 2
++    assert all(txn and state == ('running', worker[3]['run_id']) for txn, state in observed)
++
++
++def test_schedule_emits_portable_source_fixture(worker, monkeypatch, tmp_path, record_property):
++    """Export only real API-generated rows, never reconstruct a receipt by hand."""
++    def body(cap, ctx, agent, evidence):
++        from tools import kanban_tools
++        monkeypatch.setenv('HERMES_KANBAN_TASK', ctx['task_id'])
++        monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(ctx['run_id']))
++        reply = json.loads(kanban_tools._handle_schedule({
++            'reason': lifecycle._until(), 'awaiting': lifecycle.PRODUCER,
++            'owner_reassessment': lifecycle._opt(evidence, int(time.time()) + 120)}))
++        assert reply.get('ok') is True, reply
++        with kbc.connect_closing() as conn:
++            journal, = r.pending(conn, ctx['task_id'])
++            tables = ['tasks', 'task_runs', 'task_events', 'kanban_sync_outbox']
++            rows = {}
++            for table in tables:
++                columns = [row[1] for row in conn.execute(f'PRAGMA table_info({table})')]
++                assert columns, table
++                rows[table] = [dict(zip(columns, row)) for row in conn.execute(f'SELECT * FROM {table}')]
++            fixture = {'reply': reply, 'receipt': json.loads(journal['receipt']), 'pending': journal, 'source_rows': rows}
++            assert rows['kanban_sync_outbox']
++            fixture_path = tmp_path / 'core-emitted-fixture.json'
++            fixture_path.write_text(json.dumps(fixture, indent=2), encoding='utf-8')
++            loaded = json.loads(fixture_path.read_text(encoding='utf-8'))
++            assert loaded['receipt']['park_event']['payload'] == next(
++                event['payload'] for event in rows['task_events'] if event['uid'] == journal['event_uid'])
++            record_property('core_emitted_fixture', json.dumps(loaded))
++    lifecycle._turn(worker, monkeypatch, body)
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_lifecycle.py b/tests/hermes_cli/test_kanban_owner_reassessment_lifecycle.py
+new file mode 100644
+index 00000000000..aa73c0eeb09
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_lifecycle.py
+@@ -0,0 +1,269 @@
++"""Typed owner reassessment creation in schedule/delayed continue.
++
++Real private custody, real park transaction, real dispatcher wake path. Nothing here
++claims canonical confirmation, scanner suppression or execution authority.
++"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_continuation as continuation
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_owner_reassessment as r
++from hermes_cli.kanban_awaiting import AwaitingError
++from tests.hermes_cli import test_origin_worker_custody as custody
++
++worker = custody.worker
++PRODUCER = {'kind': 'external', 'ref': 'executor:example', 'why': 'queue reassessment of the example executor'}
++
++
++def _until(seconds=1800):
++    """An ordinary admitted backstop (SCHEDULED_UNTIL) that passes the existing park gates."""
++    stamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + seconds))
++    return f'waiting on example queue SCHEDULED_UNTIL={stamp}'
++
++
++def _turn(worker, monkeypatch, body, *, admitted=True):
++    """Run ``body(cap, context, agent, evidence_uid)`` inside a real facade turn."""
++    from agent.origin_worker_custody import capture
++
++    agent, _, _, context, _ = worker
++    out = []
++
++    def loop(*args, **kwargs):
++        cap = capture(context['task_id'])
++        assert cap is not None
++        evidence = None
++        with kbc.connect_closing() as conn, kb.write_txn(conn):
++            if admitted:
++                kb._append_event(conn, context['task_id'], 'owner_admitted',
++                                 {'session_id': agent.session_id}, run_id=context['run_id'])
++            evidence = conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='worker_bound'",
++                                    (context['task_id'],)).fetchone()[0]
++        out.append(body(cap, context, agent, evidence))
++        return dict(final_response='ok', messages=[], failed=False)
++
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    agent.run_conversation('bounded owner reassessment lifecycle fixture')
++    assert len(out) == 1
++    return out[0]
++
++
++def _opt(evidence, at):
++    return {'version': 1, 'reassess_at': at,
++            'target': {'kind': 'queue', 'identity': 'executor:example', 'revision': 'queue-cut:42'},
++            'evidence_refs': [{'table': 'task_events', 'uid': evidence}]}
++
++
++def _state(tid):
++    with kbc.connect_closing() as conn:
++        task = conn.execute('SELECT status,current_run_id,claim_lock FROM tasks WHERE id=?', (tid,)).fetchone()
++        return (tuple(task), conn.execute('SELECT COUNT(*) FROM task_events').fetchone()[0],
++                r.pending(conn))
++
++
++def test_schedule_creates_exact_pending_receipt_and_shortens_wake(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        now = int(time.time())
++        at = now + 120
++        with kbc.connect_closing() as conn:
++            assert kb.schedule_task(conn, ctx['task_id'], reason=_until(),
++                                    expected_run_id=ctx['run_id'], awaiting=PRODUCER,
++                                    owner_reassessment=_opt(evidence, at), owner_origin=cap)
++        return at, evidence
++
++    at, evidence = _turn(worker, monkeypatch, body)
++    tid = worker[3]['task_id']
++    with kbc.connect_closing() as conn:
++        (journal,) = r.pending(conn, tid)
++        receipt = json.loads(journal['receipt'])
++        event = conn.execute("SELECT uid,payload,created_at,run_id FROM task_events WHERE task_id=? AND kind='scheduled'",
++                             (tid,)).fetchone()
++        payload = json.loads(event[1])
++        run = conn.execute('SELECT uid,status FROM task_runs WHERE id=?', (event[3],)).fetchone()
++        task = conn.execute('SELECT status,claim_lock,claim_expires FROM tasks WHERE id=?', (tid,)).fetchone()
++        assert tuple(task) == ('scheduled', None, None) and run[1] == 'scheduled'
++        # Exact event payload is stored once, byte for byte, with the shortened wake.
++        assert receipt['park_event'] == {'uid': event[0], 'run_uid': run[0], 'kind': 'scheduled',
++                                         'created_at': event[2], 'payload': event[1]}
++        assert journal['event_uid'] == event[0] and journal['episode_uid'] == receipt['episode_uid']
++        assert payload['wake_at'] == at == receipt['reassess_at']
++        assert payload['owner_reassessment_episode_uid'] == receipt['episode_uid']
++        assert payload['awaiting']['kind'] == 'external'
++        assert receipt['backstop_at'] > at
++        assert r._uid(receipt['episode_uid']) and r._uid(event[0])
++        assert receipt['issuer']['run_uid'] == run[0]
++        assert set(receipt['issuer']) == {'session_id', 'profile', 'run_uid', 'owner_admitted_uid', 'worker_bound_uid'}
++        assert receipt['version'] == 1 and receipt['suppresses'] == ['too_long']
++        assert receipt['execution_authority'] is False
++        assert receipt['gateway'] == 'here' and receipt['board'] == worker[3]['board']
++        assert receipt['producer'] == {k: PRODUCER[k] for k in ('kind', 'ref', 'why')}
++        assert receipt['target'] == _opt(evidence, at)['target']
++        assert receipt['evidence_refs'] == _opt(evidence, at)['evidence_refs']
++        assert receipt['issued_at'] <= at
++        # The stored journal is immutable.
++        with pytest.raises(Exception, match='immutable'):
++            conn.execute('UPDATE kanban_owner_reassessment_pending SET receipt=?', ('{}',))
++
++
++def test_delayed_continue_creates_receipt_with_continued_kind(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        at = int(time.time()) + 200
++        with kbc.connect_closing() as conn:
++            res = continuation.continue_task(
++                conn, ctx['task_id'], checkpoint='waiting on example queue', resume_after_seconds=1800,
++                expected_run_id=ctx['run_id'], awaiting=PRODUCER,
++                owner_reassessment=_opt(evidence, at), owner_origin=cap)
++        return res, at
++
++    res, at = _turn(worker, monkeypatch, body)
++    assert res['ok'] and res['status'] == 'scheduled' and res['wake_at'] == at
++    tid = worker[3]['task_id']
++    with kbc.connect_closing() as conn:
++        (journal,) = r.pending(conn, tid)
++        receipt = json.loads(journal['receipt'])
++        event = conn.execute("SELECT uid,payload FROM task_events WHERE task_id=? AND kind='continued'", (tid,)).fetchone()
++        assert receipt['park_event']['kind'] == 'continued' and receipt['park_event']['payload'] == event[1]
++        assert receipt['backstop_at'] > at == receipt['reassess_at'] == json.loads(event[1])['wake_at']
++        assert json.loads(event[1])['owner_reassessment_episode_uid'] == receipt['episode_uid']
++
++
++@pytest.mark.parametrize('case', ['no_origin', 'no_awaiting', 'beyond_backstop', 'past', 'foreign_evidence', 'long_ungated_park',
++                                  'wrong_run', 'no_admission', 'bad_request', 'non_producer'])
++def test_schedule_refuses_without_changing_anything(worker, monkeypatch, case):
++    tid = worker[3]['task_id']
++    before = _state(tid)
++
++    def body(cap, ctx, agent, evidence):
++        now = int(time.time())
++        opt = _opt(evidence, now + 120)
++        kwargs = dict(reason=_until(), expected_run_id=ctx['run_id'], awaiting=PRODUCER)
++        origin = None if case == 'no_origin' else cap
++        changes = {
++            'no_origin': lambda: None,
++            'no_awaiting': lambda: kwargs.update(awaiting=None),
++            # 24h default with no probe: the ordinary gate still refuses.
++            'long_ungated_park': lambda: kwargs.update(reason='no explicit deadline'),
++            'beyond_backstop': lambda: opt.update(reassess_at=now + 10 ** 7),
++            'past': lambda: opt.update(reassess_at=now - 5),
++            'foreign_evidence': lambda: opt['evidence_refs'][0].update(uid='018f051a-657d-7001-8001-000000000001'),
++            'wrong_run': lambda: kwargs.update(expected_run_id=ctx['run_id'] + 99),
++            'bad_request': lambda: opt.update(issuer={'session_id': 'forged'}),
++            'non_producer': lambda: kwargs.update(awaiting={'kind': 'clock', 'why': 'later'}),
++            'no_admission': lambda: None,
++        }
++        changes[case]()
++        with kbc.connect_closing() as conn:
++            with pytest.raises((ValueError, AwaitingError)) as raised:
++                kb.schedule_task(conn, ctx['task_id'], owner_reassessment=opt, owner_origin=origin, **kwargs)
++            return raised.value
++
++    error = _turn(worker, monkeypatch, body, admitted=case != 'no_admission')
++    after = _state(tid)
++    assert after[0] == before[0] and after[2] == [], (case, error)
++    assert after[0][0] == 'running'
++    if case not in ('no_awaiting', 'long_ungated_park'):  # those two stop at the unchanged ordinary gates
++        assert isinstance(error, r.ReassessmentRefused), error
++
++
++def test_immediate_or_unadmitted_continue_is_refused(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            immediate = continuation.continue_task(
++                conn, ctx['task_id'], checkpoint='now', resume_after_seconds=0, expected_run_id=ctx['run_id'],
++                awaiting=PRODUCER, owner_reassessment=_opt(evidence, int(time.time()) + 50), owner_origin=cap)
++            no_origin = continuation.continue_task(
++                conn, ctx['task_id'], checkpoint='later', resume_after_seconds=1800, expected_run_id=ctx['run_id'],
++                awaiting=PRODUCER, owner_reassessment=_opt(evidence, int(time.time()) + 50), owner_origin=None)
++        return immediate, no_origin
++
++    tid = worker[3]['task_id']
++    before = _state(tid)
++    immediate, no_origin = _turn(worker, monkeypatch, body)
++    for res in (immediate, no_origin):
++        assert res['ok'] is False and res['reason_code'] == 'owner_reassessment_refused'
++    after = _state(tid)
++    assert after[0] == before[0] and after[2] == []
++
++
++def test_ordinary_park_is_unchanged_and_mints_nothing(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            assert kb.schedule_task(conn, ctx['task_id'], reason=_until(), expected_run_id=ctx['run_id'],
++                                    awaiting=PRODUCER)
++
++    _turn(worker, monkeypatch, body)
++    with kbc.connect_closing() as conn:
++        assert r.pending(conn) == []
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (r.PENDING_TABLE,)).fetchone() is None
++        payload = conn.execute("SELECT payload FROM task_events WHERE kind='scheduled'").fetchone()[0]
++        assert 'owner_reassessment' not in payload
++
++
++def test_error_after_receipt_rolls_everything_back(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        def boom(*args, **kwargs):
++            raise RuntimeError('late failure')
++        monkeypatch.setattr('hermes_cli.kanban_done_tail.post_notice', boom)
++        with kbc.connect_closing() as conn:
++            with pytest.raises(RuntimeError):
++                kb.schedule_task(conn, ctx['task_id'], reason=_until(), expected_run_id=ctx['run_id'], awaiting=PRODUCER,
++                                 owner_reassessment=_opt(evidence, int(time.time()) + 90), owner_origin=cap)
++
++    tid = worker[3]['task_id']
++    before = _state(tid)
++    _turn(worker, monkeypatch, body)
++    after = _state(tid)
++    assert after[0] == before[0] and after[2] == []
++    with kbc.connect_closing() as conn:
++        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (r.PENDING_TABLE,)).fetchone() is None
++        assert conn.execute("SELECT 1 FROM task_events WHERE kind='scheduled'").fetchone() is None
++
++
++def test_tool_ingress_captures_private_origin_and_ignores_caller_issuer(worker, monkeypatch):
++    from tools import kanban_tools
++
++    def body(cap, ctx, agent, evidence):
++        monkeypatch.setenv('HERMES_KANBAN_TASK', ctx['task_id'])
++        monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(ctx['run_id']))
++        forged = _opt(evidence, int(time.time()) + 120)
++        forged['issuer'] = {'session_id': 'forged'}
++        refused = json.loads(kanban_tools._handle_schedule(
++            {'reason': _until(), 'awaiting': PRODUCER, 'owner_reassessment': forged}))
++        with kbc.connect_closing() as conn:
++            assert r.pending(conn) == []
++        ok = json.loads(kanban_tools._handle_schedule(
++            {'reason': _until(), 'awaiting': PRODUCER,
++             'owner_reassessment': _opt(evidence, int(time.time()) + 120)}))
++        return refused, ok
++
++    refused, ok = _turn(worker, monkeypatch, body)
++    assert 'error' in refused and ok.get('ok') is True, (refused, ok)
++    with kbc.connect_closing() as conn:
++        assert len(r.pending(conn)) == 1
++
++
++def test_cold_dispatcher_wake_uses_shortened_deadline_and_missed_expiry_is_actionable(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        at = int(time.time()) + 120
++        with kbc.connect_closing() as conn:
++            kb.schedule_task(conn, ctx['task_id'], reason=_until(), expected_run_id=ctx['run_id'],
++                             awaiting=PRODUCER, owner_reassessment=_opt(evidence, at), owner_origin=cap)
++        return at
++
++    at = _turn(worker, monkeypatch, body)
++    tid = worker[3]['task_id']
++    # A cold connection, as after a dispatcher restart: no in-memory state from the park.
++    with kbc.connect_closing() as conn:
++        receipt = json.loads(r.pending(conn, tid)[0]['receipt'])
++        park = continuation.pending_wake(conn, tid)
++        assert park['wake_at'] == at < receipt['backstop_at']
++        assert continuation.wake_due_continuations(conn, now=at - 1) == []
++        assert conn.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'scheduled'
++        # Restart after the deadline was missed: the existing wake path still returns the card to work.
++        assert continuation.wake_due_continuations(conn, now=at + 1800) == [tid]
++        assert conn.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()[0] in ('ready', 'review')
++        assert continuation.wake_due_continuations(conn, now=at + 1801) == []
++        # The wake neither extended the park nor altered the immutable receipt.
++        assert json.loads(r.pending(conn, tid)[0]['receipt']) == receipt
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_transport.py b/tests/hermes_cli/test_kanban_owner_reassessment_transport.py
+new file mode 100644
+index 00000000000..c2a6223229b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_transport.py
+@@ -0,0 +1,56 @@
++"""Exact transaction-bound owner reassessment sender composition."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_owner_reassessment as r
++from hermes_cli import kanban_owner_reassessment_transport as transport
++from hermes_cli import kanban_sync_wire as wire
++from tests.hermes_cli import test_kanban_owner_reassessment_lifecycle as lifecycle
++
++worker = lifecycle.worker
++
++
++def test_actual_park_capture_carries_receipt_only_on_exact_status_op(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), expected_run_id=ctx['run_id'],
++                             awaiting=lifecycle.PRODUCER, owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120),
++                             owner_origin=cap)
++            receipt = json.loads(r.pending(conn)[0]['receipt'])
++            rows = [dict(row) for row in conn.execute('SELECT * FROM kanban_sync_outbox')]
++            carrying = [row for row in rows if 'owner_reassessment_v1' in json.loads(row['fields'])]
++            assert len(carrying) == 1, [(x['table_name'], x.get('status_origin'), x['fields']) for x in rows if x['table_name'] == 'tasks']
++            row = carrying[0]
++            assert row['table_name'] == 'tasks'
++            assert row['status_origin'] == receipt['park_event']['uid']
++            op = wire.translate(row, '1700656400000-0001-here')
++            assert op['fields']['owner_reassessment_v1'] == receipt
++            assert op['fields']['status'] == 'scheduled'
++            assert op['fields']['owner_reassessment_fallback_status_origin'] == ''
++            # The final origin binder must preserve both identities on this op.
++            assert row['status_origin'] != op['fields']['owner_reassessment_fallback_status_origin']
++            # An unrelated new same-task metadata capture does not acquire a receipt.
++            with kb.write_txn(conn):
++                conn.execute('UPDATE tasks SET title=? WHERE id=?', ('later', ctx['task_id']))
++            later = conn.execute('SELECT fields FROM kanban_sync_outbox ORDER BY rowid DESC LIMIT 1').fetchone()[0]
++            assert 'owner_reassessment_v1' not in json.loads(later)
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize('fault', ['frozen', 'origin', 'status', 'other-op'])
++def test_exact_capture_refuses_wrong_or_frozen_op(fault):
++    with sqlite3.connect(':memory:') as conn:
++        r.ensure_schema(conn)
++        receipt = {'park_event': {'uid': 'park'}}
++        conn.execute(f'INSERT INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?)', ('park', 'task', 'episode', json.dumps(receipt), 1))
++        conn.execute('CREATE TABLE kanban_sync_outbox(op_id,row_uid,table_name,op,fields,wire_json,status_origin)')
++        conn.execute('INSERT INTO kanban_sync_outbox VALUES (?,?,?,?,?,?,?)',
++                     ('op', 'task', 'tasks', 'upsert', json.dumps({'status': 'ready' if fault == 'status' else 'scheduled'}),
++                      '{}' if fault == 'frozen' else None, 'other' if fault == 'origin' else 'park'))
++        with pytest.raises(r.ReassessmentRefused):
++            transport.bind(conn, op_id='missing' if fault == 'other-op' else 'op', task_id='task', event_uid='park')
++        assert 'owner_reassessment_v1' not in conn.execute('SELECT fields FROM kanban_sync_outbox').fetchone()[0]
+diff --git a/tests/hermes_cli/test_kanban_owner_target.py b/tests/hermes_cli/test_kanban_owner_target.py
+new file mode 100644
+index 00000000000..94ea5354d4c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_target.py
+@@ -0,0 +1,410 @@
++"""Trusted owner-target observations with real local Git and source files."""
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import kanban_owner_target as target
++
++REF = "owner-target:mini/core"
++
++
++def git(repo, *args):
++    return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL).decode().strip()
++
++
++def write(path, value):
++    path.write_text(json.dumps(value))
++
++
++@pytest.fixture
++def source(tmp_path):
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    git(repo, "init")
++    git(repo, "config", "user.email", "test@invalid.local")
++    git(repo, "config", "user.name", "Test")
++    git(repo, "commit", "--allow-empty", "-m", "old")
++    old = git(repo, "rev-parse", "HEAD")
++    git(repo, "commit", "--allow-empty", "-m", "new")
++    new = git(repo, "rev-parse", "HEAD")
++    git(repo, "update-ref", "refs/pull/7/head", new)
++    git(repo, "update-ref", "refs/remotes/origin/main", new)
++    queue = tmp_path / "queue.json"
++    entry = {"pr": 7, "id": "generation1", "state": "queued", "judged_head": new,
++             "vet": {"state": "ready", "head": new}}
++    write(queue, {"entries": [entry]})
++    fresh = tmp_path / "fetch.stamp"
++    fresh.touch()
++    stamp = tmp_path / "installed.json"
++    write(stamp, {"core_sha": old})
++    train = tmp_path/'train.json'
++    write(train, {'skip':{}})
++    observation = tmp_path / 'pr-observation.json'
++    fact = dict(version=1, repository='example/project', pr=7, enqueue_generation='generation1',
++                head=new, observed_at=time.time(), state='current')
++    write(observation, fact)
++    config = {"kind": "queue", "queue_path": str(queue), "repository": 'example/project', "pr": 7,
++              "observation_path": str(observation),
++              "pause_path": str(tmp_path / "PAUSE"), 'train_path':str(train)}
++    registry = tmp_path / "registry.json"
++    write(registry, {"version": 1, "authority": "mini", "sources": {"core": config}})
++    return dict(repo=repo, queue=queue, fresh=fresh, stamp=stamp, config=config,
++                registry=registry, entry=entry, old=old, new=new, observation=observation, fact=fact)
++
++
++def observe(s, selector=REF):
++    return target.observe(selector, registry_path=s["registry"])
++
++
++def save_config(s):
++    write(s["registry"], {"version": 1, "authority": "mini", "sources": {"core": s["config"]}})
++
++
++def update_config(s):
++    git(s['repo'], 'remote', 'add', 'origin', 'https://example.com/project.git')
++    s["config"] = {"kind": "update", "repo_path": str(s["repo"]),
++                   "repository": 'https://example.com/project.git', "channel": "main",
++                   "remote_ref": "refs/heads/main", "target_ref": "refs/remotes/origin/main",
++                   "observation_path": str(s['fresh']),
++                   "stamp_path": str(s["stamp"]), "stamp_sha_key": "core_sha"}
++    s['update_fact'] = dict(version=1, host=target.socket.gethostname(), repo_path=str(s['repo'].resolve()),
++                            repository=s['config']['repository'], channel='main', remote_ref='refs/heads/main',
++                            target_ref='refs/remotes/origin/main', head=s['new'], observed_at=time.time(), state='current')
++    write(s['fresh'], s['update_fact'])
++    save_config(s)
++
++
++def test_pending_revision_binds_enqueue_and_full_reviewed_head(source):
++    s = source
++    before = observe(s)
++    assert before["disposition"] == "pending"
++    assert before['target']['identity'].startswith(REF+'@')
++    assert len(before['target']['identity'].rsplit('@',1)[1]) == 64
++    assert before["target"] == {"kind": "queue", "identity": before['target']['identity'],
++                                "revision": "generation1:" + s["new"]}
++    assert abs(before["observed_at"] - time.time()) < 2
++    assert set(before) == {"version", "observed_at", "selector", "target", "disposition"}
++    s["entry"]["id"] = "generation2"
++    write(s["queue"], {"entries": [s["entry"]]})
++    assert observe(s)['disposition'] == 'unavailable'
++    s['fact']['enqueue_generation'] = 'generation2'
++    write(s['observation'], s['fact'])
++    assert observe(s)['disposition'] == 'pending'
++    assert observe(s)["target"]["revision"] != before["target"]["revision"]
++
++
++@pytest.mark.parametrize("selector", ["owner-target:other/core", "owner-target:mini/unknown",
++    "owner-target:mini/../core", "owner-target:mini/core\n", "owner-target:mini/" + "x" * 65,
++    "owner-target:mini/core --command=x", "owner-target:mini//etc/passwd"])
++def test_selector_authority_and_literal_validation(source, selector):
++    assert observe(source, selector)["disposition"] == "unavailable"
++
++
++@pytest.mark.parametrize("change", ["head", "judged", "duplicate", "missing", "id", "vet", "state"])
++def test_missing_ambiguous_or_changed_queue_fails_closed(source, change):
++    s = source
++    entries = [s["entry"]]
++    def change_head():
++        s['fact']['head'] = s['old']
++        write(s['observation'], s['fact'])
++
++    changes = {
++        "head": change_head,
++        "judged": lambda: entries[0].update(judged_head=s["old"]),
++        "duplicate": lambda: entries.append(dict(entries[0])),
++        "missing": entries.clear,
++        "id": lambda: entries[0].pop("id"),
++        "vet": lambda: entries[0].pop("vet"),
++        "state": lambda: entries[0].update(state="merged"),
++    }
++    changes[change]()
++    write(s["queue"], {"entries": entries})
++    assert observe(s)["disposition"] == "unavailable"
++
++
++@pytest.mark.parametrize("adverse", ["hold_reason", "vet_reason", "paused", "marker", "held", "rejected"])
++def test_adverse_queue_never_pending(source, adverse):
++    s = source
++    if adverse == "marker":
++        Path(s["config"]["pause_path"]).touch()
++    elif adverse in {"held", "rejected"}:
++        s["entry"]["vet"]["state"] = adverse
++    else:
++        s["entry"][adverse] = True if adverse == "paused" else "adverse"
++    write(s["queue"], {"entries": [s["entry"]]})
++    assert observe(s)["disposition"] == "failed"
++
++
++@pytest.mark.parametrize("file", ["queue", "observation"])
++@pytest.mark.parametrize("age", [1201, -60])
++def test_stale_and_future_source_unavailable(source, file, age):
++    when = time.time() - age
++    os.utime(source[file], (when, when))
++    assert observe(source)["disposition"] == "unavailable"
++
++
++def test_terminal_history_does_not_hide_live_generation(source):
++    s = source
++    history = dict(s["entry"], id="oldgeneration", state="merged")
++    write(s["queue"], {"entries": [history, s["entry"]]})
++    assert observe(s)["disposition"] == "pending"
++
++
++def test_update_pending_then_installed_then_descendant(source):
++    s = source
++    update_config(s)
++    assert observe(s)["disposition"] == "pending"
++    assert observe(s)["target"]["revision"] == s["new"]
++    write(s["stamp"], {"core_sha": s["new"]})
++    old = time.time() - 86400
++    os.utime(s["stamp"], (old, old))  # an installed build need not be rewritten every tick
++    assert observe(s)["disposition"] == "satisfied"
++    git(s["repo"], "commit", "--allow-empty", "-m", "newer installed")
++    write(s["stamp"], {"core_sha": git(s["repo"], "rev-parse", "HEAD")})
++    assert observe(s)["disposition"] == "satisfied"
++
++
++@pytest.mark.parametrize('field,value', [
++    ('version', True), ('version', 2), ('host', 'another-host'), ('repo_path', '/wrong/repo'),
++    ('repository', 'https://example.com/other.git'), ('channel', 'canary'),
++    ('remote_ref', 'refs/heads/canary'), ('target_ref', 'refs/remotes/origin/canary'),
++    ('head', 'short'), ('head', 'a' * 40), ('state', 'unavailable'),
++    ('observed_at', True), ('observed_at', 0), ('observed_at', float('nan')),
++    ('extra', 'unknown'),
++])
++def test_update_producer_fact_exact_schema(source, field, value):
++    update_config(source)
++    source['update_fact'][field] = value
++    write(source['fresh'], source['update_fact'])
++    assert observe(source)['disposition'] == 'unavailable'
++
++
++@pytest.mark.parametrize('failure', ['retouch', 'future', 'refchange', 'originchange', 'missing', 'fifo', 'oversize'])
++def test_update_fact_cannot_be_renewed_by_scanner(source, failure):
++    s = source
++    update_config(s)
++    def retimestamp(offset):
++        s['update_fact']['observed_at'] = time.time() + offset
++        write(s['fresh'], s['update_fact'])
++        s['fresh'].touch()
++
++    def remove_fact(*, fifo=False):
++        s['fresh'].unlink()
++        if fifo:
++            os.mkfifo(s['fresh'])
++
++    changes = {
++        'retouch': lambda: retimestamp(-1201),
++        'future': lambda: retimestamp(60),
++        'refchange': lambda: git(s['repo'], 'update-ref', s['config']['target_ref'], s['old']),
++        'originchange': lambda: git(s['repo'], 'remote', 'set-url', 'origin', 'https://example.com/other.git'),
++        'oversize': lambda: s['fresh'].write_bytes(b' ' * 16385),
++        'missing': remove_fact,
++        'fifo': lambda: remove_fact(fifo=True),
++    }
++    changes[failure]()
++    assert observe(s)['disposition'] == 'unavailable'
++
++
++def test_update_ref_change_during_ancestry_read_fails_closed(source, monkeypatch):
++    update_config(source)
++    ancestry = target._ancestry
++    def changed(repo, older, newer):
++        result = ancestry(repo, older, newer)
++        git(repo, 'update-ref', source['config']['target_ref'], source['old'])
++        return result
++    monkeypatch.setattr(target, '_ancestry', changed)
++    assert observe(source)['disposition'] == 'unavailable'
++
++
++def test_update_diverged_is_not_pending(source):
++    s = source
++    update_config(s)
++    git(s["repo"], "checkout", "--detach", s["old"])
++    git(s["repo"], "commit", "--allow-empty", "-m", "divergent")
++    write(s["stamp"], {"core_sha": git(s["repo"], "rev-parse", "HEAD")})
++    assert observe(s)["disposition"] == "failed"
++
++
++@pytest.mark.parametrize("failure", ["shortsha", "unknownsha", "stampmissing", "refmissing", "stale", "wrongkey"])
++def test_update_missing_and_stale_fail_closed(source, failure):
++    s = source
++    update_config(s)
++    def stale_fact():
++        when = time.time() - 1201
++        os.utime(s["fresh"], (when, when))
++
++    def wrong_key():
++        s["config"]["stamp_sha_key"] = "arbitrary.path"
++        save_config(s)
++
++    changes = {
++        "shortsha": lambda: write(s["stamp"], {"core_sha": s["old"][:12]}),
++        "unknownsha": lambda: write(s["stamp"], {"core_sha": "a" * 40}),
++        "stampmissing": s["stamp"].unlink,
++        "refmissing": lambda: git(s["repo"], "update-ref", "-d", s["config"]["target_ref"]),
++        "stale": stale_fact,
++        "wrongkey": wrong_key,
++    }
++    changes[failure]()
++    assert observe(s)["disposition"] == "unavailable"
++
++
++@pytest.mark.parametrize("failure", ["oversize", "duplicates", "malformed", "missing", "command", "identity", "boolversion"])
++def test_registry_explicit_bounded_and_no_commands(source, failure):
++    s = source
++    def extra_config(field):
++        s["config"][field] = "do-not-execute-or-trust"
++        save_config(s)
++
++    changes = {
++        "oversize": lambda: s["registry"].write_bytes(b" " * (target.MAX_BYTES + 1)),
++        "duplicates": lambda: s["registry"].write_text('{"version":1,"version":1,"authority":"mini","sources":{}}'),
++        "malformed": lambda: s["registry"].write_text("not json"),
++        "missing": s["registry"].unlink,
++        "boolversion": lambda: write(s["registry"], {"version": True, "authority": "mini", "sources": {"core": s["config"]}}),
++        "command": lambda: extra_config("command"),
++        "identity": lambda: extra_config("identity"),
++    }
++    changes[failure]()
++    assert observe(s)["disposition"] == "unavailable"
++
++
++def test_actual_cli_default_registry_in_disposable_home(source, tmp_path):
++    home = tmp_path / "hermes-home"
++    repair = home / "session-repair"
++    repair.mkdir(parents=True)
++    (repair / "target-sources.json").write_bytes(source["registry"].read_bytes())
++    env = dict(os.environ, HERMES_HOME=str(home))
++    run = subprocess.run([sys.executable, "-m", "hermes_cli.kanban_owner_target", "observe", "--selector", REF],
++                         env=env, capture_output=True, check=False, text=True, timeout=10)
++    assert run.returncode == 0, run.stderr
++    result = json.loads(run.stdout)
++    assert result["selector"] == REF and result["disposition"] == "pending"
++    run = subprocess.run([sys.executable, "-m", "hermes_cli.kanban_owner_target", "observe", "--selector", REF,
++                          "--registry", str(source["registry"])], env=env, capture_output=True, check=False, timeout=10)
++    assert run.returncode != 0
++
++
++@pytest.mark.parametrize("key", ["commit", "core_sha", "full_sha", "serves_sha", "sha"])
++def test_explicit_installed_stamp_projection(source, key):
++    s = source
++    update_config(s)
++    s["config"]["stamp_sha_key"] = key
++    save_config(s)
++    write(s["stamp"], {key: s["old"], "unrelated_sha": s["new"]})
++    assert observe(s)["disposition"] == "pending"
++
++
++@pytest.mark.parametrize("failure", ["oversize", "duplicate", "malformed", "missing", "nonregular"])
++def test_queue_source_bounds(source, failure):
++    s = source
++    def nonregular():
++        s["queue"].unlink()
++        s["queue"].mkdir()
++
++    changes = {
++        "oversize": lambda: s["queue"].write_bytes(b" " * (target.MAX_BYTES + 1)),
++        "duplicate": lambda: s["queue"].write_text('{"entries":[],"entries":[]}'),
++        "malformed": lambda: s["queue"].write_text("["),
++        "nonregular": nonregular,
++        "missing": s["queue"].unlink,
++    }
++    changes[failure]()
++    assert observe(s)["disposition"] == "unavailable"
++
++
++@pytest.mark.parametrize('field,value', [
++    ('version', True), ('version', 2), ('repository', 'other/project'), ('pr', True), ('pr', 8),
++    ('enqueue_generation', 'old'), ('head', 'a' * 40), ('head', 'short'),
++    ('observed_at', True), ('observed_at', 'now'), ('observed_at', 0),
++    ('observed_at', float('inf')), ('observed_at', float('nan')),
++    ('state', 'unavailable'), ('state', 'merged'), ('extra', 'unknown'),
++])
++def test_exact_observation_schema_and_identity(source, field, value):
++    source['fact'][field] = value
++    write(source['observation'], source['fact'])
++    assert observe(source)['disposition'] == 'unavailable'
++
++
++@pytest.mark.parametrize('failure', ['oversize', 'duplicate', 'missing', 'fifo', 'future', 'retouched_stale'])
++def test_observation_bounded_and_producer_timestamp_not_file_touch(source, failure):
++    s = source
++    if failure == 'oversize':
++        s['observation'].write_bytes(b' ' * 4097)
++    elif failure == 'duplicate':
++        s['observation'].write_text('{"version":1,"version":1}')
++    elif failure in {'missing', 'fifo'}:
++        s['observation'].unlink()
++        if failure == 'fifo':
++            os.mkfifo(s['observation'])
++    else:
++        s['fact']['observed_at'] = time.time() + 60 if failure == 'future' else time.time() - 1201
++        write(s['observation'], s['fact'])
++        s['fresh'].touch()  # A generic fetch marker cannot renew this fact.
++    assert observe(s)['disposition'] == 'unavailable'
++
++
++def test_queue_needs_no_local_per_pr_ref(source):
++    git(source['repo'], 'update-ref', '-d', 'refs/pull/7/head')
++    source['fresh'].unlink()
++    assert observe(source)['disposition'] == 'pending'
++
++
++def test_legacy_ref_and_freshness_config_not_accepted(source):
++    source['config'].pop('repository')
++    source['config'].pop('observation_path')
++    source['config'].update(repo_path=str(source['repo']), revision_ref='refs/pull/7/head',
++                            freshness_path=str(source['fresh']))
++    save_config(source)
++    assert observe(source)['disposition'] == 'unavailable'
++
++
++def test_git_output_bound(source):
++    with pytest.raises(target.Unavailable, match="output exceeded"):
++        target._git(source["repo"], "log", "--format=tformat:" + "x" * 1100)
++
++
++def test_git_timeout(source, monkeypatch):
++    monkeypatch.setattr(target, "GIT_TIMEOUT", 0)
++    with pytest.raises(target.Unavailable, match="timeout"):
++        target._git(source["repo"], "status", "--porcelain")
++
++
++def test_registry_scope_and_actual_host_change_target_identity(source, monkeypatch):
++    original = observe(source)['target']
++    alternative = source['observation'].with_name('another-observation.json')
++    write(alternative, source['fact'])
++    source['config']['observation_path'] = str(alternative)
++    save_config(source)
++    new_scope = observe(source)['target']
++    assert new_scope['revision'] == original['revision']
++    assert new_scope['identity'] != original['identity']
++    monkeypatch.setattr(target.socket, 'gethostname', lambda: 'another-source')
++    assert observe(source)['target']['identity'] != new_scope['identity']
++
++
++@pytest.mark.parametrize('adverse', ['candidate','alone','skip','skip_nan'])
++def test_real_train_live_hold_semantics(source, adverse):
++    s = source
++    if adverse == 'candidate':
++        s['entry']['hold_candidate'] = {'head':s['new']}
++    elif adverse == 'alone':
++        s['entry']['hold_noted'] = 'validate failed on train candidate abcdefa with this PR alone on main'
++    else:
++        write(Path(s['config']['train_path']), {'skip':{s['entry']['id']:time.time()+600 if adverse == 'skip' else float('nan')}})
++    write(s['queue'],{'entries':[s['entry']]})
++    assert observe(s)['disposition'] in ('failed','unavailable')
++
++
++def test_expired_skip_and_old_dedupe_note_are_not_live_holds(source):
++    s = source
++    s['entry']['hold_noted'] = 'old resolved vet hold'
++    write(s['queue'],{'entries':[s['entry']]})
++    write(Path(s['config']['train_path']), {'skip':{s['entry']['id']:time.time()-1}})
++    assert observe(s)['disposition'] == 'pending'
+diff --git a/tests/tools/test_kanban_owner_reassessment_schema.py b/tests/tools/test_kanban_owner_reassessment_schema.py
+new file mode 100644
+index 00000000000..c00dd729da4
+--- /dev/null
++++ b/tests/tools/test_kanban_owner_reassessment_schema.py
+@@ -0,0 +1,65 @@
++"""The owner opt-in is a real strict schema, without weakening existing park policy."""
++from copy import deepcopy
++import importlib.util
++import json
++from pathlib import Path
++
++import pytest
++from jsonschema import Draft202012Validator
++
++from hermes_cli import kanban_owner_reassessment as r
++from tests.hermes_cli.test_kanban_owner_reassessment import optin
++from tools import kanban_tools as tools
++from tools.registry import registry
++
++
++@pytest.mark.parametrize('name', ['kanban_schedule', 'kanban_continue'])
++def test_owner_reassessment_is_declared_not_a_compatibility_argument(name):
++    schema = registry.get_schema(name)
++    field = schema['parameters']['properties']['owner_reassessment']
++    assert 'owner_reassessment' not in tools._UNDECLARED_ARGS.get(name, ())
++    assert 'owner_reassessment' not in schema['parameters'].get('required', ())
++    assert Draft202012Validator(field).is_valid(optin())
++    assert field['additionalProperties'] is False
++    assert set(field['required']) == {'version', 'reassess_at', 'target', 'evidence_refs'}
++    assert field['properties']['target']['additionalProperties'] is False
++    assert field['properties']['evidence_refs']['items']['additionalProperties'] is False
++    desc = field['description']
++    for claim in ('same-run', 'backstop', 'pending evidence', 'not producer health', 'privately'):
++        assert claim in desc
++    assert len(json.dumps(field).encode()) < 1900
++
++
++@pytest.mark.parametrize('change', [
++    lambda v: v.update(issuer={'session_id': 'forged'}),
++    lambda v: v.update(version=True), lambda v: v.update(reassess_at=True),
++    lambda v: v.update(reassess_at=0), lambda v: v['target'].update(revision=''),
++    lambda v: v['target'].update(kind='clock'), lambda v: v['target'].update(identity=' '),
++    lambda v: v['target'].update(identity='x' * 513), lambda v: v['target'].update(revision='x' * 257),
++    lambda v: v['target'].update(authority=True), lambda v: v.update(evidence_refs=[]),
++    lambda v: v['evidence_refs'].append(deepcopy(v['evidence_refs'][0])),
++    lambda v: v['evidence_refs'][0].update(uid='legacy:1'),
++    lambda v: v['evidence_refs'][0].update(uid=v['evidence_refs'][0]['uid'] + '\n'),
++    lambda v: v['evidence_refs'][0].update(table='comments'),
++    lambda v: v['evidence_refs'][0].update(issuer='forged'),
++])
++def test_served_schema_and_runtime_reject_same_invalid_optins(change):
++    value = optin()
++    change(value)
++    for name in ('kanban_schedule', 'kanban_continue'):
++        field = registry.get_schema(name)['parameters']['properties']['owner_reassessment']
++        assert not Draft202012Validator(field).is_valid(value), name
++    with pytest.raises(r.ReassessmentRefused):
++        r.request(value)
++
++
++def test_schema_addition_preserves_every_existing_policy_description_and_field():
++    # Load the source definitions independently, before the registration module's additive mutation.
++    source = Path(tools.__file__).with_name('kanban_tools_schemas.py')
++    spec = importlib.util.spec_from_file_location('_unmodified_park_schema', source)
++    original = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(original)
++    for name, constant in [('kanban_schedule', 'KANBAN_SCHEDULE_SCHEMA'), ('kanban_continue', 'KANBAN_CONTINUE_SCHEMA')]:
++        actual = deepcopy(registry.get_schema(name))
++        del actual['parameters']['properties']['owner_reassessment']
++        assert actual == getattr(original, constant)
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 11e46b017c7..5eff4988573 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -37,7 +37,7 @@
+ from tools.kanban_tools_park_args import (_blocker_id_arg, _clear_blocker_arg, _blocker_scope_args, _park_guard,
+                                           _wake_check_args, _wake_check_echo, _escalated)
+ from hermes_cli.kanban_ask_resolved import ask_checks, create_ask_check, filing_context
+-from tools import kanban_tools_completion as _kc, kanban_tools_create_args as _ca
++from tools import kanban_tools_completion as _kc, kanban_tools_create_args as _ca, kanban_tools_reassessment as reassessment
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA, KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+     KANBAN_COMPLETE_SCHEMA, KANBAN_CONTINUE_SCHEMA, KANBAN_MOVE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+@@ -45,6 +45,7 @@
+     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA, KANBAN_ARCHIVE_SCHEMA,
+     KANBAN_SUPERVISOR_REQUEST_SCHEMA, KANBAN_UNLINK_SCHEMA)
+ 
++reassessment.install(KANBAN_SCHEDULE_SCHEMA, KANBAN_CONTINUE_SCHEMA)
+ logger = logging.getLogger(__name__)
+ 
+ KANBAN_LIST_DEFAULT_LIMIT = 50
+@@ -1168,10 +1169,9 @@
+         register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
+                             expected_run_id=_worker_run_id(tid))
+         ok = kb.schedule_task(
+-            conn, tid, watch=kwatch.resolve(conn, tid, raw_watch), reason=reason,
+-            expected_run_id=_worker_run_id(tid),
++            conn, tid, watch=kwatch.resolve(conn, tid, raw_watch), reason=reason, expected_run_id=_worker_run_id(tid),
+             wake_check=wake[0], check_every=wake[1], clock_only=wake[2], awaiting=awaiting,
+-            clear_blocker=clear_blocker, blocker_id=blocker_id, **_blocker_scope_args(args))
++            clear_blocker=clear_blocker, blocker_id=blocker_id, **_blocker_scope_args(args), **reassessment.lifecycle_kwargs(args, tid))
+         _check(ok, "" if ok else krc.human_answer_refusal(conn, tid, "schedule")
+                or f"could not schedule {tid} (unknown id, or not in todo/ready/running/blocked/triage)")
+         escalated = _escalated(kb, conn, tid)
+@@ -1217,7 +1217,7 @@
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+                             expected_run_id=_worker_run_id(tid), metadata=metadata, awaiting=awaiting,
+                             wake_check=wake[0], check_every=wake[1], clock_only=wake[2],
+-                            **_blocker_scope_args(args))
++                            **_blocker_scope_args(args), **reassessment.lifecycle_kwargs(args, tid))
+         from hermes_cli.kanban_awaiting import CODES
+         _check(res.get("ok"), f"could not continue {tid}: {res.get('error')}",
+                res.get("reason_code") if res.get("reason_code") in CODES else None)
+diff --git a/tools/kanban_tools_reassessment.py b/tools/kanban_tools_reassessment.py
+new file mode 100644
+index 00000000000..92ad39569a8
+--- /dev/null
++++ b/tools/kanban_tools_reassessment.py
+@@ -0,0 +1,41 @@
++"""Owner reassessment tool input schema and privately captured lifecycle kwargs."""
++
++
++def schema():
++    """Typed opt-in only; no issuer coordinates or scanner/capability promise."""
++    def text(maximum):
++        return {"type": "string", "minLength": 1, "maxLength": maximum, "pattern": r"\S"}
++
++    def obj(properties):
++        return {"type": "object", "additionalProperties": False,
++                "required": list(properties), "properties": properties}
++
++    return {**obj({
++        "version": {"type": "integer", "enum": [1]},
++        "reassess_at": {"type": "integer", "minimum": 1},
++        "target": obj({"kind": {"type": "string", "enum": ["queue", "update", "external"]},
++                       "identity": text(512), "revision": text(256)}),
++        "evidence_refs": {"type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": True,
++                          "items": obj({"table": {"type": "string", "enum": ["task_events"]},
++                                        "uid": {"type": "string", "minLength": 36, "maxLength": 36, "pattern":
++                                                "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"}})},
++    }), "description": "Opt-in bounded reassessment by this admitted owner run. Requires explicit producer awaiting "
++        "and existing same-run portable event evidence; reassess_at is Unix seconds, after now and no later than "
++        "the admitted backstop. Delayed parks only. Records pending evidence, not producer health, scanner "
++        "suppression, release or execution authority. Issuer custody is captured privately, never supplied here."}
++
++
++def install(*schemas):
++    """Add only the typed field; retain every existing park policy and bound."""
++    for park_schema in schemas:
++        park_schema["parameters"]["properties"]["owner_reassessment"] = schema()
++
++
++def lifecycle_kwargs(args: dict, tid: str) -> dict:
++    """Lifecycle kwargs for an opt-in: the privately captured live owner origin (None when absent, which
++    the lifecycle refuses). A caller cannot name issuer coordinates; nothing here is scanner authority."""
++    value = args.get("owner_reassessment")
++    if value is None:
++        return {}
++    from agent.origin_worker_custody import capture
++    return {"owner_reassessment": value, "owner_origin": capture(tid)}
+-- 
+2.43.0
+

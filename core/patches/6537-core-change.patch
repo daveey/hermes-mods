@@ -1,0 +1,526 @@
+From 63d5821ff9ef6d4fdf09041ead046f54413bcf10 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 22:29:03 +0000
+Subject: [PATCH 6537] Bounded owner reassessment
+
+Public mirror of source commit 63d5821ff9ef6d4fdf09041ead046f54413bcf10.
+
+---
+diff --git a/hermes_cli/kanban_owner_reassessment_replica.py b/hermes_cli/kanban_owner_reassessment_replica.py
+index 0cec535851e..173af77eb4a 100644
+--- a/hermes_cli/kanban_owner_reassessment_replica.py
++++ b/hermes_cli/kanban_owner_reassessment_replica.py
+@@ -14,6 +14,7 @@
+ from hermes_cli import kanban_owner_reassessment_canonical as canonical
+ from hermes_cli.kanban_containment_functions import register as register_function
+ from hermes_cli.kanban_owner_reassessment import ReassessmentRefused
++from hermes_cli.kanban_sync_hub_transport import BoundedResponseTooLarge
+ 
+ TABLE = "owner_reassessment_canonical_receipts"
+ _PERMIT: contextvars.ContextVar[sqlite3.Connection | None] = contextvars.ContextVar("owner_reassessment_cache_write", default=None)
+@@ -23,6 +24,10 @@
+     """A different canonical identity arrived for an already-recorded receipt."""
+ 
+ 
++class ReassessmentEvidenceOversize(ReassessmentRefused):
++    """The Board's evidence for one park is deterministically over the response cap: unprovable, never authority."""
++
++
+ def register(conn: sqlite3.Connection) -> None:
+     register_function(conn, "kanban_owner_reassessment_cache_write", 0,
+                       lambda: int(_PERMIT.get() is conn and conn.in_transaction))
+@@ -173,12 +178,16 @@
+ 
+     A park event merely *claiming* an episode is ordinary history: if the Board attests nothing
+     for it, nothing is recorded and nothing is authorized (page still applies). Transport errors
+-    abort the page; an attestation that contradicts the feed row or a recorded receipt raises.
++    abort the page, except a deterministically over-cap evidence answer, which raises
++    :class:`ReassessmentEvidenceOversize` so the caller can hold that one card; an attestation that contradicts the feed row or a recorded receipt raises.
+     """
+     for ch in changes:
+         if not _is_candidate(ch):
+             continue
+-        evidence = hub.row_evidence(board, "task_events", ch.uid, max_response_bytes=canonical.MAX_EVIDENCE_BYTES)
++        try:
++            evidence = hub.row_evidence(board, "task_events", ch.uid, max_response_bytes=canonical.MAX_EVIDENCE_BYTES)
++        except BoundedResponseTooLarge as exc:  # deterministic for this row; other transport errors still abort
++            raise ReassessmentEvidenceOversize(f"Board evidence for park {ch.uid} exceeds the response cap: {exc}") from exc
+         if not isinstance(evidence, dict) or "owner_reassessment_v1" not in evidence:
+             continue
+         try:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index ab9d265df12..086f6f4e8c5 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -55,7 +55,7 @@
+ from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+-from hermes_cli.kanban_sync_compat import TRANSIENT_REASONS, transient_rejection  # re-exported compatibility seam
++from hermes_cli.kanban_sync_compat import REASSESSMENT_REFUSALS, TRANSIENT_REASONS, transient_rejection  # re-exported compatibility seam
+ from hermes_cli.kanban_sync_hub_transport import peer_closed as _peer_closed
+ from hermes_cli.kanban_sync_hub_transport import BoundedRedirects, BoundedResponseError, read_response
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+@@ -740,7 +740,7 @@
+                                  "WHERE op_id = ?", (reason[:500], op_id))
+                     out.rejected += 1
+                     _log.warning("kanban sync: %s %s %s rejected (%s)", board, row["table_name"], row["row_uid"], reason)
+-                    if res.get("reason") == "forbidden_field":
++                    if res.get("reason") in ("forbidden_field", *REASSESSMENT_REFUSALS):
+                         from hermes_cli.kanban_sync_compat import VIRTUAL_DROPPED, enqueue_retry, record_rejection
+                         sent_op = next(op for op in wire if op["client_op_id"] == op_id)
+                         if enqueue_retry(conn, row, sent_op, res) != VIRTUAL_DROPPED:
+diff --git a/hermes_cli/kanban_sync_compat.py b/hermes_cli/kanban_sync_compat.py
+index 7908fab0855..fa749222419 100644
+--- a/hermes_cli/kanban_sync_compat.py
++++ b/hermes_cli/kanban_sync_compat.py
+@@ -76,6 +76,8 @@
+     from hermes_cli.kanban_sync_reserved_key import is_replacement
+     if is_replacement(conn, row["op_id"]):
+         return False  # keep the exact recovery refusal visible; never omit an approved recovery field
++    if result.get("reason") in REASSESSMENT_REFUSALS:
++        return downgrade_reassessment(conn, row, wire, result)
+     if result.get("reason") != "forbidden_field" or row["op"] not in ("upsert", "import"):
+         return False
+     match = re.fullmatch(r"not writable on ([a-z0-9_]+): ([a-z0-9_]+(?:, [a-z0-9_]+)*)", str(result.get("detail") or ""))
+@@ -110,11 +112,30 @@
+ 
+ 
+ VIRTUAL_DROPPED = "virtual_dropped"
++# An advertising Board's definitive refusal of the certificate itself (binding/time/transition). The park is
++# still a valid ordinary park without it, so exactly these reasons downgrade to the saved ordinary origin.
++REASSESSMENT_REFUSALS = ("owner_reassessment_binding", "owner_reassessment_time", "owner_reassessment_transition_lost")
+ _REASSESSMENT = ("owner_reassessment_v1", "owner_reassessment_fallback_status_origin")
+ # Real columns a new Board fences on custody/manifest cards (workspace_source v1, R4c): refused one per detail.
+ FENCED_FIELDS: dict[str, frozenset[str]] = {"tasks": frozenset({"workspace_kind", "branch_name"})}
+ 
+ 
++def downgrade_reassessment(conn: sqlite3.Connection, row: dict, wire: dict, result: dict) -> bool | str:
++    """Resend an opt-in park without its certificate after the Board definitively refused only that certificate.
++
++    Only a known refusal of an op that actually carried the certificate and has its saved ordinary origin
++    qualifies; anything else (unknown reasons, lost answers, other tables) is left untouched.
++    """
++    if (result.get("status") != "rejected" or result.get("reason") not in REASSESSMENT_REFUSALS
++            or row["table_name"] != "tasks" or row["op"] != "upsert"
++            or "owner_reassessment_v1" not in wire.get("fields", {})):
++        return False
++    stored = row["fields"] if isinstance(row["fields"], dict) else json.loads(row["fields"] or "{}")
++    if not isinstance(stored.get("owner_reassessment_fallback_status_origin"), str):
++        return False  # no saved ordinary origin: never invent one
++    return _drop_virtual(conn, row, wire, ["owner_reassessment_v1"])
++
++
+ def _drop_virtual(conn: sqlite3.Connection, row: dict, wire: dict, dropped: list[str]) -> str:
+     """The Board refused fields nothing local needs delivered: a wire-only field (``sync.VIRTUAL_WIRE_FIELDS``),
+     or a source-fenced column (``FENCED_FIELDS``) whose Board value wins. Resend the same op without them under a
+diff --git a/hermes_cli/kanban_sync_hub_transport.py b/hermes_cli/kanban_sync_hub_transport.py
+index 88ca9ec827b..64b6102859b 100644
+--- a/hermes_cli/kanban_sync_hub_transport.py
++++ b/hermes_cli/kanban_sync_hub_transport.py
+@@ -7,6 +7,13 @@
+     """A capped evidence response is too large or cannot be decoded safely."""
+ 
+ 
++class BoundedResponseTooLarge(BoundedResponseError):
++    """The Board's answer is deterministically over the cap (wire or decoded bytes).
++
++    Unlike a malformed/truncated body this recurs on every retry for the same row.
++    """
++
++
+ class BoundedRedirects(urllib.request.HTTPRedirectHandler):
+     """Cap urllib's internal redirect-body drain as well as the final response."""
+ 
+@@ -42,7 +49,7 @@
+         raise ValueError("max_response_bytes must be a positive integer")
+     raw = resp.read(max_response_bytes + 1)
+     if len(raw) > max_response_bytes:
+-        raise BoundedResponseError("Board response exceeds wire byte limit")
++        raise BoundedResponseTooLarge("Board response exceeds wire byte limit")
+     encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+     if encoding in ("", "identity"):
+         return raw
+@@ -63,7 +70,7 @@
+     except (OSError, EOFError, zlib.error) as exc:
+         raise BoundedResponseError("Invalid compressed Board response") from exc
+     if len(decoded) > max_response_bytes:
+-        raise BoundedResponseError("Board response exceeds decoded byte limit")
++        raise BoundedResponseTooLarge("Board response exceeds decoded byte limit")
+     return decoded
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index ab96f6ed4bb..bb24dfe43bb 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -175,12 +175,27 @@
+     return f"hermes kanban --board {board} sync quarantine --release {receipt} --reason ..."
+ 
+ 
++REASSESSMENT_OVERSIZE = "reassessment_evidence_oversize"
++# A generic operator release refuses these (no canonical containment attestation) and stores no receipt.
++NO_GENERIC_RELEASE = ("reassessment_conflict", REASSESSMENT_OVERSIZE)
++
++
++def clear_instruction(kind: str, board: str, receipt: str) -> str:
++    """What clears a hold. Never advertises a release that cannot work for ``kind``."""
++    if kind in NO_GENERIC_RELEASE:
++        return (f"generic `sync quarantine --release` does NOT clear this kind and grants no authority; the card stays "
++                f"held (no dispatch, no park applied) until the owner adjudicates Board receipt {receipt} explicitly")
++    return f"release with `{release_command(board, receipt)}`"
++
++
+ def refusal(conn, task: str) -> str | None:
+     """Why a held card waits and how it is released (``resume-contained`` cannot: this is not an episode)."""
+     mine = holders(conn, task)
+     if not mine:
+         return None
+-    board = conn.execute("SELECT board FROM containment_sync_quarantine WHERE uid=?", (mine[0],)).fetchone()[0]
++    board, kind = conn.execute("SELECT board,kind FROM containment_sync_quarantine WHERE uid=?", (mine[0],)).fetchone()
++    if kind in NO_GENERIC_RELEASE:
++        return f"held by sync quarantine of receipt {', '.join(mine)}; {clear_instruction(kind, board, mine[0])}"
+     return (f"held by sync quarantine of receipt {', '.join(mine)}; release with "
+             f"`{release_command(board, mine[0])}` once you have ruled on the Board's copy")
+ 
+@@ -243,9 +258,9 @@
+     for change in changes:
+         try:  # one card's contradicted reassessment receipt holds that card; siblings keep syncing
+             reassessment.certify_page(conn, hub, board, [change])
+-        except reassessment.ReassessmentConflict as exc:
+-            quarantine_change(conn, board, change,
+-                              ContainmentConflict(str(exc), kind="reassessment_conflict", uid=change.uid))
++        except (reassessment.ReassessmentConflict, reassessment.ReassessmentEvidenceOversize) as exc:
++            kind = "reassessment_conflict" if isinstance(exc, reassessment.ReassessmentConflict) else REASSESSMENT_OVERSIZE
++            quarantine_change(conn, board, change, ContainmentConflict(str(exc), kind=kind, uid=change.uid))
+             continue
+         if not protected(change):
+             continue
+@@ -265,7 +280,7 @@
+     cached = replica._cached(conn, change.uid)
+     if cached:
+         held_tasks.add(cached["row"]["task_id"])
+-    if exc.kind == "reassessment_conflict":
++    if exc.kind in NO_GENERIC_RELEASE:
+         from hermes_cli import kanban_owner_reassessment_replica as reassessment
+         if _exists(conn, reassessment.TABLE):
+             prior = conn.execute(f"SELECT task_id FROM {reassessment.TABLE} WHERE event_uid=?",
+@@ -284,8 +299,8 @@
+                          [(task, change.uid) for task in held_tasks])
+     if inserted:
+         log.error("kanban sync: quarantined receipt %s on %s tasks=%s (%s: %s); unrelated rows keep syncing; "
+-                  "release with `%s`", change.uid, board, sorted(held_tasks), exc.kind, reason,
+-                  release_command(board, change.uid))
++                  "%s", change.uid, board, sorted(held_tasks), exc.kind, reason,
++                  clear_instruction(exc.kind, board, change.uid))
+     _mirror(conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_quarantine_notice.py b/hermes_cli/kanban_sync_quarantine_notice.py
+index 5eeb1506e9d..048d201130e 100644
+--- a/hermes_cli/kanban_sync_quarantine_notice.py
++++ b/hermes_cli/kanban_sync_quarantine_notice.py
+@@ -57,8 +57,20 @@
+ 
+ 
+ def _body(entry: dict) -> str:
+-    from hermes_cli.kanban_sync_quarantine import release_command
++    from hermes_cli.kanban_sync_quarantine import NO_GENERIC_RELEASE, clear_instruction, release_command
+     board, receipt = entry["board"], entry["receipt"]
++    if entry["kind"] in NO_GENERIC_RELEASE:
++        return "\n".join([
++            f"Board **{board}**: this host quarantined owner-reassessment receipt `{receipt}` "
++            f"({entry['kind']}: {entry['reason']}). The cards below are held here (no dispatch, pickup or push); "
++            "every other card keeps syncing.",
++            "",
++            f"- Receipt: `{receipt}` (task `{entry['task']}`)",
++            f"- Held tasks: {', '.join(f'`{t}`' for t in entry['held_tasks']) or '-'}",
++            f"- Refusal kind: `{entry['kind']}`",
++            "",
++            f"Do: the owner adjudicates the Board's receipt explicitly. {clear_instruction(entry['kind'], board, receipt)}.",
++        ])
+     return "\n".join([
+         f"Board **{board}**: this host quarantined containment receipt `{receipt}` because its evidence conflicts "
+         f"({entry['kind']}: {entry['reason']}). The cards below are held here (no dispatch, pickup or push) until "
+@@ -114,8 +126,8 @@
+     if host == HUB:
+         for entry in todo:
+             log.error("kanban sync: hub quarantined containment receipt %s on %s (tasks %s, %s); no hub card filed "
+-                      "(it would wait on this board's own sync); release with `%s`", entry["receipt"], board,
+-                      entry["held_tasks"], entry["kind"], quarantine.release_command(board, entry["receipt"]))
++                      "(it would wait on this board's own sync); %s", entry["receipt"], board,
++                      entry["held_tasks"], entry["kind"], quarantine.clear_instruction(entry["kind"], board, entry["receipt"]))
+             filed[key(board, entry, host)] = {"hub": True, "seen_at": now}
+         _write_state({**state, "filed": filed})
+         return []
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_review_v11.py b/tests/hermes_cli/test_kanban_owner_reassessment_review_v11.py
+new file mode 100644
+index 00000000000..dfcbfbd0fc3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_review_v11.py
+@@ -0,0 +1,128 @@
++"""Review v11: an over-cap park evidence holds only its card; a generic release is never advertised for it."""
++from __future__ import annotations
++
++import logging
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_quarantine as quarantine
++from hermes_cli import kanban_sync_quarantine_release as qr
++from hermes_cli import kanban_sync_hub_transport as transport
++BoundedResponseError = transport.BoundedResponseError
++# On the reviewed head this is the existing cap exception, so RED reaches pull/logging rather than import.
++BoundedResponseTooLarge = getattr(transport, "BoundedResponseTooLarge", BoundedResponseError)
++from tests.hermes_cli import kanban_quarantine_support as support
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++from tests.hermes_cli import test_kanban_owner_reassessment_canonical as canon
++from tests.hermes_cli.test_kanban_owner_reassessment_pull_quarantine import _feed
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++class _Hub(canon.Hub):
++    """Raises ``error`` for the park's evidence (a Board answer over the raw cap), serves nothing else."""
++
++    def __init__(self, error, ident_hub):
++        super().__init__({}, gateway=ident_hub.ident.gateway)
++        self.error = error
++
++    def row_evidence(self, board, table, uid, *, max_response_bytes):
++        assert max_response_bytes == canon.canonical.MAX_EVIDENCE_BYTES  # the raw wire cap is never raised
++        self.calls += 1
++        raise self.error
++
++
++def _scenario(conn, monkeypatch, error):
++    bad_task = kb.create_task(conn, title="big park", assignee="w")
++    sib_task = kb.create_task(conn, title="sibling", assignee="w")
++    receipt = canon.make()
++    receipt["task_id"] = bad_task
++    board = sync.sync_state(conn)["board_id"] if sync.sync_state(conn).get("board_id") else "default"
++    receipt["board"] = board
++    park = receipt["park_event"]["uid"]
++    hub = _Hub(error, canon.Hub({}))
++    shaped = canon.ch(receipt)
++    bad = sync.RemoteChange(1, "task_events", shaped.uid, "upsert", shaped.fields, 1, "", shaped.origin_gateway)
++    sib_uid = sync.uuid7()
++    sibling = sync.RemoteChange(2, "task_events", sib_uid, "upsert",
++                                {"task_id": sib_task, "kind": "commented", "payload": "{}", "created_at": 1}, 2, "", "worker")
++    _feed(monkeypatch, [bad, sibling])
++    return bad_task, sib_task, park, sib_uid, board, hub
++
++
++def test_over_cap_park_evidence_holds_that_card_and_healthy_sibling_syncs(synced_conn, monkeypatch):
++    conn = synced_conn
++    bad_task, _sib, park, sib_uid, board, hub = _scenario(
++        conn, monkeypatch, BoundedResponseTooLarge("Board response exceeds decoded byte limit"))
++    ksc.pull(conn, hub, board, observers=False)  # RED: BoundedResponseError aborted the whole pull
++    assert sync.sync_state(conn)["cursor"] == 2
++    row = conn.execute("SELECT uid,task_id,kind FROM containment_sync_quarantine").fetchone()
++    assert tuple(row) == (park, bad_task, quarantine.REASSESSMENT_OVERSIZE)
++    assert quarantine.tasks(conn) == {bad_task}
++    # no authority: no receipt stored, park withheld, card cannot be claimed; the sibling applied
++    assert support.count(conn, "owner_reassessment_canonical_receipts") == 0
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (park,)).fetchone() is None
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (sib_uid,)).fetchone() is not None
++    assert kb.claim_task(conn, bad_task) is None
++    ksc.pull(conn, hub, board, observers=False)  # the fake feed re-serves the page: still held, one row, no authority
++    assert quarantine.tasks(conn) == {bad_task} and support.count(conn, "containment_sync_quarantine") == 1
++    assert support.count(conn, "owner_reassessment_canonical_receipts") == 0
++
++
++@pytest.mark.parametrize("error", [BoundedResponseError("Invalid compressed Board response"), OSError("reset"),
++                                   TimeoutError("slow")])
++def test_other_evidence_failures_are_not_deterministic_conflicts(synced_conn, monkeypatch, error):
++    conn = synced_conn
++    _bad, _sib, _park, sib_uid, board, hub = _scenario(conn, monkeypatch, error)
++    with pytest.raises((BoundedResponseError, OSError)):
++        ksc.pull(conn, hub, board, observers=False)
++    assert sync.sync_state(conn)["cursor"] == 0
++    assert support.count(conn, "containment_sync_quarantine") == 0
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (sib_uid,)).fetchone() is None
++
++
++@pytest.mark.parametrize("kind", ["conflict", "oversize"])
++def test_release_is_not_advertised_and_an_attempt_stays_fail_closed(synced_conn, monkeypatch, caplog, kind):
++    conn = synced_conn
++    if kind == "oversize":
++        error = BoundedResponseTooLarge("Board response exceeds wire byte limit")
++    else:
++        error = None
++    bad_task, _sib, park, _sib_uid, board, hub = _scenario(conn, monkeypatch, error or BoundedResponseError("x"))
++    if kind == "conflict":
++        receipt = canon.make()
++        receipt["task_id"], receipt["board"] = bad_task, board
++        park = receipt["park_event"]["uid"]
++        hub = canon.Hub({**canon.evidence_for(receipt), "board": board})
++        shaped = canon.ch(receipt, created_at=5)
++        bad = sync.RemoteChange(1, "task_events", shaped.uid, "upsert", shaped.fields, 1, "", shaped.origin_gateway)
++        _feed(monkeypatch, [bad])
++    with caplog.at_level(logging.ERROR):
++        ksc.pull(conn, hub, board, observers=False)
++    want = "reassessment_conflict" if kind == "conflict" else quarantine.REASSESSMENT_OVERSIZE
++    assert conn.execute("SELECT kind FROM containment_sync_quarantine WHERE uid=?", (park,)).fetchone()[0] == want
++    # the operator-facing text never names the always-refusing generic release as the way out
++    texts = [r.getMessage() for r in caplog.records if "quarantined receipt" in r.getMessage()]
++    assert texts and all("--release" not in t.replace("generic `sync quarantine --release` does NOT", "") for t in texts)
++    assert all("explicitly" in t for t in texts)
++    held = quarantine.refusal(conn, bad_task)
++    assert "does NOT clear" in held and "adjudicates" in held and "--reason" not in held
++    from hermes_cli import kanban_sync_quarantine_notice as notice
++    body = notice._body(quarantine.entries(conn)[0])
++    assert "--reason" not in body and "adjudicates" in body and park in body
++    # an actual release attempt refuses, stores no receipt, keeps the hold and the card unclaimable
++    with pytest.raises(qr.ReleaseRefused):
++        qr.release(conn, hub, board, park, reason="try", operator="test")
++    assert park in quarantine.receipts(conn) and quarantine.tasks(conn) == {bad_task}
++    assert support.count(conn, "owner_reassessment_canonical_receipts") == 0
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (park,)).fetchone() is None
++    assert kb.claim_task(conn, bad_task) is None
++
++
++def test_other_kinds_still_advertise_generic_release():
++    text = quarantine.clear_instruction("identity_changed", "b", "r1")
++    assert "sync quarantine --release r1" in text
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_review_v11_push.py b/tests/hermes_cli/test_kanban_owner_reassessment_review_v11_push.py
+new file mode 100644
+index 00000000000..07c301d6bc2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_review_v11_push.py
+@@ -0,0 +1,128 @@
++"""Review v11: an advertising Board's definitive certificate refusal downgrades the park to its ordinary origin."""
++from __future__ import annotations
++
++import copy
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_owner_reassessment_lifecycle as lifecycle
++from tests.hermes_cli.test_kanban_owner_reassessment_board_compat import BASE_CAP, NEW, _status_ops
++
++worker = lifecycle.worker
++REASONS = ["owner_reassessment_binding", "owner_reassessment_time", "owner_reassessment_transition_lost"]
++
++
++def _board(calls, accepted, script):
++    """Advertises the capability. ``script`` answers each certificate-carrying task op in turn:
++    a reason string -> definitive rejection, ``"storage_error"`` -> transient, ``None`` -> applied."""
++    queue = list(script)
++
++    def ops(board, batch):
++        calls.extend(copy.deepcopy(batch))
++        out = []
++        for op in batch:
++            carries = op.get("table") == "tasks" and "owner_reassessment_v1" in op.get("fields", {})
++            verdict = queue.pop(0) if carries and queue else None
++            if verdict:
++                out.append({"client_op_id": op["client_op_id"], "status": "rejected", "reason": verdict, "detail": "x"})
++            else:
++                accepted.append(copy.deepcopy(op))
++                out.append({"client_op_id": op["client_op_id"], "status": "applied", "version": 9})
++        return {"results": out}
++    return SimpleNamespace(ops=ops, status_origin_capability=lambda board: {**BASE_CAP, "owner_reassessment_v1": 1})
++
++
++def _run(worker, monkeypatch, script, check, rounds=6):
++    def body(cap, ctx, agent, evidence):
++        tid = ctx["task_id"]
++        with kbc.connect_closing() as conn:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET sync_version=5 WHERE id=?", (tid,))
++                conn.execute("DELETE FROM kanban_sync_outbox")
++            assert kb.schedule_task(conn, tid, reason=lifecycle._until(), expected_run_id=ctx["run_id"],
++                                    awaiting=lifecycle.PRODUCER,
++                                    owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120), owner_origin=cap)
++            park = conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()[0]
++            calls, accepted = [], []
++            hub = _board(calls, accepted, script)
++            for _ in range(rounds):
++                try:
++                    client.push(conn, hub, "default", "here", primary=True)
++                except OSError:
++                    pass
++                with kb.write_txn(conn):  # transient backoff elapsed
++                    conn.execute("UPDATE kanban_sync_outbox SET retry_after=NULL")
++            left = [tuple(r) for r in conn.execute("SELECT state,last_error,status_origin FROM kanban_sync_outbox")]
++            return check(conn, park, calls, accepted, left)
++    return lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize("reason", REASONS)
++def test_definitive_certificate_refusal_still_delivers_the_park_with_ordinary_origin(worker, monkeypatch, reason):
++    def check(conn, park, calls, accepted, left):
++        got = _status_ops(accepted)
++        assert len(got) == 1, "the advertising Board never received the park's status"
++        assert not set(got[0]["fields"]) & set(NEW)
++        assert got[0]["status_origin"] == "" != park
++        assert not left, left  # nothing rejected is stranded in the outbox
++        assert len(_status_ops(calls)) == 2  # the certificate op once, the ordinary park once
++        return True
++    assert _run(worker, monkeypatch, [reason], check)
++
++
++@pytest.mark.parametrize("reason", REASONS)
++def test_resumed_transient_retry_then_definitive_refusal_still_converges(worker, monkeypatch, reason):
++    def check(conn, park, calls, accepted, left):
++        got = _status_ops(accepted)
++        assert len(got) == 1 and not set(got[0]["fields"]) & set(NEW) and got[0]["status_origin"] == ""
++        carrying = [op for op in _status_ops(calls) if "owner_reassessment_v1" in op["fields"]]
++        assert len(carrying) == 2 and carrying[0]["client_op_id"] != carrying[1]["client_op_id"]  # fresh id per retry
++        assert not left, left
++        return True
++    assert _run(worker, monkeypatch, ["storage_error", reason], check, rounds=8)
++
++
++@pytest.mark.parametrize("reason", ["owner_reassessment_other", "owner_reassessment", "forbidden", "conflict"])
++def test_unknown_refusal_reasons_are_not_downgraded(worker, monkeypatch, reason):
++    def check(conn, park, calls, accepted, left):
++        assert not _status_ops(accepted)
++        assert len(_status_ops(calls)) == 1 and [r[0] for r in left] == ["rejected"]
++        return True
++    assert _run(worker, monkeypatch, [reason], check)
++
++
++def test_unknown_outcome_is_never_downgraded_or_resent(worker, monkeypatch):
++    def body(cap, ctx, agent, evidence):
++        tid = ctx["task_id"]
++        with kbc.connect_closing() as conn:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET sync_version=5 WHERE id=?", (tid,))
++                conn.execute("DELETE FROM kanban_sync_outbox")
++            assert kb.schedule_task(conn, tid, reason=lifecycle._until(), expected_run_id=ctx["run_id"],
++                                    awaiting=lifecycle.PRODUCER,
++                                    owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120), owner_origin=cap)
++            calls, accepted = [], []
++            hub = _board(calls, accepted, [])
++
++            def lost(board, batch):
++                calls.extend(copy.deepcopy(batch))
++                raise OSError("connection reset")
++            hub.ops = lost
++            with pytest.raises(OSError):
++                client.push(conn, hub, "default", "here", primary=True)
++            first = _status_ops(calls)
++            assert len(first) == 1 and "owner_reassessment_v1" in first[0]["fields"]
++            with pytest.raises(OSError):
++                client.push(conn, hub, "default", "here", primary=True)
++            again = _status_ops(calls)
++            # the frozen identical envelope may be replayed, but never a downgraded or re-identified one
++            assert all(op == first[0] for op in again)
++            assert conn.execute("SELECT count(*) FROM kanban_sync_outbox WHERE table_name='tasks' "
++                                "AND wire_json IS NOT NULL AND fields LIKE '%owner_reassessment_v1%'").fetchone()[0] == 1
++            assert len({op["client_op_id"] for op in again}) == 1
++            return True
++    assert lifecycle._turn(worker, monkeypatch, body)
+-- 
+2.43.0
+

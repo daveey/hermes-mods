@@ -1,0 +1,397 @@
+From 8a037dce1e6a58ce4339de6c4f3b4b3b4e2ca49f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:46:41 +0000
+Subject: [PATCH 5980] Kanban scratch archive: foreign ownership, retention and promisor clones
+
+Public mirror of source commit 8a037dce1e6a58ce4339de6c4f3b4b3b4e2ca49f.
+
+---
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index 85d09598db3..feb005512bc 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -398,6 +398,9 @@
+             removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
+         with kbc.connect_closing() as conn:
+             removed_ws += gc_task_scratch(conn, older_than_days=wt_days, budget=budget)
++        # After the scratch pass: archives it just made are young, so only older ones can go.
++        from hermes_cli.kanban_scratch_archive_retention import prune_scratch_archives
++        removed_archives = prune_scratch_archives()
+ 
+     removed_events = 0
+     if event_days:
+@@ -405,7 +408,8 @@
+             removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
+     removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600) if log_days else 0
+     print(f"GC complete: {removed_ws} workspace(s), "
+-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
++          f"{removed_events} event row(s), {removed_logs} log file(s), "
++          f"{removed_archives} scratch archive(s) removed")
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_scratch_archive_retention.py b/hermes_cli/kanban_scratch_archive_retention.py
+new file mode 100644
+index 00000000000..3ac4918056a
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_archive_retention.py
+@@ -0,0 +1,157 @@
++"""Retention for scratch archives under ``<kanban home>/archive/scratch/<board>/<task>``. [daveey]
++
++``gc_task_scratch`` archives every aged scratch tree before removing it, on the same disk, and nothing
++used to remove the archives: retained archives can fill a busy
++worker's disk until the dispatcher's disk floor stops new claims.
++
++Two rules, run by ``hermes kanban gc`` after the scratch pass:
++
++* **Age**: an archive older than ``kanban.scratch_archive_retention_days`` (default 7; 0 keeps them) is
++  removed.
++* **Pressure**: when ``kanban.admission.disk_free_floor_bytes`` is set and the archive filesystem has
++  less than twice that free, the oldest archives are removed until it has three times that free or none
++  is left that is at least ``kanban.scratch_archive_pressure_min_age_hours`` old (default 24; the most
++  recent finished work stays recoverable). Hosts without a floor only get the age rule.
++
++An archive's age is its directory's mtime (publication, or the last detach intent written into it).
++Never touched: anything that is not a real directory two levels down (symlinks are not followed),
++in-flight ``.partial-<pid>`` builds, and an archive that still holds a ``detach-*.json`` recovery
++intent (an interrupted detach; ``remove_archived`` leaves those for manual recovery).
++"""
++from __future__ import annotations
++
++import logging
++import math
++import os
++import shutil
++import stat
++import time
++from pathlib import Path
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++DEFAULT_RETENTION_DAYS = 7
++DEFAULT_PRESSURE_MIN_AGE_HOURS = 24
++# Pressure starts below PRESSURE_START x floor and stops at PRESSURE_TARGET x floor free.
++PRESSURE_START = 2
++PRESSURE_TARGET = 3
++
++
++def archive_root() -> Path:
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "archive" / "scratch"
++
++
++def _number(value, name: str, default: float) -> float:
++    if value is None:
++        return default
++    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
++        raise ValueError(f"invalid kanban.{name}: {value!r}")
++    return float(value)
++
++
++def settings() -> tuple[float, float, Optional[int]]:
++    """``(retention_days, pressure_min_age_hours, floor_bytes)``; raises ValueError on a bad value."""
++    from hermes_cli.config import load_config
++    kanban = load_config().get("kanban") or {}
++    days = _number(kanban.get("scratch_archive_retention_days"), "scratch_archive_retention_days",
++                   DEFAULT_RETENTION_DAYS)
++    min_age = _number(kanban.get("scratch_archive_pressure_min_age_hours"),
++                      "scratch_archive_pressure_min_age_hours", DEFAULT_PRESSURE_MIN_AGE_HOURS)
++    floor = (kanban.get("admission") or {}).get("disk_free_floor_bytes")
++    if floor is not None and (type(floor) is not int or floor <= 0):
++        raise ValueError(f"invalid kanban.admission.disk_free_floor_bytes: {floor!r}")
++    return days, min_age, floor
++
++
++def _free_bytes(path: Path) -> int:
++    st = os.statvfs(path)
++    return st.f_bavail * st.f_frsize
++
++
++def _holds_intent(entry: Path) -> bool:
++    with os.scandir(entry) as it:
++        return any(e.name.startswith("detach-") and e.name.endswith(".json") for e in it)
++
++
++def candidates(root: Path) -> list[tuple[float, Path]]:
++    """Removable archives as ``(mtime, path)``, oldest first."""
++    found: list[tuple[float, Path]] = []
++    try:
++        boards = list(os.scandir(root))
++    except FileNotFoundError:
++        return found
++    for board in boards:
++        try:
++            if not board.is_dir(follow_symlinks=False):
++                continue
++            entries = list(os.scandir(board.path))
++        except OSError as exc:
++            log.warning("Scratch archive retention: skipping board dir %s (%s)", board.path, exc)
++            continue
++        for entry in entries:
++            if ".partial-" in entry.name:
++                continue
++            try:
++                st = entry.stat(follow_symlinks=False)
++            except OSError:
++                continue  # removed meanwhile
++            if not stat.S_ISDIR(st.st_mode):
++                continue
++            path = Path(entry.path)
++            try:
++                if _holds_intent(path):
++                    log.warning("Scratch archive retention: keeping %s (holds a detach recovery intent)", path)
++                    continue
++            except OSError as exc:
++                log.warning("Scratch archive retention: keeping %s (unreadable: %s)", path, exc)
++                continue
++            found.append((st.st_mtime, path))
++    found.sort(key=lambda item: (item[0], str(item[1])))
++    return found
++
++
++def _remove(path: Path, why: str, age_s: float) -> bool:
++    try:
++        shutil.rmtree(path)
++    except OSError as exc:
++        log.warning("Scratch archive retention: could not remove %s (%s): %s", path, why, exc)
++        return False
++    log.info("Scratch archive retention: removed %s (%s, age %.1f h)", path, why, age_s / 3600)
++    return True
++
++
++def prune_scratch_archives(*, root: Optional[Path] = None, now: Optional[float] = None) -> int:
++    """Apply the age and pressure rules; return how many archives were removed."""
++    try:
++        days, min_age_hours, floor = settings()
++    except Exception:  # health: allow BLE001 -- unreadable policy must remove nothing, not abort the gc pass
++        log.warning("Cannot read scratch archive retention; keeping every archive", exc_info=True)
++        return 0
++    root = archive_root() if root is None else root
++    now = time.time() if now is None else now
++    removed = 0
++    survivors: list[tuple[float, Path]] = []
++    for mtime, path in candidates(root):
++        age = now - mtime
++        if days and age > days * 86400:
++            removed += _remove(path, f"older than {days:g} days", age)
++        else:
++            survivors.append((mtime, path))
++    if floor is None or not root.is_dir():
++        return removed
++    free = _free_bytes(root)
++    if free >= PRESSURE_START * floor:
++        return removed
++    for mtime, path in survivors:
++        age = now - mtime
++        if free >= PRESSURE_TARGET * floor or age < min_age_hours * 3600:
++            break
++        if _remove(path, f"disk pressure: {free} bytes free, floor {floor}", age):
++            removed += 1
++        free = _free_bytes(root)
++    if free < PRESSURE_START * floor:
++        log.warning("Scratch archive retention: still %d bytes free (under %d) after pruning; no older archive "
++                    "than %g h could be removed", free, PRESSURE_START * floor, min_age_hours)
++    return removed
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_retention.py b/tests/hermes_cli/test_kanban_scratch_archive_retention.py
+new file mode 100644
+index 00000000000..3179dddf1e9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_archive_retention.py
+@@ -0,0 +1,193 @@
++"""Scratch archives are removed past their retention, and oldest-first under disk pressure. [daveey]
++
++Representative observation: `kanban gc` archived aged scratch trees into
++``archive/scratch/<board>/<task>`` on the same disk, but nothing removed
++those archives, eventually reaching the dispatcher's free-space floor.
++"""
++import logging
++import os
++import time
++
++import pytest
++
++from hermes_cli import config as hconfig
++from hermes_cli import kanban_scratch_archive_retention as ret
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++from tests.hermes_cli.test_kanban_scratch_gc_archive import _archive, _gc, _task
++
++board = helpers.board
++remote = helpers.remote
++
++NOW = 2_000_000_000.0
++DAY = 86400
++GIB = 1 << 30
++
++
++@pytest.fixture
++def root(tmp_path):
++    # Not tmp_path itself: the test Hermes home lives there too.
++    out = tmp_path / "archive-scratch"
++    out.mkdir()
++    return out
++
++
++def _cfg(monkeypatch, **kanban):
++    monkeypatch.setattr(hconfig, "load_config", lambda: {"kanban": kanban})
++
++
++def _make(root, name, age_s, board_slug="default", now=NOW):
++    path = root / board_slug / name
++    (path / "repo").mkdir(parents=True)
++    (path / "repo" / "meta.json").write_text("{}")
++    os.utime(path, (now - age_s, now - age_s))
++    return path
++
++
++def test_age_rule_removes_only_archives_past_retention(root, monkeypatch):
++    _cfg(monkeypatch)  # defaults: 7 days, no floor
++    old = _make(root, "t_old", 8 * DAY)
++    other_board = _make(root, "t_old2", 30 * DAY, board_slug="ops")
++    young = _make(root, "t_young", 6 * DAY)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 2
++    assert not old.exists() and not other_board.exists()
++    assert young.is_dir()
++
++
++def test_configured_days_and_zero(root, monkeypatch):
++    a = _make(root, "t_a", 3 * DAY)
++    _cfg(monkeypatch, scratch_archive_retention_days=0)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 0
++    assert a.is_dir()
++    _cfg(monkeypatch, scratch_archive_retention_days=2)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 1
++    assert not a.exists()
++
++
++@pytest.mark.parametrize("bad", [{"scratch_archive_retention_days": -1},
++                                 {"scratch_archive_retention_days": "7"},
++                                 {"scratch_archive_retention_days": True},
++                                 {"scratch_archive_pressure_min_age_hours": float("nan")},
++                                 {"admission": {"disk_free_floor_bytes": 0}},
++                                 {"admission": {"disk_free_floor_bytes": 1.5}}])
++def test_invalid_policy_removes_nothing(root, monkeypatch, caplog, bad):
++    a = _make(root, "t_a", 100 * DAY)
++    _cfg(monkeypatch, **bad)
++    monkeypatch.setattr(ret, "_free_bytes", lambda _p: 0)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 0
++    assert a.is_dir()
++    assert "keeping every archive" in caplog.text
++
++
++def test_partial_symlink_file_and_detach_intent_are_never_removed(root, monkeypatch, caplog):
++    _cfg(monkeypatch, scratch_archive_retention_days=1)
++    partial = _make(root, "t_p.partial-123", 30 * DAY)
++    intent = _make(root, "t_i", 30 * DAY)
++    (intent / "detach-abc.json").write_text("{}")
++    os.utime(intent, (NOW - 30 * DAY,) * 2)
++    target = root.parent / "outside"
++    target.mkdir()
++    (target / "keep.txt").write_text("x")
++    link = root / "default" / "t_link"
++    link.symlink_to(target)
++    stray = root / "default" / "t_file"
++    stray.write_text("x")
++    board_link = root / "linked-board"
++    board_link.symlink_to(target)
++    caplog.set_level(logging.WARNING)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 0
++    assert partial.is_dir() and intent.is_dir() and stray.is_file()
++    assert link.is_symlink() and (target / "keep.txt").is_file()
++    assert "holds a detach recovery intent" in caplog.text
++
++
++def test_missing_root_is_a_no_op(root, monkeypatch):
++    _cfg(monkeypatch, admission={"disk_free_floor_bytes": GIB})
++    monkeypatch.setattr(ret, "_free_bytes", lambda _p: 0)
++    assert ret.prune_scratch_archives(root=root / "absent", now=NOW) == 0
++
++
++class _Disk:
++    """Free space that grows by each removed archive's size (GiB per archive)."""
++
++    def __init__(self, free_gib, sizes):
++        self.free = free_gib * GIB
++        self.sizes = sizes
++
++    def install(self, monkeypatch):
++        real = ret._remove
++
++        def remove(path, why, age):
++            ok = real(path, why, age)
++            if ok:
++                self.free += self.sizes[path.name] * GIB
++            return ok
++        monkeypatch.setattr(ret, "_remove", remove)
++        monkeypatch.setattr(ret, "_free_bytes", lambda _p: self.free)
++
++
++def test_pressure_removes_oldest_first_until_three_floors_free(root, monkeypatch):
++    _cfg(monkeypatch, admission={"disk_free_floor_bytes": 10 * GIB})
++    ages = {"t_1": 6 * DAY, "t_2": 5 * DAY, "t_3": 4 * DAY, "t_4": 3 * DAY, "t_5": 2 * DAY}
++    paths = {n: _make(root, n, a) for n, a in ages.items()}
++    disk = _Disk(15, dict.fromkeys(ages, 6))
++    disk.install(monkeypatch)
++    # 15 -> 21 -> 27 -> 33 GiB: stops once 30 GiB (3 x floor) is free.
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 3
++    assert [n for n, p in paths.items() if p.exists()] == ["t_4", "t_5"]
++
++
++def test_no_pressure_above_two_floors(root, monkeypatch):
++    _cfg(monkeypatch, admission={"disk_free_floor_bytes": 10 * GIB})
++    a = _make(root, "t_a", 6 * DAY)
++    _Disk(20, {"t_a": 6}).install(monkeypatch)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 0
++    assert a.is_dir()
++
++
++def test_pressure_keeps_archives_younger_than_min_age(root, monkeypatch, caplog):
++    _cfg(monkeypatch, admission={"disk_free_floor_bytes": 10 * GIB}, scratch_archive_pressure_min_age_hours=24)
++    old = _make(root, "t_old", 2 * DAY)
++    fresh = _make(root, "t_fresh", 23 * 3600)
++    _Disk(1, {"t_old": 1, "t_fresh": 50}).install(monkeypatch)
++    caplog.set_level(logging.WARNING)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 1
++    assert not old.exists() and fresh.is_dir()
++    assert "after pruning" in caplog.text
++
++
++def test_no_floor_means_no_pressure_rule(root, monkeypatch):
++    _cfg(monkeypatch)
++    a = _make(root, "t_a", 6 * DAY)
++    monkeypatch.setattr(ret, "_free_bytes", lambda _p: 0)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 0
++    assert a.is_dir()
++
++
++def test_failed_removal_is_logged_and_the_pass_continues(root, monkeypatch, caplog):
++    _cfg(monkeypatch)
++    a = _make(root, "t_a", 9 * DAY, now=NOW)
++    b = _make(root, "t_b", 8 * DAY, now=NOW)
++    real = ret.shutil.rmtree
++
++    def rmtree(path, *args, **kwargs):
++        if os.path.basename(path) == "t_a":
++            raise PermissionError(13, "denied")
++        return real(path, *args, **kwargs)
++    monkeypatch.setattr(ret.shutil, "rmtree", rmtree)
++    caplog.set_level(logging.WARNING)
++    assert ret.prune_scratch_archives(root=root, now=NOW) == 1
++    assert a.is_dir() and not b.exists()
++    assert "could not remove" in caplog.text
++
++
++def test_kanban_gc_prunes_an_expired_archive_it_made_earlier(board, remote, capsys, monkeypatch):
++    tid, path = _task(remote=remote)
++    assert _gc() == 0
++    archive = _archive(tid)
++    assert archive.is_dir() and not path.exists()
++    assert capsys.readouterr().out.splitlines()[-1].endswith(", 0 scratch archive(s) removed")
++    old = time.time() - 8 * DAY
++    os.utime(archive, (old, old))
++    assert _gc() == 0
++    assert not archive.exists()
++    assert capsys.readouterr().out.splitlines()[-1].endswith(", 1 scratch archive(s) removed")
+-- 
+2.43.0
+

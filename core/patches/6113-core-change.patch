@@ -1,0 +1,360 @@
+From 447f1bb712d4ef114e29a2db57ec6a2e430d918a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:58:29 -0800
+Subject: [PATCH 6113] TUI RPC method lanes, projects tree caching and GC budget
+
+Public mirror of source commit 447f1bb712d4ef114e29a2db57ec6a2e430d918a.
+
+---
+diff --git a/tests/tui_gateway/test_rpc_method_lanes.py b/tests/tui_gateway/test_rpc_method_lanes.py
+new file mode 100644
+index 00000000000..47f8c686eb4
+--- /dev/null
++++ b/tests/tui_gateway/test_rpc_method_lanes.py
+@@ -0,0 +1,181 @@
++"""One slow, re-requested method cannot take every RPC pool worker: requests
++stuck inside ``projects.tree`` must not starve ``session.resume`` for unrelated chats."""
++
++from concurrent.futures import ThreadPoolExecutor
++import queue
++import threading
++import time
++
++import pytest
++
++from tui_gateway.rpc_method_lanes import MethodLanes
++
++
++def _wait_until(predicate, timeout=10.0):
++    deadline = time.monotonic() + timeout
++    while not predicate():
++        assert time.monotonic() < deadline, "condition not reached in time"
++        time.sleep(0.005)
++
++
++def test_method_over_its_cap_waits_without_holding_a_worker_and_keeps_order():
++    lanes = MethodLanes(2)
++    release = threading.Event()
++    started, finished, other = [], [], threading.Event()
++    lock = threading.Lock()
++
++    def slow(n):
++        def fn():
++            with lock:
++                started.append(n)
++            assert release.wait(10)
++        return fn
++
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        try:
++            for n in range(6):
++                lanes.run(pool.submit, "slow", slow(n), lambda n=n: finished.append(n))
++            _wait_until(lambda: len(started) == 2)
++            assert lanes.snapshot() == {"slow": {"running": 2, "waiting": 4}}
++            # Two workers stay free: another method runs at once although six slow calls were accepted first.
++            lanes.run(pool.submit, "other", other.set, lambda: finished.append("other"))
++            assert other.wait(10)
++            assert sorted(started) == [0, 1]
++            release.set()
++            _wait_until(lambda: len(finished) == 7)  # before the pool shuts down: waiting calls need it
++        finally:
++            release.set()
++    assert sorted(started[:2]) == [0, 1] and sorted(started) == [0, 1, 2, 3, 4, 5]
++    assert sorted(finished, key=str) == [0, 1, 2, 3, 4, 5, "other"]
++    assert lanes.snapshot() == {}
++
++
++def test_no_cap_starts_every_call_at_once():
++    lanes = MethodLanes(0)
++    assert lanes.cap is None
++    release, started = threading.Event(), []
++    with ThreadPoolExecutor(max_workers=3) as pool:
++        try:
++            for n in range(3):
++                lanes.run(pool.submit, "slow", lambda n=n: (started.append(n), release.wait(10)), lambda: None)
++            _wait_until(lambda: len(started) == 3)
++        finally:
++            release.set()
++    assert lanes.snapshot() == {}
++
++
++def test_first_handoff_failure_propagates_without_the_done_hook_and_frees_the_slot():
++    lanes = MethodLanes(1)
++    done = []
++
++    def refuse(fn):
++        raise RuntimeError("cannot schedule new futures after shutdown")
++
++    with pytest.raises(RuntimeError):
++        lanes.run(refuse, "slow", lambda: None, lambda: done.append("first"))
++    assert done == [] and lanes.snapshot() == {}
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        lanes.run(pool.submit, "slow", lambda: None, lambda: done.append("second"))
++    assert done == ["second"] and lanes.snapshot() == {}
++
++
++def test_waiting_call_that_can_no_longer_start_still_gets_its_done_hook():
++    """A pool shut down while calls wait: each waiting caller's cleanup runs, none is stranded."""
++    lanes = MethodLanes(1)
++    release, entered, done = threading.Event(), threading.Event(), []
++    live = [True]
++    pool = ThreadPoolExecutor(max_workers=1)
++
++    def submit(fn):
++        if not live[0]:
++            raise RuntimeError("cannot schedule new futures after shutdown")
++        return pool.submit(fn)
++
++    try:
++        lanes.run(submit, "slow", lambda: (entered.set(), release.wait(10)), lambda: done.append(0))
++        assert entered.wait(10)
++        lanes.run(submit, "slow", lambda: done.append("ran"), lambda: done.append(1))
++        lanes.run(submit, "slow", lambda: done.append("ran"), lambda: done.append(2))
++        live[0] = False
++    finally:
++        release.set()
++        pool.shutdown(wait=True)
++    assert done == [0, 1, 2]
++    assert lanes.snapshot() == {}
++
++
++def test_cancelled_queued_future_releases_its_slot_to_the_next_waiting_call():
++    lanes = MethodLanes(1)
++    release, done, ran = threading.Event(), [], threading.Event()
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        futures = []
++
++        def submit(fn):
++            futures.append(pool.submit(fn))
++            return futures[-1]
++
++        blocker = pool.submit(release.wait, 10)  # the only worker is busy: the next submit stays queued
++        try:
++            lanes.run(submit, "slow", lambda: done.append("ran-0"), lambda: done.append(0))
++            lanes.run(submit, "slow", ran.set, lambda: done.append(1))
++            assert futures[0].cancel()
++            assert done[0] == 0  # cancelled before it started: cleanup ran, the waiting call was handed over
++            assert len(futures) == 2
++        finally:
++            release.set()
++        blocker.result(10)
++        assert ran.wait(10)
++    assert done == [0, 1] and lanes.snapshot() == {}
++
++
++class Transport:
++    def __init__(self):
++        self.frames = queue.Queue()
++
++    def write(self, frame):
++        self.frames.put(frame)
++        return True
++
++
++def test_dispatch_keeps_workers_free_for_other_methods(monkeypatch):
++    """Entry path: ``server.dispatch``. Eight accepted calls of a slow method use half of a 4-worker
++    pool; a later ``session.resume``-like call is answered while all of them are still unanswered."""
++    from hermes_cli import backend_retirement
++    from tui_gateway import server
++
++    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
++    release, entered = threading.Event(), threading.Semaphore(0)
++    transport = Transport()
++
++    def slow(rid, params):
++        entered.release()
++        assert release.wait(10)
++        return server._ok(rid, {"slow": True})
++
++    monkeypatch.setitem(server._methods, "test.slow", slow)
++    monkeypatch.setitem(server._methods, "test.resume", lambda rid, params: server._ok(rid, {"resumed": True}))
++    monkeypatch.setattr(server, "_LONG_HANDLERS", {"test.slow", "test.resume"})
++    monkeypatch.setattr(server, "_method_lanes", MethodLanes(2))
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        monkeypatch.setattr(server, "_pool", pool)
++        try:
++            for n in range(8):
++                assert server.dispatch({"id": f"slow-{n}", "method": "test.slow"}, transport) is None
++            assert entered.acquire(timeout=10) and entered.acquire(timeout=10)
++            assert server.dispatch({"id": "resume", "method": "test.resume"}, transport) is None
++            first = transport.frames.get(timeout=10)
++            assert first["id"] == "resume" and first["result"] == {"resumed": True}
++            assert server._method_lanes.snapshot() == {"test.slow": {"running": 2, "waiting": 6}}
++        finally:
++            release.set()
++        answered = sorted(transport.frames.get(timeout=10)["id"] for _ in range(8))
++    assert answered == sorted(f"slow-{n}" for n in range(8))
++    assert server._method_lanes.snapshot() == {}
++    assert backend_retirement.retirement.prepare().get("token")  # every accepted call released its admission
++
++
++def test_default_cap_is_half_the_pool_and_always_leaves_a_worker():
++    from tui_gateway import server
++
++    assert server._method_lanes.cap == min(server._rpc_pool_workers // 2, server._rpc_pool_workers - 1)
++    assert 1 <= server._method_lanes.cap < server._rpc_pool_workers
+diff --git a/tui_gateway/rpc_dispatch.py b/tui_gateway/rpc_dispatch.py
+index fb4c69f12c9..db880476156 100644
+--- a/tui_gateway/rpc_dispatch.py
++++ b/tui_gateway/rpc_dispatch.py
+@@ -119,13 +119,16 @@
+                     if scope_token is not None:
+                         ACTIVE_SCOPE.reset(scope_token)
+                     end_work(work)
+-            future = _pool.submit(lambda: ctx.run(run))
++            # [daveey] Through the per-method cap: a method already on its share of the workers waits in
++            # its own FIFO, so one slow, re-requested method cannot hold every worker. The done hook also
++            # releases cancelled queued futures and calls that could never start; the worker's own finally
++            # would never execute for those.
++            _method_lanes.run(_pool.submit, normalized[1], lambda: ctx.run(run),
++                              lambda: (end_work(work), retirement.release()))
+         except BaseException:
+             end_work(work)
+             retirement.release()
+             raise
+-        # Also releases cancelled queued futures; the worker's own finally would never execute.
+-        future.add_done_callback(lambda _: (end_work(work), retirement.release()))
+         return None
+     finally:
+         reset_transport(token)
+diff --git a/tui_gateway/rpc_method_lanes.py b/tui_gateway/rpc_method_lanes.py
+new file mode 100644
+index 00000000000..7645458e8bd
+--- /dev/null
++++ b/tui_gateway/rpc_method_lanes.py
+@@ -0,0 +1,109 @@
++"""[daveey] Per-method concurrency cap for the JSON-RPC worker pool.
++
++The pool is small and shared by every long handler. Without a cap, one slow method that clients keep
++re-requesting fills every worker, and unrelated requests wait behind it. Representative observation: slow ``projects.tree``
++calls occupied the pool while ``session.resume`` timed out for unrelated chats. A method over
++its cap waits in its own FIFO, holding no worker, and is started
++when one of its own calls finishes. Order within a method is kept; nothing is dropped.
++"""
++
++from __future__ import annotations
++
++import collections
++import logging
++import threading
++import time
++from typing import Callable
++
++logger = logging.getLogger(__name__)
++
++#: Seconds between "at its cap" warnings for one method.
++_WARN_INTERVAL_S = 60.0
++
++
++class MethodLanes:
++    """Start at most *cap* calls of one method on the pool at a time (``cap`` None: no limit)."""
++
++    def __init__(self, cap: int | None) -> None:
++        self._cap = cap if cap is not None and cap > 0 else None
++        self._lock = threading.Lock()
++        self._running: dict[str, int] = {}
++        self._waiting: dict[str, collections.deque] = {}
++        self._warned_at: dict[str, float] = {}
++
++    @property
++    def cap(self) -> int | None:
++        return self._cap
++
++    def snapshot(self) -> dict[str, dict[str, int]]:
++        """``{method: {"running": n, "waiting": m}}`` for methods with a call in flight or queued."""
++        with self._lock:
++            return {m: {"running": n, "waiting": len(self._waiting.get(m) or ())}
++                    for m, n in self._running.items()}
++
++    def run(self, submit: Callable, method: str, fn: Callable[[], object], on_done: Callable[[], object]) -> None:
++        """Run ``fn`` through ``submit`` (the pool's), now or once *method* is back under its cap.
++
++        ``on_done`` is called exactly once after ``fn`` finished, was cancelled before it started, or
++        could not be handed to the pool later. If the FIRST hand-off raises, that error propagates and
++        ``on_done`` is NOT called: the caller still owns its cleanup, as with a bare ``submit``."""
++        with self._lock:
++            running = self._running.get(method, 0)
++            if self._cap is not None and running >= self._cap:
++                queue = self._waiting.setdefault(method, collections.deque())
++                queue.append((submit, fn, on_done))
++                depth, warn = len(queue), self._should_warn(method)
++            else:
++                self._running[method] = running + 1
++                depth, warn = 0, False
++        if depth:
++            if warn:
++                logger.warning("rpc pool: %s is at its cap of %d running calls; %d waiting behind it",
++                               method, self._cap, depth)
++            return
++        try:
++            future = submit(fn)
++        except BaseException:
++            self._finished(method)
++            raise
++        future.add_done_callback(lambda _: self._done(method, on_done))
++
++    def _should_warn(self, method: str) -> bool:  # under the lock
++        now = time.monotonic()
++        if now - self._warned_at.get(method, float("-inf")) < _WARN_INTERVAL_S:
++            return False
++        self._warned_at[method] = now
++        return True
++
++    def _done(self, method: str, on_done: Callable[[], object]) -> None:
++        try:
++            on_done()
++        finally:
++            self._finished(method)
++
++    def _finished(self, method: str) -> None:
++        """One call of *method* left the pool: hand its slot to the next waiting call, else free it."""
++        while True:
++            with self._lock:
++                queue = self._waiting.get(method)
++                if not queue:
++                    self._waiting.pop(method, None)
++                    left = self._running.get(method, 0) - 1
++                    if left > 0:
++                        self._running[method] = left
++                    else:
++                        self._running.pop(method, None)
++                        self._warned_at.pop(method, None)
++                    return
++                submit, fn, on_done = queue.popleft()
++            try:
++                future = submit(fn)
++            except Exception:  # the pool is shut down: the call never runs, its caller's cleanup still does
++                logger.warning("rpc pool: could not start a waiting %s call", method, exc_info=True)
++                try:
++                    on_done()
++                except Exception:
++                    logger.warning("rpc pool: cleanup failed for an unstarted %s call", method, exc_info=True)
++                continue
++            future.add_done_callback(lambda _, done=on_done: self._done(method, done))
++            return
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index f27758ea922..996a8c5bb4e 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -48,6 +48,7 @@
+ from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpoint_hash,
+                                      resolve_checkpoints_enabled as _resolve_checkpoints_enabled)
+ from tui_gateway._env import env_float, env_int
++from tui_gateway.rpc_method_lanes import MethodLanes
+ from tui_gateway.turn_marker import clear_turn_marker, marker_writer_state, read_turn_marker, record_turn_start
+ from tui_gateway.exit_job_receipts import journal_background_jobs_before_exit as _journal_background_jobs_before_exit
+ from tui_gateway.contracts import registry as _contracts
+@@ -213,6 +214,10 @@
+ _rpc_pool_workers = max(2, env_int("HERMES_TUI_RPC_POOL_WORKERS", 8))
+ _pool = concurrent.futures.ThreadPoolExecutor(max_workers=_rpc_pool_workers, thread_name_prefix="tui-rpc")
+ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
++# [daveey] No single method runs on more than half the pool (always leaving a worker for the others); the
++# rest of its calls wait in the method's own FIFO. ``HERMES_TUI_RPC_METHOD_CAP=0`` turns the cap off.
++_rpc_method_cap = min(env_int("HERMES_TUI_RPC_METHOD_CAP", _rpc_pool_workers // 2), _rpc_pool_workers - 1)
++_method_lanes = MethodLanes(_rpc_method_cap)
+ 
+ # Exact in-memory session record executing on the current turn thread — unlike a public session id,
+ # this object identity cannot be supplied by RPC.
+-- 
+2.43.0
+

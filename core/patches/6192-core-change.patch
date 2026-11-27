@@ -1,0 +1,125 @@
+From c75702323d4cf656e2346be19b77fa9a17a8db42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:14:08 +0000
+Subject: [PATCH 6192] Semantic annotation parts and fail-fresh caching
+
+Public mirror of source commit c75702323d4cf656e2346be19b77fa9a17a8db42.
+
+---
+diff --git a/hermes_cli/kanban_activity_revision.py b/hermes_cli/kanban_activity_revision.py
+index 038f0f457af..355aec07134 100644
+--- a/hermes_cli/kanban_activity_revision.py
++++ b/hermes_cli/kanban_activity_revision.py
+@@ -388,22 +388,37 @@
+ 
+ 
+ def projection_content_key(path: Path, tables: Iterable[str], open_ro: Callable) -> tuple | None:
+-    """The links/annotation key, or None when this file has no projection counter (caller uses ``content_key``)."""
++    """Links/annotation key from one open, or None only when the probe lock was not acquired.
++
++    None is the only case the caller retries via ``content_key``. A file with no projection
++    counter is answered as the notify key on this same connection. A busy or unreadable file
++    returns an unequal stat key. Opening again would spend a second busy budget on a board
++    that is already locked.
++    """
+     lock = probe_lock(path)
+     if not lock.acquire(timeout=0.05):
+         return None
+     try:
+-        db = file_stat(path)[0]
++        tables = tuple(tables)
++        stat = file_stat(path)
++        db = stat[0]
+         if db is None:
+             return None
+         try:
+             with open_ro(path) as conn:
+                 row = read_projection_key(conn, tables)
++                if row is not None:
++                    return ("projection", db[0], db[1], *row)
++                # Same open as ``_content_key``: an older file must not hide a write, and must
++                # not be opened again to find that out.
++                version = conn.execute("PRAGMA data_version").fetchone()[0]
++                revision = _covered_read(conn, path, db, tables)
++                fallback = ("stat", stat, conn, version)
+         except sqlite3.Error:
+-            return None
+-        if row is None:
+-            return None
+-        return ("projection", db[0], db[1], *row)
++            return ("stat", stat, object())  # unknown, never proof of unchanged content
++        if revision is None:
++            return fallback
++        return ("revision", db[0], db[1], *revision)
+     finally:
+         lock.release()
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index b2e06f1fba6..35e7e4a8019 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -819,8 +819,8 @@
+ 
+ 
+ def _projection_content_key(path: Path, tables: tuple[str, ...] = _revision.LOCAL_TABLES) -> tuple:
+-    """Links/annotation key: ignores task_events inserts those caches do not read. Falls back to the notify
+-    counter when the file has no projection column, so an older board never hides a write."""
++    """Links/annotation key: ignores task_events inserts those caches do not read. An older or busy file is
++    answered by that one open; the fallback here is only a probe-lock miss, which did not open the file."""
+     key = _revision.projection_content_key(path, tables, lambda p: cached_ro(p, busy_budget=0))
+     if key is not None:
+         return key
+diff --git a/tests/hermes_cli/test_kanban_content_key_busy_budget.py b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+index c7877885a58..74bd5b9975c 100644
+--- a/tests/hermes_cli/test_kanban_content_key_busy_budget.py
++++ b/tests/hermes_cli/test_kanban_content_key_busy_budget.py
+@@ -50,12 +50,45 @@
+     blocker.execute("BEGIN EXCLUSIVE")
+     with pytest.raises(sqlite3.OperationalError, match="locked"):
+         activity._all_counts(include_snapshot=True)
+-    # Fingerprint key, board-memo key, then the real read: only the read may wait.
++    # Failed projection probe, board-memo key, then the real read. The probe answers a
++    # locked board itself: falling back to another open used to make this 4 ([0, 0, 0, 0.5]).
+     assert len(budgets) == 3
+     assert [b for b in budgets if b > 0] == [0.5]
+     assert budgets[-1] == 0.5
+ 
+ 
++def test_busy_projection_probe_is_unknown_and_does_not_reopen(busy_board, monkeypatch):
++    """A locked board is unknown from the projection open. A second open hides nothing and
++    spends another busy budget (the CI failure on PR #4272, shard 8)."""
++    board, blocker = busy_board
++    budgets = _spy_budgets(monkeypatch)
++    blocker.execute("BEGIN EXCLUSIVE")
++    first = activity._projection_content_key(board)
++    second = activity._projection_content_key(board)
++    assert first != second
++    assert first[0] == second[0] == "stat"
++    assert budgets == [0, 0]
++
++
++def test_uncovered_file_reuses_the_projection_open(tmp_path, monkeypatch):
++    """A readable file with no projection column is the notify key, from that one open."""
++    activity._reset_cache_for_tests()
++    board = tmp_path / "old.db"
++    conn = sqlite3.connect(board)
++    conn.execute("CREATE TABLE marker(value)")
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(activity, "_board_db_paths", lambda: [board])
++    monkeypatch.setattr(activity, "_replica_paths", list)
++    budgets = _spy_budgets(monkeypatch)
++    projected = activity._projection_content_key(board)
++    assert budgets == [0]
++    assert projected == activity._board_content_key(board)
++    assert projected[0] != "projection"
++    assert budgets == [0, 0]
++    activity._reset_cache_for_tests()
++
++
+ def test_content_key_on_busy_board_falls_back_without_waiting(busy_board, monkeypatch):
+     board, blocker = busy_board
+     stat_key = ("stat", activity._revision.file_stat(board))
+-- 
+2.43.0
+

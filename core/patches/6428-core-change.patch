@@ -1,0 +1,199 @@
+From d21bbf09bf6a14008bb595ac13c1e9993f745d0b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:25:30 +0000
+Subject: [PATCH 6428] Spend review, decided-triage repair and spend-stop watch
+
+Public mirror of source commit d21bbf09bf6a14008bb595ac13c1e9993f745d0b.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 9c5b6ed1320..33d8452b2f7 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -127,10 +127,11 @@
+ def holds(conn: sqlite3.Connection, task_id: str, episode: str) -> bool:
+     """While a review is queued or running the stop needs no other decision route. With the reviewer off, a
+     queued or running review holds nothing: the stop routes as usual."""
+-    from hermes_cli.kanban_spend_caused_review import effective_cause
++    from hermes_cli.kanban_spend_caused_review import CAUSES, effective_cause
+     from hermes_cli.kanban_spend_decision import pending_episode
+     stop = pending_episode(conn, task_id)
+-    if stop and effective_cause(conn, task_id, stop) == "safety_refusal":
++    cause = effective_cause(conn, task_id, stop) if stop else None
++    if cause and cause not in CAUSES:
+         return False
+     return state(conn, task_id, episode) in (QUEUED, STARTED) and settings()[0]
+ 
+@@ -263,9 +264,9 @@
+         from hermes_cli.kanban_spend_decision import pending_episode
+         stop = pending_episode(conn, task_id)
+         cause = caused.effective_cause(conn, task_id, stop) if stop else None
+-        if cause and not journal.get(conn, task_id, episode):
++        if cause in caused.CAUSES and not journal.get(conn, task_id, episode):
+             noticed = _notice_at(conn, task_id, episode)
+-            if cause not in caused.CAUSES or noticed is None or noticed > now - review_after_seconds():
++            if noticed is None or noticed > now - review_after_seconds():
+                 continue  # an annotation cannot inherit an ordinary stop's immediate start
+         events = _review_events(conn, task_id, episode)
+         if not events or events[-1]["kind"] not in (QUEUED, STARTED):
+@@ -291,12 +292,21 @@
+     _THREADS[:] = [t for t in _THREADS if t.is_alive()]  # a long-lived dispatcher keeps only running reviews
+     db, started = _db_path(conn), []
+     for task_id, episode, attempts in _due(conn, now, skip):
++        from hermes_cli.kanban_spend_caused_review import CAUSES, effective_cause
++        from hermes_cli.kanban_spend_decision import pending_episode
++        stop = pending_episode(conn, task_id)
++        cause = effective_cause(conn, task_id, stop) if stop else None
++        if cause and cause not in CAUSES and not journal.get(conn, task_id, episode):
++            # Exclusions retire custody, never retry work. Frozen Board requests
++            # still reconcile their exact receipt instead of losing custody.
++            escalate(conn, task_id, episode, f"{cause} stops are excluded from spend review; hold retained")
++            continue
+         if attempts >= MAX_ATTEMPTS and not journal.get(conn, task_id, episode):
+             escalate(conn, task_id, episode, f"the spend reviewer did not finish after {attempts} attempts")
+             continue
+         with _LOCK:
+             if len(_INFLIGHT) >= MAX_CONCURRENT:
+-                break
++                continue  # later excluded stops still need model-free retirement
+             if (db, task_id) in _INFLIGHT:
+                 continue
+             _INFLIGHT.add((db, task_id))
+@@ -476,8 +486,9 @@
+     ctx = context(conn, task_id, episode)
+     if ctx is None or state(conn, task_id, episode) != STARTED:
+         return "moot"
+-    if ctx.get("cause") == "safety_refusal":
+-        return escalate(conn, task_id, episode, "safety stops are excluded from spend review")
++    from hermes_cli.kanban_spend_caused_review import CAUSES
++    if ctx.get("cause") and ctx["cause"] not in CAUSES:
++        return escalate(conn, task_id, episode, f"{ctx['cause']} stops are excluded from spend review; hold retained")
+     try:
+         verdict = judge(ctx)
+     except Exception as exc:  # health: allow BLE001 -- an unavailable judge escalates, never grants
+diff --git a/hermes_cli/kanban_spend_stop_watch.py b/hermes_cli/kanban_spend_stop_watch.py
+index d88024db7f6..a4c1a4367dd 100644
+--- a/hermes_cli/kanban_spend_stop_watch.py
++++ b/hermes_cli/kanban_spend_stop_watch.py
+@@ -28,7 +28,9 @@
+         if stop is None or stop['created_at'] >= now - older_than:
+             continue
+         episode = cast(str, reviewer.episode_of(stop))
+-        if reviewer.state(conn, tid, episode) is not None or _routed(conn, tid, episode):
++        if (reviewer.holds(conn, tid, episode)
++                or reviewer.state(conn, tid, episode) in (reviewer.GRANTED, reviewer.SETTLED)
++                or _routed(conn, tid, episode)):
+             continue
+         if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? AND json_valid(payload) "
+                         "AND json_extract(payload,'$.episode')=?", (tid, FILED, episode)).fetchone():
+diff --git a/tests/hermes_cli/test_kanban_spend_caused_review.py b/tests/hermes_cli/test_kanban_spend_caused_review.py
+index af8f36f3e37..2f2ab1c5df0 100644
+--- a/tests/hermes_cli/test_kanban_spend_caused_review.py
++++ b/tests/hermes_cli/test_kanban_spend_caused_review.py
+@@ -51,14 +51,52 @@
+         with kb.write_txn(conn):
+             assert reviewer.queue(conn, tid, ep)
+             kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": cause})
+-        assert reviewer._due(conn, noticed + 299, set()) == []
+         if cause == "safety_refusal":
+-            assert reviewer._due(conn, noticed + 300, set()) == []
++            # Due for model-free retirement, not a review thread.
++            assert reviewer._due(conn, noticed + 299, set()) == [(tid, ep, 0)]
+             assert not reviewer.holds(conn, tid, ep)
+         else:
++            assert reviewer._due(conn, noticed + 299, set()) == []
+             assert reviewer._due(conn, noticed + 300, set()) == [(tid, ep, 0)]
+ 
+ 
++@pytest.mark.parametrize("cause", ["decision_pending", "safety_refusal"])
++@pytest.mark.parametrize("capacity", [0, 3])
++def test_excluded_queue_retires_and_remains_discoverable(kanban_home, spend_reviewer, monkeypatch, cause, capacity):
++    from hermes_cli import kanban_spend_stop_watch as watch
++    monkeypatch.setattr(reviewer, "MAX_CONCURRENT", capacity)
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("excluded stop reached judge"))
++    routes = []
++    monkeypatch.setattr(decision, "safe_ensure_producer", lambda conn, tid: routes.append(tid))
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, None)
++        now = reviewer._notice_at(conn, tid, ep)
++        assert now is not None
++        with kb.write_txn(conn):
++            assert reviewer.queue(conn, tid, ep)
++            if cause == "decision_pending":
++                kb._append_event(conn, tid, "decision_retained", {
++                    "episode_uid": ep, "disposition": {"reason": cause}})
++            else:
++                kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": cause})
++        assert not reviewer.holds(conn, tid, ep)
++        assert [c['id'] for c in watch.stale_stops(conn, now=now + 3600)] == [tid]
++        for elapsed in (3600, 86400):
++            assert reviewer.start_due(conn, now=now + elapsed) == []
++            reviewer.wait_for_reviews()
++            assert reviewer.state(conn, tid, ep) == reviewer.ESCALATED
++            assert [c['id'] for c in watch.stale_stops(conn, now=now + elapsed)] == [tid]
++        assert routes == [tid]
++        assert kb.get_task(conn, tid).status == "triage"
++        assert caused.effective_cause(conn, tid, decision.pending_episode(conn, tid)) == cause
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
++                                "('spend_review_started','scope_renewed','promoted_manual','spend_budget_set')",
++                                (tid,)).fetchone()
++        kb.create_task(conn, title="Decide held stop", assignee="default", created_by="kanban-spend-budget",
++                       idempotency_key=f"spend-budget-decision:{tid}:{ep}")
++        assert watch.stale_stops(conn, now=now + 86400) == []
++
++
+ def test_annotation_on_ordinary_episode_and_safety_precedence(kanban_home, spend_reviewer):
+     with kbc.connect_closing() as conn:
+         tid, ep = stop(conn, None)
+@@ -230,12 +268,13 @@
+             assert calls == []
+ 
+ 
+-def test_safety_added_after_queue_never_calls_judge(kanban_home, spend_reviewer, monkeypatch):
++@pytest.mark.parametrize("cause", ["safety_refusal", "decision_pending"])
++def test_safety_added_after_queue_never_calls_judge(kanban_home, spend_reviewer, monkeypatch, cause):
+     with kbc.connect_closing() as conn:
+-        tid, ep = stop(conn)
++        tid, ep = stop(conn, None)
+         with kb.write_txn(conn):
+             kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
+-            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": "safety_refusal"})
++            kb._append_event(conn, tid, "decision_hold_restricted", {"episode": ep, "cause": cause})
+         monkeypatch.setattr(reviewer, "judge", lambda ctx: pytest.fail("safety must not reach judge"))
+         monkeypatch.setattr(decision, "safe_ensure_producer", lambda *a: None)
+         assert reviewer.review(conn, tid, ep) == "escalated"
+diff --git a/tests/hermes_cli/test_kanban_spend_stop_watch.py b/tests/hermes_cli/test_kanban_spend_stop_watch.py
+index 1f90243ee70..f2eb7637478 100644
+--- a/tests/hermes_cli/test_kanban_spend_stop_watch.py
++++ b/tests/hermes_cli/test_kanban_spend_stop_watch.py
+@@ -87,14 +87,25 @@
+         assert watchdog.watch(conn, now=NOW) == []
+ 
+ 
+-def test_reviewed_episode(kanban_home):
++@pytest.mark.parametrize('state', [reviewer.QUEUED, reviewer.STARTED, reviewer.GRANTED, reviewer.SETTLED])
++def test_reviewed_episode(kanban_home, spend_reviewer, state):
+     with kbc.connect_closing() as conn:
+         tid, ep = stop(conn)
+         with kb.write_txn(conn):
+-            kb._append_event(conn, tid, reviewer.QUEUED, {'episode': ep})
++            kb._append_event(conn, tid, state, {'episode': ep})
+         assert watchdog.watch(conn, now=NOW) == []
+ 
+ 
++@pytest.mark.parametrize('state', [reviewer.QUEUED, reviewer.STARTED, reviewer.ESCALATED])
++def test_abandoned_custody_does_not_hide_unrouted_stop(kanban_home, state):
++    # The default fixture disables the reviewer: queued/started are not custody.
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, state, {'episode': ep})
++        assert [c['id'] for c in watchdog.stale_stops(conn, now=NOW)] == [tid]
++
++
+ def test_real_decision_route(kanban_home):
+     with kbc.connect_closing() as conn:
+         tid, ep = stop(conn)
+-- 
+2.43.0
+

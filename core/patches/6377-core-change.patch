@@ -1,0 +1,474 @@
+From a73fa23baa91799220d601e117a93cd6b6ccd707 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 07:56:02 +0000
+Subject: [PATCH 6377] Read-first spend decisions and scope release fences
+
+Public mirror of source commit a73fa23baa91799220d601e117a93cd6b6ccd707.
+
+---
+diff --git a/hermes_cli/kanban_create_authority.py b/hermes_cli/kanban_create_authority.py
+index 04fdf62fd0e..72f1a3bce12 100644
+--- a/hermes_cli/kanban_create_authority.py
++++ b/hermes_cli/kanban_create_authority.py
+@@ -13,9 +13,50 @@
+ 
+ 
+ class CreateAuthorityRefused(ValueError):
+-    """The create has no renewable creator-task or owning-chat authority."""
++    """The create has no renewable creator-task or owning-chat authority.
++
++    ``wait``: a reason code when the refusal rests on local state that can still change (``wait_reason``), so a
++    courier create stays ``pending`` and is retried; None when nothing local can change it (terminal)."""
+     code = CODE
+ 
++    def __init__(self, message: str = "", *, wait: str | None = None):
++        super().__init__(message)
++        self.wait = wait
++
++
++def wait_reason(conn, task_id: str, creator_task_id) -> str | None:
++    """Why a refused create may still succeed later on this board, as a reason code naming the wait, else None.
++
++    - ``origin_owner_unsynced``: the board never synced (no Board identity) or has no synced chat-link table,
++      so it cannot hold the origin chat's ``created`` link yet;
++    - ``origin_gateway_unnamed``: this gateway has no name yet (before its first sync);
++    - ``origin_creator_unsynced``: the creator task, or its sessions, have not reached this board yet;
++    - ``origin_chat_provenance_unsynced``: a foreign chat link on the card whose provenance is not proven here
++      yet (the proving rows sync later).
++    """
++    from hermes_cli.kanban_db_sync import sync_state
++    links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone() is not None
++    if not links or not (sync_state(conn) or {}).get("gateway_id"):
++        return "origin_owner_unsynced"
++    me = _gateway(conn)
++    if not me:
++        return "origin_gateway_unnamed"
++    if creator_task_id:
++        from hermes_cli.kanban_scope_renewal_cli import _sessions
++        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (creator_task_id,)).fetchone() is None \
++                or not _sessions(conn, creator_task_id):
++            return "origin_creator_unsynced"
++    from hermes_cli.kanban_creator_chats import _chat_links
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_session_provenance import proven_foreign_chats
++    foreign = [f"{r['chat_gateway']}/{r['chat_profile']}/{r['chat_session']}" for r in _chat_links(conn, task_id)
++               if r.get("kind", "created") == "created" and r["chat_gateway"] and r["chat_gateway"] != me
++               and is_machine_session(r["chat_gateway"], r["chat_session"], local_gateway=me,
++                                      profile=r["chat_profile"])]
++    if foreign and not set(foreign) <= set(proven_foreign_chats(conn, (task_id,), local_gateway=me)):
++        return "origin_chat_provenance_unsynced"
++    return None
++
+ 
+ def _accepts(conn, task_id, session, gateway, profile, creator=None):
+     """Use the renewal reader itself, including its own-run and creator-event fences.
+@@ -142,9 +183,11 @@
+         return
+     _anchor_registered_session(conn, task_id)
+     if not has_authority(conn, task_id, creator_task_id, durable=True):
++        wait = wait_reason(conn, task_id, creator_task_id)
+         raise CreateAuthorityRefused(
+             "this card would have no renewable scope authority. Create it from a registered owning chat, "
+             "pass --origin-session with an unreleased created chat anchor, or create it from a creator "
+             "task that descends from a registered owning chat (a running creator alone ends with its run). "
+             "A creator name, bare task ID, placeholder or observer "
+-            "subscription is not authority; nothing was created.")
++            "subscription is not authority; nothing was created." + (f" (waiting: {wait})" if wait else ""),
++            wait=wait)
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index 62982ec1fd0..0c20142b805 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -111,16 +111,20 @@
+ 
+     An origin error stays a handoff that is not complete. With an origin intent (``origin``; not a bare self-work
+     create, whose receiver keeps its own pending rule), a create refused for want of renewable scope authority
+-    (``kanban_create_authority.CreateAuthorityRefused``: e.g. a never-synced owner board, which cannot hold the
+-    origin chat's ``created`` link) is definitive and wrote nothing (its transaction rolled back): ``created:
+-    False`` makes :func:`_dispatch_result` answer a terminal ``rejected`` with the reason, so the sender stops
+-    instead of retrying an endless ``pending / origin_dispatch_pending``."""
++    (``kanban_create_authority.CreateAuthorityRefused``) wrote nothing (its transaction rolled back). When it
++    rests on local state that can still change (``exc.wait``: the owner board not synced yet, no gateway name,
++    the creator or a chat's provenance not synced yet) it stays ``pending`` with that reason code, so the create
++    is retried, not dropped. Otherwise it is definitive: ``created: False`` makes :func:`_dispatch_result`
++    answer a terminal ``rejected`` with the reason, so the sender stops instead of retrying an endless
++    ``pending / origin_dispatch_pending``."""
+     from hermes_cli.kanban_create_authority import CreateAuthorityRefused
+     from hermes_cli.kanban_origin import OriginError
+     from tools.registry import tool_error
+     if isinstance(exc, OriginError):
+         return tool_error(str(exc), code=exc.code, handoff_complete=False)
+     if origin and isinstance(exc, CreateAuthorityRefused):
++        if getattr(exc, "wait", None):  # local state that can still change: keep the create, retry it
++            return tool_error(str(exc), status="pending", code=exc.wait, refusal=exc.code, handoff_complete=False)
+         return tool_error(str(exc), code=exc.code, created=False, handoff_complete=False)
+     return None
+ 
+diff --git a/hermes_cli/kanban_owner_chat.py b/hermes_cli/kanban_owner_chat.py
+index ec51502ce45..ec97b4b21dd 100644
+--- a/hermes_cli/kanban_owner_chat.py
++++ b/hermes_cli/kanban_owner_chat.py
+@@ -275,8 +275,9 @@
+         sid = ensure(name)  # state.db only; the kanban writes below are not covered by this fallback
+     except Exception as exc:  # health: allow BLE001 -- state.db trouble must not stop a monitor filing its card
+         if strict:
+-            raise kca.CreateAuthorityRefused(
+-                f"the owner chat for producer {name!r} could not be made ({exc}); nothing was created.") from exc
++            raise kca.CreateAuthorityRefused(  # state.db trouble passes: a courier create waits, never dropped
++                f"the owner chat for producer {name!r} could not be made ({exc}); nothing was created.",
++                wait="origin_owner_chat_unavailable") from exc
+         from hermes_cli.kanban_db import _append_event
+         log.warning("kanban owner chat for %s unavailable; card %s created ownerless", name, task_id, exc_info=True)
+         _append_event(conn, task_id, UNAVAILABLE, {"producer": name, "error": str(exc)[:500]})
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 925bafdf322..b34ffa21718 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -420,14 +420,21 @@
+     return sorted(items.values(), key=lambda item: (item["id"] is None, item["id"] or 0))
+ 
+ 
+-def _shown(conn: sqlite3.Connection, tid: str, session: Optional[str], cid: int) -> bool:
+-    """A read-first refusal of this board printed comment ``cid`` to agent ``session`` (a ``release_unread_shown``
+-    event). Only this board's own events count (:func:`own_events`): a row another gateway pushed proves nothing
+-    about what this caller was shown. A caller with no session has no identity to match, so never matches."""
+-    if not session:
++def _shown(conn: sqlite3.Connection, tid: str, session: Optional[str], verb: str, ids: Sequence[int]) -> bool:
++    """Every id in ``ids`` (what this verb's caller must read now) was printed to agent ``session`` by a read-first
++    refusal of the same ``verb`` on this board: ``ids`` is a subset of the union of ``comment_ids`` over this
++    board's own ``release_unread_shown`` events for that session and verb. Each verb prints its own required set
++    (``spend-budget`` prints the limit's own budget comment, ``release`` the comments after the stop), so one
++    verb's refusal never stands in for the other's. A row another gateway pushed proves nothing about what this
++    caller was shown (:func:`own_events`); a caller with no session has no identity to match."""
++    if not session or not ids:
+         return False
+-    return any(e["payload"].get("session") == session and cid in (e["payload"].get("comment_ids") or [])
+-               for e in own_events(conn, tid, (SHOWN,)))
++    printed: set = set()
++    for e in own_events(conn, tid, (SHOWN,)):
++        p = e["payload"]
++        if p.get("session") == session and p.get("verb", "release") == verb:
++            printed.update(c for c in (p.get("comment_ids") or []) if isinstance(c, int))
++    return set(ids) <= printed
+ 
+ 
+ def _record_shown(conn: sqlite3.Connection, tid: str, writer: tuple, ids: Sequence[int], verb: str) -> None:
+@@ -450,9 +457,10 @@
+     An agent authority does not decide over a person's words or a budget decision it has not been shown: the
+     refusal prints them (human comments after ``anchor``, the budget fence's decision, other sessions' recent
+     comments and ``extra``) and records a ``release_unread_shown`` event naming the caller's session and the ids
+-    it printed. ``--seen`` is accepted only as the id of the newest unread item AND only when such an event of
+-    this board shows that id was printed to the same session: a correct first guess, another session's refusal,
+-    a larger number, or ``--seen`` when nothing needs reading is refused. A human proceeds and acknowledges what
++    it printed. ``--seen`` is accepted only as the id of the newest unread item AND only when this board's own
++    such events show every item this verb requires was printed to the same session by this verb's refusal: a
++    correct first guess, another session's or another verb's refusal, a larger number, or ``--seen`` when nothing
++    needs reading is refused. A human proceeds and acknowledges what
+     is on the card now, read before the mandate is written."""
+     if writer[0] == "human":
+         return conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
+@@ -463,7 +471,7 @@
+         return None
+     ids = [item["id"] for item in items if item["id"] is not None]
+     newest = max(ids) if len(ids) == len(items) else None
+-    if newest is not None and seen == newest and _shown(conn, tid, writer[1], newest):
++    if newest is not None and seen == newest and _shown(conn, tid, writer[1], verb, ids):
+         return seen
+     shown = "\n".join(f"Comment {item['id']} | {item['who']} | {item['time']}\n{item['body']}" for item in items)
+     command = rerun or f"hermes kanban {verb} {tid}"
+@@ -475,7 +483,7 @@
+     wrong = ""
+     if seen is not None:
+         wrong = (f" (--seen {seen} is not the newest of them)" if seen != newest else
+-                 f" (--seen {seen} was not printed to this session by an earlier refusal; it is now)")
++                 f" (not everything here was printed to this session by an earlier {verb} refusal; it is now)")
+     _record_shown(conn, tid, writer, ids, verb)
+     doing = {"release": "releasing", "spend-budget": "changing the spend budget of"}.get(verb, verb)
+     raise _Refusal("budget_decision_unread", f"read these before {doing} {tid}{wrong}:\n{shown}\n{how}", unread=ids)
+@@ -574,8 +582,14 @@
+             # The cache-read limit's own attribution, always: a kept one keeps what it had (a person's run-only
+             # override defers to the board limit, and that deference is kept too); a lifted one is this writer's.
+             kept = ksb.carried(s.prior).get("cache_read_writer_kind", "unknown") if s.keeps_limit else who
++            # An agent raises the run count (that is the release) but a person's run limit stays a person's: a
++            # later agent `spend-budget --runs 0` must not read it as agent-set and lift it unread.
++            person_runs = ksb.runs_attribution(s.prior) or "unknown"
++            runs_kind = (person_runs if kind != "human" and ksb.override_set(s.prior) and person_runs != "agent"
++                         else None)
+             ksb.set_override(conn, s.tid, runs=runs, cache_read_tokens=cache, by=s.by, reason=s.reason,
+-                             seen=s.budget_seen, board=s.board, writer_kind=who, cache_read_writer_kind=kept)
++                             seen=s.budget_seen, board=s.board, writer_kind=who, cache_read_writer_kind=kept,
++                             runs_writer_kind=runs_kind)
+         except unread.UnreadComments as exc:  # a budget decision recorded since the check above
+             raise _Refusal("budget_decision_unread", f"{exc}{s.kept}")
+     out.update(spent_runs=spent, budget_runs=s.budget)
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index 6674bba5ed3..cb5a21c28b3 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -147,11 +147,31 @@
+     return out
+ 
+ 
++# Overrides the system itself writes under a fixed ``by``: the spend reviewer's grants and this module's own
++# writer. Before writers were recorded they carried no ``writer_kind``; their run limit is the system's, not a
++# person's. (The operator-courier promote writes ``by: <gateway>/<requester>`` and has always recorded
++# ``writer_kind`` through ``carried``, so it needs no name here.)
++SYSTEM_WRITERS = frozenset({"kanban-spend-reviewer", AUTHOR})
++
++
+ def runs_attribution(data: Optional[dict]) -> Optional[str]:
+     """Who set an override's run limit: ``runs_writer_kind`` when a later writer only carried (or tightened) it,
+-    otherwise the event's writer; None when the event records nothing (read as possibly a person's)."""
++    otherwise the event's writer; a legacy event of a :data:`SYSTEM_WRITERS` writer reads ``agent``; None when
++    the event records nothing (read as possibly a person's)."""
+     data = data or {}
+-    return data.get("runs_writer_kind") or data.get("writer_kind")
++    if data.get("runs_writer_kind") or data.get("writer_kind"):
++        return data.get("runs_writer_kind") or data.get("writer_kind")
++    return "agent" if data.get("by") in SYSTEM_WRITERS else None
++
++
++def _gate_cache_attribution(data: dict) -> Optional[str]:
++    """:func:`cache_attribution` for the spend-budget gate. A legacy system-writer event that sets no cache-read
++    value only deferred to the board's limit, so it is the system's; one that names a value may have kept a
++    person's number (writers before ``carried`` copied it), so it stays as :func:`cache_attribution` reads it."""
++    found = cache_attribution(data)
++    if found is None and data.get("by") in SYSTEM_WRITERS and _limit_value(data.get("cache_read_tokens")) is None:
++        return "agent"
++    return found
+ 
+ 
+ def _ceiling(value: Optional[int], board: int) -> Optional[int]:
+@@ -179,7 +199,7 @@
+         return [], {}
+     loosened, carried = [], {}
+     for name, attribution, field, new, limit in (
+-            ("cache_read_tokens", cache_attribution(prior), "cache_read_writer_kind", cache_read_tokens,
++            ("cache_read_tokens", _gate_cache_attribution(prior), "cache_read_writer_kind", cache_read_tokens,
+              board.cache_read_tokens),
+             ("runs", runs_attribution(prior), "runs_writer_kind", runs, board.runs)):
+         if attribution == "agent":
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index 17134a9250d..51875dc4499 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -98,16 +98,14 @@
+     row = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
+                        (tid, ksb.OVERRIDE_EVENT)).fetchone()
+     anchor = dict(row)
+-    note = _person_note(conn, tid, anchor)
+-    if note is None:
+-        return (f"kanban spend-budget: {tid}: refused: the {' and '.join(loosened)} limit may be a person's and its "
+-                "budget comment is not readable here; a human runs `hermes kanban spend-budget`")
++    note = _person_note(conn, tid, anchor)  # None: not readable here; the rest (and the fence's decision) still is
+     flags = ("--exempt" if args.exempt else "--clear" if args.clear else
+              " ".join(f"--{name} {value}" for name, value in (("runs", runs), ("cache-read-tokens", cache))
+                       if value is not None))
+     rerun = f"hermes kanban {'--board ' + board + ' ' if board else ''}spend-budget {tid} {flags} --reason ..."
+     try:
+-        seen = kr.read_first(conn, tid, anchor, writer, seen, board, verb="spend-budget", extra=[note], rerun=rerun)
++        seen = kr.read_first(conn, tid, anchor, writer, seen, board, verb="spend-budget",
++                            extra=[note] if note else [], rerun=rerun)
+     except kr.Refusal as exc:
+         return (f"kanban spend-budget: {tid}: refused: {exc.code}: raising or removing a {' and '.join(loosened)} "
+                 f"limit a person may have set needs a read first. {exc}")
+diff --git a/tests/hermes_cli/test_kanban_create_authority_wait.py b/tests/hermes_cli/test_kanban_create_authority_wait.py
+new file mode 100644
+index 00000000000..07407e42acf
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_create_authority_wait.py
+@@ -0,0 +1,74 @@
++"""A refused create waits (pending) on local state that can change, and is terminal only otherwise. [daveey]"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_create_authority as kca
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_origin_owner as owner
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def _synced(conn, home):
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from tests.hermes_cli import kanban_sync_support as support
++    support.write_sync_config(home, True)
++    sync.install_or_remove(conn, str(home / 'kanban.db'))
++    client.ensure_identity(conn, 'default', 'fixture')
++    with kb.write_txn(conn):
++        conn.execute("CREATE TABLE IF NOT EXISTS task_chat_links (id INTEGER PRIMARY KEY, uid TEXT, "
++                     "task_id TEXT NOT NULL, chat_gateway TEXT NOT NULL, chat_profile TEXT, chat_session TEXT NOT NULL, "
++                     "kind TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
++
++
++def _refusal(conn, tid, creator=None):
++    with pytest.raises(kca.CreateAuthorityRefused) as refused, kb.write_txn(conn):
++        kca.require(conn, tid, creator)
++    return refused.value
++
++
++def _answer(exc):
++    """What the courier owner answers for this refusal (the real mapping, then the real status rule)."""
++    return owner._dispatch_result(owner.origin_refusal(exc, origin=True))
++
++
++def test_a_never_synced_owner_waits(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title='orphan', assignee='default')
++        exc = _refusal(conn, tid)
++    assert exc.wait == 'origin_owner_unsynced'
++    out = _answer(exc)
++    assert out['status'] == 'pending' and out['code'] == 'origin_owner_unsynced'
++    assert out['refusal'] == 'scope_authority_missing' and out['handoff_complete'] is False
++
++
++def test_a_creator_not_synced_yet_waits(kanban_home, monkeypatch):
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    with kbc.connect_closing() as conn:
++        _synced(conn, kanban_home)
++        tid = kb.create_task(conn, title='child', assignee='default')
++        assert _refusal(conn, tid, creator='t_not_here_yet').wait == 'origin_creator_unsynced'
++
++
++def test_a_synced_owner_with_no_possible_owner_is_terminal(kanban_home, monkeypatch):
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    with kbc.connect_closing() as conn:
++        _synced(conn, kanban_home)
++        tid = kb.create_task(conn, title='orphan', assignee='default')
++        exc = _refusal(conn, tid)
++    assert exc.wait is None
++    out = _answer(exc)
++    assert out['status'] == 'rejected' and out['code'] == 'scope_authority_missing'
++    assert out['created'] is False and out['handoff_complete'] is False
++
++
++def test_a_bare_selfwork_create_keeps_its_own_rule(kanban_home):
++    exc = kca.CreateAuthorityRefused('no authority')
++    assert owner.origin_refusal(exc, origin=False) is None
++    assert json.loads(owner.origin_refusal(exc, origin=True))['created'] is False
+diff --git a/tests/hermes_cli/test_kanban_release.py b/tests/hermes_cli/test_kanban_release.py
+index 10bbd96f167..338244a5242 100644
+--- a/tests/hermes_cli/test_kanban_release.py
++++ b/tests/hermes_cli/test_kanban_release.py
+@@ -894,7 +894,7 @@
+     before = written(board, tid)
+     out = as_owner(board, tid, seen=said)  # the exact newest id, never printed to this caller
+     assert out['refusal'] == 'budget_decision_unread' and out['unread'] == [said]
+-    assert 'Hold this until Friday.' in out['message'] and 'was not printed to this session' in out['message']
++    assert 'Hold this until Friday.' in out['message'] and 'printed to this session by an earlier release refusal' in out['message']
+     assert written(board, tid) == before and status(board, tid) == 'triage'
+     (record,) = shown_events(board, tid)
+     assert record['session'] == scope.CHAT and record['comment_ids'] == [said] and record['verb'] == 'release'
+@@ -1051,3 +1051,48 @@
+     rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--reason', 'standing')
+     assert rc == 0, err
+     assert budget.card_limits(board, tid, budget.limits()) == budget.Limits(0, 0)
++
++
++def test_a_release_refusal_does_not_stand_in_for_the_spend_budget_read(board, monkeypatch):
++    """R1: what release printed (the human comment) leaves out the person's budget note spend-budget must show."""
++    tid = with_person_budget(board, stop=True)
++    scope.link(board, tid)
++    said = kb.add_comment(board, tid, 'default', 'Keep it under the cap.', writer_kind='human')
++    assert as_owner(board, tid)['unread'] == [said]  # release's own refusal: printed [said] only
++    person = newest_budget(board, tid)
++    rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--seen', str(said), '--reason', 'lift')
++    assert rc == 4 and 'small and cheap' in err and newest_budget(board, tid) == person
++    rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--seen', str(said), '--reason', 'lift')
++    assert rc == 0, err  # read through spend-budget's own refusal
++
++
++def test_a_spend_budget_refusal_does_not_stand_in_for_the_release_read(board, monkeypatch):
++    """R2: a person's comment only release requires (after the stop, before the budget) must be printed by release."""
++    tid = kb.create_task(board, title='Budgeted work', assignee='default')
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(board, tid, decision.EVENT, {'reason': 'Spend budget: 3 runs'})
++    scope.link(board, tid)
++    legal = kb.add_comment(board, tid, 'default', 'DO NOT RELEASE until legal signs off.', writer_kind='human')
++    budget.set_override(board, tid, runs=3, cache_read_tokens=5_000_000, by='david', reason='small and cheap',
++                        writer_kind='human')
++    rc, err = spend_budget(board, monkeypatch, tid, '--exempt', '--reason', 'lift')
++    assert rc == 4 and 'DO NOT RELEASE' not in err
++    printed = shown_events(board, tid)[-1]['comment_ids']
++    assert legal not in printed
++    out = as_owner(board, tid, seen=max(printed))
++    assert out['refusal'] == 'budget_decision_unread' and 'DO NOT RELEASE until legal signs off.' in out['message']
++    assert status(board, tid) == 'triage'
++    assert as_owner(board, tid, seen=max(out['unread']))['outcome'] == 'released'
++
++
++def test_an_agent_release_keeps_a_persons_run_limit_attribution(board, monkeypatch):
++    tid = with_person_budget(board, stop=True)
++    scope.link(board, tid)
++    assert as_owner(board, tid)['outcome'] == 'released'  # nothing after the stop to read
++    released = newest_budget(board, tid)
++    assert released['writer_kind'] == 'agent' and released['runs_writer_kind'] == 'human'
++    before = newest_budget(board, tid)
++    rc, err = spend_budget(board, monkeypatch, tid, '--runs', '0', '--cache-read-tokens', '5000000',
++                           '--reason', 'unlimited runs')
++    assert rc == 4 and 'budget_decision_unread' in err and newest_budget(board, tid) == before
+diff --git a/tests/origin_transport/test_forwarding.py b/tests/origin_transport/test_forwarding.py
+index bf2caf80af8..e64eaacbb47 100644
+--- a/tests/origin_transport/test_forwarding.py
++++ b/tests/origin_transport/test_forwarding.py
+@@ -175,39 +175,39 @@
+ 
+ 
+ @pytest.mark.parametrize("network", [False], indirect=True)
+-def test_a_rejected_owner_create_stops_the_senders_retries(network, monkeypatch):
+-    """The owner's terminal ``rejected`` (reported to the Board as the request's result) ends the forwarding
+-    obligation on the sender: it answers ``rejected`` with the owner's reason and queues nothing again."""
++def test_a_waiting_owner_create_keeps_the_sender_pending(network, monkeypatch):
++    """An owner that cannot create yet only because it never synced answers ``pending`` with the wait's reason:
++    the sender's obligation stays open (never ``rejected``), nothing is queued twice and nothing is created."""
+     courier, dbs, service, host, runner, _, _ = network
+     child = _owner_create(network, monkeypatch)
+     request = next(r for r in service.requests.values() if r["action"] == "origin-forward")
+     with host("hub"):
+         courier.journal_request(dbs["hub"], child)
+         status, creation = courier.advance_origin_create(dbs["hub"], {}, child, runner, service)
+-    assert status == "rejected", creation
+-    service.requests[child["id"]] = {**child, "state": status, "result": creation}  # the owner's POST .../result
++    assert status == "pending" and creation["code"] == "origin_owner_unsynced", creation
+     with host("macbook"):
+         sent = dbs["macbook"].execute("SELECT count(*) FROM sent").fetchone()[0]
+         for _ in range(3):
+             status, result = courier.advance_origin_forward(dbs["macbook"], {}, request, runner, service)
+-            assert status == "rejected" and result["code"] == "origin_forward_downstream_failed", result
+-            assert result["downstream"]["code"] == "scope_authority_missing" and result["handoff_complete"] is False
++            assert status == "pending" and result["code"] == "origin_forward_pending", result
+         assert dbs["macbook"].execute("SELECT count(*) FROM sent").fetchone()[0] == sent
+ 
+ 
+ @pytest.mark.parametrize("network", [False], indirect=True)
+ def test_forwarding_to_a_never_synced_owner_creates_nothing(network, monkeypatch):
+     """Creation authority (kanban_create_authority.require): a never-synced owner cannot hold the origin chat's
+-    ``created`` link, so nothing could ever renew the card's scope. The create is refused whole, every time, and
+-    terminally: ``rejected`` with the reason, never a ``pending`` the sender would retry forever."""
++    ``created`` link yet, so nothing could renew the card's scope. The create is refused whole, every time,
++    and kept: ``pending`` with ``origin_owner_unsynced`` naming the wait (the board may still sync), never the
++    reasonless ``origin_dispatch_pending`` and never a terminal ``rejected`` that would drop the create."""
+     courier, dbs, service, host, runner, _, _ = network
+     child = _owner_create(network, monkeypatch)
+     with host("hub"):
+         courier.journal_request(dbs["hub"], child)
+         for _ in range(2):
+             status, creation = courier.advance_origin_create(dbs["hub"], {}, child, runner, service)
+-            assert status == "rejected" and not creation.get("created"), creation
+-            assert creation["code"] == "scope_authority_missing" and creation["handoff_complete"] is False
++            assert status == "pending" and not creation.get("created"), creation
++            assert creation["code"] == "origin_owner_unsynced" and creation["refusal"] == "scope_authority_missing"
++            assert creation["handoff_complete"] is False
+         with kanban_db_connect.connect_closing() as board:
+             assert board.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+             assert board.execute("SELECT count(*) FROM kanban_notify_subs").fetchone()[0] == 0
+-- 
+2.43.0
+

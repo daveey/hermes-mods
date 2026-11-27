@@ -1,0 +1,180 @@
+From 0f492bfc7ebd5ea609739b3799039aa374dcd46d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:09:47 +0000
+Subject: [PATCH 6088] Early native-sessions capture at serve boot and update-admission hold
+
+Public mirror of source commit 0f492bfc7ebd5ea609739b3799039aa374dcd46d.
+
+---
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 4bdf497b0ee..c315d0e8951 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -47,8 +47,10 @@
+     previous = {}
+ 
+     def stop(signum, frame):
+-        owner.close()
+         handler = previous[signum]
++        if handler == signal.SIG_IGN:
++            return
++        owner.close()
+         if callable(handler):
+             handler(signum, frame)
+         elif handler != signal.SIG_IGN:
+diff --git a/hermes_cli/web_boot_services.py b/hermes_cli/web_boot_services.py
+index 4e29a5e0212..5581a13273a 100644
+--- a/hermes_cli/web_boot_services.py
++++ b/hermes_cli/web_boot_services.py
+@@ -17,6 +17,8 @@
+             ready = getattr(scope['app'].state, 'boot_services_ready', None)
+             if ready is not None and not ready.is_set():
+                 if scope['type'] == 'websocket':
++                    await receive()  # consume websocket.connect before a retryable close
++                    await send({'type': 'websocket.accept'})
+                     await send({'type': 'websocket.close', 'code': 1013})
+                     return
+                 if scope['method'] != 'GET' or scope['path'] not in _DISPLAY_PATHS:
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index ecfe9df06e9..30e4292f7fa 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -1818,25 +1818,27 @@
+             await server.startup()
+             if server.should_exit:
+                 return
+-            app.state.http_listener_ready.set()
+-
+-            _on_server_started(
+-                server,
+-                host=host,
+-                port=port,
+-                headless=headless,
+-                isolated=isolated,
+-                open_browser=open_browser,
+-                initial_profile=initial_profile,
+-                start_mcp_discovery_after_bind=start_mcp_discovery_after_bind,
+-                ssh_lock_path=ssh_lock_path,
+-            )
+-            if headless:
+-                from hermes_cli.observability.shared_metrics_startup import record_process_ready
+-                record_process_ready("serve_boot", background=True)
+-
+-            await server.main_loop()
+-            if server.started:
+-                await server.shutdown()
++            try:
++                app.state.http_listener_ready.set()
++                _on_server_started(
++                    server,
++                    host=host,
++                    port=port,
++                    headless=headless,
++                    isolated=isolated,
++                    open_browser=open_browser,
++                    initial_profile=initial_profile,
++                    start_mcp_discovery_after_bind=start_mcp_discovery_after_bind,
++                    ssh_lock_path=ssh_lock_path,
++                )
++                if headless:
++                    from hermes_cli.observability.shared_metrics_startup import record_process_ready
++                    record_process_ready("serve_boot", background=True)
++                await server.main_loop()
++            finally:
++                # Drain the app before asyncio.run cancels its background warmup
++                # on an exceptional loop/ready callback exit.
++                if server.started:
++                    await server.shutdown()
+ 
+     _run_serve(_serve, config, host, port)
+diff --git a/tests/hermes_cli/test_sessions_early_boot.py b/tests/hermes_cli/test_sessions_early_boot.py
+index ced243488ca..897f2226124 100644
+--- a/tests/hermes_cli/test_sessions_early_boot.py
++++ b/tests/hermes_cli/test_sessions_early_boot.py
+@@ -81,6 +81,19 @@
+     assert not calls
+ 
+ 
++def test_ignored_signal_keeps_owner_adoptable(boot):
++    calls, runtime = boot
++    original = signal.signal(signal.SIGINT, signal.SIG_IGN)
++    try:
++        with early.early_sessions(headless=True, isolated=False) as owner:
++            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
++            assert 'close' not in calls
++            assert owner.adopt() is runtime
++        assert calls.count('close') == 1
++    finally:
++        signal.signal(signal.SIGINT, original)
++
++
+ def test_failed_drain_retains_owner():
+     calls = []
+     def close():
+diff --git a/tests/hermes_cli/test_web_boot_services.py b/tests/hermes_cli/test_web_boot_services.py
+index b17c788792b..5bacf36ed6f 100644
+--- a/tests/hermes_cli/test_web_boot_services.py
++++ b/tests/hermes_cli/test_web_boot_services.py
+@@ -163,8 +163,10 @@
+         pytest.fail('uninitialized websocket handler called')
+     async def send(message):
+         sent.append(message)
+-    await BootServicesMiddleware(forbidden)({'type': 'websocket', 'app': app}, forbidden, send)
+-    assert sent == [{'type': 'websocket.close', 'code': 1013}]
++    async def receive():
++        return {'type': 'websocket.connect'}
++    await BootServicesMiddleware(forbidden)({'type': 'websocket', 'app': app}, receive, send)
++    assert sent == [{'type': 'websocket.accept'}, {'type': 'websocket.close', 'code': 1013}]
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/hermes_cli/test_web_server_launch_env_freeze.py b/tests/hermes_cli/test_web_server_launch_env_freeze.py
+index 7eeb140846a..d3939682fc1 100644
+--- a/tests/hermes_cli/test_web_server_launch_env_freeze.py
++++ b/tests/hermes_cli/test_web_server_launch_env_freeze.py
+@@ -5,6 +5,9 @@
+ ``op run``, Compose). Taken at the TOP of ``start_server`` it missed everything the rest of boot
+ injected or rotated, for the process lifetime.
+ """
++import asyncio
++from contextlib import nullcontext
++from types import SimpleNamespace
+ import os
+ 
+ import pytest
+@@ -44,3 +47,32 @@
+     assert secret_scope.is_multiplex_active()
+     assert launch_profile_policy.capture_launch_env().get(LATE_KEY) == "injected-during-boot", (
+         "the launch env was frozen before boot finished injecting credentials")
++
++
++@pytest.mark.parametrize('failure', ['ready', 'loop'])
++def test_exception_after_bind_drains_before_runner_teardown(monkeypatch, failure):
++    calls = []
++    async def startup():
++        server.started = True
++    async def loop():
++        calls.append('loop')
++        raise RuntimeError('loop failure')
++    async def shutdown():
++        calls.append('shutdown')
++    server = SimpleNamespace(started=False, should_exit=False, capture_signals=nullcontext,
++                             startup=startup, main_loop=loop, shutdown=shutdown)
++    config = SimpleNamespace(loaded=True, lifespan_class=lambda config: object())
++    def ready(*args, **kwargs):
++        calls.append('ready')
++        if failure == 'ready':
++            raise RuntimeError('ready failure')
++    monkeypatch.setattr(web_server, '_configure_auth_gate', lambda *a, **kw: None)
++    monkeypatch.setattr(web_server, '_build_uvicorn_server', lambda *a, **kw: (config, server))
++    monkeypatch.setattr(web_server, '_port_bind_conflict', lambda *a, **kw: False)
++    monkeypatch.setattr(launch_profile_policy, 'activate_multi_profile_hosting_eagerly', lambda: None)
++    monkeypatch.setattr(web_server, '_on_server_started', ready)
++    monkeypatch.setattr(web_server, '_run_serve', lambda serve, *a: asyncio.run(serve()))
++    with pytest.raises(RuntimeError, match=failure + ' failure'):
++        web_server.start_server(open_browser=False, headless=False)
++    assert calls[-1] == 'shutdown'
++    assert calls.count('shutdown') == 1
+-- 
+2.43.0
+

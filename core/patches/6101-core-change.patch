@@ -1,0 +1,718 @@
+From 7223f6dac3922d7c15c324b0a6902cf2670e5681 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:48:24 -0800
+Subject: [PATCH 6101] Desktop startup-timeout recovery and gateway-drain retry
+
+Public mirror of source commit 7223f6dac3922d7c15c324b0a6902cf2670e5681.
+
+---
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts
+new file mode 100644
+index 00000000000..cae66ca28d6
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/rejected-optimistic-sends.ts
+@@ -0,0 +1,79 @@
++import { notifyError } from '@/store/notifications'
++
++/**
++ * Optimistic user bubbles whose send was rejected before it left the client
++ * (the chat had no live runtime and `session.resume` failed or timed out).
++ *
++ * submit.ts drops such a bubble from the view, but a resume that started while
++ * the bubble was still shown holds it in its start-of-resume snapshot and would
++ * paint it back as a local pending turn: the message then looks delivered
++ * although it only went back to the composer draft. resumeSession filters that
++ * snapshot through `withoutRejectedOptimisticSends` at every repaint.
++ */
++const MAX_REJECTED = 64
++const rejectedOptimisticIds = new Set<string>()
++
++/** The bubble id of a send that starts now. A retry of a restored draft reuses
++ *  its submission id, so an earlier rejection under it no longer applies. */
++export function startOptimisticSend(submissionId: string): string {
++  const optimisticId = `user-${submissionId}`
++
++  rejectedOptimisticIds.delete(optimisticId)
++
++  return optimisticId
++}
++
++function markOptimisticSendRejected(optimisticId: string): void {
++  rejectedOptimisticIds.delete(optimisticId)
++  rejectedOptimisticIds.add(optimisticId)
++
++  for (const oldest of rejectedOptimisticIds) {
++    if (rejectedOptimisticIds.size <= MAX_REJECTED) {
++      break
++    }
++
++    rejectedOptimisticIds.delete(oldest)
++  }
++}
++
++/**
++ * The chat has no live runtime and rebinding one failed (a starved hub times
++ * `session.resume` out after 30s), so this send never left. The composer
++ * restores the words into the draft when submit returns `false`; without a
++ * notice the user sees nothing and takes the message for delivered.
++ *
++ * Call before the abort drops the bubble. A deliberate session switch (`drift`)
++ * stays silent, and so does a queued entry (`quiet`): it stays in its queue, it
++ * is not "back in the composer". A `hidden` send is machine text that is
++ * dropped, never restored.
++ */
++export function rejectSendOnFailedResume(
++  err: unknown,
++  send: {
++    copy: { promptFailed: string; promptNotSent: string }
++    drift: null | string
++    hidden: boolean
++    optimisticId: string
++    quiet: boolean
++  }
++): void {
++  markOptimisticSendRejected(send.optimisticId)
++
++  if (send.drift) {
++    console.warn('[submit-drift-abort]', send.drift, { phase: 'resume-failed' })
++  } else if (!send.quiet) {
++    notifyError(err, send.hidden ? send.copy.promptFailed : send.copy.promptNotSent)
++  }
++}
++
++export function withoutRejectedOptimisticSends<T extends { id: string }>(messages: T[]): T[] {
++  if (rejectedOptimisticIds.size === 0 || !messages.some(message => rejectedOptimisticIds.has(message.id))) {
++    return messages
++  }
++
++  return messages.filter(message => !rejectedOptimisticIds.has(message.id))
++}
++
++export function resetRejectedOptimisticSendsForTests(): void {
++  rejectedOptimisticIds.clear()
++}
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
+new file mode 100644
+index 00000000000..58b40dd6d9d
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit-resume-failed.test.tsx
+@@ -0,0 +1,323 @@
++import { act, cleanup, render, waitFor } from '@testing-library/react'
++import type { MutableRefObject } from 'react'
++import { useEffect } from 'react'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { ClientSessionState } from '@/app/types'
++import { getLatestSessionMessages } from '@/hermes'
++import { en } from '@/i18n/en'
++import { createClientSessionState } from '@/lib/chat-runtime'
++import { $notifications, clearNotifications } from '@/store/notifications'
++import {
++  $messages,
++  _resetSessionOwnerHintsForTests,
++  setActiveSessionId,
++  setAwaitingResponse,
++  setBusy,
++  setMessages,
++  setResumeFailedSessionId,
++  setSelectedStoredSessionId,
++  setSessions
++} from '@/store/session'
++
++import { useSessionActions } from '../use-session-actions'
++import { resumeFailedToastId } from '../use-session-actions/resume-latches'
++
++import { actRender, Harness, type HarnessHandle } from './index-test-utils'
++import { clearStoredJournal } from './prepared-submissions-test-utils'
++import { resetRejectedOptimisticSendsForTests } from './rejected-optimistic-sends'
++import { clearSingleFlightSessionResumeState } from './single-flight-resume'
++import { resetSubmissionIdSupportForTests } from './submission-identity-support'
++
++// Representative observation: a starved hub timed out session.resume. A
++// send without a live runtime silently returned to the composer
++// draft, while the resume retry displayed the typed message from
++// its start-of-resume snapshot. Messages appeared delivered without being sent.
++
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  getAllSessionMessages: vi.fn(),
++  getLatestSessionMessages: vi.fn(),
++  getProfiles: vi.fn(async () => ({ profiles: [] })),
++  getSession: vi.fn(),
++  listAllProfileSessions: vi.fn(),
++  setApiRequestProfile: vi.fn(),
++  transcribeAudio: vi.fn()
++}))
++
++vi.mock('@/store/profile', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  ensureGatewayAgent: vi.fn().mockResolvedValue(undefined),
++  ensureGatewayProfile: vi.fn().mockResolvedValue(undefined)
++}))
++
++vi.mock('@/store/gateway', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  requestGatewayForAgent: vi.fn(),
++  requestGatewayForProfile: vi.fn(),
++  retainGatewayForAgent: vi.fn(async () => () => undefined)
++}))
++
++vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  noteActiveTreeGroup: vi.fn(),
++  revealTreePane: vi.fn()
++}))
++
++const STORED_SESSION_ID = 'stored-1'
++const SUBMISSION_ID = 'sub-starved-1'
++const BUBBLE_ID = `user-${SUBMISSION_ID}`
++const TEXT = 'typed while the hub was starved'
++
++const STORED_MESSAGES = [
++  { content: 'earlier question', role: 'user', timestamp: 1 },
++  { content: 'earlier answer', role: 'assistant', timestamp: 2 }
++]
++
++type Gateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
++type ResumeSession = (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>
++
++const resumeTimeout = () => new Error('request timed out after 30s: session.resume')
++
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  let reject!: (error: Error) => void
++
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res
++    reject = rej
++  })
++
++  return { promise, reject, resolve }
++}
++
++/** The chat's own resume (use-route-resume's retry): the real `resumeSession`, whose failed-resume
++ *  repaint carries the local pending turn it saw when it started. */
++function ChatResume({ onReady, requestGateway }: { onReady: (resume: ResumeSession) => void; requestGateway: Gateway }) {
++  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
++  const stateMapRef = ref(new Map<string, ClientSessionState>())
++
++  const actions = useSessionActions({
++    activeSessionId: null,
++    activeSessionIdRef: ref<string | null>(null),
++    busyRef: ref(false),
++    creatingSessionRef: ref(false),
++    ensureSessionState: () => ({}) as ClientSessionState,
++    getRouteToken: () => 'token',
++    getRoutedStoredSessionId: () => null,
++    holdSessionTranscriptView: () => () => undefined,
++    navigate: vi.fn() as never,
++    requestGateway,
++    resetViewSync: vi.fn(),
++    routedSessionId: null,
++    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
++    selectedStoredSessionId: STORED_SESSION_ID,
++    selectedStoredSessionIdRef: ref<string | null>(STORED_SESSION_ID),
++    sessionStateByRuntimeIdRef: stateMapRef,
++    syncSessionStateToView: () => undefined,
++    updateSessionState: (sessionId, updater, storedSessionId) => {
++      const next = updater(stateMapRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null))
++      stateMapRef.current.set(sessionId, next)
++
++      return next
++    }
++  })
++
++  useEffect(() => {
++    onReady(actions.resumeSession)
++  }, [actions.resumeSession, onReady])
++
++  return null
++}
++
++const messageIds = () => $messages.get().map(message => message.id)
++
++const resumeCalls = (gateway: { mock: { calls: unknown[][] } }) =>
++  gateway.mock.calls.filter(([method]) => method === 'session.resume').length
++
++const errorNotices = () => $notifications.get().filter(notice => notice.kind === 'error')
++
++/** A foreground send into a chat whose runtime binding is gone, parked on the resume that must
++ *  rebind it. `routed` parks on the high-level route resume (`resumeStoredSession`); `direct` lets
++ *  that one return without a runtime and parks on submit's own `session.resume` RPC. */
++async function sendIntoUnboundChat(path: 'direct' | 'routed') {
++  const routedResume = deferred<void>()
++  const directResume = deferred<{ session_id: string }>()
++  const submits: Record<string, unknown>[] = []
++  const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_ID }
++  // The first send parks on the deferred resumes; the retry meets a hub that answers again.
++  let hubAnswers = false
++
++  const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
++    if (method === 'session.resume') {
++      return (hubAnswers ? { session_id: 'rt-rebound' } : directResume.promise) as never
++    }
++
++    if (method === 'prompt.submit') {
++      submits.push(params!)
++    }
++
++    return {} as never
++  })
++
++  const resumeStoredSession = vi.fn(async () => (hubAnswers ? undefined : routedResume.promise))
++
++  let prompt: HarnessHandle | null = null
++  await actRender(
++    <Harness
++      activeSessionId={null}
++      activeSessionIdRef={{ current: null }}
++      getRoutedStoredSessionId={() => STORED_SESSION_ID}
++      getRuntimeIdForStoredSession={() => null}
++      onReady={handle => (prompt = handle)}
++      refreshSessions={async () => undefined}
++      requestGateway={requestGateway}
++      resumeStoredSession={resumeStoredSession}
++      selectedStoredSessionIdRef={selectedStoredSessionIdRef}
++      storedSessionId={STORED_SESSION_ID}
++    />
++  )
++
++  let sent!: Promise<boolean>
++  await act(async () => {
++    // The composer names every send; `false` is its signal to restore the draft under this id.
++    sent = prompt!.submitTextRaw(TEXT, { submission_id: SUBMISSION_ID })
++  })
++  await waitFor(() => expect(resumeStoredSession).toHaveBeenCalledWith(STORED_SESSION_ID))
++  expect(messageIds()).toContain(BUBBLE_ID)
++
++  if (path === 'direct') {
++    await act(async () => routedResume.resolve())
++    await waitFor(() => expect(resumeCalls(requestGateway)).toBe(1))
++  }
++
++  const failResume = () =>
++    act(async () => {
++      ;(path === 'routed' ? routedResume : directResume).reject(resumeTimeout())
++
++      return sent
++    })
++
++  const retry = () => {
++    hubAnswers = true
++
++    return prompt!.submitText(TEXT, { submission_id: SUBMISSION_ID })
++  }
++
++  return { failResume, requestGateway, retry, selectedStoredSessionIdRef, submits }
++}
++
++/** Starts the chat's own resume while the bubble is on screen; its RPC never answers. */
++async function startChatResume() {
++  const chatResumeRpc = deferred<never>()
++
++  const requestGateway = vi.fn((method: string) =>
++    method === 'session.resume' ? chatResumeRpc.promise : Promise.resolve({} as never)
++  ) as unknown as Gateway & ReturnType<typeof vi.fn>
++
++  let resume: null | ResumeSession = null
++  render(<ChatResume onReady={r => (resume = r)} requestGateway={requestGateway} />)
++  await waitFor(() => expect(resume).not.toBeNull())
++
++  let settled!: Promise<unknown>
++  await act(async () => {
++    settled = resume!(STORED_SESSION_ID, true)
++  })
++
++  return {
++    /** The chat's resume fails too and repaints from the REST transcript. `session.resume` is
++     *  single-flight per chat: on the routed path this resume sent its own RPC, which times out
++     *  here; on the direct path it joined submit's RPC and failed with it. */
++    failAndRepaint: () =>
++      act(async () => {
++        if (resumeCalls(requestGateway) > 0) {
++          chatResumeRpc.reject(resumeTimeout())
++        }
++
++        await settled
++      })
++  }
++}
++
++beforeEach(() => {
++  clearSingleFlightSessionResumeState()
++  clearStoredJournal()
++  clearNotifications()
++  resetRejectedOptimisticSendsForTests()
++  resetSubmissionIdSupportForTests()
++  setSelectedStoredSessionId(STORED_SESSION_ID)
++  setMessages([
++    { id: 'stored-user', role: 'user', parts: [{ type: 'text', text: 'earlier question' }] },
++    { id: 'stored-assistant', role: 'assistant', parts: [{ type: 'text', text: 'earlier answer' }] }
++  ])
++  vi.mocked(getLatestSessionMessages).mockResolvedValue({
++    messages: STORED_MESSAGES,
++    session_id: STORED_SESSION_ID
++  } as never)
++})
++
++afterEach(() => {
++  cleanup()
++  clearNotifications()
++  resetRejectedOptimisticSendsForTests()
++  resetSubmissionIdSupportForTests()
++  setActiveSessionId(null)
++  setSelectedStoredSessionId(null)
++  setResumeFailedSessionId(null)
++  setBusy(false)
++  setAwaitingResponse(false)
++  setMessages([])
++  setSessions([])
++  _resetSessionOwnerHintsForTests({ storage: true })
++  vi.restoreAllMocks()
++})
++
++describe('a send whose session.resume times out', () => {
++  it.each(['routed', 'direct'] as const)(
++    '%s resume: says the message was not sent, and a failed-resume repaint does not show it as a bubble',
++    async path => {
++      const send = await sendIntoUnboundChat(path)
++      // Snapshots the transcript while the typed message is still an optimistic bubble.
++      const chat = await startChatResume()
++      clearNotifications()
++
++      // `false` is what makes the composer put the words back into the draft under SUBMISSION_ID.
++      expect(await send.failResume()).toBe(false)
++
++      // Exactly one notice from the send. (On the direct path the chat's resume shared the
++      // failed RPC, so its own "Resume failed" toast may already be up beside it.)
++      const fromSend = errorNotices().filter(notice => notice.id !== resumeFailedToastId(STORED_SESSION_ID))
++      expect(fromSend).toHaveLength(1)
++      expect(fromSend[0]).toMatchObject({ title: en.desktop.promptNotSent })
++      expect(fromSend[0]?.message).toContain('timed out')
++      expect(send.submits).toEqual([])
++      expect(messageIds()).not.toContain(BUBBLE_ID)
++
++      await chat.failAndRepaint()
++
++      expect(getLatestSessionMessages).toHaveBeenCalled()
++      expect(JSON.stringify($messages.get())).toContain('earlier answer')
++      expect(messageIds()).not.toContain(BUBBLE_ID)
++      expect(JSON.stringify($messages.get())).not.toContain(TEXT)
++
++      // Enter on the restored draft retries the same identity once the hub answers again.
++      expect(await send.retry()).toBe(true)
++      expect(send.submits).toEqual([expect.objectContaining({ submission_id: SUBMISSION_ID, text: TEXT })])
++    }
++  )
++
++  it.each(['routed', 'direct'] as const)(
++    '%s resume: a session switch during the resume still aborts without a notification',
++    async path => {
++      const send = await sendIntoUnboundChat(path)
++
++      // The user opened another chat while the resume was pending.
++      send.selectedStoredSessionIdRef.current = 'stored-other'
++
++      expect(await send.failResume()).toBe(false)
++
++      expect($notifications.get()).toEqual([])
++      expect(send.submits).toEqual([])
++    }
++  )
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 05a8e254b6e..e8e21363a3b 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -59,6 +59,7 @@
+   removePreparedSubmission,
+   writePreparedSubmission
+ } from './prepared-submissions'
++import { rejectSendOnFailedResume, startOptimisticSend } from './rejected-optimistic-sends'
+ import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
+ import { captureSubmissionDestination, destinationAfterCreate, sameAuthorityPublishedOwner } from './submission-destination'
+ import {
+@@ -648,7 +649,7 @@
+         }
+       }
+ 
+-      const optimisticId = `user-${submissionId}`
++      const optimisticId = startOptimisticSend(submissionId)
+ 
+       // What the bubble shows. A `/skill` send carries the whole expanded
+       // skill body as its text — model-facing scaffolding — so the dispatcher
+@@ -856,7 +857,16 @@
+       const resumeRoutedStoredSession = async (routedId: string): Promise<false | null | string> => {
+         try {
+           await resumeStoredSession(routedId)
+-        } catch {
++        } catch (err) {
++          // Not sent: say so (a session switch stays silent), then drop the bubble.
++          rejectSendOnFailedResume(err, {
++            copy,
++            drift: sessionDriftReason(),
++            hidden: options?.displayKind === 'hidden',
++            optimisticId,
++            quiet: Boolean(queueAdmission || options?.fromQueue)
++          })
++
+           return abortForSessionSwitch(null)
+         }
+ 
+@@ -971,12 +981,21 @@
+               })
+             }
+           }
+-        } catch {
++        } catch (err) {
+           // A target stored conversation is not a new-chat draft. If its
+           // runtime cannot be rebound, stop here rather than silently replacing
+           // it with a contextless session (#55578). For a background/queued
+           // drain this abort is a no-op on foreground state (both helpers are
+-          // targetIsCurrentView-guarded) and simply drops the queued send.
++          // targetIsCurrentView-guarded) and simply drops the queued send. A
++          // foreground send is not sent either: say so, then drop the bubble.
++          rejectSendOnFailedResume(err, {
++            copy,
++            drift: sessionDriftReason(),
++            hidden: options?.displayKind === 'hidden',
++            optimisticId,
++            quiet: Boolean(queueAdmission || options?.fromQueue)
++          })
++
+           return abortForSessionSwitch(null)
+         }
+ 
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+index fa8e01d304a..552a01a39c4 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/index.ts
+@@ -211,6 +211,7 @@
+   rememberResolvedResumeOwner,
+   resolveResumeOwner
+ } from './resume-owner'
++import { preservePendingTurnAcrossResume } from './resume-pending-turn'
+ import {
+   livePromptStreamId,
+   liveTurnSettledDuringResume,
+@@ -243,7 +244,6 @@
+   overlayConcurrentMessageChanges,
+   patchSessionWorkspace,
+   preserveEquivalentTranscript,
+-  preserveLocalPendingTurnMessages,
+   removeRepresentedLocalLiveProjection,
+   resolveResumedBusy,
+   resolveSessionProfile,
+@@ -1564,7 +1564,7 @@
+             : cachedState
+ 
+         if (resumedSameSelectedSession) {
+-          const messages = preserveLocalPendingTurnMessages(cachedViewState.messages, resumeStartMessages)
++          const messages = preservePendingTurnAcrossResume(cachedViewState.messages, resumeStartMessages)
+ 
+           if (messages !== cachedViewState.messages) {
+             cachedViewState = { ...cachedViewState, messages }
+@@ -2139,7 +2139,7 @@
+         const watchWindow = isWatchWindow()
+ 
+         let localSnapshot = resumedSameSelectedSession
+-          ? preserveLocalPendingTurnMessages(viewMessagesForReconcile(), resumeStartMessages)
++          ? preservePendingTurnAcrossResume(viewMessagesForReconcile(), resumeStartMessages)
+           : viewMessagesForReconcile()
+ 
+         let prefetchApplied = false
+@@ -2225,7 +2225,7 @@
+         // and never rebuilds the transcript a second time.
+         if (prefetchedResult && isCurrentResume()) {
+           const previousMessages = resumedSameSelectedSession
+-            ? preserveLocalPendingTurnMessages(viewMessagesForReconcile(), resumeStartMessages)
++            ? preservePendingTurnAcrossResume(viewMessagesForReconcile(), resumeStartMessages)
+             : viewMessagesForReconcile()
+ 
+           // Tail page + previously backfilled prefix (same-session re-resume).
+@@ -2322,7 +2322,7 @@
+           }
+ 
+           const previousMessages = resumedSameSelectedSession
+-            ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
++            ? preservePendingTurnAcrossResume(currentMessages, resumeStartMessages)
+             : currentMessages
+ 
+           const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+@@ -2566,7 +2566,7 @@
+           }
+ 
+           const previousMessages = resumedSameSelectedSession
+-            ? preserveLocalPendingTurnMessages(viewMessagesForReconcile(), resumeStartMessages)
++            ? preservePendingTurnAcrossResume(viewMessagesForReconcile(), resumeStartMessages)
+             : viewMessagesForReconcile()
+ 
+           // Resume failed, so there is no live projection — the journal is the
+@@ -2622,7 +2622,7 @@
+ 
+             if (stored && stored.messages.length > 0) {
+               const previousMessages = resumedSameSelectedSession
+-                ? preserveLocalPendingTurnMessages(viewMessagesForReconcile(), resumeStartMessages)
++                ? preservePendingTurnAcrossResume(viewMessagesForReconcile(), resumeStartMessages)
+                 : viewMessagesForReconcile()
+ 
+               setMessages(reconcileAuthoritativeMessages(stored.messages, previousMessages))
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/resume-pending-turn.ts b/apps/desktop/src/app/session/hooks/use-session-actions/resume-pending-turn.ts
+new file mode 100644
+index 00000000000..76712f277ee
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/resume-pending-turn.ts
+@@ -0,0 +1,18 @@
++import type { ChatMessage } from '@/lib/chat-messages'
++
++import { withoutRejectedOptimisticSends } from '../use-prompt-actions/rejected-optimistic-sends'
++
++import { preserveLocalPendingTurnMessages } from './utils'
++
++/**
++ * A resume carries the local pending turn it saw when it started across each
++ * of its repaints. Filtered at the repaint, not when the snapshot is taken: a
++ * send that was rejected while the resume was in flight (its own
++ * `session.resume` failed) must not come back as a bubble.
++ */
++export function preservePendingTurnAcrossResume(
++  nextMessages: ChatMessage[],
++  resumeStartMessages: ChatMessage[]
++): ChatMessage[] {
++  return preserveLocalPendingTurnMessages(nextMessages, withoutRejectedOptimisticSends(resumeStartMessages))
++}
+diff --git a/apps/desktop/src/i18n/ar_chat.ts b/apps/desktop/src/i18n/ar_chat.ts
+index c8fbbed7b8b..49822c73cf5 100644
+--- a/apps/desktop/src/i18n/ar_chat.ts
++++ b/apps/desktop/src/i18n/ar_chat.ts
+@@ -392,6 +392,7 @@
+     sessionUnavailable: 'الجلسة غير متاحة',
+     createSessionFailed: 'فشل إنشاء الجلسة',
+     promptFailed: 'فشل إرسال الرسالة',
++    promptNotSent: 'لم تُرسل الرسالة. أُعيدت إلى مربع الكتابة.',
+     providerCredentialRequired: 'مطلوب اعتماد المزود',
+     emptySlashCommand: 'أمر slash فارغ',
+     slashCommandIgnoredTitle: 'لم يتم إرسال الأمر',
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index 4b7bf4cfb97..8a88e70f263 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -5496,6 +5496,7 @@
+     sessionUnavailable: 'Session nicht verfügbar',
+     createSessionFailed: 'Neue Session konnte nicht erstellt werden',
+     promptFailed: 'Prompt fehlgeschlagen',
++    promptNotSent: 'Nachricht nicht gesendet. Sie steht wieder im Eingabefeld.',
+     providerCredentialRequired:
+       'Fügen Sie Anmeldedaten für einen Anbieter hinzu, bevor Sie Ihre erste Nachricht senden.',
+     emptySlashCommand: 'leerer Slash-Befehl',
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index caff9c6052f..3c881158ef1 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -4814,6 +4814,7 @@
+     sessionUnavailable: 'Session unavailable',
+     createSessionFailed: 'Could not create a new session',
+     promptFailed: 'Prompt failed',
++    promptNotSent: 'Message not sent. It is back in the composer.',
+     providerCredentialRequired: 'Add a provider credential before sending your first message.',
+     emptySlashCommand: 'empty slash command',
+     slashCommandIgnoredTitle: 'Command not sent',
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index a8a39dfc757..a13cfde6b9e 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -5480,6 +5480,7 @@
+     sessionUnavailable: 'Sesión no disponible',
+     createSessionFailed: 'No se pudo crear una sesión nueva',
+     promptFailed: 'Falló el prompt',
++    promptNotSent: 'Mensaje no enviado. Vuelve a estar en el cuadro de texto.',
+     providerCredentialRequired: 'Añade una credencial de proveedor antes de enviar tu primer mensaje.',
+     emptySlashCommand: 'comando slash vacío',
+     desktopCommands: 'Comandos de escritorio',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index 5a19712c5d6..45227030269 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -5506,6 +5506,7 @@
+     sessionUnavailable: 'Session indisponible',
+     createSessionFailed: 'Impossible de créer une nouvelle session',
+     promptFailed: "Échec de l'invite",
++    promptNotSent: 'Message non envoyé. Il est de nouveau dans la zone de saisie.',
+     providerCredentialRequired: "Ajoutez un identifiant de fournisseur avant d'envoyer votre premier message.",
+     emptySlashCommand: 'commande slash vide',
+     desktopCommands: 'Commandes Desktop',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 3d0e7de6623..c95cb7ebd45 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -3687,6 +3687,7 @@
+     sessionUnavailable: 'セッションが利用できません',
+     createSessionFailed: '新しいセッションを作成できませんでした',
+     promptFailed: 'プロンプトに失敗しました',
++    promptNotSent: 'メッセージは送信されませんでした。入力欄に戻してあります。',
+     providerCredentialRequired: '最初のメッセージを送信する前にプロバイダー認証情報を追加してください。',
+     emptySlashCommand: '空のスラッシュコマンド',
+     slashCommandIgnoredTitle: 'コマンドが送信されませんでした',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index 61db65430c8..cea6d344199 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -3849,6 +3849,7 @@
+     sessionUnavailable: 'Сеанс недоступен',
+     createSessionFailed: 'Не удалось создать новый сеанс',
+     promptFailed: 'Промпт не удался',
++    promptNotSent: 'Сообщение не отправлено. Оно возвращено в поле ввода.',
+     providerCredentialRequired: 'Добавьте учётные данные провайдера перед отправкой первого сообщения.',
+     emptySlashCommand: 'пустая слэш-команда',
+     desktopCommands: 'Команды desktop',
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 0934249f26a..7eb3f032200 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -4250,6 +4250,7 @@
+     sessionUnavailable: string
+     createSessionFailed: string
+     promptFailed: string
++    promptNotSent: string
+     providerCredentialRequired: string
+     emptySlashCommand: string
+     slashCommandIgnoredTitle: string
+diff --git a/apps/desktop/src/i18n/zh-hant_chat.ts b/apps/desktop/src/i18n/zh-hant_chat.ts
+index 1ada20d4641..4a170a02d63 100644
+--- a/apps/desktop/src/i18n/zh-hant_chat.ts
++++ b/apps/desktop/src/i18n/zh-hant_chat.ts
+@@ -415,6 +415,7 @@
+     sessionUnavailable: '工作階段不可用',
+     createSessionFailed: '無法建立新工作階段',
+     promptFailed: '提示詞傳送失敗',
++    promptNotSent: '訊息未傳送，已放回輸入框。',
+     providerCredentialRequired: '傳送第一則訊息前請先新增提供方憑證。',
+     emptySlashCommand: '空的斜線指令',
+     slashCommandIgnoredTitle: '指令未傳送',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index 697785d1e00..4884a06a30d 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -4629,6 +4629,7 @@
+     sessionUnavailable: '会话不可用',
+     createSessionFailed: '无法创建新会话',
+     promptFailed: '提示词发送失败',
++    promptNotSent: '消息未发送，已放回输入框。',
+     providerCredentialRequired: '发送第一条消息前请先添加提供方凭据。',
+     emptySlashCommand: '空 slash 命令',
+     slashCommandIgnoredTitle: '命令未发送',
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index b957e8401ac..91742a5e8cf 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -1614,6 +1614,7 @@
+     "desktop.poolSlotTimeoutOpenSettings",
+     "desktop.profileStatus",
+     "desktop.promptFailed",
++    "desktop.promptNotSent",
+     "desktop.providerCredentialRequired",
+     "desktop.readOnlyTranscriptBody",
+     "desktop.readOnlyTranscriptSendBlocked",
+-- 
+2.43.0
+

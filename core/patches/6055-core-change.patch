@@ -1,0 +1,696 @@
+From ab37e205f39d19ca5353834910e290f11b52eb3c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:52:59 +0000
+Subject: [PATCH 6055] Serve producer isolation (dormant panel producer and admission)
+
+Public mirror of source commit ab37e205f39d19ca5353834910e290f11b52eb3c.
+
+---
+diff --git a/hermes_cli/serve_producer_admission.py b/hermes_cli/serve_producer_admission.py
+index 5427eb4f3e8..c0633f3c06e 100644
+--- a/hermes_cli/serve_producer_admission.py
++++ b/hermes_cli/serve_producer_admission.py
+@@ -96,7 +96,7 @@
+         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                 or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):  # windows-footgun: ok — Linux adapter
+             raise CensusUnavailable('unsafe participant ledger')
+-        raw = _read_bytes(path, _MAX_RECEIPTS)
++        raw = _read_bytes(path, _MAX_RECEIPTS, nofollow=True)
+         values = json.loads(raw)
+         if not isinstance(values, list) or len(values) > _MAX_PARTICIPANTS:
+             raise CensusUnavailable('participant ledger budget/schema')
+@@ -107,7 +107,7 @@
+             raise CensusUnavailable('foreign pid namespace')
+         if len({receipt.identity for receipt in receipts}) != len(receipts):
+             raise CensusUnavailable('duplicate participant incarnation')
+-        if _read_bytes(path, _MAX_RECEIPTS) != raw:
++        if _read_bytes(path, _MAX_RECEIPTS, nofollow=True) != raw:
+             raise CensusUnavailable('participant ledger changed')
+         return receipts
+     except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+@@ -228,9 +228,77 @@
+     return left == right or right in left.parents
+ 
+ 
++# Environment variables whose value is an os.pathsep-separated search path, not one path.
++_PATH_LIST_ENV = frozenset(('PYTHONPATH',))
++_MAX_PATH_LIST_ENTRIES = 256
++_MAX_PATH_BYTES = 4096
++
++
++def _absolute(value: str, cwd: str) -> str | None:
++    """Lexical absolute form; None when a relative value cannot be anchored at the cwd.
++
++    A deleted/unreadable cwd leaves ``..`` unresolvable (it could climb anywhere).
++    Without ``..`` the value lies under that cwd, which is tested separately.
++    """
++    if value.startswith('/'):
++        return '/' + os.path.normpath(value).lstrip('/')
++    if cwd.startswith('/') and not cwd.endswith(' (deleted)'):
++        return '/' + os.path.normpath(os.path.join(cwd, value)).lstrip('/')
++    return None if '..' in value.split('/') else ''
++
++
++def _may_reach(value: str, cwd: str, roots: tuple[str, ...], *, follow_links: bool) -> bool:
++    """True unless this one reference provably cannot name a path under any root.
++
++    Relative references resolve against the OBSERVED cwd. Symlinks are followed
++    for import search paths, where an indirection really changes what is imported;
++    other references (argv words, flag values) are judged lexically, so a census
++    does not stat arbitrary foreign paths.
++    """
++    absolute = _absolute(value, cwd)
++    if absolute is None:
++        return True
++    if not absolute or len(absolute) > _MAX_PATH_BYTES:
++        return False
++    if any(_inside(absolute, root) for root in roots):
++        return True
++    if not follow_links:
++        return False
++    try:
++        real = os.path.realpath(absolute)
++    except (OSError, ValueError):
++        return True
++    return any(_inside(real, root) for root in roots)
++
++
+ def _record_touches(record, *roots: str) -> bool:
+-    values = (record.exe, record.cwd, *record.argv, *(value for _, value in record.environment))
+-    return any(_inside(value, root) for value in values for root in roots if root)
++    """Fail toward 'touches': absence of access must be positively established."""
++    anchors = []
++    for root in roots:
++        if root and root.startswith('/'):
++            anchors.append('/' + os.path.normpath(root).lstrip('/'))
++            try:
++                anchors.append(os.path.realpath(root))
++            except (OSError, ValueError):
++                return True
++    anchors = tuple(dict.fromkeys(anchors))
++    if not anchors:
++        return False
++    cwd = record.cwd
++    values = [(record.exe, False), (cwd, False)]
++    for item in record.argv:
++        values.append((item, False))
++        if '=' in item:  # --flag=/path, KEY=/path
++            values.append((item.partition('=')[2], False))
++    for key, value in record.environment:
++        if key in _PATH_LIST_ENV:
++            entries = value.split(os.pathsep)
++            if len(entries) > _MAX_PATH_LIST_ENTRIES:
++                return True
++            values.extend((entry, True) for entry in entries)
++        else:
++            values.append((value, False))
++    return any(value and _may_reach(value, cwd, anchors, follow_links=links) for value, links in values)
+ 
+ 
+ def _module_token(argv: tuple[str, ...]) -> str | None:
+@@ -462,9 +530,13 @@
+ def collect_raw_ledger(root: Path) -> CollectorEvidence:
+     path = root / 'spawn-ledger.json'
+     try:
+-        path.lstat()
++        info = path.lstat()
+     except FileNotFoundError as exc:
+         raise CensusUnavailable('ledger missing') from exc
++    if not stat.S_ISREG(info.st_mode):
++        # Early refusal only; the opened descriptor is re-judged without blocking,
++        # so a FIFO/device/symlink swapped in after this lstat cannot hold the gate.
++        raise CensusUnavailable('unsafe:spawn-ledger.json')
+     rows = read_ledger_strict(path)
+     return CollectorEvidence((f'ledger:{path}:{len(rows)}',), ())
+ 
+@@ -520,7 +592,7 @@
+             except FileNotFoundError:
+                 refs.append(f'{name}:absent')
+                 continue
+-            raw = _read_bytes(path, 1024 * 1024)
++            raw = _read_bytes(path, 1024 * 1024, nofollow=True)
+             if not isinstance(json.loads(raw), dict):
+                 raise CensusUnavailable(f'{name}:schema')
+             refs.append(f'{name}:{hashlib.sha256(raw).hexdigest()}')
+@@ -537,7 +609,7 @@
+             continue
+         try:
+             _regular_owned(pid_path)
+-            payload = json.loads(_read_bytes(pid_path, 1024 * 1024))
++            payload = json.loads(_read_bytes(pid_path, 1024 * 1024, nofollow=True))
+             pid = payload.get('pid') if isinstance(payload, dict) else None
+             if type(pid) is not int or pid <= 0:
+                 raise CensusUnavailable('gateway pid')
+diff --git a/hermes_cli/serve_producer_census.py b/hermes_cli/serve_producer_census.py
+index e20762e44f9..ac831f07154 100644
+--- a/hermes_cli/serve_producer_census.py
++++ b/hermes_cli/serve_producer_census.py
+@@ -11,6 +11,7 @@
+ import json
+ import math
+ import os
++import stat
+ import sys
+ import time
+ from dataclasses import dataclass
+@@ -70,8 +71,30 @@
+         return not self.errors
+ 
+ 
+-def _read_bytes(path: Path, limit: int) -> bytes:
+-    with path.open('rb') as stream:
++_O_NONBLOCK = getattr(os, 'O_NONBLOCK', 0)
++_O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
++_O_CLOEXEC = getattr(os, 'O_CLOEXEC', 0)
++
++
++def _read_bytes(path: Path, limit: int, *, nofollow: bool = False) -> bytes:
++    """Bounded read of one REGULAR file; never blocks on the path's file type.
++
++    A FIFO/socket/device swapped in for a ledger (before or after an lstat) must
++    be refused rather than hold the caller, and with it the launch gate. The
++    nonblocking open returns immediately for a FIFO with no writer; the type is
++    judged on the opened descriptor, so a swap after any path check is covered.
++    procfs files report S_IFREG and read normally. ``nofollow`` additionally
++    refuses a symlink final component (ELOOP is an OSError, hence uncertainty).
++    """
++    fd = os.open(path, os.O_RDONLY | _O_NONBLOCK | _O_CLOEXEC | (_O_NOFOLLOW if nofollow else 0))
++    try:
++        if not stat.S_ISREG(os.fstat(fd).st_mode):
++            raise CensusUnavailable('nonregular observation input')
++        stream = os.fdopen(fd, 'rb')
++    except BaseException:
++        os.close(fd)
++        raise
++    with stream:
+         value = stream.read(limit + 1)
+     if len(value) > limit:
+         raise CensusUnavailable('observation byte budget')
+@@ -260,7 +283,7 @@
+     readable evidence only, never proof that no unregistered process exists.
+     """
+     try:
+-        first_raw = _read_bytes(path, _MAX_LEDGER)
++        first_raw = _read_bytes(path, _MAX_LEDGER, nofollow=True)
+         rows = json.loads(first_raw.decode('utf-8-sig'))
+         if not isinstance(rows, list) or len(rows) > MAX_PROCESSES or not all(_valid_row(row) for row in rows):
+             raise CensusUnavailable('invalid ledger schema')
+@@ -275,7 +298,7 @@
+             candidate = pending / name
+             if candidate.suffix != '.json' or candidate.is_symlink():
+                 raise CensusUnavailable('unknown pending ledger entry')
+-            raw = _read_bytes(candidate, _MAX_LEDGER - total)
++            raw = _read_bytes(candidate, _MAX_LEDGER - total, nofollow=True)
+             total += len(raw)
+             pending_bytes[name] = raw
+             row = json.loads(raw.decode('utf-8-sig'))
+@@ -284,12 +307,12 @@
+             rows.append(row)
+         # Folding moves rows from pending into main. Validate BOTH sources after
+         # the cut; checking only pending names misses a continuously present row.
+-        if _read_bytes(path, _MAX_LEDGER) != first_raw:
++        if _read_bytes(path, _MAX_LEDGER, nofollow=True) != first_raw:
+             raise CensusUnavailable('main ledger changed')
+         if pending.exists() and _bounded_names(pending, MAX_PROCESSES) != names:
+             raise CensusUnavailable('pending ledger changed')
+         for name, raw in pending_bytes.items():
+-            if _read_bytes(pending / name, len(raw)) != raw:
++            if _read_bytes(pending / name, len(raw), nofollow=True) != raw:
+                 raise CensusUnavailable('pending ledger content changed')
+         return tuple(rows)
+     except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+diff --git a/tests/gateway/test_agent_cli_visibility.py b/tests/gateway/test_agent_cli_visibility.py
+index 1589eb5ef7a..fa42da64c6d 100644
+--- a/tests/gateway/test_agent_cli_visibility.py
++++ b/tests/gateway/test_agent_cli_visibility.py
+@@ -1,11 +1,23 @@
+ """Agent CLI visibility is frozen at creation, not inferred from the gateway's environment."""
+ import json
++import os
+ 
+ import pytest
+ 
+ from tests.gateway.test_session_row_cwd import _authority_fixture
+ 
+ 
++class _PidScopedOs:
++    """The real ``os`` for every attribute except a fixed fake ``getpid``; assigned to one module only."""
++
++    @staticmethod
++    def getpid():
++        return 999
++
++    def __getattr__(self, name):
++        return getattr(os, name)
++
++
+ @pytest.mark.parametrize('marker,visible', [('LC_HERMES_AGENT', False), ('HERMES_AGENT', False),
+                                           (None, False), ('HERMES_AGENT', True)])
+ @pytest.mark.asyncio
+@@ -16,7 +28,11 @@
+     from hermes_state_runtime import RuntimeStoreError
+     from hermes_cli import kanban_comment_writer as ancestry
+     from hermes_cli.chat_visibility import creation_visibility
+-    monkeypatch.setattr(ancestry.os, 'getpid', lambda: 999)
++    # Scope the fake pid to the ancestry module. Patching ``ancestry.os.getpid`` rewrites the process-wide
++    # ``os`` module, so the first import of ``gateway.run`` below (whose pre-import launch enrollment reads
++    # this process's own /proc entry) observed pid 999 and failed on /proc/999/stat.
++    monkeypatch.setattr(ancestry, 'os', _PidScopedOs())
++    assert os.getpid() != 999 and ancestry.os.getpid() == 999  # fake pid is module-scoped, not process-wide
+     monkeypatch.setattr(ancestry, '_read_proc', lambda pid: (998, {}) if pid == 999 else
+                         (0, {marker: 'parent'} if marker else {}))
+     monkeypatch.delenv('HERMES_CHAT_VISIBLE', raising=False)
+diff --git a/tests/hermes_cli/test_serve_producer_admission_boundaries.py b/tests/hermes_cli/test_serve_producer_admission_boundaries.py
+new file mode 100644
+index 00000000000..876e8f3926b
+--- /dev/null
++++ b/tests/hermes_cli/test_serve_producer_admission_boundaries.py
+@@ -0,0 +1,374 @@
++"""Review-driven boundaries of admission classification and raw-file observation.
++
++* A multi-entry/relative/indirect PYTHONPATH that reaches the installation is never
++  "unrelated" (that would exclude a live legacy importer from the census).
++* A non-regular file (FIFO, device, symlink, or one swapped in after a path check) in
++  a ledger slot is uncertainty, and never holds the launch gate.
++"""
++import os
++import select
++import subprocess
++import sys
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import serve_producer_admission as admission
++from hermes_cli import serve_producer_census as census
++from hermes_cli.serve_producer_census import (
++    CensusUnavailable, Incarnation, LinuxProcessCensus, ProcessObservation,
++)
++from hermes_cli.serve_producer_custody import CustodyConflict
++
++pytestmark = pytest.mark.platforms('linux')
++
++ROOT = Path(__file__).parents[2]
++
++
++def _record(*, cwd='/foreign', argv=('python', 'tool.py'), env=(), exe='/usr/bin/python'):
++    return ProcessObservation(Incarnation('boot', 321, 9), exe, cwd, tuple(argv), tuple(sorted(env)))
++
++
++def _kind(record, installation, home=''):
++    return admission.classify_process(record, (), 'generation', installation=str(installation),
++                                      home=str(home)).kind
++
++
++# ---- PYTHONPATH / path-reference classification --------------------------------------
++
++@pytest.mark.parametrize('layout', ['first', 'middle', 'last'])
++def test_multi_entry_pythonpath_containing_installation_is_never_unrelated(tmp_path, layout):
++    install = tmp_path / 'install'
++    install.mkdir()
++    entries = {'first': [install, tmp_path / 'a'], 'middle': [tmp_path / 'a', install, tmp_path / 'b'],
++               'last': [tmp_path / 'a', tmp_path / 'b', install]}[layout]
++    record = _record(env=(('PYTHONPATH', os.pathsep.join(map(str, entries))),))
++    assert _kind(record, install) == 'unknown'
++
++
++def test_pythonpath_entry_inside_installation_subtree_is_never_unrelated(tmp_path):
++    install = tmp_path / 'install'
++    (install / 'pkg').mkdir(parents=True)
++    record = _record(env=(('PYTHONPATH', f'{tmp_path}/a{os.pathsep}{install}/pkg'),))
++    assert _kind(record, install) == 'unknown'
++
++
++def test_unrelated_multi_entry_pythonpath_remains_positively_unrelated(tmp_path):
++    install = tmp_path / 'install'
++    install.mkdir()
++    sibling = tmp_path / 'install-sibling'  # component boundary, not a string prefix
++    record = _record(env=(('PYTHONPATH', os.pathsep.join((str(sibling), '/usr/lib/x', '', ''))),),
++                     argv=('python', 'tool.py', '--port', '8080'))
++    assert _kind(record, install) == 'unrelated'
++
++
++def test_relative_pythonpath_entry_is_resolved_against_the_observed_cwd(tmp_path):
++    install = tmp_path / 'work' / 'install'
++    install.mkdir(parents=True)
++    # cwd is outside (above) the installation; each relative spelling reaches it.
++    for entry in ('install', './install', 'install/', f'x{os.pathsep}install', '../work/install'):
++        record = _record(cwd=str(tmp_path / 'work'), env=(('PYTHONPATH', entry),))
++        assert _kind(record, install) == 'unknown', entry
++    # Controls: relative entries that do NOT reach it.
++    for entry in ('other', '.', '../elsewhere'):
++        record = _record(cwd=str(tmp_path / 'work'), env=(('PYTHONPATH', entry),))
++        assert _kind(record, install) == 'unrelated', entry
++
++
++def test_dotdot_and_double_slash_spellings_do_not_hide_the_installation(tmp_path):
++    install = tmp_path / 'install'
++    install.mkdir()
++    for spelling in (f'{tmp_path}/other/../install', f'/{tmp_path}/./install', f'{install}//'):
++        record = _record(env=(('PYTHONPATH', f'/usr/lib{os.pathsep}{spelling}'),))
++        assert _kind(record, install) == 'unknown', spelling
++
++
++def test_symlink_indirection_in_an_import_search_path_is_never_unrelated(tmp_path):
++    install = tmp_path / 'install'
++    install.mkdir()
++    link = tmp_path / 'alias'
++    link.symlink_to(install)
++    assert _kind(_record(env=(('PYTHONPATH', f'/usr/lib{os.pathsep}{link}'),)), install) == 'unknown'
++    # Relative symlink entry resolved at the observed cwd.
++    assert _kind(_record(cwd=str(tmp_path), env=(('PYTHONPATH', 'alias'),)), install) == 'unknown'
++    # The installation itself reached through a symlinked spelling.
++    assert _kind(_record(env=(('PYTHONPATH', str(install)),)), link) == 'unknown'
++    # Control: a symlink to somewhere else stays positively unrelated.
++    elsewhere = tmp_path / 'elsewhere'
++    elsewhere.mkdir()
++    other = tmp_path / 'other-alias'
++    other.symlink_to(elsewhere)
++    assert _kind(_record(env=(('PYTHONPATH', str(other)),)), install) == 'unrelated'
++    # Non-import references (argv words) are judged lexically, never by statting foreign paths.
++    assert _kind(_record(argv=('python', str(link / 'main.py'))), install) == 'unrelated'
++
++
++def test_relative_argv_and_flag_values_are_resolved_too(tmp_path):
++    install = tmp_path / 'work' / 'install'
++    install.mkdir(parents=True)
++    assert _kind(_record(cwd=str(tmp_path / 'work'), argv=('python', 'install/main.py')), install) == 'unknown'
++    assert _kind(_record(cwd=str(tmp_path / 'work' / 'x'), argv=('python', '../install/main.py')),
++                 install) == 'unknown'
++    assert _kind(_record(argv=('python', f'--root={install}')), install) == 'unknown'
++    assert _kind(_record(argv=('python', '--root=/elsewhere')), install) == 'unrelated'
++
++
++def test_unanchorable_relative_reference_is_uncertain_not_excluded(tmp_path):
++    install = tmp_path / 'install'
++    install.mkdir()
++    deleted = f'{tmp_path}/gone (deleted)'
++    # '..' under a deleted cwd could climb anywhere: uncertain.
++    assert _kind(_record(cwd=deleted, env=(('PYTHONPATH', '../install'),)), install) == 'unknown'
++    # Without '..', the value lies under the (foreign) deleted cwd: still positively foreign.
++    assert _kind(_record(cwd=deleted, env=(('PYTHONPATH', f'a{os.pathsep}b'),)), install) == 'unrelated'
++
++
++def test_oversized_search_path_cannot_be_proven_unrelated(tmp_path):
++    install = tmp_path / 'install'
++    install.mkdir()
++    many = os.pathsep.join(f'/nowhere/{index}' for index in range(admission._MAX_PATH_LIST_ENTRIES + 1))
++    assert _kind(_record(env=(('PYTHONPATH', many),)), install) == 'unknown'
++    few = os.pathsep.join(f'/nowhere/{index}' for index in range(admission._MAX_PATH_LIST_ENTRIES))
++    assert _kind(_record(env=(('PYTHONPATH', few),)), install) == 'unrelated'
++
++
++def test_unresolvable_scope_roots_never_exclude():
++    # No usable root => nothing to exclude against: classification reports no proof of absence either way.
++    assert admission._record_touches(_record(), '', 'relative/root') is False
++
++
++def test_overlong_reference_cannot_name_the_installation_and_resolution_errors_are_uncertain(tmp_path, monkeypatch):
++    install = tmp_path / 'install'
++    install.mkdir()
++    overlong = '/x/' + 'a' * (admission._MAX_PATH_BYTES + 1)
++    assert _kind(_record(env=(('PYTHONPATH', overlong),)), install) == 'unrelated'
++
++    def refuse(path):
++        raise OSError('no access')
++    monkeypatch.setattr(admission.os.path, 'realpath', refuse)
++    # An import search path that cannot be resolved is uncertain, never excluded...
++    assert _kind(_record(env=(('PYTHONPATH', '/somewhere/else'),)), install) == 'unknown'
++    # ...and so is an unresolvable root itself.
++    assert admission._record_touches(_record(), str(install)) is True
++
++
++@pytest.mark.parametrize('multiple', [False, True])
++def test_real_process_importing_installation_via_pythonpath_is_not_unrelated(tmp_path, multiple):
++    """Review repro: foreign cwd/script/home, real import from this checkout via PYTHONPATH."""
++    script = tmp_path / 'importer.py'
++    script.write_text('import sys\nfrom hermes_cli import serve_producer_protocol\n'
++                      'print(serve_producer_protocol.__file__, flush=True)\nsys.stdin.readline()\n')
++    path = str(ROOT) + (os.pathsep + str(tmp_path) if multiple else '')
++    child = subprocess.Popen([sys.executable, str(script)], cwd=tmp_path, text=True,
++                             env=dict(os.environ, HERMES_HOME=str(tmp_path / 'other-home'), PYTHONPATH=path),
++                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    try:
++        assert select.select([child.stdout], [], [], 30)[0]
++        assert child.stdout.readline().strip() == str(ROOT / 'hermes_cli/serve_producer_protocol.py')
++        adapter = LinuxProcessCensus()
++        record = adapter.read_process(child.pid, adapter.boot_id())
++        result = admission.classify_process(record, (), 'generation', installation=str(ROOT),
++                                            home=str(tmp_path / 'scope-home'))
++        assert result.kind != 'unrelated', (result, record.environment)
++        assert result.kind == 'unknown'
++    finally:
++        child.communicate(input='done\n', timeout=30)
++
++
++# ---- nonblocking, descriptor-typed raw file reads --------------------------------------
++
++def _bounded(call, fifo: Path | None = None, timeout: float = 10):
++    """Run ``call`` in a daemon thread; a hang is released and reported, never inherited."""
++    outcome = {}
++
++    def run():
++        try:
++            outcome['value'] = call()
++        except BaseException as exc:  # the thread reports every outcome
++            outcome['error'] = exc
++    worker = threading.Thread(target=run, daemon=True)
++    worker.start()
++    worker.join(timeout)
++    if worker.is_alive():
++        if fifo is not None:  # unblock the stuck open so no thread outlives the test
++            fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
++            os.close(fd)
++            worker.join(5)
++        pytest.fail('raw-file read blocked on a non-regular file')
++    return outcome
++
++
++def test_read_bytes_refuses_fifo_without_blocking(tmp_path):
++    fifo = tmp_path / 'ledger'
++    os.mkfifo(fifo, 0o600)
++    outcome = _bounded(lambda: census._read_bytes(fifo, 1024), fifo)
++    assert isinstance(outcome.get('error'), CensusUnavailable), outcome
++    assert 'nonregular' in str(outcome['error'])
++
++
++@pytest.mark.parametrize('device', ['/dev/null', '/dev/zero'])
++def test_read_bytes_refuses_character_devices(device):
++    with pytest.raises(CensusUnavailable, match='nonregular'):
++        census._read_bytes(Path(device), 1024)
++
++
++def test_read_bytes_nofollow_refuses_any_symlink_but_default_reads_procfs(tmp_path):
++    target = tmp_path / 'real'
++    target.write_bytes(b'[]')
++    link = tmp_path / 'link'
++    link.symlink_to(target)
++    with pytest.raises(OSError):
++        census._read_bytes(link, 16, nofollow=True)
++    assert census._read_bytes(target, 16, nofollow=True) == b'[]'
++    # Control: the nonblocking descriptor read still serves real procfs identity files.
++    assert census._read_bytes(Path('/proc/self/stat'), 8192).split(b' ', 1)[0] == str(os.getpid()).encode()
++    with pytest.raises(CensusUnavailable, match='budget'):
++        census._read_bytes(target, 1)
++
++
++def test_read_bytes_closes_descriptor_on_refusal():
++    before = len(os.listdir('/proc/self/fd'))
++    for _ in range(20):
++        with pytest.raises(CensusUnavailable):
++            census._read_bytes(Path('/dev/null'), 8)
++    assert len(os.listdir('/proc/self/fd')) == before
++
++
++@pytest.mark.parametrize('kind', ['fifo', 'symlink_to_fifo', 'symlink_to_device', 'symlink_to_regular', 'directory'])
++def test_unsafe_main_ledger_is_uncertainty_not_a_hang(tmp_path, kind):
++    path = tmp_path / 'spawn-ledger.json'
++    regular = tmp_path / 'regular.json'
++    regular.write_text('[]')
++    fifo = tmp_path / 'fifo'
++    os.mkfifo(fifo, 0o600)
++    {'fifo': lambda: os.mkfifo(path, 0o600), 'symlink_to_fifo': lambda: path.symlink_to(fifo),
++     'symlink_to_device': lambda: path.symlink_to('/dev/zero'),
++     'symlink_to_regular': lambda: path.symlink_to(regular), 'directory': path.mkdir}[kind]()
++    release = path if kind == 'fifo' else fifo
++    outcome = _bounded(lambda: admission.collect_raw_ledger(tmp_path), release)
++    assert isinstance(outcome.get('error'), CensusUnavailable), outcome
++    with pytest.raises(CensusUnavailable):
++        census.read_ledger_strict(path)  # also refused beneath the collector's own lstat check
++
++
++def test_regular_ledger_control_is_still_positive_evidence(tmp_path):
++    (tmp_path / 'spawn-ledger.json').write_text('[]')
++    evidence = admission.collect_raw_ledger(tmp_path)
++    assert evidence.refs == (f'ledger:{tmp_path / "spawn-ledger.json"}:0',) and not evidence.conflicts
++
++
++@pytest.mark.parametrize('kind', ['fifo', 'symlink_to_fifo', 'symlink_to_regular'])
++def test_unsafe_pending_row_is_uncertainty_not_a_hang(tmp_path, kind):
++    ledger = tmp_path / 'spawn-ledger.json'
++    ledger.write_text('[]')
++    pending = tmp_path / 'spawn-ledger.json.pending'
++    pending.mkdir()
++    entry = pending / 'row.json'
++    fifo = tmp_path / 'fifo'
++    os.mkfifo(fifo, 0o600)
++    real = tmp_path / 'real.json'
++    real.write_text('{}')
++    {'fifo': lambda: os.mkfifo(entry, 0o600), 'symlink_to_fifo': lambda: entry.symlink_to(fifo),
++     'symlink_to_regular': lambda: entry.symlink_to(real)}[kind]()
++    outcome = _bounded(lambda: admission.collect_raw_ledger(tmp_path), entry if kind == 'fifo' else fifo)
++    assert isinstance(outcome.get('error'), CensusUnavailable), outcome
++
++
++def test_pending_directory_that_is_a_fifo_is_uncertainty_not_a_hang(tmp_path):
++    (tmp_path / 'spawn-ledger.json').write_text('[]')
++    pending = tmp_path / 'spawn-ledger.json.pending'
++    os.mkfifo(pending, 0o600)
++    outcome = _bounded(lambda: admission.collect_raw_ledger(tmp_path), pending)
++    assert isinstance(outcome.get('error'), CensusUnavailable), outcome
++
++
++def test_ledger_swapped_for_fifo_between_lstat_and_open_is_not_a_hang(tmp_path, monkeypatch):
++    ledger = tmp_path / 'spawn-ledger.json'
++    ledger.write_text('[]')
++    real_open, swapped = os.open, []
++
++    def racing_open(path, flags, *args, **kwargs):
++        if Path(path) == ledger and not swapped:
++            swapped.append(True)  # lstat already judged a regular file; swap before the open
++            ledger.unlink()
++            os.mkfifo(ledger, 0o600)
++        return real_open(path, flags, *args, **kwargs)
++    monkeypatch.setattr(census.os, 'open', racing_open)
++    outcome = _bounded(lambda: admission.collect_raw_ledger(tmp_path), ledger)
++    assert swapped
++    assert isinstance(outcome.get('error'), CensusUnavailable), outcome
++    assert 'nonregular' in str(outcome['error'].__cause__ or outcome['error']) or 'ledger' in str(outcome['error'])
++
++
++def test_participant_ledger_swapped_after_lstat_is_refused_not_blocking(tmp_path, monkeypatch):
++    runtime = tmp_path / 'runtime'
++    admission.enroll_launch(runtime, 'serve', installation=ROOT)
++    path = runtime / 'participants.json'
++    real_open, swapped = os.open, []
++
++    def racing_open(target, flags, *args, **kwargs):
++        if Path(target) == path and not swapped:
++            swapped.append(True)
++            path.unlink()
++            os.mkfifo(path, 0o600)
++        return real_open(target, flags, *args, **kwargs)
++    monkeypatch.setattr(census.os, 'open', racing_open)
++    outcome = _bounded(lambda: admission.read_participants_strict(runtime), path)
++    assert swapped and isinstance(outcome.get('error'), CensusUnavailable), outcome
++
++
++def test_fifo_ledger_does_not_hold_the_launch_gate(tmp_path):
++    """Review repro: the real collector inside a held gate returns, and the gate is then free."""
++    home = tmp_path / 'home'
++    home.mkdir()
++    os.mkfifo(home / 'spawn-ledger.json', 0o600)
++    runtime = tmp_path / 'runtime'
++    script = tmp_path / 'reader.py'
++    script.write_text('import sys\nfrom pathlib import Path\n'
++                      'from hermes_cli.serve_producer_admission import LaunchGate, collect_raw_ledger\n'
++                      'from hermes_cli.serve_producer_census import CensusUnavailable\n'
++                      'with LaunchGate.acquire(Path(sys.argv[1])):\n'
++                      "    print('gate-held', flush=True)\n"
++                      '    try:\n        collect_raw_ledger(Path(sys.argv[2]))\n'
++                      "    except CensusUnavailable as exc:\n        print('incomplete', exc, flush=True)\n"
++                      "    else:\n        raise SystemExit(3)\n")
++    child = subprocess.Popen([sys.executable, str(script), str(runtime), str(home)], text=True,
++                             env=dict(os.environ, PYTHONPATH=str(ROOT)),
++                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    try:
++        assert select.select([child.stdout], [], [], 30)[0]
++        assert child.stdout.readline().strip() == 'gate-held'
++        try:
++            _, err = child.communicate(timeout=10)
++        except subprocess.TimeoutExpired:
++            with pytest.raises(CustodyConflict):
++                admission.LaunchGate.acquire(runtime)
++            pytest.fail('FIFO ledger blocks while retaining the shared launch gate')
++        assert child.returncode == 0, err  # the collector reported CensusUnavailable and the gate was released
++        admission.LaunchGate.acquire(runtime).close()
++    finally:
++        if child.poll() is None:
++            child.kill()
++            child.communicate(timeout=10)
++
++
++def test_gate_inspection_with_fifo_ledger_is_incomplete_and_returns(tmp_path, monkeypatch):
++    """The real host collectors inside a held gate (synthetic empty census: no real-home /proc scan)."""
++    home = tmp_path / 'home'
++    home.mkdir()
++    os.mkfifo(home / 'spawn-ledger.json', 0o600)
++    monkeypatch.setenv('HERMES_GATEWAY_LOCK_DIR', str(tmp_path / 'locks'))  # never read the account's locks
++
++    def inspect():
++        with admission.LaunchGate.acquire(tmp_path / 'runtime') as gate:
++            return gate.inspect(
++                boot_id='boot', generation='generation', installation=str(ROOT),
++                census=lambda: census.ProcessCensus('boot', 1.0, 2.0, (), (), ()),
++                collectors=admission.host_collectors(home, ROOT),
++                classify=lambda record: None, legacy_candidates=(), exited=lambda identity: False)
++    outcome = _bounded(inspect, home / 'spawn-ledger.json', timeout=60)
++    cut = outcome.get('value')
++    assert cut is not None, outcome
++    assert not cut.complete
++    assert any(error.startswith('raw_ledger:CensusUnavailable') for error in cut.errors), cut.errors
+diff --git a/tests/hermes_cli/test_serve_producer_census.py b/tests/hermes_cli/test_serve_producer_census.py
+index 206fca5942f..17809120efb 100644
+--- a/tests/hermes_cli/test_serve_producer_census.py
++++ b/tests/hermes_cli/test_serve_producer_census.py
+@@ -239,9 +239,9 @@
+     original = census._read_bytes
+     changed = False
+ 
+-    def folded(candidate, limit):
++    def folded(candidate, limit, **kwargs):
+         nonlocal changed
+-        result = original(candidate, limit)
++        result = original(candidate, limit, **kwargs)
+         if candidate == path and not changed:
+             changed = True
+             path.write_text(json.dumps([row]))
+diff --git a/tests/hermes_cli/test_serve_producer_collectors.py b/tests/hermes_cli/test_serve_producer_collectors.py
+index d284979c69b..64e39ae9c59 100644
+--- a/tests/hermes_cli/test_serve_producer_collectors.py
++++ b/tests/hermes_cli/test_serve_producer_collectors.py
+@@ -115,6 +115,8 @@
+     assert set(coverage['roles']) == set(admission.SUPPORTED_LAUNCHES)
+ 
+ 
++@pytest.mark.allow_real_home_io  # subject is the LIVE host census: classifying foreign processes lstat()s their
++# PYTHONPATH entries (read-only metadata), which on a developer host may lie under the real Hermes home.
+ def test_inspect_host_hub_shaped_does_not_treat_live_python_as_empty(tmp_path, monkeypatch):
+     root = _home(tmp_path)
+     monkeypatch.setenv('HERMES_GATEWAY_LOCK_DIR', str(tmp_path / 'no-locks'))
+diff --git a/tests/hermes_cli/test_serve_producer_launch.py b/tests/hermes_cli/test_serve_producer_launch.py
+index d39d1a8a245..073d9513542 100644
+--- a/tests/hermes_cli/test_serve_producer_launch.py
++++ b/tests/hermes_cli/test_serve_producer_launch.py
+@@ -153,3 +153,17 @@
+     record = adapter.read_process(os.getpid(), adapter.boot_id())
+     assert admission.classify_process(record, (receipt,), receipt.generation,
+                                       installation='/other-install').kind == 'unrelated'
++
++
++def test_enrollment_of_a_process_that_does_not_exist_fails_closed_and_publishes_nothing(tmp_path, monkeypatch):
++    """Positive admission stays strict: a fake pid (as some fixtures install) is refused, never enrolled.
++
++    Fixtures must scope fake pids to their own module (see tests/gateway/test_agent_cli_visibility.py)
++    instead of letting import-time launch enrollment observe them.
++    """
++    runtime = tmp_path / 'runtime'
++    monkeypatch.setattr(os, 'getpid', lambda: 2 ** 22 + 12345)
++    with pytest.raises((CensusUnavailable, OSError)):
++        admission.enroll_launch(runtime, 'serve', installation=Path(__file__).parents[2])
++    monkeypatch.undo()
++    assert not (runtime / 'participants.json').exists()
+-- 
+2.43.0
+

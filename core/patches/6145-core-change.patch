@@ -1,0 +1,431 @@
+From 91f4193b34843ba1bcd9bca277f1931d83e3beb2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 04:15:56 +0000
+Subject: [PATCH 6145] Kanban canonical home, execution separation and explicit-home readers
+
+Public mirror of source commit 91f4193b34843ba1bcd9bca277f1931d83e3beb2.
+
+---
+diff --git a/hermes_cli/kanban_creation_home.py b/hermes_cli/kanban_creation_home.py
+new file mode 100644
+index 00000000000..5d7c66d75e6
+--- /dev/null
++++ b/hermes_cli/kanban_creation_home.py
+@@ -0,0 +1,87 @@
++"""Separate a pool worker's administrative creation home from execution labels.
++
++An execution pin is not a reason to entrust parked work to an ephemeral gateway.
++The receiving hub still owns all admission, dependency and origin-custody gates.
++"""
++from __future__ import annotations
++
++
++def plan(args, *, cfg, gateway, machine_ok):
++    """Return a hub-bound view/decision, or None for an ordinary non-pool gateway.
++
++    Unsupported host-local fields refuse rather than silently dropping metadata or
++    falling back to a worker-owned card. No freshness/capacity failure authorizes a
++    change of administrative home.
++    """
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli import kanban_worker_placement as workers
++
++    queued_gateway = bool(placement._Cfg(cfg).queue_label(gateway))
++    if not queued_gateway:
++        return None  # explicit opt-in to the fork's managed worker queue policy
++    # Enrolled worker slot names remain identifiable while registry refresh is
++    # unavailable. Discovery failure must not recreate worker-local ownership.
++    worker_slot = isinstance(gateway, str) and gateway.startswith('worker-')
++    if not worker_slot and not placement.linux_pool_gateway(gateway, cfg):
++        return None
++    if args.get('board') not in (None, '', 'default'):
++        return args, {'where': 'refuse', 'pin': 'hub', 'why': 'worker creation home supports only the default board'}
++    if ((args.get('workspace_kind') or 'scratch') != 'scratch'
++            or args.get('workspace_path') or args.get('project_id') or args.get('project')):
++        return args, {'where': 'refuse', 'pin': 'hub',
++                      'why': 'publish host-local source before forwarding to the canonical creation home'}
++    labels = args.get('runs_on')
++    pin = placement.canonical_pin(args.get('placement') or 'auto', gateway, cfg)
++    if labels is None and pin not in ('', 'auto', 'local', 'here', gateway):
++        if not machine_ok(pin):
++            return args, {'where': 'refuse', 'pin': pin, 'why': 'execution pin is not an enrolled pickup machine'}
++        labels = placement.route_labels(pin)
++    if not labels:
++        # Local means caller affinity, not evidence of a machine-only need. The
++        # queue planner supplies marker/coordination capabilities without a pin.
++        portable = {k: v for k, v in args.items() if k not in ('placement', 'runs_on')}
++        queued = workers.queue_decision(portable, cfg, gateway, 'auto', machine_ok)
++        if not queued or not queued.get('runs_on'):
++            return args, {'where': 'refuse', 'pin': 'hub',
++                          'why': 'cannot establish a claimable execution route for canonical creation'}
++        labels = queued['runs_on']
++    view = {**args, 'placement': 'auto', 'runs_on': list(labels)}
++    return view, {'where': 'hub', 'canonical_home': True,
++                  'why': 'shared administrative home; execution remains constrained by runs_on'}
++
++
++def prepare(args, *, cfg, gateway, machine_ok):
++    from hermes_cli import kanban_placement as placement
++    try:
++        home = plan(args, cfg=cfg, gateway=gateway, machine_ok=machine_ok)
++    except Exception as exc:  # health: allow BLE001 -- opted-in pool creates fail closed, never worker-local
++        if not placement._Cfg(cfg).queue_label(gateway):
++            raise
++        home = args, {'where': 'refuse', 'pin': 'hub', 'why': f'canonical home planning failed: {exc}'}
++    view, decision = home if home is not None else (args, placement.decide(args, machine_ok=machine_ok))
++    return home, view, decision
++
++
++def transport_options(args, *, hub_cli):
++    """Expand/contract preflight against the installed client, before any request write."""
++    from hermes_cli import kanban_placement as placement
++    rc, help_text, _ = placement.hub_runner([hub_cli, 'create-task', '--help'])
++    if rc or 'canonical-home-v1' not in help_text or '--option' not in help_text:
++        raise ValueError('canonical_home_transport_unavailable: update the courier client before forwarding')
++    if args.get('pin_mandatory'):
++        raise ValueError('canonical_home_transport_unavailable: mandatory model pin cannot be forwarded')
++    keys = ('runs_on', 'parents', 'tenant', 'max_retries', 'initial_status', 'human_request')
++    # Preserve zero retries and empty label/dependency lists. Core's normal owner
++    # entrypoint validates typed values; never stringify structured safety fields.
++    return {key: args[key] for key in keys if args.get(key) is not None}
++
++
++def result(args, fields, *, tid, status, target):
++    """Report pending creation honestly without calling the hub an execution pin."""
++    labels = args['runs_on']
++    request = fields['placed']['request_id']
++    state = f'Created on {target} as {tid}.' if tid else f'Creation request {request} is queued for {target}; task ID pending.'
++    return {'task_id': tid, 'status': status or ('created' if tid else 'queued'), **fields,
++            'runs_where': 'board', 'runs_on': labels,
++            'note': f'{state} Administrative home is shared; execution is constrained by runs_on={labels}. '
++                    'Do not repeat creation; an identical retry uses the same request.'}
+diff --git a/hermes_cli/kanban_origin_forward_decision.py b/hermes_cli/kanban_origin_forward_decision.py
+index 9a2b2295e78..8c8573fe5a4 100644
+--- a/hermes_cli/kanban_origin_forward_decision.py
++++ b/hermes_cli/kanban_origin_forward_decision.py
+@@ -35,11 +35,13 @@
+ def _validate_create(create):
+     # Match the placement courier's surface, not arbitrary owner-tool parameters.
+     strings = {"title", "body", "assignee", "session_id", "admission_class", "admission_frees",
+-               "model", "provider", "completion_contract", "idempotency_key", "distinct_reason"}
+-    lists = {"skills", "requires", "distinct_from"}
+-    integers = {"max_runtime_seconds", "priority", "goal_max_turns"}
++               "model", "provider", "completion_contract", "idempotency_key", "distinct_reason",
++               "tenant", "initial_status"}
++    lists = {"skills", "requires", "distinct_from", "runs_on", "parents"}
++    integers = {"max_runtime_seconds", "priority", "goal_max_turns", "max_retries"}
+     booleans = {"goal_mode", "review_required", "triage"}
+-    allowed = strings | lists | integers | booleans
++    objects = {"human_request"}
++    allowed = strings | lists | integers | booleans | objects
+     if (not set(create) <= allowed
+             or not all(isinstance(create.get(key), str) and create[key].strip()
+                        for key in ("title", "assignee", "session_id"))
+@@ -49,7 +51,8 @@
+         if ((key in strings and not isinstance(value, str))
+                 or (key in lists and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)))
+                 or (key in integers and type(value) is not int)
+-                or (key in booleans and type(value) is not bool)):
++                or (key in booleans and type(value) is not bool)
++                or (key in objects and not isinstance(value, dict))):
+             raise ValueError("origin_forward_create_invalid")
+ 
+ 
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 3e506abb0b5..9c53f466074 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1287,7 +1287,8 @@
+ def create_remote(args: dict, *, target: str, origin_session: Optional[str], origin_profile: str,
+                   self_gw: str, cfg: Optional[dict] = None, hub_cli: str = "hermes-hub",
+                   transport_key: Optional[str] = None, origin_gateway: Optional[str] = None,
+-                  creator: Optional[dict] = None, run_uid: Optional[str] = None) -> dict:
++                  creator: Optional[dict] = None, run_uid: Optional[str] = None,
++                  canonical_home: bool = False) -> dict:
+     """Queue on ``target``; a fatal refusal must not fall back to a second local card."""
+     c = _Cfg(config() if cfg is None else cfg)
+     foreign_origin = bool(origin_gateway and origin_gateway != self_gw)
+@@ -1298,6 +1299,9 @@
+         return {"ok": False, "fatal": True, "error": "create identity requires hermes-hub create-task --option"}
+     try:
+         options = carried_options(args) if carried else {}
++        if canonical_home:
++            from hermes_cli.kanban_creation_home import transport_options
++            options.update(transport_options(args, hub_cli=hub_cli))
+     except (TypeError, ValueError) as exc:
+         return {"ok": False, "fatal": True, "error": str(exc)}
+     transport_args = {**args, "idempotency_key": transport_key} if transport_key else args
+diff --git a/tests/hermes_cli/test_creation_home_transport.py b/tests/hermes_cli/test_creation_home_transport.py
+new file mode 100644
+index 00000000000..0f20d0eebac
+--- /dev/null
++++ b/tests/hermes_cli/test_creation_home_transport.py
+@@ -0,0 +1,73 @@
++"""Canonical-home forwarding keeps constraints and authenticated origin custody."""
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import test_origin_forward_decision as origins
++
++forwarding = origins.forwarding
++authority = origins.authority
++
++
++@pytest.mark.parametrize('labels', [['pool:worker'], ['machine:macbook']])
++def test_foreign_origin_authorizes_complete_home_metadata(forwarding, labels):
++    request = copy.deepcopy(forwarding[0])
++    metadata = {'runs_on': labels, 'parents': ['t_0123456789abcdef'], 'tenant': 'hermes',
++                'max_retries': 2, 'initial_status': 'blocked', 'human_request': {'action': 'retained ask'}}
++    request['args']['create'].update(metadata)
++    result = origins.decide(forwarding, request)
++    assert all(result['args']['create'][k] == v for k, v in metadata.items())
++    assert forwarding[2] == [('default', 'task-1')]
++    assert origins.decide(forwarding, request, now_ms=lambda: 99999) == result
++    changed = copy.deepcopy(request)
++    changed['args']['create']['runs_on'] = ['machine:hub']
++    with pytest.raises(ValueError, match='origin_forward_conflict'):
++        origins.decide(forwarding, changed)
++
++
++@pytest.mark.parametrize('available', [False, True])
++def test_transport_preflights_actual_client_and_preserves_options(monkeypatch, available):
++    argv_seen = []
++
++    def run(argv):
++        argv_seen.append(argv)
++        if argv[-1] == '--help':
++            return 0, '--option canonical-home-v1' if available else '--option', ''
++        return 0, 'queued', ''
++
++    placement._help_cache.clear()
++    monkeypatch.setattr(placement, 'hub_runner', run)
++    monkeypatch.setattr(placement, 'remote_state', lambda rid: None)
++    args = {'title': 'portable proof', 'assignee': 'default', 'runs_on': ['pool:worker'],
++            'parents': ['t_0123456789abcdef'], 'tenant': 'hermes', 'max_retries': 2,
++            'initial_status': 'blocked', 'human_request': {'action': 'retained ask'}}
++    result = placement.create_remote(args, target='hub', origin_session=None,
++        origin_profile='default', self_gw='worker-1', cfg={}, hub_cli='fake-courier', canonical_home=True)
++    sent = [argv for argv in argv_seen if argv[-1] != '--help']
++    if not available:
++        assert result['ok'] is False and result['fatal'] is True
++        assert not sent
++        return
++    assert result['ok'] is True and len(sent) == 1
++    options = dict(value.split('=', 1) for i, value in enumerate(sent[0]) if i and sent[0][i-1] == '--option')
++    assert all(json.loads(options[key]) == args[key] for key in
++               ('runs_on', 'parents', 'tenant', 'max_retries', 'initial_status', 'human_request'))
++
++
++@pytest.mark.parametrize('failure', ['unclaimable', 'exception'])
++def test_worker_planning_failure_is_typed_not_local(monkeypatch, failure):
++    from hermes_cli import kanban_creation_home as home
++    from hermes_cli import kanban_worker_placement as workers
++
++    def queue(*args):
++        if failure == 'exception':
++            raise RuntimeError('registry unavailable')
++
++    monkeypatch.setattr(workers, 'queue_decision', queue)
++    home_plan, _, decision = home.prepare({'title': 'must not stay on worker'},
++        cfg={'worker_queue': {'worker-a3': 'pool:worker'}}, gateway='worker-a3', machine_ok=lambda _: False)
++    assert home_plan is not None
++    assert decision['where'] == 'refuse'
++    assert decision['pin'] == 'hub'
+diff --git a/tests/tools/test_kanban_worker_canonical_home.py b/tests/tools/test_kanban_worker_canonical_home.py
+new file mode 100644
+index 00000000000..361e00ec557
+--- /dev/null
++++ b/tests/tools/test_kanban_worker_canonical_home.py
+@@ -0,0 +1,111 @@
++"""Execution labels must not turn an ephemeral worker into a card's home."""
++import json
++import os
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_placement as placement
++from tools import kanban_tools as tools
++from tests.hermes_cli import test_kanban_worker_node as nodes
++
++svc = nodes.svc
++gws = nodes.gws
++
++
++@pytest.fixture(autouse=True)
++def pool_labels(monkeypatch):
++    machines = {key: dict(value) for key, value in nodes.MACHINES.items()}
++    machines[nodes.WORKER]['labels'] = ['linux', 'pool:worker', 'capability:core-ship',
++                                         'capability:tailnet-exec']
++    machines['macbook']['pickup'] = 'explicit'
++    monkeypatch.setattr(nodes, 'MACHINES', machines)
++
++
++@pytest.mark.parametrize('options,expected', [
++    ({}, ['pool:worker']),
++    ({'skills': ['session-status-panel', 'inspecting-hermes-desktop-dom'],
++      'body': 'Inspect the Desktop DOM'}, ['pool:worker', 'capability:tailnet-exec']),
++    ({'runs_on': ['pool:worker', 'capability:core-ship']},
++     ['pool:worker', 'capability:core-ship']),
++    ({'placement': 'macbook', 'body': 'Read the existing packaged Desktop on macbook'},
++     ['machine:macbook']),
++])
++def test_worker_tool_forwards_home_and_retains_execution(gws, monkeypatch, options, expected):
++    _, worker = gws
++    worker.enter()
++    monkeypatch.setattr(placement.reg, 'self_gateway', lambda: nodes.WORKER)
++    monkeypatch.setattr(placement, 'linux_pool_gateway', lambda *a, **kw: True)
++    monkeypatch.setattr(placement, 'config', lambda: {
++        'worker_queue': {nodes.WORKER: 'pool:worker'}, 'route': {nodes.WORKER: nodes.HUB}})
++    monkeypatch.setattr(placement, '_machine_picks_up', lambda labels: True)
++    sent = []
++
++    def send(view, **kwargs):
++        sent.append((view, kwargs))
++        return {'ok': True, 'request_id': 'canonical-home-test', 'queued_only': True}
++
++    monkeypatch.setattr(placement, 'create_remote', send)
++    before = worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    out = json.loads(tools._handle_create({'title': 'canonical card', 'assignee': 'default',
++                                         'requires': [], **options}))
++    assert len(sent) == 1, out
++    view, context = sent[0]
++    assert context['target'] == nodes.HUB
++    assert view['runs_on'] == expected
++    assert worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
++    assert out['placed']['gateway'] == nodes.HUB
++
++
++def test_canonical_home_failure_never_falls_back_local(gws, monkeypatch):
++    _, worker = gws
++    worker.enter()
++    monkeypatch.setattr(placement.reg, 'self_gateway', lambda: nodes.WORKER)
++    monkeypatch.setattr(placement, 'linux_pool_gateway', lambda *a, **kw: True)
++    monkeypatch.setattr(placement, 'config', lambda: {
++        'worker_queue': {nodes.WORKER: 'pool:worker'}, 'route': {nodes.WORKER: nodes.HUB}})
++    monkeypatch.setattr(placement, '_machine_picks_up', lambda labels: True)
++    monkeypatch.setattr(placement, 'create_remote', lambda *a, **kw: {'ok': False, 'error': 'unsupported'})
++    before = worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    out = json.loads(tools._handle_create({'title': 'canonical failed', 'assignee': 'default', 'requires': []}))
++    assert out.get('code') == 'placement_unavailable', out
++    assert worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
++
++
++@pytest.mark.parametrize('card,expected', [
++    ({'title': 'portable follow-up'}, ['pool:worker']),
++    ({'title': 'Inspect Desktop DOM', 'skills': ['session-status-panel', 'inspecting-hermes-desktop-dom']},
++     ['pool:worker', 'capability:tailnet-exec']),
++    ({'title': 'Machine-only installed Desktop inspection', 'placement': 'macbook'}, ['machine:macbook']),
++])
++def test_disposable_hub_really_owns_worker_created_card(gws, monkeypatch, card, expected):
++    hub, worker = gws
++    worker.enter()
++    monkeypatch.setattr(placement.reg, 'self_gateway', lambda: Path(os.environ['HERMES_HOME']).parent.name)
++    monkeypatch.setattr(placement, 'linux_pool_gateway', lambda gateway, *a, **kw: gateway == nodes.WORKER)
++    monkeypatch.setattr(placement, 'config', lambda: {
++        'worker_queue': {nodes.WORKER: 'pool:worker'}, 'route': {nodes.WORKER: nodes.HUB}})
++    monkeypatch.setattr(placement, '_machine_picks_up', lambda labels: True)
++    received = []
++
++    def courier(view, **kwargs):
++        assert kwargs['target'] == nodes.HUB
++        hub.enter()
++        try:
++            result = json.loads(tools._handle_create(view))
++            received.append(result)
++            assert result.get('task_id'), result
++        finally:
++            worker.enter()
++        return {'ok': True, 'request_id': 'composed-canonical-home-test', 'queued_only': True}
++
++    monkeypatch.setattr(placement, 'create_remote', courier)
++    out = json.loads(tools._handle_create({'assignee': 'default', 'requires': [], **card}))
++    assert out.get('placed', {}).get('gateway') == nodes.HUB, out
++    assert len(received) == 1
++    tid = received[0]['task_id']
++    hub.round()  # sync stamps administrative ownership before publishing to Board
++    stored = dict(hub.conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    assert stored['created_on'] == nodes.HUB
++    assert sorted(json.loads(stored['runs_on'])) == sorted(expected)
++    assert worker.conn.execute('SELECT 1 FROM tasks WHERE id=?', (tid,)).fetchone() is None
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 5cc1fd53d97..930824e95e2 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1450,6 +1450,7 @@
+     Returns a remote result/refusal, or local placement metadata. Worker-policy metadata
+     must reach the initial task INSERT; local storage is not permission to execute.
+     """
++    home = None
+     try:
+         from hermes_cli import kanban_placement as kp
+         from hermes_cli import kanban_capability_registry as reg
+@@ -1462,7 +1463,9 @@
+         from hermes_cli import kanban_sync_runstate as _runstate  # down: a machine pin takes the gateway route
+         machine_ok = ((lambda m: _wn.sync.board_mode(conn) == "primary" and kp._machine_picks_up(m)
+                        and not _runstate.down()) if conn is not None else None)
+-        decision = kp.decide(view, machine_ok=machine_ok)
++        from hermes_cli.kanban_creation_home import prepare as creation_home, result as home_result
++        cfg, self_gw = kp.config(), reg.self_gateway() or "local"
++        home, view, decision = creation_home(view, cfg=cfg, gateway=self_gw, machine_ok=machine_ok)
+         target = decision["where"]
+         if target == "refuse":
+             return _placement_refused(decision.get("pin", "hub"), decision.get("why", ""),
+@@ -1472,16 +1475,15 @@
+             local = _local_placement(kp, view, decision, machine_ok=machine_ok, note_local_pin=note_local_pin, origin_gateway=origin_gateway)
+             stranded = _runstate.stranded_create((local or {}).get("runs_on"))
+             return (tool_error(stranded, rejection="sync_not_running"), None) if stranded else (None, local)
+-        self_gw = reg.self_gateway() or "local"
+-        cfg = kp.config()
+         forwarding = _forwarding_fields(conn, origin_gateway, creator_task_id, self_gw, _worker_run_id)
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+                                   origin_profile=origin_profile or current_profile_name("default") or "default",
+-                                  self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")), **forwarding)
++                                  self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")),
++                                  **({"canonical_home": True} if home is not None else {}), **forwarding)
+         if not placed.get("ok"):
+             logger.warning("kanban placement: %s refused the card (%s)",
+                            target, placed.get("error"))
+-            if forwarding or placed.get("fatal") or kp.explicit_foreign_pin(view, reg.self_gateway()):
++            if home is not None or forwarding or placed.get("fatal") or kp.explicit_foreign_pin(view, reg.self_gateway()):
+                 return _placement_refused(target, f"{target} refused the card: {placed.get('error')}"), None
+             return None, None
+         rid = placed["request_id"]
+@@ -1495,6 +1497,10 @@
+                  "the same card. " if placed.get("retry") else "")
+         fields = {"placed": {"gateway": target, "request_id": rid, "task_id": tid, "origin_session": session_id,
+                              "queued_only": bool(placed.get("queued_only")), "retry": bool(placed.get("retry")), **kp.owner_chat_link(owner.get("result"))}}
++        if not tid and not placed.get("queued_only") and (refused := _placed_rejection(kp, rid, target, fields)):
++            return refused, None  # the target refused it: no card, never "IS created" [daveey]
++        if home is not None:
++            return _ok(**home_result(view, fields, tid=tid, status=remote_status, target=target)), None
+         from tools import kanban_tools_board_delivery as kbd_words  # [daveey] the stopped-sync rewrite's anchors
+         if tid:
+             shows = kbd_words.CHAT_TASKS_SHOWS if session_id else ""
+@@ -1503,8 +1509,6 @@
+                     f"`hermes-hub tasks --gw {target}`.")
+             return _ok(task_id=tid, status=remote_status or "created", **fields, runs_where=target,
+                        note=note), None
+-        if not placed.get("queued_only") and (refused := _placed_rejection(kp, rid, target, fields)):
+-            return refused, None  # the target refused it: no card, never "IS created" [daveey]
+         note = (f"{retry}The card IS created: it is queued on {target} as request {rid} and {target} makes the "
+                 f"card from it (it runs there, not here: {decision['why']}). Do NOT call kanban_create again "
+                 "for this card: an identical call returns this same request. Changed calls with an explicit "
+@@ -1514,9 +1518,9 @@
+         return _ok(task_id=None, status="queued", **fields, runs_where=target, note=note), None
+     except Exception as exc:
+         logger.warning("kanban placement failed", exc_info=True)
+-        if origin_gateway:
++        if home is not None or origin_gateway:
+             return _placement_refused(str(args.get("placement") or "auto"),
+-                                      f"qualified origin forwarding failed: {exc}"), None
++                                      f"canonical home or qualified origin forwarding failed: {exc}"), None
+         try:
+             from hermes_cli import kanban_placement as kp2
+             from hermes_cli import kanban_capability_registry as reg2
+-- 
+2.43.0
+

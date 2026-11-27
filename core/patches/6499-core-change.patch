@@ -1,0 +1,151 @@
+From 97a2682811aa3487e10d49fc7f4f339f60a9fac6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 20:25:35 +0000
+Subject: [PATCH 6499] Frozen administrative deadlines for parks, links, landings and review queues
+
+Public mirror of source commit 97a2682811aa3487e10d49fc7f4f339f60a9fac6.
+
+---
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 00998525fe3..e9c94451c2f 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -350,7 +350,10 @@
+     if source and not any((stop, facts['containment'], facts['pending_command'])):
+         from hermes_cli.kanban_actionability_creation import validated_intent
+         parent_ids = [r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (tid,))]
+-        intent = validated_intent(task, source, parent_ids=parent_ids)
++        # A park's clock is its own (the wake, the block's review): an edge changed during the park moves
++        # no deadline, and the landing after the wake or unblock freezes the dependency wait.
++        parked = task['status'] in ('scheduled', 'blocked')
++        intent = validated_intent(task, source, parent_ids=None if parked else parent_ids)
+         if intent:
+             facts['deadline_at'] = intent['deadline_at']
+         elif 'actionability_intent' in source['data']:
+diff --git a/tests/hermes_cli/test_kanban_parked_link_deadline.py b/tests/hermes_cli/test_kanban_parked_link_deadline.py
+new file mode 100644
+index 00000000000..39399643033
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parked_link_deadline.py
+@@ -0,0 +1,118 @@
++"""A parent linked or unlinked while a card is parked keeps the park's own frozen deadline. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_actionability_cli import report
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli.kanban_db_connect import connect
++
++T0 = 1_800_000_000
++DAY = 86400
++CLOCK = {'kind': 'clock', 'why': 'the release window opens then'}
++ASK = {'action': 'Reply A or B in this chat. Unblock = build the pick; archive = drop it.',
++       'why_human': 'only the owner knows the preference', 'interaction': 'reply', 'scope': 'one pick',
++       'evidence': 'both options pass the tests'}
++
++
++def _clock(monkeypatch, at):
++    monkeypatch.setattr('time.time', lambda: at)
++
++
++def _rows(conn, tid, now):
++    return (describe(conn, tid, now=now), next(r for r in report(conn, now=now)['rows'] if r['task_id'] == tid))
++
++
++def _event(conn, tid, kind):
++    row = conn.execute('SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                       (tid, kind)).fetchone()
++    return row, json.loads(row['payload'] or 'null')
++
++
++def _scheduled(conn, tid):
++    assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2026-01-20T00:00:00Z release window', awaiting=CLOCK,
++                            clock_only=True)
++    return 'scheduled', 'scheduled', 'satisfy_dependency'
++
++
++def _blocked(conn, tid):
++    assert kb.block_task(conn, tid, reason='pick one', kind='needs_input', human_request=ASK)
++    return 'blocked', 'blocked', 'supply_recorded_human_step'
++
++
++def _parked(conn, monkeypatch, park):
++    _clock(monkeypatch, T0)
++    tid = kb.create_task(conn, title='parked card', assignee='default')
++    status, kind, action = park(conn, tid)
++    assert kb.get_task(conn, tid).status == status
++    deadline = _event(conn, tid, kind)[1]['actionability_intent']['deadline_at']
++    for row in _rows(conn, tid, T0 + 10):
++        assert row['violations'] == [] and row['escalation']['at'] == deadline
++    return tid, status, kind, action, deadline
++
++
++@pytest.mark.parametrize('park', [_scheduled, _blocked])
++def test_parent_linked_during_a_park_keeps_the_parks_deadline(tmp_path, monkeypatch, park):
++    """Observed (t_079c01ec57dca1d7): parked scheduled, a prerequisite linked hours later, no wake yet."""
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, status, kind, action, deadline = _parked(conn, monkeypatch, park)
++        parent = kb.create_task(conn, title='late prerequisite', assignee='default')
++        _clock(monkeypatch, T0 + 100)
++        kb.link_tasks(conn, parent, tid)
++        assert kb.get_task(conn, tid).status == status  # still parked: the row is read before any wake
++        assert 'actionability_intent' not in _event(conn, tid, 'linked')[1]  # the edge starts no clock of its own
++        source = _event(conn, tid, kind)[0]
++        for row in _rows(conn, tid, T0 + 200):
++            assert row['status'] == status and row['action'] == action
++            assert row['source_refs'] == [source['uid'] if 'uid' in source.keys() and source['uid'] else str(source['id'])]
++            assert [d['task_id'] for d in row['dependencies']] == [parent]
++            assert row['escalation']['at'] == deadline and row['escalation']['state'] == 'pending'
++            assert row['violations'] == []
++        for row in _rows(conn, tid, deadline):  # never renewed by the edge
++            assert row['escalation']['at'] == deadline and row['violations'] == ['escalation_overdue']
++
++
++@pytest.mark.parametrize('park', [_scheduled, _blocked])
++def test_edges_changed_again_during_the_park_still_keep_it(tmp_path, monkeypatch, park):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, _status, _kind, _action, deadline = _parked(conn, monkeypatch, park)
++        first = kb.create_task(conn, title='first prerequisite', assignee='default')
++        second = kb.create_task(conn, title='second prerequisite', assignee='default')
++        _clock(monkeypatch, T0 + 100)
++        kb.link_tasks(conn, first, tid)
++        kb.link_tasks(conn, second, tid)
++        kb.unlink_tasks(conn, first, tid)
++        for row in _rows(conn, tid, T0 + 200):
++            assert [d['task_id'] for d in row['dependencies']] == [second]
++            assert row['escalation']['at'] == deadline and row['violations'] == []
++
++
++@pytest.mark.parametrize('park', [_scheduled, _blocked])
++def test_a_changed_park_intent_is_still_refused_with_a_late_parent(tmp_path, monkeypatch, park):
++    """Only the edge set is exempt: every other byte of the frozen park intent must still match."""
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid, _status, kind, _action, _deadline = _parked(conn, monkeypatch, park)
++        parent = kb.create_task(conn, title='late prerequisite', assignee='default')
++        kb.link_tasks(conn, parent, tid)
++        event, data = _event(conn, tid, kind)
++        data['actionability_intent']['deadline_at'] += DAY  # a renewed clock is not the frozen one
++        conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(data), event['id']))
++        for row in _rows(conn, tid, T0 + 200):
++            assert row['escalation']['at'] is None
++            assert {'creation_intent_invalid', 'escalation_deadline_missing'} <= set(row['violations'])
++
++
++def test_a_todo_wait_still_needs_its_frozen_edge_set(tmp_path, monkeypatch):
++    """Control: in todo the parents are the trigger, so an edge the source never froze stays invalid."""
++    with connect(tmp_path / 'kanban.db') as conn:
++        _clock(monkeypatch, T0)
++        parent = kb.create_task(conn, title='prerequisite', assignee='default')
++        tid = kb.create_task(conn, title='waiting card', assignee='default', parents=[parent])
++        assert kb.get_task(conn, tid).status == 'todo'
++        for row in _rows(conn, tid, T0 + 10):
++            assert row['violations'] == [] and row['escalation']['at']
++        other = kb.create_task(conn, title='unrecorded prerequisite', assignee='default')
++        conn.execute('INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)', (other, tid))  # no event wrote it
++        for row in _rows(conn, tid, T0 + 20):
++            assert row['escalation']['at'] is None and 'creation_intent_invalid' in row['violations']
+-- 
+2.43.0
+
