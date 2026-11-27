@@ -15,6 +15,18 @@ job's results stop advancing.
 - **Check for progress:** read utime+stime from `/proc/<pid>/stat` twice, a few seconds apart. A hung process gains
   next to nothing.
 
+### Linux child-start failures: test the reported prerequisite
+
+Before acting on a launcher's generic “user D-Bus unavailable” or systemd-scope error, run the scope control as the service user with its actual runtime directory:
+
+```sh
+XDG_RUNTIME_DIR=/run/user/<uid> DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus systemd-run --user --scope --quiet true
+```
+
+If that passes, inspect the failing supervisor's journal and resources rather than enabling linger or restarting blindly. For `EMFILE` / “Too many open files”, count `/proc/<pid>/fd`, read `/proc/<pid>/limits`, and group FD symlink targets. Inspect the supervisor, not only the exited child: an exhausted parent can fail unrelated config reads and child-launch operations while a fresh shell succeeds.
+
+For an authorized temporary mitigation, record PID/start identity and both limits first; `prlimit --pid <pid> --nofile=<bounded-new-soft>:<unchanged-hard>` can raise only the live soft limit without restarting. Read it back and record the rollback command. This establishes headroom only: require actual managed-worker startup separately, and leave descriptor-growth attribution and producer repair open.
+
 ## 2. Save the evidence before touching it
 
 1. Create the evidence directory, then use `sudo -n py-spy dump --nonblocking --pid <pid> > ~/.hermes/kanban/evidence/<topic>/pyspy-<pid>.txt`
