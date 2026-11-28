@@ -414,7 +414,7 @@ def evaluate(prev: Optional[dict], cur: dict, now: float, *, long_wait: dict,
         verdict = ('missed_twice' if any(m['misses'] >= 2 for m in missed)
                    else 'process_only' if process_only else 'missed_once')
     else:
-        verdict = classify(cards_out, process_only)
+        verdict = classify(cards_out, process_only, red_no_ask=bool(cur.get('red_no_ask')))
     predictions = [{'card': cid, 'expect': c['prediction']['expect'], 'due_at': c['prediction'].get('due_at')}
                    for cid, c in cards_out.items()]
     predictions += [{'process': pid, 'expect': p['prediction']['expect'], 'due_at': p['prediction']['due_at']}
@@ -425,8 +425,10 @@ def evaluate(prev: Optional[dict], cur: dict, now: float, *, long_wait: dict,
     return {'verdict': verdict, 'signals': signals, 'missed': missed, 'snapshot': snapshot}
 
 
-def classify(cards: dict, process_only: bool) -> str:
+def classify(cards: dict, process_only: bool, *, red_no_ask: bool = False) -> str:
     """No progress and nothing due: the healthiest wait the chat has."""
+    if red_no_ask:
+        return 'red_no_ask'  # dedicated owner-chat rule, not a healthy deliberate hold
     preds = [c['prediction'] for c in cards.values()]
     if cards and all(p.get('terminal') or p.get('dependent') for p in preds) and any(p.get('terminal') for p in preds):
         return 'valid_red'

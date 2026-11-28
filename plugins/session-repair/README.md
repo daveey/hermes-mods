@@ -27,6 +27,7 @@ Three parts:
 | BS-notice-undelivered | last message a `kanban_notice` whose close-out ended `error` / `busy`, deferred > 2 h past due, claimed > 2 h with no verdict, or never claimed > 2 h (not human-blocked); `subscription_lag` (a `tui` subscription with an event undelivered > 60 min). Never the repair chat | one close-out turn (`hermes chat --resume <id> --oneshot`) |
 | BS-long-wait | external-producer park: CI/deploy 45m, external 3h, card 4h (producer quiet 1h), resource 2h; GitHub event completed >=600s ago overrides age (producer `updatedAt`, never park age; missing timestamp cannot authorize a completion nudge); clock never | `nudge`: one owner comment plus a guarded reassessment wake (not release of a hold) |
 | BS-quiet-chat | unresolved/waiting desktop/tui chat quiet >60m within 3d, no linked card, live cron/run or open ask; never repair chat | `nudge`: one resumed chat turn |
+| BS-red-no-ask | stuck human chat or overdue triage card without a valid card-scoped ask; retained/spend/safety/containment/lane holds remain intact | one owning-chat reassessment turn; same cards/asks two hours after verified settled reply escalate to one fix card, never a repeat nudge |
 | BS-no-progress | per-chat progress snapshot + deterministic predictions ([`session-progress`](../../skills/devops/session-progress/SKILL.md)); a due prediction unmet with no progress signal anywhere in the chat: `missed_once`, `missed_twice` (same card, next window), `process_only` (cardless desktop/tui/cli chat whose only waits are live background processes whose logs stopped); valid human_request / containment / spend holds never miss; a card another rule flagged this tick gets no second finding | **soaks in shadow** (`shadow_rules`, default `["BS-no-progress"]`); then `missed_once`/`process_only` `nudge`, `missed_twice` fix card (24 h fingerprint dedupe) |
 
 A finding: `{id, variant, card, board, chat, title, summary, evidence, fix: {kind: auto|card|nudge, action, commands,
@@ -48,6 +49,20 @@ judges it. Read-only: every handle is a session-panel `CoreReaders` connection (
 so a core helper that tried to write raises instead (`tests/test_readonly.py`).
 
 ## Modes and the repair chat
+
+`BS-red-no-ask` fingerprints include the chat and sorted uncovered card ids. It
+revalidates card, ask and chat evidence before sending, preserves unknown-delivery
+receipts, and does not reset its send history merely because the owner replied.
+The prompt names each card and preserves safety refusals: no execution release;
+keep or archive, and ask a person only for a step they can actually perform.
+Pseudo-session custody is resolved through core's creator-chat resolver.
+
+To promote only this rule while other nudges remain shadow, retain the existing
+config keys and add `"BS-red-no-ask:uncovered_red_cards"` to `live_rules` and
+`"nudge_live_rules": ["BS-red-no-ask"]`, with `mode: live`. `shadow_rules` still
+holds it and `mode: off` stops everything. Remove the override to reverse this
+scoped rollout. The live lane's exact message receipts are in `nudges-live.jsonl`;
+an admission receipt is not evidence that the original task was resolved.
 
 `SESSION_REPAIR` env, else `$HERMES_HOME/session-repair/config.json` `{"mode": ...}`, default **shadow**:
 

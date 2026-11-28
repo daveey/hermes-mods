@@ -54,7 +54,7 @@ MAX_CHATS = 1000
 
 RULES = ('BS-ready-worker-free', 'BS-overdue-wake', 'BS-unexplained-wait', 'BS-parent-done', 'BS-stuck-run',
          'BS-review-no-reviewer', 'BS-broken-chain', 'BS-notice-undelivered', 'BS-long-wait', 'BS-quiet-chat',
-         'BS-no-progress')
+         'BS-no-progress', 'BS-red-no-ask')
 REPAIR_CHAT_TITLE = 'Session repair'
 REPAIR_KEY_PREFIX = 'session-repair:'
 READY_ENTRY_EVENTS = ('promoted', 'unblocked', 'continuation_woken', 'created', 'reclaimed', 'released', 'status',
@@ -81,6 +81,9 @@ class Finding:
     def fingerprint(self) -> str:
         """rule + card (rule + chat for a chat-level finding): the dedupe key and the fix card's idempotency key."""
         target = f'{self.board}/{self.card}' if self.card else f'chat/{self.chat}'
+        if self.rule == 'BS-red-no-ask':
+            cards = sorted({str(r['card']) for r in self.evidence.get('red_cards', [])})
+            target = f'chat/{self.chat}:' + ','.join(cards)
         return f'{self.rule}:{target}'
 
     def to_dict(self) -> dict:
@@ -1584,6 +1587,175 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
                      'why': 'long wait or producer event already happened; guarded owner reassessment wake'})
 
 
+def _red_signature(value: Any) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str,
+                                     separators=(',', ':')).encode()).hexdigest()
+
+
+def _red_chat_live(src: Sources, sid: str) -> bool:
+    from hermes_state import SessionDB
+    from hermes_state_outcome import _lineage_ids, _live_turn
+    with SessionDB(src.readers.state_db(), read_only=True) as db:
+        return any(_live_turn(db, ancestor) for ancestor in _lineage_ids(db, sid))
+    raise RuntimeError('live-turn read did not complete')
+
+
+def _red_ask_coverage(src: Sources, sid: str) -> tuple[set[tuple[str, str]], str]:
+    """Read validated, current scoped asks; never initialize the user-steps store.
+
+    An unrelated chat ask or a mention in prose is not permission/coverage for a card.
+    Incomplete asks are not actionable. Unreadable stores abort the finding instead of
+    turning unavailable evidence into an assertion that no ask exists.
+    """
+    path = src.home() / 'user-steps' / 'actions.sqlite3'
+    covered, state = set(), []
+    if path.exists():
+        c = src.readers.conn(path)
+        if c is None:
+            raise RuntimeError('user-steps store unreadable')
+        spec = importlib.util.spec_from_file_location('_repair_user_steps_read',
+                    Path(__file__).resolve().parent.parent / 'user-steps' / 'core.py')
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for row in c.execute('SELECT r.id,r.revision,r.state,r.resolution,v.body FROM requests r '
+                             'LEFT JOIN revisions v ON v.namespace=r.namespace AND v.id=r.id '
+                             'AND v.revision=r.revision WHERE r.session=? ORDER BY r.namespace,r.id', (sid,)):
+            state.append(tuple(row))
+            if row[2] != 'open' or row[3]:
+                continue
+            body = json.loads(row[4])
+            try:
+                mod.validate_action(body)
+            except mod.ActionError:
+                continue
+            if (body['requestId'] != row[0] or body['revision'] != row[1]
+                    or body['state'] != 'open' or body.get('resolution') or not body['scope']['complete']
+                    or body['owner']['storedSessionId'] != sid):
+                continue
+            for ref in body['scope']['sourceRefs']:
+                if (ref['type'] == 'kanban' and ref['gatewayId'] == body['owner']['gatewayId']
+                        and ref['profile'] == body['owner']['profile']):
+                    covered.add((ref['board'], ref['id']))
+    # Legacy asks have no validated card scope. Preserve them in the signature so
+    # their creation/change invalidates an in-flight nudge, but don't guess coverage.
+    legacy = src.home() / 'user-steps' / (re.sub(r'[^A-Za-z0-9_.-]', '_', sid) + '.json')
+    if legacy.exists():
+        state.append(json.loads(legacy.read_text()))
+    return covered, _red_signature(state)
+
+
+def _red_creator_chats(src: Sources, board: str, cid: str) -> set[str]:
+    """Use core's read-only provenance resolver, never ensure/link a standing chat."""
+    from hermes_cli.kanban_creator_chats import resolve_chats
+    from hermes_cli.profiles import get_active_profile_name
+    own = src.own_gateway(board)
+    conn = src.conn(board)
+    if not own or conn is None:
+        raise RuntimeError('creator gateway or board unknown')
+    return {str(r['chat_session']) for r in resolve_chats(conn, cid)
+            if r.get('chat_gateway') == own
+            and (r.get('chat_profile') or 'default') == get_active_profile_name()
+            and not str(r.get('chat_session') or '').startswith('kanban_owner_')}
+
+
+def red_no_ask_findings(src: Sources, only: Optional[str] = None) -> list[Finding]:
+    """Red, unattended human chats whose relevant cards lack a scoped actionable ask.
+
+    This is diagnosis only: retained stops, safety refusals and lane gates remain
+    intact. All target reads are repeated for ``only`` pre-write revalidation.
+    """
+    out = []
+    try:
+        c = src.state_conn()
+        if c is None:
+            return out
+        before = len(src.errors)
+        linked = {sid: set(refs) for sid, refs in src.linked_chats().items()}
+        for sid, refs in list(linked.items()):
+            if sid.startswith('kanban_owner_'):
+                for board, cid in refs:
+                    for human in _red_creator_chats(src, board, cid):
+                        linked.setdefault(human, set()).add((board, cid))
+                del linked[sid]
+        ours = src.ours_ids()
+        if len(src.errors) != before:
+            return out
+    except Exception as exc:
+        src.error('red-no-ask sources', exc)
+        return out
+    for sid, refs in sorted(linked.items()):
+        if (only is not None and sid != only) or sid in src.exclude_chats:
+            continue
+        try:
+            before = len(src.errors)
+            session = c.execute("SELECT title,outcome_json FROM sessions WHERE id=? AND archived=0 "
+                                "AND COALESCE(muted,0)=0 AND source IN ('desktop','tui','cli') "
+                                "AND COALESCE(end_reason,'') != 'compression' "
+                                "AND COALESCE(end_reason,'') NOT LIKE 'moved_to_gateway:%'", (sid,)).fetchone()
+            if not session or session[0] == REPAIR_CHAT_TITLE or _red_chat_live(src, sid):
+                continue
+            outcome = json.loads(session[1])
+            status = outcome.get('status') or outcome
+            if (status.get('coverage') or {}).get('state') == 'unknown':
+                continue
+            stuck = (status.get('presentation') or {}).get('stripe') == 'stuck'
+            items = [*(outcome.get('on') or []), *(status.get('work') or [])]
+            overdue = {str(item.get('id')) for item in items if item.get('kind') == 'card'
+                       and (item.get('state') == 'triage_overdue' or item.get('triage_overdue') is True)}
+            coverage, ask_sig = _red_ask_coverage(src, sid)
+            red, states = [], {}
+            for board, cid in sorted(refs):
+                if cid in ours or cid in src.copies(board):
+                    continue
+                task, conn = src.task(board, cid)
+                if task is None or conn is None:
+                    raise RuntimeError('linked card unreadable')
+                card = Card(cid, board, sid, task, conn, None)
+                if card.ours or task.status in TERMINAL:
+                    continue
+                # The canonical overdue predicate covers retained triage even when
+                # the stored chat outcome is still yellow because of another ask.
+                from hermes_cli.kanban_triage_attention import annotate, overdue as is_overdue
+                raw = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (cid,)).fetchone())
+                annotate(conn, [raw])
+                late = cid in overdue or is_overdue(raw, now=src.now)
+                if not late and not (stuck and task.status in ('blocked', 'triage')):
+                    continue
+                from hermes_cli.kanban_open_asks import card_is_open_human_ask
+                valid = card_is_open_human_ask(task.status, getattr(task, 'block_kind', None),
+                                              getattr(task, 'human_request', None))
+                last_event = _events(conn, cid)
+                reason = (last_event[0]['payload'].get('reason') if last_event else None)
+                states[f'{board}/{cid}'] = _red_signature({'task': raw, 'last_event': last_event})
+                if valid or (board, cid) in coverage:
+                    continue
+                from hermes_cli.kanban_spend_decision import execution_refusal
+                refusal = execution_refusal(conn, cid)
+                red.append({'card': cid, 'board': board, 'status': task.status,
+                            'execution_refusal': bool(refusal),
+                            'hold_kind': raw.get('block_kind') or raw.get('hold_kind') or '',
+                            'reason': raw.get('block_reason') or raw.get('reason') or reason or
+                                      ('triage_overdue' if late else 'stuck without actionable ask')})
+            if not red or len(src.errors) != before:
+                continue
+            last = _last_message_id(src, sid)
+            if last is None:
+                continue
+            out.append(Finding('BS-red-no-ask', None, None, sid, session[0] or '',
+                       'Red cards have no actionable, card-scoped human ask',
+                       {'red_cards': red, 'last_message_id': last, 'linked_cards': sorted(refs),
+                        'card_signatures': states, 'ask_signature': ask_sig,
+                        'outcome_signature': _red_signature(outcome)},
+                       {'kind': 'nudge', 'action': 'reassess red cards and surface the missing scoped ask',
+                        'commands': [], 'why': 'preserve every hold; diagnose or ask, never release it'},
+                       variant='uncovered_red_cards', area='card'))
+        except Exception as exc:
+            src.error(f'red-no-ask {sid}', exc)
+    return out
+
+
 def quiet_chat_findings(src: Sources, only: Optional[str] = None) -> list[Finding]:
     out = []
     c = src.state_conn()
@@ -1734,7 +1906,7 @@ def _card_status(src: Sources) -> Callable[[str, str], Optional[str]]:
 
 
 def no_progress_findings(src: Sources, chat_cards: dict[str, list[tuple[str, str]]],
-                         flagged: set[str]) -> tuple[list[Finding], dict, dict]:
+                         flagged: set[str], red_chats: frozenset = frozenset()) -> tuple[list[Finding], dict, dict]:
     """(findings, {chat: snapshot}, {chat: verdict}). `chat_cards` = each scanned chat's open cards (linked + live
     chain). `flagged` = `board/card` targets another rule already reported this tick: their finding is the more
     specific one, so BS-no-progress records the miss but files nothing for them."""
@@ -1756,7 +1928,8 @@ def no_progress_findings(src: Sources, chat_cards: dict[str, list[tuple[str, str
                 if card.status in TERMINAL or card.ours or cid in src.ours_ids() or cid in src.copies(board):
                     continue
                 cards[cid] = prog.observe_card(sys.modules[__name__], src, card, now)
-            cur = {'chat': chat, 'cards': cards, 'last_message_id': _last_message_id(src, chat),
+            cur = {'chat': chat, 'cards': cards, 'red_no_ask': chat in red_chats,
+                   'last_message_id': _last_message_id(src, chat),
                    'processes': procs.get(chat) or {}}
             if not cards and not cur['processes']:
                 continue
@@ -1767,7 +1940,7 @@ def no_progress_findings(src: Sources, chat_cards: dict[str, list[tuple[str, str
         snapshots[chat], verdicts[chat] = res['snapshot'], res['verdict']
         for miss in res['missed']:
             f = _no_progress_finding(src, chat, res, miss, cards)
-            if f is not None and not (f.card and f'{f.board}/{f.card}' in flagged):
+            if f is not None and chat not in red_chats and not (f.card and f'{f.board}/{f.card}' in flagged):
                 findings.append(f)
     return findings, snapshots, verdicts
 
@@ -2062,13 +2235,17 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
     if 'BS-quiet-chat' in wanted:
         for f in quiet_chat_findings(src):
             findings.setdefault(f.fingerprint, f)
+    if 'BS-red-no-ask' in wanted:
+        for f in red_no_ask_findings(src):
+            findings.setdefault(f.fingerprint, f)
     _allot_free_workers(findings)
     progress: dict[str, Any] = {}
     snapshots: dict = {}
     if 'BS-no-progress' in wanted:
         try:
             flagged = {f'{f.board}/{f.card}' for f in findings.values() if f.card}
-            found, snapshots, verdicts = no_progress_findings(src, chat_cards, flagged)
+            red_chats = frozenset(f.chat for f in findings.values() if f.rule == 'BS-red-no-ask')
+            found, snapshots, verdicts = no_progress_findings(src, chat_cards, flagged, red_chats)
             for f in found:
                 findings.setdefault(f.fingerprint, f)
             counts: dict[str, int] = {}
