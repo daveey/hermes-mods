@@ -281,7 +281,6 @@ budget recovery into another platform project merely to satisfy this checklist.
   window (`spent: K`): grant K + new runs, or it re-holds at once.
 - For `Downstream review implementer evidence is unavailable`, inspect concrete author evidence before promoting. A class-routed parent's launch may record only `class:standard` while its completed event records concrete `session_models`. When that evidence verifies the author, add the supported `<!-- implementer-models: model-id -->` declaration to the review body, validate it against the worker routing policy, preserve all review gates, then promote. Verify the new run's `model_tier.implementer_models`, independent `run_route`, and worker admission; promotion alone does not prove repair. Never invent author provenance or pin around the independence check.
 - Use the CLI, not the sqlite file; the board database is not where the directory listing suggests.
-- `unlink` takes several seconds per parent; run a long batch in the background.
 - A guard hook may refuse `rm` on a variable path and `mkdir`/`git commit` it believes is in a live checkout: use
   literal absolute paths and `git -C <worktree>`.
 - Filter large `hermes kanban list --json` results inside the command (`| python3 -c '…'`) before returning
@@ -300,6 +299,7 @@ budget recovery into another platform project merely to satisfy this checklist.
 - [ ] State file exists, is under 8 KB, and the body tells runs to read only it?
 - [ ] Old body saved; unlinked parents listed; `kanban context` size measured before and after?
 - [ ] The card is in a status that can start (not triage, not waiting on a dead home), read back after the change?
+      A cap you build routes the card to a linked replan card, not a bare park?
 - [ ] At least one producer (skill, template, recipe) was edited, or the reply says exactly why none could be?
 - [ ] Each platform defect claimed has evidence and a tested fix or named owner; mechanisms that worked are
       explicitly accepted without inventing additional implementation?
