@@ -35,6 +35,7 @@ First distinguish a repair request from a bounded routing acceptance check. For 
 - **False "Running", over-gated wakes, or review waiting on its implementation**: `references/running-label-and-probes.md`.
 - **"Failed/crashed tasks, why not restarted?"**: `references/crashed-runs.md`.
 - **"All my sessions are stalled" / every prompt waits minutes / Desktop timeouts, no timing indicators**: backend-wide, the scanner can't see it: `references/backend-wide-stall.md`.
+- **One chat shows only a spinner / no reasoning or progress / partial work vanishes back to the spinner**: prove whether the turn is alive first: `references/backend-wide-stall.md` § One chat shows only a spinner.
 - **"My sessions disappeared" / new chats missing from the sidebar**: `references/missing-sessions.md`.
 - **"Chat isn't accepting my messages"**: this is a transport problem and the scanner can't see it. Follow `references/message-not-delivered.md`.
 
