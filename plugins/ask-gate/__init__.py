@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, merge_ask, desktop_reopen, access_scope, approval_reuse, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, ask_context, merge_ask, desktop_reopen, access_scope, approval_reuse, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -45,6 +45,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     agent_condition = _sib("agent_condition")
     owner_recommendation = _sib("owner_recommendation")
     unblock_card_quality = _sib("unblock_card_quality")
+    ask_context = _sib("ask_context")
     merge_ask = _sib("merge_ask")
     desktop_reopen = _sib("desktop_reopen")
     access_scope = _sib("access_scope")
@@ -1125,6 +1126,53 @@ def _unblock_card_hold(session_id: str, tool_name: str, request: dict, card: str
         return None
 
 
+def _card_body(tool_name: str, args: dict) -> str:
+    """The acceptance text the ask is checked against: a blocked create's body, else the blocked card's body."""
+    if tool_name == "kanban_create":
+        return str(args.get("body") or "")
+    card = next(iter(_block_card(tool_name, args)), "")
+    if not card:
+        return ""
+    for path in core.boards():
+        try:
+            c = core._ro_connect(path, timeout=2)
+            try:
+                row = c.execute("select body from tasks where id=?", (card,)).fetchone()
+            finally:
+                c.close()
+        except Exception:
+            continue
+        if row is not None:
+            return str(row[0] or "")
+    return ""
+
+
+_ASK_CONTEXT_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _ask_context_hold(session_id: str, tool_name: str, args: dict, request: dict, card: str = "") -> dict | None:
+    """Hold an ask David cannot resolve from its panel alone (ask_context.missing), or one the card's own
+    acceptance does not need (ask_context.acceptance_met). Bounded to ask_context.MAX_HOLDS per (session, tool,
+    card) so a misread never strands a real ask; fails open."""
+    try:
+        hit = ask_context.hit(request, _card_body(tool_name, args))
+        if hit is None:
+            return None
+        key = (session_id, tool_name, card or "")
+        n = _ASK_CONTEXT_HELD.get(key, 0)
+        if n >= ask_context.MAX_HOLDS:
+            core.log_event("ask_context_released", tool=tool_name, session=session_id, holds=n, rule=hit["rule"],
+                           missing=hit["missing"])
+            return None
+        _ASK_CONTEXT_HELD[key] = n + 1
+        core.log_event(hit["rule"], tool=tool_name, session=session_id, attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", missing=hit["missing"])
+        return {"action": "block", "message": hit["message"]}
+    except Exception as e:
+        core.log_event("ask_context_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
 def _replan_reply_hold(session_id: str, asks: list[str], attempt: int, budget: int, reply: str = "") -> dict | None:
     """Chat-reply side of _replan_hold: bounded by the reply hold budget. An ask is read with its paragraph, since
     "Your call: which way?" carries the choice in the sentence before it."""
@@ -1197,6 +1245,10 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             request, choices=raw.get("choices") if isinstance(raw, dict) else None), card=_brief_card(tool_name, args))
         if briefless is not None:
             return briefless
+        thin = _ask_context_hold(session_id, tool_name, args, dict(
+            request, choices=raw.get("choices") if isinstance(raw, dict) else None), card=_brief_card(tool_name, args))
+        if thin is not None:
+            return thin
         tools = _tools_now(session_id)
         evidence = request["evidence"]
         claim = core.checked_line(evidence) or evidence
