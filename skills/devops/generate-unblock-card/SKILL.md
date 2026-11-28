@@ -41,7 +41,13 @@ Answer each in your notes first:
 5. **What do you recommend, and why?** One option, one reason that names the tradeoff. If you have no
    recommendation you have not finished thinking; go back to 4.
 6. **What does each button do?** Unblock = the recommended path. Archive = the stop/decline path. Other choices
-   map to `choices[].value`.
+   map to `choices[].value`. The decision is a button David clicks: never make him type a card id or command, or
+   go to another chat to act; every card id shown is a link.
+7. **Does the click reach the target?** An agent-filed card's Unblock only unblocks that card. When the choice is
+   releasing another stopped card whose release must be human (`allowance_exhausted`/`allowance_in_force`; an agent
+   and a `run_in_user_terminal` window both count as agent-origin), only a home-filed stamped release offer
+   (`release_target`, written by the stranded-park sweep) makes the click a human release. Check one exists or the
+   button does nothing; say so instead of handing him a typed workaround.
 
 ## 2. Map it onto human_request (core schema; nothing else is stored)
 
@@ -182,5 +188,6 @@ human_request:
 - [ ] Every option says what happens, what it costs, and whether it is reversible; one is recommended with a reason.
 - [ ] Every PR/issue cited by number has its URL; a step names where to act (URL, numbered steps, command, device).
 - [ ] The card's acceptance really needs this step (no "or document the hold" branch covers it).
-- [ ] Unblock and Archive each map to a stated option; nothing says "reply in this chat".
+- [ ] Unblock and Archive each map to a stated option; nothing says "reply in this chat" or asks him to type an id/command.
+- [ ] A release choice for another card goes through a path that really releases it on click (step 1.7).
 - [ ] The cold read passed before filing.
