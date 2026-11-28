@@ -10,7 +10,7 @@ The selected image is checked again before reading tabs, showing Chrome, activat
 
 ## Explicit CDP routing
 
-`BROWSER_CDP_URL` (then `browser.cdp_url`) selects the route instead of falling back to a locally discovered browser. An unreachable or invalid explicit route does not authorize local focus. HTTPS remains HTTPS; WSS browser WebSocket URLs derive an HTTPS discovery route. Prefix paths and query scope survive discovery and target activation. Configured fragments and embedded user information are refused. Remote focus performs CDP activation only; it does not show a local application.
+`BROWSER_CDP_URL` (then `browser.cdp_url`) selects the route instead of falling back to a locally discovered browser. An unreachable or invalid explicit route does not authorize local focus. HTTPS remains HTTPS; WSS browser WebSocket URLs derive an HTTPS discovery route. Prefix paths and query scope survive discovery and target activation. Configured fragments and embedded user information are refused. Remote focus performs CDP activation only; it does not show a local application. Explicit values that normalize to an empty URL (`/`, `///`, `#`, `?`) remain invalid configuration, never permission to discover a local browser. Loopback visibility is determined from the parsed hostname independently of path/query scope; activating a scoped loopback tab does not produce a user-visible-window claim.
 
 ## Tests
 

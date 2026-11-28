@@ -217,7 +217,7 @@ def remote_cdp() -> str | None:
         path = path.rsplit('/devtools/browser/', 1)[0]
     # Retain even invalid configured endpoints for the caller to refuse. They
     # must never silently fall back to an unrelated locally discovered browser.
-    return urlunsplit((scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+    return urlunsplit((scheme, parsed.netloc, path, parsed.query, parsed.fragment)) or raw
 
 
 def _cdp_url(base, suffix):
@@ -404,9 +404,13 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
     remote = remote_cdp()
     identities = {}
-    if remote:
-        # Explicit endpoint selection wins; never focus a different local browser
-        # because it happens to have matching page text or the remote is down.
+    if remote is not None:
+        # Explicit endpoint selection wins; reject invalid configuration before
+        # any local enumeration, network call, or window side effect.
+        try:
+            _cdp_url(remote, '/json/list')
+        except (ValueError, TypeError):
+            return {'focused': False, 'error': 'invalid configured CDP HTTP endpoint'}
         chromes = [(0, remote, 0)]
     else:
         local = agent_chromes()
@@ -483,7 +487,11 @@ def _visible(pid: int, shown: bool, app: bool, base: str) -> bool:
       a loopback endpoint is this host's own headless/virtual-display Chrome (agent-c8dc1f22d4)."""
     if pid:
         return bool(app) and (bool(shown) or not _chrome_agent_cli())
-    host = re.sub(r"^https?://", "", base or "").rsplit(":", 1)[0].lower()
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(base or '').hostname or '').lower()
+    except ValueError:
+        return False
     return bool(host) and host not in _LOOPBACK
 
 

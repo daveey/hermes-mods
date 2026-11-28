@@ -140,6 +140,79 @@ class RouteCustody(unittest.TestCase):
             process.exe.side_effect = RuntimeError('fixture AccessDenied')
             self.assertIsNone(bf._process_identity(PID))
 
+    def test_normalization_empty_endpoint_refuses_before_local_discovery(self):
+        for raw in ('/', '///', '#', '?'):
+            for match in (None, 'example'):
+                with self.subTest(raw=raw, match=match), \
+                        mock.patch.dict(os.environ, {'BROWSER_CDP_URL': raw}), \
+                        mock.patch.object(bf, '_quiet', return_value=False), \
+                        mock.patch.object(bf, 'agent_chromes', return_value=[bf._Chrome(PID, 9555, IDENTITY)]) as local, \
+                        mock.patch.object(bf, '_chrome_identity', return_value=IDENTITY), \
+                        mock.patch.object(bf, '_get') as get, \
+                        mock.patch.object(bf, '_chrome_agent') as show, \
+                        mock.patch.object(bf, 'activate_app') as activate:
+                    result = bf.focus(match)
+                    self.assertFalse(result['focused'])
+                    local.assert_not_called()
+                    get.assert_not_called()
+                    show.assert_not_called()
+                    activate.assert_not_called()
+
+    def test_invalid_config_endpoint_is_not_absent_configuration(self):
+        for raw in ('/', '///', '#', '?'):
+            yaml = types.SimpleNamespace(safe_load=lambda stream: {'browser': {'cdp_url': raw}})
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {'BROWSER_CDP_URL': ''}), \
+                    mock.patch.dict(sys.modules, {'yaml': yaml}), \
+                    mock.patch('builtins.open', mock.mock_open(read_data='fixture')), \
+                    mock.patch.object(bf, '_quiet', return_value=False), \
+                    mock.patch.object(bf, 'agent_chromes') as local, \
+                    mock.patch.object(bf, '_get') as get:
+                result = bf.focus()
+                self.assertFalse(result['focused'])
+                local.assert_not_called()
+                get.assert_not_called()
+
+    def remote_focus(self, endpoint, transform=False):
+        def get(url, timeout=3):
+            return [{'id': 'one', 'type': 'page', 'title': 'Sign in', 'url': 'https://example.invalid/login'}] if '/json/list' in url else 'ok'
+        with mock.patch.dict(os.environ, {'BROWSER_CDP_URL': endpoint}), \
+                mock.patch.object(bf, '_quiet', return_value=False), \
+                mock.patch.object(bf, 'agent_chromes') as local, \
+                mock.patch.object(bf, '_get', side_effect=get), \
+                mock.patch.object(bf, 'hold_for_user', return_value=None), \
+                mock.patch.object(bf, 'activate_app') as activate, \
+                mock.patch.object(bf, '_chrome_agent') as show, \
+                mock.patch.object(bf, '_unattended', return_value=False), \
+                mock.patch.object(bf, '_throttled', return_value=False), \
+                mock.patch.object(bf, '_remember'):
+            result = (bf.transform_tool_result('browser_exec', result='Sign in https://example.invalid/login', session_id='fixture')
+                      if transform else bf.focus('example'))
+        local.assert_not_called()
+        activate.assert_not_called()
+        show.assert_not_called()
+        return result
+
+    def test_scoped_loopback_activation_is_not_user_visibility(self):
+        for endpoint in ('http://localhost/prefix', 'https://127.0.0.1/prefix?cap=fixture', 'http://[::1]:9555/prefix'):
+            with self.subTest(endpoint=endpoint):
+                result = self.remote_focus(endpoint)
+                self.assertTrue(result['focused'])
+                self.assertFalse(result['visible_to_user'])
+
+    def test_visibility_note_preserves_loopback_and_remote_controls(self):
+        for endpoint, visible in (('http://localhost/prefix', False),
+                                  ('https://127.0.0.1/prefix?cap=fixture', False),
+                                  ('https://example.invalid/prefix?cap=fixture', True)):
+            with self.subTest(endpoint=endpoint):
+                result = self.remote_focus(endpoint, transform=True)
+                self.assertIsInstance(result, str)
+                self.assertEqual('The Chrome window is now in front of the user' in result, visible)
+                self.assertEqual("The user can't see this page" in result, not visible)
+
+    def test_ordinary_remote_and_bare_loopback_visibility_controls(self):
+        self.assertTrue(self.remote_focus('https://example.invalid/prefix?cap=fixture')['visible_to_user'])
+        self.assertFalse(self.remote_focus('http://localhost:9555')['visible_to_user'])
+
     def test_query_scope_is_preserved(self):
         self.assertEqual(bf._cdp_url('https://example.invalid/prefix?cap=fixture', '/json/list'),
                          'https://example.invalid/prefix/json/list?cap=fixture')
