@@ -111,6 +111,13 @@ request, the reducer emits a `kind: "overdue"` row in `stuck`, not `needs_you`.
 It carries the ordinary ask fields, exact request/revision/choice bindings, and an
 owner-qualified `open_card` action. Desktop renders the red card, its context and
 Release / Archive / Keep parked choices; the displayed card ID opens that target.
+Every eligible created-chat membership gets its own owner-bound presentation of the
+same board episode. Link custody includes the trusted courier gateway (not the
+ActionStore installation ID), profile and session, and is revalidated on delivery.
+The board transaction's frozen episode fence permits only one committed lifecycle
+choice; reconciliation withdraws or cancels losing presentations in all linked chats.
+A release/promotion committed before its projection receipt is recovered by its exact
+operation-tagged core event before reconciliation can retire the pending operation.
 The decision operation rechecks the frozen source snapshot on the home board.
 Release uses core's human-release route for held scopes or promotion for plain
 triage; provider-safety holds do not offer Release. Archive records a reason.

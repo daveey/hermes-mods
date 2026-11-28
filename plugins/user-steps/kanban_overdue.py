@@ -20,6 +20,7 @@ the overdue predicate publishes nothing.
 
 import json
 import re
+import sqlite3
 import time
 
 VERSION = 1
@@ -118,15 +119,31 @@ def _runs():
         return 10
 
 
-def _links_session(mirror, c, task):
-    """A local user chat linked to the card (core ``task_chat_links``), when the creator chat is not one."""
+def _gateway(mirror):
+    # Chat links use the courier name, not ActionStore's install:<id> namespace.
+    return mirror.remote.gateway()
+
+
+def _session(mirror, c, row, task, owner):
+    """Select this presentation's qualified membership, not the first linked chat."""
+    candidates = []
+    creator = mirror._ask_session(c, row, task, owner)
+    if creator:
+        candidates.append((creator, None))
     try:
+        gateway = _gateway(mirror)
         rows = c.execute(
             "SELECT chat_session FROM task_chat_links WHERE task_id=? AND kind='created' "
-            "AND COALESCE(released, 0)=0 ORDER BY chat_session", (task,)).fetchall()
-    except Exception:
-        return None
-    return next((r[0] for r in rows if r[0] and mirror.session_exists(r[0])), None)
+            "AND chat_gateway=? AND chat_profile=? AND COALESCE(released, 0)=0 ORDER BY chat_session",
+            (task, gateway, owner['profile'])).fetchall()
+        candidates.extend((r[0], dict(gateway=gateway, profile=owner['profile'], session=r[0]))
+                          for r in rows if r[0] and mirror.session_exists(r[0]))
+    except (OSError, ValueError, sqlite3.OperationalError):
+        pass  # unavailable courier identity never authorizes a bare-session link
+    for sid, link in candidates:
+        if mirror.tip(sid) == owner['storedSessionId']:
+            return sid, link
+    return None, None
 
 
 def snapshot(mirror, c, row, task, owner, *, presentation=True, now=None):
@@ -137,8 +154,8 @@ def snapshot(mirror, c, row, task, owner, *, presentation=True, now=None):
     annotated = attention.annotate(c, [{'id': task, 'status': 'triage'}])[0]
     if not attention.overdue(annotated, now=time.time() if now is None else now):
         return None
-    sid = mirror._ask_session(c, row, task, owner) or _links_session(mirror, c, task)
-    if not sid or (presentation and mirror.tip(sid) != owner['storedSessionId']):
+    sid, link = _session(mirror, c, row, task, owner)
+    if not sid:
         return None
     generation = c.execute(
         "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind IN (SELECT value FROM json_each(?))",
@@ -149,7 +166,7 @@ def snapshot(mirror, c, row, task, owner, *, presentation=True, now=None):
     holder = _holder(kind, row.get('block_kind'))
     entered = annotated['triage_entered_at']
     info = dict(version=VERSION, entered_at=entered, route=route, holder=holder, reason=reason)
-    return dict(task=task, session=sid, generation=generation, overdue=info, title=title,
+    return dict(task=task, session=sid, chat_link=link, generation=generation, overdue=info, title=title,
                 ask=ask(title, info, no_release, _runs()))
 
 
@@ -196,6 +213,27 @@ def ask(title, info, no_release, runs):
 def _encoded(value):
     # Byte-identical to kanban_mirror.encoded: bindings and receipts compare these strings.
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def committed(api, c, binding, op):
+    """Read exact durable release evidence; never issue a transition while reconciling."""
+    snap = json.loads(binding['snapshot'])
+    if not snap.get('overdue'):
+        return None
+    request = json.loads(binding['request'])
+    choice = next((i for i, ch in enumerate(request['choices'])
+                   if ch['id'] == op.get('decision', {}).get('choiceId')), None)
+    if choice is None or snap['ask']['choices'][choice]['value'] != 'release':
+        return None
+    note = 'Desktop Release, operation ' + op['operationId']
+    release = getattr(api, 'release', None)
+    done = release.released_by(c, binding['task'], note) if release is not None else None
+    if done is not None:
+        return dict(released=done, outcome='released')
+    if c.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual' "
+                 "AND json_extract(payload,'$.reason')=?", (binding['task'], note)).fetchone():
+        return dict(released=binding['task'], outcome='promoted')
+    return None
 
 
 def deliver(mirror, api, c, binding, op):
@@ -266,12 +304,9 @@ def deliver(mirror, api, c, binding, op):
     else:
         release = getattr(api, 'release', None)
         note = 'Desktop Release, operation ' + operation
-        done = release.released_by(c, task, note) if release is not None else None
+        done = committed(api, c, binding, op)
         if done is not None:  # a crash after the release, before its receipt: record it now
-            return record(dict(released=done, outcome='released'), comment + '\nReleased.')
-        if c.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='promoted_manual' "
-                     "AND json_extract(payload,'$.reason')=?", (task, note)).fetchone():
-            return record(dict(released=task, outcome='promoted'), comment)
+            return record(done, comment + '\nReleased.')
         if fence(c):
             raise changed()
         if release is not None:
