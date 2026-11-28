@@ -51,10 +51,6 @@ def test_a_stopped_retained_scope_ages_red_like_every_other_triage_cause(age, re
 def test_unknown_entry_never_fabricates_age(entry):
     b = aged()
     b['cards']['t_abc123']['detail']['events'][1]['created_at'] = entry
-    if entry == NOW + 20:
-        # Core orders lifecycle evidence by origin time: keep both holds future,
-        # rather than accidentally seeding a valid earlier entry at NOW - 1.
-        b['cards']['t_abc123']['detail']['events'][2]['created_at'] = entry + 1
     result = model.reduce_panel(b, now=NOW)
     assert not result['sections']['stuck']
     assert 'entry time unavailable' in result['sections']['waiting'][0]['detail']
