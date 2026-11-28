@@ -4,6 +4,22 @@ A `pre_tool_call` guard on direct and wrapped `ha_call_service` calls. Every cal
 
 Without a working gate, unlock/open/disarm/cover motion is blocked. Script, scene, automation, button and switch services/targets always need confirmation: their physical effects cannot be inferred from their names. Entity domains are checked in `entity_id` and `data.entity_id` (including JSON data, lists and comma-separated targets). Generic `homeassistant` calls with implicit, all, group, area, device, label or floor targets fail closed; all other nonempty data keys except `entity_id` and `exclude` also fail closed to cover new indirect selectors. Domain, service and entity IDs are classified case-insensitively to match HA entity normalization; no network expansion is attempted. Known light/media/climate and explicit closing/locking operations retain the prior no-gate behavior. This is conservative classification, not a promise that every generic service is implemented for every HA entity domain.
 
+## Default-deny policy and wrappers
+
+The exact `SAFE_DOMAINS` allowlist is **light, media_player, climate** (including area selectors).
+The only other no-gate exceptions are `lock.lock`; `cover.close_cover`, `cover.stop_cover`,
+`cover.close_cover_tilt`, `cover.stop_cover_tilt`; `alarm_control_panel.alarm_arm_home`,
+`alarm_control_panel.alarm_arm_away`, `alarm_control_panel.alarm_arm_night`; and generic
+`homeassistant.*` calls with explicit entity targets passing the checks above.
+Every other domain/service needs the confirmation gate and is blocked when none is configured
+or the gate fails: this includes unknown domains, MQTT publish, Z-Wave JS, ZHA and valve services.
+Safe-domain calls targeting critical entities still undergo the existing target checks.
+
+Both `tool_call` and `mcp__tool_call` support batched `{calls: [{name, arguments}]}` and legacy
+`{name, arguments}` wrappers, JSON-string `arguments`, and `calls` encoded as a JSON string.
+Unparseable wrappers naming `ha_call_service` are blocked by the plugin itself, independently
+of core unwrapping. The hook never executes Home Assistant calls.
+
 ## Trusted configuration (breaking security migration)
 
 Only `/etc/hermes/ha-critical-gate.json` is read:

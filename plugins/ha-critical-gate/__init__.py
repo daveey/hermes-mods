@@ -8,9 +8,14 @@ hook asks a configured gate command about every ``ha_call_service`` call (it als
 - ``hold`` / ``deny``: the call is blocked; the gate's message becomes the tool result (e.g. "waiting for a tap on
   the owner's phone; it runs by itself if approved").
 
-With no trusted gate, opening-direction security calls, opaque actuators (script, scene, automation,
-button, switch) and unresolved generic targets are blocked. Known safe light/media/climate and
-closing/locking calls remain available. Targets in entity_id and data.entity_id are checked too.
+With no trusted gate, only SAFE_DOMAINS (light, media_player, climate), lock.lock,
+cover.close_cover/stop_cover/close_cover_tilt/stop_cover_tilt, alarm_control_panel's
+alarm_arm_home/alarm_arm_away/alarm_arm_night, and generic homeassistant calls with explicit
+resolved targets that pass the existing checks remain available. Every other domain/service,
+including unknown and raw-protocol integrations, needs confirmation and is blocked without a gate.
+Targets in entity_id and data.entity_id still override safe domains. Direct calls, batched wrappers,
+JSON-string arguments/calls and legacy {name, arguments} wrappers are classified here;
+unparseable wrappers naming ha_call_service are blocked without relying on core unwrapping.
 
 Gate command comes ONLY from root-owned, non-agent-writable ``/etc/hermes/ha-critical-gate.json``:
 ``{"command": ["/absolute/trusted/gate"], "timeout": 25}``. Home/profile files and
@@ -43,6 +48,12 @@ CRITICAL_SERVICES = {
 CONFIG_NAME = "ha-critical-gate.json"  # legacy filename; home files are never authority
 TRUSTED_CONFIG = Path("/etc/hermes/ha-critical-gate.json")
 OPAQUE_ACTUATORS = {"script", "scene", "automation", "button", "switch"}
+SAFE_DOMAINS = {"light", "media_player", "climate"}
+SAFE_SERVICES = {
+    "lock": {"lock"},
+    "cover": {"close_cover", "stop_cover", "close_cover_tilt", "stop_cover_tilt"},
+    "alarm_control_panel": {"alarm_arm_home", "alarm_arm_away", "alarm_arm_night"},
+}
 DEFAULT_TIMEOUT = 25
 NO_GATE = ("BLOCKED, nothing was sent: {what} needs the owner's confirmation and no confirmation gate is "
            "available right now. Do not retry it or call Home Assistant another way; tell the user.")
@@ -80,9 +91,11 @@ def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
                 return True
     # Generic HA services expand indirect/implicit targets server-side. Unknown
     # nonempty selectors fail closed too, so a new HA selector cannot bypass us.
-    return domain == "homeassistant" and (
-        unresolved or not targets or any(value for key, value in data.items()
-                                         if key not in {"entity_id", "exclude"}))
+    if domain == "homeassistant":
+        return (unresolved or not targets or any(value for key, value in data.items()
+                                                if key not in {"entity_id", "exclude"}))
+    # Never infer physical safety from an unfamiliar integration/service name.
+    return domain not in SAFE_DOMAINS and service not in SAFE_SERVICES.get(domain, ())
 
 
 def _homes() -> list[Path]:
@@ -202,13 +215,38 @@ def decide(args: Any, run=subprocess.run, config=None) -> Optional[str]:
     return str(reply.get("message") or ("BLOCKED, nothing was sent: %s was refused by the gate." % what))
 
 
+def _decode(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
 def classify(tool_name: str, args: Any, run=subprocess.run, config=None) -> Optional[str]:
     if tool_name == TOOL:
+        args = _decode(args)
+        if _call_of(args) is None:
+            return NO_GATE.format(what="unparseable Home Assistant call")
         return decide(args, run, config)
-    if tool_name in WRAPPERS and isinstance(args, dict):
-        for call in args.get("calls") or []:
+    if tool_name in WRAPPERS:
+        decoded = _decode(args)
+        if not isinstance(decoded, dict):
+            if isinstance(args, str) and TOOL in args:
+                return NO_GATE.format(what="unparseable Home Assistant wrapper")
+            return None
+        # Both the legacy single-call form and the batched form may be present.
+        calls = [decoded]
+        raw_calls = decoded.get("calls")
+        batch = _decode(raw_calls)
+        if isinstance(batch, list):
+            calls.extend(batch)
+        elif isinstance(raw_calls, str) and TOOL in raw_calls:
+            return NO_GATE.format(what="unparseable Home Assistant wrapper")
+        for call in calls:
             if isinstance(call, dict) and str(call.get("name") or "") == TOOL:
-                why = decide(call.get("arguments"), run, config)
+                why = classify(TOOL, call.get("arguments"), run, config)
                 if why:
                     return why
     return None
