@@ -6592,8 +6592,10 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                "budget_available": b.get("available", True)}
         store.log(rec)
         return {"action": "would_file", **rec}
+    # Direct owner/fingerprint matching still folds repeats at a full cap. The
+    # ranked retry must not pay a semantic judge for every row it cannot admit.
     deduped = (_dedupe_open_owner(d, fp, args.get("board"), store, runner, now)
-               or _dupe_check(d, fp, args.get("board"), store, runner, now, cfg))
+               or (None if backlog_drain else _dupe_check(d, fp, args.get("board"), store, runner, now, cfg)))
     if deduped:
         return deduped
     unavailable = _budget_unavailable(b, fp, store)
@@ -6618,6 +6620,10 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             return {"action": "error", "why": f"daily card count unreadable: {exc}"}
         if not backlog_allowance(daily_card_cap(cfg), filed, now, backlog_bypass(d)):
             return {"action": "queued", "why": "intraday pacing", "stop_pass": False}
+    if backlog_drain:
+        deduped = _dupe_check(d, fp, args.get("board"), store, runner, now, cfg)
+        if deduped:
+            return deduped
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen

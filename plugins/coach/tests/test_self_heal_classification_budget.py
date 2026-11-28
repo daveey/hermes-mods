@@ -102,3 +102,22 @@ def test_occurrence_fold_preserves_classification_retry_order():
     assert sh.fold_payloads(old, new)["backlog_classification_attempt"] == NOW
 
 
+from test_self_heal_ranked import ranked, file as ranked_file, drain as ranked_drain
+
+
+def test_ranked_full_cap_defers_semantic_judge_not_exact_owner(ranked, monkeypatch):
+    e = ranked
+    day = int(NOW)//86400*86400
+    for i in range(5):
+        e.board.add(f"t_cap_{i}", key=f"selfheal:existing-{i}", created_at=day+1)
+    d = defect(symptom="separate cap blocked incident")
+    assert ranked_file(e, d)["action"] == "queued"
+    calls = []
+    monkeypatch.setattr(sh, "_dupe_check", lambda *a, **kw: calls.append(a) or None)
+    ranked_drain(e, NOW)
+    assert calls == []
+    assert not e.board.creates()
+    e.board.add("t_existing_owner", key=f"selfheal:{d['fingerprint']}", created_by="default")
+    ranked_drain(e, NOW+1)
+    assert calls == []
+    assert e.board.comments
