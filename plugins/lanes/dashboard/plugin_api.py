@@ -687,6 +687,37 @@ _shm_fds = {}  # -shm path -> [(st_dev, st_ino, fd)] held while the inode is lin
 _shm_lock = threading.Lock()
 
 
+def _release_unlinked_shm_locked(shm):
+    """Drop retained fds for ``shm`` that are no longer ours or whose inode is
+    unlinked; return the live list. Caller holds ``_shm_lock``."""
+    held = _shm_fds.get(shm, [])
+    for entry in list(held):
+        try:
+            f = os.fstat(entry[2])
+        except OSError:
+            f = None
+        if f is None or (f.st_dev, f.st_ino) != (entry[0], entry[1]):
+            # Not our fd any more (closed elsewhere, number maybe reused):
+            # forget it, never close or read through a foreign fd.
+            held.remove(entry)
+            continue
+        if f.st_nlink == 0:
+            held.remove(entry)
+            os.close(entry[2])
+    if not held:
+        _shm_fds.pop(shm, None)
+    return held
+
+
+def _release_unlisted_shm(listed):
+    """Apply the same release rule to -shm fds of boards no longer stamped
+    (removed or archived), so they go once SQLite unlinks that -shm. A still
+    linked -shm keeps its fd: this process may hold a connection on it."""
+    with _shm_lock:
+        for shm in [s for s in _shm_fds if s not in listed]:
+            _release_unlinked_shm_locked(shm)
+
+
 def _shm_header(shm):
     """(dev, ino, 48-byte wal-index header) of a -shm file, or None if absent.
 
@@ -699,19 +730,7 @@ def _shm_header(shm):
     in-process user closes, holding the exclusive DMS lock), so it is closed.
     """
     with _shm_lock:
-        held = _shm_fds.get(shm, [])
-        for entry in list(held):
-            try:
-                gone = os.fstat(entry[2]).st_nlink == 0
-            except OSError:
-                # Not our fd any more: forget it, never close a reused number.
-                held.remove(entry)
-                continue
-            if gone:
-                held.remove(entry)
-                os.close(entry[2])
-        if not held:
-            _shm_fds.pop(shm, None)
+        held = _release_unlinked_shm_locked(shm)
         try:
             s = os.stat(shm)
         except FileNotFoundError:
@@ -857,6 +876,8 @@ def _capture_cursor():
     paths.append(str(Path(get_hermes_home()) / 'state/governors/mac-mini.json'))
     _sibling_cursors.clear()
     _sibling_cursors.update(seen_siblings)  # only boards still listed are kept
+    if _shm_fds:
+        _release_unlisted_shm({p + '-shm' for p in paths})
     for name in paths:
         if not name.endswith('.json') or not (name.endswith('.governors.json') or name.endswith('/mac-mini.json')):
             continue
