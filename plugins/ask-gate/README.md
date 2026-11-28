@@ -27,6 +27,52 @@ One chat (a Gmail political-spam cleanup) produced four wrong asks in a row:
 5. Root: correctness of an ask depended on the model's discipline, not on a mechanism. Fix: put the check in the runtime,
    where it runs whether or not the model remembers (this plugin), and give it the facts the model lacks (live state, ledger, capabilities).
 
+## Create-time supersession reconciliation
+
+`superseding_create` runs on **every `kanban_create`**, including ordinary build cards
+and workers, without a model call. It compares the title + first 4,000 body characters
+against open, non-running cards on all locally readable boards using `superseding.py`'s
+IDF scorer. Parents, an idempotent existing card's graph neighbors, and successful
+creates this session made this turn are excluded. Naming an ID alone or retrying an
+identical request does not release it. All matches must be reconciled, not just six.
+
+A matched create needs a consecutive list under this heading:
+
+```text
+Supersedes:
+- t_0123456789abcdef: archive
+- t_abcdef0123456789: amend
+- t_1111222233334444: independent: This card only measures freshness; keep the visual acceptance.
+```
+
+- `archive`: after the replacement create succeeds, archive the matched old card with
+  an atomic pointer comment. The core's board pin, worker scope, foreign-card and
+  containment restrictions still apply; a Supersedes block grants no new authority.
+  Unavailable archive authority refuses the create so the owner can amend/reconcile
+  instead. The write transaction rechecks status, claims and the full old title/body;
+  a card that became running/claimed or changed acceptance is not archived. An
+  after-create failure is logged and a cleanup warning is posted on the new card.
+- `amend`: first make a successful `kanban_comment` this turn whose persisted body
+  begins `Acceptance change:` and describes the changed acceptance. The gate reads
+  that exact comment back; writing `amend` alone is not evidence.
+- `independent: <reason>`: keep the existing work and explain the distinction.
+
+Replay-calibrated thresholds: shared tokens must cover at least **0.50** of the
+query's IDF weight, including the distinctive-phrase path. The original **0.18**
+coverage is retained for explicit positive `delete/remove/replace/retire/drop` of
+an ALL_CAPS or backticked named component also present in the old card. This catches
+obsolete acceptance even when the replacement introduces mostly new vocabulary.
+Negated removals do not qualify for the lower threshold. The existing minimum of
+three shared tokens remains; `mentioned()` can match a distinctive phrase instead.
+Inventory/config verification errors refuse this create surface rather than silently
+allowing it. Other ask-gate rules and their release policies remain independent.
+
+Set `ask_gate.superseding_create: false` to disable this rule (default on).
+Tests: `tests/test_superseding_create.py`, with the scrubbed historical sidebar
+build/verifier/wrap-up fixture in `tests/fixtures/superseding_create_incident.json`.
+The private deployment report retains replay inputs, rates and historical-data
+limitations; no production task bodies belong in the public repository.
+
 ## Backend startup warming
 
 `register()` keeps projection warming on a daemon thread and installs all four hooks.
