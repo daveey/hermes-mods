@@ -40,6 +40,8 @@ When an implementation is parked and its exact-head reviewer is `todo`, inspect 
 4. Read both cards back: verify reviewer admission/running separately from implementation waiting on review. On review completion, verify the implementation resumes to consume the verdict; completion of a request-changes review is not approval.
 
 ## Test a wake probe on its executor host
+For `wait-comment` parks, first run the exact stored command on the executor; then test the same `--from-card` filter with `--after-id 0` against a known genuine reply. Expect rc1 for no new reply and rc0 for the positive control. A healthy negative alone does not prove the custody filter can match. After executor migration, rederive the latest matching comment cursor from that executor's supported comment listing: integer comment IDs are replica-local, so copying the old host's `--after-id` can silently ignore replies. Preserve the producer identity and finite backstop; do not manufacture a marker or relax the author filter to make the probe pass.
+
 The probe runs on the `host` named in the card's newest `external_watch` event (often a pool worker), not the
 hub. Test it there: write the probe to a script and run `~/.hermes/bin/hub-worker-exec <worker> -- <script>`.
 On the hub the same command misleads: `ssh hermes-hub` is refused (publickey), and `git` run in `~` is not a
