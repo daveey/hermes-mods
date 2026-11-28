@@ -49,6 +49,17 @@ def _sample(sample):
     if any(not isinstance(v, str) or len(v) > 256 for v in attrs.values()):
         raise ValueError('attrs must be short strings')
     result['attrs'] = dict(attrs)
+    # Preserve only validated trace context on admitted spans. Collector samples
+    # have no context and keep their existing identity/serialization unchanged.
+    if 'trace_id' in sample:
+        from . import otel
+        result['trace_id'] = otel.identifier(sample['trace_id'], 32)
+        result['span_id'] = otel.identifier(sample.get('span_id'), 16)
+        for field in ('start_time_unix_nano', 'end_time_unix_nano'):
+            result[field] = str(otel.nanos(sample.get(field)))
+        if 'parent_span_id' in sample:
+            result['parent_span_id'] = otel.identifier(sample['parent_span_id'], 16)
+        result['service_name'] = sample.get('service_name', 'hermes-gateway')
     return result
 
 

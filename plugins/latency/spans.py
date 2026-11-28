@@ -54,7 +54,11 @@ def validate_span(value, now=None):
     A missing event ID is the SHA256 of the canonical normalized event, making
     an identical retried payload replay-safe. Explicit IDs are safe opaque tokens.
     """
-    if not isinstance(value, dict) or set(value) - {'id', 'metric', 'start', 'dur_ms', 'host', 'gateway', 'attrs'}:
+    from . import otel
+    if isinstance(value, dict) and 'name' in value:
+        value = otel.to_legacy(value)
+    context_fields = {'trace_id', 'span_id', 'parent_span_id', 'start_time_unix_nano', 'end_time_unix_nano', 'service_name'}
+    if not isinstance(value, dict) or set(value) - ({'id', 'metric', 'start', 'dur_ms', 'host', 'gateway', 'attrs'} | context_fields):
         raise ValueError('span must be an object with only supported fields')
     now = time.time() if now is None else _number(now, 'now')
     start = _number(value.get('start'), 'start')
@@ -77,7 +81,20 @@ def validate_span(value, now=None):
         event_id = _token(value['id'], 'id', 256)
     else:
         event_id = hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
-    return {'id': event_id, **normalized}
+    result = {'id': event_id, **normalized}
+    if context_fields & value.keys():
+        result['trace_id'] = otel.identifier(value.get('trace_id'), 32)
+        result['span_id'] = otel.identifier(value.get('span_id'), 16)
+        if 'parent_span_id' in value:
+            result['parent_span_id'] = otel.identifier(value['parent_span_id'], 16)
+        start_ns = otel.nanos(value.get('start_time_unix_nano'))
+        end_ns = otel.nanos(value.get('end_time_unix_nano'))
+        if abs(start_ns / 1e9 - start) > .000001 or abs((end_ns-start_ns) / 1e6 - duration) > .001:
+            raise ValueError('inconsistent OpenTelemetry timing')
+        if value.get('service_name') not in ('hermes-desktop', 'hermes-gateway'):
+            raise ValueError('unsupported service name')
+        result.update(start_time_unix_nano=str(start_ns), end_time_unix_nano=str(end_ns), service_name=value['service_name'])
+    return otel.with_ids(result)
 
 
 def _home():
@@ -154,14 +171,25 @@ def span(metric, **attrs):
     No result, exception text, prompt, tool body, or query is ever captured.
     """
     start, monotonic_start = time.time(), time.monotonic()
+    trace_id = attrs.pop('trace_id', uuid.uuid4().hex)
+    span_id = uuid.uuid4().hex[:16]
+    parent = attrs.pop('parent_span_id', None)
+    context = dict(trace_id=trace_id, span_id=span_id)
+    if parent is not None:
+        context['parent_span_id'] = parent
     try:
-        yield
+        yield context
     finally:
         try:
             host = _local_token(socket.gethostname())
+            duration = (time.monotonic() - monotonic_start) * 1000
+            start_ns = round(start * 1e9)
             append_batch([{
                 'id': str(uuid.uuid4()), 'metric': metric, 'start': start,
-                'dur_ms': (time.monotonic() - monotonic_start) * 1000,
+                'dur_ms': duration, **context,
+                'start_time_unix_nano': str(start_ns),
+                'end_time_unix_nano': str(start_ns + round(duration * 1e6)),
+                'service_name': 'hermes-gateway',
                 'host': host, 'gateway': _local_token(os.environ.get('HERMES_GATEWAY_ID', host)),
                 'attrs': attrs,
             }])

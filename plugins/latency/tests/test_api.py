@@ -38,7 +38,7 @@ class API(unittest.TestCase):
         response = self.client.get('/v1/series?range=7d')
         self.assertEqual(response.status_code,200,response.text)
         metrics = response.json()['metrics']
-        self.assertEqual(len(metrics),17)
+        self.assertEqual(len(metrics),20)
         self.assertTrue(all(m['p90'] is None and m['n']==0 and m['measured_since'] for m in metrics))
         body = {'spans':[dict(metric='ui.session_switch',start=time.time()-60,dur_ms=123,host='desktop',gateway='gateway',attrs={'session':'s'})]}
         response = self.client.post('/v1/spans',json=body)

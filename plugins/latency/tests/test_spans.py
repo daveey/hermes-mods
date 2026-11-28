@@ -22,11 +22,15 @@ def process_writer(root, index):
 
 
 def load():
-    spec = importlib.util.spec_from_file_location('latency_spans_test', Path(__file__).parents[1] / 'spans.py')
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    import sys
+    root = Path(__file__).parents[1]
+    name = 'latency_spans_package_test'
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, root / '__init__.py', submodule_search_locations=[str(root)])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return importlib.import_module(name + '.spans')
 
 
 class SpanTests(unittest.TestCase):
