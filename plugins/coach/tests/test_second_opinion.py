@@ -209,6 +209,8 @@ def test_committed_change_this_turn_is_reviewed(tmp_path, env, depth, foreign_lo
         other.mkdir()
         for name in ("__init__.py", "reply_check.py", "module_cache.py"):
             shutil.copyfile(HERE / name, other / name)
+        # reply_check imports the shared helper relative to its checkout.
+        shutil.copyfile(HERE.parent / "kanban_inventory.py", other.parent / "kanban_inventory.py")
         local = _mod("coach_local_probe")
         expected = local._load("reply_check")
         spec = importlib.util.spec_from_file_location("coach_other_probe", other / "__init__.py")
