@@ -267,8 +267,13 @@ def test_env_real_launcher(tmp_path):
         result = subprocess.run([sys.executable, str(launcher), *args], env=env,
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
+        shell_env = dict(env, ANTHROPIC_AUTH_TOKEN='stale-fixture-token')
+        applied = subprocess.run(['/bin/sh', '-c', result.stdout + '\n'
+                                 'test "${ANTHROPIC_AUTH_TOKEN+x}" != x'],
+                                 env=shell_env, capture_output=True, text=True, timeout=5)
+        assert applied.returncode == 0
         values = dict(shlex.split(line.removeprefix('export '))[0].split('=', 1)
-                      for line in result.stdout.splitlines())
+                      for line in result.stdout.splitlines() if line.startswith('export '))
         outputs.append(values)
         port = '8791' if '--port' in args else '8765'
         assert values['ANTHROPIC_BASE_URL'] == f'http://127.0.0.1:{port}'

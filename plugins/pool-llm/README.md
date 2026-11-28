@@ -41,6 +41,7 @@ Regression coverage: `tests/test_ask.py` exercises both CLI output modes with mo
 responses, including thinking-only failures, successful answers and Codex compatibility.
 
 `serve` lets an unmodified harness use the pool: `eval "$(hermes-pool-llm env)"` exports
+(the command also unsets inherited `ANTHROPIC_AUTH_TOKEN` to prevent conflicting SDK headers)
 `ANTHROPIC_BASE_URL=http://127.0.0.1:8765`, `OPENAI_BASE_URL=http://127.0.0.1:8765/v1`,
 and `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` containing this home's private token. It serves Anthropic `POST /v1/messages` (Claude
 Code system prefix and `mcp__` tool names added for the OAuth token, tool names restored in the reply) and OpenAI
