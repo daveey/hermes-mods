@@ -27,6 +27,10 @@ key first and re-requested only once if it is missing.
 
 ## Spend hold that re-holds right after a release
 - While the card holds an open stop, `spend-budget` refuses with `stop_decision_required`. Run `release` first;
-  its `--runs` value is additional runs, not an absolute limit.
+  its `--runs` value is additional runs, not an absolute limit. Pass `--seen` only when a refusal asks for it
+  (`seen_not_needed` otherwise).
+- If `release` prints `Recorded renewal authority: <session>` and that is not this chat, retrying from here
+  only repeats the refusal. `cross_session send` that chat the user's words, the gate facts you verified and the
+  exact `release`/`spend-budget` commands, and ask for the claimed run id or the refusal text.
 - A spend-reviewer release that keeps a cache-read cap below the card's cumulative usage re-holds the card
   straight away. Release from the owning chat so the cap is widened as well.
