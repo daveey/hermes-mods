@@ -34,20 +34,26 @@ def setup_reader(tmp_path, monkeypatch):
     return actual_core, owner, disposals
 
 
-def test_real_reader_store_sibling_resolution(tmp_path, monkeypatch, db, board, store):
+@pytest.mark.parametrize('same_card', [False, True])
+def test_real_reader_store_sibling_resolution(tmp_path, monkeypatch, db, board, store, same_card):
     actions, owner, disposals = setup_reader(tmp_path, monkeypatch)
     try:
         tasks = [kb.create_task(board, title=title, assignee='worker', session_id='chat')
-                 for title in ('First deploy', 'Other deploy')]
+                 for title in (('First deploy',) if same_card else ('First deploy', 'Other deploy'))]
         for tid in tasks:
             assert kb.block_task(board, tid, kind='needs_input', human_request=harness.HUMAN_REQUEST)
         identity = collect(db, 'chat')['parts']['identity']
         action_store = actions.ActionStore(tmp_path / 'user-steps' / 'actions.sqlite3')
         requests = []
-        for tid in tasks:
+        for tid in (tasks * 2 if same_card else tasks):
             payload = request(aliases=[{'type': 'kanban', 'id': tid, 'board': 'default',
                 'gatewayId': identity['gateway'], 'profile': identity['profile']}])
             payload['owner'] = owner
+            if same_card and requests:
+                # Alias lookup is one-to-one; independent asks may reference the
+                # same card in their scope without stealing its lookup alias.
+                payload['scope']['sourceRefs'] = payload['aliases']
+                payload['aliases'] = []
             requests.append(action_store.create(owner, payload))
         captured = collect(db, 'chat')
         assert not captured['errors'], captured['errors']
@@ -64,10 +70,31 @@ def test_real_reader_store_sibling_resolution(tmp_path, monkeypatch, db, board, 
             'episode': before['cards'][key]['block_episode'], 'action': 'answer',
             'choice_id': 'approve', 'label': 'Approve', 'by': 'you', 'at': before['computed_at'], 'delivery': 'committed'})
         after = store.recompute('chat')
-        assert not after['cards'][key]['red']
-        assert after['cards']['default/' + tasks[1]]['red']
+        assert after['cards'][key]['red'] is same_card
+        assert after['cards']['default/' + tasks[-1]]['red']
         assert [r['id'] for r in after['asks']] == [requests[1]['requestId']]
         assert store.get('chat')['rev'] == after['rev']
+        path = tmp_path / 'user-steps' / 'actions.sqlite3'
+        saved = path.with_suffix('.saved')
+        path.rename(saved)
+        path.write_bytes(b'not sqlite')
+        try:
+            unavailable = store.recompute('chat')
+            assert unavailable['sources']['requests:user-steps']['coverage'] == 'unknown'
+            assert 'unblocked by you' not in unavailable['cards'][key]['detail']
+        finally:
+            saved.replace(path)
+        recovered = store.recompute('chat')
+        assert [r['id'] for r in recovered['asks']] == [requests[1]['requestId']]
+        assert recovered['cards'][key]['red'] is same_card
+        second_key = 'default/' + tasks[-1]
+        store.add_resolution('chat', {'request_id': requests[1]['requestId'], 'card': second_key,
+            'episode': after['cards'][second_key]['block_episode'], 'action': 'answer',
+            'choice_id': 'approve', 'label': 'Second approval', 'by': 'you', 'at': after['computed_at'],
+            'delivery': 'committed'})
+        settled = store.recompute('chat')
+        assert not any(card['red'] for card in settled['cards'].values())
+        assert settled['asks'] == []
     finally:
         for dispose in disposals:
             dispose()
