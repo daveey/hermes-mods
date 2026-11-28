@@ -128,7 +128,8 @@ def test_schedule_parser_lifecycle_retry_rotation(tmp_path, monkeypatch):
     store = core.Store(home / "coach")
     calls = []
     fail_schedule = False
-    now = time.time()
+    # Retry stays on the successor's UTC day, even when CI starts at 23:59.
+    now = _day_start(time.time()) + 12 * 3600
 
     with closing(connect(db)) as conn:
         def runner(argv, **kwargs):
