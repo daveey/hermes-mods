@@ -21,6 +21,63 @@ const tick = () => new Promise(r => setTimeout(r, 5))
 const H = 3_600_000
 const NOW = Date.UTC(2026, 10, 26, 20, 0, 0)
 
+test('Hub arrow follows pending build commits, not stale or current records', () => {
+  for (const state of ['ready', 'building']) {
+    assert.equal(m.updatePending({ state, commits: 4 }), true)
+    assert.equal(m.updateTooltip({ state, commits: 4 }), 'Update ready · 4 commits')
+    assert.equal(m.updatePending({ state, commits: 0 }), false)
+  }
+  assert.equal(m.updatePending({ state: 'idle', commits: 4 }), false)
+  assert.equal(m.updatePending(null), false)
+})
+
+test('Update now uses local API, confirms busy or unknown turns, cancel never writes', async () => {
+  for (const running_turns of [3, null, 0]) {
+    const calls = []
+    const store = m.createVersionStore(async o => {
+      calls.push(o)
+      if (o.path.endsWith('/ping')) return { api: 2 }
+      if (o.path.endsWith('/update')) return { ok: true }
+      return { running_turns, running: 'abc1234567', force_request: { by: 'hub panel' } }
+    })
+    await store.updateNow()
+    assert.ok(calls.every(c => c.connectionId === 'local'))
+    if (running_turns !== 0) {
+      assert.equal(calls.filter(c => c.method === 'POST').length, 0)
+      assert.ok(store.$confirm.get() !== null)
+      store.cancel()
+      assert.equal(store.$confirm.get(), null)
+      await store.updateNow()
+      await store.apply()
+    }
+    assert.equal(calls.filter(c => c.method === 'POST').length, 1)
+    assert.equal(store.$message.get(), 'Waiting for turns')
+  }
+})
+
+test('progress preserves real deferrals and reports applying then completed sha', async () => {
+  let v = { running_turns: 0, running: 'abc1234567', force_request: {} }
+  const store = m.createVersionStore(async o => o.path.endsWith('/ping') ? { api: 2 } : o.method === 'POST' ? { ok: true } : v)
+  await store.updateNow()
+  v = { ...v, progress: { state: 'applying' } }
+  await store.refresh()
+  assert.equal(store.$message.get(), 'Updating')
+  v = { ...v, deferral_reason: 'drain cooldown' }
+  await store.refresh()
+  assert.equal(store.$message.get(), 'drain cooldown')
+  v = { running: 'def1234567', running_turns: 0, operation: { phase: 'updated', sha: 'def1234567' } }
+  await store.refresh()
+  assert.equal(store.$message.get(), 'Updated to def1234567')
+})
+
+test('old backend cannot receive the new update mutation', async () => {
+  const calls = []
+  const store = m.createVersionStore(async o => { calls.push(o); return { api: 1 } })
+  await store.updateNow()
+  assert.equal(calls.length, 1)
+  assert.match(store.$message.get(), /activation/)
+})
+
 test('hubConnection: hermes-hub, else a remote whose name says hub, else none', () => {
   assert.equal(m.hubConnection([{ id: 'local', kind: 'local' }, { id: 'mac-mini', kind: 'ssh' }, { id: 'hermes-hub', kind: 'ssh' }]), 'hermes-hub')
   assert.equal(m.hubConnection([{ id: 'x1', kind: 'ssh', label: 'hub (EC2)' }]), 'x1')

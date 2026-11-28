@@ -28,9 +28,26 @@ def _core():
         return mod
 
 
+def _version():
+    spec = importlib.util.spec_from_file_location("core_update_version", _CORE.with_name("version.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@router.get("/version")
+def version() -> Dict[str, Any]:
+    return _version().view()
+
+
+@router.post("/update")
+def update() -> Dict[str, Any]:
+    return _version().update_now()
+
+
 @router.get("/ping")
 async def ping() -> Dict[str, Any]:
-    return {"ok": True, "api": 1}
+    return {"ok": True, "api": 2}
 
 
 @router.get("/status")

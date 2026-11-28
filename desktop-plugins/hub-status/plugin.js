@@ -79,6 +79,13 @@ const CSS = `
 .hs-ev .hs-t{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted-foreground);text-align:right}
 .hs-ftr{display:flex;justify-content:space-between;margin-top:8px;color:var(--muted-foreground);font-size:11px}
 .hs-empty{color:var(--muted-foreground);font-size:11px;padding:6px 0}
+.hs-version{margin-top:12px;padding-top:10px;border-top:1px solid var(--border)}
+.hs-version dl{display:grid;grid-template-columns:120px 1fr;gap:3px;margin:8px 0}
+.hs-version dd{margin:0;font-family:ui-monospace,monospace}
+.hs-version button{border:1px solid var(--border);border-radius:5px;padding:3px 8px;margin:6px 6px 0 0;cursor:pointer}
+.hs-commit{display:grid;grid-template-columns:62px minmax(0,1fr) 64px;gap:6px;margin:4px 0;font-size:11px}
+.hs-commit>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hs-commit time{color:var(--muted-foreground);text-align:right}
 `
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
@@ -286,7 +293,8 @@ export function createStore(ctx) {
       .catch(() => {})
   }
 
-  return { $poll, $events, $day, $now, $spans, refresh, loadEvents, loadDay, conn }
+  const version = createVersionStore()
+  return { $poll, $events, $day, $now, $spans, refresh, loadEvents, loadDay, conn, version }
 }
 
 // ── view ──────────────────────────────────────────────────────────────────
@@ -330,6 +338,84 @@ function Band({ segments, start, end, now }) {
         : `${WORD[p.state]} · ${fmtTime(p.start, now)} → ${p.end >= now - 1000 ? 'now' : fmtTime(p.end, now)} · ${fmtSpan(p.end - p.start)}${p.reason ? ` · ${p.reason}` : ''}`
     }, i))
   })
+}
+
+// Updates belong to the Desktop installation, never the selected remote gateway.
+export const updatePending = s => ['ready', 'building'].includes(s?.state) && Number(s?.commits) > 0
+export const updateTooltip = s => updatePending(s) ? `Update ready · ${s.commits} commits` : null
+
+export function createVersionStore(api = options => window.hermesDesktop.api(options)) {
+  const $version = atom(null)
+  const $message = atom('')
+  const $confirm = atom(null)
+  let busy = false
+  const request = (path, options = {}) => api({ path: `/api/plugins/core-update/${path}`, connectionId: 'local', ...options })
+  const refresh = async () => {
+    try {
+      const ping = await request('ping', { passive: true })
+      if (!(ping?.api >= 2)) throw new Error('Version panel awaits backend activation')
+      const v = await request('version', { passive: true })
+      $version.set(v)
+      if (v.deferral_reason) $message.set(v.deferral_reason)
+      else if (v.progress) $message.set(v.progress.state === 'applying' ? 'Updating' : 'Waiting for turns')
+      else if (v.force_request) $message.set('Waiting for turns')
+      else if (v.operation?.phase === 'updated' && v.operation.sha) {
+        $message.set(`Updated to ${v.operation.sha.slice(0, 10)}`); busy = false
+      } else if (['failed', 'deferred'].includes(v.operation?.phase)) {
+        $message.set(v.operation.reason || 'Update deferred'); busy = false
+      } else if (['updating', 'restarting'].includes(v.operation?.phase)) $message.set('Updating')
+      return v
+    } catch (e) { $message.set(String(e?.message || e)); return null }
+  }
+  const apply = async () => {
+    if (busy) return
+    busy = true
+    $confirm.set(null)
+    $message.set('Waiting for turns')
+    try {
+      const response = await request('update', { method: 'POST' })
+      if (!response?.ok) throw new Error(response?.reason || 'Update request refused')
+      await refresh()
+    } catch (e) { busy = false; $message.set(String(e?.message || e)) }
+  }
+  const updateNow = async () => {
+    if (busy) return
+    const v = await refresh()
+    if (!v) return
+    if (v.running_turns !== 0) $confirm.set(v.running_turns ?? 'Unknown number of')
+    else await apply()
+  }
+  return { $version, $message, $confirm, refresh, updateNow, apply, cancel: () => $confirm.set(null) }
+}
+
+export function VersionSection({ store }) {
+  const v = useValue(store.$version)
+  const message = useValue(store.$message)
+  const count = useValue(store.$confirm)
+  const commits = v?.changes || []
+  const row = c => jsxs('div', { className: 'hs-commit', children: [
+    jsx('code', { children: c.sha.slice(0, 8) }),
+    jsx('span', { title: c.subject, children: c.subject }),
+    jsx('time', { title: c.at, children: fmtTime(Date.parse(c.at)) })
+  ] }, c.sha)
+  return jsxs('section', { className: 'hs-version', 'aria-label': 'Hermes version', children: [
+    jsx('b', { children: 'Hermes version' }),
+    jsxs('dl', { children: [
+      jsx('dt', { children: 'Running backend' }), jsx('dd', { children: v?.running?.slice(0, 10) || 'Unavailable' }),
+      jsx('dt', { children: 'Installed Desktop' }), jsx('dd', { children: v?.desktop_build?.map(s => s?.slice(0, 10)).join(', ') || 'Unavailable' }),
+      jsx('dt', { children: 'Target' }), jsx('dd', { children: v?.target?.slice(0, 10) || 'Unavailable' })
+    ] }),
+    jsx('b', { children: "What’s in the update" }),
+    commits.length ? commits.slice(0, 15).map(row) : jsx('div', { className: 'hs-empty', children: v ? 'No new commits' : 'Loading version…' }),
+    commits.length > 15 ? jsxs('details', { children: [jsx('summary', { children: `${commits.length - 15} more commits` }), ...commits.slice(15).map(row)] }) : null,
+    jsx('button', { type: 'button', onClick: () => store.updateNow(), children: 'Update now' }),
+    count !== null ? jsxs('div', { role: 'alert', children: [
+      `${count} running turn(s) on this machine. Desktop/TUI turns will pause at their next boundary; other surfaces may keep the update waiting. Non-resumable turns must be sent again. `,
+      jsx('button', { type: 'button', onClick: () => store.apply(), children: 'Confirm update' }),
+      jsx('button', { type: 'button', onClick: () => store.cancel(), children: 'Cancel' })
+    ] }) : null,
+    message ? jsx('div', { role: 'status', children: message }) : null
+  ] })
 }
 
 function Popup({ store, cur, now }) {
@@ -420,7 +506,8 @@ function Popup({ store, cur, now }) {
           jsx('span', { children: `${range === '7d' ? '7 d' : '24 h'} · ${fmtPct(sum.pct)} up · ${sum.restarts} restart${sum.restarts === 1 ? '' : 's'} · ${sum.outages} outage${sum.outages === 1 ? '' : 's'}` }),
           cur && cur.reason ? jsx('span', { children: cur.reason }) : null
         ]
-      })
+      }),
+      jsx(VersionSection, { store: store.version })
     ]
   })
 }
@@ -449,6 +536,7 @@ export function chipModel(poll, day, spans, now) {
 }
 
 function Chip({ store, placement = 'titlebar' }) {
+  const version = useValue(store.version.$version)
   const poll = useValue(store.$poll)
   const day = useValue(store.$day)
   const spans = useValue(store.$spans)
@@ -473,10 +561,11 @@ function Chip({ store, placement = 'titlebar' }) {
           'data-slot': 'hub-status-chip',
           'data-state': m.cur.state,
           'aria-label': m.label,
-          title: m.title,
+          title: updateTooltip(version) || m.title,
           children: [
             jsx(Strip, { slots: m.slots }),
             jsx('span', { children: 'Hub' }),
+            updatePending(version) ? jsx('span', { className: 'codicon codicon-arrow-up', 'data-slot': 'hub-update-arrow', 'aria-label': updateTooltip(version) }) : null,
             jsx('span', { className: 'hs-dur', style: durColor ? { color: durColor } : undefined, children: m.counter })
           ]
         })
@@ -549,6 +638,8 @@ export default {
       ctx.onDispose?.(() => style.remove())
     }
     const store = createStore(ctx)
+    store.version.refresh()
+    ctx.setInterval(() => { if (!isHidden()) store.version.refresh() }, 30_000)
     store.refresh()
     store.loadDay()
     ctx.setInterval(() => { if (!isHidden() || store.$poll.get().fails > 0) store.refresh() }, POLL_MS)
