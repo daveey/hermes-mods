@@ -1810,8 +1810,8 @@ CREDIT_ASK_NUDGE = (
     "[coach] credit_ask: your reply asks the user to add or buy API credit (\"{evidence}\"), but this turn never tried "
     "the Hermes subscription account pool (Claude Max + ChatGPT accounts). Run the work there first: "
     "`~/.hermes/plugins/pool-llm/bin/hermes-pool-llm ask --provider anthropic|openai --model <m> \"...\"`, or "
-    "`hermes-pool-llm serve --port 8765` and point the harness at it (ANTHROPIC_BASE_URL=http://127.0.0.1:8765, "
-    "OPENAI_BASE_URL=http://127.0.0.1:8765/v1). Ask for money only if the pool fails too, quoting its error.")
+    '`hermes-pool-llm serve --port 8765`, then `eval "$(hermes-pool-llm env --port 8765)"` '
+    "to export loopback URLs and the private API token. Ask for money only if the pool fails too, quoting its error.")
 
 
 def credit_ask(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
