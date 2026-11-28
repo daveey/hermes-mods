@@ -231,9 +231,47 @@ def check(text, guard, cwd="", depth=0, inherited=None, *, remote=False, in_home
     budget = budget if budget is not None else _Budget()
     try:
         budget.spend(len(text))
+        why = _unsupported_write_context(text, guard, budget)
+        if why:
+            return why
         return _check(text, guard, cwd, depth, inherited, remote, in_home, budget)
     except (ValueError, RecursionError):
         return "shell syntax exceeds the bounded live-database safety analysis; use explicit paths and swap_db.py"
+
+
+def _unsupported_write_context(text, guard, budget):
+    """Do not trust path/alias state across constructs we do not interpret.
+
+    Fail closed by class, not by spelling of the final path: read/eval/functions
+    can produce an arbitrary alias. Data arguments are not command inventories;
+    explicit child scripts get this check at their own recursion boundary.
+    """
+    segments = list(_raw_segments(guard._expose_substitutions(text)))
+    hazardous = ('`' in text or bool(re.search(r'\b\w+\s*\(\s*\)\s*\{', text))
+                 or ('{' in text and any(s in (["|"], ["&"]) for s in segments)))
+    writing = False
+    for raw in segments:
+        budget.spend(len(raw))
+        argv = [_value(t, {}, budget) for t in raw]
+        while argv and (argv[0] in _CONTROL | {"{", "}", "!", "time"}
+                        or _ASSIGN.match(argv[0])):
+            hazardous = hazardous or argv[0] == 'case' or argv[0].startswith('CDPATH=')
+            argv = argv[1:]
+        if 'env' in argv and any(a.startswith('-C') or a.startswith('--chdir') for a in argv):
+            hazardous = True
+            writing = writing or any(a in _FILES for a in argv)
+        argv = guard._strip_wrappers(argv)
+        if not argv:
+            continue
+        word = os.path.basename(argv[0])
+        hazardous = hazardous or word in {'pushd', 'popd', 'builtin', 'read', 'eval', 'source', '.', 'function'}
+        hazardous = hazardous or (word == 'cd' and '-' in argv[1:])
+        hazardous = hazardous or (word == 'env' and any(a == '-C' or a.startswith('--chdir')
+                                                       or a.startswith('-C') for a in argv[1:]))
+        writing = writing or word in _FILES or any(t in {'>', '>>', '>|', '&>', '&>>', '<>'} for t in raw)
+    if hazardous and writing:
+        return 'file mutation in an unsupported shell state context; use explicit paths in a separate command and swap_db.py'
+    return None
 
 
 def _shallow(pipeline, blocks, braces):
@@ -269,7 +307,8 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     readonly = set()
     text = text.replace("\\\n", "")
     if in_home is None:
-        in_home = (os.path.realpath(guard._expand(cwd)) if cwd else False) if not remote else False
+        in_home = ((os.path.realpath(guard._expand(cwd)) if cwd else False) if not remote else
+                   (False, guard._expand('~'), guard._expand('~/.hermes')))
     text, bodies = _heredocs(text)
     blocks, rhs = 0, False
     scopes, braces, pipeline = [], [], None

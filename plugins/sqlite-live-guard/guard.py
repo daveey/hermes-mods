@@ -1668,7 +1668,7 @@ def _py_board(node: Optional[ast.AST], names: dict, depth: int = 0) -> Optional[
     if node is None or depth > 4:
         return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value if is_live(_expand(node.value)) else None
+        return node.value if is_live(_expand(node.value), True) else None
     if isinstance(node, ast.Name) and node.id in names:
         return _py_board(names[node.id], names, depth + 1)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
@@ -1693,6 +1693,29 @@ def _py_board(node: Optional[ast.AST], names: dict, depth: int = 0) -> Optional[
             return _py_board(node.args[0], names, depth + 1)
         if name in ("expanduser", "resolve", "absolute") and isinstance(fn, ast.Attribute):
             return _py_board(fn.value, names, depth + 1)
+    return None
+
+
+def _py_directory_literal(node, names, depth=0):
+    """Resolve a bounded, non-executing subset of common pathlib/home expressions."""
+    if node is None or depth > 4:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return _py_directory_literal(names.get(node.id), names, depth + 1)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left = _py_directory_literal(node.left, names, depth + 1)
+        right = _py_directory_literal(node.right, names, depth + 1)
+        return os.path.join(left, right) if left is not None and right is not None else None
+    if isinstance(node, ast.Call):
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ''
+        if name == 'home' and not node.args and not node.keywords:
+            return os.path.expanduser('~')
+        if name in {'str', 'Path', 'PurePath', 'fspath', 'expanduser'} and node.args:
+            value = _py_directory_literal(node.args[0], names, depth + 1)
+            return _expand(value) if value is not None and name == 'expanduser' else value
     return None
 
 
@@ -1723,18 +1746,21 @@ def _check_python_ast(code: str) -> Optional[str]:
         else:
             continue
         target = None
-        if identity in _PY_MOVE_FUNCS:
+        if (isinstance(fn, ast.Name) and fn.id == 'open') or identity == ('io', 'open'):
+            mode = node.args[1] if len(node.args) > 1 else next(
+                (kw.value for kw in node.keywords if kw.arg == 'mode'), None)
+            if isinstance(mode, ast.Constant) and isinstance(mode.value, str) and set(mode.value) & set('wax+'):
+                target = node.args[0] if node.args else next(
+                    (kw.value for kw in node.keywords if kw.arg == 'file'), None)
+        elif identity in _PY_MOVE_FUNCS:
             target = node.args[1] if len(node.args) >= 2 else next(
                 (kw.value for kw in node.keywords if kw.arg == "dst"), None)
         elif identity == ("shutil", "rmtree"):
             target = node.args[0] if node.args else next(
                 (kw.value for kw in node.keywords if kw.arg == "path"), None)
-            # Resolve only literals/simple assigned literals, not arbitrary Python.
-            value = target
-            if isinstance(value, ast.Name):
-                value = names.get(value.id)
-            if isinstance(value, ast.Constant) and isinstance(value.value, str) and protects_directory(value.value):
-                return f"Python recursive removal of directory containing live database files {value.value}"
+            value = _py_directory_literal(target, names)
+            if value is not None and protects_directory(value, True):
+                return f"Python recursive removal of directory containing live database files {value}"
         elif identity in _PY_DELETE_FUNCS:
             target = node.args[0] if node.args else next(
                 (kw.value for kw in node.keywords if kw.arg == "path"), None)

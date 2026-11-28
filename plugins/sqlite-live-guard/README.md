@@ -22,11 +22,19 @@ and a `cd` not followed by `&&` (including the left side of `||`, a negated `! c
 shadowed `cd`) retain prior and target directories (up to 32,
 then refusal), including across nested shells. Deferred successful `cd` contexts rejoin at a following `&&` or
 list boundary, while failed contexts rejoin after success-gated `&&` chains end.
-`pushd`/`popd` and `env -C` directory changes are not tracked. Remote initial cwd
-remains unknown: although ordinary sshd starts in the user's home, forced commands,
-server wrappers and shell initialization can change it, so explicit home/absolute
-paths or a lexically known `cd` are required; local filesystem state never resolves
-it. `mv -t DIR`, `-tDIR` and `--target-directory[=]DIR` (including GNU unambiguous
+The analyzer does not interpret `pushd`/`popd`, `builtin`, `read`, `eval`, sourced
+scripts, function definitions, `env -C`/`--chdir`, `cd -`/`CDPATH`, backticks or compound pipeline
+state precisely. A second **fail-closed mutation fallback** refuses a command list
+combining these constructs with file mutation or write redirection, even for a
+safe non-live target. Read-only lists and quoted command data remain allowed.
+Split safe maintenance into a separate explicit-path command; use `swap_db.py`
+for live replacements. This fallback is deliberately conservative, not a claim
+that those shell constructs have been implemented.
+Remote initial cwd retains unknown, login-home and Hermes-home possibilities:
+sshd normally starts in the user's home, but wrappers/init can change it. This
+protects relative `.hermes` and bare database names without consulting remote
+filesystem state. An explicit `cd /tmp && ...` still narrows its continuation.
+`mv -t DIR`, `-tDIR` and `--target-directory[=]DIR` (including GNU unambiguous
 long-option prefixes such as `--t` and `--target`) protect every source subtree.
 Prefix assignments enter the child environment without changing the invoking
 shell's word expansion. Redirect operators are split before variable expansion,
@@ -203,8 +211,23 @@ filesystem changes between classification and execution.
 
 Python AST checks resolve `from os import unlink/remove` (including `as` names)
 and `import os as ...` identities, literal and simple assigned targets, and the
-`path=` deletion argument. They do not execute submitted code or implement arbitrary
-Python dataflow, dynamic imports or rebinding.
+`path=` deletion argument. With no supplied Python cwd, a relative live database
+name is conservatively considered a possible Hermes-home target. Write-mode
+`open`/`io.open` targets use AST arguments rather than matching strings in printed
+data. `rmtree` additionally resolves bounded literal/assigned `expanduser`,
+`Path.home()` and `/` compositions; cache/backup exclusions still apply.
+These checks do not execute submitted code or implement arbitrary Python dataflow,
+dynamic imports or rebinding.
+
+PR-531 follow-up coverage: `tests/test_followups_531.py` replays every concrete
+non-blocking review family, with post-merge main verdicts in
+`tests/fixtures/followup_main_verdicts.json`; the older generated differential
+corpus is also rebaselined to post-merge main. `tests/test_followups_real_shell.py`
+runs fake-rm proofs with disposable HOME under bash, dash, zsh, bash lastpipe and
+an sshd-style fake ssh selecting each login shell. No network/deletion occurs.
+Set `FOLLOWUP_ZSH` when zsh is available at a nonstandard path. Missing shells skip
+only their matrix cells; a full local matrix is required before landing.
+Existing main refusals (including safe cd/OR over-refusals) are not relaxed.
 
 Recovery PID, receipt and pending-marker writes use adjacent unique exclusive
 0600 temporary files, write/fsync through the opened descriptor, and atomically
