@@ -167,10 +167,11 @@ def collect_board(path, store, definitions, since, until, host='local', gateway=
             events.extend(dict(r) for r in db.execute('''SELECT id,task_id,kind,created_at FROM task_events
                 WHERE task_id=? AND created_at<=? ORDER BY created_at,id''', (task['id'], until)))
     samples = [s for s in board_samples(tasks, events, definitions, source, host, gateway) if since <= s['start'] <= until]
-    observed = [sample(d['id'], (source,t['id']), 0, 0)['id']
-                for t in tasks for d in definitions if d['start'] == 'created']
+    # Board events are append-only: incoming observations revise existing values.
+    # A recently archived old card is not an authoritative deletion of its retained
+    # observation merely because its creation falls outside this backfill window.
     return store.reconcile(samples, [d['id'] for d in definitions], cursor_key,
-                           {'id': ceiling, 'at': until}, observed)
+                           {'id': ceiling, 'at': until}, [])
 
 
 def collect_journals(paths, store, definitions, until, host='local', gateway='local'):

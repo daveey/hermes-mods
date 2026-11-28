@@ -20,7 +20,7 @@ class Semantics(unittest.TestCase):
     def test_board_uses_events_id_order_not_task_timestamps(self):
         tasks = [dict(id='t', created_at=1, completed_at=900), dict(id='missing', created_at=1, completed_at=10)]
         events = [dict(id=i, task_id='t', kind=k, created_at=t) for i,k,t in
-                  [(1,'created',100),(2,'claimed',120),(3,'completed',150),(4,'claimed',110),(5,'completed',180)]]
+                  [(0,'comment',50),(1,'created',100),(2,'claimed',120),(3,'completed',150),(4,'claimed',110),(5,'completed',180)]]
         defs = [dict(id='queue',start='created',end='claimed'),dict(id='done',start='created',end='completed')]
         rows = list(collectors.board_samples(tasks,events,defs))
         self.assertEqual([(r['metric'],r['start'],r['dur_ms']) for r in rows], [('queue',100,20000),('done',100,80000)])
@@ -114,6 +114,56 @@ class Semantics(unittest.TestCase):
             view = store.view('ci',0,300600)
             self.assertEqual(view['n'],1)
             self.assertEqual(view['slowest'][0]['dur_ms'],50000)
+
+    def test_board_recent_event_does_not_retract_retained_old_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            path = Path(tmp)/'board.db'
+            day = 86400
+            with closing(sqlite3.connect(path)) as db, db:
+                db.executescript('''CREATE TABLE tasks(id TEXT);
+                    CREATE TABLE task_events(id INTEGER PRIMARY KEY,task_id TEXT,kind TEXT,created_at REAL);
+                    INSERT INTO tasks VALUES ('t');
+                    INSERT INTO task_events VALUES (1,'t','created',100),(2,'t','completed',3700);''')
+            defs = [dict(id='done',start='created',end='completed')]
+            collectors.collect_board(path,store,defs,0,5*day)
+            self.assertEqual(store.view('done',0,40*day)['n'],1)
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO task_events VALUES (3,'t','archived',?)",(35*day,))
+            collectors.collect_board(path,store,defs,5*day,35*day+1)
+            self.assertEqual(store.view('done',0,40*day)['n'],1)
+            self.assertEqual(store.view('done',0,40*day)['slowest'][0]['dur_ms'],3600000)
+
+    def test_reconcile_fences_legacy_ingest_and_prunes_contributions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            rows = [dict(id=str(i),metric='ci',start=100,dur_ms=i+1,host='h',gateway='g') for i in range(25)]
+            store.reconcile(rows,['ci'],'v2',{},[])
+            # Legacy ingesters must skip both top-20 and non-top-20 identities.
+            self.assertEqual(store.ingest(rows),0)
+            self.assertEqual(store.view('ci',0,1000)['n'],25)
+            store.prune(91*86400)
+            with store._connection() as db:
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM contributions').fetchone()[0],0)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM identities').fetchone()[0],0)
+            self.assertEqual(store.view('ci',0,1000)['n'],0)
+
+    def test_sweep_advances_across_successful_cycles(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            defs = [dict(id='ci',source='github.example',start='run_started_at',end='updated_at',workflow='ci.yml')]
+            cfg = {'example':{'repo':'example/repo'}}
+            with patch.object(github,'runs',return_value=[]):
+                github.collect_github(tmp,store,defs,cfg,0,10*86400)
+            calls = []
+            def runs(repo,a,b,fetch):
+                calls.append((a,b))
+                return []
+            with patch.object(github,'runs',side_effect=runs):
+                github.collect_github(tmp,store,defs,cfg,0,10*86400+600)
+                github.collect_github(tmp,store,defs,cfg,0,10*86400+1200)
+            self.assertEqual([pair for pair in calls if pair[0]<2*86400],[(0,86400),(86400,2*86400)])
 
     def test_reconcile_bad_sample_does_not_destroy_legacy_or_advance_cursor(self):
         with tempfile.TemporaryDirectory() as tmp:
