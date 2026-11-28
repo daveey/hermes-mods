@@ -1,4 +1,4 @@
-"""[daveey] Overdue-triage cards: a red session gets a card it can act on.
+"""Overdue-triage cards: a red session gets a card it can act on.
 
 Core turns a chat red when a card it links sits in triage past the overdue threshold
 (``hermes_cli.kanban_triage_attention``), deliberately without a human_request. Nothing
