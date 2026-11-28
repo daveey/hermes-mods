@@ -16,6 +16,15 @@ def load_yaml(path):
         except ImportError:
             import yaml
             return yaml.safe_load(Path(path).read_text())
+    # Local watches change while a process is alive. Do not reuse core's YAML
+    # cache (which is intended for immutable configuration snapshots).
+    if Path(path).name == 'metrics.local.yaml':
+        try:
+            from ruamel.yaml import YAML
+            return YAML(typ='safe').load(Path(path).read_text())
+        except ImportError:
+            import yaml
+            return yaml.safe_load(Path(path).read_text())
     return load_yaml_file_readonly(Path(path))
 
 

@@ -75,12 +75,17 @@ def build(range_key, metric=None, now=None):
         if metric and definition['id'] != metric:
             continue
         key = 'measured_since:'+definition['id']
-        measured = store.meta_get(key)
+        measured = definition.get('measured_since', store.meta_get(key))
         if measured is None:
             measured = now
             store.meta_set(key, measured)
         view = store.view(definition['id'], now-({'8d': 8*86400}.get(range_key) or RANGES[range_key]), now)
-        rows.append(links.enrich({**definition, 'measured_since': measured, **view}, sources))
+        row = {**definition, 'measured_since': measured, **view}
+        watch = importlib.import_module(pkg().__name__+'.watch')
+        row['collection_label'] = watch.collection_label(row, now)
+        if row['collection_label'] and range_key != '90d' and store.view(definition['id'], now-90*86400, now)['n']:
+            row['collection_label'] = None  # data outside the selected range is not uninstrumented
+        rows.append(links.enrich(row, sources))
     return dict(api=1, range=range_key, at=now, timezone='America/Los_Angeles',
                 quantile_relative_error=0.005, bucket_seconds=3600, metrics=rows,
                 collection=store.meta_get('last_cycle'))
@@ -175,6 +180,35 @@ def ingest(body):
     exporter = importlib.import_module(pkg().__name__+'.exporter')
     exporter.enqueue(normalized)
     return {'ok': True, 'accepted': len(normalized), 'inserted': inserted}
+
+
+@router.post('/v1/watch')
+async def add_watch(request: Request):
+    # Same dashboard authentication boundary as spans. Reject oversized or
+    # malformed requests before opening files or publishing instrumentation.
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > 4096:
+            raise HTTPException(400, 'definition too large')
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict) or set(body) != {'definition'}:
+            raise ValueError('expected {definition: {...}}')
+        def apply():
+            sampler, _, _, root = services()
+            watch = importlib.import_module(pkg().__name__+'.watch')
+            result = watch.add(root, body['definition'])
+            with _lock:
+                _cache.clear()
+            return result
+        return await asyncio.to_thread(apply)
+    except (ValueError, TypeError, RecursionError) as error:
+        raise HTTPException(400, str(error)) from error
+    except Exception as error:
+        # No internal error text or credentials in a public response. A retry
+        # uses the same instrumentation idempotency key if publication was uncertain.
+        raise HTTPException(503, 'Add could not finish; retry the same definition') from error
 
 
 @router.post('/v1/spans')

@@ -1,5 +1,5 @@
 // Ledger: server-owned quantiles and counts; renderer emits identifier-only spans.
-import { host, useValue, useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent, Dialog, DialogContent, DialogTitle } from '@hermes/plugin-sdk'
+import { host, useValue, useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, TRANSCRIPT_DIRECTIVE_AREA, Popover, PopoverTrigger, PopoverContent, Dialog, DialogContent, DialogTitle } from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect, useRef } from 'react'
 
 export const RANGES = ['24h', '7d', '30d', '90d']
@@ -80,7 +80,8 @@ function Detail({ ctx, row, range }) {
   const [error, setError] = useState('')
   const stages = row.stages || []
   return h('section', { className: 'lat-detail', id: `lat-detail-${row.id}`, 'data-testid': 'metric-detail' },
-    row.n ? h(History, { row, range }) : h('p', { className: 'lat-muted' }, 'not measured yet'),
+    row.n ? h(History, { row, range }) : h('p', { className: 'lat-muted' }, row.collection_label || 'not measured yet'),
+    h(InstrumentationLink, { ctx, ref: row.instrumentation_card }),
     h('div', { className: 'lat-legend' }, h('span', { style: { color: 'var(--lat-cyan)' } }, '— p90'), h('span', null, '— p50'), h('span', null, '-- target'), h('span', null, `n=${row.n}`)),
     stages.length > 0 && h('div', null, h('div', { className: 'lat-stages', 'aria-label': 'Stage split' }, stages.map((s, i) => h('span', { key: s.name, title: `${s.name}: ${duration(s.dur_ms)}`, style: { flexGrow: s.dur_ms, background: 'var(--lat-cyan)', opacity: .35 + .6 * (i + 1) / stages.length } }))), h('div', { className: 'lat-legend' }, stages.map(s => h('span', { key: s.name }, `${s.name} ${duration(s.dur_ms)}`)))),
     row.slowest?.length > 0 && h('div', null, h('p', { className: 'lat-muted', style: { margin: '8px 0 3px', fontSize: 11 } }, 'Slowest in this range'), row.slowest.map(s => h('div', { className: 'lat-slow', key: s.id }, h('span', { className: 'lat-value', style: { width: 52, flex: 'none' } }, duration(s.dur_ms)), h('button', { onClick: () => Promise.resolve(openSample(ctx, s)).catch(() => setError('Sample owner route is not available')) }, s.attrs?.session || s.attrs?.card || (s.attrs?.pr ? `PR #${s.attrs.pr}` : s.id)), h('time', { dateTime: new Date(s.start * 1000).toISOString() }, new Date(s.start * 1000).toLocaleString())))),
@@ -95,7 +96,7 @@ export function LedgerPanel({ ctx, payload, range, setRange, selected, setSelect
       h('button', { className: 'lat-row', 'data-metric': row.id, 'aria-expanded': selected === row.id, 'aria-controls': `lat-detail-${row.id}`, onClick: () => setSelected(selected === row.id ? null : row.id) },
         h('span', { className: 'lat-name', title: row.label }, h(Dot, { status: row.status }), row.label),
         h('span', { className: 'lat-value lat-muted' }, duration(row.p50)), h('span', { className: `lat-value lat-${row.status}` }, duration(row.p90)),
-        row.n ? h(Spark, { points: row.spark, target: row.target_p90 }) : h('span', { className: 'lat-empty' }, 'not measured yet')),
+        row.n ? h(Spark, { points: row.spark, target: row.target_p90 }) : h('span', { className: 'lat-empty' }, row.collection_label || 'not measured yet')),
       selected === row.id && h(Detail, { ctx, row, range }))))),
     h('footer', { className: 'lat-notice' }, live ? 'Live · hub measurements' : 'Not live · refreshes every 30s', payload && ` · observed ${new Date(payload.at * 1000).toLocaleTimeString()}`))
 }
@@ -179,10 +180,55 @@ export function LedgerSurface({ ctx }) {
     h(Dialog, { open: panel, onOpenChange: setPanel }, h(DialogContent, { className: 'hermes-latency lat-dialog', 'aria-describedby': undefined }, h(LedgerPanel, { ctx, payload: query.data, range, setRange, selected, setSelected, live: query.live, error: query.isError, retry: query.refetch }))))
 }
 
+export function decodeWatch(encoded) {
+  if (typeof encoded !== 'string' || encoded.length > 4096 || !/^[A-Za-z0-9_=-]+$/.test(encoded)) throw Error('Invalid latency proposal')
+  const row = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0))))
+  if (!row || typeof row !== 'object' || Object.keys(row).sort().join(',') !== 'end,group,id,kind,label,source,start,target_p90,unit' || !['derived', 'span'].includes(row.kind) || row.unit !== 'ms' || !Number.isFinite(row.target_p90) || row.target_p90 <= 0) throw Error('Invalid latency proposal')
+  for (const k of ['id', 'label', 'group', 'source', 'start', 'end']) if (typeof row[k] !== 'string' || !row[k] || row[k].length > 200) throw Error('Invalid latency proposal')
+  return row
+}
+
+export function WatchProposal({ ctx, attrs, streaming = false }) {
+  let proposal
+  try { proposal = decodeWatch(attrs?.definition) } catch { return h('p', { role: 'alert' }, 'Invalid latency proposal; ask the agent to propose it again.') }
+  return h(WatchCard, { key: attrs.definition, ctx, proposal, streaming })
+}
+
+function InstrumentationLink({ ctx, ref }) {
+  const [error, setError] = useState('')
+  if (!ref) return null
+  return h('div', null, h('button', { type: 'button', onClick: () => Promise.resolve(openSample(ctx, { link: { kind: 'card', ...ref, gateway: hubConnection() } })).catch(() => setError('Instrumentation owner route is not available')) }, `Instrumentation: ${ref.id}`), error && h('p', { role: 'alert' }, error))
+}
+
+function WatchCard({ ctx, proposal, streaming }) {
+  const client = useQueryClient()
+  const [target, setTarget] = useState(String(proposal.target_p90)), [editing, setEditing] = useState(false), [pending, setPending] = useState(false), [result, setResult] = useState(null), [error, setError] = useState('')
+  const value = Number(target)
+  const valid = target.trim() !== '' && Number.isFinite(value) && value > 0 && value <= 90 * 86400000
+  const add = async () => {
+    if (pending || result || streaming || !valid) return
+    setPending(true); setError('')
+    try {
+      const reply = await hubRest(ctx, '/v1/watch', { method: 'POST', body: { definition: { ...proposal, target_p90: value } }, timeoutMs: 60000 })
+      if (!reply?.definition || typeof reply.added !== 'boolean') throw Error('Add was not confirmed')
+      setResult(reply)
+      client.invalidateQueries({ queryKey: ['latency', 'ledger'] })
+    } catch { setError('Add was not confirmed. Retry the same definition; retries do not duplicate it.') } finally { setPending(false) }
+  }
+  return h('section', { className: 'hermes-latency lat-detail', 'data-testid': 'watch-proposal', 'aria-label': 'Latency definition' },
+    h('strong', null, proposal.label),
+    h('dl', null, h('dt', null, 'Start'), h('dd', null, proposal.start), h('dt', null, 'End'), h('dd', null, proposal.end), h('dt', null, 'Target p90'), h('dd', null, duration(value)), h('dt', null, 'History'), h('dd', null, proposal.kind === 'derived' ? 'Last 30 days · backfills within one collector cycle' : 'Collecting from Add date · new instrumentation required')),
+    editing && h('label', null, 'Target p90 (ms) ', h('input', { type: 'number', min: 1, max: 90 * 86400000, value: target, onChange: e => setTarget(e.target.value), disabled: pending || !!result, 'aria-invalid': !valid })),
+    !result && h('div', null, h('button', { type: 'button', disabled: streaming || pending || !valid, onClick: add }, pending ? 'Adding…' : 'Add'), ' ', h('button', { type: 'button', disabled: streaming || pending, onClick: () => setEditing(!editing) }, 'Change target')),
+    result && h('p', { role: 'status' }, proposal.kind === 'derived' ? 'Added · 30-day backfill on the next collector cycle' : 'Added · collecting from today'),
+    h(InstrumentationLink, { ctx, ref: result?.definition?.instrumentation_card }), error && h('p', { role: 'alert' }, error))
+}
+
 export default {
   id: 'latency', name: 'Latency',
   register(ctx) {
     const style = document.createElement('style'); style.textContent = CSS; document.head.appendChild(style)
+    ctx.register({ id: 'watch-definition', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'latency-watch', render: props => h(WatchProposal, { ...props, ctx }) } })
     ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 8, render: () => h(LedgerSurface, { ctx }) })
     ctx.register({ id: 'show', area: PALETTE_AREA, data: { title: 'Show Latency', onSelect: () => window.dispatchEvent(new CustomEvent(SHOW)) } })
     const queue = spanQueue(ctx)

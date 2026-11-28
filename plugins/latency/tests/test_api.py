@@ -70,6 +70,27 @@ class API(unittest.TestCase):
             self.assertEqual(self.client.post('/v1/spans',json={'spans':[dict(good,metric=metric)]}).status_code,400)
         self.assertEqual(self.client.post('/v1/spans',content='['*130000+'0'+']'*130000).status_code,400)
 
+    def test_watch_post_validation_cache_and_instrumentation_failure(self):
+        import importlib
+        watch = importlib.import_module(api.pkg().__name__+'.watch')
+        definition = watch.propose(describe='decision_requested -> unblocked')['definition']
+        self.client.get('/v1/series') # warm old inventory
+        for body in ({}, [], {'definition':{**definition,'extra':'private'}}, {'definition':{**definition,'target_p90':False}}):
+            self.assertEqual(self.client.post('/v1/watch',json=body).status_code,400)
+        self.assertEqual(self.client.post('/v1/watch',content='['*4200).status_code,400)
+        response=self.client.post('/v1/watch',json={'definition':definition})
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertTrue(response.json()['added'])
+        self.assertFalse(self.client.post('/v1/watch',json={'definition':definition}).json()['added'])
+        self.assertIn(definition['id'],{d['id'] for d in self.client.get('/v1/series').json()['metrics']})
+        self.assertEqual(self.client.post('/v1/watch',json={'definition':{**definition,'target_p90':3}}).status_code,400)
+        span=watch.propose(describe='decision.submit -> unblocked')['definition']
+        with patch.object(watch,'instrumentation_card',side_effect=RuntimeError('private failure')):
+            response=self.client.post('/v1/watch',json={'definition':span})
+        self.assertEqual(response.status_code,503)
+        self.assertNotIn('private',response.text)
+        self.assertNotIn(span['id'],{d['id'] for d in self.client.get('/v1/series').json()['metrics']})
+
     def test_15_second_cache_has_single_build(self):
         with patch.object(api,'build',return_value={'metrics':[]}) as build:
             self.assertEqual(api.cached('7d'),api.cached('7d'))

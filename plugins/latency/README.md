@@ -63,6 +63,46 @@ and an optional exact sanitized `path`; spans use `kind: span`.
 Only defined request-stage metrics scan the request journals: the 17 shipped rows
 are transcript/tool, board and ship proxies, not endpoint request times.
 
+## Add from chat
+
+`latency_watch(describe="decision_requested -> unblocked")` proposes an inert
+`::latency-watch` transcript card. A complete definition is also accepted.
+The Desktop card lists start, end, p90 target and history; **Change target** edits
+the proposed millisecond target. **Add** sends `POST /v1/watch` with
+`{definition: {...}}` to the same explicitly routed hub/default profile as Ledger.
+It never writes a local chat machine's registry by accident. Standard dashboard
+authentication applies; malformed/oversized requests are 400, uncertain Add is
+503 with a retry instruction. Rendering/streaming a proposal makes no request.
+
+The endpoint validates a bounded definition, locks the local registry and
+atomically adds it to `$HERMES_HOME/latency/metrics.local.yaml`. The file remains
+YAML 1.2 (JSON representation); existing values are preserved, comments are not.
+Repeated Add is a no-op; a changed definition/target under an existing id and
+any attempt to replace a shipped metric are refused. Remove a watch with a
+reviewed local registry edit if no longer needed. No historical cache is deleted.
+
+New derived definitions change the existing source fingerprint, so the next
+minute cycle backfills 30 days from real sources. The chat parser recognizes
+three board pairs; complete definitions also support state turns/tool results.
+Unknown projections must use `kind: span, source: spans`; arbitrary shell,
+SQL, request bodies and extra definition fields are not accepted.
+
+Span Add files one idempotent instrumentation card using the supported core
+creation/publication API and stores its qualified reference on the definition.
+The source config can set `instrumentation_board` and `instrumentation_assignee`
+(default current board and the existing `default` profile); an unknown profile
+or board refuses Add. Creation readback precedes registry publication. A crash
+between card creation and file replacement adopts the same card on exact retry,
+not a new card. Failed creation leaves the definition unadded. Its body contains
+the metric and exact events; normal review/CI/landing remain required.
+
+Until real samples arrive, the panel shows `collecting from today`, then the
+Add date in the panel's America/Los_Angeles timezone. It never invents zeroes or
+history. Data outside the selected range is not called uninstrumented. The
+proposal result and expanded panel row link the instrumentation card. Because
+these references are created on Ledger's hub, the button resolves that same
+configured hub transport, not the currently focused chat connection.
+
 ## Sources and limitations
 
 * Interactive turn/tool history is Desktop-source only. Earliest message UID
