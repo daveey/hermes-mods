@@ -1,0 +1,297 @@
+From 7db3fd755881ae8223ce7e53db99d2fbe3f28e8e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 19:00:21 +0000
+Subject: [PATCH 7007] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 7db3fd755881ae8223ce7e53db99d2fbe3f28e8e.
+
+---
+diff --git a/hermes_cli/kanban_home_command.py b/hermes_cli/kanban_home_command.py
+index b71c027bcd5df1924b09d0174cd662c828748666..1704a9a935280f2c2656c38b797eb147daaec51e 100644
+--- a/hermes_cli/kanban_home_command.py
++++ b/hermes_cli/kanban_home_command.py
+@@ -30,6 +30,7 @@
+     # REPLACE may delete a conflicting row without firing its DELETE trigger.
+     # Include all unique identities, not just the primary request identifier.
+     identities = []
++    identity_columns = set()
+     for index in conn.execute(f'PRAGMA index_list({table})'):
+         if not index[2]:
+             continue
+@@ -37,9 +38,20 @@
+         columns = [row[2] for row in conn.execute(f'PRAGMA index_info({quoted})')]
+         if not columns or any(column is None for column in columns) or index[4]:
+             raise ValueError('unsupported command epoch identity')
++        identity_columns.update(columns)
+         identities.append(' AND '.join(f'"{col}"=NEW."{col}"' for col in columns))
+     if not identities:
+         raise ValueError('command epoch identity missing')
++    # No command writer rekeys a captured request. Refuse identity changes before
++    # UPDATE OR REPLACE can implicitly delete a different epoch-bearing row.
++    changed = ' OR '.join(f'NEW."{col}" IS NOT OLD."{col}"' for col in sorted(identity_columns))
++    identity_name = f'home_epoch1_{table}_identity'
++    identity_sql = (f'CREATE TRIGGER {identity_name} BEFORE UPDATE ON {table} WHEN {changed} '
++                    "BEGIN SELECT RAISE(ABORT,'captured command identity is immutable'); END")
++    stored = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (identity_name,)).fetchone()
++    if not stored or stored[0] != identity_sql:
++        conn.execute(f'DROP TRIGGER IF EXISTS {identity_name}')
++        conn.execute(identity_sql)
+     conflict = ' OR '.join(f'({identity})' for identity in identities)
+     # SQLite hides the conflict mode from triggers. INSERT OR IGNORE must stay a
+     # no-op, while INSERT OR REPLACE must not swap an epoch. So BEFORE INSERT
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 4f2d2c6edd4f73c21dcca0f55ce7fd4063938404..964e15e535edce5afa55b2b7c4da5b7dea0c18e9 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -187,6 +187,12 @@
+                                nonce=nonce, expected_version=expected_version)
+     conn.execute("SAVEPOINT home_prepare")
+     try:
++        # The administrative stop fence forbids the eventual source-home stamp.
++        # Refuse before freeze/Board commit, never relax that independent fence.
++        from hermes_cli.kanban_stop_ended import KIND
++        if conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND kind=? LIMIT 1',
++                        (task_id, KIND)).fetchone():
++            raise ValueError('home preparation refuses an administratively stopped task')
+         _install(conn)
+         old = conn.execute(f"SELECT task_id,source,destination,nonce,expected_version FROM {_TABLE} WHERE task_id=?",
+                            (task_id,)).fetchone()
+@@ -286,7 +292,7 @@
+     if not conn.in_transaction:
+         raise ValueError('home custody check requires writer transaction')
+     if frozen(conn, task_id):
+-        raise ValueError('home transfer pending')
++        raise ValueError('home transfer custody is frozen')
+     yield
+ 
+ 
+diff --git a/hermes_cli/kanban_stop_guards.py b/hermes_cli/kanban_stop_guards.py
+index 1f7b935e28d28f6cd41b697d0dbfa454406c0fcc..72453271da959bbce6bc7e3d7e6fbd741c4ec4bd 100644
+--- a/hermes_cli/kanban_stop_guards.py
++++ b/hermes_cli/kanban_stop_guards.py
+@@ -93,11 +93,18 @@
+         return 0
+     stale = ('worker_started_at IS NOT NULL AND worker_pid IS NULL AND claim_lock IS NULL '
+              f'AND current_run_id IS NULL AND id IN ({_STOPPED})')
+-    if not conn.execute(f'SELECT 1 FROM tasks WHERE {stale} LIMIT 1').fetchone():
++    from hermes_cli.kanban_home_transfer import frozen
++
++    def candidates():
++        return [r[0] for r in conn.execute(f'SELECT id FROM tasks WHERE {stale}') if not frozen(conn, r[0])]
++
++    if not candidates():
+         return 0
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn, allow_nested=True):
+-        return conn.execute(f'UPDATE tasks SET worker_started_at=NULL WHERE {stale}').rowcount
++        # Re-select under the writer: custody can change after the idle read.
++        return sum(conn.execute(f'UPDATE tasks SET worker_started_at=NULL WHERE id=? AND {stale}',
++                                (task,)).rowcount for task in candidates())
+ 
+ 
+ def installed(conn) -> bool:
+diff --git a/tests/hermes_cli/test_home_shared_invariant_operators.py b/tests/hermes_cli/test_home_shared_invariant_operators.py
+index e48ea1df1116a0ceeb562a7b9d288e38da3bcb2c..d203925a1e18b9585022f1d5815d0833e96b804f 100644
+--- a/tests/hermes_cli/test_home_shared_invariant_operators.py
++++ b/tests/hermes_cli/test_home_shared_invariant_operators.py
+@@ -8,6 +8,7 @@
+ from tests.hermes_cli import test_home_release_landing_race as release_landing
+ from tests.hermes_cli import test_kanban_home_source_stop as support
+ from tests.hermes_cli import test_home_release_sweeps as sweep_cases
++from tests.hermes_cli import test_home_stop_epoch_composition as stop_epoch
+ 
+ release_board = release_landing.release_board
+ consumer_board = consumer_cases.consumer_board
+@@ -35,3 +36,11 @@
+ test_preclaim_accounting_is_write_free_for_transfers = sweep_cases.test_preclaim_accounting_is_write_free_for_transfers
+ test_spend_reviewer_due_and_grant_exclude_transfer = sweep_cases.test_spend_reviewer_due_and_grant_exclude_transfer
+ test_spend_start_reservation_rechecks_custody = sweep_cases.test_spend_start_reservation_rechecks_custody
++
++test_sync_round_heals_neighbour_without_touching_legacy_frozen_stop = stop_epoch.test_sync_round_heals_neighbour_without_touching_legacy_frozen_stop
++test_unfrozen_stopped_tokens_still_heal = stop_epoch.test_unfrozen_stopped_tokens_still_heal
++test_sweep_rechecks_custody_at_writer_entry = stop_epoch.test_sweep_rechecks_custody_at_writer_entry
++test_only_frozen_sweep_does_not_reserve_a_writer = stop_epoch.test_only_frozen_sweep_does_not_reserve_a_writer
++test_stopped_prepare_refuses_without_schema_or_custody_even_when_caught = stop_epoch.test_stopped_prepare_refuses_without_schema_or_custody_even_when_caught
++test_command_unique_identity_cannot_be_rekeyed = stop_epoch.test_command_unique_identity_cannot_be_rekeyed
++test_stopped_token_cleanup_recovers_after_exact_custody_release = stop_epoch.test_stopped_token_cleanup_recovers_after_exact_custody_release
+diff --git a/tests/hermes_cli/test_home_stop_epoch_composition.py b/tests/hermes_cli/test_home_stop_epoch_composition.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a85657275e027648185a941de76e478424dcb2ef
+--- /dev/null
++++ b/tests/hermes_cli/test_home_stop_epoch_composition.py
+@@ -0,0 +1,172 @@
++"""Stop maintenance and command identities compose with home custody (PR4300 review).
++
++Legacy stopped preparations remain immutable, but must not starve healthy sync.
++New stopped preparations refuse before committing any custody. Command identity
++rekeys cannot destroy an independently captured epoch through SQLite REPLACE.
++"""
++from __future__ import annotations
++
++import sqlite3
++from contextlib import contextmanager
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_generation as generation
++from hermes_cli import kanban_home_transfer as transfer
++from hermes_cli import kanban_stop_guards as guards
++from hermes_cli.kanban_stop_ended import KIND
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++
++board = support.board
++NONCE = 'review-stop-epoch-0001'
++
++
++def stopped(conn, *, token=111):
++    task = support.seed(conn)
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage',worker_started_at=? WHERE id=?", (token, task))
++        conn.execute('UPDATE kanban_sync_state SET applying=1')
++        kb._append_event(conn, task, KIND, {'version': 1})
++        conn.execute('UPDATE kanban_sync_state SET applying=0')
++        guards.install(conn)
++        conn.execute('DELETE FROM kanban_sync_outbox')
++    return task
++
++
++def freeze_legacy(conn, task, kind):
++    with dbc.write_txn(conn):
++        if kind == 'pending':
++            generation.mirror_feed(conn, task, {'home_generation': NONCE, 'home_transfer_pending': NONCE}, 8)
++        else:
++            # Persisted pre-fix preparation, not permission for a new transfer.
++            transfer._install(conn)
++            conn.execute('INSERT INTO kanban_home_prepared1 VALUES (?,?,?,?,?)',
++                         (task, 'worker-a3', 'hub', NONCE, 7))
++            if kind == 'malformed':
++                conn.execute('DROP TRIGGER home_prepared1_marker_update')
++                conn.execute("UPDATE kanban_home_prepared1 SET nonce='invalid' WHERE task_id=?", (task,))
++
++
++def token(conn, task):
++    return conn.execute('SELECT worker_started_at FROM tasks WHERE id=?', (task,)).fetchone()[0]
++
++
++@pytest.mark.parametrize('kind', ['prepared', 'pending', 'malformed'])
++def test_sync_round_heals_neighbour_without_touching_legacy_frozen_stop(board, monkeypatch, kind):
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli import kanban_sync_rejections as rejections
++    from hermes_cli import kanban_sync_reserved_key as reserved
++    from hermes_cli import kanban_sync_round_send as rounds
++
++    task, healthy = stopped(board), stopped(board)
++    freeze_legacy(board, task, kind)
++    before = tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
++    calls = []
++    def push(*args, **kwargs):
++        calls.append(token(board, healthy))
++        return client.PushResult()
++    monkeypatch.setattr(client, 'push', push)
++    monkeypatch.setattr(reserved, 'advance', lambda *a: None)
++    monkeypatch.setattr(rejections, 'resolve_rejections', lambda *a: 0)
++    for _ in range(2):
++        rounds.send(board, None, 'fixture', 'worker-a3', 'primary',
++                    SimpleNamespace(push=None, rejection_resolutions=0), after_pull=False, before_head=False)
++        assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()) == before
++        assert token(board, healthy) is None
++    assert calls == [None, None]
++    assert transfer.frozen(board, task)
++
++
++def test_unfrozen_stopped_tokens_still_heal(board):
++    tasks = [stopped(board), stopped(board)]
++    assert guards.clear_stale_worker_start(board) == 2
++    assert [token(board, t) for t in tasks] == [None, None]
++    assert guards.clear_stale_worker_start(board) == 0
++
++
++@pytest.mark.parametrize('kind', ['prepared', 'pending', 'malformed'])
++def test_sweep_rechecks_custody_at_writer_entry(board, monkeypatch, kind):
++    task, healthy = stopped(board), stopped(board)
++    real_writer = kb.write_txn
++    captured = []
++
++    @contextmanager
++    def raced(conn, **kwargs):
++        monkeypatch.setattr(kb, 'write_txn', real_writer)
++        freeze_legacy(conn, task, kind)
++        captured.append(tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()))
++        with real_writer(conn, **kwargs):
++            yield
++
++    monkeypatch.setattr(kb, 'write_txn', raced)
++    assert guards.clear_stale_worker_start(board) == 1
++    assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()) == captured[0]
++    assert token(board, healthy) is None
++
++
++def test_only_frozen_sweep_does_not_reserve_a_writer(board, monkeypatch):
++    task = stopped(board)
++    freeze_legacy(board, task, 'pending')
++    def unexpected_writer(*args, **kwargs):
++        pytest.fail('all-frozen idle pass must be read-only')
++    monkeypatch.setattr(kb, 'write_txn', unexpected_writer)
++    assert guards.clear_stale_worker_start(board) == 0
++
++
++@pytest.mark.parametrize('start_token', [None, 111])
++def test_stopped_prepare_refuses_without_schema_or_custody_even_when_caught(board, start_token):
++    task = stopped(board, token=start_token)
++    before = sorted(board.iterdump())
++    with dbc.write_txn(board):
++        with pytest.raises(ValueError, match='administratively stopped'):
++            support.prepare(board, task)
++    assert sorted(board.iterdump()) == before
++    assert not transfer.frozen(board, task)
++
++
++@pytest.mark.parametrize('kind', ['prepared', 'pending'])
++def test_stopped_token_cleanup_recovers_after_exact_custody_release(board, kind):
++    task = stopped(board)
++    freeze_legacy(board, task, kind)
++    assert guards.clear_stale_worker_start(board) == 0
++    with dbc.write_txn(board):
++        if kind == 'prepared':
++            transfer.abort_source(board, {'task': task, 'source': 'worker-a3', 'destination': 'hub',
++                                         'nonce': NONCE, 'expected_version': 7, 'phase': 'aborted', 'rows': []})
++        else:
++            generation.mirror_feed(board, task, {'home_generation': NONCE, 'home_transfer_pending': None}, 9)
++    assert not transfer.frozen(board, task)
++    assert guards.clear_stale_worker_start(board) == 1
++    assert token(board, task) is None
++    assert guards.clear_stale_worker_start(board) == 0
++    # The independent administrative stop is still enforced after home release.
++    with pytest.raises(sqlite3.IntegrityError, match='administrative_stop_immutable'):
++        with dbc.write_txn(board):
++            board.execute("UPDATE tasks SET status='ready' WHERE id=?", (task,))
++
++
++@pytest.mark.parametrize('column,value', [('run_uid', 'r1'), ('op_id', 'o1'), ('run_uid', 'r3')])
++@pytest.mark.parametrize('mode', ['', 'OR REPLACE', 'OR IGNORE'])
++def test_command_unique_identity_cannot_be_rekeyed(board, column, value, mode):
++    from hermes_cli import kanban_failure_release as release
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        release._ensure_commands(board)
++        board.execute('CREATE UNIQUE INDEX command_secondary_fixture ON kanban_failure_commands(op_id)')
++        from hermes_cli import kanban_home_command as command
++        command.install(board, 'kanban_failure_commands')
++        board.execute('INSERT INTO kanban_failure_commands(run_uid,task_id,op_id,operation_kind,home_generations) '
++                      'VALUES (?,?,?,?,?)', ('r1', task, 'o1', 'retain', '{"a":"epoch-old-0000000001"}'))
++        board.execute('INSERT INTO kanban_failure_commands(run_uid,task_id,op_id,operation_kind,home_generations) '
++                      'VALUES (?,?,?,?,?)', ('r2', task, 'o2', 'release', None))
++    before = [tuple(r) for r in board.execute('SELECT * FROM kanban_failure_commands ORDER BY run_uid')]
++    with pytest.raises(sqlite3.IntegrityError, match='command .* immutable'):
++        with dbc.write_txn(board):
++            board.execute(f"UPDATE {mode} kanban_failure_commands SET {column}=? WHERE run_uid='r2'", (value,))
++    assert [tuple(r) for r in board.execute('SELECT * FROM kanban_failure_commands ORDER BY run_uid')] == before
++    # Delivery bookkeeping and exact identity echoes are still ordinary writes.
++    with dbc.write_txn(board):
++        board.execute("UPDATE kanban_failure_commands SET run_uid=run_uid,op_id=op_id WHERE run_uid='r2'")
+-- 
+2.43.0
+

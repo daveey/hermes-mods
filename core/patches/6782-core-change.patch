@@ -1,0 +1,185 @@
+From 2fa77042d0db47b419ff4472aed43689463c0c7a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:01:33 +0000
+Subject: [PATCH 6782] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 2fa77042d0db47b419ff4472aed43689463c0c7a.
+
+---
+diff --git a/tests/hermes_cli/test_owner_release_composed_carrier.py b/tests/hermes_cli/test_owner_release_composed_carrier.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e82a0b6ec8fbba8ad36e228a09df0201a8b15dd
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_composed_carrier.py
+@@ -0,0 +1,168 @@
++"""TEST ONLY: real post-APPLIED origin carrier drift and foreign first observation.
++
++Requires the disposable loopback Board described in test_owner_release_composed.
++No fabricated Hub/certificate: fixture capability read and signed allowance remain
++explicit test-only preconditions inherited from that module.
++"""
++from __future__ import annotations
++
++import json
++import uuid
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_release_application as app
++from hermes_cli import kanban_release_executor as executor, kanban_release_public as public
++from hermes_cli import kanban_spend_decision as decision, kanban_sync_client as ksc
++from hermes_cli import kanban_sync_quarantine as quarantine
++from tests.hermes_cli import test_owner_release_composed as composed
++
++# Reuse fixtures without collecting the original test functions again.
++turn = composed.turn
++server = composed.server
++origin = composed.origin
++parties = composed.parties
++BOARD = composed.BOARD
++
++
++@contextmanager
++def fresh_replica(cached, tmp_path):
++    """Separate SQLite, EXACT same enrolled gateway/key, no enrollment rotation."""
++    conn = kbc.connect(tmp_path / 'fresh-executor.db')
++    hub = ksc.Hub(cached.ident)
++    ksc.ensure_identity(conn, BOARD, cached.name)
++    try:
++        assert cache(conn) == []
++        yield conn, hub
++    finally:
++        hub.close()
++        conn.close()
++
++
++def cache(conn):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (executor.TABLE,)).fetchone():
++        return []
++    return [tuple(r) for r in conn.execute(f'SELECT * FROM {executor.TABLE} ORDER BY intent_uid')]
++
++
++def local_delivery(conn, uid):
++    row = conn.execute('SELECT uid,task_id,kind,payload,created_at,origin_gateway FROM task_events WHERE uid=?',
++                       (uid,)).fetchone()
++    assert row is not None
++    return dict(zip(app.EVENT_FIELDS, row))
++
++
++def no_private_home_state(conn, intent_uid):
++    for table in ('owner_release_applied_receipts', 'owner_release_consumption_receipts', 'owner_release_home_queue'):
++        if conn.execute('SELECT 1 FROM sqlite_master WHERE name=?', (table,)).fetchone():
++            assert conn.execute(f'SELECT COUNT(*) FROM {table} WHERE intent_uid=?', (intent_uid,)).fetchone()[0] == 0
++
++
++def candidate(reply):
++    """Re-observe the actual unchanged Board result, never a synthetic attestation."""
++    row = reply['row']
++    return sync.RemoteChange(seq=reply['head'], version=row['version'], table='task_events', uid=reply['uid'],
++                             op='upsert', fields=row, hlc=row['hlc'], origin_gateway=row['origin_gateway'])
++
++
++def applied_fixture(origin, parties, monkeypatch):
++    home, cached, native, task, episode, intent_uid, _ = composed.authorize_and_drive_home(
++        origin, parties, monkeypatch)
++    done = composed.release_cli(native, task, episode)
++    assert done.returncode == 0, (done.stdout, done.stderr)
++    assert json.loads(done.stdout)['release_stage'] == 'applied'
++    cached.resync()
++    verified = executor.verified_application(cached.conn, intent_uid)
++    assert verified is not None
++    assert not decision.execution_restricted(cached.conn, task)
++    result_uid = verified['result_event']['uid']
++    reply = cached.hub.row_evidence(BOARD, 'task_events', result_uid)
++    before, _ = public.evidence(reply, board=BOARD, task=task, uid=result_uid)
++    assert before['reader_gateway'] == cached.name
++    assert local_delivery(cached.conn, before['delivery']['uid']) == before['delivery']
++    return home, cached, task, intent_uid, result_uid, before
++
++
++def edit_carrier(origin, home, before, field):
++    ident, _ = origin
++    delivery = before['delivery']
++    payload = json.loads(delivery['payload'])
++    old = payload[field]
++    payload[field] = ('0' if old != '0' * 64 else '1') * 64
++    assert payload[field] != old
++    hub = ksc.Hub(ident)
++    try:
++        outcome = hub.ops(BOARD, [{'client_op_id': str(uuid.uuid4()), 'op': 'upsert', 'table': 'task_events',
++            'uid': delivery['uid'], 'fields': {'payload': json.dumps(payload)}, 'hlc': composed.stamp(ident.gateway)}])['results'][0]
++        assert outcome['status'] == 'applied', outcome
++        current = hub.row_evidence(BOARD, 'task_events', delivery['uid'])['row']
++        assert json.loads(current['payload']) == payload
++        assert {k: v for k, v in json.loads(current['payload']).items() if k != field} == {
++            k: v for k, v in json.loads(delivery['payload']).items() if k != field}
++        assert current['origin_gateway'] == ident.gateway
++        return {k: current[k] for k in app.EVENT_FIELDS}
++    finally:
++        hub.close()
++
++
++def test_real_nonce_edit_cached_holds_fresh_accepts_and_recertification_conflicts(origin, parties, monkeypatch, tmp_path):
++    home, cached, task, uid, result_uid, before = applied_fixture(origin, parties, monkeypatch)
++    certificate = home.hub.owner_release_application(BOARD, uid)
++    frozen = cache(cached.conn)
++    changed = edit_carrier(origin, home, before, 'nonce')
++    assert home.hub.owner_release_application(BOARD, uid) == certificate
++    reply = cached.hub.row_evidence(BOARD, 'task_events', result_uid)
++    after, _ = public.evidence(reply, board=BOARD, task=task, uid=result_uid)
++    assert after == {**before, 'delivery': changed}
++    cached.pull()
++    assert local_delivery(cached.conn, changed['uid']) == changed
++    assert cache(cached.conn) == frozen
++    assert executor.verified_application(cached.conn, uid) is None
++    assert decision.execution_restricted(cached.conn, task)
++    assert not quarantine.held(cached.conn, task)  # reader-only hold, not yet recertification
++    with fresh_replica(cached, tmp_path) as (conn, hub):
++        ksc.resync(conn, hub, BOARD, observers=False)
++        assert local_delivery(conn, changed['uid']) == after['delivery']
++        assert executor.verified_application(conn, uid) is not None
++        assert not decision.execution_restricted(conn, task)
++        assert not quarantine.held(conn, task)
++        no_private_home_state(conn, uid)
++        assert json.loads(conn.execute(f'SELECT evidence FROM {executor.TABLE} WHERE intent_uid=?', (uid,)).fetchone()[0]) == after
++    change = candidate(reply)
++    with pytest.raises(executor.ReplicaConflict, match='executor receipt identity changed'):
++        executor.certify_page(cached.conn, cached.hub, BOARD, [change])
++    assert cache(cached.conn) == frozen
++    assert quarantine.certified_page(cached.conn, cached.hub, BOARD, [change]) == []
++    assert quarantine.held(cached.conn, task)
++    assert any(e['receipt'] == result_uid and e['kind'] == 'owner_release_conflict' for e in quarantine.entries(cached.conn))
++    assert cache(cached.conn) == frozen
++    assert executor.verified_application(cached.conn, uid) is None
++    assert decision.execution_restricted(cached.conn, task)
++    no_private_home_state(cached.conn, uid)
++    assert home.hub.owner_release_application(BOARD, uid) == certificate
++
++
++def test_real_invalid_digest_ingress_fresh_consumer_refuses(origin, parties, monkeypatch, tmp_path):
++    home, cached, task, uid, result_uid, before = applied_fixture(origin, parties, monkeypatch)
++    certificate = home.hub.owner_release_application(BOARD, uid)
++    changed = edit_carrier(origin, home, before, 'digest')
++    assert home.hub.owner_release_application(BOARD, uid) == certificate
++    reply = cached.hub.row_evidence(BOARD, 'task_events', result_uid)
++    assert reply['owner_release_applied_v1'] == {**before, 'delivery': changed}
++    with pytest.raises(ValueError, match='public application carrier differs'):
++        public.evidence(reply, board=BOARD, task=task, uid=result_uid)
++    with fresh_replica(cached, tmp_path) as (conn, hub):
++        ksc.resync(conn, hub, BOARD, observers=False)
++        # Conflict certification quarantines the task before the resync imports its
++        # rows: the actual invalid carrier remains in Board evidence, not accepted locally.
++        assert conn.execute('SELECT 1 FROM task_events WHERE uid=?', (changed['uid'],)).fetchone() is None
++        assert executor.verified_application(conn, uid) is None
++        # Certification withholds the conflicted event history; quarantine is
++        # the durable dispatch hold, independent of the scope-only reader.
++        assert quarantine.held(conn, task)
++        assert any(e['receipt'] == result_uid and e['kind'] == 'owner_release_conflict' for e in quarantine.entries(conn))
++        assert conn.execute(f'SELECT COUNT(*) FROM {executor.TABLE} WHERE intent_uid=?', (uid,)).fetchone()[0] == 0
++        no_private_home_state(conn, uid)
++    assert home.hub.owner_release_application(BOARD, uid) == certificate
+-- 
+2.43.0
+

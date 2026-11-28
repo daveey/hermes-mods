@@ -1,0 +1,349 @@
+From af58c2589fe54a4f4e9691056d720fc853ed86f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:39:35 +0000
+Subject: [PATCH 6796] Truthful non-running reasons and refusal provenance
+
+Public mirror of source commit af58c2589fe54a4f4e9691056d720fc853ed86f1.
+
+---
+diff --git a/hermes_cli/kanban_sync_actionability_archive.py b/hermes_cli/kanban_sync_actionability_archive.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..948dad884d1b1e822bff84e61e72be30b9173ec3
+--- /dev/null
++++ b/hermes_cli/kanban_sync_actionability_archive.py
+@@ -0,0 +1,107 @@
++"""Read-only proof that canonical archive withdrew a rejected diagnostic. [daveey]
++
++Withdrawal is not completion, delivery, authorization or transport retirement.
++The caller has already verified immutable rejected-command custody.
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli.kanban_resume_exec import _LIFECYCLE_KINDS
++from hermes_cli.kanban_sync_actionability_terminal import _before, _event, _IDLE, _TRANSITIONS
++
++
++_PHASES = frozenset(('todo', 'ready', 'running', 'review', 'blocked', 'scheduled', 'triage', 'done'))
++_RUN_KEYS = ('uid', 'status', 'outcome', 'started_at', 'ended_at')
++
++
++def _history(events, archive):
++    """Validate stamped predecessor references without treating identities as clocks."""
++    lifecycle = [e for e in events if e['kind'] in _LIFECYCLE_KINDS]
++    identities = {}
++    for event in lifecycle:
++        data = event['payload'].get('_recovery_history_v1')
++        if data is not None and (not isinstance(data, dict)
++                or not isinstance(data.get('identity'), str) or not data['identity']
++                or not isinstance(data.get('predecessors'), list)
++                or any(not isinstance(p, str) or not p for p in data['predecessors'])
++                or len(set(data['predecessors'])) != len(data['predecessors'])):
++            return False
++        key = data['identity'] if data else event['uid']
++        if key in identities:
++            return False
++        identities[key] = event
++    if not archive['payload'].get('_recovery_history_v1'):
++        return False
++    observed = set()
++    for event in lifecycle:
++        for key in event['payload'].get('_recovery_history_v1', {}).get('predecessors', []):
++            if key not in identities or not _before(identities[key], event):
++                return False  # Also excludes cycles and self-references.
++            observed.add(key)
++    heads = [event for key, event in identities.items() if key not in observed]
++    return heads == [archive]
++
++
++def _runs(conn, task_id, archive):
++    rows = [dict(r) for r in conn.execute('SELECT * FROM task_runs WHERE task_id=?', (task_id,))]
++    portable = {}
++    for run in rows:
++        if (not isinstance(run['uid'], str) or not run['uid'] or run.get('deleted_at') is not None
++                or type(run['started_at']) is not int or type(run['ended_at']) is not int
++                or not 0 <= run['started_at'] <= run['ended_at'] <= archive['created_at']
++                or not isinstance(run['status'], str) or run['status'] in ('', 'running')
++                or not isinstance(run['outcome'], str) or not run['outcome']
++                or run['uid'] in portable):
++            return None
++        portable[run['uid']] = {k: run[k] for k in _RUN_KEYS}
++    attached = [r for r in rows if r['id'] == archive['run_id']]
++    if archive['run_id'] is not None and len(attached) != 1:
++        return None
++    return {'all': portable, 'archive_run': attached[0]['uid'] if attached else None}
++
++
++def _proof(conn, task_id, source_uid):
++    rows = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchall()
++    if len(rows) != 1:
++        return None
++    task = dict(rows[0])
++    if (task['status'] != 'archived' or task.get('deleted_at') is not None
++            or any(task[k] is not None for k in _IDLE)):
++        return None
++    raw = [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=?', (task_id,))]
++    sources = [e for e in raw if e['uid'] == source_uid]
++    archives = [e for e in raw if e['kind'] == 'archived']
++    if len(sources) != 1 or not archives:
++        return None
++    last = next((e for e in archives if all(e is other or _before(other, e) for other in archives)), None)
++    if last is None or not _before(sources[0], last):
++        return None
++    original, archive = _event(sources[0]), _event(last)
++    if archive['payload'].get('source_status') not in _PHASES:
++        return None
++    history = []
++    for event in raw:
++        try:
++            data = json.loads(event['payload'])
++        except (ValueError, TypeError):
++            data = None
++        if (event['kind'] in _TRANSITIONS or event['kind'] in _LIFECYCLE_KINDS
++                or isinstance(data, dict) and 'status' in data):
++            parsed = _event(event)
++            if event is not last and not _before(event, last):
++                return None
++            history.append(parsed)
++    if not _history(history, archive):
++        return None
++    runs = _runs(conn, task_id, last)
++    if runs is None:
++        return None
++    return {'source': original, 'archive': archive, 'runs': runs, 'assignee': task['assignee'],
++            'completed_at': task['completed_at'], 'history': sorted(history, key=lambda e: e['uid'])}
++
++
++def superseded(live, shadow, task_id, source_uid):
++    """Both copies must agree on archival provenance, causal history and closed runs."""
++    current = _proof(live, task_id, source_uid)
++    return current is not None and current == _proof(shadow, task_id, source_uid)
+diff --git a/hermes_cli/kanban_sync_actionability_drift.py b/hermes_cli/kanban_sync_actionability_drift.py
+index baf1b8d983944e064a25cd182b348b30311773bf..596bbe11f9f803b2345182faf7db2034d86c6d95 100644
+--- a/hermes_cli/kanban_sync_actionability_drift.py
++++ b/hermes_cli/kanban_sync_actionability_drift.py
+@@ -113,10 +113,13 @@
+         statuses = [conn.execute('SELECT status FROM tasks WHERE id=?', (wire['task'],)).fetchone()
+                     for conn in (live, shadow)]
+         terminal_history = any(conn.execute(
+-            "SELECT 1 FROM task_events WHERE task_id=? AND kind='completed' LIMIT 1",
++            "SELECT 1 FROM task_events WHERE task_id=? AND kind IN ('completed','archived') LIMIT 1",
+             (wire['task'],)).fetchone() is not None for conn in (live, shadow))
+         if terminal_history or any(row is not None and row[0] in ('done', 'archived') for row in statuses):
+-            from hermes_cli.kanban_sync_actionability_terminal import superseded
++            if any(row is not None and row[0] == 'archived' for row in statuses):
++                from hermes_cli.kanban_sync_actionability_archive import superseded
++            else:
++                from hermes_cli.kanban_sync_actionability_terminal import superseded
+             return superseded(live, shadow, wire['task'], frozen['source_uids'][0]['uid'])
+         comparable = {**frozen, 'source_uids': [{'uid': s['uid']} for s in frozen['source_uids']]}
+         # fresh_gateway is supplied only under the refusal report's authenticated
+diff --git a/tests/hermes_cli/test_kanban_sync_actionability_archive.py b/tests/hermes_cli/test_kanban_sync_actionability_archive.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e810a8e0585e5fcbd71e7f0d1a616e0d65436118
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_actionability_archive.py
+@@ -0,0 +1,199 @@
++"""Archive withdraws stale diagnostics, never delivers or completes them. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_actionability_drift as audit
++
++pytest_plugins = ['tests.hermes_cli.test_kanban_sync_actionability_terminal']
++
++
++@pytest.fixture(params=[False, True], ids=['withdrawn', 'done-then-archived'])
++def archived(completed, request):
++    live, shadow, op = completed
++    for conn in (live, shadow):
++        if not request.param:
++            conn.execute("DELETE FROM task_events WHERE kind='completed'")
++            conn.execute("UPDATE tasks SET completed_at=NULL")
++            conn.execute("UPDATE task_runs SET status='retained',outcome='retained'")
++        conn.execute("UPDATE tasks SET status='archived' WHERE id='t_card'")
++        payload = {'source_status': 'done' if request.param else 'triage',
++                   '_recovery_history_v1': {'identity': 'archive-identity',
++                                            'predecessors': ['completion'] if request.param else []}}
++        conn.execute("INSERT INTO task_events VALUES (3,'archive','t_card','archived',130,?,NULL,NULL)",
++                     (json.dumps(payload),))
++    return live, shadow, op
++
++
++def test_archive_is_read_only_supersession_not_success_or_delivery(archived):
++    from hermes_cli.kanban_rejected_retain_retirement import retire
++    from hermes_cli.kanban_sync_client import diff
++
++    live, shadow, op = archived
++    before = [list(c.iterdump()) for c in (live, shadow)]
++    assert audit._source(live, 't_card') is None
++    assert audit.audited_rejection(live, shadow, op)
++    report = diff(live, shadow, 'macbook')
++    assert report['clean'], report
++    assert report['pending'] == 0
++    assert report['rejected_ops'] == 1
++    assert report['audited_retain_rejections'] == [op['op_id']]
++    assert retire(live, None, 'default', op)['action'] == 'retained'
++    assert [list(c.iterdump()) for c in (live, shadow)] == before
++
++
++@pytest.mark.parametrize('copies', ['live', 'shadow', 'both'])
++@pytest.mark.parametrize('sql', [
++    "DELETE FROM task_events WHERE kind='archived'",
++    "UPDATE task_events SET deleted_at=1 WHERE kind='archived'",
++    "UPDATE task_events SET payload='{' WHERE kind='archived'",
++    "UPDATE task_events SET payload='[]' WHERE kind='archived'",
++    "UPDATE task_events SET payload='{}' WHERE kind='archived'",
++    "UPDATE task_events SET created_at=123 WHERE kind='archived'",
++    "UPDATE tasks SET status='ready' WHERE id='t_card'",
++    "UPDATE tasks SET current_run_id=9 WHERE id='t_card'",
++    "UPDATE tasks SET claim_lock='worker' WHERE id='t_card'",
++    "UPDATE tasks SET claim_expires=999 WHERE id='t_card'",
++    "UPDATE tasks SET worker_pid=1 WHERE id='t_card'",
++    "UPDATE tasks SET containment_episode='held' WHERE id='t_card'",
++    "UPDATE tasks SET deleted_at=1 WHERE id='t_card'",
++    "UPDATE task_runs SET ended_at=NULL",
++    "UPDATE task_runs SET status='running'",
++    "UPDATE task_runs SET outcome=NULL",
++    "UPDATE task_runs SET started_at=-1",
++    "UPDATE task_runs SET ended_at=131",
++    "UPDATE task_events SET run_id=99 WHERE kind='archived'",
++    "UPDATE task_events SET payload='[]' WHERE uid='source'",
++    "UPDATE task_events SET deleted_at=1 WHERE uid='source'",
++    "INSERT INTO task_events VALUES (4,'reopen','t_card','reopened',131,'{}',NULL,NULL)",
++    "INSERT INTO task_events VALUES (4,'hold','t_card','contained',131,'{}',NULL,NULL)",
++    "INSERT INTO task_events VALUES (4,'bad','t_card','claimed',129,'{',NULL,NULL)",
++    "INSERT INTO task_events VALUES (4,'custom','t_card','custom',131,'{\"status\":\"ready\"}',NULL,NULL)",
++])
++def test_archive_unproven_evidence_stays_dirty(archived, copies, sql):
++    live, shadow, op = archived
++    for name, conn in [('live', live), ('shadow', shadow)]:
++        if copies in ('both', name):
++            conn.execute(sql)
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE task_events SET uid='other' WHERE kind='archived'",
++    "UPDATE task_events SET payload='{\"source_status\":\"ready\"}' WHERE kind='archived'",
++    "UPDATE task_events SET payload='{\"different\":1}' WHERE uid='source'",
++    "UPDATE task_runs SET uid='other'",
++    "DELETE FROM task_runs",
++    "UPDATE tasks SET assignee='other' WHERE id='t_card'",
++])
++def test_archive_portable_inventory_must_match(archived, sql):
++    live, shadow, op = archived
++    shadow.execute(sql)
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('column,value', [
++    ('request_json', '{}'), ('request_sha256', 'bad'), ('delivery_state', 'confirmed'),
++    ('canonical_receipt_json', '{}'), ('contract_key', 'other'),
++])
++def test_archive_never_bypasses_original_command_custody(archived, column, value):
++    live, shadow, op = archived
++    live.execute(f'UPDATE kanban_actionability_commands SET {column}=?', (value,))
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++def test_archive_run_and_event_ids_are_local(archived):
++    live, shadow, op = archived
++    shadow.execute('UPDATE task_runs SET id=99')
++    shadow.execute("UPDATE task_events SET run_id=99 WHERE kind='completed'")
++    assert audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('change', [
++    'missing-meta', 'empty-meta', 'bad-identity', 'bad-predecessors', 'missing-reference',
++    'duplicate-reference', 'self-cycle', 'fork', 'later-history', 'different-history',
++])
++def test_archive_causal_provenance_fails_closed(archived, change):
++    live, shadow, op = archived
++    for conn in (live, shadow):
++        row = conn.execute("SELECT payload FROM task_events WHERE kind='archived'").fetchone()
++        payload = json.loads(row[0])
++        meta = payload['_recovery_history_v1']
++        mutations = {
++            'missing-meta': lambda: payload.pop('_recovery_history_v1'),
++            'empty-meta': lambda: payload.update(_recovery_history_v1={}),
++            'bad-identity': lambda: meta.update(identity=[]),
++            'bad-predecessors': lambda: meta.update(predecessors='completion'),
++            'missing-reference': lambda: meta.update(predecessors=['absent']),
++            'duplicate-reference': lambda: meta.update(predecessors=['completion', 'completion']),
++            'self-cycle': lambda: meta.update(predecessors=['archive-identity']),
++        }
++        if change in mutations:
++            mutations[change]()
++        else:
++            stamp = {'identity': 'prior-identity', 'predecessors': []}
++            event = {'_recovery_history_v1': stamp}
++            if change == 'different-history' and conn is shadow:
++                event['extra'] = True
++            conn.execute("INSERT INTO task_events VALUES (4,'prior','t_card','reclaimed',?, ?,NULL,NULL)",
++                         (131 if change == 'later-history' else 128, json.dumps(event)))
++            if change != 'fork':
++                meta['predecessors'].append('prior-identity')
++        conn.execute("UPDATE task_events SET payload=? WHERE kind='archived'", (json.dumps(payload),))
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++def test_active_done_archive_transitions_keep_rejection_custody(completed):
++    live, shadow, op = completed
++    custody = list(live.execute('SELECT * FROM kanban_actionability_commands'))
++    outbox = list(live.execute('SELECT * FROM kanban_sync_outbox'))
++    for conn in (live, shadow):
++        conn.execute("UPDATE tasks SET status='todo',completed_at=NULL WHERE id='t_card'")
++        conn.execute("UPDATE tasks SET status='running' WHERE id='t_parent'")
++        conn.execute("DELETE FROM task_events WHERE kind='completed'")
++    assert not audit.audited_rejection(live, shadow, op)
++    for conn in (live, shadow):
++        conn.execute("UPDATE tasks SET status='done',completed_at=125 WHERE id='t_card'")
++        conn.execute("INSERT INTO task_events VALUES (2,'completion','t_card','completed',125,'{}',NULL,9)")
++    assert audit.audited_rejection(live, shadow, op)
++    for conn in (live, shadow):
++        conn.execute("UPDATE tasks SET status='archived' WHERE id='t_card'")
++        payload = {'source_status': 'done', '_recovery_history_v1': {
++            'identity': 'archive', 'predecessors': ['completion']}}
++        conn.execute("INSERT INTO task_events VALUES (3,'archive','t_card','archived',130,?,NULL,NULL)",
++                     (json.dumps(payload),))
++    assert audit.audited_rejection(live, shadow, op)
++    assert list(live.execute('SELECT * FROM kanban_actionability_commands')) == custody
++    assert list(live.execute('SELECT * FROM kanban_sync_outbox')) == outbox
++
++
++def test_archive_all_closed_runs_not_just_latest_must_match(archived):
++    live, shadow, op = archived
++    for conn in (live, shadow):
++        conn.execute("INSERT INTO task_runs VALUES (10,'earlier','t_card','continued','continued',120,121)")
++    assert audit.audited_rejection(live, shadow, op)
++    shadow.execute("UPDATE task_runs SET ended_at=122 WHERE uid='earlier'")
++    assert not audit.audited_rejection(live, shadow, op)
++
++
++def test_archive_allows_no_runs_and_post_archive_bookkeeping(archived):
++    live, shadow, op = archived
++    for conn in (live, shadow):
++        conn.execute('DELETE FROM task_runs')
++        conn.execute("UPDATE task_events SET run_id=NULL")
++        conn.execute("INSERT INTO task_events VALUES (4,'bookkeeping','t_card','archive_worker_termination',131,'{}',NULL,NULL)")
++    assert audit.audited_rejection(live, shadow, op)
++
++
++@pytest.mark.parametrize('offset,expected', [(1, True), (0, False), (-1, False)])
++def test_archive_same_second_requires_portable_strict_order(archived, offset, expected):
++    import uuid
++
++    live, shadow, op = archived
++    def uid(ms):
++        return str(uuid.UUID(int=(ms << 80) | (7 << 76) | (2 << 62)))
++    for conn in (live, shadow):
++        conn.execute("UPDATE task_events SET uid=?,created_at=130 WHERE kind='archived'", (uid(130500),))
++        conn.execute("INSERT INTO task_events VALUES (4,?,'t_card','custom',130,?,NULL,NULL)",
++                     (uid(130500-offset), json.dumps({'status': 'triage'})))
++    assert audit.audited_rejection(live, shadow, op) is expected
+-- 
+2.43.0
+

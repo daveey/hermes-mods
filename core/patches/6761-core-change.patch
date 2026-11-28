@@ -1,0 +1,226 @@
+From 603cfbfa2beb163c161c8c232c521cf76b004b29 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:54:45 +0000
+Subject: [PATCH 6761] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 603cfbfa2beb163c161c8c232c521cf76b004b29.
+
+---
+diff --git a/hermes_cli/kanban_release_intent.py b/hermes_cli/kanban_release_intent.py
+index 8b38e3923a2d1938687ea29f026c49f2957118ee..191386d45b44b8e912c40876d328f25d56eeee34 100644
+--- a/hermes_cli/kanban_release_intent.py
++++ b/hermes_cli/kanban_release_intent.py
+@@ -158,6 +158,43 @@
+     return False
+ 
+ 
++def acknowledged_successor(conn: sqlite3.Connection, body: dict, expired_intent: str) -> bool:
++    """An explicit ACK replay may resume only its already-recorded successor."""
++    row, _ = _current(conn, body)
++    return not _replace_expired(conn, row, {k: body[k] for k in _ACTION}, body["actor"], expired_intent)
++
++
++def existing(conn: sqlite3.Connection, action: dict) -> dict | None:
++    """Resolve this invocation's frozen journal before mutable canonical preflight.
++
++    HOME is intentionally absent from the invocation: a rename or new task episode
++    must not prevent reconciling the exact old request. Never select a child-named
++    UID or use the current task row to decide historical identity.
++    """
++    fields = sorted(_ACTION - {"home"})
++    action = _action({**action, "home": "pending-canonical-home"})
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone():
++        return None
++    clauses = " AND ".join(f"json_extract(body,'$.{key}')=?" for key in fields)
++    values = [encode(action[key]) if key == "capability_episodes" else action[key] for key in fields]
++    try:
++        rows = conn.execute("SELECT action_key,intent_uid,body,digest,stage FROM native_owner_release_intents "
++                            f"WHERE length(action_key)=64 AND {clauses} LIMIT 2", values).fetchall()
++    except sqlite3.OperationalError as exc:
++        raise ValueError("native release invocation journal is unavailable or corrupt") from exc
++    if len(rows) > 1:
++        raise ValueError("ambiguous native release invocation journal")
++    if not rows:
++        return None
++    row = rows[0]
++    body = validate(json.loads(row[2]))
++    full_action = {k: body[k] for k in _ACTION}
++    if row[0] != digest(full_action):
++        raise ValueError("release invocation journal key changed")
++    _current(conn, body)  # exact live actor/primary board and immutable bytes
++    return body
++
++
+ def prepare(conn: sqlite3.Connection, action: dict, *, gate, expired_intent=None) -> dict:
+     """Journal or resume under fresh parent custody; admit before the first write.
+ 
+diff --git a/hermes_cli/kanban_release_native.py b/hermes_cli/kanban_release_native.py
+index 006268d84680fdab918f4516e77c3a3504297320..17e54c3de89bb60dd9d1d357ad9a566ba8e9b8f4 100644
+--- a/hermes_cli/kanban_release_native.py
++++ b/hermes_cli/kanban_release_native.py
+@@ -83,6 +83,12 @@
+         scope.callback(hub.close)
+         if hub.ident.gateway != qualified["gateway"]:
+             raise ValueError("native release gateway differs from authenticated transport")
++        recorded = intent.existing(conn, args)
++        if recorded is not None and (expired_intent is None or intent.acknowledged_successor(conn, recorded, expired_intent)):
++            # Reconcile the immutable request before capability/current HOME reads.
++            # prepare still reauthenticates and admits this exact actor/action.
++            body = intent.prepare(conn, {**args, "home": recorded["home"]}, gate=gate, expired_intent=expired_intent)
++            return _send(conn, hub, body)
+         capability = hub.decision_retain_capability(args["board"])
+         if not isinstance(capability, dict) or type(capability.get("owner_release")) is not int or capability["owner_release"] != 1:
+             return {"ok": False, "reason": "board_unsupported", "error": "Board owner-release v1 is not available; nothing sent"}
+diff --git a/tests/hermes_cli/test_native_owner_release_cli.py b/tests/hermes_cli/test_native_owner_release_cli.py
+index 95c398cf6c96f2592d78d47249e4ff04eb0db5b6..932dbbf8d00fae2a1dcae5f992e6bcaaa141db06 100644
+--- a/tests/hermes_cli/test_native_owner_release_cli.py
++++ b/tests/hermes_cli/test_native_owner_release_cli.py
+@@ -172,12 +172,60 @@
+         assert fresh["intent_uid"] != old
+         assert cli(native, "--fresh-after-expiry", old).stdout == fresh_result.stdout
+         assert len(transport.sent) == 2
++        transport.calls.clear()
++        transport.support = 0
++        def unavailable(*a, **kw):
++            pytest.fail("recorded expiry-ACK successor must not re-resolve HOME")
++        monkeypatch.setattr(transport, "row_evidence", unavailable)
++        assert cli(native, "--fresh-after-expiry", old).stdout == fresh_result.stdout
++        assert transport.calls == []
++        assert len(transport.sent) == 2
+         before, after = (op["intent"] for op in transport.sent)
+         assert {k: v for k, v in before.items() if k != "intent_uid"} == {k: v for k, v in after.items() if k != "intent_uid"}
+     finally:
+         close(native)
+ 
+ 
++def test_actual_cli_historical_journal_replay_precedes_mutable_preflight(turn, transport, monkeypatch):
++    native = launch(monkeypatch)
++    try:
++        transport.proof_changes = {"state": "expired"}
++        first = cli(native)
++        assert first.returncode == 2
++        before = json.loads(first.stdout)
++        transport.calls.clear()
++        transport.support = 0
++        def unavailable(*a, **kw):
++            pytest.fail("historical journal replay must not re-resolve mutable HOME")
++        monkeypatch.setattr(transport, "row_evidence", unavailable)
++        again = cli(native)
++        assert again.returncode == 2
++        assert json.loads(again.stdout) == before
++        assert transport.calls == []
++        assert len(transport.sent) == 1
++    finally:
++        close(native)
++
++
++def test_actual_cli_pending_journal_reconcile_precedes_mutable_preflight(turn, transport, monkeypatch):
++    native = launch(monkeypatch)
++    try:
++        first = cli(native)
++        assert first.returncode == 0
++        transport.calls.clear()
++        transport.support = 0
++        def unavailable(*a, **kw):
++            pytest.fail("pending journal reconciliation must not re-resolve mutable HOME")
++        monkeypatch.setattr(transport, "row_evidence", unavailable)
++        again = cli(native)
++        assert again.returncode == 0, (again.stdout, again.stderr)
++        assert json.loads(again.stdout) == json.loads(first.stdout)
++        assert transport.calls == []
++        assert len(transport.sent) == 1
++    finally:
++        close(native)
++
++
+ def test_actual_cli_never_accepts_foreign_integer_seen(turn, transport, monkeypatch):
+     native = launch(monkeypatch)
+     try:
+diff --git a/tests/hermes_cli/test_owner_release_invocation.py b/tests/hermes_cli/test_owner_release_invocation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..59377cb2c1c2ac06ba218fbb8a964951290ca5e8
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_invocation.py
+@@ -0,0 +1,79 @@
++"""Exact invocation lookup is historical identity, never current release authority."""
++import pytest
++
++from hermes_cli import kanban_release_intent as intent
++from tests.hermes_cli import test_owner_release_intent as fixtures
++
++turn = fixtures.turn
++journal = fixtures.journal
++action = fixtures.action
++gate = fixtures.gate
++
++
++def invocation(**changes):
++    return {k: v for k, v in action(**changes).items() if k != "home"}
++
++
++def test_existing_never_prepares_or_writes(turn, journal):
++    assert intent.existing(journal, invocation()) is None
++    assert not journal.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()
++    body = intent.prepare(journal, action(), gate=gate())
++    before = journal.total_changes
++    assert intent.existing(journal, invocation()) == body
++    assert journal.total_changes == before
++    assert intent.existing(journal, invocation(runs=7)) is None
++
++
++@pytest.mark.parametrize("mode", ["key", "digest", "bytes", "stage", "actor"])
++def test_existing_refuses_corrupted_exact_identity(turn, journal, mode):
++    body = intent.prepare(journal, action(), gate=gate())
++    if mode == "key":
++        journal.execute("UPDATE native_owner_release_intents SET action_key=?", ("f" * 64,))
++    if mode == "digest":
++        journal.execute("UPDATE native_owner_release_intents SET digest='changed'")
++    if mode == "bytes":
++        journal.execute("UPDATE native_owner_release_intents SET body=?", (intent.encode(body) + " ",))
++    if mode == "stage":
++        journal.execute("UPDATE native_owner_release_intents SET stage='created'")
++    if mode == "actor":
++        changed = {**body, "actor": {**body["actor"], "session": "other-chat"}}
++        journal.execute("UPDATE native_owner_release_intents SET body=?,digest=?", (intent.encode(changed), intent.digest(changed)))
++    journal.commit()
++    before = journal.total_changes
++    with pytest.raises(ValueError):
++        intent.existing(journal, invocation())
++    assert journal.total_changes == before
++
++
++def test_existing_refuses_two_frozen_homes_instead_of_picking_latest(turn, journal):
++    intent.prepare(journal, action(), gate=gate())
++    intent.prepare(journal, action(home="other-home"), gate=gate())
++    with pytest.raises(ValueError, match="ambiguous"):
++        intent.existing(journal, invocation())
++
++
++def test_existing_reauthenticates_revoked_native_custody(turn, journal):
++    intent.prepare(journal, action(), gate=gate())
++    turn.release()
++    with pytest.raises(ValueError, match="custody"):
++        intent.existing(journal, invocation())
++
++
++def test_existing_reports_unrelated_malformed_journal_without_raw_sql_error(turn, journal):
++    intent.prepare(journal, action(), gate=gate())
++    journal.execute("UPDATE native_owner_release_intents SET body='not-json'")
++    journal.commit()
++    with pytest.raises(ValueError, match="unavailable or corrupt"):
++        intent.existing(journal, invocation())
++
++
++def test_existing_ignores_archived_predecessor_and_ack_binds_successor(turn, journal):
++    old = intent.prepare(journal, action(), gate=gate())
++    intent.advance(journal, old, expected="intent_journaled_unsent", stage="send_pending")
++    intent.advance(journal, old, expected="send_pending", stage="expired")
++    assert not intent.acknowledged_successor(journal, old, old["intent_uid"])
++    successor = intent.prepare(journal, action(), gate=gate(), expired_intent=old["intent_uid"])
++    assert intent.existing(journal, invocation()) == successor
++    assert intent.acknowledged_successor(journal, successor, old["intent_uid"])
++    with pytest.raises(ValueError):
++        intent.acknowledged_successor(journal, successor, "foreign-expired")
+-- 
+2.43.0
+

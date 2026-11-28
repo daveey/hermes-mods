@@ -1,0 +1,252 @@
+From 227b8eaced030fa8ecc03e14d3caff26caf87c3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 12:34:32 +0000
+Subject: [PATCH 6900] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 227b8eaced030fa8ecc03e14d3caff26caf87c3d.
+
+---
+diff --git a/docs/kanban-replay-final-audit.md b/docs/kanban-replay-final-audit.md
+index 8059f71dd98f573bb88ece4b787f6a9a88e62a5a..62954dd8273b185679c7bee1f8e9039098a16046 100644
+--- a/docs/kanban-replay-final-audit.md
++++ b/docs/kanban-replay-final-audit.md
+@@ -1,5 +1,22 @@
+ # Sender final audit: remaining gates (not approval)
+ 
++## Malformed strict endpoint envelopes (review 6038956723)
++
++HTTP 200 with a non-object capability (`[]`) or a serving envelope missing a
++dict `slot` (`{}`, `{slot: []}`) previously escaped as AttributeError/KeyError
++and aborted `sync_all_once` before a later healthy board. Capability and slot
++payloads are now typed into ValueError at the envelope boundary, which the
++strict sender turns into ReplayFault. Inspect, session, post-send inspect and
++ACK all use the same slot helper. Exact pre-send journal custody is unchanged;
++a malformed ACK after a successful send still isolates the board without
++uncaught indexing errors.
++
++Nine HTTP/dispatch cases plus a helper unit test cover those shapes, a valid
++two-board control, and ACK `{}`. Four source mutants are killed: capability
++passthrough, inspect/session raw `['slot']` indexing, and a `.get` slot helper
++that skips the typed refusal. Restored hashes precede the post-control run.
++This is not live Board proof, activation, or D completion.
++
+ ## Exact-successor ACK and strict HTTP410 corrections
+ 
+ Review6038016773 at3044c5c4c4215b9afdca27a9e67788a92e2ae03e reproduced
+diff --git a/hermes_cli/kanban_replay_reply.py b/hermes_cli/kanban_replay_reply.py
+index 01b87d3428a7ed7bf9c182c654e6ea70bfff2150..4b708296459a6f955177f617c2a8245e1e563d7c 100644
+--- a/hermes_cli/kanban_replay_reply.py
++++ b/hermes_cli/kanban_replay_reply.py
+@@ -13,6 +13,23 @@
+                         'row', 'source_predecessor'})
+ 
+ 
++def capability_envelope(payload):
++    """Refuse a non-object capability as a board-local stream fault."""
++    if not isinstance(payload, dict):
++        raise ValueError('replay capability unavailable')
++    return payload
++
++
++def slot_envelope(payload):
++    """Refuse a missing or non-object serving slot as a board-local stream fault."""
++    if not isinstance(payload, dict):
++        raise ValueError('replay serving envelope malformed')
++    slot = payload.get('slot')
++    if not isinstance(slot, dict):
++        raise ValueError('replay serving envelope malformed')
++    return slot
++
++
+ def consumed_slot(reply, wire, previous, local):
+     """Return a validated final snapshot, or require inspect without settlement.
+ 
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 83e90697846d422ba9d6ae0fe2f64384f5655d7b..091314dc2128f122a97a290b3a7ac3d60ed4fb72 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -114,16 +114,17 @@
+     local = journal.snapshot(conn)
+     if isinstance(hub, client._HTTP_HUB) and send_ops is None:
+         raise ValueError('strict HTTP transport requires pinned session')
+-    cap = recovery.call(hub, 'GET', root + 'capability') if capability is None else capability
++    from hermes_cli.kanban_replay_reply import capability_envelope, slot_envelope
++    cap = capability_envelope(recovery.call(hub, 'GET', root + 'capability') if capability is None else capability)
+     if (cap.get('processed_prefix') is not True or
+             cap.get('board_incarnation') != local['board_incarnation'] or
+             cap.get('gateway_principal') != local['gateway_principal']):
+         raise ValueError('replay capability unavailable')
+-    remote = recovery.call(hub, 'GET', root + 'inspect')['slot']
++    remote = slot_envelope(recovery.call(hub, 'GET', root + 'inspect'))
+     reconcile(local, remote)  # inspect before authenticated full-state session CAS
+     identity = dict(board_incarnation=local['board_incarnation'], journal_id=local['journal_id'])
+     expected = dict(remote, session=str(int(remote['session']) + 1))
+-    remote = recovery.call(hub, 'POST', root + 'session', dict(identity, expected=remote))['slot']
++    remote = slot_envelope(recovery.call(hub, 'POST', root + 'session', dict(identity, expected=remote)))
+     if remote != expected:
+         raise ValueError('session readback mismatch')
+     reconcile(local, remote)
+@@ -416,14 +417,14 @@
+             # Inspect immediately, but leave recording/ACK to the next serialized
+             # turn. A lost mutation reply never authorizes a blind resend.
+             try:
+-                reconcile(journal.snapshot(conn), recovery.call(hub, 'GET', root + 'inspect')['slot'])
++                reconcile(journal.snapshot(conn), slot_envelope(recovery.call(hub, 'GET', root + 'inspect')))
+             except (OSError, client.HubError, client.Resync):
+                 pass  # Offline inspection preserves the original transport error/custody.
+             raise
+         out.sent += 1
+         from hermes_cli.kanban_replay_reply import consumed_slot
+         remote = (consumed_slot(reply, wire, remote, journal.snapshot(conn)) or
+-                  recovery.call(hub, 'GET', root + 'inspect')['slot'])
++                  slot_envelope(recovery.call(hub, 'GET', root + 'inspect')))
+         membership = refresh_capacity()
+         current_row = refresh_current_row()
+         with settlement():
+@@ -446,9 +447,10 @@
+     # authenticated prefix must never be moved back to our settled predecessor.
+     if int(remote['a']) < int(settled['settled']):
+         expected = dict(remote, a=settled['settled'])
+-        remote = recovery.call(hub, 'POST', root + 'ack', dict(identity, session=remote['session'],
++        from hermes_cli.kanban_replay_reply import slot_envelope
++        remote = slot_envelope(recovery.call(hub, 'POST', root + 'ack', dict(identity, session=remote['session'],
+             generation=settled['generation'], ack=dict(sequence=settled['settled'],
+-                op_id=settled['last_op_id'], payload_sha256=settled['last_payload_sha256'])))['slot']
++                op_id=settled['last_op_id'], payload_sha256=settled['last_payload_sha256']))))
+         from hermes_cli.kanban_replay_reply import same_slot
+         if not same_slot(expected, remote):
+             raise ValueError('ack readback mismatch')
+diff --git a/hermes_cli/kanban_sync_exposure.py b/hermes_cli/kanban_sync_exposure.py
+index 7215cf4cbf432cb8d6ae783fe4c88679fc0910db..052af110d3243fcbe30840ba2be43a57f69cd11a 100644
+--- a/hermes_cli/kanban_sync_exposure.py
++++ b/hermes_cli/kanban_sync_exposure.py
+@@ -106,7 +106,8 @@
+     root = f'/v2/boards/{quote(board, safe="")}/replay/'
+     transport = Hub(hub.ident, timeout=hub.timeout, deadline=hub.deadline)
+     try:
+-        capability = transport._call('GET', root + 'capability')
++        from hermes_cli.kanban_replay_reply import capability_envelope
++        capability = capability_envelope(transport._call('GET', root + 'capability'))
+         observed_capability = dict(capability)
+ 
+         def send_ops(conn, ops, replay):
+diff --git a/tests/hermes_cli/test_kanban_replay_endpoint_shapes.py b/tests/hermes_cli/test_kanban_replay_endpoint_shapes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7de3f1ef7c447588019b62823a1eaa0ae0238941
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_endpoint_shapes.py
+@@ -0,0 +1,111 @@
++"""Malformed strict endpoint envelopes stay board-local faults.
++
++HTTP 200 with a non-object capability or a missing serving slot must not
++escape as AttributeError/KeyError or abort a later healthy board.
++"""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli.kanban_replay_reply import capability_envelope, slot_envelope
++from tests.hermes_cli.test_kanban_replay_http_session import serving, AckReceiver
++from tests.hermes_cli.test_kanban_replay_sender import live
++
++__all__ = ['live']
++
++
++def test_envelope_helpers_refuse_non_object_payloads():
++    with pytest.raises(ValueError, match='replay capability unavailable'):
++        capability_envelope([])
++    with pytest.raises(ValueError, match='replay serving envelope malformed'):
++        slot_envelope([])
++    with pytest.raises(ValueError, match='replay serving envelope malformed'):
++        slot_envelope({})
++    with pytest.raises(ValueError, match='replay serving envelope malformed'):
++        slot_envelope({'slot': []})
++    assert slot_envelope({'slot': {'mode': 'STRICT'}}) == {'mode': 'STRICT'}
++    assert capability_envelope({'processed_prefix': True})['processed_prefix'] is True
++
++
++@pytest.mark.parametrize('endpoint,body', [
++    ('capability', []),
++    ('inspect', {}),
++    ('inspect', {'slot': []}),
++    ('session', {}),
++    ('session', {'slot': []}),
++])
++def test_malformed_endpoint_is_typed_board_local_refusal(live, endpoint, body):
++    kb.create_task(live, title='malformed envelope custody', assignee='worker')
++    peer = AckReceiver()
++    before = journal.snapshot(live)
++
++    def encode(path, reply):
++        return json.dumps(body if path.endswith('/' + endpoint) else reply).encode()
++
++    with serving(live, peer, encode_reply=encode) as (url, _requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            with pytest.raises((client.ReplayFault, client.HubError, client.SyncUnavailable)):
++                client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
++            assert journal.snapshot(live) == before
++            assert not peer.sent
++        finally:
++            hub.close()
++
++
++@pytest.mark.parametrize('malformed', [True, False])
++def test_missing_inspection_envelope_does_not_abort_later_board(live, tmp_path, monkeypatch, malformed):
++    kb.create_task(live, title='broken first board', assignee='worker')
++    broken_path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++    peer = AckReceiver()
++    original = peer._call
++
++    def route(method, path, body=None):
++        if '/changes' in path:
++            return dict(changes=[], next=0, head=0, more=False)
++        if malformed and '/default/replay/inspect' in path:
++            return {}
++        return original(method, path, body)
++
++    peer._call = route
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    with serving(live, peer) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            results = client.sync_all_once(hub, boards=[('default', broken_path), ('healthy', healthy_path)])
++            assert [r.board for r in results] == ['default', 'healthy']
++            assert bool(results[0].error) is malformed
++            assert results[1].error is None
++            assert any('/healthy/' in p for _, p, _, _ in requests)
++        finally:
++            hub.close()
++
++
++def test_malformed_ack_envelope_is_typed_board_local_refusal(live):
++    kb.create_task(live, title='malformed ack envelope', assignee='worker')
++    peer = AckReceiver()
++
++    def encode(path, reply):
++        return json.dumps({} if path.endswith('/ack') else reply).encode()
++
++    with serving(live, peer, encode_reply=encode) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            with pytest.raises((client.ReplayFault, client.HubError, client.SyncUnavailable)):
++                client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
++            assert len(peer.sent) == 1
++            assert any(path.endswith('/ack') for _, path, _, _ in requests)
++        finally:
++            hub.close()
+-- 
+2.43.0
+

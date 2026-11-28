@@ -1,0 +1,143 @@
+From 7f937cbcd6fa519579c0d525ca95e08c26f9e7b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:16:59 +0000
+Subject: [PATCH 6633] Code-attestation inventory cost, diagnostics and quiet-start review records
+
+Public mirror of source commit 7f937cbcd6fa519579c0d525ca95e08c26f9e7b6.
+
+---
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index 6862bb23a707bb4419bc3ad5698bd9bfcbb6995e..ac96dfb953531e9194edc392e74fdb6997109efa 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -1262,7 +1262,7 @@
+             self.mark_unknown(("dependency-skew:" if path in self._deps.rows
+                                else "dependency-unreceipted:") + filename)
+             return
+-        if not _same(code, self._compiled(source, filename)):
++        if not _same(code, self._module_compilation(source, code)):
+             self.mark_unknown("executed-code-mismatch:" + filename)
+             return
+         component = "dependency:" + receipt[0]
+@@ -1468,6 +1468,16 @@
+                         "native bytes are hashed before load (TOCTOU); loader-resolved "
+                         "transitive libraries are not audited"]}
+ 
++    def _module_compilation(self, source, code):
++        # Admit only repeated module objects, not one-shot import graphs. Identity
++        # selects cache policy only: fresh source and exact equality stay mandatory.
++        if len(source) > MAX_SOURCE:
++            raise ValueError("source-limit")
++        known = self._known.get(id(code))
++        if known is not None and known[0] is code:
++            return self._compiled(source, code.co_filename)
++        return _compile(source, code.co_filename)
++
+     def _compiled(self, source, filename, mode="exec"):
+         # Every caller supplies freshly bounded bytes; no stat/mtime trust. Only
+         # compilation is cached. Filename/mode/optimization remain in the key.
+@@ -1535,7 +1545,7 @@
+                 (kind != "core" and digests.get(relative) != digest)):
+             self.mark_unknown("source-skew:" + str(path))
+             return
+-        if not _same(code, self._compiled(source, code.co_filename)):
++        if not _same(code, self._module_compilation(source, code)):
+             self.mark_unknown("executed-code-mismatch:" + str(path))
+             return
+         self._record(code, component, digest, filename=code.co_filename)
+diff --git a/tests/hermes_cli/test_code_attestation.py b/tests/hermes_cli/test_code_attestation.py
+index 71e9ec984081d4af54b3ffa004b9189549c7dffe..9e88bd9193219f04b87e83bcae4a287e19940a8e 100644
+--- a/tests/hermes_cli/test_code_attestation.py
++++ b/tests/hermes_cli/test_code_attestation.py
+@@ -298,7 +298,9 @@
+         print(json.dumps({'calls': count, 'delta': delta,
+             'units': len(a.executed_units()), 'unknowns': a.unknowns()}))
+     ''')
+-    assert result['calls'] == 1
++    # The first observation is deliberately not admitted; the second establishes
++    # reuse, and the remaining eighteen still share the content-keyed compile.
++    assert result['calls'] == 2
+     assert result['delta'] == 20
+     assert result['units'] == 20
+     assert any('source-skew:' in r for r in result['unknowns'])
+diff --git a/tests/hermes_cli/test_code_attestation_cache_admission.py b/tests/hermes_cli/test_code_attestation_cache_admission.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad3c5914e3f51cef5ea34d463b31df01d8d2f4db
+--- /dev/null
++++ b/tests/hermes_cli/test_code_attestation_cache_admission.py
+@@ -0,0 +1,72 @@
++"""Cold module checks must not evict reusable generator/interpreter compilations."""
++from tests.hermes_cli.test_code_attestation import run_probe
++from tests.hermes_cli.test_code_attestation_deps import run as run_dependency_probe
++
++
++def test_component_observations_do_not_admit_cold_compilations(tmp_path):
++    result = run_probe(tmp_path, r'''
++        from hermes_cli import code_attestation as ca
++        p = pathlib.Path('plugin').resolve(); p.mkdir()
++        source = b'def work():\n    return 17\n'
++        digests = {f'module{i}.py': hashlib.sha256(source).hexdigest()
++                   for i in range(ca.MAX_CACHE_ENTRIES + 2)}
++        a.register_component_root('reviewed', p, 'plugin', digests=digests)
++        a._compiled(b'pass\n', '<hot>')
++        before = list(a._source_cache)
++        for name in digests:
++            f = p / name; f.write_bytes(source)
++            a._observe(compile(source, str(f), 'exec'))
++        after = list(a._source_cache)
++        print(json.dumps({'before': before, 'after': after,
++                          'units': len(a.executed_units())}))
++    ''')
++    assert result['after'] == result['before']
++    assert result['units'] == 34
++
++
++def test_dependency_observations_do_not_admit_cold_compilations(tmp_path):
++    result = run_dependency_probe(tmp_path, r'''
++        from hermes_cli import code_attestation as ca
++        source = b'VALUE = 7\n'
++        files = {f'module{i}.py': source for i in range(ca.MAX_CACHE_ENTRIES + 2)}
++        dist('coldpkg', files)
++        assert a.register_dependency_environment(SITE)
++        a._compiled(b'pass\n', '<hot>')
++        before = list(a._source_cache)
++        for name in files:
++            f = SITE / name
++            a._dependency_exec(compile(source, str(f), 'exec'))
++        after = list(a._source_cache)
++        print(json.dumps({'before': before, 'after': after,
++                          'units': sum(pathlib.Path(u['filename']).name in files
++                                       for u in a.dependency_receipts()['units'])}))
++    ''')
++    assert result['after'] == result['before']
++    assert result['units'] == 34
++
++
++def test_uncached_checks_reject_stale_source_and_nested_filename(tmp_path):
++    result = run_probe(tmp_path, r'''
++        p = pathlib.Path('plugin').resolve(); p.mkdir()
++        source = b'def work():\n    return 17\n'
++        f = p / 'entry.py'; f.write_bytes(source)
++        a.register_component_root('reviewed', p, 'plugin',
++            digests={'entry.py': hashlib.sha256(source).hexdigest()})
++        code = compile(source, str(f), 'exec')
++        a._observe(code)
++        units = len(a.executed_units())
++        child = next(c for c in code.co_consts if isinstance(c, type(code)))
++        forged = code.replace(co_consts=tuple(
++            child.replace(co_filename='forged.py') if c is child else c
++            for c in code.co_consts))
++        a._observe(forged)
++        stat = f.stat()
++        f.write_bytes(source.replace(b'17', b'18'))
++        __import__('os').utime(f, ns=(stat.st_atime_ns, stat.st_mtime_ns))
++        a._observe(code)
++        print(json.dumps({'units': len(a.executed_units()), 'before': units,
++                          'unknowns': a.unknowns()}))
++    ''')
++    assert result['units'] == result['before'] == 1
++    assert any(x.startswith('executed-code-mismatch:') for x in result['unknowns'])
++    assert any(x.startswith('source-skew:') for x in result['unknowns'])
+-- 
+2.43.0
+

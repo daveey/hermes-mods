@@ -1,0 +1,191 @@
+From 82293271f0eed66e8bf82b808695f3d26a048224 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:50:29 +0000
+Subject: [PATCH 6748] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 82293271f0eed66e8bf82b808695f3d26a048224.
+
+---
+diff --git a/tests/tui_gateway/test_notify_private_chat.py b/tests/tui_gateway/test_notify_private_chat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d32fc367d1a2bfb2d133c5c9d3b97c3b4a68d43f
+--- /dev/null
++++ b/tests/tui_gateway/test_notify_private_chat.py
+@@ -0,0 +1,118 @@
++"""Private notification fallbacks read only the asking chat's subscription rows.
++
++Under a GIL convoy the retained observer's 50 ms wait often fails, so each chat poller
++takes a private read. That read used to fetch and group every tui subscription row on the
++board (thousands of rows across hundreds of chats on a large board, one sqlite3 step and GIL handoff
++per row) only to return one chat's slice and discard the rest: private results are never
++published. Profiling a busy serve (t_d0c5000000000005) put most of the
++active tui-notif-poller samples on that fetch.
++"""
++import contextlib
++import threading
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_generation as generation
++from tests.tui_gateway import test_notify_subs_gate as helpers
++from tui_gateway import notification_idle as idle
++from tui_gateway import notification_reader as reader
++
++board = helpers.board
++CHAT, OTHER = helpers.CHAT, helpers.OTHER
++
++
++@contextlib.contextmanager
++def _shared_observer_busy(path):
++    """Hold the board's retained observer so the next signature read is private."""
++    ready, release = threading.Event(), threading.Event()
++
++    def hold():
++        with reader.reading(path):
++            ready.set()
++            release.wait(10)
++
++    thread = threading.Thread(target=hold)
++    thread.start()
++    try:
++        assert ready.wait(5)
++        yield
++    finally:
++        release.set()
++        thread.join(5)
++    assert not thread.is_alive()
++
++
++def _traced_private(monkeypatch):
++    original = generation.open_ro
++    statements: list = []
++
++    def traced(*args, **kwargs):
++        conn = original(*args, **kwargs)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    monkeypatch.setattr(generation, "open_ro", traced)
++    return statements
++
++
++def _many_chats(tasks, n=40):
++    with contextlib.closing(kbc.connect()) as conn:
++        for i in range(n):
++            kbn.add_notify_sub(conn, task_id=tasks[i % len(tasks)], platform="tui",
++                               chat_id=f"20261113_1300{i:02d}_bulk{i:02d}")
++
++
++def test_private_fallback_reads_only_the_asking_chat(board, monkeypatch):
++    path, tasks = board
++    _many_chats(tasks)
++    shared = {chat: idle.board_signature(path, chat) for chat in (CHAT, OTHER, "absent-chat")}
++    held = idle._SIGS[str(path)]
++    statements = _traced_private(monkeypatch)
++    with _shared_observer_busy(path):
++        private = {chat: idle.board_signature(path, chat) for chat in (CHAT, OTHER, "absent-chat")}
++    assert private == shared  # byte-identical signatures, including the empty slice
++    assert idle._SIGS[str(path)] is held  # still never published
++    assert not any(s.startswith(idle._SUBS_SQL) for s in statements), statements
++    chat_reads = [s for s in statements if "FROM kanban_notify_subs" in s and "chat_id = " in s]
++    assert len(chat_reads) == 3, statements
++
++
++def test_private_fallback_sees_fresh_rows_for_its_chat(board, monkeypatch):
++    from tests.tui_gateway.test_notify_revision import writer
++    path, _tasks = board
++    before = idle.board_signature(path, CHAT)
++    _traced_private(monkeypatch)
++    with _shared_observer_busy(path):
++        with writer(path) as conn:
++            conn.execute("UPDATE kanban_notify_subs SET last_event_id = 77, inflight_from = 5 WHERE chat_id = ?",
++                         (CHAT,))
++        fresh = idle.board_signature(path, CHAT)
++    assert fresh != before
++    assert {row[4] for row in fresh[2]} == {77} and {row[5] for row in fresh[2]} == {5}
++    # the retained observer then reads the same rows
++    assert idle.board_signature(path, CHAT) == fresh
++
++
++def test_private_fallback_platform_match_is_case_insensitive(board):
++    path, tasks = board
++    with contextlib.closing(kbc.connect()) as conn:
++        kbn.add_notify_sub(conn, task_id=tasks[1], platform="TUI", chat_id=OTHER)
++        kbn.add_notify_sub(conn, task_id=tasks[2], platform="telegram", chat_id=OTHER)
++    shared = idle.board_signature(path, OTHER)
++    with _shared_observer_busy(path):
++        assert idle.board_signature(path, OTHER) == shared
++
++
++def test_unscoped_private_fallback_keeps_every_chat(board):
++    """``chat_id=None`` (session-list stamping) still needs the whole map."""
++    path, _tasks = board
++    shared = idle.board_signature(path)
++    with _shared_observer_busy(path):
++        assert idle.board_signature(path) == shared
++    assert set(shared[2]) == {CHAT, OTHER}
++
++
++def test_retained_reader_still_publishes_every_chat(board):
++    path, _tasks = board
++    idle.board_signature(path, CHAT)
++    assert set(idle._SIGS[str(path)][4]) == {CHAT, OTHER}
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index 8ba762c6439e46d04255e35225b582ea111599ea..edefe3dd9c044e71c406591f3de5ef241a2db1e7 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -85,7 +85,17 @@
+     return read_revision(conn, (str(path), st.st_dev, st.st_ino))
+ 
+ 
+-def _notify_content(conn, version, held, path=None):
++# A private (unpublished) read asked for one chat needs only that chat's rows; same order as its slice of
++# _SUBS_SQL. Fetching all of them (thousands of rows, one sqlite3 step and GIL handoff each) to return one
++# slice was most of the tui pollers' work under contention (t_d0c5000000000005).
++_CHAT_SUBS_SQL = ("SELECT chat_id, task_id, platform, thread_id, last_event_id, inflight_from "
++                  "FROM kanban_notify_subs WHERE chat_id = ? AND LOWER(platform) = 'tui' "
++                  "ORDER BY task_id, platform, thread_id")
++
++
++def _notify_content(conn, version, held, path=None, only_chat=None):
++    """``only_chat``: a private read for one chat; its result is never published, so it reads only that chat's
++    subscription rows and skips the memo-only subscription revision."""
+     from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS
+     present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+                                           "('task_events', 'kanban_notify_subs')")}
+@@ -94,7 +104,7 @@
+     conn.execute("BEGIN")  # one snapshot for the event scan and the subscription rows
+     try:
+         revision = None
+-        if path is not None:
++        if path is not None and only_chat is None:
+             with contextlib.suppress(Exception):  # unknown coverage: read the rows
+                 revision = _subs_revision(conn, path)
+         top = int(conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0)
+@@ -106,7 +116,12 @@
+             newest = max(newest, int(row[0] or 0))
+         subs_key = revision  # includes inflight_from; no per-commit subscription scan
+         by_chat = held[4] if subs_key is not None and held is not None and held[5] == subs_key else None
+-        rows = conn.execute(_SUBS_SQL).fetchall() if by_chat is None else ()
++        if by_chat is not None:
++            rows = ()
++        elif only_chat is not None:
++            rows = conn.execute(_CHAT_SUBS_SQL, (only_chat,)).fetchall()
++        else:
++            rows = conn.execute(_SUBS_SQL).fetchall()
+     finally:
+         conn.execute("COMMIT")
+     if by_chat is None:
+@@ -130,7 +145,8 @@
+         if held is not None and held[0] is not conn:
+             held = None  # another reader (reopened, replaced file): its scan offsets prove nothing here
+         if held is None or held[1] != version:
+-            held = _notify_content(conn, version, held, path)
++            # A private read is never published: it needs only the asking chat's rows.
++            held = _notify_content(conn, version, held, path, None if retained else chat_id)
+             if held is None:
+                 return conn, version
+             if retained:
+-- 
+2.43.0
+

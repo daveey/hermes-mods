@@ -1,0 +1,113 @@
+From bcf6239a1221064b4043ff1d8883bd22a158b7b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:59:04 +0000
+Subject: [PATCH 6599] Stage-local unloaded-notification diagnostic receipts
+
+Public mirror of source commit bcf6239a1221064b4043ff1d8883bd22a158b7b9.
+
+---
+diff --git a/docs/designs/unloaded-diagnostics.md b/docs/designs/unloaded-diagnostics.md
+index 815e065839420c328a870283096400701d2dc818..0e05aa9b6f83753ec86a02930ab68215f2cc0910 100644
+--- a/docs/designs/unloaded-diagnostics.md
++++ b/docs/designs/unloaded-diagnostics.md
+@@ -53,8 +53,12 @@
+ poll still occurs after fingerprint collection even if prints are None. Existing
+ per-board cursor comparisons, seed/ack behavior and health acknowledgement order
+ remain intact. Unevaluated short-circuit tests are never reported false. Health,
+-certification, chat and call receipts are different units. A later health failure
+-keeps the finalized certification outcome (including a successful memo assignment).
++certification, chat and call receipts are different units. Certification entry is
++observed immediately before projection acknowledgment, and ends after the final
++certification decision, before health acknowledgment. Earlier projection acquisition,
++iteration, load or seed failures retain `not_attempted`; failures inside that interval
++emit `exception`. A later health failure keeps the finalized certification outcome
++(including a successful memo assignment).
+ 
+ ## Proof surface
+ 
+diff --git a/tests/tui_gateway/test_remote_change_diagnostics.py b/tests/tui_gateway/test_remote_change_diagnostics.py
+index fba9ba1ce9d9c584dbc5fee9f6e2971f748db34e..bc365d1bd069537e87d3e4cc1999bde66f9ef53a 100644
+--- a/tests/tui_gateway/test_remote_change_diagnostics.py
++++ b/tests/tui_gateway/test_remote_change_diagnostics.py
+@@ -153,13 +153,18 @@
+     conservation()
+ 
+ 
+-@pytest.mark.parametrize('step', ['cards', 'load', 'ack', 'prints', 'poll', 'health'])
++@pytest.mark.parametrize('step', ['origin', 'pending', 'cards_call', 'cards', 'load', 'seed',
++                                 'ack', 'recovery', 'prints', 'poll', 'ledger', 'health'])
+ def test_exceptions_are_terminal_once(remote, monkeypatch, step):
+     def fail(*a, **k):
+         raise RuntimeError(step)
+-    targets = {'cards': (activity, '_remote_cards'), 'load': (state, 'load_remote'),
+-               'ack': (state, 'ack_remote'), 'prints': (nf, '_known_prints'),
+-               'health': (fact_links_health, 'acknowledge')}
++    targets = {'origin': (activity, '_origin_scope'), 'pending': (fact_links_health, 'pending'),
++               'cards_call': (activity, '_remote_cards'), 'load': (state, 'load_remote'),
++               'seed': (state, 'seed_remote'), 'ack': (state, 'ack_remote'),
++               'recovery': (notice_links_health, 'recover_into'), 'prints': (nf, '_known_prints'),
++               'ledger': (nf, '_ledger_content_key'), 'health': (fact_links_health, 'acknowledge')}
++    if step == 'seed':
++        remote['previous'] = None
+     if step == 'cards':
+         def cards(*a, **k):
+             yield from ()
+@@ -173,7 +178,9 @@
+     with pytest.raises(RuntimeError, match=step):
+         remote['run']()
+     assert runs('call') == {'exception': 1}
+-    assert runs('cert') == {('certified' if step == 'health' else 'exception'): 1}
++    expected_cert = ('not_attempted' if step in {'origin', 'pending', 'cards_call', 'cards', 'load', 'seed'}
++                     else 'certified' if step == 'health' else 'exception')
++    assert runs('cert') == {expected_cert: 1}
+     assert runs('health') == {('exception' if step == 'health' else 'not_reached'): 1}
+     conservation()
+ 
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index ae33cf4de2e838b7904e412e7d31f99936a9e3ea..1cdc293e04cdefeb8d59ddf79bdfe0298c485751 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -497,6 +497,7 @@
+             out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
+                         "status": None, "skipped": skipped, "source": "remote"})
+             observed.result = 'acked_refreshed' if skipped is None else 'acked_intentionally_skipped'
++    diagnostic.cert_active = True
+     committed = state.ack_remote(acked)
+     if not committed:
+         out.retry()
+@@ -504,6 +505,7 @@
+     diagnostic.cert = ('ack_failed' if not committed else 'inputs_unavailable' if inputs is None else 'not_all_acked')
+     if committed and inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
+         _certify_remote(inputs, polled, known, diagnostic)
++    diagnostic.cert_active = False
+     diagnostic.health = 'exception'
+     complete = committed and recovered_all and (previous.keys() | snapshot.keys()) <= acked.keys()
+     fact_links_health.acknowledge(origin, health_generation, complete=complete)
+diff --git a/tui_gateway/unloaded_diagnostics.py b/tui_gateway/unloaded_diagnostics.py
+index e265356ca8593e8163c275fff2d9dc390702e44e..9b93c36ef7df42193eb1264963fe7e477b9c0704 100644
+--- a/tui_gateway/unloaded_diagnostics.py
++++ b/tui_gateway/unloaded_diagnostics.py
+@@ -53,6 +53,7 @@
+     def __init__(self):
+         self.call = 'unknown'
+         self.cert = 'not_attempted'
++        self.cert_active = False
+         self.health = 'not_reached'
+         self.miss = {}
+ 
+@@ -70,9 +71,9 @@
+     def __exit__(self, kind, exc, tb):
+         if kind is not None:
+             self.call = 'exception'
+-            # Health acknowledgment follows the finalized certification stage;
+-            # its failure cannot undo a memo assignment or conflate their units.
+-            if self.health == 'not_reached':
++            # Only an entered, unfinished certification stage owns this failure.
++            # Projection failures precede it; health acknowledgment follows it.
++            if self.cert_active:
+                 self.cert = 'exception'
+         emit('remote.call', self.call)
+         emit('remote.cert', self.cert)
+-- 
+2.43.0
+

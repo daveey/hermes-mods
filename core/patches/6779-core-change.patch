@@ -1,0 +1,186 @@
+From 990b44c9c85c94f92bac90449173966bb6d26dd4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:20:45 +0000
+Subject: [PATCH 6779] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 990b44c9c85c94f92bac90449173966bb6d26dd4.
+
+---
+diff --git a/tests/hermes_cli/test_owner_release_quarantine.py b/tests/hermes_cli/test_owner_release_quarantine.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..beee8350364fd715818aefd43b03e55e47e7de54
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_quarantine.py
+@@ -0,0 +1,169 @@
++"""R8 authority-coverage controls for owner-release quarantine (not a deployment proof).
++
++Synthetic Board adapter, as in test_owner_release_executor. Covers: generic release is refused for BOTH
++conflict and oversize holds; a conflicting incoming result naming another task holds BOTH it and the retained
++cached task; unrelated sibling rows and the cursor still progress; an old DO (no attestation) stays ordinary
++history and gains no native authority.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_sync as sync
++from hermes_cli import kanban_release_executor as subject
++from hermes_cli import kanban_sync_quarantine as quarantine
++from hermes_cli import kanban_sync_quarantine_release as release
++from tests.hermes_cli import test_owner_release_executor as base
++
++assembly = base.assembly
++board = base.board
++proof = base.proof
++reply, changes, Hub, foreign = base.reply, base.changes, base.Hub, base.foreign
++
++
++def _sibling(conn):
++    task = kb.create_task(conn, title='sibling', assignee='default')
++    change = sync.RemoteChange(seq=900, version=1, table='task_events', uid=sync.uuid7(), op='upsert',
++                               fields={'task_id': task, 'kind': 'commented', 'payload': '{}', 'created_at': 1},
++                               hlc='1700000000000-0000-server', origin_gateway='worker')
++    return task, change
++
++
++def _table(conn, name):
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
++
++
++def _oversize(hub):
++    def oversized(*args, **kwargs):
++        raise subject.BoundedResponseTooLarge('bounded')
++    hub.row_evidence = oversized
++    return hub
++
++
++def _hold(a, mode):
++    """Quarantine the result receipt by conflict or oversize; return (rows, receipt uid, live hub value)."""
++    value = reply(a)
++    foreign(a)
++    rows = changes(value)
++    live = Hub(a.conn, value)
++    hub = live
++    if mode == 'conflict':
++        rows[-1].fields['payload'] = '{}'
++    else:
++        hub = _oversize(Hub(a.conn, value))
++    safe = quarantine.certified_page(a.conn, hub, value['board'], rows)
++    assert not safe
++    return rows, rows[-1].uid, live
++
++
++@pytest.mark.parametrize('mode', ['conflict', 'oversize'])
++def test_generic_release_prohibited_for_conflict_and_oversize(assembly, mode):
++    a = assembly
++    _rows, receipt, live = _hold(a, mode)
++    entry = quarantine.entries(a.conn)[0]
++    expected = {'conflict': 'owner_release_conflict', 'oversize': 'owner_release_oversize'}[mode]
++    assert entry['kind'] == expected and entry['kind'] in quarantine.NO_GENERIC_RELEASE
++    assert a.tid in entry['held_tasks']
++    # Operator-facing text never advertises a generic release for these kinds.
++    why = quarantine.refusal(a.conn, a.tid)
++    assert 'does NOT clear' in why and '--release' in why and 'grants no authority' in why
++    assert quarantine.release_command(value_board(a), receipt) not in why
++    before = list(a.conn.iterdump())
++    # Even when the Board answers with a live, fully valid attestation, the generic release cannot clear it.
++    with pytest.raises(release.ReleaseRefused):
++        release.release(a.conn, live, value_board(a), receipt, reason='try', operator='op')
++    assert list(a.conn.iterdump()) == before  # no acceptance, no lift, no replay
++    assert quarantine.held(a.conn, a.tid) and receipt in quarantine.receipts(a.conn)
++    assert not release.accepted_evidence(a.conn, receipt)
++    assert subject.verified_application(a.conn, 'intent-1') is None
++    from hermes_cli import kanban_spend_decision as decision
++    assert decision.execution_restricted(a.conn, a.tid)
++
++
++def value_board(a):
++    return a.conn.execute('SELECT board_id FROM kanban_sync_state LIMIT 1').fetchone()[0]
++
++
++@pytest.mark.parametrize('kind', ['reassessment_conflict', 'reassessment_evidence_oversize',
++                                  'owner_release_conflict', 'owner_release_oversize'])
++def test_no_generic_release_kind_membership(kind):
++    assert kind in quarantine.NO_GENERIC_RELEASE
++    assert 'does NOT clear' in quarantine.clear_instruction(kind, 'example', 'r')
++    assert 'does NOT clear' not in quarantine.clear_instruction('identity_changed', 'example', 'r')
++
++
++@pytest.mark.parametrize('mode', ['conflict', 'oversize'])
++def test_conflicting_result_for_other_task_holds_both_incoming_and_cached_task(assembly, mode):
++    a = assembly
++    value = reply(a)
++    foreign(a)
++    rows = changes(value)
++    # First observation certifies and caches the result for task A (a.tid).
++    quarantine.certified_page(a.conn, Hub(a.conn, value), value['board'], rows)
++    cached_before = a.conn.execute(f'SELECT * FROM {subject.TABLE}').fetchall()
++    assert len(cached_before) == 1 and cached_before[0]['task_id'] == a.tid
++    other = kb.create_task(a.conn, title='other', assignee='default')
++    # The same result uid now arrives naming a different task.
++    moved = base.copy.deepcopy(rows[-1])
++    moved.fields['task_id'] = other
++    hub = Hub(a.conn, value)
++    if mode == 'oversize':
++        hub = _oversize(hub)
++    safe = quarantine.certified_page(a.conn, hub, value['board'], [moved])
++    assert safe == []
++    entry = quarantine.entries(a.conn)[0]
++    assert entry['kind'] == f'owner_release_{mode}'
++    assert entry['task'] in {a.tid, other}
++    assert set(entry['held_tasks']) == {a.tid, other}
++    assert quarantine.held(a.conn, a.tid) and quarantine.held(a.conn, other)
++    # The retained first observation is untouched and still the only authority.
++    assert a.conn.execute(f'SELECT * FROM {subject.TABLE}').fetchall() == cached_before
++    assert 'does NOT clear' in quarantine.refusal(a.conn, other)
++    assert 'does NOT clear' in quarantine.refusal(a.conn, a.tid)
++
++
++@pytest.mark.parametrize('mode', ['conflict', 'oversize'])
++def test_unrelated_sibling_rows_and_cursor_progress_while_card_stays_held(assembly, mode):
++    a = assembly
++    value = reply(a)
++    foreign(a)
++    rows = changes(value)
++    hub = Hub(a.conn, value)
++    if mode == 'conflict':
++        rows[-1].fields['payload'] = '{}'
++    else:
++        hub = _oversize(hub)
++    sib_task, sib = _sibling(a.conn)
++    page = [*rows, sib]
++    safe = quarantine.certified_page(a.conn, hub, value['board'], page)
++    assert safe == [sib]  # the whole card is held, the sibling is not
++    assert quarantine.held(a.conn, a.tid) and not quarantine.held(a.conn, sib_task)
++    withheld = {r[0] for r in a.conn.execute('SELECT wire FROM containment_sync_withheld')}
++    assert withheld == {quarantine.wire(r) for r in rows}
++    sync.apply_remote_changes(a.conn, safe, new_cursor=999, observers=False)
++    assert int(sync.sync_state(a.conn)['cursor']) == 999
++    assert a.conn.execute('SELECT 1 FROM task_events WHERE uid=?', (sib.uid,)).fetchone()
++    assert subject.verified_application(a.conn, 'intent-1') is None
++    assert quarantine.held(a.conn, a.tid)
++
++
++def test_old_do_without_attestation_is_ordinary_history_and_gains_no_authority(assembly):
++    from hermes_cli import kanban_spend_decision as decision
++    a = assembly
++    value = reply(a)
++    foreign(a)
++    rows = changes(value)
++    del value['owner_release_applied_v1']  # old DO: row evidence carries no certificate key
++    hub = Hub(a.conn, value)
++    safe = quarantine.certified_page(a.conn, hub, value['board'], rows)
++    assert len(hub.calls) == 1  # the candidate was looked up, not trusted
++    assert safe == rows and not quarantine.receipts(a.conn) and not quarantine.held(a.conn, a.tid)
++    assert not _table(a.conn, 'containment_sync_withheld') or not a.conn.execute(
++        'SELECT 1 FROM containment_sync_withheld').fetchone()
++    sync.apply_remote_changes(a.conn, safe, new_cursor=500, observers=False)
++    assert int(sync.sync_state(a.conn)['cursor']) == 500  # history and cursor progressed
++    # ...but no native authority: no cache row, no verified application, restriction unchanged.
++    assert not _table(a.conn, subject.TABLE) or not a.conn.execute(f'SELECT 1 FROM {subject.TABLE}').fetchone()
++    assert subject.verified_application(a.conn, 'intent-1') is None
++    assert decision.execution_restricted(a.conn, a.tid)
++    assert kb.get_task(a.conn, a.tid).status == 'triage'
+-- 
+2.43.0
+

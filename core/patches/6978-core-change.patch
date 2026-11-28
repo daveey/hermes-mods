@@ -1,0 +1,307 @@
+From 6cceb2bd5ca99494a6aa125ef88c4603140d1e8a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:58:32 +0000
+Subject: [PATCH 6978] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 6cceb2bd5ca99494a6aa125ef88c4603140d1e8a.
+
+---
+diff --git a/hermes_cli/kanban_home_probe.py b/hermes_cli/kanban_home_probe.py
+index 0cc5628cbca5bd734e263f83282f49ad7ca11adc..8af5593e7c994b5e161f85fa4796a6d115056fe1 100644
+--- a/hermes_cli/kanban_home_probe.py
++++ b/hermes_cli/kanban_home_probe.py
+@@ -48,6 +48,21 @@
+     return UNKNOWN
+ 
+ 
++def claim_wake(conn, task_id, cmd, every, generation, purpose, status, ts, claim):
++    """Check handoff custody under the same writer lock as the probe claim."""
++    from hermes_cli import kanban_db_connect as dbc
++    from hermes_cli.kanban_home_transfer import frozen
++
++    with dbc.write_txn(conn):
++        if frozen(conn, task_id):
++            return False
++        return conn.execute(
++            "UPDATE task_wake_checks SET next_at = ?, generation = ? "
++            "WHERE task_id = ? AND cmd = ? AND generation IS ? AND next_at <= ? AND purpose IS ? "
++            "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ?)",
++            (ts + int(every), claim, task_id, cmd, generation, ts, purpose, task_id, status)).rowcount == 1
++
++
+ def require_source_probe(conn: sqlite3.Connection, task_id: str, source: str) -> None:
+     """Refuse preparation until an active logical source probe is registered.
+ 
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 1508bce66e74c57bc05a0968a833dbde8b2db050..cf54a9db650cbc4592ecad9fc21ab2f8ad880496 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -13,7 +13,7 @@
+ 
+ from hermes_cli import kanban_home_abort as abort
+ 
+-_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
++_SOURCE = re.compile(r"worker-[a-z0-9-]{1,24}\Z")
+ _NONCE = re.compile(r"[A-Za-z0-9._:-]{16,128}\Z")
+ _TABLE = "kanban_home_prepared1"
+ 
+@@ -124,9 +124,9 @@
+     """
+     if not conn.in_transaction:
+         raise ValueError("home preparation requires a write transaction")
+-    if (not isinstance(source, str) or not _NAME.fullmatch(source)
+-            or not isinstance(destination, str) or not _NAME.fullmatch(destination)
+-            or source == destination or not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
++    if (not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", task_id)
++            or not isinstance(source, str) or not _SOURCE.fullmatch(source)
++            or destination != 'hub' or not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
+             or type(expected_version) is not int or expected_version < 1):
+         raise ValueError("invalid home preparation identity")
+     record = dict(task_id=task_id, source=source, destination=destination,
+diff --git a/hermes_cli/kanban_operator_label_delivery.py b/hermes_cli/kanban_operator_label_delivery.py
+index 54269ef7a754a2048ecc2ecda8743d6768fed095..a54e6e67440e2a8aebd8040138bb9826343a0546 100644
+--- a/hermes_cli/kanban_operator_label_delivery.py
++++ b/hermes_cli/kanban_operator_label_delivery.py
+@@ -10,21 +10,42 @@
+ from hermes_cli import kanban_sync_client as client
+ 
+ 
++def _legacy(conn, event_uid, task):
++    """Record producer-version custody BEFORE identity/snapshot I/O can fail.
++
++    Attempts are retry scheduling, not proof that bytes were transmitted. Only
++    pre-upgrade attempted jobs without this durable discriminator stay unknown.
++    """
++    with kb.write_txn(conn):
++        conn.execute('CREATE TABLE IF NOT EXISTS kanban_home_label_capture1 '
++                     '(event_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL, legacy INTEGER NOT NULL)')
++        row = conn.execute('SELECT task_id,legacy FROM kanban_home_label_capture1 WHERE event_uid=?', (event_uid,)).fetchone()
++        if row is not None:
++            if row[0] != task:
++                raise ValueError('label capture identity changed')
++            return bool(row[1])
++        job = conn.execute('SELECT delivery_attempts FROM operator_label_jobs WHERE event_uid=?', (event_uid,)).fetchone()
++        legacy = job is None or job[0] > 0
++        conn.execute('INSERT INTO kanban_home_label_capture1 VALUES (?,?,?)', (event_uid, task, int(legacy)))
++        return legacy
++
++
+ def push_event(conn, board, own, task, event_uid, payload):
+     from hermes_cli.kanban_operator_call import RESULT_KIND
+ 
++    legacy = _legacy(conn, event_uid, task)
+     hub = client.Hub(client.load_identity())
+     try:
+         encoded = json.dumps(payload, sort_keys=True)
+         op = memo.get(conn, event_uid)
+         if op is None:
+-            row = conn.execute('SELECT delivery_attempts FROM operator_label_jobs WHERE event_uid=?', (event_uid,)).fetchone()
+-            legacy = row is None or row[0] > 0
++
+             # Existing attempted jobs have UNKNOWN capture custody. Never enrich
+             # them from today's epoch. They remain fail-closed on a moved task.
+             evidence = hub.row_evidence(board, 'tasks', task)
+             target = evidence.get('row') if evidence.get('state') == 'live' else None
+-            epoch = None if legacy else home.from_evidence(task, target)
++            captured = home.from_evidence(task, target)
++            epoch = None if legacy else captured
+             with kb.write_txn(conn):
+                 raw = {'client_op_id': uuid.uuid4().hex, 'op': 'upsert', 'table': 'task_events', 'uid': event_uid,
+                        'hlc': client._next_hlc(conn, own), 'fields': {'task_id': task, 'kind': RESULT_KIND,
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 2cb496f08654562c9a3d69d86070da97c1aef788..a1e90c976d3751555289a0dcb1292e130e2ecf9d 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -1043,6 +1043,9 @@
+     from hermes_cli import kanban_ci_progress  # [daveey] a card parked on a CI run that never starts
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_home_probe import claim_wake
++    from hermes_cli.kanban_home_transfer import frozen
++    from itertools import filterfalse
+ 
+     submitted: list[str] = []
+     futures: list[Future] = []
+@@ -1059,7 +1062,7 @@
+             return {"submitted": [], "in_flight": 0}
+         if stale:
+             with kb.write_txn(conn):
+-                for row in stale:
++                for row in filterfalse(lambda row: frozen(conn, row[0]), stale):
+                     conn.execute("DELETE FROM task_wake_checks WHERE task_id = ? AND task_id IN (SELECT w.task_id "
+                                  "FROM task_wake_checks w LEFT JOIN tasks t ON t.id = w.task_id "
+                                  f"WHERE t.id IS NULL OR NOT {_LIVE_ROW})", (row[0],))
+@@ -1098,15 +1101,9 @@
+                 continue
+             # Claim the slot first so a crash mid-probe cannot re-run it every tick.
+             claim = uuid.uuid4().hex
+-            with kb.write_txn(conn):
+-                claimed = conn.execute(
+-                    "UPDATE task_wake_checks SET next_at = ?, generation = ? "
+-                    "WHERE task_id = ? AND cmd = ? AND generation IS ? AND next_at <= ? AND purpose IS ? "
+-                    "AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND status = ?)",
+-                    (ts + int(every), claim, task_id, cmd, generation, ts, purpose, task_id,
+-                     PURPOSE_STATUS.get(purpose, "scheduled")))
+-                if claimed.rowcount != 1:
+-                    continue
++            if not claim_wake(conn, task_id, cmd, every, generation, purpose,
++                              PURPOSE_STATUS.get(purpose, "scheduled"), ts, claim):
++                continue
+             cwd = probe_cwd(task.workspace_path)
+             fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim,
+                                  purpose, stale_interval, passive_policy, ts + int(every), notice_interval)
+diff --git a/tests/hermes_cli/test_home_label_presend.py b/tests/hermes_cli/test_home_label_presend.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2bce1c8f19fe8a5517595811cd68c2955917c56f
+--- /dev/null
++++ b/tests/hermes_cli/test_home_label_presend.py
+@@ -0,0 +1,69 @@
++"""Pre-send errors are not historical transmission custody."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as dbc, kanban_sync_client as client
++from hermes_cli import kanban_operator_labels as labels
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++
++board = support.board
++
++
++@pytest.mark.parametrize('fault', ['snapshot', 'pending', 'identity', 'constructor', 'legacy'])
++def test_actual_delivery_retry_distinguishes_presend_failure_from_legacy(board, monkeypatch, fault):
++    task = support.seed(board)
++    event = 'label-presend-event-0001'
++    with dbc.write_txn(board):
++        for sql in labels.SCHEMA:
++            board.execute(sql)
++        board.execute("INSERT INTO operator_label_jobs(request_uid,board,machine,labels,caller,result_task_id,"
++                      "state,outcome,detail,event_uid,created_at,delivery_attempts) "
++                      "VALUES ('request','default','worker-a3','[]','{}',?,'done','verified','ok',?,1,?)",
++                      (task, event, int(fault == 'legacy')))
++    sent = []
++    failing = [fault != 'legacy']
++    epoch = ['epoch-before-send-00001']
++    def evidence(_board, table, _uid):
++        if table == 'task_events':
++            return {'state':'live', 'row':{**sent[-1]['fields'], 'uid':event, 'origin_gateway':'hub'}}
++        if failing[0] and fault == 'snapshot':
++            raise OSError('snapshot unavailable')
++        return {'state':'live', 'row':{'id':task, 'home_generation':epoch[0],
++                                      'home_transfer_pending':'pending' if failing[0] and fault == 'pending' else None}}
++    def send(_board, ops):
++        sent.extend(ops)
++        return {'results':[{'status':'applied', 'client_op_id':ops[0]['client_op_id']}]}
++    hub = SimpleNamespace(row_evidence=evidence, ops=send, close=lambda: None)
++    def identity():
++        if failing[0] and fault == 'identity':
++            raise OSError('identity unavailable')
++    def constructor(_identity):
++        if failing[0] and fault == 'constructor':
++            raise OSError('constructor unavailable')
++        return hub
++    monkeypatch.setattr(client, 'load_identity', identity)
++    monkeypatch.setattr(client, 'Hub', constructor)
++    if fault != 'legacy':
++        assert labels._deliver(board, 'hub', 'default', now=10) == 0
++        assert not sent
++        assert board.execute('SELECT delivery_attempts FROM operator_label_jobs').fetchone()[0] == 1
++        if fault == 'pending':
++            assert labels._deliver(board, 'hub', 'default', now=15) == 0
++            assert not sent, 'an attempted pre-send retry bypassed pending validation'
++    # Reopen before first capture: producer-version evidence must be durable.
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    reopened = dbc.connect(Path(path))
++    try:
++        failing[0] = False
++        assert labels._deliver(reopened, 'hub', 'default', now=20) == 1
++        assert sent[0].get('home_generations') == (None if fault == 'legacy' else {task:epoch[0]})
++        epoch[0] = 'epoch-after-send-00002'
++        labels._push_event(reopened, 'default', 'hub', task, event, json.loads(sent[0]['fields']['payload']))
++        assert sent[1] == sent[0]
++    finally:
++        reopened.close()
+diff --git a/tests/hermes_cli/test_home_review_boundaries.py b/tests/hermes_cli/test_home_review_boundaries.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef3a671c77c6bbfa8fa84c67a3c77725753f8eca
+--- /dev/null
++++ b/tests/hermes_cli/test_home_review_boundaries.py
+@@ -0,0 +1,58 @@
++"""Regression coverage for the three independently reproduced home-review defects."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_owner as owner, kanban_home_transfer as transfer
++from hermes_cli import kanban_wake_check as wake
++from hermes_cli.kanban_sync_client import Hub, Identity
++from tests.hermes_cli import test_home_transfer_capture as support
++
++board = support.board
++
++
++@pytest.mark.parametrize('purpose,status', [('wake', 'scheduled'), ('ask_resolved', 'blocked'), ('wake', 'todo')])
++def test_prepared_probe_does_not_starve_due_neighbour(board, monkeypatch, purpose, status):
++    task = kb.create_task(board, title='frozen probe')
++    other = kb.create_task(board, title='independent probe')
++    with dbc.write_txn(board):
++        board.execute('UPDATE tasks SET status=?,created_on=\'worker-a3\',sync_version=7 WHERE id=?', (status, task))
++        board.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (other,))
++        wake.set_check(board, task, 'exit 1', 120, now=1)
++        board.execute('UPDATE task_wake_checks SET purpose=? WHERE task_id=?', (purpose, task))
++        wake.set_check(board, other, 'exit 1', 120, now=2)
++        board.execute("UPDATE kanban_sync_state SET gateway_id='worker-a3'")
++        board.execute('DELETE FROM kanban_sync_outbox')
++        transfer.prepare(board, task, source='worker-a3', destination='hub', nonce='review-probe-00001', expected_version=7)
++    before = tuple(board.execute('SELECT * FROM task_wake_checks WHERE task_id=?', (task,)).fetchone())
++    ran = []
++    def probe(*args):
++        ran.append(args[0][1])
++        return 1, 'not yet'
++    monkeypatch.setattr(wake, '_run_probe', probe)
++    try:
++        result = wake.run_due_wake_checks(board, now=100, wait=True)
++        assert result['submitted'] == [other]
++        assert ran == [other]
++        assert tuple(board.execute('SELECT * FROM task_wake_checks WHERE task_id=?', (task,)).fetchone()) == before
++    finally:
++        wake._shutdown_for_tests()
++
++
++@pytest.mark.parametrize('source,destination', [('macbook', 'hub'), ('worker-a3', 'hermes-hub'),
++                                               ('worker-', 'hub'), ('worker-' + 'a' * 25, 'hub')])
++def test_owner_rejects_unsupported_identity_before_fencing_or_network(board, monkeypatch, source, destination):
++    task = kb.create_task(board, title='invalid protocol identity')
++    with dbc.write_txn(board):
++        board.execute('UPDATE tasks SET created_on=?,sync_version=7 WHERE id=?', (source, task))
++        board.execute("UPDATE kanban_sync_state SET gateway_id=?,board_id='default'", (source,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++    hub = Hub(Identity('http://127.0.0.1:1', 'fixture-key', source))
++    monkeypatch.setattr(hub, 'home_transfer', lambda *a: pytest.fail('invalid identity reached network'))
++    before = list(board.iterdump())
++    with pytest.raises(ValueError, match='invalid home preparation identity'):
++        owner.source_step(board, hub, 'default', dict(task=task, source=source, destination=destination,
++                          nonce='review-invalid-00001', expected_version=7))
++    assert list(board.iterdump()) == before
++    assert not transfer.frozen(board, task)
+diff --git a/tests/hermes_cli/test_kanban_home_transfer_fence.py b/tests/hermes_cli/test_kanban_home_transfer_fence.py
+index 06358ef8c12b23293fe21ab79f253c5ad1073879..641f48ec9659456e6dc709d16b169c7103379c6c 100644
+--- a/tests/hermes_cli/test_kanban_home_transfer_fence.py
++++ b/tests/hermes_cli/test_kanban_home_transfer_fence.py
+@@ -19,7 +19,7 @@
+ def prepare(conn, tid, nonce="transfer-00000001"):
+     from hermes_cli import kanban_home_transfer
+ 
+-    return kanban_home_transfer.prepare(conn, tid, source="worker-a3", destination="hermes-hub",
++    return kanban_home_transfer.prepare(conn, tid, source="worker-a3", destination="hub",
+                                        nonce=nonce, expected_version=7)
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,271 @@
+From 2a0b5a9b1f79844140fb06cd5e4173e22678a5e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:03:00 +0000
+Subject: [PATCH 6619] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 2a0b5a9b1f79844140fb06cd5e4173e22678a5e5.
+
+---
+diff --git a/hermes_cli/machine_throughput_incremental.py b/hermes_cli/machine_throughput_incremental.py
+index a08901b58cc15a546483260d230549da580a19b7..8275486f770617719c0a85606a62ebcbb45706d7 100644
+--- a/hermes_cli/machine_throughput_incremental.py
++++ b/hermes_cli/machine_throughput_incremental.py
+@@ -1,7 +1,7 @@
+ """Bounded, snapshot-local throughput contributions; unsupported data uses SQL.
+ 
+-No connections survive a read. The caller serializes this memo and drops a path
+-on any failure, including an interrupted in-place delta application.
++No read transactions survive a read; connection lifetime belongs to the caller.
++The caller serializes this memo and drops a path on any failure, including an interrupted delta application.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/machine_throughput_metrics.py b/hermes_cli/machine_throughput_metrics.py
+index e7109670fc671d2e3174108029a66094934c196e..fbba2d5b9c687469bd247396af754fbd7afcd190 100644
+--- a/hermes_cli/machine_throughput_metrics.py
++++ b/hermes_cli/machine_throughput_metrics.py
+@@ -19,7 +19,9 @@
+ sent to the Board (a Board that predates a field rejects the whole sample).
+ 
+ Totals only grow while rows are kept; deleting sessions (prune) lowers them, which a consumer treats as a reset.
+-Read-only URI connections with a 1 s busy timeout. The result (success or failure) is cached for :data:`CACHE_TTL_S`
++Read-only URI connections with a 1 s busy timeout. Throughput refreshes keep only their parsed schema via
++BoardWatch's restore/checkpoint-safe readers, with a new BEGIN/rollback snapshot on every read and no answer
++memo. Provider reads still open fresh connections. The result (success or failure) is cached for :data:`CACHE_TTL_S`
+ because ``collect()`` runs every 10 s. Any unreadable database omits all throughput fields: a partial sum would read as
+ a drop, and 0 would read as a reset.
+ """
+@@ -44,6 +46,16 @@
+ _SESSIONS_SQL = "SELECT count(*), count(ended_at) FROM sessions"
+ 
+ _cache: Optional[tuple[str, float, dict]] = None  # (root key, taken at, value)
++_readers = None  # lazy restore/checkpoint-safe parsed schemas; never cached answers
++_reader_paths: tuple = ()
++
++
++def _kept_readers():
++    global _readers
++    if _readers is None:
++        from hermes_cli.kanban_sync_board_watch import BoardWatch
++        _readers = BoardWatch()
++    return _readers
+ 
+ 
+ _PREFIXES = (("claude", "anthropic"), ("gpt-", "openai-codex"), ("codex", "openai-codex"), ("o1", "openai-codex"),
+@@ -117,7 +129,20 @@
+     key = str(path)
+     before = path.stat()
+     identity = (before.st_dev, before.st_ino)
+-    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
++    try:
++        got = _kept_readers().read(path, "throughput.snapshot",
++                                  lambda db: _read_snapshot(db, path, key, identity, models),
++                                  unchanged_ok=False)
++        if got is None:
++            raise sqlite3.OperationalError("throughput reader unavailable")
++        return got[1]
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        incremental.forget(key)
++        _kept_readers().reset()
++        raise
++
++
++def _read_snapshot(db, path, key, identity, models):
+     try:
+         db.execute("BEGIN")
+         result = incremental.read(db, key, identity)
+@@ -141,7 +166,7 @@
+         incremental.forget(key)
+         raise
+     finally:
+-        db.close()
++        db.rollback()  # release every snapshot before this kept reader can be reused
+ 
+ 
+ def _full_read(db):
+@@ -163,10 +188,16 @@
+ 
+ 
+ def _counters_locked(root):
++    global _reader_paths
+     totals, seen = [0, 0, 0, 0], set()
+     models: dict[str, list[int]] = {}
+     try:
++        _kept_readers().release_gone()
+         paths = state_db_paths(root)
++        reader_paths = tuple(str(path.resolve()) for path in paths)
++        if reader_paths != _reader_paths:
++            _kept_readers().reset()
++            _reader_paths = reader_paths
+         incremental.prune(paths)
+         for path in paths:
+             stat = path.stat()
+@@ -229,7 +260,10 @@
+ 
+ 
+ def reset_cache() -> None:
+-    global _cache, _provider_cache
++    global _cache, _provider_cache, _reader_paths
+     with _lock:
+         _cache = _provider_cache = None
++        _reader_paths = ()
++        if _readers is not None:
++            _readers.reset()
+         incremental.reset()
+diff --git a/tests/hermes_cli/test_throughput_kept_readers.py b/tests/hermes_cli/test_throughput_kept_readers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..784c94813c484ed1349afbe49bcbcf26190f21e0
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_kept_readers.py
+@@ -0,0 +1,148 @@
++"""Throughput refreshes keep parsed schemas, never a SQLite read transaction. [daveey]"""
++import os
++import sqlite3
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_state import SessionDB
++
++
++@pytest.fixture(autouse=True)
++def clear():
++    mt.reset_cache()
++    yield
++    mt.reset_cache()
++
++
++def database(path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    store = SessionDB(db_path=path)
++    store.close()
++    db = sqlite3.connect(path)
++    db.execute("INSERT INTO sessions(id,source,started_at) VALUES ('fixture','test',1)")
++    db.execute("INSERT INTO session_model_usage(session_id,model,input_tokens,output_tokens,"
++               "cache_read_tokens,cache_write_tokens) VALUES ('fixture','m',1,2,3,4)")
++    db.commit()
++    return db
++
++
++def observe(monkeypatch):
++    original = sqlite3.connect
++    opened = []
++
++    def connect(*args, **kwargs):
++        db = original(*args, **kwargs)
++        opened.append(db)
++        return db
++
++    monkeypatch.setattr(mt.sqlite3, "connect", connect)
++    return opened
++
++
++def test_refresh_keeps_connection_but_sees_commit_and_releases_snapshot(tmp_path, monkeypatch):
++    writer = database(tmp_path / "state.db")
++    opened = observe(monkeypatch)
++    try:
++        first = mt.cached_counters(tmp_path, clock=lambda: 0)
++        writer.execute("UPDATE session_model_usage SET input_tokens=9")
++        writer.commit()
++        second = mt.cached_counters(tmp_path, clock=lambda: 60)
++        assert second["tokens_io_total"] == first["tokens_io_total"] + 8
++        assert len(opened) == 1  # exact forced-fresh-open mutant anchor
++        assert not opened[0].in_transaction  # exact missing-rollback mutant anchor
++        # Even unchanged refreshes execute the snapshot read, not an answer memo.
++        statements = []
++        opened[0].set_trace_callback(statements.append)
++        assert mt.cached_counters(tmp_path, clock=lambda: 120) == second
++        assert any(s == "BEGIN" for s in statements)
++        assert any(s == "ROLLBACK" for s in statements)
++        assert not opened[0].in_transaction
++        with pytest.raises(sqlite3.OperationalError, match="readonly"):
++            opened[0].execute("UPDATE session_model_usage SET input_tokens=99")
++        mt.reset_cache()
++        with pytest.raises(sqlite3.ProgrammingError):
++            opened[0].execute("SELECT 1")
++    finally:
++        writer.close()
++
++
++def test_wal_checkpoint_and_replacement_revalidate(tmp_path, monkeypatch):
++    path = tmp_path / "state.db"
++    writer = database(path)
++    opened = observe(monkeypatch)
++    try:
++        first = mt.counters(tmp_path)
++        writer.execute("UPDATE session_model_usage SET input_tokens=20")
++        writer.commit()
++        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
++        assert mt.counters(tmp_path)["tokens_io_total"] == 22
++        assert all(not db.in_transaction for db in opened)
++        # Close the writer before replacing the fixture's complete image.
++        writer.close()
++        replacement = tmp_path / "new.db"
++        other = database(replacement)
++        other.execute("UPDATE session_model_usage SET input_tokens=30")
++        other.commit()
++        other.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
++        other.close()
++        # Existing kept reader must not pin the old inode as the current path.
++        os.replace(replacement, path)
++        assert mt.counters(tmp_path)["tokens_io_total"] == 32
++        assert first["tokens_io_total"] == 3
++    finally:
++        writer.close()
++
++
++def test_profile_removal_closes_reader_and_readdition_is_fresh(tmp_path, monkeypatch):
++    root = database(tmp_path / "state.db")
++    profile_path = tmp_path / "profiles" / "extra" / "state.db"
++    profile = database(profile_path)
++    opened = observe(monkeypatch)
++    try:
++        assert mt.counters(tmp_path)["tokens_io_total"] == 6
++        assert len(opened) == 2
++        profile.close()
++        profile_path.unlink()
++        assert mt.counters(tmp_path)["tokens_io_total"] == 3
++        # The old profile reader is closed even though it was not queried again.
++        with pytest.raises(sqlite3.ProgrammingError):
++            opened[1].execute("SELECT 1")
++        profile = database(profile_path)
++        assert mt.counters(tmp_path)["tokens_io_total"] == 6
++    finally:
++        root.close()
++        profile.close()
++
++
++def test_two_threads_share_only_serialized_connection_not_snapshots(tmp_path, monkeypatch):
++    writer = database(tmp_path / "state.db")
++    opened = observe(monkeypatch)
++    try:
++        expected = mt.counters(tmp_path)
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            results = list(pool.map(mt.counters, [tmp_path] * 20))
++        assert all(result == expected for result in results)
++        assert len(opened) == 1
++        assert not opened[0].in_transaction
++    finally:
++        writer.close()
++
++
++def test_read_failure_omits_whole_tuple_then_recovers(tmp_path, monkeypatch):
++    writer = database(tmp_path / "state.db")
++    try:
++        expected = mt.counters(tmp_path)
++        original = mt.incremental.read
++
++        def failed(db, *args):
++            assert db.in_transaction
++            raise sqlite3.OperationalError("fixture")
++
++        monkeypatch.setattr(mt.incremental, "read", failed)
++        assert mt.counters(tmp_path) == {}
++        monkeypatch.setattr(mt.incremental, "read", original)
++        assert mt.counters(tmp_path) == expected
++    finally:
++        writer.close()
+-- 
+2.43.0
+

@@ -1,0 +1,230 @@
+From cbcee95af10f8106b15c24d9d90fd551546b1220 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:49:35 +0000
+Subject: [PATCH 6788] Origin-forward refusals, queued-create wait handles and wait-check parsing
+
+Public mirror of source commit cbcee95af10f8106b15c24d9d90fd551546b1220.
+
+---
+diff --git a/hermes_cli/kanban_origin_forward_run_end.py b/hermes_cli/kanban_origin_forward_run_end.py
+index 3aa973c97582c7ac6b937afec3cf36a2a384f578..2d46e10d70a7e396e1797cc32ceddfd8a70a973a 100644
+--- a/hermes_cli/kanban_origin_forward_run_end.py
++++ b/hermes_cli/kanban_origin_forward_run_end.py
+@@ -1,7 +1,8 @@
+-"""Keep a queued forward's live admission lease until the courier settles it.
++"""Keep ordinary creator handoffs from revoking queued origin admission.
+ 
+-This is a voluntary-lifecycle gate, not an authorization source. Only the origin
+-can freeze admission; courier bodies and replica rows never grant authority.
++Reservations are obligations, never authority. Only the origin can authorize a
++forward. Mandatory stops and kernel cleanup must remain possible; those exits
++cannot promise delivery of still-unadmitted requests.
+ """
+ from __future__ import annotations
+ 
+@@ -12,37 +13,73 @@
+ 
+ VOLUNTARY = frozenset({'continued', 'scheduled', 'completed', 'blocked',
+                        'review_requested', 'changes_requested'})
++_RESERVED = 'origin_forward_reserved'
++
++
++def reserve(conn, task_id, run_uid, request_id):
++    """Commit an obligation under the same writer lock as ordinary run endings.
++
++    Called before starting the courier subprocess. A concurrent ending either
++    sees this reservation or wins first, in which case nothing is submitted.
++    """
++    from hermes_cli import kanban_db as kb
++    if conn.in_transaction:
++        raise ValueError('origin_forward_submit_transaction: reservation must commit before enqueue')
++    with kb.write_txn(conn):
++        row = conn.execute('SELECT r.id FROM tasks t JOIN task_runs r ON r.id=t.current_run_id '
++                           "WHERE t.id=? AND t.status='running' AND r.task_id=t.id "
++                           'AND r.uid=? AND r.ended_at IS NULL', (task_id, run_uid)).fetchone()
++        if row is None:
++            raise ValueError('origin_forward_submit_run_ended: no request submitted')
++        found = conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
++                             "AND json_extract(payload,'$.request_id')=?",
++                             (task_id, row[0], _RESERVED, request_id)).fetchone()
++        if not found:
++            kb._append_event(conn, task_id, _RESERVED, {'request_id': request_id}, run_id=row[0])
++
++
++def _pending(identity):
++    raise ValueError('origin_forward_pending: keep this run alive until request ' + str(identity)
++                     + ' is admitted or definitively rejected. Fetch its courier outcome and retry '
++                     'this lifecycle call; do not recreate or modify the frozen request.')
+ 
+ 
+ def require_settled(conn, task_id, run_id, outcome):
+-    """Raise before a voluntary run close; never interfere with crash/reclaim."""
++    """Refuse ordinary endings transactionally; never interfere with mandatory stops."""
+     from hermes_cli.kanban_workspace_publication import _kernel_park
+     if outcome not in VOLUNTARY or _kernel_park.get() == task_id:
+         return
+     from hermes_cli import kanban_db_sync as sync
+     if 'uid' not in sync.table_columns(conn, 'task_runs'):
+-        return  # Local-only boards cannot submit qualified origin forwarding.
++        return
+     row = conn.execute('SELECT uid FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
+     if not row or not row[0]:
+         return
++    reservations = {json.loads(event[0])['request_id'] for event in conn.execute(
++        'SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=?', (task_id, run_id, _RESERVED))}
+     from hermes_cli.kanban_capability_registry import hub_db_path
+     path = hub_db_path()
+     try:
+         path.lstat()
+     except FileNotFoundError:
+-        return  # No courier store: there have been no local outbound requests.
++        if reservations:
++            _pending(sorted(reservations)[0])
++        return
+     try:
+         with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+-            rows = db.execute("SELECT id,body FROM sent WHERE state NOT IN ('done','rejected') "
++            for identity in sorted(reservations):
++                sent = db.execute('SELECT state FROM sent WHERE id=?', (identity,)).fetchone()
++                if not sent or sent[0] not in ('done', 'rejected'):
++                    _pending(identity)
++            # Also protect requests already queued by pre-reservation core.
++            rows = db.execute("SELECT id,body FROM sent WHERE (state IS NULL OR state NOT IN ('done','rejected')) "
+                               "AND body LIKE '%origin-forward%'")
+             for identity, raw in rows:
+                 request = json.loads(raw)
+                 args = request.get('args', {})
+                 if (request.get('coll') == 'sessions' and request.get('action') == 'origin-forward'
+                         and args.get('run_uid') == row[0] and args.get('creator', {}).get('task_id') == task_id):
+-                    raise ValueError('origin_forward_pending: keep this run alive until request ' + str(identity)
+-                                     + ' is admitted or definitively rejected. Fetch its courier outcome and retry '
+-                                     'this lifecycle call; do not recreate or modify the frozen request.')
+-    except (sqlite3.Error, OSError, TypeError, json.JSONDecodeError) as exc:
++                    _pending(identity)
++    except (sqlite3.Error, OSError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+         raise ValueError('origin_forward_evidence_unavailable: cannot verify outstanding forwards; '
+                          'keep this run alive and retry the courier read') from exc
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index a3f4040b0122ad716449aab6e652c893aac515c4..dcc0cff824a7d3cd56cb144031ba581c70241cd5 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1288,7 +1288,7 @@
+                   self_gw: str, cfg: Optional[dict] = None, hub_cli: str = "hermes-hub",
+                   transport_key: Optional[str] = None, origin_gateway: Optional[str] = None,
+                   creator: Optional[dict] = None, run_uid: Optional[str] = None,
+-                  canonical_home: bool = False) -> dict:
++                  canonical_home: bool = False, conn=None) -> dict:
+     """Queue on ``target``; a fatal refusal must not fall back to a second local card."""
+     c = _Cfg(config() if cfg is None else cfg)
+     foreign_origin = bool(origin_gateway and origin_gateway != self_gw)
+@@ -1350,6 +1350,9 @@
+                 argv += ["--creator-" + flag, value]
+     else:
+         argv += ["--origin-session", ""]
++    if foreign_origin and conn is not None:
++        from hermes_cli.kanban_origin_forward_run_end import reserve
++        reserve(conn, creator['task_id'], run_uid, rid)
+     rc, out, err = hub_runner(argv)
+     if rc == 0:
+         return {"ok": True, "request_id": rid, "queued_only": False, "retry": prior is not None}
+diff --git a/tests/hermes_cli/test_origin_forward_delayed_park.py b/tests/hermes_cli/test_origin_forward_delayed_park.py
+index 61bb113faec58000e204c44800cc3a4d1309ce4f..f4e4bb4b2ac2e1f09b178c73716909c259be7af5 100644
+--- a/tests/hermes_cli/test_origin_forward_delayed_park.py
++++ b/tests/hermes_cli/test_origin_forward_delayed_park.py
+@@ -46,6 +46,9 @@
+                         'destination': {'gateway': 'owner', 'profile': 'default', 'board': 'default'},
+                         'create': {'title': 'child', 'assignee': 'default', 'session_id': 'creator'}}}
+     frozen = json.dumps(request)
++    from hermes_cli.kanban_origin_forward_run_end import reserve
++    with kbc.connect_closing() as conn:
++        reserve(conn, creator, uid, request['id'])
+     with sqlite3.connect(path) as db:
+         db.execute('INSERT INTO sent VALUES(?,?,?,?)', (request['id'], 'sent', '{}', frozen))
+     # The genuine schedule entry rolls back rather than releasing admission custody.
+diff --git a/tests/hermes_cli/test_origin_forward_run_end.py b/tests/hermes_cli/test_origin_forward_run_end.py
+index d3bd2fedce0a9acf1fedde125a7ccd507af53948..eab3a6bb8a7ae28e71c7306d87b46b169ef6d316 100644
+--- a/tests/hermes_cli/test_origin_forward_run_end.py
++++ b/tests/hermes_cli/test_origin_forward_run_end.py
+@@ -108,6 +108,66 @@
+         assert kb.latest_run(conn, task).ended_at is not None
+ 
+ 
++def test_forward_reserves_before_enqueue(pending, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++    task, run, path, body = pending
++    with sqlite3.connect(path) as db:
++        db.execute('DELETE FROM sent')
++    monkeypatch.setattr(placement, 'hub_carries_options', lambda cli: True)
++    monkeypatch.setattr(placement, 'remote_state', lambda rid: None)
++    calls = []
++    with kbc.connect_closing() as conn:
++        def enqueue(argv):
++            # Enqueue is paused BEFORE its courier row exists. The durable
++            # board reservation must already prevent a concurrent lifecycle.
++            with kbc.connect_closing() as other:
++                with pytest.raises(ValueError, match='origin_forward_pending'):
++                    continuation.continue_task(other, task, checkpoint='next', expected_run_id=run)
++            calls.append(argv)
++            return 3, '', 'queued offline'
++        monkeypatch.setattr(placement, 'hub_runner', enqueue)
++        out = placement.create_remote({'title': 'child', 'assignee': 'default'}, target='hub', self_gw='worker',
++                                      origin_session='chat', origin_profile='default', origin_gateway='hub',
++                                      creator=body['args']['creator'], run_uid='run-current', cfg={}, conn=conn)
++        assert out['ok'], out
++        assert len(calls) == 1
++
++
++@pytest.mark.parametrize('missing', ['row', 'store'])
++def test_reservation_survives_missing_courier_evidence(pending, missing):
++    from hermes_cli.kanban_origin_forward_run_end import reserve
++    task, run, path, body = pending
++    with kbc.connect_closing() as conn:
++        reserve(conn, task, 'run-current', body['id'])
++        reserve(conn, task, 'run-current', body['id'])
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='origin_forward_reserved'").fetchone()[0] == 1
++    if missing == 'store':
++        path.unlink()
++    else:
++        with sqlite3.connect(path) as db:
++            db.execute('DELETE FROM sent')
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='origin_forward_pending'):
++            continuation.continue_task(conn, task, checkpoint='next', expected_run_id=run)
++        assert kb.get_task(conn, task).status == 'running'
++
++
++def test_ending_wins_before_submission(pending, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++    task, run, path, body = pending
++    with sqlite3.connect(path) as db:
++        db.execute('DELETE FROM sent')
++    monkeypatch.setattr(placement, 'hub_carries_options', lambda cli: True)
++    monkeypatch.setattr(placement, 'remote_state', lambda rid: None)
++    monkeypatch.setattr(placement, 'hub_runner', lambda argv: pytest.fail('ended creator must not enqueue'))
++    with kbc.connect_closing() as conn:
++        assert continuation.continue_task(conn, task, checkpoint='next', expected_run_id=run)['ok']
++        with pytest.raises(ValueError, match='origin_forward_submit_run_ended'):
++            placement.create_remote({'title': 'child', 'assignee': 'default'}, target='hub', self_gw='worker',
++                                    origin_session='chat', origin_profile='default', origin_gateway='hub',
++                                    creator=body['args']['creator'], run_uid='run-current', cfg={}, conn=conn)
++
++
+ def test_unreadable_courier_is_not_absence(pending):
+     task, run, path, _ = pending
+     path.write_bytes(b'not a database')
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 45719d29d232227484f2295f580bb11824a65743..ec23cbdd777568e01f7127e1e4538108e493840a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1478,7 +1478,7 @@
+         placed = kp.create_remote(view, target=target, origin_session=session_id,
+                                   origin_profile=origin_profile or current_profile_name("default") or "default",
+                                   self_gw=self_gw, cfg=cfg, hub_cli=reg.hub_cli_path(cfg.get("hub_cli")),
+-                                  **({"canonical_home": True} if home is not None else {}), **forwarding)
++                                  **({"canonical_home": True} if home is not None else {}), **({"conn": conn} if forwarding else {}), **forwarding)
+         if not placed.get("ok"):
+             logger.warning("kanban placement: %s refused the card (%s)",
+                            target, placed.get("error"))
+-- 
+2.43.0
+

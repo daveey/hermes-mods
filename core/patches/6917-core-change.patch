@@ -1,0 +1,554 @@
+From 25c9be1b2c5829294cce9f1bc9a987553dee7825 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:59:54 +0000
+Subject: [PATCH 6917] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 25c9be1b2c5829294cce9f1bc9a987553dee7825.
+
+---
+diff --git a/hermes_cli/kanban_replay_primary.py b/hermes_cli/kanban_replay_primary.py
+index 45d494e9b85396c781066ec0db9b79252990bfdc..043fea6b9fa9668abdba97b570acbdae761bc419 100644
+--- a/hermes_cli/kanban_replay_primary.py
++++ b/hermes_cli/kanban_replay_primary.py
+@@ -27,13 +27,14 @@
+         from hermes_cli.kanban_sync_client import HubError, Resync
+         try:
+             from hermes_cli.kanban_replay_reply import row_evidence_envelope
+-            evidence = row_evidence_envelope(self.hub.row_evidence(self.board, row['table_name'], row['row_uid']))
++            evidence = row_evidence_envelope(self.hub.row_evidence(self.board, row['table_name'], row['row_uid']),
++                                             conn=self.conn, table=row['table_name'])
+         except (OSError, HubError, Resync, ValueError) as exc:
+             raise CurrentRowHold(f'primary replay live current row unavailable: {exc}', transient=True) from exc
+         image = evidence.get('row')
+         if (evidence.get('board') != self.board or evidence.get('table') != row['table_name'] or
+                 evidence.get('uid') != row['row_uid'] or
+-                type(evidence.get('head')) is not int or evidence['head'] < 0):
++                type(evidence.get('head')) is not int or not 0 <= evidence['head'] < 1 << 63):
+             raise CurrentRowHold('primary replay live current row unavailable: unbound evidence')
+         if (row['op'] == 'delete' and verdict['status'] in ('applied', 'merged') and
+                 evidence.get('state') == 'deleted' and 'row' in evidence and image is None):
+diff --git a/hermes_cli/kanban_replay_reconcile.py b/hermes_cli/kanban_replay_reconcile.py
+index deaf2f680158d4f51a8ff1035c905124205d3474..ea46a5c3837f21789cfa1f1d413fa99d05db641a 100644
+--- a/hermes_cli/kanban_replay_reconcile.py
++++ b/hermes_cli/kanban_replay_reconcile.py
+@@ -56,6 +56,19 @@
+             not isinstance(verdict.get('status'), str) or verdict['status'] not in _FINAL or
+             verdict.get('row') is not None or verdict.get('source_predecessor') is not None):
+         raise ValueError('invalid retained verdict')
++    # Both inspected and consuming replies pass here before settlement binds SQLite.
++    if 'version' in verdict:
++        version = verdict['version']
++        if type(version) is not int or not 0 <= version <= _MAX:
++            raise ValueError('invalid retained verdict version')
++    for key in ('reason', 'detail'):
++        if verdict.get(key) is not None and not isinstance(verdict[key], str):
++            raise ValueError(f'invalid retained verdict {key}')
++    if verdict.get('deferred') is not None:
++        reference = verdict['deferred']
++        if (not isinstance(reference, dict) or set(reference) != {'task', 'origin'} or
++                any(not isinstance(reference[key], str) or not reference[key] for key in ('task', 'origin'))):
++            raise ValueError('invalid retained verdict deferred reference')
+     return verdict
+ 
+ 
+diff --git a/hermes_cli/kanban_replay_reply.py b/hermes_cli/kanban_replay_reply.py
+index 29e7883622ccfc51692ac61657826c5922279613..6c124119837dffd9cebec5f9911bc706e9102616 100644
+--- a/hermes_cli/kanban_replay_reply.py
++++ b/hermes_cli/kanban_replay_reply.py
+@@ -24,6 +24,8 @@
+     """Refuse a non-object capability as a board-local stream fault."""
+     if not isinstance(payload, dict):
+         raise ValueError('replay capability unavailable')
++    if payload.get('deferred_observation') is not None and not isinstance(payload['deferred_observation'], str):
++        raise ValueError('invalid replay deferred capability')
+     return payload
+ 
+ 
+@@ -36,9 +38,17 @@
+     return slot
+ 
+ 
+-def row_evidence_envelope(payload):
+-    """Refuse a non-object current-row evidence payload before dereference."""
+-    return mapping_envelope(payload, 'current-row')
++def row_evidence_envelope(payload, *, conn=None, table=None):
++    """Validate current-row scalars before either projection path can bind them."""
++    from hermes_cli.kanban_replay_values import integer, row_image
++    mapping_envelope(payload, 'current-row')
++    image = payload.get('row')
++    if image:  # {} and None are judged by the caller's own deletion/evidence rules
++        mapping_envelope(image, 'current-row image')
++        integer(image.get('version'), 'current-row version', minimum=1)
++        if conn is not None:
++            row_image(conn, table, image)
++    return payload
+ 
+ 
+ def consumed_slot(reply, wire, previous, local):
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index f6c63817a7720320690a738e32a9bdac0ceed843..33d7800e9a2ddf66f1c82c9155d94acb3626ea8d 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -222,13 +222,14 @@
+         from hermes_cli.kanban_replay_existence import CurrentRowHold
+         try:
+             from hermes_cli.kanban_replay_reply import row_evidence_envelope
+-            evidence = row_evidence_envelope(hub.row_evidence(board, 'tasks', row['row_uid']))
++            evidence = row_evidence_envelope(hub.row_evidence(board, 'tasks', row['row_uid']),
++                                             conn=conn, table='tasks')
+         except (OSError, client.HubError, client.Resync, ValueError) as exc:
+             raise CurrentRowHold(f'synthetic parent current row unavailable: {exc}', transient=True) from exc
+         state = evidence.get('row')
+         if (evidence.get('board') != board or evidence.get('table') != 'tasks' or
+                 evidence.get('uid') != row['row_uid'] or evidence.get('state') != 'live' or
+-                type(evidence.get('head')) is not int or evidence['head'] < 0 or
++                type(evidence.get('head')) is not int or not 0 <= evidence['head'] < 1 << 63 or
+                 not isinstance(state, dict) or state.get('uid') != row['row_uid'] or
+                 type(state.get('version')) is not int or state['version'] <= 0 or
+                 state.get('deleted_at') is not None):
+diff --git a/hermes_cli/kanban_replay_values.py b/hermes_cli/kanban_replay_values.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..811bd0dfb7ef74ef4490c1c7a91c0f47aa1f5742
+--- /dev/null
++++ b/hermes_cli/kanban_replay_values.py
+@@ -0,0 +1,69 @@
++"""Scalar validation before replay current-row projection touches SQLite."""
++import math
++
++from hermes_cli import kanban_db_sync as sync
++
++MAX_INTEGER = (1 << 63) - 1
++
++
++def integer(value, label, *, minimum=0):
++    """Require an exact bounded integer, never bool or a coercible wire value."""
++    if type(value) is not int or not minimum <= value <= MAX_INTEGER:
++        raise ValueError(f'invalid replay {label}')
++    return value
++
++
++def row_image(conn, table, image):
++    """Validate actual projected columns against the destination's declared types.
++
++    Wire-only and unknown columns are not projected. JSON server columns retain
++    their structured contract; scalar columns must not borrow SQLite's coercions.
++    """
++    if table not in sync.SYNCED_TABLES or not isinstance(image, dict):
++        raise ValueError('invalid replay current-row image')
++    if not isinstance(image.get('uid'), str) or not image['uid']:
++        raise ValueError('invalid replay current-row uid')
++    integer(image.get('version'), 'current-row version', minimum=1)
++    for key in ('hlc', 'origin_gateway'):
++        if image.get(key) is not None and not isinstance(image[key], str):
++            raise ValueError(f'invalid replay current-row {key}')
++    allowed = sync.SYNCED_COLUMNS[table] | sync.SERVER_COLUMNS.get(table, frozenset())
++    for column in conn.execute(f'PRAGMA table_info({table})'):
++        name, kind = column[1], column[2].upper()
++        wire = sync.REF_COLUMNS.get((table, name), name)
++        if name not in allowed or wire not in image:
++            continue
++        value = image[wire]
++        if value is None:
++            if column[3]:
++                raise ValueError(f'invalid replay current-row {wire}')
++            continue
++        if (table, name) in sync.REF_COLUMNS:
++            ok = isinstance(value, str) and bool(value)
++        elif name in sync.JSON_SERVER_COLUMNS.get(table, ()):
++            ok = isinstance(value, (str, dict, list))
++        else:
++            ok = _scalar_ok(value, kind)
++        if not ok:
++            raise ValueError(f'invalid replay current-row {wire}')
++    return image
++
++
++def _scalar_ok(value, kind):
++    """Whether ``value`` fits a declared SQLite column type without coercion."""
++    low = -(MAX_INTEGER + 1)
++    if 'INT' in kind:
++        return type(value) is int and low <= value <= MAX_INTEGER
++    if any(token in kind for token in ('REAL', 'FLOAT', 'DOUBLE')):
++        if type(value) is int:
++            return low <= value <= MAX_INTEGER
++        return type(value) is float and math.isfinite(value)
++    if 'BLOB' in kind:
++        if not isinstance(value, dict) or set(value) != {'$blob'} or not isinstance(value['$blob'], str):
++            return False
++        try:
++            bytes.fromhex(value['$blob'])
++        except ValueError:
++            return False
++        return True
++    return 'TEXT' not in kind or isinstance(value, str)
+diff --git a/tests/hermes_cli/kanban_replay_field_matrix_support.py b/tests/hermes_cli/kanban_replay_field_matrix_support.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce67e183b6c1ced99e6d56063efddec2ad699bd2
+--- /dev/null
++++ b/tests/hermes_cli/kanban_replay_field_matrix_support.py
+@@ -0,0 +1,135 @@
++"""Field/value cross-product through HTTP and multi-board dispatch in both orders.
++
++Some probe values are valid for optional text/bools or decimal-string counters.
++Those are positive controls, not grounds for changing the wire protocol.
++"""
++import json
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli.test_kanban_replay_http_session import AckReceiver, serving
++
++live = helpers.live
++VALUES = [2 ** 70, [3], None, '3', True, -1, 1.5]
++FIELDS = {
++    'capability': ('processed_prefix', 'board_incarnation', 'gateway_principal', 'deferred_observation'),
++    'slot': ('mode', 'h', 'a', 'generation', 'session', 'board_incarnation', 'gateway_principal',
++             'journal_id', 'last_op_id', 'last_payload_sha256', 'last_verdict'),
++    'verdict': ('client_op_id', 'status', 'version', 'row', 'source_predecessor', 'reason', 'detail', 'deferred'),
++    'reply': ('protocol', 'results', 'consumed', 'outcome_unknown', 'dup', 'sequence', 'h', 'payload_sha256'),
++    'evidence': ('board', 'table', 'uid', 'state', 'head', 'row'),
++    'image': ('uid', 'version', 'deleted_at', 'hlc', 'origin_gateway', 'title', 'created_at'),
++}
++REPLY_TRANSPORT_ONLY = {('verdict', 'row'), ('verdict', 'source_predecessor')}
++CASES = [(envelope, field) for envelope, fields in FIELDS.items() for field in fields]
++
++
++class FieldReceiver(AckReceiver):
++    def __init__(self, envelope, field, value, tid):
++        super().__init__()
++        self.envelope, self.field, self.value, self.tid = envelope, field, value, tid
++        self.changed_slot = False
++
++    def _call(self, method, path, body=None):
++        if '/changes?' in path:
++            return dict(changes=[], next=0, head=0, more=False)
++        if '/evidence' in path:
++            image = dict(uid=self.tid, version=7, title='current', status='todo', created_at=1)
++            result = dict(board='default', table='tasks', uid=self.tid, state='live', head=1, row=image)
++            target = image if self.envelope == 'image' else result
++            target[self.field] = self.value
++            return result
++        if self.envelope == 'slot' and path.endswith('/inspect') and not self.changed_slot:
++            self.slot[self.field] = self.value
++            self.changed_slot = True
++        result = super()._call(method, path, body)
++        if self.envelope == 'capability' and path.endswith('/capability'):
++            result[self.field] = self.value
++        if path.endswith('/replay/ops'):
++            if self.envelope == 'verdict':
++                verdict = json.loads(self.slot['last_verdict'])
++                verdict[self.field] = self.value
++                self.slot['last_verdict'] = json.dumps(verdict)
++                result['results'][0][self.field] = self.value
++            elif self.envelope == 'reply':
++                target = result if self.field in ('protocol', 'results') else result['results'][0]
++                target[self.field] = self.value
++        return result
++
++
++def valid_control(envelope, field, value):
++    if envelope == 'capability':
++        return ((field == 'processed_prefix' and value is True) or
++                (field == 'deferred_observation' and (value is None or value == '3')))
++    if envelope == 'slot':
++        return ((field in ('last_op_id', 'last_payload_sha256', 'last_verdict') and value is None) or
++                (field == 'session' and value == '3'))
++    if envelope == 'verdict':
++        return ((field in ('row', 'source_predecessor', 'deferred') and value is None) or
++                (field in ('reason', 'detail') and (value is None or value == '3')))
++    if envelope == 'reply':
++        # This reply cannot certify consumption; authoritative inspect is required.
++        return True
++    if envelope == 'image':
++        return ((field == 'deleted_at' and value is None) or
++                (field in ('hlc', 'origin_gateway') and (value is None or value == '3')) or
++                (field == 'title' and value == '3') or
++                (field == 'created_at' and type(value) is int and value == -1))
++    return False
++
++
++def check_field(live, tmp_path, monkeypatch, envelope, field):
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    for index, value in enumerate(VALUES):
++        for reverse in (False, True):
++            path = tmp_path / f'{index}-{reverse}.db'
++            with kbc.connect(path) as conn:
++                live.backup(conn)
++                tid = kb.create_task(conn, title='field matrix', assignee='worker')
++                with kbc.write_txn(conn):
++                    conn.execute("DELETE FROM kanban_sync_outbox WHERE table_name != 'tasks'")
++                if envelope in ('evidence', 'image'):
++                    sync.set_mode(conn, 'primary')
++                peer = FieldReceiver(envelope, field, value, tid)
++                with serving(conn, peer) as (url, requests, _):
++                    hub = client.Hub(client.Identity(url, 'fixture-key', 'macbook'))
++                    boards = [('default', path), ('healthy', healthy_path)]
++                    if reverse:
++                        boards.reverse()
++                    try:
++                        results = client.sync_all_once(hub, boards=boards)
++                    finally:
++                        hub.close()
++                context = (envelope, field, value, reverse, [(r.board, r.error) for r in results])
++                assert [r.board for r in results] == [board for board, _ in boards], context
++                by_board = {r.board: r for r in results}
++                assert by_board['healthy'].error is None, context
++                pulls = {p.split('/')[3] for _, p, _, _ in requests if '/changes?' in p}
++                assert pulls == {'default', 'healthy'}, context
++                if valid_control(envelope, field, value):
++                    assert not by_board['default'].error, context
++                    assert journal.pending_wire(conn) is None, context
++                    assert journal.snapshot(conn)['settled'] == '1', context
++                    if envelope == 'reply' and not (field == 'consumed' and value is True):
++                        assert peer.calls.count('inspect') >= 2, context
++                else:
++                    assert by_board['default'].error, context
++                    # The returned board fault is separate from healthy feed progress.
++                    # The ops reply strips row/source_predecessor as transport fields, so
++                    # that case may settle; the corrupt retained slot verdict is then
++                    # refused at the next authenticated inspect, still as this board's fault.
++                    if (envelope, field) not in REPLY_TRANSPORT_ONLY:
++                        assert journal.snapshot(conn)['settled'] == '0', context
++                        assert conn.execute('SELECT 1 FROM kanban_sync_outbox').fetchone(), context
++                        if peer.sent:
++                            assert journal.pending_wire(conn) is not None, context
++                assert len(peer.sent) <= 1, context
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_capability.py b/tests/hermes_cli/test_kanban_replay_fields_capability.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..689a98891494c24410dc6b79c8a885bcb001976c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_capability.py
+@@ -0,0 +1,9 @@
++"""Capability field matrix through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['capability'])
++def test_capability_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'capability', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_evidence.py b/tests/hermes_cli/test_kanban_replay_fields_evidence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ece72cb218f26e32a502ef5aaf20b4a0dd3f0ec4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_evidence.py
+@@ -0,0 +1,9 @@
++"""Evidence field matrix through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['evidence'])
++def test_evidence_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'evidence', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_image.py b/tests/hermes_cli/test_kanban_replay_fields_image.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..505df4223d980b0d2f51cebb3a20ce212b850787
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_image.py
+@@ -0,0 +1,9 @@
++"""Current image field matrix through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['image'])
++def test_image_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'image', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_reply.py b/tests/hermes_cli/test_kanban_replay_fields_reply.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..670a4dc207c83d3a26604c09a2b5055cd56dd4bd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_reply.py
+@@ -0,0 +1,9 @@
++"""Consuming reply field matrix through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['reply'])
++def test_reply_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'reply', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_slot.py b/tests/hermes_cli/test_kanban_replay_fields_slot.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e161150a2d7123d949a9c1d1849141e0732a0198
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_slot.py
+@@ -0,0 +1,9 @@
++"""Slot field matrix through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['slot'][:6])
++def test_slot_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'slot', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_slot_identity.py b/tests/hermes_cli/test_kanban_replay_fields_slot_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e91b438bc93c593c4e17a82e4a01b55b3998e7f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_slot_identity.py
+@@ -0,0 +1,9 @@
++"""Slot field matrix (identity and retained verdict) through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['slot'][6:])
++def test_slot_identity_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'slot', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_fields_verdict.py b/tests/hermes_cli/test_kanban_replay_fields_verdict.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55830e8f42d053447b9771eb8b936ee3559b53c2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_fields_verdict.py
+@@ -0,0 +1,9 @@
++"""Verdict field matrix through real HTTP and both board orders."""
++import pytest
++from tests.hermes_cli import kanban_replay_field_matrix_support as matrix
++live = matrix.live
++
++
++@pytest.mark.parametrize('field', matrix.FIELDS['verdict'])
++def test_verdict_fields(live, tmp_path, monkeypatch, field):
++    matrix.check_field(live, tmp_path, monkeypatch, 'verdict', field)
+diff --git a/tests/hermes_cli/test_kanban_replay_verdict_version.py b/tests/hermes_cli/test_kanban_replay_verdict_version.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3db3f18e47da19a092ad6876d88781421f4b7f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_verdict_version.py
+@@ -0,0 +1,116 @@
++"""Verdict versions are validated before SQLite settlement, including HTTP recovery."""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_replay_reconcile as reconcile
++from hermes_cli import kanban_replay_reply as reply
++from hermes_cli import kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli.test_kanban_replay_http_session import AckReceiver, serving
++from tests.hermes_cli.test_kanban_replay_reconcile import local, pending, settled_remote, slot
++
++live = helpers.live
++INVALID = [2 ** 70, -(2 ** 63) - 1, -1, [3], {'value': 3}, '3', 3.5, True, None]
++
++
++def snapshots(version, *, absent=False):
++    verdict = dict(client_op_id='operation-one', status='applied')
++    if not absent:
++        verdict['version'] = version
++    remote = settled_remote()
++    remote['last_verdict'] = json.dumps(verdict)
++    wire = dict(client_op_id='operation-one', replay=dict(sequence='1', payload_sha256='a' * 64))
++    result = dict(verdict, consumed=True, sequence='1', h='1', payload_sha256='a' * 64)
++    response = dict(protocol='processed_prefix1', results=[result])
++    return verdict, remote, wire, response
++
++
++@pytest.mark.parametrize('version', INVALID)
++def test_invalid_version_refuses_inspection_and_consuming_reply(version):
++    _, remote, wire, response = snapshots(version)
++    state = local(pending=pending())
++    with pytest.raises(ValueError, match='invalid retained verdict version'):
++        reconcile.reconcile(state, remote)
++    assert reply.consumed_slot(response, wire, slot(), state) is None
++
++
++@pytest.mark.parametrize('version,absent', [(None, True), (0, False), (3, False),
++                                          (2 ** 63 - 1, False)])
++def test_storable_integer_and_absent_versions_keep_both_settlement_paths(version, absent):
++    verdict, remote, wire, response = snapshots(version, absent=absent)
++    state = local(pending=pending())
++    assert reconcile.reconcile(state, remote) == dict(action='record', verdict=verdict)
++    candidate = reply.consumed_slot(response, wire, slot(), state)
++    assert candidate is not None
++    assert reconcile.reconcile(state, candidate) == dict(action='record', verdict=verdict)
++
++
++class VersionReceiver(AckReceiver):
++    def __init__(self, version):
++        super().__init__()
++        self.version = version
++
++    def _call(self, method, path, body=None):
++        if '/changes?' in path:
++            return dict(changes=[], next=0, head=0, more=False)
++        response = super()._call(method, path, body)
++        if path.endswith('/replay/ops'):
++            verdict = json.loads(self.slot['last_verdict'])
++            verdict['version'] = self.version
++            self.slot['last_verdict'] = json.dumps(verdict, separators=(',', ':'))
++            response['results'][0]['version'] = self.version
++        return response
++
++
++@pytest.mark.parametrize('order', ['broken-first', 'healthy-first'])
++@pytest.mark.parametrize('version', [3, 2 ** 70, [3]])
++def test_http_version_fault_keeps_pending_and_both_board_pulls(live, tmp_path, monkeypatch, version, order):
++    kb.create_task(live, title='version response', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name != 'tasks'")
++    broken_path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    boards = [('default', broken_path), ('healthy', healthy_path)]
++    if order == 'healthy-first':
++        boards.reverse()
++    receiver = VersionReceiver(version)
++    with serving(live, receiver) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'macbook'))
++        frozen = None
++        try:
++            for _round in range(2):
++                start = len(requests)
++                results = client.sync_all_once(hub, boards=boards)
++                assert [result.board for result in results] == [board for board, _ in boards]
++                by_board = {result.board: result for result in results}
++                assert not by_board['healthy'].error
++                pulls = {p.split('/')[3] for _, p, _, _ in requests[start:] if '/changes?' in p}
++                assert pulls == {'default', 'healthy'}
++                if version == 3:
++                    assert not by_board['default'].error
++                    assert journal.snapshot(live)['settled'] == '1'
++                    assert journal.pending_wire(live) is None
++                else:
++                    assert 'invalid retained verdict version' in by_board['default'].error
++                    assert journal.snapshot(live)['settled'] == '0'
++                    current = journal.pending_wire(live)
++                    assert current is not None
++                    if frozen is not None:
++                        assert current == frozen
++                    frozen = current
++                    row = live.execute('SELECT state FROM kanban_sync_outbox').fetchone()
++                    assert row is not None and row['state'] == 'pending'
++        finally:
++            hub.close()
++    assert sum(p.endswith('/replay/ops') for _, p, _, _ in requests) == 1
+-- 
+2.43.0
+

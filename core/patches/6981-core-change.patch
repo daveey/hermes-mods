@@ -1,0 +1,270 @@
+From eebc41292487b41de1afccaf3e11100461d83678 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:07:49 +0000
+Subject: [PATCH 6981] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit eebc41292487b41de1afccaf3e11100461d83678.
+
+---
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+index e6d4dd59bc8bacd6185b189983117c2a784d79ba..fda356cfeac914aa42ac2a031d29bb30cada298f 100644
+--- a/hermes_cli/kanban_ask_resolved.py
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -445,7 +445,8 @@
+                 continue
+             last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
+                                 (tid, filed_id, ALIVE_EVENT)).fetchone()[0]
+-            silent = now - max(filed_at, int(last or 0))
++            baseline = kanban_home_probe.remote_baseline(conn, tid, filed_id, host, payload.get("probe_host"), now)
++            silent = now - max(filed_at, int(last or 0), baseline)
+             if silent <= kwc.ALIVE_EVERY + 2 * int(every) + kwc.SILENT_GRACE:
+                 continue
+             with kb.write_txn(conn):
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index cf54a9db650cbc4592ecad9fc21ab2f8ad880496..d9a89f7a1a38a572c896ca96c172159b174fe32d 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -102,8 +102,10 @@
+                                    WHERE f.task_id={_TABLE}.task_id AND f.nonce={_TABLE}.nonce)
+                     AND NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {abort.predicate()}))
+                 BEGIN SELECT RAISE(ABORT, 'home transfer prepared'); END""")
++    # Upgrade the earlier task+nonce-only guard on existing dormant stores.
++    conn.execute("DROP TRIGGER IF EXISTS home_prepared1_marker_delete")
+     for action in ("UPDATE", "DELETE"):
+-        condition = ("WHEN NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE a.task_id=OLD.task_id AND a.nonce=OLD.nonce)"
++        condition = (f"WHEN NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {abort.predicate('OLD')})"
+                      if action == "DELETE" else "")
+         conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_prepared1_marker_{action.lower()}
+             BEFORE {action} ON {_TABLE} {condition}
+@@ -136,6 +138,9 @@
+         _install(conn)
+         old = conn.execute(f"SELECT task_id,source,destination,nonce,expected_version FROM {_TABLE} WHERE task_id=?",
+                            (task_id,)).fetchone()
++        if (not old or tuple(old) != tuple(record.values())) and conn.execute(
++                'SELECT 1 FROM kanban_home_aborted1 WHERE nonce=?', (nonce,)).fetchone():
++            raise ValueError("home preparation nonce already aborted")
+         if old and tuple(old) != tuple(record.values()) and abort.aborted(conn, task_id):
+             conn.execute(f"DELETE FROM {_TABLE} WHERE task_id=?", (task_id,))
+             old = None
+diff --git a/tests/hermes_cli/test_home_nonce_ask_boundaries.py b/tests/hermes_cli/test_home_nonce_ask_boundaries.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..55338124e958548de21fb76dc7677c7924279db7
+--- /dev/null
++++ b/tests/hermes_cli/test_home_nonce_ask_boundaries.py
+@@ -0,0 +1,172 @@
++"""Consumed attempt custody and ask-specific post-transfer clocks. [daveey]"""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as transfer, kanban_ask_resolved as ask, kanban_wake_check as wake
++from tests.hermes_cli import test_kanban_home_source_stop as stop
++from tests.hermes_cli import test_home_probe_custody as probes
++
++board = stop.board
++
++
++def aborted(board):
++    task, record = stop.prepared(board)
++    receipt = {**record, 'phase': 'aborted', 'rows': []}
++    with dbc.write_txn(board):
++        transfer.abort_source(board, receipt)
++    return task, record, receipt
++
++
++def prepare(board, task, record, **changes):
++    args = {k: record[k] for k in ('source', 'destination', 'nonce', 'expected_version')}
++    return transfer.prepare(board, task, **{**args, **changes})
++
++
++def test_refused_nonce_reuse_preserves_old_marker_even_when_caller_commits(board):
++    task, record, receipt = aborted(board)
++    with dbc.write_txn(board):
++        board.execute('UPDATE tasks SET sync_version=8 WHERE id=?', (task,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        before = tuple(board.execute('SELECT * FROM kanban_home_prepared1').fetchone())
++        with pytest.raises(ValueError, match='nonce already aborted'):
++            prepare(board, task, record, expected_version=8)
++        assert tuple(board.execute('SELECT * FROM kanban_home_prepared1').fetchone()) == before
++        # Exact old retries retain idempotent noncommit custody, not a new attempt.
++        assert prepare(board, task, record)['expected_version'] == 7
++        assert transfer.abort_source(board, receipt)['phase'] == 'aborted_local'
++    assert not transfer.frozen(board, task)
++
++
++@pytest.mark.parametrize('remove_marker', [False, True])
++def test_consumed_nonce_is_refused_without_matching_old_marker(board, remove_marker):
++    task, record, _ = aborted(board)
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_home_prepared1 WHERE task_id=?', (task,))
++        if not remove_marker:
++            prepare(board, task, record, nonce='another-fresh-attempt-0001')
++        before = [tuple(r) for r in board.execute('SELECT * FROM kanban_home_prepared1')]
++        with pytest.raises(ValueError, match='nonce already aborted'):
++            prepare(board, task, record)
++        assert [tuple(r) for r in board.execute('SELECT * FROM kanban_home_prepared1')] == before
++
++
++def test_fresh_nonce_can_replace_aborted_attempt_and_abort_after_reopen(board):
++    task, record, _ = aborted(board)
++    new = {**record, 'nonce': 'fresh-home-attempt-0001', 'expected_version': 8, 'phase': 'aborted', 'rows': []}
++    with dbc.write_txn(board):
++        board.execute('UPDATE tasks SET sync_version=8 WHERE id=?', (task,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        prepare(board, task, new)
++    assert transfer.frozen(board, task)
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path) as peer:
++        peer.execute('BEGIN IMMEDIATE')
++        assert prepare(peer, task, new)['nonce'] == new['nonce']
++        assert transfer.abort_source(peer, new)['phase'] == 'aborted_local'
++        peer.commit()
++        assert not transfer.frozen(peer, task)
++        assert peer.execute('SELECT COUNT(*) FROM kanban_home_aborted1').fetchone()[0] == 2
++
++
++@pytest.mark.parametrize('column,value', [('expected_version', 8), ('source', 'worker-a2'), ('destination', 'worker-a2')])
++def test_marker_delete_needs_full_aborted_tuple_on_raw_connection(board, column, value):
++    task, record, _ = aborted(board)
++    # Model an already persisted malformed/legacy marker, not new authority.
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_home_prepared1 WHERE task_id=?', (task,))
++        fields = dict(task_id=task, source=record['source'], destination=record['destination'],
++                      nonce=record['nonce'], expected_version=7)
++        fields[column] = value
++        board.execute('INSERT INTO kanban_home_prepared1 VALUES (?,?,?,?,?)', tuple(fields.values()))
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path) as peer:
++        with pytest.raises(sqlite3.IntegrityError, match='preparation immutable'):
++            peer.execute('DELETE FROM kanban_home_prepared1 WHERE task_id=?', (task,))
++        assert peer.execute('SELECT COUNT(*) FROM kanban_home_prepared1').fetchone()[0] == 1
++    assert transfer.frozen(board, task)
++
++
++def test_existing_dormant_delete_trigger_is_upgraded_on_exact_prepare_retry(board):
++    task, record, _ = aborted(board)
++    with dbc.write_txn(board):
++        board.execute('DROP TRIGGER home_prepared1_marker_delete')
++        board.execute('CREATE TRIGGER home_prepared1_marker_delete BEFORE DELETE ON kanban_home_prepared1 '
++                      'WHEN NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a '
++                      'WHERE a.task_id=OLD.task_id AND a.nonce=OLD.nonce) '
++                      "BEGIN SELECT RAISE(ABORT, 'home transfer preparation immutable'); END")
++        prepare(board, task, record)
++    sql = board.execute("SELECT sql FROM sqlite_master WHERE name='home_prepared1_marker_delete'").fetchone()[0]
++    assert 'OLD.expected_version' in sql and 'OLD.source' in sql and 'OLD.destination' in sql
++
++
++def moved_ask(board, *, host=None, complete=True):
++    support = probes.support
++    support.prepare_destination(board)
++    record = probes.probe_manifest(ask=True, host=host)
++    support.materialize(board, record)
++    if complete:
++        support.complete_feed(board, record)
++    return record['task']
++
++
++LIMIT = wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE
++START = 1000 + LIMIT + 5
++
++
++def test_ask_baseline_is_durable_bounded_write_free_and_never_resolves(board):
++    task = moved_ask(board)
++    assert ask.reconcile(board, now=START)['silent'] == []
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path) as peer:
++        peer.row_factory = sqlite3.Row
++        before = peer.total_changes
++        assert ask.reconcile(peer, now=START + LIMIT)['silent'] == []
++        assert peer.total_changes == before
++        assert ask.reconcile(peer, now=START + LIMIT + 1)['silent'] == [task]
++        assert ask.reconcile(peer, now=START + LIMIT + 2)['silent'] == []
++        assert peer.execute('SELECT first_at FROM kanban_home_probe_watch1').fetchone()[0] == START
++        assert peer.execute('SELECT status FROM tasks WHERE id=?', (task,)).fetchone()[0] == 'blocked'
++        assert wake.get_state(peer, task) is None
++        assert peer.execute('SELECT COUNT(*) FROM task_events WHERE kind=?', (ask.ALIVE_EVENT,)).fetchone()[0] == 0
++
++
++@pytest.mark.parametrize('event,extends', [(ask.ALIVE_EVENT, True), (wake.ALIVE_EVENT, False)])
++def test_only_ask_alive_extends_ask_silence(board, event, extends):
++    task = moved_ask(board)
++    ask.reconcile(board, now=START)
++    alive = START + 100
++    with dbc.write_txn(board):
++        kb._append_event(board, task, event, {})
++        board.execute('UPDATE task_events SET created_at=? WHERE task_id=? AND kind=?', (alive, task, event))
++    result = ask.reconcile(board, now=START + LIMIT + 1)
++    assert result['silent'] == ([] if extends else [task])
++    if extends:
++        assert ask.reconcile(board, now=alive + LIMIT)['silent'] == []
++        assert ask.reconcile(board, now=alive + LIMIT + 1)['silent'] == [task]
++    assert board.execute('SELECT first_at FROM kanban_home_probe_watch1').fetchone()[0] == START
++
++
++def test_explicit_remote_ask_keeps_old_silence_contract(board):
++    task = moved_ask(board, host='worker-a2')
++    assert ask.reconcile(board, now=START)['silent'] == [task]
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_probe_watch1'").fetchone()
++
++
++def test_pending_transfer_ask_installs_no_baseline(board):
++    moved_ask(board, complete=False)
++    before = board.total_changes
++    assert ask.reconcile(board, now=START) == {'restored': [], 'lost': [], 'dropped': [], 'silent': []}
++    assert board.total_changes == before
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_probe_watch1'").fetchone()
++
++
++def test_new_explicit_ask_cannot_borrow_old_observation_window(board):
++    task = moved_ask(board)
++    assert ask.reconcile(board, now=START)['silent'] == []
++    with dbc.write_txn(board):
++        kb._append_event(board, task, 'blocked', {'probe_host': 'worker-a2'})
++        board.execute("UPDATE task_events SET created_at=1000 WHERE task_id=? AND kind='blocked'", (task,))
++    assert ask.reconcile(board, now=START + 1)['silent'] == [task]
++    assert board.execute('SELECT COUNT(*) FROM kanban_home_probe_watch1').fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_review_4300_ask.py b/tests/hermes_cli/test_review_4300_ask.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..da2e828d7f0fa5ce811785a9b23221ecb63afc5e
+--- /dev/null
++++ b/tests/hermes_cli/test_review_4300_ask.py
+@@ -0,0 +1,14 @@
++from tests.hermes_cli import test_home_probe_custody as probes
++from hermes_cli import kanban_ask_resolved as ask, kanban_wake_check as wake
++board = probes.board
++
++def test_transferred_hostless_ask_gets_fresh_observation_window(board):
++    support = probes.support
++    support.prepare_destination(board)
++    record = probes.probe_manifest(ask=True)
++    support.materialize(board, record)
++    support.complete_feed(board, record)
++    now = 1000 + wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE + 5
++    result = ask.reconcile(board, now=now)
++    print('FIRST POST-TRANSFER RECONCILE', result)
++    assert result['silent'] == []
+diff --git a/tests/hermes_cli/test_review_4300_nonce.py b/tests/hermes_cli/test_review_4300_nonce.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8061009e7bfcb9a6fe269f3cb7818ddd5c073433
+--- /dev/null
++++ b/tests/hermes_cli/test_review_4300_nonce.py
+@@ -0,0 +1,15 @@
++import pytest
++from hermes_cli import kanban_db_connect as dbc, kanban_home_transfer as transfer
++from tests.hermes_cli import test_kanban_home_source_stop as support
++board = support.board
++
++
++def test_aborted_nonce_cannot_be_reused_for_new_version(board):
++    tid, record = support.prepared(board)
++    with dbc.write_txn(board):
++        transfer.abort_source(board, {**record, 'phase': 'aborted', 'rows': []})
++        board.execute('UPDATE tasks SET sync_version=8 WHERE id=?', (tid,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++    with dbc.write_txn(board), pytest.raises(ValueError):
++        transfer.prepare(board, tid, source=record['source'], destination=record['destination'],
++                         nonce=record['nonce'], expected_version=8)
+-- 
+2.43.0
+

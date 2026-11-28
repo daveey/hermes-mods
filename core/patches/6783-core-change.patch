@@ -1,0 +1,597 @@
+From 21dafc278b4ae79472f667e31f7f8a2c71392079 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:03:14 +0000
+Subject: [PATCH 6783] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 21dafc278b4ae79472f667e31f7f8a2c71392079.
+
+---
+diff --git a/hermes_cli/kanban_release_assemble.py b/hermes_cli/kanban_release_assemble.py
+index 6492cca3ea10aac57826595c1279011124b8e415..ef9ad4d8b252bb37fa658db9cad35f4834b9ab36 100644
+--- a/hermes_cli/kanban_release_assemble.py
++++ b/hermes_cli/kanban_release_assemble.py
+@@ -6,12 +6,16 @@
+ """
+ from __future__ import annotations
+ 
++import contextvars
+ from dataclasses import dataclass
+ from types import SimpleNamespace
+ 
+ from hermes_cli import kanban_release_application as app, kanban_release_certificate as cert
+ from hermes_cli import kanban_release_replica as replica, kanban_scope_renewal as renewal
+ 
++# Per-invocation observation only; helper return contracts remain unchanged.
++_BUDGET_OBSERVATION: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar('owner_release_budget_observation', default=None)
++
+ 
+ def _scope(conn, proof):
+     body = proof['intent']
+@@ -135,6 +139,9 @@
+     actor = body['actor']
+     state = SimpleNamespace(tid=body['task_id'], writer=('agent', actor['session'], 'native-owner'), runs=body['runs'])
+     runs, cache, _spent, text = release._budget_plan(conn, state)
++    capture = _BUDGET_OBSERVATION.get()
++    if capture is not None:
++        capture.append(_spent)
+     if runs is not None:
+         kept = budget.carried(state.prior).get('cache_read_writer_kind', 'unknown') if state.keeps_limit else 'agent'
+         prior_runs = budget.runs_attribution(state.prior) or 'unknown'
+diff --git a/hermes_cli/kanban_release_final.py b/hermes_cli/kanban_release_final.py
+index 1fb5a17f6c0aaf1871f3e9ac7fd6c4f6c133fa3c..3592b132e458cbc6e179ac563ff54eb8a94892a5 100644
+--- a/hermes_cli/kanban_release_final.py
++++ b/hermes_cli/kanban_release_final.py
+@@ -102,7 +102,7 @@
+     return op
+ 
+ 
+-def freeze(conn, proof, *, delivery_uid):
++def freeze(conn, proof, *, delivery_uid, application_version=1):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_sync import uuid7
+     install(conn)
+@@ -111,7 +111,8 @@
+         if prior['proposal']['delivery_uid'] != delivery_uid or cert.encode(prior['proposal']['consumption']) != cert.encode(proof):
+             raise ValueError('final application replay differs')
+         return prior
+-    proposal = prepared.prepare(conn, proof, delivery_uid=delivery_uid)
++    proposal = (prepared.prepare(conn, proof, delivery_uid=delivery_uid) if application_version == 1 else
++                prepared.prepare(conn, proof, delivery_uid=delivery_uid, application_version=application_version))
+     with kb.write_txn(conn):
+         prior = saved(conn, proof['intent']['intent_uid'])
+         if prior is not None:
+@@ -168,8 +169,10 @@
+ def _validate(value, op):
+     _wire(op)
+     value = cert.parse(cert.encode(value), max_bytes=MAX_BYTES)
+-    if (not cert._exact(value, {'version', 'operation', 'consumption', 'task', 'events', 'comments', 'allowance'})
+-            or type(value['version']) is not int or value['version'] != 1
++    version = op['proposal']['version']
++    fields = {'version', 'operation', 'consumption', 'task', 'events', 'comments'}
++    if (not cert._exact(value, fields | ({'allowance'} if version == 1 else {'governance'}))
++            or type(value['version']) is not int or value['version'] != version
+             or cert.encode(value['operation']) != cert.encode(op)
+             or cert.encode(value['consumption']) != cert.encode(op['proposal']['consumption'])):
+         raise ValueError('canonical application operation differs')
+@@ -181,7 +184,15 @@
+     task = value['task']
+     if not isinstance(task, dict) or task.get('uid') != body['task_id'] or task.get('status') != 'ready':
+         raise ValueError('canonical application historical task differs')
+-    allowance = value['allowance']
++    if version == 2:
++        governance = value['governance']
++        if cert._exact(governance, {'state'}) and governance['state'] == 'ungoverned':
++            return value
++        if not cert._exact(governance, {'state', 'allowance'}) or governance['state'] != 'governed':
++            raise ValueError('canonical application governance differs')
++        allowance = governance['allowance']
++    else:
++        allowance = value['allowance']
+     if (not cert._exact(allowance, {'window_uid', 'episode_uid', 'runs', 'used', 'remaining'})
+             or not cert.intent._coordinate(allowance['window_uid']) or allowance['episode_uid'] != body['episode']
+             or not all(cert._integer(allowance[k]) for k in ('runs', 'used', 'remaining'))
+diff --git a/hermes_cli/kanban_release_final_home.py b/hermes_cli/kanban_release_final_home.py
+index 1469a59b43880db727f0a3a868ddc687310a4efe..57a4cbc0135edc4913b476deec3e034d253a44e6 100644
+--- a/hermes_cli/kanban_release_final_home.py
++++ b/hermes_cli/kanban_release_final_home.py
+@@ -2,25 +2,42 @@
+ from hermes_cli import kanban_release_application as app, kanban_release_final as final
+ from hermes_cli import kanban_release_materialize as materialize, kanban_release_replica as replica
+ 
++_V2_UNAVAILABLE = 'Board owner release application v2 is unavailable; no downgrade or send'
++
+ 
+ def process(conn, hub, row, own, board):
+     from hermes_cli import kanban_release_home as home
+     from hermes_cli.kanban_sync_client import HubError
+     home._identity(conn, hub, row, own, board)
+     final.install(conn)
+-    wire = final.saved(conn, row['intent_uid'])
+-    if wire is None:
+-        proof = replica.verified_consumption(conn, home.queue.wire(row)['client_op_id'])
+-        if proof is None:
+-            raise ValueError('HOME final application lacks winning private consumption')
+-        wire = final.freeze(conn, proof, delivery_uid=row['delivery_uid'])
+-    # Completed private result first, before mutable owner/comments/TTL. It never
+-    # promotes from the historical task image or clears a later independent hold.
++    # Completed private result first, before mutable capability/owner/comments/TTL.
++    # It never promotes from the historical task image or clears a later hold.
+     prior = app.verified_application(conn, row['intent_uid'])
+     if prior is not None:
+         if materialize.verified(conn, row['intent_uid']) is None:
+             raise ValueError('HOME application result lacks canonical private certificate')
+         return prior
++
++    def supports_v2():
++        reader = getattr(hub, 'decision_retain_capability', None)
++        capability = reader(board) if callable(reader) else {}
++        return (isinstance(capability, dict)
++                and type(capability.get('owner_release_application')) is int
++                and capability['owner_release_application'] == 2)
++
++    wire = final.saved(conn, row['intent_uid'])
++    if wire is None:
++        # NEW freeze is gated on present capability; a retained v2 never downgrades.
++        v2 = supports_v2()
++        proposal = final.prepared.verified_prepared(conn, row['intent_uid'])
++        if proposal is not None and proposal['version'] == 2 and not v2:
++            raise ValueError(_V2_UNAVAILABLE)
++        proof = replica.verified_consumption(conn, home.queue.wire(row)['client_op_id'])
++        if proof is None:
++            raise ValueError('HOME final application lacks winning private consumption')
++        wire = (final.freeze(conn, proof, delivery_uid=row['delivery_uid'], application_version=2)
++                if v2 else final.freeze(conn, proof, delivery_uid=row['delivery_uid']))
++    # Historical GET of the exact frozen wire needs no present-day capability.
+     try:
+         value = hub.owner_release_application(board, row['intent_uid'])
+     except HubError as exc:
+@@ -30,6 +47,8 @@
+         home._identity(conn, hub, row, own, board)
+         return materialize.materialize(conn, final.validate(value, wire))
+     home._identity(conn, hub, row, own, board)
++    if wire['proposal']['version'] == 2 and not supports_v2():
++        raise ValueError(_V2_UNAVAILABLE)  # no POST, fallback or remint
+     # No writer during I/O. Even a rejected/unknown/lost POST has to reconcile the
+     # same immutable operation; no new wire is ever created from a missing reply.
+     try:
+diff --git a/hermes_cli/kanban_release_prepared.py b/hermes_cli/kanban_release_prepared.py
+index df1630b36199985bba7164ee9bf386350124c3de..1d298eeb529688a016a9d5c9c5ebf860873feffd 100644
+--- a/hermes_cli/kanban_release_prepared.py
++++ b/hermes_cli/kanban_release_prepared.py
+@@ -33,8 +33,17 @@
+ 
+ 
+ def _validate(data):
+-    if not cert._exact(data, _FIELDS) or type(data['version']) is not int or data['version'] != 1:
++    version = data.get('version') if isinstance(data, dict) else None
++    if (type(version) is not int or version not in (1, 2)
++            or not cert._exact(data, _FIELDS | ({'accounting'} if version == 2 else set()))):
+         raise ValueError('prepared proposal shape differs')
++    if version == 2:
++        accounting = data['accounting']
++        if (not cert._exact(accounting, {'semantics', 'spent_runs'})
++                or accounting['semantics'] != 'core_home_ordinary_v1'
++                or type(accounting['spent_runs']) is not int
++                or not 0 <= accounting['spent_runs'] <= 9007199254740991):
++            raise ValueError('prepared proposal accounting differs')
+     proof = cert.parse(cert.encode(data['consumption']))
+     body, delivery = proof['intent'], data['delivery_uid']
+     cert.validate(proof, board=body['board'], task=body['task_id'], intent_uid=body['intent_uid'])
+@@ -116,7 +125,7 @@
+     raw: str
+ 
+ 
+-def _observe(conn, proof, delivery):
++def _observe(conn, proof, delivery, *, application_version=1):
+     from hermes_cli import kanban_release_assemble as assemble
+     if app._PERMIT.get() is not conn or app._INVOCATION.get() is None or not conn.in_transaction:
+         raise ValueError('proposal trial requires its unique application writer')
+@@ -125,19 +134,26 @@
+     marks = {table:conn.execute(f'SELECT COALESCE(MAX(id),0) FROM {table}').fetchone()[0]
+              for table in ('task_events', 'task_comments')}
+     conn.execute('SAVEPOINT owner_release_proposal_trial')
++    observed = []
++    token = assemble._BUDGET_OBSERVATION.set(observed if application_version == 2 else None)
+     try:
+         assemble._compose(conn, proof, delivery)
+         application = app.verified_application(conn, proof['intent']['intent_uid'])
+         if application is None:
+             raise ValueError('trial failed to produce actual application proof')
+-        data = dict(version=1, consumption=proof, delivery_uid=delivery, task_before=before,
++        data = dict(version=application_version, consumption=proof, delivery_uid=delivery, task_before=before,
+                     task_after=dict(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()),
+                     events=[dict(r) for r in conn.execute('SELECT * FROM task_events WHERE id>? ORDER BY id', (marks['task_events'],))],
+                     comments=[dict(r) for r in conn.execute('SELECT * FROM task_comments WHERE id>? ORDER BY id', (marks['task_comments'],))],
+                     application=application)
++        if application_version == 2:
++            if len(observed) != 1:
++                raise ValueError('proposal requires exactly one real budget observation')
++            data['accounting'] = dict(semantics='core_home_ordinary_v1', spent_runs=observed[0])
+         raw = cert.encode(_validate(data))
+         cert.parse(raw)  # whole-envelope cap, not merely per-row limits
+     finally:
++        assemble._BUDGET_OBSERVATION.reset(token)
+         conn.execute('ROLLBACK TO owner_release_proposal_trial')
+         conn.execute('RELEASE owner_release_proposal_trial')
+     return _Trial(conn, app._INVOCATION.get(), raw)
+@@ -166,8 +182,10 @@
+     return None
+ 
+ 
+-def prepare(conn, proof, *, delivery_uid):
++def prepare(conn, proof, *, delivery_uid, application_version=1):
+     """Retain only an immutable proposal; real trial effects never survive commit."""
++    if type(application_version) is not int or application_version not in (1, 2):
++        raise ValueError('unsupported application version')
+     install(conn)
+     prior = _replay(conn, proof, delivery_uid)
+     if prior is not None:
+@@ -179,6 +197,7 @@
+             return prior
+         if app.verified_application(conn, proof['intent']['intent_uid']) is not None:
+             raise ValueError('existing application cannot be converted into a proposal')
+-        trial = _observe(conn, proof, delivery_uid)
++        trial = (_observe(conn, proof, delivery_uid) if application_version == 1 else
++                 _observe(conn, proof, delivery_uid, application_version=application_version))
+         _store(conn, trial)
+     return verified_prepared(conn, proof['intent']['intent_uid'])
+diff --git a/tests/hermes_cli/test_owner_release_accounting_v2.py b/tests/hermes_cli/test_owner_release_accounting_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c946749d81c7065ce7334652a72d10a706fd423c
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_accounting_v2.py
+@@ -0,0 +1,270 @@
++"""V2 HOME ledger observation; unit contracts, not composed transport proof."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_release as release
++from hermes_cli import kanban_release_prepared as prepared, kanban_release_final as final
++from hermes_cli import kanban_release_certificate as cert, kanban_spend_budget as budget
++from tests.hermes_cli import test_owner_release_assemble as helpers
++from tests.hermes_cli.test_owner_release_prepared import snapshot
++from tests.hermes_cli import test_owner_release_final as final_helpers
++from tests.hermes_cli import test_owner_release_materialize as materialize_helpers
++
++canonical = final_helpers.canonical
++
++board = helpers.board
++proof = helpers.proof
++assembly = helpers.assembly
++
++
++def test_v2_real_observation_once_and_whole_rollback(assembly, monkeypatch):
++    a = assembly
++    import time
++    now = int(time.time())
++    with kb.write_txn(a.conn):
++        for _ in range(2):
++            a.conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome) VALUES (?,'default','continued',?,?,'continued')",
++                           (a.tid, now-budget.MIN_RUN_SECONDS, now))
++    original = release._budget_plan
++    observed = []
++    def observe(conn, state):
++        result = original(conn, state)
++        observed.append(result)
++        return result
++    monkeypatch.setattr(release, '_budget_plan', observe)
++    before = snapshot(a)
++    data = prepared.prepare(a.conn, a.proof, delivery_uid='delivery-1', application_version=2)
++    assert snapshot(a) == before
++    assert len(observed) == 1
++    assert observed[0][2] == 2
++    assert data['version'] == 2
++    assert data['accounting'] == {'semantics': 'core_home_ordinary_v1', 'spent_runs': 2}
++    b = cert.parse(next(e['payload'] for e in data['events'] if e['kind'] == 'spend_budget_set'))
++    assert b['runs'] == 2 + a.proof['intent']['runs']
++    assert data['application']['result']['version'] == 1
++    assert prepared.prepare(a.conn, a.proof, delivery_uid='delivery-1') == data
++    assert len(observed) == 1
++
++
++@pytest.mark.parametrize('governed', [False, True])
++def test_v2_final_governance_union(canonical, governed):
++    value = canonical
++    op = value['operation']
++    op['proposal'].update(version=2, accounting={'semantics': 'core_home_ordinary_v1', 'spent_runs': 0})
++    allowance = value.pop('allowance')
++    value.update(version=2, governance={'state': 'governed', 'allowance': allowance} if governed else {'state': 'ungoverned'})
++    assert final.validate(value, op) == value
++
++
++@pytest.mark.parametrize('bad', [True, 2.0, '2', 0, 3])
++def test_proposal_version_strict(canonical, bad):
++    p = canonical['operation']['proposal']
++    p.update(version=bad, accounting={'semantics': 'core_home_ordinary_v1', 'spent_runs': 0})
++    with pytest.raises(ValueError):
++        prepared._validate(p)
++
++
++@pytest.mark.parametrize('bad', [True, 0.0, -1, 9007199254740992, None, '0'])
++def test_accounting_spent_strict(canonical, bad):
++    p = canonical['operation']['proposal']
++    p.update(version=2, accounting={'semantics': 'core_home_ordinary_v1', 'spent_runs': bad})
++    with pytest.raises(ValueError):
++        prepared._validate(p)
++
++
++@pytest.mark.parametrize('bad', [{}, {'state': 'unknown'}, {'state':'ungoverned','allowance':{}}, {'state':'governed'}, {'state':'ungoverned','extra':1}])
++def test_governance_exact(canonical, bad):
++    p = canonical['operation']['proposal']
++    p.update(version=2, accounting={'semantics': 'core_home_ordinary_v1', 'spent_runs': 0})
++    canonical.pop('allowance')
++    canonical.update(version=2, governance=bad)
++    with pytest.raises(ValueError):
++        final.validate(canonical, canonical['operation'])
++
++
++@pytest.mark.parametrize('feature,expected', [(None, 1), (True, 1), (2.0, 1), ('2', 1), (1, 1), (2, 2)])
++def test_capability_before_freeze_and_no_advertisement(assembly, monkeypatch, feature, expected):
++    from hermes_cli import kanban_release_final_home as home, kanban_release_home as transport
++    from types import SimpleNamespace
++    a = assembly
++    row = a.conn.execute('SELECT * FROM owner_release_home_queue').fetchone()
++    monkeypatch.setattr(transport, '_identity', lambda *args: None)
++    calls = []
++    def capability(board):
++        calls.append('capability')
++        return {} if feature is None else {'owner_release_application': feature}
++    def freeze(*args, **kwargs):
++        calls.append('freeze')
++        assert kwargs.get('application_version', 1) == expected
++        raise RuntimeError('freeze observed')
++    hub = SimpleNamespace(decision_retain_capability=capability)
++    monkeypatch.setattr(final, 'freeze', freeze)
++    with pytest.raises(RuntimeError, match='freeze observed'):
++        home.process(a.conn, hub, row, 'home', 'example')
++    assert calls == ['capability', 'freeze']
++
++
++def test_saved_v2_incompatible_capability_never_sends(assembly, monkeypatch):
++    from hermes_cli import kanban_release_final_home as home, kanban_release_home as transport
++    from types import SimpleNamespace
++    a = assembly
++    final.freeze(a.conn, a.proof, delivery_uid='delivery-1', application_version=2)
++    row = a.conn.execute('SELECT * FROM owner_release_home_queue').fetchone()
++    monkeypatch.setattr(transport, '_identity', lambda *args: None)
++    hub = materialize_helpers.Hub(a)
++    hub.decision_retain_capability = lambda board: {}
++    with pytest.raises(ValueError, match='application v2'):
++        home.process(a.conn, hub, row, 'home', 'example')
++    assert final.saved(a.conn, 'intent-1')['proposal']['version'] == 2
++
++
++@pytest.mark.parametrize('writer,unlimited,reached', [('agent', True, False), ('agent', True, True), ('human', False, False), ('human', False, True), ('unknown', False, False)])
++def test_actual_usage_receipt_cache_and_provenance_parity(assembly, writer, unlimited, reached):
++    from types import SimpleNamespace
++    import time
++    a = assembly
++    now = int(time.time())
++    with kb.write_txn(a.conn):
++        rid = a.conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at,outcome) VALUES (?,'default','continued',?,?,'continued')",
++                             (a.tid, now-1, now)).lastrowid
++        kb._append_event(a.conn, a.tid, 'worker_result', {'usage': {'cache_read_tokens': 100}}, run_id=rid)
++        prior = {'runs': 0 if unlimited else 10, 'cache_read_tokens': 50 if reached else 1000,
++                 'writer_kind': writer, 'reason':'prior', 'by':'prior'}
++        if writer == 'unknown':
++            prior.pop('writer_kind')
++        # Standing budget predates the selected stop, not an unacknowledged
++        # competing decision made after it.
++        a.conn.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at,origin_gateway) VALUES ('prior-budget',?,'spend_budget_set',?,1,'home')",
++                       (a.tid, cert.encode(prior)))
++    spent = budget.spend(a.conn, a.tid)
++    assert spent.runs == 1 and spent.reported == 1 and spent.tokens['cache_read_tokens'] == 100
++    state = SimpleNamespace(tid=a.tid, writer=('agent', 'chat-1', 'ordinary'), runs=a.proof['intent']['runs'])
++    before = snapshot(a)
++    if writer == 'human' and reached:
++        with pytest.raises(release._Refusal, match='cache-read limit'):
++            release._budget_plan(a.conn, state)
++        with pytest.raises(release._Refusal, match='cache-read limit'):
++            prepared.prepare(a.conn, a.proof, delivery_uid='delivery-1', application_version=2)
++    else:
++        ordinary = release._budget_plan(a.conn, state)
++        data = prepared.prepare(a.conn, a.proof, delivery_uid='delivery-1', application_version=2)
++        assert data['accounting']['spent_runs'] == ordinary[2] == 1
++        budgets = [cert.parse(e['payload']) for e in data['events'] if e['kind']=='spend_budget_set']
++        if ordinary[0] is None:
++            assert budgets == [] and data['comments'] == []
++        else:
++            assert budgets[0]['runs'] == ordinary[0]
++            assert budgets[0]['cache_read_tokens'] == ordinary[1]
++            if writer in ('human', 'unknown'):
++                assert budgets[0]['cache_read_writer_kind'] == writer
++    assert snapshot(a) == before
++
++
++@pytest.mark.parametrize('accounting', [None, {}, {'semantics':'other','spent_runs':0},
++    {'semantics':'core_home_ordinary_v1','spent_runs':0,'window_start':0}])
++def test_accounting_exact_keys(canonical, accounting):
++    p = canonical['operation']['proposal']
++    p.update(version=2, accounting=accounting)
++    with pytest.raises(ValueError, match='accounting'):
++        prepared._validate(p)
++
++
++@pytest.mark.parametrize('version', [1, True, 2.0, '2'])
++def test_certificate_version_must_match_proposal_strictly(canonical, version):
++    p = canonical['operation']['proposal']
++    p.update(version=2, accounting={'semantics':'core_home_ordinary_v1','spent_runs':0})
++    canonical.pop('allowance')
++    canonical.update(version=version, governance={'state':'ungoverned'})
++    with pytest.raises(ValueError, match='operation'):
++        final.validate(canonical, canonical['operation'])
++
++
++def test_v1_does_not_accept_accounting(canonical):
++    canonical['operation']['proposal']['accounting'] = {'semantics':'core_home_ordinary_v1','spent_runs':0}
++    with pytest.raises(ValueError, match='shape'):
++        final._wire(canonical['operation'])
++
++
++def test_saved_v1_stays_v1_with_feature2(assembly, monkeypatch):
++    from hermes_cli import kanban_release_final_home as home, kanban_release_home as transport
++    from tests.hermes_cli.test_owner_release_materialize import Hub
++    a = assembly
++    expected = final.freeze(a.conn, a.proof, delivery_uid='delivery-1')
++    hub = Hub(a)
++    hub.decision_retain_capability = lambda board: {'owner_release_application': 2}
++    monkeypatch.setattr(transport, '_identity', lambda *args: None)
++    row = a.conn.execute('SELECT * FROM owner_release_home_queue').fetchone()
++    home.process(a.conn, hub, row, 'home', 'example')
++    assert hub.posts == [[expected]]
++    assert final.saved(a.conn, 'intent-1') == expected
++
++
++class _V2Hub(materialize_helpers.Hub):
++    """Actual materialize-test Hub adapter stamped as v2."""
++    def __init__(self, a, capability, loss=False):
++        super().__init__(a, loss)
++        self.cap_calls = 0
++        self._cap = capability
++
++    def decision_retain_capability(self, board):
++        self.cap_calls += 1
++        if isinstance(self._cap, Exception):
++            raise self._cap
++        return self._cap
++
++    def ops(self, board, ops):
++        try:
++            return super().ops(board, ops)
++        finally:
++            _as_v2(self.value)
++
++
++def _as_v2(value):
++    value.pop('allowance', None)
++    value.update(version=2, governance={'state': 'ungoverned'})
++    return value
++
++
++def _setup(a, monkeypatch):
++    from hermes_cli import kanban_release_home as transport, kanban_operator_call as operator
++    monkeypatch.setattr(operator, '_board_slug', lambda _conn: 'example')
++    return a.conn.execute('SELECT * FROM owner_release_home_queue').fetchone()
++
++
++@pytest.mark.parametrize('later', [{}, {'owner_release_application': 1}, OSError('capability down')])
++def test_completed_local_v2_precedes_mutable_capability(assembly, monkeypatch, later):
++    from hermes_cli import kanban_release_home as home
++    a = assembly
++    row = _setup(a, monkeypatch)
++    hub = _V2Hub(a, {'owner_release_application': 2})
++    got = home._process(a.conn, hub, row, 'home', 'example')
++    assert len(hub.posts) == 1 and hub.posts[0][0]['proposal']['version'] == 2
++    hub._cap, hub.cap_calls, hub.value = later, 0, None
++    assert home._process(a.conn, hub, row, 'home', 'example') == got
++    assert hub.cap_calls == 0 and len(hub.posts) == 1
++
++
++@pytest.mark.parametrize('later', [{}, OSError('capability down')])
++def test_remote_v2_history_recovers_without_capability_or_post(assembly, monkeypatch, later):
++    from hermes_cli import kanban_release_home as home
++    a = assembly
++    row = _setup(a, monkeypatch)
++    wire = final.freeze(a.conn, a.proof, delivery_uid='delivery-1', application_version=2)
++    hub = _V2Hub(a, later)
++    hub.value = _as_v2(materialize_helpers.adapter(wire))
++    got = home._process(a.conn, hub, row, 'home', 'example')
++    assert got['result']['outcome'] == 'released'
++    assert hub.posts == [] and hub.cap_calls == 0
++
++
++@pytest.mark.parametrize('later', [{}, {'owner_release_application': 1}])
++def test_missing_remote_v2_with_refused_capability_never_sends(assembly, monkeypatch, later):
++    from hermes_cli import kanban_release_home as home
++    a = assembly
++    row = _setup(a, monkeypatch)
++    wire = final.freeze(a.conn, a.proof, delivery_uid='delivery-1', application_version=2)
++    hub = _V2Hub(a, later)
++    with pytest.raises(ValueError, match='application v2'):
++        home._process(a.conn, hub, row, 'home', 'example')
++    assert hub.posts == [] and final.saved(a.conn, 'intent-1') == wire
+diff --git a/tests/hermes_cli/test_owner_release_composed.py b/tests/hermes_cli/test_owner_release_composed.py
+index 14d57ec4f965383325e4f6f2e6e41fabc934f970..aae2972c3a763658645df0108313f466ea0b4cc4 100644
+--- a/tests/hermes_cli/test_owner_release_composed.py
++++ b/tests/hermes_cli/test_owner_release_composed.py
+@@ -364,7 +364,7 @@
+                 and home.conn.execute("SELECT 1 FROM owner_release_applied_receipts WHERE intent_uid=?", (intent_uid,)).fetchone())
+ 
+ 
+-def authorize_and_drive_home(origin, parties, monkeypatch, *, stacked=False, select=True):
++def authorize_and_drive_home(origin, parties, monkeypatch, *, stacked=False, select=True, governed=True):
+     home, executor = parties
+     ident, native = origin
+     if stacked:
+@@ -394,7 +394,8 @@
+         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE kind='stop_released'").fetchone()[0] == 0
+     # 2. real HOME: pull carrier, queue, consume, final apply, atomic materialization.
+     home.resync()
+-    install_allowance(home, task, episode, intent_uid)
++    if governed:
++        install_allowance(home, task, episode, intent_uid)
+     for _ in range(80):  # the HOME queue also drains stale releases left on the reused disposable Board
+         home_tick(home, monkeypatch)
+         if applied(home, intent_uid):
+diff --git a/tests/hermes_cli/test_owner_release_composed_v2.py b/tests/hermes_cli/test_owner_release_composed_v2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..89cadfb6d276db0f00ce87c2fd3f2b205642dcda
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_composed_v2.py
+@@ -0,0 +1,52 @@
++"""Real CLI/socket/DO/HOME/public executor v2, without any signer call.
++
++The two advertisement READs are fixture overlays only; production remains off.
++"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_release_executor as executor_reader, kanban_spend_decision as decision
++from tests.hermes_cli import test_owner_release_composed as composed
++
++turn = composed.turn
++server = composed.server
++origin = composed.origin
++parties = composed.parties
++
++
++@pytest.mark.parametrize('stacked', [False, True])
++def test_ordinary_no_signer_real_transport_and_public_executor(origin, parties, monkeypatch, stacked):
++    capability = composed.ksc.Hub.decision_retain_capability
++    monkeypatch.setattr(composed.ksc.Hub, 'decision_retain_capability',
++                        lambda self, board: {**capability(self, board), 'owner_release_application': 2})
++    def no_signer(*args):
++        pytest.fail('ordinary path called the signed-window producer')
++    monkeypatch.setattr(composed, 'install_allowance', no_signer)
++    home, executor, native, task, episode, uid, old = composed.authorize_and_drive_home(
++        origin, parties, monkeypatch, stacked=stacked, governed=False)
++    certificate = home.hub.owner_release_application(composed.BOARD, uid)
++    assert certificate['version'] == 2
++    assert certificate['governance'] == {'state': 'ungoverned'}
++    assert 'allowance' not in certificate
++    proposal = certificate['operation']['proposal']
++    assert proposal['version'] == 2
++    assert proposal['accounting']['semantics'] == 'core_home_ordinary_v1'
++    payload = json.loads(next(e['payload'] for e in proposal['events'] if e['kind'] == 'spend_budget_set'))
++    assert payload['runs'] == proposal['accounting']['spent_runs'] + certificate['consumption']['intent']['runs']
++    assert [r['episode'] for r in composed.release_receipts(home, task)] == ([old] if old else []) + [episode]
++    extra = ('--capability-episode', old) if old else ()
++    result = composed.release_cli(native, task, episode, *extra)
++    assert result.returncode == 0, (result.stdout, result.stderr)
++    assert json.loads(result.stdout)['release_stage'] == 'applied'
++    executor.resync()
++    public = executor_reader.verified_application(executor.conn, uid)
++    assert public is not None
++    evidence = executor.hub.row_evidence(composed.BOARD, 'task_events', public['result_event']['uid'])['owner_release_applied_v1']
++    assert evidence['version'] == 1
++    assert 'governance' not in evidence and 'accounting' not in evidence and 'allowance' not in evidence
++    assert not decision.execution_restricted(executor.conn, task)
++    before = composed.event_inventory(home, task)
++    composed.home_tick(home, monkeypatch, rounds=3)
++    assert composed.event_inventory(home, task) == before
++    assert home.hub.owner_release_application(composed.BOARD, uid) == certificate
+-- 
+2.43.0
+

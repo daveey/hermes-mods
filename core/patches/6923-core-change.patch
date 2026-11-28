@@ -1,0 +1,151 @@
+From fcde3bdbeb852b3795d0bae0a7c4b71b3d40062a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:31:07 +0000
+Subject: [PATCH 6923] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit fcde3bdbeb852b3795d0bae0a7c4b71b3d40062a.
+
+---
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 825a86f9df015cf87251658fe8aaa6d5dd452a68..c630338c87fc6543984a20c54e5f04db0a7e5f57 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -44,14 +44,43 @@
+     cancelled: int = 0
+ 
+ 
++# Direct callers (run endings, scope renewal) overlap the sync round's push by design;
++# they wait this long for a bound board's sender fence instead of failing. Tests set 0.
++DIRECT_WAIT_S = 10.0
++
++
++def _sender_fence(path):
++    import time
++    from contextlib import ExitStack
++    from hermes_cli.kanban_sync_guard import SyncRoundBusy, sender_lock
++    deadline = time.monotonic() + DIRECT_WAIT_S
++    while True:
++        stack = ExitStack()
++        try:
++            stack.enter_context(sender_lock(path))
++            return stack
++        except SyncRoundBusy:
++            if time.monotonic() >= deadline:
++                raise
++            time.sleep(0.1)
++
++
+ def push(conn, hub, board, gateway, *, primary, max_batches=25, before_head=False, seen=None):
+-    """Serialize the complete session/send, not only individual SQL writes."""
++    """Serialize a bound journal's complete session/send, not only individual SQL writes.
++
++    A never-enrolled legacy board has no replay custody to fence and keeps the
++    pre-fence behaviour: overlapping legacy pushes are not refused.
++    """
+     from hermes_cli.kanban_db_connect import _main_db_file
+-    from hermes_cli.kanban_sync_guard import sender_lock
++    from hermes_cli import kanban_sync_client as client
+     path = _main_db_file(conn)
+     if path is None:
+         raise ValueError('sender requires an on-disk board')
+-    with sender_lock(path):
++    client.refuse_if_schema_ahead(conn)
++    if not journal.bound_custody(conn):
++        return _push(conn, hub, board, gateway, primary=primary, max_batches=max_batches,
++                     before_head=before_head, seen=seen)
++    with _sender_fence(path):
+         return _push(conn, hub, board, gateway, primary=primary, max_batches=max_batches,
+                      before_head=before_head, seen=seen)
+ 
+diff --git a/tests/hermes_cli/test_kanban_legacy_direct_push.py b/tests/hermes_cli/test_kanban_legacy_direct_push.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4cacf5adc7d1aa54dc06f771b3cd70b126476bc8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_legacy_direct_push.py
+@@ -0,0 +1,68 @@
++"""Review probe (t_d0c500000000000b): a never-enrolled LEGACY board's direct push while another push is in flight.
++
++Public API only, so the same file runs on the merge base and on the PR head.
++"""
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++
++class LegacyHub:
++    """In-process legacy Board: no replay routes, no status-origin capability."""
++    def __init__(self, entered=None, release=None):
++        self.entered, self.release, self.sent = entered, release, []
++        self.ident = client.Identity('http://127.0.0.1:9', 'fixture-key', 'macbook')
++
++    def ops(self, board, ops, **_kwargs):
++        if self.entered is not None:
++            self.entered.set()
++            assert self.release.wait(30)
++        self.sent.append(ops)
++        return {'results': [dict(client_op_id=o['client_op_id'], status='applied', version=1) for o in ops]}
++
++
++def test_direct_legacy_push_while_round_push_in_flight(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    client.ensure_identity(conn, 'default', 'macbook')
++    kb.create_task(conn, title='round row', assignee='worker')
++    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_replay_sender1'").fetchone()  # never enrolled
++    entered, release = threading.Event(), threading.Event()
++    slow = LegacyHub(entered, release)
++    errors = []
++
++    def round_push():
++        other = kbc.connect(home / 'kanban.db')
++        try:
++            client.push(other, slow, 'default', 'macbook', primary=True, max_batches=1)
++        except BaseException as exc:
++            errors.append(exc)
++        finally:
++            other.close()
++
++    thread = threading.Thread(target=round_push)
++    thread.start()
++    try:
++        assert entered.wait(30), 'round push never reached the Board'
++        # A worker's direct caller (retain / completion artifacts / scope renewal) pushes now.
++        direct = LegacyHub()
++        outcome = None
++        try:
++            client.push(conn, direct, 'default', 'macbook', primary=True, max_batches=1)
++            outcome = 'pushed'
++        except RuntimeError as exc:
++            outcome = f'{type(exc).__name__}: {exc}'
++        print('DIRECT_OUTCOME', outcome)
++        with open(str(tmp_path / 'outcome.txt'), 'w') as fh:
++            fh.write(outcome)
++    finally:
++        release.set()
++        thread.join(30)
++        conn.close()
++    assert not errors
++    assert outcome == 'pushed', outcome
+diff --git a/tests/hermes_cli/test_kanban_replay_sender_process.py b/tests/hermes_cli/test_kanban_replay_sender_process.py
+index 2f889ba3afae0cd6b96e13d1d0f9c1456349a8fa..e4650a506e8a9e0bac3ba1cfcb1cf45c319ef9e4 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender_process.py
++++ b/tests/hermes_cli/test_kanban_replay_sender_process.py
+@@ -73,7 +73,9 @@
+ 
+ @pytest.mark.parametrize('action', ['push', 'detach'])
+ @pytest.mark.parametrize('stage', ['session', 'ops'])
+-def test_process_in_http_session_excludes_other_sender_and_detach(live, action, stage):
++def test_process_in_http_session_excludes_other_sender_and_detach(live, action, stage, monkeypatch):
++    from hermes_cli import kanban_replay_sender
++    monkeypatch.setattr(kanban_replay_sender, 'DIRECT_WAIT_S', 0)
+     kb.create_task(live, title='one sender', assignee='worker')
+     path = Path(live.execute('PRAGMA database_list').fetchone()[2])
+     peer = Peer(stage)
+-- 
+2.43.0
+

@@ -1,0 +1,562 @@
+From 38837ceecbf8771aced055ed03a6f0186a3ecd0c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:17:20 +0000
+Subject: [PATCH 6647] Desktop session identity across gateway renames, clarify attention and first send
+
+Public mirror of source commit 38837ceecbf8771aced055ed03a6f0186a3ecd0c.
+
+---
+diff --git a/apps/desktop/electron/profile-session-routing.test.ts b/apps/desktop/electron/profile-session-routing.test.ts
+index 1ec374dce127dbef15d3ee8f6fd022ee207dcfb1..0a11fcfb963d777b9f02659fb029402d1069620c 100644
+--- a/apps/desktop/electron/profile-session-routing.test.ts
++++ b/apps/desktop/electron/profile-session-routing.test.ts
+@@ -1926,3 +1926,41 @@
+     assert.equal(new URL(path, 'http://x').searchParams.get('automated'), 'exclude', path)
+   }
+ })
++
++// Owner-qualified identity: the same profile + stored id on two canonical gateways is two sessions.
++const ownedRow = (id: string, gateway: string | null, extra: Record<string, unknown> = {}) => ({
++  id,
++  profile: 'default',
++  ...(gateway ? { outcome: { kind: 'done', status: { identity: { gateway, profile: 'default', session_id: id, owner_epoch: 'e' } } } } : {}),
++  ...extra
++})
++
++test('registry splice keeps same-id rows from different canonical gateways, in either order', () => {
++  for (const order of [['gw-a', 'gw-b'], ['gw-b', 'gw-a']]) {
++    const merged: unknown[] = [ownedRow('kanban_owner_terminal', order[0], { connection_id: order[0] })]
++    const totals: Record<string, number> = {}
++    const { added } = spliceRegistrySessionRows(merged, [ownedRow('kanban_owner_terminal', order[1], { connection_id: order[1] })], totals)
++    assert.equal(added, 1)
++    assert.deepEqual(merged.map((row: any) => row.outcome.status.identity.gateway), order)
++  }
++})
++
++test('registry splice still replaces the same owner and legacy rows without a canonical gateway', () => {
++  const merged: unknown[] = [ownedRow('s1', 'gw-a'), ownedRow('s2', null)]
++  const { added } = spliceRegistrySessionRows(
++    merged,
++    [ownedRow('s1', 'gw-a', { connection_id: 'alias' }), ownedRow('s2', 'gw-a'), ownedRow('s2', null, { connection_id: 'alias' })],
++    {}
++  )
++  assert.equal(added, 0)
++  assert.equal(merged.length, 2)
++})
++
++test('pinned window keeps same-id pinned rows from two gateways', () => {
++  const rows = [
++    ownedRow('filler', 'gw-a'),
++    ownedRow('twin', 'gw-a', { pinned: true }),
++    ownedRow('twin', 'gw-b', { pinned: true })
++  ]
++  assert.equal(mergeProfileSessionWindow(rows, 0, 1).length, 3)
++})
+diff --git a/apps/desktop/electron/profile-session-routing.ts b/apps/desktop/electron/profile-session-routing.ts
+index 07e2acaf6076ffcb7024e04885c38658a681a2fa..26a0fe4dfcf8d0f039ded574a839f0928e4f087d 100644
+--- a/apps/desktop/electron/profile-session-routing.ts
++++ b/apps/desktop/electron/profile-session-routing.ts
+@@ -1,3 +1,5 @@
++import { SessionOwnerSet } from './session-owner-identity'
++
+ interface SessionListResponse {
+   sessions: unknown[]
+   total: number
+@@ -180,10 +182,44 @@
+   return `${profile}\0${id}`
+ }
+ 
++/** Owner-qualified twin of {@link profileSessionId}: same profile + id on two canonical gateways are
++ *  two sessions. Set-shaped so legacy rows without a canonical gateway still collapse. */
++class RowIdentitySet {
++  private readonly owners = new SessionOwnerSet()
++
++  private split(row: unknown): [string, string] | null {
++    const key = profileSessionId(row)
++
++    if (!key) {
++      return null
++    }
++
++    const at = key.indexOf('\0')
++
++    return [key.slice(0, at), key.slice(at + 1)]
++  }
++
++  /** Rows without an id never match (callers handle them separately). */
++  has(row: unknown): boolean {
++    const parts = this.split(row)
++
++    return parts ? this.owners.has(parts[0], parts[1], row) : false
++  }
++
++  add(row: unknown): void {
++    const parts = this.split(row)
++
++    if (parts) {
++      this.owners.add(parts[0], parts[1], row)
++    }
++  }
++}
++
+ export function mergeProfileSessionWindow(rows: unknown[], offset: number, limit: number): unknown[] {
+   const window = rows.slice(offset, offset + limit)
+   const seenRows = new Set(window)
+-  const seenIds = new Set(window.map(profileSessionId).filter((id): id is string => id !== null))
++  const seenIds = new RowIdentitySet()
++  window.forEach(row => seenIds.add(row))
+ 
+   for (const row of rows.slice(offset + limit)) {
+     if (!isPinned(row)) {
+@@ -192,12 +228,12 @@
+ 
+     const id = profileSessionId(row)
+ 
+-    if ((id && seenIds.has(id)) || (!id && seenRows.has(row))) {
++    if ((id && seenIds.has(row)) || (!id && seenRows.has(row))) {
+       continue
+     }
+ 
+     if (id) {
+-      seenIds.add(id)
++      seenIds.add(row)
+     } else {
+       seenRows.add(row)
+     }
+@@ -793,7 +829,7 @@
+ }
+ 
+ /** Splice registry-gateway rows into an already-merged unified list: dedupe by
+- *  profile + session id (a v1 remote-override splice may already carry a row), keep the
++ *  profile + session id (+ canonical gateway when both rows name one; a v1 remote-override splice may already carry a row), keep the
+  *  recency sort, and extend the per-profile totals so truncation flags stay
+  *  honest. Mutates and returns `merged`/`profileTotals` the way the v1 splice
+  *  does. */
+@@ -802,18 +838,19 @@
+   registryRows: unknown[],
+   profileTotals: Record<string, number>
+ ): { added: number } {
+-  const seen = new Set(merged.map(profileSessionId).filter((id): id is string => id !== null))
++  const seen = new RowIdentitySet()
++  merged.forEach(row => seen.add(row))
+   let added = 0
+ 
+   for (const row of registryRows) {
+     const id = profileSessionId(row)
+ 
+-    if (id && seen.has(id)) {
++    if (id && seen.has(row)) {
+       continue
+     }
+ 
+     if (id) {
+-      seen.add(id)
++      seen.add(row)
+     }
+ 
+     merged.push(row)
+@@ -1308,14 +1345,15 @@
+ 
+ function archivedOnlyWindow(merged: unknown[], offset: number, limit: number): unknown[] {
+   const window = mergeProfileSessionWindow(merged.filter(isArchived), offset, limit)
+-  const ids = new Set(window.map(profileSessionId).filter((id): id is string => id !== null))
++  const ids = new RowIdentitySet()
++  window.forEach(row => ids.add(row))
+ 
+   for (const row of merged) {
+     const id = profileSessionId(row)
+ 
+-    if (!isArchived(row) && isPinned(row) && !(id && ids.has(id))) {
++    if (!isArchived(row) && isPinned(row) && !(id && ids.has(row))) {
+       if (id) {
+-        ids.add(id)
++        ids.add(row)
+       }
+ 
+       window.push(row)
+diff --git a/apps/desktop/electron/session-owner-identity.ts b/apps/desktop/electron/session-owner-identity.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..157fb0ce4a730d9af4f3445e00afa3085f787c1c
+--- /dev/null
++++ b/apps/desktop/electron/session-owner-identity.ts
+@@ -0,0 +1,39 @@
++/** Owner-qualified identity for session list rows. Stored ids are only unique per profile AND per
++ *  gateway: two gateways may both serve `kanban_owner_terminal`. A row's canonical owner is
++ *  `outcome.status.identity.gateway` (a connection id is only an alias of a gateway, so it never
++ *  separates rows). Legacy rows with no canonical gateway keep the old profile + id collapse.
++ *  Renderer twin: src/lib/session-owner-identity.ts (electron cannot import from src). */
++
++function field(value: unknown, key: string): unknown {
++  return value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined
++}
++
++export function canonicalGatewayOf(row: unknown): string {
++  const gateway = field(field(field(field(row, 'outcome'), 'status'), 'identity'), 'gateway')
++
++  return typeof gateway === 'string' ? gateway.trim() : ''
++}
++
++/** Set of profile + id (+ canonical gateway when known). A row matches an entry of the same
++ *  profile + id unless both name a canonical gateway and the gateways differ. */
++export class SessionOwnerSet {
++  private readonly byKey = new Map<string, Set<string>>()
++
++  private key(profile: string, id: string): string {
++    return `${profile}\0${id}`
++  }
++
++  has(profile: string, id: string, row: unknown): boolean {
++    const owners = this.byKey.get(this.key(profile, id))
++    const gateway = canonicalGatewayOf(row)
++
++    return Boolean(owners && (!gateway || owners.has('') || owners.has(gateway)))
++  }
++
++  add(profile: string, id: string, row: unknown): void {
++    const key = this.key(profile, id)
++    const owners = this.byKey.get(key) ?? new Set<string>()
++    owners.add(canonicalGatewayOf(row))
++    this.byKey.set(key, owners)
++  }
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/session-index.test.ts b/apps/desktop/src/app/chat/sidebar/session-index.test.ts
+index 2a2fba12e1dde19eacc0411052c961dab75367a7..e8e7e80831ec2d89c43d42d92838e02aa1a714fd 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-index.test.ts
++++ b/apps/desktop/src/app/chat/sidebar/session-index.test.ts
+@@ -155,3 +155,32 @@
+     expect(resolvePinnedSessions([], index, sessions, settled)).toEqual([])
+   })
+ })
++
++describe('owner-qualified pins', () => {
++  const owned = (gateway: string, extra: Partial<SessionInfo> = {}) =>
++    row('kanban_owner_terminal', {
++      outcome: { kind: 'done', status: { identity: { gateway, owner_epoch: 'e', profile: 'default', session_id: 'kanban_owner_terminal' } } },
++      ...extra
++    } as Partial<SessionInfo>)
++
++  it('shows both server-pinned twins from different gateways and still dedupes the same owner', () => {
++    const a = owned('gw-a', { pinned: true })
++    const b = owned('gw-b', { pinned: true })
++    const index = buildSessionByAnyId([a, b], [], [])
++
++    // bare legacy pin resolves the index winner; the other owner's pinned twin comes via the row flag
++    expect(resolvePinnedSessions(['kanban_owner_terminal'], index, [a, b], settled)).toHaveLength(2)
++    expect(resolvePinnedSessions([], index, [a, owned('gw-a', { pinned: true })], settled)).toHaveLength(1)
++  })
++
++  it('resolves an owner-qualified pin exactly, bare pins stay a legacy fallback', () => {
++    const a = owned('gw-a')
++    const b = owned('gw-b')
++    const index = buildSessionByAnyId([a, b], [], [])
++
++    expect(index.get('gw-a\0kanban_owner_terminal')).toBe(a)
++    expect(index.get('gw-b\0kanban_owner_terminal')).toBe(b)
++    expect(resolvePinnedSessions(['gw-a\0kanban_owner_terminal'], index, [], settled)).toEqual([a])
++    expect(resolvePinnedSessions(['kanban_owner_terminal'], index, [], settled)).toHaveLength(1)
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/session-index.ts b/apps/desktop/src/app/chat/sidebar/session-index.ts
+index 8b101e42cf60a691eaac8c5a34c25c0b466560aa..a1005b02e9fbf64cf6c1fb68ae50e3648ace66ec 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-index.ts
++++ b/apps/desktop/src/app/chat/sidebar/session-index.ts
+@@ -1,3 +1,4 @@
++import { canonicalGatewayOf, SessionOwnerSet } from '@/lib/session-owner-identity'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+ /**
+@@ -24,6 +25,14 @@
+   for (const session of [...cronSessions, ...messagingSessions, ...visibleSessions]) {
+     map.set(session.id, session)
+ 
++    // Exact-owner key (`<canonical gateway>\0<id>`) for a pin that names its owner; bare ids stay the
++    // legacy fallback, so an owner-less pin keeps resolving exactly as before.
++    const owner = canonicalGatewayOf(session)
++
++    if (owner) {
++      map.set(`${owner}\0${session.id}`, session)
++    }
++
+     if (session._lineage_root_id && !map.has(session._lineage_root_id)) {
+       map.set(session._lineage_root_id, session)
+     }
+@@ -63,20 +72,21 @@
+   allSessions: readonly SessionInfo[],
+   unconfirmedPinWrites: ReadonlySet<string>
+ ): SessionInfo[] {
+-  const seen = new Set<string>()
++  // Owner-aware: the same stored id served by two canonical gateways is two pinned rows.
++  const seen = new SessionOwnerSet()
+   const out: SessionInfo[] = []
+ 
+   for (const pinId of pinnedSessionIds) {
+     const session = sessionByAnyId.get(pinId)
+ 
+-    if (session && !seen.has(session.id)) {
+-      seen.add(session.id)
++    if (session && !seen.has('', session.id, session)) {
++      seen.add('', session.id, session)
+       out.push(session)
+     }
+   }
+ 
+   for (const session of allSessions) {
+-    if (session.pinned !== true || seen.has(session.id)) {
++    if (session.pinned !== true || seen.has('', session.id, session)) {
+       continue
+     }
+ 
+@@ -89,7 +99,7 @@
+       continue
+     }
+ 
+-    seen.add(session.id)
++    seen.add('', session.id, session)
+     out.push(session)
+   }
+ 
+diff --git a/apps/desktop/src/lib/session-owner-identity.ts b/apps/desktop/src/lib/session-owner-identity.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1670cd33f972f426744f077af518e88ae25d43ad
+--- /dev/null
++++ b/apps/desktop/src/lib/session-owner-identity.ts
+@@ -0,0 +1,50 @@
++/** Owner-qualified identity for session list rows. Stored ids are only unique per profile AND per
++ *  gateway: two gateways may both serve `kanban_owner_terminal`. A row's canonical owner is
++ *  `outcome.status.identity.gateway` (a connection id is only an alias of a gateway, so it never
++ *  separates rows). Legacy rows with no canonical gateway keep the old profile + id collapse.
++ *  Electron twin: electron/session-owner-identity.ts (the two trees cannot import each other). */
++
++function field(value: unknown, key: string): unknown {
++  return value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined
++}
++
++export function canonicalGatewayOf(row: unknown): string {
++  const gateway = field(field(field(field(row, 'outcome'), 'status'), 'identity'), 'gateway')
++
++  return typeof gateway === 'string' ? gateway.trim() : ''
++}
++
++/** Set of profile + id (+ canonical gateway when known). A row matches an entry of the same
++ *  profile + id unless both name a canonical gateway and the gateways differ. */
++export class SessionOwnerSet {
++  private readonly byKey = new Map<string, Set<string>>()
++
++  private key(profile: string, id: string): string {
++    return `${profile}\0${id}`
++  }
++
++  has(profile: string, id: string, row: unknown): boolean {
++    const owners = this.byKey.get(this.key(profile, id))
++    const gateway = canonicalGatewayOf(row)
++
++    return Boolean(owners && (!gateway || owners.has('') || owners.has(gateway)))
++  }
++
++  add(profile: string, id: string, row: unknown): void {
++    const key = this.key(profile, id)
++    const owners = this.byKey.get(key) ?? new Set<string>()
++    owners.add(canonicalGatewayOf(row))
++    this.byKey.set(key, owners)
++  }
++}
++
++/** The row in `candidates` (all sharing one profile + id) that is the same owner as `row`: an exact
++ *  canonical-gateway match wins, else a candidate that does not conflict (legacy fallback). */
++export function sameOwnerRow<T>(candidates: readonly T[] | undefined, row: unknown): T | undefined {
++  const gateway = canonicalGatewayOf(row)
++
++  return (
++    candidates?.find(c => gateway !== '' && canonicalGatewayOf(c) === gateway) ??
++    candidates?.find(c => !gateway || !canonicalGatewayOf(c))
++  )
++}
+diff --git a/apps/desktop/src/store/session.test.ts b/apps/desktop/src/store/session.test.ts
+index 6e20ec8e30e41dd2c40321f8935757c5a6954e44..8dd6ab91277d25c6e957899b0ac88be670e5ae89 100644
+--- a/apps/desktop/src/store/session.test.ts
++++ b/apps/desktop/src/store/session.test.ts
+@@ -1791,3 +1791,50 @@
+     expect(knownSessionOwner([], 'hidden-session')).toEqual(owner)
+   })
+ })
++
++describe('owner-qualified session identity (same id on two gateways)', () => {
++  const owned = (gateway: string, over: Partial<SessionInfo> = {}) =>
++    session({
++      id: 'kanban_owner_terminal',
++      outcome: { kind: 'done', status: { identity: { gateway, owner_epoch: 'e', profile: 'default', session_id: 'kanban_owner_terminal' } } },
++      profile: 'default',
++      ...over
++    })
++
++  it('keeps both rows and never stitches one owner’s title onto the other, in both orders', () => {
++    const a = owned('gw-a', { connection_id: 'conn-a', last_active: 50, title: 'A work' })
++    const b = owned('gw-b', { connection_id: 'conn-b', last_active: 10 })
++
++    for (const [previous, incoming] of [
++      [[a], [b, a]],
++      [[b], [a, b]]
++    ]) {
++      const merged = mergeSessionPage(previous, incoming, [])
++      expect(merged.map(s => s.connection_id).sort()).toEqual(['conn-a', 'conn-b'])
++      expect(merged.find(s => s.connection_id === 'conn-b')?.title ?? null).toBeNull()
++    }
++  })
++
++  it('a kept (live) row survives a refresh page that only carries the other owner’s twin', () => {
++    const a = owned('gw-a', { connection_id: 'conn-a' })
++    const b = owned('gw-b', { connection_id: 'conn-b' })
++
++    expect(mergeSessionPage([a, b], [b], ['kanban_owner_terminal']).map(s => s.connection_id).sort()).toEqual([
++      'conn-a',
++      'conn-b'
++    ])
++    expect(carryForwardFailedProfileSessions([a, b], [b], [{ profile: 'default' }]).map(s => s.connection_id).sort()).toEqual([
++      'conn-a',
++      'conn-b'
++    ])
++  })
++
++  it('same owner still replaces (carry title/activity) and a legacy row without a gateway still collapses', () => {
++    const prev = owned('gw-a', { last_active: 50, title: 'Kept' })
++    const [updated] = mergeSessionPage([prev], [owned('gw-a', { last_active: 10 })], [])
++    expect(updated).toMatchObject({ last_active: 50, title: 'Kept' })
++
++    const legacy = session({ id: 'kanban_owner_terminal', profile: 'default' })
++    expect(mergeSessionPage([prev], [legacy], ['kanban_owner_terminal'])).toHaveLength(1)
++  })
++})
+diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
+index 9267259148d89b9af3c9b41c32e378785fe1e8a3..03f30ff34e87616a869a1cf0b8751fe779c9d3f5 100644
+--- a/apps/desktop/src/store/session.ts
++++ b/apps/desktop/src/store/session.ts
+@@ -13,6 +13,7 @@
+   rescopeConnectionScopedStores
+ } from '@/lib/connection-scoped'
+ import { hostHas } from '@/lib/host-capabilities'
++import { sameOwnerRow, SessionOwnerSet } from '@/lib/session-owner-identity'
+ import { isMessagingSource } from '@/lib/session-source'
+ import type { TileSessionFocusStamp } from '@/lib/session-timer-since'
+ import {
+@@ -584,15 +585,30 @@
+   // flashing its raw message preview in the gap between persist and the async
+   // auto-titler. A real clear sets the local title null first, so this never
+   // masks one.
+-  const prevById = new Map(previous.map(session => [identity(session), session]))
++  // Owner-qualified: the same (profile, id) on two canonical gateways is two sessions, so each key
++  // holds every candidate and `sameOwnerRow` picks the matching owner (legacy rows fall back).
++  const groupBy = (key: (session: SessionInfo) => string) => {
++    const groups = new Map<string, SessionInfo[]>()
++
++    for (const session of previous) {
++      groups.set(key(session), [...(groups.get(key(session)) ?? []), session])
++    }
++
++    return groups
++  }
++
++  const prevById = groupBy(identity)
+   // Tip rotation changes the live id — carry activity/title across the lineage
+   // root so a mid-turn refresh can't drop a touchSessionActivity bump.
+-  const prevByLineage = new Map(previous.map(session => [lineageIdentity(session), session]))
++  const prevByLineage = groupBy(lineageIdentity)
+ 
+   const merged = incoming
+     .filter(session => !session.is_internal_child)
+     .map(session => {
+-      const prev = prevById.get(identity(session)) ?? prevByLineage.get(lineageIdentity(session))
++      const prev =
++        sameOwnerRow(prevById.get(identity(session)), session) ??
++        sameOwnerRow(prevByLineage.get(lineageIdentity(session)), session)
++
+       // User-send stamps last_active before the DB flushes the user row
+       // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
+       const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)
+@@ -616,7 +632,18 @@
+     return merged
+   }
+ 
+-  const incomingIds = new Set(merged.map(identity))
++  const incomingIds = new SessionOwnerSet()
++  const incomingLineageKeys = new SessionOwnerSet()
++  const incomingLineageIdMembers = new SessionOwnerSet()
++
++  for (const row of merged) {
++    incomingIds.add(profileKeyOf(row), row.id, row)
++    incomingLineageKeys.add(profileKeyOf(row), row._lineage_root_id ?? row.id, row)
++
++    for (const id of row._lineage_ids ?? []) {
++      incomingLineageIdMembers.add(profileKeyOf(row), id, row)
++    }
++  }
+ 
+   // Deduplicate by compression lineage: when auto-compression rotates the tip
+   // id (old #4 → new #5), the incoming page carries the new tip but the
+@@ -624,7 +651,6 @@
+   // rows survive as separate sidebar entries (fixes #43483). Lineage keys are
+   // profile-qualified for the same reason as identity above — a twin id in
+   // another profile is a DIFFERENT session and must survive the dedupe.
+-  const incomingLineageKeys = new Set(merged.map(lineageIdentity))
+ 
+   // Absorption filter: a survivor whose id appears ANYWHERE inside an
+   // incoming row's compression lineage is not a separate session anymore —
+@@ -643,9 +669,6 @@
+   // above, members are qualified by the owning row's profile — stored ids
+   // are only unique per-profile (#92454), so a bare-id match would evict a
+   // kept twin in another profile whose id merely coincides with a lineage.
+-  const incomingLineageIdMembers = new Set(
+-    merged.flatMap(session => (session._lineage_ids ?? []).map(id => `${profileKeyOf(session)}::${id}`))
+-  )
+ 
+   // The tombstone set is re-read here, not at the caller: optimistic removal
+   // can land between `previous` being captured and this merge committing (a
+@@ -672,9 +695,9 @@
+       // open tab must not resurrect it into the sidebar (#113273).
+       !session.hidden &&
+       !tombstoned(session) &&
+-      !incomingIds.has(identity(session)) &&
+-      !incomingLineageKeys.has(lineageIdentity(session)) &&
+-      !incomingLineageIdMembers.has(identity(session)) &&
++      !incomingIds.has(profileKeyOf(session), session.id, session) &&
++      !incomingLineageKeys.has(profileKeyOf(session), session._lineage_root_id ?? session.id, session) &&
++      !incomingLineageIdMembers.has(profileKeyOf(session), session.id, session) &&
+       (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))
+   )
+ 
+@@ -723,10 +746,6 @@
+   return (session.profile ?? '').trim() || 'default'
+ }
+ 
+-function sessionListIdentity(session: Pick<SessionInfo, 'id' | 'profile'>): string {
+-  return `${sidebarProfileKey(session)}::${session.id}`
+-}
+-
+ /**
+  * Re-attach previous rows for profiles whose sidebar slice failed this refresh.
+  *
+@@ -747,16 +766,20 @@
+   }
+ 
+   const failed = new Set(errors.map(error => (error.profile ?? '').trim() || 'default'))
+-  const incomingIds = new Set(incoming.map(sessionListIdentity))
++  const incomingIds = new SessionOwnerSet()
+   const carried: SessionInfo[] = []
+ 
++  for (const session of incoming) {
++    incomingIds.add(sidebarProfileKey(session), session.id, session)
++  }
++
+   for (const session of previous) {
+     // A hidden row (canonical Bot Chat) is LISTED-NEVER by design: the
+     // failed-slice carry must not ride it back into the sidebar (#113273).
+     if (
+       session.hidden ||
+       !(failed.has(ALL_PROFILES_SCAN) || failed.has(sidebarProfileKey(session))) ||
+-      incomingIds.has(sessionListIdentity(session))
++      incomingIds.has(sidebarProfileKey(session), session.id, session)
+     ) {
+       continue
+     }
+-- 
+2.43.0
+

@@ -1,0 +1,129 @@
+From 32324cd0bf94f3b669df1e1f273048c3bb27a84c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 19:44:21 +0000
+Subject: [PATCH 7008] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 32324cd0bf94f3b669df1e1f273048c3bb27a84c.
+
+---
+diff --git a/tests/hermes_cli/test_home_replay_confirmation_composition.py b/tests/hermes_cli/test_home_replay_confirmation_composition.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcbeb60a98da96b864995d8225d969cd1791a179
+--- /dev/null
++++ b/tests/hermes_cli/test_home_replay_confirmation_composition.py
+@@ -0,0 +1,62 @@
++"""Captured epochs compose with enrollment-gated confirmation after rebase."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync, kanban_home_generation as epochs
++from hermes_cli import kanban_retain_transport as retain
++from tests.hermes_cli import test_kanban_failure_transport as failure
++from tests.hermes_cli import test_kanban_retain_transport as fixture
++from tests.hermes_cli import test_kanban_replay_sender as sender
++
++live = sender.live
++
++
++@pytest.mark.parametrize('anchor', ['bound', 'never', 'null', 'missing'])
++@pytest.mark.parametrize('state', ['pending', 'acknowledged'])
++def test_retain_confirmation_preserves_epoch_and_replay_enrollment(live, anchor, state):
++    sync.set_mode(live, 'primary')
++    task, rid = failure._running(live)
++    with kbc.write_txn(live):
++        epochs.install(live)
++        live.execute('INSERT INTO kanban_home_generations1(task_id,nonce,pending) VALUES (?,?,0)',
++                     (task, 'captured-confirmation-epoch'))
++    owned = fixture.reserve(live, task, rid)
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_failure_commands SET delivery_state=? WHERE run_uid=?',
++                     (state, owned['run_uid']))
++        live.execute('UPDATE kanban_home_generations1 SET nonce=? WHERE task_id=?',
++                     ('new-mirror-not-capture', task))
++        if anchor == 'never':
++            live.execute('DROP TABLE kanban_replay_sender1')
++            live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++        elif anchor == 'null':
++            live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++        elif anchor == 'missing':
++            live.execute('DELETE FROM kanban_sync_state')
++    before = retain.command(live, owned['run_uid'])
++    calls = []
++    evidence = []
++
++    class Peer:
++        ident = SimpleNamespace(gateway='macbook')
++
++        def decision_retain_capability(self, board):
++            return {'decision_retain': 1, 'frozen_replay': 1, 'hlc': '0000000000001-0000-server'}
++
++        def ops(self, board, wires):
++            calls.extend(wires)
++            return {'results': [{'client_op_id': owned['op_id'], 'status': 'applied'}]}
++
++        def row_evidence(self, board, table, uid):
++            evidence.append((table, uid))
++            raise LookupError('independent receipt intentionally unavailable')
++
++    with pytest.raises((ValueError, RuntimeError, LookupError)):
++        retain.confirm(live, Peer(), 'default', owned['run_uid'])
++    expected = {**json.loads(owned['request_json']),
++                'home_generations': {task: 'captured-confirmation-epoch'}}
++    assert calls == ([expected] if anchor == 'never' else [])
++    assert bool(evidence) == (anchor == 'never' or anchor == 'bound' and state == 'acknowledged')
++    assert retain.command(live, owned['run_uid']) == before
+diff --git a/tests/hermes_cli/test_kanban_protect_replay_custody.py b/tests/hermes_cli/test_kanban_protect_replay_custody.py
+index 4801fbeb56e24e816af751600cb7df031dfae5d5..ae907b50d63981249d0173ac7c46bda3068be752 100644
+--- a/tests/hermes_cli/test_kanban_protect_replay_custody.py
++++ b/tests/hermes_cli/test_kanban_protect_replay_custody.py
+@@ -37,7 +37,7 @@
+         return {'results': [{'client_op_id': wires[0]['client_op_id'], 'status': 'applied'}]}
+ 
+ 
+-def _reserved(conn, hub):
++def _reserved(conn, hub, *, captured=False):
+     sync.set_mode(conn, 'primary')
+     state = sync.sync_state(conn)
+     home = state['gateway_id']
+@@ -56,6 +56,11 @@
+                'target_task_id': target, 'requested_at': int(time.time()),
+                'caller': {'gateway': home, 'task_id': actor, 'run_uid': run}, 'args': args}
+     with kbc.write_txn(conn):
++        if captured:
++            from hermes_cli import kanban_home_generation as epochs
++            epochs.install(conn)
++            conn.execute('INSERT INTO kanban_home_generations1(task_id,nonce,pending) VALUES (?,?,0)',
++                         (target, 'protect-captured-epoch'))
+         frozen = transport.reserve(conn, board, payload, request_event)
+     hub.events[request_event] = {'uid': request_event, 'deleted_at': None, 'kind': 'operator_call_requested',
+                                  'version': 1, 'task_id': actor, 'run_uid': run, 'origin_gateway': home,
+@@ -63,10 +68,11 @@
+     return board, request_uid, frozen
+ 
+ 
++@pytest.mark.parametrize('captured', [False, True])
+ @pytest.mark.parametrize('anchor', ['bound', 'never', 'null', 'missing'])
+-def test_protect_transport_respects_enrollment_without_starving_pending(live, anchor):
++def test_protect_transport_respects_enrollment_without_starving_pending(live, anchor, captured):
+     hub = FakeHub()
+-    board, request_uid, frozen = _reserved(live, hub)
++    board, request_uid, frozen = _reserved(live, hub, captured=captured)
+     assert frozen['delivery_state'] == 'pending'
+     assert journal.bound_custody(live) is True
+     assert journal.pending_wire(live) is None
+@@ -81,6 +87,9 @@
+     # No canonical receipt is supplied: delivery must not imply confirmation.
+     with pytest.raises(ValueError):
+         transport.confirm(live, hub, board, request_uid)
+-    assert hub.ops_calls == ([json.loads(frozen['request_json'])] if anchor in ('bound', 'never') else [])
++    expected = json.loads(frozen['request_json'])
++    if captured:
++        expected['home_generations'] = {expected['task']: 'protect-captured-epoch'}
++    assert hub.ops_calls == ([expected] if anchor in ('bound', 'never') else [])
+     assert transport.command(live, request_uid) == frozen
+ 
+-- 
+2.43.0
+

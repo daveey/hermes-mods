@@ -1,0 +1,120 @@
+From 4ca6285c46d380102a43b5700ec96f0673c50570 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 16:38:16 +0000
+Subject: [PATCH 6827] Annotation holder counts custody and read sharing
+
+Public mirror of source commit 4ca6285c46d380102a43b5700ec96f0673c50570.
+
+---
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 354ed7b108e2da99560bfca5eab114f9f92a8c2f..dd7984f4b6da7ac7dad93caec321ab0e2d0a7638 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -781,6 +781,7 @@
+                 _ksa._revalidate.force_read.scope = scope
+                 _ksa._revalidate.force_read.parts = forced
+                 _ksa._revalidate.force_read.content_only_boards = not (lost or clock or renew)
++                _ksa._revalidate.force_read.links_pass = {}  # this pass's one forced links projection
+                 # No part needs a read: avoid prepare/freeze/publication and ordinary inner TTLs.
+                 # Keep the deadline/settle path below: this hint can precede COMMIT visibility.
+                 if forced:
+@@ -807,6 +808,7 @@
+                 _holder_ctx.deadlines = None
+                 _ksa._revalidate.force_read.scope = None
+                 _ksa._revalidate.force_read.parts = None
++                _ksa._revalidate.force_read.links_pass = None
+                 _ksa._revalidate.force_read.content_only_boards = False
+                 _ksa._annotate_refresh_lock.release()
+         try:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index a4bdbc3f358a8d7706f6b5c1c9aede67a09c6792..32794a74dba333ec4006af29daaed821b4769647 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1018,9 +1018,10 @@
+         # verdicts move without any key), no key can vouch for the inputs, or the links part key moved
+         # (``kanban_annotation_parts``); state/config churn alone is left to ``_LINKS_MAX_AGE_S``.
+         if _revalidate.forced(scope, 'links'):
+-            with _links_lock:
+-                fingerprint = diag.timed("fingerprint", _links_fingerprint)
+-                return _publish_links(scope, fingerprint)
++            def project():
++                with _links_lock:
++                    return _publish_links(scope, diag.timed("fingerprint", _links_fingerprint))
++            return _revalidate.pass_links(scope, project)
+         hit = _links_cache.get(scope)
+         # A warm display read still precedes ALL fingerprint and lock work.
+         if stale_ok and hit is not None:
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index ba619ad66fc2498c9e259aa259dbbf0dc992bbdd..3321f86ed64d5112ee041b5d0b32b6433582a6e3 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -39,6 +39,22 @@
+     return parts is None or part in parts
+ 
+ 
++def pass_links(scope: tuple[str, ...], project):
++    """One forced links projection per holder pass. [daveey]
++
++    ``force_read.links_pass`` is a dict only inside one ``kanban_annotation_host._event_refresh`` scope read. The
++    counts and each waiting source (chat-closeout) forced their own ledger projection in that pass: 480 strict
++    projections for many forced passes on a busy serve, each under ``_links_lock`` (t_d0c5000000000005). The pass is
++    one snapshot, as ``one_annotation_snapshot`` already is for a request: a write during it wakes the holder again.
++    Outside a pass (the memo is None) every forced read still projects; a failed projection is never kept."""
++    held = getattr(force_read, "links_pass", None)
++    if held is None:
++        return project()
++    if scope not in held:
++        held[scope] = project()
++    return held[scope]
++
++
+ def revalidatable(fingerprint: tuple, wall: float) -> bool:
+     """True when ``fingerprint`` (taken at wall time ``wall``) proves no write since: every board is keyed by its
+     content revision, or by a file stat last modified more than ``STAT_SETTLED_S`` before ``wall``. A stat key can
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index 6588d0702a5638803db86c9384ac12df88f8ffb6..1dea8e35d41605a494ece0ae00943147232b440b 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -106,6 +106,39 @@
+         parts._seen.update(saved)
+ 
+ 
++def test_one_holder_pass_projects_the_links_once_for_every_part(world, monkeypatch):
++    """t_d0c5000000000005: the counts and a waiting source (chat-closeout) each forced their own ledger projection
++    in the same holder pass: many strict projections for as many forced passes on a busy serve."""
++    def waiting():
++        ksa.remote_links_and_origin_rows()
++        return {}
++    monkeypatch.setattr(ksa, '_waiting_sources', {'fixture': waiting})
++    _refresh()
++    assert world.links == 1, 'one holder pass projected the links once per part'
++    assert getattr(ksa._revalidate.force_read, 'links_pass', None) is None, 'the pass memo outlived its pass'
++
++    world.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't1'")
++    _refresh()
++    assert world.links == 2, 'a later pass must project again: the memo is one pass old at most'
++
++
++def test_a_forced_links_read_outside_a_holder_pass_is_never_shared(monkeypatch):
++    scope = ('no-pass',)
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', scope, raising=False)
++    monkeypatch.setattr(ksa._revalidate.force_read, 'links_pass', None, raising=False)
++    monkeypatch.setattr(ksa, '_links_fingerprint', lambda: ('same',))
++    published = []
++    monkeypatch.setattr(ksa, '_publish_links', lambda s, f: published.append(s) or (0.0, s, f, [], []))
++    first, second = ksa._links_lookup(scope, False), ksa._links_lookup(scope, False)
++    assert published == [scope, scope] and first is not second
++
++    monkeypatch.setattr(ksa._revalidate.force_read, 'links_pass', {})
++    assert ksa._links_lookup(scope, False) is ksa._links_lookup(scope, True)
++    assert published == [scope] * 3, 'the pass memo is per pass: the earlier unshared reads are not in it'
++    monkeypatch.setattr(ksa._revalidate.force_read, 'scope', ('other',))
++    assert ksa._links_lookup(('other',), False)[1] == ('other',), "another scope got this scope's projection"
++
++
+ def test_a_write_to_one_source_rereads_only_the_parts_that_read_it(world):
+     _refresh()
+     assert _reads(world) == (1, 1, 1), 'the first read of a scope reads every part'
+-- 
+2.43.0
+

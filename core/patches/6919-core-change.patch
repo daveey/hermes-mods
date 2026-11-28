@@ -1,0 +1,132 @@
+From e57114f70d307caf271f60dee379fb317bcf98fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:09:41 +0000
+Subject: [PATCH 6919] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit e57114f70d307caf271f60dee379fb317bcf98fc.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_replay_synthetic_lease.py b/tests/hermes_cli/test_kanban_replay_synthetic_lease.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce9e7fe761be21063e3c2adbbe34d43787da17f5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_synthetic_lease.py
+@@ -0,0 +1,115 @@
++"""Malformed lease fields in synthetic-parent current-row evidence never reach SQLite."""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++CASES = (('peer', 2 ** 70, True), ('peer', 1.5, True), ('peer', True, True), ('peer', '3', True),
++         (3, None, True), ('peer', 1893456000000, False), (None, None, False))
++
++
++def _evidence(tid, holder, expires):
++    return dict(board='default', table='tasks', uid=tid, state='live', head=4,
++                row=dict(uid=tid, title='cur', status='todo', version=4, created_at=1,
++                         lease_holder=holder, lease_expires=expires))
++
++
++def _versionless(result, receiver, path):
++    if path.endswith('/ops'):
++        verdict = json.loads(receiver.slot['last_verdict'])
++        verdict.pop('version', None)
++        receiver.slot['last_verdict'] = json.dumps(verdict, separators=(',', ':'))
++    return result
++
++
++def _parent_with_child_comment(conn):
++    tid = kb.create_task(conn, title='parent', assignee='worker')
++    with kbc.write_txn(conn):
++        conn.execute('DELETE FROM kanban_sync_outbox WHERE 1=1')
++    kb.add_comment(conn, tid, 'author', 'child')
++    return tid
++
++
++def _lease(conn, tid):
++    return tuple(conn.execute('SELECT lease_holder, lease_expires FROM tasks WHERE id=?', (tid,)).fetchone())
++
++
++@pytest.mark.parametrize('holder,expires,bad', CASES)
++def test_synthetic_parent_lease_direct_push(live, holder, expires, bad):
++    tid = _parent_with_child_comment(live)
++    before = _lease(live, tid)
++
++    class R(helpers.Receiver):
++        def _call(self, method, path, body=None):
++            return _versionless(super()._call(method, path, body), self, path)
++
++        def row_evidence(self, board, table, uid):
++            return _evidence(tid, holder, expires)
++
++    err = None
++    try:
++        client.push(live, R(), 'default', 'macbook', primary=False, max_batches=1)
++    except Exception as exc:
++        err = exc
++    assert not isinstance(err, (OverflowError, TypeError, KeyError)), repr(err)
++    if bad:
++        assert _lease(live, tid) == before
++        assert journal.snapshot(live)['pending'] is not None
++    else:
++        assert err is None and _lease(live, tid) == (holder, expires)
++
++
++@pytest.mark.parametrize('order', ['broken_first', 'healthy_first'])
++@pytest.mark.parametrize('holder,expires', [('peer', 2 ** 70), ('peer', 1.5), (3, None)])
++def test_synthetic_parent_lease_sync_all_once_isolated(live, tmp_path, monkeypatch, order, holder, expires):
++    tid = _parent_with_child_comment(live)
++    before = _lease(live, tid)
++    broken_path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++    peer = helpers.Receiver()
++    original = peer._call
++
++    def route(method, path, body=None):
++        if '/default/' in path and '/evidence' in path:
++            return _evidence(tid, holder, expires)
++        if '/changes' in path:
++            return dict(changes=[], next=0, head=0, more=False)
++        return _versionless(original(method, path, body), peer, path)
++
++    peer._call = route
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    boards = [('default', broken_path), ('healthy', healthy_path)]
++    if order == 'healthy_first':
++        boards.reverse()
++    requests = []
++
++    def call(self, method, path, body=None, **_):
++        requests.append(path)
++        return route(method, path, body)
++
++    monkeypatch.setattr(client.Hub, '_call', call)
++    hub = client.Hub(client.Identity('http://hub.invalid', 'fixture-key', 'display'))
++    try:
++        results = {r.board: r for r in client.sync_all_once(hub, boards=boards)}
++    finally:
++        hub.close()
++    assert set(results) == {'default', 'healthy'}
++    assert results['default'].error
++    assert results['healthy'].error is None
++    assert any('/healthy/' in p for p in requests)
++    assert _lease(live, tid) == before
++    assert journal.snapshot(live)['pending'] is not None
+-- 
+2.43.0
+

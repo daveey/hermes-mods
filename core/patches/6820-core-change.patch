@@ -1,0 +1,185 @@
+From f90f74dcf66cfe2cd544c84f21e71d89b1c3a30d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 13:41:20 +0000
+Subject: [PATCH 6820] Policy-config interning: exact-byte storage and opt-in rollout
+
+Public mirror of source commit f90f74dcf66cfe2cd544c84f21e71d89b1c3a30d.
+
+---
+diff --git a/hermes_state_policy_config.py b/hermes_state_policy_config.py
+index 0d724df8fe994e8df69d2aa9e9ebb5fb164a2c7a..414b10fd229588863c7b5237781a4b91cdc284f5 100644
+--- a/hermes_state_policy_config.py
++++ b/hermes_state_policy_config.py
+@@ -169,6 +169,13 @@
+     # The caller's recovery transaction owns all writes; no live-store migration.
+     conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (REF_PREFIX + '*',))
+     conn.executemany('INSERT INTO state_meta(key,value) VALUES(?,?)', refs)
++    # Only after validating the complete surviving owner inventory can recovery
++    # retire payloads whose policy rows were not salvaged. Never keep them forever.
++    for (key,) in conn.execute('SELECT key FROM state_meta WHERE key GLOB ?', (BLOB_PREFIX + '*',)).fetchall():
++        digest = key[len(BLOB_PREFIX):]
++        if conn.execute('SELECT 1 FROM state_meta WHERE key GLOB ? LIMIT 1',
++                        (REF_PREFIX + digest + ':*',)).fetchone() is None:
++            conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+     return len(refs)
+ 
+ 
+diff --git a/tests/gateway/test_policy_config_profile.py b/tests/gateway/test_policy_config_profile.py
+index 16fe4b8e2cc314cabc004395b20a3313501df18b..1b471652f677b64cdd4803e77582c766670ade0f 100644
+--- a/tests/gateway/test_policy_config_profile.py
++++ b/tests/gateway/test_policy_config_profile.py
+@@ -22,6 +22,12 @@
+         commit_selection(authority, ref, policy, config, model,
+                          db.get_session(ref.session_id)['runtime_generation'], ended=ended)
+         assert local_receipt(db, ref.session_id)['policy'] == original['policy']
++        from hermes_state_policy_config import delete_receipt
++        from hermes_state_runtime import RuntimeStoreError
++        db._execute_write(lambda conn: delete_receipt(conn, ref.session_id))
++        with pytest.raises(RuntimeStoreError, match='revision_conflict'):
++            commit_selection(authority, ref, policy, config, model,
++                             db.get_session(ref.session_id)['runtime_generation'], ended=ended)
+     finally:
+         await owner.close()
+         store.close_all_db_handles()
+diff --git a/tests/hermes_cli/test_session_recovery_policy_config.py b/tests/hermes_cli/test_session_recovery_policy_config.py
+index 6dab2c6bc3fd1113cbc7b9555746b20354cdebb9..07a32c2cc20a95c75b639aecc35663ea32f7b3d6 100644
+--- a/tests/hermes_cli/test_session_recovery_policy_config.py
++++ b/tests/hermes_cli/test_session_recovery_policy_config.py
+@@ -29,6 +29,21 @@
+                             (BLOB_PREFIX + '*', REF_PREFIX + '*')).fetchall() == []
+ 
+ 
++
++def test_recovery_collects_blob_whose_owner_was_not_salvaged(tmp_path):
++    source, output = tmp_path / 'source.db', tmp_path / 'recovered.db'
++    with closing(SessionDB(source)) as db:
++        def write(conn):
++            store_receipt(conn, 'one', {'policy': {'config_json': '{}'}}, intern=True)
++            conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.local_policy.v1:one',))
++        db._execute_write(write)
++    report = recover_session_database(source, output, allow_partial=True)
++    assert report['verified'], report
++    with closing(sqlite3.connect(output)) as conn:
++        assert conn.execute('SELECT key FROM state_meta WHERE key GLOB ? OR key GLOB ?',
++                            (BLOB_PREFIX + '*', REF_PREFIX + '*')).fetchall() == []
++
++
+ @pytest.mark.parametrize('damage', ['missing_blob', 'corrupt_blob', 'missing_blob_and_refs'])
+ def test_recovery_refuses_unreadable_policy_config(tmp_path, damage):
+     from hermes_state_runtime import RuntimeStoreError
+diff --git a/tests/hermes_state/test_policy_config_consumers.py b/tests/hermes_state/test_policy_config_consumers.py
+index aff24140f8afae3c472fb37dde1558ea0948aa7f..0c4f46f9103e934d5cd67e266f37ee80f67f0428 100644
+--- a/tests/hermes_state/test_policy_config_consumers.py
++++ b/tests/hermes_state/test_policy_config_consumers.py
+@@ -77,6 +77,9 @@
+     db, _epoch, sid, original = interned
+     _, result = db._execute_write(lambda conn: branch_in_transaction(db, conn, sid, {}))
+     child = result['branched_session_id']
++    with db._read_ctx() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM state_meta WHERE key GLOB ?',
++                            (REF_PREFIX + '*',)).fetchone()[0] == 2
+     db._execute_write(lambda conn: retire_local_receipts(conn, [sid]))
+     assert local_receipt(db, child)['policy'] == original['policy']
+     db._execute_write(lambda conn: release_receipts(conn, [child]))
+@@ -88,3 +91,15 @@
+     db, _epoch, sid, _original = interned
+     db._execute_write(lambda conn: remove(conn, [sid]))
+     _assert_no_blobs(db)
++
++
++def test_retirement_preserves_non_policy_key_semantics(interned):
++    from hermes_state_local import API_BINDING_PREFIX, API_DECLARED_PREFIX
++    db, _epoch, sid, _original = interned
++    def remove(conn):
++        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (API_BINDING_PREFIX + sid, 'binding'))
++        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (API_DECLARED_PREFIX + 'conversation', sid))
++        retire_local_receipts(conn, [sid])
++        return conn.execute('SELECT key FROM state_meta WHERE key IN (?,?)',
++                            (API_BINDING_PREFIX + sid, API_DECLARED_PREFIX + 'conversation')).fetchall()
++    assert db._execute_write(remove) == []
+diff --git a/tests/hermes_state/test_policy_config_storage.py b/tests/hermes_state/test_policy_config_storage.py
+index 56e30e09246ffd63f606fd3b75f524d302af4791..2bafe4e24cd75e2f1d66306c317679748ca589a7 100644
+--- a/tests/hermes_state/test_policy_config_storage.py
++++ b/tests/hermes_state/test_policy_config_storage.py
+@@ -200,3 +200,78 @@
+     plan = conn.execute('EXPLAIN QUERY PLAN SELECT 1 FROM state_meta WHERE key GLOB ? LIMIT 1',
+                         (REF_PREFIX + 'a' * 64 + ':*',)).fetchall()
+     assert any('SEARCH' in row[3] and 'INDEX' in row[3] for row in plan)
++
++
++@pytest.mark.parametrize('operation', ['decode', 'reconcile'])
++def test_snapshot_operations_require_owner_transaction(conn, operation):
++    from hermes_state_policy_config import decode_receipt, reconcile_recovered_references
++    conn.commit()
++    operations = {'decode': lambda: decode_receipt(conn, json.dumps(receipt())),
++                  'reconcile': lambda: reconcile_recovered_references(conn)}
++    with pytest.raises(RuntimeStoreError, match='runtime_coordination_required'):
++        operations[operation]()
++
++
++def test_missing_receipt_fails_at_storage_boundary(conn):
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        load_receipt(conn, 'missing')
++
++
++@pytest.mark.parametrize('digest', ['bad', 'A' * 64, {}, 1])
++def test_invalid_stored_reference_cannot_be_retired(conn, digest):
++    conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
++                 ('gateway.local_policy.v1:one', json.dumps({'policy': {'config_ref_v1': digest}})))
++    before = conn.execute('SELECT * FROM state_meta').fetchall()
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        delete_receipt(conn, 'one')
++    assert conn.execute('SELECT * FROM state_meta').fetchall() == before
++
++
++def test_storing_raw_reference_instead_of_hydrated_policy_is_refused(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    raw = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?',
++                                  ('gateway.local_policy.v1:one',)).fetchone()[0])
++    before = conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall()
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        store_receipt(conn, 'two', raw)
++    assert conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall() == before
++
++
++def test_repeated_same_owner_same_config_keeps_its_reference(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    store_receipt(conn, 'one', receipt(), intern=True)
++    assert load_receipt(conn, 'one') == receipt()
++    assert len(inventory(conn, BLOB_PREFIX)) == len(inventory(conn, REF_PREFIX)) == 1
++
++
++def test_existing_corrupt_blob_cannot_be_reused_by_new_owner(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    conn.execute('UPDATE state_meta SET value=? WHERE key GLOB ?', ('wrong', BLOB_PREFIX + '*'))
++    before = conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall()
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        store_receipt(conn, 'two', receipt(), intern=True)
++    assert conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall() == before
++
++
++def test_legacy_only_recovery_does_not_reinterpret_old_malformed_receipts(conn):
++    from hermes_state_policy_config import reconcile_recovered_references
++    conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
++                 ('gateway.local_policy.v1:old', 'legacy malformed receipt'))
++    before = conn.execute('SELECT * FROM state_meta').fetchall()
++    assert reconcile_recovered_references(conn) == 0
++    assert conn.execute('SELECT * FROM state_meta').fetchall() == before
++
++
++def test_non_object_receipt_is_typed_storage_failure(conn):
++    from hermes_state_policy_config import decode_receipt
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        decode_receipt(conn, '[]')
++
++
++@pytest.mark.parametrize('text', [None, 1, {}])
++def test_config_payload_must_be_exact_string(conn, text):
++    malformed = receipt()
++    malformed['policy']['config_json'] = text
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        store_receipt(conn, 'one', malformed, intern=True)
++    assert conn.execute('SELECT * FROM state_meta').fetchall() == []
+-- 
+2.43.0
+

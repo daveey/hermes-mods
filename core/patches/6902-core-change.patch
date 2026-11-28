@@ -1,0 +1,144 @@
+From 63ab4454017b200fa149562ae8ea81e5a28f2451 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:38:53 +0000
+Subject: [PATCH 6902] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 63ab4454017b200fa149562ae8ea81e5a28f2451.
+
+---
+diff --git a/hermes_cli/kanban_protect_transport.py b/hermes_cli/kanban_protect_transport.py
+index 70b8da750f4d8969532d730d30647d4859fdbcd5..0174d2481e44170b3d3a731bceb172a4b16ebbf0 100644
+--- a/hermes_cli/kanban_protect_transport.py
++++ b/hermes_cli/kanban_protect_transport.py
+@@ -107,9 +107,11 @@
+     proof.frozen(old, wire, board)
+     capability(hub,board)  # Old serving DO/unsupported route cannot consume this identity.
+     actor_gateway = proof.request(hub, board, old, wire)
+-    from hermes_cli.kanban_replay_controls import confirmed_transport
+-    strict = confirmed_transport(conn, old)
+-    reply=None if strict else hub.ops(board,[wire])
++    from hermes_cli import kanban_replay_journal as journal
++    # Protect has its own frozen transport, not the replay sender's ACK state.
++    # Still refuse enrollment loss before this independent command can leave.
++    journal.bound_custody(conn)
++    reply=hub.ops(board,[wire])
+     results=reply.get('results',[]) if isinstance(reply,dict) else []
+     if (isinstance(results,list) and len(results)==1 and isinstance(results[0],dict)
+             and results[0].get('client_op_id')==wire['client_op_id'] and results[0].get('status')=='rejected'
+@@ -121,7 +123,7 @@
+                          "WHERE request_uid=? AND request_sha256=? AND delivery_state!='confirmed'",
+                          (wireutil.canonical(rejection),request_uid,old['request_sha256']))
+         raise Rejected(results[0])
+-    if not strict and (not isinstance(results,list) or len(results)!=1 or not isinstance(results[0],dict)
++    if (not isinstance(results,list) or len(results)!=1 or not isinstance(results[0],dict)
+             or results[0].get('client_op_id')!=wire['client_op_id'] or results[0].get('status')!='applied'):
+         raise ValueError('protect delivery unknown; preserve exact request')
+     gateway=old['home']
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index c455f4ab15ed94117f4cf8444499194b23ca3bca..57385820767e52ae1c19e00eb3bd77bef3eabb9d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1147,7 +1147,7 @@
+             # (no WARNING, the board is not marked failed, the outbox-age alarm keeps its last verdict).
+             _log.debug("kanban sync: round for %s skipped (%s)", slug, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"SyncRoundBusy: {exc}", skipped=True))
+-        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, RestoreRequired, ReplayFault, ValueError) as exc:
++        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, RestoreRequired, ReplayFault) as exc:
+             _log.warning("kanban sync: round for %s failed (%s: %s)%s", slug, type(exc).__name__, exc,
+                          udf_errors.error_suffix(exc))
+             from hermes_cli.kanban_sync_host_outage import classify  # one host card, not one per board [daveey]
+diff --git a/tests/hermes_cli/test_kanban_protect_replay_custody.py b/tests/hermes_cli/test_kanban_protect_replay_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4801fbeb56e24e816af751600cb7df031dfae5d5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_protect_replay_custody.py
+@@ -0,0 +1,86 @@
++"""Protect's independent frozen transport retains lost-anchor safety and liveness."""
++import json
++import time
++import uuid
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_protect_transport as transport
++from hermes_cli import kanban_replay_journal as journal
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++class Ident:
++    gateway = 'macbook'
++
++
++class FakeHub:
++    ident = Ident()
++
++    def __init__(self):
++        self.ops_calls = []
++        self.events = {}
++
++    def _call(self, method, path, body=None):
++        assert path.endswith('/protect-stopped/capability'), path
++        return {transport.KIND: 1, 'frozen_replay': 1, 'administrative_only': True}
++
++    def row_evidence(self, board, table, uid):
++        row = self.events.get(uid)
++        return {'board': board, 'table': table, 'uid': uid, 'state': 'live' if row else 'never', 'head': 1, 'row': row}
++
++    def ops(self, board, wires):
++        self.ops_calls.extend(wires)
++        return {'results': [{'client_op_id': wires[0]['client_op_id'], 'status': 'applied'}]}
++
++
++def _reserved(conn, hub):
++    sync.set_mode(conn, 'primary')
++    state = sync.sync_state(conn)
++    home = state['gateway_id']
++    hub.ident.gateway = home
++    board = 'default'
++    target = kb.create_task(conn, title='target', assignee='default')
++    conn.execute('UPDATE tasks SET created_on=? WHERE id=?', (home, target)) if not conn.in_transaction else None
++    conn.commit()
++    actor, run, source, oldrun, request_event, request_uid = ['p-' + uuid.uuid4().hex for _ in range(6)]
++    args = {'source_event_uid': source, 'source_run_uid': oldrun, 'expected_status': 'triage',
++            'expected_current_run_uid': None, 'expected_updated_at': 1000, 'expected_episode': None,
++            'requested_owner': actor, 'next_step': 'Resolve original administrative authority only',
++            'recovery_trigger': 'Explicit supported disposition, never retry original scope',
++            'escalate_at': int(time.time()) + 86400, 'evidence': [source]}
++    payload = {'version': 1, 'request_uid': request_uid, 'action': 'protect_stopped', 'board': board, 'home': home,
++               'target_task_id': target, 'requested_at': int(time.time()),
++               'caller': {'gateway': home, 'task_id': actor, 'run_uid': run}, 'args': args}
++    with kbc.write_txn(conn):
++        frozen = transport.reserve(conn, board, payload, request_event)
++    hub.events[request_event] = {'uid': request_event, 'deleted_at': None, 'kind': 'operator_call_requested',
++                                 'version': 1, 'task_id': actor, 'run_uid': run, 'origin_gateway': home,
++                                 'payload': json.dumps(payload)}
++    return board, request_uid, frozen
++
++
++@pytest.mark.parametrize('anchor', ['bound', 'never', 'null', 'missing'])
++def test_protect_transport_respects_enrollment_without_starving_pending(live, anchor):
++    hub = FakeHub()
++    board, request_uid, frozen = _reserved(live, hub)
++    assert frozen['delivery_state'] == 'pending'
++    assert journal.bound_custody(live) is True
++    assert journal.pending_wire(live) is None
++    if anchor != 'bound':
++        with kbc.write_txn(live):
++            if anchor == 'never':
++                live.execute('DROP TABLE kanban_replay_sender1')
++            if anchor == 'missing':
++                live.execute('DELETE FROM kanban_sync_state')
++            else:
++                live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++    # No canonical receipt is supplied: delivery must not imply confirmation.
++    with pytest.raises(ValueError):
++        transport.confirm(live, hub, board, request_uid)
++    assert hub.ops_calls == ([json.loads(frozen['request_json'])] if anchor in ('bound', 'never') else [])
++    assert transport.command(live, request_uid) == frozen
++
+-- 
+2.43.0
+

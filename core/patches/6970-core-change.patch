@@ -1,0 +1,119 @@
+From 524ce723256aa2d2141e1c283af043461a470a67 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:16:01 +0000
+Subject: [PATCH 6970] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 524ce723256aa2d2141e1c283af043461a470a67.
+
+---
+diff --git a/hermes_cli/kanban_home_destination.py b/hermes_cli/kanban_home_destination.py
+index 325fa6e1daa1d2bd55325210fb49a67cf5abd7c3..ceba96092c86e1b010df1ba4df045e82c5933163 100644
+--- a/hermes_cli/kanban_home_destination.py
++++ b/hermes_cli/kanban_home_destination.py
+@@ -59,6 +59,23 @@
+     return encoded
+ 
+ 
++def _ordered_rows(record: dict) -> list[dict]:
++    """Local event ids carry chronology; manifest UID order is not chronology.
++
++    Resolve run references first and insert events in the Board's canonical ord.
++    Keep the authenticated manifest bytes/order untouched for its immutable ACK.
++    """
++    def key(row):
++        table, fields = row["table"], row["fields"]
++        if table == "task_events":
++            order = fields.get("ord")
++            if type(order) is not int or order < 0:
++                raise ValueError("destination event order is unavailable")
++            return (2, order, row["uid"])
++        return ({"tasks": 0, "task_runs": 1}.get(table, 3), 0, row["uid"])
++    return sorted(record["rows"], key=key)
++
++
+ def _readback(conn: sqlite3.Connection, record: dict) -> None:
+     task = record["task"]
+     expected = {table: set() for table in sync.SYNCED_TABLES}
+@@ -105,6 +122,11 @@
+             found = {r[0] for r in conn.execute(f"SELECT uid FROM {table} WHERE task_id=?", (task,))}
+         if found != expected[table]:
+             raise ValueError(f"destination materialization extra or missing rows: {table}")
++    event_order = [r["uid"] for r in _ordered_rows(record)
++                   if r["table"] == "task_events" and r["fields"].get("deleted_at") is None]
++    installed = [r[0] for r in conn.execute("SELECT uid FROM task_events WHERE task_id=? ORDER BY id", (task,))]
++    if installed != event_order:
++        raise ValueError("destination event chronology differs")
+     generation = conn.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone()
+     if not generation or generation[0] != record["nonce"]:
+         raise ValueError("destination materialization epoch missing")
+@@ -143,7 +165,7 @@
+             changes = [sync.RemoteChange(seq=r["fields"].get("seq", 0), table=r["table"], uid=r["uid"],
+                        op="delete" if r["fields"].get("deleted_at") is not None else "upsert", fields=r["fields"],
+                        version=r["fields"]["version"], hlc=r["fields"]["hlc"], origin_gateway=r["fields"]["origin_gateway"])
+-                       for r in record["rows"]]
++                       for r in _ordered_rows(record)]
+             containment.prepare_apply(conn, changes)
+             applying = conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0]
+             conn.execute("UPDATE kanban_sync_state SET applying=1")
+diff --git a/tests/hermes_cli/test_home_destination_materialize.py b/tests/hermes_cli/test_home_destination_materialize.py
+index cbadd6adbf408a770304ca6abc634e2e118aa024..f737ffef243aef2e08f3fc6cfe04ec8f6176ff48 100644
+--- a/tests/hermes_cli/test_home_destination_materialize.py
++++ b/tests/hermes_cli/test_home_destination_materialize.py
+@@ -65,6 +65,45 @@
+         assert peer.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (task.id,)).fetchone()[0] == record["nonce"]
+ 
+ 
++def test_manifest_import_resolves_runs_before_events_and_orders_events_causally(board):
++    prepare_destination(board)
++    record = manifest()
++    event = record["rows"][2]
++    run = record["rows"][3]
++    event["uid"] = event["fields"]["uid"] = "a-later-event"
++    event["fields"].update(ord=2, run_uid=run["uid"])
++    earlier = copy.deepcopy(event)
++    earlier["uid"] = earlier["fields"]["uid"] = "z-earlier-event"
++    earlier["fields"].update(ord=1)
++    record["rows"].insert(3, earlier)  # actual Board snapshots sort event UIDs
++    materialize(board, record)
++    events = board.execute("SELECT uid,run_id FROM task_events WHERE task_id=? ORDER BY id", (record["task"],)).fetchall()
++    run_id = board.execute("SELECT id FROM task_runs WHERE uid=?", (run["uid"],)).fetchone()[0]
++    assert [tuple(row) for row in events] == [("z-earlier-event",run_id),("a-later-event",run_id)]
++
++
++def test_existing_event_ids_with_conflicting_order_refuse_ack_without_rewriting(board):
++    prepare_destination(board)
++    record = manifest()
++    later = record["rows"][2]
++    later["fields"]["ord"] = 2
++    earlier = copy.deepcopy(later)
++    earlier["uid"] = earlier["fields"]["uid"] = "earlier-event"
++    earlier["fields"]["ord"] = 1
++    record["rows"].insert(3, earlier)
++    # An existing feed replica can already have allocated local IDs in UID order.
++    changes = [sync.RemoteChange(seq=i+1, table=r["table"], uid=r["uid"],
++        op="delete" if r["fields"].get("deleted_at") is not None else "upsert", fields=r["fields"],
++        version=r["fields"]["version"], hlc=r["fields"]["hlc"], origin_gateway=r["fields"]["origin_gateway"])
++        for i,r in enumerate(record["rows"])]
++    sync.apply_remote_changes(board, changes, new_cursor=len(changes), observers=False)
++    before = [tuple(row) for row in board.execute("SELECT id,uid FROM task_events ORDER BY id")]
++    with pytest.raises(ValueError, match="event chronology"):
++        materialize(board, record)
++    assert [tuple(row) for row in board.execute("SELECT id,uid FROM task_events ORDER BY id")] == before
++    assert board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_materialized1'").fetchone() is None
++
++
+ def test_import_failure_rolls_back_task_epoch_children_and_ack_even_when_caught(board):
+     prepare_destination(board)
+     with kbc.write_txn(board):
+@@ -168,7 +207,7 @@
+     hub = wire.Hub(op, stop, episode)
+     # The transport double supplies canonical envelope bytes, not a production
+     # attestation. Matching receipt verification remains ordinary admission.
+-    fields = dict(hub.events[episode]["row"], version=1, hlc="1000-0-server", deleted_at=None, created_at=1)
++    fields = dict(hub.events[episode]["row"], version=1, hlc="1000-0-server", deleted_at=None, created_at=1, ord=2)
+     hub.events[episode]["row"] = copy.deepcopy(fields)
+     record["rows"].append(dict(table="task_events", uid=episode, fields=fields))
+     change = sync.RemoteChange(seq=1, table="task_events", uid=episode, op="upsert", fields=fields,
+-- 
+2.43.0
+

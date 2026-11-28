@@ -1,0 +1,111 @@
+From 2cbe356c1ccc36272c560a8f75b97000eec57c02 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 19:37:30 +0000
+Subject: [PATCH 6958] TUI turn-start outcome publishing and status counts agreement
+
+Public mirror of source commit 2cbe356c1ccc36272c560a8f75b97000eec57c02.
+
+---
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 2db10e95f93f932ef30fa48fb5991c31fc7e45d7..1a52a4dded9540af1965c3635e5be7f31c983619 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -377,18 +377,23 @@
+         raise
+ 
+ 
+-def _deferred_refresh(db_path: Optional[Path], sid: str) -> None:
+-    """The chat's refresh again after the count recompute settled (trigger ``card_change``, which carries no
+-    turn conclusion). A caller-supplied store is reopened by path: the caller's handle may be closed by now."""
++def _deferred_refresh(db_path: Optional[Path], sid: str, trigger: str = "card_change",
++                      concluding: frozenset[str] = frozenset()) -> None:
++    """The chat's refresh again after the count recompute settled, with the deferred refresh's own trigger and
++    concluding-turn identity: a ``turn_end`` that hit contention while its own evidence was still held must not
++    come back as ``running`` (review 6092548112). A caller-supplied store is reopened by path: the caller's
++    handle may be closed by now."""
+     token = _agreement_blocking.set(True)
+     try:
+         if db_path is None:
+-            refresh_outcomes_quietly([sid], "card_change")
++            refresh_outcome(sid, trigger, concluding_turn=concluding)
+             return
+         from hermes_state import SessionDB
+ 
+         with SessionDB(db_path=db_path) as handle:
+-            refresh_outcomes_quietly([sid], "card_change", db=handle)
++            refresh_outcome(sid, trigger, db=handle, concluding_turn=concluding)
++    except Exception:  # health: allow BLE001 -- a deferred retry runs on the recompute thread; log, never raise
++        logger.warning("session outcome deferred refresh (%s) failed for %s", trigger, sid, exc_info=True)
+     finally:
+         _agreement_blocking.reset(token)
+ 
+@@ -1033,8 +1038,10 @@
+             return refresh(handle, sid, trigger, frozenset(concluding_turn or ()))
+         raw_path = getattr(handle, "db_path", None) if db is not None else None
+         path = Path(raw_path) if isinstance(raw_path, (str, Path)) else None
+-        retry = functools.partial(contextvars.copy_context().run, _deferred_refresh, path, sid)
+-        token = _agreement_target.set({"key": (str(path), sid), "pending": False, "retry": retry})
++        concluding = frozenset(concluding_turn or ())
++        retry = functools.partial(contextvars.copy_context().run, _deferred_refresh, path, sid, trigger, concluding)
++        key = (str(path), sid, trigger, concluding)  # each pending refresh replays with its own turn identity
++        token = _agreement_target.set({"key": key, "pending": False, "retry": retry})
+         try:
+             return refresh(handle, sid, trigger, frozenset(concluding_turn or ()))
+         finally:
+diff --git a/tests/hermes_state/test_session_status_counts_agreement.py b/tests/hermes_state/test_session_status_counts_agreement.py
+index 68f874ef2846c7cc937dc996759a392390e5337d..ac8a7a56a2a1a7c4f0ebf79efed7d8f85eb1d0f7 100644
+--- a/tests/hermes_state/test_session_status_counts_agreement.py
++++ b/tests/hermes_state/test_session_status_counts_agreement.py
+@@ -282,3 +282,49 @@
+     monkeypatch.setattr(threading, "Thread", InlineThread)
+     controls_refresh(state_db)
+     assert is_done(stored_status(state_db))
++
++
++def _turn_end_under_contention(state_db, board, monkeypatch, *, held_by, concluding_holder):
++    """A turn_end refresh that hits the held counts while ``held_by``'s turn lease is still taken; returns the
++    status published once the deferred refresh ran (review 6092548112)."""
++    controls = Controls()
++    so.register_outcome_provider("user-steps", controls)
++    controls_refresh(state_db)
++    deferred = threading.Event()
++    real_deferred = so._deferred_refresh
++
++    def observed(*args):
++        try:
++            real_deferred(*args)
++        finally:
++            deferred.set()
++
++    monkeypatch.setattr(so, "_deferred_refresh", observed)
++    with SessionDB(db_path=state_db) as handle:
++        assert handle.try_acquire_session_turn_lease("chat", held_by, ttl_seconds=300.0)
++    try:
++        unrelated_write(board)
++        with Held():
++            controls.open = False
++            with SessionDB(db_path=state_db) as handle:
++                so.refresh_outcome("chat", "turn_end", db=handle,
++                                   concluding_turn=so.turn_identity(lease_holder=concluding_holder))
++            held = stored_status(state_db)
++            assert not is_done(held) and held["coverage"]["state"] == "unknown", held
++        assert deferred.wait(10), "the settled recompute did not re-run the chat's refresh"
++        return stored_status(state_db)
++    finally:
++        with SessionDB(db_path=state_db) as handle:
++            handle.release_session_turn_lease("chat", held_by)
++
++
++def test_a_deferred_turn_end_keeps_its_concluding_identity(state_db, board, monkeypatch):
++    """The concluded turn's own unreleased lease is discounted by the deferred refresh too: done, not running."""
++    status = _turn_end_under_contention(state_db, board, monkeypatch, held_by="turn-1", concluding_holder="turn-1")
++    assert is_done(status), status
++
++
++def test_a_deferred_turn_end_still_sees_a_newer_turn_running(state_db, board, monkeypatch):
++    """Negative control: the concluded turn names only its own lease; a newer turn's lease stays a live turn."""
++    status = _turn_end_under_contention(state_db, board, monkeypatch, held_by="turn-2", concluding_holder="turn-1")
++    assert not is_done(status) and status.get("kind") == "running", status
+-- 
+2.43.0
+

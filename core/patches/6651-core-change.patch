@@ -1,0 +1,173 @@
+From fea793794c4ab64541789d7be41d2942097a0ff2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:50:09 +0000
+Subject: [PATCH 6651] Small fixes and test-harness hardening
+
+Public mirror of source commit fea793794c4ab64541789d7be41d2942097a0ff2.
+
+---
+diff --git a/tests/gateway/fixtures/hosted_failure_evidence.py b/tests/gateway/fixtures/hosted_failure_evidence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..643e05126a0975c08bd564588748ded515bd56f7
+--- /dev/null
++++ b/tests/gateway/fixtures/hosted_failure_evidence.py
+@@ -0,0 +1,66 @@
++"""Failure-only, bounded diagnostics for the disposable hosted-room daemon test."""
++from contextlib import closing
++import json
++import sqlite3
++
++from hermes_cli.debug_redaction import redact_debug_support_text
++
++
++TAIL_BYTES = 4096
++
++
++def _tail(path):
++    try:
++        with path.open('rb') as stream:
++            stream.seek(0, 2)
++            stream.seek(max(0, stream.tell() - TAIL_BYTES))
++            return stream.read(TAIL_BYTES).decode('utf-8', errors='replace')
++    except OSError as exc:
++        return f'unavailable: {type(exc).__name__}'
++
++
++def follower_failure_evidence(home, target, snapshot, request_count):
++    """Read only this fixture's task metadata and log tails, never config or prompts.
++
++    The observation is after the failed deadline, not an atomic historical snapshot.
++    Failed settlement and a still-running follower must remain distinguishable.
++    """
++    try:
++        with closing(sqlite3.connect(f'file:{home / "state.db"}?mode=ro', uri=True, timeout=.1)) as db:
++            rows = db.execute(
++                'SELECT task_id, status, execution_generation, settlement_status, '
++                'substr(result_json, 1, 4096), started_at, terminal_at '
++                'FROM hosted_room_driver_tasks WHERE room_id=? ORDER BY source_event_seq, task_id LIMIT 10',
++                ('unknown',),
++            ).fetchall()
++        tasks = []
++        for task_id, status, generation, settlement, result, started, terminal in rows:
++            try:
++                parsed = json.loads(result or '{}')
++            except ValueError:
++                parsed = {}
++            tasks.append(dict(task_id=task_id, status=status, execution_generation=generation,
++                              settlement_status=settlement,
++                              error=parsed.get('error') if isinstance(parsed, dict) else None,
++                              started_at=started, terminal_at=terminal))
++    except sqlite3.Error as exc:
++        tasks = f'unavailable: {type(exc).__name__}'
++    evidence = dict(snapshot=snapshot, request_count=request_count, tasks=tasks,
++                    logs={f'{label}/{name}': _tail(profile / name)
++                          for label, profile in [('host', home), ('member', target)]
++                          for name in ('restart.log', 'logs/gateway.log')})
++    def scrub(value):
++        if isinstance(value, str):
++            return redact_debug_support_text(value, max_chars=4096)
++        if isinstance(value, dict):
++            return {key: scrub(item) for key, item in value.items()}
++        if isinstance(value, list):
++            return [scrub(item) for item in value]
++        return value
++    return json.dumps(scrub(evidence), default=str)[:24000]
++
++
++def assert_follower_deadline(within_deadline, home, target, snapshot, request_count):
++    # The assert message is lazy: passing polls do no diagnostic I/O at all.
++    assert within_deadline, ('the follower never settled after discard: '
++                             + follower_failure_evidence(home, target, snapshot, request_count))
+diff --git a/tests/gateway/test_hosted_failure_evidence.py b/tests/gateway/test_hosted_failure_evidence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a813fd635268d15ae7abf99606d0f3047b9d9be2
+--- /dev/null
++++ b/tests/gateway/test_hosted_failure_evidence.py
+@@ -0,0 +1,63 @@
++"""Controlled failed settlement versus running-task deadline diagnostic signatures."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import hosted_room_driver as state, hosted_rooms
++from tests.gateway.fixtures import hosted_failure_evidence as evidence
++from tui_gateway.hosted_room_driver import HostedRoomRuntime
++
++
++@pytest.mark.parametrize('failed', [True, False], ids=['failed-settlement', 'running-starvation'])
++def test_failure_capture_preserves_the_settlement_signature(tmp_path, failed):
++    home, target = tmp_path / 'host', tmp_path / 'member'
++    home.mkdir()
++    target.mkdir()
++    db = home / 'state.db'
++    clock = lambda: 100.0
++    hosted_rooms.create_room(db, room_id='unknown', name='fixture',
++                             members=[{'profile': 'default', 'handle': 'one'}],
++                             authority_gateway_id='gateway', now=90)
++    identity = state.TaskIdentity(room_id='unknown', task_id='follower', thread_id='thread', turn_id='turn')
++    state.admit_task(db, identity, payload={'target_profile': 'default', 'prompt': 'DO_NOT_DUMP_PROMPT',
++                                          'source_event_seq': 1}, clock=clock)
++    lease = state.acquire_lease(db, room_id='unknown', gateway_id='gateway', authority_epoch=1,
++                                process_generation='process', ttl_seconds=30, clock=clock)
++    attempt = state.start_task(db, identity, lease, expected_cancel_generation=0, clock=clock)
++    if failed:
++        driver = SimpleNamespace(db_path=db, clock=clock, _record_task_error=lambda *_: None)
++        HostedRoomRuntime._settle_failure_if_current(
++            driver, attempt, RuntimeError('resolve_exact failed Authorization: Bearer fixture-secret-value'))
++    (target / 'restart.log').write_text('x' * 9000 + '\nmember transport diagnostic\n')
++    snapshot = {'counts': {'cancelled': 1, 'settled': 1, 'failed' if failed else 'running': 1},
++                'last_error': 'Authorization: Bearer snapshot-secret-value'}
++    with pytest.raises(AssertionError, match='the follower never settled after discard: ') as caught:
++        evidence.assert_follower_deadline(False, home, target, snapshot, 2)
++    report = json.loads(str(caught.value).split(': ', 1)[1])
++    task, = report['tasks']
++    assert task['status'] == ('failed' if failed else 'running')
++    assert task['settlement_status'] == ('failed' if failed else None)
++    assert task['terminal_at'] == (100.0 if failed else None)
++    assert ('resolve_exact failed' in (task['error'] or '')) is failed
++    assert report['request_count'] == 2
++    assert report['snapshot']['counts'] == snapshot['counts']
++    assert 'member transport diagnostic' in report['logs']['member/restart.log']
++    assert len(report['logs']['member/restart.log']) <= evidence.TAIL_BYTES
++    assert len(str(caught.value)) < 24500
++    assert all(secret not in str(caught.value) for secret in (
++        'DO_NOT_DUMP_PROMPT', 'fixture-secret-value', 'snapshot-secret-value'))
++
++
++def test_passing_poll_does_not_collect_evidence(monkeypatch, tmp_path):
++    def forbidden(*args):
++        pytest.fail('passing path collected diagnostics')
++    monkeypatch.setattr(evidence, 'follower_failure_evidence', forbidden)
++    evidence.assert_follower_deadline(True, tmp_path, tmp_path, {}, 0)
++
++
++def test_missing_db_still_reports_original_failure_without_creating_it(tmp_path):
++    with pytest.raises(AssertionError, match='the follower never settled after discard: ') as caught:
++        evidence.assert_follower_deadline(False, tmp_path, tmp_path, {'counts': {'running': 1}}, 2)
++    assert 'OperationalError' in str(caught.value)
++    assert not (tmp_path / 'state.db').exists()
+diff --git a/tests/gateway/test_session_hosted_daemon.py b/tests/gateway/test_session_hosted_daemon.py
+index 521384b86e4fa56d08809546a87b5a4067b71fd9..a289dc317696da5b84a5b018dd61963133814e2a 100644
+--- a/tests/gateway/test_session_hosted_daemon.py
++++ b/tests/gateway/test_session_hosted_daemon.py
+@@ -6,6 +6,7 @@
+ import threading
+ import time
+ 
++from tests.gateway.fixtures.hosted_failure_evidence import assert_follower_deadline
+ from tests.gateway.fixtures.local_recovery_probe import child_env, daemon, rpc, websocket
+ 
+ 
+@@ -322,7 +323,7 @@
+                 snapshot = await state(ws)
+                 if snapshot['counts'].get('settled', 0) >= 2:
+                     break
+-                assert time.monotonic() < deadline, f'the follower never settled after discard: {snapshot}'
++                assert_follower_deadline(time.monotonic() < deadline, home, target, snapshot, len(model.requests))
+                 await asyncio.sleep(.1)
+             assert snapshot['counts'].get('cancelled') == 1, snapshot
+             assert len(model.requests) == 3, model.requests
+-- 
+2.43.0
+

@@ -1,0 +1,303 @@
+From 36a5e656c4cc6af76282d7e6fe7c0b440aab18eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:05:58 +0000
+Subject: [PATCH 6961] Desktop session identity across gateway renames, clarify attention and first send
+
+Public mirror of source commit 36a5e656c4cc6af76282d7e6fe7c0b440aab18eb.
+
+---
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx
+index 6a4536b8e757eb163dc452954d2e189e4f448241..719c4a520266ed028acb24652200f107480f4cec 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx
+@@ -21,6 +21,7 @@
+ import {
+   $activeSessionId,
+   $selectedStoredSessionId,
++  $unlistedSessionOwnerRows,
+   _resetSessionOwnerHintsForTests,
+   setActiveSessionId,
+   setAwaitingResponse,
+@@ -28,6 +29,7 @@
+   setMessages,
+   setSelectedStoredSessionId,
+   setSessions,
++  setUnlistedSessionOwnerRows,
+   setYoloActive
+ } from '@/store/session'
+ import { _resetSessionOwnerHoldsForTests } from '@/store/session-states'
+@@ -277,6 +279,7 @@
+   setActiveSessionId(null)
+   setSelectedStoredSessionId(null)
+   setSessions([])
++  setUnlistedSessionOwnerRows([])
+   setBusy(false)
+   setAwaitingResponse(false)
+   setMessages([])
+@@ -596,3 +599,72 @@
+   await waitFor(() => expect(ids()).toHaveLength(4))
+   expect(ids()[3]).toBe(ids()[2])
+ })
++
++const outboxKeys = () => Object.keys(window.localStorage).filter(key => key.startsWith('hermes:composer-outbox:'))
++
++// A hub that created the session but answers prompt.submit with `onSubmit` (receives the call number
++// and the composer's submission id).
++const mockHubFirstSend = (onSubmit: (call: number, submissionId: string) => unknown) => {
++  let call = 0
++
++  vi.mocked(requestGatewayForAgent).mockImplementation(async (_connection, _profile, method, params) => {
++    if (method === 'session.create') {
++      return { session_id: 'rt-B', stored_session_id: 'stored-B', info: {} }
++    }
++
++    if (method === 'prompt.submit') {
++      call += 1
++
++      return await onSubmit(call, (params as { submission_id: string }).submission_id)
++    }
++
++    throw new Error(`unexpected ${method}`)
++  })
++
++  return () => call
++}
++
++it('waits out a hub that is still loading its chat model, then delivers the first send', async () => {
++  stashSessionDraft(null, 'first message while the model loads', [])
++  $newChatRoute.set({ connectionId: 'connection-loading', profile: 'default' })
++
++  const calls = mockHubFirstSend((call, submissionId) => {
++    if (call === 1) {
++      throw new Error('400: Chat model is still loading; retry when it is ready')
++    }
++
++    return { status: 'started', session_id: 'rt-B', submission_id: submissionId }
++  })
++
++  seed({}, null)
++  act(() => handles.submit.submitDraft())
++  await waitFor(() => expect(calls()).toBe(2), { timeout: 8_000 })
++  await waitFor(() => expect(outboxKeys()).toEqual([]))
++  // Delivered, never parked: no retry draft and no unsent row.
++  expect(window.localStorage.getItem('hermes:composer-draft-retry:v1:stored-B')).toBeNull()
++  expect($unlistedSessionOwnerRows.get()).toEqual([])
++}, 15_000)
++
++it('parks a refused first send with a warning naming the session and keeps its chat listed as unsent', async () => {
++  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
++  stashSessionDraft(null, 'first message the hub refuses', [])
++  $newChatRoute.set({ connectionId: 'connection-refused', profile: 'default' })
++  mockHubFirstSend(() => {
++    throw new Error('fixture hub refused the first send')
++  })
++
++  seed({}, null)
++  act(() => handles.submit.submitDraft())
++
++  await waitFor(() =>
++    expect(warn).toHaveBeenCalledWith('[first-send-parked]', expect.stringContaining('stored-B'), expect.anything())
++  )
++  await waitFor(() => expect(outboxKeys()).toEqual([]))
++
++  // The words sit in the retry draft AND the chat has a sidebar row to find them from.
++  expect(JSON.parse(window.localStorage.getItem('hermes:composer-draft-retry:v1:stored-B') ?? 'null')).toMatchObject({
++    text: expect.stringContaining('first message the hub refuses')
++  })
++  expect($unlistedSessionOwnerRows.get().map(row => row.id)).toContain('stored-B')
++  warn.mockRestore()
++})
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
+index 04a607d087b54b13d57d2fade1bfba2728ca388a..8bfbbed26b18e39f9e3e84b8b57f36ff23c9e8f7 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.ts
+@@ -24,6 +24,7 @@
+ import { isOnboardingChat } from '@/store/onboarding-session'
+ import { answerParkedCard, skipParkedCards, yieldParkedCardsToMessage } from '@/store/parked-card-answers'
+ import { hasBlockingPromptRequest } from '@/store/prompts'
++import { $sessions, setUnlistedSessionOwnerRows } from '@/store/session'
+ 
+ import { cloneAttachments, type QueueEditState } from '../composer-utils'
+ import { onComposerSubmitRequest } from '../focus'
+@@ -47,6 +48,17 @@
+   )
+ }
+ 
++// A first send's chat exists only in this window until the hub admits its prompt, so the server list
++// never carries it. Keep its optimistic row as an unlisted stub: the sidebar shows it as "Not sent -
++// retry" for as long as its retry draft exists.
++function keepUnsentChatListed(sessionId: string): void {
++  const row = $sessions.get().find(session => session.id === sessionId)
++
++  if (row) {
++    setUnlistedSessionOwnerRows(prev => [row, ...prev.filter(stub => stub.id !== sessionId)])
++  }
++}
++
+ interface UseComposerSubmitArgs {
+   activeQueueSessionKey: string | null
+   activeQueueSessionKeyRef: RefObject<string | null>
+@@ -175,6 +187,17 @@
+       // Restored with its identity: Enter on this exact draft retries the same send.
+       rememberDraftRetry?.(restoreScope, draftRetry(submissionId, text, submittedAttachments))
+ 
++      // A first message whose session.create succeeded but whose prompt the hub never accepted: the
++      // chat exists only here, so the server list will not carry it. Say so, and keep a sidebar row
++      // ("Not sent - retry") so the parked words are never in a chat nobody can open.
++      if (submittedScope === null && restoreScope !== null && !displayKind) {
++        console.warn('[first-send-parked]', `session ${restoreScope} first message parked as a retry draft`, {
++          sessionId: restoreScope,
++          submissionId
++        })
++        keepUnsentChatListed(restoreScope)
++      }
++
+       if ((isFreshDraftScope(draftScopeRef.current) ? null : draftScopeRef.current) === restoreScope) {
+         loadIntoComposer(text, submittedAttachments)
+       }
+diff --git a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+index 6a0755d13630c5f1b06475f58bd43ab6f81bbbcf..25f01f572df912cf3b0e1e0232584fdadbe2d514 100644
+--- a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
++++ b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+@@ -9,6 +9,7 @@
+ import { useI18n } from '@/i18n'
+ import { cn } from '@/lib/utils'
+ import { $draftTitles, $freshDraftKey, takeSessionDraft } from '@/store/composer'
++import { readDraftRetry } from '@/store/composer-draft-retry'
+ import { $projectOwnerBySessionId, $projects, $projectTree } from '@/store/projects'
+ import {
+   $activeSessionId,
+@@ -28,6 +29,8 @@
+   git_repo_root?: string | null
+   selected: boolean
+   main: boolean
++  /** A first message the hub never accepted: parked as a retry draft in this chat. */
++  unsent?: boolean
+ }
+ 
+ /** Presentation only: drafts never enter $sessions, project snapshots, or storage. */
+@@ -67,19 +70,25 @@
+     const tile = tiles.find(candidate => candidate.storedSessionId === stub.id)
+     const draft = takeSessionDraft(stub.id)
+ 
++    // A first send the hub refused parks its words as a retry draft in a chat the server never
++    // listed: the row stays (tile or not) until the send lands, so the words are never orphaned.
++    const unsent = Boolean(readDraftRetry(stub.id))
++
+     if (
+-      tile &&
+-      !tile.error &&
+-      (tile.workspaceMode ?? 'sessions') === 'sessions' &&
+       !sessions.some(session => session.id === stub.id) &&
+-      (focused === stub.id || titles[stub.id] || draft.attachments.length)
++      (unsent ||
++        (tile &&
++          !tile.error &&
++          (tile.workspaceMode ?? 'sessions') === 'sessions' &&
++          (focused === stub.id || titles[stub.id] || draft.attachments.length)))
+     ) {
+       rows.set(stub.id, {
+         cwd: stub.cwd ?? null,
+         git_repo_root: stub.git_repo_root,
+         id: stub.id,
+         main: false,
+-        selected: focused === stub.id
++        selected: focused === stub.id,
++        unsent
+       })
+     }
+   }
+@@ -120,7 +129,10 @@
+         }}
+         type="button"
+       >
+-        <span className="truncate">{titles[row.id] || t.sidebar.nav['new-session']}</span>
++        <span className="truncate">
++          {row.unsent ? 'Not sent \u2013 retry: ' : ''}
++          {titles[row.id] || t.sidebar.nav['new-session']}
++        </span>
+       </button>
+     )
+   })
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index 7f9858766986164be245d2dd65ee10724f4a13ae..efc5e3c47d9d8b99a825727716e89c77207a83b3 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -83,6 +83,7 @@
+   type GatewayRequest,
+   inlineErrorMessage,
+   isAdmittedSubmissionConflict,
++  isChatModelLoadingError,
+   isForwardedReceipt,
+   isProviderSetupError,
+   isSessionBusyError,
+@@ -271,7 +272,8 @@
+     }
+   }
+ 
+-  return isPreAdmissionRefusal(error)
++  // 400 "Chat model is still loading": refused before admission.
++  return isChatModelLoadingError(error) || isPreAdmissionRefusal(error)
+ }
+ 
+ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+@@ -1040,9 +1042,13 @@
+         let createdId: null | string
+ 
+         try {
+-          createdId = await createBackendSessionForSend(bubbleText, {
+-            onComposerScopeAssigned: options?.onComposerScopeAssigned
+-          })
++          // A hub still loading its chat model refuses the create too: wait it out instead of
++          // failing a first send the user cannot see again.
++          createdId = await withSessionBusyRetry(() =>
++            createBackendSessionForSend(bubbleText, {
++              onComposerScopeAssigned: options?.onComposerScopeAssigned
++            })
++          )
+         } catch (err) {
+           dropOptimistic(null)
+           releaseBusy()
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+index ab5be9b6c09f6b55fdcec5cb4d0b19113d7ffafb..1a45dd404b52e0af3da1d2039b00fec512409a02 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+@@ -402,12 +402,22 @@
+   return result?.voice_stopped === true
+ }
+ 
++/** The hub answered 400 "Chat model is still loading; retry when it is ready": nothing was admitted and
++ *  the condition clears on its own (a gateway restart or model warm-up), so callers wait it out. */
++export function isChatModelLoadingError(error: unknown): boolean {
++  return /chat model is still loading/i.test(error instanceof Error ? error.message : String(error))
++}
++
++export const CHAT_MODEL_LOADING_RETRY_TIMEOUT_MS = 180_000
++export const CHAT_MODEL_LOADING_RETRY_INTERVAL_MS = 2_000
++
+ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
+ 
+ // Retry a gateway call across transient "session busy" so it never reaches the
+ // user — the turn settles within the deadline and the call lands.
+ export async function withSessionBusyRetry<T>(call: () => Promise<T>): Promise<T> {
+   const deadline = Date.now() + SESSION_BUSY_RETRY_TIMEOUT_MS
++  const loadingDeadline = Date.now() + CHAT_MODEL_LOADING_RETRY_TIMEOUT_MS
+ 
+   for (;;) {
+     try {
+@@ -419,6 +429,12 @@
+         continue
+       }
+ 
++      if (isChatModelLoadingError(err) && Date.now() < loadingDeadline) {
++        await sleep(CHAT_MODEL_LOADING_RETRY_INTERVAL_MS)
++
++        continue
++      }
++
+       throw err
+     }
+   }
+-- 
+2.43.0
+

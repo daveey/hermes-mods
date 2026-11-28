@@ -1,0 +1,106 @@
+From 6158d32628d74a9b9b0d83d0b701398428406526 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:43:50 +0000
+Subject: [PATCH 6686] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit 6158d32628d74a9b9b0d83d0b701398428406526.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 8a67745f7f36152387cc73b92c0aa9a85a6ed336..15fe8a076e092b3f7d548db9120b78b450f81df3 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -185,12 +185,13 @@
+             'wait_for_named_producer', 'satisfy_dependency', 'repair_lifecycle_contract'):
+         return
+     awaiting = facts.get('awaiting')
+-    if not isinstance(awaiting, dict) or not valid_awaiting(awaiting):
++    if not isinstance(awaiting, dict) or not valid_awaiting(awaiting) or awaiting.get('inferred'):
+         return
+-    why = ' '.join(str(awaiting.get('why') or '').split())
++    from hermes_cli.kanban_wait_info import PREREQUISITE_MAX
++    why = ' '.join(str(awaiting.get('why') or '').split())[:PREREQUISITE_MAX]
+     trigger = blocker['trigger']
+-    if not why or why in trigger or trigger.startswith('Repair the missing'):
+-        return  # nothing recorded, no trigger to pair it with, or the trigger already is the reason (a chat question)
++    if not why or trigger.startswith('Repair the missing'):
++        return  # nothing recorded, or no trigger to pair it with
+     wake = positive_time(facts.get('wake_at'))
+     backstop = (f'; backstop: recorded clock reaches {wake}'
+                 if wake and awaiting.get('kind') == 'clock' and 'clock reaches' not in trigger else '')
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index f2734980f16c11eef32db3343efb54dabb3a4c67..a40ca73191fba7c86d5f69a4a02823b03aac809e 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -44,7 +44,7 @@
+     assert row['action'] == action
+     assert trigger in row['blocker']['trigger']
+     assert row['blocker']['prerequisite'] == (
+-        'Named finite producer and recovery condition' if violation else row['blocker']['trigger'])
++        'Named finite producer and recovery condition' if violation else awaiting.get('why') or row['blocker']['trigger'])
+     assert ('scheduled_wake_missing' in row['violations']) == (violation == 'scheduled_wake_missing')
+     assert ('recovery_trigger_missing' in row['violations']) == (violation is not None)
+     assert row['escalation']['at'] == (1600 if wake else None)
+diff --git a/tests/hermes_cli/test_kanban_actionability_wait_reason.py b/tests/hermes_cli/test_kanban_actionability_wait_reason.py
+index 9938d904b16207d5e3c3995d9d3f49fd2b1e59eb..1d947d8c2bf4b39a3b946b5aa410a4adf2e54124 100644
+--- a/tests/hermes_cli/test_kanban_actionability_wait_reason.py
++++ b/tests/hermes_cli/test_kanban_actionability_wait_reason.py
+@@ -222,6 +222,22 @@
+     assert 'prerequisite' not in unpublished and 'watching' not in unpublished
+ 
+ 
++@pytest.mark.parametrize('why', ['ci', 'x' * 900])
++def test_actionability_keeps_short_reasons_and_bounds_long_ones(why):
++    row = project({'task': {'id': 'f', 'status': 'scheduled', 'assignee': 'default'}, 'wake_at': WAKE,
++                   'awaiting': {'kind': 'ci', 'ref': 'https://example.com/run/1', 'why': why}}, now=T0)
++    assert row['blocker']['prerequisite'] == why[:kwi.PREREQUISITE_MAX]
++    assert row['instruction'].startswith('Waiting on: ')
++
++
++def test_actionability_does_not_promote_inferred_reason():
++    row = project({'task': {'id': 'f', 'status': 'scheduled', 'assignee': 'default'}, 'wake_at': WAKE,
++                   'awaiting': {'kind': 'chat', 'ref': 'owning orchestrator', 'why': 'inferred wording', 'inferred': True},
++                   'probe': 'test -f result'}, now=T0)
++    assert 'inferred wording' not in row['instruction']
++    assert 'inferred wording' not in row['blocker']['prerequisite']
++
++
+ def test_reason_is_flattened_and_bounded():
+     park = {'awaiting': {'kind': 'clock', 'why': 'a\n  b ' + 'x' * 900}, 'wake_at': T0 + 600}
+     wait = _described('scheduled', park=park, since=T0, now=T0 + 10)
+diff --git a/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py b/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py
+index 37c76b46a26e6a59ea56393b52291d55b290dd6a..6298de6e151b69f96a7ef117aa0dd75225c68a56 100644
+--- a/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py
++++ b/tests/hermes_cli/test_kanban_cli_outside_park_live_claim.py
+@@ -149,6 +149,28 @@
+     assert _status(tid) == "scheduled"
+ 
+ 
++@pytest.mark.parametrize("verb,extra", [("schedule", ()), ("block", ("--kind", "time"))])
++def test_park_reason_survives_cli_schedule_and_show(home, capsys, verb, extra):
++    tid = _ready()
++    assert _cli()(verb, tid, COOLDOWN, *extra, "--clock-only", *WHY) == 0
++    capsys.readouterr()
++    assert _cli()("show", tid, "--json") == 0
++    shown = json.loads(capsys.readouterr().out)
++    assert shown['actionability']['blocker']['prerequisite'] == 'the cooldown window'
++    assert shown['actionability']['instruction'].startswith('Waiting on: the cooldown window. Next check:')
++
++
++def test_park_reason_survives_tool_schedule_and_show(home, capsys):
++    from tools import kanban_tools as kt
++    tid = _ready()
++    out = json.loads(kt._handle_schedule({'task_id': tid, 'reason': COOLDOWN, 'clock_only': True,
++                                         'awaiting': {'kind': 'clock', 'why': 'the cooldown window'}}))
++    assert out.get('ok'), out
++    shown = json.loads(kt._handle_show({'task_id': tid}))
++    assert shown['actionability']['blocker']['prerequisite'] == 'the cooldown window'
++    assert shown['actionability']['instruction'].startswith('Waiting on: the cooldown window. Next check:')
++
++
+ def test_tool_and_cli_refusals_carry_the_same_facts(home, capsys):
+     """One helper decides both paths: the tool's typed error and the CLI line name the same holder and run."""
+     tid, run_id = _claimed()
+-- 
+2.43.0
+

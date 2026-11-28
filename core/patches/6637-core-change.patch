@@ -1,0 +1,173 @@
+From 0abd3cff048dbdd2d9bc900a35660efba2bbb0af Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:39:27 +0000
+Subject: [PATCH 6637] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 0abd3cff048dbdd2d9bc900a35660efba2bbb0af.
+
+---
+diff --git a/hermes_cli/kanban_replace_guard.py b/hermes_cli/kanban_replace_guard.py
+index 3a1a7ba7ea72f74f2dd3c88c3f38ca957c1a3430..06d4ab50a75777577c9a73cb1aef11753840b5fa 100644
+--- a/hermes_cli/kanban_replace_guard.py
++++ b/hermes_cli/kanban_replace_guard.py
+@@ -8,6 +8,7 @@
+ 
+ import re
+ import sqlite3
++from functools import lru_cache
+ 
+ 
+ class ProtectedRowReplaceError(sqlite3.IntegrityError):
+@@ -45,6 +46,20 @@
+ 
+ def reject_replace(sql):
+     """Preflight the complete SQL before SQLite can write or implicitly commit."""
++    # Only immutable built-in strings: subclass equality/hash cannot certify SQL.
++    # Bound retained text as well as entries; parameters and DB results never enter.
++    if type(sql) is str and len(sql) <= 4096:
++        return _checked_syntax(sql)
++    return _parse_replace(sql)
++
++
++@lru_cache(maxsize=256)
++def _checked_syntax(sql):
++    # functools never caches exceptions: every refused statement still raises.
++    return _parse_replace(sql)
++
++
++def _parse_replace(sql):
+     if not isinstance(sql, str):
+         return  # preserve sqlite3's native type error
+     tokens = list(_tokens(sql))
+diff --git a/tests/hermes_cli/test_kanban_replace_guard_syntax_memo.py b/tests/hermes_cli/test_kanban_replace_guard_syntax_memo.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fb6829f8b7d8aa737c91ae2b093af0966ef5057
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replace_guard_syntax_memo.py
+@@ -0,0 +1,123 @@
++"""Reuse SQL syntax work, never statement execution or database evidence."""
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_cli import kanban_replace_guard as guard
++
++
++@pytest.fixture(autouse=True)
++def clean_syntax_memo():
++    guard._checked_syntax.cache_clear()
++    yield
++    guard._checked_syntax.cache_clear()
++
++
++class Guarded(guard.ReplaceGuardMixin, sqlite3.Connection):
++    pass
++
++
++def test_repeated_bound_queries_parse_once_but_read_current_rows(monkeypatch):
++    parsed = []
++    original = guard._tokens
++
++    def tokens(sql):
++        parsed.append(sql)
++        yield from original(sql)
++
++    monkeypatch.setattr(guard, '_tokens', tokens)
++    select = 'SELECT status FROM memo_fixture WHERE id=? /* repeated syntax work */'
++    with closing(sqlite3.connect(':memory:', factory=Guarded)) as conn:
++        conn.execute('CREATE TABLE memo_fixture(id INTEGER PRIMARY KEY,status TEXT)')
++        conn.execute('INSERT INTO memo_fixture VALUES(1,?)', ('ready',))
++        for status in ('ready', 'running', 'blocked', 'done'):
++            conn.execute('UPDATE memo_fixture SET status=? WHERE id=?', (status, 1))
++            assert conn.execute(select, (1,)).fetchone() == (status,)
++        # Both connection and cursor preflight invoke the same complete parser.
++        assert parsed.count(select) == 1
++
++
++def test_oversized_sql_is_not_retained(monkeypatch):
++    parsed = []
++    original = guard._tokens
++
++    def tokens(sql):
++        parsed.append(sql)
++        yield from original(sql)
++
++    monkeypatch.setattr(guard, '_tokens', tokens)
++    sql = 'SELECT 1 /*' + 'x' * 4096 + '*/'
++    guard.reject_replace(sql)
++    guard.reject_replace(sql)
++    assert parsed == [sql, sql]
++    assert guard._checked_syntax.cache_info().currsize == 0
++
++
++def test_syntax_cache_is_bounded_and_evicts_oldest(monkeypatch):
++    parsed = []
++    original = guard._tokens
++
++    def tokens(sql):
++        parsed.append(sql)
++        yield from original(sql)
++
++    monkeypatch.setattr(guard, '_tokens', tokens)
++    for i in range(257):
++        guard.reject_replace(f'SELECT {i} /* bounded syntax */')
++    assert guard._checked_syntax.cache_info().currsize == 256
++    guard.reject_replace('SELECT 0 /* bounded syntax */')
++    assert parsed.count('SELECT 0 /* bounded syntax */') == 2
++
++
++def test_subclass_hash_equality_cannot_alias_allowed_sql():
++    class SameKey(str):
++        def __hash__(self):
++            return 1
++
++        def __eq__(self, other):
++            return True
++
++    guard.reject_replace(SameKey('SELECT 1'))
++    with pytest.raises(guard.ProtectedRowReplaceError):
++        guard.reject_replace(SameKey('REPLACE INTO tasks VALUES(1)'))
++    assert guard._checked_syntax.cache_info().currsize == 0
++
++
++def test_refused_sql_is_not_cached_as_success(monkeypatch):
++    parsed = []
++    original = guard._tokens
++
++    def tokens(sql):
++        parsed.append(sql)
++        yield from original(sql)
++
++    monkeypatch.setattr(guard, '_tokens', tokens)
++    sql = 'REPLACE INTO main.task_runs VALUES(1)'
++    for _ in range(2):
++        with pytest.raises(guard.ProtectedRowReplaceError):
++            guard.reject_replace(sql)
++    assert parsed == [sql, sql]
++    assert guard._checked_syntax.cache_info().currsize == 0
++
++
++def test_cached_prefix_never_authorizes_script_suffix_or_commit():
++    prefix = 'SELECT 1; /* cached script prefix */'
++    with closing(sqlite3.connect(':memory:', factory=Guarded)) as conn:
++        conn.execute('CREATE TABLE tasks(id INTEGER PRIMARY KEY)')
++        conn.executescript(prefix)
++        conn.execute('INSERT INTO tasks VALUES(2)')
++        assert conn.in_transaction
++        with pytest.raises(guard.ProtectedRowReplaceError):
++            conn.executescript(prefix + '\nREPLACE INTO tasks VALUES(2);')
++        assert conn.in_transaction
++        conn.rollback()
++        assert conn.execute('SELECT * FROM tasks').fetchall() == []
++
++
++@pytest.mark.parametrize('sql', [None, [], b'SELECT 1'])
++def test_native_nonstring_type_errors_are_preserved(sql):
++    with closing(sqlite3.connect(':memory:', factory=Guarded)) as conn:
++        with pytest.raises(TypeError):
++            conn.execute(sql)
++    assert guard._checked_syntax.cache_info().currsize == 0
+-- 
+2.43.0
+

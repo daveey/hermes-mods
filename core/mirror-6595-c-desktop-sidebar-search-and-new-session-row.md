@@ -60,9 +60,27 @@ Treat this series (source ordinals 6508-6512, 5 commits: 6508, 6509, 6510, 6511,
 ## Gotchas
 
 - Test result caveat: the "107 tests across 9 Desktop files, plus typecheck/build" figure is a **prior owner-reported result only**; it was not reproduced or re-run in this mirror. Electron specs touched here were executed only by the prior owner in isolated windows and failed on backend-readiness and seeded-session/dot preconditions; the source commit text records the pre-feature baseline comparison as still running (the baseline reproduction is supplied by the task context, not by source text), so no attribution is made either way. This doc makes **no all-E2E-green claim**. Desktop E2E is disabled in source CI, so the retargeted Electron specs have no green required-CI evidence. Keyboard dispatch was exercised only in jsdom test windows; installed native renderer behaviour is unverified.
-- Not included: the later navigation-block follow-up (PR4494) is **not** part of this series; this doc covers only ordinals 6508-6512.
-- Capabilities stays protected by sidebar nav prefs.
+- Snapshot 7018 also includes the navigation-block follow-up described below. The original 6508–6512 behavior and evidence remain historical; in particular, the old unconditional navigation-group padding no longer exists after 7018.
+- Removing navigation rows does not unregister their pages or action contributions.
 - Nothing in this document is a deployment or live-behaviour claim.
+
+## Navigation-block follow-up (7018)
+
+Source: `6eb51e04afd24f29d8126dd22b29fc28d3060ed6`, ordinal **7018**.
+
+### Behavior and implementation
+
+`ChatSidebar` no longer renders either built-in or contributed page-navigation rows, their context menus, or the group that reserved their space. The content wrapper retains only titlebar clearance. Sessions, Bots, counters, LANES/status/tab surfaces, the session list and existing search disclosure remain. This is presentation removal, not disabling pages, plugins or their registrations: palette navigation, registered actions and shortcuts remain available. No keyboard binding changes; the existing search shortcut and Cmd+N behavior above are unchanged. Obsolete tour stops and tips targeting removed rows are dropped.
+
+### Code and tests
+
+The follow-up changes `sidebar/index.tsx`, `built-in-tour.ts`, `lib/tips/catalog.ts`, both full-DOM parity receipts, `chat-sidebar.integration.test.tsx`, `built-in-tour.test.ts` and `command-palette/hidden-nav-routes.test.tsx` under `apps/desktop/src/app/` (the tips file is under `src/lib/`). Integration expectations cover absence of the navigation block and its spacing while retaining titlebar clearance and session presentation. The palette test exercises four built-in and five contributed routes, including contributed page mounting. Tour expectations cover both interface modes and presets.
+
+Prior implementation evidence reports 571 tests in 30 files and five assertion-killed mutation controls; later post-rebase evidence reports 85 tests in seven files plus typecheck. Those are **prior owner results, not tests rerun by this mirror**. Separately supplied installed-proof evidence reports 12 native checks of the signed package at this exact source stamp, 38 raw CDP responses and no exceptions, without user-window input or restart. That evidence is private and was not rerun here. None of these results establishes all Electron E2E green; the earlier baseline-reproduced failures remain disclosed above. Source inspection is not fresh installation verification.
+
+### Applying and gotchas
+
+Apply the full ordered snapshot through 7018 using the current README recipe and mandatory repair, not this patch alone. Earlier paragraphs describe the original 6508–6512 snapshot; after 7018 the old navigation group and its padding are gone. Route registration is intentionally preserved even though its sidebar entry is absent. This publication performs no build, installation, restart or live UI input.
 
 ## Why core, not a plugin?
 

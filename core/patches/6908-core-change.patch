@@ -1,0 +1,137 @@
+From fb240d9ae52695d8e28bb5f4d232965758f438ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:44:20 +0000
+Subject: [PATCH 6908] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit fb240d9ae52695d8e28bb5f4d232965758f438ad.
+
+---
+diff --git a/hermes_cli/kanban_sync_apply_budget.py b/hermes_cli/kanban_sync_apply_budget.py
+index 07c934a7b14309995f861681abf50c471a73febe..63e6acee1b129a1664a00da6c5d689d65e5b668f 100644
+--- a/hermes_cli/kanban_sync_apply_budget.py
++++ b/hermes_cli/kanban_sync_apply_budget.py
+@@ -96,7 +96,7 @@
+     def send():
+         try:
+             client._send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True, seen=evidence)
+-        except (client.HubError, OSError) as exc:
++        except (client.HubError, OSError, client.SyncUnavailable, client.ReplayFault) as exc:
+             client._log.info("kanban sync: %s interleaved push failed (%s)", slug, exc)
+     return push_service(send)
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 57385820767e52ae1c19e00eb3bd77bef3eabb9d..1406211cdf9f51dc4dbd3181a89e82358ffe409d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1028,7 +1028,7 @@
+         evidence = backlog.round_evidence(path)
+         try:
+             _send(live, hub, slug, gateway, mode, result, after_pull=False, before_head=True, seen=evidence)
+-        except (HubError, OSError) as exc:
++        except (HubError, OSError, SyncUnavailable, ReplayFault) as exc:
+             _log.info("kanban sync: %s push before the pull failed (%s); pulling anyway", slug, exc)
+         from hermes_cli.kanban_sync_apply_budget import round_pushes
+         with round_pushes(live, hub, slug, gateway, mode, result, evidence), quarantine.mirroring(live), _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+@@ -1092,7 +1092,7 @@
+         # Still behind the head: the Board may hold a run's end in a page not read yet, so run rows wait.
+         try:
+             _send(live, hub, slug, gateway, mode, result, after_pull=True, before_head=result.behind, seen=evidence)
+-        except (HubError, OSError):
++        except (HubError, OSError, SyncUnavailable, ReplayFault):
+             backlog.note(path, result.behind)  # the pulls landed: a board still behind reruns at once
+             raise
+         if mode == "primary":
+diff --git a/tests/hermes_cli/test_kanban_replay_http_resync.py b/tests/hermes_cli/test_kanban_replay_http_resync.py
+index cf11bdd6c614af52156603eaed44822921875d79..0151ab104c1923cda6e759c7e1aa626f2945ee71 100644
+--- a/tests/hermes_cli/test_kanban_replay_http_resync.py
++++ b/tests/hermes_cli/test_kanban_replay_http_resync.py
+@@ -151,3 +151,86 @@
+             assert recovery.fault(live) is not None
+         finally:
+             hub.close()
++
++
++def test_paused_send_does_not_starve_pull(live):
++    kb.create_task(live, title='healthy feed during sender pause', assignee='worker')
++    receiver = Receiver()
++    original = receiver._call
++
++    def reply(method, path, body=None):
++        if '/changes' in path or '/snapshot' in path:
++            return {'events': [], 'cursor': 0, 'more': False}
++        return original(method, path, body)
++
++    receiver._call = reply
++    broken = [True]
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    frozen = journal.pending_wire(live)
++    with serving(live, receiver, response_status=lambda p: 410 if broken[0] and p.endswith('/inspect') else 200) as (url, requests, _):
++        hub = hub_at(url)
++        try:
++            for _ in range(4):
++                with pytest.raises(client.HubError):
++                    client.sync_board('default', path, hub, 'macbook')
++            assert any('/changes' in p for _, p, _, _ in requests)
++            assert recovery.fault(live)['paused'] == 1
++            before = len(requests)
++            broken[0] = False
++            with pytest.raises(client.SyncUnavailable):
++                client.sync_board('default', path, hub, 'macbook')
++            assert any('/changes' in p or '/snapshot' in p for _, p, _, _ in requests[before:]), 'sender pause starved the healthy feed'
++            assert journal.pending_wire(live) == frozen
++        finally:
++            hub.close()
++
++
++def test_current_row_hold_does_not_starve_pull(live):
++    _tid, receiver = issued_parent(live)
++    original = receiver._call
++
++    def reply(method, path, body=None):
++        if '/changes' in path or '/snapshot' in path:
++            return {'events': [], 'cursor': 0, 'more': False}
++        if '/evidence' in path:
++            return receiver.evidence
++        return original(method, path, body)
++
++    receiver._call = reply
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    frozen = journal.pending_wire(live)
++    with serving(live, receiver, response_status=lambda p: 410 if '/evidence' in p else 200) as (url, requests, _):
++        hub = hub_at(url)
++        try:
++            with pytest.raises(existence.CurrentRowHold):
++                client.sync_board('default', path, hub, 'macbook')
++            assert any('/changes' in p or '/snapshot' in p for _, p, _, _ in requests)
++            assert journal.pending_wire(live) == frozen
++        finally:
++            hub.close()
++
++
++def test_malformed_strict_envelope_does_not_starve_pull(live):
++    kb.create_task(live, title='malformed capability still pulls', assignee='worker')
++    receiver = Receiver()
++    original = receiver._call
++
++    def reply(method, path, body=None):
++        if '/changes' in path or '/snapshot' in path:
++            return {'events': [], 'cursor': 0, 'more': False}
++        if path.endswith('/capability'):
++            return []
++        return original(method, path, body)
++
++    receiver._call = reply
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    frozen = journal.pending_wire(live)
++    with serving(live, receiver) as (url, requests, _):
++        hub = hub_at(url)
++        try:
++            with pytest.raises(client.ReplayFault):
++                client.sync_board('default', path, hub, 'macbook')
++            assert any('/changes' in p or '/snapshot' in p for _, p, _, _ in requests)
++            assert journal.pending_wire(live) == frozen
++        finally:
++            hub.close()
+-- 
+2.43.0
+

@@ -1,0 +1,360 @@
+From 5fa5786aed4084d94fd31748f6a42d0f420c9a59 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:12:19 +0000
+Subject: [PATCH 6688] Annotation holder counts custody and read sharing
+
+Public mirror of source commit 5fa5786aed4084d94fd31748f6a42d0f420c9a59.
+
+---
+diff --git a/hermes_cli/kanban_annotation_deadlines.py b/hermes_cli/kanban_annotation_deadlines.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf54fe252182d174bd62f699cf26cb6f086c54bd
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_deadlines.py
+@@ -0,0 +1,44 @@
++"""Publication-local ownership of supersedable annotation clocks. [daveey]
++
++Legacy clocks and settle confirmations remain conservative. Only a successful
++source projection may replace all boundaries of its own scope-local owner.
++"""
++from __future__ import annotations
++
++
++class Schedule(list):
++    """List-compatible next wakes, retaining distinct clock provenance."""
++
++    def __init__(self, plain, owners, confirmations=()):
++        self.plain = tuple(sorted(set(plain)))
++        self.owners = {owner: tuple(values) for owner, values in owners.items() if values}
++        self.confirmations = tuple(confirmations)
++        super().__init__(sorted({*self.plain, *self.confirmations,
++                                 *(due for values in self.owners.values() for due in values)}))
++
++
++class Plan(list):
++    """Stage clock replacement; discard this object when projection fails."""
++
++    def __init__(self, previous, confirmations, now):
++        plain = (previous.plain if isinstance(previous, Schedule)
++                 else [due for due in previous if due not in confirmations])
++        owners = previous.owners if isinstance(previous, Schedule) else {}
++        self.expired = any(due <= now for due in plain) or any(
++            due <= now for values in owners.values() for due in values)
++        super().__init__(due for due in plain if due > now)
++        self.owners = {owner: tuple(due for due in values if due > now) for owner, values in owners.items()}
++
++    def replace(self, owner, values, now):
++        self.owners[owner] = tuple(sorted({due for due in values if due is not None and due > now}))
++
++    def finish(self, confirmations=()):
++        return Schedule(self, self.owners, confirmations)
++
++
++def retry(previous, due, now):
++    """A failed/busy scope keeps every unconsumed source clock and its identity."""
++    plan = Plan(previous, (), now)
++    plan.append(due)
++    confirmations = getattr(previous, 'confirmations', ())
++    return plan.finish(t for t in confirmations if t > now)
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 7ec1d8264327977bf63b8ab77e2622346f5d9a0c..f45790aa9da3d4db3ae4771f0b5377bfda6c5635 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -623,6 +623,18 @@
+         pending.append(due)
+ 
+ 
++def replace_deadlines(owner: tuple, values) -> None:
++    """Stage a successful source's complete current clocks; never replace a peer's."""
++    from hermes_cli.kanban_annotation_deadlines import Plan
++
++    pending = getattr(_holder_ctx, 'deadlines', None)
++    if isinstance(pending, Plan):
++        pending.replace(owner, values, time.time())
++    elif pending is not None:  # legacy holder: retain conservative unowned clocks
++        for due in values:
++            note_deadline(due)
++
++
+ def wake_holder() -> None:
+     """Wake native demand/registration changes without reading any source."""
+     _wake.set()
+@@ -656,9 +668,11 @@
+ 
+ 
+ def _scope_retry(scope: tuple[str, ...]) -> float:
++    from hermes_cli.kanban_annotation_deadlines import retry
++
+     now = time.time()
+     due = now + HOLDER_INTERVAL_S
+-    _clock_deadlines[scope] = sorted({due, *[t for t in _clock_deadlines.get(scope, ()) if t > now]})
++    _clock_deadlines[scope] = retry(_clock_deadlines.get(scope, ()), due, now)
+     return due
+ 
+ 
+@@ -735,13 +749,14 @@
+             try:
+                 # Native scheduling uses part keys, never the legacy narrow-key gate. Do not build its expensive
+                 # inventory in prepare or claim its extended display lifetime: publish the ordinary exact copy.
+-                # Inner caches can return without emitting their clock boundaries.
+-                # Preserve those until consumed; replacing the list needs per-cache
+-                # deadline ownership, not just a successful outer projection.
++                # Unread owners and legacy clocks retain their boundaries. A
++                # successful source may replace only its own superseded clocks.
+                 confirmations = _settle_deadlines.get(scope, ())
+                 started = time.time()
+-                pending = [t for t in _clock_deadlines.get(scope, ()) if t not in confirmations]
+-                _holder_ctx.deadlines = [t for t in pending if t > started]
++                from hermes_cli.kanban_annotation_deadlines import Plan
++
++                pending = Plan(_clock_deadlines.get(scope, ()), confirmations, started)
++                _holder_ctx.deadlines = pending
+                 # [daveey] Force only the parts whose own inputs moved (kanban_annotation_parts). A provider deadline
+                 # that came due is a wall-time transition no key sees: it forces them all. A settle confirmation is
+                 # not one: it re-takes the keys, which is what shows a commit the first read was too early for. The
+@@ -754,7 +769,7 @@
+                         read_at = _ksa._count_scopes.read_at_locked(scope)
+                 if lost:
+                     _parts.failed(scope)
+-                clock = len(_holder_ctx.deadlines) != len(pending)
++                clock = pending.expired
+                 renew = read_at is None or time.monotonic() - read_at >= STRICT_REFRESH_AGE_S
+                 forced, part_keys = _parts.plan(scope, clock=clock, renew=renew)
+                 _ksa._revalidate.force_read.scope = scope
+@@ -775,7 +790,7 @@
+                 else:
+                     confirmations = tuple(t for t in confirmations if t > now)
+                 _settle_deadlines[scope] = confirmations
+-                _clock_deadlines[scope] = sorted({*_holder_ctx.deadlines, *confirmations})
++                _clock_deadlines[scope] = pending.finish(confirmations)
+                 _event_ready.add(scope)
+                 return min(_clock_deadlines[scope], default=None)
+             except BaseException:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 68512855420c9ec62fc4923778667722e0d3f2d2..cd9e41715839e8061319dad82ddd26b3542794a9 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -631,11 +631,6 @@
+         version_column = 'version' if 'version' in columns else 'NULL'
+         info_rows = conn.execute("SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'").fetchall()
+         last_ok, offline = _meta_float(conn, "last_ok"), _meta_float(conn, "offline_since")
+-        if last_ok is not None and offline is None:
+-            _host_copy.note_deadline(last_ok + HUB_STALE_AFTER_S + .001)
+-        for beat, window in _scope_heartbeats(info_rows).values():
+-            _host_copy.note_deadline(beat)
+-            _host_copy.note_deadline(beat + window + .001)
+         key = view = rows = probe = None
+         packed = '[]'
+         memo_hit = None
+@@ -690,6 +685,12 @@
+                                 qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out,
+                                 closed_out=closed_out)
+     _note_known_gateways(moved_out, info_rows)
++    # Replace only after the complete source projection succeeds. A swallowed
++    # lower-level failure must not postpone the published copy's old boundary.
++    deadlines = [last_ok + HUB_STALE_AFTER_S + .001] if last_ok is not None and offline is None else []
++    for beat, window in _scope_heartbeats(info_rows).values():
++        deadlines.extend((beat, beat + window + .001))
++    _host_copy.replace_deadlines(('replica', str(path)), deadlines)
+     return cards
+ 
+ 
+diff --git a/tests/hermes_cli/test_annotation_deadline_custody.py b/tests/hermes_cli/test_annotation_deadline_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..240322f3dc964ad31d792b324cddb1bad299299a
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_deadline_custody.py
+@@ -0,0 +1,190 @@
++"""A renewed replica observation supersedes only its own earlier clock boundaries."""
++import contextvars
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_annotation_disk as disk
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_annotation_counts as counts
++from hermes_cli import kanban_session_activity as ksa
++
++
++@pytest.fixture
++def replica_holder(monkeypatch, tmp_path):
++    scope = ('replica-deadline',)
++    path = tmp_path / 'replica.db'
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE replica (coll TEXT, key TEXT, gw TEXT, data TEXT, updated_at INTEGER, seq INTEGER, version INTEGER)')
++        conn.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++        conn.execute("INSERT INTO meta VALUES ('last_ok','100')")
++    now = [100.0]
++    revision = [0]
++    monkeypatch.setattr(host.time, 'time', lambda: now[0])
++    monkeypatch.setattr(host, '_known', {scope: contextvars.copy_context()})
++    monkeypatch.setattr(host, '_clock_deadlines', {})
++    monkeypatch.setattr(host, '_event_ready', set())
++    monkeypatch.setattr(host, '_coverage_stale', set())
++    monkeypatch.setattr(host, '_settle_deadlines', {})
++    monkeypatch.setattr(host, '_unsettled', set())
++    monkeypatch.setattr(host, 'SETTLE_S', ())
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([], []))
++    monkeypatch.setattr(host, '_discovery_paths', lambda: (set(), set()))
++    monkeypatch.setattr(host, 'waiting_events', lambda now: (set(), None))
++    monkeypatch.setattr(host, '_scope_interested', lambda scope: True)
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / 'copy')
++    monkeypatch.setattr(disk, 'demand_age', lambda scope: 0)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(ksa, '_self_gateway', lambda conn: 'local')
++    monkeypatch.setattr(ksa, '_remote_read_memo', {})
++    monkeypatch.setattr(ksa, '_note_known_gateways', lambda *args: None)
++    monkeypatch.setattr(parts, '_seen', {})
++    monkeypatch.setattr(parts, 'keys', lambda scope: {name: revision[0] for name in parts.ALL})
++    monkeypatch.setattr(counts, 'begin', lambda *args: None)
++    monkeypatch.setattr(counts, 'needs_read', lambda scope: False)
++    monkeypatch.setattr(counts, 'read_at', lambda scope: host.time.monotonic())
++    calls = []
++    def refresh(scope):
++        calls.append(now[0])
++        assert ksa._read_remote_links(path) == []
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', refresh)
++    events = SimpleNamespace(replace=lambda *a, **kw: None, control_only=False)
++    return SimpleNamespace(scope=scope, path=path, now=now, revision=revision, calls=calls, events=events, refresh=refresh)
++
++
++def test_successful_replica_refresh_replaces_superseded_staleness_deadline(replica_holder):
++    scope, path, now, revision, calls, events = (replica_holder.scope, replica_holder.path, replica_holder.now,
++                                               replica_holder.revision, replica_holder.calls, replica_holder.events)
++    for observed in (100.0, 120.0, 140.0, 160.0):
++        now[0] = observed
++        with sqlite3.connect(path) as conn:
++            conn.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(observed),))
++        revision[0] += 1
++        host._event_refresh(events)
++    expected = 160.0 + ksa.HUB_STALE_AFTER_S + .001
++    assert host._clock_deadlines[scope] == [expected], 'superseded healthy observations left clock chains'
++    events.control_only = True
++    now[0] = 100.0 + ksa.HUB_STALE_AFTER_S + .001
++    assert host._event_refresh(events) == expected
++    assert calls == [100.0, 120.0, 140.0, 160.0], 'old freshness boundary forced another read'
++    now[0] = expected
++    host._event_refresh(events)
++    assert calls[-1] == expected, 'the final real stale transition was lost'
++
++
++@pytest.mark.parametrize('failure', ['outer', 'reader'])
++def test_failed_refresh_cannot_replace_published_clock(replica_holder, monkeypatch, failure):
++    h = replica_holder
++    host._event_refresh(h.events)
++    old = 100.0 + ksa.HUB_STALE_AFTER_S + .001
++    h.now[0] = 120.0
++    h.revision[0] += 1
++    with sqlite3.connect(h.path) as conn:
++        conn.execute("UPDATE meta SET v='120' WHERE k='last_ok'")
++    if failure == 'reader':
++        from hermes_cli import kanban_replica_memo
++        monkeypatch.setattr(ksa, '_remote_read_memo', {})
++        def broken(*args, **kwargs):
++            raise sqlite3.OperationalError('controlled detached projection failure')
++        monkeypatch.setattr(kanban_replica_memo, 'finish', broken)
++        def refresh(scope):
++            try:
++                h.refresh(scope)
++            except sqlite3.OperationalError:
++                pass  # display reader fallback; outer projection still succeeds
++    else:
++        def refresh(scope):
++            h.refresh(scope)
++            raise ValueError('controlled outer publication failure')
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', refresh)
++    host._event_refresh(h.events)
++    schedule = host._clock_deadlines[h.scope]
++    assert old in schedule, 'failed observation discarded the published clock'
++    assert 120.0 + ksa.HUB_STALE_AFTER_S + .001 not in schedule
++
++
++def test_unread_replica_keeps_clock_while_other_source_changes(replica_holder, monkeypatch):
++    h = replica_holder
++    host._event_refresh(h.events)
++    old = list(host._clock_deadlines[h.scope])
++    h.now[0] = 120.0
++    h.revision[0] += 1
++    monkeypatch.setattr(ksa, '_refresh_annotation_locked', lambda scope: None)
++    host._event_refresh(h.events)
++    assert host._clock_deadlines[h.scope] == old
++
++
++def test_deadline_owners_legacy_clocks_and_confirmations_do_not_alias():
++    from hermes_cli.kanban_annotation_deadlines import Plan
++    plan = Plan([], (), 100.0)
++    plan.append(150.0)  # legacy recovery deadline must survive same-valued ownership
++    plan.replace(('replica', 'a'), [150.0], 100.0)
++    plan.replace(('replica', 'b'), [150.0, 170.0], 100.0)
++    first = plan.finish((150.0,))
++    next_plan = Plan(first, (150.0,), 120.0)
++    next_plan.replace(('replica', 'a'), [200.0], 120.0)
++    assert next_plan.finish() == [150.0, 170.0, 200.0], 'peer owner was mistaken for a settle confirmation'
++    assert not next_plan.expired
++    expired = Plan(next_plan.finish(), (), 150.0)
++    assert expired.expired, 'same-valued confirmation swallowed the real peer clock'
++    assert expired.finish() == [170.0, 200.0]
++
++
++def test_retry_preserves_owner_and_scope_independence():
++    from hermes_cli.kanban_annotation_deadlines import Plan, retry
++    first = Plan([], (), 100.0)
++    first.replace(('replica', 'a'), [150.0], 100.0)
++    schedule = first.finish()
++    second = Plan(retry(schedule, 122.0, 120.0), (), 121.0)
++    second.replace(('replica', 'a'), [200.0], 121.0)
++    assert second.finish() == [122.0, 200.0], 'retry flattened owned clocks into unowned chains'
++    assert schedule == [150.0], 'another scope mutated retained source evidence'
++
++
++def test_successful_removal_and_earlier_observation_replace_only_own_clocks():
++    from hermes_cli.kanban_annotation_deadlines import Plan
++    first = Plan([], (), 100.0)
++    first.replace(('replica', 'a'), [200.0], 100.0)
++    first.replace(('replica', 'b'), [180.0], 100.0)
++    next_plan = Plan(first.finish(), (), 110.0)
++    next_plan.replace(('replica', 'a'), [150.0], 110.0)
++    assert next_plan.finish() == [150.0, 180.0], 'older source evidence must not inherit a later expiry'
++    next_plan.replace(('replica', 'a'), [], 110.0)
++    assert next_plan.finish() == [180.0], 'removed/offline source cleared a peer deadline'
++
++
++def test_legacy_holder_retains_conservative_deadlines(monkeypatch):
++    pending = []
++    monkeypatch.setattr(host._holder_ctx, 'deadlines', pending, raising=False)
++    now = host.time.time()
++    host.replace_deadlines(('replica', 'a'), [now + 10.0, now - 1.0])
++    host.replace_deadlines(('replica', 'a'), [now + 20.0])
++    assert pending == [now + 10.0, now + 20.0]
++
++
++def test_real_heartbeat_renewal_replaces_only_previous_heartbeat_boundaries(replica_holder):
++    h = replica_holder
++    for observed in (100.0, 120.0):
++        h.now[0] = observed
++        h.revision[0] += 1
++        info = {'gateway': 'remote', 'scope_heartbeat_period_s': 60,
++                'task_scopes': [{'board': 'main', 'profile': 'default', 'state': 'ok', 'observed_at': observed}]}
++        with sqlite3.connect(h.path) as conn:
++            conn.execute('DELETE FROM meta')  # isolate the heartbeat from transport freshness
++            conn.execute('DELETE FROM replica')
++            conn.execute("INSERT INTO replica VALUES ('gateway','info','remote',?,1,?,?)",
++                         (json.dumps(info), h.revision[0], h.revision[0]))
++        host._event_refresh(h.events)
++    beat, window = next(iter(ksa._scope_heartbeats([('remote', json.dumps(info))]).values()))
++    assert host._clock_deadlines[h.scope] == [beat + window + .001]
++    h.events.control_only = True
++    h.now[0] = 100.0 + window + .001
++    host._event_refresh(h.events)
++    assert h.calls == [100.0, 120.0]
++    h.now[0] = beat + window + .001
++    host._event_refresh(h.events)
++    assert h.calls[-1] == h.now[0], 'actual heartbeat expiry did not force a read'
++
+-- 
+2.43.0
+

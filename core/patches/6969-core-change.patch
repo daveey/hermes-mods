@@ -1,0 +1,341 @@
+From 1d4ca0beac9d42df4e6615cb95d9625e6e0a97e5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:58:45 +0000
+Subject: [PATCH 6969] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 1d4ca0beac9d42df4e6615cb95d9625e6e0a97e5.
+
+---
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+index 34cf1e006a820cec458ccac24c70b2493bdd8681..c8e7b74c21347f61a8c12841c67a873912b0b5ec 100644
+--- a/hermes_cli/kanban_ask_resolved.py
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -427,7 +427,10 @@
+         if filed is None:
+             continue
+         filed_id, payload, filed_at = int(filed[0]), kb._json_dict(filed[1]), int(filed[2] or 0)
+-        host = payload.get("probe_host")
++        from hermes_cli import kanban_home_probe
++        host = kanban_home_probe.host(conn, tid, filed_id, payload.get("probe_host"))
++        if host == kanban_home_probe.UNKNOWN:
++            continue
+         if host and own and host != own:
+             # Another gateway runs this ask's probe. On its home board, say once when that host went silent;
+             # a worker node's copy of another gateway's card is left alone. Never run it here, never unblock.
+diff --git a/hermes_cli/kanban_home_probe.py b/hermes_cli/kanban_home_probe.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cc5628cbca5bd734e263f83282f49ad7ca11adc
+--- /dev/null
++++ b/hermes_cli/kanban_home_probe.py
+@@ -0,0 +1,80 @@
++"""Probe execution stays with its filing gateway across an administrative move.
++
++This is routing evidence, never permission to run or release a held card. The
++capture epoch is mirrored only by authenticated feed/source finalization; local
++manifest receipts are installed only by the authenticated handoff caller.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++UNKNOWN = "home-probe-custody-unknown"
++
++
++def host(conn: sqlite3.Connection, task_id: str, event_id: int, explicit: str | None) -> str | None:
++    """Preserve explicit custody, or recover the exact hostless event's old host.
++
++    Ordinary unmoved boards retain legacy behavior. During a transferred task's
++    early feed (before full destination import), an unknown event origin refuses
++    restoration instead of guessing the new home. A later filing cannot borrow
++    the former source from an unrelated historical event.
++    """
++    if explicit:
++        return explicit
++    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN "
++              "('kanban_home_generations1','kanban_home_materialized1','kanban_home_finalized1')")}
++    if "kanban_home_generations1" not in tables or not conn.execute(
++            "SELECT 1 FROM kanban_home_generations1 WHERE task_id=?", (task_id,)).fetchone():
++        return None
++    event = conn.execute("SELECT uid,origin_gateway FROM task_events WHERE task_id=? AND id=?", (task_id,event_id)).fetchone()
++    if event is None:
++        return UNKNOWN
++    if event[1]:
++        return str(event[1])  # authenticated remote origin, or the native filing gateway
++    for table, column in (("kanban_home_materialized1", "manifest"), ("kanban_home_finalized1", "receipt")):
++        if table not in tables:
++            continue
++        row = conn.execute(f"SELECT {column} FROM {table} WHERE task_id=?", (task_id,)).fetchone()
++        if row is None:
++            continue
++        try:
++            record = json.loads(row[0])
++            if (record["task"] == task_id and isinstance(record["source"], str)
++                    and any(r["table"] == "task_events" and r["uid"] == event[0] for r in record["rows"])):
++                return record["source"]
++        except (ValueError, TypeError, KeyError):
++            continue
++    return UNKNOWN
++
++
++def require_source_probe(conn: sqlite3.Connection, task_id: str, source: str) -> None:
++    """Refuse preparation until an active logical source probe is registered.
++
++    Run ordinary restoration before preparing, then drain its published events.
++    Never reset an exhausted probe or restore inside the transfer transaction.
++    Explicit foreign-host custody stays foreign.
++    """
++    from hermes_cli import kanban_ask_resolved as ask, kanban_wake_check as wake
++    from hermes_cli import kanban_continuation as continuation
++
++    task = conn.execute("SELECT status,human_request FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if not task or task[0] not in ("scheduled", "blocked"):
++        return
++    purpose = ask.PURPOSE if task[0] == "blocked" else None
++    kinds = ("blocked",) if purpose else continuation.SCHEDULED_ENTRY_EVENTS
++    marks = ",".join("?" for _ in kinds)
++    event = conn.execute(f"SELECT id,payload FROM task_events WHERE task_id=? AND kind IN ({marks}) "
++                         "ORDER BY id DESC LIMIT 1", (task_id,*kinds)).fetchone()
++    payload = json.loads(event[1]) if event else {}
++    cmd = ask.resolved_check(task[1])[0] if purpose else payload.get("wake_check")
++    if not cmd:
++        return
++    probe_host = host(conn, task_id, event[0], payload.get("probe_host")) if event else None
++    if probe_host and probe_host != source:
++        if probe_host == UNKNOWN:
++            raise ValueError("source probe host is unknown")
++        return
++    state = wake.get_state(conn, task_id)
++    if state is None or state["cmd"] != cmd or (state.get("purpose") == ask.PURPOSE) != bool(purpose):
++        raise ValueError("source probe must be restored and drained before preparation")
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 08d994244040d865ad92aaf1341bae33b44e545e..3bd48ee5365ee5b95d4cbeff675aea6f4b1f5efd 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -149,6 +149,8 @@
+                     or conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes LIMIT 1").fetchone()
+                     or conn.execute("SELECT 1 FROM kanban_sync_omissions LIMIT 1").fetchone()):
+                 raise ValueError("home preparation requires drained pending custody")
++            from hermes_cli.kanban_home_probe import require_source_probe
++            require_source_probe(conn, task_id, source)
+             conn.execute(f"INSERT INTO {_TABLE}(task_id,source,destination,nonce,expected_version) VALUES (?,?,?,?,?)",
+                          tuple(record.values()))
+     except BaseException:
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index e0e01bd7a2e7d5f26c9823f50c9b2d29abc9a61e..3a1f227dfaf3fef2c2a51bb99708c45bcdd671de 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -379,6 +379,13 @@
+     return woke
+ 
+ 
++def _settled_park(conn: sqlite3.Connection, task_id: str, park_id: int, payload: dict) -> bool:
++    """Clock-only/invalid probes and superseded parks need no restoration."""
++    return (not payload.get("wake_check") or not isinstance(payload.get("wake_at"), (int, float))
++            or conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND id>? AND kind IN ('claimed','spawned') "
++                            "LIMIT 1", (task_id,park_id)).fetchone() is not None)
++
++
+ def restore_missing_checks(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict:
+     """Lint every ``scheduled`` card whose latest park carries a wake_check but has no probe on this board.
+ 
+@@ -430,15 +437,14 @@
+         if _RESTORE_SEEN.get(key) == park_id:
+             continue
+         cmd = payload.get("wake_check")
+-        if not cmd or not isinstance(payload.get("wake_at"), (int, float)):
+-            _RESTORE_SEEN[key] = park_id  # a clock-only park: nothing to restore until it parks again
++        if _settled_park(conn, tid, park_id, payload):
++            _RESTORE_SEEN[key] = park_id  # only a newer park reopens a settled probe
+             continue
+-        if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ('claimed', 'spawned') "
+-                        "LIMIT 1", (tid, park_id)).fetchone():
+-            _RESTORE_SEEN[key] = park_id  # G2e: events never go away; only a newer park (a new id) reopens this
+-            continue  # a later run's park has not reached this board yet
+         every = normalize_every(payload.get("check_every"))
+-        host = payload.get("probe_host")
++        from hermes_cli import kanban_home_probe
++        host = kanban_home_probe.host(conn, tid, park_id, payload.get("probe_host"))
++        if host == kanban_home_probe.UNKNOWN:
++            continue  # committed move, but the original probe host has not arrived yet
+         copy = tid in foreign
+         base = {"wake_check": cmd, "check_every": every, "probe_host": host}
+         if host and own and host != own:
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index f38821017ba0975d71e22eda608ff0c376a6cca7..232c4574abeb9d32012eb107b1a97bd607afaedb 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -343,6 +343,11 @@
+     # would silently erase that binding and every other local column. Keep the
+     # row even when the directory is currently absent; existence is not custody.
+     keep += " AND NOT (workspace_kind IN ('dir', 'worktree') AND workspace_path IS NOT NULL)"
++    # A finalized live-home source retains its open replica even if an execution
++    # probe row is lost. Its immutable handoff receipt is the fallback custody for
++    # legacy hostless probes; this is not home or execution/lease affinity.
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_home_finalized1'").fetchone():
++        keep += " AND NOT (status NOT IN ('done','archived') AND EXISTS (SELECT 1 FROM kanban_home_finalized1 h WHERE h.task_id=tasks.id))"
+     rows = conn.execute(
+         "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ? AND claim_lock IS NULL "
+         "AND status != 'running'" + keep, (own,)).fetchall()
+diff --git a/tests/hermes_cli/test_home_probe_custody.py b/tests/hermes_cli/test_home_probe_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b9b7b4dd7f0036f372b67dbc407f06cfc306133
+--- /dev/null
++++ b/tests/hermes_cli/test_home_probe_custody.py
+@@ -0,0 +1,153 @@
++"""A home move must not relocate shell probes to the receiving gateway."""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_wake_check as wake
++import pytest
++from tests.hermes_cli import test_home_destination_materialize as support
++
++board = support.board
++
++
++def probe_manifest(*, host=None, ask=False):
++    record = support.manifest()
++    task = record["rows"][0]["fields"]
++    event = record["rows"][2]["fields"]
++    payload = {"wake_check": "test -f ~/.hermes/source-only-ready", "wake_at": 9000000, "check_every": 120}
++    if host:
++        payload["probe_host"] = host
++    if ask:
++        task["status"] = "blocked"
++        task["human_request"] = json.dumps({"resolved_check": payload["wake_check"], "resolved_check_every": 120})
++    event.update(kind="blocked" if ask else "scheduled", payload=json.dumps(payload), created_at=1000)
++    return record
++
++
++def test_hostless_park_does_not_register_on_the_new_home(board):
++    support.prepare_destination(board)
++    record = probe_manifest()
++    support.materialize(board, record)
++    result = wake.restore_missing_checks(board, now=1001)
++    assert result == {"restored": [], "woken": []}
++    assert wake.get_state(board, record["task"]) is None
++
++
++def test_hostless_ask_does_not_register_on_the_new_home(board):
++    from hermes_cli import kanban_ask_resolved as ask
++    support.prepare_destination(board)
++    record = probe_manifest(ask=True)
++    support.materialize(board, record)
++    result = ask.reconcile(board, now=1001)
++    assert result["restored"] == []
++    assert wake.get_state(board, record["task"]) is None
++
++
++def test_explicit_hub_probe_still_registers_on_the_new_home(board):
++    support.prepare_destination(board)
++    record = probe_manifest(host="hub")
++    support.materialize(board, record)
++    assert wake.restore_missing_checks(board, now=1001)["restored"] == [record["task"]]
++    state = wake.get_state(board, record["task"])
++    assert state is not None and state["cmd"] == "test -f ~/.hermes/source-only-ready"
++
++
++def source_park(conn, *, with_check=True, ask=False):
++    from tests.hermes_cli import test_kanban_home_source_stop as stop
++    from hermes_cli import kanban_home_transfer as transfer, kanban_ask_resolved as resolved
++    tid = stop.support.seed(conn)
++    kind = "blocked" if ask else "scheduled"
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (kind,tid))
++        kb._append_event(conn, tid, kind, {"wake_check": "test -f ~/.hermes/source-only-ready", "wake_at": 9000000, "check_every": 120})
++        if ask:
++            conn.execute("UPDATE tasks SET human_request=? WHERE id=?", (json.dumps({"resolved_check": "test -f ~/.hermes/source-only-ready", "resolved_check_every": 120}),tid))
++        if with_check:
++            if ask:
++                resolved.sync_row(conn, tid, now=1000)
++            else:
++                wake.set_check(conn, tid, "test -f ~/.hermes/source-only-ready", 120, now=1000)
++        conn.execute("DELETE FROM kanban_sync_outbox")
++        reply = stop.record(conn, tid)
++        event = dict(conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind=?", (tid,kind)).fetchone())
++        reply["rows"].append({"table": "task_events", "uid": event["uid"], "fields": event})
++    return tid, reply, transfer
++
++
++@pytest.mark.parametrize("ask", [False, True])
++def test_preparation_refuses_a_lost_logical_source_probe_before_installing_a_fence(board, ask):
++    tid, reply, transfer = source_park(board, with_check=False, ask=ask)
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError, match="source probe"):
++            transfer.prepare(board, tid, source=reply["source"], destination="hub", nonce=reply["nonce"], expected_version=7)
++    assert board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_prepared1'").fetchone() is None
++
++
++@pytest.mark.parametrize("ask", [False, True])
++def test_source_copy_survives_a_lost_execution_row_and_restores_there(board, ask):
++    from hermes_cli import kanban_worker_node as node, kanban_ask_resolved as resolved
++    tid, reply, transfer = source_park(board, ask=ask)
++    with kbc.write_txn(board):
++        transfer.prepare(board, tid, source=reply["source"], destination="hub", nonce=reply["nonce"], expected_version=7)
++        transfer.finalize_source(board, reply)
++        board.execute("DELETE FROM task_wake_checks WHERE task_id=?", (tid,))
++    assert tid not in node.evict(board)
++    assert kb.get_task(board, tid) is not None
++    result = resolved.reconcile(board, now=1001) if ask else wake.restore_missing_checks(board, now=1001)
++    assert result["restored"] == [tid]
++
++
++@pytest.mark.parametrize("ask", [False, True])
++def test_early_feed_without_destination_receipt_never_guesses_the_new_home(board, ask):
++    from hermes_cli import kanban_ask_resolved as resolved
++    support.prepare_destination(board)
++    record = probe_manifest(ask=ask)
++    support.materialize(board, record)
++    with kbc.write_txn(board):
++        board.execute("DELETE FROM kanban_home_materialized1")
++        # A genuinely old hostless event might have no origin before its full
++        # authenticated manifest arrives. Do not interpret unknown as local.
++        board.execute("UPDATE task_events SET origin_gateway=NULL WHERE uid=?", (record["rows"][2]["uid"],))
++    result = resolved.reconcile(board, now=1001) if ask else wake.restore_missing_checks(board, now=1001)
++    assert result["restored"] == []
++    assert wake.get_state(board, record["task"]) is None
++
++
++def test_receipt_fallback_only_applies_to_the_exact_historical_event(board):
++    from hermes_cli import kanban_home_probe as probe
++    support.prepare_destination(board)
++    record = probe_manifest()
++    support.materialize(board, record)
++    tid = record["task"]
++    with kbc.write_txn(board):
++        board.execute("UPDATE task_events SET origin_gateway=NULL WHERE task_id=?", (tid,))
++        old = board.execute("SELECT id FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++        assert probe.host(board, tid, old, None) == "worker-a3"
++        kb._append_event(board, tid, "scheduled", {"wake_check": "new probe", "wake_at": 99999999})
++        new = board.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++        board.execute("UPDATE task_events SET origin_gateway=NULL WHERE id=?", (new,))
++        assert probe.host(board, tid, new, None) == probe.UNKNOWN
++        assert probe.host(board, tid, new, "worker-a2") == "worker-a2"
++        board.execute("UPDATE task_events SET origin_gateway='hub' WHERE id=?", (new,))
++        assert probe.host(board, tid, new, None) == "hub"
++
++
++def test_prepare_preserves_explicit_foreign_probe_custody_without_registering_it_locally(board):
++    tid, reply, transfer = source_park(board, with_check=False)
++    with kbc.write_txn(board):
++        event = board.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='scheduled'", (tid,)).fetchone()
++        payload = json.loads(event[1])
++        payload["probe_host"] = "hub"
++        board.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload),event[0]))
++        board.execute("DELETE FROM kanban_sync_outbox")
++        transfer.prepare(board, tid, source=reply["source"], destination="hub", nonce=reply["nonce"], expected_version=7)
++    assert wake.get_state(board, tid) is None
++
++
++def test_ordinary_unmoved_hostless_park_retains_legacy_restoration(board):
++    support.prepare_destination(board)
++    record = probe_manifest()
++    support.materialize(board, record)
++    with kbc.write_txn(board):
++        board.execute("DELETE FROM kanban_home_generations1 WHERE task_id=?", (record["task"],))
++    assert wake.restore_missing_checks(board, now=1001)["restored"] == [record["task"]]
+-- 
+2.43.0
+

@@ -1,0 +1,556 @@
+From d2ba19f2711a51e55178162941ea4cb15db8fa16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:02:38 +0000
+Subject: [PATCH 6774] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit d2ba19f2711a51e55178162941ea4cb15db8fa16.
+
+---
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index 371ceb06020554d0f1bb29a7978bfe2edad45601..8c5c739aa394b19347ca71fb048d4ac905b52eba 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -194,6 +194,9 @@
+ #   * HERMES_TEST_USER_STEPS_API points tests/hermes_cli/test_web_links_stale.py at a
+ #     user-steps plugin_api.py other than ~/code/hermes-mods (a candidate worktree, or
+ #     hermes-mods CI running that core regression against its own plugin).
++#   * HERMES_COMPOSED_BOARD_URL / REQUIRED arm the loopback-only owner-release
++#     transport proof and make an unavailable fixture fail instead of silently skip.
++#     Never forward its admin key (the disposable fixture uses a public test key).
+ #
+ # These are test-infrastructure knobs, not credentials — same class as the
+ # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
+@@ -213,7 +216,8 @@
+   HERMES_E2E_STRICT_ACCEPTANCE HERMES_E2E_UPGRADE_BASE HERMES_E2E_N1_REF \
+   HERMES_E2E_INSTALL_REF HERMES_E2E_GIT_OBJECTS HERMES_E2E_KEEP_ROOT \
+   HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
+-  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE HERMES_TEST_DOCKER_MOUNT_ROOT; do
++  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE HERMES_TEST_DOCKER_MOUNT_ROOT \
++  HERMES_COMPOSED_BOARD_URL HERMES_COMPOSED_REQUIRED; do
+   if [ -n "${!_test_var:-}" ]; then
+     TEST_ENV+=("$_test_var=${!_test_var}")
+   fi
+diff --git a/tests/hermes_cli/test_owner_release_composed.py b/tests/hermes_cli/test_owner_release_composed.py
+index 010d637c4c5a49d8982146bbee5f9d57a6f07545..14d57ec4f965383325e4f6f2e6e41fabc934f970 100644
+--- a/tests/hermes_cli/test_owner_release_composed.py
++++ b/tests/hermes_cli/test_owner_release_composed.py
+@@ -10,8 +10,12 @@
+ 
+ Needs a DISPOSABLE local wrangler (never a live Board)::
+ 
+-    HERMES_COMPOSED_BOARD_URL=http://127.0.0.1:8794 bash scripts/run_tests.sh \
+-        tests/hermes_cli/test_owner_release_composed.py
++    HERMES_COMPOSED_BOARD_URL=http://127.0.0.1:8794 HERMES_COMPOSED_REQUIRED=1 \
++        bash scripts/run_tests.sh -j 1 tests/hermes_cli/test_owner_release_composed.py \
++        tests/hermes_cli/test_owner_release_composed_controls.py
++
++Use one per-file worker: the native fixture binds exact gateway names; running
++these two files concurrently would rotate each other's disposable enrollment keys.
+ 
+ The server must run with ADMIN_KEY_SHA256=sha256("review-local-admin"). Without it the
+ module skips (HERMES_COMPOSED_REQUIRED=1 turns the skip into a failure).
+@@ -74,7 +78,8 @@
+         signature = base64.b64encode(key.sign(message)).decode()
+         path = f"/v2/boards/{BOARD}/spend-windows" + ("/episodes" if kind == "register" else "")
+         reply = home.hub._call("POST", path, {"payload": payload, "kid": "k1", "signature": signature})
+-        assert reply.get("status", "applied") in {"applied", "ok", "installed", "registered"} or "error" not in reply, reply
++        assert reply.get("status") == {"register": "registered", "install": "installed"}[kind], reply
++        assert reply["current_episode_uid"] == episode and reply["state"] == {"register": "pending", "install": "active"}[kind], reply
+ 
+ 
+ def _raw(path, key=None, body=None):
+@@ -148,24 +153,40 @@
+     return _link_origin(home, origin_ident, session, task, episode)
+ 
+ 
+-def _home_stop(home):
++def _home_stop(home, task=None, reason="scope_stopped", refused=False):
+     # HOME acts through its OWN primary SQLite board: real create/push, then the real retain command ledger
+     # (reserve -> frozen wire -> Board retain -> independent confirmation -> projection), not a bare Hub op.
+     from hermes_cli import kanban_retain_transport as retain
+     conn = home.conn
+-    task = kb.create_task(conn, title="composed owner release", assignee="default")
+-    pushed = ksc.push(conn, home.hub, BOARD, home.name, primary=True)
+-    assert pushed.rejected == 0, pushed
++    if task is None:
++        task = kb.create_task(conn, title="composed owner release", assignee="default")
++        pushed = ksc.push(conn, home.hub, BOARD, home.name, primary=True)
++        assert pushed.rejected == 0, pushed
+     with kbc.write_txn(conn):
+         rid = conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, 'default', 'running', 1)",
+                            (task,)).lastrowid
+         conn.execute("UPDATE tasks SET status='running', current_run_id=? WHERE id=?", (rid, task))
+         conn.execute("DELETE FROM kanban_sync_outbox")  # claim/run rows are synthesised by the lease grant below
+     run = sync.run_uid(conn, rid)
++    assert isinstance(run, str) and run
+     grant = home.hub.leases(BOARD, {"action": "grant", "task": task, "run_uid": run, "ttl_s": 60})
+     assert grant["status"] == "applied", grant
++    if refused:
++        bound = "bound-" + uuid.uuid4().hex
++        value = home.hub.ops(BOARD, [{"client_op_id": str(uuid.uuid4()), "op": "upsert", "table": "task_events",
++            "uid": bound, "fields": {"task_id": task, "run_uid": run, "kind": "worker_bound",
++            "payload": json.dumps({"pid": 1, "claim_lock": "fixture-only-no-os-probe"}), "created_at": 1001},
++            "hlc": stamp(home.name)}])["results"][0]
++        assert value["status"] == "applied", value
++        source = "refusal-" + uuid.uuid4().hex
++        value = home.hub.ops(BOARD, [{"client_op_id": str(uuid.uuid4()), "op": "upsert", "table": "task_events",
++            "uid": source, "fields": {"task_id": task, "run_uid": run, "kind": "worker_result",
++            "payload": json.dumps({"failed": True, "failure_reason": "content_policy_blocked", "pid": 1,
++                                   "claim_lock": "fixture-only-no-os-probe", "failure_retryable": False, "exit_code": 1}), "created_at": 1001},
++            "hlc": stamp(home.name)}])["results"][0]
++        assert value["status"] == "applied", value
+     with kbc.write_txn(conn):
+-        owned = retain.reserve(conn, task, run, {"version": 1, "summary": "incomplete", "reason": "scope_stopped",
++        owned = retain.reserve(conn, task, run, {"version": 1, "summary": "incomplete", "reason": reason,
+                                                  "next_step": "owner decides", "release_condition": "scoped release",
+                                                  "evidence": ["composed fixture"]}, None)
+     result = retain.confirm(conn, home.hub, BOARD, run)
+@@ -176,6 +197,52 @@
+     return task, stops[0]["uid"]
+ 
+ 
++def seed_stacked_task(home, origin_ident, session):
++    """Two real retained runs, separated only by the supported legacy promotion.
++
++    Promotion is ordinary history, NOT a private capability release receipt. Use
++    real elapsed seconds so the subsequent server stop sorts after that history.
++    """
++    import time
++    from tests.waiting import wait_until
++    with pytest.MonkeyPatch.context() as scoped:
++        scoped.setattr(kanban_origin, "gateway_names", lambda: (home.name, {home.name}))
++        task, old = _home_stop(home, reason="capability_unavailable")
++        stop = home.hub.row_evidence(BOARD, "task_events", old)["row"]
++        assert json.loads(stop["payload"])["cause"] == "capability_unavailable"
++        wait_until(lambda: int(time.time()) > stop["created_at"], timeout=3)
++        promoted_at = int(time.time())
++        promotion = "legacy-promotion-" + uuid.uuid4().hex
++        results = home.hub.ops(BOARD, [{"client_op_id": str(uuid.uuid4()), "op": "upsert",
++            "table": "task_events", "uid": promotion, "fields": {"task_id": task,
++            "kind": "promoted_manual", "payload": json.dumps({"reason": "legacy promotion without release receipt"}),
++            "created_at": promoted_at}, "hlc": stamp(home.name)},
++            {"client_op_id": str(uuid.uuid4()), "op": "upsert", "table": "tasks", "uid": task,
++             "fields": {"status": "ready"}, "hlc": stamp(home.name)}])["results"]
++        assert all(r["status"] == "applied" for r in results), results
++        assert home.hub.row_evidence(BOARD, "task_events", promotion)["row"]["kind"] == "promoted_manual"
++        wait_until(lambda: int(time.time()) > promoted_at, timeout=3)
++        home.pull()
++        task, current = _home_stop(home, task=task)
++    assert old != current
++    assert not release_receipts(home, task)
++    _link_origin(home, origin_ident, session, task, current)
++    return task, current, old
++
++
++def release_receipts(home, task):
++    home.pull()
++    return [json.loads(r[0]) for r in home.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='stop_released' ORDER BY id", (task,))]
++
++
++def event_inventory(home, task):
++    # Pull the real canonical feed, including any new duplicate release/budget rows.
++    home.pull()
++    return [tuple(r) for r in home.conn.execute(
++        "SELECT uid,kind,payload FROM task_events WHERE task_id=? ORDER BY uid", (task,))]
++
++
+ def _link_origin(home, origin_ident, session, task, episode):
+     link = "link-" + uuid.uuid4().hex[:8]
+     linked = ksc.Hub(origin_ident)
+@@ -297,22 +364,29 @@
+                 and home.conn.execute("SELECT 1 FROM owner_release_applied_receipts WHERE intent_uid=?", (intent_uid,)).fetchone())
+ 
+ 
+-def authorize_and_drive_home(origin, parties, monkeypatch):
++def authorize_and_drive_home(origin, parties, monkeypatch, *, stacked=False, select=True):
+     home, executor = parties
+     ident, native = origin
+-    task, episode = seed_stopped_task(home, ident, chats.CHAT)
++    if stacked:
++        task, episode, old = seed_stacked_task(home, ident, chats.CHAT)
++    else:
++        task, episode = seed_stopped_task(home, ident, chats.CHAT)
++        old = None
++    extra = ("--capability-episode", old) if old and select else ()
+     # 1. real CLI -> parent -> real Hub -> DO authorization, read-first challenge, then publication.
+-    first = release_cli(native, task, episode)
++    first = release_cli(native, task, episode, *extra)
+     assert first.returncode == 0, (first.stdout, first.stderr)
+     nonce = json.loads(first.stdout)["release_read"]["nonce"]
+-    ack = release_cli(native, task, episode, "--seen-release", nonce)
++    ack = release_cli(native, task, episode, "--seen-release", nonce, *extra)
+     assert ack.returncode == 0, (ack.stdout, ack.stderr)
+     published = json.loads(ack.stdout)
+     assert published["publication_stage"] == "published", published
+     intent_uid = published["intent_uid"]
+     probe = ksc.Hub(ident)
+     try:
+-        assert probe.owner_release_evidence(BOARD, intent_uid)["state"] == "authorized"
++        proof = probe.owner_release_evidence(BOARD, intent_uid)
++        assert proof["state"] == "authorized"
++        assert proof["intent"]["capability_episodes"] == ([old] if old and select else [])
+     finally:
+         probe.close()
+     # Nothing is released yet: HOME has not consumed.
+@@ -326,16 +400,26 @@
+         if applied(home, intent_uid):
+             break
+     queue = [tuple(r) for r in home.conn.execute("SELECT stage FROM owner_release_home_queue")]
+-    if not applied(home, intent_uid):
++    omitted = bool(old and not select)
++    if not applied(home, intent_uid) and not omitted:
+         print("HOME-DIAG", diagnose(home, task, episode, intent_uid))
+-    assert applied(home, intent_uid), queue
+-    return home, executor, native, task, episode, intent_uid
+-
+-
+-def test_happy_path_native_to_do_home_native_result_and_executor_import(origin, parties, monkeypatch):
+-    _home, executor, native, task, episode, intent_uid = authorize_and_drive_home(origin, parties, monkeypatch)
++    if not omitted:
++        assert applied(home, intent_uid), queue
++    else:
++        # An omitted private capability may conservatively prevent final apply,
++        # but authorization/consumption must still traverse the real pipeline.
++        assert home.hub.owner_release_evidence(BOARD, intent_uid)["state"] == "consumed", queue
++    return home, executor, native, task, episode, intent_uid, old
++
++
++@pytest.mark.parametrize("stacked", [False, True], ids=["scope-only", "selected-historical-capability"])
++def test_happy_path_native_to_do_home_native_result_and_executor_import(origin, parties, monkeypatch, stacked):
++    home, executor, native, task, episode, intent_uid, old = authorize_and_drive_home(
++        origin, parties, monkeypatch, stacked=stacked)
++    extra = ("--capability-episode", old) if old else ()
++    assert [r["episode"] for r in release_receipts(home, task)] == ([old] if old else []) + [episode]
+     # 3. native result reads the private application via the origin's real Hub.
+-    done = release_cli(native, task, episode)
++    done = release_cli(native, task, episode, *extra)
+     assert done.returncode == 0, (done.stdout, done.stderr)
+     value = json.loads(done.stdout)
+     assert value["release_stage"] == "applied" and value["execution_clearance"] is False, value
+@@ -347,3 +431,46 @@
+     assert got is not None
+     from hermes_cli import kanban_spend_decision as decision
+     assert not decision.execution_restricted(executor.conn, task)
++    before = event_inventory(home, task)
++    task_before = home.hub.row_evidence(BOARD, "tasks", task)["row"]
++    certificate = home.hub.owner_release_application(BOARD, intent_uid)
++    for _ in range(2):
++        replay = release_cli(native, task, episode, *extra)
++        assert replay.returncode == 0, (replay.stdout, replay.stderr)
++        result = json.loads(replay.stdout)
++        assert result["intent_uid"] == intent_uid and result["release_stage"] == "applied", result
++        home_tick(home, monkeypatch, rounds=3)
++    assert home.hub.owner_release_application(BOARD, intent_uid) == certificate
++    assert event_inventory(home, task) == before  # no duplicate release OR budget events
++    assert home.hub.row_evidence(BOARD, "tasks", task)["row"] == task_before
++    executor.resync()
++    assert subject.verified_application(executor.conn, intent_uid) is not None
++    assert not decision.execution_restricted(executor.conn, task)
++
++
++def test_omitted_historical_capability_remains_held(origin, parties, monkeypatch, caplog):
++    home, executor, native, task, episode, intent_uid, old = authorize_and_drive_home(
++        origin, parties, monkeypatch, stacked=True, select=False)
++    from hermes_cli import kanban_spend_decision as decision
++    receipts = [r["episode"] for r in release_receipts(home, task)]
++    assert not applied(home, intent_uid) and receipts == []
++    delivery = home.conn.execute("SELECT delivery_uid FROM owner_release_home_queue WHERE intent_uid=?", (intent_uid,)).fetchone()[0]
++    assert any(delivery in r.getMessage() and "restriction_unattributable" in r.getMessage() for r in caplog.records)
++    assert old not in receipts
++    historical = home.hub.row_evidence(BOARD, "task_events", old)["row"]
++    assert historical["kind"] == "spend_budget_triaged"
++    assert json.loads(historical["payload"])["cause"] == "capability_unavailable"
++    assert decision.execution_restricted(home.conn, task)
++    executor.resync()
++    assert decision.execution_restricted(executor.conn, task)
++    before = event_inventory(home, task)
++    for _ in range(2):
++        replay = release_cli(native, task, episode)
++        assert replay.returncode == 0, (replay.stdout, replay.stderr)
++        result = json.loads(replay.stdout)
++        assert result["intent_uid"] == intent_uid, result
++        assert result.get("execution_clearance") is not True, result
++        home_tick(home, monkeypatch, rounds=3)
++    assert event_inventory(home, task) == before
++    assert old not in [r["episode"] for r in release_receipts(home, task)]
++    assert decision.execution_restricted(home.conn, task)
+diff --git a/tests/hermes_cli/test_owner_release_composed_controls.py b/tests/hermes_cli/test_owner_release_composed_controls.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccfb44050e71d1dac428b5ca70a7c7530b1ae3a8
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_composed_controls.py
+@@ -0,0 +1,229 @@
++"""Freshness and independent-gate controls through actual CLI/socket/HTTP/HOME.
++
++Shares the disposable loopback Board from test_owner_release_composed. No direct
++canonical SQL, private authority injection or synthetic receipt construction.
++"""
++import json
++import uuid
++
++import pytest
++
++from hermes_cli import kanban_origin
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_spend_decision as decision
++from tests.hermes_cli import test_owner_release_composed as helpers
++from tests.tools import test_kanban_worker_created_chats as chats
++
++turn = helpers.turn
++server = helpers.server
++origin = helpers.origin
++parties = helpers.parties
++
++
++def put(party, table, uid, fields):
++    result = party.hub.ops(helpers.BOARD, [{"client_op_id": str(uuid.uuid4()), "op": "upsert", "table": table,
++        "uid": uid, "fields": fields, "hlc": helpers.stamp(party.name)}])["results"][0]
++    assert result["status"] == "applied", result
++
++
++def publish(native, task, episode):
++    first = helpers.release_cli(native, task, episode)
++    assert first.returncode == 0, (first.stdout, first.stderr)
++    nonce = json.loads(first.stdout)["release_read"]["nonce"]
++    ack = helpers.release_cli(native, task, episode, "--seen-release", nonce)
++    assert ack.returncode == 0, (ack.stdout, ack.stderr)
++    value = json.loads(ack.stdout)
++    assert value["publication_stage"] == "published", value
++    return value["intent_uid"]
++
++
++def consume_wire(home, task, intent_uid):
++    proof = home.hub.owner_release_evidence(helpers.BOARD, intent_uid)
++    comments = home.hub.owner_release_comments(helpers.BOARD, intent_uid)["comments"]
++    return {"client_op_id": str(uuid.uuid4()), "op": "consume_owner_release", "task": task,
++            "intent_uid": intent_uid, "digest": proof["digest"], "seen_comments": comments}
++
++
++def assert_consume_refusal(home, wire, reason):
++    value = home.hub.ops(helpers.BOARD, [wire])["results"][0]
++    assert value["status"] == "rejected" and value["reason"] == reason, value
++
++
++def assert_held(home, executor, task, intent_uid, monkeypatch, *, state="authorized"):
++    before = helpers.event_inventory(home, task)
++    attempts = set()
++    row = None
++    for _ in range(128):
++        helpers.home_tick(home, monkeypatch)
++        row = home.conn.execute("SELECT * FROM owner_release_home_queue WHERE intent_uid=?", (intent_uid,)).fetchone()
++        if row and row["checked"]:
++            attempts.add(row["checked"])
++        if len(attempts) >= 3:
++            break
++    assert row is not None and len(attempts) >= 3, "HOME never processed the exact queued request"
++    assert home.hub.owner_release_evidence(helpers.BOARD, intent_uid)["state"] == state
++    assert row["stage"] == {"authorized": "consume_pending", "consumed": "consumed_pending_apply"}[state]
++    assert not helpers.applied(home, intent_uid)
++    assert not helpers.release_receipts(home, task)
++    after = helpers.event_inventory(home, task)
++    if state == "consumed":
++        consume = home.hub.owner_release_consumption(helpers.BOARD, intent_uid)["renewal"]
++        assert [r[0] for r in after if r not in before] == [consume["uid"]]
++        after = [r for r in after if r[0] != consume["uid"]]
++    assert after == before
++    assert decision.execution_restricted(home.conn, task)
++    executor.resync()
++    assert decision.execution_restricted(executor.conn, task)
++    with pytest.raises(ksc.HubError):
++        home.hub.owner_release_application(helpers.BOARD, intent_uid)
++
++
++@pytest.mark.parametrize("mode", ["released", "ambiguous", "other-gateway"])
++def test_real_owner_link_changed_after_publication_refuses_home(origin, parties, monkeypatch, mode):
++    home, executor = parties
++    ident, native = origin
++    task, episode = helpers.seed_stopped_task(home, ident, chats.CHAT)
++    intent_uid = publish(native, task, episode)
++    wire = consume_wire(home, task, intent_uid)
++    helpers.install_allowance(home, task, episode, intent_uid)
++    home.pull()
++    link = home.conn.execute("SELECT uid FROM task_chat_links WHERE task_id=? AND kind='created'", (task,)).fetchone()[0]
++    actor = helpers.Party("actor-control", home.path.parent)
++    try:
++        owner = ksc.Hub(ident)
++        try:
++            if mode == "ambiguous":
++                fields = {"task_id": task, "chat_gateway": ident.gateway, "chat_profile": "default",
++                          "chat_session": "another-chat", "kind": "created", "released": 0, "created_at": 1000}
++                uid = "conflicting-link-" + uuid.uuid4().hex
++            else:
++                fields = {"released": 1} if mode == "released" else {"chat_gateway": actor.name}
++                uid = link
++            result = owner.ops(helpers.BOARD, [{"client_op_id": str(uuid.uuid4()), "op": "upsert",
++                "table": "task_chat_links", "uid": uid, "fields": fields,
++                "hlc": helpers.stamp(ident.gateway)}])["results"][0]
++            assert result["status"] == "applied", result
++        finally:
++            owner.close()
++        assert_consume_refusal(home, wire, "owner_release_actor")
++        assert_held(home, executor, task, intent_uid, monkeypatch)
++    finally:
++        actor.close()
++
++
++def test_real_changed_comments_invalidate_emitted_read_nonce(origin, parties, monkeypatch):
++    home, executor = parties
++    ident, native = origin
++    task, episode = helpers.seed_stopped_task(home, ident, chats.CHAT)
++    first = helpers.release_cli(native, task, episode)
++    assert first.returncode == 0, (first.stdout, first.stderr)
++    nonce = json.loads(first.stdout)["release_read"]["nonce"]
++    put(home, "task_comments", "comment-" + uuid.uuid4().hex,
++        {"task_id": task, "author": "fixture", "body": "New current instruction, not acknowledged", "created_at": 1001})
++    before = helpers.event_inventory(home, task)
++    ack = helpers.release_cli(native, task, episode, "--seen-release", nonce)
++    value = json.loads(ack.stdout)
++    assert ack.returncode == 0 and value["ok"] is True, value
++    assert value["release_stage"] == "read_first_pending", value
++    assert value["release_read"]["nonce"] != nonce
++    assert value.get("publication_stage") != "published", value
++    assert value.get("release_stage") != "applied", value
++    helpers.home_tick(home, monkeypatch, rounds=3)
++    assert not helpers.release_receipts(home, task)
++    assert helpers.event_inventory(home, task) == before
++    executor.resync()
++    assert decision.execution_restricted(executor.conn, task)
++
++
++@pytest.mark.parametrize("mode", ["comments", "task", "dependency", "no-allowance"])
++def test_real_postpublication_current_gates_refuse_before_effects(origin, parties, monkeypatch, caplog, mode):
++    home, executor = parties
++    ident, native = origin
++    task, episode = helpers.seed_stopped_task(home, ident, chats.CHAT)
++    intent_uid = publish(native, task, episode)
++    wire = consume_wire(home, task, intent_uid)
++    if mode != "no-allowance":
++        helpers.install_allowance(home, task, episode, intent_uid)
++    if mode == "comments":
++        put(home, "task_comments", "late-" + uuid.uuid4().hex,
++            {"task_id": task, "author": "fixture", "body": "Changed after emitted acknowledgement", "created_at": 1001})
++    elif mode == "task":
++        put(home, "tasks", task, {"title": "Changed original acceptance snapshot"})
++    elif mode == "dependency":
++        parent = "t_" + uuid.uuid4().hex[:16]
++        put(home, "tasks", parent, {"title": "Independent unfinished prerequisite", "status": "todo", "assignee": "default", "created_at": 1000})
++        put(home, "task_links", f"{parent}>{task}",
++            {"parent_id": parent, "child_id": task})
++    # No independent signed allowance is provisioned for no-allowance: added
++    # budget cannot manufacture canonical grants from the original release intent.
++    home.resync()
++    if mode in {"comments", "task"}:
++        assert_consume_refusal(home, wire, {"comments": "owner_release_read_first", "task": "owner_release_changed"}[mode])
++    replies = []
++    actual_ops = ksc.Hub.ops
++
++    def observe_ops(hub, board, ops, *args, **kwargs):
++        result = actual_ops(hub, board, ops, *args, **kwargs)
++        if any(op.get("op") == "apply_owner_release" and op.get("intent_uid") == intent_uid for op in ops):
++            replies.extend(result["results"])
++        return result
++
++    monkeypatch.setattr(ksc.Hub, "ops", observe_ops)
++    assert_held(home, executor, task, intent_uid, monkeypatch,
++                state="consumed" if mode in {"dependency", "no-allowance"} else "authorized")
++    if mode == "dependency":
++        delivery = home.conn.execute("SELECT delivery_uid FROM owner_release_home_queue WHERE intent_uid=?", (intent_uid,)).fetchone()[0]
++        assert any(delivery in r.getMessage() and "HOME dependencies remain unsatisfied" in r.getMessage()
++                   for r in caplog.records)
++    if mode == "no-allowance":
++        from hermes_cli import kanban_release_final as final
++        frozen = final.saved(home.conn, intent_uid)
++        assert frozen is not None
++        assert replies and replies[0]["status"] == "rejected" and replies[0]["reason"] == "owner_release_allowance", replies
++        value = home.hub.ops(helpers.BOARD, [frozen])["results"][0]
++        assert value["status"] == "rejected" and value["reason"] == "owner_release_conflict", value
++
++
++def test_real_stale_episode_cannot_authorize_current_scope(origin, parties, monkeypatch):
++    home, executor = parties
++    ident, native = origin
++    task, current, old = helpers.seed_stacked_task(home, ident, chats.CHAT)
++    before = helpers.event_inventory(home, task)
++    stale = helpers.release_cli(native, task, old)
++    value = json.loads(stale.stdout)
++    assert stale.returncode == 2 and not value["ok"], value
++    assert value.get("publication_stage") != "published", value
++    helpers.home_tick(home, monkeypatch, rounds=3)
++    assert not helpers.release_receipts(home, task)
++    assert helpers.event_inventory(home, task) == before
++    assert current != old
++    executor.resync()
++    assert decision.execution_restricted(executor.conn, task)
++
++
++@pytest.mark.parametrize("safety", [False, True], ids=["scope-successor", "safety-successor"])
++def test_real_historical_native_replay_never_renews_successor(origin, parties, monkeypatch, safety):
++    home, executor, native, task, episode, intent_uid, old = helpers.authorize_and_drive_home(
++        origin, parties, monkeypatch, stacked=True)
++    certificate = home.hub.owner_release_application(helpers.BOARD, intent_uid)
++    with monkeypatch.context() as scoped:
++        scoped.setattr(kanban_origin, "gateway_names", lambda: (home.name, {home.name}))
++        _, successor = helpers._home_stop(home, task=task, refused=safety)
++    stop = home.hub.row_evidence(helpers.BOARD, "task_events", successor)["row"]
++    assert json.loads(stop["payload"])["cause"] == ("safety_refusal" if safety else "scope_stopped")
++    assert successor not in {old, episode}
++    assert decision.execution_restricted(home.conn, task)
++    before = helpers.event_inventory(home, task)
++    task_before = home.hub.row_evidence(helpers.BOARD, "tasks", task)["row"]
++    for _ in range(2):
++        replay = helpers.release_cli(native, task, episode, "--capability-episode", old)
++        value = json.loads(replay.stdout)
++        assert replay.returncode == 0 and value["intent_uid"] == intent_uid, value
++        assert value["release_stage"] == "applied" and value["execution_clearance"] is False, value
++        helpers.home_tick(home, monkeypatch, rounds=3)
++    assert home.hub.owner_release_application(helpers.BOARD, intent_uid) == certificate
++    assert helpers.event_inventory(home, task) == before
++    assert home.hub.row_evidence(helpers.BOARD, "tasks", task)["row"] == task_before
++    assert successor not in [r["episode"] for r in helpers.release_receipts(home, task)]
++    executor.resync()
++    assert decision.execution_restricted(executor.conn, task)
+diff --git a/tests/scripts/test_owner_release_runner_env.py b/tests/scripts/test_owner_release_runner_env.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..233c06a2eec5bdbdb2e087776ba35dcf11d9fb35
+--- /dev/null
++++ b/tests/scripts/test_owner_release_runner_env.py
+@@ -0,0 +1,35 @@
++"""The requested composed acceptance must execute, never silently lose its opt-in."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++
++@pytest.mark.platforms("posix")
++def test_canonical_runner_preserves_composed_opt_in_without_credentials(tmp_path):
++    knobs = {"HERMES_COMPOSED_BOARD_URL": "http://127.0.0.1:8794", "HERMES_COMPOSED_REQUIRED": "1"}
++    case = tmp_path / "test_composed_environment_canary.py"
++    marker = tmp_path / "executed"
++    case.write_text(
++        "import os\nfrom pathlib import Path\n"
++        "def test_canary():\n"
++        f"    expected = {knobs!r}\n"
++        "    assert {k: os.environ.get(k) for k in expected} == expected\n"
++        "    assert 'HERMES_COMPOSED_ADMIN_KEY' not in os.environ\n"
++        "    assert 'HERMES_COMPOSED_UNTRUSTED_SECRET' not in os.environ\n"
++        f"    Path({str(marker)!r}).write_text('executed')\n",
++        encoding="utf-8",
++    )
++    root = Path(__file__).resolve().parents[2]
++    result = subprocess.run(
++        ["bash", str(root / "scripts/run_tests.sh"), "-j", "1", str(case)],
++        cwd=tmp_path, capture_output=True, text=True, timeout=180,
++        env={**os.environ, "HERMES_PYTHON": sys.executable, "HERMES_TEST_FILE_RETRIES": "0",
++             **knobs, "HERMES_COMPOSED_ADMIN_KEY": "must-not-forward",
++             "HERMES_COMPOSED_UNTRUSTED_SECRET": "must-not-forward"},
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout + result.stderr
++    assert marker.read_text() == "executed"
+-- 
+2.43.0
+

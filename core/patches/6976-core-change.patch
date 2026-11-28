@@ -1,0 +1,501 @@
+From 3a3bb8b84d14ad08316700e314d9025a110ef4c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:49:15 +0000
+Subject: [PATCH 6976] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 3a3bb8b84d14ad08316700e314d9025a110ef4c4.
+
+---
+diff --git a/hermes_cli/kanban_foreign_comment.py b/hermes_cli/kanban_foreign_comment.py
+index 2d26623b25ff46669235c698fc5bb141c9a2f699..37f6563903d90c35fc9eda01218494cf9820a5bc 100644
+--- a/hermes_cli/kanban_foreign_comment.py
++++ b/hermes_cli/kanban_foreign_comment.py
+@@ -12,6 +12,7 @@
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_home_command as home
+ 
+ 
+ class CommentUnconfirmed(ValueError):
+@@ -42,6 +43,7 @@
+         row = proof.get('row') if proof.get('state') == 'live' else None
+         if not isinstance(row, dict) or row.get('id') != task_id or row.get('deleted_at') is not None:
+             raise ValueError('foreign comment target is not live on the Board')
++        epoch = home.from_evidence(task_id, row)
+         payload = {'author': author, 'len': len(body.strip()), 'comment_uid': comment_uid}
+         if writer_kind:
+             payload['writer_kind'] = writer_kind
+@@ -56,8 +58,8 @@
+                   ('task_events', event_uid, {'task_id': task_id, 'run_uid': None, 'kind': 'commented',
+                    'payload': json.dumps(payload), 'created_at': now})]
+         with kb.write_txn(conn):
+-            ops = [{'client_op_id': uid, 'op': 'upsert', 'table': table, 'uid': uid,
+-                    'hlc': client._next_hlc(conn, gateway), 'fields': values}
++            ops = [home.outbound({'home_generations': epoch}, {'client_op_id': uid, 'op': 'upsert', 'table': table, 'uid': uid,
++                    'hlc': client._next_hlc(conn, gateway), 'fields': values})
+                    for table, uid, values in fields]
+         recovery = (f'comment {comment_uid}, writer event {event_uid}. Do not retry; reconcile these IDs '
+                     'through Board/replica readback before any replacement.')
+diff --git a/hermes_cli/kanban_home_cli.py b/hermes_cli/kanban_home_cli.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e901fa2efafc5f050a6f8f47dcabccaca26a9b2c
+--- /dev/null
++++ b/hermes_cli/kanban_home_cli.py
+@@ -0,0 +1,44 @@
++"""Explicit cooperative home maintenance owner; no sweep or automatic activation. [daveey]"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_owner as owner
++from hermes_cli.kanban_sync_client import Hub, load_identity
++
++
++def command(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('step', choices=('source', 'destination', 'reconcile-precommit'))
++    parser.add_argument('--task', required=True)
++    parser.add_argument('--source', required=True)
++    parser.add_argument('--destination', default='hub', choices=('hub',))
++    parser.add_argument('--nonce', required=True)
++    parser.add_argument('--expected-version', required=True, type=int)
++    parser.add_argument('--board', default='default')
++    parser.add_argument('--db', type=Path)
++    args = parser.parse_args(argv)
++    # This is administrative custody movement, never a worker-side lifecycle
++    # alternative. Source/destination eligibility is still checked transactionally.
++    if os.environ.get('HERMES_KANBAN_TASK') or os.environ.get('HERMES_KANBAN_WORKER_TASK'):
++        raise PermissionError('cooperative home maintenance requires the owner operator surface')
++    identity = {k: getattr(args, k.replace('-', '_')) for k in ('task', 'source', 'destination', 'nonce', 'expected_version')}
++    methods = {'source': owner.source_step, 'destination': owner.destination_step,
++               'reconcile-precommit': owner.reconcile_precommit}
++    hub = Hub(load_identity())
++    conn = dbc.connect(args.db) if args.db else dbc.connect()
++    try:
++        record = methods[args.step](conn, hub, args.board, identity)
++        print(json.dumps({**identity, 'phase': record['phase'], 'row_count': len(record['rows'])}, sort_keys=True))
++        return 0
++    finally:
++        conn.close()
++        hub.close()
++
++
++if __name__ == '__main__':
++    raise SystemExit(command())
+diff --git a/hermes_cli/kanban_home_command.py b/hermes_cli/kanban_home_command.py
+index 0d5c8aca727a56d53b0cae7acdd04f65bc2e4446..6a7677c83c8a1c45c669987341af80a10e9cb55d 100644
+--- a/hermes_cli/kanban_home_command.py
++++ b/hermes_cli/kanban_home_command.py
+@@ -12,7 +12,7 @@
+ from hermes_cli.sqlite_util import add_column_if_missing
+ 
+ _TABLES = frozenset({'kanban_failure_commands', 'kanban_actionability_commands',
+-                    'kanban_protect_commands', 'containment_delivery'})
++                    'kanban_protect_commands', 'containment_delivery', 'kanban_home_delivery1'})
+ 
+ 
+ def install(conn, table: str) -> None:
+@@ -55,6 +55,24 @@
+     return json.dumps(values, sort_keys=True, separators=(',', ':')) if values else None
+ 
+ 
++def from_evidence(task: str, row: dict) -> str | None:
++    """Bind a NEW nonjournaled foreign appendage to its authenticated snapshot.
++
++    The caller must obtain this row from the real Hub before minting the op.
++    Existing/replayed commands must never use this to refresh their epoch.
++    """
++    if not isinstance(row, dict) or row.get('id') != task:
++        raise ValueError('home evidence identity mismatch')
++    if row.get('home_transfer_pending') is not None:
++        raise ValueError('home transfer pending')
++    nonce = row.get('home_generation')
++    if nonce is None:
++        return None
++    if not isinstance(nonce, str) or not nonce:
++        raise ValueError('home evidence epoch invalid')
++    return json.dumps({task: nonce}, sort_keys=True, separators=(',', ':'))
++
++
+ def outbound(owned: dict, semantic: dict) -> dict:
+     """Read only the durable sidecar; no lookup of today's task/epoch is allowed."""
+     return epochs.add_captured(owned, semantic)
+diff --git a/hermes_cli/kanban_home_memo.py b/hermes_cli/kanban_home_memo.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..342917479a7ab48a156bd6edf13253c370a13a29
+--- /dev/null
++++ b/hermes_cli/kanban_home_memo.py
+@@ -0,0 +1,56 @@
++"""Original custody for small administrative commands outside the sync outbox. [daveey]"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_home_command as home
++
++_TABLE = 'kanban_home_delivery1'
++
++
++def install(conn):
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {_TABLE} (request_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL, '
++                 'request_json TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0)')
++    home.install(conn, _TABLE)
++    for action in ('UPDATE OF request_uid,task_id,request_json', 'DELETE'):
++        name = 'update' if action.startswith('UPDATE') else 'delete'
++        conn.execute(f'CREATE TRIGGER IF NOT EXISTS home_delivery1_{name} BEFORE {action} ON {_TABLE} '
++                     "BEGIN SELECT RAISE(ABORT,'home delivery intent immutable'); END")
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS home_delivery1_insert BEFORE INSERT ON {_TABLE} '
++                 f'WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE request_uid=NEW.request_uid) '
++                 "BEGIN SELECT RAISE(ABORT,'home delivery intent immutable'); END")
++
++
++def get(conn, key):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (_TABLE,)).fetchone():
++        return None
++    row = conn.execute(f'SELECT request_json,home_generations FROM {_TABLE} WHERE request_uid=?', (key,)).fetchone()
++    return home.outbound({'home_generations': row[1]}, json.loads(row[0])) if row else None
++
++
++def reserve(conn, key, task, op, *, epoch=None, foreign=False):
++    """An exact retry reads original bytes/epoch before any new capture."""
++    if not conn.in_transaction:
++        raise ValueError('home delivery reservation requires writer transaction')
++    install(conn)
++    old = get(conn, key)
++    if old is not None:
++        semantic = {k:v for k,v in old.items() if k != 'home_generations'}
++        if semantic != op:
++            raise ValueError('home delivery request identity changed')
++        return old
++    captured = epoch if foreign else home.capture(conn, op)
++    raw = json.dumps(op, sort_keys=True, separators=(',', ':'), allow_nan=False)
++    conn.execute(f'INSERT INTO {_TABLE}(request_uid,task_id,request_json,home_generations) VALUES (?,?,?,?)',
++                 (key, task, raw, captured))
++    return home.outbound({'home_generations': captured}, op)
++
++
++def settled(conn, key, status):
++    if status in ('applied', 'merged', 'rejected'):
++        conn.execute(f'UPDATE {_TABLE} SET settled=1 WHERE request_uid=?', (key,))
++
++
++def pending(conn, task):
++    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (_TABLE,)).fetchone()
++                and conn.execute(f'SELECT 1 FROM {_TABLE} WHERE task_id=? AND settled=0', (task,)).fetchone())
+diff --git a/hermes_cli/kanban_home_owner.py b/hermes_cli/kanban_home_owner.py
+index b4b508eb7a848d6c16ee15f615a234e51659908c..05eff96ea66a3c8f69fe6b57f640e03326f21a48 100644
+--- a/hermes_cli/kanban_home_owner.py
++++ b/hermes_cli/kanban_home_owner.py
+@@ -1,8 +1,8 @@
+-"""Dormant cooperative handoff owner; no CLI/sweep/automatic activation yet.
++"""Explicit cooperative handoff owner; never an automatic migration sweep.
+ 
+ Only actual credential-pinned Hub transport responses enter local finalizers.
+ A caller-provided manifest/ACK dictionary is never accepted as a network reply.
+-Finish destination pre-STOP eligibility and typed capture gates before rollout.
++The operator CLI retains all source/destination eligibility and custody checks.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index f5121c955d9e3a775dabf23189b1b76088490f0e..1508bce66e74c57bc05a0968a833dbde8b2db050 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -158,6 +158,13 @@
+                     or conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes LIMIT 1").fetchone()
+                     or conn.execute("SELECT 1 FROM kanban_sync_omissions LIMIT 1").fetchone()):
+                 raise ValueError("home preparation requires drained pending custody")
++            from hermes_cli import kanban_home_memo as memo
++            if memo.pending(conn, task_id):
++                raise ValueError("home preparation requires drained administrative intent")
++            if (conn.execute("SELECT 1 FROM sqlite_master WHERE name='containment_delivery'").fetchone()
++                    and conn.execute("SELECT 1 FROM containment_delivery WHERE confirmed=0 AND "
++                        "(json_extract(op_json,'$.task')=? OR json_extract(op_json,'$.actor_task')=?)", (task_id, task_id)).fetchone()):
++                raise ValueError("home preparation requires drained containment intent")
+             from hermes_cli.kanban_home_probe import require_source_probe
+             require_source_probe(conn, task_id, source)
+             conn.execute(f"INSERT INTO {_TABLE}(task_id,source,destination,nonce,expected_version) VALUES (?,?,?,?,?)",
+diff --git a/hermes_cli/kanban_operator_label_delivery.py b/hermes_cli/kanban_operator_label_delivery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..54269ef7a754a2048ecc2ecda8743d6768fed095
+--- /dev/null
++++ b/hermes_cli/kanban_operator_label_delivery.py
+@@ -0,0 +1,49 @@
++"""Epoch-bound result delivery for label jobs; original wire survives retry. [daveey]"""
++from __future__ import annotations
++
++import json
++import time
++import uuid
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_home_command as home, kanban_home_memo as memo
++from hermes_cli import kanban_sync_client as client
++
++
++def push_event(conn, board, own, task, event_uid, payload):
++    from hermes_cli.kanban_operator_call import RESULT_KIND
++
++    hub = client.Hub(client.load_identity())
++    try:
++        encoded = json.dumps(payload, sort_keys=True)
++        op = memo.get(conn, event_uid)
++        if op is None:
++            row = conn.execute('SELECT delivery_attempts FROM operator_label_jobs WHERE event_uid=?', (event_uid,)).fetchone()
++            legacy = row is None or row[0] > 0
++            # Existing attempted jobs have UNKNOWN capture custody. Never enrich
++            # them from today's epoch. They remain fail-closed on a moved task.
++            evidence = hub.row_evidence(board, 'tasks', task)
++            target = evidence.get('row') if evidence.get('state') == 'live' else None
++            epoch = None if legacy else home.from_evidence(task, target)
++            with kb.write_txn(conn):
++                raw = {'client_op_id': uuid.uuid4().hex, 'op': 'upsert', 'table': 'task_events', 'uid': event_uid,
++                       'hlc': client._next_hlc(conn, own), 'fields': {'task_id': task, 'kind': RESULT_KIND,
++                       'payload': encoded, 'created_at': int(time.time())}}
++                op = memo.reserve(conn, event_uid, task, raw, epoch=epoch, foreign=True)
++        if op.get('uid') != event_uid or op.get('fields', {}).get('task_id') != task or op['fields'].get('payload') != encoded:
++            raise ValueError('label result delivery identity changed')
++        res = (hub.ops(board, [op]).get('results') or [{}])[0]
++        if not isinstance(res, dict) or res.get('client_op_id') != op['client_op_id']:
++            raise ValueError('label result delivery response identity unconfirmed')
++        status = str(res.get('status') or '')
++        if status in ('applied', 'merged'):
++            proof = hub.row_evidence(board, 'task_events', event_uid)
++            row = proof.get('row') if proof.get('state') == 'live' else None
++            if (not isinstance(row, dict) or row.get('uid') != event_uid or row.get('origin_gateway') != own
++                    or any(row.get(k) != v for k,v in op['fields'].items())):
++                raise ValueError('label result canonical readback unconfirmed')
++        with kb.write_txn(conn):
++            memo.settled(conn, event_uid, status)
++        return status, f"{res.get('reason') or ''}: {res.get('detail') or ''}".strip(': ')
++    finally:
++        hub.close()
+diff --git a/hermes_cli/kanban_operator_labels.py b/hermes_cli/kanban_operator_labels.py
+index 949ecaa7f9081cc8b22019873389a84f72d081ac..b99939a6fcb613be35e40a36a72fe0866d343304 100644
+--- a/hermes_cli/kanban_operator_labels.py
++++ b/hermes_cli/kanban_operator_labels.py
+@@ -200,16 +200,9 @@
+     """Write one ``operator_call_result`` event on ``task_id`` (another gateway's card) through the Board.
+ 
+     Returns ``(status, detail)``; status is the Board's per-op answer (``applied``/``merged``/``rejected``)."""
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_operator_call as kox
+-    from hermes_cli import kanban_sync_client as ksc
+-    with kb.write_txn(conn):
+-        hlc = ksc._next_hlc(conn, own)
+-    op = {"client_op_id": uuid.uuid4().hex, "op": "upsert", "table": "task_events", "uid": event_uid, "hlc": hlc,
+-          "fields": {"task_id": task_id, "kind": kox.RESULT_KIND, "payload": json.dumps(payload, sort_keys=True),
+-                     "created_at": int(time.time())}}
+-    res = (ksc.Hub(ksc.load_identity()).ops(board, [op]).get("results") or [{}])[0]
+-    return str(res.get("status") or ""), f"{res.get('reason') or ''}: {res.get('detail') or ''}".strip(": ")
++    from hermes_cli.kanban_operator_label_delivery import push_event
++
++    return push_event(conn, board, own, task_id, event_uid, payload)
+ 
+ 
+ def _start(fn: Callable[[], None]) -> Optional[threading.Thread]:
+diff --git a/tests/hermes_cli/test_home_admin_capture.py b/tests/hermes_cli/test_home_admin_capture.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f91758fbe8026629f2e52058f578881b4e142c2a
+--- /dev/null
++++ b/tests/hermes_cli/test_home_admin_capture.py
+@@ -0,0 +1,100 @@
++"""Administrative result custody never refreshes a replay from today's home. [daveey]"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as dbc, kanban_sync_client as client
++from hermes_cli import kanban_operator_labels as labels, kanban_home_memo as memo
++from hermes_cli import kanban_home_transfer as source
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++
++board = support.board
++
++
++def hub_fixture(board, monkeypatch, epoch='original-epoch-00001', tries=0):
++    task = support.seed(board)
++    event = 'event-result-0000001'
++    with dbc.write_txn(board):
++        board.execute('CREATE TABLE operator_label_jobs(event_uid TEXT PRIMARY KEY,delivery_attempts INTEGER)')
++        board.execute('INSERT INTO operator_label_jobs VALUES (?,?)', (event, tries))
++    sent = []
++    def send(_board, ops):
++        sent.extend(ops)
++        return {'results':[{'status':'applied', 'client_op_id':ops[0]['client_op_id']}]}
++    def evidence(_board, table, _uid):
++        if table == 'task_events':
++            return {'state':'live', 'row':{**sent[-1]['fields'], 'uid':event, 'origin_gateway':'worker-a3'}}
++        return {'state':'live', 'row':{'id':task, 'home_generation':epoch}}
++    hub = SimpleNamespace(ops=send, close=lambda: None, row_evidence=evidence)
++    monkeypatch.setattr(client, 'Hub', lambda *a: hub)
++    monkeypatch.setattr(client, 'load_identity', lambda: None)
++    return task, event, sent, hub
++
++
++@pytest.mark.parametrize('tries', [0, 1])
++def test_label_first_reservation_and_legacy_unknown_are_stable_on_retry(board, monkeypatch, tries):
++    task, event, sent, hub = hub_fixture(board, monkeypatch, tries=tries)
++    labels._push_event(board, 'default', 'worker-a3', task, event, {'outcome':'verified'})
++    expected = {task:'original-epoch-00001'} if tries == 0 else None
++    assert sent[0].get('home_generations') == expected
++    previous = hub.row_evidence
++    hub.row_evidence = lambda b,t,u: pytest.fail('retry fetched a newer epoch') if t == 'tasks' else previous(b,t,u)
++    labels._push_event(board, 'default', 'worker-a3', task, event, {'outcome':'verified'})
++    assert sent[1] == sent[0]
++    with pytest.raises(ValueError, match='identity changed'):
++        labels._push_event(board, 'default', 'worker-a3', task, event, {'outcome':'changed'})
++    stored = board.execute('SELECT request_json FROM kanban_home_delivery1').fetchone()[0]
++    assert 'home_generations' not in json.loads(stored)
++
++
++def test_unknown_admin_result_prevents_source_prepare_until_settled(board, monkeypatch):
++    task, event, _sent, hub = hub_fixture(board, monkeypatch)
++    hub.ops = lambda *a: (_ for _ in ()).throw(TimeoutError('lost result'))
++    with pytest.raises(TimeoutError):
++        labels._push_event(board, 'default', 'worker-a3', task, event, {'outcome':'verified'})
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++    with dbc.write_txn(board), pytest.raises(ValueError, match='drained administrative intent'):
++        source.prepare(board, task, source='worker-a3', destination='hub', nonce='next-attempt-00001', expected_version=7)
++    with dbc.write_txn(board):
++        memo.settled(board, event, 'applied')
++        source.prepare(board, task, source='worker-a3', destination='hub', nonce='next-attempt-00001', expected_version=7)
++    assert source.frozen(board, task)
++
++
++@pytest.mark.parametrize('fault', ['wrong_receipt', 'wrong_readback'])
++def test_label_result_never_settles_unconfirmed_delivery(board, monkeypatch, fault):
++    task, event, _sent, hub = hub_fixture(board, monkeypatch)
++    original = hub.ops
++    if fault == 'wrong_receipt':
++        def bad(*args):
++            result = original(*args)
++            result['results'][0]['client_op_id'] = 'unrelated'
++            return result
++        hub.ops = bad
++    else:
++        original_proof = hub.row_evidence
++        hub.row_evidence = lambda b,t,u: {'state':'missing'} if t == 'task_events' else original_proof(b,t,u)
++    with pytest.raises(ValueError, match='unconfirmed'):
++        labels._push_event(board, 'default', 'worker-a3', task, event, {'outcome':'verified'})
++    assert memo.pending(board, task)
++
++
++@pytest.mark.parametrize('reference', ['task', 'actor_task'])
++def test_pending_containment_reference_prevents_source_prepare(board, reference):
++    from hermes_cli import kanban_containment_canonical as canonical, kanban_db_sync as sync
++    task = support.seed(board)
++    op = {'op':'contain', 'task':'t_1234567890abcdef', 'actor_task':'t_1234567890abcdef', 'event_uid':sync.uuid7(),
++          'client_op_id':sync.uuid7(), 'actor_run_uid':sync.uuid7(), 'payload':{}, reference:task}
++    canonical.stage(board, board='default', gateway='worker-a3', op=op)
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++    with dbc.write_txn(board), pytest.raises(ValueError, match='drained containment intent'):
++        source.prepare(board, task, source='worker-a3', destination='hub', nonce='next-attempt-00001', expected_version=7)
++    with dbc.write_txn(board):
++        board.execute('UPDATE containment_delivery SET confirmed=1')
++        source.prepare(board, task, source='worker-a3', destination='hub', nonce='next-attempt-00001', expected_version=7)
++    assert source.frozen(board, task)
+diff --git a/tests/hermes_cli/test_home_cli.py b/tests/hermes_cli/test_home_cli.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c915590d6d441ef848709a3e9ce1480158ed2e88
+--- /dev/null
++++ b/tests/hermes_cli/test_home_cli.py
+@@ -0,0 +1,42 @@
++"""Explicit maintenance CLI routes to the authenticated owner, never raw row edits. [daveey]"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_home_cli as cli
++
++_ARGS = ['--task','t_1234567890abcdef','--source','worker-a3','--nonce','fixture-nonce-00001','--expected-version','7']
++
++
++@pytest.mark.parametrize('marker', ['HERMES_KANBAN_TASK','HERMES_KANBAN_WORKER_TASK'])
++def test_worker_cannot_use_admin_move_cli(monkeypatch, marker):
++    monkeypatch.setenv(marker, 't_1234567890abcdef')
++    monkeypatch.setattr(cli, 'load_identity', lambda: pytest.fail('operator check must precede credentials'))
++    with pytest.raises(PermissionError, match='owner operator surface'):
++        cli.command(['source', *_ARGS])
++
++
++@pytest.mark.parametrize(('step','method'), [('source','source_step'), ('destination','destination_step'),
++                                           ('reconcile-precommit','reconcile_precommit')])
++def test_explicit_cli_owner_route_and_bounded_receipt(monkeypatch, capsys, step, method):
++    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
++    monkeypatch.delenv('HERMES_KANBAN_WORKER_TASK', raising=False)
++    closed = []
++    conn = SimpleNamespace(close=lambda: closed.append('db'))
++    hub = SimpleNamespace(close=lambda: closed.append('hub'))
++    monkeypatch.setattr(cli, 'Hub', lambda ident: hub)
++    monkeypatch.setattr(cli, 'load_identity', lambda: object())
++    monkeypatch.setattr(cli.dbc, 'connect', lambda: conn)
++    def apply(c,h,b,i):
++        assert (c,h,b) == (conn,hub,'default')
++        assert i == {'task':'t_1234567890abcdef','source':'worker-a3','destination':'hub',
++                     'nonce':'fixture-nonce-00001','expected_version':7}
++        return {**i,'phase':'aborted','rows':[{'private':'never print manifest'}]}
++    monkeypatch.setattr(cli.owner, method, apply)
++    assert cli.command([step, *_ARGS]) == 0
++    result = json.loads(capsys.readouterr().out)
++    assert result['phase'] == 'aborted' and result['row_count'] == 1 and 'rows' not in result
++    assert closed == ['db','hub']
+diff --git a/tests/hermes_cli/test_home_foreign_capture.py b/tests/hermes_cli/test_home_foreign_capture.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b79b46e4e6d9f1662847b7e33a0cc2708cb55882
+--- /dev/null
++++ b/tests/hermes_cli/test_home_foreign_capture.py
+@@ -0,0 +1,37 @@
++"""Nonjournaled foreign appendages bind their original canonical snapshot. [daveey]"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_home_command as home
++from hermes_cli import kanban_foreign_comment as comments
++from tests.hermes_cli import test_kanban_foreign_comment as support
++
++foreign = support.foreign
++live = support.live
++
++
++def test_foreign_comment_and_writer_event_keep_one_canonical_epoch(foreign, monkeypatch):
++    primary, _, _, task, _, _, _, _ = foreign
++    hub = support.setup(monkeypatch, task)
++    hub.target_damage = {'home_generation': 'minted-epoch-00001', 'home_transfer_pending': None}
++    comments.append(primary, task, 'actor', 'new mandate', writer_kind='agent', writer_session='session')
++    assert len(hub.sent) == 2
++    assert all(op.get('home_generations') == {task: 'minted-epoch-00001'} for op in hub.sent)
++
++
++def test_foreign_comment_pending_refuses_before_any_post(foreign, monkeypatch):
++    primary, _, _, task, _, _, _, _ = foreign
++    hub = support.setup(monkeypatch, task)
++    hub.target_damage = {'home_generation': 'minted-epoch-00001', 'home_transfer_pending': 'pending'}
++    with pytest.raises(ValueError, match='home transfer pending'):
++        comments.append(primary, task, 'actor', 'new mandate', writer_kind='agent', writer_session='session')
++    assert not hub.sent
++
++
++def test_evidence_capture_is_strict_but_keeps_legacy_absence():
++    assert home.from_evidence('t_fixture', {'id':'t_fixture'}) is None
++    for row in [{'id':'other'}, {'id':'t_fixture', 'home_generation': []},
++                {'id':'t_fixture', 'home_generation': ''}]:
++        with pytest.raises(ValueError):
++            home.from_evidence('t_fixture', row)
+-- 
+2.43.0
+

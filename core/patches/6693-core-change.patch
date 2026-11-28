@@ -1,0 +1,205 @@
+From fea0fef1641706a3786700fd55488372dadebaa8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:51:05 +0000
+Subject: [PATCH 6693] Absent-session ACKs, expired claims and fanout custody
+
+Public mirror of source commit fea0fef1641706a3786700fd55488372dadebaa8.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py b/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py
+index 69e0040513df4c085baef678db354c151782594e..1d1faf8661c5b84443e50fa7e893e6fb70949d7e 100644
+--- a/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py
++++ b/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py
+@@ -131,7 +131,7 @@
+ 
+     @contextlib.contextmanager
+     def find(chat):
+-        yield (object(), "tip-of-" + chat)
++        yield ku.SessionLookup(object(), "tip-of-" + chat)
+ 
+     monkeypatch.setattr(ku, "find_session_db", find)
+     monkeypatch.setattr(notice_fanout, "chat_skip_reason", lambda db, chat: "archived" if chat == "old" else None)
+diff --git a/tests/tui_gateway/test_card_change_stages.py b/tests/tui_gateway/test_card_change_stages.py
+index 10dadc7611b5736b61f045cc46c7c594e14a5120..f3e7e71f9df4e76e6fdb96bc7990f67193b0c131 100644
+--- a/tests/tui_gateway/test_card_change_stages.py
++++ b/tests/tui_gateway/test_card_change_stages.py
+@@ -67,6 +67,46 @@
+     assert not any('.lookup.' in key or '.outcome_refresh.' in key for key in rows)
+ 
+ 
++@pytest.mark.parametrize('step', ['load', 'lookup', 'refresh', 'ack', 'prints', 'after_poll', 'health'])
++def test_real_stage_failure_entry_and_completed_custody(remote, monkeypatch, step):
++    from contextlib import contextmanager
++    from hermes_cli import fact_links_health
++    from tui_gateway import notice_fanout_state as state
++    remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='chat')]
++    def fail(*args, **kwargs):
++        raise ValueError(step)
++    @contextmanager
++    def opener(chat):
++        if step == 'lookup':
++            fail()
++        yield remote['db'], chat
++    targets = {'load': (state, 'load_remote'), 'ack': (state, 'ack_remote'),
++               'prints': (nf, '_known_prints'), 'health': (fact_links_health, 'acknowledge')}
++    if step in targets:
++        monkeypatch.setattr(*targets[step], fail)
++    if step == 'refresh':
++        monkeypatch.setattr('hermes_state_outcome.refresh_outcomes_quietly', fail)
++    if step == 'after_poll':
++        remote['polls'][1] = ValueError(step)
++    if step in ('lookup', 'refresh'):
++        assert nf._remote_change_pass(opener).incomplete
++    else:
++        with pytest.raises(ValueError):
++            nf._remote_change_pass(opener)
++    stages = {key.removeprefix('unloaded.diag.card_stage.'): row['runs']
++              for key, row in la.counters().items() if key.startswith('unloaded.diag.card_stage.')}
++    assert stages['projection.complete'] == 1
++    assert stages['remote_flow.' + ('complete' if step in ('lookup', 'refresh') else 'exception')] == 1
++    assert stages.get('lookup.exception', 0) == int(step in ('lookup', 'refresh'))
++    assert stages.get('outcome_refresh.exception', 0) == int(step == 'refresh')
++    assert stages.get('outcome_refresh.complete', 0) == int(step not in ('load', 'lookup', 'refresh'))
++    assert stages.get('certification.exception', 0) == int(step in ('prints', 'after_poll'))
++    assert stages.get('certification.complete', 0) == int(step == 'health')
++    assert stages.get('health.exception', 0) == int(step == 'health')
++    for name in diag.STAGES:
++        assert sum(count for key, count in stages.items() if key.startswith(name + '.')) <= 1
++
++
+ def test_stage_labels_bounded_and_parent_resumes_after_failure():
+     la.reset()
+     with diag.Stage('dispatch'):
+diff --git a/tests/tui_gateway/test_notice_fanout_durability.py b/tests/tui_gateway/test_notice_fanout_durability.py
+index f080c2235e61b85eb1d77fe681b4f633af372b46..15fab01bd7e8b67105b243e3e07ef97d4dc72a11 100644
+--- a/tests/tui_gateway/test_notice_fanout_durability.py
++++ b/tests/tui_gateway/test_notice_fanout_durability.py
+@@ -59,7 +59,7 @@
+ 
+     @contextlib.contextmanager
+     def missing(chat):
+-        yield None, None
++        yield helpers.ku.SessionLookup(unavailable=True)
+ 
+     with monkeypatch.context() as m:
+         m.setattr(helpers.ku, "chat_hosted_here", lambda chat: False)
+@@ -320,7 +320,7 @@
+         if failure == "missing_db":
+             @contextlib.contextmanager
+             def missing(chat):
+-                yield None, None
++                yield helpers.ku.SessionLookup(unavailable=True)
+             opener = missing
+         elif failure == "stale_write":
+             def broken(*args):
+diff --git a/tests/tui_gateway/test_remote_absent_expired_claims.py b/tests/tui_gateway/test_remote_absent_expired_claims.py
+index 037e42003517fdbda22dc09b806e16e82d80ccfa..f919413a7c9670e05038c8e70dbd35a3a32f9162 100644
+--- a/tests/tui_gateway/test_remote_absent_expired_claims.py
++++ b/tests/tui_gateway/test_remote_absent_expired_claims.py
+@@ -60,6 +60,34 @@
+     assert all(value in warnings[0].getMessage() for value in (REF, STATE, CHAT, 't_expired'))
+ 
+ 
++def test_T1_settlement_clears_real_gate_pending_preserves_healthy_claim(claim, monkeypatch):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_origin
++    from tui_gateway import kanban_unloaded_gates as gates, kanban_replica_observer
++    ledger, source = claim
++    execute(claim, 'INSERT INTO notices (session,ref,state,at,delivered,holder_pid,holder_start) '
++                    'VALUES (?,?,?,?,0,2,20)', ('healthy-chat', 'worker/default/default/t_healthy', STATE, NOW))
++    with sqlite3.connect(ledger) as conn:
++        before = conn.execute('SELECT * FROM notices WHERE session=?', ('healthy-chat',)).fetchone()
++    monkeypatch.setattr(kanban_origin, '_hub_db', lambda: source)
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('gw',))
++    stamp = SimpleNamespace(ident='source', generation=1, signature=1)
++    monkeypatch.setattr(kanban_replica_observer, 'fingerprint', lambda path: stamp)
++    monkeypatch.setattr(notices, 'ledger_path', lambda: ledger)
++    monkeypatch.setattr(notices, '_woken', set())
++    monkeypatch.setattr(gates, '_replica_token', lambda *args: 1)
++    monkeypatch.setattr(notices, '_sweep_snapshot', lambda *args: ([], {}))
++    gates.reset_for_tests()
++    try:
++        assert gates._remote().pending
++        assert run(claim) == 1
++        assert not gates._remote().pending
++        with sqlite3.connect(ledger) as conn:
++            assert conn.execute('SELECT * FROM notices WHERE session=?', ('healthy-chat',)).fetchone() == before
++    finally:
++        gates.reset_for_tests()
++
++
+ @pytest.mark.parametrize(('state_age', 'observation_age', 'settled'), [(80, 7, False), (7, 80, True)])
+ def test_T2_observation_not_state_clock(claim, state_age, observation_age, settled):
+     execute(claim, 'UPDATE notices SET at=?', (NOW - state_age * HOUR,))
+@@ -190,7 +218,19 @@
+ # ---- additional R5 coverage: T4 errors, T5 holder race, T7 public custody, T9 two-connection races ----
+ import pathlib
+ import threading
+-import time
++
++
++def blocked_peer_insert(claim, ready, outcome):
++    """Prove lock exclusion before attempting the ordinary waiting writer."""
++    with sqlite3.connect(claim[0], timeout=0) as conn:
++        with pytest.raises(sqlite3.OperationalError, match='locked'):
++            conn.execute('INSERT INTO observations VALUES (?,?,?,?)',
++                         (str(claim[1]), HUB_ALIAS, STATE, NOW))
++    ready.set()
++    with sqlite3.connect(claim[0], timeout=5) as conn:
++        conn.execute('INSERT INTO observations VALUES (?,?,?,?)',
++                     (str(claim[1]), HUB_ALIAS, STATE, NOW))
++        outcome.append('inserted')
+ 
+ HUB_ALIAS = 'hub/default/default/t_expired'
+ 
+@@ -432,20 +472,13 @@
+ 
+ def test_T9_after_acquisition_peer_alias_waits_then_wins_after_commit(claim, monkeypatch):
+     """A real peer thread inserts a young alias after BEGIN IMMEDIATE: it blocks, then lands after the commit."""
+-    outcome, started = [], threading.Event()
+-
+-    def peer():
+-        started.set()
+-        with sqlite3.connect(claim[0], timeout=5) as conn:
+-            conn.execute('INSERT INTO observations VALUES (?,?,?,?)', (str(claim[1]), HUB_ALIAS, STATE, NOW))
+-            outcome.append('inserted')
+-    thread = threading.Thread(target=peer)
++    outcome, ready = [], threading.Event()
++    thread = threading.Thread(target=blocked_peer_insert, args=(claim, ready, outcome))
+ 
+     def start_once():
+-        if not started.is_set():
++        if not ready.is_set():
+             thread.start()
+-            started.wait(2)
+-            time.sleep(0.3)  # the peer is now waiting on the held write lock
++            assert ready.wait(2), 'peer did not observe the held writer lock'
+             assert thread.is_alive() and not outcome
+     hooked(monkeypatch, on_select=start_once)
+     assert run(claim) == 1  # decision made while the young alias could not yet exist
+@@ -458,18 +491,13 @@
+ 
+ 
+ def test_T9_after_acquisition_rollback_releases_peer(claim, monkeypatch):
+-    outcome = []
+-
+-    def peer():
+-        with sqlite3.connect(claim[0], timeout=5) as conn:
+-            conn.execute('INSERT INTO observations VALUES (?,?,?,?)', (str(claim[1]), HUB_ALIAS, STATE, NOW))
+-            outcome.append('inserted')
+-    thread = threading.Thread(target=peer)
++    outcome, ready = [], threading.Event()
++    thread = threading.Thread(target=blocked_peer_insert, args=(claim, ready, outcome))
+ 
+     def start():
+-        if not thread.is_alive() and not outcome:
++        if not ready.is_set():
+             thread.start()
+-            time.sleep(0.2)
++            assert ready.wait(2), 'peer did not observe the held writer lock'
+ 
+     def fail(*args):
+         raise sqlite3.OperationalError('injected')
+-- 
+2.43.0
+

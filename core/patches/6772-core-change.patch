@@ -1,0 +1,833 @@
+From 85bd36231e697cc015bafbc4d207bc1b0b49357b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:14:01 +0000
+Subject: [PATCH 6772] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 85bd36231e697cc015bafbc4d207bc1b0b49357b.
+
+---
+diff --git a/hermes_cli/kanban_release_application.py b/hermes_cli/kanban_release_application.py
+index f86bc4f1c60f7afe18c35a4f8773238f334ac9db..923440a9dcde2aed76b4e33338d96e1de17d2c65 100644
+--- a/hermes_cli/kanban_release_application.py
++++ b/hermes_cli/kanban_release_application.py
+@@ -241,6 +241,12 @@
+         return None
+ 
+ 
++def consumer_application(conn, intent_uid):
++    """HOME proof stays private; foreign readers use a separate certified cache."""
++    from hermes_cli import kanban_release_executor as executor
++    return verified_application(conn, intent_uid) or executor.verified_application(conn, intent_uid)
++
++
+ def verified_renewal(conn, event):
+     """Explicit intent-backed context, never pretend the intent is a comment."""
+     try:
+@@ -248,10 +254,16 @@
+         uid = p.get('owner_release_intent_uid')
+         if not cert.intent._coordinate(uid):
+             return None
+-        app = verified_application(conn, uid)
+-        if app is None or not cert.event_matches(event, app['consumption']):
++        app = consumer_application(conn, uid)
++        if app is None:
++            return None
++        renewal = app.get('renewal') or app.get('consumption', {}).get('renewal')
++        from hermes_cli import kanban_release_public as public
++        matched = (cert.event_matches(event, app['consumption']) if 'consumption' in app
++                   else renewal is not None and public.matches(event, renewal))
++        if not matched:
+             return None
+-        return {'payload': cert.parse(app['consumption']['renewal']['payload']),
++        return {'payload': cert.parse(renewal['payload']),
+                 'mandate': {'kind': 'owner_release_intent', 'intent_uid': uid,
+                             'body': app['result']['mandate']}}
+     except (TypeError, ValueError, KeyError, UnicodeError, RecursionError):
+@@ -265,7 +277,7 @@
+         uid = p.get('owner_release_intent_uid')
+         if not cert.intent._coordinate(uid) or event.get('run_id') is not None or event.get('deleted_at') is not None:
+             return None
+-        app = verified_application(conn, uid)
++        app = consumer_application(conn, uid)
+         if app is None:
+             return None
+         current = _event(conn, event['uid'])
+diff --git a/hermes_cli/kanban_release_executor.py b/hermes_cli/kanban_release_executor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5afb23d8f43d9e76d3d15743043464f08833015
+--- /dev/null
++++ b/hermes_cli/kanban_release_executor.py
+@@ -0,0 +1,160 @@
++"""Immutable host-local Board-certified final application for foreign consumers.
++
++Capture only through authenticated prewriter row_evidence; offline pickup copies
++only recertified protected cache bytes. Never creates HOME consumption or queues.
++Every SQL-only read rechecks all local public halves. No task/allowance writes.
++"""
++from __future__ import annotations
++
++import contextvars
++import sqlite3
++
++from hermes_cli import kanban_release_application as app, kanban_release_certificate as cert
++from hermes_cli import kanban_release_public as public
++from hermes_cli.kanban_containment_functions import register as register_function
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++from hermes_cli.kanban_sync_hub_transport import BoundedResponseTooLarge
++
++TABLE = 'owner_release_executor_receipts'
++_PERMIT = contextvars.ContextVar('owner_release_executor_write', default=None)
++
++
++class ReplicaConflict(ContainmentRefused):
++    """Canonical final receipt conflicts with immutable first observation."""
++
++
++class ReplicaOversize(ContainmentRefused):
++    """One final receipt exceeds the bound; hold that card, not its whole page."""
++
++
++def install(conn):
++    register_function(conn, 'kanban_owner_release_executor_write', 0,
++                      lambda: int(_PERMIT.get() is conn and conn.in_transaction))
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (intent_uid TEXT PRIMARY KEY, result_uid TEXT NOT NULL UNIQUE, '
++                 'consume_uid TEXT NOT NULL UNIQUE, delivery_uid TEXT NOT NULL UNIQUE, board TEXT NOT NULL, '
++                 'task_id TEXT NOT NULL, evidence TEXT NOT NULL, digest TEXT NOT NULL)')
++    abort = "BEGIN SELECT RAISE(ABORT,'owner release executor receipt immutable'); END"
++    for op in ('UPDATE', 'DELETE'):
++        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {TABLE}_{op.lower()} BEFORE {op} ON {TABLE} {abort}')
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {TABLE}_insert BEFORE INSERT ON {TABLE} '
++                 f'WHEN NOT kanban_owner_release_executor_write() {abort}')
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {TABLE}_replace BEFORE INSERT ON {TABLE} '
++                 f'WHEN EXISTS(SELECT 1 FROM {TABLE} WHERE intent_uid=NEW.intent_uid OR result_uid=NEW.result_uid '
++                 f'OR consume_uid=NEW.consume_uid OR delivery_uid=NEW.delivery_uid OR rowid=NEW.rowid) {abort}')
++
++
++def _board(conn):
++    row = conn.execute('SELECT board_id FROM kanban_sync_state LIMIT 1').fetchone()
++    return row[0] if row else None
++
++
++def _store(conn, value, receipt):
++    from hermes_cli import kanban_db as kb
++    body = receipt['intent']
++    if _board(conn) != body['board'] or conn.execute('SELECT gateway_id FROM kanban_sync_state LIMIT 1').fetchone()[0] != value['reader_gateway']:
++        raise ReplicaConflict('executor receipt board or authenticated reader differs')
++    raw = cert.encode(value)
++    values = (body['intent_uid'], receipt['result_event']['uid'], receipt['renewal']['uid'],
++              receipt['delivery_uid'], body['board'], body['task_id'], raw, app._sha(value))
++    with kb.write_txn(conn, allow_nested=True):
++        install(conn)
++        prior = conn.execute(f'SELECT intent_uid,result_uid,consume_uid,delivery_uid,board,task_id,evidence,digest '
++                             f'FROM {TABLE} WHERE intent_uid=? OR result_uid=? OR consume_uid=? OR delivery_uid=?',
++                             values[:4]).fetchall()
++        if prior:
++            if len(prior) != 1 or tuple(prior[0]) != values:
++                raise ReplicaConflict('executor receipt identity changed')
++            return
++        token = _PERMIT.set(conn)
++        try:
++            conn.execute(f'INSERT INTO {TABLE} VALUES (?,?,?,?,?,?,?,?)', values)
++        finally:
++            _PERMIT.reset(token)
++
++
++def _cached(conn, uid):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone():
++        return None
++    row = conn.execute(f'SELECT intent_uid,result_uid,consume_uid,delivery_uid,board,task_id,evidence,digest '
++                       f'FROM {TABLE} WHERE (intent_uid=? OR result_uid=?) AND typeof(evidence)=\'text\' '
++                       'AND length(CAST(evidence AS BLOB))<=?', (uid, uid, public.MAX_BYTES)).fetchone()
++    if row is None or row[4] != _board(conn):
++        return None
++    value = cert.parse(row[6], max_bytes=public.MAX_BYTES)
++    result = public.validate(value, board=row[4], task=row[5], uid=row[1])
++    expected = (result['intent']['intent_uid'], result['result_event']['uid'], result['renewal']['uid'],
++                result['delivery_uid'], result['intent']['board'], result['intent']['task_id'])
++    if tuple(row)[:6] != expected or app._sha(value) != row[7]:
++        raise ReplicaConflict('executor receipt cache binding differs')
++    return value, result
++
++
++def verified_application(conn, uid):
++    """Foreign-only history; HOME must retain its stronger private assembler proof."""
++    try:
++        cached = _cached(conn, uid)
++        if cached is None:
++            return None
++        value, result = cached
++        local = conn.execute('SELECT gateway_id,mode FROM kanban_sync_state LIMIT 1').fetchone()
++        # Exact primary HOME must never fall back if its private receipt is lost.
++        if local is None or local[0] != value['reader_gateway'] or local[0] in (
++                result['intent']['home'], result['renewal']['origin_gateway']):
++            return None
++        columns = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++        live = ' AND deleted_at IS NULL' if 'deleted_at' in columns else ''
++        for frozen in [value['delivery'], value['renewal'], *value['events']]:
++            row = conn.execute('SELECT uid,task_id,kind,payload,created_at,origin_gateway,run_id FROM task_events '
++                               'WHERE uid=? AND typeof(payload)=\'text\' AND length(CAST(payload AS BLOB))<=?' + live,
++                               (frozen['uid'], cert.MAX_BYTES)).fetchone()
++            if row is None or row[6] is not None:
++                return None
++            if not public.matches(dict(zip(app.EVENT_FIELDS, tuple(row)[:6])), frozen):
++                return None
++        return result
++    except (sqlite3.Error, TypeError, ValueError, KeyError, UnicodeError, RecursionError, ReplicaConflict):
++        return None
++
++
++def _candidate(change):
++    return (change.table == 'task_events' and change.op == 'upsert'
++            and change.fields.get('kind') == 'owner_release_applied')
++
++
++def certify_page(conn, hub, board, changes):
++    for change in changes:
++        if not _candidate(change):
++            continue
++        if conn.in_transaction:
++            raise ContainmentRefused('executor receipt fetch requires prewriter boundary')
++        try:
++            reply = hub.row_evidence(board, 'task_events', change.uid, max_response_bytes=public.MAX_RESPONSE_BYTES)
++        except BoundedResponseTooLarge as exc:
++            raise ReplicaOversize(str(exc)) from exc
++        if not isinstance(reply, dict) or 'owner_release_applied_v1' not in reply:
++            continue  # old DO or public lookalike: no authority, ordinary history proceeds
++        try:
++            value, result = public.evidence(reply, board=board, task=change.fields.get('task_id'), uid=change.uid)
++        except (ValueError, KeyError) as exc:
++            raise ReplicaConflict(f'invalid canonical executor receipt: {exc}') from exc
++        current = {**change.fields, 'uid': change.uid, 'origin_gateway': change.origin_gateway}
++        if not public.matches(current, result['result_event']):
++            raise ReplicaConflict('feed result differs from certified executor receipt')
++        _store(conn, value, result)
++
++
++def adopt_receipts(conn, source, changes):
++    for change in changes:
++        if not _candidate(change):
++            continue
++        try:
++            cached = _cached(source, change.uid)
++        except sqlite3.Error as exc:
++            raise ReplicaConflict('pickup executor receipt schema unreadable') from exc
++        if cached is None:
++            continue
++        value, result = cached
++        current = {**change.fields, 'uid': change.uid, 'origin_gateway': change.origin_gateway}
++        if not public.matches(current, result['result_event']):
++            raise ReplicaConflict('pickup result differs from certified executor receipt')
++        _store(conn, value, result)
+diff --git a/hermes_cli/kanban_release_public.py b/hermes_cli/kanban_release_public.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd78b327aa94db6d5fcb618fda430cc5275e9944
+--- /dev/null
++++ b/hermes_cli/kanban_release_public.py
+@@ -0,0 +1,98 @@
++"""Public-only final APPLIED attestation from authenticated Board row evidence.
++
++Not a private consumption certificate. Exact public payload strings avoid a new
++cross-language JSON hash convention. Delivery is already public, including its
++read inventory; no private task, allowance, proposal or separate comments escape.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_release_application as app, kanban_release_certificate as cert
++
++MAX_BYTES = 4 * 1024 * 1024
++MAX_RESPONSE_BYTES = 8 * 1024 * 1024
++FIELDS = set(app.EVENT_FIELDS)
++
++
++def event(value, *, task, home=None):
++    if (not cert._exact(value, FIELDS) or value['task_id'] != task
++            or not all(cert.intent._coordinate(value[k]) for k in ('uid', 'origin_gateway'))
++            or not isinstance(value['kind'], str) or not cert._integer(value['created_at'])
++            or home is not None and value['origin_gateway'] != home):
++        raise ValueError('invalid public application event')
++    cert.parse(value['payload'])
++    return value
++
++
++def _validate(value, *, board, task, uid):
++    if (not cert._exact(value, {'version', 'board', 'reader_gateway', 'intent', 'renewal', 'delivery', 'events'})
++            or type(value['version']) is not int or value['version'] != 1 or value['board'] != board):
++        raise ValueError('invalid public application attestation')
++    cert.parse(cert.encode(value), max_bytes=MAX_BYTES)
++    body = cert.intent.validate(value['intent'])
++    if (cert.encode(body) != cert.encode(value['intent']) or body['board'] != board or body['task_id'] != task
++            or body['actor']['gateway'] == body['home'] or not cert.intent._coordinate(value['reader_gateway'])
++            or value['reader_gateway'] == body['home']):
++        raise ValueError('public application intent differs')
++    renewal = event(value['renewal'], task=task)
++    if renewal['kind'] != 'scope_renewed':
++        raise ValueError('public application renewal kind differs')
++    digest = cert.intent.digest(body)
++    cert._payload(renewal, body, digest, renewal['uid'])
++    delivery = event(value['delivery'], task=task, home=body['actor']['gateway'])
++    cp = cert.parse(delivery['payload'])
++    if (delivery['kind'] != 'operator_call_requested' or cp.get('version') != 1
++            or cp.get('carrier') != 'owner_release' or cp.get('action') != 'owner_release'
++            or cp.get('request_uid') != delivery['uid'] or cp.get('board') != board
++            or cp.get('target_task_id') != task or cp.get('home') != body['home']
++            or cp.get('digest') != digest or cert.encode(cp.get('intent')) != cert.encode(body)):
++        raise ValueError('public application carrier differs')
++    rows = value['events']
++    if not isinstance(rows, list) or not 3 <= len(rows) <= 38:
++        raise ValueError('public application event count differs')
++    for row in rows:
++        event(row, task=task, home=renewal['origin_gateway'])
++    ids = [body['intent_uid'], renewal['uid'], delivery['uid'], *[r['uid'] for r in rows]]
++    if len(set(ids)) != len(ids) or rows[-1]['uid'] != uid:
++        raise ValueError('public application identities collide')
++    kinds = [r['kind'] for r in rows]
++    prefix = ['wake_episode_evidence'] if kinds[0] == 'wake_episode_evidence' else []
++    offset = len(prefix)
++    if kinds[offset] == 'commented':
++        prefix += ['commented', 'spend_budget_set']
++    expected = prefix + ['stop_released'] * (1 + len(body['capability_episodes'])) + ['promoted_manual', 'owner_release_applied']
++    if kinds != expected:
++        raise ValueError('public application generated sequence differs')
++    # Narrow validation context only: never returned as a consumption certificate.
++    context = {'intent': body, 'renewal': renewal, 'consume': {'client_op_id': renewal['uid']}}
++    result = app._result(rows[-1], context, delivery['uid'])
++    effects = [r for r in rows if r['kind'] in ('stop_released', 'spend_budget_set', 'promoted_manual')]
++    if result['outcome'] != 'released' or result['effect_uids'] != [r['uid'] for r in effects]:
++        raise ValueError('public application result effects differ')
++    app._effects(effects, context)
++    return {'intent': body, 'renewal': renewal, 'delivery_uid': delivery['uid'],
++            'result': result, 'result_event': rows[-1], 'effects': effects}
++
++
++def validate(value, *, board, task, uid):
++    try:
++        return _validate(value, board=board, task=task, uid=uid)
++    except (KeyError, TypeError, UnicodeError, RecursionError) as exc:
++        raise ValueError('invalid public application structure') from exc
++
++
++def matches(current, frozen):
++    """Portable projection equality, exact strings; local integer IDs irrelevant."""
++    return (current.get('run_uid') is None and current.get('run_id') is None
++            and current.get('deleted_at') is None
++            and cert.encode({k: current.get(k) for k in app.EVENT_FIELDS}) == cert.encode(frozen))
++
++
++def evidence(value, *, board, task, uid):
++    if (not isinstance(value, dict) or value.get('board') != board or value.get('table') != 'task_events'
++            or value.get('uid') != uid or value.get('state') != 'live' or value.get('tombstone') is not None):
++        raise ValueError('public application row evidence differs')
++    attestation = value['owner_release_applied_v1']
++    result = validate(attestation, board=board, task=task, uid=uid)
++    if not isinstance(value.get('row'), dict) or not matches(value['row'], result['result_event']):
++        raise ValueError('public application canonical result differs')
++    return attestation, result
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index bb24dfe43bb712bb39d84e681393906b0fee5a8e..2200680fb2c27e79f77810e13ab7df38b797ddc5 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -177,7 +177,7 @@
+ 
+ REASSESSMENT_OVERSIZE = "reassessment_evidence_oversize"
+ # A generic operator release refuses these (no canonical containment attestation) and stores no receipt.
+-NO_GENERIC_RELEASE = ("reassessment_conflict", REASSESSMENT_OVERSIZE)
++NO_GENERIC_RELEASE = ("reassessment_conflict", REASSESSMENT_OVERSIZE, "owner_release_conflict", "owner_release_oversize")
+ 
+ 
+ def clear_instruction(kind: str, board: str, receipt: str) -> str:
+@@ -254,8 +254,15 @@
+     """
+     from hermes_cli import kanban_containment_replica as replica
+     from hermes_cli import kanban_owner_reassessment_replica as reassessment
++    from hermes_cli import kanban_release_executor as executor
+     from hermes_cli.kanban_containment_lifecycle import ContainmentConflict
+     for change in changes:
++        try:
++            executor.certify_page(conn, hub, board, [change])
++        except (executor.ReplicaConflict, executor.ReplicaOversize) as exc:
++            kind = 'owner_release_conflict' if isinstance(exc, executor.ReplicaConflict) else 'owner_release_oversize'
++            quarantine_change(conn, board, change, ContainmentConflict(str(exc), kind=kind, uid=change.uid))
++            continue
+         try:  # one card's contradicted reassessment receipt holds that card; siblings keep syncing
+             reassessment.certify_page(conn, hub, board, [change])
+         except (reassessment.ReassessmentConflict, reassessment.ReassessmentEvidenceOversize) as exc:
+@@ -287,6 +294,12 @@
+                                  (change.uid,)).fetchone()
+             if prior:
+                 held_tasks.add(prior[0])
++    if exc.kind in ('owner_release_conflict', 'owner_release_oversize'):
++        from hermes_cli import kanban_release_executor as executor
++        if _exists(conn, executor.TABLE):
++            prior = conn.execute(f'SELECT task_id FROM {executor.TABLE} WHERE result_uid=?', (change.uid,)).fetchone()
++            if prior:
++                held_tasks.add(prior[0])
+     if not held_tasks:
+         raise exc  # no task identity: fail the board round rather than skip uncertain history
+     reason = str(exc) if exc.uid in (None, change.uid) else f"{exc} (receipt {exc.uid})"
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index bdc75c64f8de08fe0527520e054371689bd61cd4..f38821017ba0975d71e22eda608ff0c376a6cca7 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -549,6 +549,8 @@
+             containment.adopt_receipts(conn, replica, card_changes)
+             from hermes_cli import kanban_owner_reassessment_replica as reassessment
+             reassessment.adopt_receipts(conn, replica, card_changes)
++            from hermes_cli import kanban_release_executor as executor
++            executor.adopt_receipts(conn, replica, card_changes)
+         except (ContainmentRefused, KeyError, ValueError, TypeError) as exc:  # malformed evidence refuses too
+             why = f"containment receipts not certified for task_events: {exc}"
+             _log.warning("kanban worker node: not importing %s (table task_events): %s", tid, why)
+diff --git a/tests/fixtures/owner_release_executor_board.json b/tests/fixtures/owner_release_executor_board.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b34fab4c23f2ccbf46c3a26bd562f8fa203151a
+--- /dev/null
++++ b/tests/fixtures/owner_release_executor_board.json
+@@ -0,0 +1,122 @@
++{
++  "board": "release-mwy330w9-3",
++  "table": "task_events",
++  "uid": "00000000-0000-7000-8000-00000000000b",
++  "state": "live",
++  "row": {
++    "uid": "00000000-0000-7000-8000-00000000000b",
++    "ord": 15,
++    "task_id": "t_mwy330w9-4",
++    "run_uid": null,
++    "kind": "owner_release_applied",
++    "payload": "{\"version\":1,\"intent_uid\":\"intent-mwy332d4-16\",\"consume_uid\":\"consume-mwy332j0-17\",\"delivery_uid\":\"delivery-mwy332w3-18\",\"outcome\":\"released\",\"mandate\":\"Released to finish this card's acceptance. Budget: 2 more runs. Narrower run counts, dollar caps and stop-on-finding conditions written by agents earlier are superseded. Stop conditions in a note below do not add to the stop list that follows. The card's budget after this release: 2 runs (2 more than the 0 counted), no cache-read limit. Stop only on: a provider safety refusal; a step that needs David physically; the same error three times; the run budget. Findings, design changes, review CHANGES, CI waits and sandbox refusals of -c scripts are work inside the round. Safety exclusions in the card body stay. If it stops, say what was built, what is left and the one next step.\\n\\nFinish the original acceptance within existing independent limits.\",\"effect_uids\":[\"00000000-0000-7000-8000-000000000008\",\"00000000-0000-7000-8000-000000000009\",\"00000000-0000-7000-8000-000000000007\",\"00000000-0000-7000-8000-00000000000a\"]}",
++    "created_at": 1700018599,
++    "seq": 27,
++    "version": 1,
++    "updated_at": 1700029678744,
++    "hlc": "1700029678744-0000-server",
++    "origin_gateway": "sw-home",
++    "deleted_at": null
++  },
++  "tombstone": null,
++  "floor": 0,
++  "feed_floor": 0,
++  "head": 28,
++  "owner_release_applied_v1": {
++    "version": 1,
++    "board": "release-mwy330w9-3",
++    "reader_gateway": "other-mwy330mp-2",
++    "intent": {
++      "actor": {
++        "gateway": "origin-mwy330mp-1",
++        "profile": "default",
++        "session": "chat-mwy330w9-6"
++      },
++      "board": "release-mwy330w9-3",
++      "capability_episodes": [
++        "capability-mwy331c1-9"
++      ],
++      "episode": "00000000-0000-7000-8000-00000000000d",
++      "home": "sw-home",
++      "intent_uid": "intent-mwy332d4-16",
++      "note": "Finish the original acceptance within existing independent limits.",
++      "runs": 2,
++      "task_id": "t_mwy330w9-4",
++      "version": 1
++    },
++    "renewal": {
++      "uid": "consume-mwy332j0-17",
++      "task_id": "t_mwy330w9-4",
++      "kind": "scope_renewed",
++      "payload": "{\"version\":1,\"episode\":\"00000000-0000-7000-8000-00000000000d\",\"covered_restriction_uids\":[\"00000000-0000-7000-8000-00000000000d\",\"receipt-mwy331v3-14\"],\"request_uid\":\"consume-mwy332j0-17\",\"owner_release_intent_uid\":\"intent-mwy332d4-16\",\"owner_release_digest\":\"4408b9044a47c00aee7106727b67da208babd579375344ca849feff0688121e6\",\"actor_kind\":\"agent\",\"actor_gateway\":\"origin-mwy330mp-1\",\"actor_profile\":\"default\",\"actor_session\":\"chat-mwy330w9-6\",\"authority_kind\":\"chat\",\"authority_ref\":null,\"reason\":\"Finish the original acceptance within existing independent limits.\"}",
++      "created_at": 1700029677,
++      "origin_gateway": "sw-home"
++    },
++    "delivery": {
++      "uid": "delivery-mwy332w3-18",
++      "task_id": "t_mwy330w9-4",
++      "kind": "operator_call_requested",
++      "payload": "{\"version\":1,\"carrier\":\"owner_release\",\"action\":\"owner_release\",\"request_uid\":\"delivery-mwy332w3-18\",\"board\":\"release-mwy330w9-3\",\"target_task_id\":\"t_mwy330w9-4\",\"home\":\"sw-home\",\"intent\":{\"version\":1,\"intent_uid\":\"intent-mwy332d4-16\",\"board\":\"release-mwy330w9-3\",\"task_id\":\"t_mwy330w9-4\",\"home\":\"sw-home\",\"episode\":\"00000000-0000-7000-8000-00000000000d\",\"capability_episodes\":[\"capability-mwy331c1-9\"],\"runs\":2,\"note\":\"Finish the original acceptance within existing independent limits.\",\"actor\":{\"gateway\":\"origin-mwy330mp-1\",\"profile\":\"default\",\"session\":\"chat-mwy330w9-6\"}},\"digest\":\"4408b9044a47c00aee7106727b67da208babd579375344ca849feff0688121e6\",\"seen_comments\":[],\"nonce\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
++      "created_at": 1002,
++      "origin_gateway": "origin-mwy330mp-1"
++    },
++    "events": [
++      {
++        "uid": "00000000-0000-7000-8000-000000000005",
++        "task_id": "t_mwy330w9-4",
++        "kind": "wake_episode_evidence",
++        "payload": "{\"_wake_episode_v1\":null,\"_wake_episode_barriers\":{\"00000000-0000-4000-8000-00000000000e\":1}}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      },
++      {
++        "uid": "00000000-0000-7000-8000-000000000006",
++        "task_id": "t_mwy330w9-4",
++        "kind": "commented",
++        "payload": "{\"author\":\"kanban-spend-budget\",\"len\":264,\"comment_id\":1,\"comment_uid\":\"00000000-0000-7000-8000-000000000004\"}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      },
++      {
++        "uid": "00000000-0000-7000-8000-000000000008",
++        "task_id": "t_mwy330w9-4",
++        "kind": "spend_budget_set",
++        "payload": "{\"runs\":2,\"cache_read_tokens\":0,\"by\":\"origin-mwy330mp-1/default/chat-mwy330w9-6\",\"reason\":\"hermes kanban release: authenticated original-owner intent intent-mwy332d4-16\",\"writer_kind\":\"agent\",\"cache_read_writer_kind\":\"agent\",\"episode\":\"00000000-0000-7000-8000-00000000000d\",\"decision_comment\":{\"comment_id\":1,\"author\":\"kanban-spend-budget\",\"comment_uid\":\"00000000-0000-7000-8000-000000000004\"}}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      },
++      {
++        "uid": "00000000-0000-7000-8000-000000000009",
++        "task_id": "t_mwy330w9-4",
++        "kind": "stop_released",
++        "payload": "{\"version\":1,\"owner_release_intent_uid\":\"intent-mwy332d4-16\",\"consume_uid\":\"consume-mwy332j0-17\",\"actor_kind\":\"agent\",\"actor_gateway\":\"origin-mwy330mp-1\",\"actor_profile\":\"default\",\"actor_session\":\"chat-mwy330w9-6\",\"authority_kind\":\"chat\",\"runs\":2,\"note\":\"Finish the original acceptance within existing independent limits.\",\"episode\":\"capability-mwy331c1-9\"}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      },
++      {
++        "uid": "00000000-0000-7000-8000-000000000007",
++        "task_id": "t_mwy330w9-4",
++        "kind": "stop_released",
++        "payload": "{\"version\":1,\"owner_release_intent_uid\":\"intent-mwy332d4-16\",\"consume_uid\":\"consume-mwy332j0-17\",\"actor_kind\":\"agent\",\"actor_gateway\":\"origin-mwy330mp-1\",\"actor_profile\":\"default\",\"actor_session\":\"chat-mwy330w9-6\",\"authority_kind\":\"chat\",\"runs\":2,\"note\":\"Finish the original acceptance within existing independent limits.\",\"episode\":\"00000000-0000-7000-8000-00000000000d\"}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      },
++      {
++        "uid": "00000000-0000-7000-8000-00000000000a",
++        "task_id": "t_mwy330w9-4",
++        "kind": "promoted_manual",
++        "payload": "{\"actor\":\"origin-mwy330mp-1/default/chat-mwy330w9-6\",\"reason\":\"Finish the original acceptance within existing independent limits.\",\"from_status\":\"triage\",\"_recovery_history_v1\":{\"identity\":\"00000000-0000-4000-8000-00000000000f\",\"predecessors\":[]}}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      },
++      {
++        "uid": "00000000-0000-7000-8000-00000000000b",
++        "task_id": "t_mwy330w9-4",
++        "kind": "owner_release_applied",
++        "payload": "{\"version\":1,\"intent_uid\":\"intent-mwy332d4-16\",\"consume_uid\":\"consume-mwy332j0-17\",\"delivery_uid\":\"delivery-mwy332w3-18\",\"outcome\":\"released\",\"mandate\":\"Released to finish this card's acceptance. Budget: 2 more runs. Narrower run counts, dollar caps and stop-on-finding conditions written by agents earlier are superseded. Stop conditions in a note below do not add to the stop list that follows. The card's budget after this release: 2 runs (2 more than the 0 counted), no cache-read limit. Stop only on: a provider safety refusal; a step that needs David physically; the same error three times; the run budget. Findings, design changes, review CHANGES, CI waits and sandbox refusals of -c scripts are work inside the round. Safety exclusions in the card body stay. If it stops, say what was built, what is left and the one next step.\\n\\nFinish the original acceptance within existing independent limits.\",\"effect_uids\":[\"00000000-0000-7000-8000-000000000008\",\"00000000-0000-7000-8000-000000000009\",\"00000000-0000-7000-8000-000000000007\",\"00000000-0000-7000-8000-00000000000a\"]}",
++        "created_at": 1700018599,
++        "origin_gateway": "sw-home"
++      }
++    ]
++  }
++}
+diff --git a/tests/hermes_cli/test_owner_release_executor.py b/tests/hermes_cli/test_owner_release_executor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..80951ffa11dcca639fc1c38db3b8b7da2535efe8
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_executor.py
+@@ -0,0 +1,223 @@
++"""Foreign final-certificate reader through page certification and pickup.
++
++Assembly adapter is synthetic; actual Board HTTP attestation has separate coverage.
++These tests do not claim composed original CLI→DO→HOME→executor/live proof.
++"""
++from __future__ import annotations
++
++import copy
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_sync as sync
++from hermes_cli import kanban_release_application as app, kanban_release_certificate as cert
++from hermes_cli import kanban_release_executor as subject, kanban_release_public as public
++from hermes_cli import kanban_sync_quarantine as quarantine
++from tests.hermes_cli import test_owner_release_materialize as helpers
++
++board=helpers.board
++proof=helpers.proof
++assembly=helpers.assembly
++
++
++def projection(row):
++    return {k:row[k] for k in app.EVENT_FIELDS}
++
++
++def reply(a):
++    value=helpers.adapter(helpers.wire(a))
++    p=value['consumption']
++    delivery=app._event(a.conn,'delivery-1')
++    att=dict(version=1,board=p['intent']['board'],reader_gateway='executor',intent=p['intent'],renewal=projection(p['renewal']),
++             delivery=delivery,events=[projection(e) for e in value['events']])
++    result=value['events'][-1]
++    return dict(board=att['board'],table='task_events',uid=result['uid'],state='live',row=result,
++                tombstone=None,floor=0,feed_floor=0,head=500,owner_release_applied_v1=att)
++
++
++def changes(value):
++    att=value['owner_release_applied_v1']
++    return [sync.RemoteChange(seq=100+i,version=1,table='task_events',uid=e['uid'],op='upsert',fields=e,
++                              hlc='1700000000000-0000-server',origin_gateway=e['origin_gateway'])
++            for i,e in enumerate([att['delivery'],att['renewal'],*att['events']])]
++
++
++class Hub:
++    def __init__(self,conn,value):
++        self.conn,self.value=conn,value
++        self.calls=[]
++    def row_evidence(self,board,table,uid,**kwargs):
++        assert not self.conn.in_transaction
++        self.calls.append((board,table,uid,kwargs))
++        return copy.deepcopy(self.value)
++
++
++def foreign(a):
++    with kb.write_txn(a.conn):
++        a.conn.execute("UPDATE kanban_sync_state SET gateway_id='executor'")
++
++
++def test_page_capture_split_arrival_and_foreign_actual_execution_reader(assembly):
++    from hermes_cli import kanban_spend_decision as decision
++    a=assembly;value=reply(a);foreign(a);rows=changes(value);hub=Hub(a.conn,value)
++    assert decision.execution_restricted(a.conn,a.tid)
++    safe=quarantine.certified_page(a.conn,hub,value['board'],rows)
++    assert len(hub.calls)==1 and hub.calls[0][3]['max_response_bytes']==public.MAX_RESPONSE_BYTES
++    assert subject.verified_application(a.conn,'intent-1') is None
++    sync.apply_remote_changes(a.conn,safe[:-1],new_cursor=400,observers=False)
++    assert subject.verified_application(a.conn,'intent-1') is None
++    sync.apply_remote_changes(a.conn,safe[-1:],new_cursor=500,observers=False)
++    got=subject.verified_application(a.conn,'intent-1')
++    assert got is not None and 'consumption' not in got
++    assert app.verified_application(a.conn,'intent-1') is None
++    assert app.consumer_application(a.conn,'intent-1')==got
++    assert not decision.execution_restricted(a.conn,a.tid)
++    assert kb.get_task(a.conn,a.tid).status=='triage'  # no task-image import
++    assert not a.conn.execute("SELECT 1 FROM sqlite_master WHERE name='owner_release_applied_receipts'").fetchone() or app.verified_application(a.conn,'intent-1') is None
++
++
++@pytest.mark.parametrize('half',['renewal','delivery','result','release','promotion','budget'])
++@pytest.mark.parametrize('damage',['payload','origin','run','missing'])
++def test_every_local_public_half_rechecked(assembly,half,damage):
++    a=assembly;value=reply(a);foreign(a);rows=changes(value)
++    quarantine.certified_page(a.conn,Hub(a.conn,value),value['board'],rows)
++    sync.apply_remote_changes(a.conn,rows,new_cursor=500,observers=False)
++    assert subject.verified_application(a.conn,'intent-1') is not None
++    att=value['owner_release_applied_v1']
++    kinds={'result':'owner_release_applied','release':'stop_released','promotion':'promoted_manual','budget':'spend_budget_set'}
++    target=att[half] if half in ('renewal','delivery') else next(e for e in att['events'] if e['kind']==kinds[half])
++    with kb.write_txn(a.conn):
++        if damage=='missing':
++            a.conn.execute('DELETE FROM task_events WHERE uid=?',(target['uid'],))
++        else:
++            column,new={'payload':('payload','{}'),'origin':('origin_gateway','forged'),'run':('run_id',999)}[damage]
++            if damage=='run':
++                new=a.conn.execute("INSERT INTO task_runs(task_id,profile,status,started_at,ended_at) VALUES (?,'default','scheduled',1,2)", (a.tid,)).lastrowid
++            a.conn.execute(f'UPDATE task_events SET {column}=? WHERE uid=?',(new,target['uid']))
++    assert subject.verified_application(a.conn,'intent-1') is None
++
++
++def test_home_must_not_fallback_and_successor_stays_held(assembly):
++    from hermes_cli import kanban_spend_decision as decision
++    a=assembly;value=reply(a);rows=changes(value);foreign(a)
++    quarantine.certified_page(a.conn,Hub(a.conn,value),value['board'],rows)
++    sync.apply_remote_changes(a.conn,rows,new_cursor=500,observers=False)
++    with kb.write_txn(a.conn):
++        a.conn.execute("UPDATE kanban_sync_state SET gateway_id='home'")
++    assert subject.verified_application(a.conn,'intent-1') is None
++    assert app.consumer_application(a.conn,'intent-1') is None
++    with kb.write_txn(a.conn):
++        a.conn.execute("UPDATE kanban_sync_state SET gateway_id='renamed-home'")
++    assert app.consumer_application(a.conn,'intent-1') is None
++    foreign(a)
++    assert subject.verified_application(a.conn,'intent-1') is not None
++    with kb.write_txn(a.conn):
++        kb._append_event(a.conn,a.tid,'decision_hold_restricted',{'cause':'safety_refusal','episode':'successor'})
++    assert decision.execution_restricted(a.conn,a.tid)
++
++
++@pytest.mark.parametrize('mode',['absent','malformed','feed','oversize'])
++def test_no_proof_or_conflict_does_not_authorize_or_livelock_page(assembly,mode):
++    a=assembly;value=reply(a);foreign(a);rows=changes(value)
++    if mode=='absent':
++        del value['owner_release_applied_v1']
++    if mode=='malformed':
++        value['owner_release_applied_v1']['intent']['actor']['session']='forged'
++    if mode=='feed':
++        rows[-1].fields['payload']='{}'
++    hub=Hub(a.conn,value)
++    if mode=='oversize':
++        def oversized(*args,**kwargs):
++            raise subject.BoundedResponseTooLarge('bounded')
++        hub.row_evidence=oversized
++    safe=quarantine.certified_page(a.conn,hub,value['board'],rows)
++    assert subject.verified_application(a.conn,'intent-1') is None
++    if mode=='absent':
++        assert safe==rows and not quarantine.held(a.conn,a.tid)
++    else:
++        assert not safe and quarantine.held(a.conn,a.tid)
++        kind=quarantine.entries(a.conn)[0]['kind']
++        assert kind in quarantine.NO_GENERIC_RELEASE
++
++
++def test_immutable_receipt_sql_replace_and_readonly_reopen(assembly):
++    a=assembly;value=reply(a);foreign(a);rows=changes(value)
++    quarantine.certified_page(a.conn,Hub(a.conn,value),value['board'],rows)
++    sync.apply_remote_changes(a.conn,rows,new_cursor=500,observers=False)
++    for statement in (f'DELETE FROM {subject.TABLE}',f"UPDATE {subject.TABLE} SET digest='changed'",
++                      f'INSERT OR REPLACE INTO {subject.TABLE} SELECT * FROM {subject.TABLE}'):
++        with pytest.raises(sqlite3.Error):
++            a.conn.execute(statement)
++    path=a.conn.execute('PRAGMA database_list').fetchone()[2]
++    ro=sqlite3.connect(f'file:{path}?mode=ro',uri=True)
++    try:
++        class Rows:
++            def execute(self,*args):
++                return ro.execute(*args)
++        assert subject.verified_application(Rows(),'intent-1') is not None
++        assert app.consumer_application(Rows(),'intent-1') is not None
++    finally:
++        ro.close()
++
++
++def test_real_pickup_adopts_before_apply_and_remaps_history(assembly,tmp_path,monkeypatch):
++    from hermes_cli import kanban_worker_node as worker, kanban_db_connect as kbc
++    from hermes_cli import kanban_spend_decision as decision
++    a=assembly;value=reply(a);foreign(a);rows=changes(value)
++    quarantine.certified_page(a.conn,Hub(a.conn,value),value['board'],rows)
++    sync.apply_remote_changes(a.conn,rows,new_cursor=500,observers=False)
++    monkeypatch.setenv('HERMES_KANBAN_DB',str(tmp_path/'executor.db'))
++    kb.init_db()
++    with kbc.connect_closing() as dest:
++        sync.apply_sync_schema_steps(dest);dest.commit()
++        with kb.write_txn(dest):
++            dest.execute("INSERT INTO kanban_sync_state(board_id,gateway_id,hlc_last,mode) VALUES ('example','executor','','primary')")
++        sync.set_identity(dest,'example','executor');sync.set_mode(dest,'primary')
++        assert worker.import_cards(dest,a.conn,[a.tid])==[a.tid]
++        got=subject.verified_application(dest,'intent-1')
++        assert got is not None
++        assert not decision.execution_restricted(dest,a.tid)
++        assert app.verified_application(dest,'intent-1') is None
++        assert not dest.execute("SELECT 1 FROM sqlite_master WHERE name='owner_release_home_queue'").fetchone()
++
++
++@pytest.mark.parametrize('table',['kanban_sync_state',subject.TABLE])
++def test_optional_malformed_schema_fails_closed(table):
++    conn=sqlite3.connect(':memory:')
++    try:
++        conn.execute(f'CREATE TABLE {table} (unexpected TEXT)')
++        assert subject.verified_application(conn,'intent-1') is None
++    finally:
++        conn.close()
++
++
++def test_authenticated_reader_feed_and_cache_hash_fences(assembly):
++    a=assembly;value=reply(a);foreign(a);rows=changes(value)
++    att,parsed=public.evidence(value,board=value['board'],task=a.tid,uid=rows[-1].uid)
++    with kb.write_txn(a.conn):a.conn.execute("UPDATE kanban_sync_state SET gateway_id='wrong-reader'")
++    with pytest.raises(subject.ReplicaConflict,match='reader'):
++        subject._store(a.conn,att,parsed)
++    foreign(a)
++    altered=copy.deepcopy(rows[-1]);altered.fields['created_at']+=1
++    with pytest.raises(subject.ReplicaConflict,match='feed result'):
++        subject.certify_page(a.conn,Hub(a.conn,value),value['board'],[altered])
++    subject.certify_page(a.conn,Hub(a.conn,value),value['board'],rows)
++    sync.apply_remote_changes(a.conn,rows,new_cursor=500,observers=False)
++    with kb.write_txn(a.conn):
++        a.conn.execute(f'DROP TRIGGER {subject.TABLE}_update')
++        a.conn.execute(f"UPDATE {subject.TABLE} SET digest='corrupt'")
++    assert subject.verified_application(a.conn,'intent-1') is None
++
++
++def test_unreadable_pickup_receipt_holds_one_card(assembly,tmp_path,monkeypatch):
++    from hermes_cli import kanban_worker_node as worker, kanban_db_connect as kbc
++    a=assembly;value=reply(a);foreign(a);rows=changes(value)
++    sync.apply_remote_changes(a.conn,rows,new_cursor=500,observers=False)
++    a.conn.execute(f'CREATE TABLE {subject.TABLE}(unexpected TEXT)');a.conn.commit()
++    monkeypatch.setenv('HERMES_KANBAN_DB',str(tmp_path/'broken-pickup.db'));kb.init_db()
++    with kbc.connect_closing() as dest:
++        assert worker.import_cards(dest,a.conn,[a.tid])==[]
++        assert kb.get_task(dest,a.tid) is None
++
+diff --git a/tests/hermes_cli/test_owner_release_public.py b/tests/hermes_cli/test_owner_release_public.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2922b4399cb8b9e725d90f9943ffc5de0e4c9041
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_public.py
+@@ -0,0 +1,88 @@
++"""Actual Board HTTP/DO fixture and real bounded Hub HTTP consumer.
++
++Fixture is captured from owner-release.test.ts public executor test; the HTTP peer
++below replays those bytes, not a composed DO/HOME/executor proof.
++"""
++from __future__ import annotations
++
++import copy
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_release_public as subject
++from hermes_cli.kanban_sync_client import Hub, Identity
++from hermes_cli.kanban_sync_hub_transport import BoundedResponseTooLarge
++
++
++def fixture():
++    return json.loads((Path(__file__).parents[1]/'fixtures'/'owner_release_executor_board.json').read_text())
++
++
++def validate(value):
++    return subject.evidence(value,board=value['board'],task=value['row']['task_id'],uid=value['uid'])
++
++
++def test_actual_board_producer_contract():
++    value=fixture()
++    public,got=validate(value)
++    assert got['result']['outcome']=='released'
++    assert 'consumption' not in got
++    assert set(public)=={'version','board','reader_gateway','intent','renewal','delivery','events'}
++    assert len(got['effects'])==4
++
++
++@pytest.mark.parametrize('damage',['version','actor','reader','sequence','duplicate','effect','carrier','result','canonical','origin','extra'])
++def test_invalid_wire_never_certifies(damage):
++    value=fixture();p=value['owner_release_applied_v1']
++    if damage=='version':p['version']=True
++    if damage=='actor':p['intent']['actor']['gateway']=p['intent']['home']
++    if damage=='reader':p['reader_gateway']=p['intent']['home']
++    if damage=='sequence':p['events'].reverse()
++    if damage=='duplicate':p['delivery']['uid']=p['renewal']['uid']
++    if damage=='effect':next(row for row in p['events'] if row['kind']=='stop_released')['payload']='{}'
++    if damage=='carrier':p['delivery']['payload']='{}'
++    if damage=='result':p['events'][-1]['payload']='{}'
++    if damage=='canonical':value['row']['payload']='{}'
++    if damage=='origin':p['events'][0]['origin_gateway']='other'
++    if damage=='extra':p['consumption']={}
++    with pytest.raises(ValueError):validate(value)
++
++
++def test_real_hub_row_evidence_bounded_whole_response_and_auth():
++    value=fixture();raw=json.dumps(value).encode();requests=[]
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            requests.append((self.path,self.headers.get('Authorization')))
++            self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(raw)
++        def log_message(self,*args):pass
++    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
++    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
++    hub=Hub(Identity(url=f'http://127.0.0.1:{server.server_port}',key='fixture-key',gateway=value['owner_release_applied_v1']['reader_gateway']))
++    try:
++        got=hub.row_evidence(value['board'],'task_events',value['uid'],max_response_bytes=subject.MAX_RESPONSE_BYTES)
++        assert got==value and validate(got)[1]['result']['outcome']=='released'
++        assert requests[0][1]=='Bearer fixture-key'
++        assert '/evidence?table=task_events&uid=' in requests[0][0]
++        with pytest.raises(BoundedResponseTooLarge):
++            hub.row_evidence(value['board'],'task_events',value['uid'],max_response_bytes=100)
++    finally:
++        hub.close();server.shutdown();server.server_close();thread.join(5)
++        assert not thread.is_alive()
++
++
++def test_complete_escaped_envelope_bound_is_separate_from_source_cap():
++    value=fixture();p=value['owner_release_applied_v1']
++    # Existing public delivery inventory can dominate nested encoding. It remains
++    # public history, not private consumption; exercise full escaped raw payload.
++    cp=json.loads(p['delivery']['payload']);cp['seen_comments']=[{'body':'\x01'*128000}]
++    p['delivery']['payload']=json.dumps(cp)
++    raw=json.dumps(value).encode()
++    assert len(raw)>768000 and len(raw)<subject.MAX_RESPONSE_BYTES
++    assert validate(value)[1]['result']['outcome']=='released'
++    oversized=copy.deepcopy(p);oversized['delivery']['payload']='x'*(subject.MAX_BYTES+1)
++    with pytest.raises(ValueError,match='oversized'):
++        subject.validate(oversized,board=value['board'],task=value['row']['task_id'],uid=value['uid'])
+-- 
+2.43.0
+

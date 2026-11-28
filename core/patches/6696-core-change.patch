@@ -1,0 +1,516 @@
+From f891bace0d82a43be54569da9e72a4e5ea035b05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:39:34 +0000
+Subject: [PATCH 6696] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit f891bace0d82a43be54569da9e72a4e5ea035b05.
+
+---
+diff --git a/hermes_cli/kanban_external_activity.py b/hermes_cli/kanban_external_activity.py
+index 134e6a3972eacf03d10e02e3bfe949089dbcf7d5..e0628676bdcf230cfca1864e8686159472cdef5e 100644
+--- a/hermes_cli/kanban_external_activity.py
++++ b/hermes_cli/kanban_external_activity.py
+@@ -13,7 +13,8 @@
+ import sqlite3
+ import threading
+ import time
+-from typing import Any, Iterable, Optional
++from contextlib import contextmanager
++from typing import Any, Iterable, Iterator, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -188,9 +189,42 @@
+         return _read_board_external(path, open_ro, parked_pairs, signature, wall)
+ 
+ 
++# [daveey] Set by ``one_board_read``: ``path -> contribution`` of the boards this block already read. Boards are
++# root-pinned (``kanban_db.kanban_home``), so every profile's annotation in one response reads the same files; the
++# projects tree annotates many profiles and the batched sidebar three slices, and on a busy board (frequent commits)
++# each call re-read the boards' external/ETA history (t_d0c500000000000a). One read per board per response, like
++# ``one_annotation_snapshot``'s counts. A failed read (``None``) is not shared: the next call in the block retries.
++_block = threading.local()
++
++
++@contextmanager
++def one_board_read() -> Iterator[None]:
++    """Every ``stamp_boards`` call in this block (this thread) stamps from one read of each board."""
++    if getattr(_block, "reads", None) is not None:
++        yield
++        return
++    _block.reads = {}
++    try:
++        yield
++    finally:
++        _block.reads = None
++
++
+ def _read_board_external(path, open_ro, parked_pairs, signature, wall: float) -> dict[str, dict[str, Any]]:
+     """One board's stored contribution while unchanged, otherwise one short-lived read."""
+     key = str(path)
++    shared = getattr(_block, "reads", None)
++    if shared is not None and key in shared:
++        return shared[key]
++    found = _read_board_external_once(path, open_ro, parked_pairs, signature, wall)
++    if shared is not None and found is not None:
++        shared[key] = found
++    return {} if found is None else found
++
++
++def _read_board_external_once(path, open_ro, parked_pairs, signature, wall: float):
++    """``_read_board_external`` outside a block; None = the read failed."""
++    key = str(path)
+     sig = signature(path) if signature is not None else None
+     if sig is not None:
+         with _lock:
+@@ -200,7 +234,7 @@
+     try:
+         conn = open_ro(path)
+     except sqlite3.Error:
+-        return {}
++        return None
+     try:
+         pairs = parked_pairs(conn)
+         # With a signature the stored contribution is the only memo: ``session_external``'s own ``_TTL_S`` memo
+@@ -209,7 +243,7 @@
+         clocked = bool(pairs) and _clocked(conn, pairs)
+     except sqlite3.Error:
+         logger.debug("kanban external read failed for %s", path, exc_info=True)
+-        return {}
++        return None
+     finally:
+         conn.close()
+     if sig is not None:  # taken before the read: a commit racing it moves the next request's signature
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index cd9e41715839e8061319dad82ddd26b3542794a9..4a3b26d9af2491949b8e2319455a0d83b175351e 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1859,7 +1859,8 @@
+         return
+     _annotation_scope.reads, _annotation_scope.attention, _annotation_scope.links = [], None, None
+     try:
+-        yield
++        with _external_activity.one_board_read():
++            yield
+     finally:
+         _annotation_scope.reads = _annotation_scope.attention = _annotation_scope.links = None
+ 
+diff --git a/hermes_cli/turn_session_activity.py b/hermes_cli/turn_session_activity.py
+index a9af43dfa27c194b61049d066d10292da1d7350b..8a91d564f8f816eddcb9add0df1734a5ef6f506c 100644
+--- a/hermes_cli/turn_session_activity.py
++++ b/hermes_cli/turn_session_activity.py
+@@ -104,6 +104,12 @@
+ def _update_paused_gateway_turns(conn: sqlite3.Connection, now: float) -> set[str]:
+     """Sessions whose started gateway admission is parked on an update checkpoint
+     (``hermes_state_update_pause.checkpoint_session_input``), dated by the checkpointed last message."""
++    return {sid for sid, stamp in _paused_gateway_checkpoints(conn) if now - stamp <= _GATEWAY_PAUSE_FRESH_S}
++
++
++def _paused_gateway_checkpoints(conn: sqlite3.Connection) -> list[tuple[str, float]]:
++    """``(session id, checkpointed last message time)`` of every started gateway admission parked on an update
++    checkpoint; clock-free, so a retained read stays exact (the caller applies the freshness window)."""
+     # Driven from the checkpoint keys (state_meta's primary-key range, usually empty), then the admission by
+     # its unique id: CROSS JOIN pins that order. Starting from session_admissions scans the whole table (no
+     # index leads with status), 87 ms of CPU per poll on one 4.8k-admission profile store.
+@@ -113,17 +119,18 @@
+             " ON a.admission_id = substr(m.key, ?) WHERE m.key >= ? AND m.key < ? AND a.status = 'started'",
+             (len(_GATEWAY_CHECKPOINT_PREFIX) + 1, _GATEWAY_CHECKPOINT_PREFIX, _GATEWAY_CHECKPOINT_END)).fetchall()
+     except sqlite3.Error:  # no admissions table (older store) or a busy one
+-        return set()
+-    out: set[str] = set()
++        return []
++    out: list[tuple[str, float]] = []
+     for sid, value in rows:
+         try:
+             receipt = json.loads(value)
+             stamp = conn.execute("SELECT timestamp FROM messages WHERE id = ?",
+                                  (int(receipt["max_message_id"]),)).fetchone()
++            when = float(stamp[0]) if stamp and stamp[0] is not None else None
+         except (ValueError, TypeError, KeyError, sqlite3.Error):
+             continue
+-        if sid and stamp and stamp[0] is not None and now - float(stamp[0]) <= _GATEWAY_PAUSE_FRESH_S:
+-            out.add(str(sid))
++        if sid and when is not None:
++            out.append((str(sid), when))
+     return out
+ 
+ 
+@@ -172,29 +179,86 @@
+     return auto_continue_bounds(cfg)
+ 
+ 
++_store_lock = threading.Lock()
++# [daveey] Per state.db: (commit stamp, lease rows, paused-checkpoint (session, message time) pairs) of its last read.
++# Only clock-free facts are kept: expiry, pause freshness and holder liveness are judged again on every collect, so
++# a retained read answers exactly what a fresh one would until the store commits (which moves the stamp). Opening
++# every profile's store for each collect (schema load + close of 13 WAL stores) was most of this annotation's cost
++# on the hub, where most stores are idle between sidebar polls (t_d0c500000000000a).
++_store_reads: dict[Path, tuple[tuple, tuple, tuple]] = {}
++
++
++def _db_stamp(path: Path) -> tuple | None:
++    """The store's committed generation (``goal_session_activity._db_stamp``); None = unknown, never retained."""
++    from hermes_cli.goal_session_activity import _db_stamp as stamp
++
++    return stamp(path)
++
++
++def _read_store(path: Path, now: float) -> tuple[tuple, tuple]:
++    """``(lease rows unexpired at ``now``, paused gateway (session id, message time) pairs)`` of one store."""
++    conn = _open_ro(path)
++    try:
++        try:
++            rows = tuple(conn.execute(
++                "SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases"
++                " WHERE expires_at > ?", (now,)
++            ).fetchall())
++        except sqlite3.Error:  # no lease table yet (nothing ever ran a turn there) or a busy/odd store
++            rows = ()
++        paused = tuple(_paused_gateway_checkpoints(conn))
++    finally:
++        conn.close()
++    return rows, paused
++
++
++def _store(path: Path, now: float) -> tuple[tuple, tuple]:
++    """``_read_store``, reused while the store's commit stamp is unchanged. A lease unexpired at the retained
++    read's time may expire since (the caller filters by its own clock); one expired then cannot revive without a
++    write, so the retained rows are a superset of a fresh read's."""
++    before = _db_stamp(path)
++    with _store_lock:
++        prior = _store_reads.get(path)
++    if before is not None and prior is not None and prior[0] == before:
++        return prior[1], prior[2]
++    rows, paused = _read_store(path, now)
++    with _store_lock:
++        if before is not None and before == _db_stamp(path):
++            _store_reads[path] = (before, rows, paused)
++        else:
++            _store_reads.pop(path, None)
++    return rows, paused
++
++
++def _unexpired(expires_at: Any, now: float) -> bool:
++    """``expires_at > now`` for a retained row; a row SQL returned with a non-numeric expiry stays counted, as the
++    read that returned it counted it (SQLite orders text above every number)."""
++    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
++        return expires_at > now
++    return expires_at is not None
++
++
+ def _collect(now: float) -> frozenset[str]:
+     global _leases
+     live: set[str] = set()
+     leases: dict[str, list[dict[str, Any]]] = {}
+-    for path in _state_db_paths():
++    paths = _state_db_paths()
++    with _store_lock:
++        for gone in _store_reads.keys() - set(paths):
++            del _store_reads[gone]
++    for path in paths:
+         try:
+-            conn = _open_ro(path)
++            rows, paused = _store(path, now)
+         except (sqlite3.Error, OSError):
+             _log.debug("turn leases unreadable in %s", path, exc_info=True)
++            with _store_lock:
++                _store_reads.pop(path, None)
+             continue
+-        try:
+-            try:
+-                rows = conn.execute(
+-                    "SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases"
+-                    " WHERE expires_at > ?", (now,)
+-                ).fetchall()
+-            except sqlite3.Error:  # no lease table yet (nothing ever ran a turn there) or a busy/odd store
+-                rows = []
+-            live.update(_update_paused_gateway_turns(conn, now))
+-        finally:
+-            conn.close()
++        live.update(sid for sid, stamp in paused if now - stamp <= _GATEWAY_PAUSE_FRESH_S)
+         live.update(_update_paused_tui_turns(path.parent, now))
+         for cid, holder, acquired_at, expires_at in rows:
++            if not _unexpired(expires_at, now):
++                continue
+             if cid and not _holder_dead(str(holder or "")):
+                 live.add(cid)
+                 leases.setdefault(cid, []).append({"conversation_id": cid, "holder": holder, "acquired_at": acquired_at,
+@@ -266,6 +330,8 @@
+     global _cache
+     with _cache_lock:
+         _cache = None
++    with _store_lock:
++        _store_reads.clear()
+ 
+ 
+ _reset_cache_for_tests = _invalidate_cache
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index bab6f233245297685b012e941b4deeacee4aab59..4bb136ad4575b1dde85787268830a4f738ba5435 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -808,8 +808,13 @@
+     scoped_session_ids: list[str] = []
+     errors: list[dict[str, str]] = []
+ 
+-    for name, tree in profile_project_trees(
+-            preview_limit, session_limit, errors, log_label="GET /api/profiles/projects/tree", profile=profile):
++    from hermes_cli.kanban_external_activity import one_board_read
++
++    # One read of each (root-pinned) board's external state for every profile's annotation in this response.
++    with one_board_read():
++        trees = profile_project_trees(
++            preview_limit, session_limit, errors, log_label="GET /api/profiles/projects/tree", profile=profile)
++    for name, tree in trees:
+         if tree is not None:
+             _merge_profile_tree(merged, tree["projects"], name, preview_limit)
+             scoped_session_ids.extend(tree["scoped_session_ids"])
+diff --git a/tests/hermes_cli/test_kanban_external_activity.py b/tests/hermes_cli/test_kanban_external_activity.py
+index fac07ccf76bccf3b29760cd90955cedb9100016d..fee2fbd009c6070b848f197f3eeaa8707086e77b 100644
+--- a/tests/hermes_cli/test_kanban_external_activity.py
++++ b/tests/hermes_cli/test_kanban_external_activity.py
+@@ -12,9 +12,11 @@
+ from hermes_cli import kanban_external_activity as kea
+ from hermes_cli import kanban_session_activity as ksa
+ from tests.hermes_cli import test_kanban_external_watch as helpers
++from tests.hermes_cli import test_profiles_sidebar_scope as sidebar
+ 
+ kanban_home, gh, clock = helpers.kanban_home, helpers.gh, helpers.clock
+ park, tick = helpers.park, helpers.tick
++profiles_on_disk = sidebar.profiles_on_disk
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -235,3 +237,103 @@
+             kea.stamp_boards([{"id": "s1"}], lambda: [path], open_ro, ksa._parked_pairs, ksa._identity.row_ids,
+                              signature=lambda p: None)
+         assert len(opens) == 3 and not kea._boards
++
++
++# --- one response reads each board once (t_d0c500000000000a) --------------------------------------------------------
++
++def test_every_stamp_in_one_block_shares_one_board_read_even_across_a_commit(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        _session_card(conn, "s1")
++        stamp, opens = _counting(monkeypatch, conn)
++        with kea.one_board_read():
++            first = stamp([{"id": "s1"}])
++            _session_card(conn, "s1")  # a board commit mid-response (a busy board commits often)
++            for _ in range(12):  # the projects tree's per-profile annotations, the sidebar's slices
++                assert stamp([{"id": "s1"}]) == first
++        assert len(opens) == 1, "one response must read a board once, however many annotations it stamps"
++
++
++def test_a_commit_during_a_block_is_seen_by_the_next_response(kanban_home, gh, clock, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a = park(conn, 8001)
++        tick(conn, gh, clock, 0)
++        pairs = {("s1", a)}
++        monkeypatch.setattr(ksa, "_parked_pairs", lambda c: set(pairs))
++        stamp, _opens = _counting(monkeypatch, conn)
++        with kea.one_board_read():
++            assert stamp([{"id": "s1"}])[0]["kanban_external"] == 1
++            b = park(conn, 8002)
++            tick(conn, gh, clock, 1)
++            pairs.add(("s1", b))
++        row = stamp([{"id": "s1"}])[0]  # notification loss would leave this at 1 until some later commit
++        assert row["kanban_external"] == 2
++        assert row == _fresh_stamp(conn, [{"id": "s1"}])[0]
++
++
++def test_a_failed_read_in_a_block_is_not_shared(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        _session_card(conn, "s1")
++        path = Path(str(kbc._main_db_file(conn)))
++        calls = []
++
++        def flaky(p):
++            calls.append(p)
++            if len(calls) == 1:
++                raise ksa.sqlite3.OperationalError("database is locked")
++            return ksa._open_ro(p)
++
++        with kea.one_board_read():
++            kea.stamp_boards([{"id": "s1"}], lambda: [path], flaky, ksa._parked_pairs, ksa._identity.row_ids)
++            got = kea.stamp_boards([{"id": "s1"}], lambda: [path], flaky, ksa._parked_pairs, ksa._identity.row_ids)
++        assert len(calls) == 2, "the next stamp in the block retries a failed read"
++        assert got == _fresh_stamp(conn, [{"id": "s1"}])
++
++
++def test_blocks_nest_and_another_thread_reads_on_its_own(kanban_home, monkeypatch):
++    import threading
++
++    with kbc.connect_closing() as conn:
++        _session_card(conn, "s1")
++        stamp, opens = _counting(monkeypatch, conn)
++        with kea.one_board_read():
++            stamp([{"id": "s1"}])
++            with kea.one_board_read():
++                stamp([{"id": "s1"}])
++            stamp([{"id": "s1"}])  # the inner block's end does not drop the outer one's read
++            assert len(opens) == 1
++            _session_card(conn, "s1")
++            worker = threading.Thread(target=lambda: stamp([{"id": "s1"}]))
++            worker.start()
++            worker.join()
++            assert len(opens) == 2, "a block is this thread's response only"
++
++
++def test_annotation_snapshot_opens_one_board_read():
++    with ksa.one_annotation_snapshot():
++        assert kea._block.reads == {}
++        with ksa.one_annotation_snapshot():
++            assert kea._block.reads == {}
++    assert getattr(kea._block, "reads", None) is None
++
++
++def test_projects_tree_reads_each_board_once_for_all_profiles(profiles_on_disk, monkeypatch, tmp_path):
++    from hermes_cli.web_routers import profiles
++
++    for name, home in profiles_on_disk.items():
++        sidebar._seed_session(home, name + "-chat", source="cli", cwd="/fixture/repo")
++    board = tmp_path / "board" / "kanban.db"
++    reads = []
++
++    def once(path, *_a):
++        reads.append(path)
++        return {}
++
++    def annotate(rows, **_kw):  # the real annotation's board stamp, without the counts machinery
++        return kea.stamp_boards(rows, lambda: [board], ksa._open_ro, ksa._parked_pairs, ksa._identity.row_ids)
++
++    monkeypatch.setattr(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 0)
++    monkeypatch.setattr(ksa, "annotate_kanban_activity", annotate)
++    monkeypatch.setattr(kea, "_read_board_external_once", once)
++    profiles.get_profiles_projects_tree()
++    assert len(profiles_on_disk) > 1
++    assert reads == [board], "every profile's annotation in one tree response shares one read of the board"
+diff --git a/tests/hermes_cli/test_turn_session_activity.py b/tests/hermes_cli/test_turn_session_activity.py
+index 7168cf3eac3ab476f9868d5a2d6071b690d85326..118aca769d5e7982b2b15b89b203a54a7c42bbcf 100644
+--- a/tests/hermes_cli/test_turn_session_activity.py
++++ b/tests/hermes_cli/test_turn_session_activity.py
+@@ -365,3 +365,122 @@
+     _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=0,
+             started_at=_PINNED_NOW - 7200, paused_at=_PINNED_NOW - 60)
+     assert tsa._update_paused_tui_turns(home, _PINNED_NOW) == {"tui_chat"}
++
++
++# [daveey] t_d0c500000000000a: an idle store is read once per commit, not once per collect; every clock-dependent
++# judgement (lease expiry, holder liveness, pause freshness) is still made per collect, and a commit is never lost.
++
++@pytest.fixture
++def wal_store(home):
++    path = home / "state.db"
++    _leases(path, [])
++    keeper = sqlite3.connect(path)
++    keeper.execute("PRAGMA journal_mode=WAL")
++    keeper.execute("SELECT * FROM session_turn_leases").fetchall()  # initialize the WAL index
++    yield path, keeper
++    keeper.close()
++
++
++def _count_opens(monkeypatch):
++    opened = []
++    original = tsa._open_ro
++
++    def counting(path):
++        opened.append(path)
++        return original(path)
++
++    monkeypatch.setattr(tsa, "_open_ro", counting)
++    return opened
++
++
++def _lease(keeper, sid, holder_pid, acquired_at, expires_at):
++    keeper.execute("INSERT INTO session_turn_leases VALUES (?, ?, ?, ?)",
++                   (sid, _holder(holder_pid, sid), acquired_at, expires_at))
++    keeper.commit()
++
++
++def test_unchanged_store_is_not_reopened_on_every_collect(wal_store, monkeypatch):
++    path, keeper = wal_store
++    now = time.time()
++    _lease(keeper, "a", os.getpid(), now - 5, now + 600)
++    opened = _count_opens(monkeypatch)
++    assert tsa._collect(now) == {"a"}
++    assert tsa._collect(now + 1) == {"a"}
++    assert tsa._collect(now + 2) == {"a"}
++    assert opened == [path]  # one read for one commit; the 2 s answer TTL is not what saved it
++
++
++def test_commit_after_a_retained_read_is_seen_by_the_next_collect(wal_store):
++    _path, keeper = wal_store
++    now = time.time()
++    assert tsa._collect(now) == frozenset()
++    _lease(keeper, "late", os.getpid(), now, now + 600)
++    assert tsa._collect(now + 0.001) == {"late"}  # no TTL: the commit moves the stamp
++    keeper.execute("DELETE FROM session_turn_leases WHERE conversation_id = 'late'")
++    keeper.commit()
++    assert tsa._collect(now + 0.002) == frozenset()
++
++
++def test_retained_lease_expires_by_the_collect_clock_without_a_write(wal_store, monkeypatch):
++    _path, keeper = wal_store
++    now = time.time()
++    _lease(keeper, "a", os.getpid(), now - 5, now + 10)
++    assert tsa._collect(now) == {"a"}
++    opened = _count_opens(monkeypatch)
++    assert tsa._collect(now + 11) == frozenset()
++    assert opened == []  # judged on the retained rows
++
++
++def test_retained_lease_of_a_holder_that_died_stops_counting(wal_store):
++    _path, keeper = wal_store
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        now = time.time()
++        _lease(keeper, "a", proc.pid, now - 5, now + 600)
++        assert tsa._collect(now) == {"a"}
++    finally:
++        proc.kill()
++        proc.wait()
++    assert tsa._collect(now + 1) == frozenset()
++
++
++def test_retained_gateway_pause_leaves_the_freshness_window_by_the_collect_clock(wal_store):
++    _path, keeper = wal_store
++    now = time.time()
++    keeper.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
++    keeper.execute("CREATE TABLE session_admissions (admission_id TEXT PRIMARY KEY, target_session_id TEXT, "
++                   "status TEXT)")
++    keeper.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, timestamp REAL)")
++    keeper.execute("INSERT INTO messages VALUES (7, ?)", (now - 10,))
++    keeper.execute("INSERT INTO session_admissions VALUES ('adm', 'paused_chat', 'started')")
++    keeper.execute("INSERT INTO state_meta VALUES (?, ?)",
++                   (tsa._GATEWAY_CHECKPOINT_PREFIX + "adm", json.dumps({"max_message_id": 7})))
++    keeper.commit()
++    assert tsa._collect(now) == {"paused_chat"}
++    assert tsa._collect(now + tsa._GATEWAY_PAUSE_FRESH_S) == frozenset()
++
++
++def test_failed_store_read_is_not_retained(wal_store, monkeypatch):
++    _path, keeper = wal_store
++    now = time.time()
++    _lease(keeper, "a", os.getpid(), now - 5, now + 600)
++    original = tsa._open_ro
++
++    def failed(_path):
++        raise sqlite3.OperationalError("busy")
++
++    monkeypatch.setattr(tsa, "_open_ro", failed)
++    assert tsa._collect(now) == frozenset()
++    monkeypatch.setattr(tsa, "_open_ro", original)
++    assert tsa._collect(now) == {"a"}
++
++
++def test_removed_profile_store_drops_its_retained_read(home, wal_store):
++    now = time.time()
++    work = home / "profiles" / "work" / "state.db"
++    _leases(work, [("p", _holder(os.getpid(), "p"), now - 5, now + 600)])
++    assert "p" in tsa._collect(now)
++    for suffix in ("", "-wal", "-shm"):
++        (work.parent / f"state.db{suffix}").unlink(missing_ok=True)
++    assert "p" not in tsa._collect(now + 1)
++    assert work not in tsa._store_reads
+-- 
+2.43.0
+

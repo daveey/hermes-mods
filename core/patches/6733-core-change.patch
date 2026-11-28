@@ -1,0 +1,205 @@
+From 8f7cabb483f6d53b3c1c5504290b58a3f0a22bba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:02:32 +0000
+Subject: [PATCH 6733] Aggregate-bus discovery and superseded-unit retirement deadlines
+
+Public mirror of source commit 8f7cabb483f6d53b3c1c5504290b58a3f0a22bba.
+
+---
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 66a423b56b873d5577b023483b5b651a5591a1df..98e058581e1d10488e7e7f3d7d8d9fef45a202e0 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -555,12 +555,14 @@
+             return None
+         return parsed if isinstance(parsed, dict) else None
+ 
+-    def unit_active(self, port: int, timeout: float = 15) -> bool:
++    def _unit_state(self, port: int, timeout: float = 15) -> Optional[str]:
+         try:
+-            state = (self.systemctl("is-active", backend_unit(port), timeout=timeout).stdout or "").strip()
++            return (self.systemctl("is-active", backend_unit(port), timeout=timeout).stdout or "").strip()
+         except (OSError, subprocess.SubprocessError):
+-            return False
+-        return state in ("active", "activating", "reloading")
++            return None
++
++    def unit_active(self, port: int, timeout: float = 15) -> bool:
++        return self._unit_state(port, timeout) in ("active", "activating", "reloading")
+ 
+     def unit_pid(self, port: int, timeout: float = 15) -> int:
+         with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
+@@ -900,6 +902,10 @@
+         commit = self.post(port, "/api/health/retirement", {"action": "commit", "token": permit["token"]}) or {}
+         if commit.get("ok") is not True:
+             return False
++        return self._request_stop(port)
++
++    def _request_stop(self, port: int) -> bool:
++        """A successful asynchronous request is not proof of unit disappearance."""
+         try:
+             return self.systemctl("stop", "--no-block", backend_unit(port), timeout=15).returncode == 0
+         except (OSError, subprocess.SubprocessError):
+@@ -909,7 +915,8 @@
+         """Backstop for backends that are neither active nor warming and have not retired themselves (a core
+         without the superseded watchdog, a lost watchdog thread). After *grace_s* the roller retires one
+         through its idle fence, so a live turn is never cut. Only after *hard_s*, a backend that has stayed
+-        busy that long is stopped (SIGTERM checkpoints its turns) so the port pool cannot leak forever."""
++        busy that long is stopped (SIGTERM checkpoints its turns) so the port pool cannot leak forever.
++        Returns accepted stop requests, retaining their ages until the unit is confirmed inactive."""
+         record = read_active(self.home)
+         if record is None:
+             return []
+@@ -918,25 +925,30 @@
+         demoted = self._load_demoted()
+         now, stopped = self.wall(), []
+         for port in self.ports:
+-            if port in live or not self.unit_active(port):
++            if port in live:
+                 since.pop(port, None)
+                 demoted.pop(port, None)
+                 continue
++            state = self._unit_state(port)
++            if state in ("inactive", "failed"):
++                since.pop(port, None)
++                demoted.pop(port, None)
++                continue
++            if state not in ("active", "activating", "reloading"):
++                continue  # deactivating/unknown is not retirement proof; preserve both deadlines
+             age = now - since.setdefault(port, now)
+             if port in demoted and now - demoted[port] >= min(hard_s, DEMOTED_HARD_S):
+                 log(f"backend :{port} demoted {now - demoted[port]:.0f}s ago for not answering; stopping it")
+-                with contextlib.suppress(OSError, subprocess.SubprocessError):
+-                    self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
++                if not self._request_stop(port):
++                    continue
+             elif age >= hard_s:
+                 log(f"backend :{port} still busy {age:.0f}s after it was superseded; stopping it")
+-                with contextlib.suppress(OSError, subprocess.SubprocessError):
+-                    self.systemctl("stop", "--no-block", backend_unit(port), timeout=15)
++                if not self._request_stop(port):
++                    continue
+             elif age >= grace_s and self._retire_fenced(port):
+-                log(f"backend :{port} superseded {age:.0f}s ago and idle; retired it through its fence")
++                log(f"backend :{port} superseded {age:.0f}s ago and idle; stop requested through its fence")
+             else:
+                 continue
+-            since.pop(port, None)
+-            demoted.pop(port, None)
+             stopped.append(port)
+         self._save_superseded(since)
+         self._save_demoted(demoted)
+diff --git a/tests/hermes_cli/test_always_on_reap_retry.py b/tests/hermes_cli/test_always_on_reap_retry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b70b7080a3a1a988575f51fdac30b06b40e62d6
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_reap_retry.py
+@@ -0,0 +1,105 @@
++"""Retirement deadlines survive failed requests and indeterminate unit state."""
++import subprocess
++
++import pytest
++
++from hermes_cli import always_on_rollover as ro
++from tests.hermes_cli import test_always_on_rollover as helpers
++
++home = helpers.home
++
++
++@pytest.mark.parametrize('demoted', [False, True])
++@pytest.mark.parametrize('failure', ['nonzero', 'oserror', 'timeout'])
++def test_hard_stop_failure_preserves_original_ages_and_retries(home, demoted, failure):
++    host, fence, wall = helpers.FakeHost(running={9148, 9149}), helpers.FakeFence(busy={9148}), [1000.0]
++    ro.write_active(9149)
++    roller = helpers.make_reaper(home, host, fence, wall)
++    if demoted:
++        roller.demote(9148)
++    assert roller.reap_superseded() == []
++    since, demotions = roller._load_superseded(), roller._load_demoted()
++    wall[0] += ro.DEMOTED_HARD_S if demoted else ro.SUPERSEDED_HARD_S
++    original = host.systemctl
++    stops = []
++
++    def refused(*args, **kwargs):
++        if args[0] == 'stop':
++            stops.append(args)
++            if failure == 'oserror':
++                raise OSError('manager unavailable')
++            if failure == 'timeout':
++                raise subprocess.TimeoutExpired(args, 15)
++            return subprocess.CompletedProcess(args, 1, '', 'refused')
++        return original(*args, **kwargs)
++
++    host.systemctl = refused
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == []
++    assert roller._load_superseded() == since
++    assert roller._load_demoted() == demotions
++    assert len(stops) == 1
++    wall[0] += ro.SUPERVISE_POLL_S
++    host.systemctl = original
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == [9148]
++    assert host.running == {9149}
++
++
++@pytest.mark.parametrize('state', ['deactivating', 'unknown', 'oserror', 'timeout'])
++def test_reaping_does_not_forget_age_until_confirmed_inactive(home, state):
++    host, fence, wall = helpers.FakeHost(running={9148, 9149}), helpers.FakeFence(busy={9148}), [1000.0]
++    ro.write_active(9149)
++    roller = helpers.make_reaper(home, host, fence, wall)
++    roller.demote(9148)
++    assert roller.reap_superseded() == []
++    since, demotions = roller._load_superseded(), roller._load_demoted()
++    original = host.systemctl
++
++    def querying(*args, **kwargs):
++        if args[0] == 'is-active' and ro.backend_unit(9148) in args:
++            if state == 'oserror':
++                raise OSError('manager unavailable')
++            if state == 'timeout':
++                raise subprocess.TimeoutExpired(args, 15)
++            return subprocess.CompletedProcess(args, 3, state, '')
++        return original(*args, **kwargs)
++
++    host.systemctl = querying
++    wall[0] += ro.DEMOTED_HARD_S
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == []
++    assert roller._load_superseded() == since
++    assert roller._load_demoted() == demotions
++    host.systemctl = original
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == [9148]
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == []
++    assert roller._load_superseded() == roller._load_demoted() == {}
++
++
++@pytest.mark.parametrize('demoted', [False, True])
++def test_accepted_async_stop_retains_age_while_unit_is_still_active(home, demoted):
++    host, fence, wall = helpers.FakeHost(running={9148, 9149}), helpers.FakeFence(busy={9148}), [1000.0]
++    ro.write_active(9149)
++    roller = helpers.make_reaper(home, host, fence, wall)
++    if demoted:
++        roller.demote(9148)
++    roller.reap_superseded()
++    since, demotions = roller._load_superseded(), roller._load_demoted()
++    original = host.systemctl
++    attempts = []
++
++    def accepted(*args, **kwargs):
++        if args[0] == 'stop':
++            attempts.append(args)
++            return subprocess.CompletedProcess(args, 0, '', '')
++        return original(*args, **kwargs)
++
++    host.systemctl = accepted
++    wall[0] += ro.DEMOTED_HARD_S if demoted else ro.SUPERSEDED_HARD_S
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == [9148]
++    assert roller._load_superseded() == since
++    assert roller._load_demoted() == demotions
++    wall[0] += ro.SUPERVISE_POLL_S
++    assert helpers.make_reaper(home, host, fence, wall).reap_superseded() == [9148]
++    assert len(attempts) == 2
++    host.running.discard(9148)
++    assert roller.reap_superseded() == []
++    assert roller._load_superseded() == roller._load_demoted() == {}
+-- 
+2.43.0
+

@@ -1,0 +1,290 @@
+From f0f23b54ca50fe56114784128b13a5468a6cc903 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:35:34 +0000
+Subject: [PATCH 6787] Origin-forward refusals, queued-create wait handles and wait-check parsing
+
+Public mirror of source commit f0f23b54ca50fe56114784128b13a5468a6cc903.
+
+---
+diff --git a/hermes_cli/kanban_db_run.py b/hermes_cli/kanban_db_run.py
+index 065a812d514adbd1b7449e880efdd8f88374e1b1..2318b3860de0c8e3f68eea823001bd89facd0d4a 100644
+--- a/hermes_cli/kanban_db_run.py
++++ b/hermes_cli/kanban_db_run.py
+@@ -22,6 +22,8 @@
+     is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
+     to end a worker that survived its own terminal transition."""
+     from hermes_cli import kanban_db as _kb
++    from hermes_cli.kanban_origin_forward_run_end import require_settled
++    require_settled(conn, task_id, _kb._current_run_id(conn, task_id), outcome)
+     from hermes_cli.kanban_source_receipt import purge
+     purge(conn, task_id)  # no pending source receipt outlives the run it was staged for
+     now = int(time.time())
+diff --git a/hermes_cli/kanban_origin_forward_run_end.py b/hermes_cli/kanban_origin_forward_run_end.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3aa973c97582c7ac6b937afec3cf36a2a384f578
+--- /dev/null
++++ b/hermes_cli/kanban_origin_forward_run_end.py
+@@ -0,0 +1,48 @@
++"""Keep a queued forward's live admission lease until the courier settles it.
++
++This is a voluntary-lifecycle gate, not an authorization source. Only the origin
++can freeze admission; courier bodies and replica rows never grant authority.
++"""
++from __future__ import annotations
++
++from contextlib import closing
++import json
++import sqlite3
++
++
++VOLUNTARY = frozenset({'continued', 'scheduled', 'completed', 'blocked',
++                       'review_requested', 'changes_requested'})
++
++
++def require_settled(conn, task_id, run_id, outcome):
++    """Raise before a voluntary run close; never interfere with crash/reclaim."""
++    from hermes_cli.kanban_workspace_publication import _kernel_park
++    if outcome not in VOLUNTARY or _kernel_park.get() == task_id:
++        return
++    from hermes_cli import kanban_db_sync as sync
++    if 'uid' not in sync.table_columns(conn, 'task_runs'):
++        return  # Local-only boards cannot submit qualified origin forwarding.
++    row = conn.execute('SELECT uid FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
++    if not row or not row[0]:
++        return
++    from hermes_cli.kanban_capability_registry import hub_db_path
++    path = hub_db_path()
++    try:
++        path.lstat()
++    except FileNotFoundError:
++        return  # No courier store: there have been no local outbound requests.
++    try:
++        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
++            rows = db.execute("SELECT id,body FROM sent WHERE state NOT IN ('done','rejected') "
++                              "AND body LIKE '%origin-forward%'")
++            for identity, raw in rows:
++                request = json.loads(raw)
++                args = request.get('args', {})
++                if (request.get('coll') == 'sessions' and request.get('action') == 'origin-forward'
++                        and args.get('run_uid') == row[0] and args.get('creator', {}).get('task_id') == task_id):
++                    raise ValueError('origin_forward_pending: keep this run alive until request ' + str(identity)
++                                     + ' is admitted or definitively rejected. Fetch its courier outcome and retry '
++                                     'this lifecycle call; do not recreate or modify the frozen request.')
++    except (sqlite3.Error, OSError, TypeError, json.JSONDecodeError) as exc:
++        raise ValueError('origin_forward_evidence_unavailable: cannot verify outstanding forwards; '
++                         'keep this run alive and retry the courier read') from exc
+diff --git a/tests/hermes_cli/test_origin_forward_delayed_park.py b/tests/hermes_cli/test_origin_forward_delayed_park.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..61bb113faec58000e204c44800cc3a4d1309ce4f
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_delayed_park.py
+@@ -0,0 +1,83 @@
++"""Compose creator parking, origin admission and real owner creation entries."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_sync_client
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_state import SessionDB
++from tests.hermes_cli import test_kanban_origin_owner as owner
++from tests.hermes_cli import test_origin_forward_adapter as forward
++
++world = owner.world
++
++
++def test_creator_park_waits_for_exactly_one_admitted_child(world, tmp_path, monkeypatch, capsys):
++    from hermes_cli import kanban_capability_registry as registry
++    home = tmp_path
++    path = home / 'hub' / 'hub.db'
++    path.parent.mkdir(exist_ok=True)
++    monkeypatch.setattr(registry, 'hub_db_path', lambda: path)
++    with sqlite3.connect(path) as db:
++        db.executescript("CREATE TABLE meta(k TEXT PRIMARY KEY,v TEXT);"
++                         "INSERT INTO meta VALUES('gateway','owner');"
++                         "CREATE TABLE sent(id TEXT PRIMARY KEY,state TEXT,result TEXT,body TEXT);")
++    state = SessionDB(db_path=home / 'state.db')
++    state.create_session('original', 'cli')
++    state.close()
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title='creator')
++        assert kb.claim_task(conn, creator)
++        run = kb._current_run_id(conn, creator)
++        uid = conn.execute('SELECT uid FROM task_runs WHERE id=?', (run,)).fetchone()[0]
++    binding = {'binding_id': 'binding-creator', 'version': 1, 'publication_version': 1,
++               'origin': {'gateway': 'owner', 'profile': 'default', 'session': 'original'},
++               'owner': {'gateway': 'hub', 'profile': 'default', 'board': 'default', 'task_id': creator},
++               'task_record_key': 'default/default/' + creator}
++    with ledger._db(home / 'kanban' / 'origin-ledger.db') as db:
++        db.execute('INSERT INTO origin_obligations VALUES(?,?,?,?,?,?,?)',
++                   (ledger._binding_key(binding), ledger.binding_hash(binding), json.dumps(binding),
++                    'original', '{}', 1, 0))
++        db.commit()
++    request = {'id': 'placement:worker:delayed', 'from': 'gw:worker', 'to_gw': 'owner',
++               'coll': 'sessions', 'key': 'default/original', 'action': 'origin-forward',
++               'args': {'origin': binding['origin'], 'creator': binding['owner'], 'run_uid': uid,
++                        'destination': {'gateway': 'owner', 'profile': 'default', 'board': 'default'},
++                        'create': {'title': 'child', 'assignee': 'default', 'session_id': 'creator'}}}
++    frozen = json.dumps(request)
++    with sqlite3.connect(path) as db:
++        db.execute('INSERT INTO sent VALUES(?,?,?,?)', (request['id'], 'sent', '{}', frozen))
++    # The genuine schedule entry rolls back rather than releasing admission custody.
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='origin_forward_pending'):
++            kb.schedule_task(conn, creator, expected_run_id=run, reason='calendar window', clock_only=True,
++                             awaiting={'kind': 'clock', 'why': 'calendar window'})
++        assert kb.latest_run(conn, creator).ended_at is None
++
++    def lease(*args, **kwargs):
++        with kbc.connect_closing() as conn:
++            assert kb.latest_run(conn, creator).ended_at is None
++        return {'table': 'leases', 'rows': [{'task_id': creator, 'holder': 'worker', 'run_uid': uid,
++                                            'expires': 9999999999999}], 'more': False}
++
++    monkeypatch.setattr(kanban_sync_client, 'load_identity', lambda: None)
++    monkeypatch.setattr(kanban_sync_client.Hub, 'snapshot_page', lease)
++    monkeypatch.setattr(kanban_sync_client.Hub, 'machines', lambda self: {
++        'me': 'owner', 'machines': [{'name': 'owner', 'state': 'active'}]})
++    with monkeypatch.context() as scoped:
++        prepared = forward.invoke(None, scoped, capsys, request)
++    assert prepared['status'] == 'prepared', prepared
++    outbound = prepared['outbound'] | {'from': 'gw:owner'}
++    first = owner.invoke(outbound, monkeypatch, capsys)
++    second = owner.invoke(outbound, monkeypatch, capsys)
++    assert first.get('created') is True, first
++    assert second['task_id'] == first['task_id']
++    with sqlite3.connect(path) as db:
++        assert db.execute('SELECT body FROM sent').fetchone()[0] == frozen
++        db.execute('UPDATE sent SET state=?,result=?', ('done', json.dumps(first)))
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 2
++        assert kb.schedule_task(conn, creator, expected_run_id=run, reason='calendar window', clock_only=True,
++                                awaiting={'kind': 'clock', 'why': 'calendar window'})
++        assert kb.get_task(conn, creator).status == 'scheduled'
+diff --git a/tests/hermes_cli/test_origin_forward_run_end.py b/tests/hermes_cli/test_origin_forward_run_end.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3bd2fedce0a9acf1fedde125a7ccd507af53948
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_forward_run_end.py
+@@ -0,0 +1,117 @@
++"""Voluntary parking must not revoke a queued forward's admission authority."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_continuation as continuation
++from tests.hermes_cli.test_kanban_continuation import home as home  # noqa: PLC0414 -- pytest fixture reexport
++
++
++@pytest.fixture
++def pending(home, monkeypatch):
++    from hermes_cli import kanban_capability_registry as registry
++    path = home / 'courier.db'
++    monkeypatch.setattr(registry, 'hub_db_path', lambda: path)
++    with kbc.connect_closing() as conn:
++        task = kb.create_task(conn, title='creator')
++        assert kb.claim_task(conn, task) is not None
++        run = kb._current_run_id(conn, task)
++        # Portable run IDs are a synced-board feature. Keep the rest of the real
++        # local transition path and transaction machinery unchanged.
++        conn.execute('ALTER TABLE task_runs ADD COLUMN uid TEXT')
++        conn.execute('UPDATE task_runs SET uid=? WHERE id=?', ('run-current', run))
++        conn.commit()
++    body = {'id': 'placement:worker:pending', 'from': 'gw:worker', 'coll': 'sessions',
++            'action': 'origin-forward', 'args': {'run_uid': 'run-current',
++                'creator': {'gateway': 'hub', 'profile': 'default', 'board': 'default', 'task_id': task}}}
++    with sqlite3.connect(path) as db:
++        db.execute('CREATE TABLE sent(id TEXT PRIMARY KEY, state TEXT, result TEXT, body TEXT)')
++        db.execute('INSERT INTO sent VALUES(?,?,?,?)', (body['id'], 'sent', '{}', json.dumps(body)))
++    return task, run, path, body
++
++
++def test_pending_forward_refuses_creator_park_atomically(pending):
++    task, run, _, _ = pending
++    with kbc.connect_closing() as conn:
++        before = tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
++        with pytest.raises(ValueError, match='origin_forward_pending'):
++            kb.schedule_task(conn, task, reason='wait for CI', expected_run_id=run, clock_only=True,
++                             awaiting={'kind': 'clock', 'why': 'bounded CI window'})
++        assert tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()) == before
++        assert kb.latest_run(conn, task).ended_at is None
++
++
++def test_pending_forward_refuses_creator_continuation(pending):
++    task, run, _, _ = pending
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='origin_forward_pending'):
++            continuation.continue_task(conn, task, checkpoint='wait', expected_run_id=run)
++        assert kb.get_task(conn, task).status == 'running'
++        assert kb._current_run_id(conn, task) == run
++
++
++@pytest.mark.parametrize('state', ['done', 'rejected'])
++def test_settled_forward_allows_original_park(pending, state):
++    task, run, path, _ = pending
++    with sqlite3.connect(path) as db:
++        db.execute('UPDATE sent SET state=?', (state,))
++    with kbc.connect_closing() as conn:
++        assert kb.schedule_task(conn, task, reason='pure calendar window', expected_run_id=run, clock_only=True,
++                                awaiting={'kind': 'clock', 'why': 'calendar window window'})
++        assert kb.get_task(conn, task).status == 'scheduled'
++        assert kb.latest_run(conn, task).ended_at is not None
++
++
++@pytest.mark.parametrize('change', ['run', 'task', 'action', 'coll'])
++def test_unrelated_forward_does_not_hold_creator(pending, change):
++    task, run, path, body = pending
++    if change == 'run':
++        body['args']['run_uid'] = 'old-run'
++    elif change == 'task':
++        body['args']['creator']['task_id'] = 'other-task'
++    else:
++        body[change] = 'unrelated'
++    with sqlite3.connect(path) as db:
++        db.execute('UPDATE sent SET body=?', (json.dumps(body),))
++    with kbc.connect_closing() as conn:
++        assert continuation.continue_task(conn, task, checkpoint='next', expected_run_id=run)['ok']
++
++
++@pytest.mark.parametrize('state', ['local', 'queued', 'sent', 'failed', 'expired'])
++def test_unresolved_forward_cannot_be_completed(pending, state):
++    task, run, path, _ = pending
++    with sqlite3.connect(path) as db:
++        db.execute('UPDATE sent SET state=?', (state,))
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='origin_forward_pending'):
++            kb.complete_task(conn, task, summary='finished', expected_run_id=run)
++        assert kb.get_task(conn, task).status == 'running'
++        assert kb.latest_run(conn, task).ended_at is None
++
++
++def test_kernel_reclaim_remains_possible(pending):
++    task, run, _, _ = pending
++    with kbc.connect_closing() as conn, kb.write_txn(conn):
++        assert kb._end_run(conn, task, outcome='reclaimed') == run
++        assert kb.latest_run(conn, task).ended_at is not None
++
++
++def test_kernel_forced_park_remains_possible(pending):
++    from hermes_cli.kanban_workspace_publication import involuntary_park
++    task, run, _, _ = pending
++    with kbc.connect_closing() as conn:
++        assert involuntary_park(task, kb.schedule_task, conn, task,
++                                expected_run_id=run, reason='calendar window', clock_only=True,
++                                awaiting={'kind': 'clock', 'why': 'calendar window'})
++        assert kb.latest_run(conn, task).ended_at is not None
++
++
++def test_unreadable_courier_is_not_absence(pending):
++    task, run, path, _ = pending
++    path.write_bytes(b'not a database')
++    with kbc.connect_closing() as conn:
++        with pytest.raises(ValueError, match='origin_forward_evidence_unavailable'):
++            continuation.continue_task(conn, task, checkpoint='next', expected_run_id=run)
++        assert kb.get_task(conn, task).status == 'running'
+-- 
+2.43.0
+

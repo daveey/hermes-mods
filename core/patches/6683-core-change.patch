@@ -1,0 +1,373 @@
+From bc745e8f60c57d307d3263934f0911632cfab5da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:32:41 +0000
+Subject: [PATCH 6683] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit bc745e8f60c57d307d3263934f0911632cfab5da.
+
+---
+diff --git a/hermes_cli/fd_headroom_config.py b/hermes_cli/fd_headroom_config.py
+index ed1734c09d65c8e7363f7311899c3b22e41ca958..ab27fc8f18c09ca5319c1de0920e3138c31edd5a 100644
+--- a/hermes_cli/fd_headroom_config.py
++++ b/hermes_cli/fd_headroom_config.py
+@@ -23,7 +23,7 @@
+                 if key in ('warn_ratio', 'raise_ratio'):
+                     valid = 0 < value < 1
+                 elif key == 'interval_seconds':
+-                    valid = 30 <= value <= 600
++                    valid = 30 <= value <= 590
+                 elif key == 'max_soft':
+                     valid = isinstance(value, int) and value >= 1024
+                 else:
+diff --git a/hermes_cli/fd_headroom_incident.py b/hermes_cli/fd_headroom_incident.py
+index cb24180dcd578024b4d8b91840a30f68289e00c6..4e27a97835576dc00fffa5f0101fc6eb3b174e49 100644
+--- a/hermes_cli/fd_headroom_incident.py
++++ b/hermes_cli/fd_headroom_incident.py
+@@ -139,7 +139,7 @@
+     tid = state.get('task_id')
+     if tid:
+         evidence = client.read(tid, board)  # Failed read propagates; never confused with absence.
+-        if evidence['state'] == 'absent':
++        if evidence['state'] in {'never_existed', 'unknown'}:
+             state.setdefault('card_unreplicated_since', wall)
+             raise PendingVisibility('card not yet replicated')
+         state.pop('card_unreplicated_since', None)
+diff --git a/hermes_cli/fd_headroom_transport.py b/hermes_cli/fd_headroom_transport.py
+index 3e826be084288070da72669394249099ff4db346..cb4eed73c3ae85d948a9985338519d549dad705d 100644
+--- a/hermes_cli/fd_headroom_transport.py
++++ b/hermes_cli/fd_headroom_transport.py
+@@ -10,6 +10,8 @@
+ class Client:
+     """One total 20s budget across request readback/delivery, privately owned connections.
+ 
++    ``never_existed`` or history-floor ``unknown`` Board evidence is inconclusive:
++    retain the acknowledged incident until explicit deletion or live terminal status.
+     ``_bounded_call`` closes its connection on success/error/timeout and interrupts stalled
+     reads. Persisted incident envelopes make uncertain POSTs safe to retry on the next tick.
+     """
+@@ -34,7 +36,7 @@
+                 or type(evidence.get('head')) is not int):
+             raise ValueError('invalid authoritative fd incident read')
+         state = evidence.get('state')
+-        if state in {'absent', 'tombstone'}:
++        if state in {'never_existed', 'deleted', 'unknown'}:
+             return {'state': state, 'row': None}
+         row = evidence.get('row')
+         if state != 'live' or not isinstance(row, dict) or not isinstance(row.get('status'), str):
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index 68cf098e7e8d887eafc7bd1c707fab19291f2de7..94eb23ebbdd741bf1539acd103b3e9942065fe23 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -241,7 +241,6 @@
+     One in flight per process; an overlapping tick is counted, never queued. The reporter
+     additionally serializes the host/profile/role identity across processes.
+     """
+-    global _fd_check_warning
+     from hermes_cli.config_backend import ConfigBackendUnavailable
+     if not _fd_lock.acquire(blocking=False):
+         _fd_status['skipped'] = _fd_status.get('skipped', 0) + 1
+@@ -251,15 +250,21 @@
+         return _check_fd_headroom(config, role, stamp,
+                                   time.time() if wall_now is None else wall_now, probe, probe_board)
+     except (Exception, ConfigBackendUnavailable) as exc:  # health: allow BLE001 -- typed config outage is SystemExit
+-        _fd_status.update(state='config_error', error_class=type(exc).__name__)
+-        if _fd_check_warning is None or stamp - _fd_check_warning >= 3600:
+-            logger.warning('fd-headroom: check failed: %s', exc)
+-            _fd_check_warning = stamp
++        _fd_check_failed(exc, stamp)
+         return None
+     finally:
+         _fd_lock.release()
+ 
+ 
++def _fd_check_failed(exc, stamp, *, config=False):
++    global _fd_check_warning
++    # A resource/sampling failure caps diagnostics, not configuration validity.
++    _fd_status.update(state='config_error' if config else 'capped', error_class=type(exc).__name__)
++    if _fd_check_warning is None or stamp - _fd_check_warning >= 3600:
++        logger.warning('fd-headroom: check failed: %s', exc)
++        _fd_check_warning = stamp
++
++
+ def _raise_fd_soft(sample, maximum):
+     soft, hard = sample['soft'], sample['hard']
+     target = min(maximum, soft * 4)
+@@ -296,7 +301,12 @@
+         return None
+     if config is None:
+         from hermes_cli.config import load_config_readonly
+-        config = load_config_readonly()
++        from hermes_cli.config_backend import ConfigBackendUnavailable
++        try:
++            config = load_config_readonly()
++        except (Exception, ConfigBackendUnavailable) as exc:  # health: allow BLE001 -- mark only config reads as config_error
++            _fd_check_failed(exc, now, config=True)
++            return None
+     settings, errors = validated(config)
+     _fd_interval = settings['interval_seconds']
+     if not settings['enabled']:
+diff --git a/tests/hermes_cli/test_fd_headroom_amended.py b/tests/hermes_cli/test_fd_headroom_amended.py
+index 9ef4fd21c945e0d9b196c255529bafab9f2abdfe..547249de743f00d73e066ba0e81dc4df07cc98d6 100644
+--- a/tests/hermes_cli/test_fd_headroom_amended.py
++++ b/tests/hermes_cli/test_fd_headroom_amended.py
+@@ -120,13 +120,14 @@
+     assert limits.fd_headroom_status()['state'] == 'config_error'
+ 
+ 
+-def test_interval_600_retains_four_sample_trend_and_601_falls_back(guard):
++def test_interval_590_retains_four_sample_trend_and_591_falls_back(guard):
+     _, snapshot, notify = guard
+-    for now, count in [(0, 100), (600, 140), (1200, 180), (1800, 220)]:
++    for now, count in [(0, 100), (591, 140), (1182, 180), (1773, 220)]:
+         snapshot.return_value = (count, {})
+-        sample = check(now, settings={'interval_seconds': 600})
+-    assert sample is not None and sample['slope'] == 4 and notify.call_count == 1
+-    check(2400, settings={'interval_seconds': 601})
++        sample = check(now, settings={'interval_seconds': 590})
++    assert sample is not None and sample['slope'] == pytest.approx(120 * 60 / 1773)
++    assert notify.call_count == 1
++    check(2400, settings={'interval_seconds': 591})
+     assert limits.fd_headroom_status()['state'] == 'config_error'
+     assert limits._fd_interval == 300
+ 
+diff --git a/tests/hermes_cli/test_fd_headroom_delivery.py b/tests/hermes_cli/test_fd_headroom_delivery.py
+index 594644ea46e46d5bedab90e960d0454769f50e3e..15fd1fc32e52b6a0dc7e07be715d69b0b796ff92 100644
+--- a/tests/hermes_cli/test_fd_headroom_delivery.py
++++ b/tests/hermes_cli/test_fd_headroom_delivery.py
+@@ -17,7 +17,7 @@
+             return cards[key]['id']
+         def read(self, tid, board):
+             row = next((row for row in cards.values() if row['id'] == tid), None)
+-            return {'state': 'live' if row else 'tombstone', 'row': row}
++            return {'state': 'live' if row else 'deleted', 'row': row}
+         def comment(self, envelope):
+             comments.append(envelope)
+         def close(self):
+@@ -35,7 +35,7 @@
+     return incidents.report(sample(), now=now, client=cls(), state_path=path, **kwargs)
+ 
+ 
+-@pytest.mark.parametrize('closed', ['done', 'archived', 'tombstone'])
++@pytest.mark.parametrize('closed', ['done', 'archived', 'deleted'])
+ def test_shared_incident_one_card_hourly_and_new_after_closed(delivery, closed):
+     _, cards, creates, comments, path = delivery
+     first = report(delivery, 10000)
+@@ -46,7 +46,7 @@
+     report(delivery, 13600)
+     report(delivery, 13601)
+     assert len(comments) == 1
+-    if closed == 'tombstone':
++    if closed == 'deleted':
+         cards.clear()
+     else:
+         next(iter(cards.values()))['status'] = closed
+@@ -111,7 +111,7 @@
+     cls, cards, creates, _, path = delivery
+     first = report(delivery, 10000)
+     monkeypatch.setattr(sync, 'load_identity', lambda: None)
+-    result = {'state': 'absent', 'table': 'tasks', 'uid': first['task_id'], 'head': 4}
++    result = {'state': 'never_existed', 'table': 'tasks', 'uid': first['task_id'], 'head': 4}
+     monkeypatch.setattr(sync, '_bounded_call', lambda *a: result)
+     for wall in (10300, 10600, 13900):
+         client = cls()
+@@ -143,11 +143,11 @@
+     assert caplog.text.count('prior incident state unreadable') == 1
+ 
+ 
+-@pytest.mark.parametrize('closed', ['done', 'archived', 'tombstone'])
++@pytest.mark.parametrize('closed', ['done', 'archived', 'deleted'])
+ def test_healthy_closed_incident_clears_and_stops_polling(delivery, closed):
+     cls, cards, creates, comments, path = delivery
+     report(delivery, 10000)
+-    if closed == 'tombstone':
++    if closed == 'deleted':
+         cards.clear()
+     else:
+         next(iter(cards.values()))['status'] = closed
+diff --git a/tests/hermes_cli/test_fd_headroom_incident.py b/tests/hermes_cli/test_fd_headroom_incident.py
+index b358422dec6cb8bed8db3cbd384d98d22a2cec69..62fc3891fd454d83c681fa661d5c2c7407c8f99f 100644
+--- a/tests/hermes_cli/test_fd_headroom_incident.py
++++ b/tests/hermes_cli/test_fd_headroom_incident.py
+@@ -43,7 +43,7 @@
+ 
+ 
+ def test_absent_status_and_closed_recovery_stop_board_reads(monkeypatch, caplog, tmp_path):
+-    wall, visibility = [10000.0], ['absent']
++    wall, visibility = [10000.0], ['never_existed']
+     monkeypatch.setattr(limits, '_fd_last_check', None)
+     monkeypatch.setattr(limits, '_fd_incident', {})
+     monkeypatch.setattr(limits, '_fd_status', {})
+@@ -73,7 +73,7 @@
+     assert public['create_state'] == 'failing' and public['failing_since'] == 10300
+     assert public['error_class'] == 'PendingVisibility'
+     assert 'card create failing since' in caplog.text
+-    visibility[0], count[0] = 'tombstone', 100
++    visibility[0], count[0] = 'deleted', 100
+     limits.check_fd_headroom({}, now=4200)
+     assert limits.fd_headroom_status()['last_card_id'] is None
+     reads.clear()
+diff --git a/tests/hermes_cli/test_fd_headroom_review.py b/tests/hermes_cli/test_fd_headroom_review.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a83c067a6076434a4a89cb1dc6538b6046b0e039
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_review.py
+@@ -0,0 +1,105 @@
++"""Real Board evidence vocabulary and late/error monitoring regressions."""
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import fd_headroom_incident as incidents
++from hermes_cli import kanban_sync_client as sync
++from hermes_cli import resource_limits as limits
++from hermes_cli.fd_headroom_transport import Client
++
++
++@pytest.mark.parametrize('state', ['never_existed', 'unknown', 'deleted', 'deleted_row'])
++@pytest.mark.parametrize('triggered', [True, False])
++def test_real_board_evidence_through_delivery(monkeypatch, tmp_path, state, triggered):
++    monkeypatch.setattr(sync, 'load_identity', lambda: None)
++    creates, reads = [], []
++    tid = 't_0123456789abcdef'
++    evidence = dict(state='deleted' if state == 'deleted_row' else state,
++                    table='tasks', uid=tid, head=4)
++    if state == 'deleted_row':
++        evidence['row'] = dict(id=tid, status='ready', deleted_at=10001)
++    def request(*args):
++        reads.append(args)
++        return evidence
++    monkeypatch.setattr(sync, '_bounded_call', request)
++    class DeliveryClient(Client):
++        def create(self, envelope):
++            creates.append(envelope)
++            return tid
++    path = tmp_path / 'incident.json'
++    sample = dict(host='example', profile='default', role='gateway', triggered=True,
++                  count=800, soft=1000, hard=10000, census={}, raised='')
++    first = incidents.report(sample, now=10000, client=DeliveryClient(), state_path=path)
++    sample['triggered'] = triggered
++    for tick in range(24):
++        current = incidents.report(sample, now=10300 + tick * 300,
++                                   client=DeliveryClient(), state_path=path)
++        if state.startswith('deleted') and triggered:
++            break
++    if state in {'never_existed', 'unknown'}:
++        assert len(creates) == 1 and len(reads) == 24
++        assert current['task_id'] == first['task_id']
++        assert current['incident_started_at'] == first['incident_started_at']
++        assert current['error_class'] == 'PendingVisibility'
++        assert current['card_unreplicated_since'] == current['failing_since'] == 10300
++    elif triggered:
++        assert len(creates) == 2 and creates[0]['id'] != creates[1]['id']
++        assert not current.get('error')
++    else:
++        assert len(creates) == len(reads) == 1
++        assert not current.get('task_id') and not current.get('envelope')
++        assert not current.get('error')
++
++
++@pytest.fixture
++def guard(monkeypatch):
++    monkeypatch.setattr(limits, '_fd_last_check', None)
++    monkeypatch.setattr(limits, '_fd_interval', 300)
++    monkeypatch.setattr(limits, '_fd_pid', limits.os.getpid())
++    monkeypatch.setattr(limits, '_fd_status', {})
++    monkeypatch.setattr(limits, '_fd_incident', {})
++    monkeypatch.setattr(limits, '_fd_check_warning', None)
++    limits._fd_samples.clear()
++    resource = Mock(RLIMIT_NOFILE=7, RLIM_INFINITY=-1)
++    resource.getrlimit.return_value = (10000, 10000)
++    snapshot = Mock(return_value=(100, {}))
++    monkeypatch.setattr(limits, '_resource', resource)
++    monkeypatch.setattr(limits, '_fd_snapshot', snapshot)
++    monkeypatch.setattr(limits, '_fd_core_head', lambda: 'a' * 40)
++    monkeypatch.setattr(limits, '_notify_fd_incident', Mock(return_value={}))
++    return resource, snapshot
++
++
++def test_late_ticks_at_maximum_interval_keep_mature_slope(guard):
++    from hermes_cli.fd_headroom_config import validated
++    _, snapshot = guard
++    maximum = max(i for i in range(30, 602) if not validated(
++        {'runtime': {'fd_headroom': {'interval_seconds': i}}})[1])
++    settings = {'runtime': {'fd_headroom': {'interval_seconds': maximum}}}
++    for tick in range(8):
++        snapshot.return_value = (100 + tick * 400, {})
++        sample = limits.check_fd_headroom(settings, now=tick * (maximum + 1), wall_now=tick * 600)
++        assert sample is not None
++        if tick >= 3:
++            assert sample['slope'] > 0 and sample['triggered']
++    assert all(t >= 7 * (maximum + 1) - 1800 for t, _ in limits._fd_samples)
++
++
++@pytest.mark.parametrize('failure', ['snapshot', 'limit', 'config'])
++def test_failed_check_status_identifies_config_boundary(guard, monkeypatch, caplog, failure):
++    from hermes_cli import config
++    resource, snapshot = guard
++    if failure == 'config':
++        monkeypatch.setattr(config, 'load_config_readonly', Mock(side_effect=OSError('private config')))
++    elif failure == 'limit':
++        resource.getrlimit.side_effect = OSError('private resource')
++    else:
++        snapshot.side_effect = OSError('private snapshot')
++    for now in [0, 300]:
++        limits.check_fd_headroom(None if failure == 'config' else {}, now=now)
++    status = limits.fd_headroom_status()
++    assert status['state'] == ('config_error' if failure == 'config' else 'capped')
++    assert status['error_class'] == 'OSError'
++    assert 'private' not in str(status)
++    assert caplog.text.count('fd-headroom: check failed') == 1
+diff --git a/tests/hermes_cli/test_fd_headroom_transport.py b/tests/hermes_cli/test_fd_headroom_transport.py
+index 6d75a1ad4e3782840d3e3cf0961986337608d42d..0947bdd45dc87ef1b1e8d55b6abd017b5a7c1230 100644
+--- a/tests/hermes_cli/test_fd_headroom_transport.py
++++ b/tests/hermes_cli/test_fd_headroom_transport.py
+@@ -38,11 +38,13 @@
+ def test_authoritative_evidence_requires_successful_missing_or_live(monkeypatch):
+     from hermes_cli.fd_headroom_transport import Client
+     monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
+-    result = {'state': 'absent', 'table': 'tasks', 'uid': 't_0123456789abcdef', 'head': 4}
++    result = {'state': 'never_existed', 'table': 'tasks', 'uid': 't_0123456789abcdef', 'head': 4}
+     monkeypatch.setattr(sync, '_bounded_call', lambda *a: result)
+-    assert Client().read(result['uid'], 'default') == {'state': 'absent', 'row': None}
+-    result['state'] = 'tombstone'
+-    assert Client().read(result['uid'], 'default') == {'state': 'tombstone', 'row': None}
++    assert Client().read(result['uid'], 'default') == {'state': 'never_existed', 'row': None}
++    result['state'] = 'deleted'
++    assert Client().read(result['uid'], 'default') == {'state': 'deleted', 'row': None}
+     result['state'] = 'unknown'
++    assert Client().read(result['uid'], 'default') == {'state': 'unknown', 'row': None}
++    result['state'] = 'invalid'
+     with pytest.raises(ValueError):
+         Client().read(result['uid'], 'default')
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index d3bd9f752c1fff44882291b50759c3f9c476858d..b97af1fd0e5760681bfa4cff6e2d74b1ba179ae5 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -293,7 +293,9 @@
+ same durable key; failed reads never start a new incident. Delivery errors are
+ logged hourly. An absent Board row is unreplicated, not closed: its original key
+ and task ID are retained, with prolonged absence reported as a delivery failure.
+-Only a tombstone or a live done/archived row closes an incident; healthy ticks
++Only Board `deleted` evidence (tombstone or soft-deleted row) or a live
++done/archived row closes an incident. `never_existed` and history-floor `unknown`
++are inconclusive and retain the incident; healthy ticks
+ stop polling after that close. Unreadable state files are preserved as
+ `.corrupt-<unix>` files, logged once, and replaced by a new incident whose card
+ notes the recovery. State writes are atomic and fsynced before delivery.
+@@ -307,9 +309,11 @@
+ changes `runtime.nofile_soft_limit`, the hard limit, another process or service
+ configuration. Checks run off-loop with one worker in flight and count skipped
+ overlapping ticks. Invalid values fall back to their defaults with `config_error`:
+-ratios must satisfy 0 < warn < raise < 1, horizon > 0, 30 ≤ interval ≤ 600 seconds, and
++ratios must satisfy 0 < warn < raise < 1, horizon > 0, 30 ≤ interval ≤ 590 seconds, and
+ max_soft ≥ 1024. Set `enabled: false` to disable monitoring and in-process rescue.
+-The upper cadence bound preserves four samples in the 30-minute growth window.
++The upper cadence bound leaves 30 seconds of lateness across three intervals
++while preserving four samples in the 30-minute growth window. Non-config resource
++or sampling failures report `capped` and their error class, not `config_error`.
+ Unsupported platforms and configuration outages retain the last validated
+ cadence (300 seconds before the first valid config), without a fast retry loop.
+ 
+-- 
+2.43.0
+

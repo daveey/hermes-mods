@@ -1,0 +1,209 @@
+From dc90ba3ef15e81a55c346b7538fa5bf7db341105 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:17:24 +0000
+Subject: [PATCH 6658] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit dc90ba3ef15e81a55c346b7538fa5bf7db341105.
+
+---
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index 5edc6214eb73a8182f6e897ab07b608443e641a7..dd9edb85f79a4ec5dd1cbacc4595a5eac930459e 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -342,7 +342,8 @@
+             pr = card["pr"].get("url")
+         cards.append({"id": card["id"], "title": card["title"] or "",
+                       "lane": pol.lane_of(card["tenant"]), "step": step, "reason": reason,
+-                      "source": source, "age_h": card["age_h"], "pr": pr})
++                      "source": source, "age_h": card["age_h"], "pr": pr,
++                      "wait": (card["awaiting"] or {}).get("kind") if isinstance(card.get("awaiting"), dict) else None})
+         if reason == "you":
+             from hermes_cli.kanban_wait_info import describe
+ 
+diff --git a/hermes_cli/kanban_stop_sync.py b/hermes_cli/kanban_stop_sync.py
+index e9e1b08129a0a6faab7cdf1b4789a54aa5df7a7a..31ceef92c273bdd0286eb5c2e80db84a63db3f4d 100644
+--- a/hermes_cli/kanban_stop_sync.py
++++ b/hermes_cli/kanban_stop_sync.py
+@@ -2,14 +2,29 @@
+ from hermes_cli.kanban_stop_ended import KIND
+ 
+ 
++def is_replica(conn) -> bool:
++    """Whether ``conn`` is a board's pulled copy (``sync-shadow/<board>.db``), never a gateway's live file."""
++    from pathlib import Path
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_db_sync import SHADOW_DIR
++    path = _main_db_file(conn)
++    return bool(path) and Path(path).parent.name == SHADOW_DIR
++
++
+ def frozen_change(conn, change) -> bool:
+     """Ignore lifecycle rewrites of an already stopped local card, including old feed echoes.
+ 
++    Only the live file freezes. A replica mirrors the Board, which holds the card's later archive, comments and
++    events; freezing it left a stopped card ``scheduled`` for hours after its home archived it
++    (t_d0c5000000000009).
++
+     The serving Board prevents future foreign writes after its marker arrives. Previously
+     accepted rows can still be in flight, so local fences must not turn their delivery into
+     a board-wide page rollback. Keep the frozen bytes; the caller still advances its cursor.
+     This is not authority to install a stop from an arbitrary remote event.
+     """
++    if is_replica(conn):
++        return False
+     table = change.table
+     if table not in {'tasks', 'task_runs', 'task_events', 'task_links'}:
+         return False
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index a00d5639ea384588fa975facd8fb4d9e42775940..99dcf0b40d81fc7fb79c6b991502c54654dffb0d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -952,6 +952,9 @@
+             replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+             rebuilt = True
+             pulled = Pulled(resync(replica, hub, slug, observers=False), status_changed=acw.rebuilt(before, replica))
++        if not diagnostic and not pulled.more:
++            from hermes_cli.kanban_sync_replica_unfreeze import unfreeze
++            unfreeze(replica, hub, slug, path)
+         if not diagnostic:
+             from hermes_cli.kanban_sync_closure_backfill import backfill
+             pulled.status_changed.update(backfill(replica, hub, slug))
+diff --git a/hermes_cli/kanban_sync_replica_unfreeze.py b/hermes_cli/kanban_sync_replica_unfreeze.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fb425ec3edb2f61b5a958fc91a19b783ef78439
+--- /dev/null
++++ b/hermes_cli/kanban_sync_replica_unfreeze.py
+@@ -0,0 +1,39 @@
++"""One-time rebuild of replicas that froze stopped cards against the feed. [daveey]
++
++Before ``kanban_stop_sync.frozen_change`` skipped replicas, a pulled copy (``sync-shadow/<board>.db``) dropped every
++feed change for a card holding an ``administrative_stop_restricted`` event, while its cursor advanced. The feed
++never resends those changes, so such a replica keeps the stopped card's status as of the stop (a stopped card
++stayed ``scheduled`` after its home archived it). A snapshot resync re-delivers every row; it runs once per replica
++that holds a stop event, and a marker beside the file records it.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++from pathlib import Path
++from typing import Any
++
++_log = logging.getLogger(__name__)
++SUFFIX = ".stop-unfrozen"
++
++
++def _marker(path: Path) -> Path:
++    return path.with_name(path.name + SUFFIX)
++
++
++def needed(replica: sqlite3.Connection, path: Path) -> bool:
++    from hermes_cli.kanban_stop_ended import KIND
++    if _marker(path).exists():
++        return False
++    return replica.execute("SELECT 1 FROM task_events WHERE kind = ? LIMIT 1", (KIND,)).fetchone() is not None
++
++
++def unfreeze(replica: sqlite3.Connection, hub: Any, slug: str, path: Path) -> int:
++    """Resync ``replica`` from the Board snapshot once when it may hold frozen cards; returns rows read."""
++    from hermes_cli import kanban_sync_client as ksc
++    if not needed(replica, path):
++        return 0
++    count = ksc.resync(replica, hub, slug, observers=False)
++    _marker(path).write_text("done\n", encoding="utf-8")
++    _log.warning("kanban sync: %s replica held stopped cards frozen against the feed; resynced %d rows", slug, count)
++    return count
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow.py b/tests/hermes_cli/test_kanban_lanes_flow.py
+index 7f12deee7db0b3f09e54e58020a5a2f2b4ac9d51..183c07bd7c9b465be3c2875ed5ead60951485358 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow.py
+@@ -141,7 +141,8 @@
+     assert data["window"] == "6h"
+     assert set(data) >= {"window", "cards", "lanes"}
+     card = next(c for c in data["cards"] if c["id"] == tid)
+-    assert set(card) == {"id", "title", "lane", "step", "reason", "source", "age_h", "pr"}
++    assert set(card) == {"id", "title", "lane", "step", "reason", "source", "age_h", "pr", "wait"}
++    assert card["wait"] is None
+     assert card["lane"] == "myapp" and card["step"] == "ready" and card["reason"] == "slot"
+     assert card["pr"] is None and isinstance(card["age_h"], (int, float))
+     assert set(card["source"]) == {"kind", "id", "project"}
+@@ -238,3 +239,22 @@
+     assert by_id[published] == "https://github.com/example/repo/pull/7"
+     assert by_id[waiting] == "https://github.com/example/repo/pull/8"
+     assert by_id == {c["id"]: (c["pr"] or {}).get("url") for c in plain_cards}
++
++
++@pytest.mark.parametrize("awaiting,wait", [
++    ({"kind": "card", "ref": "t_other"}, "card"),
++    ({"kind": "ci", "ref": "https://github.com/example/repo/pull/9"}, "ci"),
++    ({"kind": "clock", "why": "soak"}, "clock"),
++    (None, None),
++])
++def test_scheduled_card_emits_its_awaiting_kind_as_wait(conn, configured, awaiting, wait):
++    configured()
++    tid = base._ready_in(conn, "myapp", "parked")
++    conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++    payload = {"awaiting": awaiting} if awaiting else {}
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'scheduled', ?, ?)",
++                 (tid, json.dumps(payload), int(time.time())))
++    conn.commit()
++    reader = type("R", (), {"prefetch": lambda self, urls: None, "get": lambda self, url: {}})()
++    snap = flow.snapshot(conn, window="6h", pol=lanes.policy(), reader=reader)
++    assert next(c for c in snap["cards"] if c["id"] == tid)["wait"] == wait
+diff --git a/tests/hermes_cli/test_kanban_stop_sync.py b/tests/hermes_cli/test_kanban_stop_sync.py
+index 1a8fdef05f1e13b06beaf4c2541023426face3bf..96892dcdac5e20b158d6953b9151addb57842bd7 100644
+--- a/tests/hermes_cli/test_kanban_stop_sync.py
++++ b/tests/hermes_cli/test_kanban_stop_sync.py
+@@ -116,3 +116,49 @@
+     assert after['task'] == protected['task'] and after['runs'] == protected['runs'] and after['links'] == protected['links']
+     assert shadow.execute('SELECT worker_started_at FROM tasks WHERE id=?', (source,)).fetchone()[0]
+     assert guards.clear_stale_worker_start(shadow) == 0
++
++
++def _replica_after_stop(shadow, service, hub):
++    """The live file stops the card; the replica (sync-shadow/<board>.db) pulls the Board feed up to the stop."""
++    _source, target, _child = fixtures.ended_card(shadow)
++    _stop(shadow, target)
++    ksc.push(shadow, hub, BOARD, ME, primary=False)
++    replica = ksc.open_shadow(BOARD, ME)
++    ksc.pull(replica, hub, BOARD, observers=False)
++    return target, replica
++
++
++def test_replica_applies_the_archive_of_a_stopped_card_but_live_stays_frozen(shadow):
++    """t_d0c5000000000009: the replica froze a stopped card at its pre-archive status for hours."""
++    service = FakeService()
++    hub = service.hub(ME)
++    target, replica = _replica_after_stop(shadow, service, hub)
++    try:
++        assert sync.SHADOW_DIR in str(ksc.shadow_path(BOARD))
++        board = service.board(BOARD)
++        service._put(board, 'tasks', target, {'status': 'archived', 'title': 'M5'}, ME, None, '9999999999999-0000-hub')
++        ksc.pull(replica, hub, BOARD, observers=False)
++        assert kb.get_task(replica, target).status == 'archived'
++        ksc.pull(shadow, hub, BOARD, observers=False)  # the live file keeps its stop fence
++        assert kb.get_task(shadow, target).status == 'triage'
++    finally:
++        replica.close()
++
++
++def test_replica_frozen_before_the_fix_is_resynced_once(shadow, monkeypatch):
++    from hermes_cli import kanban_sync_replica_unfreeze as unfreeze
++    service = FakeService()
++    hub = service.hub(ME)
++    target, replica = _replica_after_stop(shadow, service, hub)
++    try:
++        board = service.board(BOARD)
++        service._put(board, 'tasks', target, {'status': 'archived', 'title': 'M5'}, ME, None, '9999999999999-0000-hub')
++        path = ksc.shadow_path(BOARD)
++        assert unfreeze.needed(replica, path)
++        assert unfreeze.unfreeze(replica, hub, BOARD, path) > 0
++        assert kb.get_task(replica, target).status == 'archived'
++        assert not unfreeze.needed(replica, path)
++        assert unfreeze.unfreeze(replica, hub, BOARD, path) == 0
++    finally:
++        replica.close()
++        ksc.shadow_path(BOARD).with_name(ksc.shadow_path(BOARD).name + unfreeze.SUFFIX).unlink(missing_ok=True)
+-- 
+2.43.0
+

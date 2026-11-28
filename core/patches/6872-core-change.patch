@@ -1,0 +1,693 @@
+From 735b0de509413a9890022d10a4a56325c2a911db Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:53:56 +0000
+Subject: [PATCH 6872] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 735b0de509413a9890022d10a4a56325c2a911db.
+
+---
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+index 047082b072d4e306f4955bc41eaec3f9de041cd2..bb1d5a6f9805d0cc2d71e7bee6411bb1cba1f3b1 100644
+--- a/hermes_cli/kanban_replay_journal.py
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -176,7 +176,7 @@
+     return _read(conn)[1]
+ 
+ 
+-def issue(conn: sqlite3.Connection, intent: dict) -> bytes:
++def issue(conn: sqlite3.Connection, intent: dict, *, source_op: str | None = None) -> bytes:
+     """Freeze only the dependency-ordered head selected by the serialized sender."""
+     import rfc8785
+ 
+@@ -201,6 +201,8 @@
+     wire = freeze(wire)
+     state['pending'] = dict(sequence=sequence, op_id=wire['client_op_id'],
+                             payload_sha256=wire['replay']['payload_sha256'])
++    if source_op is not None:
++        state['pending']['source_op'] = source_op
+     _validate(state)
+     encoded = rfc8785.dumps(wire)
+     conn.execute('UPDATE kanban_replay_sender1 SET state=?,wire=? WHERE singleton=1',
+diff --git a/hermes_cli/kanban_replay_primary.py b/hermes_cli/kanban_replay_primary.py
+index ca04110d1092491f9de7d95499144a8e89522b04..891fcddcf8809c8c6a0a2f3aba8f0d1d3e62cee4 100644
+--- a/hermes_cli/kanban_replay_primary.py
++++ b/hermes_cli/kanban_replay_primary.py
+@@ -16,6 +16,9 @@
+     def read(self, row, verdict):
+         """Read separately authenticated live state, not a historical result."""
+         self.current = None
++        from hermes_cli.kanban_replay_repair import retryable
++        if retryable(row, verdict):
++            return  # Legacy transient refusal never projects an image over unacked edits.
+         if verdict['status'] not in ('applied', 'merged', 'rejected', 'deferred'):
+             raise ValueError('primary replay disposition not integrated')
+         from hermes_cli.kanban_replay_existence import CurrentRowHold
+@@ -35,6 +38,9 @@
+         self.current = image
+ 
+     def stage(self, row, wire, verdict):
++        from hermes_cli.kanban_replay_repair import retryable
++        if retryable(row, verdict):
++            return
+         if self.current is None:
+             raise ValueError('primary replay current row not read')
+         row = dict(row, fields=wire.get('fields', {}))
+diff --git a/hermes_cli/kanban_replay_repair.py b/hermes_cli/kanban_replay_repair.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d106ebc15f04f2c5bc65d54806552f15577a0e9
+--- /dev/null
++++ b/hermes_cli/kanban_replay_repair.py
+@@ -0,0 +1,29 @@
++"""Existing bounded identity-changing retry, only after final replay settlement. [daveey]"""
++from time import time
++
++
++def retryable(row, verdict):
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_sync_compat import transient_rejection
++    return (verdict['status'] == 'rejected' and transient_rejection(verdict)
++            and row.get('attempts', 0) + 1 < client.MAX_TRANSIENT_ATTEMPTS)
++
++
++def remap_refusal(conn, row, verdict):
++    """A recorded non-success may mint a new identity; an uncertain send may not."""
++    from hermes_cli import kanban_sync_client as client
++    if not retryable(row, verdict):
++        return
++    from hermes_cli import kanban_replay_journal as journal
++    if journal.pending_wire(conn) is not None:
++        raise ValueError('retry requires settled replay custody')
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_sync_omissions import remap
++    from hermes_cli.kanban_sync_reserved_key import remap as remap_key
++    identity = sync.uuid7()
++    remap(conn, row['op_id'], identity)
++    remap_key(conn, row['op_id'], identity)
++    reason = f"{verdict.get('reason')}: {verdict.get('detail') or ''}".strip(': ')
++    conn.execute("UPDATE kanban_sync_outbox SET op_id=?,wire_json=NULL,state='pending',last_error=?,retry_after=? "
++                 "WHERE op_id=? AND state='rejected'",
++                 (identity, f'retrying: {reason}'[:500], int(time()) + client._backoff_s(row['attempts']), row['op_id']))
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 41a89d95c5429be1b8321819cf53e41c4a1715d0..fcb4d30ed15ee6d8dcadb4f13fe430ce300b759d 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -15,6 +15,18 @@
+ from hermes_cli.kanban_replay_reconcile import reconcile
+ 
+ 
++# Physical operation stays in the outbox; only the transport spelling is normalized.
++_WIRE_OPS = {'upsert': 'upsert', 'delete': 'delete', 'compat': 'upsert',
++             'compat_import': 'upsert', 'import': 'upsert'}
++
++
++def _wire_op(physical):
++    try:
++        return _WIRE_OPS[physical]
++    except KeyError:
++        raise ValueError('tracer operation kind not integrated') from None
++
++
+ @dataclass
+ class PushResult:
+     sent: int = 0
+@@ -66,6 +78,7 @@
+     if remote != expected:
+         raise ValueError('session readback mismatch')
+     reconcile(local, remote)
++    remote = _ack_settled(conn, hub, root, identity, remote)
+ 
+     def source():
+         pending = journal.snapshot(conn)['pending']
+@@ -80,13 +93,16 @@
+         if row['wire_json'] is None or json.loads(row['wire_json']) != wire:
+             raise ValueError('issued source custody changed')
+         if (row['row_uid'] != wire['uid'] or row['table_name'] != wire['table'] or
+-                row['op'] != wire['op'] or row['state'] != 'pending'):
++                pending.get('source_op', wire['op']) != row['op'] or
++                _wire_op(row['op']) != wire['op'] or row['state'] != 'pending' or
++                bool(wire.get('import')) != (row['table_name'] == 'tasks' and row['op'] in ('import', 'compat_import'))):
+             raise ValueError('issued source custody routing changed')
+         return dict(row)
+ 
+     membership = None
+     current_row = None
+     lagged = set()
++    refused = []
+     from hermes_cli.kanban_replay_primary import PrimarySettlement
+     projection = PrimarySettlement(conn, hub, board) if primary else None
+ 
+@@ -101,6 +117,10 @@
+             yield
+             if projection is not None:
+                 projection.finish()
++            from hermes_cli.kanban_replay_repair import remap_refusal
++            for row, verdict in refused:
++                remap_refusal(conn, row, verdict)
++            refused.clear()
+             existence.clear_settled(conn)
+         if lagged:
+             lag.acked(client.shadow_path(board), lagged)
+@@ -131,7 +151,7 @@
+                     deferred.handoff(conn, wire, verdict, local['board_incarnation'], membership=membership)
+         if projection is not None:
+             projection.read(source(), verdict)
+-            return client._row_change('tasks', projection.current) if source().get('_parent') else None
++            return client._row_change('tasks', projection.current) if source().get('_parent') and projection.current else None
+         if verdict['status'] not in ('applied', 'merged', 'deferred'):
+             return None
+         if verdict['status'] != 'deferred' and verdict.get('version'):
+@@ -216,6 +236,8 @@
+                              (pending['op_id'], 'tasks', row['row_uid'], 'upsert', json.dumps(wire['fields']),
+                               wire['hlc'], int(time() * 1000), wire.get('status_origin'), json.dumps(wire)))
+                 retire_parent(conn, row['row_uid'], remote=remote)
++                row = dict(conn.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?',
++                                        (pending['op_id'],)).fetchone())
+             reason = f"{verdict.get('reason') or status}: {verdict.get('detail') or ''}".strip(': ')
+             if status == 'cancelled':
+                 # Reuse non-success custody so dependency/import fences also hold
+@@ -224,6 +246,8 @@
+             conn.execute("UPDATE kanban_sync_outbox SET state='rejected', last_error=?, attempts=attempts+1 "
+                          "WHERE op_id=?", (reason[:500], pending['op_id']))
+             setattr(out, status, getattr(out, status) + 1)
++            if status == 'rejected' and not row.get('_parent'):
++                refused.append((row, verdict))
+             return  # Keep the semantic obligation visible; no sync success or identity rotation.
+         if status == 'deferred':
+             if cap.get('deferred_observation') != 'origin_pending1':
+@@ -284,8 +308,7 @@
+                 if not rows:
+                     break
+                 row = rows[0]
+-                if row['op'] not in ('upsert', 'delete'):
+-                    raise ValueError('tracer operation kind not integrated')
++                _wire_op(row['op'])
+                 from hermes_cli import kanban_sync_envelope as envelopes
+                 from hermes_cli import kanban_sync_wire as wire_ops
+                 from hermes_cli.kanban_terminal_guard import strip_stale_push
+@@ -296,7 +319,10 @@
+                 else:
+                     intent = envelopes.outbound(conn, row, lambda: strip_stale_push(conn, wire_ops.translate(
+                         client._full_row_if_unseen(conn, row), client._next_hlc(conn, gateway))), supported=True)
+-                encoded = journal.issue(conn, intent)
++                    if conn.execute('SELECT wire_json FROM kanban_sync_outbox WHERE op_id=?',
++                                    (row['op_id'],)).fetchone()[0] is None:
++                        raise ValueError('uncaptured source status cannot enter replay journal')
++                encoded = journal.issue(conn, intent, source_op=None if parents else row['op'])
+             row = source()  # Validate retained source custody on RETRY as well as final recovery.
+         wire = json.loads(encoded)
+         if before_head:
+@@ -317,6 +343,17 @@
+             decision = journal.recover(conn, remote, record)
+         if decision['action'] != 'record':
+             break
++        # W=1: locally settling a verdict is not enough to open the next slot.
++        # Publish its ACK before selecting/issuing another intent in this push.
++        remote = _ack_settled(conn, hub, root, identity, remote)
++    settled = journal.snapshot(conn)
++    remote = _ack_settled(conn, hub, root, identity, remote)
++    from hermes_cli.kanban_replay_observation import after_push
++    after_push(conn, hub, root, settled, cap)
++    return out
++
++
++def _ack_settled(conn, hub, root, identity, remote):
+     settled = journal.snapshot(conn)
+     if settled['settled'] != '0' and remote['a'] != settled['settled']:
+         expected = dict(remote, a=settled['settled'])
+@@ -326,6 +363,4 @@
+         if remote != expected:
+             raise ValueError('ack readback mismatch')
+         reconcile(settled, remote)
+-    from hermes_cli.kanban_replay_observation import after_push
+-    after_push(conn, hub, root, settled, cap)
+-    return out
++    return remote
+diff --git a/hermes_cli/kanban_sync_reserved_key.py b/hermes_cli/kanban_sync_reserved_key.py
+index ebb1529394eae2bb3b4d7deceb02ace9349093ac..e1a97374f7d34adb082deda17cdad0dd4007dcca 100644
+--- a/hermes_cli/kanban_sync_reserved_key.py
++++ b/hermes_cli/kanban_sync_reserved_key.py
+@@ -503,10 +503,16 @@
+         raise _Veto("task_changed_before_write")
+     from hermes_cli import kanban_sync_client as ksc
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++    # Correction is a new explicitly authorized intent, not a retry of the rejected
++    # identity. Carry only the already captured descriptor for this exact status;
++    # never infer a lifecycle origin from current events at transmission time.
++    captured = conn.execute('SELECT origin,status FROM kanban_sync_status_origins WHERE task_id=?',
++                            (task_id,)).fetchone()
++    origin = captured['origin'] if captured and captured['status'] == row['status'] else None
+     conn.execute(
+-        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+-        "VALUES (?, 'tasks', ?, 'import', ?, NULL, '', ?)",
+-        (parent_op, task_id, json.dumps(ksc._row_fields(conn, "tasks", row)), time.time_ns() // 1_000_000))
++        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at, status_origin) "
++        "VALUES (?, 'tasks', ?, 'import', ?, NULL, '', ?, ?)",
++        (parent_op, task_id, json.dumps(ksc._row_fields(conn, "tasks", row)), time.time_ns() // 1_000_000, origin))
+ 
+ 
+ def apply(conn: sqlite3.Connection, hub: Any, board: str, task_id: str, new_key: str, expected: Optional[str],
+diff --git a/tests/hermes_cli/test_kanban_replay_repair.py b/tests/hermes_cli/test_kanban_replay_repair.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..82a34ae3a1583b79e5c0b39daf40c17caf8d0e8a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_repair.py
+@@ -0,0 +1,218 @@
++"""Authorized repair keeps physical custody while issuing fresh normalized wire identities."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli import test_kanban_replay_primary as primary
++from tests.hermes_cli import test_kanban_sync_reserved_key as reserved
++
++live = helpers.live
++kanban_home = reserved.kanban_home
++reserved_live = reserved.live
++
++
++def row(conn, op_id):
++    hit = conn.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++    return dict(hit) if hit else None
++
++
++def push(conn, receiver, *, primary_mode=False, batches=1):
++    try:
++        return client.push(conn, receiver, 'default', 'macbook', primary=primary_mode, max_batches=batches)
++    except ValueError as exc:
++        pending = [tuple(r) for r in conn.execute("SELECT table_name,op,state,row_uid FROM kanban_sync_outbox ORDER BY created_at,rowid")]
++        pytest.fail(f'authorized repair cannot reach the next replay identity: {exc}; pending={pending}')
++
++
++@pytest.mark.parametrize('physical,repair', [('upsert', 'compat'), ('import', 'compat_import')])
++def test_schema_refusal_reopen_repairs_then_sequence_two_and_unrelated_progress(live, physical, repair):
++    tid = kb.create_task(live, title='repair original', body='retain omitted body', assignee='worker')
++    original = live.execute("SELECT op_id FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0]
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_outbox SET op=?,created_at=created_at-1000 WHERE op_id=?',
++                     (physical, original))
++    receiver = primary.Primary(live)
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        push(live, receiver, primary_mode=True)
++    frozen = journal.pending_wire(live)
++    original_row = row(live, original)
++    kb.add_comment(live, tid, 'user', 'dependent comment retained')
++    other = kb.create_task(live, title='unrelated progress', assignee='worker')
++    dependent = [dict(r) for r in live.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='task_comments'")]
++    assert dependent
++    assert row(live, original) == original_row
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE op IN ('compat','compat_import')").fetchone()
++    verdict = json.loads(receiver.slot['last_verdict'])
++    verdict.update(status='rejected', reason='forbidden_field', detail='not writable on tasks: body')
++    receiver.slot['last_verdict'] = json.dumps(verdict)
++    reopened = helpers.reopen(live)
++    receiver.conn = reopened
++    receiver.lose_reply = False
++    receiver.evidence = dict(board='default', table='tasks', uid=tid, state='live', head=90,
++                             row=dict(uid=tid, title='repair original', status='todo', version=19))
++    try:
++        assert journal.pending_wire(reopened) == frozen
++        assert push(reopened, receiver, primary_mode=True).rejected == 1
++        assert receiver.slot['a'] == '1' and len(receiver.sent) == 1
++        replacement = dict(reopened.execute('SELECT * FROM kanban_sync_outbox WHERE op=?', (repair,)).fetchone())
++        assert replacement['op_id'] != original and row(reopened, original)['state'] == 'rejected'
++        assert [row(reopened, r['op_id']) for r in dependent] == dependent
++        assert replacement['wire_json'] is None and journal.snapshot(reopened)['settled'] == '1'
++        receiver.status = 'applied'
++        receiver.lose_reply = True
++        with pytest.raises(OSError, match='reply lost'):
++            push(reopened, receiver)
++        sent = receiver.sent[-1]
++        assert sent['client_op_id'] == replacement['op_id'] and sent['replay']['sequence'] == '2'
++        assert sent['op'] == 'upsert' and bool(sent.get('import')) == (repair == 'compat_import')
++        assert 'body' not in sent['fields']
++        assert row(reopened, replacement['op_id'])['op'] == repair
++        assert [row(reopened, r['op_id']) for r in dependent] == dependent
++        pending = journal.pending_wire(reopened)
++        reopened2 = helpers.reopen(reopened)
++        receiver.conn = reopened2
++        receiver.lose_reply = False
++        try:
++            assert journal.pending_wire(reopened2) == pending
++            assert push(reopened2, receiver).applied == 1 and len(receiver.sent) == 2
++            assert receiver.slot['a'] == '2' and row(reopened2, replacement['op_id']) is None
++            for _ in range(12):
++                push(reopened2, receiver)
++            assert any(op['uid'] == other for op in receiver.sent)
++            assert any(op['client_op_id'] == dependent[0]['op_id'] for op in receiver.sent)
++            assert row(reopened2, original)['state'] == 'rejected'
++        finally:
++            reopened2.close()
++    finally:
++        reopened.close()
++
++
++class ReservedReplay(helpers.Receiver):
++    """Replay custody fixture composed with the existing row-contract fake Board."""
++    def __init__(self):
++        super().__init__()
++        self.service = reserved.StrictService()
++        self.rows = self.service.hub('macbook')
++        self.import_fault = False
++
++    def __getattr__(self, name):
++        return getattr(self.rows, name)
++
++    def _call(self, method, path, body=None):
++        if not path.endswith('/ops'):
++            return super()._call(method, path, body)
++        losing, self.lose_reply = self.lose_reply, False
++        reply = super()._call(method, path, body)
++        self.lose_reply = losing
++        wire, = body['ops']
++        if self.import_fault and wire.get('import'):
++            result = dict(client_op_id=wire['client_op_id'], status='rejected', reason='storage_error')
++        else:
++            result, = self.rows.ops('default', [wire])['results']
++        self.slot['last_verdict'] = json.dumps({k: v for k, v in result.items() if k != 'row'})
++        if losing:
++            raise OSError('reply lost after commit')
++        return reply
++
++
++@pytest.mark.parametrize('transient', [False, True])
++def test_reserved_key_correction_import_lost_reply_reopen_preserves_receipt(reserved_live, monkeypatch, transient):
++    from hermes_cli import kanban_sync_reserved_key as rk
++    from tests.hermes_cli.test_kanban_replay_journal import binding
++    live = reserved_live
++    receiver = ReservedReplay()
++    tid, _ = reserved.bad_card(live, receiver.service, monkeypatch)
++    original = reserved.key_op(live)
++    with kbc.write_txn(live):
++        journal.initialize(live, binding(), board_id='default')
++    reopened = helpers.reopen(live)
++    try:
++        rejected = row(reopened, original)
++        report = rk.plan(reopened, receiver, 'default', tid, reserved.GOOD, reserved.REASON)
++        assert report['eligible'], json.dumps(report)
++        applied = rk.apply(reopened, receiver, 'default', tid, reserved.GOOD, report['token'], reserved.REASON)
++        assert applied['action'] == 'applied', applied
++        receipt = rk.receipt_for_task(reopened, tid)
++        replacement = row(reopened, receipt['parent_op_id'])
++        assert replacement['op'] == 'import' and replacement['op_id'] != original
++        receiver.lose_reply = True
++        receiver.import_fault = transient
++        with pytest.raises(OSError, match='reply lost'):
++            push(reopened, receiver)
++        wire = receiver.sent[-1]
++        assert wire['replay']['sequence'] == '1' and wire['op'] == 'upsert' and wire['import'] is True
++        assert wire['fields']['idempotency_key'] == reserved.GOOD
++        pending = journal.pending_wire(reopened)
++        assert row(reopened, replacement['op_id'])['op'] == 'import'
++        reopened2 = helpers.reopen(reopened)
++        receiver.lose_reply = False
++        try:
++            assert journal.pending_wire(reopened2) == pending
++            result = push(reopened2, receiver)
++            assert (result.rejected if transient else result.applied) == 1
++            assert len(receiver.sent) == 1 and receiver.slot['a'] == '1'
++            assert row(reopened2, original) == rejected
++            if transient:
++                remapped = rk.receipt_for_task(reopened2, tid)
++                assert remapped['parent_op_id'] != receipt['parent_op_id']
++                assert dict(remapped, parent_op_id=receipt['parent_op_id']) == receipt
++                assert row(reopened2, remapped['parent_op_id'])['op'] == 'import'
++                receiver.import_fault = False
++                with kbc.write_txn(reopened2):
++                    reopened2.execute('UPDATE kanban_sync_outbox SET retry_after=0 WHERE op_id=?', (remapped['parent_op_id'],))
++                assert push(reopened2, receiver).applied == 1
++                assert receiver.sent[-1]['replay']['sequence'] == '2'
++                assert receiver.sent[-1]['client_op_id'] == remapped['parent_op_id']
++            else:
++                assert rk.receipt_for_task(reopened2, tid) == receipt
++            assert receiver.service.board('default')['rows']['tasks'][tid]['idempotency_key'] == reserved.GOOD
++            assert row(reopened2, replacement['op_id']) is None
++        finally:
++            reopened2.close()
++    finally:
++        reopened.close()
++
++
++def test_transient_refusal_reopen_remaps_only_after_final_and_other_work_flows(live):
++    tid = kb.create_task(live, title='transient remap', assignee='worker')
++    receiver = helpers.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        push(live, receiver)
++    original = receiver.sent[0]['client_op_id']
++    frozen = journal.pending_wire(live)
++    with kbc.write_txn(live):
++        live.execute('INSERT INTO kanban_sync_omissions (original_op_id,table_name,row_uid,field,compat_op_id) '
++                     'VALUES (?,?,?,?,?)', (original, 'tasks', tid, 'title', original))
++    other = kb.create_task(live, title='independent intent', assignee='worker')
++    assert row(live, original)['state'] == 'pending' and journal.pending_wire(live) == frozen
++    verdict = json.loads(receiver.slot['last_verdict'])
++    verdict.update(status='rejected', reason='storage_error', detail='temporary storage fault')
++    receiver.slot['last_verdict'] = json.dumps(verdict)
++    reopened = helpers.reopen(live)
++    receiver.lose_reply = False
++    try:
++        assert push(reopened, receiver).rejected == 1
++        assert receiver.slot['a'] == '1' and len(receiver.sent) == 1
++        replacement = reopened.execute("SELECT * FROM kanban_sync_outbox WHERE row_uid=? AND state='pending'", (tid,)).fetchone()
++        assert replacement is not None, 'durable refusal must enter bounded authorized remap'
++        assert replacement['op_id'] != original and replacement['wire_json'] is None
++        assert replacement['attempts'] == 1 and replacement['retry_after'] > 0
++        assert row(reopened, original) is None
++        omission = reopened.execute('SELECT original_op_id,compat_op_id FROM kanban_sync_omissions').fetchone()
++        assert tuple(omission) == (original, replacement['op_id'])
++        push(reopened, receiver, batches=1)
++        assert receiver.sent[-1]['uid'] == other and receiver.sent[-1]['replay']['sequence'] == '2'
++        with kbc.write_txn(reopened):
++            reopened.execute('UPDATE kanban_sync_outbox SET retry_after=0 WHERE op_id=?', (replacement['op_id'],))
++        push(reopened, receiver, batches=1)
++        assert receiver.sent[-1]['client_op_id'] == replacement['op_id']
++        assert receiver.sent[-1]['replay']['sequence'] == '3'
++        assert sum(op['client_op_id'] == original for op in receiver.sent) == 1
++    finally:
++        reopened.close()
+diff --git a/tests/hermes_cli/test_kanban_replay_repair_fences.py b/tests/hermes_cli/test_kanban_replay_repair_fences.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69ad5f0616c4bbc1df73ad8f65930dfd8f98247
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_repair_fences.py
+@@ -0,0 +1,108 @@
++"""Replay repair fences: no uncertain remap, bounded retries, transactional failure and W=1 ACK."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli import test_kanban_replay_primary as primary
++from tests.hermes_cli import test_kanban_replay_repair as repair
++
++live = helpers.live
++
++
++@pytest.mark.parametrize('mode', [False, True])
++@pytest.mark.parametrize('reason,attempts,status', [
++    ('invalid', 0, 'rejected'), ('storage_error', 19, 'rejected'), ('storage_error', 0, 'cancelled'),
++])
++def test_non_retryable_or_exhausted_verdict_keeps_visible_identity(live, mode, reason, attempts, status):
++    tid = kb.create_task(live, title='bounded refusal', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_outbox SET attempts=?', (attempts,))
++    receiver = primary.Primary(live)
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=mode, max_batches=1)
++    original = receiver.sent[0]['client_op_id']
++    verdict = json.loads(receiver.slot['last_verdict'])
++    verdict.update(status=status, reason=reason, detail='bounded fault')
++    receiver.slot['last_verdict'] = json.dumps(verdict)
++    receiver.lose_reply = False
++    receiver.evidence = dict(board='default', table='tasks', uid=tid, state='live', head=99,
++                             row=dict(uid=tid, title='bounded refusal', status='todo', version=19))
++    if mode and status == 'cancelled':
++        with pytest.raises(ValueError, match='primary replay disposition not integrated'):
++            client.push(live, receiver, 'default', 'macbook', primary=mode, max_batches=1)
++        assert journal.pending_wire(live) is not None
++        return  # later controls gate, not silently expanded here
++    client.push(live, receiver, 'default', 'macbook', primary=mode, max_batches=1)
++    source = repair.row(live, original)
++    assert source['state'] == 'rejected' and source['attempts'] == attempts + 1
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE row_uid=? AND state='pending'", (tid,)).fetchone()
++    assert receiver.slot['a'] == '1' and len(receiver.sent) == 1
++
++
++def test_remap_rollback_retains_exact_frozen_source_and_final_slot(live, monkeypatch):
++    from hermes_cli import kanban_sync_omissions as omissions
++    kb.create_task(live, title='atomic remap', assignee='worker')
++    receiver = helpers.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    original = receiver.sent[0]['client_op_id']
++    before, frozen, state = repair.row(live, original), journal.pending_wire(live), journal.snapshot(live)
++    verdict = json.loads(receiver.slot['last_verdict'])
++    verdict.update(status='rejected', reason='storage_error')
++    receiver.slot['last_verdict'] = json.dumps(verdict)
++    receiver.lose_reply = False
++    def fail(*args):
++        raise OSError('remap persistence fault')
++    with monkeypatch.context() as m:
++        m.setattr(omissions, 'remap', fail)
++        with pytest.raises(OSError, match='remap persistence fault'):
++            client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert repair.row(live, original) == before
++    assert journal.snapshot(live) == state and journal.pending_wire(live) == frozen
++    assert receiver.slot['a'] == '0' and len(receiver.sent) == 1
++    client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert repair.row(live, original) is None and receiver.slot['a'] == '1'
++
++
++class Window(helpers.Receiver):
++    def __init__(self):
++        super().__init__()
++        self.ack_failure = False
++
++    def _call(self, method, path, body=None):
++        if path.endswith('/ops'):
++            assert self.slot['a'] == self.slot['h'], 'next identity sent before durable preceding ACK'
++        if path.endswith('/ack') and self.ack_failure:
++            raise OSError('ACK not committed')
++        return super()._call(method, path, body)
++
++
++def test_multibatch_unrelated_intents_ack_each_slot_before_next_send(live):
++    tids = {kb.create_task(live, title=f'work {i}', assignee='worker') for i in range(3)}
++    receiver = Window()
++    client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=25)
++    assert {op['uid'] for op in receiver.sent if op['table'] == 'tasks'} == tids
++    assert receiver.slot['a'] == receiver.slot['h'] and journal.pending_wire(live) is None
++
++
++def test_ack_failure_prevents_issuing_next_identity_but_other_intents_survive(live):
++    for i in range(2):
++        kb.create_task(live, title=f'ACK gated {i}', assignee='worker')
++    receiver = Window()
++    receiver.ack_failure = True
++    with pytest.raises(OSError, match='ACK not committed'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=25)
++    assert len(receiver.sent) == 1 and journal.snapshot(live)['settled'] == '1'
++    assert journal.pending_wire(live) is None and receiver.slot['a'] == '0'
++    assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0] > 0
++    receiver.ack_failure = False
++    # The normal production entry must acknowledge the previous settled identity
++    # before it can select more work; no special idle recovery call is needed.
++    client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=25)
++    assert len(receiver.sent) > 1 and receiver.slot['a'] == receiver.slot['h']
+diff --git a/tests/hermes_cli/test_kanban_replay_repair_flavors.py b/tests/hermes_cli/test_kanban_replay_repair_flavors.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf1b1f93626e842e0123d727caf254fb6ee53720
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_repair_flavors.py
+@@ -0,0 +1,98 @@
++"""Physical flavor and transient repair remain fenced through the actual sender."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli import test_kanban_replay_primary as primary
++from tests.hermes_cli import test_kanban_replay_repair as repair
++
++live = helpers.live
++
++
++@pytest.mark.parametrize('physical,changed', [('upsert', 'compat'), ('import', 'compat_import'),
++                                               ('compat', 'upsert'), ('compat_import', 'import')])
++def test_physical_source_kind_is_pinned_across_lost_reply_reopen(live, physical, changed):
++    kb.create_task(live, title='physical custody', assignee='worker')
++    original = live.execute("SELECT op_id FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0]
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_outbox SET op=? WHERE op_id=?', (physical, original))
++    receiver = helpers.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    frozen = journal.pending_wire(live)
++    assert journal.snapshot(live)['pending']['source_op'] == physical
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_outbox SET op=? WHERE op_id=?', (changed, original))
++    reopened = helpers.reopen(live)
++    receiver.lose_reply = False
++    try:
++        with pytest.raises(ValueError, match='source custody routing changed'):
++            client.push(reopened, receiver, 'default', 'macbook', primary=False, max_batches=1)
++        assert journal.pending_wire(reopened) == frozen
++        assert receiver.slot['a'] == '0' and len(receiver.sent) == 1
++    finally:
++        reopened.close()
++
++
++def test_primary_transient_refusal_does_not_read_or_overwrite_local_intent(live):
++    tid = kb.create_task(live, title='unsynced edit survives refusal', assignee='worker')
++    receiver = primary.Primary(live)
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=True, max_batches=1)
++    verdict = json.loads(receiver.slot['last_verdict'])
++    verdict.update(status='rejected', reason='storage_error')
++    receiver.slot['last_verdict'] = json.dumps(verdict)
++    receiver.lose_reply = False
++    receiver.evidence = dict(board='default', table='tasks', uid=tid, state='live', head=99,
++                             row=dict(uid=tid, title='stale remote title', status='todo', version=19))
++    reopened = helpers.reopen(live)
++    receiver.conn = reopened
++    try:
++        client.push(reopened, receiver, 'default', 'macbook', primary=True, max_batches=1)
++        assert reopened.execute('SELECT title FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 'unsynced edit survives refusal'
++        assert receiver.reads == [] and receiver.slot['a'] == '1'
++        assert reopened.execute("SELECT 1 FROM kanban_sync_outbox WHERE row_uid=? AND state='pending'", (tid,)).fetchone()
++    finally:
++        reopened.close()
++
++
++def test_uncaptured_import_fails_before_allocation_not_as_an_issued_wedge(live):
++    kb.create_task(live, title='unknown historical status', assignee='worker')
++    original = live.execute("SELECT op_id FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()[0]
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_outbox SET op='import',status_origin=NULL WHERE op_id=?", (original,))
++    receiver = helpers.Receiver()
++    before = repair.row(live, original)
++    with pytest.raises(ValueError, match='uncaptured source status'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert journal.pending_wire(live) is None and journal.snapshot(live)['settled'] == '0'
++    assert repair.row(live, original) == before and receiver.sent == []
++
++
++@pytest.mark.parametrize('mode', [False, True])
++def test_synthetic_parent_transient_refusal_retains_child_and_queues_bounded_retry(live, mode):
++    tid = kb.create_task(live, title='synthetic parent', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name='tasks'")
++    receiver = primary.Primary(live)
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=mode, max_batches=1)
++    original = receiver.sent[0]['client_op_id']
++    assert receiver.sent[0]['uid'] == tid and receiver.sent[0]['table'] == 'tasks'
++    verdict = json.loads(receiver.slot['last_verdict'])
++    verdict.update(status='rejected', reason='storage_error')
++    receiver.slot['last_verdict'] = json.dumps(verdict)
++    receiver.lose_reply = False
++    children = [dict(r) for r in live.execute('SELECT * FROM kanban_sync_outbox')]
++    client.push(live, receiver, 'default', 'macbook', primary=mode, max_batches=1)
++    retry = live.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND state='pending'").fetchone()
++    assert retry is not None and retry['op_id'] != original and retry['attempts'] == 1
++    assert all(repair.row(live, child['op_id']) == child for child in children)
++    assert journal.pending_wire(live) is None and receiver.slot['a'] == '1' and len(receiver.sent) == 1
+-- 
+2.43.0
+

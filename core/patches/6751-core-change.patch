@@ -1,0 +1,179 @@
+From 63db84085366a01e309bcc40ee93080ac4a97309 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 12:24:33 +0000
+Subject: [PATCH 6751] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit 63db84085366a01e309bcc40ee93080ac4a97309.
+
+---
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index 94eb23ebbdd741bf1539acd103b3e9942065fe23..126db8dd781a3cd375a84cbd90b78e72faa77f90 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -204,8 +204,7 @@
+             if _fd_thread is not None and _fd_thread.is_alive():
+                 _fd_status['skipped'] = _fd_status.get('skipped', 0) + 1
+                 if role == 'gateway':
+-                    from gateway.status import publish_runtime_status
+-                    publish_runtime_status(fd_headroom=fd_headroom_status())
++                    _publish_gateway_fd_headroom()
+                 return
+             import contextvars
+             scope = contextvars.copy_context()
+@@ -229,7 +228,14 @@
+     """The gateway's existing housekeeping thread owns this process-wide tick."""
+     check_fd_headroom(role='gateway')
+     if _fd_status:
+-        from gateway.status import publish_runtime_status
++        _publish_gateway_fd_headroom()
++
++
++def _publish_gateway_fd_headroom() -> None:
++    # Boot samples run before reservation. Publishing then stamps a contender's PID as a
++    # live starting owner, making sibling starts refuse before any runtime lock exists.
++    from gateway.status import owns_gateway_runtime_lock, publish_runtime_status
++    if owns_gateway_runtime_lock():
+         publish_runtime_status(fd_headroom=fd_headroom_status())
+ 
+ 
+diff --git a/tests/hermes_cli/test_fd_headroom_callers.py b/tests/hermes_cli/test_fd_headroom_callers.py
+index d38e3b74d7ab4cc7c9f3562933af0570937487fe..b18cdb86553f16932e28f8463d11b7a2188d9066 100644
+--- a/tests/hermes_cli/test_fd_headroom_callers.py
++++ b/tests/hermes_cli/test_fd_headroom_callers.py
+@@ -210,8 +210,12 @@
+                         'incident': {'error': '/private/path'}})
+     monkeypatch.setattr(status, '_get_runtime_status_path', lambda: tmp_path / 'gateway_state.json')
+     monkeypatch.setattr(status, '_emit_runtime_status_transition', lambda *a: None)
+-    limits.gateway_fd_headroom_tick()
+-    assert status.flush_runtime_status()
++    assert status.acquire_gateway_runtime_lock()
++    try:
++        limits.gateway_fd_headroom_tick()
++        assert status.flush_runtime_status()
++    finally:
++        status.release_gateway_runtime_lock()
+     saved = status.read_runtime_status(tmp_path / 'gateway_state.json')['fd_headroom']
+     assert saved['count'] == 50 and saved['create_state'] == 'failing'
+     assert 'private' not in str(saved)
+diff --git a/tests/hermes_cli/test_fd_headroom_owner_publication.py b/tests/hermes_cli/test_fd_headroom_owner_publication.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc135f49efa931d9f9da808d44f52a353bab2050
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_owner_publication.py
+@@ -0,0 +1,113 @@
++"""FD samples must not lend a pre-reservation contender a live gateway identity."""
++import os
++import subprocess
++import sys
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import resource_limits as limits
++
++
++@pytest.mark.parametrize('overlap', [False, True])
++def test_prelock_gateway_sample_does_not_publish_runtime_owner(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlap: bool,
++) -> None:
++    from gateway import status
++
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setattr(limits, '_fd_status', {'state': 'ok', 'count': 12})
++    sampled = []
++    monkeypatch.setattr(limits, 'check_fd_headroom', lambda **kwargs: sampled.append(kwargs))
++    monkeypatch.setattr(limits, '_fd_thread', None)
++    entered, release = threading.Event(), threading.Event()
++    worker = threading.Thread(target=lambda: (entered.set(), release.wait(10)))
++    if overlap:
++        worker.start()
++        assert entered.wait(5)
++        monkeypatch.setattr(limits, '_fd_thread', worker)
++
++    def tick() -> None:
++        limits.request_fd_headroom(role='gateway')
++        if not overlap:
++            assert limits._fd_thread is not None
++            limits._fd_thread.join(5)
++            assert not limits._fd_thread.is_alive()
++        assert status.flush_runtime_status(timeout=5)
++
++    try:
++        assert not status.owns_gateway_runtime_lock()
++        tick()
++        assert not (home / 'gateway_state.json').exists()
++        if not overlap:
++            assert sampled == [{'role': 'gateway'}]  # Sampling still happens before reservation.
++        assert status.acquire_gateway_runtime_lock()
++        try:
++            tick()
++            assert status.read_runtime_status()['fd_headroom']['count'] == 12
++            # A reservation for a different launch home cannot authorize this writer.
++            foreign = tmp_path / 'foreign'
++            foreign.mkdir()
++            monkeypatch.setenv('HERMES_HOME', str(foreign))
++            assert not status.owns_gateway_runtime_lock()
++            tick()
++            assert not (foreign / 'gateway_state.json').exists()
++            monkeypatch.setenv('HERMES_HOME', str(home))
++        finally:
++            status.release_gateway_runtime_lock()
++        before = (home / 'gateway_state.json').read_bytes()
++        monkeypatch.setattr(limits, '_fd_status', {'state': 'ok', 'count': 99})
++        tick()
++        assert (home / 'gateway_state.json').read_bytes() == before
++    finally:
++        release.set()
++        if overlap:
++            worker.join(5)
++            assert not worker.is_alive()
++
++
++@pytest.mark.parametrize('overlap', [False, True])
++def test_contender_sample_preserves_real_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overlap: bool) -> None:
++    from gateway import status
++
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    assert status.acquire_gateway_runtime_lock()
++    try:
++        status.publish_runtime_status(gateway_state='running', fd_headroom={'count': 42})
++        assert status.flush_runtime_status(timeout=5)
++        before = (home / 'gateway_state.json').read_bytes()
++        code = """
++import threading
++from gateway import status
++from hermes_cli import resource_limits as limits
++assert not status.acquire_gateway_runtime_lock()
++limits._fd_status = {'state': 'ok', 'count': 99}
++limits.check_fd_headroom = lambda **kwargs: None
++release = threading.Event()
++worker = threading.Thread(target=release.wait, args=(5,))
++if OVERLAP:
++    worker.start()
++    limits._fd_thread = worker
++try:
++    limits.request_fd_headroom(role='gateway')
++    if not OVERLAP:
++        limits._fd_thread.join(5)
++        assert not limits._fd_thread.is_alive()
++    assert status.flush_runtime_status(timeout=5)
++finally:
++    release.set()
++    if OVERLAP:
++        worker.join(5)
++""".replace('OVERLAP', repr(overlap))
++        child = subprocess.run([sys.executable, '-c', code], env=os.environ.copy(),
++                               capture_output=True, text=True, timeout=20, check=False)
++        assert child.returncode == 0, child.stdout + child.stderr
++        assert (home / 'gateway_state.json').read_bytes() == before
++        assert status.read_runtime_status()['pid'] == os.getpid()
++    finally:
++        status.release_gateway_runtime_lock()
+-- 
+2.43.0
+

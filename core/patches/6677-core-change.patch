@@ -1,0 +1,820 @@
+From 327e544f42670e42217d0553888369131d1d758c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:38:00 +0000
+Subject: [PATCH 6677] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit 327e544f42670e42217d0553888369131d1d758c.
+
+---
+diff --git a/gateway/run.py b/gateway/run.py
+index 8a2a4ff0d41c9c4549c8f790f90fa617c47a8634..fd713c7af69c92dfde32ec45cb6fe31e235aae49 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4260,10 +4260,7 @@
+         release_or_close(_adb)
+ 
+ 
+-def _housekeeping_memory_trim() -> None:
+-    """Messaging-gateway counterpart to the TUI idle reaper; timer lane: full GC only once idle (#139763)."""
+-    from hermes_cli.mem_trim import trim_memory_when_idle
+-    trim_memory_when_idle(reason="messaging gateway housekeeping")
++from gateway.run_housekeeping_resources import housekeeping_memory_trim as _housekeeping_memory_trim
+ 
+ 
+ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
+@@ -4305,6 +4302,7 @@
+     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+     from gateway.run_housekeeping_disk import housekeeping_gone_board_handles, housekeeping_media_caches, maybe_post_auto_prune_prompt
+     from hermes_cli.plugins_idle_tasks import IdleTaskFence
++    from hermes_cli.resource_limits import gateway_fd_headroom_tick
+     prune_worker = CheckpointPruneWorker(logger, start=process_ownership.start_writer)
+     chores: list[tuple[int, str, Any]] = [
+         # First stamp thread liveness (#113372), then request a coalesced loop-side recount.
+@@ -4338,6 +4336,7 @@
+         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
+         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
+         (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
++        (1, "FD headroom", gateway_fd_headroom_tick),
+         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
+         (1, "FTS backfill tick", _housekeeping_fts_backfill),
+         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
+diff --git a/gateway/run_housekeeping_resources.py b/gateway/run_housekeeping_resources.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a696d99a5d3e9b05da644712509001aedd7a9442
+--- /dev/null
++++ b/gateway/run_housekeeping_resources.py
+@@ -0,0 +1,7 @@
++"""Allocator housekeeping shared by the gateway's periodic resource chores."""
++
++
++def housekeeping_memory_trim() -> None:
++    """Messaging-gateway timer lane: full GC only once idle (#139763)."""
++    from hermes_cli.mem_trim import trim_memory_when_idle
++    trim_memory_when_idle(reason="messaging gateway housekeeping")
+diff --git a/gateway/status.py b/gateway/status.py
+index 2bfe25a0632a019ec9df004b50e99fc575c1f372..6c0fe0c222bac253a60fd3c8f6af9d563e514e73 100644
+--- a/gateway/status.py
++++ b/gateway/status.py
+@@ -1099,7 +1099,7 @@
+     error_code: Any = _UNSET, error_message: Any = _UNSET, needs_attention: Any = _UNSET,
+     retrying_since: Any = _UNSET, served_profiles: Any = _UNSET, session_store: Any = _UNSET,
+     parked_profiles: Any = _UNSET, multiplex_standalone_reason: Any = _UNSET,
+-    platform_metrics: Any = _UNSET,
++    platform_metrics: Any = _UNSET, fd_headroom: Any = _UNSET,
+     ingress_url: Any = _UNSET, listener_base: Any = _UNSET, clear_profile_platforms: bool = False,
+     drop_profile_platforms: Optional[str] = None, keep_platforms: Iterable[str] = (),
+     load_existing: bool = True, reload_existing: bool = False,
+@@ -1140,7 +1140,7 @@
+             # Profiles the multiplexer could not serve, name -> reason; clients fail fast on them.
+             ("parked_profiles", parked_profiles, lambda v: {str(k): str(r) for k, r in dict(v or {}).items()}),
+             ("multiplex_standalone_reason", multiplex_standalone_reason, lambda v: str(v) if v else None),
+-            ("session_store", session_store, _coerce_session_store),
++            ("session_store", session_store, _coerce_session_store), ("fd_headroom", fd_headroom, dict),
+         ))
+         if platform is not _UNSET:
+             platform_payload = copy.deepcopy(payload["platforms"].get(platform, {}))
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 22a9e04961892c1b42e4d6e1797bc7d1b703506d..49c96de4522c2188e0b5489024cf28e03d0dd451 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -21,6 +21,7 @@
+ from hermes_cli.config_defaults_routing import routing_defaults
+ from hermes_cli.kanban_workspace_source_config import DEFAULTS as _WORKSPACE_SOURCE_DEFAULTS
+ from hermes_cli.kanban_pacing_defaults import DEFAULTS as _PACING_DEFAULTS
++from hermes_cli.fd_headroom_config import DEFAULTS as _FD_HEADROOM_DEFAULTS
+ 
+ DEFAULT_CONFIG = {
+     "model": "",
+@@ -44,8 +45,7 @@
+         "wal_autocheckpoint": None,
+         "journal_size_limit": None,
+     },
+-    # Server-process fd soft limit (clamped to the hard limit) + glibc arena cap; 0/false/null = off.
+-    "runtime": {"nofile_soft_limit": 4096, "malloc_arena_max": 4},
++    "runtime": {"nofile_soft_limit": 4096, "malloc_arena_max": 4, "fd_headroom": _FD_HEADROOM_DEFAULTS},
+     # Global active chat session cap across CLI, TUI/dashboard, and messaging. None/0 = unbounded.
+     "max_concurrent_sessions": None,
+     # Soft LRU cap on in-memory TUI/desktop/dashboard sessions. Above it the gateway evicts the
+diff --git a/hermes_cli/fd_headroom_config.py b/hermes_cli/fd_headroom_config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..249cf1d9964a0a1afe1ec42e313ae7b37b9bcf24
+--- /dev/null
++++ b/hermes_cli/fd_headroom_config.py
+@@ -0,0 +1,3 @@
++"""FD headroom defaults, shared without importing runtime measurement or courier code."""
++DEFAULTS = {'enabled': True, 'warn_ratio': 0.5, 'raise_ratio': 0.75,
++            'horizon_hours': 6, 'interval_seconds': 300}
+diff --git a/hermes_cli/fd_headroom_incident.py b/hermes_cli/fd_headroom_incident.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..16e42ca93725e74ee253df89e9ad1a6bb6321fba
+--- /dev/null
++++ b/hermes_cli/fd_headroom_incident.py
+@@ -0,0 +1,162 @@
++"""Host-shared, durable FD incident coalescing through the existing hub courier."""
++from __future__ import annotations
++
++import json
++import logging
++import subprocess
++import time
++import uuid
++from datetime import UTC, datetime
++from pathlib import Path
++
++from hermes_constants import get_default_hermes_root
++
++logger = logging.getLogger(__name__)
++HOUR = 3600
++
++
++def _path(probe: bool) -> Path:
++    return get_default_hermes_root() / 'runtime' / ('fd-headroom-probe.json' if probe else 'fd-headroom.json')
++
++
++def _run(argv):
++    result = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8',
++                            errors='replace', timeout=12, check=False)
++    if result.returncode not in (0, 3):
++        raise OSError(f'courier exit {result.returncode}: {result.stderr[-300:]}')
++    return result.stdout
++
++
++def _courier():
++    from hermes_cli import kanban_capability_registry as registry, kanban_placement as placement
++    return registry.hub_cli_path(placement.config().get('hub_cli'))
++
++
++def _rows(cli, run):
++    rows = json.loads(run([cli, 'tasks', '--gw', 'hub', '--json', '--all']))
++    if not isinstance(rows, list):
++        raise ValueError('invalid hub card inventory')
++    return rows
++
++
++def _pending_task(request_id):
++    from hermes_cli import kanban_placement as placement
++    return placement.remote_task_id(request_id), placement.remote_state(request_id)
++
++
++def _load(path):
++    try:
++        value = json.loads(path.read_text(encoding='utf-8-sig'))
++        return value if isinstance(value, dict) else {}
++    except (OSError, ValueError):
++        return {}
++
++
++def _save(path, state):
++    temporary = path.with_suffix('.tmp')
++    temporary.write_text(json.dumps(state), encoding='utf-8')
++    temporary.replace(path)
++
++
++def report(sample: dict, *, probe=False, now=None, run=None, cli=None) -> dict:
++    """Serialize across server processes/profiles, reserve before sending, and back off errors.
++
++    An uncertain create keeps the SAME frozen request; it is never treated as an unreadable
++    card. Completed probe incidents retain their one-hour suppression even after archiving.
++    """
++    import fcntl
++    from hermes_state_guard import _in_test_context
++    if run is None and _in_test_context():
++        return {'error': 'test process: courier disabled'}
++    path = _path(probe)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.with_suffix('.lock').open('a') as lock:
++        try:
++            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except BlockingIOError:
++            return _load(path)
++        state = _load(path)
++        wall = time.time() if now is None else now
++        if sample.get('raised'):
++            state['raises'] = (state.get('raises', []) + [sample['raised']])[-8:]
++        if wall < state.get('next_attempt', 0):
++            _save(path, state)
++            return state
++        try:
++            _report(sample, state, wall, probe, run or _run, cli or _courier(), path)
++        except Exception as exc:  # health: allow BLE001 -- a failed alert is visible, never fatal to the tick
++            state.setdefault('failure_since', wall)
++            state.update(error=str(exc)[:500], next_attempt=wall + HOUR)
++            logger.warning('fd-headroom: card create/report failed: %s', state['error'])
++        _save(path, state)
++        return state
++
++
++def _report(sample, state, now, probe, run, cli, path):
++    rows = _rows(cli, run)
++    tid = state.get('task_id')
++    pending = state.get('pending')
++    if pending:
++        found = next((r for r in rows if r.get('idempotency_key') == pending['id']), None)
++        if found:
++            tid = found['id']
++        else:
++            tid, status = _pending_task(pending['id'])
++            if not tid:
++                if status in {'rejected', 'failed', 'expired'}:
++                    state.pop('pending', None)
++                    raise OSError(f'card create rejected: {status}')
++                # Exact immutable replay only, after the hourly backoff (including lost acknowledgements).
++                if now >= pending['retry_at']:
++                    pending['retry_at'] = now + HOUR
++                    _save(path, state)
++                    run(pending['argv'])
++                return
++        state.update(task_id=tid)
++        state.pop('pending', None)
++    row = next((r for r in rows if r.get('id') == tid), None)
++    opened = tid and row and row.get('status') not in {'done', 'archived'}
++    text = json.dumps({**sample, 'raises': state.get('raises', [])}, sort_keys=True)
++    if opened:
++        if not sample.get('triggered', True) and not state.get('raises'):
++            return
++        if now - state.get('commented_at', state.get('filed_at', 0)) < HOUR:
++            return
++        state.update(commented_at=now)
++        _save(path, state)  # reserve the hour even when the acknowledgement is lost
++        run([cli, 'request', 'hub', 'tasks', f'default/default/{tid}', 'comment',
++             '--arg', f'text=fd-headroom: {text}', '--id', f'fd-headroom:{tid}:{int(now)}'])
++        state['raises'] = []
++    else:
++        if not sample.get('triggered', True):
++            return
++        if probe and now - state.get('filed_at', -HOUR) < HOUR:
++            return
++        key = f'fd-headroom:{sample["host"]}:{uuid.uuid4().hex}'
++        top = max(sample['census'], key=sample['census'].get, default='other')
++        title = (f'fd headroom: {sample["host"]} {sample["role"]} at '
++                 f'{sample["count"]}/{sample["soft"]} fds ({top})')
++        body = (f'Process FD headroom warning.\n\n{ text }\n\n'
++                'Investigate descriptor growth and the installed core. Never signal/restart production '
++                'services, change configured nofile limits or raise a hard limit for this alert. '
++                'The guard may have raised only its own soft limit; see raised above.')
++        argv = [cli, 'create-task', 'hub', ('[probe] ' if probe else '') + title,
++                '--body', body, '--assignee', 'default', '--board', 'default', '--origin-session', '',
++                '--id', key, '--option', f'idempotency_key={json.dumps(key)}',
++                '--option', 'runs_on=["pool:worker"]']
++        if probe:
++            argv += ['--option', 'triage=true']
++        state.update(pending={'id': key, 'argv': argv, 'retry_at': now + HOUR}, task_id=None,
++                     filed_at=now, commented_at=now)
++        _save(path, state)  # persist frozen envelope BEFORE any possible external write
++        run(argv)
++    state.pop('error', None)
++    state.pop('failure_since', None)
++
++
++def failure_note(state: dict, now=None) -> str:
++    since = state.get('failure_since')
++    if since is not None and (time.time() if now is None else now) - since >= HOUR:
++        stamp = datetime.fromtimestamp(since, UTC).isoformat()
++        return f'card create failing since {stamp}: {state.get("error", "unknown")}'
++    return ''
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index 3db5d53f4216abe0587c771ee59fe5c745bfa539..c417a1df03b0958b1510280c41be504c710b36fe 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -5,6 +5,11 @@
+ import ctypes
+ import logging
+ import os
++import socket
++import subprocess
++import threading
++import time
++from collections import Counter, deque
+ from collections.abc import Mapping
+ from typing import Any
+ 
+@@ -89,6 +94,146 @@
+         return False
+ 
+ 
++_fd_samples: deque[tuple[float, int]] = deque(maxlen=1801)
++_fd_last_check: float | None = None
++_fd_pid = os.getpid()
++_fd_lock = threading.Lock()
++
++
++def _fd_snapshot(soft: int) -> tuple[int, dict[str, int]]:
++    """Count actual entries, then classify only above 25%; closed/racing entries are harmless."""
++    for directory in ('/proc/self/fd', '/dev/fd'):
++        try:
++            names = os.listdir(directory)
++            break
++        except FileNotFoundError:
++            continue
++    else:
++        raise OSError('no process fd directory')
++    census: Counter[str] = Counter()
++    if len(names) > soft * 0.25:
++        for name in names:
++            try:
++                target = os.readlink(f'{directory}/{name}').removesuffix(' (deleted)')
++            except OSError:
++                continue
++            if '/.resource-leases/' in target:
++                kind = 'resource-leases'
++            elif target.endswith(('.db', '-wal', '-shm')):
++                kind = 'sqlite'
++            elif target.startswith(('socket:', 'socket[')):
++                kind = 'socket'
++            elif target.startswith(('pipe:', 'pipe[')):
++                kind = 'pipe'
++            else:
++                kind = 'other'
++            census[kind] += 1
++    return len(names), dict(census)
++
++
++def _fd_core_head() -> str:
++    from hermes_cli._startup_fast import project_root_str
++    try:
++        return subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=project_root_str(),
++                              capture_output=True, text=True, encoding='utf-8', errors='replace',
++                              timeout=2, check=True).stdout.strip()
++    except (OSError, subprocess.SubprocessError):
++        return 'unknown'
++
++
++def _notify_fd_incident(sample: dict, *, probe: bool = False) -> dict:
++    from hermes_cli.fd_headroom_incident import report
++    return report(sample, probe=probe)
++
++
++_fd_status: dict = {}
++
++
++def fd_headroom_status() -> dict:
++    """Latest census and incident-delivery state for existing runtime status readers."""
++    return dict(_fd_status)
++
++
++def gateway_fd_headroom_tick() -> None:
++    """The gateway's existing housekeeping thread owns this process-wide tick."""
++    sample = check_fd_headroom(role='gateway')
++    if sample is not None:
++        from gateway.status import publish_runtime_status
++        publish_runtime_status(fd_headroom=fd_headroom_status())
++
++
++def check_fd_headroom(config: Mapping[str, Any] | None = None, *, role: str = 'backend',
++                      now: float | None = None, probe: bool = False) -> dict | None:
++    """Due-gated, never-raising own-process census/rescue. Call from existing service ticks.
++
++    Samples cover 30 minutes; the endpoint slope projects time to the current soft limit.
++    A host-shared reporter serializes incident cards across profiles and processes. ``probe``
++    uses a separate incident namespace and [probe] title, never a production incident.
++    """
++    try:
++        with _fd_lock:
++            return _check_fd_headroom(config, role, time.monotonic() if now is None else now, probe)
++    except Exception:  # health: allow BLE001 -- diagnostics must never escape a service tick
++        logger.debug('fd-headroom: check failed', exc_info=True)
++        return None
++
++
++def _check_fd_headroom(config, role, now, probe):
++    global _fd_last_check, _fd_pid
++    if _resource is None:
++        return None
++    if config is None:
++        from hermes_cli.config import load_config_readonly
++        config = load_config_readonly()
++    settings = {**DEFAULT_CONFIG['runtime']['fd_headroom'], **config.get('runtime', {}).get('fd_headroom', {})}
++    if settings['enabled'] is not True:
++        return None
++    if _fd_pid != os.getpid():
++        _fd_pid, _fd_last_check = os.getpid(), None
++        _fd_samples.clear()
++    interval = max(1.0, float(settings['interval_seconds']))
++    if _fd_last_check is not None and now - _fd_last_check < interval:
++        return None
++    _fd_last_check = now
++    soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
++    if soft <= 0 or soft == _resource.RLIM_INFINITY:
++        return None
++    count, census = _fd_snapshot(soft)
++    while _fd_samples and _fd_samples[0][0] < now - 1800:
++        _fd_samples.popleft()
++    _fd_samples.append((now, count))
++    elapsed = now - _fd_samples[0][0]
++    slope = (count - _fd_samples[0][1]) / elapsed if elapsed > 0 else 0.0
++    predicted = slope > 0 and (soft - count) / slope <= float(settings['horizon_hours']) * 3600
++    warn = count >= soft * float(settings['warn_ratio']) or predicted
++    sample = dict(host=socket.gethostname(), pid=os.getpid(), role=role, count=count,
++                  soft=soft, hard=hard, census=census, slope=slope, core=_fd_core_head(), raised='')
++    if count >= soft * float(settings['raise_ratio']):
++        target = soft * 4 if hard == _resource.RLIM_INFINITY else min(hard, soft * 4)
++        if target > soft:
++            try:
++                _resource.setrlimit(_resource.RLIMIT_NOFILE, (target, hard))
++                sample['raised'] = f'fd-headroom: raised soft {soft}→{target}'
++            except (OSError, ValueError) as exc:
++                sample['raised'] = f'fd-headroom: raise failed: {exc}'
++            logger.warning('%s', sample['raised'])
++    sample['triggered'] = bool(warn or sample['raised'])
++    incident = _fd_status.get('incident', {})
++    if sample['triggered'] or incident:
++        try:
++            incident = _notify_fd_incident(sample, probe=probe) or {}
++        except Exception as exc:  # health: allow BLE001 -- even unwritable reporter state must not hide the census
++            incident = {**incident, 'error': str(exc)[:500],
++                        'failure_since': incident.get('failure_since', time.time())}
++    from hermes_cli.fd_headroom_incident import failure_note
++    note = failure_note(incident)
++    _fd_status.update(sample, incident=incident, card_error=note)
++    log = logger.warning if warn or note else logger.info
++    log('fd-headroom: host=%s pid=%s role=%s count=%s soft=%s hard=%s census=%s slope=%.6f fd/s core=%s %s',
++        sample['host'], sample['pid'], role, count, soft, hard, census, slope, sample['core'], note)
++    return sample
++
++
+ def glibc_malloc() -> Any | None:
+     """This process's libc handle when it is glibc with ``mallopt`` (else ``None``: musl, macOS, Windows)."""
+     try:
+@@ -172,4 +317,4 @@
+ 
+ __all__ = [
+     "DEFAULT_MALLOC_ARENA_MAX", "DEFAULT_NOFILE_SOFT_LIMIT", "apply_malloc_arena_max",
+-    "apply_nofile_soft_limit", "configured_nofile_soft_limit", "glibc_malloc", "server_process_argv"]
++    "apply_nofile_soft_limit", "check_fd_headroom", "configured_nofile_soft_limit", "glibc_malloc", "server_process_argv"]
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 236c28a2d6479d400b816906b7c966f68b740697..2de481c43978ad88cb04086b5f6707c9e81d7be6 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -750,12 +750,14 @@
+     def snapshot(self) -> dict[str, Any]:
+         """Public component payload: status enum + counts + timestamps only."""
+         errors = self.recent_error_count()
++        from hermes_cli.resource_limits import fd_headroom_status
+         status = "degraded" if (errors or self.selftest_status == "failing") else "ok"
+         return {
+             "status": status,
+             "recent_unhandled_errors": errors,
+             "last_error_at": self.last_error_at,
+             "selftest": self.selftest_status,
++            "fd_headroom": fd_headroom_status(),
+         }
+ 
+ 
+@@ -826,12 +828,10 @@
+ 
+ async def _dashboard_selftest_loop() -> None:
+     """Periodic self-test driver started from the lifespan."""
+-    try:
+-        import httpx
+-    except ImportError:
+-        _log.debug("httpx unavailable — dashboard self-test disabled")
+-        return
++    from hermes_cli.resource_limits import check_fd_headroom
+     while True:
++        # Same lifespan for cmd_dashboard and direct _start_server_runtime; never block the loop.
++        await asyncio.to_thread(check_fd_headroom, role='backend')
+         await asyncio.sleep(_DASHBOARD_SELFTEST_INTERVAL_SECONDS)
+         # OAuth-gated binds don't honour the session token; the probe would false-alarm 401.
+         if getattr(app.state, "auth_required", False):
+diff --git a/tests/hermes_cli/test_fd_headroom.py b/tests/hermes_cli/test_fd_headroom.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6bd63517c4b7f92bb6e9b92581c1adb84cad9ddd
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom.py
+@@ -0,0 +1,118 @@
++"""Process-local headroom, with no live limit or Board mutations."""
++import logging
++from unittest.mock import Mock
++
++import pytest
++from hermes_cli import resource_limits as limits
++
++
++@pytest.fixture
++def guard(monkeypatch):
++    limits._fd_samples.clear()
++    limits._fd_status.clear()
++    monkeypatch.setattr(limits, '_fd_last_check', None)
++    monkeypatch.setattr(limits, '_fd_pid', limits.os.getpid())
++    resource = Mock(RLIMIT_NOFILE=7, RLIM_INFINITY=-1)
++    resource.getrlimit.return_value = (1000, 10000)
++    monkeypatch.setattr(limits, '_resource', resource)
++    snapshot = Mock(return_value=(500, {'other': 500}))
++    notify = Mock(return_value={})
++    monkeypatch.setattr(limits, '_fd_snapshot', snapshot)
++    monkeypatch.setattr(limits, '_notify_fd_incident', notify)
++    monkeypatch.setattr(limits, '_fd_core_head', lambda: 'a' * 40)
++    return resource, snapshot, notify
++
++
++def check(now=0, **kwargs):
++    return limits.check_fd_headroom({'runtime': {'fd_headroom': {'interval_seconds': 1}}},
++                                    role='gateway', now=now, **kwargs)
++
++
++def test_ratio_trigger(guard, caplog):
++    resource, _, notify = guard
++    with caplog.at_level(logging.INFO):
++        check()
++    assert notify.call_count == 1
++    assert 'fd-headroom:' in caplog.text
++    assert '500' in caplog.text and 'gateway' in caplog.text and 'a' * 40 in caplog.text
++    resource.setrlimit.assert_not_called()
++
++
++def test_slope_trigger_and_below_both(guard):
++    _, snapshot, notify = guard
++    snapshot.return_value = (100, {})
++    check(0)
++    check(1800)
++    notify.assert_not_called()
++    snapshot.return_value = (200, {})
++    check(3600)  # +100 / 30 min => exhaustion in four hours, below ratio
++    assert notify.call_count == 1
++    check(7201)  # old growth has fallen out of the 30-minute window
++    assert notify.call_count == 1
++
++
++@pytest.mark.parametrize(('hard', 'expected'), [(10000, 4000), (2000, 2000), (-1, 4000)])
++def test_raise_soft_and_hard_clamp(guard, hard, expected):
++    resource, snapshot, notify = guard
++    resource.getrlimit.return_value = (1000, hard)
++    snapshot.return_value = (750, {'resource-leases': 750})
++    check()
++    resource.setrlimit.assert_called_once_with(7, (expected, hard))
++    assert f'raised soft 1000→{expected}' in notify.call_args.args[0]['raised']
++
++
++def test_raise_failure_does_not_suppress_incident(guard):
++    resource, snapshot, notify = guard
++    snapshot.return_value = (800, {})
++    resource.setrlimit.side_effect = OSError('denied')
++    check()
++    assert notify.call_count == 1
++    assert 'failed' in notify.call_args.args[0]['raised']
++
++
++def test_never_raises_and_due_gate(guard):
++    _, snapshot, notify = guard
++    notify.side_effect = RuntimeError('courier down')
++    check()
++    check(0.5)
++    assert snapshot.call_count == 1
++    check(1)
++    assert snapshot.call_count == 2
++
++
++@pytest.mark.parametrize('directory', ['/proc/self/fd', '/dev/fd'])
++def test_fd_directory_and_census(monkeypatch, directory):
++    targets = ['/.resource-leases/a', '/data/state.db', '/data/state.db-wal',
++               '/data/state.db-shm (deleted)', 'socket:[123]', 'pipe:[456]', '/data/log']
++    def listing(path):
++        if path != directory:
++            raise FileNotFoundError(path)
++        return [str(i) for i in range(len(targets))]
++    monkeypatch.setattr(limits.os, 'listdir', listing)
++    monkeypatch.setattr(limits.os, 'readlink', lambda p: targets[int(p.rsplit('/', 1)[1])])
++    count, census = limits._fd_snapshot(20)
++    assert count == 7
++    assert census == {'resource-leases': 1, 'sqlite': 3, 'socket': 1, 'pipe': 1, 'other': 1}
++
++
++def test_below_quarter_avoids_readlinks(monkeypatch):
++    monkeypatch.setattr(limits.os, 'listdir', lambda _: ['1', '2'])
++    links = Mock(side_effect=AssertionError('unneeded census'))
++    monkeypatch.setattr(limits.os, 'readlink', links)
++    assert limits._fd_snapshot(100) == (2, {})
++    links.assert_not_called()
++
++
++def test_disabled_and_infinite_soft(guard):
++    resource, snapshot, notify = guard
++    limits.check_fd_headroom({'runtime': {'fd_headroom': {'enabled': False}}})
++    snapshot.assert_not_called()
++    resource.getrlimit.return_value = (-1, -1)
++    check()
++    notify.assert_not_called()
++
++
++def test_config_defaults():
++    assert limits.DEFAULT_CONFIG['runtime']['fd_headroom'] == {
++        'enabled': True, 'warn_ratio': 0.5, 'raise_ratio': 0.75,
++        'horizon_hours': 6, 'interval_seconds': 300}
+diff --git a/tests/hermes_cli/test_fd_headroom_callers.py b/tests/hermes_cli/test_fd_headroom_callers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e48b54c58fe0b71286ee72d674c0e92a1bd9c037
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_callers.py
+@@ -0,0 +1,47 @@
++"""Execute existing service ticks, not text-only wiring assertions."""
++import asyncio
++import threading
++from unittest.mock import Mock
++
++import pytest
++from hermes_cli import resource_limits as limits
++
++
++def test_gateway_housekeeping_runs_check_and_publishes_status(monkeypatch, tmp_path):
++    import gateway.run as gateway
++    from gateway import status
++    stop = threading.Event()
++    seen = []
++    monkeypatch.setattr(limits, 'check_fd_headroom', lambda **kw: seen.append(kw) or {'count': 50})
++    monkeypatch.setattr(limits, '_fd_status', {'count': 50, 'soft': 100,
++                        'incident': {'error': 'offline', 'failure_since': 10000}})
++    monkeypatch.setattr(status, '_get_runtime_status_path', lambda: tmp_path / 'gateway_state.json')
++    monkeypatch.setattr(status, '_emit_runtime_status_transition', lambda *a: None)
++    def chore(label, fn, *args, **kwargs):
++        if label == 'FD headroom':
++            fn(*args, **kwargs)
++            stop.set()
++    monkeypatch.setattr(gateway, '_housekeeping_chore', chore)
++    gateway._start_gateway_housekeeping(stop, interval=0)
++    assert seen == [{'role': 'gateway'}]
++    assert status.flush_runtime_status()
++    saved = status.read_runtime_status(tmp_path / 'gateway_state.json')
++    assert saved['fd_headroom']['count'] == 50
++    assert saved['fd_headroom']['incident']['error'] == 'offline'
++
++
++def test_backend_tick_runs_check_and_health_exposes_status(monkeypatch):
++    from hermes_cli import web_server as backend
++    calls = []
++    monkeypatch.setattr(limits, 'check_fd_headroom', lambda **kw: calls.append(kw))
++    monkeypatch.setattr(limits, '_fd_status', {'count': 50, 'soft': 100,
++                        'incident': {'error': 'offline', 'failure_since': 10000}})
++    async def stop(_):
++        raise asyncio.CancelledError
++    monkeypatch.setattr(backend.asyncio, 'sleep', stop)
++    async def exercise():
++        with pytest.raises(asyncio.CancelledError):
++            await backend._dashboard_selftest_loop()
++    asyncio.run(exercise())
++    assert calls == [{'role': 'backend'}]
++    assert backend.DASHBOARD_HEALTH.snapshot()['fd_headroom']['incident']['error'] == 'offline'
+diff --git a/tests/hermes_cli/test_fd_headroom_incident.py b/tests/hermes_cli/test_fd_headroom_incident.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fcd625820801f5b0d1cf4d8d324e6d7a91c3116
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_incident.py
+@@ -0,0 +1,120 @@
++"""Durable coalescing; external courier replaced, state/locking remain real."""
++import json
++import logging
++from unittest.mock import Mock
++
++import pytest
++from hermes_cli import fd_headroom_incident as incidents, resource_limits as limits
++
++
++@pytest.fixture
++def courier(monkeypatch, tmp_path):
++    monkeypatch.setattr(incidents, '_path', lambda probe: tmp_path / ('probe.json' if probe else 'state.json'))
++    monkeypatch.setattr(incidents, '_pending_task', lambda _: (None, 'pending'))
++    rows, creates, comments = [], [], []
++    def run(argv):
++        if argv[1] == 'tasks':
++            return json.dumps(rows)
++        if argv[1] == 'create-task':
++            creates.append(argv)
++            key = argv[argv.index('--id') + 1]
++            rows.append(dict(id=f't_{len(creates):016x}', idempotency_key=key, status='ready'))
++        else:
++            comments.append(argv)
++        return '{}'
++    return run, rows, creates, comments
++
++
++def sample():
++    return dict(host='example-host', pid=123, role='gateway', count=80, soft=100,
++                hard=1000, census={'resource-leases': 70}, slope=0.1, core='a' * 40,
++                raised='fd-headroom: raised soft 100→400')
++
++
++def report(courier, now, **kwargs):
++    return incidents.report(sample(), now=now, run=courier[0], cli='courier', **kwargs)
++
++
++@pytest.mark.parametrize('closed', ['done', 'archived'])
++def test_one_card_per_incident_and_hourly_comments(courier, closed):
++    _, rows, creates, comments = courier
++    report(courier, 0)
++    report(courier, 1)
++    report(courier, 3599)
++    assert len(creates) == 1 and len(comments) == 0
++    report(courier, 3600)
++    report(courier, 3601)
++    assert len(creates) == 1 and len(comments) == 1
++    assert 'raised soft' in comments[0][comments[0].index('--arg') + 1]
++    rows[0]['status'] = closed
++    report(courier, 3602)
++    assert len(creates) == 2
++    assert creates[0][2] == 'hub' and creates[0][creates[0].index('--board') + 1] == 'default'
++    assert 'runs_on=["pool:worker"]' in creates[0]
++
++
++def test_probe_archive_then_immediate_second_process_is_suppressed(courier):
++    _, rows, creates, _ = courier
++    report(courier, 0, probe=True)
++    assert creates[0][3].startswith('[probe]')
++    rows[0]['status'] = 'archived'
++    report(courier, 1, probe=True)
++    assert len(creates) == 1
++
++
++def test_uncertain_create_replays_same_frozen_envelope_hourly(courier):
++    run, _, creates, _ = courier
++    def lost_ack(argv):
++        if argv[1] == 'create-task':
++            creates.append(argv)
++            raise OSError('lost acknowledgement')
++        return run(argv)
++    incidents.report(sample(), now=0, run=lost_ack, cli='courier')
++    incidents.report(sample(), now=1, run=lost_ack, cli='courier')
++    incidents.report({**sample(), 'count': 90}, now=3600, run=lost_ack, cli='courier')
++    assert len(creates) == 2 and creates[0] == creates[1]
++
++
++def test_raise_queued_during_comment_cooldown_is_not_lost(courier):
++    run, _, creates, comments = courier
++    incidents.report({**sample(), 'raised': ''}, now=0, run=run, cli='courier')
++    report(courier, 10)
++    assert not comments
++    incidents.report({**sample(), 'raised': '', 'triggered': False}, now=3600, run=run, cli='courier')
++    assert len(creates) == 1 and len(comments) == 1
++    assert 'raised soft' in comments[0][comments[0].index('--arg') + 1]
++
++
++def test_failed_create_backoff_warning_and_process_status(courier, monkeypatch, caplog):
++    run, _, _, _ = courier
++    attempts = []
++    def failing(argv):
++        if argv[1] == 'create-task':
++            attempts.append(argv)
++            raise OSError('offline')
++        return run(argv)
++    wall = [10000.0]
++    monkeypatch.setattr(incidents.time, 'time', lambda: wall[0])
++    monkeypatch.setattr(limits, '_fd_last_check', None)
++    limits._fd_samples.clear()
++    limits._fd_status.clear()
++    monkeypatch.setattr(limits, '_resource', Mock(RLIMIT_NOFILE=7, RLIM_INFINITY=-1,
++                        getrlimit=Mock(return_value=(100, 1000))))
++    monkeypatch.setattr(limits, '_fd_snapshot', lambda _: (50, {'other': 50}))
++    monkeypatch.setattr(limits, '_fd_core_head', lambda: 'a' * 40)
++    monkeypatch.setattr(limits, '_notify_fd_incident', lambda s, **kw:
++                        incidents.report(s, run=failing, cli='courier'))
++    with caplog.at_level(logging.WARNING):
++        limits.check_fd_headroom({}, now=0)
++        wall[0] += 300
++        limits.check_fd_headroom({}, now=300)
++        assert len(attempts) == 1
++        wall[0] += 3300
++        limits.check_fd_headroom({}, now=3600)
++    assert len(attempts) == 2
++    assert 'card create failing since' in caplog.text
++    state = limits.fd_headroom_status()
++    assert state['count'] == 50 and state['soft'] == 100
++    assert state['incident']['failure_since'] == 10000
++    assert 'offline' in state['incident']['error']
++    assert 'card create failing since' in state['card_error']
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 0fda3bce64392a8d092e8a2e66105ccc3db8c4a8..aa1ef7eae870a2a645415a136e7d9f5c765fcce3 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -268,6 +268,31 @@
+ where the limit cannot be changed, startup continues without changing the
+ limit.
+ 
++On Linux and macOS, long-lived gateways and dashboard/Desktop backends also monitor
++file-descriptor headroom using their existing periodic ticks:
++
++```yaml
++runtime:
++  fd_headroom:
++    enabled: true
++    warn_ratio: 0.5
++    raise_ratio: 0.75
++    horizon_hours: 6
++    interval_seconds: 300
++```
++
++`fd-headroom:` census logs include the process count and limits. Above 25% usage,
++readlink targets are counted as resource-leases, sqlite, socket, pipe or other;
++paths themselves are not published. A warning fires at `warn_ratio` or when the
++last 30 minutes' growth projects exhaustion within `horizon_hours`. The hub default
++board receives one portable incident card per host, with at most one update per hour.
++Failed deliveries back off for an hour; prolonged failure appears in warnings and
++runtime status (`gateway_state.json` or dashboard health's `fd_headroom` field).
++At `raise_ratio`, Hermes raises only its own soft limit to four times the current
++value, clamped to the existing hard limit. This never changes `runtime.nofile_soft_limit`,
++the hard limit, another process or service configuration. Set `enabled: false` to
++turn off monitoring and this in-process rescue.
++
+ On Linux with glibc, the gateway, `hermes serve` and `hermes dashboard` also cap the number of
+ malloc arenas the process may create:
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,73 @@
+From a817e3ab26037db1e50cef99e22f5df7ab513d63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:52:37 +0000
+Subject: [PATCH 6887] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit a817e3ab26037db1e50cef99e22f5df7ab513d63.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_replay_repair_fences.py b/tests/hermes_cli/test_kanban_replay_repair_fences.py
+index 3a260e65696ddd6775a1188d21d567d7fba0eaee..3218d06d424e3ef2d1cc30f25fc5e2a921317988 100644
+--- a/tests/hermes_cli/test_kanban_replay_repair_fences.py
++++ b/tests/hermes_cli/test_kanban_replay_repair_fences.py
+@@ -66,13 +66,20 @@
+ 
+ 
+ class Window(helpers.Receiver):
+-    def __init__(self):
++    def __init__(self, conn):
+         super().__init__()
++        self.conn = conn
+         self.ack_failure = False
+ 
+     def _call(self, method, path, body=None):
+-        if path.endswith('/ops'):
+-            assert self.slot['a'] == self.slot['h'], 'next identity sent before durable preceding ACK'
++        if path.endswith('/ops') and self.slot['h'] != '0':
++            assert not self.conn.in_transaction, 'predecessor settlement must already be committed'
++            assert journal.snapshot(self.conn)['settled'] == self.slot['h']
++            op, = body['ops']
++            assert op['replay']['ack'] == dict(sequence=self.slot['h'], op_id=self.slot['last_op_id'],
++                                              payload_sha256=self.slot['last_payload_sha256'])
++            if self.slot['a'] != self.slot['h'] and self.ack_failure:
++                raise OSError('ACK not committed')
+         if path.endswith('/ack') and self.ack_failure:
+             raise OSError('ACK not committed')
+         return super()._call(method, path, body)
+@@ -80,24 +87,27 @@
+ 
+ def test_multibatch_unrelated_intents_ack_each_slot_before_next_send(live):
+     tids = {kb.create_task(live, title=f'work {i}', assignee='worker') for i in range(3)}
+-    receiver = Window()
++    receiver = Window(live)
+     client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=25)
+     assert {op['uid'] for op in receiver.sent if op['table'] == 'tasks'} == tids
+     assert receiver.slot['a'] == receiver.slot['h'] and journal.pending_wire(live) is None
+ 
+ 
+-def test_ack_failure_prevents_issuing_next_identity_but_other_intents_survive(live):
++def test_ack_failure_holds_issued_successor_and_preserves_other_intents(live):
+     for i in range(2):
+         kb.create_task(live, title=f'ACK gated {i}', assignee='worker')
+-    receiver = Window()
++    receiver = Window(live)
+     receiver.ack_failure = True
+     with pytest.raises(OSError, match='ACK not committed'):
+         client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=25)
+     assert len(receiver.sent) == 1 and journal.snapshot(live)['settled'] == '1'
+-    assert journal.pending_wire(live) is None and receiver.slot['a'] == '0'
++    frozen = journal.pending_wire(live)
++    assert frozen is not None and receiver.slot['a'] == '0'
++    assert journal.snapshot(live)['pending']['sequence'] == '2'
++    assert json.loads(frozen)['replay']['ack']['op_id'] == receiver.sent[0]['client_op_id']
+     assert live.execute("SELECT COUNT(*) FROM kanban_sync_outbox WHERE state='pending'").fetchone()[0] > 0
+     receiver.ack_failure = False
+-    # The normal production entry must acknowledge the previous settled identity
+-    # before it can select more work; no special idle recovery call is needed.
++    # Recovery acknowledges the durable predecessor, then retries the SAME
++    # issued successor before selecting any additional identity.
+     client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=25)
+     assert len(receiver.sent) > 1 and receiver.slot['a'] == receiver.slot['h']
+-- 
+2.43.0
+

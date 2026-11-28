@@ -1,0 +1,145 @@
+From 13f4523d99e5b758e6d5ad28f15d11cd57150525 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:19:27 +0000
+Subject: [PATCH 6710] Spend-review lease allowance consumer, decision liveness and budget fences
+
+Public mirror of source commit 13f4523d99e5b758e6d5ad28f15d11cd57150525.
+
+---
+diff --git a/hermes_cli/kanban_allowance_observation.py b/hermes_cli/kanban_allowance_observation.py
+index 563ae90a9afffa27333049cb84b23b7aaaa56fb5..b7569e22580633ee0c52a88cd085530bfd8cd47b 100644
+--- a/hermes_cli/kanban_allowance_observation.py
++++ b/hermes_cli/kanban_allowance_observation.py
+@@ -140,11 +140,14 @@
+         return None
+     now = time.monotonic()
+     deadline = min(now + READ_SECONDS, deadline) if deadline is not None else now + READ_SECONDS
++    # Bind the reading to the coordinates it was asked about, taken BEFORE the read: a budget or Board written
++    # while the reply is in flight (a human release) must invalidate it, never be adopted by it.
++    state = sync.sync_state(conn)
++    budget = _budget(conn, task_id)
+     seen = board_state(conn, task_id, deadline=deadline)
+-    if not seen:
++    if not seen or not state:
+         return None
+-    return Held(sync.sync_state(conn)["board_id"], _budget(conn, task_id), seen["review_uid"], seen["state"],
+-                deadline)
++    return Held(state["board_id"], budget, seen["review_uid"], seen["state"], deadline)
+ 
+ 
+ def still_stuck(conn, task_id, held: Held | None) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_allowance_supersession.py b/tests/hermes_cli/test_kanban_allowance_supersession.py
+index 73069f3929d71c943df8e606361aafd72a59d3a4..c2bbf42eccb89f0bb69d99cfde747b5b38b0be00 100644
+--- a/tests/hermes_cli/test_kanban_allowance_supersession.py
++++ b/tests/hermes_cli/test_kanban_allowance_supersession.py
+@@ -1,6 +1,7 @@
+ """Only a human operator's canonical renewal replaces the Board's reviewer allowance; everything else holds."""
+ from contextlib import contextmanager
+ import json
++import sys
+ import time
+ from types import SimpleNamespace
+ 
+@@ -252,6 +253,47 @@
+         held.board, observation._budget(primary, tid), "r", "active", time.monotonic() + 5))
+ 
+ 
++@pytest.mark.parametrize("change", ["budget", "board"])
++def test_a_reply_in_flight_across_a_newer_budget_or_board_never_triages(primary, monkeypatch, change):
++    """The reading binds the coordinates taken before the read: a human release (or Board rebind) that lands
++    while an older held reply is in flight invalidates it instead of being adopted by it."""
++    tid, _, _ = _decided(primary, monkeypatch)
++    real = observation.board_state
++
++    def release_during_read(conn, task_id, **kwargs):
++        seen = real(conn, task_id, **kwargs)
++        if change == "budget":
++            _generic(conn, task_id, runs=3, by="human-release")
++        else:
++            with fixtures.kbc.write_txn(conn):
++                conn.execute("UPDATE kanban_sync_state SET board_id='rebound'")
++        return seen
++
++    monkeypatch.setattr(observation, "board_state", release_during_read)
++    before = observation._budget(primary, tid)
++    stale = observation.stuck(primary, tid)
++    assert stale is not None and stale.budget == before
++    assert not observation.still_stuck(primary, tid, stale)
++    assert not maintenance.triage_stuck(primary, tid, stale)
++    assert kb.get_task(primary, tid).status == "ready"
++
++
++def test_a_reading_begun_without_sync_identity_is_never_stuck(primary, monkeypatch):
++    """No identity before the read means nothing to bind it to, even if one appears while it is in flight."""
++    tid, _, _ = _decided(primary, monkeypatch)
++    real = fixtures.sync.sync_state
++    calls = []
++
++    def appearing(conn):
++        caller = sys._getframe(1).f_code.co_name
++        calls.append(caller)
++        return None if caller == "stuck" else real(conn)
++
++    monkeypatch.setattr(fixtures.sync, "sync_state", appearing)
++    assert observation.stuck(primary, tid) is None
++    assert "stuck" in calls and "board_state" in calls  # the in-flight read did see an identity
++
++
+ @pytest.mark.parametrize("state", ["active", "invalidated"])
+ def test_sweep_triages_a_decided_but_stuck_card_once_with_the_human_route(primary, monkeypatch, state):
+     tid, _, calls = _decided(primary, monkeypatch, state=state)
+diff --git a/tests/hermes_cli/test_kanban_spend_allowance_board.py b/tests/hermes_cli/test_kanban_spend_allowance_board.py
+index ad86b18226cd10155e21dd5f22f52670fd49e325..a463c5cdceb3e6e710c3242ef7cbbf3e8579b3fe 100644
+--- a/tests/hermes_cli/test_kanban_spend_allowance_board.py
++++ b/tests/hermes_cli/test_kanban_spend_allowance_board.py
+@@ -607,3 +607,47 @@
+         assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:cleared") is not None, sync.pop_claim_deferral(task)
+     finally:
+         maintenance._CURSORS.clear()
++
++
++def test_stale_held_reply_cannot_retriage_a_completed_human_release(composed, monkeypatch, capsys):
++    """Review 6083677847: an active-allowance reply delayed across another observer's triage and the human
++    release must not bind to the release's newer budget and put the released card back into triage."""
++    from hermes_cli import kanban_allowance_maintenance as maintenance
++    from hermes_cli import kanban_allowance_observation as observation
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    home, _pool, task = composed
++    home.round()
++    home.enter()
++    seen = home.conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (task,)).fetchone()[0]
++    budget.set_override(home.conn, task, runs=40, cache_read_tokens=0, by="fixture-operator",
++                        reason="generic budget", seen=seen)
++    home.round()
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    earlier = observation.stuck(home.conn, task)
++    assert earlier is not None
++    original = client.Hub.reviewer_allowance
++    interleaved = []
++
++    def read_then_release(hub, board, tid):
++        reply = original(hub, board, tid)
++        if not interleaved:
++            interleaved.append(True)
++            assert maintenance.triage_stuck(home.conn, task, earlier)
++            assert _cli_release(monkeypatch, home, task, "--runs", "3") == 0
++            capsys.readouterr()
++            home.round()
++            home.enter()
++            assert original(hub, board, tid)["allowance"] is None
++            assert kb.get_task(home.conn, task).status == "ready"
++        return reply
++
++    maintenance._CURSORS.clear()
++    try:
++        monkeypatch.setattr(client.Hub, "reviewer_allowance", read_then_release)
++        stale = observation.stuck(home.conn, task)
++        assert interleaved
++        assert not maintenance.triage_stuck(home.conn, task, stale), "stale pre-release reply undid the human release"
++        assert kb.get_task(home.conn, task).status == "ready"
++    finally:
++        maintenance._CURSORS.clear()
+-- 
+2.43.0
+

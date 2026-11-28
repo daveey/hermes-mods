@@ -1,0 +1,2654 @@
+From 1350871dc0cf88735635ff7bb47965b7f4e2f4d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:51:05 +0000
+Subject: [PATCH 6699] Spend-review lease allowance consumer, decision liveness and budget fences
+
+Public mirror of source commit 1350871dc0cf88735635ff7bb47965b7f4e2f4d9.
+
+---
+diff --git a/hermes_cli/kanban_allowance_maintenance.py b/hermes_cli/kanban_allowance_maintenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7b0ad4e23a541b60a483f7a100772ce5468bde0
+--- /dev/null
++++ b/hermes_cli/kanban_allowance_maintenance.py
+@@ -0,0 +1,111 @@
++"""Home-owned exhaustion recovery before dispatch capacity gates. [daveey]
++
++Private Board observations never authorize execution. Exhaustion is monotonic for
++one exact override; a successor override invalidates it. Cadence/cursor state is
++only bounded process-local I/O pacing, never a spending counter or durable proof.
++"""
++from collections import OrderedDict
++import time
++
++from hermes_cli import kanban_allowance_observation as observation
++
++BATCH = 8
++CADENCE = 60.0
++MAX_BOARDS = 64
++_CURSORS = OrderedDict()
++
++
++HELD_NOTE = ("The Board still holds this card's reviewer allowance ({state}, review {review}), so the newer budget "
++             "does not let it run: only a human operator's `hermes kanban release` replaces that allowance.")
++
++
++def triage(conn, task_id, observed):
++    from hermes_cli.kanban_wake_check import foreign_copy
++    if observed is None or observed.remaining != 0 or foreign_copy(conn, task_id):
++        return False
++    note = "The Board's ten fresh-lease reviewer allowance is exhausted; the owner must decide the next round."
++    return _hold(conn, task_id, lambda: observation.current(conn, task_id, observed), note,
++                 {**observed.expected, "remaining": 0, "board": observed.board})
++
++
++def triage_stuck(conn, task_id, held):
++    """Decided but stuck: the Board refuses every grant of a card whose newest budget is generic."""
++    from hermes_cli.kanban_wake_check import foreign_copy
++    if held is None or foreign_copy(conn, task_id):
++        return False
++    return _hold(conn, task_id, lambda: observation.still_stuck(conn, task_id, held),
++                 HELD_NOTE.format(state=held.state, review=held.review_uid),
++                 {"basis": observation.allowance.BASIS, "review_uid": held.review_uid, "state": held.state,
++                  "board": held.board, "superseded": False})
++
++
++def _hold(conn, task_id, valid, note, evidence):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli.kanban_wake_check import foreign_copy
++    with kb.write_txn(conn):
++        if not valid() or foreign_copy(conn, task_id):
++            return False
++        if decision.pending(conn, task_id):
++            return False  # preserve that episode; ordinary decision maintenance owns its notice
++        now = int(time.time())
++        changed = conn.execute(
++            "UPDATE tasks SET status='triage',claim_lock=NULL,claim_expires=NULL,worker_pid=NULL "
++            "WHERE id=? AND status IN ('ready','review') AND current_run_id IS NULL AND " + budget._UNCLAIMED,
++            (task_id, now)).rowcount
++        if changed != 1:
++            return False
++        spent = budget.spend(conn, task_id, as_of=now + 1)
++        limits = budget.card_limits(conn, task_id, budget.limits())
++        kb._append_event(conn, task_id, budget.EVENT, {
++            "limit": "runs", "runs": spent.runs, "since": spent.since, "tokens": spent.tokens,
++            "runs_with_usage": spent.reported, "cost_usd": spent.cost_usd, "override": True,
++            "limits": {"runs": limits.runs, "cache_read_tokens": limits.cache_read_tokens}, "reason": note,
++            "allowance": evidence})
++        kb.add_comment(conn, task_id, budget.AUTHOR, budget._comment(task_id, note), system=True)
++        decision.safe_ensure_producer(conn, task_id)
++    return True
++
++
++def sweep(conn):
++    """At most eight reads and five seconds per minute per DB, outside write transactions."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_wake_check import foreign_copy
++    if conn.in_transaction or sync.board_mode(conn) != "primary":
++        return []
++    state = sync.sync_state(conn)
++    if not state:
++        return []
++    path = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), "")
++    key = (path, state["board_id"])
++    now = time.monotonic()
++    after, next_at = _CURSORS.get(key, ("", 0.0))
++    if now < next_at:
++        return []
++    _CURSORS[key] = (after, now + CADENCE)
++    _CURSORS.move_to_end(key)
++    while len(_CURSORS) > MAX_BOARDS:
++        _CURSORS.popitem(last=False)
++    rows = conn.execute(
++        "SELECT t.id FROM tasks t WHERE t.status IN ('ready','review') AND t.current_run_id IS NULL "
++        "AND t.id>? AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.id "
++        "AND e.kind='spend_budget_set' AND json_valid(e.payload) "
++        "AND json_extract(e.payload,'$.runs_basis')='board_lease_allowance_v1') ORDER BY t.id LIMIT ?",
++        (after, BATCH)).fetchall()
++    deadline, held = now + observation.READ_SECONDS, []
++    for (task_id,) in rows:
++        if time.monotonic() >= deadline:
++            break
++        after = task_id
++        if foreign_copy(conn, task_id):
++            continue
++        # One read per card: an exhausted exact allowance, else a generic newest budget the Board still refuses.
++        if (triage(conn, task_id, observation.read(conn, task_id, deadline=deadline))
++                or triage_stuck(conn, task_id, observation.stuck(conn, task_id, deadline=deadline))):
++            held.append(task_id)
++    # Wrap only after exhausting this bounded page, not after a deadline-shortened pass.
++    if not rows or (len(rows) < BATCH and after == rows[-1][0]):
++        after = ""
++    _CURSORS[key] = (after, now + CADENCE)
++    return held
+diff --git a/hermes_cli/kanban_allowance_observation.py b/hermes_cli/kanban_allowance_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9a6ba7437ff856bc8513e363b8aa039aafffd4e
+--- /dev/null
++++ b/hermes_cli/kanban_allowance_observation.py
+@@ -0,0 +1,156 @@
++"""Bounded Board allowance diagnostics for decision recovery, never claim authority. [daveey]
++
++Read only outside SQLite transactions. An observation is usable only for the same
++Board and override, within its original request deadline. Missing/malformed/failed
++reads are unknown, not exhausted and never permission to claim. The real lease
++endpoint remains the sole spending authority on every claim.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++import time
++
++from hermes_cli import kanban_spend_allowance as allowance
++
++READ_SECONDS = 5.0
++
++
++@dataclass(frozen=True)
++class Observation:
++    board: str
++    expected: dict
++    remaining: int
++    deadline: float
++
++
++def _remaining(reply, board, task, want):
++    if not isinstance(reply, dict) or reply.get("board") != board:
++        return None
++    data = reply.get("allowance")
++    if not isinstance(data, dict):
++        return None
++    coordinates = {"runs_basis": want["basis"], "task": task, "review_uid": want["review_uid"],
++                   "budget_event_uid": want["budget_event_uid"], "state": "active"}
++    if any(data.get(key) != value for key, value in coordinates.items()):
++        return None
++    if any(not isinstance(data.get(key), str) or not data[key] for key in ("home", "episode")):
++        return None
++    runs, used, remaining = (data.get(key) for key in ("runs", "used", "remaining"))
++    if (any(type(value) is not int for value in (runs, used, remaining)) or runs != allowance.BOARD_RUNS
++            or not 0 <= used <= runs or remaining != runs - used):
++        return None
++    return remaining
++
++
++def read(conn, task_id, *, deadline: float | None = None) -> Observation | None:
++    """One authenticated bounded read; refuse transaction callers before opening transport."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    if conn.in_transaction:
++        return None
++    want, state = allowance.expected(conn, task_id), sync.sync_state(conn)
++    if want is None or not state:
++        return None
++    now = time.monotonic()
++    deadline = min(now + READ_SECONDS, deadline) if deadline is not None else now + READ_SECONDS
++    if deadline <= now:
++        return None
++    hub = None
++    try:
++        hub = client.Hub(client.load_identity(), deadline=deadline)
++        remaining = _remaining(hub.reviewer_allowance(state["board_id"], task_id), state["board_id"], task_id, want)
++        if remaining is None or time.monotonic() >= deadline:
++            return None
++        return Observation(state["board_id"], want, remaining, deadline)
++    except (client.SyncUnavailable, client.HubError, OSError, TimeoutError, ValueError):
++        return None  # unknown diagnostic; the ordinary exact-debit claim guard still refuses
++    finally:
++        if hub is not None:
++            hub.close()
++
++
++def current(conn, task_id, observed: Observation | None) -> bool:
++    """Recheck local identity and freshness under the caller's write transaction; no I/O."""
++    from hermes_cli import kanban_db_sync as sync
++    if observed is None or time.monotonic() >= observed.deadline:
++        return False
++    state = sync.sync_state(conn)
++    return bool(state and state["board_id"] == observed.board and allowance.expected(conn, task_id) == observed.expected)
++
++
++@dataclass(frozen=True)
++class Held:
++    """The Board still holds a private allowance although the card's newest local budget is a generic one."""
++    board: str
++    budget: object  # the newest local override row at read time (None: no override)
++    review_uid: str
++    state: str  # active | invalidated
++    deadline: float
++
++
++def _budget(conn, task_id):
++    row = allowance._newest(conn, task_id)
++    return tuple(row) if row is not None else None
++
++
++def _held(reply, board, task):
++    """None (unknown), ``{}`` (the Board holds no allowance) or its validated active/invalidated allowance."""
++    if not isinstance(reply, dict) or reply.get("board") != board or "allowance" not in reply:
++        return None
++    data = reply["allowance"]
++    if data is None:
++        return {}
++    if (not isinstance(data, dict) or data.get("runs_basis") != allowance.BASIS or data.get("task") != task
++            or data.get("state") not in ("active", "invalidated")
++            or any(not isinstance(data.get(key), str) or not data[key] for key in ("review_uid", "budget_event_uid"))):
++        return None
++    return data
++
++
++def board_state(conn, task_id, *, deadline: float | None = None):
++    """What the Board itself holds for the card, whatever the local budget says: None when unknown, ``{}`` when
++    it holds none, else its allowance. One authenticated bounded read, never under a transaction, never authority."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    state = None if conn.in_transaction else sync.sync_state(conn)
++    if not state or sync.board_mode(conn) != "primary":
++        return None
++    now = time.monotonic()
++    deadline = min(now + READ_SECONDS, deadline) if deadline is not None else now + READ_SECONDS
++    if deadline <= now:
++        return None
++    hub = None
++    try:
++        hub = client.Hub(client.load_identity(), deadline=deadline)
++        seen = _held(hub.reviewer_allowance(state["board_id"], task_id), state["board_id"], task_id)
++        return None if time.monotonic() >= deadline else seen
++    except (client.SyncUnavailable, client.HubError, OSError, TimeoutError, ValueError):
++        return None
++    finally:
++        if hub is not None:
++            hub.close()
++
++
++def stuck(conn, task_id, *, deadline: float | None = None) -> Held | None:
++    """A decided-but-stuck card: a generic budget is newest locally (cumulative accounting, so the claim states
++    no allowance) while the Board still holds one and refuses every such grant. Unknown reads are not stuck."""
++    from hermes_cli import kanban_db_sync as sync
++    if conn.in_transaction or allowance.state(conn, task_id) is not None or not allowance.history(conn, task_id):
++        return None
++    now = time.monotonic()
++    deadline = min(now + READ_SECONDS, deadline) if deadline is not None else now + READ_SECONDS
++    seen = board_state(conn, task_id, deadline=deadline)
++    if not seen:
++        return None
++    return Held(sync.sync_state(conn)["board_id"], _budget(conn, task_id), seen["review_uid"], seen["state"],
++                deadline)
++
++
++def still_stuck(conn, task_id, held: Held | None) -> bool:
++    """Recheck under the caller's write transaction; no I/O. A newer budget of any kind invalidates the reading."""
++    from hermes_cli import kanban_db_sync as sync
++    if held is None or time.monotonic() >= held.deadline:
++        return False
++    state = sync.sync_state(conn)
++    return bool(state and state["board_id"] == held.board and allowance.state(conn, task_id) is None
++                and _budget(conn, task_id) == held.budget)
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index c119fbe67320fae0e4b7488f5f2ee7a710a6ec12..1dbd7cefdbf99bf931adbfa27ae13745cc7d73d0 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -38,7 +38,7 @@
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_dup_detector as _dup_detector, kanban_placement_forward as _placement_fwd  # no cycle
+ from hermes_cli import kanban_run_end_lease as _run_end_lease  # stdlib-only at import: no cycle
+-from hermes_cli import kanban_containment_connections as _containment, kanban_spend_claim as _spend_claim
++from hermes_cli import kanban_containment_connections as _containment, kanban_spend_claim as _spend_claim, kanban_spend_allowance as _spend_allowance
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_terminal_guard import unblock_refusal  # stdlib-only at import: no cycle; re-exported for plugins
+@@ -2000,7 +2000,7 @@
+     if gate.deferred:
+         return None
+     with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+-        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()):  # [daveey] same txn as the CAS
++        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()) or _spend_allowance.claim_refused(conn, task_id, gate):  # [daveey] same txn as the CAS
+             return None
+         # Never ready -> running with an undone parent; recompute_ready re-promotes when parents finish.
+         if not _parents_satisfied(conn, task_id):
+@@ -2040,7 +2040,7 @@
+     if gate.deferred:
+         return None
+     with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+-        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()):  # [daveey] same txn as the CAS
++        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()) or _spend_allowance.claim_refused(conn, task_id, gate):  # [daveey] same txn as the CAS
+             return None
+         if not _parents_satisfied(conn, task_id):
+             demoted = conn.execute(
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index b6624d6069307760e1e0bca4ddeba9050855c585..8b712407fd4c0b076a1176c6c69c4434008f9173 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -829,11 +829,14 @@
+     version: Optional[int] = None
+     # workspace_source v1: the grant response row's manifest/custody (``None``: an old Board sent no snapshot keys).
+     source_snapshot: Optional[Any] = None
++    # board_lease_allowance_v1: the grant's charge evidence (``kanban_spend_allowance.evidence_ok``), or None.
++    spend_allowance: Optional[dict] = None
+ 
+ 
+ class LeaseClient(Protocol):
+     def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
+-                lane: str = "ready", source_protocol: Optional[int] = None) -> Lease: ...
++                lane: str = "ready", source_protocol: Optional[int] = None,
++                expected_reviewer_allowance: Optional[dict] = None) -> Lease: ...
+ 
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> Lease: ...
+ 
+@@ -962,9 +965,13 @@
+     try:
+         from hermes_cli.kanban_source_board import grant_protocol
+         protocol = grant_protocol()  # workspace_source: only the dispatcher's claim, only when enabled (R3-a)
++        from hermes_cli.kanban_spend_allowance import expected
++        allowance = expected(conn, task_id)
++        identity = ({k: allowance[k] for k in ("review_uid", "budget_event_uid")} if allowance else None)
+         lease = _client().acquire(board_id=ids[0], task_uid=task_id, run_uid=run_uid, gateway_id=ids[1],
+                                   ttl_s=max(expires - int(time.time()), 1), lane=lane,
+-                                  **({"source_protocol": protocol} if protocol else {}))
++                                  **({"source_protocol": protocol} if protocol else {}),
++                                  **({"expected_reviewer_allowance": identity} if identity else {}))
+     except _CLIENT_ERRORS as exc:  # fail closed: an unreachable service defers the claim
+         _log.info("claim_deferred: offline task=%s (%s: %s)", task_id, type(exc).__name__, exc)
+         defer_claim(task_id, "offline", ORIGIN_BOARD)
+diff --git a/hermes_cli/kanban_dispatch_maintenance.py b/hermes_cli/kanban_dispatch_maintenance.py
+index 46e5f674fa83099606e82cf9bec924c4fbdf9554..e6d7584fa004c2f6979208004492258ab8aae40b 100644
+--- a/hermes_cli/kanban_dispatch_maintenance.py
++++ b/hermes_cli/kanban_dispatch_maintenance.py
+@@ -51,7 +51,9 @@
+     """Spend-stop reviews run outside the worker queue, so a full host never delays a budget decision."""
+     import logging
+     from hermes_cli.kanban_spend_reviewer import start_due
++    from hermes_cli import kanban_allowance_maintenance
+     try:
++        kanban_allowance_maintenance.sweep(conn)
+         start_due(conn)
+     except DispatchWriteContended:
+         raise
+diff --git a/hermes_cli/kanban_release.py b/hermes_cli/kanban_release.py
+index 277fe4281f8b8eb91ff7b14dfe851da857314ea0..08345c5637cd86da6ac248179ad856e8a41b1eac 100644
+--- a/hermes_cli/kanban_release.py
++++ b/hermes_cli/kanban_release.py
+@@ -602,6 +602,38 @@
+             "message": f"{tid} -> {'todo' if parents else 'ready'}: finished the release already recorded"}
+ 
+ 
++def _board_allowance(conn: sqlite3.Connection, s) -> None:
++    """What this release does about a reviewer allowance the Board may still hold for the card (authenticated
++    read, outside any transaction; never authority by itself). Sets ``s.supersede`` (a human operator: the
++    canonical renewal below retires it, then the ordinary budget applies) or ``s.keep_allowance`` (an agent
++    authority: the Board's remaining fresh leases stay the budget; nothing local replaces them)."""
++    from hermes_cli import kanban_allowance_observation as observation
++    from hermes_cli import kanban_spend_allowance as allowance
++    s.supersede = s.keep_allowance = False
++    if not allowance.history(conn, s.tid):
++        return
++    seen = observation.board_state(conn, s.tid)
++    if seen is None:
++        raise _Refusal("allowance_unreadable", f"the Board's reviewer allowance for {s.tid} could not be read; "
++                       "nothing was changed. Rerun when the Board is reachable")
++    if not seen:
++        return
++    if seen["state"] != "active":
++        raise _Refusal("allowance_invalidated", f"the Board invalidated {s.tid}'s reviewer allowance (the card "
++                       "was re-homed or deleted) and holds it; a release cannot replace it. Nothing was changed")
++    if s.writer[0] == "human" and s.authority == "human":
++        s.supersede = True
++        return
++    route = f"a human operator runs `hermes kanban release {s.tid}`"
++    if allowance.state(conn, s.tid) != allowance.BOARD:
++        raise _Refusal("allowance_in_force", f"the Board still holds {s.tid}'s reviewer allowance and a newer "
++                       f"budget does not replace it; {route}")
++    if seen.get("remaining") == 0:
++        raise _Refusal("allowance_exhausted", f"{s.tid}'s ten fresh-lease reviewer allowance is exhausted and an "
++                       f"agent release does not replace it; {route}")
++    s.keep_allowance = True
++
++
+ def _budget_plan(conn: sqlite3.Connection, s) -> tuple[Optional[int], Optional[int], int, str]:
+     """``(runs limit, cache-read limit, runs spent, text)`` this release leaves on the card; a None run limit
+     leaves the override untouched.
+@@ -629,6 +661,8 @@
+         raise _Refusal("budget_limit_in_force", f"{s.tid} has reached its cache-read limit ({used} of {limit}) and an "
+                        "agent does not raise a limit a person may have set; a human runs "
+                        f"`hermes kanban release {s.tid}` or `hermes kanban spend-budget {s.tid}`")
++    if getattr(s, "keep_allowance", False):
++        return None, None, spent.runs, "unchanged (the Board's reviewer allowance stays in force)"
+     unlimited = ksb._limit_value(prior.get("runs")) == 0
+     if unlimited and not reached:
+         return None, None, spent.runs, "unchanged (no run limit on this card)"
+@@ -664,13 +698,17 @@
+     s.comment = comment
+     s.reason = f"hermes kanban release: {s.runs} more runs (mandate comment {comment})"
+     s.kept = f"; mandate comment {comment} is on the card and a rerun reuses it"
+-    if s.scope:
++    if s.scope or s.supersede:
+         try:
++            # ``supersede``: the same validated human renewal also retires the Board's reviewer allowance, and is
++            # the only thing that does. It grants nothing; the budget below is the release's own.
+             renewal_cli.renew(conn, s.tid, episode=s.episode, comment_id=comment, reason=s.reason, board=s.board,
+-                              writer=s.writer, env=s.env, ancestry=s.ancestry)
++                              writer=s.writer, env=s.env, ancestry=s.ancestry, allowance_only=s.supersede)
+         except renewal.RenewalRefused as exc:
+             raise _Refusal(exc.code, str(exc) + s.kept)
+-        out["scope_renewed"] = True
++        out["scope_renewed"] = bool(s.scope)
++        if s.supersede:
++            out["allowance_superseded"] = True
+     runs, cache, spent, _ = _budget_plan(conn, s)  # again: a human's mandate comment may have opened a new window
+     if runs is None:
+         s.budget = 0  # an exempt card (or one with no run limit) stays that way: a release never makes it finite
+@@ -841,6 +879,7 @@
+                                rerun=capability.rerun(tid, s.capability_rows))
+     if s.precondition and (why := s.precondition(conn)):
+         raise _Refusal("ask_changed", str(why))
++    _board_allowance(conn, s)
+     s.budget_text = _budget_plan(conn, s)[3]  # also the up-front budget_limit_in_force refusal
+     _mandate_and_budget(conn, out, s)
+     outcome = _decide(conn, s)
+diff --git a/hermes_cli/kanban_scope_renewal.py b/hermes_cli/kanban_scope_renewal.py
+index b4fe20be811a1a831c4ea40efb73b25a45f5bc07..540b5c8900870143cd2336e9043e6d437c231018 100644
+--- a/hermes_cli/kanban_scope_renewal.py
++++ b/hermes_cli/kanban_scope_renewal.py
+@@ -214,8 +214,12 @@
+ 
+ 
+ def prepare(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: str | int, reason: str,
+-            actor: Actor) -> dict:
+-    """The ``scope_renewed`` payload, or :class:`RenewalRefused`. Call inside the write transaction that appends it."""
++            actor: Actor, allowance_only: bool = False) -> dict:
++    """The ``scope_renewed`` payload, or :class:`RenewalRefused`. Call inside the write transaction that appends it.
++
++    ``allowance_only``: the caller read an active Board reviewer allowance for this card. A human operator's
++    renewal is then accepted for a stop with no scope restriction (it covers nothing; the Board retires the
++    allowance and revalidates all of this). No other authority gets that path."""
+     from hermes_cli import kanban_spend_decision as ksd
+     from hermes_cli.kanban_refusal_receipt import restricted as safety_restricted
+     from hermes_cli.kanban_sync_divergence import _event_order
+@@ -236,7 +240,8 @@
+                              "reread the card")
+     done = covered(conn, task_id)
+     evidence = [e for e in scope_evidence(conn, task_id, episode) if key(e) not in done]
+-    if not evidence:
++    supersedes = allowance_only and not evidence and actor.authority == "human" and actor.kind == "human"
++    if not evidence and not supersedes:
+         raise RenewalRefused("not_scope_stopped", f"stop {episode} on {task_id} carries no unrenewed scope restriction")
+     comment = _mandate_comment(conn, task_id, comment_id)
+     body = (comment["body"] or "").strip() if comment is not None else ""
+@@ -252,7 +257,7 @@
+                              "write a fresh mandate comment")
+     if why := _writer_refusal(conn, actor, written):
+         raise RenewalRefused("mandate_authority", why)
+-    if any(_event_order(e) >= _event_order(written) for e in evidence):
++    if any(_event_order(e) >= _event_order(written) for e in (evidence or [stop])):
+         raise RenewalRefused("mandate_stale", f"comment {comment_id} predates the scope stop it would renew; "
+                              "write the mandate after the stop")
+     return {"version": 1, "episode": episode, "mandate_comment_uid": comment_ref(comment),
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+index 3b8768459f01845f07a4beb7e3e69848081544ec..860b7149565ba328d64424c1afea160e4c2b1856 100644
+--- a/hermes_cli/kanban_scope_renewal_cli.py
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -206,7 +206,7 @@
+     return conn
+ 
+ 
+-def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: int, reason: str,
++def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: int, reason: str, allowance_only: bool = False,
+           board: Optional[str] = None, writer: Optional[tuple] = None,
+           env: Optional[Mapping[str, str]] = None,
+           ancestry: Optional[Sequence[Mapping[str, str]]] = None) -> dict:
+@@ -231,17 +231,18 @@
+                                   conn, board, task_id, gateway, profile, session),
+                               delegate=lambda session: delegates.live_grant(
+                                   conn, board, gateway=gateway, profile=profile, session=session))
+-        return _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor)
++        return _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor, allowance_only)
+ 
+ 
+-def _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor):
++def _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor, allowance_only=False):
+     from hermes_cli import kanban_db_sync as sync
+     mode = sync.board_mode(conn)
+     if mode == "off" and not sync.sync_state(conn):
+         return renewal.renew_local(conn, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
+     if mode == "off":
+         raise RenewalRefused("board_unavailable", "this board is synced but sync is not active in this process")
+-    payload = renewal.prepare(evidence, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
++    payload = renewal.prepare(evidence, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor,
++                              allowance_only=allowance_only)
+     return _canonical(conn, board or sync.sync_state(conn)["board_id"], task_id, payload, mode, evidence=evidence)
+ 
+ 
+diff --git a/hermes_cli/kanban_spend_allowance.py b/hermes_cli/kanban_spend_allowance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..622789bc9fd82c97a15bc46caa56f05ddefc4400
+--- /dev/null
++++ b/hermes_cli/kanban_spend_allowance.py
+@@ -0,0 +1,116 @@
++"""Portable consumer of the Board's reviewer lease allowance (``board_lease_allowance_v1``). [daveey]
++
++A canonical ``spend_review`` release writes the card's ``spend_budget_set`` with ``runs: 10``,
++``runs_basis: board_lease_allowance_v1`` and the ``review_uid`` of the request it answers. The Board keeps a
++private ledger for that exact release and charges every fresh lease grant against it (no refunds, no reset);
++its existing signed ``spend_windows`` stay an independent intersection. Core therefore never counts the
++allowance from replica ``task_runs`` history, on any host:
++
++* :func:`state` classifies the card's newest override: ``None`` (no basis: ordinary cumulative accounting),
++  :data:`BOARD` (a well-formed recognized override on a ``primary`` synced board: the run limit is the Board's,
++  enforced on each grant) or :data:`UNPROVEN` (any other basis, a retired draft basis, malformed fields, or a
++  board that is not ``primary``: the run limit holds). There is no cumulative or local fallback.
++* :func:`grant_refusal` runs inside the claim transaction: a :data:`BOARD` card is admitted only when the
++  actual lease grant returned evidence naming exactly this basis, review and budget event, with a charged
++  non-negative ``remaining`` (a new Core against an old Board that sends none refuses).
++
++The cache-read limit and every other gate keep their cumulative semantics; this module only replaces the run
++count. Decision liveness lives beside it: ``kanban_allowance_observation`` reads the Board's allowance (bounded,
++authenticated, never under a write transaction; a diagnostic, never debit proof) and
++``kanban_allowance_maintenance`` moves an exhausted or decided-but-stuck card on its home into decision triage
++with one notice. Only a human ``hermes kanban release`` supersedes an active allowance, through the Board's
++canonical human ``renew_scope``; generic budget rows never do.
++"""
++from __future__ import annotations
++
++import sqlite3
++from typing import Any, Optional
++
++BASIS = "board_lease_allowance_v1"
++BOARD_RUNS = 10  # the canonical spend_review release: a fixed allowance of ten fresh leases
++BOARD, UNPROVEN = "board", "unproven"
++REFUSAL = "spend_allowance_unproven"
++
++
++def _exact(value: Any, want: int) -> bool:
++    return type(value) is int and value == want  # never a bool, a float (10.0) or a numeric string
++
++
++def _text(value: Any) -> bool:
++    return isinstance(value, str) and bool(value)
++
++
++def _newest(conn: sqlite3.Connection, task_id: str) -> Optional[tuple]:
++    from hermes_cli import kanban_spend_budget as budget
++    has_uid = "uid" in {row[1] for row in conn.execute("PRAGMA table_info(task_events)")}
++    return conn.execute(f"SELECT {'uid' if has_uid else 'NULL'}, payload FROM task_events WHERE task_id = ? "
++                        "AND kind = ? ORDER BY id DESC LIMIT 1", (task_id, budget.OVERRIDE_EVENT)).fetchone()
++
++
++def expected(conn: sqlite3.Connection, task_id: str, data: Optional[dict] = None) -> Optional[dict]:
++    """The exact grant evidence a :data:`BOARD` card needs, else None."""
++    from hermes_cli import kanban_spend_budget as budget
++    data = budget.card_override(conn, task_id) if data is None else data
++    if not isinstance(data, dict) or data.get("runs_basis") != BASIS:
++        return None
++    row = _newest(conn, task_id)
++    uid = row[0] if row else None
++    if not (_exact(data.get("runs"), BOARD_RUNS) and _text(data.get("review_uid")) and _text(uid)):
++        return None
++    from hermes_cli import kanban_db_sync as sync
++    if sync.board_mode(conn) != "primary":
++        return None  # never a local allowance: only the Board's lease grant can enforce it
++    return {"basis": BASIS, "review_uid": data["review_uid"], "budget_event_uid": uid}
++
++
++def state(conn: sqlite3.Connection, task_id: str, data: Optional[dict] = None) -> Optional[str]:
++    """``None`` (cumulative accounting), :data:`BOARD` or :data:`UNPROVEN` (the run limit holds)."""
++    from hermes_cli import kanban_spend_budget as budget
++    data = budget.card_override(conn, task_id) if data is None else data
++    if not isinstance(data, dict) or "runs_basis" not in data:
++        return None
++    return BOARD if expected(conn, task_id, data) is not None else UNPROVEN
++
++
++def history(conn: sqlite3.Connection, task_id: str) -> bool:
++    """Some budget of this primary synced card named the Board basis, so the Board may still hold a private
++    allowance for it whatever the newest local budget says. A reason to ask the Board, never a count."""
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_db_sync as sync
++    if sync.board_mode(conn) != "primary" or not sync.sync_state(conn):
++        return False
++    return conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND json_valid(payload) "
++        "AND json_extract(payload, '$.runs_basis') = ? LIMIT 1", (task_id, budget.OVERRIDE_EVENT, BASIS)).fetchone() is not None
++
++
++def evidence_ok(want: Optional[dict], got: Any) -> bool:
++    if want is None or not isinstance(got, dict):
++        return False
++    remaining = got.get("remaining")
++    return (all(got.get(k) == v for k, v in want.items()) and got.get("charged") is True
++            and type(remaining) is int and 0 <= remaining < BOARD_RUNS)
++
++
++def claim_refused(conn: sqlite3.Connection, task_id: str, gate) -> bool:
++    """Final transactional admission predicate shared by both claim lanes."""
++    from hermes_cli import kanban_db_sync as sync
++    refusal = grant_refusal(conn, task_id, gate)
++    if refusal is None:
++        return False
++    sync.defer_claim(task_id, refusal, sync.ORIGIN_BOARD)
++    return True  # the unused grant is released on gate exit
++
++
++def grant_refusal(conn: sqlite3.Connection, task_id: str, gate) -> Optional[str]:
++    """Inside the claim transaction: :data:`REFUSAL` when the card's run limit is the Board allowance and the
++    gate's actual lease grant did not prove the exact charge (or there was no grant at all)."""
++    current = state(conn, task_id)
++    lease = getattr(gate, "lease", None)
++    if current is None:
++        # A paged/removed local budget cannot turn an actual portable debit into legacy authority.
++        return REFUSAL if getattr(lease, "spend_allowance", None) is not None else None
++    if current == BOARD:
++        if lease is not None and evidence_ok(expected(conn, task_id), getattr(lease, "spend_allowance", None)):
++            return None
++    return REFUSAL
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index de4b372ef4d33a072658c54a6d3a2afbcd477b99..8ecc17b895528457473cce5afd3729a3dcd73b34 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -73,6 +73,9 @@
+     reported: int  # how many of ``runs`` carried a usage receipt
+     cost_usd: float
+     excluded: int = 0  # closed runs left out because the owner refused them and no turn ran
++    # ``kanban_spend_allowance.state`` of the card's override: None (cumulative runs), ``board`` (the Board's
++    # lease allowance enforces the run limit on every grant) or ``unproven`` (the run limit holds).
++    allowance: Optional[str] = None
+ 
+ 
+ def _int(raw: Any, default: int) -> int:
+@@ -388,12 +391,15 @@
+         value = item.get("cost_usd")
+         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+             cost += float(value)
+-    return Spend(len(run_ids), since, tokens, len(usage), round(cost, 2), excluded)
++    from hermes_cli.kanban_spend_allowance import state
++    return Spend(len(run_ids), since, tokens, len(usage), round(cost, 2), excluded, state(conn, task_id))
+ 
+ 
+ def over(spent: Spend, lim: Limits) -> Optional[str]:
+     """Which limit ``spent`` reached (``runs`` / ``cache_read_tokens``), or None."""
+-    if lim.runs and spent.runs >= lim.runs:
++    if spent.allowance == "unproven":  # a recognized-looking basis without provable Board enforcement
++        return "runs"
++    if spent.allowance is None and lim.runs and spent.runs >= lim.runs:  # ``board``: the lease grant counts
+         return "runs"
+     if lim.cache_read_tokens and spent.tokens["cache_read_tokens"] >= lim.cache_read_tokens:
+         return "cache_read_tokens"
+diff --git a/hermes_cli/kanban_spend_caused_review.py b/hermes_cli/kanban_spend_caused_review.py
+index 0e2cf2477d05157bc67a237b38c3d2bf6e9755fd..b1687a41034f70820c9cc2f1aa8d1e47b7b32d86 100644
+--- a/hermes_cli/kanban_spend_caused_review.py
++++ b/hermes_cli/kanban_spend_caused_review.py
+@@ -62,22 +62,44 @@
+             or row[3] is not None or pending(conn, task_id) or stopped_at(conn, task_id) is not None)
+ 
+ 
++def _human_reset(conn, task_id):
++    """The newest human scope renewal's order on a canonical primary board, else None. The Board's privately
++    marked renewal is the authority for the cap (spend_review.ts humanReset); this only decides whether Core
++    asks. A forged synced row makes Core ask and the Board refuse ``grant_cap``; it never grants."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_sync_divergence import _event_order
++    if sync.board_mode(conn) != "primary" or not sync.sync_state(conn):
++        return None
++    rows = [dict(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='scope_renewed'", (task_id,))]
++    human = [r for r in rows if record(r["payload"]).get("version") == 1
++             and record(r["payload"]).get("authority_kind") == "human" and record(r["payload"]).get("actor_kind") == "human"]
++    return max(map(_event_order, human), default=None)
++
++
+ def grant_count(conn, task_id):
+-    """Conservative count: agent budget edits never reset caused-stop grants."""
++    """Conservative count: agent budget edits never reset caused-stop grants; a canonical human renewal does."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    reset = _human_reset(conn, task_id)
+     episodes = set()
+-    for kind, raw, uid in conn.execute("SELECT kind,payload,id FROM task_events WHERE task_id=? AND kind IN "
+-                                       "('spend_review','spend_review_granted','spend_review_settled')", (task_id,)):
+-        p = record(raw)
+-        if kind == "spend_review_granted" or p.get("verdict") == "release":
+-            episodes.add(p.get("episode") or str(uid))
++    for row in conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN "
++                            "('spend_review','spend_review_granted','spend_review_settled')", (task_id,)):
++        row = dict(row)
++        p = record(row["payload"])
++        if reset is not None and _event_order(row) <= reset:
++            continue
++        if row["kind"] == "spend_review_granted" or p.get("verdict") == "release":
++            episodes.add(p.get("episode") or str(row["id"]))
+     return len(episodes)
+ 
+ 
+ def enrich(conn, task_id, stop, ctx):
+     cause = effective_cause(conn, task_id, stop)
+-    if cause is None:
++    from hermes_cli import kanban_db_sync as sync
++    ctx["_canonical"] = sync.board_mode(conn) == "primary" and bool(sync.sync_state(conn))
++    if cause is None and not ctx["_canonical"]:
+         return ctx
+-    ctx["cause"] = cause
++    if cause is not None:
++        ctx["cause"] = cause
+     # Board is the definitive window validator. This bounded advisory corpus must
+     # never confer authority; an overinclusive old quote is refused there.
+     texts = [record(stop.get("payload")).get("reason") or ""]
+@@ -98,8 +120,8 @@
+     """Return only bounded v1 wire fields, never model-supplied identity."""
+     choice = verdict.get("decision")
+     reason = verdict.get("reason")
+-    if choice not in {"release", "wait_on", "archive", "escalate"}:
+-        raise ValueError("invalid caused-stop decision")
++    if choice not in {"release", "wait_on", "archive", "escalate"} or "runs" in verdict:
++        raise ValueError("invalid canonical decision or custom run budget")
+     if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 2000:
+         raise ValueError("missing or oversized reason")
+     fields = {"verdict": choice, "reason": reason.strip()}
+@@ -212,10 +234,12 @@
+     try:
+         stop = decision.strict_episode(conn, task_id)
+         enabled, cap = reviewer.settings()
++        cause = effective_cause(conn, task_id, stop) if stop else None
++        ordinary = stop is not None and cause is None and reviewer._refusal(conn, task_id, episode) is None
+         allowed = (stop is not None and reviewer.episode_of(stop) == episode and not fenced(conn, task_id)
+                    and not foreign_copy(conn, task_id) and not reviewer._disposed(conn, task_id, episode)
+                    and not reviewer._human_after_stop(conn, task_id, stop) and enabled
+-                   and effective_cause(conn, task_id, stop) in CAUSES
++                   and (cause in CAUSES or ordinary)
+                    and grant_count(conn, task_id) < min(cap, 2))
+         if reviewer.state(conn, task_id, episode) != reviewer.STARTED:
+             return "moot"
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 5e5b4b2b42914344d2a102863b986dc5c2f9f934..0e9749febbdf2ccbc1bf4eb4937a8c07ca570089 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -486,7 +486,7 @@
+     from agent.model_routing_managed import managed_config, verify_selected_route
+     from hermes_cli.kanban_hub_admission import _bounded, _owner_scope
+     from hermes_cli.kanban_spend_caused_review import PROMPT as CAUSED_PROMPT
+-    prompt = CAUSED_PROMPT if ctx.get("cause") else PROMPT
++    prompt = CAUSED_PROMPT if ctx.get("cause") or ctx.get("_canonical") else PROMPT
+     user = {k: v for k, v in ctx.items() if not k.startswith("_")}
+     route: dict = {}
+     managed: dict = {}
+@@ -562,7 +562,7 @@
+         verdict = None
+     if verdict is None:
+         return escalate(conn, task_id, episode, "the reviewer model was unavailable")
+-    if ctx.get("cause"):
++    if ctx.get("cause") or ctx.get("_canonical"):
+         from hermes_cli.kanban_spend_caused_review import review as caused_review
+         return caused_review(conn, task_id, episode, verdict, ctx)
+     if verdict["decision"] == "grant":
+@@ -642,6 +642,9 @@
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_spend_budget as ksb
+     from hermes_cli.kanban_spend_promote import WINDOW_KEY
++    from hermes_cli import kanban_db_sync as sync
++    if sync.sync_state(conn):
++        return "synced reviewer grants require the canonical fixed-ten Board operation"
+     with kb.write_txn(conn):
+         if why := _refusal(conn, task_id, episode):
+             return why
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 6d5bae2b70b88009ad3a3fbc4bacde13e3f6a33e..9fbedf2dba7db2c958080f6f71233ebcbdf86c76 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1969,7 +1969,7 @@
+     def __init__(self, hub: Hub) -> None:
+         self.hub = hub
+ 
+-    def _lease(self, board_id: str, body: dict, run_uid: str) -> sync.Lease:
++    def _lease(self, board_id: str, body: dict, run_uid: str, gateway_id: str) -> sync.Lease:
+         try:
+             res = self.hub.leases(board_id, {**body, "client_op_id": sync.uuid7()})
+         except (HubError, OSError) as exc:
+@@ -1980,18 +1980,23 @@
+         return sync.Lease(granted=granted, run_uid=run_uid, expires_ms=lease.get("expires"),
+                           holder=lease.get("holder"), reason=None if granted else res.get("reason"),
+                           version=res.get("version"), source_snapshot=snapshot_from_row(res.get("row"), grant={
+-                              k: res.get(k) for k in ("status", "lease", "source_predecessor")}))
++                              k: res.get(k) for k in ("status", "lease", "source_predecessor")}),
++                          spend_allowance=res.get("spend_allowance") if granted and
++                          lease.get("task_id") == body.get("task") and lease.get("holder") == gateway_id and isinstance(
++                              res.get("spend_allowance"), dict) else None)
+ 
+     def acquire(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int,
+-                lane: str = "ready", source_protocol: Optional[int] = None) -> sync.Lease:
++                lane: str = "ready", source_protocol: Optional[int] = None,
++                expected_reviewer_allowance: Optional[dict] = None) -> sync.Lease:
+         return self._lease(board_id, {"action": "grant", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s, "lane": lane,
+-                                      **({"source_protocol": source_protocol} if source_protocol else {})}, run_uid)
++                                      **({"source_protocol": source_protocol} if source_protocol else {}),
++                                      "expected_reviewer_allowance": expected_reviewer_allowance}, run_uid, gateway_id)
+ 
+     def renew(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str, ttl_s: int) -> sync.Lease:
+-        return self._lease(board_id, {"action": "renew", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s}, run_uid)
++        return self._lease(board_id, {"action": "renew", "task": task_uid, "run_uid": run_uid, "ttl_s": ttl_s}, run_uid, gateway_id)
+ 
+     def release(self, *, board_id: str, task_uid: str, run_uid: str, gateway_id: str,
+                 unused_grant: bool = False) -> None:
+         # ``unused_grant``: released before anything started locally (the Board does not count it as a start).
+         self._lease(board_id, {"action": "release", "task": task_uid, "run_uid": run_uid,
+-                               **({"unused_grant": True} if unused_grant else {})}, run_uid)
++                               **({"unused_grant": True} if unused_grant else {})}, run_uid, gateway_id)
+diff --git a/hermes_cli/kanban_sync_hub_routes.py b/hermes_cli/kanban_sync_hub_routes.py
+index 9aba409edad051584c9bea62fb520b2ceb9c3562..4b3164ae45b46d68db0209347dc1c452ab91ee4c 100644
+--- a/hermes_cli/kanban_sync_hub_routes.py
++++ b/hermes_cli/kanban_sync_hub_routes.py
+@@ -40,6 +40,12 @@
+             "GET", f"/v2/boards/{quote(board, safe='')}/containment/capability"
+         )
+ 
++    def reviewer_allowance(self, board: str, task: str) -> dict:
++        """SELECT-only diagnostic, with a small hard response bound; never a lease grant."""
++        from urllib.parse import quote, urlencode
++        return self._call("GET", f"/v2/boards/{quote(board, safe='')}/reviewer-allowance?"
++                          + urlencode({"task": task}), max_response_bytes=8192)
++
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
+diff --git a/hermes_cli/kanban_terminal_run.py b/hermes_cli/kanban_terminal_run.py
+index 20f4b4e0a1d989fcd38984400c1e8352dc07ed9d..0049d59eb4e43f7910d093697d4154716e1675aa 100644
+--- a/hermes_cli/kanban_terminal_run.py
++++ b/hermes_cli/kanban_terminal_run.py
+@@ -37,6 +37,8 @@
+         return False
+     limits = budget.card_limits(conn, task_id, budget.limits())
+     spent = budget.spend(conn, task_id)
++    if spent.allowance is not None:  # the Board's lease allowance has no local count to reserve a last run from
++        return False
+     if not limits.runs or limits.runs - spent.runs != 1 or budget.over(spent, limits):
+         return False
+     from hermes_cli import kanban_db as kb
+diff --git a/tests/hermes_cli/test_kanban_allowance_maintenance.py b/tests/hermes_cli/test_kanban_allowance_maintenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ada1f5379ae9b69a500758ae94ef51de1bbd3251
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_allowance_maintenance.py
+@@ -0,0 +1,144 @@
++"""Real home decision/notice recovery of an exhausted Board allowance."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_allowance_maintenance as maintenance
++from hermes_cli import kanban_allowance_observation as observation
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from tests.hermes_cli import test_kanban_spend_allowance as fixtures
++from tests.hermes_cli import test_kanban_allowance_observation as reads
++
++kanban_home = fixtures.kanban_home
++primary = fixtures.primary
++
++
++@pytest.fixture(autouse=True)
++def isolated_cursors():
++    maintenance._CURSORS.clear()
++    yield
++    maintenance._CURSORS.clear()
++
++
++def _prepare(primary, monkeypatch, **changes):
++    tid, uid = fixtures._released(primary)
++    with fixtures.kbc.write_txn(primary):
++        primary.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, **changes))
++    return tid
++
++
++def test_exhaustion_creates_one_real_decision_episode_and_route(primary, monkeypatch):
++    tid = _prepare(primary, monkeypatch)
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    assert maintenance.sweep(primary) == [tid]
++    assert fixtures.kb.get_task(primary, tid).status == "triage"
++    stop = decision.pending_episode(primary, tid)
++    assert stop is not None
++    payload = json.loads(stop["payload"])
++    assert payload["allowance"]["remaining"] == 0
++    assert payload["allowance"]["review_uid"] == fixtures.REVIEW
++    episode = stop.get("uid") or str(stop["id"])
++    notice = primary.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                             (tid, decision.NOTICE)).fetchone()
++    assert notice is not None
++    assert json.loads(notice[0])["episode"] == episode
++    assert json.loads(notice[0])["producer"]["kind"] in {"supervisor", "chats", "unavailable"}
++    before = primary.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++    maintenance._CURSORS.clear()
++    assert maintenance.sweep(primary) == []
++    assert primary.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0] == before
++
++
++@pytest.mark.parametrize("status", ["running", "done", "archived", "blocked", "scheduled", "todo"])
++def test_no_other_lifecycle_state_is_triaged(primary, monkeypatch, status):
++    tid = _prepare(primary, monkeypatch)
++    observed = observation.read(primary, tid)
++    with fixtures.kbc.write_txn(primary):
++        primary.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++    assert not maintenance.triage(primary, tid, observed)
++    assert fixtures.kb.get_task(primary, tid).status == status
++
++
++def test_live_claim_cannot_be_triaged(primary, monkeypatch):
++    tid = _prepare(primary, monkeypatch)
++    observed = observation.read(primary, tid)
++    with fixtures.kbc.write_txn(primary):
++        primary.execute("UPDATE tasks SET claim_lock='other',claim_expires=? WHERE id=?", (int(time.time())+100, tid))
++    assert not maintenance.triage(primary, tid, observed)
++    assert fixtures.kb.get_task(primary, tid).status == "ready"
++
++
++def test_successor_budget_wins_before_write(primary, monkeypatch):
++    tid = _prepare(primary, monkeypatch)
++    observed = observation.read(primary, tid)
++    fixtures._override(primary, tid, runs=10, runs_basis=fixtures.allowance.BASIS, review_uid="new")
++    assert not maintenance.triage(primary, tid, observed)
++    assert fixtures.kb.get_task(primary, tid).status == "ready"
++
++
++def test_nonexhausted_never_triaged_and_paces_network(primary, monkeypatch):
++    tid = _prepare(primary, monkeypatch, used=9, remaining=1)
++    calls = reads._hub(monkeypatch, primary, reads._reply(primary, tid, fixtures.allowance.expected(primary, tid)["budget_event_uid"], used=9, remaining=1))
++    assert maintenance.sweep(primary) == []
++    assert maintenance.sweep(primary) == []
++    assert sum(call[0] == "read" for call in calls) == 1
++    assert fixtures.kb.get_task(primary, tid).status == "ready"
++
++
++def test_actual_dispatch_maintenance_calls_allowance_recovery_before_reviews(primary, monkeypatch):
++    from hermes_cli import kanban_dispatch_maintenance as dispatch
++    calls = []
++    monkeypatch.setattr(maintenance, "sweep", lambda conn: calls.append("allowance"))
++    monkeypatch.setattr(reviewer, "start_due", lambda conn: calls.append("review"))
++    dispatch._start_spend_reviews(primary)
++    assert calls == ["allowance", "review"]
++
++
++def test_cursor_advances_and_wraps_without_starving_healthy_prefix(primary, monkeypatch):
++    tids = sorted(_prepare(primary, monkeypatch, used=0, remaining=10) for _ in range(3))
++    clock = [100.0]
++    monkeypatch.setattr(maintenance.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(maintenance, "BATCH", 2)
++    calls = []
++    monkeypatch.setattr(observation, "read", lambda conn, tid, **kw: calls.append(tid))
++    assert maintenance.sweep(primary) == []
++    assert calls == tids[:2]
++    clock[0] += maintenance.CADENCE
++    maintenance.sweep(primary)
++    assert calls == tids
++    clock[0] += maintenance.CADENCE
++    maintenance.sweep(primary)
++    assert calls == tids + tids[:2]
++
++
++def test_foreign_copy_is_neither_read_nor_written(primary, monkeypatch):
++    from hermes_cli import kanban_wake_check
++    tid = _prepare(primary, monkeypatch)
++    observed = observation.read(primary, tid)
++    monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda conn, task: True)
++    calls = []
++    monkeypatch.setattr(observation, "read", lambda *a, **kw: calls.append(a))
++    assert maintenance.sweep(primary) == []
++    assert calls == []
++    assert not maintenance.triage(primary, tid, observed)
++    assert fixtures.kb.get_task(primary, tid).status == "ready"
++
++
++def test_expired_observation_preserves_ready(primary, monkeypatch):
++    tid = _prepare(primary, monkeypatch)
++    observed = observation.read(primary, tid)
++    monkeypatch.setattr(observation.time, "monotonic", lambda: observed.deadline)
++    assert not maintenance.triage(primary, tid, observed)
++    assert fixtures.kb.get_task(primary, tid).status == "ready"
++
++
++def test_sweep_never_reads_under_write_transaction(primary, monkeypatch):
++    _prepare(primary, monkeypatch)
++    calls = []
++    monkeypatch.setattr(observation, "read", lambda *a, **kw: calls.append(a))
++    with fixtures.kbc.write_txn(primary):
++        assert maintenance.sweep(primary) == []
++    assert calls == []
+diff --git a/tests/hermes_cli/test_kanban_allowance_observation.py b/tests/hermes_cli/test_kanban_allowance_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b19a1418f47d18e9310ca515f9daa142c82f8e4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_allowance_observation.py
+@@ -0,0 +1,135 @@
++"""Allowance diagnostics are bounded authenticated reads, never lease authority."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_allowance_observation as observation
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_spend_allowance as fixtures
++
++kanban_home = fixtures.kanban_home
++primary = fixtures.primary
++
++
++def _reply(conn, tid, uid, **changes):
++    return {"board": sync.sync_state(conn)["board_id"], "allowance": {
++        "runs_basis": "board_lease_allowance_v1", "task": tid, "review_uid": fixtures.REVIEW,
++        "budget_event_uid": uid, "episode": "stop-1", "home": "test-home", "state": "active",
++        "runs": 10, "used": 10, "remaining": 0, **changes}}
++
++
++def _hub(monkeypatch, conn, reply):
++    calls = []
++    class Hub:
++        def __init__(self, ident, *, deadline):
++            assert not conn.in_transaction
++            calls.append(("open", deadline))
++        def reviewer_allowance(self, board, task):
++            assert not conn.in_transaction
++            calls.append(("read", board, task))
++            if isinstance(reply, Exception):
++                raise reply
++            return reply
++        def close(self):
++            calls.append(("close",))
++    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="test-home"))
++    monkeypatch.setattr(client, "Hub", Hub)
++    return calls
++
++
++def test_exhaustion_is_exact_diagnostic_not_claim_evidence(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    calls = _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    result = observation.read(primary, tid)
++    assert result is not None and result.remaining == 0
++    assert result.expected == fixtures.allowance.expected(primary, tid)
++    assert result.board == sync.sync_state(primary)["board_id"]
++    assert observation.current(primary, tid, result)
++    assert calls[1] == ("read", result.board, tid)
++    assert calls[-1] == ("close",)
++    assert not fixtures.allowance.evidence_ok(result.expected, result)
++
++
++@pytest.mark.parametrize("changes", [
++    {"task": "other"}, {"review_uid": "other"}, {"budget_event_uid": "other"},
++    {"runs_basis": "unknown"}, {"state": "invalidated"}, {"runs": 11}, {"runs": True},
++    {"used": True}, {"used": -1}, {"used": 11}, {"remaining": True},
++    {"remaining": -1}, {"remaining": 11}, {"remaining": 1}, {"home": ""}, {"episode": ""},
++])
++def test_malformed_or_wrong_coordinates_never_prove_exhaustion(primary, monkeypatch, changes):
++    tid, uid = fixtures._released(primary)
++    _hub(monkeypatch, primary, _reply(primary, tid, uid, **changes))
++    assert observation.read(primary, tid) is None
++
++
++@pytest.mark.parametrize("reply", [None, [], {}, {"board": "wrong", "allowance": {}},
++                                  client.HubError(503, "rollover"), TimeoutError("deadline")])
++def test_absent_or_failed_read_does_not_invent_exhaustion(primary, monkeypatch, reply):
++    tid, _ = fixtures._released(primary)
++    calls = _hub(monkeypatch, primary, reply)
++    assert observation.read(primary, tid) is None
++    assert calls[-1] == ("close",)
++
++
++def test_write_transaction_refuses_before_identity_or_network(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    calls = _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    with fixtures.kbc.write_txn(primary):
++        assert observation.read(primary, tid) is None
++    assert calls == []
++
++
++def test_successor_override_invalidates_observation(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    result = observation.read(primary, tid)
++    fixtures._override(primary, tid, runs=10, runs_basis=fixtures.allowance.BASIS, review_uid="successor")
++    assert not observation.current(primary, tid, result)
++
++
++def test_observation_deadline_and_expiry(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    clock = [100.0]
++    monkeypatch.setattr(observation.time, "monotonic", lambda: clock[0])
++    calls = _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    result = observation.read(primary, tid)
++    assert calls[0] == ("open", 105.0)
++    clock[0] = 106.0
++    assert not observation.current(primary, tid, result)
++
++
++def test_route_quotes_coordinates_and_bounds_response():
++    calls = []
++    class Hub(client.HubRoutesMixin):
++        def _call(self, *args, **kwargs):
++            calls.append((args, kwargs))
++            return {"ok": True}
++    assert Hub().reviewer_allowance("a/b", "task&other") == {"ok": True}
++    assert calls == [(("GET", "/v2/boards/a%2Fb/reviewer-allowance?task=task%26other"),
++                      {"max_response_bytes": 8192})]
++
++
++def test_late_reply_is_not_an_observation(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    from itertools import chain, repeat
++    times = chain([100.0], repeat(106.0))
++    monkeypatch.setattr(observation.time, "monotonic", lambda: next(times))
++    _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    assert observation.read(primary, tid) is None
++
++
++def test_expired_shared_deadline_does_not_open_transport(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    monkeypatch.setattr(observation.time, "monotonic", lambda: 100.0)
++    calls = _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    assert observation.read(primary, tid, deadline=100.0) is None
++    assert calls == []
++
++
++def test_shared_deadline_cannot_extend_per_read_bound(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    monkeypatch.setattr(observation.time, "monotonic", lambda: 100.0)
++    calls = _hub(monkeypatch, primary, _reply(primary, tid, uid))
++    assert observation.read(primary, tid, deadline=1000.0) is not None
++    assert calls[0] == ("open", 105.0)
+diff --git a/tests/hermes_cli/test_kanban_allowance_supersession.py b/tests/hermes_cli/test_kanban_allowance_supersession.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..109781058fa8d112ce7f461a8c246dd2ff6104cd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_allowance_supersession.py
+@@ -0,0 +1,367 @@
++"""Only a human operator's canonical renewal replaces the Board's reviewer allowance; everything else holds."""
++import json
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_allowance_maintenance as maintenance
++from hermes_cli import kanban_allowance_observation as observation
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_release as release
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli import kanban_spend_caused_review as caused
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_allowance_observation as reads
++from tests.hermes_cli import test_kanban_spend_allowance as fixtures
++
++kanban_home = fixtures.kanban_home
++primary = fixtures.primary
++HUMAN = release.human_writer("test-operator")
++AGENT = ("agent", "20261112_052539_8d8534", "4242:HERMES_SESSION_ID")
++PERSON = renewal.Actor("human", None, "human")
++
++
++@pytest.fixture(autouse=True)
++def isolated_cursors():
++    maintenance._CURSORS.clear()
++    yield
++    maintenance._CURSORS.clear()
++
++
++def _generic(conn, tid, **payload):
++    """A later generic budget (a release or ``spend-budget``): cumulative locally, no private authority."""
++    return fixtures._override(conn, tid, **{"runs": 25, "cache_read_tokens": 0, "by": "user", **payload})
++
++
++def _ready(conn, tid):
++    with fixtures.kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++
++
++def _decided(primary, monkeypatch, **changes):
++    """Reviewer-released card a generic budget was later written over; the Board still reports its allowance."""
++    tid, uid = fixtures._released(primary)
++    _generic(primary, tid)
++    _ready(primary, tid)
++    calls = reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, used=3, remaining=7, **changes))
++    return tid, uid, calls
++
++
++def _stopped(conn, tid):
++    """An ordinary pending stop (no scope restriction) and a human mandate written after it."""
++    with fixtures.kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT, {"reason": "Spend budget: allowance exhausted"})
++    stop = decision.pending_episode(conn, tid)
++    return renewal.key(stop)
++
++
++# -- the Board's own state, whatever the local budget says ---------------------------------------------------
++
++@pytest.mark.parametrize("reply, want", [
++    ({"allowance": None}, {}), (None, None), ([], None), ({}, None), ({"board": "wrong", "allowance": None}, None),
++    (client.HubError(503, "rollover"), None), (TimeoutError("deadline"), None)])
++def test_board_state_separates_none_held_from_unknown(primary, monkeypatch, reply, want):
++    tid, _ = fixtures._released(primary)
++    if isinstance(reply, dict) and "board" not in reply and reply:
++        reply = {"board": fixtures.sync.sync_state(primary)["board_id"], **reply}
++    reads._hub(monkeypatch, primary, reply)
++    assert observation.board_state(primary, tid) == want
++
++
++@pytest.mark.parametrize("changes", [{"runs_basis": "unknown"}, {"task": "other"}, {"state": "superseded"},
++                                     {"state": None}, {"review_uid": ""}, {"review_uid": 7}, {"budget_event_uid": ""}])
++def test_board_state_malformed_allowance_is_unknown(primary, monkeypatch, changes):
++    tid, uid = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, **changes))
++    assert observation.board_state(primary, tid) is None
++
++
++@pytest.mark.parametrize("state", ["active", "invalidated"])
++def test_board_state_reports_a_held_allowance_without_local_agreement(primary, monkeypatch, state):
++    tid, _, calls = _decided(primary, monkeypatch, state=state)
++    seen = observation.board_state(primary, tid)
++    assert seen["state"] == state and seen["review_uid"] == fixtures.REVIEW
++    assert calls[-1] == ("close",)
++
++
++def test_board_state_never_reads_in_a_transaction_or_off_primary(primary, monkeypatch):
++    tid, _, calls = _decided(primary, monkeypatch)
++    with fixtures.kbc.write_txn(primary):
++        assert observation.board_state(primary, tid) is None
++    fixtures.sync.set_mode(primary, "shadow")
++    assert observation.board_state(primary, tid) is None
++    assert calls == []
++
++
++def test_board_state_deadline_is_bounded_and_an_expired_one_reads_nothing(primary, monkeypatch):
++    tid, _, calls = _decided(primary, monkeypatch)
++    clock = [100.0]
++    monkeypatch.setattr(observation.time, "monotonic", lambda: clock[0])
++    assert observation.board_state(primary, tid, deadline=100.0) is None
++    assert calls == []
++    assert observation.board_state(primary, tid, deadline=900.0)
++    assert calls[0] == ("open", 105.0)
++    assert observation.board_state(primary, tid, deadline=102.0)
++    assert ("open", 102.0) in calls
++
++
++def test_board_state_that_answers_after_its_deadline_is_unknown(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    clock = [100.0]
++    monkeypatch.setattr(observation.time, "monotonic", lambda: clock[0])
++
++    class Slow:
++        def __init__(self, ident, *, deadline):
++            pass
++
++        def reviewer_allowance(self, board, task):
++            clock[0] = 105.0
++            return reads._reply(primary, tid, uid)
++
++        def close(self):
++            pass
++    monkeypatch.setattr(client, "load_identity", lambda: SimpleNamespace(gateway="test-home"))
++    monkeypatch.setattr(client, "Hub", Slow)
++    assert observation.board_state(primary, tid) is None
++
++
++# -- decided but stuck ---------------------------------------------------------------------------------------
++
++def test_stuck_names_the_held_allowance_only_for_a_generic_newest_budget(primary, monkeypatch):
++    tid, _, calls = _decided(primary, monkeypatch)
++    held = observation.stuck(primary, tid)
++    assert (held.review_uid, held.state) == (fixtures.REVIEW, "active")
++    assert observation.still_stuck(primary, tid, held)
++    governed, _uid = fixtures._released(primary)  # newest budget is the Board's own: exhaustion's path, not this one
++    before = len(calls)
++    assert observation.stuck(primary, governed) is None
++    plain = kb.create_task(primary, title="never reviewed", assignee="worker")
++    _generic(primary, plain)
++    assert observation.stuck(primary, plain) is None
++    assert len(calls) == before  # neither asked the Board
++
++
++def test_stuck_is_not_claimed_when_the_board_holds_none_or_is_unknown(primary, monkeypatch):
++    tid, _uid = fixtures._released(primary)
++    _generic(primary, tid)
++    board = fixtures.sync.sync_state(primary)["board_id"]
++    reads._hub(monkeypatch, primary, {"board": board, "allowance": None})
++    assert observation.stuck(primary, tid) is None
++    reads._hub(monkeypatch, primary, client.HubError(503, "rollover"))
++    assert observation.stuck(primary, tid) is None
++    with fixtures.kbc.write_txn(primary):
++        assert observation.stuck(primary, tid) is None
++
++
++def test_still_stuck_is_invalidated_by_any_newer_budget_board_or_expiry(primary, monkeypatch):
++    tid, _, _ = _decided(primary, monkeypatch)
++    held = observation.stuck(primary, tid)
++    assert not observation.still_stuck(primary, tid, None)
++    monkeypatch.setattr(observation.time, "monotonic", lambda: held.deadline)
++    assert not observation.still_stuck(primary, tid, held)
++    monkeypatch.undo()
++    reads._hub(monkeypatch, primary, None)
++    assert observation.still_stuck(primary, tid, held)
++    assert not observation.still_stuck(primary, tid, observation.Held("other", held.budget, "r", "active", held.deadline))
++    _generic(primary, tid, runs=30)
++    assert not observation.still_stuck(primary, tid, held)
++    again = observation.Held(held.board, observation._budget(primary, tid), "r", "active", time.monotonic() + 5)
++    assert observation.still_stuck(primary, tid, again)
++    fixtures._override(primary, tid, runs=10, runs_basis=fixtures.allowance.BASIS, review_uid="successor")
++    assert not observation.still_stuck(primary, tid, observation.Held(
++        held.board, observation._budget(primary, tid), "r", "active", time.monotonic() + 5))
++
++
++@pytest.mark.parametrize("state", ["active", "invalidated"])
++def test_sweep_triages_a_decided_but_stuck_card_once_with_the_human_route(primary, monkeypatch, state):
++    tid, _, calls = _decided(primary, monkeypatch, state=state)
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    assert maintenance.sweep(primary) == [tid]
++    assert sum(call[0] == "read" for call in calls) == 1
++    assert kb.get_task(primary, tid).status == "triage"
++    stop = decision.pending_episode(primary, tid)
++    payload = json.loads(stop["payload"])
++    assert payload["allowance"] == {"basis": fixtures.allowance.BASIS, "review_uid": fixtures.REVIEW, "state": state,
++                                    "board": fixtures.sync.sync_state(primary)["board_id"], "superseded": False}
++    assert "hermes kanban release" in payload["reason"] and state in payload["reason"]
++    notice = primary.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, decision.NOTICE)).fetchone()
++    assert notice is not None and json.loads(notice[0])["episode"] == renewal.key(stop)
++    before = primary.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0]
++    maintenance._CURSORS.clear()
++    assert maintenance.sweep(primary) == []
++    assert primary.execute("SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)).fetchone()[0] == before
++
++
++def test_stuck_triage_refuses_foreign_stale_claimed_and_missing_readings(primary, monkeypatch):
++    from hermes_cli import kanban_wake_check
++    tid, _, _ = _decided(primary, monkeypatch)
++    held = observation.stuck(primary, tid)
++    assert not maintenance.triage_stuck(primary, tid, None)
++    with fixtures.kbc.write_txn(primary):
++        primary.execute("UPDATE tasks SET claim_lock='other',claim_expires=? WHERE id=?", (int(time.time()) + 100, tid))
++    assert not maintenance.triage_stuck(primary, tid, held)
++    with fixtures.kbc.write_txn(primary):
++        primary.execute("UPDATE tasks SET claim_lock=NULL,claim_expires=NULL WHERE id=?", (tid,))
++    monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda conn, task: True)
++    assert not maintenance.triage_stuck(primary, tid, held)
++    monkeypatch.setattr(kanban_wake_check, "foreign_copy", lambda conn, task: False)
++    _generic(primary, tid, runs=40)
++    assert not maintenance.triage_stuck(primary, tid, held)
++    assert kb.get_task(primary, tid).status == "ready"
++
++
++def test_a_healthy_or_unknown_card_is_never_triaged_as_stuck(primary, monkeypatch):
++    tid, _uid = fixtures._released(primary)
++    _generic(primary, tid)
++    _ready(primary, tid)
++    reads._hub(monkeypatch, primary, {"board": fixtures.sync.sync_state(primary)["board_id"], "allowance": None})
++    assert maintenance.sweep(primary) == []
++    maintenance._CURSORS.clear()
++    reads._hub(monkeypatch, primary, client.HubError(503, "rollover"))
++    assert maintenance.sweep(primary) == []
++    assert kb.get_task(primary, tid).status == "ready"
++
++
++# -- release: who may replace it -----------------------------------------------------------------------------
++
++def _state(tid, writer=HUMAN, authority="human"):
++    return SimpleNamespace(tid=tid, writer=writer, authority=authority)
++
++
++def _refusal(conn, s):
++    with pytest.raises(release.Refusal) as caught:
++        release._board_allowance(conn, s)
++    return caught.value.code
++
++
++def test_release_without_allowance_history_never_asks_the_board(primary, monkeypatch):
++    tid = kb.create_task(primary, title="plain", assignee="worker")
++    _generic(primary, tid)
++    calls = reads._hub(monkeypatch, primary, client.HubError(503, "down"))
++    s = _state(tid)
++    release._board_allowance(primary, s)
++    assert (s.supersede, s.keep_allowance, calls) == (False, False, [])
++
++
++def test_release_with_an_unreadable_or_invalidated_allowance_is_refused_for_everyone(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    for writer, authority in ((HUMAN, "human"), (AGENT, "chat")):
++        reads._hub(monkeypatch, primary, client.HubError(503, "down"))
++        assert _refusal(primary, _state(tid, writer, authority)) == "allowance_unreadable"
++        reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, state="invalidated"))
++        assert _refusal(primary, _state(tid, writer, authority)) == "allowance_invalidated"
++
++
++def test_release_after_the_board_retired_it_is_an_ordinary_release(primary, monkeypatch):
++    tid, _ = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, {"board": fixtures.sync.sync_state(primary)["board_id"], "allowance": None})
++    for writer, authority in ((HUMAN, "human"), (AGENT, "chat")):
++        s = _state(tid, writer, authority)
++        release._board_allowance(primary, s)
++        assert (s.supersede, s.keep_allowance) == (False, False)
++
++
++def test_only_a_human_operator_supersedes_an_active_allowance(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, used=4, remaining=6))
++    s = _state(tid)
++    release._board_allowance(primary, s)
++    assert (s.supersede, s.keep_allowance) == (True, False)
++    for writer, authority in ((AGENT, "chat"), (AGENT, "delegate"), (AGENT, "creator_task"), (AGENT, "human"),
++                              (HUMAN, "chat")):
++        s = _state(tid, writer, authority)
++        release._board_allowance(primary, s)
++        assert (s.supersede, s.keep_allowance) == (False, True), (writer, authority)
++
++
++def test_an_agent_release_never_replaces_an_exhausted_or_overwritten_allowance(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid))  # used 10, remaining 0
++    assert _refusal(primary, _state(tid, AGENT, "chat")) == "allowance_exhausted"
++    s = _state(tid)
++    release._board_allowance(primary, s)
++    assert s.supersede  # the human route the refusal names
++    _generic(primary, tid)
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, used=4, remaining=6))
++    assert _refusal(primary, _state(tid, AGENT, "chat")) == "allowance_in_force"
++
++
++def test_a_kept_allowance_writes_no_budget(primary, monkeypatch):
++    tid, _uid = fixtures._released(primary)
++    s = SimpleNamespace(tid=tid, writer=AGENT, runs=5, keep_allowance=True)
++    assert release._budget_plan(primary, s)[:2] == (None, None)
++    s.keep_allowance = False
++    assert release._budget_plan(primary, s)[0] == 5
++
++
++# -- the renewal a human supersession rides on ---------------------------------------------------------------
++
++def _mandate(conn, tid, kind="human"):
++    return kb.add_comment(conn, tid, "default", "Renewed: finish the acceptance.", writer_kind=kind,
++                          writer_session=AGENT[1] if kind == "agent" else None)
++
++
++def _prepare(conn, tid, episode, comment, actor=PERSON, **kw):
++    return renewal.prepare(conn, tid, episode=episode, comment_id=comment, reason="operator release", actor=actor, **kw)
++
++
++def test_allowance_only_renewal_is_a_human_path_that_covers_nothing(primary):
++    tid, _ = fixtures._released(primary)
++    episode = _stopped(primary, tid)
++    comment = _mandate(primary, tid)
++    payload = _prepare(primary, tid, episode, comment, allowance_only=True)
++    assert payload["covered_restriction_uids"] == [] and payload["authority_kind"] == "human"
++    for actor, kw in ((PERSON, {}), (renewal.Actor("agent", AGENT[1], "chat"), {"allowance_only": True}),
++                      (renewal.Actor("agent", AGENT[1], "human"), {"allowance_only": True}),
++                      (renewal.Actor("human", None, "delegate", ref="g"), {"allowance_only": True})):
++        with pytest.raises(renewal.RenewalRefused) as caught:
++            _prepare(primary, tid, episode, comment, actor=actor, **kw)
++        assert caught.value.code == "not_scope_stopped", (actor, kw)
++
++
++def test_allowance_only_renewal_keeps_the_mandate_fences(primary):
++    tid, _ = fixtures._released(primary)
++    early = _mandate(primary, tid)
++    episode = _stopped(primary, tid)
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        _prepare(primary, tid, episode, early, allowance_only=True)
++    assert caught.value.code == "mandate_stale"
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        _prepare(primary, tid, episode, _mandate(primary, tid, "agent"), allowance_only=True)
++    assert caught.value.code == "mandate_authority"
++    with pytest.raises(renewal.RenewalRefused) as caught:
++        _prepare(primary, tid, "another-stop", _mandate(primary, tid), allowance_only=True)
++    assert caught.value.code == "episode_mismatch"
++
++
++# -- advisory cap alignment ----------------------------------------------------------------------------------
++
++def _grant(conn, tid, episode):
++    with fixtures.kbc.write_txn(conn):
++        kb._append_event(conn, tid, "spend_review", {"version": 1, "verdict": "release", "episode": episode})
++
++
++def _renewed(conn, tid, **payload):
++    with fixtures.kbc.write_txn(conn):
++        kb._append_event(conn, tid, renewal.EVENT, {"version": 1, "authority_kind": "human", "actor_kind": "human",
++                                                    **payload})
++
++
++def test_grant_count_restarts_after_a_canonical_human_renewal_only(primary):
++    tid = kb.create_task(primary, title="capped", assignee="worker")
++    _grant(primary, tid, "stop-1")
++    _grant(primary, tid, "stop-2")
++    assert caused.grant_count(primary, tid) == 2
++    for forged in ({"authority_kind": "chat"}, {"actor_kind": "agent"}, {"version": 2}):
++        _renewed(primary, tid, **forged)
++        assert caused.grant_count(primary, tid) == 2, forged
++    _renewed(primary, tid)
++    assert caused.grant_count(primary, tid) == 0
++    _grant(primary, tid, "stop-3")
++    assert caused.grant_count(primary, tid) == 1
++    fixtures.sync.set_mode(primary, "shadow")  # no canonical Board decides here: stay conservative
++    assert caused.grant_count(primary, tid) == 3
+diff --git a/tests/hermes_cli/test_kanban_spend_allowance.py b/tests/hermes_cli/test_kanban_spend_allowance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0885e0fe9e66ca959d36c55b3cb2f268f12402ae
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_allowance.py
+@@ -0,0 +1,339 @@
++"""Portable board_lease_allowance_v1 consumer: the Board's lease grant counts, nothing local ever does."""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_spend_allowance as allowance
++from hermes_cli import kanban_spend_budget as budget
++from tests.hermes_cli import kanban_sync_support as support
++
++TEN = budget.Limits(10, 0)
++REVIEW = "rev-0001"
++LATER = int(time.time()) + 100_000  # read spend as of after the synthetic history below
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def lease_client():
++    yield from support.lease_client()
++
++
++@pytest.fixture
++def primary(kanban_home):
++    for conn in support.synced_conn(kanban_home):
++        sync.set_mode(conn, "primary")
++        yield conn
++
++
++def _override(conn, tid, **payload):
++    with kbc.write_txn(conn):
++        kb._append_event(conn, tid, budget.OVERRIDE_EVENT, payload)
++    if "uid" not in {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}:
++        return None
++    return conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
++                        (tid, budget.OVERRIDE_EVENT)).fetchone()[0]
++
++
++def _released(conn, **extra):
++    tid = kb.create_task(conn, title="reviewed", assignee="worker")
++    uid = _override(conn, tid, **{"runs": 10, "cache_read_tokens": None, "runs_basis": allowance.BASIS,
++                                  "review_uid": REVIEW, "by": "kanban-spend-reviewer", **extra})
++    return tid, uid
++
++
++def _history(conn, tid, n):
++    now = int(time.time()) + 10
++    with kbc.write_txn(conn):
++        for i in range(n):
++            conn.execute("INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
++                         "VALUES (?, 'crashed', 'crashed', ?, ?)", (tid, now + 200 * i, now + 200 * i + 120))
++
++
++def _evidence(uid, **over):
++    return {"basis": allowance.BASIS, "review_uid": REVIEW, "budget_event_uid": uid, "charged": True,
++            "remaining": 9, **over}
++
++
++def _grant_with(lease_client, evidence):
++    original = lease_client.acquire
++
++    def acquire(**kw):
++        lease = original(**kw)
++        return sync.Lease(**{**lease.__dict__, "spend_allowance": evidence})
++    lease_client.acquire = acquire
++
++
++@pytest.mark.parametrize("noise", ["foreign_budget", "other_kind"])
++def test_expected_ignores_newer_unrelated_events(primary, noise):
++    tid, event_uid = _released(primary)
++    if noise == "foreign_budget":
++        _released(primary)
++    else:
++        with kbc.write_txn(primary):
++            kb._append_event(primary, tid, "fixture_other", {"runs_basis": allowance.BASIS})
++    expected = allowance.expected(primary, tid)
++    assert expected is not None and expected["budget_event_uid"] == event_uid
++
++
++@pytest.mark.parametrize("data", [False, [], "malformed"])
++def test_explicit_nonmapping_override_is_legacy_not_an_exception(primary, data):
++    tid, _ = _released(primary)
++    assert allowance.expected(primary, tid, data) is None
++    assert allowance.state(primary, tid, data) is None
++
++
++def test_explicit_valid_data_without_event_has_no_authority(primary):
++    tid = kb.create_task(primary, title="no override", assignee="worker")
++    assert allowance.expected(primary, tid, {"runs_basis": allowance.BASIS, "runs": 10, "review_uid": REVIEW}) is None
++
++
++def test_legacy_schema_without_uid_is_unproven_not_an_exception():
++    import sqlite3
++    conn = sqlite3.connect(":memory:")
++    try:
++        conn.execute("CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
++        data = {"runs_basis": allowance.BASIS, "runs": 10, "review_uid": REVIEW}
++        conn.execute("INSERT INTO task_events(task_id,kind,payload) VALUES (?,?,?)", ("t", budget.OVERRIDE_EVENT, json.dumps(data)))
++        assert allowance.expected(conn, "t", data) is None
++        assert allowance.state(conn, "t", data) == allowance.UNPROVEN
++    finally:
++        conn.close()
++
++
++def test_replica_history_never_counts_for_a_recognized_board_allowance(primary):
++    tid, _ = _released(primary)
++    _history(primary, tid, 25)  # replica history far past the fixed ten
++    spent = budget.spend(primary, tid, as_of=LATER)
++    assert spent.allowance == allowance.BOARD and spent.runs >= 10
++    assert budget.over(spent, TEN) is None
++
++
++def test_cache_limit_still_cumulative_under_board_allowance(primary):
++    tid, _ = _released(primary)
++    spent = budget.spend(primary, tid)._replace(tokens={**budget.spend(primary, tid).tokens, "cache_read_tokens": 5})
++    assert budget.over(spent, budget.Limits(10, 5)) == "cache_read_tokens"
++
++
++@pytest.mark.parametrize("extra", [{"runs": 10.0}, {"runs": True}, {"runs": 11}, {"review_uid": ""},
++                                   {"review_uid": 123}, {"runs_basis": None}, {"runs_basis": ""},
++                                   {"runs_basis": "source_attempt_allowance_v1"}, {"runs_basis": "v2"}])
++def test_malformed_or_unknown_basis_holds_without_cumulative_fallback(primary, extra):
++    tid, _ = _released(primary, **extra)  # zero history: a cumulative fallback would admit
++    spent = budget.spend(primary, tid)
++    assert spent.allowance == allowance.UNPROVEN
++    assert budget.over(spent, TEN) == "runs"
++
++
++def test_unsynced_board_never_grants_a_local_allowance(kanban_home):
++    conn = kbc.connect(kanban_home / "kanban.db")
++    try:
++        tid, _ = _released(conn)
++        assert budget.over(budget.spend(conn, tid), TEN) == "runs"
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("mode", ["off", "shadow"])
++def test_nonprimary_mode_with_valid_uid_never_authorizes(primary, mode):
++    tid, uid = _released(primary)
++    assert uid and allowance.expected(primary, tid) is not None
++    sync.set_mode(primary, mode)
++    assert allowance.expected(primary, tid) is None
++    assert allowance.state(primary, tid) == allowance.UNPROVEN
++    assert budget.over(budget.spend(primary, tid), TEN) == "runs"
++
++
++def test_claim_admits_only_with_exact_board_charge(primary, lease_client):
++    tid, uid = _released(primary)
++    _history(primary, tid, 25)
++    _grant_with(lease_client, _evidence(uid))
++    assert kb.claim_task(primary, tid, ttl_seconds=900, claimer="host:a") is not None
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("evidence", [None, "missing-field", "wrong-review", "wrong-budget", "uncharged",
++                                      "float-remaining", "negative", "basis", "full", "bool", "truthy"])
++def test_old_or_skewed_board_evidence_refuses_and_releases(primary, lease_client, evidence, lane):
++    tid, uid = _released(primary)
++    if lane == "review":
++        with kbc.write_txn(primary):
++            primary.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++    bad = {None: None, "missing-field": {k: v for k, v in _evidence(uid).items() if k != "remaining"},
++           "wrong-review": _evidence(uid, review_uid="rev-other"), "wrong-budget": _evidence(uid, budget_event_uid="x"),
++           "uncharged": _evidence(uid, charged=False), "float-remaining": _evidence(uid, remaining=9.0),
++           "full": _evidence(uid, remaining=10), "bool": _evidence(uid, remaining=True),
++           "truthy": _evidence(uid, charged=1),
++           "negative": _evidence(uid, remaining=-1), "basis": _evidence(uid, basis="source_attempt_allowance_v1")}
++    _grant_with(lease_client, bad[evidence])
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(primary, tid, ttl_seconds=900, claimer="host:a") is None
++    assert str(sync.pop_claim_deferral(tid)) == allowance.REFUSAL
++    assert primary.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == lane
++    assert [kw.get("unused_grant") for kind, kw in lease_client.calls if kind == "release"] == [True]
++
++
++def test_newer_ordinary_override_supersedes_allowance(primary, lease_client):
++    tid, _uid = _released(primary)
++    _override(primary, tid, runs=10, cache_read_tokens=None, by="someone")
++    _history(primary, tid, 12)
++    spent = budget.spend(primary, tid, as_of=LATER)
++    assert spent.allowance is None and spent.runs >= 10
++    assert budget.over(spent, TEN) == "runs"  # cumulative again
++
++
++def test_hub_client_parses_grant_evidence_only_when_granted():
++    from hermes_cli import kanban_sync_client as ksc
++
++    class FakeHub:
++        def __init__(self, res):
++            self.res = res
++
++        def leases(self, board, body):
++            return self.res
++    ev = {"basis": allowance.BASIS, "remaining": 3}
++    granted = ksc.HubLeaseClient(FakeHub({"status": "applied", "lease": {"run_uid": "r1", "expires": 1, "task_id": "t", "holder": "g"},
++                                          "spend_allowance": ev}))
++    assert granted.acquire(board_id="b", task_uid="t", run_uid="r1", gateway_id="g", ttl_s=5).spend_allowance == ev
++    denied = ksc.HubLeaseClient(FakeHub({"status": "rejected", "reason": "spend_allowance_exhausted",
++                                         "spend_allowance": ev}))
++    lease = denied.acquire(board_id="b", task_uid="t", run_uid="r1", gateway_id="g", ttl_s=5)
++    assert not lease.granted and lease.spend_allowance is None and lease.reason == "spend_allowance_exhausted"
++    assert json.dumps(ev)
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_expected_identity_reaches_claim_client(primary, lease_client, lane):
++    tid, event = _released(primary)
++    if lane == "review":
++        with kbc.write_txn(primary):
++            primary.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++    _grant_with(lease_client, _evidence(event))
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(primary, tid, ttl_seconds=900, claimer="host:a") is not None
++    acquire = [kw for kind, kw in lease_client.calls if kind == "acquire"]
++    assert acquire[0]["expected_reviewer_allowance"] == {"review_uid": REVIEW, "budget_event_uid": event}
++
++
++def test_portable_reply_cannot_authorize_legacy_local_view(primary, lease_client):
++    tid = kb.create_task(primary, title="status page before budget page", assignee="worker")
++    _grant_with(lease_client, _evidence("missing-budget-page"))
++    assert kb.claim_task(primary, tid, ttl_seconds=900, claimer="host:a") is None
++    assert [kw.get("unused_grant") for kind, kw in lease_client.calls if kind == "release"] == [True]
++
++
++@pytest.mark.parametrize("remaining", [0, 9])
++def test_last_and_first_charged_grants_admit(primary, lease_client, remaining):
++    tid, event = _released(primary)
++    _grant_with(lease_client, _evidence(event, remaining=remaining))
++    assert kb.claim_task(primary, tid, ttl_seconds=900, claimer="host:a") is not None
++
++
++def test_expected_uses_newest_budget_identity(primary):
++    tid, old = _released(primary)
++    new = _override(primary, tid, runs=10, runs_basis=allowance.BASIS, review_uid="successor")
++    assert new != old
++    assert allowance.expected(primary, tid) == {
++        "basis": allowance.BASIS, "review_uid": "successor", "budget_event_uid": new}
++
++
++@pytest.mark.parametrize("field", ["run_uid", "task_id", "holder"])
++def test_hub_client_wrong_lease_identity_never_supplies_charge(field):
++    from hermes_cli import kanban_sync_client as ksc
++
++    class Hub:
++        def leases(self, board, body):
++            return {"status": "applied", "lease": {"run_uid": "r", "task_id": "t", "holder": "g", field: "foreign"},
++                    "spend_allowance": _evidence("e")}
++
++    lease = ksc.HubLeaseClient(Hub()).acquire(board_id="b", task_uid="t", run_uid="r", gateway_id="g", ttl_s=5)
++    assert lease.spend_allowance is None
++
++
++def test_terminal_reservation_never_invents_local_allowance(primary, monkeypatch):
++    from hermes_cli import kanban_terminal_run as terminal_run, kanban_continuation as continuation
++    tid, _ = _released(primary)
++    monkeypatch.setattr(continuation, "park_state", lambda *_: {
++        "timed": True, "payload": {"wake_check": "true", "probe_host": "remote-fixture"}})
++    observed = budget.spend(primary, tid)._replace(runs=9)
++    monkeypatch.setattr(budget, "spend", lambda *_: observed)
++    assert not terminal_run.reserve(primary, tid, "continuation_woken")
++    assert primary.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='terminal_run_reserved'", (tid,)).fetchone()[0] == 0
++    # Adjacent ordinary-accounting control proves the tested guard is reached.
++    observed = observed._replace(allowance=None)
++    with kbc.write_txn(primary):
++        assert terminal_run.reserve(primary, tid, "continuation_woken")
++
++
++def test_final_boundary_rejects_unproven_even_if_earlier_gate_was_bypassed(primary):
++    from types import SimpleNamespace
++    tid, event = _released(primary, runs_basis="retired")
++    assert allowance.grant_refusal(primary, tid, SimpleNamespace(lease=SimpleNamespace(spend_allowance=_evidence(event)))) == allowance.REFUSAL
++
++
++def test_missing_budget_uid_never_authorizes(primary):
++    tid, _ = _released(primary)
++    with kbc.write_txn(primary):
++        primary.execute("UPDATE task_events SET uid=NULL WHERE task_id=? AND kind=?", (tid, budget.OVERRIDE_EVENT))
++    assert allowance.state(primary, tid) == allowance.UNPROVEN
++
++
++@pytest.mark.parametrize("got", [None, [], "bad", True])
++def test_malformed_proof_is_not_evidence(got):
++    assert not allowance.evidence_ok({"basis": allowance.BASIS}, got)
++    assert not allowance.evidence_ok(None, _evidence("e"))
++
++
++def test_claim_carries_exact_budget_identity(primary, lease_client):
++    tid, event_uid = _released(primary)
++    original = lease_client.acquire
++    calls = []
++
++    def acquire(**kwargs):
++        calls.append(kwargs)
++        lease = original(**kwargs)
++        return sync.Lease(**{**lease.__dict__, "spend_allowance": _evidence(event_uid)})
++
++    lease_client.acquire = acquire
++    assert kb.claim_task(primary, tid, ttl_seconds=900, claimer="host:a") is not None
++    assert calls[0]["expected_reviewer_allowance"] == {"review_uid": REVIEW, "budget_event_uid": event_uid}
++
++
++@pytest.mark.parametrize("status,proof", [("rejected", _evidence("e")), ("applied", []), ("applied", "bad")])
++def test_hub_client_never_attaches_ungranted_or_nonmapping_proof(status, proof):
++    from hermes_cli import kanban_sync_client as ksc
++
++    class Hub:
++        def leases(self, board, body):
++            return {"status": status, "reason": "fixture", "lease": {
++                "task_id": "t", "run_uid": "r", "holder": "g"}, "spend_allowance": proof}
++
++    result = ksc.HubLeaseClient(Hub()).acquire(board_id="b", task_uid="t", run_uid="r", gateway_id="g", ttl_s=5)
++    assert result.spend_allowance is None
++
++
++def test_hub_client_always_sends_observed_allowance_identity():
++    from hermes_cli import kanban_sync_client as ksc
++    calls = []
++
++    class Hub:
++        def leases(self, board, body):
++            calls.append(body)
++            return {"status": "rejected", "reason": "fixture"}
++
++    lease = ksc.HubLeaseClient(Hub())
++    args = dict(board_id="b", task_uid="t", run_uid="r", gateway_id="g", ttl_s=5)
++    lease.acquire(**args)
++    assert "expected_reviewer_allowance" in calls[-1] and calls[-1]["expected_reviewer_allowance"] is None
++    identity = {"review_uid": "r1", "budget_event_uid": "e1"}
++    lease.acquire(**args, expected_reviewer_allowance=identity)
++    assert calls[-1]["expected_reviewer_allowance"] == identity
+diff --git a/tests/hermes_cli/test_kanban_spend_allowance_board.py b/tests/hermes_cli/test_kanban_spend_allowance_board.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad86b18226cd10155e21dd5f22f52670fd49e325
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_allowance_board.py
+@@ -0,0 +1,609 @@
++"""Real local Board HTTP/DO -> sync shadow -> pickup -> Core claim composition.
++
++Opt in: B2_M1_LOCAL_BOARD_URL=http://127.0.0.1:8793 bash scripts/run_tests.sh <this file>
++Start the recovered Board with `npx wrangler dev --local --ip 127.0.0.1 --port 8793
++--var ADMIN_KEY_SHA256:<sha256-of-test-admin-key> --persist-to <disposable directory>` first.
++No production enrollment, signer, provider call or permission changes.
++"""
++import hashlib
++import json
++import os
++import uuid
++from contextlib import closing
++from urllib.request import Request, urlopen
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as worker
++from hermes_cli import kanban_spend_allowance as allowance
++from tests.hermes_cli import kanban_sync_support as support
++
++BOARD = "default"
++QUOTE = "Remaining work is the portable allowance composition and its refusal proof."
++
++
++def uid():
++    return uuid.uuid4().hex
++
++
++@pytest.fixture
++def composed(tmp_path, monkeypatch):
++    url = os.environ.get("B2_M1_LOCAL_BOARD_URL")
++    if not url:
++        pytest.skip("requires isolated local wrangler Board")
++    assert url.startswith("http://127.0.0.1:")
++    root = support.kanban_home(tmp_path, monkeypatch)
++    # Each fixture owns a separate real Durable Object. A shared "default" Board
++    # accumulates every prior test run and makes full snapshots quadratic across reruns.
++    monkeypatch.setattr(__name__ + ".BOARD", "allowance-" + uid())
++    conns = []
++    fixture_label = "fixture:" + uid()
++    previous = sync.set_lease_client(None)
++
++    def api(path, payload, key="test-admin-key"):
++        with urlopen(Request(url + path, json.dumps(payload).encode(),
++                             {"Content-Type": "application/json", "Authorization": "Bearer " + key}), timeout=20) as res:
++            return json.load(res)
++
++    class Gateway:
++        def __init__(self, prefix):
++            self.name = prefix + uid()[:12]
++            key = "hmk_" + uid()
++            entry = api("/v1/admin/gateways", {"name": self.name})
++            api("/v1/enroll", {"gateway": self.name, "code": entry["code"],
++                              "key_sha256": hashlib.sha256(key.encode()).hexdigest()}, key)
++            api(f"/v1/admin/gateways/{self.name}/machine", {
++                "labels": ["linux", "pool:worker", "profile:default", fixture_label], "pickup": "explicit", "max_card_runs": 12})
++            self.hub = client.Hub(client.Identity(url, key, self.name))
++            self.home = root / self.name
++            self.home.mkdir()
++            self.path = self.home / "kanban" / "boards" / BOARD / "kanban.db"
++            self.path.parent.mkdir(parents=True)
++            from tests.hermes_cli.test_kanban_managed_pin_policy import _managed_yaml
++            (self.home / "config.yaml").write_text("kanban:\n  sync:\n    enabled: true\n    pickup: explicit\n" + _managed_yaml())
++            self.enter()
++            self.conn = kbc.connect(self.path)
++            conns.append(self.conn)
++            client.ensure_identity(self.conn, BOARD, self.name)
++            sync.set_mode(self.conn, "primary")
++
++        def enter(self):
++            monkeypatch.setenv("HERMES_HOME", str(self.home))
++            monkeypatch.setattr(client, "load_identity", lambda: self.hub.ident)
++            sync.set_lease_client(client.HubLeaseClient(self.hub))
++            worker.set_registry_fetch(self.hub.machines)
++
++        def round(self):
++            self.enter()
++            result = client.sync_board(BOARD, self.path, self.hub, self.name)
++            assert result.error is None, result
++            assert result.push is None or result.push.rejected == 0, result
++            return result
++
++        def reopen(self):
++            conns.remove(self.conn)
++            self.conn.close()
++            self.enter()
++            self.conn = kbc.connect(self.path)
++            conns.append(self.conn)
++
++    try:
++        home, pool = Gateway("m1home-"), Gateway("m1pool-")
++        home.enter()
++        task = kb.create_task(home.conn, title="isolated M1 portable proof", assignee="default",
++                              runs_on=["pool:worker", fixture_label])
++        home.round()
++        # Establish the caused stop through the actual authenticated lifecycle endpoint.
++
++        run = uid()
++        lease = home.hub.leases(BOARD, {"action": "grant", "task": task, "run_uid": run, "ttl_s": 900})
++        assert lease["status"] == "applied", lease
++        retained = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "retain", "task": task, "run_uid": run,
++            "event_uid": uid(), "expected_episode": None, "payload": {"version": 1, "summary": QUOTE,
++            "reason": "scope_stopped", "next_step": "Owner decides", "release_condition": "Scoped decision",
++            "evidence": ["isolated composition fixture"]}}])
++        assert retained["results"][0]["status"] == "applied", retained
++        snap = home.hub._call("GET", f"/v2/boards/{BOARD}/snapshot")
++        episode = [e for e in snap["task_events"] if e["task_id"] == task and e["kind"] == "spend_budget_triaged"][-1]["uid"]
++        review = uid()
++        released = home.hub.ops(BOARD, [{"client_op_id": review, "op": "spend_review", "task": task,
++            "event_uid": review, "episode": episode, "verdict": "release", "reason": "unfinished proof", "quote": QUOTE}])
++        assert released["results"][0]["status"] == "applied", released
++        pool.round()
++        pool.enter()
++        picked = worker.pickup(pool.conn, budget=1)
++        with closing(worker.open_replica(pool.conn)) as replica:
++            diagnostic = worker._evaluate(pool.conn, replica, pool.name, mode="explicit", limit=1,
++                profile_exists=None, full_detail="fixture batch full")
++        assert picked == [task], diagnostic
++        assert pool.conn.execute("SELECT created_on FROM tasks WHERE id=?", (task,)).fetchone()[0] == home.name
++        assert allowance.state(pool.conn, task) == allowance.BOARD
++        yield home, pool, task
++    finally:
++        for conn in conns:
++            conn.close()
++        sync.set_lease_client(previous)
++        worker.set_registry_fetch(None)
++        client.reset_board_watch()
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_safety_stop_never_renews_or_spends_existing_allowance(composed, lane):
++    import time
++    home, pool, task = composed
++    run = uid()
++    granted = home.hub.leases(BOARD, {"action": "grant", "task": task, "run_uid": run, "ttl_s": 900})
++    assert granted["status"] == "applied", granted
++    lock = home.name + ":fixture"
++    entries = []
++    for kind, payload in [("worker_bound", {"pid": 321, "claim_lock": lock}), ("worker_result", {
++        "pid": 321, "claim_lock": lock, "exit_code": 1, "failed": True,
++        "failure_reason": "content_policy_blocked", "failure_retryable": False})]:
++        entries.append({"client_op_id": uid(), "op": "upsert", "table": "task_events", "uid": uid(),
++            "hlc": f"{int(time.time() * 1000):013d}-0000-fixture", "fields": {
++                "task_id": task, "run_uid": run, "kind": kind, "payload": json.dumps(payload),
++                "created_at": int(time.time())}})
++    result = home.hub.ops(BOARD, entries)
++    assert all(r["status"] == "applied" for r in result["results"]), result
++    # The canonical terminal release settles typed refusal evidence; row publication
++    # alone is not terminal settlement. Deliberately supply no retry/fallback request.
++    terminal = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "release", "task": task,
++        "run_uid": run, "outcome": "crashed"}])
++    assert terminal["results"][0]["status"] == "applied", terminal
++    snapshot = home.hub._call("GET", f"/v2/boards/{BOARD}/snapshot")
++    stops = [e for e in snapshot["task_events"] if e["task_id"] == task and e["kind"] == "spend_budget_triaged"
++             and json.loads(e["payload"]).get("cause") == "safety_refusal"]
++    assert len(stops) == 1
++    review = uid()
++    denied = home.hub.ops(BOARD, [{"client_op_id": review, "op": "spend_review", "task": task,
++        "event_uid": review, "episode": stops[0]["uid"], "verdict": "release", "reason": "fixture forbidden retry", "quote": QUOTE}])
++    assert denied["results"][0]["reason"] == "safety_restricted", denied
++    pool.round()
++    pool.enter()
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:safety") is None
++    assert pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]["used"] == 1
++    # The one debit preceded the typed refusal. Neither denied reviewer nor later claim debits.
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_human_hold_never_spends_portable_allowance(composed, lane):
++    home, pool, task = composed
++    if lane == "review":
++        out = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert out["results"][0]["status"] == "applied", out
++        pool.round()
++    # Install the hold on the actual authority, not an unpushed local field which
++    # the authoritative grant snapshot is allowed to replace.
++    import time
++    out = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "upsert", "table": "tasks", "uid": task,
++        "hlc": f"{int(time.time() * 1000):013d}-0000-fixture", "fields": {
++            "human_request": json.dumps({"action": "fixture human step"}),
++            "status": "blocked", "block_kind": "needs_input"}}])
++    assert out["results"][0]["status"] == "applied", out
++    pool.round()
++    pool.enter()
++    held = kb.get_task(pool.conn, task)
++    assert held is not None and held.human_request and held.status == "blocked"
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:human") is None
++    assert pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]["used"] == 0
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_cache_hold_still_refuses_without_board_debit(composed, monkeypatch, lane):
++    home, pool, task = composed
++    if lane == "review":
++        out = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert out["results"][0]["status"] == "applied", out
++        pool.round()
++    pool.enter()
++    want = allowance.expected(pool.conn, task)
++    assert want is not None
++    # Deliberately narrow the replica's cache budget while keeping a recognized
++    # portable run basis. Real history accounting must stop before any lease RPC.
++    with kbc.write_txn(pool.conn):
++        kb._append_event(pool.conn, task, "spend_budget_set", {
++            "runs": 10, "runs_basis": allowance.BASIS, "review_uid": want["review_uid"],
++            "cache_read_tokens": 1, "cache_read_writer_kind": "human", "writer_kind": "human"})
++        run = pool.conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id LIMIT 1", (task,)).fetchone()[0]
++        kb._append_event(pool.conn, task, "worker_result", {"usage": {"cache_read_tokens": 10}}, run_id=run)
++    from hermes_cli import kanban_spend_budget as budget
++    assert budget.spend(pool.conn, task).tokens["cache_read_tokens"] >= 10
++    observed = []
++    original = pool.hub.leases
++
++    def watch(board, body):
++        observed.append(body)
++        return original(board, body)
++
++    monkeypatch.setattr(pool.hub, "leases", watch)
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:cache") is None
++    assert str(sync.pop_claim_deferral(task)) == "spend_budget_exhausted"
++    assert observed == []
++    assert pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]["used"] == 0
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_snapshot_status_before_budget_refuses_then_recovers(composed, monkeypatch, lane):
++    home, pool, task = composed
++    if lane == "review":
++        out = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert out["results"][0]["status"] == "applied", out
++    pool.enter()
++    # The fixture first proves real foreign pickup. This independent cold rebuild then
++    # pauses at the actual HTTP table-page boundary, with status present but no budget.
++    with closing(kbc.connect(pool.home / "paged-recovery.db")) as conn:
++        client.ensure_identity(conn, BOARD, pool.name)
++        sync.set_mode(conn, "primary")
++        original = pool.hub.snapshot_page
++        observed = []
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++
++        def page(board, table, after="", limit=1000):
++            if table == "task_events" and not observed:
++                partial = kb.get_task(conn, task)
++                assert partial is not None and partial.status == lane
++                assert allowance.state(conn, task) is None
++                assert claim(conn, task, ttl_seconds=900, claimer="fixture:paged") is None
++                assert str(sync.pop_claim_deferral(task)) == "reviewer_allowance_changed"
++                before = pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]
++                assert before["used"] == 0
++                observed.append(before)
++            response = original(board, table, after, 7 if table == "task_events" else limit)
++            if table == "task_events":
++                snapshot_events.extend(response["rows"])
++            return response
++
++        snapshot_events = []
++        monkeypatch.setattr(pool.hub, "snapshot_page", page)
++        client.resync(conn, pool.hub, BOARD, observers=False)
++        # Actual HTTP pagination must transport canonical arrival order, not UID,
++        # writer clock, or mutable feed seq. Local arrival reducers depend on it.
++        canonical = [e["uid"] for e in sorted(snapshot_events, key=lambda e: (e["ord"], e["uid"]))]
++        assert [e["uid"] for e in snapshot_events] == canonical
++        imported = [r[0] for r in conn.execute("SELECT uid FROM task_events ORDER BY id")]
++        assert imported == canonical
++        assert len(observed) == 1
++        assert allowance.state(conn, task) == allowance.BOARD
++        result = claim(conn, task, ttl_seconds=900, claimer="fixture:paged")
++        from hermes_cli import kanban_spend_decision as decision
++        assert result is not None, json.dumps({"reason": str(sync.pop_claim_deferral(task)),
++            "pending": decision.pending_episode(conn, task),
++            "events": [dict(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=?", (task,))],
++            "picked_events": [dict(r) for r in pool.conn.execute("SELECT * FROM task_events WHERE task_id=?", (task,))]}, default=str)
++        after = pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]
++        assert after["used"] == 1 and after["remaining"] == 9
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_foreign_pickup_exact_debit(composed, lane):
++    home, pool, task = composed
++    pool.reopen()  # persisted foreign pickup survives a real SQLite close/reopen
++    if lane == "review":
++        # Supported ready->review command, synchronized before the real review claim.
++        out = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert out["results"][0]["status"] == "applied", out
++        pool.round()
++    pool.enter()
++    want = allowance.expected(pool.conn, task)
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    result = claim(pool.conn, task, ttl_seconds=900, claimer="fixture:pool")
++    assert result is not None, sync.pop_claim_deferral(task)
++    run = pool.conn.execute("SELECT uid FROM task_runs WHERE id=?", (result.current_run_id,)).fetchone()[0]
++    response = pool.hub.leases(BOARD, {"action": "grant", "task": task, "run_uid": run, "lane": lane})
++    assert response["lease"]["holder"] == pool.name
++    assert response["lease"]["run_uid"] == run
++    assert allowance.evidence_ok(want, response["spend_allowance"])
++    assert response["reviewer_allowance"]["used"] == 1
++    assert response["spend_allowance"]["remaining"] == 9
++    # A second run cannot borrow this debit, even through the real response parser.
++    other = client.HubLeaseClient(pool.hub).acquire(board_id=BOARD, task_uid=task,
++        run_uid=uid(), gateway_id=pool.name, ttl_s=900, lane=lane)
++    assert not other.granted and other.spend_allowance is None
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("fault", ["missing", "review", "budget", "charged", "remaining", "basis", "task", "holder", "run"])
++def test_real_grant_corrupt_evidence_never_claims(composed, monkeypatch, lane, fault):
++    home, pool, task = composed
++    if lane == "review":
++        out = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert out["results"][0]["status"] == "applied", out
++        pool.round()
++    pool.enter()
++    original = pool.hub.leases
++    observed = []
++
++    def corrupt(board, body):
++        response = original(board, body)
++        observed.append((dict(body), response))
++        if body["action"] == "grant" and response["status"] == "applied":
++            if fault in {"task", "holder", "run"}:
++                field = {"task": "task_id", "holder": "holder", "run": "run_uid"}[fault]
++                return {**response, "lease": {**response["lease"], field: "foreign"}}
++            evidence = dict(response["spend_allowance"])
++            if fault == "missing":
++                evidence = None
++            else:
++                field, value = {"review": ("review_uid", "stale"), "budget": ("budget_event_uid", "stale"),
++                    "charged": ("charged", False), "remaining": ("remaining", 9.0),
++                    "basis": ("basis", "retired")}[fault]
++                evidence[field] = value
++            return {**response, "spend_allowance": evidence}
++        return response
++
++    monkeypatch.setattr(pool.hub, "leases", corrupt)
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:pool") is None
++    expected_reason = "denied" if fault == "run" else allowance.REFUSAL
++    assert str(sync.pop_claim_deferral(task)) == expected_reason
++    assert kb.get_task(pool.conn, task).current_run_id is None
++    # Wrong run identity is rejected by lease admission itself, before an owned
++    # grant exists locally. Do not release somebody else's reported run.
++    expected_releases = [] if fault == "run" else [True]
++    assert [body["unused_grant"] for body, _ in observed if body["action"] == "release"] == expected_releases
++    canonical = pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]
++    assert canonical["used"] == 1 and canonical["remaining"] == 9  # release never refunds
++
++
++@pytest.mark.parametrize("kind", ["stale", "removed", "unknown", "malformed"])
++def test_local_budget_disagreement_never_burns_private_allowance(composed, kind):
++    _, pool, task = composed
++    from tests.hermes_cli.test_kanban_spend_allowance import _override
++    payload = {"runs": 10, "review_uid": "stale", "runs_basis": allowance.BASIS}
++    if kind == "removed":
++        payload.pop("runs_basis")
++    elif kind == "unknown":
++        payload["runs_basis"] = "retired"
++    elif kind == "malformed":
++        payload["runs"] = True
++    # A local forged/stale newest override is not canonical Board authority.
++    _override(pool.conn, task, **payload)
++    for _ in range(2):
++        assert kb.claim_task(pool.conn, task, ttl_seconds=900, claimer="fixture:pool") is None
++    canonical = pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]
++    assert canonical["used"] == 0 and canonical["remaining"] == 10
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_zero_cumulative_spend_still_exhausts_on_board(composed, lane):
++    home, pool, task = composed
++    for _ in range(10):
++        run = uid()
++        reply = pool.hub.leases(BOARD, {"action": "grant", "task": task, "run_uid": run})
++        assert reply["status"] == "applied", reply
++        released = pool.hub.leases(BOARD, {"action": "release", "task": task, "run_uid": run, "unused_grant": True})
++        assert released["status"] == "applied", released
++    if lane == "review":
++        result = home.hub.ops(BOARD, [{"client_op_id":uid(), "op":"request_review", "task":task}])
++        assert result["results"][0]["status"] == "applied", result
++    pool.round()
++    pool.reopen()
++    from hermes_cli import kanban_spend_budget as budget
++    assert budget.spend(pool.conn, task).runs == 0
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:pool") is None
++    assert str(sync.pop_claim_deferral(task)) == "reviewer_allowance_exhausted"
++    canonical = pool.hub._call("GET", f"/v2/boards/{BOARD}/reviewer-allowance?task={task}")["allowance"]
++    assert canonical["used"] == 10 and canonical["remaining"] == 0
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_ordinary_after_renewed_scope_gets_canonical_fresh_round(composed, lane, monkeypatch):
++    import time
++    from hermes_cli import kanban_allowance_maintenance as maintenance
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    home, pool, task = composed
++    # Real integer-second ordering: ordinary review requires a spending run strictly
++    # after the earlier scope release's promotion. This is not a mocked Board clock.
++    from tests.waiting import wait_until
++    promotion = pool.conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id=? AND kind='promoted_manual'",
++                                  (task,)).fetchone()[0]
++    assert promotion is not None
++    wait_until(lambda: int(time.time()) > promotion, what="real clock past canonical promotion second")
++    for _ in range(10):
++        run = uid()
++        granted = pool.hub.leases(BOARD, {"action": "grant", "task": task, "run_uid": run})
++        assert granted["status"] == "applied", granted
++        # These isolated fixture runs make no model call. Publish their genuine
++        # zero-usage terminal receipt; do not disable the independent accounting gate.
++        result = pool.hub.ops(BOARD, [{"client_op_id": uid(), "op": "upsert", "table": "task_events",
++            "uid": uid(), "hlc": f"{int(time.time() * 1000):013d}-0000-fixture", "fields": {
++                "task_id": task, "run_uid": run, "kind": "worker_result", "created_at": int(time.time()),
++                "payload": json.dumps({"usage_final": True, "exit_code": 0, "usage": {
++                    "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}})}}])
++        assert result["results"][0]["status"] == "applied", result
++        released = pool.hub.ops(BOARD, [{"client_op_id": uid(), "op": "release", "task": task,
++                                       "run_uid": run, "outcome": "released"}])
++        assert released["results"][0]["status"] == "applied", released
++    home.round()
++    home.enter()
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    maintenance._CURSORS.clear()
++    try:
++        assert maintenance.sweep(home.conn) == [task]
++        stop = decision.pending_episode(home.conn, task)
++        assert stop is not None
++        episode = stop["uid"]
++        kb.add_comment(home.conn, task, "fixture-worker", QUOTE, system=True)
++        monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (True, 2))
++        with kb.write_txn(home.conn):
++            kb._append_event(home.conn, task, reviewer.STARTED, {"episode": episode})
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++            "decision": "release", "reason": "Finish the integration proof", "remaining_quote": QUOTE})
++        assert reviewer.review(home.conn, task, episode) == "settled"
++        home.round()
++        current = home.hub.reviewer_allowance(BOARD, task)["allowance"]
++        assert current["used"] == 0 and current["remaining"] == 10
++        if lane == "review":
++            result = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++            assert result["results"][0]["status"] == "applied", result
++        pool.round()
++        pool.enter()
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:ordinary") is not None, sync.pop_claim_deferral(task)
++        after = pool.hub.reviewer_allowance(BOARD, task)["allowance"]
++        assert after["used"] == 1 and after["remaining"] == 9
++    finally:
++        maintenance._CURSORS.clear()
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_exhausted_real_board_reaches_home_decision_notice(composed, lane, monkeypatch):
++    from hermes_cli import kanban_allowance_maintenance as maintenance
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    test_zero_cumulative_spend_still_exhausts_on_board(composed, lane)
++    home, pool, task = composed
++    home.round()
++    home.enter()
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    maintenance._CURSORS.clear()
++    try:
++        assert maintenance.sweep(home.conn) == [task]
++        assert kb.get_task(home.conn, task).status == "triage"
++        stop = decision.pending_episode(home.conn, task)
++        assert stop is not None
++        notice = home.conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
++                                   (task, decision.NOTICE)).fetchone()
++        assert notice is not None and json.loads(notice[0])["episode"] == stop["uid"]
++        home.round()
++        pool.round()
++        assert pool.hub.reviewer_allowance(BOARD, task)["allowance"]["used"] == 10
++        assert kb.get_task(pool.conn, task).status == "triage"
++        assert kb.claim_task(pool.conn, task, ttl_seconds=900, claimer="fixture:exhausted") is None
++    finally:
++        maintenance._CURSORS.clear()
++
++
++
++def _cli_release(monkeypatch, home, *args):
++    """The real ``hermes kanban release`` command in the home gateway's own isolated HERMES_HOME."""
++    import argparse
++    from hermes_cli import kanban
++    from hermes_cli import kanban_release as release
++    from hermes_cli.kanban_parser import build_parser
++    home.enter()
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(home.path))
++    monkeypatch.setattr("hermes_cli.kanban_comment_writer.cli_comment_writer",
++                        lambda **kw: release.human_writer("isolated-operator"))
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers())
++    return kanban.kanban_command(parser.parse_args(["kanban", "release", *args, "--json"]))
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_human_cli_release_supersedes_exhausted_allowance_and_pool_claims(composed, lane, monkeypatch, capsys):
++    from hermes_cli import kanban_allowance_maintenance as maintenance
++    from hermes_cli import kanban_release as release
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    test_zero_cumulative_spend_still_exhausts_on_board(composed, lane)
++    home, pool, task = composed
++    home.round()
++    home.enter()
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    maintenance._CURSORS.clear()
++    try:
++        assert maintenance.sweep(home.conn) == [task]
++        assert decision.pending_episode(home.conn, task) is not None
++        # An agent authority cannot replace it: nothing is written and the Board still holds the ten debits.
++        decided = "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind IN ('scope_renewed','spend_budget_set','stop_released')"
++        before = home.conn.execute(decided, (task,)).fetchone()[0]
++        agent = ("agent", "20261112_052539_8d8534", "4242:HERMES_SESSION_ID")
++        refused = release.release(home.conn, task, writer=agent, env={"HERMES_SESSION_ID": agent[1]},
++                                  ancestry=[{"HERMES_SESSION_ID": agent[1]}])
++        assert refused["outcome"] == "refused", refused
++        assert home.conn.execute(decided, (task,)).fetchone()[0] == before
++        assert home.hub.reviewer_allowance(BOARD, task)["allowance"]["remaining"] == 0
++        capsys.readouterr()
++        assert _cli_release(monkeypatch, home, task, "--runs", "3") == 0
++        result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
++        assert result["outcome"] == "released" and result["allowance_superseded"] is True, result
++        assert result["scope_renewed"] is False and result["budget_runs"] == result["spent_runs"] + 3
++        assert home.hub.reviewer_allowance(BOARD, task)["allowance"] is None
++        home.reopen()
++        renewed = [json.loads(r[0]) for r in home.conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='scope_renewed' ORDER BY id", (task,))]
++        assert renewed[-1]["authority_kind"] == "human" and renewed[-1]["covered_restriction_uids"] == []
++        assert renewed[-1]["superseded_allowance"]
++        assert allowance.state(home.conn, task) is None
++        assert _cli_release(monkeypatch, home, task, "--runs", "3") == 0  # duplicate: nothing more
++        assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["outcome"] == "already_released"
++        home.round()
++        if lane == "review":
++            result = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++            assert result["results"][0]["status"] == "applied", result
++        pool.round()
++        pool.reopen()
++        assert allowance.state(pool.conn, task) is None
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:human") is not None, sync.pop_claim_deferral(task)
++        # The home sweep finds nothing stuck or exhausted afterwards: no ready-loop, no second episode.
++        home.round()
++        home.enter()
++        maintenance._CURSORS.clear()
++        assert maintenance.sweep(home.conn) == []
++    finally:
++        maintenance._CURSORS.clear()
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_generic_budget_over_active_allowance_is_triaged_not_ready_looped(composed, lane, monkeypatch, capsys):
++    """Decided but stuck: a generic budget row cannot reset the private allowance; the Board refuses each claim,
++    home maintenance turns that into one decision episode, and only the human release route clears it."""
++    from hermes_cli import kanban_allowance_maintenance as maintenance
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    home, pool, task = composed
++    home.round()
++    home.enter()
++    # A budget decision is read first (kanban_release_comments): this writer has read every comment here.
++    seen = home.conn.execute("SELECT MAX(id) FROM task_comments WHERE task_id=?", (task,)).fetchone()[0]
++    budget.set_override(home.conn, task, runs=40, cache_read_tokens=0, by="fixture-operator", reason="generic budget",
++                        seen=seen)
++    home.round()
++    assert home.hub.reviewer_allowance(BOARD, task)["allowance"]["state"] == "active"
++    if lane == "review":
++        result = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert result["results"][0]["status"] == "applied", result
++    pool.round()
++    pool.reopen()
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:stuck") is None
++    assert str(sync.pop_claim_deferral(task)) == "reviewer_allowance_changed"
++    assert home.hub.reviewer_allowance(BOARD, task)["allowance"]["used"] == 0  # the refusal burned nothing
++    home.round()
++    home.enter()
++    monkeypatch.setattr(reviewer, "settings", lambda cfg=None: (False, 2))
++    maintenance._CURSORS.clear()
++    try:
++        assert maintenance.sweep(home.conn) == [task]
++        stop = decision.pending_episode(home.conn, task)
++        assert stop is not None and json.loads(stop["payload"])["allowance"]["superseded"] is False
++        notice = home.conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
++                                   (task, decision.NOTICE)).fetchone()
++        assert notice is not None and json.loads(notice[0])["episode"] == stop["uid"]
++        home.round()
++        capsys.readouterr()
++        assert _cli_release(monkeypatch, home, task, "--runs", "2") == 0
++        result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
++        assert result["outcome"] == "released" and result["allowance_superseded"] is True, result
++        assert home.hub.reviewer_allowance(BOARD, task)["allowance"] is None
++        home.round()
++        if lane == "review":
++            result = home.hub.ops(BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++            assert result["results"][0]["status"] == "applied", result
++        pool.round()
++        pool.reopen()
++        assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:cleared") is not None, sync.pop_claim_deferral(task)
++    finally:
++        maintenance._CURSORS.clear()
+diff --git a/tests/hermes_cli/test_kanban_spend_allowance_board_review.py b/tests/hermes_cli/test_kanban_spend_allowance_board_review.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ae6af286f533b6978c87739a3d7ffc743ee4718
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_allowance_board_review.py
+@@ -0,0 +1,110 @@
++"""Real local Board: a stop reviewed by the dispatcher's own maintenance after the configured delay.
++
++Opt in exactly as ``test_kanban_spend_allowance_board`` (B2_M1_LOCAL_BOARD_URL). The judge is stubbed (no provider
++request); the Board operation, sync, pickup and claim are real.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import test_kanban_spend_allowance_board as base
++
++composed = base.composed
++QUOTE, uid = base.QUOTE, base.uid
++
++
++def _stop_again(home, task, summary):
++    """A second real scope stop of the reviewed card (one debit of its allowance), pending and unreviewed."""
++    run = uid()
++    granted = home.hub.leases(base.BOARD, {"action": "grant", "task": task, "run_uid": run, "ttl_s": 900})
++    assert granted["status"] == "applied", granted
++    retained = home.hub.ops(base.BOARD, [{
++        "client_op_id": uid(), "op": "retain", "task": task, "run_uid": run, "event_uid": uid(),
++        "expected_episode": None, "payload": {
++            "version": 1, "summary": summary, "reason": "scope_stopped", "next_step": "Owner decides",
++            "release_condition": "Scoped decision", "evidence": ["isolated composition fixture"]}}])
++    assert retained["results"][0]["status"] == "applied", retained
++    home.round()
++    home.enter()
++
++
++def _review_at_configured_delay(home, task, monkeypatch, verdict):
++    """The dispatcher's own maintenance entry with ``kanban.spend_review_after_seconds: 300`` read from the
++    isolated HERMES_HOME config: nothing starts before the routed notice is 300 s old; the review runs after."""
++    from hermes_cli import kanban_dispatch_maintenance as dispatch
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    config = home.home / "config.yaml"
++    config.write_text(config.read_text().replace("kanban:\n", "kanban:\n  spend_review_after_seconds: 300\n", 1))
++    assert reviewer.review_after_seconds() == 300
++    monkeypatch.setattr(reviewer, "judge", lambda ctx: verdict)
++    stop = decision.pending_episode(home.conn, task)
++    assert stop is not None
++    with kb.write_txn(home.conn):
++        decision.safe_ensure_producer(home.conn, task)
++    noticed = home.conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id=? AND kind=?",
++                                (task, decision.NOTICE)).fetchone()[0]
++    assert noticed is not None
++    started = (reviewer.QUEUED, reviewer.STARTED)
++    dispatch._start_spend_reviews(home.conn)  # the real clock: the notice is seconds old
++    assert reviewer.start_due(home.conn, now=noticed + 299) == []
++    assert not home.conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN (?,?)",
++                                 (task, *started)).fetchone()
++    from hermes_cli import kanban_spend_caused_review as caused
++    why = {"eligible": reviewer.eligible(home.conn, task, stop["uid"]), "fenced": caused.fenced(home.conn, task),
++           "grants": (caused.grant_count(home.conn, task), reviewer.consecutive_grants(home.conn, task)),
++           "cause": caused.effective_cause(home.conn, task, stop), "state": reviewer.state(home.conn, task, stop["uid"]),
++           "human": reviewer._human_after_stop(home.conn, task, stop), "notice": reviewer._notice_at(home.conn, task, stop["uid"]),
++           "noticed": noticed, "settings": reviewer.settings(), "disposed": reviewer._disposed(home.conn, task, stop["uid"]),
++           "route": decision.episode_route(home.conn, task, stop["uid"]),
++           "admin": home.conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='administrative_decision'", (task,)).fetchone()[0]}
++    import json
++    assert reviewer.start_due(home.conn, now=noticed + 300) == [task], json.dumps(why, default=str)
++    for thread in list(reviewer._THREADS):
++        thread.join(120)
++        assert not thread.is_alive()
++    home.reopen()
++    return stop["uid"]
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_scope_stop_reviewed_after_configured_delay_releases_and_claims(composed, lane, monkeypatch, spend_reviewer):
++    home, pool, task = composed
++    first = home.hub.reviewer_allowance(base.BOARD, task)["allowance"]["review_uid"]
++    _stop_again(home, task, QUOTE)
++    episode = _review_at_configured_delay(home, task, monkeypatch, {
++        "decision": "release", "reason": "Finish the integration proof", "remaining_quote": QUOTE})
++    current = home.hub.reviewer_allowance(base.BOARD, task)["allowance"]
++    assert current["review_uid"] != first and current["episode"] == episode
++    assert (current["used"], current["remaining"]) == (0, 10)
++    home.round()
++    if lane == "review":
++        result = home.hub.ops(base.BOARD, [{"client_op_id": uid(), "op": "request_review", "task": task}])
++        assert result["results"][0]["status"] == "applied", result
++    pool.round()
++    pool.reopen()
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(pool.conn, task, ttl_seconds=900, claimer="fixture:delayed") is not None, sync.pop_claim_deferral(task)
++    after = pool.hub.reviewer_allowance(base.BOARD, task)["allowance"]
++    assert (after["used"], after["remaining"]) == (1, 9)
++
++
++def test_duplicate_named_in_the_stop_is_archived_without_any_grant(composed, monkeypatch, spend_reviewer):
++    home, pool, task = composed
++    home.enter()
++    replacement = kb.create_task(home.conn, title="the finished replacement", assignee="default")
++    with kb.write_txn(home.conn):
++        home.conn.execute("UPDATE tasks SET status='done' WHERE id=?", (replacement,))
++    home.round()
++    before = home.hub.reviewer_allowance(base.BOARD, task)["allowance"]["review_uid"]
++    _stop_again(home, task, f"This card duplicates {replacement} which already finished the acceptance work.")
++    _review_at_configured_delay(home, task, monkeypatch, {
++        "decision": "archive", "reason": "duplicate of the finished replacement", "target": replacement})
++    home.round()
++    snap = home.hub._call("GET", f"/v2/boards/{base.BOARD}/snapshot")
++    assert next(t for t in snap["tasks"] if t["uid"] == task)["status"] == "archived"
++    left = home.hub.reviewer_allowance(base.BOARD, task)["allowance"]
++    assert left is None or (left["review_uid"], left["used"]) == (before, 1)  # no new allowance, no further debit
++    pool.round()
++    pool.reopen()
++    assert kb.claim_task(pool.conn, task, ttl_seconds=900, claimer="fixture:archived") is None
+diff --git a/tests/hermes_cli/test_kanban_spend_caused_review.py b/tests/hermes_cli/test_kanban_spend_caused_review.py
+index 2f2ab1c5df08b4aca6625ad50c7ea7db2f45bef7..1d1d8bb16d619a45198836ad07924ad9911a2450 100644
+--- a/tests/hermes_cli/test_kanban_spend_caused_review.py
++++ b/tests/hermes_cli/test_kanban_spend_caused_review.py
+@@ -224,6 +224,45 @@
+         caused.validate({"decision": "wait_on", "reason": "wait", "target": "t_other"}, ctx)
+ 
+ 
++@pytest.mark.parametrize("runs", [None, 0, 1, 10, True, "10"])
++def test_canonical_verdict_cannot_silently_replace_custom_budget(runs):
++    with pytest.raises(ValueError, match="custom run budget"):
++        caused.validate({"decision": "release", "reason": "Finish acceptance", "remaining_quote": QUOTE,
++                         "runs": runs}, {"task_id": "t_source", "evidence": [QUOTE]})
++
++
++@pytest.mark.parametrize("choice", ["release", "grant"])
++def test_primary_ordinary_uses_fixed_canonical_contract(kanban_home, spend_reviewer, board, monkeypatch, choice):
++    _hub, calls = board
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, None)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='spend_budget_triaged'",
++                         (json.dumps({"reason": QUOTE, "runs": 20, "since": 0}), tid))
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
++        ctx = reviewer.context(conn, tid, ep)
++        assert ctx["_canonical"] is True
++        assert QUOTE in ctx["evidence"]
++        monkeypatch.setattr(reviewer, "judge", lambda ctx: {
++            "decision": choice, **({"runs": 1} if choice == "grant" else {}), "reason": "Finish acceptance",
++            "remaining_quote": QUOTE, "progress_quote": QUOTE})
++        monkeypatch.setattr(decision, "safe_ensure_producer", lambda *a: None)
++        assert reviewer.review(conn, tid, ep) == ("settled" if choice == "release" else "escalated")
++        assert len(calls) == (1 if choice == "release" else 0)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN "
++                                "('scope_renewed','spend_budget_set','promoted_manual')", (tid,)).fetchone()
++
++
++def test_primary_direct_grant_never_writes_local_budget(kanban_home, spend_reviewer, board):
++    with kbc.connect_closing() as conn:
++        tid, ep = stop(conn, None)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, reviewer.STARTED, {"episode": ep})
++        assert reviewer.grant(conn, tid, ep, 10, "wrong route", QUOTE) is not None
++        assert kb.get_task(conn, tid).status == "triage"
++
++
+ def test_review_calls_canonical_without_local_renewal(kanban_home, spend_reviewer, board, monkeypatch):
+     with kbc.connect_closing() as conn:
+         tid, ep = stop(conn)
+-- 
+2.43.0
+

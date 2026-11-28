@@ -1,0 +1,149 @@
+From 2aa3e9f61f6f681e02cd518331bf77370e3a31d6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:24:37 +0000
+Subject: [PATCH 6731] Aggregate-bus discovery and superseded-unit retirement deadlines
+
+Public mirror of source commit 2aa3e9f61f6f681e02cd518331bf77370e3a31d6.
+
+---
+diff --git a/hermes_cli/kanban_aggregate_scope.py b/hermes_cli/kanban_aggregate_scope.py
+index fd2b4276b1b7efd443181918aa91c5fdb79d1196..fd67820af571d3492c8e9635249250d8fc44faab 100644
+--- a/hermes_cli/kanban_aggregate_scope.py
++++ b/hermes_cli/kanban_aggregate_scope.py
+@@ -17,12 +17,15 @@
+ @lru_cache(maxsize=1)
+ def configure_pool():
+     """Set runtime properties; only cache success, never launch unbounded on failure."""
++    from tools.process_registry import systemd_user_bus_env
++
+     for attempt, delay in enumerate((1, 3, None), start=1):
+         try:
+             subprocess.run(
+                 ['systemctl', '--user', 'set-property', '--runtime', 'hermes-kanban.slice',
+                  'MemoryHigh=70%', 'MemoryMax=80%'], check=True,
+-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
++                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
++                env=systemd_user_bus_env())
+             return
+         except (OSError, subprocess.SubprocessError) as exc:
+             stderr = getattr(exc, 'stderr', None) or ''
+diff --git a/tests/hermes_cli/test_kanban_aggregate_bus.py b/tests/hermes_cli/test_kanban_aggregate_bus.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7cb0c848b9a028cabe6c86115993108c68a8bbb2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_aggregate_bus.py
+@@ -0,0 +1,91 @@
++"""Aggregate setup must use the same verified bus as restart-safe worker launch."""
++import json
++import os
++from pathlib import Path
++import socket
++import sys
++
++import pytest
++
++from hermes_cli import kanban_aggregate_scope as scope
++from tools import process_registry as pr
++
++
++@pytest.fixture
++def bus_setup(tmp_path, monkeypatch):
++    if sys.platform != 'linux':
++        pytest.skip('Linux user bus')
++    # AF_UNIX paths are bounded; pytest's nested tmp_path can exceed sun_path.
++    import tempfile
++    with tempfile.TemporaryDirectory(prefix='kb-bus-') as directory:
++        runtime = Path(directory)
++        runtime.chmod(0o700)
++        bus = socket.socket(socket.AF_UNIX)
++        bus.bind(str(runtime / 'bus'))
++        monkeypatch.setattr(pr, '_default_user_runtime_dir', lambda: runtime)
++        monkeypatch.delenv('XDG_RUNTIME_DIR', raising=False)
++        monkeypatch.delenv('DBUS_SESSION_BUS_ADDRESS', raising=False)
++        scope.configure_pool.cache_clear()
++        try:
++            yield runtime
++        finally:
++            scope.configure_pool.cache_clear()
++            bus.close()
++
++
++def fake_systemctl(tmp_path, monkeypatch, runtime):
++    """Execute a real child, checking its environment and exact caps/arguments."""
++    executable = tmp_path / 'systemctl'
++    report = tmp_path / 'report.json'
++    executable.write_text(
++        f'#!{sys.executable}\n'
++        'import json, os, sys\n'
++        f'expected = {str(runtime)!r}\n'
++        f'out = {str(report)!r}\n'
++        'env = {k: os.environ.get(k) for k in '
++        '("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")}\n'
++        'with open(out, "w") as f: json.dump([sys.argv[1:], env], f)\n'
++        'sys.exit(0 if env == {"XDG_RUNTIME_DIR": expected, '
++        '"DBUS_SESSION_BUS_ADDRESS": "unix:path=" + expected + "/bus"} else 1)\n')
++    executable.chmod(0o700)
++    monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ.get('PATH', ''))
++    return report
++
++
++@pytest.mark.parametrize('present', [False, True])
++def test_pool_child_gets_verified_bus_and_unchanged_caps(bus_setup, tmp_path, monkeypatch, present):
++    runtime = bus_setup
++    if present:
++        monkeypatch.setenv('XDG_RUNTIME_DIR', str(runtime))
++        monkeypatch.setenv('DBUS_SESSION_BUS_ADDRESS', f'unix:path={runtime}/bus')
++    before = dict(os.environ)
++    report = fake_systemctl(tmp_path, monkeypatch, runtime)
++    # PATH is the only mutation after before; discovery must not export bus vars.
++    before['PATH'] = os.environ['PATH']
++    scope.configure_pool()
++    args, env = json.loads(report.read_text())
++    assert args == ['--user', 'set-property', '--runtime', 'hermes-kanban.slice',
++                    'MemoryHigh=70%', 'MemoryMax=80%']
++    assert env['XDG_RUNTIME_DIR'] == str(runtime)
++    assert dict(os.environ) == before
++
++
++@pytest.mark.parametrize('invalid', ['missing', 'file', 'symlink', 'writable', 'foreign'])
++def test_unverified_bus_never_returns_unbounded_command(bus_setup, tmp_path, monkeypatch, invalid):
++    runtime = bus_setup
++    (runtime / 'bus').unlink()
++    actions = {
++        'missing': lambda: None,
++        'file': lambda: (runtime / 'bus').touch(),
++        'symlink': lambda: (runtime / 'bus').symlink_to(tmp_path / 'absent'),
++        'writable': lambda: runtime.chmod(0o777),
++        'foreign': lambda: monkeypatch.setattr(pr.os, 'getuid', lambda: runtime.stat().st_uid + 1),
++    }
++    actions[invalid]()
++    report = fake_systemctl(tmp_path, monkeypatch, runtime)
++    monkeypatch.setattr(scope.time, 'sleep', lambda _: None)
++    with pytest.raises(pr.RestartSafeScopeUnavailable, match='aggregate'):
++        scope.bounded_scope(['systemd-run', '--user', '--scope', '--', 'worker'])
++    _, env = json.loads(report.read_text())
++    assert env == {'XDG_RUNTIME_DIR': None, 'DBUS_SESSION_BUS_ADDRESS': None}
++    assert scope.configure_pool.cache_info().currsize == 0
+diff --git a/tests/hermes_cli/test_kanban_aggregate_scope.py b/tests/hermes_cli/test_kanban_aggregate_scope.py
+index c735b24d42aa804bc00ca95acc07fdf6db83e522..4de39ca16ffb36c0194e5908b8e234fed3da4ce7 100644
+--- a/tests/hermes_cli/test_kanban_aggregate_scope.py
++++ b/tests/hermes_cli/test_kanban_aggregate_scope.py
+@@ -17,12 +17,14 @@
+     from hermes_cli.kanban_aggregate_scope import bounded_scope, configure_pool
+     configure_pool.cache_clear()
+     command = ['systemd-run', '--user', '--scope', '--unit=x.scope', '--', 'worker']
++    from tools.process_registry import systemd_user_bus_env
++    env = systemd_user_bus_env()
+     with patch('subprocess.run') as run:
+         got = bounded_scope(command)
+         run.assert_called_once_with(
+             ['systemctl', '--user', 'set-property', '--runtime', 'hermes-kanban.slice',
+              'MemoryHigh=70%', 'MemoryMax=80%'], check=True,
+-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
++            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10, env=env)
+         assert '--slice=hermes-kanban.slice' in got[:got.index('--')]
+         assert got[got.index('--') + 1:] == ['worker']
+         bounded_scope(command)
+-- 
+2.43.0
+

@@ -1,0 +1,189 @@
+From a71efdc2aee2ca3bd51c9232eaa6e9da015a96ca Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 17:28:16 +0000
+Subject: [PATCH 6836] PR-guard comment provenance and soft duplicate check handling
+
+Public mirror of source commit a71efdc2aee2ca3bd51c9232eaa6e9da015a96ca.
+
+---
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 89312948c461b7c957e76934e5b38f29292266e3..2f3f39639f415293e7c6630769337f2598b21f6b 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -301,8 +301,16 @@
+             if not selected:
+                 outcomes.append("missing")
+                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
++            successful_apps = {r["app"]["id"] for r in matching
++                               if check_receipt(r, sha)["classification"] == "success"}
+             for check in selected:
+                 evidence = check_receipt(check, sha)
++                # Only a real completed exact-head success from this same app
++                # can satisfy a duplicate soft run; legacy statuses do not lend it.
++                if (check.get("conclusion") in {"skipped", "neutral"}
++                        and check.get("status") == "completed" and check.get("head_sha") == sha
++                        and check["app"]["id"] in successful_apps):
++                    evidence["classification"] = "success"
+                 outcomes.append(evidence["classification"])
+                 receipt["checks"].append(evidence)
+         outcomes = fallback_outcomes(receipt, required, outcomes, runs, statuses, suites,
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index b2d3d4d8d365136948d66de4260908d98f4841b8..469e37afd1b84d72c9fcbb684992ed8b2a934234 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -66,6 +66,7 @@
+ 
+     gated = {gate_key(c) for c in checks if start(c) < cutoff and concluded_at_merge(c)} if runs else set()
+     latest = {}
++    substantive = {}
+     post = []
+     for check in checks:
+         started = start(check)
+@@ -82,6 +83,9 @@
+             latest.setdefault(key, []).append(check)
+             continue
+         order = (started, check["id"])
++        if runs and check.get("conclusion") not in {"skipped", "neutral"}:
++            if key not in substantive or order > substantive[key][0]:
++                substantive[key] = (order, check)
+         if key not in latest or order > latest[key][0]:
+             latest[key] = (order, check)
+     if runs and distinct_suites:
+@@ -91,7 +95,18 @@
+         kept = [c for key, group in latest.items()
+                 for c in _unsuperseded(group, start, family[key], attempt_of)]
+         return _drop_cancelled_superseded(kept, checks, cutoff, run_of), post
+-    return [entry[1] for entry in latest.values()], post
++    kept = [entry[1] for entry in latest.values()]
++    # Required contexts normally use the latest name/app row. A soft latest
++    # conclusion may also carry its latest substantive success, never an older
++    # success superseded by a failure/pending run or one completed after merge.
++    if runs:
++        for key, (_, check) in latest.items():
++            previous = substantive.get(key)
++            if check.get("conclusion") in {"skipped", "neutral"} and previous:
++                candidate = previous[1]
++                if candidate.get("conclusion") == "success" and concluded_at_merge(candidate):
++                    kept.append(candidate)
++    return kept, post
+ 
+ 
+ def _unsuperseded(group, start, family, attempt_of):
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance_duplicates.py b/tests/hermes_cli/test_kanban_pr_acceptance_duplicates.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3fafbaf45808e0bf87da32eebd2d3e41e22d665
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_acceptance_duplicates.py
+@@ -0,0 +1,109 @@
++"""Required duplicate names need a real success, never merely a soft conclusion."""
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as acceptance
++
++SHA = "4eef563b5812ee1fa99524fb54731035974afa15"
++URL = "https://github.com/example-org/repo/pull/211"
++
++
++def run(identifier, conclusion, *, app=15368, sha=SHA, status="completed"):
++    return {"id": identifier, "name": "conformance", "head_sha": sha,
++            "status": status, "conclusion": conclusion, "app": {"id": app},
++            "started_at": "2099-01-01T13:30:00Z", "completed_at": "2099-01-01T13:30:00Z",
++            "html_url": f"https://github.com/example-org/repo/actions/runs/{identifier}",
++            "check_suite": {"id": identifier}}
++
++
++def collect(monkeypatch, runs, state="MERGED", app: int | None = 15368):
++    def api(endpoint, **_kwargs):
++        if endpoint == "graphql":
++            return {"data": {"repository": {"pullRequest": {
++                "headRefOid": SHA, "baseRefName": "main", "state": state,
++                "mergedAt": "2099-01-01T15:00:00Z", "mergeCommit": {"oid": "2" * 40},
++                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
++                    {"context": "conformance", "app": {"databaseId": app}}]}}}}}}
++        if "/rules/branches/" in endpoint or "/statuses?" in endpoint:
++            return [[]]
++        if "/check-runs?" in endpoint:
++            return [{"total_count": len(runs), "check_runs": runs}]
++        if "/check-suites?" in endpoint:
++            return [{"total_count": len(runs), "check_suites": [
++                {"id": r["check_suite"]["id"], "head_sha": SHA,
++                 "app": r["app"], "latest_check_runs_count": 1} for r in runs]}]
++        if endpoint.endswith("/pulls/211"):
++            return {"head": {"sha": SHA}, "base": {"ref": "main"},
++                    "state": "closed" if state == "MERGED" else "open", "merged": state == "MERGED"}
++        pytest.fail(f"Unexpected GitHub read: {endpoint}")
++    monkeypatch.setattr(acceptance, "_api", api)
++    return acceptance.collect_acceptance(URL, URL)
++
++
++@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
++@pytest.mark.parametrize("conclusions,expected", [
++    (["success", "skipped"], "success"),
++    (["skipped"], "infra"),
++    (["success", "failure"], "failure"),
++    (["success", "neutral"], "success"),
++    (["neutral"], "infra"),
++    (["skipped", "neutral"], "infra"),
++    ([], "missing"),
++    (["success", "cancelled"], "infra"),
++    (["success", "timed_out"], "infra"),
++    (["success", "action_required"], "infra"),
++])
++def test_required_duplicate_conclusions(monkeypatch, state, conclusions, expected):
++    receipt = collect(monkeypatch, [run(i + 1, c) for i, c in enumerate(conclusions)], state)
++    assert receipt["classification"] == expected, receipt
++    assert receipt["ok"] is (expected == "success")
++
++
++def test_repo_211_pair(monkeypatch):
++    # Reduced API fixture. Different workflows/suites,
++    # same Actions app and exact PR head; both completed before merge.
++    success = {**run(140500000001, "success"),
++               "started_at": "2099-01-01T12:00:00Z", "completed_at": "2099-01-01T13:00:00Z",
++               "check_suite": {"id": 124400000001},
++               "html_url": "https://github.com/example-org/repo/actions/runs/46000000001/job/140500000001"}
++    skipped = {**run(140500000002, "skipped"), "check_suite": {"id": 124400000002},
++               "html_url": "https://github.com/example-org/repo/actions/runs/46000000002/job/140500000002"}
++    receipt = collect(monkeypatch, [skipped, success])
++    assert receipt["classification"] == "success", receipt
++    assert {c["id"] for c in receipt["checks"]} == {success["id"], skipped["id"]}
++
++
++@pytest.mark.parametrize("fault", ["foreign_app", "stale", "pending", "post_merge"])
++def test_soft_conclusion_cannot_borrow_invalid_success(monkeypatch, fault):
++    success = run(1, "success")
++    if fault == "foreign_app":
++        success["app"] = {"id": 9}
++    elif fault == "stale":
++        success["head_sha"] = "b" * 40
++    elif fault == "pending":
++        success["status"] = "in_progress"
++    else:
++        success.update(started_at="2099-01-01T16:00:00Z", completed_at="2099-01-01T16:01:00Z")
++    receipt = collect(monkeypatch, [success, run(2, "skipped")], app=None)
++    assert not receipt["ok"], receipt
++
++
++@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required", None])
++def test_merged_soft_run_never_resurrects_superseded_success(monkeypatch, conclusion):
++    receipt = collect(monkeypatch, [run(1, "success"), run(2, conclusion), run(3, "skipped")])
++    assert not receipt["ok"], receipt
++
++
++@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
++@pytest.mark.parametrize("fault", ["stale", "pending"])
++def test_invalid_soft_run_stays_non_success(monkeypatch, state, fault):
++    soft = run(2, "skipped", sha="b" * 40 if fault == "stale" else SHA,
++               status="in_progress" if fault == "pending" else "completed")
++    assert not collect(monkeypatch, [run(1, "success"), soft], state)["ok"]
++
++
++@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
++@pytest.mark.parametrize("soft", ["skipped", "neutral"])
++def test_success_latest_and_input_order_independent(monkeypatch, state, soft):
++    rows = [run(1, soft), run(2, "success")]
++    for ordered in (rows, rows[::-1]):
++        assert collect(monkeypatch, ordered, state)["ok"]
+-- 
+2.43.0
+

@@ -1,0 +1,117 @@
+From 62c7ec5efdeef4df429235ffd7df40e08c243c79 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:33:39 +0000
+Subject: [PATCH 6639] Profile resource custody and retirement before deletion
+
+Public mirror of source commit 62c7ec5efdeef4df429235ffd7df40e08c243c79.
+
+---
+diff --git a/hermes_profile_resources.py b/hermes_profile_resources.py
+index 442a3d3f29dae6fbdf8d2aefea8e0c73d6b6accf..2bca38f17e9f13b225eb82a64a4349262e0560e4 100644
+--- a/hermes_profile_resources.py
++++ b/hermes_profile_resources.py
+@@ -68,9 +68,10 @@
+ class ProfileResourceLease:
+     """One writer and its pooled readers; acknowledgement follows the last close."""
+ 
+-    def __init__(self, home: Path):
++    def __init__(self, home: Path, *, drain_profile_probes: bool = False):
+         from gateway.status import _try_acquire_file_lock
+ 
++        self._drain_profile_probes = drain_profile_probes
+         self.home = home
+         self._lock = threading.Lock()
+         self._finish_lock = threading.Lock()
+@@ -157,16 +158,18 @@
+         with self._lock:
+             if self._refs or self.handle.closed:
+                 return
+-        # Header probes also own state.db descriptors. This runs outside registry
+-        # teardown's lifecycle mutex, and after the final pooled reader is gone.
+-        from hermes_state_registry import _release_header_probes_under
+-        from hermes_state_dbfile import all_header_probes_under
+-        from hermes_cli.sqlite_safe_read import release_profile_pread_fds
+-        _release_header_probes_under(self.home)
+-        if all_header_probes_under(self.home):
+-            return
+-        if not release_profile_pread_fds(self.home):
+-            return
++        if self._drain_profile_probes:
++            # Each cache publishes a dedicated probe owner BEFORE opening a raw fd.
++            # Only that lease drains profile-wide probes. A closed SessionDB must not
++            # retain a lease forever behind a different, still-live SQLite owner.
++            from hermes_state_registry import _release_header_probes_under
++            from hermes_state_dbfile import all_header_probes_under
++            from hermes_cli.sqlite_safe_read import release_profile_pread_fds
++            _release_header_probes_under(self.home)
++            if all_header_probes_under(self.home):
++                return
++            if not release_profile_pread_fds(self.home):
++                return
+         _unlink_lease(self.path, self.handle)
+         self.handle.close()  # the only positive acknowledgement is an actual close
+         with _lock:
+@@ -205,7 +208,7 @@
+ 
+ class _ProfileProbeOwner:
+     def __init__(self, home: Path):
+-        self.lease = ProfileResourceLease(home)
++        self.lease = ProfileResourceLease(home, drain_profile_probes=True)
+         self.lease.set_owner(self, retire=_retire_probe_owner)
+ 
+ 
+diff --git a/tests/hermes_state/test_profile_transient_lease_drain.py b/tests/hermes_state/test_profile_transient_lease_drain.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1df99f4e2ed5946849faa919d0c642b79e60473e
+--- /dev/null
++++ b/tests/hermes_state/test_profile_transient_lease_drain.py
+@@ -0,0 +1,46 @@
++"""Closed connection owners must not accumulate behind another owner's raw probes."""
++import os
++
++from hermes_constants import mark_named_profile_deleted
++from hermes_profile_resources import wait_profile_resources
++from hermes_state import SessionDB
++from hermes_state_dbfile import _pread_db_range, header_probes_under
++from hermes_cli.sqlite_safe_read import pread_lock_safe
++from tests.hermes_state import test_profile_retirement_custody as helpers
++
++profile_home = helpers.profile_home
++
++
++def test_transient_connection_leases_drain_while_keeper_pins_probes(profile_home):
++    keeper = SessionDB(profile_home / 'state.db')
++    transients = []
++    try:
++        path = profile_home / 'state.db'
++        assert _pread_db_range(path, 0, 16) == b'SQLite format 3\x00'
++        assert pread_lock_safe(path, 0, 16) == b'SQLite format 3\x00'
++        probe_fds = [r[0] for r in header_probes_under(profile_home).values()]
++        assert probe_fds
++        for _ in range(8):
++            db = SessionDB(path, read_only=True)
++            lease = db._profile_lease
++            assert lease is not None
++            db.close()
++            lease.finish_if_drained()
++            transients.append(lease)
++        assert all(lease.handle.closed for lease in transients)
++        assert all(not lease.path.exists() for lease in transients)
++        assert not keeper._profile_lease.handle.closed
++        for fd in probe_fds:
++            os.fstat(fd)  # no unsafe close of another owner's probe
++        mark_named_profile_deleted(profile_home)
++        assert wait_profile_resources(profile_home, timeout=10)
++        for fd in probe_fds:
++            try:
++                os.fstat(fd)
++            except OSError:
++                continue
++            raise AssertionError('probe outlived deletion acknowledgement')
++    finally:
++        keeper.close()
++        for lease in transients:
++            lease.finish_if_drained()
+-- 
+2.43.0
+

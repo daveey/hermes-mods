@@ -1,0 +1,1057 @@
+From 7da43d9f062509acbafe2c1eb5e0c67c0764eec1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:32:06 +0000
+Subject: [PATCH 6998] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 7da43d9f062509acbafe2c1eb5e0c67c0764eec1.
+
+---
+diff --git a/hermes_cli/kanban_home_command.py b/hermes_cli/kanban_home_command.py
+index 443f0fcedbacb9dc5697fab350c83138de348a7c..6d6f9d355dcff8164d3331c21a8dec1e01da9252 100644
+--- a/hermes_cli/kanban_home_command.py
++++ b/hermes_cli/kanban_home_command.py
+@@ -11,6 +11,10 @@
+ from hermes_cli import kanban_home_generation as epochs
+ from hermes_cli.sqlite_util import add_column_if_missing
+ 
++class Pending(ValueError):
++    """Temporary custody refusal before submission; not a failed transmission."""
++
++
+ _TABLES = frozenset({'kanban_failure_commands', 'kanban_actionability_commands',
+                     'kanban_protect_commands', 'containment_delivery', 'kanban_home_delivery1'})
+ 
+@@ -62,7 +66,7 @@
+     from hermes_cli.kanban_home_transfer import frozen
+     tasks = touched(wire)
+     if any(frozen(conn, task) for task in tasks):
+-        raise ValueError('home transfer pending')
++        raise Pending('home transfer pending')
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_generations1'").fetchone():
+         return None
+     values = {}
+@@ -82,7 +86,7 @@
+     if not isinstance(row, dict) or row.get('id') != task:
+         raise ValueError('home evidence identity mismatch')
+     if row.get('home_transfer_pending') is not None:
+-        raise ValueError('home transfer pending')
++        raise Pending('home transfer pending')
+     nonce = row.get('home_generation')
+     if nonce is None:
+         return None
+@@ -93,4 +97,6 @@
+ 
+ def outbound(owned: dict, semantic: dict) -> dict:
+     """Read only the durable sidecar; no lookup of today's task/epoch is allowed."""
++    if owned.get('capture_pending'):
++        raise Pending('home capture still pending; decision is not a transport request')
+     return epochs.add_captured(owned, semantic)
+diff --git a/hermes_cli/kanban_home_generation.py b/hermes_cli/kanban_home_generation.py
+index 30756832d9bbd7c10f3f1574105a234353aa1571..51f144b49666502bd1c86a5d1862cdc0bcb8c304 100644
+--- a/hermes_cli/kanban_home_generation.py
++++ b/hermes_cli/kanban_home_generation.py
+@@ -21,6 +21,8 @@
+                  "(task_id TEXT PRIMARY KEY, nonce TEXT NOT NULL)")
+     add_column_if_missing(conn, "kanban_home_generations1", "version", "version INTEGER NOT NULL DEFAULT 0")
+     add_column_if_missing(conn, "kanban_home_generations1", "pending", "pending INTEGER NOT NULL DEFAULT 1")
++    from hermes_cli import kanban_home_revision as revision
++    revision.install(conn, ('kanban_home_generations1',))
+     add_column_if_missing(conn, "kanban_sync_outbox", "home_generations", "home_generations TEXT")
+     # Keep this independent from removable sync capture triggers. Do not retrofit
+     # a generation onto an extant pending op even if its source row now has one.
+diff --git a/hermes_cli/kanban_home_memo.py b/hermes_cli/kanban_home_memo.py
+index a3517249088466b81fba0d14155ca6536beb2c2d..8e17bae31b28cfa35eabeb119280485fc541a748 100644
+--- a/hermes_cli/kanban_home_memo.py
++++ b/hermes_cli/kanban_home_memo.py
+@@ -41,7 +41,7 @@
+         return old
+     from hermes_cli.kanban_home_transfer import frozen
+     if frozen(conn, task):
+-        raise ValueError('home transfer pending')
++        raise home.Pending('home transfer pending')
+     captured = epoch if foreign else home.capture(conn, op)
+     raw = json.dumps(op, sort_keys=True, separators=(',', ':'), allow_nan=False)
+     conn.execute(f'INSERT INTO {_TABLE}(request_uid,task_id,request_json,home_generations) VALUES (?,?,?,?)',
+diff --git a/hermes_cli/kanban_home_revision.py b/hermes_cli/kanban_home_revision.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4146a0b2d4e663bdeeb8d7b05d05d0be6beab619
+--- /dev/null
++++ b/hermes_cli/kanban_home_revision.py
+@@ -0,0 +1,39 @@
++"""Transactional custody inputs for retained maintenance results. [daveey]
++
++Independent of task/content revisions: an exact abort or pending clear can
++change eligibility without touching any task. Unknown coverage disables reuse.
++"""
++from __future__ import annotations
++
++TABLES = ('kanban_home_prepared1', 'kanban_home_finalized1',
++          'kanban_home_aborted1', 'kanban_home_generations1')
++_COUNTER = 'kanban_home_revision1'
++
++
++def install(conn, tables):
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {_COUNTER} (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL)')
++    conn.execute(f'INSERT OR IGNORE INTO {_COUNTER} VALUES (1,0)')
++    for table in tables:
++        if table not in TABLES:
++            raise ValueError('unsupported custody revision table')
++        for action in ('INSERT', 'UPDATE', 'DELETE'):
++            name = f'home_revision1_{table}_{action.lower()}'
++            conn.execute(f'CREATE TRIGGER IF NOT EXISTS {name} AFTER {action} ON {table} '
++                         f'BEGIN UPDATE {_COUNTER} SET revision=revision+1 WHERE id=1; END')
++
++
++def read(conn):
++    """O(1) counter, with bounded schema coverage proof; None means uncached."""
++    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?,?)", TABLES)}
++    if not names:
++        return 0
++    for table in names:
++        for action in ('insert', 'update', 'delete'):
++            name = f'home_revision1_{table}_{action}'
++            row = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
++            expected = (f'CREATE TRIGGER {name} AFTER {action.upper()} ON {table} '
++                        f'BEGIN UPDATE {_COUNTER} SET revision=revision+1 WHERE id=1; END')
++            if row is None or row[0] != expected:
++                return None
++    row = conn.execute(f'SELECT revision FROM {_COUNTER} WHERE id=1').fetchone()
++    return int(row[0]) if row is not None else None
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 70284a68c4291e856bf1cd251e3af2215044fb8a..f0da0e1028cdc797d2f17adb2d681225e1f99bc4 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -62,6 +62,8 @@
+             AND json_type(NEW.receipt,'$.expected_version') IS 'integer')
+         BEGIN SELECT RAISE(ABORT, 'home finalization scope mismatch'); END""")
+     abort.install(conn)
++    from hermes_cli import kanban_home_revision as revision
++    revision.install(conn, ('kanban_home_prepared1', 'kanban_home_finalized1', 'kanban_home_aborted1'))
+     valid = finalized.predicate('p', 'NEW')
+     conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_finalized1_manifest
+         BEFORE INSERT ON kanban_home_finalized1
+diff --git a/hermes_cli/kanban_operator_label_delivery.py b/hermes_cli/kanban_operator_label_delivery.py
+index a55505dbbb13ef16eb47a0cfc3fcff088aa14217..325059b4e02cc92f97c818a4f48392a58301c615 100644
+--- a/hermes_cli/kanban_operator_label_delivery.py
++++ b/hermes_cli/kanban_operator_label_delivery.py
+@@ -19,7 +19,7 @@
+     with kb.write_txn(conn):
+         from hermes_cli.kanban_home_transfer import frozen
+         if frozen(conn, task):
+-            raise ValueError('home transfer pending')
++            raise home.Pending('home transfer pending')
+         conn.execute('CREATE TABLE IF NOT EXISTS kanban_home_label_capture1 '
+                      '(event_uid TEXT PRIMARY KEY, task_id TEXT NOT NULL, legacy INTEGER NOT NULL)')
+         row = conn.execute('SELECT task_id,legacy FROM kanban_home_label_capture1 WHERE event_uid=?', (event_uid,)).fetchone()
+diff --git a/hermes_cli/kanban_operator_labels.py b/hermes_cli/kanban_operator_labels.py
+index b99939a6fcb613be35e40a36a72fe0866d343304..29ce79348718c823c4a168130d95c3355b4cee07 100644
+--- a/hermes_cli/kanban_operator_labels.py
++++ b/hermes_cli/kanban_operator_labels.py
+@@ -410,11 +410,13 @@
+ 
+ def _deliver(conn: sqlite3.Connection, own: str, board: str, now: Optional[int] = None) -> int:
+     from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_home_command as home
++    from hermes_cli.kanban_home_transfer import frozen
+     now = int(time.time()) if now is None else now
+     rows = conn.execute("SELECT request_uid, board, machine, labels, caller, result_task_id, outcome, detail, "
+                         "labels_after, event_uid, delivery_attempts, last_delivery_at FROM operator_label_jobs "
+                         "WHERE state='done' AND delivered_at IS NULL ORDER BY created_at").fetchall()
+-    rows = [r for r in rows if _delivery_due(int(r[10] or 0), r[11], now)][:MAX_DELIVERIES_PER_TICK]
++    rows = [r for r in rows if _delivery_due(int(r[10] or 0), r[11], now) and not frozen(conn, r[5])][:MAX_DELIVERIES_PER_TICK]
+     sent = 0
+     for (uid, jboard, machine, labels, caller, task, outcome, detail, after, euid, tries, _last) in rows:
+         payload = {"request_uid": uid, "action": ACTION, "outcome": outcome, "detail": detail,
+@@ -422,6 +424,10 @@
+                    "labels_after": json.loads(after) if after else None, "caller": json.loads(caller or "{}")}
+         try:
+             status, why = _push_event(conn, jboard or board, own, task, euid, payload)
++        except home.Pending:
++            # No bytes left: do not consume retries or reinterpret new jobs as
++            # historical attempts. The durable original intent, if any, stays.
++            continue
+         except Exception as exc:  # health: allow BLE001 -- unreachable Board: retried next tick
+             status, why = "error", f"{type(exc).__name__}: {exc}"
+         done = status in ("applied", "merged") or (status == "rejected" and why.startswith("not_found")) \
+diff --git a/hermes_cli/kanban_spend_caused_review.py b/hermes_cli/kanban_spend_caused_review.py
+index 742dd8a67d7d3959d815539e7db3e9ebf0874050..d29d4ac5d12eefb517f55ce7f3107d462b32f24a 100644
+--- a/hermes_cli/kanban_spend_caused_review.py
++++ b/hermes_cli/kanban_spend_caused_review.py
+@@ -180,17 +180,26 @@
+             if prior["board"] != board or prior["gateway"] != hub.ident.gateway:
+                 raise Unconfirmed("frozen request belongs to another Board or gateway")
+             wire = prior["wire"]
++            if prior.get('capture_pending'):
++                if not resend:
++                    raise Unconfirmed('uncaptured decision retained; current holds prohibit submission')
++                owned = journal.capture_deferred(conn, task_id, episode)
+         else:
+             capability = hub.decision_retain_capability(board)
+             if not isinstance(capability, dict) or type(capability.get("spend_review")) is not int or capability["spend_review"] != 1:
+                 raise ValueError("Board spend_review v1 unavailable")
+             owned = journal.freeze(conn, board, hub.ident.gateway, wire)
+             wire = owned["wire"]
++        from hermes_cli import kanban_home_command as home
++        if owned is None:
++            raise Unconfirmed('decision custody disappeared before capture')
++        if owned.get('capture_pending'):
++            raise home.Pending('home capture pending; decision retained without submission')
+         uid = wire["event_uid"]
+         fields = wire
+         digest = hashlib.sha256(json.dumps(wire, sort_keys=True, separators=(",", ":"),
+                                          ensure_ascii=False).encode()).hexdigest()
+-        proof = hub.row_evidence(board, "task_events", uid) if prior else None
++        proof = hub.row_evidence(board, "task_events", uid) if prior and not prior.get('capture_pending') else None
+         if not isinstance(proof, dict) or proof.get("state") != "live":
+             if not resend:
+                 raise Unconfirmed("frozen request readback pending; current holds prohibit resubmission")
+diff --git a/hermes_cli/kanban_spend_review_deferred.py b/hermes_cli/kanban_spend_review_deferred.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb602256a872f146e2487fc876b293187fd59818
+--- /dev/null
++++ b/hermes_cli/kanban_spend_review_deferred.py
+@@ -0,0 +1,57 @@
++"""Never-submitted semantic decisions awaiting prerequisite custody. [daveey]
++
++Keep these OUT of spend_review_requests: older senders must never mistake an
++uncaptured decision for a captured legacy request. Wire/UID remain immutable.
++"""
++from __future__ import annotations
++
++import json
++
++TABLE = 'spend_review_deferred1'
++
++
++def exists(conn):
++    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone())
++
++
++def install(conn):
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (task_id TEXT NOT NULL, episode TEXT NOT NULL, '
++                 'request TEXT NOT NULL, closed INTEGER NOT NULL DEFAULT 0, captured INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task_id,episode))')
++    conn.execute(f'CREATE INDEX IF NOT EXISTS {TABLE}_open ON {TABLE}(task_id,episode) WHERE closed=0')
++    for action in ('UPDATE OF task_id,episode,request', 'DELETE'):
++        suffix = 'update' if action.startswith('UPDATE') else 'delete'
++        conn.execute(f'CREATE TRIGGER IF NOT EXISTS {TABLE}_{suffix} BEFORE {action} ON {TABLE} '
++                     "BEGIN SELECT RAISE(ABORT,'deferred decision immutable'); END")
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {TABLE}_insert BEFORE INSERT ON {TABLE} '
++                 f'WHEN EXISTS(SELECT 1 FROM {TABLE} WHERE task_id=NEW.task_id AND episode=NEW.episode) '
++                 "BEGIN SELECT RAISE(ABORT,'deferred decision immutable'); END")
++    # A pre-upgrade sender can neither see this as legacy nor overwrite it with
++    # a different judgment/UID after custody clears. New capture retains wire.
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS {TABLE}_binding BEFORE INSERT ON spend_review_requests '
++                 f'WHEN EXISTS(SELECT 1 FROM {TABLE} d WHERE d.task_id=NEW.task AND d.episode=NEW.episode '
++                 "AND (d.captured!=1 OR json_extract(d.request,'$.wire') IS NOT json_extract(NEW.request,'$.wire'))) "
++                 "BEGIN SELECT RAISE(ABORT,'deferred decision identity changed'); END")
++
++
++def get(conn, task, episode):
++    if not exists(conn):
++        return None
++    row = conn.execute(f'SELECT request FROM {TABLE} WHERE task_id=? AND episode=?', (task, episode)).fetchone()
++    return json.loads(row[0]) if row else None
++
++
++def open_keys(conn):
++    if not exists(conn):
++        return []
++    return [tuple(row) for row in conn.execute(f'SELECT task_id,episode FROM {TABLE} WHERE closed=0')]
++
++
++def save(conn, task, episode, request):
++    install(conn)
++    conn.execute(f'INSERT INTO {TABLE}(task_id,episode,request) VALUES (?,?,?)',
++                 (task, episode, json.dumps(request, ensure_ascii=False)))
++
++
++def close(conn, keys):
++    if exists(conn):
++        conn.executemany(f'UPDATE {TABLE} SET closed=1 WHERE task_id=? AND episode=?', keys)
+diff --git a/hermes_cli/kanban_spend_review_request.py b/hermes_cli/kanban_spend_review_request.py
+index 27c130ccff9aa426670a0d8f68db1ffca1c25135..12d0e8a5e778c34b0351664b0552ccd04b2ab205 100644
+--- a/hermes_cli/kanban_spend_review_request.py
++++ b/hermes_cli/kanban_spend_review_request.py
+@@ -2,11 +2,23 @@
+ 
+ This is not sync authority: only authenticated Board receipt readback settles it.
+ Keep completed requests too, so no later invocation can replace their bytes.
++A capture_pending record is only an immutable validated semantic decision/UID,
++not a serialized transport envelope. It has never been submitted. Its one legal
++transition captures epochs once under the native writer and removes that marker;
++existing captured or legacy requests never acquire a newer epoch. The semantic
++decision names a prerequisite task, not a particular administrative home: first
++capture may follow that task's completed transfer, with current source/stop/hold
++validation and Board admission still required. It never rebinds a prior packet.
++Outbound rejects
++the marker. Frozen prerequisite waits consume no model/reconciliation attempts;
++ordinary submission/reconciliation retains the existing bounded attempt budget.
+ """
+ from __future__ import annotations
+ 
+ import json
+ 
++from hermes_cli import kanban_spend_review_deferred as deferred_store
++
+ TABLE = "spend_review_requests"
+ # Separate from judge retries: allow receipt recovery after the model budget ends,
+ # but never monopolize reviewer custody indefinitely when no receipt is reachable.
+@@ -36,7 +48,8 @@
+     if marked is None:
+         return []
+     where = " WHERE closed = 0" if marked else ""
+-    return [(row[0], row[1]) for row in conn.execute(f"SELECT task, episode FROM {TABLE}{where}")]
++    return list(dict.fromkeys([(row[0], row[1]) for row in conn.execute(f"SELECT task, episode FROM {TABLE}{where}")]
++                              + deferred_store.open_keys(conn)))
+ 
+ 
+ def close(conn, keys):
+@@ -53,13 +66,14 @@
+             conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
+             conn.execute(OPEN_INDEX)
+         conn.executemany(f"UPDATE {TABLE} SET closed = 1 WHERE task = ? AND episode = ?", list(keys))
++        deferred_store.close(conn, list(keys))
+ 
+ 
+ def get(conn, task, episode):
+     if not exists(conn):
+         return None
+     row = conn.execute(f"SELECT request FROM {TABLE} WHERE task=? AND episode=?", (task, episode)).fetchone()
+-    return json.loads(row[0]) if row else None
++    return json.loads(row[0]) if row else deferred_store.get(conn, task, episode)
+ 
+ 
+ def freeze(conn, board, gateway, wire):
+@@ -72,20 +86,59 @@
+         if prior is not None:
+             return prior  # Immutable legacy/current wire; never enrich on replay.
+         from hermes_cli import kanban_home_command as home
+-        # wait_on can install a dependency; fence its target as well as the source.
+-        epoch = home.capture(conn, {**wire, "parent": wire.get("target")})
++        from hermes_cli.kanban_home_transfer import frozen as home_frozen
++        if home_frozen(conn, wire['task']):
++            raise home.Pending('home transfer pending')
++        # Retain the validated decision/UID even when its prerequisite cannot
++        # yet be captured. This is NOT a transport request and cannot be sent.
++        deferred = False
++        try:
++            epoch = home.capture(conn, {**wire, "parent": wire.get("target")})
++        except home.Pending:
++            epoch, deferred = None, True
+         conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task TEXT NOT NULL, episode TEXT NOT NULL, "
+                      "request TEXT NOT NULL, closed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task,episode))")
+         if _has_closed(conn):
+             conn.execute(OPEN_INDEX)
+         request = {"board": board, "gateway": gateway, "wire": wire, "home_generations": epoch}
+-        conn.execute(f"INSERT OR IGNORE INTO {TABLE} (task, episode, request) VALUES (?,?,?)",
+-                     (wire["task"], wire["episode"], json.dumps(request, ensure_ascii=False)))
++        if deferred:
++            request['capture_pending'] = True
++            deferred_store.save(conn, wire['task'], wire['episode'], request)
++        else:
++            conn.execute(f"INSERT OR IGNORE INTO {TABLE} (task, episode, request) VALUES (?,?,?)",
++                         (wire["task"], wire["episode"], json.dumps(request, ensure_ascii=False)))
+         frozen = get(conn, wire["task"], wire["episode"])
+         assert frozen is not None
+         return frozen
+ 
+ 
++def capture_deferred(conn, task, episode):
++    """Capture a never-submitted decision once; old/legacy envelopes never change."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_home_command as home
++    if conn.in_transaction:
++        raise ValueError('cannot capture a review inside another transaction')
++    with kb.write_txn(conn):
++        request = get(conn, task, episode)
++        if not request or not request.get('capture_pending'):
++            return request
++        wire = request['wire']
++        epoch = home.capture(conn, {**wire, 'parent': wire.get('target')})
++        request = {k: v for k, v in request.items() if k != 'capture_pending'}
++        request['home_generations'] = epoch
++        conn.execute(f'UPDATE {deferred_store.TABLE} SET captured=1,closed=1 WHERE task_id=? AND episode=?', (task, episode))
++        conn.execute(f'INSERT INTO {TABLE}(task,episode,request) VALUES (?,?,?)',
++                     (task, episode, json.dumps(request, ensure_ascii=False)))
++        return request
++
++
++def waiting_for_custody(conn, request):
++    """No reconciliation attempt is spent while a never-sent target is frozen."""
++    from hermes_cli.kanban_home_transfer import frozen
++    return bool(request and request.get('capture_pending')
++                and frozen(conn, request['wire']['target']))
++
++
+ def escalate_unconfirmed(conn, task, episode):
+     """Transfer exhausted automation to an administrative owner, never cancel it.
+ 
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 8c8453cb4222e3d3a3ed093e94102d5dd3616071..b5375a51c07ae72589a40e29fbf9c91b54e7e8b3 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -315,6 +315,7 @@
+     """Queue the backlog and start every due review this process has room for. Returns started task ids."""
+     from hermes_cli.kanban_wake_check import foreign_ids
+     from hermes_cli import kanban_spend_review_request as journal
++    from hermes_cli import kanban_home_command as home
+     cfg = settings()
+     if not cfg[0]:
+         return []
+@@ -335,12 +336,20 @@
+                 escalate(conn, task_id, episode, f"{cause} stops are excluded from spend review; hold retained")
+                 continue
+             frozen = journal.get(conn, task_id, episode)
++            if journal.waiting_for_custody(conn, frozen):
++                continue  # no model/submission retry while only the prerequisite is frozen
++            if frozen and frozen.get('capture_pending'):
++                # Bind under the writer BEFORE consuming another STARTED attempt.
++                # A target that refreezes after the read must remain a no-send wait.
++                frozen = journal.capture_deferred(conn, task_id, episode)
+             if frozen and attempts >= journal.MAX_RECONCILE_ATTEMPTS:
+                 journal.escalate_unconfirmed(conn, task_id, episode)
+                 continue
+             if attempts >= MAX_ATTEMPTS and not frozen:
+                 escalate(conn, task_id, episode, f"the spend reviewer did not finish after {attempts} attempts")
+                 continue
++        except home.Pending:
++            continue  # target/source custody raced selection; no STARTED charge
+         except Exception:  # health: allow BLE001 -- per-card boundary; this hold is retained, siblings proceed
+             logger.exception("kanban: spend review not started for %s; hold retained", task_id)
+             continue
+diff --git a/hermes_cli/kanban_sweep_gate.py b/hermes_cli/kanban_sweep_gate.py
+index bcf02d318fb91aae823b98ae3a1147df74c35817..e8e6dfe071df01ce5e9e2738bf264296f83a380b 100644
+--- a/hermes_cli/kanban_sweep_gate.py
++++ b/hermes_cli/kanban_sweep_gate.py
+@@ -89,7 +89,11 @@
+     if revision is None:
+         return None
+     try:
+-        return (ident, revision, extra(conn) if extra is not None else None)
++        from hermes_cli import kanban_home_revision as custody
++        home_revision = custody.read(conn)
++        if home_revision is None:
++            return None
++        return (ident, revision, home_revision, extra(conn) if extra is not None else None)
+     except sqlite3.Error:
+         return None
+ 
+diff --git a/tests/hermes_cli/test_home_custody_revision.py b/tests/hermes_cli/test_home_custody_revision.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5dc784aca715ce7ea0bf15f505787989c7f3575f
+--- /dev/null
++++ b/tests/hermes_cli/test_home_custody_revision.py
+@@ -0,0 +1,58 @@
++"""Custody is a transactional sweep input, independent of task writes. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_generation as generation
++from hermes_cli import kanban_home_revision as revision
++from hermes_cli import kanban_sweep_gate as gate
++from tests.hermes_cli import test_home_release_candidates as support
++
++board = support.board
++
++
++def test_pending_revision_is_committed_and_peer_visible(board):
++    task = support.card(board, 'ready')
++    calls = []
++    run = lambda: gate.gated('custody-control', board, lambda: calls.append(1))
++    gate.reset()
++    run()
++    run()
++    assert len(calls) == 1
++    before = revision.read(board)
++    with pytest.raises(RuntimeError, match='rollback'):
++        with dbc.write_txn(board):
++            generation.mirror_feed(board, task, {'home_generation': 'revision-control-0001'}, 8)
++            assert revision.read(board) != before
++            raise RuntimeError('rollback')
++    assert revision.read(board) == before
++    run()
++    assert len(calls) == 1
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    from pathlib import Path
++    with dbc.connect_closing(Path(path)) as peer:
++        with dbc.write_txn(peer):
++            generation.mirror_feed(peer, task, {'home_generation': 'revision-control-0001'}, 8)
++    run()
++    assert len(calls) == 2
++    run()
++    assert len(calls) == 2
++    with dbc.write_txn(board):
++        generation.mirror_feed(board, task, {'home_generation': 'revision-control-0001',
++                                           'home_transfer_pending': None}, 9)
++    run()
++    assert len(calls) == 3
++
++
++@pytest.mark.parametrize('broken', ['absent', 'wrong'])
++def test_unknown_custody_trigger_coverage_disables_cache(board, broken):
++    with dbc.write_txn(board):
++        board.execute('DROP TRIGGER home_revision1_kanban_home_generations1_update')
++        if broken == 'wrong':
++            board.execute('CREATE TRIGGER home_revision1_kanban_home_generations1_update '
++                          'AFTER UPDATE ON kanban_home_generations1 BEGIN SELECT 1; END')
++    assert revision.read(board) is None
++    assert gate.key(board) is None
++    calls = []
++    for _ in range(2):
++        gate.gated('unknown-custody', board, lambda: calls.append(1))
++    assert len(calls) == 2
+diff --git a/tests/hermes_cli/test_home_deferred_decision.py b/tests/hermes_cli/test_home_deferred_decision.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b771a07e923091cc7df19d6724558165350828e9
+--- /dev/null
++++ b/tests/hermes_cli/test_home_deferred_decision.py
+@@ -0,0 +1,72 @@
++"""Uncaptured decisions are not legacy packets and cannot be rebound. [daveey]"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_command as home
++from hermes_cli import kanban_spend_review_request as journal
++from tests.hermes_cli import test_home_review_composed_delivery as cases
++
++board = cases.board
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending'])
++@pytest.mark.parametrize('replacement_kind', ['same', 'different'])
++def test_deferred_is_invisible_to_legacy_sender_and_binds_once(board, phase, replacement_kind):
++    source = cases.support.card(board, 'triage')
++    target = cases.support.card(board, 'ready')
++    cases.support.freeze(board, target, phase)
++    wire = {'task': source, 'episode': 'deferred-episode', 'event_uid': 'original-decision-0001',
++            'verdict': 'wait_on', 'target': target, 'reason': 'wait on existing prerequisite'}
++    retained = journal.freeze(board, 'board', 'worker-a3', wire)
++    assert retained['capture_pending'] is True
++    # The pre-upgrade get() reads only this table; no unbound envelope is there.
++    assert board.execute('SELECT request FROM spend_review_requests WHERE task=? AND episode=?',
++                         (source, wire['episode'])).fetchone() is None
++    assert journal.open_keys(board) == [(source, wire['episode'])]
++    with pytest.raises(home.Pending):
++        home.outbound(retained, wire)
++    replacement = {k: v for k, v in retained.items() if k != 'capture_pending'}
++    if replacement_kind == 'different':
++        replacement['wire'] = {**wire, 'event_uid': 'replacement-must-not-send'}
++    with pytest.raises(sqlite3.IntegrityError, match='deferred decision identity'):
++        with dbc.write_txn(board):
++            board.execute('INSERT INTO spend_review_requests(task,episode,request) VALUES (?,?,?)',
++                          (source, wire['episode'], json.dumps(replacement)))
++    assert journal.get(board, source, wire['episode']) == retained
++    cases.unfreeze(board, target, phase)
++    captured = journal.capture_deferred(board, source, wire['episode'])
++    assert captured['wire'] == wire and 'capture_pending' not in captured
++    assert journal.capture_deferred(board, source, wire['episode']) == captured
++    with dbc.write_txn(board):
++        board.execute('UPDATE kanban_home_generations1 SET nonce=? WHERE task_id=?',
++                      ('later-epoch-not-for-original', target))
++    assert journal.capture_deferred(board, source, wire['episode']) == captured
++    journal.close(board, [(source, wire['episode'])])
++    assert journal.open_keys(board) == []
++    assert journal.get(board, source, wire['episode']) == captured
++
++
++def test_selection_to_capture_race_does_not_charge_started_attempt(board, monkeypatch):
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    from hermes_cli import kanban_wake_check as wake
++    source = cases.support.card(board, 'triage')
++    target = cases.support.card(board, 'ready')
++    cases.support.freeze(board, target, 'pending')
++    wire = {'task': source, 'episode': 'raced-episode', 'event_uid': 'raced-decision-0001',
++            'verdict': 'wait_on', 'target': target, 'reason': 'wait on prerequisite'}
++    retained = journal.freeze(board, 'board', 'worker-a3', wire)
++    before = list(board.execute('SELECT * FROM task_events WHERE task_id=?', (source,)))
++    monkeypatch.setattr(reviewer, 'settings', lambda: (True, 2))
++    monkeypatch.setattr(reviewer, 'queue_backlog', lambda *a, **k: [])
++    monkeypatch.setattr(wake, 'foreign_ids', lambda c: set())
++    monkeypatch.setattr(reviewer, '_due', lambda *a: [(source, wire['episode'], journal.MAX_RECONCILE_ATTEMPTS)])
++    # Selection saw clear; the real writer still sees the pending target.
++    monkeypatch.setattr(journal, 'waiting_for_custody', lambda *a: False)
++    for _ in range(5):
++        assert reviewer.start_due(board, now=10**10) == []
++    assert list(board.execute('SELECT * FROM task_events WHERE task_id=?', (source,))) == before
++    assert journal.get(board, source, wire['episode']) == retained
++
+diff --git a/tests/hermes_cli/test_home_deferred_scheduler.py b/tests/hermes_cli/test_home_deferred_scheduler.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..086eedc181f026d6fb189e878ec2469d671c1819
+--- /dev/null
++++ b/tests/hermes_cli/test_home_deferred_scheduler.py
+@@ -0,0 +1,39 @@
++"""Actual due/start/thread recovery of a never-submitted wait decision. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli import kanban_spend_review_request as journal
++from tests.hermes_cli import test_home_review_composed_delivery as cases
++
++board = cases.board
++hub = cases.hub
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending'])
++def test_native_due_thread_retries_same_decision_after_release(board, spend_reviewer, hub, phase):
++    target = cases.support.card(board, 'ready')
++    source = kb.create_task(board, title='caused stop with prerequisite', assignee='default')
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?", (source,))
++        kb._append_event(board, source, 'spend_budget_triaged',
++                         {'cause': 'scope_stopped', 'reason': f'Stopped until {target} lands.'})
++    episode = reviewer._current_episode(board, source)
++    assert episode is not None
++    with kb.write_txn(board):
++        kb._append_event(board, source, decision.NOTICE, {'episode': episode})
++        kb._append_event(board, source, reviewer.STARTED, {'episode': episode})
++    cases.support.freeze(board, target, phase)
++    spend_reviewer.append({'decision': 'wait_on', 'reason': f'Blocked on {target}.', 'target': target})
++    assert reviewer.review(board, source, episode) == 'pending'
++    semantic = journal.get(board, source, episode)['wire']
++    assert reviewer.start_due(board, now=10**10) == []
++    cases.unfreeze(board, target, phase)
++    assert reviewer.start_due(board, now=10**10) == [source]
++    reviewer.wait_for_reviews(timeout=30)
++    assert reviewer.state(board, source, episode) == reviewer.SETTLED
++    assert journal.get(board, source, episode)['wire'] == semantic
++    assert len(hub) == 1 and not spend_reviewer
++    assert {k: v for k, v in hub[0].items() if k != 'home_generations'} == semantic
++    assert reviewer.start_due(board, now=10**10 + 1000) == []
+diff --git a/tests/hermes_cli/test_home_label_delivery_retry.py b/tests/hermes_cli/test_home_label_delivery_retry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a104e53b622cc941bbf385da09b6dc38fae17b45
+--- /dev/null
++++ b/tests/hermes_cli/test_home_label_delivery_retry.py
+@@ -0,0 +1,90 @@
++"""Captured label bytes survive temporary destination custody. [daveey]"""
++from copy import deepcopy
++from types import SimpleNamespace
++
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_memo as memo
++from hermes_cli import kanban_operator_labels as labels
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_home_review_composed_delivery as cases
++
++board = cases.board
++
++
++def test_captured_label_retry_never_rebinds_epoch(board, monkeypatch):
++    task = cases.support.card(board, 'ready')
++    event = 'captured-label-retry-0001'
++    cases._label_job(board, task, event)
++    sent, epoch = [], ['original-captured-epoch']
++    applied = [False]
++
++    def evidence(_board, table, _uid):
++        if table == 'tasks':
++            return {'state': 'live', 'row': {'id': task, 'home_generation': epoch[0], 'home_transfer_pending': None}}
++        return {'state': 'live', 'row': {**sent[-1]['fields'], 'uid': event, 'origin_gateway': 'hub'}}
++
++    def ops(_board, batch):
++        sent.extend(deepcopy(batch))
++        return {'results': [{'client_op_id': batch[0]['client_op_id'], 'status': 'applied' if applied[0] else 'error'}]}
++
++    peer = SimpleNamespace(row_evidence=evidence, ops=ops, close=lambda: None)
++    monkeypatch.setattr(client, 'load_identity', lambda: object())
++    monkeypatch.setattr(client, 'Hub', lambda _identity: peer)
++    assert labels._deliver(board, 'hub', 'default', now=10) == 0
++    original = deepcopy(memo.get(board, event))
++    assert original['home_generations'] == {task: epoch[0]}
++    cases._label_freeze(board, task, 'pending')
++    for now in range(20, 50):
++        assert labels._deliver(board, 'hub', 'default', now=now) == 0
++    assert len(sent) == 1
++    assert cases._job(board)['delivery_attempts'] == 1
++    assert memo.get(board, event) == original
++    cases.unfreeze(board, task, 'pending')
++    epoch[0], applied[0] = 'newer-epoch-must-not-be-borrowed', True
++    assert labels._deliver(board, 'hub', 'default', now=60) == 1
++    assert sent == [original, original]
++    assert cases._job(board)['delivery_attempts'] == 2
++    assert cases._job(board)['delivered_at'] is not None
++    with dbc.write_txn(board):
++        assert memo.get(board, event) == original
++
++
++def test_frozen_prefix_does_not_consume_delivery_selection_budget(board, monkeypatch):
++    frozen = cases.support.card(board, 'ready')
++    healthy = cases.support.card(board, 'ready')
++    cases._label_job(board, frozen, 'frozen-event-0001')
++    with dbc.write_txn(board):
++        board.execute("INSERT INTO operator_label_jobs(request_uid,board,machine,labels,caller,result_task_id,"
++                      "state,outcome,detail,event_uid,created_at,delivery_attempts) "
++                      "VALUES ('healthy','default','worker-a3','[]','{}',?,'done','verified','ok',?,2,0)",
++                      (healthy, 'healthy-event-0001'))
++    cases._label_freeze(board, frozen, 'pending')
++    sent = []
++    cases._fake_label_hub(monkeypatch, healthy, 'healthy-event-0001', sent, 'healthy-epoch-0001')
++    monkeypatch.setattr(labels, 'MAX_DELIVERIES_PER_TICK', 1)
++    assert labels._deliver(board, 'hub', 'default', now=10) == 1
++    assert len(sent) == 1 and sent[0]['fields']['task_id'] == healthy
++    row = board.execute("SELECT delivery_attempts,delivered_at FROM operator_label_jobs WHERE request_uid='request'").fetchone()
++    assert tuple(row) == (0, None)
++
++
++def test_freeze_after_selection_is_not_an_attempt(board, monkeypatch):
++    task = cases.support.card(board, 'ready')
++    event = 'selection-race-label-0001'
++    cases._label_job(board, task, event)
++    original = labels._push_event
++    sent = []
++    cases._fake_label_hub(monkeypatch, task, event, sent, 'race-epoch-0001')
++
++    def raced(*args):
++        cases._label_freeze(board, task, 'pending')
++        return original(*args)
++
++    monkeypatch.setattr(labels, '_push_event', raced)
++    assert labels._deliver(board, 'hub', 'default', now=10) == 0
++    assert cases._job(board)['delivery_attempts'] == 0
++    assert not sent and memo.get(board, event) is None
++    cases.unfreeze(board, task, 'pending')
++    monkeypatch.setattr(labels, '_push_event', original)
++    assert labels._deliver(board, 'hub', 'default', now=20) == 1
++    assert len(sent) == 1 and sent[0]['home_generations'] == {task: 'race-epoch-0001'}
+diff --git a/tests/hermes_cli/test_home_label_presend.py b/tests/hermes_cli/test_home_label_presend.py
+index 2bce1c8f19fe8a5517595811cd68c2955917c56f..ca8f4160cf94b1f77d065007b716a806fb0ad986 100644
+--- a/tests/hermes_cli/test_home_label_presend.py
++++ b/tests/hermes_cli/test_home_label_presend.py
+@@ -51,7 +51,7 @@
+     if fault != 'legacy':
+         assert labels._deliver(board, 'hub', 'default', now=10) == 0
+         assert not sent
+-        assert board.execute('SELECT delivery_attempts FROM operator_label_jobs').fetchone()[0] == 1
++        assert board.execute('SELECT delivery_attempts FROM operator_label_jobs').fetchone()[0] == int(fault != 'pending')
+         if fault == 'pending':
+             assert labels._deliver(board, 'hub', 'default', now=15) == 0
+             assert not sent, 'an attempted pre-send retry bypassed pending validation'
+diff --git a/tests/hermes_cli/test_home_review_composed_delivery.py b/tests/hermes_cli/test_home_review_composed_delivery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e488f5086d3cbde0c27c45c1b3b4587de09029c5
+--- /dev/null
++++ b/tests/hermes_cli/test_home_review_composed_delivery.py
+@@ -0,0 +1,291 @@
++"""Composed delivery/recovery must retain custody and eventual progress. [daveey]
++
++S1: actual hub label delivery, including destination-pending replicas.
++S2: retained shared-blocker sweep after a genuine exact source abort.
++S3: caused-stop review with an unfrozen source and frozen wait_on target.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as transfer
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_home_release_candidates as support
++
++board = support.board
++NONCE = "release-candidates-0001"
++
++
++def unfreeze(conn, task, phase):
++    """Genuine release: trusted Board abort for prepared, authenticated feed unpend for pending."""
++    with dbc.write_txn(conn):
++        if phase == "prepared":
++            transfer.abort_source(conn, {"task": task, "source": "worker-a3", "destination": "hub", "nonce": NONCE,
++                                         "expected_version": 7, "phase": "aborted", "rows": []})
++        else:
++            from hermes_cli.kanban_home_generation import mirror_feed
++            mirror_feed(conn, task, {"home_generation": NONCE, "home_transfer_pending": None}, 9)
++    assert not transfer.frozen(conn, task)
++
++
++# ---------------------------------------------------------------- S1 label delivery
++def _label_job(conn, task, event):
++    from hermes_cli import kanban_operator_labels as labels
++    with dbc.write_txn(conn):
++        for sql in labels.SCHEMA:
++            conn.execute(sql)
++        conn.execute("INSERT INTO operator_label_jobs(request_uid,board,machine,labels,caller,result_task_id,"
++                     "state,outcome,detail,event_uid,created_at,delivery_attempts) "
++                     "VALUES ('request','default','worker-a3','[]','{}',?,'done','verified','ok',?,1,0)",
++                     (task, event))
++
++
++def _fake_label_hub(monkeypatch, task, event, sent, epoch):
++    def evidence(_board, table, _uid):
++        if table == "task_events":
++            return {"state": "live", "row": {**sent[-1]["fields"], "uid": event, "origin_gateway": "hub"}}
++        return {"state": "live", "row": {"id": task, "home_generation": epoch, "home_transfer_pending": None}}
++
++    def ops(_board, batch):
++        sent.extend(batch)
++        return {"results": [{"status": "applied", "client_op_id": batch[0]["client_op_id"]}]}
++    hub = SimpleNamespace(row_evidence=evidence, ops=ops, close=lambda: None)
++    monkeypatch.setattr(client, "load_identity", lambda: object())
++    monkeypatch.setattr(client, "Hub", lambda _ident: hub)
++
++
++def _label_freeze(conn, task, phase):
++    if phase != 'pending':
++        return support.freeze(conn, task, phase)
++    # The actual label executor is the hub, holding a destination-pending replica.
++    from hermes_cli.kanban_home_generation import mirror_feed
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET gateway_id='hub'")
++        conn.execute("UPDATE tasks SET created_on='hub',sync_version=8 WHERE id=?", (task,))
++        conn.execute('DELETE FROM kanban_sync_outbox')
++        mirror_feed(conn, task, {'home_generation': NONCE, 'home_transfer_pending': NONCE}, 8)
++
++
++def _job(conn):
++    return dict(conn.execute("SELECT delivery_attempts,delivered_at,last_error FROM operator_label_jobs").fetchone())
++
++
++def _capture(conn, event):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_label_capture1'").fetchone():
++        return None
++    row = conn.execute("SELECT task_id,legacy FROM kanban_home_label_capture1 WHERE event_uid=?", (event,)).fetchone()
++    return None if row is None else tuple(row)
++
++
++@pytest.mark.parametrize("phase", ["prepared", "pending", None])
++def test_s1_frozen_delivery_then_release_keeps_epoch(board, monkeypatch, phase):
++    from hermes_cli import kanban_operator_labels as labels
++    task = support.card(board, "ready")
++    event = "review4300-label-event-0001"
++    _label_job(board, task, event)
++    sent, epoch = [], "epoch-release-target-0001"
++    _fake_label_hub(monkeypatch, task, event, sent, epoch)
++    if phase:
++        _label_freeze(board, task, phase)
++        assert transfer.frozen(board, task)
++        out = labels._deliver(board, "hub", "default", now=10)
++        after_frozen = _job(board)
++        print("S1", phase, "frozen tick sent=", out, "job=", after_frozen, "capture=", _capture(board, event),
++              "ops=", len(sent))
++        assert out == 0 and not sent
++        unfreeze(board, task, phase)
++    out = labels._deliver(board, "hub", "default", now=20)
++    print("S1", phase, "healthy tick sent=", out, "job=", _job(board), "capture=", _capture(board, event),
++          "wire_home_generations=", sent[0].get("home_generations") if sent else "<none sent>")
++    assert out == 1
++    assert sent[0].get("home_generations") == {task: epoch}, (
++        "frozen pre-capture refusal reclassified a new-producer job as legacy: epoch dropped")
++
++
++@pytest.mark.parametrize("phase", ["prepared", "pending"])
++def test_s1_frozen_delivery_cap_marks_delivered_without_send(board, monkeypatch, phase):
++    from hermes_cli import kanban_operator_labels as labels
++    task = support.card(board, "ready")
++    event = "review4300-label-event-0002"
++    _label_job(board, task, event)
++    sent = []
++    _fake_label_hub(monkeypatch, task, event, sent, "epoch-cap-0001")
++    _label_freeze(board, task, phase)
++    now, ticks = 10, 0
++    while _job(board)["delivered_at"] is None and ticks < labels.MAX_DELIVERY_ATTEMPTS + 5:
++        labels._deliver(board, "hub", "default", now=now)
++        now += labels.DELIVERY_BACKOFF_CAP_S + 1
++        ticks += 1
++    job = _job(board)
++    print("S1cap", phase, "ticks=", ticks, "job=", job, "ops_sent=", len(sent), "still_frozen=",
++          transfer.frozen(board, task))
++    assert transfer.frozen(board, task)
++    assert not sent
++    assert job['delivery_attempts'] == 0
++    assert job["delivered_at"] is None, "label result abandoned (delivered_at set) while transfer only pending"
++    unfreeze(board, task, phase)
++    assert labels._deliver(board, 'hub', 'default', now=now) == 1
++    assert len(sent) == 1 and sent[0]['home_generations'] == {task: 'epoch-cap-0001'}
++
++
++# ---------------------------------------------------------------- S2 gated shared-blocker sweep
++class _Result:
++    shared_blocker_probed = shared_blocker_released = None
++
++
++def _stranded(conn):
++    from unittest import mock
++    from hermes_cli import kanban_timed_park as ktp
++    with mock.patch.object(ktp, "park_mode", lambda *a, **k: None):
++        tid = kb.create_task(conn, title="stranded", assignee="default")
++        assert kb.claim_task(conn, tid) is not None
++        assert kb.block_task(conn, tid, reason="GitHub Actions refuses every job: billing",
++                             kind="capability", blocker_id="review4300-wall")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET started_at=started_at-7200, "
++                     "ended_at=CASE WHEN ended_at IS NULL THEN NULL ELSE ended_at-7200 END")
++        conn.execute("UPDATE task_events SET created_at=created_at-7200")
++    assert kb.get_task(conn, tid).status == "blocked"
++    return tid
++
++
++def _sweep(conn):
++    from hermes_cli import kanban_idle_candidates as idle
++    r = _Result()
++    idle.sweep_shared_blockers(conn, r)
++    return r.shared_blocker_probed
++
++
++@pytest.mark.parametrize("phase", ["prepared", "pending", None])
++def test_s2_gated_probe_after_genuine_release(board, phase):
++    from hermes_cli import kanban_sweep_gate as gate
++    from hermes_cli.kanban_activity_revision import LOCAL_TABLES
++    task = _stranded(board)
++    gate.reset()
++    if phase is None:
++        out = _sweep(board)
++        print("S2", phase, "control probed=", out, "status=", kb.get_task(board, task).status)
++        assert out == [task]
++        return
++    support.freeze(board, task, phase)
++    assert transfer.frozen(board, task)
++    first = _sweep(board)
++    k1 = gate.key(board)
++    print("S2", phase, "warm frozen probed=", first, "status=", kb.get_task(board, task).status, "key=", k1)
++    assert first == [] and kb.get_task(board, task).status == "blocked"
++    assert k1 is not None, "gate key unknown: sweep never skips (refutes S2)"
++    unfreeze(board, task, phase)
++    k2 = gate.key(board)
++    second = _sweep(board)
++    print("S2", phase, "after release key_equal=", k1 == k2, "probed=", second, "status=",
++          kb.get_task(board, task).status, "custody tables in key=",
++          [t for t in ("kanban_home_aborted1", "kanban_home_generations1") if t in LOCAL_TABLES])
++    gate.reset()
++    diag = _sweep(board)
++    print("S2", phase, "diagnostic after gate.reset probed=", diag, "status=", kb.get_task(board, task).status)
++    assert second == [task], "warm gated sweep stayed skipped after genuine release"
++    assert diag is None, "no blocked candidate remains after release"
++
++
++# ---------------------------------------------------------------- S3 caused-stop wait_on frozen target
++@pytest.fixture
++def hub(monkeypatch):
++    import hashlib
++    from hermes_cli import kanban_db_sync as sync
++    calls = []
++
++    class Hub:
++        ident = SimpleNamespace(gateway="home")
++
++        def decision_retain_capability(self, _board):
++            return {"spend_review": 1}
++
++        def ops(self, _board, batch):
++            calls.append(batch[0])
++            return {"results": [{"client_op_id": batch[0]["event_uid"], "status": "applied"}]}
++
++        def row_evidence(self, board, table, uid):
++            if not calls:
++                return {'state': 'missing'}
++            op = calls[-1]
++            payload = {k: op[k] for k in ("task", "episode", "verdict", "reason", "max_grants")}
++            payload.update(version=1, runs=None, quote=op.get("quote"), target=op.get("target"), request_uid=uid,
++                           request_sha256=hashlib.sha256(json.dumps(
++                               {k: v for k, v in op.items() if k != 'home_generations'},
++                               sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest(),
++                           actor_kind="system", actor_session=None, actor_gateway="home",
++                           authority_kind="spend_reviewer", authority_ref="kanban-spend-reviewer")
++            row = dict(uid=uid, task_id=op["task"], kind="spend_review", version=1, origin_gateway="home",
++                       deleted_at=None, payload=json.dumps(payload))
++            return {"board": board, "table": table, "uid": uid, "state": "live", "row": row}
++
++        def close(self):
++            pass
++    monkeypatch.setattr(sync, "sync_state", lambda c: {"board_id": "test"})
++    monkeypatch.setattr(sync, "board_mode", lambda c: "primary")
++    monkeypatch.setattr(client, "load_identity", lambda: None)
++    monkeypatch.setattr(client, "Hub", lambda ident, **kw: Hub())
++    monkeypatch.setattr(client, "push", lambda *a, **kw: None)
++    return calls
++
++
++@pytest.mark.parametrize("phase", ["prepared", "pending", None])
++def test_s3_wait_on_frozen_target_escalates_source(board, spend_reviewer, hub, monkeypatch, phase):
++    from hermes_cli import kanban_spend_reviewer as reviewer
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_review_request as journal
++    target = support.card(board, "ready")
++    source = kb.create_task(board, title="caused stop source", assignee="default")
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?", (source,))
++        kb._append_event(board, source, "spend_budget_triaged",
++                         {"cause": "scope_stopped", "reason": f"Stopped until {target} lands."})
++    ep = reviewer._current_episode(board, source)
++    with kb.write_txn(board):
++        kb._append_event(board, source, decision.NOTICE, {"episode": ep})
++        kb._append_event(board, source, reviewer.STARTED, {"episode": ep})
++    if phase:
++        support.freeze(board, target, phase)
++        assert transfer.frozen(board, target) and not transfer.frozen(board, source)
++    spend_reviewer.append({"decision": "wait_on", "reason": f"Blocked on {target}.", "target": target})
++    out = reviewer.review(board, source, ep)
++    events = [r[0] for r in board.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (source,))]
++    print("S3", phase, "review=", out, "state=", reviewer.state(board, source, ep), "journal=",
++          journal.get(board, source, ep) is not None, "ops=", len(hub), "source_events=", events[-4:])
++    if phase is None:
++        assert out == "settled" and len(hub) == 1
++        return
++    assert not hub, "no submission while target frozen"
++    assert out == 'pending'
++    retained = journal.get(board, source, ep)
++    assert retained['capture_pending'] is True
++    from hermes_cli import kanban_home_command as home
++    with pytest.raises(home.Pending):
++        home.outbound(retained, retained['wire'])
++    import sqlite3
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as reopened:
++        assert journal.get(reopened, source, ep) == retained
++    original_wire = retained['wire']
++    assert reviewer.review(board, source, ep) == 'pending'
++    assert journal.get(board, source, ep) == retained
++    assert not hub and not spend_reviewer  # consumed exactly one judgment, no replacement
++    assert reviewer.start_due(board, now=10**10) == []
++    unfreeze(board, target, phase)
++    with monkeypatch.context() as held:
++        held.setattr(reviewer, 'settings', lambda: (False, 2))
++        assert reviewer.review(board, source, ep) == 'pending'
++        assert journal.get(board, source, ep) == retained and not hub
++    assert reviewer.review(board, source, ep) == 'settled'
++    captured = journal.get(board, source, ep)
++    assert 'capture_pending' not in captured
++    assert captured['wire'] == original_wire
++    assert len(hub) == 1
++    assert {k: v for k, v in hub[0].items() if k != 'home_generations'} == original_wire
++    assert kb.get_task(board, target).status == 'ready'
++    assert reviewer.review(board, source, ep) == 'moot'
++    assert len(hub) == 1
+diff --git a/tests/hermes_cli/test_home_shared_consumer_io.py b/tests/hermes_cli/test_home_shared_consumer_io.py
+index c000c9fbb2fad60bdf8556b99b41f3ac9c88f702..cadfded609f5251ca96ec9dd53392b62572e492c 100644
+--- a/tests/hermes_cli/test_home_shared_consumer_io.py
++++ b/tests/hermes_cli/test_home_shared_consumer_io.py
+@@ -130,9 +130,15 @@
+     support.freeze(c, 't_target', phase)
+     wire = {**wire, 'verdict': 'wait_on', 'target': 't_target'}
+     if phase != 'completed':
+-        with pytest.raises(ValueError, match='home transfer'):
+-            journal.freeze(c, 'board', 'worker-a3', wire)
+-        assert journal.get(c, 't_A', ep) is None
++        request = journal.freeze(c, 'board', 'worker-a3', wire)
++        assert request['capture_pending'] is True
++        assert request['home_generations'] is None
++        assert request['wire'] == wire
++        from hermes_cli import kanban_home_command as home
++        with pytest.raises(home.Pending, match='home capture'):
++            home.outbound(request, wire)
++        assert c.execute('SELECT 1 FROM spend_review_requests WHERE task=? AND episode=?', ('t_A', ep)).fetchone() is None
++        assert journal.get(c, 't_A', ep) == request
+     else:
+         request = journal.freeze(c, 'board', 'worker-a3', wire)
+         assert json.loads(request['home_generations']) == {'t_target': 'fixture-generation-0001'}
+-- 
+2.43.0
+

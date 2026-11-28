@@ -1,0 +1,395 @@
+From 757e4d067bb1a70882d533a5d30e3f3ea1d1689f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 10:52:17 +0000
+Subject: [PATCH 6986] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 757e4d067bb1a70882d533a5d30e3f3ea1d1689f.
+
+---
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+index fda356cfeac914aa42ac2a031d29bb30cada298f..4b6bf96c8422aa31ea1649d2ae2ee40891fc9fdf 100644
+--- a/hermes_cli/kanban_ask_resolved.py
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -288,7 +288,10 @@
+ 
+ def _current(conn: sqlite3.Connection, task_id: str, cmd: str, generation: str) -> Optional[dict]:
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_home_transfer import frozen
+ 
++    if frozen(conn, task_id):
++        return None
+     state = kwc.get_state(conn, task_id)
+     row = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     if (state is None or state.get("purpose") != PURPOSE or state["cmd"] != cmd or state["generation"] != generation
+@@ -408,6 +411,8 @@
+     if stale:
+         with kb.write_txn(conn):
+             for tid in stale:
++                if frozen(conn, tid):
++                    continue
+                 sync_row(conn, tid)
+                 out["dropped"].append(tid)
+     if not missing:
+@@ -450,6 +455,8 @@
+             if silent <= kwc.ALIVE_EVERY + 2 * int(every) + kwc.SILENT_GRACE:
+                 continue
+             with kb.write_txn(conn):
++                if frozen(conn, tid):
++                    continue
+                 st = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (tid,)).fetchone()
+                 if (st is None or st[0] != "blocked" or resolved_check(st[1])[0] != cmd
+                         or after(tid, filed_id, (SILENT_EVENT, *terminal))):
+@@ -466,6 +473,8 @@
+             continue
+         restored = after(tid, filed_id, (RESTORED_EVENT,))
+         with kb.write_txn(conn):
++            if frozen(conn, tid):
++                continue
+             row = conn.execute("SELECT status, human_request FROM tasks WHERE id = ?", (tid,)).fetchone()
+             cmd = resolved_check(row[1])[0] if row is not None and row[0] == "blocked" else None
+             if (not cmd or kwc.get_state(conn, tid) is not None or after(tid, filed_id, terminal)
+diff --git a/hermes_cli/kanban_ask_resolved_backfill.py b/hermes_cli/kanban_ask_resolved_backfill.py
+index 6b433e5da7e279332c2c206c37af4f45120d725a..0830c7beff8a51bbbe2fbae8430f397441d07cc8 100644
+--- a/hermes_cli/kanban_ask_resolved_backfill.py
++++ b/hermes_cli/kanban_ask_resolved_backfill.py
+@@ -51,6 +51,8 @@
+     from hermes_cli import kanban_ask_resolved as kar
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli import kanban_home_probe as probe
++    from hermes_cli.kanban_home_transfer import frozen
+ 
+     try:
+         ids = [r[0] for r in conn.execute(
+@@ -63,15 +65,17 @@
+     foreign = kwc.foreign_ids(conn, own)
+     marked: list[str] = []
+     for tid in ids:
++        if frozen(conn, tid):
++            continue
+         drop = _latest_drop(conn, tid)
+         if drop is None:
+             continue
+-        payload = conn.execute("SELECT payload FROM task_events WHERE id = ?", (drop[0],)).fetchone()
+-        host = kb._json_dict(payload[0]).get("probe_host") if payload else None
+-        if (host and own and host != own) or (tid in foreign and not host):
+-            continue
+         with kb.write_txn(conn):
+-            if _latest_drop(conn, tid) != drop or not _eligible(conn, tid):
++            if frozen(conn, tid) or _latest_drop(conn, tid) != drop or not _eligible(conn, tid):
++                continue
++            payload = conn.execute("SELECT payload FROM task_events WHERE id = ?", (drop[0],)).fetchone()
++            host = probe.host(conn, tid, drop[0], kb._json_dict(payload[0]).get("probe_host") if payload else None)
++            if host == probe.UNKNOWN or (host and own and host != own) or (tid in foreign and not host):
+                 continue
+             kar.mark_dropped(conn, tid, drop[2], drop[3])
+             # Sync remaps integer IDs but preserves UIDs and payloads verbatim. Older unsynced
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index 1f479e5b01fea578ddf01cfe82589a58b01c9d8d..685097fc5ca8cb03faa2bf38594ce4ff203c7446 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -84,6 +84,9 @@
+     from hermes_cli import kanban_awaiting as kaw
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
++        from hermes_cli.kanban_home_transfer import frozen
++        if frozen(conn, task_id):
++            return False  # late probe follow-up still belongs to the pending epoch
+         task = kb.get_task(conn, task_id)
+         if task is None or task.status != "scheduled":
+             return False
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index c1839837802e4b311c463cb86d1bda1c9089228e..2449ad664f7480f0f210fd7dbac1c28ac602b272 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -891,6 +891,9 @@
+     tail = _tail(out)
+     interval = episode.stale_seconds() if stale_interval is None else stale_interval
+     with kb.write_txn(conn):
++        from hermes_cli.kanban_home_transfer import frozen
++        if frozen(conn, task_id):
++            return None  # a submitted probe cannot write into a later custody interval
+         state = get_state(conn, task_id)
+         status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if (state is None or state["cmd"] != cmd or state["generation"] != generation
+diff --git a/tests/hermes_cli/test_home_probe_writer_custody.py b/tests/hermes_cli/test_home_probe_writer_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f56ea302d2081ff77637063dc50edc9e4b3933b4
+--- /dev/null
++++ b/tests/hermes_cli/test_home_probe_writer_custody.py
+@@ -0,0 +1,153 @@
++"""Probe writers preserve exact auxiliary state across custody races."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_ask_resolved as ask, kanban_ask_resolved_backfill as backfill
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as transfer, kanban_wake_check as wake
++from tests.hermes_cli import test_home_probe_custody as support
++
++board = support.board
++
++
++def snapshot(conn, tid):
++    """Include every task-keyed local table, not just synced task/event rows."""
++    result = {}
++    for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
++        columns = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
++        key = 'id' if table == 'tasks' else 'task_id'
++        if key in columns:
++            result[table] = sorted((tuple(r) for r in conn.execute(
++                f'SELECT * FROM "{table}" WHERE "{key}"=?', (tid,))), key=repr)
++    return result
++
++
++def freeze(conn, tid, record, phase):
++    with dbc.write_txn(conn):
++        transfer.prepare(conn, tid, source=record['source'], destination='hub',
++                         nonce=record['nonce'], expected_version=7)
++        if phase == 'pending':
++            transfer.finalize_source(conn, record)
++        elif phase == 'malformed':
++            conn.execute('DROP TRIGGER IF EXISTS home_prepared1_marker_update')
++            conn.execute("UPDATE kanban_home_prepared1 SET source='' WHERE task_id=?", (tid,))
++        elif phase == 'aborted':
++            transfer.abort_source(conn, {**record, 'phase': 'aborted', 'rows': []})
++
++
++@pytest.mark.parametrize('is_ask', [False, True])
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', 'aborted'])
++@pytest.mark.parametrize('rc', [0, 1, 2])
++def test_late_results_preserve_all_local_tables_and_healthy_neighbor(board, is_ask, phase, rc):
++    tid, record, _ = support.source_park(board, ask=is_ask)
++    healthy, _, _ = support.source_park(board, ask=is_ask)
++    apply = ask.apply_result if is_ask else wake.apply_result
++    state = wake.get_state(board, tid)
++    other = wake.get_state(board, healthy)
++    # Real bookkeeping seeds wake episode, barrier and confirmation tables before capture.
++    apply(board, tid, state['cmd'], 1, 'not yet', generation=state['generation'], now=999)
++    from hermes_cli.kanban_home_probe import claim_wake
++    assert claim_wake(board, tid, state['cmd'], state['every'], state['generation'],
++                      state.get('purpose'), 'blocked' if is_ask else 'scheduled', 1120, 'inflight')
++    state = wake.get_state(board, tid)
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++    freeze(board, tid, record, phase)
++    before = snapshot(board, tid)
++    apply(board, tid, state['cmd'], rc, 'not yet', generation=state['generation'], now=1121)
++    if phase != 'aborted':
++        assert transfer.frozen(board, tid)
++        assert snapshot(board, tid) == before
++    else:
++        assert not transfer.frozen(board, tid)
++        assert wake.get_state(board, tid) != state
++    apply(board, healthy, other['cmd'], 1, 'not yet', generation=other['generation'], now=1001)
++    assert wake.get_state(board, healthy)['last_at'] == 1001
++
++
++@pytest.mark.parametrize('action', ['restore', 'lost', 'silent', 'backfill'])
++def test_reconcile_writer_entry_race_keeps_local_tables(board, monkeypatch, action):
++    tid, record, _ = support.source_park(board, ask=True)
++    with dbc.write_txn(board):
++        if action == 'silent':
++            board.execute("UPDATE task_events SET payload=json_set(payload,'$.probe_host','hub') "
++                          "WHERE task_id=? AND kind='blocked'", (tid,))
++        if action in ('lost', 'backfill'):
++            kind = ask.RESTORED_EVENT if action == 'lost' else ask.BROKEN_EVENT
++            kb._append_event(board, tid, kind, {})
++        # Retain source probe through prepare preconditions, delete at writer seam below.
++        board.execute('DELETE FROM kanban_sync_outbox')
++    original = kb.write_txn
++    entered = []
++    expected = {}
++
++    @contextmanager
++    def writer(c, *args, **kwargs):
++        if not entered:
++            entered.append(True)
++            freeze(c, tid, record, 'pending')
++            expected.update(snapshot(c, tid))
++        with original(c, *args, **kwargs):
++            yield
++
++    # Reconcile needs a missing row to select the restoration/silent/backfill writers.
++    # An explicitly foreign probe permits preparation without local execution state.
++    with dbc.write_txn(board):
++        board.execute("UPDATE task_events SET payload=json_set(payload,'$.probe_host','hub') "
++                      "WHERE task_id=? AND kind='blocked'", (tid,))
++        board.execute('DELETE FROM task_wake_checks WHERE task_id=?', (tid,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        # Refresh the exact manifest after the genuine filing edit.
++        for entry in record['rows']:
++            if entry['table'] == 'task_events' and entry['fields'].get('kind') == 'blocked':
++                payload = json.loads(entry['fields']['payload'])
++                payload['probe_host'] = 'hub'
++                entry['fields']['payload'] = json.dumps(payload)
++    # For local restoration/loss paths, own gateway is hub; source identity remains worker-a3.
++    monkeypatch.setattr(wake, 'own_gateway', lambda c: 'worker-a3' if action == 'silent' else 'hub')
++    monkeypatch.setattr(wake, 'foreign_ids', lambda c, own: set())
++    monkeypatch.setattr(kb, 'write_txn', writer)
++    if action == 'backfill':
++        backfill.backfill(board)
++    else:
++        ask.reconcile(board, now=2000000000)
++    assert entered and transfer.frozen(board, tid)
++    after = snapshot(board, tid)
++    assert after == expected
++
++
++@pytest.mark.parametrize('known', [True, False])
++def test_backfill_respects_completed_historical_host_and_unknown_custody(board, known):
++    support.support.prepare_destination(board)
++    record = support.probe_manifest(ask=True)
++    event = copy.deepcopy(record['rows'][2])
++    event['uid'] = event['fields']['uid'] = 'legacy-drop'
++    event['fields'].update(kind=ask.BROKEN_EVENT, ord=2, created_at=1001, payload='{}')
++    record['rows'].append(event)
++    support.support.materialize(board, record)
++    support.support.complete_feed(board, record)
++    tid = record['task']
++    if not known:
++        with dbc.write_txn(board):
++            board.execute('DELETE FROM kanban_home_materialized1')
++            board.execute('UPDATE task_events SET origin_gateway=NULL WHERE task_id=?', (tid,))
++    before = snapshot(board, tid)
++    assert backfill.backfill(board) == []
++    assert snapshot(board, tid) == before
++
++
++def test_late_probe_followup_cannot_record_decision_recovery(board):
++    from hermes_cli import kanban_decision_ask as decision
++    tid, record, _ = support.source_park(board)
++    with dbc.write_txn(board):
++        kb._append_event(board, tid, decision.NOTICE_KIND, {'why': 'question'})
++        board.execute('DELETE FROM kanban_sync_outbox')
++    freeze(board, tid, record, 'pending')
++    before = snapshot(board, tid)
++    assert not decision.escalate(board, tid, 'late unanswered probe', trust_probe=True)
++    assert snapshot(board, tid) == before
+diff --git a/tests/hermes_cli/test_home_review_custody_repros.py b/tests/hermes_cli/test_home_review_custody_repros.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10aad1e5e67f7a8b6769a60bfcf50896dc91d965
+--- /dev/null
++++ b/tests/hermes_cli/test_home_review_custody_repros.py
+@@ -0,0 +1,75 @@
++"""Independent exact-head review custody regressions; expected invariants."""
++import copy
++import json
++import pytest
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_wake_check as wake, kanban_ask_resolved as ask
++from hermes_cli import kanban_home_transfer as transfer
++from tests.hermes_cli import test_home_probe_custody as support
++
++board = support.board
++
++@pytest.mark.parametrize('is_ask', [False, True])
++def test_pending_drops_inflight_result_without_probe_mutation(board, is_ask):
++    tid, record, _ = support.source_park(board, ask=is_ask)
++    state = wake.get_state(board, tid)
++    if not is_ask:
++        wake.apply_result(board, tid, state['cmd'], 1, 'not yet', generation=state['generation'], now=999)
++        with dbc.write_txn(board):
++            board.execute('DELETE FROM kanban_sync_outbox')
++    with dbc.write_txn(board):
++        transfer.prepare(board, tid, source=record['source'], destination='hub', nonce=record['nonce'], expected_version=7)
++        transfer.finalize_source(board, record)
++    assert transfer.frozen(board, tid)
++    before = dict(wake.get_state(board, tid))
++    apply = ask.apply_result if is_ask else wake.apply_result
++    apply(board, tid, state['cmd'], 1, 'not yet', generation=state['generation'], now=1001)
++    assert dict(wake.get_state(board, tid)) == before
++
++
++def test_backfill_skips_pending_ask_and_restores_neighbor(board):
++    support.support.prepare_destination(board)
++    record = support.probe_manifest(ask=True)
++    event = copy.deepcopy(record['rows'][2])
++    event['uid'] = event['fields']['uid'] = 'drop-event'
++    event['fields'].update(kind=ask.BROKEN_EVENT, ord=2, created_at=1001, payload='{}')
++    record['rows'].append(event)
++    support.support.materialize(board, record)
++    healthy = kb.create_task(board, title='healthy')
++    with dbc.write_txn(board):
++        board.execute("UPDATE tasks SET status='blocked',human_request=?,created_on='hub' WHERE id=?", (json.dumps({'resolved_check':'true'}),healthy))
++        kb._append_event(board, healthy, 'blocked', {})
++    assert transfer.frozen(board, record['task'])
++    result = ask.reconcile(board, now=1002)
++    assert result['restored'] == [healthy]
++
++
++def test_reconcile_rechecks_custody_after_selection(board, monkeypatch):
++    from contextlib import contextmanager
++    tid, record, _ = support.source_park(board, ask=True)
++    with dbc.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET cmd='old command' WHERE task_id=?", (tid,))
++        board.execute("UPDATE task_events SET payload=json_set(payload,'$.probe_host','hub') WHERE task_id=? AND kind='blocked'", (tid,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        for entry in record['rows']:
++            if entry['table'] == 'task_events' and entry['fields'].get('kind') == 'blocked':
++                payload = json.loads(entry['fields']['payload'])
++                payload['probe_host'] = 'hub'
++                entry['fields']['payload'] = json.dumps(payload)
++    before = dict(wake.get_state(board, tid))
++    original = kb.write_txn
++    admitted = False
++    @contextmanager
++    def interleaved(conn, *args, **kwargs):
++        nonlocal admitted
++        if not admitted:
++            admitted = True
++            with dbc.write_txn(conn):
++                transfer.prepare(conn, tid, source=record['source'], destination='hub', nonce=record['nonce'], expected_version=7)
++                transfer.finalize_source(conn, record)
++        with original(conn, *args, **kwargs):
++            yield
++    monkeypatch.setattr(kb, 'write_txn', interleaved)
++    ask.reconcile(board, now=1001)
++    assert admitted and transfer.frozen(board, tid)
++    assert dict(wake.get_state(board, tid)) == before
+diff --git a/tests/hermes_cli/test_home_shared_path_invariant.py b/tests/hermes_cli/test_home_shared_path_invariant.py
+index b78ad1a67695b82e09b2bff3910da808c229775d..e73bbdf6b058e832e2fd260763d34fe0801128ca 100644
+--- a/tests/hermes_cli/test_home_shared_path_invariant.py
++++ b/tests/hermes_cli/test_home_shared_path_invariant.py
+@@ -21,6 +21,8 @@
+ from tests.hermes_cli import test_home_release_auxiliary as auxiliary_cases
+ from tests.hermes_cli import test_home_release_sweeps as sweep_cases
+ from tests.hermes_cli import test_home_feed_entrypoints as entry_cases
++from tests.hermes_cli import test_home_review_custody_repros as custody_review
++from tests.hermes_cli import test_home_probe_writer_custody as writer_cases
+ 
+ board = support.board
+ live = contracts.live
+@@ -63,6 +65,13 @@
+ test_poison_or_slow_replay_cannot_abort_independent_incoming_page = entry_cases.test_poison_or_slow_replay_cannot_abort_independent_incoming_page
+ test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody = entry_cases.test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody
+ test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write = entry_cases.test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write
++test_pending_drops_inflight_result_without_probe_mutation = custody_review.test_pending_drops_inflight_result_without_probe_mutation
++test_backfill_skips_pending_ask_and_restores_neighbor = custody_review.test_backfill_skips_pending_ask_and_restores_neighbor
++test_reconcile_rechecks_custody_after_selection = custody_review.test_reconcile_rechecks_custody_after_selection
++test_late_results_preserve_all_local_tables_and_healthy_neighbor = writer_cases.test_late_results_preserve_all_local_tables_and_healthy_neighbor
++test_reconcile_writer_entry_race_keeps_local_tables = writer_cases.test_reconcile_writer_entry_race_keeps_local_tables
++test_backfill_respects_completed_historical_host_and_unknown_custody = writer_cases.test_backfill_respects_completed_historical_host_and_unknown_custody
++test_late_probe_followup_cannot_record_decision_recovery = writer_cases.test_late_probe_followup_cannot_record_decision_recovery
+ 
+ 
+ def mixed(conn, status, setup=None):
+@@ -94,7 +103,9 @@
+ 
+ def snapshot(conn, ids):
+     return {tid: (tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()),
+-                  [tuple(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=? ORDER BY id', (tid,))])
++                  [tuple(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=? ORDER BY id', (tid,))],
++                  {table: rows for table, rows in writer_cases.snapshot(conn, tid).items()
++                   if rows and (table.startswith('task_wake_') or table == 'kanban_home_probe_watch1')})
+             for tid in ids}
+ 
+ 
+-- 
+2.43.0
+

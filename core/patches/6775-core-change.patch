@@ -1,0 +1,244 @@
+From d06e4ae3e6e450e79703c73dc038d2cf43810e19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:53:49 +0000
+Subject: [PATCH 6775] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit d06e4ae3e6e450e79703c73dc038d2cf43810e19.
+
+---
+diff --git a/tests/hermes_cli/test_native_owner_release_cli.py b/tests/hermes_cli/test_native_owner_release_cli.py
+index 2646197f737948e84c2544430028b0d36b482a04..824f4be651f17d7f830f676879620e26238e2083 100644
+--- a/tests/hermes_cli/test_native_owner_release_cli.py
++++ b/tests/hermes_cli/test_native_owner_release_cli.py
+@@ -90,11 +90,12 @@
+     return result
+ 
+ 
+-def cli(launch, *extra):
++def cli(launch, *extra, board=None):
+     env = build_subprocess_env(scrub_secrets=True)
+     env["PYTHONPATH"] = os.getcwd()
+     env[bridge.ENV_KEY] = launch.locator
+-    return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "release", "t_target",
++    return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", *(("--board", board) if board else ()),
++                           "release", "t_target",
+                            "--episode", "00000000-0000-7000-8000-000000000002", "--runs", "1",
+                            "--capability-episode", "00000000-0000-7000-8000-000000000001",
+                            "--note", "complete the exact original acceptance", "--json", *extra],
+@@ -261,3 +262,42 @@
+         assert transport.calls == [] and transport.sent == []
+     finally:
+         close(native)
++
++
++def _assert_no_release_effect(transport):
++    assert transport.calls == [] and transport.sent == [] and transport.carriers == []
++    with kbc.connect_closing() as conn:
++        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()
++
++
++def test_actual_cli_foreign_transport_gateway_refuses_before_first_hub_call(turn, transport, monkeypatch):
++    # Origin, primary board/profile and grants are valid; only the authenticated transport differs.
++    transport.ident = SimpleNamespace(gateway="foreign-gateway")
++    native = launch(monkeypatch)
++    try:
++        result = cli(native)
++        assert result.returncode == 2, (result.stdout, result.stderr)
++        value = json.loads(result.stdout)
++        assert not value["ok"] and "intent_uid" not in value
++        _assert_no_release_effect(transport)
++    finally:
++        close(native)
++
++
++@pytest.mark.parametrize("variation", ["profile", "board"])
++def test_actual_cli_nonprimary_profile_or_board_refuses_before_first_hub_call(turn, transport, monkeypatch, variation):
++    extra = {}
++    if variation == "profile":
++        from hermes_cli import kanban_execution_observations as observations
++        monkeypatch.setattr(observations, "board_owner_profile", lambda path: "other-profile")
++    else:
++        extra = {"board": "other-board"}
++    native = launch(monkeypatch)
++    try:
++        result = cli(native, **extra)
++        assert result.returncode == 2, (result.stdout, result.stderr)
++        value = json.loads(result.stdout)
++        assert not value["ok"] and "intent_uid" not in value
++        _assert_no_release_effect(transport)
++    finally:
++        close(native)
+diff --git a/tests/hermes_cli/test_owner_release_composed_holds.py b/tests/hermes_cli/test_owner_release_composed_holds.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d2ea3a67f5ce2e272996cac6571b59cb1729546
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_composed_holds.py
+@@ -0,0 +1,103 @@
++"""Current independent safety/containment through native CLI and real Board HTTP.
++
++No private Board injection: the safety source uses a real bound run/refusal retain;
++containment uses its authenticated lease-bound ingress and frozen authority policy.
++"""
++import json
++import uuid
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_origin
++from tests.hermes_cli import test_owner_release_composed as helpers
++from tests.hermes_cli import test_owner_release_composed_controls as controls
++from tests.tools import test_kanban_worker_created_chats as chats
++
++turn = helpers.turn
++server = helpers.server
++origin = helpers.origin
++parties = helpers.parties
++
++
++def _contain(home, task):
++    """Real canonical self-containment from a live HOME lease, not a public lookalike."""
++    authority = kb.create_task(home.conn, title="Independent containment decision", assignee="default")
++    pushed = helpers.ksc.push(home.conn, home.hub, helpers.BOARD, home.name, primary=True)
++    assert pushed.rejected == 0, pushed
++    with kbc.write_txn(home.conn):
++        rid = home.conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at) VALUES (?, 'default', 'running', 1)",
++                                (task,)).lastrowid
++        home.conn.execute("UPDATE tasks SET status='running', current_run_id=? WHERE id=?", (rid, task))
++        home.conn.execute("DELETE FROM kanban_sync_outbox")  # canonical lease supplies claim/run, as _home_stop
++    run = sync.run_uid(home.conn, rid)
++    grant = home.hub.leases(helpers.BOARD, {"action": "grant", "task": task, "run_uid": run, "ttl_s": 60})
++    assert grant["status"] == "applied", grant
++    context = home.hub.containment_context(helpers.BOARD, task)
++    episode = str(uuid.uuid7())
++    policy = {"version": 1, "authority": {"board": helpers.BOARD, "gateway": home.name, "task_id": authority}}
++    payload = {"version": 1, "target": context["target"], "policy": policy, "producer_baseline": None}
++    op = {"client_op_id": str(uuid.uuid7()), "op": "contain", "task": task, "actor_task": task,
++          "actor_run_uid": run, "event_uid": episode, "payload": payload}
++    result = home.hub.ops(helpers.BOARD, [op])["results"][0]
++    assert result["status"] == "applied", result
++    held = home.hub.containment_context(helpers.BOARD, task)
++    assert held["held"] is True and held["containment_events"] == [episode], held
++    event = home.hub.row_evidence(helpers.BOARD, "task_events", episode)["row"]
++    assert event["origin_gateway"] == home.name and event["kind"] == "contained"
++    return episode, held
++
++
++@pytest.mark.parametrize("hold", ["safety", "containment"])
++def test_real_current_independent_hold_refuses_native_release(origin, parties, monkeypatch, hold):
++    home, executor = parties
++    ident, native = origin
++    with monkeypatch.context() as scoped:
++        scoped.setattr(kanban_origin, "gateway_names", lambda: (home.name, {home.name}))
++        task, episode = helpers._home_stop(home, reason="capability_unavailable" if hold == "containment" else "scope_stopped",
++                                            refused=hold == "safety")
++        helpers._link_origin(home, ident, chats.CHAT, task, episode)
++        if hold == "containment":
++            # Legacy capability promotion is not a release receipt. This real
++            # next run contains itself; release must refuse the live containment
++            # before interpreting the old capability as a scope episode. This is
++            # ingress ordering coverage, not an unmasked per-clause mutation proof.
++            import time
++            from tests.waiting import wait_until
++            stopped_at = home.hub.row_evidence(helpers.BOARD, "task_events", episode)["row"]["created_at"]
++            wait_until(lambda: int(time.time()) > stopped_at, timeout=3)
++            controls.put(home, "task_events", "promotion-" + uuid.uuid4().hex,
++                         {"task_id": task, "kind": "promoted_manual", "payload": "{}", "created_at": int(time.time())})
++            controls.put(home, "tasks", task, {"status": "ready"})
++            home.resync()
++            containment, held = _contain(home, task)
++        else:
++            event = home.hub.row_evidence(helpers.BOARD, "task_events", episode)["row"]
++            assert json.loads(event["payload"])["cause"] == "safety_refusal"
++    before = helpers.event_inventory(home, task)
++    task_before = home.hub.row_evidence(helpers.BOARD, "tasks", task)["row"]
++    replies = []
++    actual_ops = helpers.ksc.Hub.ops
++
++    def observe_ops(hub, board, ops, *args, **kwargs):
++        result = actual_ops(hub, board, ops, *args, **kwargs)
++        if any(op.get("op") == "authorize_owner_release" and op.get("task") == task for op in ops):
++            replies.extend(result["results"])
++        return result
++
++    monkeypatch.setattr(helpers.ksc.Hub, "ops", observe_ops)
++    first = helpers.release_cli(native, task, episode)
++    value = json.loads(first.stdout)
++    assert first.returncode == 2 and not value["ok"], (value, first.stderr)
++    assert replies and replies[0]["status"] == "rejected", replies
++    assert replies[0]["reason"] == {"safety": "owner_release_restricted", "containment": "containment_hold"}[hold], replies
++    assert "release_read" not in value and value.get("publication_stage") != "published", value
++    helpers.home_tick(home, monkeypatch, rounds=3)
++    assert helpers.event_inventory(home, task) == before
++    assert home.hub.row_evidence(helpers.BOARD, "tasks", task)["row"] == task_before
++    assert not helpers.release_receipts(home, task)
++    executor.resync()
++    assert executor.hub.row_evidence(helpers.BOARD, "tasks", task)["row"] == task_before
++    if hold == "containment":
++        assert home.hub.containment_context(helpers.BOARD, task) == held
++        assert home.hub.row_evidence(helpers.BOARD, "task_events", containment)["row"]["kind"] == "contained"
+diff --git a/tests/tools/test_origin_cli_release_bridge.py b/tests/tools/test_origin_cli_release_bridge.py
+index 86692fcfc2d2e3d1a85c92780006fb5aadead765..373e7bd52f687f446bfe8ad52b0b510d77a258b9 100644
+--- a/tests/tools/test_origin_cli_release_bridge.py
++++ b/tests/tools/test_origin_cli_release_bridge.py
+@@ -96,3 +96,57 @@
+     assert result["outcome"] == "outcome_unknown" and not result["ok"]
+     assert "private detail" not in str(result)
+     assert launch.retire()[0]["operation"] == "release"
++
++
++def _real_release_policy_launch(monkeypatch, *, enabled, delegated=False):
++    """Capture a real parent policy; only the downstream dispatch is replaced below."""
++    import model_tools
++    from contextlib import nullcontext
++    from agent.delegation_context import delegated_child_context
++    monkeypatch.setattr(model_tools, "_select_tool_names", lambda *a, **kw: {"terminal"})
++    with delegated_child_context() if delegated else nullcontext():
++        with monkeypatch.context() as scoped:
++            scoped.setattr(model_tools, "_handle_function_call", lambda *a: bridge.Launch("test"))
++            return model_tools.handle_function_call("terminal", {}, enabled_tools=enabled)
++
++
++def _release_request(monkeypatch, **launch_kwargs):
++    captured = _real_release_policy_launch(monkeypatch, **launch_kwargs)
++    try:
++        return bridge.request(captured.locator, {"task_id": "t_target"}, operation="release")
++    finally:
++        captured.close()
++        captured._thread.join(2)
++        assert not captured._thread.is_alive()
++
++
++@pytest.fixture
++def release_dispatch(monkeypatch):
++    """Records only whether captured policy reached native release dispatch."""
++    from hermes_cli import kanban_release_native
++    reached = []
++    def dispatch(args, *, gate):
++        reached.append(args)
++        return {"ok": True, "release_stage": "read_first_pending"}
++    monkeypatch.setattr(kanban_release_native, "dispatch", dispatch)
++    return reached
++
++
++def test_release_policy_refuses_delegated_child_before_native_dispatch(turn, monkeypatch, release_dispatch):
++    # Terminal is granted and selected in both calls; only delegated ancestry differs.
++    result = _release_request(monkeypatch, enabled=["terminal"], delegated=True)
++    assert result == {"ok": False, "error": "delegated children cannot use native CLI custody"}
++    assert release_dispatch == []
++    control = _release_request(monkeypatch, enabled=["terminal"])
++    assert control["ok"] and control["release_stage"] == "read_first_pending"
++    assert release_dispatch == [{"task_id": "t_target"}]
++
++
++@pytest.mark.parametrize("enabled", [None, [], ["kanban_create"]])
++def test_release_policy_refuses_ungranted_terminal_before_native_dispatch(turn, monkeypatch, release_dispatch, enabled):
++    # Session toolset selection still contains terminal: only the launch grant is absent.
++    result = _release_request(monkeypatch, enabled=enabled)
++    assert result == {"ok": False, "error": "terminal is not granted to this launch"}
++    assert release_dispatch == []
++    control = _release_request(monkeypatch, enabled=["terminal"])
++    assert control["ok"] and release_dispatch == [{"task_id": "t_target"}]
+-- 
+2.43.0
+

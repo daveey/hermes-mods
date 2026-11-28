@@ -1,0 +1,234 @@
+From 3a8b21ef068b57265173a92f7f564f9be0fbf45c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 22:20:36 +0000
+Subject: [PATCH 6882] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 3a8b21ef068b57265173a92f7f564f9be0fbf45c.
+
+---
+diff --git a/docs/kanban-replay-sender-admission.md b/docs/kanban-replay-sender-admission.md
+index fad2961da061e3ef29b604987f8d7767972d71d9..49776a51ee5d90b28328b0ee01f73f6cfb255fe6 100644
+--- a/docs/kanban-replay-sender-admission.md
++++ b/docs/kanban-replay-sender-admission.md
+@@ -33,10 +33,20 @@
+ The peer is controlled test infrastructure, not proof of the deployed receiver.
+ 
+ `test_kanban_sync_writer_process` preopens a separate process's SQLite connection,
+-then activates the existing gate in a disposable fixture. Missing and lower
+-revision functions refuse writes, preserving the database image; a matching
+-revision proceeds. This proves database downgrade refusal, not that a fleet's old
+-processes or already-read network bytes have drained.
++then explicitly activates or upgrades the gate in a disposable fixture. Missing,
++revision-0 and revision-1 functions refuse writes under minimum 2, preserving the
++database image; revision 2 proceeds. The matrix covers both fresh activation and
++an existing revision-1 gate, with the child connection opened before the upgrade.
++This proves database downgrade refusal, not that a fleet's old processes or
++already-read network bytes have drained.
++
++The registered build revision is now 2: it distinguishes this sender's audited
++pending provenance and whole-public-exchange exclusion from revision-1 builds.
++It does not certify original captures. Merely opening a connection or updating
++core neither installs nor raises a persisted gate; only explicit `activate`
++inside the caller's transaction does so. The raise is monotone, preserves higher
++minimums, rolls back with its outer transaction, and survives detach/reopen.
++No production activation caller has been added.
+ 
+ The existing stale-session takeover control now invokes the internal strict
+ engine for its deliberately unfenced predecessor and the public entry for its
+@@ -46,10 +56,17 @@
+ 
+ ## Remaining C acceptance
+ 
+-- Implement/prove the migration owner's old-process and in-flight drainage gate,
+-  including an admission revision that distinguishes the complete sender contract
+-  from previously installed revision-1 cores. The revision-1 fixture alone is not
+-  readiness and cannot revoke bytes held in an older process's memory.
++- Implement/prove the migration owner's old-process and in-flight drainage gate.
++  Minimum revision 2 distinguishes the current build from revision-1 cores, but
++  cannot revoke bytes held in an older process's memory. Gateway update pause
++  acknowledgements are not this proof: the updater separately verifies process
++  exit and suppresses supervisor restart (`update_cmd_posix_pause._stop_gateways`).
++  Even actual old-process exit cannot retract a request already at the Board;
++  spec §8 requires Board-serialized ingress barriers for the complete exposure
++  principal set before inspection. Those external barriers/readiness are still
++  unimplemented/unproved here; a free local sender lock or idle gateway is not
++  their substitute. The existing gateway active-work count does not include
++  background sync (`gateway.run_shutdown._active_work_count`).
+ - Deliver due unresolved deferred diagnostics to the existing owner with a durable
+   delivery receipt and episode/evidence deduplication across restart. Current
+   `episodes.diagnostics` only lists due rows. Courier exit 3 means queued, not
+diff --git a/hermes_cli/kanban_sync_writer_gate.py b/hermes_cli/kanban_sync_writer_gate.py
+index e23bec2a8d1850ffb991456df0292d5e5b827a87..d88267c0d031e6047c28330b99533d16059284af 100644
+--- a/hermes_cli/kanban_sync_writer_gate.py
++++ b/hermes_cli/kanban_sync_writer_gate.py
+@@ -1,15 +1,17 @@
+ """Monotone, opt-in local Board writer admission. [daveey]
+ 
+-Revision 1 promises this DB fence only, NOT certified original captures. Installing
+-this code does not activate a gate. The migration owner must first drain old
+-processes AND in-flight sends; SQLite cannot revoke bytes already in memory.
++Revision 1 promised only the DB fence. Revision 2 additionally identifies the
++sender build with audited pending provenance and full public sender exclusion;
++it does NOT certify original captures or establish migration readiness. Installing
++this code does not activate or raise a gate. The migration owner must first drain
++old processes AND in-flight sends; SQLite cannot revoke bytes already in memory.
+ Active gates survive sync detach/rollback. No downgrade/removal API is provided.
+ """
+ from __future__ import annotations
+ 
+ import sqlite3
+ 
+-REVISION = 1
++REVISION = 2
+ _TABLE = "replay_writer_gate1"
+ _FUNCTION = "replay_writer_revision"
+ 
+@@ -20,7 +22,7 @@
+ 
+ 
+ def activate(conn: sqlite3.Connection) -> None:
+-    """Persist revision 1 and guards inside the caller's exclusive write boundary.
++    """Persist/raise the minimum to this revision inside an exclusive write boundary.
+ 
+     This is the local downgrade prerequisite, not migration readiness or authority
+     to certify provenance. No production caller activates it yet. Trigger names
+@@ -48,6 +50,9 @@
+         minimum INTEGER NOT NULL CHECK(typeof(minimum)='integer' AND minimum>=1))""")
+     conn.execute(f"""INSERT INTO {_TABLE}(id,minimum)
+         SELECT 1,? WHERE NOT EXISTS(SELECT 1 FROM {_TABLE} WHERE id=1)""", (REVISION,))
++    # A revision-1 gate already exists on some images. Merely registering the new
++    # connection or reinstalling IF NOT EXISTS triggers must not silently admit it.
++    conn.execute(f"UPDATE {_TABLE} SET minimum=? WHERE id=1 AND minimum<?", (REVISION, REVISION))
+     names = [row[0] for row in conn.execute(
+         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+     for table in names:
+diff --git a/tests/hermes_cli/test_kanban_sync_writer_gate.py b/tests/hermes_cli/test_kanban_sync_writer_gate.py
+index 8880ad88fa71554a48f6004b34cff99cb6d26933..af77da1b9746b90bb98846dd7ed8c4eaebd81cb9 100644
+--- a/tests/hermes_cli/test_kanban_sync_writer_gate.py
++++ b/tests/hermes_cli/test_kanban_sync_writer_gate.py
+@@ -40,7 +40,7 @@
+         with pytest.raises(sqlite3.OperationalError, match="replay_writer_revision"):
+             old.execute("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_old','old','todo',1)")
+         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+-        assert old.execute("SELECT minimum FROM replay_writer_gate1").fetchone() == (1,)
++        assert old.execute("SELECT minimum FROM replay_writer_gate1").fetchone() == (gate().REVISION,)
+         conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_new','new','todo',1)")
+         assert conn.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == 1
+     finally:
+@@ -66,13 +66,14 @@
+     _, conn = board
+     with kb.write_txn(conn):
+         gate().activate(conn)
+-    conn.execute("UPDATE replay_writer_gate1 SET minimum=2")
+-    conn.create_function("replay_writer_revision", 0, lambda: 2)
++    higher = gate().REVISION + 1
++    conn.execute("UPDATE replay_writer_gate1 SET minimum=?", (higher,))
++    conn.create_function("replay_writer_revision", 0, lambda: higher)
+     before = list(conn.iterdump())
+     with kb.write_txn(conn):
+         gate().activate(conn)
+     assert list(conn.iterdump()) == before
+-    assert conn.execute("SELECT minimum FROM replay_writer_gate1").fetchone()[0] == 2
++    assert conn.execute("SELECT minimum FROM replay_writer_gate1").fetchone()[0] == higher
+ 
+ 
+ def test_install_does_not_activate_or_certify(board):
+@@ -119,7 +120,7 @@
+         sync.drop_triggers(conn)
+         sync.install_triggers(conn)
+     sync.set_mode(conn, "off")
+-    assert conn.execute("SELECT minimum FROM replay_writer_gate1").fetchone()[0] == 1
++    assert conn.execute("SELECT minimum FROM replay_writer_gate1").fetchone()[0] == gate().REVISION
+     old = sqlite3.connect(path, isolation_level=None)  # noqa: kanban-lockguard -- detached old writer
+     try:
+         with pytest.raises(sqlite3.OperationalError, match="replay_writer_revision"):
+@@ -235,3 +236,44 @@
+         assert conn.execute("SELECT title FROM tasks WHERE id=?", (task,)).fetchone()[0] == 'before'
+     finally:
+         old.close()
++
++
++def test_new_core_reopen_does_not_raise_old_gate(board, monkeypatch):
++    path, conn = board
++    with monkeypatch.context() as old_core:
++        old_core.setattr(gate(), 'REVISION', 1)
++        gate().register(conn)
++        with kb.write_txn(conn):
++            gate().activate(conn)
++    before = list(conn.iterdump())
++    reopened = kbc.connect(path)
++    try:
++        assert list(reopened.iterdump()) == before
++        assert reopened.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 1
++        assert reopened.execute('SELECT replay_writer_revision()').fetchone()[0] == 2
++        # Explicit fixture upgrade is the sole operation allowed to raise it.
++        with kb.write_txn(reopened):
++            gate().activate(reopened)
++        assert reopened.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 2
++    finally:
++        reopened.close()
++
++
++def test_upgrade_rollback_preserves_old_minimum_and_writer(board, monkeypatch):
++    _, conn = board
++    with monkeypatch.context() as old_core:
++        old_core.setattr(gate(), 'REVISION', 1)
++        gate().register(conn)
++        with kb.write_txn(conn):
++            gate().activate(conn)
++    gate().register(conn)
++    before = list(conn.iterdump())
++    with pytest.raises(RuntimeError, match='rollback upgrade'):
++        with kb.write_txn(conn):
++            gate().activate(conn)
++            assert conn.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 2
++            raise RuntimeError('rollback upgrade')
++    assert list(conn.iterdump()) == before
++    conn.create_function('replay_writer_revision', 0, lambda: 1)
++    conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_old','still allowed','todo',1)")
++    assert conn.execute("SELECT title FROM tasks WHERE id='t_old'").fetchone()[0] == 'still allowed'
+diff --git a/tests/hermes_cli/test_kanban_sync_writer_process.py b/tests/hermes_cli/test_kanban_sync_writer_process.py
+index 7eb48126b499c234e5c6344ab0ec826545f14142..273a8de2a35a01f2796d2da74931423f3a09d014 100644
+--- a/tests/hermes_cli/test_kanban_sync_writer_process.py
++++ b/tests/hermes_cli/test_kanban_sync_writer_process.py
+@@ -30,9 +30,18 @@
+         channel.close()
+ 
+ 
+-@pytest.mark.parametrize('revision', [None, 0, 1])
+-def test_preopened_independent_writer_checks_persisted_minimum(board, revision):
++@pytest.mark.parametrize('revision', [None, 0, 1, 2])
++@pytest.mark.parametrize('upgrade', [False, True])
++def test_preopened_independent_writer_checks_persisted_minimum(board, monkeypatch, revision, upgrade):
+     path, conn = board
++    if upgrade:
++        with monkeypatch.context() as old_core:
++            old_core.setattr(gate, 'REVISION', 1)
++            gate.register(conn)
++            with kbc.write_txn(conn):
++                gate.activate(conn)
++        gate.register(conn)
++        assert conn.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 1
+     ctx = multiprocessing.get_context('spawn')
+     parent, child = ctx.Pipe()
+     proc = ctx.Process(target=_writer, args=(path, revision, child))
+@@ -49,14 +58,14 @@
+         outcome, detail = parent.recv()
+         proc.join(10)
+         assert proc.exitcode == 0
+-        if revision == 1:
++        if revision == 2:
+             assert outcome == 'written'
+             assert conn.execute("SELECT title FROM tasks WHERE id='t_child'").fetchone()[0] == 'child'
+         else:
+             assert outcome == 'refused'
+             assert ('replay_writer_revision' if revision is None else 'revision too old') in detail
+             assert list(conn.iterdump()) == before
+-        assert conn.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 1
++        assert conn.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 2
+     finally:
+         parent.close()
+         if proc.is_alive():
+-- 
+2.43.0
+

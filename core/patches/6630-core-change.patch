@@ -1,0 +1,424 @@
+From 48734167eff7c823eec983f278414ede77330744 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 19:04:38 +0000
+Subject: [PATCH 6630] Certified park ingress ordering in Kanban sync push
+
+Public mirror of source commit 48734167eff7c823eec983f278414ede77330744.
+
+---
+diff --git a/hermes_cli/kanban_owner_reassessment_transport.py b/hermes_cli/kanban_owner_reassessment_transport.py
+index 288b9d79d19c5b36ac31aac539052cd99a5eafa1..71ad9fc623151389bba0108dede1a67fb870ca51 100644
+--- a/hermes_cli/kanban_owner_reassessment_transport.py
++++ b/hermes_cli/kanban_owner_reassessment_transport.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import json
++import sqlite3
+ 
+ from hermes_cli.kanban_owner_reassessment import PENDING_TABLE, ReassessmentRefused
+ 
+@@ -75,3 +76,38 @@
+     fields['owner_reassessment_v1'] = receipt
+     conn.execute('UPDATE kanban_sync_outbox SET fields=? WHERE op_id=? AND wire_json IS NULL',
+                  (json.dumps(fields, ensure_ascii=False, separators=(',', ':')), op_id))
++
++
++def pending_park_parent(conn, row):
++    """One exact pending status origin, journal-validated; never search latest task."""
++    if row.get('table_name') != 'task_events' or row.get('op') != 'upsert':
++        return None
++    fields = row.get('fields')
++    fields = json.loads(fields) if isinstance(fields, str) else (fields or {})
++    hit = conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND op='upsert' "
++        "AND state='pending' AND row_uid=? AND status_origin=? LIMIT 1",
++        (fields.get('task_id'), row['row_uid'])).fetchone()
++    parent = dict(hit) if hit else None
++    return parent if parent is not None and bound_park_uid(conn, parent) == row['row_uid'] else None
++
++
++def bound_park_uid(conn, row):
++    """The park event uid this status op exactly carries, else None (never trust a lone field)."""
++    try:
++        fields = row.get('fields')
++        fields = json.loads(fields) if isinstance(fields, str) else (fields or {})
++        receipt = fields.get('owner_reassessment_v1')
++        if not isinstance(receipt, dict) or fields.get('status') != 'scheduled':
++            return None
++        uid = (receipt.get('park_event') or {}).get('uid')
++        if (not uid or row.get('table_name') != 'tasks' or row.get('status_origin') != uid
++                or row.get('evidence_uid') != uid or receipt.get('task_id') != row.get('row_uid')):
++            return None
++        saved = conn.execute(f'SELECT receipt FROM {PENDING_TABLE} WHERE event_uid=? AND task_id=?',
++                             (uid, row['row_uid'])).fetchone()
++        if saved is None or json.loads(saved[0]) != receipt:
++            return None
++        return uid
++    except (sqlite3.Error, ValueError, TypeError, AttributeError, KeyError):
++        return None  # missing journal or malformed fields keep the ordinary order
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 13025083df7d0bead36cf83e8bdbed5af88d9335..a00d5639ea384588fa975facd8fb4d9e42775940 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -660,15 +660,15 @@
+     out, seen = PushResult(), {} if seen is None else seen
+     for _ in range(max_batches):
+         from hermes_cli.kanban_sync_parent_order import select_pending
++        from hermes_cli.kanban_sync_status_origin import absorb_clock, capability
++        origin_cap = capability(hub, board)  # one snapshot per batch: selection and serialization agree
+         rows, selected, stopped = select_pending(conn, hub, board, seen, now=int(time.time()),
+-                                                limit=PUSH_BATCH, before_head=before_head)
++                                                limit=PUSH_BATCH, before_head=before_head, origin_cap=origin_cap)
+         if not rows:
+             break
+         command_batch = retain_transport.own_batch(rows)
+         retain_split, rows = len(command_batch) < len(rows), command_batch
+         retain_transport.before_send(conn, rows, hub, board)
+-        from hermes_cli.kanban_sync_status_origin import absorb_clock, capability
+-        origin_cap = capability(hub, board)
+         with write_txn(conn):
+             absorb_clock(conn, origin_cap)
+             from hermes_cli.kanban_terminal_guard import strip_stale_push  # no wake reopens a done card [daveey]
+diff --git a/hermes_cli/kanban_sync_evidence_order.py b/hermes_cli/kanban_sync_evidence_order.py
+index 4d058342ba7c167d0c402a5884a91911d8234427..b6facad44c7b7d223778f70d58fe648cb8e9cfd9 100644
+--- a/hermes_cli/kanban_sync_evidence_order.py
++++ b/hermes_cli/kanban_sync_evidence_order.py
+@@ -27,6 +27,7 @@
+ """
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import sqlite3
+ 
+@@ -106,10 +107,12 @@
+             pass
+ 
+ 
+-def firsts(conn: sqlite3.Connection, row: dict) -> list[dict]:
++def firsts(conn: sqlite3.Connection, row: dict, *, reassessment: bool = False) -> list[dict]:
+     """Pending ops of this status op's group that go before it, in send order; [] keeps the legacy order.
+ 
+     Once the named event is acknowledged, rejected or gone the status op travels alone.
++    ``reassessment`` (Board advertises owner_reassessment_v1): only the exact bound certified park event
++    is not promoted; the Board inserts and seals it atomically from the status op, so it must follow.
+     """
+     uid = row.get(COLUMN)
+     fields = row.get("fields")
+@@ -124,4 +127,11 @@
+         "ORDER BY o.table_name='tasks', o.rowid", (uid, row["op_id"]))]
+     if not any(r["table_name"] == "task_events" and r["row_uid"] == uid for r in group):
+         return []
++    frozen = row.get('wire_json')
++    frozen_fields = json.loads(frozen).get('fields', {}) if frozen else {}
++    if reassessment or 'owner_reassessment_v1' in frozen_fields:
++        from hermes_cli.kanban_owner_reassessment_transport import bound_park_uid
++        park = bound_park_uid(conn, row)
++        if park is not None:
++            group = [r for r in group if not (r["table_name"] == "task_events" and r["row_uid"] == park)]
+     return group
+diff --git a/hermes_cli/kanban_sync_parent_order.py b/hermes_cli/kanban_sync_parent_order.py
+index 50c042bbf37a32a2253715d7a03d8ed340d7f114..103e2a21fa8b394cd04cd26ac283a6f25656e0c1 100644
+--- a/hermes_cli/kanban_sync_parent_order.py
++++ b/hermes_cli/kanban_sync_parent_order.py
+@@ -4,21 +4,35 @@
+ import json
+ 
+ 
+-def select_pending(conn, hub, board, seen, *, now: int, limit: int, before_head: bool):
+-    """Dependency selection and the existing pre-head fence share one batch."""
++def reassessment_supported(cap) -> bool:
++    """True only for a valid serving capability advertising owner_reassessment_v1 == 1."""
++    return bool(cap) and type(cap.get('owner_reassessment_v1')) is int and cap['owner_reassessment_v1'] == 1
++
++
++def select_pending(conn, hub, board, seen, *, now: int, limit: int, before_head: bool, origin_cap: dict | None = None):
++    """Dependency selection and the existing pre-head fence share one batch.
++
++    ``origin_cap`` is the caller's one per-push capability snapshot; omitted, it is read normally.
++    """
++    if origin_cap is None:
++        from hermes_cli.kanban_sync_status_origin import capability
++        origin_cap = capability(hub, board)
++    certified = reassessment_supported(origin_cap)
+     from hermes_cli import kanban_sync_backlog as backlog
+     from hermes_cli.kanban_sync_quarantine import pending_rows
+ 
+     from hermes_cli.kanban_actionability_transport import eligible_pending
+-    rows = selected = parent_first(conn, eligible_pending(conn, pending_rows(conn, now), hub, board), now, limit)
++    rows = selected = parent_first(conn, eligible_pending(conn, pending_rows(conn, now), hub, board), now, limit,
++                                   reassessment=certified)
+     stopped = False
+     if before_head:
+         rows, stopped = backlog.sendable_before_head(conn, hub, board, rows, seen)
+-        rows = parent_first(conn, rows, now, limit, allowed={r['op_id'] for r in rows})
++        rows = parent_first(conn, rows, now, limit, allowed={r['op_id'] for r in rows}, reassessment=certified)
+     return rows, selected, stopped
+ 
+ 
+-def parent_first(conn, rows, now: int, limit: int, *, allowed: set[str] | None = None) -> list[dict]:
++def parent_first(conn, rows, now: int, limit: int, *, allowed: set[str] | None = None,
++                 reassessment: bool = False) -> list[dict]:
+     """Promote the existing FIFO parent, never synthesize a competing retry identity.
+ 
+     Only an unacknowledged card needs this dependency ordering. A parent's backoff
+@@ -58,7 +72,7 @@
+             if parent['op_id'] not in included and all(p['op_id'] != parent['op_id'] for p in required):
+                 required.append(parent)
+         from hermes_cli.kanban_sync_evidence_order import firsts
+-        for event in [] if blocked else firsts(conn, row):
++        for event in [] if blocked else firsts(conn, row, reassessment=reassessment):
+             # The status op waits behind its own event exactly as a child waits behind its parent.
+             if ((event['retry_after'] or 0) > now or not sendable(conn, [event])
+                     or (allowed is not None and event['op_id'] not in allowed)):
+@@ -68,6 +82,22 @@
+                 required.append(event)
+         if blocked:
+             continue
++        from hermes_cli.kanban_owner_reassessment_transport import pending_park_parent
++        certificate = pending_park_parent(conn, row)
++        frozen = json.loads(certificate['wire_json']) if certificate is not None and certificate.get('wire_json') else {}
++        if certificate is not None and (reassessment or 'owner_reassessment_v1' in frozen.get('fields', {})):
++            # A frozen certificate cannot fall back when support disappears.
++            # Never let its separately captured park consume the uid first.
++            if (not reassessment or (certificate['retry_after'] or 0) > now
++                    or not sendable(conn, [certificate])
++                    or (allowed is not None and certificate['op_id'] not in allowed)):
++                continue
++            if certificate['op_id'] not in included:
++                dependency = parent_first(conn, [certificate], now, limit, allowed=allowed,
++                                          reassessment=reassessment)
++                if not any(p['op_id'] == certificate['op_id'] for p in dependency):
++                    continue
++                required.extend(dependency)
+         # Keep both link parents together with their child when possible. If the
+         # batch is full, the ordinary next round drains the remaining FIFO rows.
+         for item in required + [row]:
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_transport.py b/tests/hermes_cli/test_kanban_owner_reassessment_transport.py
+index c2a6223229b636ba6316c2b6927f8022f6423544..1df705a794825c4251ff75ca7dd7289946777129 100644
+--- a/tests/hermes_cli/test_kanban_owner_reassessment_transport.py
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_transport.py
+@@ -54,3 +54,219 @@
+         with pytest.raises(r.ReassessmentRefused):
+             transport.bind(conn, op_id='missing' if fault == 'other-op' else 'op', task_id='task', event_uid='park')
+         assert 'owner_reassessment_v1' not in conn.execute('SELECT fields FROM kanban_sync_outbox').fetchone()[0]
++
++
++@pytest.mark.parametrize('park_kind', ['schedule', 'continue'])
++@pytest.mark.parametrize('advertise', [True, False], ids=['certified', 'unsupported'])
++@pytest.mark.parametrize('boundary', ['selection', 'push'])
++def test_real_park_transaction_orders_certificate_before_its_own_evidence(
++        worker, monkeypatch, park_kind, advertise, boundary):
++    """Sender integration, not a Board acceptance fake.
++
++    Board prepareOwnerReassessment rejects a preexisting park uid; the task op
++    must insert/seal it atomically before its generic event or run-end arrives.
++    Unsupported Boards must retain ordinary evidence-first serialization.
++    """
++    from copy import deepcopy
++    from types import SimpleNamespace
++
++    from hermes_cli import kanban_continuation as continuation
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli import kanban_sync_parent_order as ordering
++    from tests.hermes_cli.test_kanban_owner_reassessment_board_compat import BASE_CAP, NEW
++
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            # Model an acknowledged running card, then retain only actual
++            # lifecycle captures. No hand-built outbox or evidence-order hints.
++            with kb.write_txn(conn):
++                conn.execute('UPDATE tasks SET sync_version=5 WHERE id=?', (ctx['task_id'],))
++                conn.execute('DELETE FROM kanban_sync_outbox')
++            kwargs = dict(expected_run_id=ctx['run_id'], awaiting=lifecycle.PRODUCER,
++                          owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120), owner_origin=cap)
++            if park_kind == 'schedule':
++                assert kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), **kwargs)
++            else:
++                result = continuation.continue_task(
++                    conn, ctx['task_id'], checkpoint='waiting on example queue', resume_after_seconds=1800, **kwargs)
++                assert result['ok'] and result['status'] == 'scheduled'
++            receipt = json.loads(r.pending(conn)[0]['receipt'])
++            raw = [dict(row) for row in conn.execute('SELECT * FROM kanban_sync_outbox ORDER BY rowid')]
++            status, = [row for row in raw if 'owner_reassessment_v1' in json.loads(row['fields'])]
++            park, = [row for row in raw if row['table_name'] == 'task_events'
++                     and row['row_uid'] == receipt['park_event']['uid']]
++            end, = [row for row in raw if row['table_name'] == 'task_runs'
++                    and row['row_uid'] == receipt['issuer']['run_uid']]
++            # These are real write_txn.bind results, not manually tagged rows.
++            assert status['evidence_uid'] == park['evidence_uid'] == park['row_uid']
++            assert json.loads(end['fields'])['status'] in ('scheduled', 'continued')
++            assert json.loads(status['fields'])['owner_reassessment_v1'] == receipt
++            calls = []
++
++            def capture_only(board, batch):
++                calls.extend(deepcopy(batch))
++                raise OSError('test transport capture: no Board acceptance simulated')
++
++            hub = SimpleNamespace(ops=capture_only, status_origin_capability=lambda board: {
++                **BASE_CAP, **({'owner_reassessment_v1': 1} if advertise else {})})
++            if boundary == 'selection':
++                rows, _, stopped = ordering.select_pending(
++                    conn, hub, 'default', {}, now=int(time.time()), limit=100, before_head=False)
++                assert not stopped
++                ids = [row['op_id'] for row in rows]
++            else:
++                with pytest.raises(OSError, match='test transport capture'):
++                    client.push(conn, hub, 'default', 'here', primary=True, max_batches=1)
++                ids = [op['client_op_id'] for op in calls]
++                sent, = [op for op in calls if op['client_op_id'] == status['op_id']]
++                if advertise:
++                    assert sent['fields']['owner_reassessment_v1'] == receipt
++                    assert sent['status_origin'] == park['row_uid']
++                else:
++                    assert not set(NEW) & sent['fields'].keys()
++                    assert sent['status_origin'] == ''
++            positions = {name: ids.index(row['op_id']) for name, row in
++                         [('status', status), ('park', park), ('run_end', end)]}
++            assert positions['status'] < positions['run_end'], positions
++            if advertise:
++                assert positions['status'] < positions['park'], positions
++            else:
++                assert positions['park'] < positions['status'], positions
++
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++def _park_only(conn, ctx, cap, evidence):
++    with kb.write_txn(conn):
++        conn.execute('UPDATE tasks SET sync_version=5 WHERE id=?', (ctx['task_id'],))
++        conn.execute('DELETE FROM kanban_sync_outbox WHERE 1=1')
++    assert kb.schedule_task(conn, ctx['task_id'], reason=lifecycle._until(), expected_run_id=ctx['run_id'],
++                            awaiting=lifecycle.PRODUCER,
++                            owner_reassessment=lifecycle._opt(evidence, int(time.time()) + 120), owner_origin=cap)
++    raw = [dict(row) for row in conn.execute('SELECT * FROM kanban_sync_outbox ORDER BY rowid')]
++    status, = [row for row in raw if 'owner_reassessment_v1' in json.loads(row['fields'])]
++    park, = [row for row in raw if row['table_name'] == 'task_events' and row['row_uid'] == status['evidence_uid']]
++    return status, park
++
++
++@pytest.mark.parametrize('fault', ['exact', 'receipt', 'origin', 'evidence', 'unsupported'])
++def test_only_exact_bound_park_is_exempt_from_evidence_first(worker, monkeypatch, fault):
++    """Controls: any broken binding or unsupported capability keeps the ordinary event-first order."""
++    from hermes_cli import kanban_sync_evidence_order as eo
++
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park = _park_only(conn, ctx, cap, evidence)
++            if fault == 'receipt':
++                f = json.loads(status['fields'])
++                f['owner_reassessment_v1']['issuer'] = {'run_uid': 'other'}
++                status['fields'] = json.dumps(f)
++            elif fault == 'origin':
++                status['status_origin'] = 'other'
++            elif fault == 'evidence':
++                status['evidence_uid'] = 'other'
++            first = [x['op_id'] for x in eo.firsts(conn, status, reassessment=fault != 'unsupported')]
++            if fault == 'exact':
++                assert transport.bound_park_uid(conn, status) == park['row_uid']
++                assert park['op_id'] not in first
++            else:
++                if fault != 'unsupported':
++                    assert transport.bound_park_uid(conn, status) is None
++                if fault in ('origin', 'evidence'):
++                    return  # firsts keys on the (now altered) evidence/origin column itself
++                assert park['op_id'] in first
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize('cap_value', [False, 0, 2, '1', None])
++def test_invalid_reassessment_capability_value_is_unsupported(cap_value):
++    from hermes_cli import kanban_sync_parent_order as ordering
++    assert not ordering.reassessment_supported({})
++    assert not ordering.reassessment_supported({'owner_reassessment_v1': cap_value})
++    assert ordering.reassessment_supported({'owner_reassessment_v1': 1})
++
++
++@pytest.mark.parametrize('exclusion', ['backoff', 'allowed', 'before-head', 'frozen-unsupported', 'frozen-fallback'])
++def test_pending_certificate_holds_its_exact_park_when_excluded(worker, monkeypatch, exclusion):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_sync_parent_order as ordering
++    from hermes_cli import kanban_sync_backlog as backlog
++    from tests.hermes_cli.test_kanban_owner_reassessment_board_compat import BASE_CAP
++
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park = _park_only(conn, ctx, cap, evidence)
++            now = int(time.time())
++            if exclusion == 'backoff':
++                conn.execute('UPDATE kanban_sync_outbox SET retry_after=? WHERE op_id=?',
++                             (now + 3600, status['op_id']))
++            elif exclusion in ('frozen-unsupported', 'frozen-fallback'):
++                frozen = wire.translate(status, '1795610000000-0001-here')
++                if exclusion == 'frozen-fallback':
++                    from tests.hermes_cli.test_kanban_owner_reassessment_board_compat import NEW
++                    frozen['fields'] = {k: v for k, v in frozen['fields'].items() if k not in NEW}
++                    frozen['status_origin'] = ''
++                conn.execute('UPDATE kanban_sync_outbox SET wire_json=? WHERE op_id=?',
++                             (json.dumps(frozen), status['op_id']))
++            hub = SimpleNamespace(status_origin_capability=lambda board: {
++                **BASE_CAP, **({} if exclusion in ('frozen-unsupported', 'frozen-fallback')
++                               else {'owner_reassessment_v1': 1})})
++            if exclusion == 'frozen-fallback':
++                rows = ordering.parent_first(conn, [park], now, 2, reassessment=False)
++                assert park['op_id'] in [x['op_id'] for x in rows]
++                return
++            if exclusion == 'allowed':
++                rows = ordering.parent_first(conn, [park], now, 2, allowed={park['op_id']}, reassessment=True)
++            else:
++                if exclusion == 'before-head':
++                    monkeypatch.setattr(backlog, 'sendable_before_head', lambda c, h, b, rows, seen:
++                                        ([x for x in rows if x['op_id'] != status['op_id']], False))
++                rows, _, _ = ordering.select_pending(conn, hub, 'default', {}, now=now, limit=100,
++                                                     before_head=exclusion == 'before-head')
++            assert park['op_id'] not in [x['op_id'] for x in rows]
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize('limit', [1, 2])
++def test_split_batches_allow_prior_evidence_but_never_park_before_certificate(worker, monkeypatch, limit):
++    from hermes_cli import kanban_sync_parent_order as ordering
++
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park = _park_only(conn, ctx, cap, evidence)
++            # A real earlier lifecycle event remains unrelated to the certified park.
++            prior = dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE table_name='task_events' "
++                                      "AND row_uid!=? ORDER BY rowid LIMIT 1", (park['row_uid'],)).fetchone())
++            raw = [prior, park, status]
++            sent = []
++            while raw:
++                batch = ordering.parent_first(conn, raw, int(time.time()), limit, reassessment=True)
++                assert batch
++                ids = [x['op_id'] for x in batch]
++                sent.extend(ids)
++                conn.executemany("UPDATE kanban_sync_outbox SET state='acked' WHERE op_id=?", [(x,) for x in ids])
++                raw = [x for x in raw if x['op_id'] not in ids]
++            assert sent.index(prior['op_id']) < sent.index(status['op_id']) < sent.index(park['op_id'])
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++def test_selection_reads_capability_once_and_two_row_batch_keeps_status_first(worker, monkeypatch):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_sync_parent_order as ordering
++    from tests.hermes_cli.test_kanban_owner_reassessment_board_compat import BASE_CAP
++
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park = _park_only(conn, ctx, cap, evidence)
++            reads = []
++            hub = SimpleNamespace(status_origin_capability=lambda board: reads.append(1) or {
++                **BASE_CAP, 'owner_reassessment_v1': 1})
++            rows, _, _ = ordering.select_pending(conn, hub, 'default', {}, now=int(time.time()), limit=2,
++                                                 before_head=False)
++            ids = [x['op_id'] for x in rows]
++            assert len(reads) == 1 and status['op_id'] in ids
++            assert park['op_id'] not in ids or ids.index(status['op_id']) < ids.index(park['op_id'])
++            ordering.select_pending(conn, hub, 'default', {}, now=int(time.time()), limit=100, before_head=False,
++                                    origin_cap={**BASE_CAP, 'owner_reassessment_v1': 1})
++            assert len(reads) == 1  # explicit snapshot: no extra read
++    lifecycle._turn(worker, monkeypatch, body)
+-- 
+2.43.0
+

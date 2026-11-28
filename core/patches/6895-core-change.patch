@@ -1,0 +1,235 @@
+From 13cea8ca13a78d921c529d02e10a1860c04e656d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:10:05 +0000
+Subject: [PATCH 6895] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 13cea8ca13a78d921c529d02e10a1860c04e656d.
+
+---
+diff --git a/hermes_cli/kanban_replay_primary.py b/hermes_cli/kanban_replay_primary.py
+index 891fcddcf8809c8c6a0a2f3aba8f0d1d3e62cee4..9771b137b484283fd0ce90ecf63c4723406b2742 100644
+--- a/hermes_cli/kanban_replay_primary.py
++++ b/hermes_cli/kanban_replay_primary.py
+@@ -10,12 +10,14 @@
+     def __init__(self, conn, hub, board):
+         self.conn, self.hub, self.board = conn, hub, board
+         self.current = None
++        self.deleted = False
+         self.staged = None
+         self.projected = None
+ 
+     def read(self, row, verdict):
+         """Read separately authenticated live state, not a historical result."""
+         self.current = None
++        self.deleted = False
+         from hermes_cli.kanban_replay_repair import retryable
+         if retryable(row, verdict):
+             return  # Legacy transient refusal never projects an image over unacked edits.
+@@ -29,8 +31,17 @@
+             raise CurrentRowHold(f'primary replay live current row unavailable: {exc}', transient=True) from exc
+         image = evidence.get('row')
+         if (evidence.get('board') != self.board or evidence.get('table') != row['table_name'] or
+-                evidence.get('uid') != row['row_uid'] or evidence.get('state') != 'live' or
+-                type(evidence.get('head')) is not int or evidence['head'] < 0 or
++                evidence.get('uid') != row['row_uid'] or
++                type(evidence.get('head')) is not int or evidence['head'] < 0):
++            raise CurrentRowHold('primary replay live current row unavailable: unbound evidence')
++        if (row['op'] == 'delete' and verdict['status'] in ('applied', 'merged') and
++                evidence.get('state') == 'deleted' and 'row' in evidence and image is None):
++            # The exact delete already removed the local row. Authenticated current
++            # absence permits settlement, not a synthetic row image or deletion of
++            # a later local recreation. Unknown/never evidence cannot do this.
++            self.deleted = True
++            return
++        if (evidence.get('state') != 'live' or
+                 not isinstance(image, dict) or image.get('uid') != row['row_uid'] or
+                 type(image.get('version')) is not int or image['version'] <= 0 or
+                 image.get('deleted_at') is not None):
+@@ -41,10 +52,10 @@
+         from hermes_cli.kanban_replay_repair import retryable
+         if retryable(row, verdict):
+             return
+-        if self.current is None:
++        if self.current is None and not self.deleted:
+             raise ValueError('primary replay current row not read')
+         row = dict(row, fields=wire.get('fields', {}))
+-        if verdict['status'] in ('applied', 'merged'):
++        if verdict['status'] in ('applied', 'merged') and not self.deleted:
+             from hermes_cli.kanban_sync_omissions import acknowledge
+             acknowledge(self.conn, wire['client_op_id'], self.current, sent=wire.get('fields', {}))
+         self.staged = row, wire, verdict
+@@ -55,6 +66,8 @@
+             return
+         row, wire, verdict = self.staged
+         self.staged = None
++        if self.deleted:
++            return  # Current absence has no row image to project over newer local work.
+         from hermes_cli import kanban_sync_client as client
+         changes = []
+         if verdict['status'] == 'rejected':
+diff --git a/hermes_cli/kanban_replay_recovery.py b/hermes_cli/kanban_replay_recovery.py
+index c6f7a1f3e62ffc6d4bfc84b2d588d8b6359a3c68..b93b1e783dff5eac95211f54ed0209fcdf6a671f 100644
+--- a/hermes_cli/kanban_replay_recovery.py
++++ b/hermes_cli/kanban_replay_recovery.py
+@@ -119,6 +119,13 @@
+ 
+ 
+ def completed(conn):
++    state = journal.snapshot(conn)
++    if state['pending'] is None:
++        # A successful predecessor retires its elapsed window even when it never
++        # created a durable fault. The next issued identity owns only its time.
++        sample = _SAMPLE.get()
++        if sample is not None and sample['started'] is not None:
++            sample['started'] = time()
+     held = fault(conn)
+     if held is None:
+         return
+diff --git a/tests/hermes_cli/test_kanban_replay_episode_clock.py b/tests/hermes_cli/test_kanban_replay_episode_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb6c86adcb48e31e71609bc1c25c9dc1921a6ae6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_episode_clock.py
+@@ -0,0 +1,42 @@
++"""Successful predecessor time never ages a new replay recovery episode."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_replay_recovery as recovery
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++@pytest.mark.parametrize('failure_seconds', [0, 35, 300])
++def test_successful_predecessors_do_not_age_successor_failure(live, monkeypatch, failure_seconds):
++    now = [1000.0]
++    monkeypatch.setattr(recovery, 'time', lambda: now[0])
++    for i in range(12):
++        kb.create_task(live, title=f'task {i}', assignee='worker')
++
++    class Peer(helpers.Receiver):
++        def _call(self, method, path, body=None):
++            if path.endswith('/ops'):
++                if len(self.sent) == 20:
++                    now[0] += failure_seconds
++                    raise OSError('first failure of operation 21')
++                now[0] += 15.0
++            return super()._call(method, path, body)
++
++    peer = Peer()
++    with pytest.raises(OSError, match='first failure'):
++        client.push(live, peer, 'default', 'macbook', primary=False, max_batches=25)
++    held = recovery.fault(live)
++    assert len(peer.sent) == 20 and journal.snapshot(live)['settled'] == '20'
++    assert held['sequence'] == '21' and held['op_id'] == journal.snapshot(live)['pending']['op_id']
++    assert held['attempts'] == 1
++    assert held['reachable_s'] == failure_seconds, 'predecessor time charged to successor'
++    assert held['paused'] == int(failure_seconds >= 300)
++    reopened = helpers.reopen(live)
++    try:
++        assert recovery.fault(reopened) == held
++    finally:
++        reopened.close()
+diff --git a/tests/hermes_cli/test_kanban_replay_primary_delete.py b/tests/hermes_cli/test_kanban_replay_primary_delete.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a53e20b61d13421a62bb5680234f3f7c10fa19f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_primary_delete.py
+@@ -0,0 +1,91 @@
++"""Primary delete settlement requires authenticated absence, not an impossible live row."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_replay_existence as existence
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli.test_kanban_replay_primary import Primary
++
++live = helpers.live
++
++
++def pending_delete(conn):
++    a = kb.create_task(conn, title='a', assignee='worker')
++    b = kb.create_task(conn, title='b', assignee='worker')
++    kb.link_tasks(conn, a, b)
++    receiver = Primary(conn)
++    receiver.status = 'applied'
++    for _ in range(60):
++        if not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone() \
++                and journal.pending_wire(conn) is None:
++            break
++        client.push(conn, receiver, 'default', 'macbook', primary=False, max_batches=5)
++    else:
++        raise AssertionError('initial real outbox not drained')
++    kb.unlink_tasks(conn, a, b)
++    row = dict(conn.execute("SELECT * FROM kanban_sync_outbox WHERE state='pending' AND op='delete'").fetchone())
++    assert row['table_name'] == 'task_links'
++    receiver.evidence = dict(board='default', table=row['table_name'], uid=row['row_uid'],
++                             state='deleted', head=5, row=None)
++    return receiver, row
++
++
++@pytest.mark.parametrize('lost_reply', [False, True])
++@pytest.mark.parametrize('status', ['applied', 'merged'])
++def test_primary_applied_real_delete_settles_and_acknowledges_once(live, lost_reply, status):
++    receiver, row = pending_delete(live)
++    receiver.status = status
++    before = len(receiver.sent)
++    receiver.lose_reply = lost_reply
++    if lost_reply:
++        with pytest.raises(OSError, match='reply lost'):
++            client.push(live, receiver, 'default', 'macbook', primary=True, max_batches=1)
++    reopened = helpers.reopen(live)
++    receiver.conn = reopened
++    receiver.lose_reply = False
++    try:
++        result = client.push(reopened, receiver, 'default', 'macbook', primary=True, max_batches=1)
++        assert getattr(result, status) == 1 and result.sent == int(not lost_reply)
++        assert len(receiver.sent) == before + 1
++        assert receiver.sent[-1]['op'] == 'delete' and receiver.sent[-1]['client_op_id'] == row['op_id']
++        assert journal.pending_wire(reopened) is None and existence.fault(reopened) is None
++        assert receiver.slot['a'] == journal.snapshot(reopened)['settled']
++        assert not reopened.execute('SELECT 1 FROM kanban_sync_outbox WHERE op_id=?', (row['op_id'],)).fetchone()
++        assert reopened.execute('SELECT COUNT(*) FROM task_links').fetchone()[0] == 0
++        client.push(reopened, receiver, 'default', 'macbook', primary=True, max_batches=0)
++        assert len(receiver.sent) == before + 1
++    finally:
++        reopened.close()
++
++
++@pytest.mark.parametrize('key,value', [
++    ('board', 'foreign'), ('table', 'tasks'), ('uid', 'foreign'),
++    ('head', True), ('head', -1), ('head', None),
++    ('state', 'unknown'), ('state', 'never'), ('row', {}),
++])
++def test_deleted_evidence_must_be_bound_and_authoritative(live, key, value):
++    receiver, row = pending_delete(live)
++    valid = copy.deepcopy(receiver.evidence)
++    receiver.evidence[key] = value
++    with pytest.raises(existence.CurrentRowHold):
++        client.push(live, receiver, 'default', 'macbook', primary=True, max_batches=1)
++    wire = journal.pending_wire(live)
++    assert wire is not None and journal.snapshot(live)['pending']['op_id'] == row['op_id']
++    assert live.execute('SELECT 1 FROM kanban_sync_outbox WHERE op_id=?', (row['op_id'],)).fetchone()
++    held = existence.fault(live)
++    assert held['paused'] == 1
++    reopened = helpers.reopen(live)
++    receiver.conn = reopened
++    receiver.evidence = valid
++    before = len(receiver.sent)
++    try:
++        assert journal.pending_wire(reopened) == wire
++        existence.resume(reopened, row['op_id'], 'verified current deletion evidence')
++        assert client.push(reopened, receiver, 'default', 'macbook', primary=True, max_batches=1).applied == 1
++        assert journal.pending_wire(reopened) is None and len(receiver.sent) == before
++    finally:
++        reopened.close()
+-- 
+2.43.0
+

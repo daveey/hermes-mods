@@ -1,0 +1,317 @@
+From 2647ed866a1304e265ef6df7eab01fceb76a465c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:32:23 +0000
+Subject: [PATCH 6980] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 2647ed866a1304e265ef6df7eab01fceb76a465c.
+
+---
+diff --git a/hermes_cli/kanban_home_probe.py b/hermes_cli/kanban_home_probe.py
+index 8af5593e7c994b5e161f85fa4796a6d115056fe1..1c4507425f3e3e043ffa73d972ac4285acce56e2 100644
+--- a/hermes_cli/kanban_home_probe.py
++++ b/hermes_cli/kanban_home_probe.py
+@@ -48,6 +48,61 @@
+     return UNKNOWN
+ 
+ 
++def remote_baseline(conn, task_id, event_id, source, explicit, now):
++    """Start a bounded, durable liveness window for a formerly local probe.
++
++    The old local probe had no obligation to publish remote ALIVE events. Only
++    the exact hostless park in this epoch's authenticated destination manifest
++    gets a new observation baseline. Repeated sweeps/restarts never renew it;
++    ordinary explicit remote probes retain their existing silence accounting.
++    This is not an ALIVE attestation and never grants readiness or execution.
++    """
++    from hermes_cli import kanban_db_connect as dbc
++    from hermes_cli.kanban_home_transfer import frozen
++
++    if explicit:
++        return 0
++    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    if not {'kanban_home_materialized1', 'kanban_home_generations1'} <= tables:
++        return 0
++    row = conn.execute('SELECT m.manifest,g.nonce FROM kanban_home_materialized1 m '
++                       'JOIN kanban_home_generations1 g ON g.task_id=m.task_id WHERE m.task_id=?',
++                       (task_id,)).fetchone()
++    event = conn.execute('SELECT uid FROM task_events WHERE task_id=? AND id=?', (task_id, event_id)).fetchone()
++    if row is None or event is None:
++        return 0
++    try:
++        record = json.loads(row[0])
++        matches = (record['task'] == task_id and record['source'] == source and record['nonce'] == row[1]
++                   and any(r['table'] == 'task_events' and r['uid'] == event[0] for r in record['rows']))
++    except (ValueError, TypeError, KeyError):
++        return 0
++    if not matches:
++        return 0
++    key = (task_id, event[0], row[1])
++    read = 'SELECT first_at FROM kanban_home_probe_watch1 WHERE task_id=? AND event_uid=? AND nonce=?'
++    if 'kanban_home_probe_watch1' in tables:
++        saved = conn.execute(read, key).fetchone()
++        if saved is not None:
++            return saved[0]
++    with dbc.write_txn(conn):
++        if frozen(conn, task_id):
++            return now  # concurrent preparation still owns custody; no probe writes
++        conn.execute('CREATE TABLE IF NOT EXISTS kanban_home_probe_watch1 '
++                     '(task_id TEXT NOT NULL,event_uid TEXT NOT NULL,nonce TEXT NOT NULL,first_at INTEGER NOT NULL,'
++                     'PRIMARY KEY(task_id,event_uid,nonce))')
++        conn.execute('INSERT OR IGNORE INTO kanban_home_probe_watch1 VALUES (?,?,?,?)', (*key, now))
++        return conn.execute(read, key).fetchone()[0]
++
++
++def remote_last(conn, task_id, event_id, source, explicit, now):
++    from hermes_cli.kanban_wake_check import ALIVE_EVENT
++
++    last = conn.execute('SELECT MAX(created_at) FROM task_events WHERE task_id=? AND id>? AND kind=?',
++                        (task_id, event_id, ALIVE_EVENT)).fetchone()[0]
++    return max(int(last or 0), remote_baseline(conn, task_id, event_id, source, explicit, now))
++
++
+ def claim_wake(conn, task_id, cmd, every, generation, purpose, status, ts, claim):
+     """Check handoff custody under the same writer lock as the probe claim."""
+     from hermes_cli import kanban_db_connect as dbc
+diff --git a/hermes_cli/kanban_home_source_stop.py b/hermes_cli/kanban_home_source_stop.py
+index 8634ea721ee2c9c790bd2e8f67a41e42747fad2d..742009ad9e8517e70b614cea71fa86e4433e3ab1 100644
+--- a/hermes_cli/kanban_home_source_stop.py
++++ b/hermes_cli/kanban_home_source_stop.py
+@@ -92,7 +92,10 @@
+                 if ("tasks", column) in sync.REF_COLUMNS:
+                     run = conn.execute("SELECT uid FROM task_runs WHERE id=?", (value,)).fetchone()
+                     value = run[0] if run else None
+-                if wire not in fields or sync._from_wire(fields[wire]) != value:
++                received = sync._from_wire(fields.get(wire))
++                if column in sync.SECONDS_COLUMNS.get("tasks", ()):
++                    received = sync.to_seconds(received)
++                if wire not in fields or received != value:
+                     raise ValueError(f"source stop changed task field: {column}")
+             for table in ("kanban_sync_outbox", "kanban_sync_parent_envelopes", "kanban_sync_omissions"):
+                 if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+diff --git a/hermes_cli/kanban_operator_label_delivery.py b/hermes_cli/kanban_operator_label_delivery.py
+index a54e6e67440e2a8aebd8040138bb9826343a0546..580ab0125afb7f2b3b68f831a76891927642f317 100644
+--- a/hermes_cli/kanban_operator_label_delivery.py
++++ b/hermes_cli/kanban_operator_label_delivery.py
+@@ -43,6 +43,8 @@
+             # Existing attempted jobs have UNKNOWN capture custody. Never enrich
+             # them from today's epoch. They remain fail-closed on a moved task.
+             evidence = hub.row_evidence(board, 'tasks', task)
++            if evidence.get('state') == 'deleted':
++                return 'rejected', 'not_found: canonical label result target deleted'
+             target = evidence.get('row') if evidence.get('state') == 'live' else None
+             captured = home.from_evidence(task, target)
+             epoch = None if legacy else captured
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+index b1ed7f49c7a7d91a8c02f2c6d8ede1c2c9d1d9e5..a2e714f03739b809cb04c58b7a3e10bc1e67e961 100644
+--- a/hermes_cli/kanban_scope_renewal_cli.py
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -177,6 +177,8 @@
+         snapshot.execute('SAVEPOINT renewal_home_capture')
+         try:
+             epoch = home.capture(snapshot, wire)
++        except ValueError as exc:
++            raise RenewalRefused("home_capture_refused", str(exc)) from exc
+         finally:
+             snapshot.execute('RELEASE renewal_home_capture')
+         results = hub.ops(board, [home.outbound({'home_generations': epoch}, wire)]).get("results", [])
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index a1e90c976d3751555289a0dcb1292e130e2ecf9d..c1839837802e4b311c463cb86d1bda1c9089228e 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -453,9 +453,8 @@
+         if host and own and host != own:
+             if copy:
+                 continue  # another gateway's probe on a card another gateway owns
+-            last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND id > ? AND kind = ?",
+-                                (tid, park_id, ALIVE_EVENT)).fetchone()[0]
+-            silent = now - max(parked_at, int(last or 0))
++            last = kanban_home_probe.remote_last(conn, tid, park_id, host, payload.get("probe_host"), now)
++            silent = now - max(parked_at, last)
+             if silent <= ALIVE_EVERY + 2 * every + SILENT_GRACE:
+                 continue
+             with kb.write_txn(conn):
+diff --git a/tests/hermes_cli/test_home_review_contracts.py b/tests/hermes_cli/test_home_review_contracts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e9a3e2cfa06925494e13251ec90348016fd597c
+--- /dev/null
++++ b/tests/hermes_cli/test_home_review_contracts.py
+@@ -0,0 +1,163 @@
++"""STOP normalization, transferred probe clocks and public refusal contracts. [daveey]"""
++from contextlib import nullcontext
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc, kanban_sync_client as client
++from hermes_cli import kanban_operator_labels as labels, kanban_home_transfer as transfer
++from hermes_cli import kanban_home_probe as probe, kanban_wake_check as wake
++from hermes_cli.kanban_scope_renewal import RenewalRefused
++from tests.hermes_cli import test_kanban_home_source_stop as stop
++from tests.hermes_cli import test_home_probe_custody as probes
++from tests.hermes_cli import test_kanban_scope_renewal_synced as rs
++from tests.hermes_cli.test_home_typed_capture import mirror
++
++board = stop.board
++live = rs.live
++
++
++def test_stop_accepts_wire_millisecond_timestamp(board):
++    task, record = stop.prepared(board)
++    fields = record['rows'][0]['fields']
++    original = fields['created_at']
++    fields['created_at'] *= 1000
++    with dbc.write_txn(board):
++        result = transfer.finalize_source(board, record)
++    assert result['phase'] == 'stopped_local'
++    assert board.execute('SELECT created_at FROM tasks WHERE id=?', (task,)).fetchone()[0] == original
++
++
++def test_stop_rejects_real_timestamp_change_and_rolls_back(board):
++    task, record = stop.prepared(board)
++    record['rows'][0]['fields']['created_at'] = (record['rows'][0]['fields']['created_at'] + 1) * 1000
++    with dbc.write_txn(board), pytest.raises(ValueError, match='changed task field: created_at'):
++        transfer.finalize_source(board, record)
++    assert board.execute('SELECT count(*) FROM kanban_home_finalized1').fetchone()[0] == 0
++    assert board.execute('SELECT created_on FROM tasks WHERE id=?', (task,)).fetchone()[0] == 'worker-a3'
++
++
++def moved_park(board, *, explicit=None):
++    support = probes.support
++    support.prepare_destination(board)
++    record = probes.probe_manifest(host=explicit)
++    support.materialize(board, record)
++    support.complete_feed(board, record)
++    return record['task']
++
++
++def test_old_local_park_does_not_become_silent_at_home_transition(board):
++    task = moved_park(board)
++    now = 1000 + wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE + 5
++    assert wake.restore_missing_checks(board, now=now)['woken'] == []
++    assert board.execute('SELECT status FROM tasks WHERE id=?', (task,)).fetchone()[0] == 'scheduled'
++    assert wake.get_state(board, task) is None  # never execute on the destination
++
++
++def test_transfer_liveness_grace_is_bounded_and_survives_reopen(board):
++    task = moved_park(board)
++    start = 1000 + wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE + 5
++    limit = wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE
++    assert wake.restore_missing_checks(board, now=start)['woken'] == []
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path) as other:
++        other.row_factory = sqlite3.Row
++        before = other.total_changes
++        assert wake.restore_missing_checks(other, now=start + limit)['woken'] == []
++        assert other.total_changes == before
++        assert wake.restore_missing_checks(other, now=start + limit + 1)['woken'] == [task]
++        assert other.execute('SELECT first_at FROM kanban_home_probe_watch1').fetchone()[0] == start
++        assert other.execute('SELECT status FROM tasks WHERE id=?', (task,)).fetchone()[0] == 'todo'
++
++
++def test_post_transfer_alive_extends_observation_not_baseline(board):
++    task = moved_park(board)
++    limit = wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE
++    wake.restore_missing_checks(board, now=9000)
++    with dbc.write_txn(board):
++        kb._append_event(board, task, wake.ALIVE_EVENT, {})
++        board.execute('UPDATE task_events SET created_at=? WHERE task_id=? AND kind=?', (9500, task, wake.ALIVE_EVENT))
++    assert wake.restore_missing_checks(board, now=9500 + limit)['woken'] == []
++    assert wake.restore_missing_checks(board, now=9501 + limit)['woken'] == [task]
++    assert board.execute('SELECT first_at FROM kanban_home_probe_watch1').fetchone()[0] == 9000
++
++
++def test_explicit_remote_probe_keeps_existing_silence_contract(board):
++    task = moved_park(board, explicit='worker-a2')
++    assert wake.restore_missing_checks(board, now=1000 + wake.ALIVE_EVERY + 240 + wake.SILENT_GRACE + 1)['woken'] == [task]
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_probe_watch1'").fetchone()
++
++
++def test_new_park_cannot_borrow_historical_transfer_grace(board):
++    task = moved_park(board)
++    with dbc.write_txn(board):
++        kb._append_event(board, task, 'scheduled', {'wake_check': 'new check'})
++        event = board.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (task,)).fetchone()[0]
++    assert probe.remote_baseline(board, task, event, 'worker-a3', None, 9000) == 0
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_probe_watch1'").fetchone()
++
++
++def test_pending_transfer_never_installs_liveness_grace(board):
++    support = probes.support
++    support.prepare_destination(board)
++    record = probes.probe_manifest()
++    support.materialize(board, record)
++    assert wake.restore_missing_checks(board, now=9000) == {'restored': [], 'woken': []}
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_probe_watch1'").fetchone()
++
++
++def test_pending_renewal_uses_public_refusal_contract(live, monkeypatch):
++    hub = rs.Hub({'decision_retain': 1, 'scope_renewal': 1})
++    tid, episode, comment = rs.stopped(live, monkeypatch, hub)
++    mirror(live, tid, 'renewal-capture-epoch', pending=1)
++    with pytest.raises(RenewalRefused) as caught:
++        rs.renew(live, tid, episode, comment)
++    assert caught.value.code == 'home_capture_refused'
++    assert not hub.sent
++
++
++def test_pending_renewal_command_returns_structured_refusal(live, monkeypatch, capsys):
++    cli = rs.cli
++    hub = rs.Hub({'decision_retain': 1, 'scope_renewal': 1})
++    tid, episode, comment = rs.stopped(live, monkeypatch, hub)
++    mirror(live, tid, 'renewal-capture-epoch', pending=1)
++    original = cli.renew
++
++    def authorized(conn, task_id, **kwargs):
++        return original(conn, task_id, **kwargs, writer=rs.AGENT, env={}, ancestry=[{'HERMES_SESSION_ID': rs.CHAT}])
++
++    monkeypatch.setattr(cli, 'renew', authorized)
++    monkeypatch.setattr(dbc, 'connect_closing', lambda: nullcontext(live))
++    args = SimpleNamespace(task_id=tid, episode=episode, mandate_comment=comment, reason='authorized', json=True)
++    assert cli.command(args) == 1
++    result = json.loads(capsys.readouterr().out)
++    assert result == {'ok': False, 'error': 'home_capture_refused', 'message': 'home transfer pending'}
++    assert not hub.sent
++    assert not live.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize('state,terminal', [('deleted', True), ('absent', False), ('unavailable', False), ('live', False)])
++def test_deleted_label_target_terminates_delivery(board, monkeypatch, state, terminal):
++    task = stop.support.seed(board)
++    event = 'label-deleted-target-0001'
++    with dbc.write_txn(board):
++        for sql in labels.SCHEMA:
++            board.execute(sql)
++        board.execute("INSERT INTO operator_label_jobs(request_uid,board,machine,labels,caller,result_task_id,"
++                      "state,outcome,detail,event_uid,created_at,delivery_attempts) "
++                      "VALUES ('request','default','worker-a3','[]','{}',?,'done','verified','ok',?,1,0)",
++                      (task, event))
++    sent = []
++    hub = SimpleNamespace(row_evidence=lambda *args: {'state': state, 'row': None},
++                          ops=lambda *args: sent.append(args), close=lambda: None)
++    monkeypatch.setattr(client, 'load_identity', lambda: None)
++    monkeypatch.setattr(client, 'Hub', lambda _: hub)
++    labels._deliver(board, 'hub', 'default', now=10)
++    row = board.execute('SELECT delivered_at,delivery_attempts,last_error FROM operator_label_jobs').fetchone()
++    assert (row[0] is not None) is terminal
++    assert row[1] == 1
++    if terminal:
++        assert row[2].startswith('not_found')
++    assert sent == []
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_synced.py b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+index a64de61b59734297360a02d2c50666d235909f7b..c35831a1dd88f61e5757c854bf82ad616a616470 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal_synced.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+@@ -81,7 +81,7 @@
+     tid, episode, comment = stopped(live, monkeypatch, hub)
+     mirror(live, tid, 'renewal-capture-epoch', pending=int(pending))
+     if pending:
+-        with pytest.raises(ValueError, match='home transfer pending'):
++        with pytest.raises(RenewalRefused, match='home transfer pending'):
+             renew(live, tid, episode, comment)
+         assert not hub.sent
+     else:
+-- 
+2.43.0
+

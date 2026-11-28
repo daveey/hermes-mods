@@ -1,0 +1,165 @@
+From ee5be07aae93aca2043d206faaf2761ba31a3a37 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:38:07 +0000
+Subject: [PATCH 6755] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit ee5be07aae93aca2043d206faaf2761ba31a3a37.
+
+---
+diff --git a/hermes_cli/kanban_db_parent_states.py b/hermes_cli/kanban_db_parent_states.py
+index 1ab6770657332d72f3acc6517bfe8552722504b5..d40093947458eb95af5f257cc8b9aea4543f6ed7 100644
+--- a/hermes_cli/kanban_db_parent_states.py
++++ b/hermes_cli/kanban_db_parent_states.py
+@@ -18,6 +18,51 @@
+     return execution_restricted(conn, pid)
+ 
+ 
++# Every event kind ``execution_restricted`` reads on the parent itself: a terminal parent with none of
++# them cannot be restricted, so the exact (per-parent, multi-statement) check runs only on candidates.
++RESTRICTION_EVIDENCE_KINDS = ("administrative_stop_restricted", "spend_budget_triaged",
++                              "decision_hold_restricted", "decision_retained")
++
++
++def parent_blocks_many(conn: sqlite3.Connection, pairs) -> dict[str, bool]:
++    """``parent_blocks`` for many ``(parent, status)`` pairs in a bounded number of statements.
++
++    Read-only presentation readers only. Statement count does not grow with ordinary terminal parents:
++    one archived-projection read, one restriction-evidence prefilter, then the exact ``parent_blocks``
++    check for each parent that actually carries restriction evidence (genuinely held parents).
++    """
++    import json
++
++    from hermes_cli.kanban_containment_terminal import parent_status_sql
++    from hermes_cli.kanban_stop_ended import KIND
++    kinds = tuple(dict.fromkeys((KIND, *RESTRICTION_EVIDENCE_KINDS)))  # the stop kind is read from its owner
++    status_of = dict(pairs)
++    out = {pid: True for pid, status in status_of.items() if status not in ("done", "archived")}
++    terminal = [pid for pid in status_of if pid not in out]
++    if not terminal:
++        return out
++    archived = [pid for pid in terminal if status_of[pid] == "archived"]
++    if archived:
++        projected = parent_status_sql(conn)
++        for pid, status in conn.execute(f"SELECT id, {projected} FROM tasks WHERE id IN (SELECT value FROM json_each(?))",
++                                        (json.dumps(archived),)).fetchall():
++            if status != "archived":
++                out[pid] = True
++    rest = [pid for pid in terminal if pid not in out]
++    if not rest:
++        return out
++    marks = ",".join("?" for _ in kinds)
++    try:
++        candidates = {row[0] for row in conn.execute(
++            f"SELECT DISTINCT task_id FROM task_events WHERE task_id IN (SELECT value FROM json_each(?)) "
++            f"AND kind IN ({marks})", (json.dumps(rest), *kinds)).fetchall()}
++    except sqlite3.OperationalError:
++        candidates = set(rest)  # no prefilter evidence: fall back to the exact check for every parent
++    for pid in rest:
++        out[pid] = parent_blocks(conn, pid, status_of[pid]) if pid in candidates else False
++    return out
++
++
+ def mirrored_status(conn: sqlite3.Connection, pid: str, status: str) -> str:
+     """Freeze restriction evidence in the status-only foreign-parent mirror, in the replica snapshot."""
+     return f"{status}:restricted" if status in ("done", "archived") and parent_blocks(conn, pid, status) else status
+diff --git a/hermes_cli/kanban_dependency_wait_clock.py b/hermes_cli/kanban_dependency_wait_clock.py
+index 2c59e6404940f8b2938ddeeb749cec46243794bf..ff89db60cbc7eaf76bbc67c3291c201c14cd03ad 100644
+--- a/hermes_cli/kanban_dependency_wait_clock.py
++++ b/hermes_cli/kanban_dependency_wait_clock.py
+@@ -70,9 +70,8 @@
+     Use core's parent-state resolver so local parents and stored remote-parent mirrors follow readiness.
+     This is presentation evidence, never permission to release/execute a card.
+     """
+-    from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_table_columns import table_columns
+-    from hermes_cli.kanban_db_parent_states import parent_states_many
++    from hermes_cli.kanban_db_parent_states import parent_blocks_many, parent_states_many
+     from hermes_state_page_pack import read_rows
+ 
+     ids = [tid for tid, row in parked.items() if row[0] == 'todo']
+@@ -80,7 +79,8 @@
+         return
+     try:  # One graph read for every todo card: this reader is on the sidebar poll path.
+         graph = parent_states_many(conn, ids)
+-        gating = {tid: [pid for pid, status in graph[tid] if kb.parent_blocks(conn, pid, status)] for tid in ids}
++        blocks = parent_blocks_many(conn, [pair for tid in ids for pair in graph[tid]])  # bounded, not per parent
++        gating = {tid: [pid for pid, _status in graph[tid] if blocks[pid]] for tid in ids}
+     except sqlite3.Error:
+         graph, gating = {}, {}  # No graph evidence, not proof of a dependency wait.
+     for tid in ids:
+diff --git a/tests/hermes_cli/test_kanban_dependency_wait_clock.py b/tests/hermes_cli/test_kanban_dependency_wait_clock.py
+index e7506384c8c75f0068d3da1d4656ca47ddaf0a85..7532e70ef494e12d283fddba60c4b288ed183029 100644
+--- a/tests/hermes_cli/test_kanban_dependency_wait_clock.py
++++ b/tests/hermes_cli/test_kanban_dependency_wait_clock.py
+@@ -154,3 +154,68 @@
+         assert many == {k: kb.parent_states(board, k) for k in kids}
+     assert work[0] == work[1], work  # constant: no per-card graph statement
+     assert parent_states_many(board, []) == {}
++
++
++def _terminal(conn, tid, how):
++    if how == 'done':
++        assert kb.complete_task(conn, tid, result='ok')
++    else:
++        assert kb.archive_task(conn, tid)
++
++
++@pytest.mark.parametrize('how', ['done', 'archived'])
++def test_terminal_parent_restriction_check_is_batched_on_the_poll_path(board, how):
++    """Every statement counts: a terminal parent's restriction evidence is read in bounded statements."""
++    blocker = create(board, 'Open blocker')
++    work = []
++    for n in (3, 30):
++        kids = []
++        for i in range(n):
++            done = create(board, f'Terminal {how} {n}-{i}')
++            _terminal(board, done, how)
++            kids.append(create(board, f'Child {how} {n}-{i}', parents=[blocker, done]))
++        seen = []
++        board.set_trace_callback(seen.append)
++        try:
++            info = _local_wait_info(board, kids, now=2000000000)
++        finally:
++            board.set_trace_callback(None)
++        # Only the open blocker gates; the ordinary terminal parent is satisfied and not named.
++        assert set(info) == set(kids) and all(v['waiting_on'] == 'card ' + blocker for v in info.values())
++        work.append(len(seen))
++    assert work[0] == work[1], work  # constant in board size, every statement counted
++
++
++@pytest.mark.parametrize('how', ['done', 'archived'])
++@pytest.mark.parametrize('kind', ['decision_hold_restricted', 'administrative_stop_restricted'])
++def test_restricted_terminal_parent_still_gates_beside_ordinary_ones(board, how, kind):
++    """Negative control: batching keeps held-terminal-parent semantics (restricted never counts as success)."""
++    from hermes_cli.kanban_db_parent_states import parent_blocks, parent_blocks_many
++    held, plain = create(board, 'Held terminal'), create(board, 'Plain terminal')
++    child = create(board, 'Child', parents=[held, plain])
++    other = create(board, 'Other child', parents=[plain])
++    with kb.write_txn(board):
++        kb._append_event(board, held, kind, {'cause': 'scope_stopped'})
++    _terminal(board, held, how)
++    _terminal(board, plain, how)
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == 'todo'  # the real gate agrees: held terminal is not success
++    assert wait(board, child)['waiting_on'] == 'card ' + held
++    assert wait(board, other) is None
++    pairs = [(held, how), (plain, how), ('t_missing', None), (child, 'todo')]
++    assert parent_blocks_many(board, pairs) == {p: parent_blocks(board, p, s) for p, s in pairs}
++    assert parent_blocks_many(board, pairs) == {held: True, plain: False, 't_missing': True, child: True}
++
++
++def test_contained_archive_parent_gates_without_restriction_events(board):
++    """An archived parent whose projection is not archived (containment) gates in the batch too."""
++    from hermes_cli.kanban_db_parent_states import parent_blocks, parent_blocks_many
++    from hermes_cli.kanban_table_columns import table_columns
++    if 'containment_episode' not in table_columns(board, 'tasks'):
++        pytest.skip('legacy schema has no containment marker')
++    parent = create(board, 'Contained')
++    _terminal(board, parent, 'archived')
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET containment_episode='ep' WHERE id=?", (parent,))
++    assert parent_blocks_many(board, [(parent, 'archived')]) == {parent: parent_blocks(board, parent, 'archived')}
++    assert parent_blocks_many(board, [(parent, 'archived')]) == {parent: True}
+-- 
+2.43.0
+

@@ -1,0 +1,131 @@
+From 0ca4c21f4284c2b724fb8ab631d042575570be31 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:27:11 +0000
+Subject: [PATCH 6673] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 0ca4c21f4284c2b724fb8ab631d042575570be31.
+
+---
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 8ad324e21428b3ed200e2aacdfef421c16f1a16c..e96ea409ef7d7748d0c06ab3b5d1f3ff376ef952 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -214,7 +214,8 @@
+     this connection, never an implicitly discovered process-home shadow.
+     ``read`` carries this card's rows when the caller already read them in this same transaction
+     (``kanban_origin_local._prefetch``): the task row, its markers, its latest completed/archived/withdrawn
+-    events and its latest run. Every check below is unchanged; only the keyed reads are skipped.
++    events and its latest run. Optional ``upstream`` is presentation from a shared same-pass graph walk;
++    copy it before hashing so separate obligations never share mutable output. Authority checks are unchanged.
+     """
+     if not conn.in_transaction:
+         raise ValueError('origin_observation_snapshot_required')
+@@ -259,7 +260,12 @@
+     payload = {k: v for k, v in task.items()
+                if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients', 'ask_notice')}
+     from hermes_cli.kanban_session_activity_card_details import _add_blocked_upstream
+-    if local_only:
++    if read is not None and 'upstream' in read:
++        from copy import deepcopy
++        payload.pop('blocked_upstream', None)
++        payload.pop('upstream', None)
++        payload.update(deepcopy(read['upstream']))
++    elif local_only:
+         _add_blocked_upstream(conn, {task['id']: payload}, replica=None)
+     else:
+         _add_blocked_upstream(conn, {task['id']: payload})
+diff --git a/hermes_cli/kanban_origin_local.py b/hermes_cli/kanban_origin_local.py
+index 47531bdea2cf7a6f4223d97c364689c8d8d3468c..6b1193b565824906d5b5782993983d83cf7ea76f 100644
+--- a/hermes_cli/kanban_origin_local.py
++++ b/hermes_cli/kanban_origin_local.py
+@@ -114,7 +114,7 @@
+         'markers': [json.loads(raw) for raw in read['markers'].get(task_id, ())],
+         'event': event, 'run': read['runs'].get(task_id),
+         'archived': read['archived'].get(task_id) if row['status'] == 'archived' and event else None,
+-        'withdrawn': read['withdrawn'].get(task_id)})
++        'withdrawn': read['withdrawn'].get(task_id), 'upstream': read['upstream'][task_id]})
+ 
+ 
+ def observe_local_bindings(bindings: list[dict], *, profile: str, now: float, home=None) -> list[dict | None]:
+@@ -141,6 +141,15 @@
+                 conn.row_factory = sqlite3.Row
+                 conn.execute('BEGIN')
+                 read = _prefetch(conn, sorted({bindings[i]['owner']['task_id'] for i in indexes}))
++                # One graph walk shares ancestor reads across this board's same-snapshot cards.
++                from hermes_cli.kanban_session_activity_card_details import _add_blocked_upstream
++                cards = {tid: dict(row) for tid, row in read['tasks'].items()}
++                if home is not None:
++                    _add_blocked_upstream(conn, cards, replica=None)
++                else:
++                    _add_blocked_upstream(conn, cards)
++                read['upstream'] = {tid: {k: card[k] for k in ('blocked_upstream', 'upstream') if k in card}
++                                    for tid, card in cards.items()}
+                 while alone:
+                     try:
+                         out[alone[0]] = _observe_prefetched(conn, bindings[alone[0]], read, now=now,
+diff --git a/tests/hermes_cli/test_kanban_origin_local_batch.py b/tests/hermes_cli/test_kanban_origin_local_batch.py
+index f7f83d3cd1e32b8bf7ebb5c67e4fb3997f06b63b..ef9ad0a36f8e7220197f5856684409f5b33229ed 100644
+--- a/tests/hermes_cli/test_kanban_origin_local_batch.py
++++ b/tests/hermes_cli/test_kanban_origin_local_batch.py
+@@ -117,6 +117,58 @@
+     assert len(seen) <= 8 + 4, [s[:90] for s in seen]
+ 
+ 
++@pytest.mark.parametrize('explicit', [False, True])
++def test_open_cards_share_upstream_walk_in_one_projection(world, board, monkeypatch, explicit):
++    tasks = seed(world, monkeypatch, ('ready',) * 16)
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='Shared parent', assignee='default', completion_contract='local-only')
++        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (parent,))
++        for tid in tasks:
++            conn.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', (parent, tid))
++    seen = count_board_statements(monkeypatch)
++    def read(flag):
++        monkeypatch.setenv('HERMES_ORIGIN_BATCH_READS', flag)
++        kw = {'home': kb.kanban_db_path('default').parent} if explicit else {}
++        return ledger.project(world[0], replica=None, gateway='owner', profile='default', now=5000, **kw)
++    single = read('0')
++    seen.clear()
++    batched = read('1')
++    assert batched == single and len(batched) == 16
++    assert all(row['blocked_upstream']['id'] == parent for row in batched)
++    graph_reads = [sql for sql in seen if 'task_links' in sql or 'FROM tasks WHERE id=' in sql]
++    assert len(graph_reads) <= 4, graph_reads
++    # Neither the next transaction nor the next projection can reuse graph evidence.
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
++    again = read('1')
++    assert again == read('0')
++    assert all('blocked_upstream' not in row and row['upstream']['status'] == 'running' for row in again)
++
++
++@pytest.mark.parametrize('explicit', [False, True])
++def test_batched_upstream_preserves_hashes_cycles_and_independent_answers(world, board, monkeypatch, explicit):
++    tasks = seed(world, monkeypatch, ('ready', 'ready', 'done', 'blocked'))
++    ids = list(tasks)
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='Shared ancestor', assignee='default', completion_contract='local-only')
++        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (parent,))
++        conn.executemany('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)',
++                         [(parent, ids[0]), (parent, ids[1]), (ids[0], parent)])
++        bindings = [json.loads(r[0]) for r in conn.execute(
++            'SELECT binding_json FROM origin_creation_intents ORDER BY rowid')]
++    kw = {'home': kb.kanban_db_path('default').parent} if explicit else {}
++    bindings.append(bindings[0])
++    expected = [local.observe_local_binding(b, profile='default', now=5000, **kw) for b in bindings]
++    actual = local.observe_local_bindings(bindings, profile='default', now=5000, **kw)
++    assert actual == expected  # Includes the hash over the entire observed payload, not just public projection.
++    first = next(i for i, b in enumerate(bindings) if b['owner']['task_id'] == ids[0])
++    answer = actual[first]
++    assert answer is not None
++    assert answer['upstream'] == {'id': parent, 'status': 'running'}
++    answer['upstream']['status'] = 'changed by caller'
++    assert actual[-1] == expected[-1]
++
++
+ @pytest.mark.parametrize('fault', ['prefetch', 'second_card', 'second_card_value'])
+ def test_failed_batched_read_falls_back_to_single_card_reads(world, board, monkeypatch, fault):
+     seed(world, monkeypatch, ('ready', 'done', 'blocked', 'archived'))
+-- 
+2.43.0
+

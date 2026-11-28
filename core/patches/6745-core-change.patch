@@ -1,0 +1,225 @@
+From f60fc208912de760c83520aee31cfb3c6d80011c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:05:47 +0000
+Subject: [PATCH 6745] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit f60fc208912de760c83520aee31cfb3c6d80011c.
+
+---
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index c4bcab08b8749db8a54e316defc85ef0f169ae55..df7cb8390e2d1bb6408c568ef1877bc4cb12e64e 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -166,8 +166,10 @@
+     """Live and retained processes of this chat from the registry's strict qualified inventory."""
+     from tools.process_registry import process_registry
+     from hermes_state_process_checkpoint import checkpoint_items
++    from tools.process_registry_results import _owner_pass
+ 
+-    with _so()._owner_scope(db):
++    # One lineage handle for the whole inventory (results, owner filter, checkpoint), opened under the owner's home.
++    with _so()._owner_scope(db), _owner_pass():
+         rows = process_registry.list_sessions(include_retained=True, strict=True, owner_session_id=tip)
+         checkpoints = checkpoint_items(process_registry, tip, {row['session_id'] for row in rows})
+     items = list(checkpoints)
+diff --git a/tests/tools/test_process_results_lineage_pass.py b/tests/tools/test_process_results_lineage_pass.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c194406f6194c668f749773aa1e9313bc3ddbcf
+--- /dev/null
++++ b/tests/tools/test_process_results_lineage_pass.py
+@@ -0,0 +1,101 @@
++"""Retained-result owner checks share one lineage handle per inventory pass.
++
++Every outcome refresh walks up to MAX_RETAINED_RESULTS receipts in load_completed_results
++and again in the strict owner filter. Opening a SessionDB per receipt cost many opens
++per refresh in a busy serve (turn-start-outcome threads under heavy contention,
++t_d0c5000000000005). One pass now opens at most one read-only handle and resolves each
++parent's compression tip once; ownership results must be unchanged.
++"""
++import json
++import time
++
++import pytest
++
++import hermes_state
++from tools import process_registry_results as results
++from tools.process_registry import ProcessRegistry
++
++
++@pytest.fixture
++def lineage(tmp_path, monkeypatch):
++    monkeypatch.setattr(results, "get_hermes_home", lambda: tmp_path)
++    directory = tmp_path / "logs" / "process-results"
++    directory.mkdir(parents=True)
++    db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
++    # owner-root was compressed into owner-tip; unrelated-* are other chats.
++    db.create_session("owner-root", "cli")
++    db.end_session("owner-root", end_reason="compression")
++    db.create_session("owner-tip", "cli", parent_session_id="owner-root")
++    for i in range(3):
++        db.create_session(f"unrelated-{i}", "cli")
++    db.close()
++
++    opens = []
++    real = hermes_state.SessionDB
++
++    class Counting(real):
++        def __init__(self, *args, **kwargs):
++            kwargs.setdefault("db_path", tmp_path / "state.db")
++            opens.append(kwargs.get("read_only"))
++            super().__init__(*args, **kwargs)
++
++    monkeypatch.setattr(hermes_state, "SessionDB", Counting)
++    return directory, opens
++
++
++def write(directory, pid, parent):
++    data = dict(id=pid, command="true", cwd="/", task_id="task", owner_task_id="task",
++                session_key="", parent_session_id=parent, started_at=time.time(), exit_code=0,
++                completion_reason="exited", termination_source="", notify_on_complete=False,
++                output="")
++    (directory / f"{pid}.json").write_text(json.dumps(data))
++
++
++def corpus(directory):
++    parents = ["owner-root", "owner-tip"] + [f"unrelated-{i % 3}" for i in range(20)]
++    for i, parent in enumerate(parents):
++        write(directory, f"proc_{i:03d}", parent)
++    return {f"proc_{i:03d}" for i, p in enumerate(parents) if p.startswith("owner")}
++
++
++@pytest.mark.parametrize("strict", [True, False])
++def test_load_opens_one_lineage_handle_with_same_owners(lineage, strict):
++    directory, opens = lineage
++    expected = corpus(directory)
++    loaded = results.load_completed_results(strict=strict, owner_session_id="owner-tip")
++    assert set(loaded) == expected
++    # owner-root resolves through the compression chain; four foreign parents, one handle.
++    assert opens == [True]
++
++
++def test_strict_registry_inventory_is_one_pass(lineage, monkeypatch):
++    directory, opens = lineage
++    expected = corpus(directory)
++    registry = ProcessRegistry()
++    registry._running, registry._finished = {}, {}
++    monkeypatch.setattr(registry, "_refresh_detached_session", lambda s: s)
++    monkeypatch.setattr(registry, "_reconcile_local_exit", lambda s: None)
++    monkeypatch.setattr(registry, "_uncollected_gone", lambda s: False)
++    rows = registry.list_sessions(include_retained=True, strict=True, owner_session_id="owner-tip")
++    assert {row["session_id"] for row in rows} == expected
++    assert opens == [True]  # load and owner filter share the pass
++
++
++def test_memo_does_not_outlive_the_pass(lineage, tmp_path):
++    directory, _opens = lineage
++    write(directory, "proc_late", "unrelated-0")
++    assert "proc_late" not in results.load_completed_results(strict=True, owner_session_id="unrelated-0-tip")
++    db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
++    db.end_session("unrelated-0", end_reason="compression")
++    db.create_session("unrelated-0-tip", "cli", parent_session_id="unrelated-0")
++    db.close()
++    # A rotation between passes is seen by the next pass.
++    assert "proc_late" in results.load_completed_results(strict=True, owner_session_id="unrelated-0-tip")
++
++
++def test_single_call_outside_a_pass_still_closes_its_handle(lineage):
++    _, opens = lineage
++    assert results._owns_result("owner-tip", "owner-root") is True
++    assert results._owns_result("owner-tip", "unrelated-1") is False
++    assert opens == [True, True]
++    assert results._lineage_pass.get() is None
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index ec20da8428478623988585b9e20adbf93d60d687..3f6ce93c1281a33316edb6578759cd77070746fa 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -5,6 +5,8 @@
+ parents cannot overwrite each other's results in the running-PID checkpoint.
+ """
+ 
++import contextlib
++import contextvars
+ import json
+ import logging
+ import re
+@@ -143,6 +145,31 @@
+     return fields
+ 
+ 
++_lineage_pass: contextvars.ContextVar = contextvars.ContextVar("process_result_lineage_pass", default=None)
++
++
++@contextlib.contextmanager
++def _owner_pass():
++    """Share one read-only lineage handle and per-parent tips across one inventory pass.
++
++    Every outcome refresh walks up to MAX_RETAINED_RESULTS receipts twice (load, then the
++    strict owner filter); opening a SessionDB per receipt cost many opens per refresh, each
++    a GIL release in the serve. Reentrant: a nested pass reuses the outer one. The memo only
++    lives for the pass, so a later rotation is seen by the next pass.
++    """
++    if _lineage_pass.get() is not None:
++        yield
++        return
++    state = {"db": None, "tips": {}}
++    token = _lineage_pass.set(state)
++    try:
++        yield
++    finally:
++        _lineage_pass.reset(token)
++        if state["db"] is not None:
++            state["db"].close()
++
++
+ def _owns_result(owner: str, parent: str | None) -> bool:
+     if not parent:
+         return False
+@@ -152,15 +179,28 @@
+ 
+     # Pure lineage read on the hot path of every retained-result load; a writable open here
+     # was one more writer handle per call inside the gateway (#100896).
+-    db = SessionDB(read_only=True)
+-    try:
+-        return db.get_compression_tip(parent) == owner
+-    finally:
+-        db.close()
++    state = _lineage_pass.get()
++    if state is None:
++        db = SessionDB(read_only=True)
++        try:
++            return db.get_compression_tip(parent) == owner
++        finally:
++            db.close()
++    tips = state["tips"]
++    if parent not in tips:
++        if state["db"] is None:
++            state["db"] = SessionDB(read_only=True)
++        tips[parent] = state["db"].get_compression_tip(parent)
++    return tips[parent] == owner
+ 
+ 
+ def registry_sessions(registry, include_retained, strict, owner_session_id, loader) -> dict:
+     """Opt-in qualified status view; preserve the default tool/display inventory."""
++    with _owner_pass():
++        return _registry_sessions(registry, include_retained, strict, owner_session_id, loader)
++
++
++def _registry_sessions(registry, include_retained, strict, owner_session_id, loader) -> dict:
+     from tools.environments.sandbox_scope import sandbox_visible
+ 
+     if strict and (not include_retained or not owner_session_id):
+@@ -191,6 +231,11 @@
+ 
+ def load_completed_results(prefix: str = "", *, strict: bool = False, owner_session_id: str | None = None) -> dict:
+     """Restore read-only snapshots; no process handles, watchers, or queue events."""
++    with _owner_pass():
++        return _load_completed_results(prefix, strict=strict, owner_session_id=owner_session_id)
++
++
++def _load_completed_results(prefix: str, *, strict: bool, owner_session_id: str | None) -> dict:
+     from tools.process_registry import ProcessSession
+ 
+     from gateway.session_context import get_session_env
+-- 
+2.43.0
+

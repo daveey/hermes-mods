@@ -1,0 +1,351 @@
+From c791e2aad5c0a737ae159388ec688f6da65c3e57 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:12:36 +0000
+Subject: [PATCH 6972] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit c791e2aad5c0a737ae159388ec688f6da65c3e57.
+
+---
+diff --git a/hermes_cli/kanban_ask_resolved.py b/hermes_cli/kanban_ask_resolved.py
+index c8e7b74c21347f61a8c12841c67a873912b0b5ec..e6d4dd59bc8bacd6185b189983117c2a784d79ba 100644
+--- a/hermes_cli/kanban_ask_resolved.py
++++ b/hermes_cli/kanban_ask_resolved.py
+@@ -401,6 +401,9 @@
+             "AND w.task_id IS NULL AND t.human_request LIKE '%\"resolved_check\"%'").fetchall()
+     except sqlite3.OperationalError:
+         return out
++    from hermes_cli.kanban_home_transfer import frozen
++    rows = [r for r in rows if not frozen(conn, r[0])]
++    missing = [r for r in missing if not frozen(conn, r[0])]
+     stale = [r[0] for r in rows if resolved_check(r[2])[0] != r[1]]
+     if stale:
+         with kb.write_txn(conn):
+diff --git a/hermes_cli/kanban_home_generation.py b/hermes_cli/kanban_home_generation.py
+index 79dac66f5a89033550c68d1d467f7988e8073fd6..30756832d9bbd7c10f3f1574105a234353aa1571 100644
+--- a/hermes_cli/kanban_home_generation.py
++++ b/hermes_cli/kanban_home_generation.py
+@@ -20,6 +20,7 @@
+     conn.execute("CREATE TABLE IF NOT EXISTS kanban_home_generations1 "
+                  "(task_id TEXT PRIMARY KEY, nonce TEXT NOT NULL)")
+     add_column_if_missing(conn, "kanban_home_generations1", "version", "version INTEGER NOT NULL DEFAULT 0")
++    add_column_if_missing(conn, "kanban_home_generations1", "pending", "pending INTEGER NOT NULL DEFAULT 1")
+     add_column_if_missing(conn, "kanban_sync_outbox", "home_generations", "home_generations TEXT")
+     # Keep this independent from removable sync capture triggers. Do not retrofit
+     # a generation onto an extant pending op even if its source row now has one.
+@@ -42,12 +43,27 @@
+     if (not isinstance(nonce, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{16,128}", nonce)
+             or type(version) is not int or version < 1):
+         raise ValueError("invalid feed home generation")
+-    old = conn.execute("SELECT nonce,version FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone()
+-    if old and (version < old[1] or (version == old[1] and nonce != old[0])):
++    old = conn.execute("SELECT nonce,version,pending FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone()
++    # Absence is unknown/pending, never an implicit source-STOP certificate.
++    flag = fields.get("home_transfer_pending", nonce)
++    if flag is not None and flag != nonce:
++        raise ValueError("invalid feed home generation pending scope")
++    pending = int(flag is not None)
++    if old and (version < old[1] or (version == old[1] and (nonce != old[0] or pending != old[2]))):
+         raise ValueError("feed home generation regressed")
+-    conn.execute("INSERT INTO kanban_home_generations1(task_id,nonce,version) VALUES (?,?,?) "
+-                 "ON CONFLICT(task_id) DO UPDATE SET nonce=excluded.nonce,version=excluded.version",
+-                 (task, nonce, version))
++    conn.execute("INSERT INTO kanban_home_generations1(task_id,nonce,version,pending) VALUES (?,?,?,?) "
++                 "ON CONFLICT(task_id) DO UPDATE SET nonce=excluded.nonce,version=excluded.version,pending=excluded.pending",
++                 (task, nonce, version, pending))
++
++
++def pending(conn: sqlite3.Connection, task: str) -> bool:
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_home_generations1'").fetchone():
++        return False
++    columns = {r[1] for r in conn.execute("PRAGMA table_info(kanban_home_generations1)")}
++    if "pending" not in columns:
++        return bool(conn.execute("SELECT 1 FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone())
++    row = conn.execute("SELECT pending FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone()
++    return bool(row and row[0] != 0)
+ 
+ 
+ def mirror_change(conn: sqlite3.Connection, change) -> None:
+@@ -70,7 +86,9 @@
+         ids = f"{ref}.parent_id,{ref}.child_id"
+     else:
+         ids = f"{ref}.task_id"
+-    return ("(SELECT NULLIF(json_group_object(task_id,nonce),'{}') "
++    return ("(SELECT CASE WHEN EXISTS(SELECT 1 FROM kanban_home_generations1 "
++            f"WHERE task_id IN ({ids}) AND pending != 0) "
++            "THEN RAISE(ABORT,'home transfer pending') ELSE NULLIF(json_group_object(task_id,nonce),'{}') END "
+             f"FROM kanban_home_generations1 WHERE task_id IN ({ids}))")
+ 
+ 
+diff --git a/hermes_cli/kanban_home_owner.py b/hermes_cli/kanban_home_owner.py
+index 556036d2dc3b23b5574771f9a447ff9347080593..60759df2dd3bc9336b6193417cc9da94a764eefe 100644
+--- a/hermes_cli/kanban_home_owner.py
++++ b/hermes_cli/kanban_home_owner.py
+@@ -65,7 +65,10 @@
+     """
+     identity = _identity(conn, hub, board, identity, "destination")
+     record = _advance(hub, board, identity, "read")
+-    if record["phase"] == "prepared":
++    if record["phase"] in ("prepared", "complete"):
++        # A complete response is historical custody, not a request to re-import
++        # an old manifest over later legitimate execution. Native eligibility
++        # releases only when the newer authenticated STOP feed arrives.
+         return record
+     with dbc.write_txn(conn):
+         rows = destination.materialize(conn, record)
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index c3cdb92e1700dc3c881d7eb8a6a908da76816ec4..5d99fc003fe17ea3bbaab1df2d58e08e61950a3d 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -169,7 +169,10 @@
+     again under its ordinary future lease. SQL mutation fences remain separate.
+     """
+     import json
++    from hermes_cli.kanban_home_generation import pending
+ 
++    if pending(conn, task_id):
++        return True
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone():
+         return False
+     row = conn.execute(f"SELECT task_id,source,destination,nonce,expected_version FROM {_TABLE} WHERE task_id=?", (task_id,)).fetchone()
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 3a1f227dfaf3fef2c2a51bb99708c45bcdd671de..2cb496f08654562c9a3d69d86070da97c1aef788 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -426,7 +426,10 @@
+     if not missing:
+         return out
+     foreign = foreign_ids(conn, own)
+-    for tid in missing:
++    from itertools import filterfalse
++    from hermes_cli.kanban_home_transfer import frozen
++    # Never register, cache or diagnose a frozen handoff candidate.
++    for tid in filterfalse(lambda task: frozen(conn, task), missing):
+         park = conn.execute(
+             f"SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
+             "ORDER BY id DESC LIMIT 1", (tid, *kc.SCHEDULED_ENTRY_EVENTS)).fetchone()
+diff --git a/tests/hermes_cli/test_home_destination_materialize.py b/tests/hermes_cli/test_home_destination_materialize.py
+index f737ffef243aef2e08f3fc6cfe04ec8f6176ff48..8901dc8e1311d7616c71f8ca3bbd29dd48b93310 100644
+--- a/tests/hermes_cli/test_home_destination_materialize.py
++++ b/tests/hermes_cli/test_home_destination_materialize.py
+@@ -39,6 +39,16 @@
+         conn.execute("DELETE FROM kanban_sync_outbox")
+ 
+ 
++def complete_feed(conn, record):
++    """Model the newer authenticated source-STOP feed, not a local release flag."""
++    fields = dict(next(r["fields"] for r in record["rows"] if r["table"] == "tasks"))
++    version = fields["version"] + 1
++    fields.update(home_generation=record["nonce"], home_transfer_pending=None, version=version)
++    change = sync.RemoteChange(seq=version, table="tasks", uid=record["task"], op="upsert",
++        fields=fields, version=version, hlc=fields.get("hlc", "1001-0-server"), origin_gateway="server")
++    sync.apply_remote_changes(conn, [change], new_cursor=version, observers=False)
++
++
+ def materialize(conn, record):
+     from hermes_cli.kanban_home_destination import materialize as apply
+     with kbc.write_txn(conn):
+@@ -123,7 +133,9 @@
+     materialize(board, record)
+     assert materialize(board, record) == record["rows"]
+     with kbc.write_txn(board):
++        board.execute("UPDATE kanban_sync_state SET applying=1")  # deliberate projection corruption, not admitted intent
+         board.execute("UPDATE tasks SET title='corrupt local projection' WHERE id=?", (record["task"],))
++        board.execute("UPDATE kanban_sync_state SET applying=0")
+         board.execute("DELETE FROM kanban_sync_outbox")
+     with pytest.raises(ValueError, match="materialization"):
+         materialize(board, record)
+diff --git a/tests/hermes_cli/test_home_generation_feed.py b/tests/hermes_cli/test_home_generation_feed.py
+index c84ee7311bce0bf1f345f7fb30990f83969b20fc..752f459f7c908ab67280ef7b08cd08f8da338629 100644
+--- a/tests/hermes_cli/test_home_generation_feed.py
++++ b/tests/hermes_cli/test_home_generation_feed.py
+@@ -13,8 +13,9 @@
+ 
+ 
+ def feed(conn, task, version=8, nonce="committed-nonce-0001", **extra):
+-    fields = dict(id=task, title="canonical", status="scheduled", created_at=1,
++    fields: dict = dict(id=task, title="canonical", status="scheduled", created_at=1,
+                   created_on="hub", home_generation=nonce, **extra)
++    fields.setdefault("home_transfer_pending", None)  # this helper models a completed transfer
+     change = sync.RemoteChange(seq=version, table="tasks", uid=task, op="upsert", fields=fields,
+                                version=version, hlc="1-0-server", origin_gateway="server")
+     sync.apply_remote_changes(conn, [change], new_cursor=version, observers=False)
+@@ -79,7 +80,7 @@
+     task = kb.create_task(board, title="local value must survive echo")
+     op = board.execute("SELECT op_id FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid=?", (task,)).fetchone()[0]
+     change = sync.RemoteChange(seq=8, table="tasks", uid=task, op="upsert",
+-        fields=dict(id=task, title="different echoed title", home_generation="committed-nonce-0001"),
++        fields=dict(id=task, title="different echoed title", home_generation="committed-nonce-0001", home_transfer_pending=None),
+         version=8, hlc="1-0-server", origin_gateway="worker-a3", client_op_id=op)
+     result = sync.apply_remote_changes(board, [change], new_cursor=8, observers=False)
+     assert result.skipped_echo == 1
+diff --git a/tests/hermes_cli/test_home_pending_eligibility.py b/tests/hermes_cli/test_home_pending_eligibility.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d357a82c0fc1557db24d21047d575010090cfd5a
+--- /dev/null
++++ b/tests/hermes_cli/test_home_pending_eligibility.py
+@@ -0,0 +1,92 @@
++"""A committed-home feed is not a native execution release before source STOP."""
++from __future__ import annotations
++
++import pytest
++import sqlite3
++
++from hermes_cli import kanban_db as kb, kanban_db_sync as sync, kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as transfer
++from tests.hermes_cli import test_home_generation_feed as feed_support
++from tests.hermes_cli import test_home_destination_materialize as dest_support
++
++board = feed_support.board
++NONCE = "pending-destination-0001"
++
++
++def pending(conn, status="todo"):
++    task = kb.create_task(conn, title="early destination feed")
++    neighbour = kb.create_task(conn, title="independent")
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET gateway_id='hub'")
++        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (neighbour,))
++    feed_support.feed(conn, task, home_transfer_pending=NONCE, nonce=NONCE)
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying=1")
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task))
++        conn.execute("UPDATE kanban_sync_state SET applying=0")
++    return task, neighbour
++
++
++def test_early_feed_pending_cannot_promote_but_neighbour_can(board):
++    task, neighbour = pending(board)
++    assert kb.recompute_ready(board) == 1
++    assert kb.get_task(board, task).status == "todo"
++    assert kb.get_task(board, neighbour).status == "ready"
++    assert transfer.frozen(board, task)
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_pending_claim_stops_before_external_lease(board, monkeypatch, review):
++    task, _ = pending(board, "review" if review else "ready")
++    monkeypatch.setattr(sync, "claim_gate", lambda *a, **k: pytest.fail("pending destination requested lease"))
++    assert (kb.claim_review_task if review else kb.claim_task)(board, task) is None
++
++
++def test_pending_wake_and_new_capture_refuse_until_newer_completion_feed(board):
++    from hermes_cli.kanban_terminal_guard import skip_wake
++    task, _ = pending(board, "scheduled")
++    assert skip_wake(board, task, "scheduled")
++    with pytest.raises(sqlite3.IntegrityError, match="home transfer pending"):
++        kb.add_comment(board, task, "actor", "must not become delayed executable intent")
++    with pytest.raises(ValueError, match="generation"):
++        feed_support.feed(board, task, version=8, nonce=NONCE, home_transfer_pending=None)
++    feed_support.feed(board, task, version=9, nonce=NONCE, home_transfer_pending=None)
++    assert not transfer.frozen(board, task)
++    kb.add_comment(board, task, "actor", "post STOP intent")
++
++
++def test_actual_manifest_materialization_remains_ineligible(board):
++    dest_support.prepare_destination(board)
++    record = dest_support.manifest()
++    record["rows"][0]["fields"]["home_transfer_pending"] = record["nonce"]
++    dest_support.materialize(board, record)
++    assert transfer.frozen(board, record["task"])
++
++
++@pytest.mark.parametrize("ask", [False, True])
++def test_actual_probe_restore_skips_pending_without_caching_it_as_settled(board, ask):
++    from hermes_cli import kanban_wake_check as wake, kanban_ask_resolved as resolved
++    from tests.hermes_cli.test_home_probe_custody import probe_manifest
++    dest_support.prepare_destination(board)
++    record = probe_manifest(host="hub", ask=ask)
++    record["rows"][0]["fields"]["home_transfer_pending"] = record["nonce"]
++    dest_support.materialize(board, record)
++    repair = resolved.reconcile if ask else wake.restore_missing_checks
++    before = board.total_changes
++    assert repair(board, now=1001)["restored"] == []
++    assert board.total_changes == before
++    assert wake.get_state(board, record["task"]) is None
++    dest_support.complete_feed(board, record)
++    assert repair(board, now=1001)["restored"] == [record["task"]]
++
++
++def test_pending_survives_existing_readonly_peer_and_missing_phase_is_not_release(board):
++    import sqlite3
++    dest_support.prepare_destination(board)
++    record = dest_support.manifest()  # missing phase field is deliberately unknown
++    dest_support.materialize(board, record)
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as peer:
++        assert transfer.frozen(peer, record["task"])
++        dest_support.complete_feed(board, record)
++        assert not transfer.frozen(peer, record["task"])
+diff --git a/tests/hermes_cli/test_home_probe_custody.py b/tests/hermes_cli/test_home_probe_custody.py
+index 5b9b7b4dd7f0036f372b67dbc407f06cfc306133..e926c01dbabb231079219fe2ae29ff373cbd413c 100644
+--- a/tests/hermes_cli/test_home_probe_custody.py
++++ b/tests/hermes_cli/test_home_probe_custody.py
+@@ -47,6 +47,7 @@
+     support.prepare_destination(board)
+     record = probe_manifest(host="hub")
+     support.materialize(board, record)
++    support.complete_feed(board, record)
+     assert wake.restore_missing_checks(board, now=1001)["restored"] == [record["task"]]
+     state = wake.get_state(board, record["task"])
+     assert state is not None and state["cmd"] == "test -f ~/.hermes/source-only-ready"
+@@ -91,6 +92,7 @@
+         transfer.prepare(board, tid, source=reply["source"], destination="hub", nonce=reply["nonce"], expected_version=7)
+         transfer.finalize_source(board, reply)
+         board.execute("DELETE FROM task_wake_checks WHERE task_id=?", (tid,))
++    support.complete_feed(board, reply)
+     assert tid not in node.evict(board)
+     assert kb.get_task(board, tid) is not None
+     result = resolved.reconcile(board, now=1001) if ask else wake.restore_missing_checks(board, now=1001)
+@@ -118,6 +120,7 @@
+     support.prepare_destination(board)
+     record = probe_manifest()
+     support.materialize(board, record)
++    support.complete_feed(board, record)
+     tid = record["task"]
+     with kbc.write_txn(board):
+         board.execute("UPDATE task_events SET origin_gateway=NULL WHERE task_id=?", (tid,))
+diff --git a/tests/hermes_cli/test_home_transfer_capture.py b/tests/hermes_cli/test_home_transfer_capture.py
+index 227b9a80d8cd63bfcd42be77e90e0bf460750f18..39b1ddee7d55185856242465c3849fd88e84d910 100644
+--- a/tests/hermes_cli/test_home_transfer_capture.py
++++ b/tests/hermes_cli/test_home_transfer_capture.py
+@@ -22,7 +22,7 @@
+         # Disposable source mirror of a future authenticated committed handoff.
+         # No production migration or activation API exists in this slice.
+         conn.execute("CREATE TABLE IF NOT EXISTS kanban_home_generations1(task_id TEXT PRIMARY KEY, nonce TEXT NOT NULL)")
+-        conn.execute("INSERT OR REPLACE INTO kanban_home_generations1(task_id,nonce) VALUES (?,?)", (task, nonce))
++        conn.execute("INSERT OR REPLACE INTO kanban_home_generations1(task_id,nonce,pending) VALUES (?,?,0)", (task, nonce))
+ 
+ 
+ def captured(conn, table, uid=None):
+diff --git a/tests/hermes_cli/test_kanban_home_source_stop.py b/tests/hermes_cli/test_kanban_home_source_stop.py
+index a22b7e262d0ffda8e877b205ae157d24b06102a3..f44ff0684dc41fa281210bfdf70716542644f338 100644
+--- a/tests/hermes_cli/test_kanban_home_source_stop.py
++++ b/tests/hermes_cli/test_kanban_home_source_stop.py
+@@ -50,8 +50,12 @@
+     assert [tuple(r) for r in board.execute("SELECT * FROM task_wake_checks WHERE task_id=?", (tid,))] == probes
+     assert board.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == 0
+     assert board.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (tid,)).fetchone()[0] == reply["nonce"]
+-    # Retained foreign probe custody can write a wake later; capture has the new
+-    # epoch, not permission to execute without the usual Board lease/hold gates.
++    # The local STOP precedes Board STOP: fresh intent is still refused until
++    # the independently newer authenticated completion feed arrives.
++    with pytest.raises(sqlite3.IntegrityError, match="home transfer pending"):
++        kb.add_comment(board, tid, "actor", "too early")
++    from tests.hermes_cli.test_home_destination_materialize import complete_feed
++    complete_feed(board, reply)
+     kb.add_comment(board, tid, "actor", "fresh post-stop evidence")
+     captures = board.execute("SELECT home_generations FROM kanban_sync_outbox WHERE table_name='task_comments'").fetchall()
+     assert captures and all(json.loads(r[0]) == {tid:reply["nonce"]} for r in captures)
+@@ -61,6 +65,9 @@
+     tid, reply = prepared(board)
+     with kbc.write_txn(board):
+         transfer.finalize_source(board, reply)
++    from tests.hermes_cli.test_home_destination_materialize import complete_feed
++    complete_feed(board, reply)
++    with kbc.write_txn(board):
+         board.execute("UPDATE tasks SET title='later real work',sync_version=9 WHERE id=?", (tid,))
+     path = board.execute("PRAGMA database_list").fetchone()[2]
+     with sqlite3.connect(path) as other:
+-- 
+2.43.0
+

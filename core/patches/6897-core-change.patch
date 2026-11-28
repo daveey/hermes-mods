@@ -1,0 +1,362 @@
+From 7270aeffcc10b46a69375e680cb735c65a03f29b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 08:00:06 +0000
+Subject: [PATCH 6897] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 7270aeffcc10b46a69375e680cb735c65a03f29b.
+
+---
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index cf687d54b88d0e4f6447eb03fcd84df309e58ab2..9e8f5dbd7be3616e93bdc4fd389cd3b86a3f5b8d 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -418,10 +418,10 @@
+                 raise
+         raise AssertionError("unreachable")  # pragma: no cover
+ 
+-    def ops(self, board: str, ops: list[dict], *, custody=None) -> dict:
++    def ops(self, board: str, ops: list[dict], *, custody=None, legacy_parents=()) -> dict:
+         if custody is not None:
+             from hermes_cli.kanban_sync_exposure import send
+-            return send(self, custody, board, ops)
++            return send(self, custody, board, ops, legacy_parents=legacy_parents)
+         return self._call("POST", f"/v2/boards/{board}/ops", {"ops": ops})
+ 
+     def changes(self, board: str, since: int, limit: int = FEED_PAGE) -> dict:
+@@ -676,7 +676,7 @@
+             parents = [(envelopes.parent(conn, tid, lambda op=op: op, supported=bool(origin_cap)), tid) for op, tid in parents]
+             wire = [op for op, _tid in parents] + wire
+         try:
+-            resp = hub.ops(board, wire, custody=conn) if isinstance(hub, _HTTP_HUB) else hub.ops(board, wire)
++            resp = hub.ops(board, wire, custody=conn, legacy_parents=[op for op, _tid in parents]) if isinstance(hub, _HTTP_HUB) else hub.ops(board, wire)
+         except (HubError, OSError) as exc:
+             with write_txn(conn):
+                 conn.executemany("UPDATE kanban_sync_outbox SET attempts = attempts + 1, last_error = ? WHERE op_id = ?",
+diff --git a/hermes_cli/kanban_sync_exposure.py b/hermes_cli/kanban_sync_exposure.py
+index 683074a12bfefb31295b0e9cf0b098769362313e..7215cf4cbf432cb8d6ae783fe4c88679fc0910db 100644
+--- a/hermes_cli/kanban_sync_exposure.py
++++ b/hermes_cli/kanban_sync_exposure.py
+@@ -34,35 +34,63 @@
+             "'{\"protocol\":\"exposure1\",\"coverage\":\"candidate\",\"certified\":false,\"exposures\":[]}' END FROM capture;")
+ 
+ 
+-def _observe(conn, ops, board, endpoint, ident, capability):
++class ExposureCustodyError(OSError):
++    """A board-local refusal, caught by the sync round without losing custody."""
++
++
++def _sources(conn, op, ops, legacy_parents):
++    op_id = op.get('client_op_id')
++    row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++    if row is not None:
++        return [('kanban_sync_outbox', row)]
++    row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_parent_envelopes '
++                       "WHERE json_extract(wire,'$.client_op_id')=?", (op_id,)).fetchone()
++    if row is not None:
++        return [('kanban_sync_parent_envelopes', row)]
++    sources = []
++    # Only the legacy batch builder can declare an intentionally unsaved parent.
++    # Its pending children own the support operation's exposure, not its capture
++    # identity. A lost persisted/frozen parent must still refuse, never downgrade.
++    if op in legacy_parents and not op.get('frozen_replay'):
++        for child in ops:
++            refs = (str(child.get('uid', '')).split('>') if child.get('table') == 'task_links'
++                    else [child.get('fields', {}).get('task_id')])
++            if op.get('uid') in refs:
++                row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_outbox WHERE op_id=?',
++                                   (child.get('client_op_id'),)).fetchone()
++                if row is None:
++                    raise ExposureCustodyError('exposure child custody missing')
++                sources.append(('kanban_sync_outbox', row))
++    if not sources:
++        raise ExposureCustodyError('exposure source custody missing')
++    return sources
++
++
++def _observe(conn, ops, board, endpoint, ident, capability, *, legacy_parents=()):
+     """Append under the writer reservation; COMMIT is a prerequisite to sending."""
+     principal = capability.get('gateway_principal')
+     incarnation = capability.get('board_incarnation')
+     authenticated = all(isinstance(value, str) and value for value in (principal, incarnation))
+     with write_txn(conn):
+         for op in ops:
+-            op_id = op.get('client_op_id')
+-            row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
+-            table = 'kanban_sync_outbox'
+-            if row is None:
+-                table = 'kanban_sync_parent_envelopes'
+-                row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_parent_envelopes '
+-                                   "WHERE json_extract(wire,'$.client_op_id')=?", (op_id,)).fetchone()
+-            if row is None:
+-                raise ValueError('exposure source custody missing')
+-            history = json.loads(row[1]) if row[1] is not None else dict(
+-                protocol='exposure1', coverage='unknown', certified=False, exposures=[])
+-            if (history.get('protocol') != 'exposure1' or history.get('certified') is not False or
+-                    history.get('coverage') not in ('unknown', 'candidate') or not isinstance(history.get('exposures'), list)):
+-                raise ValueError('unsupported exposure history; preserve custody')
+-            exposure = dict(board=board, endpoint=endpoint, url=ident.url,
+-                            credential_epoch=hashlib.sha256(ident.key.encode()).hexdigest(),
+-                            gateway_principal=principal if authenticated else None,
+-                            board_incarnation=incarnation if authenticated else None, wire=op)
+-            if exposure not in history['exposures']:
+-                history['exposures'].append(exposure)
+-            conn.execute(f'UPDATE {table} SET exposure_history=? WHERE rowid=?',
+-                         (json.dumps(history, sort_keys=True, separators=(',', ':'), allow_nan=False), row[0]))
++            for table, row in _sources(conn, op, ops, legacy_parents):
++                _append(conn, table, row, op, board, endpoint, ident, principal, incarnation, authenticated)
++
++
++def _append(conn, table, row, op, board, endpoint, ident, principal, incarnation, authenticated):
++    history = json.loads(row[1]) if row[1] is not None else dict(
++        protocol='exposure1', coverage='unknown', certified=False, exposures=[])
++    if (history.get('protocol') != 'exposure1' or history.get('certified') is not False or
++            history.get('coverage') not in ('unknown', 'candidate') or not isinstance(history.get('exposures'), list)):
++        raise ExposureCustodyError('unsupported exposure history; preserve custody')
++    exposure = dict(board=board, endpoint=endpoint, url=ident.url,
++                    credential_epoch=hashlib.sha256(ident.key.encode()).hexdigest(),
++                    gateway_principal=principal if authenticated else None,
++                    board_incarnation=incarnation if authenticated else None, wire=op)
++    if exposure not in history['exposures']:
++        history['exposures'].append(exposure)
++    conn.execute(f'UPDATE {table} SET exposure_history=? WHERE rowid=?',
++                 (json.dumps(history, sort_keys=True, separators=(',', ':'), allow_nan=False), row[0]))
+ 
+ 
+ @contextmanager
+@@ -92,7 +120,7 @@
+         transport.close()
+ 
+ 
+-def send(hub, conn, board, ops, *, replay=None):
++def send(hub, conn, board, ops, *, replay=None, legacy_parents=()):
+     """Pin the credentials for capability AND mutation, including header creation.
+ 
+     A fresh transport prevents a caller replacing hub.ident during the probe from
+@@ -112,7 +140,8 @@
+             if exc.status not in (404, 405, 501, 503):
+                 raise
+             capability = {}
+-        _observe(conn, ops, board, endpoint, transport.ident, capability)
++        _observe(conn, ops, board, endpoint, transport.ident, capability,
++                 legacy_parents=legacy_parents if replay is None else ())
+         body = dict(replay, ops=ops) if replay is not None else dict(ops=ops)
+         return transport._call('POST', endpoint, body)
+     finally:
+diff --git a/tests/hermes_cli/test_kanban_legacy_parent_exposure.py b/tests/hermes_cli/test_kanban_legacy_parent_exposure.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..86d71066b152da5ba92cda3dbcb4f9c5593a9097
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_legacy_parent_exposure.py
+@@ -0,0 +1,209 @@
++"""Legacy synthetic parents keep rebuild semantics and durable supporting exposure.
++
++Production Hub/loopback transport; no deployed Board or migration certification.
++The initial three cases reproduce independent review 6035459985.
++"""
++import json
++import sqlite3
++import threading
++from contextlib import contextmanager
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync, kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_exposure as exposure
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    client.ensure_identity(conn, 'default', 'macbook')
++    yield conn
++    conn.close()
++
++
++def pending_parent(conn, *, missing_origin=False):
++    tid = kb.create_task(conn, title='parent', assignee='worker')
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_outbox SET state='rejected' WHERE table_name='tasks' AND row_uid=?", (tid,))
++        if missing_origin:
++            conn.execute('DELETE FROM kanban_sync_status_origins WHERE task_id=?', (tid,))
++    return tid
++
++
++@contextmanager
++def serving(conn, *, origins=False, lost=False, remove_source=False):
++    path = conn.execute('PRAGMA database_list').fetchone()[2]
++    state = SimpleNamespace(sent=[], histories=[], lost=lost, remove_source=remove_source)
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            if self.path.endswith('/replay/capability'):
++                if state.remove_source and '/default/' in self.path:
++                    with sqlite3.connect(path) as other:
++                        other.execute("UPDATE kanban_sync_outbox SET op_id='lost-'||op_id WHERE table_name='task_events'")
++                self.reply(dict(gateway_principal='principal', board_incarnation='incarnation'))
++            elif '/changes?' in self.path:
++                self.reply(dict(changes=[], next=0, head=0, more=False))
++            else:
++                self.reply(dict(status_origin=1, frozen_replay=1, hlc='1800000000000-0000-server') if origins else {})
++
++        def do_POST(self):
++            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
++            state.sent.append(body['ops'])
++            with sqlite3.connect('file:' + path + '?mode=ro', uri=True) as other:
++                state.histories.append({row[0]: json.loads(row[1]) for row in other.execute(
++                    'SELECT op_id,exposure_history FROM kanban_sync_outbox WHERE exposure_history IS NOT NULL')})
++            if state.lost:
++                self.close_connection = True
++                return
++            self.reply({'results': [dict(client_op_id=o['client_op_id'], status='applied', version=1) for o in body['ops']]})
++
++        def reply(self, body):
++            data = json.dumps(body).encode()
++            self.send_response(200)
++            self.send_header('Content-Length', str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++        def log_message(self, *_args):
++            pass
++
++    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    worker = threading.Thread(target=server.serve_forever)
++    worker.start()
++    hub = client.Hub(client.Identity(f'http://127.0.0.1:{server.server_port}', 'fixture-key', 'macbook'))
++    try:
++        yield hub, state
++    finally:
++        hub.close()
++        server.shutdown()
++        worker.join(5)
++        server.server_close()
++
++
++@pytest.mark.parametrize('origins,missing_origin', [(False, False), (True, True), (True, False)])
++def test_legacy_parent_http(board, origins, missing_origin):
++    tid = pending_parent(board, missing_origin=missing_origin)
++    with serving(board, origins=origins) as (hub, state):
++        result = client.push(board, hub, 'default', 'macbook', primary=False, max_batches=1)
++    assert result.applied > 0
++    wire, = state.sent
++    parent = next(o for o in wire if o['table'] == 'tasks')
++    children = [o for o in wire if o['table'] == 'task_events']
++    assert parent['uid'] == tid and children
++    if not origins or missing_origin:
++        assert 'status_origin' not in parent and 'frozen_replay' not in parent
++        assert not board.execute('SELECT 1 FROM kanban_sync_parent_envelopes').fetchone()
++        for child in children:
++            history = state.histories[0][child['client_op_id']]
++            assert history['coverage'] == 'unknown' and history['certified'] is False
++            assert any(e['wire'] == parent for e in history['exposures']), 'parent exposure must commit before POST'
++    assert board.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('origins', [False, True])
++def test_lost_legacy_parent_rebuild_keeps_prior_exposure_on_each_child(board, origins):
++    tid = pending_parent(board, missing_origin=True)
++    path = Path(board.execute('PRAGMA database_list').fetchone()[2])
++    with serving(board, origins=origins, lost=True) as (hub, state):
++        with pytest.raises(OSError):
++            client.push(board, hub, 'default', 'macbook', primary=False, max_batches=1)
++        original = state.sent[0][0]
++        children = [op for op in state.sent[0] if op['table'] != 'tasks']
++        first = state.histories[0]
++        with kbc.connect(path) as reopened:
++            for child in children:
++                row = reopened.execute('SELECT exposure_history,capture_protocol,identity_state FROM kanban_sync_outbox '
++                                       'WHERE op_id=?', (child['client_op_id'],)).fetchone()
++                assert json.loads(row[0]) == first[child['client_op_id']]
++                assert tuple(row)[1:] == (None, None)
++            with kbc.write_txn(reopened):
++                reopened.execute('UPDATE kanban_sync_outbox SET created_at=0')
++                reopened.execute('UPDATE tasks SET title=? WHERE id=?', ('later local edit', tid))
++                reopened.execute("UPDATE kanban_sync_outbox SET state='rejected' WHERE table_name='tasks'")
++            with pytest.raises(OSError):
++                client.push(reopened, hub, 'default', 'macbook', primary=False, max_batches=1)
++            replacement = state.sent[1][0]
++            assert replacement['client_op_id'] != original['client_op_id']
++            assert replacement['fields']['title'] == 'later local edit'
++            assert not reopened.execute('SELECT 1 FROM kanban_sync_parent_envelopes').fetchone()
++            for child in children:
++                history = state.histories[1][child['client_op_id']]
++                assert history['exposures'][:len(first[child['client_op_id']]['exposures'])] == first[child['client_op_id']]['exposures']
++                for parent in (original, replacement):
++                    entry = next(e for e in history['exposures'] if e['wire'] == parent)
++                    assert entry['gateway_principal'] == 'principal' and entry['board_incarnation'] == 'incarnation'
++                assert history['coverage'] == 'unknown' and history['certified'] is False
++
++
++@pytest.mark.parametrize('declared,frozen,child_kind,replay', [
++    pytest.param(False, False, 'valid', False, id='undeclared'),
++    pytest.param(True, True, 'valid', False, id='frozen'),
++    pytest.param(True, False, 'none', False, id='no_child'),
++    pytest.param(True, False, 'lost', False, id='missing_child'),
++    pytest.param(True, False, 'unrelated', False, id='unrelated_child'),
++    pytest.param(True, False, 'valid', True, id='replay'),
++])
++def test_missing_custody_never_becomes_a_legacy_exemption(board, declared, frozen, child_kind, replay):
++    tid = pending_parent(board, missing_origin=True)
++    row = board.execute("SELECT op_id,row_uid FROM kanban_sync_outbox WHERE table_name='task_events'").fetchone()
++    parent = dict(client_op_id='ephemeral', table='tasks', uid=tid, op='upsert', fields={'title': 'support'})
++    child = dict(client_op_id='lost-child' if child_kind == 'lost' else row[0],
++                 table='task_events', uid=row[1], op='upsert',
++                 fields={'task_id': 'another-task' if child_kind == 'unrelated' else tid})
++    if frozen:
++        parent['frozen_replay'] = 1
++    ops = [parent] + ([] if child_kind == 'none' else [child])
++    before = [tuple(r) for r in board.execute('SELECT * FROM kanban_sync_outbox')]
++    with serving(board) as (hub, state):
++        with pytest.raises(exposure.ExposureCustodyError, match='custody missing'):
++            exposure.send(hub, board, 'default', ops, legacy_parents=[parent] if declared else [],
++                          replay={} if replay else None)
++        assert state.sent == []
++    assert [tuple(r) for r in board.execute('SELECT * FROM kanban_sync_outbox')] == before
++
++
++def test_link_support_exposure_is_kept_for_both_unsaved_parents(board):
++    left, right = pending_parent(board), pending_parent(board)
++    with kbc.write_txn(board):
++        board.execute("UPDATE kanban_sync_outbox SET state='rejected' WHERE table_name='task_events'")
++        board.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                      "VALUES ('link','task_links',?,'upsert','{}','',1)", (left + '>' + right,))
++    with serving(board) as (hub, state):
++        result = client.push(board, hub, 'default', 'macbook', primary=False, max_batches=1)
++    assert result.applied == 1
++    ops, = state.sent
++    parents = [op for op in ops if op['table'] == 'tasks']
++    assert {op['uid'] for op in parents} == {left, right}
++    history = state.histories[0]['link']
++    for parent in parents:
++        assert any(e['wire'] == parent for e in history['exposures'])
++
++
++def test_lost_custody_refusal_isolates_board_in_actual_http_round(board, tmp_path, monkeypatch):
++    pending_parent(board)
++    broken_path = Path(board.execute('PRAGMA database_list').fetchone()[2])
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++        tid = kb.create_task(healthy, title='healthy work', assignee='worker')
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    with serving(board, remove_source=True) as (hub, state):
++        results = client.sync_all_once(hub, boards=[('default', broken_path), ('healthy', healthy_path)])
++    assert [r.board for r in results] == ['default', 'healthy']
++    assert 'ExposureCustodyError' in results[0].error
++    assert results[1].error is None, results[1].error
++    assert any(op.get('uid') == tid for batch in state.sent for op in batch)
++    with kbc.connect(healthy_path) as healthy:
++        assert not healthy.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='pending'").fetchone()
+-- 
+2.43.0
+

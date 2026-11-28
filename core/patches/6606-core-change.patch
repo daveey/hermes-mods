@@ -1,0 +1,294 @@
+From 99518c798bd400ce5a71b0d3db7122c3bd017770 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:27:28 +0000
+Subject: [PATCH 6606] Small fixes and test-harness hardening
+
+Public mirror of source commit 99518c798bd400ce5a71b0d3db7122c3bd017770.
+
+---
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index efb9518e76b16d04a9f43c74e7d5468bf9b88319..22a9e04961892c1b42e4d6e1797bc7d1b703506d 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1875,10 +1875,10 @@
+         # A job failing with the SAME error alerts once, then stays silent for this many hours
+         # before one reminder ping (the run is still recorded; `hermes cron incidents` shows it).
+         # A green run or a different error alerts again immediately; `hermes cron incidents ack`
+-        # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
+-        # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
++        # silences a signature for good. 0 = re-alert every failure. Sync: cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
+         "failure_repeat_alert_hours": 6,
+     },
++    "bb_owner_response": {"source": None},
+     "kanban": {
+         # Evidence only; never changes urgency or starts capture without explicit activation.
+         "fairness_capture": {"enabled": False, "capture_id": None, "directory": None, "max_bytes": 536870912},
+diff --git a/hermes_cli/kanban_bb_binding_runtime.py b/hermes_cli/kanban_bb_binding_runtime.py
+index 372a5c02caf9c9135bf458da97390b0be5c8b038..b80e49171e13df8bd988d40ae8198d7bca3a4df1 100644
+--- a/hermes_cli/kanban_bb_binding_runtime.py
++++ b/hermes_cli/kanban_bb_binding_runtime.py
+@@ -15,16 +15,19 @@
+ from hermes_cli.kanban_bb_owner_binding import binding
+ from hermes_cli.kanban_card_answer import AnswerRefused
+ from hermes_cli.kanban_card_answer_runtime import _board_db, _profile
+-from hermes_cli.kanban_card_answer_transport import Records
++from hermes_cli.kanban_bb_binding_source import BindingRecords as Records, configured_source
+ from hermes_cli.kanban_lockguard import connect
+ 
+ 
+ def produce(request_id: str) -> dict:
+     """Read eligibility only, never create/migrate a board or accept an envelope."""
++    source = configured_source()
+     records = Records()
+     profile, _ = _profile()
+     record = records.read(request_id)
+     if (not isinstance(record, dict) or record.get('id') != request_id
++            or record.get('from') != 'gw:' + source['gateway']
++            or 'base_version' not in record or record['base_version'] is not None
+             or record.get('to_gw') != records.gateway or record.get('coll') != 'tasks'
+             or record.get('action') != 'bb-owner-binding' or record.get('args') != {}
+             or not isinstance(record.get('key'), str)):
+diff --git a/hermes_cli/kanban_bb_binding_source.py b/hermes_cli/kanban_bb_binding_source.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..89b759449779fb757ba46f6ad61a8a3212899da4
+--- /dev/null
++++ b/hermes_cli/kanban_bb_binding_source.py
+@@ -0,0 +1,63 @@
++"""Private binding source policy and strict authenticated record decoding. [daveey]"""
++from __future__ import annotations
++
++import json
++import math
++import re
++
++from hermes_cli.kanban_card_answer import AnswerRefused
++from hermes_cli.kanban_card_answer_transport import Records
++
++
++def configured_source() -> dict:
++    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    try:
++        config = load_user_config_effective(fail_closed=True)
++    except ConfigBackendUnavailable:
++        raise OSError('bb_binding_source_unavailable') from None
++    section = config.get('bb_owner_response')
++    source = section.get('source') if isinstance(section, dict) else None
++    if (not isinstance(source, dict) or set(source) != {'gateway', 'profile'}
++            or any(not isinstance(v, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', v)
++                   for v in source.values())):
++        raise OSError('bb_binding_source_unavailable')
++    return source
++
++
++def _unique(pairs):
++    value = {}
++    for key, item in pairs:
++        if key in value:
++            raise ValueError('duplicate key')
++        value[key] = item
++    return value
++
++
++def _finite(value):
++    raise ValueError('nonfinite constant')
++
++
++def _float(value):
++    number = float(value)
++    if not math.isfinite(number):
++        raise ValueError('nonfinite number')
++    return number
++
++
++class BindingRecords(Records):
++    def read(self, request_id: str) -> dict:
++        raw = self.raw(request_id)
++        try:
++            body = json.loads(raw, object_pairs_hook=_unique, parse_constant=_finite, parse_float=_float)
++        except (ValueError, UnicodeError, RecursionError):
++            raise AnswerRefused('courier_record_invalid') from None
++        record = body.get('request') if isinstance(body, dict) else None
++        fields = {'id', 'from', 'to_gw', 'coll', 'key', 'action', 'args', 'base_version',
++                  'state', 'claims', 'result', 'created_at', 'done_at'}
++        if (not isinstance(body, dict) or set(body) != {'request'}
++                or not isinstance(record, dict) or not set(record) <= fields
++                or record.get('id') != request_id):
++            raise AnswerRefused('courier_record_invalid')
++        return record
+diff --git a/tests/hermes_cli/test_kanban_bb_binding_runtime.py b/tests/hermes_cli/test_kanban_bb_binding_runtime.py
+index a91d3bd4d738d2ee45419e981c8b0de4a403dbc4..b944e232f4bc85cb15ec50618b3d4d395a068822 100644
+--- a/tests/hermes_cli/test_kanban_bb_binding_runtime.py
++++ b/tests/hermes_cli/test_kanban_bb_binding_runtime.py
+@@ -25,8 +25,11 @@
+         binding_db.backup(target)
+     monkeypatch.setattr('hermes_constants.get_default_hermes_root', lambda: home)
+     monkeypatch.setattr(runtime, '_profile', lambda: ('default', home))
+-    record = dict(id=REQUEST, from_gw='producer', to_gw='owner', coll='tasks',
+-                  action='bb-owner-binding', key='default/default/' + helpers.TASK, args={})
++    monkeypatch.setattr('hermes_cli.config_effective.load_user_config_effective',
++                        lambda **kw: {'bb_owner_response': {'source': {'gateway': 'producer', 'profile': 'bb'}}})
++    record = dict(id=REQUEST, to_gw='owner', coll='tasks',
++                  action='bb-owner-binding', key='default/default/' + helpers.TASK, args={}, base_version=None)
++    record['from'] = 'gw:producer'
+     reads = []
+     class Records:
+         gateway = 'owner'
+@@ -229,7 +232,7 @@
+     from hermes_cli import kanban_card_answer_runtime as owner_runtime
+     from hermes_cli import kanban_card_answer_transport as transport
+     monkeypatch.setattr(owner_runtime, '_profile', runtime._profile)
+-    monkeypatch.setattr(transport, 'Records', runtime.Records)
++    monkeypatch.setattr('hermes_cli.kanban_bb_binding_source.BindingRecords', runtime.Records)
+     monkeypatch.setattr(sys, 'argv', ['binding-runtime', REQUEST])
+     name = 'hermes_cli.kanban_bb_binding_runtime'
+     # run_module must execute a new namespace, not the already imported facade.
+@@ -258,7 +261,8 @@
+                              request.get_header('Authorization'), timeout))
+             return BytesIO(json.dumps({'request':record}).encode())
+     monkeypatch.setattr(transport.urllib.request, 'build_opener', lambda *args: Opener())
+-    monkeypatch.setattr(runtime, 'Records', transport.Records)
++    from hermes_cli.kanban_bb_binding_source import BindingRecords
++    monkeypatch.setattr(runtime, 'Records', BindingRecords)
+     before = path.read_bytes()
+     code, out = invoke(capsys)
+     assert code == 0 and out['result']['tenant'] == 'myapp'
+diff --git a/tests/hermes_cli/test_kanban_bb_binding_source.py b/tests/hermes_cli/test_kanban_bb_binding_source.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f50841d28ae1b89f974a371e75bfea40a0f94942
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_bb_binding_source.py
+@@ -0,0 +1,87 @@
++"""Configured endpoint is not a native decision or sender-profile attestation."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_bb_binding_source as source
++from hermes_cli import kanban_bb_binding_runtime as runtime
++from hermes_cli.kanban_card_answer import AnswerRefused
++from tests.hermes_cli import test_kanban_bb_binding_runtime as helpers
++
++binding_db = helpers.binding_db
++fixture = helpers.fixture
++
++
++@pytest.mark.parametrize('field,value', [('from', 'gw:foreign'), ('from', 'human'),
++                                        ('from', None), ('base_version', 1),
++                                        ('base_version', False)])
++def test_source_and_null_base_before_board_access(fixture, monkeypatch, capsys, field, value):
++    fixture[2][field] = value
++    monkeypatch.setattr(runtime, '_board_db', lambda *_: pytest.fail('untrusted request opened board'))
++    code, out = helpers.invoke(capsys)
++    assert code == 2 and out['refused'] == 'bb_binding_request_invalid'
++
++
++def test_missing_base_is_not_explicit_null(fixture, capsys):
++    fixture[2].pop('base_version')
++    assert helpers.invoke(capsys)[0] == 2
++
++
++@pytest.mark.parametrize('config', [{}, {'bb_owner_response': None}, {'bb_owner_response': {}}] + [
++    {'bb_owner_response': {'source': s}} for s in [None, [], 'producer', {},
++        {'gateway': 'producer'}, {'profile': 'bb'}, {'gateway': '*', 'profile': 'bb'},
++        {'gateway': 'producer', 'profile': 'b/b'}, {'gateway': 'producer', 'profile': ''},
++        {'gateway': True, 'profile': 'bb'}, {'gateway': 'producer', 'profile': 'bb', 'url': 'x'}]])
++def test_missing_or_malformed_configuration_is_pending(fixture, monkeypatch, capsys, config):
++    monkeypatch.setattr('hermes_cli.config_effective.load_user_config_effective', lambda **kw: config)
++    code, out = helpers.invoke(capsys)
++    assert code == 3 and out == {'ok': False, 'retryable': True, 'error': 'unavailable'}
++
++
++def test_supported_effective_config_reader(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    from hermes_cli import config_backend
++    config_backend.write_config_document(tmp_path / 'config.yaml',
++                                         {'bb_owner_response': {'source': {'gateway': 'source', 'profile': 'work'}}})
++    assert source.configured_source() == {'gateway': 'source', 'profile': 'work'}
++
++
++@pytest.mark.parametrize('raw', [b'{"request":{},"request":{}}', b'{"request":{"id":"binding-request","claims":NaN}}',
++    b'{"request":{"id":"binding-request","claims":1e400}}',
++    b'{"request":{"id":"binding-request","args":{"x":1,"x":2}}}',
++    b'{"request":{"id":"binding-request"},"override":true}',
++    b'{"request":{"id":"binding-request","override":true}}',
++    b'[]', b'{"request":null}', b'{"request":{"id":"foreign"}}', b'\xff'])
++def test_strict_authenticated_json(monkeypatch, raw):
++    records = object.__new__(source.BindingRecords)
++    monkeypatch.setattr(records, 'raw', lambda rid: raw)
++    with pytest.raises(AnswerRefused, match='courier_record_invalid'):
++        records.read(helpers.REQUEST)
++
++
++def test_unavailable_configuration_is_pending(fixture, monkeypatch, capsys):
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++    def unavailable(**kw):
++        raise ConfigBackendUnavailable('synthetic unavailable')
++    monkeypatch.setattr('hermes_cli.config_effective.load_user_config_effective', unavailable)
++    code, out = helpers.invoke(capsys)
++    assert code == 3 and out['error'] == 'unavailable'
++
++
++def test_strict_record_preserves_finite_json_and_read_identity(monkeypatch):
++    records = object.__new__(source.BindingRecords)
++    seen = []
++    def raw(rid):
++        seen.append(rid)
++        return json.dumps({'request': {'id': rid, 'claims': 1.25}}).encode()
++    monkeypatch.setattr(records, 'raw', raw)
++    assert records.read(helpers.REQUEST) == {'id': helpers.REQUEST, 'claims': 1.25}
++    assert seen == [helpers.REQUEST]
++
++
++def test_gateway_is_authenticated_not_unobservable_sender_profile(fixture, capsys):
++    # No source profile is on the binding wire. Its destination is the receiving profile.
++    assert 'source' not in fixture[2] and fixture[2]['args'] == {}
++    assert helpers.invoke(capsys)[0] == 0
++    fixture[2]['key'] = 'bb/default/' + fixture[2]['key'].split('/')[-1]
++    assert helpers.invoke(capsys)[0] == 2
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 831d4ced2ddbb80b04689a70ee30ee1cb763c0c0..0fda3bce64392a8d092e8a2e66105ccc3db8c4a8 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -16,6 +16,37 @@
+ Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](../integrations/nous-portal.md).
+ :::
+ 
++## Private BB owner binding source
++
++`bb_owner_response.source` defaults to `null` (unavailable). On each canonical
++receiving profile, set the complete endpoint pair only after an operator has
++verified the existing enrolled courier and compatible installed participants:
++
++```bash
++hermes config set bb_owner_response.source '{"gateway":"verified-source","profile":"verified-profile"}'
++hermes config get bb_owner_response.source
++```
++
++The names above are placeholders, not enrollment. The mapping accepts exactly
++`gateway` and `profile`, without defaults, wildcard or caller override. Missing or
++invalid configuration leaves read-only binding requests pending. Disable new
++requests before resetting this setting or downgrading; preserve courier journals.
++
++The private `hermes_cli.kanban_bb_binding_runtime REQUEST_ID` module independently
++reads the authenticated courier. It verifies the configured sender gateway,
++`tasks/bb-owner-binding` purpose, empty args, explicit null `base_version`, receiving
++profile and canonical primary board. It returns only the versioned route, tenant,
++complete lifecycle generation and declared choice pairs; no raw ask or mutation.
++Unknown core/I/O is unavailable, not verified binding. Duplicate JSON keys,
++non-finite constants and unrecognized readback fields are refused.
++
++Board authenticates a sender **gateway**, not its profile. The configured pair is
++an endpoint binding, not cryptographic sender-profile attribution. The local BB
++source must bind its installed gateway and configured profile/account; source
++credential/store compromise within that account is outside this transport claim.
++Eligibility does not prove an enrolled native decision and enables no writes.
++Distinct durable native evidence and correlated canonical proof remain mandatory.
++
+ ## Upstream conflict reporting
+ 
+ `update.upstream_conflict_reporting` defaults to `null` (legacy per-checkout repair
+-- 
+2.43.0
+

@@ -1,0 +1,116 @@
+From 6cfd81f12614d88b375d03ed87a45fce1ef2afd8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 19:49:25 +0000
+Subject: [PATCH 6944] Policy-config interning: exact-byte storage and opt-in rollout
+
+Public mirror of source commit 6cfd81f12614d88b375d03ed87a45fce1ef2afd8.
+
+---
+diff --git a/hermes_state_policy_rollout.py b/hermes_state_policy_rollout.py
+index dd05fb6685a40c3df9aff8d143a7e25dc0671799..ca1c310cee771f687785b22828d8b62f80ef6347 100644
+--- a/hermes_state_policy_rollout.py
++++ b/hermes_state_policy_rollout.py
+@@ -130,7 +130,12 @@
+             result = convert_policy_config_batch(db, intern=args.direction == 'intern', apply=args.apply,
+                 readers_compatible=args.readers_compatible, after=args.after,
+                 limit=args.limit, max_bytes=args.max_bytes)
+-    except (RuntimeStoreError, sqlite3.Error):
++    except RuntimeStoreError as exc:
++        # Only fixed public labels: never echo detail, config or exception text.
++        reason = 'invalid_params' if exc.reason == 'invalid_params' else 'storage_unavailable'
++        print(json.dumps({'error': reason}))
++        return 2
++    except sqlite3.Error:
+         # Never echo frozen config, request data or SQLite exception payloads.
+         print(json.dumps({'error': 'storage_unavailable'}))
+         return 2
+diff --git a/tests/hermes_state/test_policy_config_rollout_boundaries.py b/tests/hermes_state/test_policy_config_rollout_boundaries.py
+index 64c8feebbcf82962a011f9c6f6ead7ea3ffa3129..15af57bcd09d45e6ee2e6c3445b472b3a7be6d7b 100644
+--- a/tests/hermes_state/test_policy_config_rollout_boundaries.py
++++ b/tests/hermes_state/test_policy_config_rollout_boundaries.py
+@@ -46,6 +46,22 @@
+         assert local_receipt(db, sid) == expected
+ 
+ 
++@pytest.mark.parametrize('ack', [False, None, 1, 'yes', [True], {'compatible': True}])
++def test_conversion_requires_literal_true_ack_without_mutation(tmp_path, ack):
++    from hermes_state_policy_rollout import convert_policy_config_batch
++    with closing(SessionDB(tmp_path / 'state.db')) as db:
++        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
++        sid, expected = create(db, epoch, tmp_path, False)
++        with db._read_ctx() as conn:
++            before = conn.execute('SELECT key,value FROM state_meta ORDER BY key').fetchall()
++        with pytest.raises(rt.RuntimeStoreError) as refusal:
++            convert_policy_config_batch(db, intern=True, apply=True, readers_compatible=ack)
++        assert refusal.value.reason == 'runtime_coordination_required'
++        with db._read_ctx() as conn:
++            assert conn.execute('SELECT key,value FROM state_meta ORDER BY key').fetchall() == before
++        assert local_receipt(db, sid) == expected
++
++
+ def test_converter_rolls_back_earlier_owner_on_later_bad_receipt(tmp_path):
+     from hermes_state_policy_rollout import convert_policy_config_batch
+     with closing(SessionDB(tmp_path / 'state.db')) as db:
+diff --git a/tests/hermes_state/test_policy_config_rollout_cli.py b/tests/hermes_state/test_policy_config_rollout_cli.py
+index 868757b0f33014c38a696612aac670fcc0b41788..92a777b49f689d1a5b239447a2fd578bc86f3372 100644
+--- a/tests/hermes_state/test_policy_config_rollout_cli.py
++++ b/tests/hermes_state/test_policy_config_rollout_cli.py
+@@ -1,9 +1,12 @@
+ """Exercise the real module entrypoint on a disposable store, not mocked calls."""
+ from contextlib import closing
+ import json
++import sqlite3
+ import subprocess
+ import sys
+ 
++import pytest
++
+ from hermes_state import SessionDB
+ from hermes_state_local import local_receipt
+ import hermes_state_runtime as rt
+@@ -27,3 +30,42 @@
+     assert json.loads(applied.stdout)['converted'] == 1
+     with closing(SessionDB(path, read_only=True)) as db:
+         assert local_receipt(db, sid) == expected
++
++
++@pytest.mark.parametrize('error', [rt.RuntimeStoreError('private payload', detail='secret'),
++                                   sqlite3.OperationalError('secret')], ids=['runtime', 'sqlite'])
++def test_cli_storage_failures_do_not_echo_exception_payloads(tmp_path, monkeypatch, capsys, error):
++    import hermes_state_policy_rollout as rollout
++    path = tmp_path / 'state.db'
++    with closing(SessionDB(path)):
++        pass
++
++    def fail(*args, **kwargs):
++        raise error
++
++    monkeypatch.setattr(rollout, 'convert_policy_config_batch', fail)
++    assert rollout.main(['--db', str(path), '--direction', 'inline']) == 2
++    assert json.loads(capsys.readouterr().out) == {'error': 'storage_unavailable'}
++
++
++@pytest.mark.parametrize('option,value', [('--limit', '0'), ('--limit', '64'),
++                                        ('--max-bytes', '0'), ('--max-bytes', '4194305')])
++@pytest.mark.parametrize('apply', [False, True])
++def test_actual_cli_invalid_bounds_are_not_storage_failures(tmp_path, option, value, apply):
++    path = tmp_path / 'state.db'
++    with closing(SessionDB(path)) as db:
++        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
++        sid, expected = create(db, epoch, tmp_path, False)
++        with db._read_ctx() as conn:
++            before = conn.execute('SELECT key,value FROM state_meta ORDER BY key').fetchall()
++    command = [sys.executable, '-m', 'hermes_state_policy_rollout', '--db', str(path),
++               '--direction', 'intern', option, value]
++    if apply:
++        command += ['--apply', '--readers-compatible']
++    result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 2, result.stderr
++    assert json.loads(result.stdout) == {'error': 'invalid_params'}
++    with closing(SessionDB(path, read_only=True)) as db:
++        with db._read_ctx() as conn:
++            assert conn.execute('SELECT key,value FROM state_meta ORDER BY key').fetchall() == before
++        assert local_receipt(db, sid) == expected
+-- 
+2.43.0
+

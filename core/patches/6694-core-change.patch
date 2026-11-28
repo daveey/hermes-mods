@@ -1,0 +1,215 @@
+From 6604bbc5a2200d7ea42fae35f40bee513dcc47f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:41:07 +0000
+Subject: [PATCH 6694] Absent-session ACKs, expired claims and fanout custody
+
+Public mirror of source commit 6604bbc5a2200d7ea42fae35f40bee513dcc47f4.
+
+---
+diff --git a/tests/tui_gateway/test_kanban_unloaded_busy.py b/tests/tui_gateway/test_kanban_unloaded_busy.py
+index 3f1f9dbee1dc43654d602b6eb763a745af7a7e28..f479074c0e35ffee57f1d699a5c93ee1e84e5761 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_busy.py
++++ b/tests/tui_gateway/test_kanban_unloaded_busy.py
+@@ -39,7 +39,7 @@
+         yield d if not params else None  # launch store holds the chat; the named profile has none
+ 
+     monkeypatch.setattr(server, "_profile_db", profile_db)
+-    monkeypatch.setattr(server, "_readopt_wake_profiles", lambda: [None, "other"])
++    monkeypatch.setattr('tui_gateway.kanban_chat_hosting.profile_roster', lambda: ([None, 'other'], True))
+     monkeypatch.setenv("HERMES_KANBAN_UNLOADED_WAKE", "0")
+     ku._reset_overdue_for_tests()
+     yield d
+diff --git a/tests/tui_gateway/test_remote_change_absence.py b/tests/tui_gateway/test_remote_change_absence.py
+index ebf136123cfd1bff7ea4f84f09ef2d516e63a1bb..357feca3bd85b0e410d64d3323d70331c5655948 100644
+--- a/tests/tui_gateway/test_remote_change_absence.py
++++ b/tests/tui_gateway/test_remote_change_absence.py
+@@ -144,7 +144,7 @@
+ @pytest.mark.parametrize('failure', ['raise', 'none', 'healthy'])
+ def test_A2_real_finder_reports_open_failures(monkeypatch, failure):
+     from tui_gateway import server
+-    monkeypatch.setattr(server, '_readopt_wake_profiles', lambda: [None, 'second'])
++    monkeypatch.setattr('tui_gateway.kanban_chat_hosting.profile_roster', lambda: ([None, 'second'], True))
+     class Store:
+         def get_session(self, chat):
+             return None
+diff --git a/tests/tui_gateway/test_remote_change_review_regressions.py b/tests/tui_gateway/test_remote_change_review_regressions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1508ef855f8d4b7bddc23ea267ae331511b29f02
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_change_review_regressions.py
+@@ -0,0 +1,107 @@
++"""Real discovery/source identity regressions from the first independent review."""
++import contextlib
++from pathlib import Path
++
++import pytest
++
++from tests.tui_gateway import test_remote_absent_expired_claims as claims
++from tests.tui_gateway import test_remote_change_absence as absence
++from tui_gateway import notice_fanout as nf, kanban_unloaded as ku
++
++claim = claims.claim
++remote = absence.remote
++absent = absence.absent
++
++
++@pytest.mark.parametrize('spelling', ['symlink', 'relative'])
++def test_expired_absent_claim_uses_canonical_source(claim, tmp_path, monkeypatch, spelling):
++    ledger, source = claim
++    source.touch()
++    if spelling == 'symlink':
++        alias = tmp_path / 'linked'
++        alias.symlink_to(source.parent, target_is_directory=True)
++        alias_source = alias / source.name
++    else:
++        monkeypatch.chdir(source.parent)
++        alias_source = Path(source.name)
++    assert str(alias_source) != str(source.resolve())
++    assert claims.notices._settle_stale_claims({}, alias_source, ledger, now=claims.NOW) == 1
++    assert claims.row(claim)['settled'] == 'expired'
++    with claims.sqlite3.connect(ledger) as conn:
++        assert conn.execute('SELECT replica,reason FROM swept').fetchall() == [(str(source.resolve()), 'expired')]
++    assert claims.notices._settle_stale_claims({}, source, ledger, now=claims.NOW) == 0
++
++
++@pytest.mark.parametrize('failure', ['listing', 'stat'])
++def test_profile_discovery_failure_keeps_retry_then_recovers(absent, tmp_path, monkeypatch, failure):
++    from tui_gateway import server
++    import hermes_constants
++
++    root = tmp_path / 'profiles'
++    profile = root / 'work'
++    profile.mkdir(parents=True)
++    (profile / 'state.db').touch()
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
++    monkeypatch.setattr('tui_gateway.kanban_chat_hosting.get_hermes_home', lambda: tmp_path)
++    original_iterdir, original_stat = Path.iterdir, Path.stat
++    broken = [True]
++
++    def iterdir(path):
++        if broken[0] and failure == 'listing' and path == root:
++            raise OSError(4, 'Interrupted system call')
++        return original_iterdir(path)
++
++    def stat(path, *args, **kwargs):
++        if broken[0] and failure == 'stat' and path == profile / 'state.db':
++            raise OSError(4, 'Interrupted system call')
++        return original_stat(path, *args, **kwargs)
++
++    class EmptyStore:
++        def get_session(self, chat):
++            return None
++
++    class PresentStore:
++        def get_session(self, chat):
++            return {'id': chat}
++
++        def get_compression_tip(self, chat):
++            return chat
++
++    @contextlib.contextmanager
++    def profile_db(params=None, **kwargs):
++        yield PresentStore() if params == {'profile': 'work'} else EmptyStore()
++
++    monkeypatch.setattr(Path, 'iterdir', iterdir)
++    monkeypatch.setattr(Path, 'stat', stat)
++    monkeypatch.setattr(server, '_profile_db', profile_db)
++    with ku.find_session_db('missing') as lookup:
++        assert tuple(lookup) == (None, None)
++        assert lookup.unavailable
++    result = nf._remote_change_pass(ku.find_session_db)
++    assert result.incomplete
++    assert absent['acks'] == [{}]
++    assert 'missing' not in nf._remote_absent
++    broken[0] = False
++    with ku.find_session_db('missing') as lookup:
++        assert lookup[1] == 'missing'
++        assert not lookup.unavailable
++    # Discovery repair is retried immediately, not held behind absence maintenance.
++    assert not nf._remote_change_pass(ku.find_session_db).incomplete
++    assert absent['acks'][-1] == {'missing': frozenset({('owner/board/card', 'blocked')})}
++
++
++def test_warning_history_tracks_only_current_snapshot(absent, caplog):
++    import logging
++
++    with caplog.at_level(logging.WARNING, logger=nf.__name__):
++        absent['run']()
++        for status in ['running', 'blocked', 'running']:
++            absent['remote']['cards'][0]['status'] = status
++            nf._remote_memo = None
++            absent['run']()
++            assert len(nf._remote_absent_warned) == 1
++        absent['remote']['cards'] = []
++        nf._remote_memo = None
++        absent['run']()
++    assert nf._remote_absent_warned == set()
++    assert nf._remote_absent == {}
+diff --git a/tui_gateway/kanban_remote_expired_claims.py b/tui_gateway/kanban_remote_expired_claims.py
+index 6620868e3b5dfad7805015898a4f67705fc6024e..8d0e56999440b2b8d33a12c13dce2f86e6c4412e 100644
+--- a/tui_gateway/kanban_remote_expired_claims.py
++++ b/tui_gateway/kanban_remote_expired_claims.py
+@@ -4,6 +4,7 @@
+ import math
+ import re
+ import sqlite3
++from pathlib import Path
+ 
+ 
+ def _key(ref):
+@@ -64,6 +65,7 @@
+ 
+     committed = False
+     try:
++        source = str(Path(source).resolve())  # observation producers use canonical replica identity
+         conn.execute('BEGIN IMMEDIATE')
+         row = conn.execute('SELECT session,ref,state,holder_pid,holder_start,notice_key,delivered FROM notices '
+                            'WHERE session=? AND ref=? AND state=?',
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index a3d8d3f0087d6bf8e60e080724be1419083d1a88..5af96050971abe0aacaaad6211989a7cc4ccdfde 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1252,7 +1252,8 @@
+     ``stale`` in the same transaction. Its text is never delivered: it describes a state the card is no longer in,
+     so it never counts as DELIVERED (that means "in the transcript"; row 842 was re-settled as delivered=1 with
+     swept reason=delivered after 9eb41135c6). A live holder, a card still in that state (the re-offer path owns
+-    it) and a card missing from the replica (partial sync) are left alone. Never raises.
++    it) are left alone. Missing cards settle only with same-source/key observations proving every alias
++    expired; unknown or young observations and live alias holders retain the claim. Never raises.
+     """
+     from tui_gateway.remote_sweep_projection import CompactTask
+     from tui_gateway.kanban_remote_expired_claims import settle_absent
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 70eeb7151294be2fab18702a07c97634f74695a8..4d752aeae5da56c0d26eb3675240da7b2ea41982 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -234,10 +234,12 @@
+     raised by the caller's block propagates unchanged (it is never caught here: catching at the ``yield`` and
+     yielding again turns it into "generator didn't stop after throw()", kanban-e5babca565)."""
+     from tui_gateway import server
++    from tui_gateway.kanban_chat_hosting import profile_roster
++    profiles, complete = profile_roster()
+     with contextlib.ExitStack() as stack:
+         found: tuple[Any, Optional[str]] = (None, None)
+-        unavailable = False
+-        for profile in server._readopt_wake_profiles():
++        unavailable = not complete
++        for profile in profiles:
+             scope = contextlib.ExitStack()
+             try:
+                 db = scope.enter_context(server._profile_db({"profile": profile} if profile else None, writer=True))
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index f347c1294a439901b8a4603ad27fbfe4eab9a993..686faea06a3838470759e5caf55bec4ba8ddc19a 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -526,6 +526,7 @@
+     if committed:
+         for chat in _remote_absent.keys() - snapshot.keys():
+             del _remote_absent[chat]
++        _remote_absent_warned.intersection_update((chat, entry) for chat, entry in snapshot.items())
+ 
+ 
+ def _remote_unchanged(chat, previous, snapshot, health_generation, absent_due):
+-- 
+2.43.0
+

@@ -1,0 +1,354 @@
+From 2d1ba844b61a94c1c245502254885f78cc59262a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 17:43:49 +0000
+Subject: [PATCH 6971] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 2d1ba844b61a94c1c245502254885f78cc59262a.
+
+---
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 4035bdcec2f23550dcd3dd3023e1bca989190219..f3e72cd32d4bb97de553250e8ba4f2354ddabe2e 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -37,7 +37,7 @@
+ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_dup_detector as _dup_detector, kanban_placement_forward as _placement_fwd  # no cycle
+-from hermes_cli import kanban_run_end_lease as _run_end_lease  # stdlib-only at import: no cycle
++from hermes_cli import kanban_run_end_lease as _run_end_lease, kanban_home_transfer as _home_transfer  # no cycle
+ from hermes_cli import kanban_containment_connections as _containment, kanban_spend_claim as _spend_claim, kanban_spend_allowance as _spend_allowance
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+@@ -1924,7 +1924,7 @@
+             # The home gateway owns readiness and missing-parent maintenance.
+             # A retained worker copy may still claim ready work, but must not
+             # publish a second promotion or expire the owner's missing streak.
+-            if task_id in copies or _containment.held(conn, task_id):
++            if task_id in copies or _home_transfer.frozen(conn, task_id) or _containment.held(conn, task_id):
+                 continue
+             # A spend stop leaves only on a recorded decision (kanban_spend_decision.pending). The triage clause
+             # above would read an older ``gave_up`` as the stop: promote here, re-triage in the hold, every tick.
+@@ -1994,13 +1994,13 @@
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     # [daveey] Spend decisions are home-owned, but every executor must honour their hold before taking a lease.
+     spend_check = _spend_claim.claim_check(conn, task_id)
+-    if _containment.held(conn, task_id) or spend_check() or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):
++    if _home_transfer.frozen(conn, task_id) or _containment.held(conn, task_id) or spend_check() or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):
+         return None
+     gate = _sync.claim_gate(conn, task_id, expires)
+     if gate.deferred:
+         return None
+     with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+-        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()) or _spend_allowance.claim_refused(conn, task_id, gate):  # [daveey] same txn as the CAS
++        if not admitted or _home_transfer.frozen(conn, task_id) or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()) or _spend_allowance.claim_refused(conn, task_id, gate):  # [daveey] same txn as the CAS
+             return None
+         # Never ready -> running with an undone parent; recompute_ready re-promotes when parents finish.
+         if not _parents_satisfied(conn, task_id):
+@@ -2034,13 +2034,13 @@
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+     spend_check = _spend_claim.claim_check(conn, task_id)
+-    if _containment.held(conn, task_id) or spend_check() or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):  # [daveey] before the Board-service lease (see claim_task)
++    if _home_transfer.frozen(conn, task_id) or _containment.held(conn, task_id) or spend_check() or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):  # [daveey] before the Board-service lease (see claim_task)
+         return None
+     gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+         return None
+     with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+-        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()) or _spend_allowance.claim_refused(conn, task_id, gate):  # [daveey] same txn as the CAS
++        if not admitted or _home_transfer.frozen(conn, task_id) or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()) or _spend_allowance.claim_refused(conn, task_id, gate):  # [daveey] same txn as the CAS
+             return None
+         if not _parents_satisfied(conn, task_id):
+             demoted = conn.execute(
+diff --git a/hermes_cli/kanban_home_owner.py b/hermes_cli/kanban_home_owner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..556036d2dc3b23b5574771f9a447ff9347080593
+--- /dev/null
++++ b/hermes_cli/kanban_home_owner.py
+@@ -0,0 +1,72 @@
++"""Dormant cooperative handoff owner; no CLI/sweep/automatic activation yet.
++
++Only actual credential-pinned Hub transport responses enter local finalizers.
++A caller-provided manifest/ACK dictionary is never accepted as a network reply.
++Finish destination pre-STOP eligibility and typed capture gates before rollout.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as source
++from hermes_cli import kanban_home_destination as destination
++from hermes_cli.kanban_sync_client import Hub
++
++_KEYS = ("task", "source", "destination", "nonce", "expected_version")
++_PHASES = ("prepared", "committed", "materialized", "complete")
++
++
++def _identity(conn, hub: Hub, board: str, identity: dict, actor: str) -> dict:
++    if not isinstance(hub, Hub) or conn.in_transaction:
++        raise ValueError("home owner requires real Hub transport outside a writer")
++    if not isinstance(identity, dict) or set(identity) != set(_KEYS):
++        raise ValueError("home owner needs one exact identity tuple")
++    state = conn.execute("SELECT board_id,gateway_id FROM kanban_sync_state").fetchall()
++    if (len(state) != 1 or tuple(state[0]) != (board, identity[actor])
++            or hub.ident.gateway != identity[actor]):
++        raise ValueError("home owner gateway/board mismatch")
++    return dict(identity)
++
++
++def _advance(hub: Hub, board: str, identity: dict, step: str, rows=None) -> dict:
++    body = {**identity, "step": step}
++    if rows is not None:
++        body["rows"] = rows
++    record = hub.home_transfer(board, body)
++    if (not isinstance(record, dict) or any(type(record.get(k)) is not type(v) or record[k] != v for k,v in identity.items())
++            or record.get("phase") not in _PHASES or not isinstance(record.get("rows"), list)):
++        raise ValueError("authenticated home response identity/shape mismatch")
++    return record
++
++
++def source_step(conn, hub: Hub, board: str, identity: dict) -> dict:
++    """Prepare/fence -> Board commit, or durable local STOP -> Board STOP.
++
++    An unknown response retains the SAME immutable tuple. No timeout release,
++    fresh nonce, local rollback of already committed protocol or lease repair.
++    """
++    identity = _identity(conn, hub, board, identity, "source")
++    with dbc.write_txn(conn):
++        source.prepare(conn, identity["task"], **{k:v for k,v in identity.items() if k != "task"})
++    record = _advance(hub, board, identity, "prepare")
++    if record["phase"] == "prepared":
++        record = _advance(hub, board, identity, "commit")
++    if record["phase"] in ("materialized", "complete"):
++        with dbc.write_txn(conn):
++            source.finalize_source(conn, record)
++        record = _advance(hub, board, identity, "stop", record["rows"])
++    return record
++
++
++def destination_step(conn, hub: Hub, board: str, identity: dict) -> dict:
++    """Read authenticated manifest -> actual committed import/readback -> ACK.
++
++    No network operation runs inside the native writer. If the ACK is lost,
++    retry re-reads actual durable materialization before sending the same ACK.
++    """
++    identity = _identity(conn, hub, board, identity, "destination")
++    record = _advance(hub, board, identity, "read")
++    if record["phase"] == "prepared":
++        return record
++    with dbc.write_txn(conn):
++        rows = destination.materialize(conn, record)
++    return _advance(hub, board, identity, "materialize", rows)
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 3bd48ee5365ee5b95d4cbeff675aea6f4b1f5efd..c3cdb92e1700dc3c881d7eb8a6a908da76816ec4 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -161,6 +161,41 @@
+     return {"phase": "prepared_local", **record}
+ 
+ 
++def frozen(conn: sqlite3.Connection, task_id: str) -> bool:
++    """Read-only candidate exclusion; marker presence is not release authority.
++
++    A malformed/orphan marker stays frozen. Only a scoped finalized receipt plus
++    the installed local home/version/epoch makes the former source executable
++    again under its ordinary future lease. SQL mutation fences remain separate.
++    """
++    import json
++
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone():
++        return False
++    row = conn.execute(f"SELECT task_id,source,destination,nonce,expected_version FROM {_TABLE} WHERE task_id=?", (task_id,)).fetchone()
++    if not row:
++        return False
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_home_finalized1'").fetchone():
++        return True
++    final = conn.execute("SELECT nonce,receipt FROM kanban_home_finalized1 WHERE task_id=?", (task_id,)).fetchone()
++    if not final:
++        return True
++    try:
++        receipt = json.loads(final[1])
++        keys = ("task", "source", "destination", "nonce", "expected_version")
++        if (not isinstance(receipt, dict) or tuple(row) != tuple(receipt.get(k) for k in keys)
++                or receipt.get("phase") != "materialized" or final[0] != row[3]
++                or type(row[4]) is not int or row[4] < 1 or not _NONCE.fullmatch(row[3])
++                or not isinstance(receipt.get("rows"), list) or not receipt["rows"]):
++            return True
++        current = conn.execute("SELECT created_on,sync_version FROM tasks WHERE id=?", (task_id,)).fetchone()
++        epoch = conn.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (task_id,)).fetchone()
++        return not (current and current[0] == row[2] and type(current[1]) is int
++                    and current[1] >= row[4] + 1 and epoch and epoch[0] == row[3])
++    except (ValueError, TypeError, sqlite3.Error):
++        return True
++
++
+ def finalize_source(conn: sqlite3.Connection, record: dict) -> dict:
+     """Stop local ownership after the authenticated destination materialization ACK."""
+     from hermes_cli.kanban_home_source_stop import finalize_source as finish
+diff --git a/hermes_cli/kanban_sync_hub_routes.py b/hermes_cli/kanban_sync_hub_routes.py
+index 68037f9c238f2c5a7fe625f74c013d54723eeb97..11504a66112ba079962664e4fdab48bda7596515 100644
+--- a/hermes_cli/kanban_sync_hub_routes.py
++++ b/hermes_cli/kanban_sync_hub_routes.py
+@@ -72,6 +72,13 @@
+         return self._call("GET", f"/v2/boards/{quote(board, safe='')}/reviewer-allowance?"
+                           + urlencode({"task": task}), max_response_bytes=8192)
+ 
++    def home_transfer(self, board: str, body: dict) -> dict:
++        """Cooperative handoff; exact tuple/phase retry, never legacy rehome fallback."""
++        from urllib.parse import quote
++
++        return self._call("POST", f"/v2/boards/{quote(board, safe='')}/home-transfer", body, replay_safe=True)
++
++
+     def leases(self, board: str, body: dict) -> dict:
+         return self._call("POST", f"/v2/boards/{board}/leases", body)
+ 
+diff --git a/hermes_cli/kanban_sync_status_origin.py b/hermes_cli/kanban_sync_status_origin.py
+index 9532c623acd94705911d0cce575b1dcc928a6a80..383b2c3ffa0ad0d386360e7a38990765a4ab1d9e 100644
+--- a/hermes_cli/kanban_sync_status_origin.py
++++ b/hermes_cli/kanban_sync_status_origin.py
+@@ -77,7 +77,10 @@
+         counts: dict[str, int] = {}
+         for _op, task in rows:
+             counts[task] = counts.get(task, 0) + 1
++        from hermes_cli.kanban_home_transfer import frozen
+         for op, task in rows:
++            if frozen(conn, task):
++                continue  # source preparation is a durable mutation fence
+             change = conn.execute("SELECT status, n FROM temp.kanban_status_changes WHERE task_id=?", (task,)).fetchone()
+             if not change:
+                 continue  # repair/requeue did not capture a new status intent
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index 83db7029e8de65f5333ca9fb387eb7b4628442e0..213d434808e48c2f1c074835551c54a5ab1a0caf 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -128,6 +128,9 @@
+     The local row can still read ``scheduled`` (a stale copy: the completion reached the events but not the row,
+     or the row was restored from an older copy), so the event log decides, not the row. Records one
+     ``stale_wake_ignored`` per producer and terminal event, so a due clock does not write one every tick."""
++    from hermes_cli.kanban_home_transfer import frozen
++    if frozen(conn, task_id):
++        return True
+     hold = terminal_hold(conn, task_id)
+     if hold is None:
+         return False
+diff --git a/tests/hermes_cli/test_home_owner.py b/tests/hermes_cli/test_home_owner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c6df257b66181cd6c1aae78fc0b8a2cff87b5a4
+--- /dev/null
++++ b/tests/hermes_cli/test_home_owner.py
+@@ -0,0 +1,42 @@
++"""Owner orchestration refuses local/network identity skew before writes."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db_connect as dbc
++from hermes_cli import kanban_home_owner as owner
++from hermes_cli.kanban_sync_client import Hub, Identity
++from tests.hermes_cli import test_home_transfer_capture as support
++
++board = support.board
++
++
++def identity():
++    return dict(task="t_1234567890abcdef",source="worker-a3",destination="hub",nonce="owner-test-0000001",expected_version=1)
++
++
++def test_supplied_ack_dictionary_is_not_a_transport(board):
++    with pytest.raises(ValueError, match="real Hub transport"):
++        owner.source_step(board, {"phase":"materialized"}, "default", identity())
++
++
++def test_owner_refuses_wrong_local_actor_before_network(board, monkeypatch):
++    hub = Hub(Identity("http://127.0.0.1:1", "fixture-key", "worker-a3"))
++    monkeypatch.setattr(hub, "home_transfer", lambda *a: pytest.fail("network before local identity gate"))
++    with pytest.raises(ValueError, match="gateway/board mismatch"):
++        owner.source_step(board, hub, "default", identity())
++
++
++def test_owner_never_sends_inside_native_writer(board):
++    hub = Hub(Identity("http://127.0.0.1:1", "fixture-key", "worker-a3"))
++    with dbc.write_txn(board), pytest.raises(ValueError, match="outside a writer"):
++        owner.source_step(board, hub, "default", identity())
++
++
++@pytest.mark.parametrize("change", [{"nonce":"changed-0000001"},{"expected_version":True},{"task":"other"},{"phase":"unknown"},{"rows":None}])
++def test_authenticated_wrong_scope_response_never_reaches_local_finalizer(monkeypatch, change):
++    ident = identity()
++    hub = Hub(Identity("http://127.0.0.1:1", "fixture-key", "worker-a3"))
++    monkeypatch.setattr(hub, "home_transfer", lambda *a: {**ident,"phase":"committed","rows":[],**change})
++    with pytest.raises(ValueError, match="identity/shape mismatch"):
++        owner._advance(hub, "default", ident, "read")
+diff --git a/tests/hermes_cli/test_home_prepared_maintenance.py b/tests/hermes_cli/test_home_prepared_maintenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bc3e427c0001ad20561909db84750b83250d361
+--- /dev/null
++++ b/tests/hermes_cli/test_home_prepared_maintenance.py
+@@ -0,0 +1,64 @@
++"""Prepared source candidates must not abort unrelated native maintenance."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as transfer
++from tests.hermes_cli import test_home_transfer_capture as support
++
++board = support.board
++
++
++def prepared(conn, status="todo"):
++    task = kb.create_task(conn, title="source preparation candidate")
++    neighbour = kb.create_task(conn, title="independent candidate")
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task))
++        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (neighbour,))
++        conn.execute("UPDATE tasks SET created_on='worker-a3',sync_version=7 WHERE id=?", (task,))
++        conn.execute("UPDATE kanban_sync_state SET gateway_id='worker-a3'")
++        conn.execute("DELETE FROM kanban_sync_outbox")
++        transfer.prepare(conn, task, source="worker-a3", destination="hub", nonce="maintenance-test-0001", expected_version=7)
++    return task, neighbour
++
++
++def test_real_recompute_skips_prepared_source_and_promotes_independent_neighbour(board):
++    task, neighbour = prepared(board)
++    before = [tuple(r) for r in board.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task,))]
++    assert kb.recompute_ready(board) == 1
++    assert kb.get_task(board, task).status == "todo"
++    assert kb.get_task(board, neighbour).status == "ready"
++    assert [tuple(r) for r in board.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task,))] == before
++
++
++def test_real_wake_skip_is_write_free_for_prepared_source(board):
++    from hermes_cli.kanban_terminal_guard import skip_wake
++    task, _ = prepared(board, "scheduled")
++    with dbc.write_txn(board):
++        before = board.total_changes
++        assert skip_wake(board, task, "scheduled") is True
++        assert board.total_changes == before
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_prepared_claim_refuses_before_requesting_any_lease(board, monkeypatch, review):
++    from hermes_cli import kanban_db_sync as sync
++    task, _ = prepared(board, "review" if review else "ready")
++    def no_lease(*args, **kwargs):
++        pytest.fail("prepared source attempted a Board lease")
++    monkeypatch.setattr(sync, "claim_gate", no_lease)
++    claim = kb.claim_review_task if review else kb.claim_task
++    assert claim(board, task) is None
++
++
++def test_malformed_marker_presence_is_not_release_authority(board):
++    task, neighbour = prepared(board)
++    # The existing SQLite fence remains; malformed non-key custody cannot make
++    # maintenance try an effect and abort the independent neighbour's promotion.
++    with dbc.write_txn(board):
++        board.execute("DROP TRIGGER home_prepared1_marker_update")
++        board.execute("UPDATE kanban_home_prepared1 SET nonce='invalid',source='' WHERE task_id=?", (task,))
++    assert kb.recompute_ready(board) == 1
++    assert kb.get_task(board, task).status == "todo"
++    assert kb.get_task(board, neighbour).status == "ready"
+-- 
+2.43.0
+

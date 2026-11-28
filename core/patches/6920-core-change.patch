@@ -1,0 +1,122 @@
+From 18906ed25f3bb8370a50d753146256b3c33b932d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:57:02 +0000
+Subject: [PATCH 6920] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 18906ed25f3bb8370a50d753146256b3c33b932d.
+
+---
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 33d7800e9a2ddf66f1c82c9155d94acb3626ea8d..b2968f990c468ae6c8176244dd2bd39a60dbf73d 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -184,6 +184,10 @@
+         if projection is not None:
+             projection.after_commit()
+ 
++    def _parent_projectable(uid):
++        return conn.execute('SELECT 1 FROM tasks WHERE id=?', (uid,)).fetchone() is not None and not conn.execute(
++            "SELECT 1 FROM kanban_sync_tombstones WHERE table_name='tasks' AND row_uid=?", (uid,)).fetchone()
++
+     def read_current_row():
+         """Read current state separately; never enrich the historical slot verdict."""
+         decision = reconcile(journal.snapshot(conn), remote)
+@@ -214,11 +218,13 @@
+             return client._row_change('tasks', projection.current) if source().get('_parent') and projection.current else None
+         if verdict['status'] not in ('applied', 'merged', 'deferred'):
+             return None
+-        if verdict['status'] != 'deferred' and verdict.get('version'):
+-            return None
+         row = source()
+         if not row.get('_parent'):
+             return None
++        if verdict['status'] != 'deferred' and verdict.get('version') and not _parent_projectable(row['row_uid']):
++            return None  # Locally deleted: the authoritative version needs no image.
++        # A versioned verdict still needs the current image: the issued feed echo
++        # was skipped to keep custody, so this read is the only projection of it.
+         from hermes_cli.kanban_replay_existence import CurrentRowHold
+         try:
+             from hermes_cli.kanban_replay_reply import row_evidence_envelope
+@@ -333,7 +339,7 @@
+             return  # Transport handoff is not authoritative row success.
+         if status not in ('applied', 'merged'):
+             raise ValueError('tracer final disposition requires custody integration')
+-        if row.get('_parent') and not verdict.get('version'):
++        if row.get('_parent') and (not verdict.get('version') or current_row is not None):
+             project_parent(row)
+         if verdict.get('version') and row['table_name'] == 'tasks' and row['op'] != 'release':
+             conn.execute('UPDATE tasks SET sync_version=MAX(COALESCE(sync_version,0),?) WHERE id=?',
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index 5fa0d8c4064940c99d9869dfd112adcb26943048..1f6667ddc89fc4e7e08b9c3b301ea51a30e5e87b 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -56,6 +56,11 @@
+             raise OSError('reply lost after commit')
+         return {'protocol': 'processed_prefix1', 'results': []}
+ 
++    def row_evidence(self, board, table, uid):
++        version = json.loads(self.slot['last_verdict'])['version']
++        return dict(board=board, table=table, uid=uid, state='live', head=version,
++                    row=dict(uid=uid, status='todo', version=version, created_at=1))
++
+     def ops(self, *args):
+         pytest.fail('bound replay journal fell back to legacy transport')
+ 
+diff --git a/tests/hermes_cli/test_kanban_replay_synthetic_echo.py b/tests/hermes_cli/test_kanban_replay_synthetic_echo.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7a005fef5b0704299ff971566f246dde91485ee
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_synthetic_echo.py
+@@ -0,0 +1,49 @@
++"""Issued synthetic-parent feed echo vs settlement: the merged image must survive."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client, kanban_replay_journal as journal
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++@pytest.mark.parametrize('echo_before_settle', [False, True])
++def test_synthetic_merged_echo_keeps_canonical_image(live, echo_before_settle):
++    tid = kb.create_task(live, title='local title', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_sync_outbox')
++    kb.add_comment(live, tid, 'author', 'child')
++    class Merged(helpers.Receiver):
++        def row_evidence(self, board, table, uid):
++            return dict(board=board, table=table, uid=uid, state='live', head=7,
++                        row=dict(uid=uid, title='server merged title', status='todo', version=7,
++                                 created_at=1))
++
++    receiver = Merged()
++    receiver.status = 'merged'
++    receiver.lose_reply = True
++    with pytest.raises(OSError):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    op = json.loads(journal.pending_wire(live))
++    assert op['table'] == 'tasks' and op['uid'] == tid
++    change = sync.RemoteChange(seq=7, table='tasks', uid=tid, op='upsert',
++                               fields={'title': 'server merged title'}, version=7,
++                               hlc=op['hlc'], origin_gateway='macbook',
++                               client_op_id=op['client_op_id'])
++    if echo_before_settle:
++        frozen = journal.pending_wire(live)
++        sync.apply_remote_changes(live, [change], new_cursor=7, observers=False)
++        assert journal.pending_wire(live) == frozen  # custody kept until settlement
++        assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    receiver.lose_reply = False
++    result = client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert result.merged == 1 and len(receiver.sent) == 1  # no resend
++    assert journal.pending_wire(live) is None
++    if not echo_before_settle:
++        sync.apply_remote_changes(live, [change], new_cursor=7, observers=False)
++    assert sync.sync_state(live)['cursor'] == 7
++    row = live.execute('SELECT title,sync_version FROM tasks WHERE id=?', (tid,)).fetchone()
++    assert tuple(row) == ('server merged title', 7)
+-- 
+2.43.0
+

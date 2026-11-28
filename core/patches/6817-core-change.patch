@@ -1,0 +1,204 @@
+From c3171cdd60eb0eaa62dc26d97032cfdb323473cb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:21:37 +0000
+Subject: [PATCH 6817] Annotation holder counts custody and read sharing
+
+Public mirror of source commit c3171cdd60eb0eaa62dc26d97032cfdb323473cb.
+
+---
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index d0753c0ad1dffed2985363b254f8d90daf4c5a5a..b25935313bb1656086a6986a3ee414676f1e26ab 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -211,9 +211,14 @@
+     """The read planned with ``now`` completed: its forced parts answered those keys."""
+     _seen.pop(scope, None)
+     receipt = getattr(now, 'receipt', None)
+-    if receipt is not None and not receipt.valid():
+-        failed(scope)
+-        return  # a racing result cannot authorize heartbeat-normalized suppression
++    if now is not None and receipt is not None and not receipt.valid():
++        from hermes_cli import kanban_annotation_counts as counts
++
++        counts.failed(scope)
++        # Only COUNTS normalized this receipt. Successful independent readers
++        # retain their original pre-read keys; their next probes see any move.
++        # Omission forces COUNTS again without certifying the rejected source.
++        now = {part: key for part, key in now.items() if part != COUNTS}
+     if now is not None:
+         while len(_seen) >= _MAX_SCOPES:
+             del _seen[next(iter(_seen))]
+diff --git a/tests/hermes_cli/test_annotation_counts_races.py b/tests/hermes_cli/test_annotation_counts_races.py
+index 723bca0e15c4578b35b946aeba3708926db27e75..56f1cf3fbfe9e36768a749c12fdcafba23cf6b58 100644
+--- a/tests/hermes_cli/test_annotation_counts_races.py
++++ b/tests/hermes_cli/test_annotation_counts_races.py
+@@ -36,7 +36,7 @@
+     world.declared.write_text('attention')
+     holders._refresh()
+     assert fired and world.counts == before + 1
+-    assert holders.SCOPE not in parts._seen and holders.SCOPE not in counts._entries
++    assert parts.COUNTS not in parts._seen[holders.SCOPE] and holders.SCOPE not in counts._entries
+     holders._refresh()
+     assert world.counts == before + 2 and holders.SCOPE in counts._entries
+ 
+diff --git a/tests/hermes_cli/test_annotation_heartbeat_fence.py b/tests/hermes_cli/test_annotation_heartbeat_fence.py
+index e9a3c413189365bfadfb1fb8c7ceaa4d2d7edb7c..1adba7df5af6fbd25a80c73fdfbb71c823ecee1e 100644
+--- a/tests/hermes_cli/test_annotation_heartbeat_fence.py
++++ b/tests/hermes_cli/test_annotation_heartbeat_fence.py
+@@ -110,7 +110,7 @@
+         return read(*args, **kwargs)
+     monkeypatch.setattr(ksa, '_recompute_all_counts', crossing)
+     holders._refresh()
+-    assert holders.SCOPE not in parts._seen, 'racing result received a normalized certificate'
++    assert parts.COUNTS not in parts._seen[holders.SCOPE], 'racing result received a normalized certificate'
+     holders._refresh()
+     assert len(calls) == 2, 'a matching late probe certified the rejected result'
+     holders._refresh()
+diff --git a/tests/hermes_cli/test_annotation_part_custody.py b/tests/hermes_cli/test_annotation_part_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..852b9a9ecfdd2a10becd1d0e68f2ad67d566e3c7
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_part_custody.py
+@@ -0,0 +1,139 @@
++"""A normalized COUNTS receipt cannot revoke independent completed readers."""
++import pytest
++
++from hermes_cli import kanban_annotation_counts as counts
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_annotation_heartbeat_fence as fence
++from tests.hermes_cli import test_kanban_annotation_waiting_gate as gate
++
++world = gate.world
++waiting = gate.waiting
++replica = fence.replica
++
++
++def test_session_commit_during_counts_preserves_waiting_certificate(waiting, replica, monkeypatch):
++    path, writer, _beat = replica
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: path)
++    monkeypatch.setattr(fence.hk.time, 'time', lambda: fence.NOW)
++    original = ksa._recompute_all_counts
++    reads = []
++
++    def crossing(*args, **kwargs):
++        value = original(*args, **kwargs)
++        reads.append(True)
++        writer.execute('INSERT INTO sessions VALUES(?)', (len(reads),))
++        return value
++
++    monkeypatch.setattr(ksa, '_recompute_all_counts', crossing)
++    gate.refresh()
++    assert waiting.reads == 1
++    gate.refresh()
++    assert len(reads) == 2, 'the rejected COUNTS receipt must force another actual count read'
++    assert waiting.reads == 1, 'a session-only commit revoked an independent waiting answer'
++    assert parts.COUNTS not in parts._seen[fence.holders.SCOPE]
++    assert fence.holders.SCOPE not in counts._entries
++    assert ksa._last_annotation[fence.holders.SCOPE][9] == {'s1': frozenset({'t1'})}
++    waiting.key += 1
++    waiting.ids = {'changed'}
++    gate.refresh()
++    assert waiting.reads == 2
++    assert ksa._last_annotation[fence.holders.SCOPE][9] == {'s1': frozenset({'changed'})}
++
++
++@pytest.mark.parametrize('moved', [parts.LINKS, parts.ATTENTION, parts.WAITING])
++def test_rejected_receipt_keeps_original_keys_not_later_inputs(world, replica, monkeypatch, moved):
++    path, writer, _beat = replica
++    _semantic, receipt = fence.hk.capture(path, fence.NOW)
++    original = parts._Keys({part: object() for part in parts.ALL})
++    original.receipt = receipt
++    old = dict(original)
++    scope = fence.holders.SCOPE
++    parts._waiting[scope] = (('s1', frozenset({'original'})),)
++    counts._entries[scope] = counts.Source(counts.CountSnapshot((), {}), old[parts.COUNTS], 0.0, 0.0, (), None)
++    writer.execute('INSERT INTO sessions VALUES(1)')
++    assert not receipt.valid()
++    parts.done(scope, original)
++    assert dict(original) == old, 'done mutated the plan held by counts.begin'
++    assert parts._seen[scope] == {part: key for part, key in old.items() if part != parts.COUNTS}
++    assert scope not in counts._entries
++    assert parts._waiting[scope] == (('s1', frozenset({'original'})),)
++    later = dict(original)
++    later[moved] = object()
++    monkeypatch.setattr(parts, 'keys', lambda _scope: later)
++    forced, _keys = parts.plan(scope, clock=False)
++    assert forced == {parts.COUNTS, moved}
++    assert parts.plan(scope, clock=True)[0] == parts.ALL
++    parts.failed(scope)
++    assert scope not in parts._seen and scope not in parts._waiting
++    assert parts.plan(scope, clock=False)[0] == parts.ALL
++
++
++def test_receipt_error_still_invalidates_entire_holder(waiting, replica, monkeypatch):
++    path, writer, _beat = replica
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: path)
++    monkeypatch.setattr(fence.hk.time, 'time', lambda: fence.NOW)
++    original = ksa._recompute_all_counts
++
++    def crossing(*args, **kwargs):
++        value = original(*args, **kwargs)
++        writer.execute('INSERT INTO sessions VALUES(1)')
++        return value
++
++    monkeypatch.setattr(ksa, '_recompute_all_counts', crossing)
++    gate.refresh()
++    scope = fence.holders.SCOPE
++    assert scope in parts._seen and scope in parts._waiting
++
++    def broken(_receipt):
++        raise ValueError('unavailable publication fence')
++
++    monkeypatch.setattr(fence.hk.Receipt, 'valid', broken)
++    gate.refresh()
++    assert scope not in parts._seen and scope not in parts._waiting
++    assert scope not in counts._entries
++
++
++def test_missing_or_valid_receipt_preserves_all_certificates(world, replica):
++    path, _writer, _beat = replica
++    _key, receipt = fence.hk.capture(path, fence.NOW)
++    scope = fence.holders.SCOPE
++    for carrier in (dict, parts._Keys):
++        keys = carrier({part: object() for part in parts.ALL})
++        if isinstance(keys, parts._Keys):
++            keys.receipt = receipt
++        parts.done(scope, keys)
++        assert parts._seen[scope] == keys
++
++
++def test_late_outer_failure_clears_independent_output(waiting, replica, monkeypatch):
++    path, writer, _beat = replica
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: path)
++    monkeypatch.setattr(fence.hk.time, 'time', lambda: fence.NOW)
++    original = ksa._recompute_all_counts
++
++    def crossing(*args, **kwargs):
++        value = original(*args, **kwargs)
++        writer.execute('INSERT INTO sessions VALUES(1)')
++        return value
++
++    monkeypatch.setattr(ksa, '_recompute_all_counts', crossing)
++    gate.refresh()
++    scope = fence.holders.SCOPE
++    assert scope in parts._seen and scope in parts._waiting
++    publish = host.publish
++
++    def broken(*args, **kwargs):
++        raise ValueError('publication refused after independent readers')
++
++    monkeypatch.setattr(host, 'publish', broken)
++    waiting.key += 1
++    waiting.ids = {'unpublished'}
++    gate.refresh()
++    assert scope not in parts._seen and scope not in parts._waiting
++    assert scope not in counts._entries
++    monkeypatch.setattr(host, 'publish', publish)
++    gate.refresh()
++    assert waiting.reads == 3
++    assert ksa._last_annotation[scope][9] == {'s1': frozenset({'unpublished'})}
+-- 
+2.43.0
+

@@ -1,0 +1,451 @@
+From f1fbf41080e8e35b6fcd368ac27e880c0134a963 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:35:15 +0000
+Subject: [PATCH 6954] Sessions capture standby child and exit-signal dispatch
+
+Public mirror of source commit f1fbf41080e8e35b6fcd368ac27e880c0134a963.
+
+---
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 5d5f8799de24b631b8d323af95db13ea1a94b2f6..92690df4e566006a4e71db7ae3526807d9fecd89 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -12,6 +12,9 @@
+         self.runtime = runtime
+         self.adopted = False
+         self.closed = False
++        # The app lifespan closes on a worker thread (asyncio.to_thread); an exit signal closes on
++        # the main thread. The runtime's close is not safe to run twice at once.
++        self._close_lock = threading.Lock()
+ 
+     def adopt(self):
+         if self.adopted or self.closed:
+@@ -19,10 +22,18 @@
+         self.adopted = True
+         return self.runtime
+ 
+-    def close(self):
+-        if not self.closed:
+-            self.runtime.close()
+-            self.closed = True  # failed drain retains custody for the outer retry
++    def close(self, *, blocking=True):
++        """Close once. With ``blocking=False`` (the signal path) a close already running on another
++        thread is left to finish and False is returned; it never waits inside a signal handler."""
++        if not self._close_lock.acquire(blocking):
++            return False
++        try:
++            if not self.closed:
++                self.runtime.close()
++                self.closed = True  # failed drain retains custody for the outer retry
++            return True
++        finally:
++            self._close_lock.release()
+ 
+ 
+ def adopted_early_owner(state):
+@@ -39,23 +50,36 @@
+     """SIGTERM/SIGINT custody for the early sessions reader (main thread only, where CPython runs
+     Python signal handlers).
+ 
+-    A signal is never acted on inside a custody step: a spawn whose child ``prepare()`` alone owns,
+-    or a close (the reader's, or the runtime's, whose locks are not re-entrant). Every handler
+-    invocation is one entry of an ordered queue (``_queue``: handler frame -> entry), so:
+-      * an invocation is queued by ONE ``dict.setdefault`` keyed by its own frame: a C call, so no
+-        other handler runs inside it. A handler that interrupts an outer handler invocation (at any
+-        bytecode, even before that one's first line) first queues every such outer invocation, by
+-        the same setdefault on the outer frame, then its own. So whichever runs first queues an
+-        invocation exactly once, older invocations stay ahead, and an exit raised by the inner one
+-        cannot drop the outer signal;
+-      * the dispatcher runs only at ``depth`` 0 and holds ``depth`` above 0 while it runs, so a
+-        signal arriving inside it, its close or a previous handler is queued behind, never run
+-        inside them; it marks each entry delivered before acting, and delivers every queued entry
+-        even when an earlier handler raised (the last exception propagates, chained);
+-      * a delivered entry stays queued, as a tombstone, until its invocation has returned, so the
+-        invocation's own setdefault cannot queue it a second time;
+-      * an undelivered entry for a signal being delivered collapses into it, as a pending signal;
+-      * whoever brings ``depth`` back to 0 reads the queue AFTER the decrement and dispatches it.
++    A signal is never acted on inside a main-thread custody step: a spawn whose child ``prepare()``
++    alone owns, or a close (the reader's, or the runtime's, whose locks are not re-entrant). An
++    *invocation* is one call of ``handler`` (its frame); an *action* for a signum is ``close()`` then
++    the previous handler. Every invocation is one entry of an ordered queue (``_queue``: handler
++    frame -> [signum, flags]). Invariants:
++      I1 queued once: an invocation is queued by ONE ``dict.setdefault`` keyed by its frame (a C
++         call, so no handler runs inside it), done by the invocation itself or by the first handler
++         that interrupts it (at any bytecode, even before its first line) and finds it on the stack.
++         The walk adds only *unfinished* invocations: ``finished`` is set first thing in the
++         ``finally``, after the invocation is queued, and an entry is dropped only when it is
++         delivered AND its invocation has reached that ``finally``. So a walk that still finds the
++         frame either finds its entry or runs before its own setdefault; nobody queues it again
++         after its tombstone is dropped, though its frame stays on the stack until it returns.
++      I2 exactly once, in invocation order: outer invocations are queued oldest first, ahead of the
++         interrupting one; an entry is marked delivered before its action runs. Caveat: an
++         undelivered entry for the signum being delivered collapses into that delivery (a pending
++         repeat), which can move it ahead of other signals but never loses it.
++      I3 one dispatcher: actions run only from ``depth`` 0, and the dispatcher holds ``depth`` above
++         0 while it runs, so a signal arriving inside it, its close or a previous handler is only
++         queued. Nested ``depth`` changes are balanced, so its read-modify-write is safe.
++      I4 nothing stranded: whoever brings ``depth`` back to 0 reads the queue AFTER the decrement.
++      I5 exceptions: later deliveries still run when an earlier action raised; the last exception
++         propagates, chained. A close failure never propagates (below).
++      C1 custody is main-thread only: ``deferred()`` covers ``prepare()`` and the early_sessions
++         close. A close on another thread (the app lifespan's ``asyncio.to_thread``) is guarded by
++         ``EarlySessions``' close lock, which the signal path only tries: if it is held, the close is
++         left to that thread and the previous handler still runs.
++    Residue: an invocation unwound by an exception before or inside its ``finally`` leaves its
++    delivered entry as a tombstone (the frame is dead but referenced, so the key is never reused);
++    an empty queue is therefore not guaranteed once an exit propagates.
+     Order is CPython's handler-invocation order (it runs tripped handlers in signal-number order,
+     not kernel arrival order). A thread signal mask cannot do this: a process-directed signal caught
+     on another thread still runs its Python handler on the main thread.
+@@ -81,7 +105,8 @@
+         try:
+             outer, walk = [], frame
+             while walk is not None:  # outer handler invocations this one interrupted
+-                if walk.f_code is _HANDLER_CODE and walk.f_locals.get('self') is self:
++                if (walk.f_code is _HANDLER_CODE and walk.f_locals.get('self') is self
++                        and not walk.f_locals.get('finished')):
+                     outer.append(walk)
+                 walk = walk.f_back
+             for invocation in reversed(outer):  # outermost (oldest) first
+@@ -90,6 +115,11 @@
+             if self.depth == 0:
+                 self._dispatch()
+         finally:
++            # From here this invocation is queued (by its own setdefault, or by the handler that
++            # interrupted it first) and is never queued again. Its frame stays on the stack until it
++            # returns, after its tombstone is dropped here or by a dispatcher: a handler
++            # interrupting it then must not re-queue it (the walk above skips finished invocations).
++            finished = True  # noqa: F841  # health: allow F841 -- read via f_locals by a nested handler's walk
+             entry = self._queue.get(me)
+             if entry is not None:
+                 entry[1] |= self._RETURNED
+@@ -179,7 +209,16 @@
+     reader = CaptureProcess()
+     owner = None
+     previous = {}
+-    signals = _ExitSignals(previous, lambda: (reader if owner is None else owner).close())
++
++    def close_on_signal():
++        if owner is None:
++            reader.close()  # only the main thread holds the reader before the runtime owns it
++        elif not owner.close(blocking=False):
++            import logging
++            logging.getLogger(__name__).info(
++                'sessions capture close already running on another thread; exit signal chains on')
++
++    signals = _ExitSignals(previous, close_on_signal)
+     stop = signals.handler
+ 
+     def close():
+diff --git a/tests/hermes_cli/test_sessions_early_boot.py b/tests/hermes_cli/test_sessions_early_boot.py
+index 5290010577052ee14062060ca7c8e41581787d19..c672545134cf9348abb4926302521d5c221769f0 100644
+--- a/tests/hermes_cli/test_sessions_early_boot.py
++++ b/tests/hermes_cli/test_sessions_early_boot.py
+@@ -150,6 +150,57 @@
+         owner.adopt()
+ 
+ 
++def test_close_on_another_thread_is_not_run_twice_at_once():
++    entered, release, inside, overlap = threading.Event(), threading.Event(), [0], []
++
++    def close():
++        inside[0] += 1
++        overlap.append(inside[0] > 1)
++        entered.set()
++        release.wait(5)
++        inside[0] -= 1
++    owner = early.EarlySessions(SimpleNamespace(close=close))
++    worker = threading.Thread(target=owner.close)
++    worker.start()
++    assert entered.wait(5)
++    assert owner.close(blocking=False) is False  # the signal path never waits or re-enters
++    release.set()
++    worker.join(5)
++    assert owner.closed and overlap == [False] and owner.close(blocking=False) is True
++
++
++def test_exit_signal_during_the_lifespan_close_on_a_worker_thread_chains_without_a_second_close(boot):
++    """The app lifespan closes the owner through asyncio.to_thread, outside ``deferred()``. A SIGTERM
++    handled on the main thread meanwhile must not run the runtime's close concurrently."""
++    import os
++    calls, runtime = boot
++    entered, release, inside, overlap, seen = threading.Event(), threading.Event(), [0], [], []
++
++    def close():
++        inside[0] += 1
++        overlap.append(inside[0] > 1)
++        calls.append('close')
++        if threading.current_thread() is not threading.main_thread():
++            entered.set()
++            release.wait(5)
++        inside[0] -= 1
++    runtime.close = close
++    saved = signal.signal(signal.SIGTERM, lambda signum, frame: seen.append(signum))
++    try:
++        with early.early_sessions(headless=True, isolated=False) as owner:
++            worker = threading.Thread(target=owner.close, name='lifespan-to_thread')
++            worker.start()
++            assert entered.wait(5)
++            os.kill(os.getpid(), signal.SIGTERM)
++            release.set()
++            worker.join(5)
++            assert owner.closed
++    finally:
++        signal.signal(signal.SIGTERM, saved)
++    assert seen == [signal.SIGTERM]  # the previous handler still ran
++    assert overlap == [False] and calls.count('close') == 1
++
++
+ class _Startup(ModuleType):
+     """Stands in for sessions_native_startup: the from-import of SessionsRuntime is its import point."""
+     def __init__(self, calls, factory):
+diff --git a/tests/hermes_cli/test_sessions_exit_signals.py b/tests/hermes_cli/test_sessions_exit_signals.py
+index 7385887f23f51a62c1c822ed9274378489fe2c29..9ba265dfccfd8ad0af30c6f544510e0284027a40 100644
+--- a/tests/hermes_cli/test_sessions_exit_signals.py
++++ b/tests/hermes_cli/test_sessions_exit_signals.py
+@@ -4,6 +4,8 @@
+ line-level trace for that: a second signal is delivered at each line event inside the dispatcher
+ (one boundary per run), and the invariants are checked for every boundary.
+ """
++import os
++import random
+ import signal
+ import sys
+ 
+@@ -16,16 +18,20 @@
+ 
+ class _Run:
+     """One dispatcher with recording previous handlers and a close that must never be re-entered
+-    or interrupted by a handler."""
++    or interrupted by a handler. Violations are recorded, not asserted: ``_act`` contains any
++    exception raised by close, which would swallow an AssertionError."""
+     def __init__(self, raising, close_raises=False):
+         self.raising, self.close_raises = raising, close_raises
+         self.log, self.closing, self.inside, self.armed = [], False, False, False
++        self.violations = []
+         handlers: dict = {TERM: self.previous, INT: self.previous}
+         self.signals = early._ExitSignals(handlers, self.close)
+ 
+     def close(self):
+-        assert not self.closing, 'close re-entered'
+-        assert not self.inside, 'close run inside a previous handler'
++        if self.closing:
++            self.violations.append('close re-entered')
++        if self.inside:
++            self.violations.append('close run inside a previous handler')
+         self.closing = True
+         self.log.append('close')
+         self.closing = False
+@@ -33,8 +39,10 @@
+             raise TimeoutError('custody retained; close() again')
+ 
+     def previous(self, signum, frame):
+-        assert not self.closing, 'handler ran inside a close'
+-        assert not self.inside, 'handler ran inside another handler'
++        if self.closing:
++            self.violations.append('handler ran inside a close')
++        if self.inside:
++            self.violations.append('handler ran inside another handler')
+         self.inside = True
+         self.log.append(signal.Signals(signum).name)
+         self.inside = False
+@@ -47,17 +55,21 @@
+ _CODES |= {_Run.close.__code__, _Run.previous.__code__}  # also inside a close and a previous handler
+ 
+ 
+-def _inject_at(boundary, run, scenario):
+-    """Run ``scenario``, delivering SIGINT at line event number ``boundary`` inside the dispatcher,
+-    with the interrupted frame, as CPython passes it. Line events include each handler's first
+-    line, so the window before an outer handler queued itself is covered.
++def _inject_at(boundary, run, scenario, granularity='line'):
++    """Run ``scenario``, delivering SIGINT at event number ``boundary`` inside the dispatcher, with
++    the interrupted frame, as CPython passes it. ``granularity`` 'line' counts line events (each
++    handler's first line included, so the window before an outer handler queued itself is covered);
++    'opcode' counts every bytecode, which is a superset of CPython's eval-breaker points (it also
++    covers the instructions after a function's last line, e.g. POP_TOP/RETURN_VALUE/RERAISE).
+     Returns (whether it was injected, the exception that escaped, if any)."""
+     seen, injected = [0], [False]
+ 
+     def trace(frame, event, arg):
+         if frame.f_code not in _CODES:
+             return None
+-        if event == 'line' and not injected[0] and run.armed:
++        if granularity == 'opcode':
++            frame.f_trace_opcodes = True
++        if event == granularity and not injected[0] and run.armed:
+             seen[0] += 1
+             if seen[0] == boundary:
+                 injected[0] = True
+@@ -89,25 +101,28 @@
+     return scenario
+ 
+ 
++@pytest.mark.parametrize('granularity', ['call', 'line', 'opcode'])
+ @pytest.mark.parametrize('make', [_held_term_then_boundary, _term_at_depth_zero], ids=['held', 'depth-zero'])
+ @pytest.mark.parametrize('close_raises', [False, True], ids=['close-ok', 'close-keeps-custody'])
+ @pytest.mark.parametrize('raising', [False, True], ids=['handlers-return', 'handlers-exit'])
+-def test_a_second_signal_at_any_boundary_is_delivered_once_after_the_first(make, close_raises, raising):
++def test_a_second_signal_at_any_boundary_is_delivered_once_after_the_first(make, close_raises, raising,
++                                                                            granularity):
+     boundaries = 0
+-    for boundary in range(1, 500):
++    for boundary in range(1, 5000):
+         run = _Run(raising, close_raises)
+-        injected, escaped = _inject_at(boundary, run, make(run))
++        injected, escaped = _inject_at(boundary, run, make(run), granularity)
+         if not injected:
+             break
+         boundaries += 1
+         # Both delivered, each once, in invocation order, each after its own close; nothing queued.
++        assert run.violations == [], (boundary, run.violations)
+         assert run.log == ['close', 'SIGTERM', 'close', 'SIGINT'], (boundary, run.log)
+         assert run.signals.pending == [] and run.signals.depth == 0, boundary
+         if raising:  # the later exit propagates (the earlier one is its context)
+             assert escaped is not None and escaped.code == INT, boundary
+         else:  # a close that kept custody never leaks into the interrupted code
+             assert escaped is None, boundary
+-    assert boundaries >= 10  # the trace really walked the dispatcher
++    assert boundaries >= (5 if granularity == 'call' else 10)  # the trace really walked the dispatcher
+ 
+ 
+ def test_a_signal_while_none_is_held_acts_at_once():
+@@ -144,3 +159,136 @@
+     with pytest.raises(SystemExit):
+         run.signals.handler(TERM, None)
+     assert run.log == ['close', 'SIGTERM'] and run.signals.depth == 0
++
++
++# Real CPython signal delivery. os.kill(self) runs the Python handler synchronously (PyErr_CheckSignals)
++# with the interrupted frames above it, as at an eval-breaker point; a trace event only picks the moment.
++# sys.call_tracing keeps the injected handler traced, so a later signal can land inside it (nesting).
++_REAL = (TERM, INT, signal.SIGUSR1, signal.SIGUSR2)
++_INJECT = (INT, signal.SIGUSR1, signal.SIGUSR2)
++
++
++@pytest.fixture(autouse=True)
++def _quiet_logging():
++    import logging
++    logging.disable(logging.CRITICAL)  # the contained close failure logs a traceback per delivery
++    yield
++    logging.disable(logging.NOTSET)
++
++
++@pytest.fixture
++def real_handlers():
++    saved = {s: signal.getsignal(s) for s in _REAL}
++    yield
++    for s, handler in saved.items():
++        signal.signal(s, handler)
++
++
++def _real_run(raising, close_raises, held, points):
++    """One scenario with real signals: SIGTERM held in a custody step (``held``) or acted on at once,
++    then one real signal at each event number in ``points`` (call/line/opcode/return/exception events
++    in the dispatcher, its close and the previous handler). Returns (violations, events seen)."""
++    run = _Run(raising, close_raises)
++    for s in _REAL:
++        run.signals.previous[s] = run.previous
++        signal.signal(s, run.signals.handler)
++    codes = _CODES
++    handler_code = early._ExitSignals.handler.__code__
++    count, invoked, sent, todo = [0], [], [0], list(points)
++    pid = os.getpid()
++
++    def trace(frame, event, arg):
++        if frame.f_code not in codes:
++            return None
++        frame.f_trace_opcodes = True
++        if event == 'call' and frame.f_code is handler_code:
++            invoked.append(frame.f_locals['signum'])  # CPython invocation order
++        if run.armed and todo:
++            count[0] += 1
++            if count[0] == todo[0]:
++                todo.pop(0)
++                signum = _INJECT[sent[0]]
++                sent[0] += 1
++                mark = len(invoked)
++                try:
++                    sys.call_tracing(os.kill, (pid, signum))
++                finally:
++                    if signum not in invoked[mark:]:  # 3.11 does not trace the nested handler
++                        invoked.insert(mark, signum)
++        return trace
++
++    sys.settrace(trace)
++    escaped = None
++    try:
++        if held:
++            with run.signals.deferred():
++                os.kill(pid, TERM)
++                run.armed = True
++        else:
++            run.armed = True
++            os.kill(pid, TERM)
++    except SystemExit as error:
++        escaped = error
++    finally:
++        sys.settrace(None)
++    expected = [step for s in invoked for step in ('close', signal.Signals(s).name)]
++    violations = list(run.violations)
++    if run.log != expected:
++        violations.append(f'log {run.log} != {expected}')
++    if run.signals.pending or run.signals.depth:
++        violations.append(f'pending={run.signals.pending} depth={run.signals.depth}')
++    if raising and (escaped is None or escaped.code != invoked[-1]):
++        violations.append(f'escaped {escaped and escaped.code!r}, want {invoked[-1]}')
++    if not raising and escaped is not None:
++        violations.append(f'leaked {escaped!r}')
++    return violations, count[0]
++
++
++def test_real_signal_while_the_delivered_handler_frame_returns_is_not_delivered_again(real_handlers):
++    """Review of 04efe26f2c: SIGINT handled after the SIGTERM invocation dropped its delivered entry,
++    while its frame was still on the stack, queued SIGTERM again (previous handler and close twice)."""
++    run = _Run(raising=False)
++    signal.signal(TERM, run.signals.handler)
++    signal.signal(INT, run.signals.handler)
++    fired = []
++
++    def trace(frame, event, arg):
++        if frame.f_code is early._ExitSignals.handler.__code__:
++            if event == 'return' and not fired and frame.f_locals['signum'] == TERM:
++                fired.append(True)
++                os.kill(os.getpid(), INT)  # the SIGTERM handler frame is still on the stack
++            return trace
++        return None
++    sys.settrace(trace)
++    try:
++        os.kill(os.getpid(), TERM)
++    finally:
++        sys.settrace(None)
++    assert fired and run.violations == []
++    assert run.log == ['close', 'SIGTERM', 'close', 'SIGINT']
++    assert run.signals._queue == {} and run.signals.depth == 0
++
++
++@pytest.mark.parametrize('held', [True, False], ids=['held', 'depth-zero'])
++@pytest.mark.parametrize('close_raises', [False, True], ids=['close-ok', 'close-keeps-custody'])
++@pytest.mark.parametrize('raising', [False, True], ids=['handlers-return', 'handlers-exit'])
++def test_real_nested_signals_are_each_delivered_once_in_invocation_order(real_handlers, raising,
++                                                                         close_raises, held):
++    """One real signal at every event, then (sampled) a second one at a later event of that run,
++    including inside the handler the first one ran (a nested invocation)."""
++    rng = random.Random(4647)
++    _, total = _real_run(raising, close_raises, held, [10 ** 9])
++    assert total >= 20
++    failures, runs = [], 0
++    for first in range(1, total + 1):
++        violations, after = _real_run(raising, close_raises, held, [first, 10 ** 9])
++        runs += 1
++        if violations:
++            failures.append(([first], violations))
++        if after > first:
++            plan = [first, rng.randint(first + 1, after)]
++            violations, _ = _real_run(raising, close_raises, held, plan)
++            runs += 1
++            if violations:
++                failures.append((plan, violations))
++    assert failures == [], (runs, failures[:3])
+-- 
+2.43.0
+

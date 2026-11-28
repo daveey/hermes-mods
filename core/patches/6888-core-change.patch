@@ -1,0 +1,421 @@
+From c2b6fa8e08d68996c8d11111a42fe799a7a23b28 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 01:31:45 +0000
+Subject: [PATCH 6888] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit c2b6fa8e08d68996c8d11111a42fe799a7a23b28.
+
+---
+diff --git a/docs/kanban-replay-final-audit.md b/docs/kanban-replay-final-audit.md
+index b245d48026141050c459472664bc9055f089679a..0f8f363db1494919c6d4cfac2a75999bfdf90442 100644
+--- a/docs/kanban-replay-final-audit.md
++++ b/docs/kanban-replay-final-audit.md
+@@ -47,10 +47,25 @@
+    settlements, uncertain successor/reopen, bad consuming metadata, compact JSON,
+    changed verdict refusal and exclusion of current-row reply enrichment.
+ 
+-   This is **not yet production HTTP one-round-trip or throughput acceptance**:
+-   `kanban_sync_exposure.send` still performs a pinned credential capability probe
+-   for each mutation. Preserve that exposure/authentication boundary while designing
+-   session-scoped reuse; never simply omit the probe. The real receiver's reply
++   The production HTTP sender now pins a private transport, immutable credential
++   snapshot and one capability response for the entire sender turn. Capability,
++   inspect, session, mutation, recovery and final ACK all use that same transport;
++   each mutation still commits exposure before its body leaves. A new public turn
++   starts a new snapshot/probe, never a cross-turn or cross-Board cache. Legacy
++   sends retain their independent per-mutation pin/probe.
++
++   Seven real-loopback tests exercise20 settled operations with one kept-alive
++   connection and exactly capability→inspect→session→20ops→ACK, replacement of the
++   outer credential during the initial probe, capability refusal, turn boundaries,
++   actual accepted-body/lost-reply→reopen→no-resend recovery, and read-only or open
++   transaction exposure refusal. Separate SQLite readers verify each exposure is
++   committed, bound to its full wire and matching authenticated identity before
++   the HTTP body is processed. This proves the production HTTP request sequence
++   against a fixture, **not realistic-latency/lease throughput or real Board
++   interoperability**. Two unchanged-source assertions failed first: redundant
++   probes and outer-credential replacement during the initial session probe.
++
++   The real receiver's reply
+    shape was read from `settleReplay` at hub main f4ca27cfe489b413c1bc576684b9655ed2a1cac1,
+    not invented from client expectations. Its current ingress reads top-level
+    `op.ack`, whereas the frozen sender stores `op.replay.ack`; this interoperability
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 396205ddb92ba8b57443df535402361e58c6826f..6a0812aa978431d4113d674d054b54ebcf1528bf 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -67,7 +67,7 @@
+         from hermes_cli import kanban_replay_existence as existence
+         existence.guard(conn)
+         try:
+-            return _push_strict(conn, hub, board, gateway, max_batches=max_batches,
++            return _push_authenticated(conn, hub, board, gateway, max_batches=max_batches,
+                                 primary=primary, before_head=before_head, seen={} if seen is None else seen)
+         except existence.CurrentRowHold as exc:
+             from hermes_cli.kanban_replay_episodes import interrupt
+@@ -86,12 +86,28 @@
+                                max_batches=max_batches, before_head=before_head, seen=seen)
+ 
+ 
+-def _push_strict(conn, hub, board, gateway, *, max_batches, primary, before_head, seen):
++def _push_authenticated(conn, hub, board, gateway, *, max_batches, primary, before_head, seen):
++    from hermes_cli import kanban_sync_client as client
++    if isinstance(hub, client._HTTP_HUB):
++        journal.snapshot(conn)  # Corrupt local custody refuses before even a read-only probe.
++        from hermes_cli.kanban_sync_exposure import replay_session
++        with replay_session(hub, board) as (transport, capability, send_ops):
++            return _push_strict(conn, transport, board, gateway, max_batches=max_batches,
++                                primary=primary, before_head=before_head, seen=seen,
++                                capability=capability, send_ops=send_ops)
++    return _push_strict(conn, hub, board, gateway, max_batches=max_batches,
++                        primary=primary, before_head=before_head, seen=seen)
++
++
++def _push_strict(conn, hub, board, gateway, *, max_batches, primary, before_head, seen,
++                 capability=None, send_ops=None):
+     from hermes_cli import kanban_sync_client as client
+     root = f'/v2/boards/{quote(board, safe="")}/replay/'
+     out = client.PushResult()
+     local = journal.snapshot(conn)
+-    cap = hub._call('GET', root + 'capability')
++    if isinstance(hub, client._HTTP_HUB) and send_ops is None:
++        raise ValueError('strict HTTP transport requires pinned session')
++    cap = hub._call('GET', root + 'capability') if capability is None else capability
+     if (cap.get('processed_prefix') is not True or
+             cap.get('board_incarnation') != local['board_incarnation'] or
+             cap.get('gateway_principal') != local['gateway_principal']):
+@@ -382,9 +398,8 @@
+             if not allowed:
+                 break
+         wire['replay']['session'] = remote['session']
+-        if isinstance(hub, client._HTTP_HUB):
+-            from hermes_cli.kanban_sync_exposure import send
+-            reply = send(hub, conn, board, [wire], replay=identity)
++        if send_ops is not None:
++            reply = send_ops(conn, [wire], identity)
+         else:
+             reply = hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
+         out.sent += 1
+diff --git a/hermes_cli/kanban_sync_exposure.py b/hermes_cli/kanban_sync_exposure.py
+index 0e7efba62c9cbbcaa11cdfcdff9122ff298de918..683074a12bfefb31295b0e9cf0b098769362313e 100644
+--- a/hermes_cli/kanban_sync_exposure.py
++++ b/hermes_cli/kanban_sync_exposure.py
+@@ -9,6 +9,7 @@
+ 
+ import hashlib
+ import json
++from contextlib import contextmanager
+ from urllib.parse import quote
+ 
+ from hermes_cli.kanban_db_connect import write_txn
+@@ -64,6 +65,33 @@
+                          (json.dumps(history, sort_keys=True, separators=(',', ':'), allow_nan=False), row[0]))
+ 
+ 
++@contextmanager
++def replay_session(hub, board):
++    """One immutable credential snapshot owns capability, session and ops I/O.
++
++    Reuse is confined to this sender turn, never across reenrollment or boards.
++    The closure retains its own capability copy so callers cannot relabel an
++    exposure by changing the returned capability. Each exposure still commits
++    before its operation body; a connection failure never skips that commit.
++    """
++    from hermes_cli.kanban_sync_client import Hub
++    root = f'/v2/boards/{quote(board, safe="")}/replay/'
++    transport = Hub(hub.ident, timeout=hub.timeout, deadline=hub.deadline)
++    try:
++        capability = transport._call('GET', root + 'capability')
++        observed_capability = dict(capability)
++
++        def send_ops(conn, ops, replay):
++            if conn.in_transaction:
++                raise ValueError('exposure requires a standalone durable commit before I/O')
++            _observe(conn, ops, board, root + 'ops', transport.ident, observed_capability)
++            return transport._call('POST', root + 'ops', dict(replay, ops=ops))
++
++        yield transport, capability, send_ops
++    finally:
++        transport.close()
++
++
+ def send(hub, conn, board, ops, *, replay=None):
+     """Pin the credentials for capability AND mutation, including header creation.
+ 
+diff --git a/tests/hermes_cli/test_kanban_replay_http_session.py b/tests/hermes_cli/test_kanban_replay_http_session.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f463d27676b26fdf230363b7ec29b12b403840d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_http_session.py
+@@ -0,0 +1,203 @@
++"""Production HTTP request budget against a loopback fixture, not Board proof."""
++import hashlib
++import json
++import sqlite3
++import threading
++from contextlib import contextmanager
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli.test_kanban_replay_ack_carrier import AckReceiver
++from tests.hermes_cli.test_kanban_replay_exposure import history
++from tests.hermes_cli import test_kanban_replay_sender as sender
++
++live = sender.live
++
++
++@contextmanager
++def serving(conn, receiver, *, before_reply=None, lose_ops_reply=False):
++    path = conn.execute('PRAGMA database_list').fetchone()[2]
++    requests = []
++    observations = []
++    errors = []
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = 'HTTP/1.1'
++
++        def do_GET(self):
++            self.reply('GET')
++
++        def do_POST(self):
++            self.reply('POST')
++
++        def reply(self, method):
++            try:
++                auth = self.headers.get('Authorization')
++                requests.append((method, self.path, auth, self.client_address))
++                length = int(self.headers.get('Content-Length', '0'))
++                body = json.loads(self.rfile.read(length)) if length else None
++                if self.path.endswith('/ops'):
++                    with sqlite3.connect('file:' + path + '?mode=ro', uri=True) as observed:
++                        observed.row_factory = sqlite3.Row
++                        for op in body['ops']:
++                            saved = history(observed, op['client_op_id'])
++                            assert saved is not None, 'HTTP body preceded exposure commit'
++                            assert saved['exposures'], 'HTTP body preceded durable exposure entry'
++                            entry = saved['exposures'][-1]
++                            assert entry['wire'] == op
++                            assert entry['credential_epoch'] == hashlib.sha256(b'fixture-key').hexdigest()
++                            assert entry['gateway_principal'] == receiver.slot['gateway_principal']
++                            assert entry['board_incarnation'] == receiver.slot['board_incarnation']
++                            assert auth == 'Bearer fixture-key'
++                            observations.append(saved)
++                reply = receiver._call(method, self.path, body)
++                if lose_ops_reply and self.path.endswith('/ops'):
++                    self.close_connection = True
++                    return
++                if before_reply is not None:
++                    before_reply(self.path)
++                data = json.dumps(reply).encode()
++                self.send_response(200)
++                self.send_header('Content-Length', str(len(data)))
++                self.end_headers()
++                self.wfile.write(data)
++            except Exception as exc:
++                errors.append(exc)
++                self.close_connection = True
++
++        def log_message(self, *_args):
++            pass
++
++    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f'http://127.0.0.1:{server.server_port}', requests, observations
++    finally:
++        server.shutdown()
++        thread.join(5)
++        server.server_close()
++        assert not thread.is_alive()
++        assert not errors, errors
++
++
++def test_http_backlog_has_one_capability_probe_and_one_roundtrip_per_mutation(live):
++    for n in range(20):
++        kb.create_task(live, title=f'HTTP backlog {n}', assignee='worker')
++    receiver = AckReceiver()
++    with serving(live, receiver) as (url, requests, observations):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            result = client.push(live, hub, 'default', 'macbook', primary=False, max_batches=20)
++        finally:
++            hub.close()
++    assert result.sent == result.applied == 20
++    actions = [path.rsplit('/', 1)[-1] for _, path, _, _ in requests]
++    assert actions == ['capability', 'inspect', 'session'] + ['ops'] * 20 + ['ack']
++    assert len({address for _, _, _, address in requests}) == 1, 'session did not reuse its HTTP connection'
++    assert len(observations) == 20
++    assert all(item['certified'] is False for item in observations)
++    assert journal.snapshot(live)['settled'] == receiver.slot['a'] == '20'
++    assert journal.pending_wire(live) is None
++
++
++def test_outer_credential_replacement_during_probe_cannot_change_session_headers(live):
++    kb.create_task(live, title='immutable session credentials', assignee='worker')
++    receiver = AckReceiver()
++    hub = None
++
++    def replace(path):
++        if path.endswith('/capability'):
++            hub.ident = client.Identity(url, 'replacement-key', 'replacement-display')
++
++    with serving(live, receiver, before_reply=replace) as (url, requests, observations):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            assert client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++        finally:
++            hub.close()
++    assert {auth for _, _, auth, _ in requests} == {'Bearer fixture-key'}
++    assert len(observations) == 1
++
++
++def test_capability_refusal_never_opens_session_or_sends_mutation(live):
++    kb.create_task(live, title='unavailable capability', assignee='worker')
++    receiver = AckReceiver()
++    receiver.supported = False
++    with serving(live, receiver) as (url, requests, observations):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            with pytest.raises(ValueError, match='replay capability unavailable'):
++                client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
++        finally:
++            hub.close()
++    assert len(requests) == 1 and observations == []
++    assert journal.pending_wire(live) is None
++    assert live.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] > 0
++
++
++def test_each_public_turn_reprobes_and_uses_a_new_pinned_connection(live):
++    receiver = AckReceiver()
++    with serving(live, receiver) as (url, requests, observations):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            for n in range(2):
++                kb.create_task(live, title=f'separate turn {n}', assignee='worker')
++                assert client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++        finally:
++            hub.close()
++    assert receiver.calls == ['capability', 'inspect', 'session', 'ops', 'ack'] * 2
++    assert len({address for _, _, _, address in requests}) == 2
++    assert len(observations) == 2
++
++
++def test_actual_http_reply_loss_reopen_recovers_without_resend(live):
++    from pathlib import Path
++    from hermes_cli import kanban_db_connect as kbc
++    kb.create_task(live, title='accepted then disconnected', assignee='worker')
++    receiver = AckReceiver()
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    with serving(live, receiver, lose_ops_reply=True) as (url, requests, observations):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            with pytest.raises(OSError):
++                client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
++            pending = journal.pending_wire(live)
++            assert pending is not None and journal.snapshot(live)['settled'] == '0'
++            with kbc.connect(path) as reopened:
++                assert journal.pending_wire(reopened) == pending
++                assert client.push(reopened, hub, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++                assert journal.pending_wire(reopened) is None
++                assert journal.snapshot(reopened)['settled'] == receiver.slot['a'] == '1'
++        finally:
++            hub.close()
++    assert len(receiver.sent) == len(observations) == 1
++    assert [p for _, p, _, _ in requests if p.endswith('/ops')] == ['/v2/boards/default/replay/ops']
++    assert receiver.calls.count('capability') == 2
++
++
++@pytest.mark.parametrize('uncommitted', [False, True])
++def test_pinned_session_refuses_mutation_without_durable_exposure(live, uncommitted):
++    from hermes_cli.kanban_sync_exposure import replay_session
++    tid = kb.create_task(live, title='exposure commit refusal', assignee='worker')
++    row = live.execute('SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone()
++    receiver = AckReceiver()
++    path = live.execute('PRAGMA database_list').fetchone()[2]
++    with serving(live, receiver) as (url, requests, observations):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            with replay_session(hub, 'default') as (_transport, _capability, send_ops):
++                with sqlite3.connect('file:' + path + '?mode=ro', uri=True) as readonly:
++                    if uncommitted:
++                        readonly.execute('BEGIN')
++                    error = ValueError if uncommitted else sqlite3.OperationalError
++                    with pytest.raises(error, match='standalone durable commit|readonly'):
++                        send_ops(readonly, [dict(client_op_id=row[0])], {})
++        finally:
++            hub.close()
++    assert len(requests) == 1 and observations == []
++    assert history(live, row[0])['exposures'] == []
+diff --git a/tests/hermes_cli/test_kanban_replay_observation.py b/tests/hermes_cli/test_kanban_replay_observation.py
+index d6cb51a84329d18c2f4d43a93dd12e4e318e7574..9ae5fe25d1e8ce26e9d12470b2d7d151f79f9bec 100644
+--- a/tests/hermes_cli/test_kanban_replay_observation.py
++++ b/tests/hermes_cli/test_kanban_replay_observation.py
+@@ -261,18 +261,32 @@
+     local = journal.snapshot(live)
+     with kbc.write_txn(live):
+         live.execute(deferred._SCHEMA)
+-        live.executemany('INSERT INTO kanban_replay_deferred1 VALUES (?,?,?,?,?)',
+-                         [(local['board_incarnation'], f'task-{i:04d}', 'origin', 'done', 'hlc')
+-                          for i in range(500)])
+-    # Warm lazy schema creation before measuring the indexed selection work.
++        live.execute('INSERT INTO kanban_replay_deferred1 VALUES (?,?,?,?,?)',
++                     (local['board_incarnation'], 'task-0000', 'origin', 'done', 'hlc'))
++    # Warm lazy schema creation. Measure the entire reservation on the same
++    # connection: shared transaction/schema overhead may grow with core's schema,
++    # but adding tracked tasks must not add a table scan under the reservation.
+     observation._reserve(live, local)
+-    steps = []
+-    live.set_progress_handler(lambda: steps.append(100) or 0, 100)
+-    try:
+-        assert observation._reserve(live, local)[0] == 'task-0001'
+-    finally:
+-        live.set_progress_handler(None, 0)
+-    assert sum(steps) < 2000
++
++    def measure():
++        steps = []
++        live.set_progress_handler(lambda: steps.append(100) or 0, 100)
++        try:
++            task = observation._reserve(live, local)[0]
++        finally:
++            live.set_progress_handler(None, 0)
++        return task, sum(steps)
++
++    small_task, small_steps = measure()
++    assert small_task == 'task-0000'
++    with kbc.write_txn(live):
++        live.executemany('INSERT INTO kanban_replay_deferred1 '
++                         '(board_incarnation,task,origin,status,hlc) VALUES (?,?,?,?,?)',
++                         [(local['board_incarnation'], f'task-{i:04d}', 'origin', 'done', 'hlc')
++                          for i in range(1, 500)])
++    large_task, large_steps = measure()
++    assert large_task == 'task-0001'
++    assert large_steps <= small_steps + 200
+ 
+ 
+ def test_observation_and_retirement_rollback_together(live, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index d92923920d0dd96e530df19a1105b075e961e38f..5512ea16c561e711ff2547a7feda0806006dd1ab 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -148,9 +148,9 @@
+         kb.create_task(live, title='HTTP tracer', assignee='worker')
+         result = client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
+         assert result.applied == 1 and receiver.slot['a'] == '1'
+-        # A second authenticated capability probe pins exposure to the mutation's
+-        # own immutable credential snapshot, after issuance and before HTTP I/O.
+-        assert len(authorizations) == 7 and set(authorizations) == {'Bearer fixture-key'}
++        # The session pins capability and all mutation headers once. This slim
++        # fixture reply still needs an independent post-send inspection.
++        assert len(authorizations) == 6 and set(authorizations) == {'Bearer fixture-key'}
+     finally:
+         server.shutdown()
+         server.server_close()
+-- 
+2.43.0
+

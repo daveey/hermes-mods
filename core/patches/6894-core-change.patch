@@ -1,0 +1,480 @@
+From 2b96f93975a1dc8476106ae000fb791e4cd5f3d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 05:53:30 +0000
+Subject: [PATCH 6894] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 2b96f93975a1dc8476106ae000fb791e4cd5f3d5.
+
+---
+diff --git a/docs/kanban-replay-final-audit.md b/docs/kanban-replay-final-audit.md
+index f7d273bf96704a49274246c1f629efb49a497e3e..3dae8f98c788dd95307689a4b319906dd9d4f897 100644
+--- a/docs/kanban-replay-final-audit.md
++++ b/docs/kanban-replay-final-audit.md
+@@ -213,3 +213,33 @@
+ fence/writer2 proofs are not to be repeated. No activation, deploy or held-original
+ release occurs here. Section 9 rollback remains mandatory. Fresh independent
+ exact-head review, required CI and canonical ship still follow completed D work.
++
++## Independent review corrections (not approval)
++
++Review6034244968 at8bfa642467541d841f5e805749a49300d1161ddc found three
++introduced behavior defects. These corrections stay in the dormant sender PR:
++
++- Custody helpers no longer classify NULL/missing sync anchors as never enrolled
++  when the sender journal, recovery-loss marker or restore flag survives. Import,
++  lifecycle stripping, parent pruning/retirement and feed echoes refuse before
++  source edits. Thirty damaged-anchor/evidence/consumer cases retain exact source,
++  journal, parent and task bytes; five no-evidence legacy controls still progress.
++  Missing-row feed/import public preflights already refuse; their lower custody
++  helpers are additionally exercised under the writer, not bypassed in production.
++- Current-row retry deadlines now use monotonic time and a persisted process-clock
++  identity, just like general transport recovery. A foreign/legacy clock rearms
++  one bounded delay without resetting attempts or automatically resuming paused
++  faults. Six cases cover rollback, forward jumps, inclusive deadline progress,
++  process-clock replacement, legacy schema migration and unchanged paused state.
++  This is simulated interpreter-clock replacement, not an actual host reboot.
++- Optional observation treats production HTTP410/Resync as unavailable, interrupting
++  its timing episode and releasing its read token rather than escaping after ACK.
++  Three actual loopback HTTP cases (410,403,503) preserve old membership and pending
++  origins, retain committed settlement/ACK, release tokens and allow the next origin
++  event to drain. A read refusal is never empty membership or business success.
++
++All three defects were reproduced on unchanged production before their fixes.
++Historical malformed-reply, storage, model and migration evidence above is not
++independent approval. Exact-head consumer/mutation receipts, required CI, a fresh
++independent review and canonical landing are still separate gates. No activation,
++deployment, runtime hook, authorizer or reentrancy change is authorized here.
+diff --git a/hermes_cli/kanban_replay_existence.py b/hermes_cli/kanban_replay_existence.py
+index e6c496d7134aae59ab6b681dfb3e78582b9f503c..81989d6594d9e4354130e48f0eb8ece89a6b1ad0 100644
+--- a/hermes_cli/kanban_replay_existence.py
++++ b/hermes_cli/kanban_replay_existence.py
+@@ -1,7 +1,8 @@
+ """Bounded current-image recovery for one W=1 stream, not a result ledger. [daveey]"""
+ import json
+ import logging
+-from time import time
++from time import monotonic as time
++from uuid import uuid4
+ 
+ from hermes_cli import kanban_replay_journal as journal
+ from hermes_cli.kanban_db_connect import write_txn
+@@ -11,8 +12,35 @@
+     id INTEGER PRIMARY KEY CHECK(id=1), journal_id TEXT NOT NULL,
+     generation TEXT NOT NULL, sequence TEXT NOT NULL, op_id TEXT NOT NULL,
+     task TEXT NOT NULL, reason TEXT NOT NULL, recovery TEXT NOT NULL,
+-    attempts INTEGER NOT NULL, retry_after REAL NOT NULL, paused INTEGER NOT NULL
++    attempts INTEGER NOT NULL, retry_after REAL NOT NULL, paused INTEGER NOT NULL,
++    retry_clock TEXT NOT NULL DEFAULT ''
+ )'''
++_CLOCK = uuid4().hex
++
++
++def _schema(conn):
++    conn.execute(_SCHEMA)
++    if 'retry_clock' not in {row[1] for row in conn.execute('PRAGMA table_info(kanban_replay_existence_fault1)')}:
++        conn.execute("ALTER TABLE kanban_replay_existence_fault1 ADD COLUMN retry_clock TEXT NOT NULL DEFAULT ''")
++
++
++def _deadline(conn, held):
++    if held.get('retry_clock') == _CLOCK:
++        return held['retry_after']
++    # A restart/boot or legacy wall deadline cannot share our monotonic origin.
++    # Rearm once without resetting attempts or automatically resuming a pause.
++    with write_txn(conn):
++        state = journal.snapshot(conn)
++        pending = state['pending']
++        if (fault(conn) != held or pending is None or
++                (state['journal_id'], state['generation'], pending['sequence'], pending['op_id']) !=
++                tuple(held[key] for key in ('journal_id', 'generation', 'sequence', 'op_id'))):
++            raise SyncUnavailable('current-row recovery changed while reanchoring clock')
++        _schema(conn)
++        deadline = time() + min(60, 2 ** held['attempts'])
++        conn.execute('UPDATE kanban_replay_existence_fault1 SET retry_after=?,retry_clock=? WHERE id=1',
++                     (deadline, _CLOCK))
++    return deadline
+ 
+ 
+ class CurrentRowHold(ValueError, SyncUnavailable):
+@@ -32,7 +60,7 @@
+ 
+ def guard(conn):
+     held = fault(conn)
+-    if held and (held['paused'] or time() < held['retry_after']):
++    if held and (held['paused'] or time() < _deadline(conn, held)):
+         raise CurrentRowHold(f"Replay current-row hold: {held['reason']}; {held['recovery']}")
+ 
+ 
+@@ -50,7 +78,7 @@
+         recovery = (f'Inspect serving Board current state and reconcile its prerequisite; then '
+                     f'hermes kanban --board {board} sync replay-resume --expect {pending["op_id"]} '
+                     '--reason "owner verified prerequisite". Retry exact custody; never skip or cancel.')
+-        conn.execute(_SCHEMA)
++        _schema(conn)
+         old = fault(conn)
+         if old and (old['op_id'], old['journal_id'], old['generation'], old['sequence']) != (
+                 pending['op_id'], state['journal_id'], state['generation'], pending['sequence']):
+@@ -58,11 +86,12 @@
+         attempts = min(8, old['attempts'] + 1) if old else 1
+         paused = not error.transient or attempts >= 8
+         notify = paused and not (old and old['paused'])
+-        conn.execute('INSERT INTO kanban_replay_existence_fault1 VALUES (1,?,?,?,?,?,?,?,?,?,?) '
++        conn.execute('INSERT INTO kanban_replay_existence_fault1 VALUES (1,?,?,?,?,?,?,?,?,?,?,?) '
+                      'ON CONFLICT(id) DO UPDATE SET reason=excluded.reason,attempts=excluded.attempts,'
+-                     'retry_after=excluded.retry_after,paused=excluded.paused',
++                     'retry_after=excluded.retry_after,paused=excluded.paused,retry_clock=excluded.retry_clock',
+                      (state['journal_id'], state['generation'], pending['sequence'], pending['op_id'],
+-                      wire.get('uid', wire.get('task')), str(error)[:500], recovery, attempts, time() + min(60, 2 ** attempts), int(paused)))
++                      wire.get('uid', wire.get('task')), str(error)[:500], recovery, attempts,
++                      time() + min(60, 2 ** attempts), int(paused), _CLOCK))
+     if notify:
+         logging.getLogger(__name__).error('Replay current-row hold: %s', fault(conn))
+     guard(conn)
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+index 846e4865d1c622cd35fa226ac5ad6f102ba736bc..83f5869183c6fc1277e1f0206cfbbcc336610829 100644
+--- a/hermes_cli/kanban_replay_journal.py
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -113,11 +113,22 @@
+     return _read(conn)[0]
+ 
+ 
++def _bound_custody(conn: sqlite3.Connection) -> bool:
++    """A lost anchor cannot erase surviving enrollment or recovery-loss evidence."""
++    anchor = conn.execute('SELECT journal_id,replay_restore_required FROM kanban_sync_state LIMIT 1').fetchone()
++    if anchor is not None and anchor[0] is not None:
++        return True
++    evidence = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN "
++                            "('kanban_replay_sender1','kanban_replay_recovery_loss1') LIMIT 1").fetchone()
++    if evidence or (anchor is not None and anchor[1] != 0):
++        raise ValueError('journal restore reconciliation required; custody LOSS or invalid anchor')
++    return False
++
++
+ def guard_import(conn: sqlite3.Connection, tables: tuple[str, ...], only: Mapping[str, set[str]] | None) -> bool:
+     """Fence import scopes under the writer reservation; imports are not replay repair."""
+     _transaction(conn)
+-    anchor = conn.execute('SELECT journal_id FROM kanban_sync_state').fetchone()
+-    if anchor is None or anchor[0] is None:
++    if not _bound_custody(conn):
+         return False
+     _reserve(conn)
+     _state, encoded = _read(conn)
+@@ -134,8 +145,7 @@
+ 
+ def issued_operation(conn: sqlite3.Connection) -> str | None:
+     """Reserve and validate bound custody before an explicit identity-changing repair."""
+-    anchor = conn.execute('SELECT journal_id FROM kanban_sync_state LIMIT 1').fetchone()
+-    if anchor is None or anchor[0] is None:
++    if not _bound_custody(conn):
+         return None
+     _reserve(conn)
+     state, _encoded = _read(conn)
+@@ -150,8 +160,7 @@
+     bookkeeping transaction. Ordinary cleanup has no authority to infer a final
+     outcome from local row existence or a newer sync version.
+     """
+-    anchor = conn.execute('SELECT journal_id FROM kanban_sync_state LIMIT 1').fetchone()
+-    if anchor is None or anchor[0] is None:
++    if not _bound_custody(conn):
+         return None
+     _reserve(conn)
+     state, encoded = _read(conn)
+diff --git a/hermes_cli/kanban_replay_observation.py b/hermes_cli/kanban_replay_observation.py
+index 01431c1c99b6e6b546b47f241491267cfa6d95c8..24caa7a22df9be77ecf2ded71583d29f30369256 100644
+--- a/hermes_cli/kanban_replay_observation.py
++++ b/hermes_cli/kanban_replay_observation.py
+@@ -108,7 +108,7 @@
+ 
+ def observe_one(conn, hub, root, local, cap):
+     """Observe at most one tracked task outside the writer; failure never means empty."""
+-    from hermes_cli.kanban_sync_client import HubError
++    from hermes_cli.kanban_sync_client import HubError, Resync
+     if cap.get('deferred_observation') != 'origin_pending1':
+         episodes.interrupt(conn)
+         return dict(status='unavailable')
+@@ -120,7 +120,7 @@
+     try:
+         reply = hub._call('GET', root + 'deferred?task=' + quote(task, safe=''))
+         deferred.validate_membership(reply, local, task)
+-    except (OSError, ValueError, HubError) as exc:
++    except (OSError, ValueError, HubError, Resync) as exc:
+         episodes.interrupt(conn)
+         with write_txn(conn):
+             _release(conn, local['board_incarnation'], task, token)
+diff --git a/tests/hermes_cli/test_kanban_replay_existence_clock.py b/tests/hermes_cli/test_kanban_replay_existence_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a24a167b748081e2c3dddbf5933036c99899bc0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_existence_clock.py
+@@ -0,0 +1,99 @@
++"""Current-row recovery uses bounded clock-owned retry deadlines."""
++import importlib
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_replay_existence as existence
++from hermes_cli import kanban_replay_journal as journal
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli import test_kanban_replay_current_row as current
++from tests.hermes_cli import test_kanban_replay_existence as cases
++from tests.hermes_cli.test_kanban_replay_http_recovery import clocks
++
++live = helpers.live
++
++
++@contextmanager
++def current_clocks(monkeypatch):
++    try:
++        with clocks(monkeypatch) as clock:
++            importlib.reload(existence)
++            yield clock
++    finally:
++        importlib.reload(existence)
++
++
++def fail_read(*args):
++    raise OSError('current service unavailable')
++
++
++@pytest.mark.parametrize('jump,elapsed,progress', [(-3600, 61, True), (3600, 1, False), (0, 2, True)])
++def test_wall_jump_does_not_extend_or_skip_retry(live, monkeypatch, jump, elapsed, progress):
++    _, receiver = current.issued_parent(live)
++    frozen = journal.pending_wire(live)
++    with current_clocks(monkeypatch) as clock:
++        original = receiver.row_evidence
++        receiver.row_evidence = fail_read
++        cases.hold(live, receiver)
++        assert existence.fault(live)['attempts'] == 1
++        receiver.row_evidence = original
++        before = list(receiver.calls)
++        clock['wall'] += jump + elapsed
++        clock['mono'] += elapsed
++        cases.hold(live, receiver)
++        assert (receiver.calls != before) is progress
++        if progress:
++            assert journal.pending_wire(live) is None
++            assert existence.fault(live) is None
++            assert len(receiver.sent) == 1
++        else:
++            assert journal.pending_wire(live) == frozen
++            assert existence.fault(live)['attempts'] == 1
++
++
++@pytest.mark.parametrize('legacy', [False, True])
++def test_foreign_clock_reanchors_once_without_resetting_attempts(live, monkeypatch, legacy):
++    _, receiver = current.issued_parent(live)
++    frozen = journal.pending_wire(live)
++    with current_clocks(monkeypatch) as clock:
++        receiver.row_evidence = fail_read
++        cases.hold(live, receiver)
++        if legacy:
++            with kbc.write_txn(live):
++                if 'retry_clock' in {row[1] for row in live.execute('PRAGMA table_info(kanban_replay_existence_fault1)')}:
++                    live.execute('ALTER TABLE kanban_replay_existence_fault1 DROP COLUMN retry_clock')
++                live.execute('UPDATE kanban_replay_existence_fault1 SET retry_after=99999999')
++        importlib.reload(existence)
++        clock['mono'] = 10.0
++        reopened = helpers.reopen(live)
++        receiver.conn = reopened
++        try:
++            before = list(receiver.calls)
++            cases.hold(reopened, receiver)
++            held = existence.fault(reopened)
++            assert held['retry_after'] == 12.0
++            assert held['attempts'] == 1 and not held['paused']
++            assert receiver.calls == before and journal.pending_wire(reopened) == frozen
++            cases.hold(reopened, receiver)
++            assert existence.fault(reopened) == held, 'same clock must not renew its own deadline'
++            clock['mono'] = 12.0
++            cases.hold(reopened, receiver)
++            assert existence.fault(reopened)['attempts'] == 2
++            assert journal.pending_wire(reopened) == frozen
++        finally:
++            reopened.close()
++
++
++def test_paused_fault_is_not_rearmed_by_foreign_clock(live, monkeypatch):
++    _, receiver = current.issued_parent(live)
++    receiver.evidence.update(state='unknown', row=None)
++    with current_clocks(monkeypatch):
++        cases.hold(live, receiver)
++        before = existence.fault(live)
++        calls = list(receiver.calls)
++        importlib.reload(existence)
++        cases.hold(live, receiver)
++        assert existence.fault(live) == before and before['paused'] == 1
++        assert receiver.calls == calls
+diff --git a/tests/hermes_cli/test_kanban_replay_http_session.py b/tests/hermes_cli/test_kanban_replay_http_session.py
+index bb7e40796ed69b6ed1c7317d72c2205898fea4a9..4819930c7b9a8566e9855f86c5ff407ead39da88 100644
+--- a/tests/hermes_cli/test_kanban_replay_http_session.py
++++ b/tests/hermes_cli/test_kanban_replay_http_session.py
+@@ -19,7 +19,7 @@
+ 
+ 
+ @contextmanager
+-def serving(conn, receiver, *, before_reply=None, lose_ops_reply=False, encode_reply=None):
++def serving(conn, receiver, *, before_reply=None, lose_ops_reply=False, encode_reply=None, response_status=None):
+     path = conn.execute('PRAGMA database_list').fetchone()[2]
+     requests = []
+     observations = []
+@@ -61,7 +61,7 @@
+                 if before_reply is not None:
+                     before_reply(self.path)
+                 data = json.dumps(reply).encode() if encode_reply is None else encode_reply(self.path, reply)
+-                self.send_response(200)
++                self.send_response(200 if response_status is None else response_status(self.path))
+                 self.send_header('Content-Length', str(len(data)))
+                 self.end_headers()
+                 self.wfile.write(data)
+diff --git a/tests/hermes_cli/test_kanban_replay_lost_anchor_cleanup.py b/tests/hermes_cli/test_kanban_replay_lost_anchor_cleanup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b45b80998711514580bfe55ed4f397d61d2e90c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_lost_anchor_cleanup.py
+@@ -0,0 +1,80 @@
++"""Lost anchors are not permission to destroy surviving replay custody."""
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client, kanban_sync_envelope as envelopes
++from hermes_cli.kanban_containment_outbox import strip_lifecycle
++from hermes_cli.kanban_replay_admission import mark_rebuilt
++from tests.hermes_cli.test_kanban_replay_parent_custody import issued_parent
++from tests.hermes_cli.test_kanban_replay_feed_custody import echo
++from tests.hermes_cli import test_kanban_replay_sender as sender
++
++live = sender.live
++
++
++def custody(conn):
++    tables = ('kanban_sync_outbox', 'kanban_sync_parent_envelopes', 'kanban_replay_sender1',
++              'kanban_replay_recovery_loss1', 'kanban_sync_state', 'tasks')
++    present = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    return {table: list(map(tuple, conn.execute(f'SELECT * FROM {table}'))) for table in tables if table in present}
++
++
++def consume(conn, tid, op_id, consumer):
++    if consumer == 'import':
++        client.import_board(conn, tables=['tasks'])
++    elif consumer == 'echo':
++        sync.apply_remote_changes(conn, [echo(conn, tid, op_id)], new_cursor=8, observers=False)
++    else:
++        with kbc.write_txn(conn):
++            actions = {'strip': lambda: strip_lifecycle(conn, tid),
++                       'prune': lambda: envelopes.prune_parents(conn),
++                       'retire': lambda: envelopes.retire_parent(conn, tid)}
++            actions[consumer]()
++
++
++@pytest.mark.parametrize('damage', ['null', 'missing'])
++@pytest.mark.parametrize('evidence', ['journal', 'loss', 'both'])
++@pytest.mark.parametrize('consumer', ['strip', 'prune', 'retire', 'echo', 'import'])
++def test_lost_anchor_refuses_destructive_consumers(live, damage, evidence, consumer):
++    tid, _, _ = issued_parent(live)
++    op_id = live.execute('SELECT op_id FROM kanban_sync_outbox LIMIT 1').fetchone()[0]
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_state SET journal_id=NULL' if damage == 'null' else 'DELETE FROM kanban_sync_state')
++        if evidence != 'journal':
++            mark_rebuilt(live, {'kanban_sync_state': {'known_lost': 1}})
++        if evidence == 'loss':
++            live.execute('DROP TABLE kanban_replay_sender1')
++        live.execute('UPDATE tasks SET sync_version=9 WHERE id=?', (tid,))
++    before = custody(live)
++    refusal = (ValueError, RuntimeError, client.SyncUnavailable)
++    with pytest.raises(refusal, match='custody LOSS or invalid anchor|sync is not enabled|does not sync'):
++        consume(live, tid, op_id, consumer)
++    # Missing sync rows refuse before public feed/import dispatch. Also exercise
++    # their custody helpers under the writer, rather than bypassing that preflight.
++    if damage == 'missing' and consumer in ('echo', 'import'):
++        with pytest.raises(ValueError, match='custody LOSS or invalid anchor'):
++            with kbc.write_txn(live):
++                if consumer == 'echo':
++                    journal.issued_operation(live)
++                else:
++                    journal.guard_import(live, ('tasks',), None)
++    assert custody(live) == before
++
++
++@pytest.mark.parametrize('consumer', ['strip', 'prune', 'retire', 'echo', 'import'])
++def test_never_enrolled_legacy_consumer_still_progresses(live, consumer):
++    tid, _, _ = issued_parent(live)
++    op_id = live.execute('SELECT op_id FROM kanban_sync_outbox LIMIT 1').fetchone()[0]
++    with kbc.write_txn(live):
++        live.execute('DROP TABLE kanban_replay_sender1')
++        live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++        live.execute('UPDATE tasks SET sync_version=9 WHERE id=?', (tid,))
++    consume(live, tid, op_id, consumer)
++    if consumer in ('prune', 'retire'):
++        assert not live.execute('SELECT 1 FROM kanban_sync_parent_envelopes').fetchone()
++    elif consumer == 'import':
++        assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks'").fetchone()
++    elif consumer == 'echo':
++        assert not live.execute('SELECT 1 FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
+diff --git a/tests/hermes_cli/test_kanban_replay_observation_http.py b/tests/hermes_cli/test_kanban_replay_observation_http.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..723d79c5ce438d5bf8af6b8035abd1d694d555de
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_observation_http.py
+@@ -0,0 +1,56 @@
++"""Real HTTP observation refusals do not fail already ACKed transport."""
++import pytest
++
++from hermes_cli import kanban_replay_deferred as deferred
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_replay_observation as observation
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_deferred as helpers
++from tests.hermes_cli import test_kanban_replay_observation as reads
++from tests.hermes_cli.test_kanban_replay_http_session import serving
++
++live = helpers.live
++
++
++@pytest.mark.parametrize('status', [410, 403, 503])
++def test_observation_http_refusal_releases_token_keeps_membership_and_transport(live, status, caplog):
++    task = helpers.intent(live)
++    reads.seed(live, task=task)
++    receiver = reads.Observing()
++    receiver.entries = [reads.entry('captured-origin')]
++    assert reads.poll(live, receiver)['status'] == 'observed'
++    prior = observation.observed(live)
++    state = journal.snapshot(live)
++    receiver.slot.update(h='1', a='1', last_op_id=state['last_op_id'],
++                         last_payload_sha256=state['last_payload_sha256'], last_verdict=state['last_verdict'])
++
++    def response_status(path):
++        return status if '/deferred?task=' in path else 200
++
++    with serving(live, receiver, response_status=response_status) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            result = client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
++            assert result.deferred == 1
++            assert receiver.slot['a'] == '2' and journal.pending_wire(live) is None
++            assert observation.observed(live) == prior, 'HTTP failure is not empty membership'
++            pending = deferred.pending(live)
++            assert pending and any(row['origin'] == 'captured-origin' for row in pending)
++            assert live.execute('SELECT COUNT(*) FROM kanban_replay_observation_reads1').fetchone()[0] == 0
++            assert 'Deferred observation unavailable' in caplog.text
++            assert '/deferred?task=' in requests[-1][1]
++            # The origin lifecycle event remains transportable despite the read failure.
++            original = receiver._call
++
++            def ordinary_event(method, path, body=None):
++                if path.endswith('/ops'):
++                    return helpers.helpers.Receiver._call(receiver, method, path, body)
++                return original(method, path, body)
++
++            receiver._call = ordinary_event
++            assert client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++            assert receiver.slot['a'] == '3' and receiver.sent[-1]['table'] == 'task_events'
++            assert deferred.pending(live) == pending
++            assert live.execute('SELECT COUNT(*) FROM kanban_replay_observation_reads1').fetchone()[0] == 0
++        finally:
++            hub.close()
+-- 
+2.43.0
+

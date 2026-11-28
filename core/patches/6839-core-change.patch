@@ -1,0 +1,366 @@
+From 1d4384103c4ab1b5113354cbfea489b101b2b4e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:19:18 +0000
+Subject: [PATCH 6839] Annotation holder counts custody and read sharing
+
+Public mirror of source commit 1d4384103c4ab1b5113354cbfea489b101b2b4e1.
+
+---
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index dd7984f4b6da7ac7dad93caec321ab0e2d0a7638..410f2947b459b15bc7e973ce9bceb84895b4acc2 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -404,9 +404,12 @@
+         ksa._bounded.record(scope, value, holder_counts.observed_at(read_at))
+         ksa._last_annotation[scope] = value
+         ksa._annotate_flight_result = value
+-        if not holder_counts.reused():
+-            ksa._annotation_copy.published(scope, value)
+-        publish(scope, prepared, value)
++        # The capture child has no plugin checks/sources; it may use its read
++        # locally, but must never replace the long-lived holder's shared copies.
++        if not ksa._bounded.in_capture_role():
++            if not holder_counts.reused():
++                ksa._annotation_copy.published(scope, value)
++            publish(scope, prepared, value)
+         return value
+     finally:
+         holder_counts.clear_use()
+diff --git a/hermes_cli/kanban_annotation_refresh.py b/hermes_cli/kanban_annotation_refresh.py
+index 3e9a94d8c8a8c93d65c97217b29b19ae0eb138ed..8a28dcdcd1e67a83162261c604639c25eef53f5b 100644
+--- a/hermes_cli/kanban_annotation_refresh.py
++++ b/hermes_cli/kanban_annotation_refresh.py
+@@ -10,6 +10,7 @@
+ 
+ from __future__ import annotations
+ 
++from contextlib import contextmanager
+ import contextvars
+ import logging
+ import threading
+@@ -18,6 +19,24 @@
+ 
+ _log = logging.getLogger("hermes_cli.kanban_session_activity")
+ 
++COPY_FIRST_MAX_AGE_S = 30.0
++_capture_role = contextvars.ContextVar('annotation_capture_role', default=False)
++
++
++@contextmanager
++def capture_role():
++    """Scope the plugin-incomplete child's reads, including bounded helper threads."""
++    token = _capture_role.set(True)
++    try:
++        yield
++    finally:
++        _capture_role.reset(token)
++
++
++def in_capture_role() -> bool:
++    return _capture_role.get()
++
++
+ # Wall time each published parts tuple was read (by identity): a served previous read keeps its own date.
+ _read_at: dict[tuple[str, ...], tuple[tuple, float]] = {}
+ 
+@@ -52,6 +71,22 @@
+     return parts is None or (display and observed_at is not None and time.time() - observed_at > 180.0)
+ 
+ 
++def recent_copy(candidate: tuple | None, saved_at: Callable[[Any], float | None]) -> tuple | None:
++    """``candidate`` when the capture child may serve it at once instead of starting a refresh it cannot finish.
++
++    A publication-age shortcut, not a data-age guarantee: a restart copy carries its SAVE time (``saved_at``), a
++    previous read its read time. Rows keep the copy's own date (``copy_at`` in ``annotate_kanban_activity``). Past
++    ``COPY_FIRST_MAX_AGE_S``, or with an unknown or future date, the caller runs the ordinary bounded refresh, and
++    the 180 s display horizon (:func:`unavailable`) still marks expired rows unknown.
++    """
++    if candidate is None:
++        return None
++    date = saved_at(candidate)
++    if date is None:
++        date = read_at(candidate)
++    return candidate if date is not None and 0 <= time.time() - date <= COPY_FIRST_MAX_AGE_S else None
++
++
+ def reset() -> None:
+     _read_at.clear()
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index e69f16e9d93444ba76b4ac98265a7c56c0ac704b..41f5fd7f1f8d8e2a15f8b068e11292eed1e9c090 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1826,7 +1826,10 @@
+         if parts is None:
+             parts = previous is not None and _revalidate.refresh_if_unchanged(scope, _refresh_annotation_locked)
+         parts = parts or _host_copy.adopt(scope)
+-    except BaseException:
++        if parts is None and display and _bounded.in_capture_role():
++            parts = _bounded.recent_copy(previous if previous is not None else _annotation_copy.seed(
++                scope, _last_annotation, _identity.freeze_annotation), _annotation_copy.observed_at)
++    except BaseException:  # health: allow BLE001 -- release owned lock before propagating candidate/read failures
+         _annotate_refresh_lock.release()
+         raise
+     if parts is not None:
+diff --git a/hermes_cli/sessions_capture_worker.py b/hermes_cli/sessions_capture_worker.py
+index 410c9c1a56f6dd3cddf2c56e95b6c683948f0b38..e66aca5a0a2d5d13cb5c70deecdb6cf179165a73 100644
+--- a/hermes_cli/sessions_capture_worker.py
++++ b/hermes_cli/sessions_capture_worker.py
+@@ -9,14 +9,21 @@
+ 
+ 
+ def capture(name, selector):
+-    from hermes_cli.web_routers import profiles
+-    from hermes_cli.web_json_response import native_json_response
+-    readers = {'sessions': profiles.get_profiles_sessions,
+-               'sessions_sidebar': profiles.get_profiles_sessions_sidebar.__wrapped__,
+-               'sessions_stamps': profiles.get_profiles_session_stamps}
+-    # No native binding is installed in this fresh child. Keep the canonical
+-    # SQL/policy/ordering and all seven annotation families, bypassing sidebar TTL.
+-    return native_json_response(readers[name](**selector)).body
++    from contextlib import nullcontext
++    import os
++    from hermes_cli.kanban_annotation_refresh import capture_role
++
++    # health: allow HX002 -- creator-defined rollback switch, never a credential
++    role = nullcontext() if os.environ.get('HERMES_SESSIONS_CAPTURE_COPY_FIRST') == '0' else capture_role()
++    with role:
++        from hermes_cli.web_routers import profiles
++        from hermes_cli.web_json_response import native_json_response
++        readers = {'sessions': profiles.get_profiles_sessions,
++                   'sessions_sidebar': profiles.get_profiles_sessions_sidebar.__wrapped__,
++                   'sessions_stamps': profiles.get_profiles_session_stamps}
++        # No native binding is installed in this fresh child. Keep the canonical
++        # SQL/policy/ordering and all seven annotation families, bypassing sidebar TTL.
++        return native_json_response(readers[name](**selector)).body
+ 
+ 
+ def main():
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+index 59f44eaf5c6711c9faf46a331051014a06c65153..b7f251fb362cc7a121b7c3987c8e94005f141b7e 100644
+--- a/hermes_cli/sessions_native_source.py
++++ b/hermes_cli/sessions_native_source.py
+@@ -141,6 +141,16 @@
+             for key in keys:
+                 self._dirty.pop(key)
+             self._capturing.update(keys)
++        # The feed retains the launch profile's context. Teach its long-lived
++        # holder this scope once per batch; a child's demand cannot do that.
++        # Do not pull annotation imports into early sessions bootstrap.
++        import sys
++        try:
++            ksa = sys.modules.get('hermes_cli.kanban_session_activity')
++            if ksa is not None:
++                ksa._host_copy.demand(ksa._origin_scope())
++        except Exception:  # health: allow BLE001 -- advisory holder demand must never fail capture
++            logger.debug('sessions annotation demand unavailable', exc_info=True)
+         try:
+             bodies = (self.reader_many(views) if self.reader_many is not None else
+                       [self.reader(*views[0])])
+diff --git a/tests/hermes_cli/test_sessions_capture_copy_first.py b/tests/hermes_cli/test_sessions_capture_copy_first.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2179446bdf7854e6c9b99be66ac5e81c774516c5
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_capture_copy_first.py
+@@ -0,0 +1,198 @@
++"""One-shot capture can reuse recent publications but cannot publish incomplete reads."""
++from contextlib import nullcontext
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_annotation_refresh as bounded
++
++
++def role():
++    # Exercise the old snapshot path too, rather than failing on a missing API.
++    return getattr(bounded, 'capture_role', nullcontext)()
++
++
++@pytest.fixture
++def snapshot(monkeypatch):
++    ksa._reset_cache_for_tests()
++    scope = ('copy-first-test',)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: scope)
++    monkeypatch.setattr(ksa, 'time', SimpleNamespace(time=lambda: 1000., monotonic=lambda: 10.))
++    monkeypatch.setattr(bounded, 'time', ksa.time)
++    monkeypatch.setattr(ksa._host_copy, 'demand', lambda *a, **kw: None)
++    monkeypatch.setattr(ksa._host_copy, 'adopt_display', lambda *a: None)
++    monkeypatch.setattr(ksa._host_copy, 'adopt', lambda *a: None)
++    monkeypatch.setattr(ksa._host_copy, 'peek_display', lambda scope, parts: parts)
++    monkeypatch.setattr(ksa._revalidate, 'refresh_if_unchanged', lambda *a: None)
++    monkeypatch.setattr(ksa._external_activity, 'stamp_boards', lambda *a: None)
++    monkeypatch.setattr(ksa._external_activity, 'stamp_replica_counts', lambda rows, *a: rows)
++    parts = ksa._identity.freeze_annotation(({'target': 3}, *({} for _ in range(10))))
++    monkeypatch.setattr(ksa._annotation_copy, 'load', lambda scope: (parts, 990.))
++    calls, threads = [], []
++    real = bounded.refresh_bounded
++    def refresh(refresh, lock, previous, wait_s):
++        calls.append(wait_s)
++        def read():
++            threads.append(threading.current_thread().name)
++            return previous
++        return real(read, lock, previous, wait_s)
++    monkeypatch.setattr(bounded, 'refresh_bounded', refresh)
++    yield scope, parts, calls, threads
++    assert ksa._annotate_refresh_lock.acquire(timeout=5)
++    ksa._annotate_refresh_lock.release()
++    ksa._reset_cache_for_tests()
++
++
++def test_fresh_restart_copy_no_thread_keeps_date_and_previous(snapshot):
++    scope, _parts, calls, threads = snapshot
++    with role():
++        with ksa.one_annotation_snapshot():
++            row = ksa.annotate_kanban_activity([{'id': 'target'}], display=True)[0]
++        assert row['kanban_active'] == 3
++        assert row['kanban_observed_at'] == 990.
++        assert ksa._annotate_refresh_lock.acquire(blocking=False)
++        ksa._annotate_refresh_lock.release()
++        assert ksa._annotation_snapshot_owned(display=True) is ksa._last_annotation[scope]
++    assert calls == []
++    assert threads == []
++
++
++@pytest.mark.parametrize('date', [969., 1001., None])
++def test_unusable_copy_uses_bounded_refresh(snapshot, monkeypatch, date):
++    _, parts, calls, threads = snapshot
++    monkeypatch.setattr(ksa._annotation_copy, 'load', lambda scope: None if date is None else (parts, date))
++    with role():
++        ksa._annotation_snapshot_owned(display=True)
++    assert calls == [1.]
++    assert threads == ['kanban-annotation-refresh']
++
++
++@pytest.mark.parametrize('active,display', [(True, False), (False, True)])
++def test_strict_and_ordinary_callers_still_refresh(snapshot, active, display):
++    with role() if active else nullcontext():
++        ksa._annotation_snapshot_owned(display=display)
++    assert snapshot[2] == [1.]
++    assert snapshot[3] == ['kanban-annotation-refresh']
++
++
++def test_candidate_exception_releases_lock(snapshot, monkeypatch):
++    def fail(*args):
++        raise ValueError('candidate date')
++    monkeypatch.setattr(ksa._annotation_copy, 'observed_at', fail)
++    with role(), pytest.raises(ValueError, match='candidate date'):
++        ksa._annotation_snapshot_owned(display=True)
++    assert not ksa._annotate_refresh_lock.locked()
++
++
++@pytest.mark.parametrize('date,expected', [(1000., False), (970., False), (None, True), (float('nan'), True)])
++def test_previous_read_date_fallback(snapshot, date, expected):
++    scope, parts, calls, _ = snapshot
++    ksa._last_annotation[scope] = parts
++    if date is not None:
++        bounded.record(scope, parts, date)
++    with role():
++        assert ksa._annotation_snapshot_owned(display=True) is parts
++    assert bool(calls) is expected
++
++
++@pytest.mark.parametrize('active', [True, False])
++def test_helper_refresh_only_publishes_outside_capture(monkeypatch, tmp_path, active):
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_annotation_disk as disk
++    ksa._reset_cache_for_tests()
++    scope, full = ('publication-test',), ('inputs',)
++    path = tmp_path / 'restart.json'
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(disk, '_path', lambda scope: path)
++    monkeypatch.setattr(host, 'prepare', lambda scope: (full, 1000., ('digest', True), None, None, None, None))
++    monkeypatch.setattr(ksa, '_cache', {})
++    monkeypatch.setattr(ksa, '_cache_scope', scope)
++    monkeypatch.setattr(ksa, '_cache_fingerprint', full)
++    monkeypatch.setattr(ksa, '_cache_revalidatable', True)
++    parts = tuple({} for _ in range(11))
++    roles = []
++    def read():
++        roles.append((bounded.in_capture_role(), threading.current_thread().name))
++        return parts
++    monkeypatch.setattr(ksa, '_read_annotation_parts', read)
++    lock = threading.Lock()
++    lock.acquire()
++    try:
++        with role() if active else nullcontext():
++            assert bounded.refresh_bounded(lambda: host.refresh_locked(scope), lock, None, 5) is parts
++        assert roles == [(active, 'kanban-annotation-refresh')]
++        assert ksa._last_annotation[scope] is parts
++        assert ksa._annotate_flight_result is parts
++        assert bounded.read_at(parts) is not None
++        assert path.exists() is (not active)
++        assert path.with_suffix('.host.json').exists() is (not active)
++    finally:
++        assert lock.acquire(timeout=5)
++        lock.release()
++        ksa._reset_cache_for_tests()
++
++
++@pytest.mark.parametrize('rollback,raises', [(False, False), (False, True), (True, False), (True, True)])
++def test_worker_role_restored(monkeypatch, rollback, raises):
++    import sys
++    from hermes_cli import sessions_capture_worker as worker
++    from hermes_cli import web_routers
++    seen = []
++    def reader(**selector):
++        seen.append(bounded.in_capture_role())
++        if raises:
++            raise ValueError('reader failed')
++        return {'sessions': []}
++    reader.__wrapped__ = reader
++    profiles = SimpleNamespace(get_profiles_sessions=reader, get_profiles_sessions_sidebar=reader,
++                               get_profiles_session_stamps=reader)
++    monkeypatch.setitem(sys.modules, 'hermes_cli.web_routers.profiles', profiles)
++    monkeypatch.setattr(web_routers, 'profiles', profiles, raising=False)
++    if rollback:
++        monkeypatch.setenv('HERMES_SESSIONS_CAPTURE_COPY_FIRST', '0')
++    else:
++        monkeypatch.delenv('HERMES_SESSIONS_CAPTURE_COPY_FIRST', raising=False)
++    assert not bounded.in_capture_role()
++    with pytest.raises(ValueError, match='reader failed') if raises else nullcontext():
++        assert worker.capture('sessions', {}) == b'{"sessions":[]}'
++    assert seen == [not rollback]
++    assert not bounded.in_capture_role()
++
++
++@pytest.mark.parametrize('loaded,fails', [(True, False), (True, True), (False, False)])
++def test_parent_demands_once_per_batch_without_boot_import(monkeypatch, loaded, fails):
++    import builtins
++    import sys
++    from hermes_cli import sessions_native_source as native
++    from hermes_cli.fact_capture import CaptureBudget
++    from hermes_cli.fact_contract import Scope, SourceId
++    from hermes_cli.fact_store import FactStore
++    calls = []
++    def demand(scope):
++        calls.append(scope)
++        if fails:
++            raise RuntimeError('holder unavailable')
++    monkeypatch.setattr(ksa._host_copy, 'demand', demand)
++    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('launch-profile',))
++    if not loaded:
++        monkeypatch.delitem(sys.modules, 'hermes_cli.kanban_session_activity')
++    original_import = builtins.__import__
++    def importing(name, globals=None, locals=None, fromlist=(), level=0):
++        if not loaded and (name == 'hermes_cli.kanban_session_activity' or 'kanban_session_activity' in (fromlist or ())):
++            pytest.fail('capture imported annotation at boot')
++        return original_import(name, globals, locals, fromlist, level)
++    monkeypatch.setattr(builtins, '__import__', importing)
++    owner = native.SessionsSource(FactStore(), SourceId(Scope('install', 'scope'), 'sessions', 'test'),
++                                 [], lambda *a: b'{}', capture_many=lambda views: [b'{}'] * len(views))
++    owner._watch = SimpleNamespace(check=lambda: None)
++    for batch in range(2):
++        owner._next_capture = 0
++        owner.demand('sessions', {'limit': batch})
++        owner.demand('sessions_sidebar', {'limit': batch})
++        capture = owner.capture(None, CaptureBudget(max_seconds=5))
++        assert len(capture.facts) == 2
++        assert all(f.error_code is None for f in capture.facts)
++        owner.commit(capture)
++    assert calls == [('launch-profile',)] * 2 if loaded else calls == []
+-- 
+2.43.0
+

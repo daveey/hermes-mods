@@ -1,0 +1,201 @@
+From 096ae00d37e455176adc3e01ffec4a4e8fcda727 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:04:58 +0000
+Subject: [PATCH 6852] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 096ae00d37e455176adc3e01ffec4a4e8fcda727.
+
+---
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 6c794848a28858b7998d391d82ed6e10e759e56a..7934083e1ec1f68cdac8c1a13f876cc2acc4ee77 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -21,6 +21,7 @@
+     merged: int = 0
+     rejected: int = 0
+     deferred: int = 0
++    cancelled: int = 0
+ 
+ 
+ def push(conn, hub, board, gateway, *, primary, max_batches=25, before_head=False, seen=None):
+@@ -77,7 +78,7 @@
+             raise ValueError('source verdict identity mismatch')
+         row = source()
+         status = verdict['status']
+-        if status == 'rejected':
++        if status in ('rejected', 'cancelled'):
+             if row.get('_parent'):
+                 # Move exact synthetic custody into the ordinary visible repair queue.
+                 # This is not a new intent, a retry, or an authoritative row success.
+@@ -91,10 +92,14 @@
+                              (pending['op_id'], 'tasks', row['row_uid'], 'upsert', json.dumps(wire['fields']),
+                               wire['hlc'], int(time() * 1000), wire.get('status_origin'), json.dumps(wire)))
+                 retire_parent(conn, row['row_uid'])
+-            reason = f"{verdict.get('reason') or 'rejected'}: {verdict.get('detail') or ''}".strip(': ')
++            reason = f"{verdict.get('reason') or status}: {verdict.get('detail') or ''}".strip(': ')
++            if status == 'cancelled':
++                # Reuse non-success custody so dependency/import fences also hold
++                # cancelled intents. The label and retained verdict distinguish them.
++                reason = f'cancelled: {reason}'
+             conn.execute("UPDATE kanban_sync_outbox SET state='rejected', last_error=?, attempts=attempts+1 "
+                          "WHERE op_id=?", (reason[:500], pending['op_id']))
+-            out.rejected += 1
++            setattr(out, status, getattr(out, status) + 1)
+             return  # Keep the semantic obligation visible; no sync success or identity rotation.
+         if status not in ('applied', 'merged'):
+             raise ValueError('tracer final disposition requires custody integration')
+diff --git a/tests/hermes_cli/test_kanban_replay_cancelled.py b/tests/hermes_cli/test_kanban_replay_cancelled.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a995da7f686436e7002b493ba89196cb07f421da
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_cancelled.py
+@@ -0,0 +1,133 @@
++"""Final cancellation is visible non-success custody, not a successful row apply."""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++class Cancelled(helpers.Receiver):
++    def __init__(self):
++        super().__init__()
++        self.status = 'cancelled'
++        self.reason = None
++
++    def _call(self, method, path, body=None):
++        reply = super()._call(method, path, body)
++        if path.endswith('/ops'):
++            verdict = json.loads(self.slot['last_verdict'])
++            verdict.update(reason=self.reason, detail='explicit owner cancellation')
++            self.slot['last_verdict'] = json.dumps(verdict)
++        return reply
++
++
++def push(conn, receiver):
++    return client.push(conn, receiver, 'default', 'macbook', primary=False, max_batches=1)
++
++
++def retained(conn, receiver):
++    wire = dict(receiver.sent[0])
++    del wire['replay']
++    row = conn.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (wire['client_op_id'],)).fetchone()
++    assert row is not None and row['state'] == 'rejected'
++    assert row['last_error'].startswith('cancelled:')
++    assert row['attempts'] == 1
++    assert json.loads(row['wire_json']) == wire
++    assert journal.pending_wire(conn) is None
++    assert journal.snapshot(conn)['settled'] == '1'
++    assert json.loads(journal.snapshot(conn)['last_verdict'])['status'] == 'cancelled'
++    assert receiver.slot['a'] == '1'
++    return dict(row)
++
++
++@pytest.mark.parametrize('reason', [None, 'forbidden_field', 'x' * 600], ids=['no-reason', 'reason', 'bounded'])
++def test_cancelled_retains_exact_custody_without_success_and_holds_import(live, reason):
++    tid = kb.create_task(live, title='cancelled intent', assignee='worker')
++    receiver = Cancelled()
++    receiver.reason = reason
++    result = push(live, receiver)
++    row = retained(live, receiver)
++    assert row['last_error'] == f"cancelled: {reason or 'cancelled'}: explicit owner cancellation"[:500]
++    assert result.cancelled == 1
++    assert result.applied == result.merged == result.rejected == result.deferred == 0
++    assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++    with kbc.write_txn(live), pytest.raises(ValueError, match='import overlaps replay custody'):
++        journal.guard_import(live, ('tasks',), {'tasks': {tid}})
++    # Settlement is transport-only: later ordinary work remains selectable.
++    other = kb.create_task(live, title='unrelated intent', assignee='worker')
++    receiver.status = 'applied'
++    result = push(live, receiver)
++    assert result.applied == 1 and receiver.sent[-1]['uid'] == other
++    assert dict(live.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (row['op_id'],)).fetchone()) == row
++
++
++def test_postcommit_loss_recovers_cancellation_after_reopen_without_resend(live):
++    kb.create_task(live, title='cancelled lost reply', assignee='worker')
++    receiver = Cancelled()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        push(live, receiver)
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    frozen = journal.pending_wire(live)
++    live.close()
++    restarted = kbc.connect(path)
++    try:
++        assert journal.pending_wire(restarted) == frozen
++        receiver.lose_reply = False
++        result = push(restarted, receiver)
++        assert result.cancelled == 1 and len(receiver.sent) == 1
++        row = retained(restarted, receiver)
++        again = client.push(restarted, receiver, 'default', 'macbook', primary=False, max_batches=0)
++        assert again.cancelled == 0
++        assert dict(restarted.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (row['op_id'],)).fetchone()) == row
++    finally:
++        restarted.close()
++
++
++def test_cancelled_synthetic_parent_moves_exact_wire_and_holds_child(live):
++    tid = kb.create_task(live, title='synthetic cancelled parent', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_sync_outbox')
++    kb.add_comment(live, tid, author='worker', body='child must wait')
++    receiver = Cancelled()
++    result = push(live, receiver)
++    row = retained(live, receiver)
++    assert result.cancelled == 1 and row['row_uid'] == tid
++    assert not live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++    receiver.status = 'applied'
++    assert push(live, receiver).sent == 0
++    assert len(receiver.sent) == 1
++
++
++def test_cancellation_record_and_parent_retirement_roll_back_together(live, monkeypatch):
++    tid = kb.create_task(live, title='rollback cancelled parent', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_sync_outbox')
++    kb.add_comment(live, tid, author='worker', body='retained child')
++    receiver = Cancelled()
++    original = journal.recover
++
++    def fail_after_record(conn, remote, record):
++        def fail(verdict):
++            record(verdict)
++            raise ValueError('after cancellation custody write')
++        return original(conn, remote, fail)
++
++    monkeypatch.setattr(journal, 'recover', fail_after_record)
++    with pytest.raises(ValueError, match='after cancellation custody write'):
++        push(live, receiver)
++    assert journal.pending_wire(live) is not None
++    assert journal.snapshot(live)['settled'] == receiver.slot['a'] == '0'
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='rejected'").fetchone()
++    assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    monkeypatch.setattr(journal, 'recover', original)
++    result = push(live, receiver)
++    assert result.cancelled == 1 and len(receiver.sent) == 1
++    retained(live, receiver)
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index f1706321769db77960efe4c16017b5421249a5af..042130462a37f54d6849139ab4b4ac19cb769c5e 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -259,7 +259,7 @@
+         restarted.close()
+ 
+ 
+-@pytest.mark.parametrize('status', ['cancelled', 'deferred'])
++@pytest.mark.parametrize('status', ['deferred'])
+ def test_unintegrated_disposition_stays_in_custody_without_ack(live, status):
+     kb.create_task(live, title='final custody', assignee='worker')
+     receiver = Receiver()
+-- 
+2.43.0
+

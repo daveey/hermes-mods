@@ -1,0 +1,1149 @@
+From 814768390f65ae201c0bdfe73948e87919322bae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 02:53:44 +0000
+Subject: [PATCH 6674] Code-attestation inventory cost, diagnostics and quiet-start review records
+
+Public mirror of source commit 814768390f65ae201c0bdfe73948e87919322bae.
+
+---
+diff --git a/hermes_bootstrap.py b/hermes_bootstrap.py
+index c9ef7f872c62c8cfaada546ab77d8a6f6ea871e1..6f073b951ba23b397f98fbec8fe1b3ed8eb6a74e 100644
+--- a/hermes_bootstrap.py
++++ b/hermes_bootstrap.py
+@@ -574,13 +574,17 @@
+         boot_sha = fingerprint.rsplit(":", 1)[-1] if fingerprint else None
+         local_work.install()
+         code_attestation.install(_root, boot_sha)
++        if sys.argv[1:2] == ["serve"]:
++            # The sessions backend must answer within seconds of its unit start. Its module
++            # comparisons are settled after it serves, and before any ledger read.
++            code_attestation.defer_comparisons()
+         # Only supported owner/worker launch routes need the strict Git fence.
+         # Capture before dependencies or application code can load, retaining
+         # the original boot fingerprint; the installed ledger is never rebuilt.
+         if code_attestation.route_report()['route'] in (
+                 'managed-stub', 'managed-stub-relaunch', 'console-main-first',
+                 'managed-worker-stub'):
+-            git_fingerprint.record_capsule_boot_identity(_root)
++            git_fingerprint.begin_capsule_boot_identity(_root)
+     except Exception:  # health: allow BLE001 -- observation must never fail a launch; a missing installation is refused downstream
+         return
+ 
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index 53ea716a3e8b099f0be9e0c9034b93b985e82529..b1685f68e8d06e652851ad103e4ca7998765d4ca 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -5,6 +5,7 @@
+ inputs, not permission to declare arbitrary code passive. No third-party imports.
+ """
+ import ast
++import atexit
+ import base64
+ import csv
+ import dis
+@@ -16,7 +17,7 @@
+ import subprocess
+ import sys
+ import sysconfig
+-from collections import Counter, OrderedDict
++from collections import Counter, OrderedDict, deque
+ from itertools import islice
+ import threading
+ import time
+@@ -68,6 +69,11 @@
+ MAX_LOADED_CODE = 1 << 18  # code objects kept for executed-code lookups; the gateway graph uses ~70k
+ MAX_CACHE_ENTRIES = 32
+ MAX_CACHE_BYTES = 8 * 1024 * 1024
++# Module executions whose source comparison is still owed. Every ledger read settles
++# them first, so a pending comparison is never reported as verified.
++MAX_PENDING = 8192
++SETTLE_DELAY = 6.0  # seconds after the first deferral before the background settler works
++SETTLE_DUTY = 0.25  # share of one core the settler may take from the importing thread
+ _FROZEN_ALIASES: dict[str, str] = {"importlib._bootstrap": "_frozen_importlib",
+                    "importlib._bootstrap_external": "_frozen_importlib_external"}
+ 
+@@ -618,6 +624,12 @@
+         self._generation = 0
+         self._units = []
+         self._known = {}  # identity-keyed strong references: no id recycling
++        self._pending = deque()  # FIFO of [module code, producer code, settled]
++        self._pending_index = {}  # id(nested code) -> its pending entry (entry holds the reference)
++        self._settler = None
++        self._stopping = self._exit_hooked = False
++        self._deferring = False  # set only by defer_comparisons(), never cleared
++        self._demand = threading.Event()  # a bounded reader ran out of budget: settle at full speed
+         self._components = {}
+         self._seed = []
+         self._generators = {}
+@@ -703,6 +715,11 @@
+         self._lock = threading.RLock()
+         self._tls = threading.local()
+         self._known = {}
++        self._pending = deque()
++        self._pending_index = {}
++        self._settler = None
++        self._stopping = self._exit_hooked = False
++        self._demand = threading.Event()
+         self.mark_unknown("fork-inherited-attestation")
+ 
+     def mark_unknown(self, reason):
+@@ -832,6 +849,7 @@
+         """Register BEFORE executing a reviewed extension; digests are relative sha256s."""
+         root = Path(path).resolve()
+         with self._lock:
++            self._settle_under(root)
+             if component in self._components or any(
+                     root.is_relative_to(r) or r.is_relative_to(root)
+                     for r, _, _ in self._components.values()):
+@@ -912,16 +930,73 @@
+ 
+     def _origin(self, producer):
+         """(component, None) for an attested caller, else (None, unattested caller file)."""
++        return self._origin_codes(self._caller_codes(producer))
++
++    @staticmethod
++    def _caller_codes(producer):
++        codes = []
+         frame = producer.f_back
+         while frame is not None:
+-            known = self._known.get(id(frame.f_code))
+-            if known is not None and known[0] is frame.f_code:
+-                return known[1], None
+-            if not self._interpreter_code(frame.f_code):
+-                return None, frame.f_code.co_filename
++            codes.append(frame.f_code)
+             frame = frame.f_back
++        return tuple(codes)
++
++    def _origin_codes(self, codes):
++        for code in codes:
++            self._settle_code(code)
++            known = self._known.get(id(code))
++            if known is not None and known[0] is code:
++                return known[1], None
++            if not self._interpreter_code(code):
++                return None, code.co_filename
+         return None, "<top>"
+ 
++    def _deferred_origin(self, descriptor, codes):
++        """Queue a generator's origin, fixed to the modules executed so far.
++
++        Each caller is marked now as executed-by-now or not, so a module that
++        executes later can never vouch for this call. The marked callers are
++        read after exactly their own comparison.
++        """
++        index, known = self._pending_index, self._known
++        marks = tuple((code, id(code) in index or id(code) in known) for code in codes)
++        return self._enqueue(["origin", (descriptor, marks), False, None])
++
++    def _settled_origin(self, descriptor, marks):
++        for code, executed in marks:
++            if executed:
++                self._settle_code(code)
++                known = self._known.get(id(code))
++                if known is not None and known[0] is code:
++                    return known[1]
++            if not self._interpreter_code(code):
++                return self._generated_origin(descriptor, None, code.co_filename)
++        return self._generated_origin(descriptor, None, "<top>")
++
++    def _generated_origin(self, descriptor, codes, unattested=None):
++        origin = None
++        if codes is not None:
++            origin, unattested = self._origin_codes(codes)
++        if origin is None:
++            # Name the unattested caller: a dependency-origin generation stays
++            # unknown, but is distinguishable from a core/plugin escape. Its
++            # receipt is still kept (origin None) so the paired exec is consumed
++            # as already-unknown instead of being misreported as receipt-missing.
++            self._extension_unknown("generated-origin-unknown:" + descriptor.name + ":" + str(unattested), unattested)
++        return origin
++
++    def _generated_unit(self, descriptor, site, code, source, filename, mode, origin):
++        if origin is None:
++            return  # never recorded as an attested unit; the unknown is latched
++        if not _same(code, self._compiled(source, filename, mode)):
++            self.mark_unknown("generated-code-mismatch:" + descriptor.name)
++            return
++        extra = {"producer_distribution": descriptor.distribution} if "dist" in descriptor.distribution else {}
++        self._record(code, origin, _sha(source), filename=filename,
++                     generator=descriptor.name, producer_sha256=descriptor.source_sha256,
++                     producer_site=site, interpreter_sha256=descriptor.distribution.get('binary_sha256'),
++                     **extra)
++
+     def _generated_event(self, event, args, frame):
+         descriptor = self._generators.get(id(frame.f_code))
+         if descriptor is None or descriptor.code is not frame.f_code:
+@@ -957,13 +1032,11 @@
+                 self.mark_unknown("generated-receipt-overflow:" + descriptor.name)
+                 return True
+             source = source.encode() if isinstance(source, str) else source
+-            origin, unattested = self._origin(frame)
+-            if origin is None:
+-                # Name the unattested caller: a dependency-origin generation stays
+-                # unknown, but is distinguishable from a core/plugin escape. Its
+-                # receipt is still kept (origin None) so the paired exec is consumed
+-                # as already-unknown instead of being misreported as receipt-missing.
+-                self._extension_unknown("generated-origin-unknown:" + descriptor.name + ":" + str(unattested), unattested)
++            codes = self._caller_codes(frame)
++            if self._deferring and os.getpid() == self._pid:
++                origin = self._deferred_origin(descriptor, codes)
++            else:
++                origin = self._generated_origin(descriptor, codes)
+             if (len(source) > MAX_SOURCE or len(receipts) >= 8 or
+                     sum(len(r[2]) for r in receipts) + len(source) > 2 * MAX_SOURCE):
+                 self.mark_unknown("generated-receipt-overflow:" + descriptor.name)
+@@ -977,17 +1050,17 @@
+             return True
+         receipts.remove(receipt)
+         _, _, source, filename, mode, origin = receipt
+-        if origin is None:
+-            return True  # never recorded as an attested unit; the unknown is latched
+         code = args[0]
+-        if not _same(code, self._compiled(source, filename, mode)):
+-            self.mark_unknown("generated-code-mismatch:" + descriptor.name)
+-            return True
+-        extra = {"producer_distribution": descriptor.distribution} if "dist" in descriptor.distribution else {}
+-        self._record(code, origin, _sha(source), filename=filename,
+-                     generator=descriptor.name, producer_sha256=descriptor.source_sha256,
+-                     producer_site=site, interpreter_sha256=descriptor.distribution.get('binary_sha256'),
+-                     **extra)
++        if isinstance(origin, list):
++            if isinstance(code, CodeType):
++                entry = self._enqueue(
++                    ["generated", (descriptor, site, code, source, filename, mode, origin), False, None])
++                for nested in _codes(code):
++                    self._pending_index.setdefault(id(nested), entry)
++                return True
++            self._settle_entry(origin)
++            origin = origin[3]
++        self._generated_unit(descriptor, site, code, source, filename, mode, origin)
+         return True
+ 
+     def _forwardref_event(self, event, args, frame, descriptor):
+@@ -1097,6 +1170,9 @@
+                 if event == "ctypes.dlopen":
+                     self._native_load(args[0], sys._getframe(1))
+                     return
++                # A pending producer module registers its generator descriptors
++                # only when settled: do that before classifying its output.
++                self._settle_code(sys._getframe(1).f_code)
+                 if self._pth_event(event, args, sys._getframe(1)):
+                     return
+                 if self._generated_event(event, args, sys._getframe(1)):
+@@ -1104,7 +1180,7 @@
+                 if event == "exec" and self._launcher_event(args[0], sys._getframe(1)):
+                     return
+                 if event == "exec":
+-                    self._observe(args[0], sys._getframe(1))
++                    (self._defer if self._deferring else self._observe)(args[0], sys._getframe(1))
+         except Exception as exc:  # health: allow BLE001 -- diagnostic boundary latches unknown; must never alter observed execution
+             # A diagnostic failure must not affect the production execution.
+             self.mark_unknown("audit-error:" + type(exc).__name__)
+@@ -1134,6 +1210,8 @@
+             root = Path(site_dir).resolve()
+         except (OSError, ValueError):
+             root = None
++        with self._lock:
++            self._settle()  # executions so far are judged against the roots they ran under
+         self._tls.busy = True
+         try:
+             with self._lock:
+@@ -1243,20 +1321,21 @@
+                     self.mark_unknown("prehook-unrooted:" + hook)
+ 
+     def _dependency_exec(self, code, producer=None):
++        producer = getattr(producer, "f_code", producer)
+         filename = code.co_filename
+         try:
+             path = Path(filename).resolve()
+         except (OSError, ValueError):
+             path = None
+         if path is None or filename.startswith("<") or not self._deps.indexed(path):
+-            provenance = (producer.f_code.co_filename if filename.startswith("<") and producer is not None
++            provenance = (producer.co_filename if filename.startswith("<") and producer is not None
+                           else filename)
+             self._extension_unknown("unrooted-exec:" + filename, provenance)
+             if producer is not None and len(self._unknown_detail) < MAX_DEP_REPORT:
+                 # Diagnosis only (which code produced it); the unknown stays latched.
+                 self._unknown_detail.setdefault("unrooted-exec:" + filename, set()).add(
+-                    f"{producer.f_code.co_filename}:{producer.f_code.co_qualname}")
+-                self._unknown_producer_source("unrooted-exec:" + filename, producer.f_code)
++                    f"{producer.co_filename}:{producer.co_qualname}")
++                self._unknown_producer_source("unrooted-exec:" + filename, producer)
+             return
+         if not self._dep_ready():
+             return
+@@ -1317,6 +1396,7 @@
+         if caller is None or caller.f_code.co_qualname not in allowed:
+             return None
+         code = caller.f_code
++        self._settle_code(code)
+         known = self._known.get(id(code))
+         if (code is not descriptor.attrs_codes.get(code.co_qualname) or
+                 known is None or known[0] is not code):
+@@ -1411,6 +1491,7 @@
+             frame = frame.f_back
+         if frame is None:
+             return None
++        self._settle_code(frame.f_code)
+         known = self._known.get(id(frame.f_code))
+         if known is not None and known[0] is frame.f_code:
+             kind = self._components.get(known[1], (None, None, None))[1]
+@@ -1445,6 +1526,7 @@
+         An installer receipt for the producer does not attest its output. Keep
+         every unknown and the closed generator table unchanged.
+         """
++        self._settle_code(code)
+         known = self._known.get(id(code))
+         if known is None or known[0] is not code:
+             return
+@@ -1463,6 +1545,7 @@
+     def dependency_receipts(self):
+         """Receipts actually used: trusted by installer receipt, not audited, no coverage."""
+         with self._lock:
++            self._settle()
+             return {"trust": DEPENDENCY_TRUST, "roots": [str(r) for r in self._deps.roots],
+                     "dists": self._deps.receipts(),
+                     "units": [dict(u) for u in self._dep_units.values()],
+@@ -1529,7 +1612,136 @@
+         return _same(code, expected) if module else any(
+             _same(code, candidate) for candidate in _codes(expected))
+ 
++    def defer_comparisons(self):
++        """Let this process compare executed module code after it executes (see ``_defer``)."""
++        with self._lock:
++            self._deferring = True
++
++    def _defer(self, code, producer):
++        """Queue one module execution for the comparison ``_observe`` performs.
++
++        Only the time of the comparison moves. The entry keeps the executed code
++        object itself, the comparison still reads fresh source bytes, and every
++        ledger read settles the queue first: nothing unsettled is ever reported.
++        """
++        if not isinstance(code, CodeType) or os.getpid() != self._pid:
++            self._observe(code, producer)
++            return
++        entry = self._enqueue(["module", (code, getattr(producer, "f_code", None)), False, None])
++        index = self._pending_index
++        for nested in _codes(code):
++            index.setdefault(id(nested), entry)
++
++    def _enqueue(self, entry):
++        # [kind, payload, settled, result]; the payload holds every code reference.
++        if len(self._pending) >= MAX_PENDING:
++            self._settle()
++        self._pending.append(entry)
++        if self._settler is None and not self._stopping:
++            settler = threading.Thread(
++                target=self._settle_slowly, args=(os.getpid(),),
++                name="code-attestation-settle", daemon=True)
++            settler.start()
++            self._settler = settler
++            if not self._exit_hooked:
++                self._exit_hooked = True
++                atexit.register(self._stop_settling)
++        return entry
++
++    def _stop_settling(self):
++        # Interpreter exit freezes daemon threads wherever they are. A settler frozen
++        # inside the ledger lock would hang every audited event of the teardown, so it
++        # is stopped and joined while threads still run. What is still owed stays owed.
++        with self._lock:
++            self._stopping = True
++            settler = self._settler
++        self._demand.set()
++        if settler is not None and settler is not threading.current_thread() and os.getpid() == self._pid:
++            settler.join()
++
++    def _settle_under(self, root):
++        """Settle pending modules executed from under ``root`` before it becomes a component.
++
++        Their comparison then sees the roots they actually ran under: registration
++        after execution stays unrooted, exactly as when compared inline.
++        """
++        below = os.path.join(str(root), "")
++        for entry in tuple(self.__dict__.get("_pending", ())):
++            if entry[0] != "module" or entry[2]:
++                continue
++            if entry[3] is None:
++                filename = entry[1][0].co_filename
++                try:
++                    entry[3] = "" if filename.startswith("<") else str(Path(filename).resolve())
++                except (OSError, ValueError):
++                    entry[3] = ""
++            if entry[3].startswith(below):
++                self._settle_entry(entry)
++
++    def _settle_entry(self, entry):
++        if entry[2]:
++            return
++        entry[2] = True
++        kind, payload = entry[0], entry[1]
++        entry[1] = None
++        busy = getattr(self._tls, "busy", False)
++        self._tls.busy = True
++        try:
++            index = self._pending_index
++            if kind != "origin":
++                for nested in _codes(payload[0] if kind == "module" else payload[2]):
++                    if index.get(id(nested)) is entry:
++                        del index[id(nested)]
++            if kind == "module":
++                self._observe(*payload)
++            elif kind == "origin":
++                entry[3] = self._settled_origin(*payload)
++            else:
++                self._settle_entry(payload[6])
++                self._generated_unit(*payload[:6], payload[6][3])
++        except Exception as exc:  # health: allow BLE001 -- diagnostic boundary latches unknown; must never alter observed execution
++            self.mark_unknown("audit-error:" + type(exc).__name__)
++        except BaseException as exc:
++            # The module already ran: an interrupted comparison is unknown, never skipped.
++            self.mark_unknown("audit-error:" + type(exc).__name__)
++            raise
++        finally:
++            self._tls.busy = busy
++
++    def _settle_code(self, code):
++        """Settle the pending module that owns ``code`` before its identity is read."""
++        # Callers hold the ledger lock. Bare fixtures have no queue.
++        entry = self.__dict__.get("_pending_index", {}).get(id(code))
++        if entry is not None:
++            self._settle_entry(entry)
++
++    def _settle(self, *, deadline=None):
++        """Settle every pending comparison in execution order; a deadline keeps the rest pending."""
++        # Callers hold the ledger lock. Bare fixtures have no queue.
++        pending = self.__dict__.get("_pending")
++        if pending and deadline is not None:
++            self._demand.set()  # a bounded reader waits on the backlog: stop pacing it
++        while pending:
++            _check_inventory_deadline(deadline)
++            self._settle_entry(pending.popleft())
++
++    def _settle_slowly(self, pid):
++        # Background only: bounded share of the interpreter, one comparison per lock hold.
++        demand = self._demand
++        demand.wait(SETTLE_DELAY)
++        while os.getpid() == pid and self._pid == pid:
++            began = time.perf_counter()
++            with self._lock:
++                if not self._pending or self._stopping:
++                    self._settler = None
++                    demand.clear()  # the next backlog is paced again
++                    return
++                self._settle_entry(self._pending.popleft())
++            if not demand.is_set():
++                time.sleep(max(0.001, (time.perf_counter() - began) * (1 / SETTLE_DUTY - 1)))
++
+     def _observe(self, code, producer=None):
++        producer = getattr(producer, "f_code", producer)
+         owner = self._owner(code.co_filename)
+         if owner is None:
+             filename = code.co_filename
+@@ -1578,6 +1790,7 @@
+     def attest_code(self, code):
+         """Identity-bind a currently loaded callback, never trust filename alone."""
+         with self._lock:
++            self._settle_code(code)
+             known = self._known.get(id(code))
+             if known is not None and known[0] is code:
+                 return True
+@@ -1586,6 +1799,7 @@
+ 
+     def executed_units(self):
+         with self._lock:
++            self._settle()
+             return tuple(dict(unit) for unit in self._units)
+ 
+     def trusted_bootstrap_seed(self):
+@@ -1601,6 +1815,7 @@
+ 
+     def unknowns(self):
+         with self._lock:
++            self._settle()
+             self._inventory_modules()
+             return tuple(sorted(self._unknown))
+ 
+@@ -1610,12 +1825,15 @@
+         Consumers must reject pending/unsupported provenance, not manufacture a
+         ledger after startup or filter observational unknowns into permission.
+         """
++        if deadline is not None and self.__dict__.get("_pending"):
++            self._demand.set()  # even a reader that is already out of budget is waiting
+         _check_inventory_deadline(deadline)
+         acquired = (self._lock.acquire() if deadline is None else
+                     self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())))
+         if not acquired:
+             raise TimeoutError('code attestation inventory budget exhausted')
+         try:
++            self._settle(deadline=deadline)
+             _check_inventory_deadline(deadline)
+             self._inventory_modules(deadline=deadline)
+             _check_inventory_deadline(deadline)
+@@ -1632,10 +1850,12 @@
+     def latched_unknowns(self):
+         """The latched unknowns without a module inventory (cheap: polled while measuring)."""
+         with self._lock:
++            self._settle()
+             return tuple(sorted(self._unknown))
+ 
+     def generation(self):
+         with self._lock:
++            self._settle()
+             return self._generation
+ 
+ 
+@@ -1696,6 +1916,14 @@
+     return _installed.register_dependency_environment(site_dir)
+ 
+ 
++def defer_comparisons():
++    """Opt this process into deferred module comparisons; False when nothing is installed."""
++    if _installed is None:
++        return False
++    _installed.defer_comparisons()
++    return True
++
++
+ def _check_inventory_deadline(deadline):
+     # Cancellation is advisory-only; never return a partially verified positive.
+     # One filesystem operation is not interruptible, so check between modules.
+diff --git a/hermes_cli/code_attestation_snapshot.py b/hermes_cli/code_attestation_snapshot.py
+index a7fd5135690366908e45bf0d8e27e36be5327cf4..7d21d2a18328df1f5b27a277605d31d8028f5799 100644
+--- a/hermes_cli/code_attestation_snapshot.py
++++ b/hermes_cli/code_attestation_snapshot.py
+@@ -194,6 +194,7 @@
+     try:
+         if progress is not None:
+             progress.set_phase('inventory')
++        ledger._settle(deadline=deadline)
+         ledger._inventory_modules(deadline=deadline)
+         if time.monotonic() >= deadline:
+             raise TimeoutError('snapshot_deadline')
+diff --git a/hermes_cli/dashboard_server_start.py b/hermes_cli/dashboard_server_start.py
+index 4f1d34319d2afd6035115096859c2b7607420979..5bf649147fb8fd0d8d3fac0ef46b93276726870d 100644
+--- a/hermes_cli/dashboard_server_start.py
++++ b/hermes_cli/dashboard_server_start.py
+@@ -5,7 +5,9 @@
+     from contextlib import nullcontext
+     from hermes_cli.serve_bootstrap_listener import BootstrapListener
+     from hermes_cli.sessions_early_boot import early_sessions
++    from hermes_cli.version_info import prewarm_version_info
+ 
++    prewarm_version_info()  # git waits overlap runtime preparation; web_server joins the result
+     listener = BootstrapListener(args.host, args.port) if headless else nullcontext(None)
+     with listener as bootstrap_listener:
+         with early_sessions(headless=headless, isolated=getattr(args, 'isolated', False)) as owner:
+diff --git a/hermes_cli/git_fingerprint.py b/hermes_cli/git_fingerprint.py
+index 66ca11be082b058961ffcf3be73f3697c778d840..c581820eb530cb2f013e04234383cc09e1fa2ac5 100644
+--- a/hermes_cli/git_fingerprint.py
++++ b/hermes_cli/git_fingerprint.py
+@@ -99,6 +99,8 @@
+ # Capsule compatibility is stricter than the ordinary restart-ignore heuristic.
+ # A missing/dirty initial observation is sticky for this process, never adopted late.
+ _capsule_boot: dict[str, str | None] = {}
++# Boot captures still running: the status read started at bootstrap, its result is not in yet.
++_capsule_capturing: dict[str, object] = {}
+ 
+ 
+ def _capsule_clean_sha(root) -> str | None:
+@@ -107,6 +109,12 @@
+     Bracket the bounded status read with HEAD reads. This is an operational update
+     fence, not protection against a same-uid attacker rewriting and restoring code.
+     """
++    started = _capsule_status_start(root)
++    return _capsule_status_finish(started) if started is not None else None
++
++
++def _capsule_status_start(root):
++    """Read HEAD, check the quiescence markers and start the status process; None is unknown."""
+     import re
+     import subprocess
+     import threading
+@@ -128,13 +136,25 @@
+             return None
+         # Read at most one byte: any output means dirty. A timer bounds even a
+         # Git process which never closes stdout; no arbitrary status buffer.
+-        with subprocess.Popen(
+-                ['git', '-C', str(root), 'status', '--porcelain=v1', '-z', '--untracked-files=normal'],
+-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+-                env={'PATH': os.defpath, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_NO_LAZY_FETCH': '1',
+-                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}) as process:
+-            timer = threading.Timer(2, process.kill)
+-            timer.start()
++        process = subprocess.Popen(
++            ['git', '-C', str(root), 'status', '--porcelain=v1', '-z', '--untracked-files=normal'],
++            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++            env={'PATH': os.defpath, 'GIT_OPTIONAL_LOCKS': '0', 'GIT_NO_LAZY_FETCH': '1',
++                 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull})
++        timer = threading.Timer(2, process.kill)
++        timer.start()
++        return root, before, sha, process, timer
++    except (OSError, ValueError, subprocess.SubprocessError):
++        return None
++
++
++def _capsule_status_finish(started) -> str | None:
++    """Wait for a started status read and bracket it with the second HEAD read."""
++    import subprocess
++
++    root, before, sha, process, timer = started
++    try:
++        with process:
+             try:
+                 dirty = process.stdout.read(1)
+                 if dirty:
+@@ -150,13 +170,50 @@
+ def record_capsule_boot_identity(root) -> None:
+     """Bootstrap-only capture; repeated calls cannot repair an unknown/dirty boot."""
+     key = _key(root)
+-    if key not in _capsule_boot:
++    if key not in _capsule_boot and key not in _capsule_capturing:
+         fingerprint = process_boot_fingerprint(root)
+         sha = _capsule_clean_sha(root)
+         _capsule_boot[key] = sha if fingerprint and fingerprint.rsplit(':', 1)[-1] == sha else None
+ 
+ 
++def begin_capsule_boot_identity(root) -> None:
++    """Start the bootstrap capture now and let the launch continue while Git reads the tree.
++
++    HEAD is read, the quiescence markers are checked and the status process is started on
++    this thread, before dependencies or application code load, exactly as
++    ``record_capsule_boot_identity`` does. Only waiting for Git moves: readers join the
++    capture, and one that cannot finish leaves the boot unknown for this process.
++    """
++    import threading
++
++    key = _key(root)
++    if key in _capsule_boot or key in _capsule_capturing:
++        return
++    fingerprint = process_boot_fingerprint(root)
++    pid = os.getpid()
++    started = _capsule_status_start(root)
++
++    def capture():
++        sha = _capsule_status_finish(started) if started is not None else None
++        if os.getpid() == pid:
++            _capsule_boot.setdefault(key, sha if fingerprint and fingerprint.rsplit(':', 1)[-1] == sha else None)
++
++    thread = threading.Thread(target=capture, name='capsule-boot-identity', daemon=True)
++    _capsule_capturing[key] = thread
++    thread.start()
++
++
++def _capsule_boot_sha(key) -> str | None:
++    thread = _capsule_capturing.get(key)
++    if thread is not None:
++        thread.join()
++        # A capture that did not record (a fork lost its thread) is unknown, never retried.
++        _capsule_boot.setdefault(key, None)
++        _capsule_capturing.pop(key, None)
++    return _capsule_boot.get(key)
++
++
+ def capsule_code_sha(root) -> str | None:
+     """Strict boot/disk identity for capsule launches; absence is not proof."""
+-    boot = _capsule_boot.get(_key(root))
++    boot = _capsule_boot_sha(_key(root))
+     return boot if boot and _capsule_clean_sha(root) == boot else None
+diff --git a/hermes_cli/version_info.py b/hermes_cli/version_info.py
+index d2f437147253be5daa3b35a9949ceb603abbcba9..9777a9eb3d9a744e9c73cd87290ea8856b0d90e3 100644
+--- a/hermes_cli/version_info.py
++++ b/hermes_cli/version_info.py
+@@ -12,7 +12,9 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import subprocess
++import threading
+ import tomllib
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -267,6 +269,17 @@
+ # --- Cache + public API -----------------------------------------------------
+ 
+ _cached_version_info: VersionInfo | None = None
++_version_info_lock = threading.Lock()
++
++
++def _fresh_version_info_lock() -> None:
++    # A fork during a resolution would leave the child's copy held forever.
++    global _version_info_lock
++    _version_info_lock = threading.Lock()
++
++
++if hasattr(os, "register_at_fork"):
++    os.register_at_fork(after_in_child=_fresh_version_info_lock)
+ 
+ 
+ def _reset_version_info_cache() -> None:
+@@ -295,22 +308,37 @@
+     global _cached_version_info
+     if _cached_version_info is not None:
+         return _cached_version_info
++    # One resolution at a time: a caller arriving during ``prewarm_version_info``
++    # waits for that read instead of starting the same git walk again.
++    with _version_info_lock:
++        if _cached_version_info is not None:
++            return _cached_version_info
+ 
+-    # 1. Install stamp (packaged builds: Docker, Nix)
+-    info = _stamp_or_none()
++        # 1. Install stamp (packaged builds: Docker, Nix)
++        info = _stamp_or_none()
+ 
+-    # 2. Live git (source/dev installs)
+-    if info is None:
+-        repo_dir = _resolve_repo_dir()
+-        if repo_dir is not None:
+-            info = _git_version_info(repo_dir)
++        # 2. Live git (source/dev installs)
++        if info is None:
++            repo_dir = _resolve_repo_dir()
++            if repo_dir is not None:
++                info = _git_version_info(repo_dir)
+ 
+-    # 3. Unknown — no stamp, no git
+-    if info is None:
+-        info = VersionInfo("unknown", "unknown", None, None, None, "unknown")
++        # 3. Unknown — no stamp, no git
++        if info is None:
++            info = VersionInfo("unknown", "unknown", None, None, None, "unknown")
+ 
+-    _cached_version_info = info
+-    return info
++        _cached_version_info = info
++        return info
++
++
++def prewarm_version_info() -> None:
++    """Resolve the identity on a daemon thread while the caller keeps importing.
++
++    A source checkout pays several git subprocesses for it. ``serve`` needs the
++    answer when it builds its app, so it starts the read first and joins it there.
++    """
++    if _cached_version_info is None:
++        threading.Thread(target=get_version_info, name="version-info-prewarm", daemon=True).start()
+ 
+ 
+ def hermes_user_agent(product: str = "hermes-cli") -> str:
+diff --git a/tests/hermes_cli/test_capsule_code_identity.py b/tests/hermes_cli/test_capsule_code_identity.py
+index 2deba51eb4f720f25ac22cc6996b422271637add..55e06b208212ffe56086c185ec4bf7a578c52d5f 100644
+--- a/tests/hermes_cli/test_capsule_code_identity.py
++++ b/tests/hermes_cli/test_capsule_code_identity.py
+@@ -28,11 +28,11 @@
+     from hermes_cli import code_attestation, local_work
+     monkeypatch.setattr(hermes_bootstrap, '_root', repo)
+     calls = []
+-    capture = identity.record_capsule_boot_identity
++    capture = identity.begin_capsule_boot_identity
+     def record(root):
+         calls.append(root)
+         capture(root)
+-    monkeypatch.setattr(identity, 'record_capsule_boot_identity', record)
++    monkeypatch.setattr(identity, 'begin_capsule_boot_identity', record)
+     monkeypatch.setattr(code_attestation, 'install', lambda *args: None)
+     monkeypatch.setattr(code_attestation, 'route_report', lambda: {'route': route})
+     monkeypatch.setattr(local_work, 'install', lambda: None)
+diff --git a/tests/hermes_cli/test_code_attestation_deferral.py b/tests/hermes_cli/test_code_attestation_deferral.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..45543fe1234ad4c6830308db92432d08a129a514
+--- /dev/null
++++ b/tests/hermes_cli/test_code_attestation_deferral.py
+@@ -0,0 +1,247 @@
++"""Deferred module comparisons move only the time of the check, never its verdict."""
++import json
++
++from tests.hermes_cli.test_code_attestation import run_probe
++
++FIXTURE = r'''
++        from hermes_cli import code_attestation as ca
++        p = pathlib.Path('plugin').resolve(); p.mkdir()
++        outside = pathlib.Path('outside').resolve(); outside.mkdir()
++        sources = {
++            'plain.py': b'def work():\n    return 17\n',
++            'data.py': (b'from dataclasses import dataclass\nfrom collections import namedtuple\n'
++                        b'@dataclass\nclass Value:\n    number: int = 7\n'
++                        b'Pair = namedtuple("Pair", "left right")\n'),
++        }
++        for name, source in sources.items():
++            (p / name).write_bytes(source)
++        stray = b'from dataclasses import dataclass\n@dataclass\nclass Stray:\n    number: int = 1\n'
++        (outside / 'stray.py').write_bytes(stray)
++        a.register_component_root('reviewed', p, 'plugin', digests={
++            name: hashlib.sha256(source).hexdigest() for name, source in sources.items()})
++
++        def load(path, source):
++            namespace = {'__name__': 'fixture_' + path.stem}
++            exec(compile(source, str(path), 'exec'), namespace)
++            return namespace
++
++        base = set(a.unknowns())  # what this bare fixture boot latches before any module runs
++
++        def new_unknowns():
++            return sorted(set(a.unknowns()) - base)
++
++        def ledger():
++            units = sorted((u['component'], u['source_sha256'], u['filename'], u.get('generator') or '')
++                           for u in a.executed_units())
++            return {'units': units, 'unknowns': new_unknowns()}
++'''
++
++
++def _run(tmp_path, name, body, *, defer):
++    target = tmp_path / name
++    target.mkdir()
++    opt_in = '\n        a.defer_comparisons()\n' if defer else ''
++    result = run_probe(target, FIXTURE + opt_in + body)
++    # Each arm runs in its own directory; compare ledgers by path below it.
++    return json.loads(json.dumps(result).replace(str(target.resolve()), '<run>'))
++
++
++def test_deferred_ledger_equals_the_inline_ledger(tmp_path):
++    body = r'''
++        spaces = [load(p / name, source) for name, source in sources.items()]
++        spaces.append(load(outside / 'stray.py', stray))
++        assert spaces[1]['Value']().number == 7
++        owed = len(a._pending)
++        early = len(a._units)
++        print(json.dumps(dict(ledger(), owed=owed, early=early, left=len(a._pending))))
++    '''
++    inline = _run(tmp_path, 'inline', body, defer=False)
++    deferred = _run(tmp_path, 'deferred', body, defer=True)
++    assert inline['owed'] == 0 and inline['early'] > 0
++    # Nothing was compared while the modules executed, and nothing is owed after a read.
++    assert deferred['owed'] >= 3 and deferred['early'] == 0 and deferred['left'] == 0
++    assert deferred['units'] == inline['units']
++    assert deferred['unknowns'] == inline['unknowns']
++    assert {u[3] for u in deferred['units'] if u[3]} >= {'collections.namedtuple'}
++    assert len([u for u in deferred['units'] if 'dataclass' in u[3]]) >= 1
++    assert any(x.startswith('generated-origin-unknown:') for x in deferred['unknowns'])
++    assert any(x.startswith('unrooted-exec:') for x in deferred['unknowns'])
++
++
++def test_deferred_comparison_still_refuses_forged_and_changed_code(tmp_path):
++    result = _run(tmp_path, 'forged', r'''
++        good = sources['plain.py']
++        forged = compile(good.replace(b'17', b'18'), str(p / 'plain.py'), 'exec')
++        exec(forged, {})
++        first = list(a.unknowns())
++        exec(compile(sources['data.py'], str(p / 'data.py'), 'exec'), {'__name__': 'fixture_data'})
++        (p / 'data.py').write_bytes(sources['data.py'] + b'# changed before the comparison\n')
++        print(json.dumps({'first': first, 'second': list(a.unknowns()),
++                          'units': len(a.executed_units())}))
++    ''', defer=True)
++    assert any(x.startswith('executed-code-mismatch:') for x in result['first'])
++    # Source that changed between execution and comparison is unknown, never trusted.
++    assert any(x.startswith('source-skew:') for x in result['second'])
++    assert result['units'] == 0
++
++
++def test_identity_read_settles_only_the_owning_module(tmp_path):
++    result = _run(tmp_path, 'owner', r'''
++        plain = load(p / 'plain.py', sources['plain.py'])
++        data = load(p / 'data.py', sources['data.py'])
++        ok = a.attest_code(plain['work'].__code__)
++        units = [u['filename'] for u in a._units]
++        generated = a.attest_code(data['Value'].__init__.__code__)
++        forged = a.attest_code(plain['work'].__code__.replace(co_name='other'))
++        print(json.dumps({'ok': ok, 'units': units, 'generated': generated, 'forged': forged,
++                          'unknowns': list(a.unknowns())}))
++    ''', defer=True)
++    assert result['ok'] is True and result['generated'] is True and result['forged'] is False
++    assert [name.rsplit('/', 1)[-1] for name in result['units']] == ['plain.py']
++    assert any(x.startswith('unobserved-code:') for x in result['unknowns'])
++
++
++def test_expired_budget_reports_nothing_and_requests_full_speed(tmp_path):
++    result = _run(tmp_path, 'budget', r'''
++        ca.SETTLE_DELAY = 3600.0
++        for name, source in sources.items():
++            load(p / name, source)
++        owed = len(a._pending)
++        try:
++            a.integrity_observation(deadline=time.monotonic() - 1)
++            outcome = 'returned'
++        except TimeoutError:
++            outcome = 'timeout'
++        still = len(a._pending)
++        limit = time.monotonic() + 10
++        while a._pending and time.monotonic() < limit:
++            time.sleep(0.01)
++        print(json.dumps({'owed': owed, 'outcome': outcome, 'still': still,
++                          'left': len(a._pending), 'units': len(a._units)}))
++    ''', defer=True)
++    assert result['outcome'] == 'timeout'
++    assert result['owed'] >= 2 and result['still'] == result['owed']
++    # The settler did not wait out its hour: a bounded reader ran out of budget.
++    assert result['left'] == 0 and result['units'] >= 2
++
++
++def test_background_settler_compares_without_any_read(tmp_path):
++    result = _run(tmp_path, 'settler', r'''
++        ca.SETTLE_DELAY = 0.0
++        for name, source in sources.items():
++            load(p / name, source)
++        limit = time.monotonic() + 10
++        while a._pending and time.monotonic() < limit:
++            time.sleep(0.01)
++        print(json.dumps({'left': len(a._pending), 'units': len(a._units), 'unknown': new_unknowns()}))
++    ''', defer=True)
++    assert result['left'] == 0 and result['units'] >= 4 and result['unknown'] == []
++
++
++def test_backlog_is_bounded(tmp_path):
++    result = _run(tmp_path, 'bound', r'''
++        ca.MAX_PENDING = 4
++        ca.SETTLE_DELAY = 3600.0
++        peak = 0
++        for index in range(12):
++            load(p / 'plain.py', sources['plain.py'])
++            peak = max(peak, len(a._pending))
++        print(json.dumps({'peak': peak, 'units': len(a.executed_units()), 'unknowns': new_unknowns()}))
++    ''', defer=True)
++    assert result['peak'] <= 4 and result['units'] == 12 and result['unknowns'] == []
++
++
++def test_interrupted_comparison_is_unknown_not_skipped(tmp_path):
++    result = _run(tmp_path, 'interrupt', r'''
++        (p / 'plain.py').write_bytes(b'def work():\n    return 18\n')
++        load(p / 'plain.py', b'def work():\n    return 18\n')
++        observe = a._observe
++        def interrupted(*args):
++            a._observe = observe
++            raise KeyboardInterrupt
++        a._observe = interrupted
++        try:
++            a.unknowns()
++            outcome = 'returned'
++        except KeyboardInterrupt:
++            outcome = 'interrupted'
++        print(json.dumps({'outcome': outcome, 'unknowns': new_unknowns(), 'left': len(a._pending)}))
++    ''', defer=True)
++    assert result['outcome'] == 'interrupted' and result['left'] == 0
++    assert 'audit-error:KeyboardInterrupt' in result['unknowns']
++
++
++def test_root_registered_after_execution_stays_unrooted(tmp_path):
++    body = r'''
++        late = pathlib.Path('late').resolve(); late.mkdir()
++        source = b'VALUE = 5\n'
++        (late / 'm.py').write_bytes(source)
++        load(late / 'm.py', source)
++        a.register_component_root('late', late, 'plugin', digests={'m.py': hashlib.sha256(source).hexdigest()})
++        print(json.dumps(ledger()))
++    '''
++    inline = _run(tmp_path, 'inline', body, defer=False)
++    deferred = _run(tmp_path, 'deferred', body, defer=True)
++    assert any(x.startswith('unrooted-exec:') and x.endswith('m.py') for x in inline['unknowns'])
++    assert deferred == inline
++
++
++def test_module_executed_later_cannot_vouch_for_an_earlier_generation(tmp_path):
++    body = r'''
++        import types
++        source = (b'def build():\n    from dataclasses import dataclass\n'
++                  b'    @dataclass\n    class Late:\n        number: int = 3\n    return Late\n')
++        (p / 'plain.py').write_bytes(source)
++        a._components['reviewed'][2]['plain.py'] = hashlib.sha256(source).hexdigest()
++        code = compile(source, str(p / 'plain.py'), 'exec')
++        build = next(c for c in code.co_consts if isinstance(c, types.CodeType))
++        types.FunctionType(build, {'__name__': 'fixture_plain', '__builtins__': __builtins__})()
++        exec(code, {'__name__': 'fixture_plain'})
++        print(json.dumps(ledger()))
++    '''
++    inline = _run(tmp_path, 'inline', body, defer=False)
++    deferred = _run(tmp_path, 'deferred', body, defer=True)
++    assert any(x.startswith('generated-origin-unknown:') for x in inline['unknowns'])
++    assert deferred == inline
++
++
++def test_exit_with_a_backlog_does_not_hang_on_the_settler(tmp_path):
++    result = _run(tmp_path, 'exit', r'''
++        ca.SETTLE_DELAY = 0.0
++        a._demand.set()
++        class Late:
++            def __del__(self):
++                exec(compile('VALUE = 1', '<late>', 'exec'), {})
++        keep = Late()
++        for index in range(400):
++            load(p / 'plain.py', sources['plain.py'])
++        print(json.dumps({'owed': len(a._pending) > 0}))
++    ''', defer=True)
++    assert result['owed'] is True
++
++
++def test_only_serve_opts_in_at_bootstrap(monkeypatch, tmp_path):
++    import hermes_bootstrap
++    from hermes_cli import code_attestation, git_fingerprint, local_work
++
++    calls = []
++    monkeypatch.setattr(hermes_bootstrap, '_root', tmp_path)
++    monkeypatch.setattr(code_attestation, 'install', lambda *args: None)
++    monkeypatch.setattr(code_attestation, 'defer_comparisons', lambda: calls.append('defer'))
++    monkeypatch.setattr(code_attestation, 'route_report', lambda: {'route': None})
++    monkeypatch.setattr(local_work, 'install', lambda: None)
++    monkeypatch.setattr(git_fingerprint, 'process_boot_fingerprint', lambda root: None)
++    for argv in (['hermes'], ['hermes', 'gateway', 'run'], ['hermes', 'kanban', 'serve']):
++        monkeypatch.setattr(hermes_bootstrap.sys, 'argv', argv)
++        hermes_bootstrap._install_code_attestation()
++    assert calls == []
++    monkeypatch.setattr(hermes_bootstrap.sys, 'argv', ['hermes', 'serve', '--isolated'])
++    hermes_bootstrap._install_code_attestation()
++    assert calls == ['defer']
++
++
++def test_uninstalled_opt_in_is_refused(monkeypatch):
++    from hermes_cli import code_attestation
++
++    monkeypatch.setattr(code_attestation, '_installed', None)
++    assert code_attestation.defer_comparisons() is False
+diff --git a/tests/hermes_cli/test_startup_git_waits.py b/tests/hermes_cli/test_startup_git_waits.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c2298337855033e330a1784dee5d42710e8dd20
+--- /dev/null
++++ b/tests/hermes_cli/test_startup_git_waits.py
+@@ -0,0 +1,109 @@
++"""Startup git waits overlap the launch; their answers and refusals do not change."""
++import subprocess
++import threading
++import time
++
++import pytest
++
++from hermes_cli import git_fingerprint as identity
++from hermes_cli import version_info
++
++
++def git(root, *args):
++    return subprocess.check_output(['git', '-C', str(root), *args], text=True).strip()
++
++
++@pytest.fixture
++def repo(tmp_path):
++    git(tmp_path, 'init', '-q')
++    git(tmp_path, 'config', 'user.email', 'fixture@example.invalid')
++    git(tmp_path, 'config', 'user.name', 'Fixture')
++    (tmp_path / 'module.py').write_text('VALUE = 1\n')
++    git(tmp_path, 'add', '.')
++    git(tmp_path, 'commit', '-qm', 'initial')
++    return tmp_path
++
++
++def test_begun_capture_returns_before_git_finishes_and_readers_join_it(repo, monkeypatch):
++    identity.record_process_boot_fingerprint(repo)
++    release = threading.Event()
++    finish = identity._capsule_status_finish
++
++    def slow(started):
++        release.wait(10)
++        return finish(started)
++
++    monkeypatch.setattr(identity, '_capsule_status_finish', slow)
++    began = time.monotonic()
++    identity.begin_capsule_boot_identity(repo)
++    assert time.monotonic() - began < 5
++    key = identity._key(repo)
++    assert key not in identity._capsule_boot and key in identity._capsule_capturing
++    identity.begin_capsule_boot_identity(repo)  # one capture per boot
++    identity.record_capsule_boot_identity(repo)  # cannot replace a running capture
++    assert key not in identity._capsule_boot
++    threading.Timer(0.2, release.set).start()
++    monkeypatch.setattr(identity, '_capsule_status_finish', finish)
++    assert identity.capsule_code_sha(repo) == git(repo, 'rev-parse', 'HEAD')
++    assert key not in identity._capsule_capturing
++
++
++def test_begun_capture_of_a_dirty_boot_stays_unknown(repo):
++    identity.record_process_boot_fingerprint(repo)
++    (repo / 'module.py').write_text('VALUE = 2\n')
++    identity.begin_capsule_boot_identity(repo)
++    assert identity.capsule_code_sha(repo) is None
++    git(repo, 'checkout', '--', 'module.py')
++    identity.begin_capsule_boot_identity(repo)
++    identity.record_capsule_boot_identity(repo)
++    assert identity.capsule_code_sha(repo) is None
++
++
++def test_begun_capture_refuses_a_revision_that_moved_while_git_ran(repo, monkeypatch):
++    identity.record_process_boot_fingerprint(repo)
++    finish = identity._capsule_status_finish
++
++    def moved(started):
++        (repo / 'module.py').write_text('VALUE = 3\n')
++        git(repo, 'commit', '-qam', 'moved')
++        return finish(started)
++
++    monkeypatch.setattr(identity, '_capsule_status_finish', moved)
++    identity.begin_capsule_boot_identity(repo)
++    assert identity.capsule_code_sha(repo) is None
++
++
++def test_capture_lost_with_its_thread_is_unknown_not_retried(repo, monkeypatch):
++    identity.record_process_boot_fingerprint(repo)
++    key = identity._key(repo)
++    lost = threading.Thread(target=lambda: None)
++    lost.start()
++    lost.join()
++    monkeypatch.setitem(identity._capsule_capturing, key, lost)
++    assert identity.capsule_code_sha(repo) is None
++    identity.record_capsule_boot_identity(repo)
++    assert identity.capsule_code_sha(repo) is None
++
++
++def test_prewarm_resolves_once_and_callers_wait_for_it(monkeypatch):
++    calls = []
++    release = threading.Event()
++    info = version_info.VersionInfo('1.2.3', '1.2.3', 0, 'a' * 40, 'main', 'git')
++
++    def resolve():
++        calls.append(threading.current_thread().name)
++        release.wait(10)
++        return info
++
++    monkeypatch.setattr(version_info, '_cached_version_info', None)
++    monkeypatch.setattr(version_info, '_stamp_or_none', resolve)
++    version_info.prewarm_version_info()
++    limit = time.monotonic() + 5
++    while not calls and time.monotonic() < limit:
++        time.sleep(0.01)
++    assert calls == ['version-info-prewarm']
++    threading.Timer(0.2, release.set).start()
++    assert version_info.get_version_info() is info
++    assert calls == ['version-info-prewarm']
++    version_info.prewarm_version_info()  # cached: no second thread
++    assert version_info.get_version_info() is info and len(calls) == 1
+diff --git a/website/docs/developer-guide/plugins/code-attestation.md b/website/docs/developer-guide/plugins/code-attestation.md
+index 7a98b147866d78800ef33ebf99fd91b3f0ab489f..383f7a864cd460da5e2cb70bb4b7317533d103b6 100644
+--- a/website/docs/developer-guide/plugins/code-attestation.md
++++ b/website/docs/developer-guide/plugins/code-attestation.md
+@@ -94,3 +94,22 @@
+ cannot be hard-preempted by a Python deadline; this is not a hard-real-time
+ promise. Owner launch still performs full synchronous verification, without
+ filtering the ledger's unknowns.
++
++## Deferred comparison in the sessions backend
++
++`hermes serve` must answer within seconds of its unit start, so it is the one
++process that compares executed module code after the module has run instead of
++during its import. Nothing else changes: the ledger keeps the executed code
++object, reads the source and its approval fresh, recompiles and requires the
++same exact code equality. Every ledger read (`unknowns`, `integrity_observation`,
++`executed_units`, `dependency_receipts`, `attest_code`, `generation`, snapshots)
++first settles what is owed, so an uncompared module is never reported as
++verified, and a deadline-bound read that cannot settle in time raises instead of
++answering. A background thread settles the backlog at a bounded share of one
++core once startup is past.
++
++Two consequences follow. Source is read at comparison time, so a file that
++changes between execution and comparison is reported unknown even when the bytes
++that ran were approved. And an executed module is judged against the component
++roots registered when it ran: registering a root still has to happen before its
++code executes. All other processes compare inline.
+-- 
+2.43.0
+

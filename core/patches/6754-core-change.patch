@@ -1,0 +1,173 @@
+From 58dcd0d84dc763dcf987ea0a43921264b929fae3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:02:46 +0000
+Subject: [PATCH 6754] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 58dcd0d84dc763dcf987ea0a43921264b929fae3.
+
+---
+diff --git a/hermes_cli/kanban_containment_terminal.py b/hermes_cli/kanban_containment_terminal.py
+index 596c9dcfca7ef4f0b4584102f2f759c487fd8ed7..b2b3a3711ae6bf1253fe54e226d5ea231a218425 100644
+--- a/hermes_cli/kanban_containment_terminal.py
++++ b/hermes_cli/kanban_containment_terminal.py
+@@ -144,7 +144,8 @@
+ 
+ def parent_status_sql(conn, alias="", *, table="tasks"):
+     """Legacy schemas lack the marker; ordinary archived parents remain successful."""
++    from hermes_cli.kanban_table_columns import table_columns  # one row, not one per column
+     prefix = alias + "." if alias else ""
+-    if "containment_episode" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
++    if "containment_episode" not in table_columns(conn, table):
+         return prefix + "status"
+     return f"CASE WHEN {prefix}status='archived' AND {prefix}containment_episode IS NOT NULL THEN 'triage' ELSE {prefix}status END"
+diff --git a/hermes_cli/kanban_db_parent_states.py b/hermes_cli/kanban_db_parent_states.py
+index 1ea1fe132fc6748af2bc15d9a254661cc1f2395a..1ab6770657332d72f3acc6517bfe8552722504b5 100644
+--- a/hermes_cli/kanban_db_parent_states.py
++++ b/hermes_cli/kanban_db_parent_states.py
+@@ -31,16 +31,40 @@
+     still satisfied. A terminal containment archive is non-success, not release.
+     """
+     from hermes_cli import kanban_db_sync as sync
+-    from hermes_cli.kanban_containment_terminal import parent_status_sql
+     if remote is None:
+         remote = sync.has_remote_parents(conn)
++    sql = _states_sql(conn, remote, "l.child_id = ?")
++    return [(row[1], row[2]) for row in conn.execute(sql, (task_id,)).fetchall()]
++
++
++def parent_states_many(conn: sqlite3.Connection, task_ids) -> dict[str, list[tuple[str, str | None]]]:
++    """``parent_states`` for many children in one statement (read-only presentation readers)."""
++    import json
++
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_table_columns import tables_columns
++    ids = [str(t) for t in dict.fromkeys(task_ids)]
++    out: dict[str, list[tuple[str, str | None]]] = {tid: [] for tid in ids}
++    if not ids:
++        return out
++    links, remote = tables_columns(conn, "task_links", sync.REMOTE_PARENTS_TABLE)  # one row for both probes
++    if not links:
++        return out  # a board without the link table has no prerequisites
++    sql = _states_sql(conn, bool(remote), "l.child_id IN (SELECT value FROM json_each(?))")
++    for child, pid, status in conn.execute(sql, (json.dumps(ids),)).fetchall():
++        out[str(child)].append((pid, status))
++    return out
++
++
++def _states_sql(conn: sqlite3.Connection, remote: bool, child_filter: str) -> str:
++    """One status projection for single and batched readers, so they cannot drift."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_containment_terminal import parent_status_sql
+     parent_status = parent_status_sql(conn, "p")
+     if remote:
+-        sql = (f"SELECT l.parent_id AS id, COALESCE({parent_status}, r.status) AS status FROM task_links l "
+-               "LEFT JOIN tasks p ON p.id = l.parent_id "
+-               f"LEFT JOIN {sync.REMOTE_PARENTS_TABLE} r ON r.parent_id = l.parent_id "
+-               "WHERE l.child_id = ? ORDER BY l.parent_id")
+-    else:
+-        sql = (f"SELECT l.parent_id AS id, {parent_status} AS status FROM task_links l "
+-               "LEFT JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ? ORDER BY l.parent_id")
+-    return [(row["id"], row["status"]) for row in conn.execute(sql, (task_id,)).fetchall()]
++        return (f"SELECT l.child_id AS child, l.parent_id AS id, COALESCE({parent_status}, r.status) AS status "
++                "FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
++                f"LEFT JOIN {sync.REMOTE_PARENTS_TABLE} r ON r.parent_id = l.parent_id "
++                f"WHERE {child_filter} ORDER BY l.child_id, l.parent_id")
++    return (f"SELECT l.child_id AS child, l.parent_id AS id, {parent_status} AS status FROM task_links l "
++            f"LEFT JOIN tasks p ON p.id = l.parent_id WHERE {child_filter} ORDER BY l.child_id, l.parent_id")
+diff --git a/hermes_cli/kanban_dependency_wait_clock.py b/hermes_cli/kanban_dependency_wait_clock.py
+index 14ced669662a1d869de01a5f2549038c94a12fa8..2c59e6404940f8b2938ddeeb749cec46243794bf 100644
+--- a/hermes_cli/kanban_dependency_wait_clock.py
++++ b/hermes_cli/kanban_dependency_wait_clock.py
+@@ -72,9 +72,22 @@
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_table_columns import table_columns
++    from hermes_cli.kanban_db_parent_states import parent_states_many
+     from hermes_state_page_pack import read_rows
+ 
+     ids = [tid for tid, row in parked.items() if row[0] == 'todo']
++    if not ids:
++        return
++    try:  # One graph read for every todo card: this reader is on the sidebar poll path.
++        graph = parent_states_many(conn, ids)
++        gating = {tid: [pid for pid, status in graph[tid] if kb.parent_blocks(conn, pid, status)] for tid in ids}
++    except sqlite3.Error:
++        graph, gating = {}, {}  # No graph evidence, not proof of a dependency wait.
++    for tid in ids:
++        if not gating.get(tid):
++            parked.pop(tid)
++            events.pop(tid, None)
++    ids = [tid for tid in ids if gating.get(tid)]
+     if not ids:
+         return
+     history = {tid: [] for tid in ids}
+@@ -92,16 +105,5 @@
+     except sqlite3.Error:
+         pass  # Old/incomplete boards still name dependencies, without inventing a start time.
+     for tid in ids:
+-        try:
+-            states = kb.parent_states(conn, tid)
+-        except sqlite3.Error:
+-            parked.pop(tid)
+-            events.pop(tid, None)
+-            continue  # No graph evidence, not proof of a dependency wait.
+-        parents = [pid for pid, status in states if kb.parent_blocks(conn, pid, status)]
+-        if not parents:
+-            parked.pop(tid)
+-            events.pop(tid, None)
+-            continue
+-        events[tid] = ('dependency_wait', {'parents': parents},
+-                       episode(history[tid], parents_now=[pid for pid, _status in states]))
++        events[tid] = ('dependency_wait', {'parents': gating[tid]},
++                       episode(history[tid], parents_now=[pid for pid, _status in graph[tid]]))
+diff --git a/tests/hermes_cli/test_kanban_actionability_wait_reason.py b/tests/hermes_cli/test_kanban_actionability_wait_reason.py
+index a236f3c8bf5cf5d48886abcf3189ebae439a5929..b13b3d72e6743eec0cef540f1d04ed61e6413e0c 100644
+--- a/tests/hermes_cli/test_kanban_actionability_wait_reason.py
++++ b/tests/hermes_cli/test_kanban_actionability_wait_reason.py
+@@ -221,7 +221,12 @@
+         assert kb.get_task(conn, tid).status == 'todo'
+         row = _row(conn, tid, T0 + 500)
+         assert WHY not in row['instruction'] and WHY not in str(row['blocker'])
+-        assert _local_wait_info(conn, [tid], now=T0 + 500) == {}
++        # The stale clock reason is gone; what remains is the real prerequisite, the late parent.
++        wait = _local_wait_info(conn, [tid], now=T0 + 500)
++        assert set(wait) == {tid} and wait[tid]['waiting_on'] == f'card {parent}', wait
++        assert WHY not in str(wait) and 'prerequisite' not in wait[tid] and 'next_actor' not in wait[tid]
++        kb.unlink_tasks(conn, parent, tid)
++        assert _local_wait_info(conn, [tid], now=T0 + 600) == {}  # no parent left: no wait, no reason
+ 
+ 
+ def test_core_inferred_awaiting_is_never_reported_as_the_parkers_reason():
+diff --git a/tests/hermes_cli/test_kanban_dependency_wait_clock.py b/tests/hermes_cli/test_kanban_dependency_wait_clock.py
+index be105adca287f48632a304aeb44c2b0ed992afa6..e7506384c8c75f0068d3da1d4656ca47ddaf0a85 100644
+--- a/tests/hermes_cli/test_kanban_dependency_wait_clock.py
++++ b/tests/hermes_cli/test_kanban_dependency_wait_clock.py
+@@ -132,3 +132,25 @@
+     assert kb.claim_task(board, child) is None
+     assert kb.get_task(board, child).status == 'todo'
+     assert wait(board, child)['waiting_since'] == entry
++
++
++def test_todo_graph_read_is_batched_and_matches_single_card_reader(board):
++    """The sidebar poll path reads every todo card's parents in one statement, not one per card."""
++    from hermes_cli.kanban_db_parent_states import parent_states_many
++
++    parent = create(board, 'Parent')
++    work = []
++    for n in (3, 30):
++        kids = [create(board, f'Child {n}-{i}', parents=[parent]) for i in range(n)]
++        seen = []
++        board.set_trace_callback(seen.append)
++        try:
++            info = _local_wait_info(board, kids, now=2000000000)
++        finally:
++            board.set_trace_callback(None)
++        assert set(info) == set(kids) and all(v['waiting_on'] == 'card ' + parent for v in info.values())
++        work.append(sum('task_links' in s for s in seen))
++        many = parent_states_many(board, kids)
++        assert many == {k: kb.parent_states(board, k) for k in kids}
++    assert work[0] == work[1], work  # constant: no per-card graph statement
++    assert parent_states_many(board, []) == {}
+-- 
+2.43.0
+

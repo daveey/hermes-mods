@@ -1,0 +1,557 @@
+From 3c6299a22944208031b5081a207aeadfd298c8b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:23:37 +0000
+Subject: [PATCH 6843] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 3c6299a22944208031b5081a207aeadfd298c8b8.
+
+---
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b02360f8c6c99095593c111938e82ebdc88a27b
+--- /dev/null
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -0,0 +1,152 @@
++"""Dormant W=1 replay journal in the caller's Board database. [daveey]
++
++No production installer or transport calls this yet. Admission, capture provenance,
++parent ordering and source-custody bookkeeping must be integrated before activation.
++The caller owns the transaction and COMMIT, including source custody changes.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from collections.abc import Callable
++
++import rfc8785
++
++from hermes_cli.kanban_replay_reconcile import _identity, _local_state, reconcile
++from hermes_cli.kanban_replay_wire import freeze, verify
++
++_SCHEMA = """CREATE TABLE IF NOT EXISTS kanban_replay_sender1 (
++    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
++    state TEXT NOT NULL, wire BLOB
++)"""
++
++
++def _transaction(conn: sqlite3.Connection) -> None:
++    if not conn.in_transaction or getattr(conn, 'autocommit', False) is True:
++        raise ValueError('caller transaction required')
++
++
++def _reserve(conn: sqlite3.Connection) -> None:
++    _transaction(conn)
++    # Reserve before reading even when the caller used a deferred BEGIN.
++    conn.execute('UPDATE kanban_replay_sender1 SET state=state WHERE singleton=1')
++
++
++def _validate(state: dict) -> None:
++    if not isinstance(state, dict):
++        raise ValueError('invalid journal state')
++    _local_state(state)
++    for key in ('board_incarnation', 'gateway_principal', 'journal_id'):
++        if not isinstance(state.get(key), str) or not state[key]:
++            raise ValueError(f'invalid journal binding: {key}')
++
++
++def _ack(state: dict) -> dict | None:
++    return (dict(sequence=state['settled'], op_id=state['last_op_id'],
++                 payload_sha256=state['last_payload_sha256']) if state['settled'] != '0' else None)
++
++
++def _check_wire(state: dict, encoded: bytes | None) -> None:
++    pending = state['pending']
++    if pending is None:
++        if encoded is not None:
++            raise ValueError('unexpected pending wire')
++        return
++    if not isinstance(encoded, bytes):
++        raise ValueError('missing pending wire')
++    wire = json.loads(encoded)
++    if not isinstance(wire, dict) or not isinstance(wire.get('replay'), dict):
++        raise ValueError('invalid pending wire')
++    replay = wire['replay']
++    if (rfc8785.dumps(wire) != encoded or verify(wire) != pending['payload_sha256'] or
++            wire.get('client_op_id') != pending['op_id'] or replay.get('protocol') != 'processed_prefix1' or
++            replay.get('generation') != state['generation'] or replay.get('sequence') != pending['sequence'] or
++            replay.get('ack') != _ack(state) or 'session' in replay):
++        raise ValueError('pending wire custody mismatch')
++
++
++def _read(conn: sqlite3.Connection) -> tuple[dict, bytes | None]:
++    row = conn.execute('SELECT state,wire FROM kanban_replay_sender1 WHERE singleton=1').fetchone()
++    if row is None:
++        raise ValueError('missing journal state')
++    state = json.loads(row[0])
++    _validate(state)
++    _check_wire(state, row[1])
++    return state, row[1]
++
++
++def initialize(conn: sqlite3.Connection, binding: dict) -> None:
++    """Install an explicitly bound empty journal, without taking remote authority."""
++    _transaction(conn)
++    _validate(binding)
++    if binding['settled'] != '0' or binding['pending'] is not None:
++        raise ValueError('initial journal must be empty')
++    conn.execute(_SCHEMA)
++    conn.execute('INSERT INTO kanban_replay_sender1(singleton,state) VALUES (1,?)',
++                 (json.dumps(binding),))
++
++
++def snapshot(conn: sqlite3.Connection) -> dict:
++    """Read and validate persisted allocation/custody without business-row hydration."""
++    return _read(conn)[0]
++
++
++def pending_wire(conn: sqlite3.Connection) -> bytes | None:
++    """Return exact canonical bytes after validating identity, digest and ack custody."""
++    return _read(conn)[1]
++
++
++def issue(conn: sqlite3.Connection, intent: dict) -> bytes:
++    """Freeze only the dependency-ordered head selected by the serialized sender."""
++    _reserve(conn)
++    state = snapshot(conn)
++    if state['pending'] is not None:
++        raise ValueError('outstanding issued envelope')
++    if 'replay' in intent:
++        raise ValueError('intent already framed')
++    _identity(intent.get('client_op_id'), '0' * 64, 'intent')
++    sequence = str(int(state['settled']) + 1)
++    wire = dict(intent)
++    replay: dict = dict(protocol='processed_prefix1', generation=state['generation'], sequence=sequence)
++    ack = _ack(state)
++    if ack is not None:
++        replay['ack'] = ack
++    wire['replay'] = replay
++    wire = freeze(wire)
++    state['pending'] = dict(sequence=sequence, op_id=wire['client_op_id'],
++                            payload_sha256=wire['replay']['payload_sha256'])
++    _validate(state)
++    encoded = rfc8785.dumps(wire)
++    conn.execute('UPDATE kanban_replay_sender1 SET state=?,wire=? WHERE singleton=1',
++                 (json.dumps(state), encoded))
++    return encoded
++
++
++def recover(conn: sqlite3.Connection, remote: dict, record: Callable[[dict], None]) -> dict:
++    """Record an inspected exact final verdict with caller's bookkeeping/prune.
++
++    ``record`` must persist visible rejection/cancellation/deferred custody or
++    success bookkeeping in this transaction. It must not commit or issue work.
++    Authentication and serving capability are the transport caller's obligations.
++    """
++    _reserve(conn)
++    state = snapshot(conn)
++    decision = reconcile(state, remote)
++    if decision['action'] == 'record':
++        conn.execute('SAVEPOINT replay_record1')
++        try:
++            record(decision['verdict'])
++            pending = state['pending']
++            state.update(settled=pending['sequence'], last_op_id=pending['op_id'],
++                         last_payload_sha256=pending['payload_sha256'],
++                         last_verdict=remote['last_verdict'], pending=None)
++            conn.execute('UPDATE kanban_replay_sender1 SET state=?,wire=NULL WHERE singleton=1',
++                         (json.dumps(state),))
++            conn.execute('RELEASE replay_record1')
++        except BaseException:
++            # Storage faults may already have rolled back the outer transaction.
++            if conn.in_transaction:
++                conn.execute('ROLLBACK TO replay_record1')
++                conn.execute('RELEASE replay_record1')
++            raise
++    return decision
+diff --git a/hermes_cli/kanban_replay_wire.py b/hermes_cli/kanban_replay_wire.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fe90caa8ef5e1ab4e524df3c4c94a3350cbdf920
+--- /dev/null
++++ b/hermes_cli/kanban_replay_wire.py
+@@ -0,0 +1,33 @@
++"""Canonical immutable replay envelope framing (RFC8785). [daveey]
++
++Session is replaceable transport authority; it and the self digest are the only
++excluded replay fields. All intent fields and a piggybacked ack remain hashed.
++"""
++from __future__ import annotations
++
++import copy
++import hashlib
++
++import rfc8785
++
++
++def _digest(wire: dict) -> str:
++    body = copy.deepcopy(wire)
++    body['replay'].pop('payload_sha256', None)
++    body['replay'].pop('session', None)
++    return hashlib.sha256(rfc8785.dumps(body)).hexdigest()
++
++
++def freeze(wire: dict) -> dict:
++    """Return an isolated first-send envelope with its canonical digest."""
++    frozen = copy.deepcopy(wire)
++    frozen['replay']['payload_sha256'] = _digest(frozen)
++    return frozen
++
++
++def verify(wire: dict) -> str:
++    """Refuse changed intent bytes; never repair an issued digest."""
++    digest = _digest(wire)
++    if wire['replay'].get('payload_sha256') != digest:
++        raise ValueError('replay digest mismatch')
++    return digest
+diff --git a/pyproject.toml b/pyproject.toml
+index a024a0cef5e59d22659a0d763498a29a6c779fc0..2e84712321a68f9db88ef82709c15c994ea1c324 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -50,6 +50,9 @@
+   "python-dotenv==1.2.4; python_version >= '3.14'",
+   "fire==0.7.1; python_version >= '3.14'",
+   "httpx[socks]==0.28.1; python_version >= '3.14'",
++  # The built-in Board sync sender hashes immutable replay envelopes with RFC8785.
++  # This pure-Python codec has no transitive dependencies.
++  "rfc8785==0.1.4; python_version >= '3.14'",
+   "rich==14.3.4; python_version >= '3.14'",
+   "tomli-w==1.2.0; python_version >= '3.14'",  # Preserve relative dependency paths in staged plugin metadata.
+   # 0.18.17 requires ruamel.yaml.clib on 3.14, which has no Windows ARM64 wheel.
+diff --git a/tests/hermes_cli/test_kanban_replay_journal.py b/tests/hermes_cli/test_kanban_replay_journal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdc3175fb009b9be9008e222dcef1c36ffe1d058
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_journal.py
+@@ -0,0 +1,233 @@
++"""Durable W=1 allocator uses the caller's Board transaction, not another writer."""
++import json
++import sqlite3
++
++import pytest
++
++
++def binding():
++    return dict(board_incarnation='board-incarnation', gateway_principal='principal-0001',
++                journal_id='journal-0001', generation='1', settled='0',
++                last_op_id=None, last_payload_sha256=None, pending=None)
++
++
++def test_allocate_rollback_and_restart_keep_one_exact_successor(tmp_path):
++    from hermes_cli import kanban_replay_journal as journal
++
++    path = tmp_path / 'board.db'
++    conn = sqlite3.connect(path)
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++    conn.execute('BEGIN IMMEDIATE')
++    first = journal.issue(conn, {'client_op_id': 'operation-0001', 'fields': {'n': 1.0}})
++    assert json.loads(first)['replay']['sequence'] == '1'
++    conn.rollback()
++    assert journal.snapshot(conn)['pending'] is None
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        second = journal.issue(conn, {'client_op_id': 'operation-0002', 'fields': {'n': 1.0}})
++    conn.close()
++    conn = sqlite3.connect(path)
++    assert journal.pending_wire(conn) == second
++    assert journal.snapshot(conn)['pending']['op_id'] == 'operation-0002'
++    with pytest.raises(ValueError, match='outstanding issued envelope'):
++        with conn:
++            conn.execute('BEGIN IMMEDIATE')
++            journal.issue(conn, {'client_op_id': 'operation-0003'})
++    assert journal.pending_wire(conn) == second
++    conn.close()
++
++
++@pytest.mark.parametrize('action', ['initialize', 'issue', 'recover'])
++def test_mutation_requires_caller_transaction(action):
++    from hermes_cli import kanban_replay_journal as journal
++
++    conn = sqlite3.connect(':memory:')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++    with pytest.raises(ValueError, match='caller transaction required'):
++        if action == 'initialize':
++            journal.initialize(conn, binding())
++        elif action == 'issue':
++            journal.issue(conn, {'client_op_id': 'operation-0001'})
++        else:
++            journal.recover(conn, {}, lambda verdict: None)
++    assert not conn.in_transaction
++    conn.close()
++
++
++@pytest.mark.parametrize('defect', ['digest', 'wire', 'missing', 'ack', 'state'])
++def test_corrupt_custody_never_retries_or_records(defect):
++    from hermes_cli import kanban_replay_journal as journal
++    from hermes_cli.kanban_replay_wire import freeze
++    import rfc8785
++
++    conn = sqlite3.connect(':memory:')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++        encoded = journal.issue(conn, {'client_op_id': 'operation-0001'})
++    wire = json.loads(encoded)
++    state = journal.snapshot(conn)
++    mutate = {
++        'digest': lambda: wire['replay'].update(payload_sha256='0' * 64),
++        'wire': lambda: wire.update(client_op_id='operation-9999'),
++        'ack': lambda: wire['replay'].update(ack=dict(sequence='1', op_id='operation-9999',
++                                                    payload_sha256='0' * 64)),
++        'state': lambda: state.update(settled='01'),
++        'missing': lambda: None,
++    }
++    mutate[defect]()
++    if defect in ('wire', 'ack'):
++        wire = freeze(wire)
++    if defect == 'ack':
++        state['pending']['payload_sha256'] = wire['replay']['payload_sha256']
++    with conn:
++        conn.execute('UPDATE kanban_replay_sender1 SET wire=?,state=?',
++                     (None if defect == 'missing' else rfc8785.dumps(wire), json.dumps(state)))
++    remote = dict(binding(), mode='STRICT', session='1', h='0', a='0', last_verdict=None)
++    recorded = []
++    with pytest.raises(ValueError):
++        with conn:
++            conn.execute('BEGIN IMMEDIATE')
++            journal.recover(conn, remote, recorded.append)
++    assert recorded == []
++    conn.close()
++
++
++@pytest.mark.parametrize('intent,expected', [
++    ({'client_op_id': 'bad'}, 'identity'),
++    ({'client_op_id': 'operation-0001', 'replay': {}}, 'already framed'),
++])
++def test_invalid_intent_never_allocates(intent, expected):
++    from hermes_cli import kanban_replay_journal as journal
++
++    conn = sqlite3.connect(':memory:')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++    with pytest.raises(ValueError, match=expected):
++        with conn:
++            conn.execute('BEGIN IMMEDIATE')
++            journal.issue(conn, intent)
++    assert journal.snapshot(conn) == binding()
++    assert journal.pending_wire(conn) is None
++    conn.close()
++
++
++def test_two_connections_cannot_allocate_two_successors(tmp_path):
++    from hermes_cli import kanban_replay_journal as journal
++
++    path = tmp_path / 'board.db'
++    first, second = sqlite3.connect(path), sqlite3.connect(path, timeout=0)
++    with first:
++        first.execute('BEGIN IMMEDIATE')
++        journal.initialize(first, binding())
++    first.execute('BEGIN IMMEDIATE')
++    issued = journal.issue(first, {'client_op_id': 'operation-0001'})
++    second.execute('BEGIN')
++    with pytest.raises(sqlite3.OperationalError, match='locked'):
++        journal.issue(second, {'client_op_id': 'operation-0002'})
++    second.rollback()
++    first.commit()
++    second.execute('BEGIN')
++    with pytest.raises(ValueError, match='outstanding issued envelope'):
++        journal.issue(second, {'client_op_id': 'operation-0002'})
++    second.rollback()
++    assert journal.pending_wire(second) == issued
++    first.close()
++    second.close()
++
++
++@pytest.mark.parametrize('settled,op_id,expected', [
++    (str(2**63-1), 'operation-0002', 'pending sequence'),
++    ('1', 'operation-0001', 'reuses settled'),
++])
++def test_exhaustion_and_identity_reuse_cannot_allocate(settled, op_id, expected):
++    from hermes_cli import kanban_replay_journal as journal
++
++    conn = sqlite3.connect(':memory:')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++        state = dict(binding(), settled=settled, last_op_id='operation-0001', last_payload_sha256='0' * 64)
++        conn.execute('UPDATE kanban_replay_sender1 SET state=?', (json.dumps(state),))
++    with pytest.raises(ValueError, match=expected):
++        with conn:
++            conn.execute('BEGIN IMMEDIATE')
++            journal.issue(conn, {'client_op_id': op_id})
++    assert journal.snapshot(conn) == state
++    conn.close()
++
++
++def test_callback_failure_cannot_commit_partial_bookkeeping():
++    from hermes_cli import kanban_replay_journal as journal
++
++    conn = sqlite3.connect(':memory:')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++        conn.execute('CREATE TABLE outcomes(verdict TEXT)')
++        wire = json.loads(journal.issue(conn, {'client_op_id': 'operation-0001'}))
++    remote = dict(binding(), mode='STRICT', session='1', h='1', a='0', last_op_id='operation-0001',
++                  last_payload_sha256=wire['replay']['payload_sha256'],
++                  last_verdict=json.dumps({'client_op_id': 'operation-0001', 'status': 'applied'}))
++
++    def fail(verdict):
++        conn.execute('INSERT INTO outcomes VALUES (?)', (json.dumps(verdict),))
++        raise RuntimeError('bookkeeping failed')
++
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        with pytest.raises(RuntimeError, match='bookkeeping failed'):
++            journal.recover(conn, remote, fail)
++        assert conn.in_transaction
++    assert conn.execute('SELECT COUNT(*) FROM outcomes').fetchone()[0] == 0
++    assert journal.snapshot(conn)['settled'] == '0'
++    assert journal.pending_wire(conn) is not None
++    conn.close()
++
++
++def test_recovered_verdict_bookkeeping_and_custody_commit_together(tmp_path):
++    from hermes_cli import kanban_replay_journal as journal
++
++    conn = sqlite3.connect(tmp_path / 'board.db')
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        journal.initialize(conn, binding())
++        conn.execute('CREATE TABLE outcomes (verdict TEXT)')
++        wire = json.loads(journal.issue(conn, {'client_op_id': 'operation-0001'}))
++    remote = dict(binding(), mode='STRICT', session='1', h='1', a='0',
++                  last_op_id='operation-0001', last_payload_sha256=wire['replay']['payload_sha256'],
++                  last_verdict=json.dumps({'client_op_id': 'operation-0001', 'status': 'rejected'}))
++
++    def record(verdict):
++        conn.execute('INSERT INTO outcomes VALUES (?)', (json.dumps(verdict),))
++
++    with pytest.raises(RuntimeError, match='lost commit'):
++        with conn:
++            conn.execute('BEGIN IMMEDIATE')
++            journal.recover(conn, remote, record)
++            raise RuntimeError('lost commit')
++    assert journal.pending_wire(conn) is not None
++    assert conn.execute('SELECT COUNT(*) FROM outcomes').fetchone()[0] == 0
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        assert journal.recover(conn, remote, record)['action'] == 'record'
++    assert journal.pending_wire(conn) is None
++    assert journal.snapshot(conn)['settled'] == '1'
++    assert journal.snapshot(conn)['last_verdict'] == remote['last_verdict']
++    assert json.loads(conn.execute('SELECT verdict FROM outcomes').fetchone()[0])['status'] == 'rejected'
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        successor = json.loads(journal.issue(conn, {'client_op_id': 'operation-0002'}))
++    assert successor['replay']['sequence'] == '2'
++    assert successor['replay']['ack'] == dict(sequence='1', op_id='operation-0001',
++                                             payload_sha256=wire['replay']['payload_sha256'])
++    with conn:
++        conn.execute('BEGIN IMMEDIATE')
++        assert journal.recover(conn, remote, record)['action'] == 'retry'
++    assert conn.execute('SELECT COUNT(*) FROM outcomes').fetchone()[0] == 1
++    conn.close()
+diff --git a/tests/hermes_cli/test_kanban_replay_wire.py b/tests/hermes_cli/test_kanban_replay_wire.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7149793e36a942c499f17676e94112dcdffd00a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_wire.py
+@@ -0,0 +1,54 @@
++"""RFC8785 digest framing matches the Board, not Python's JSON spelling."""
++import hashlib
++
++import pytest
++
++
++def test_digest_uses_jcs_and_excludes_replaceable_session_and_self_digest():
++    from hermes_cli.kanban_replay_wire import freeze, verify
++
++    op = {'client_op_id': 'operation-0001', 'fields': {'n': 1.0, 'z': -0.0},
++          'replay': {'protocol': 'processed_prefix1', 'generation': '1', 'sequence': '1', 'session': '9'}}
++    wire = freeze(op)
++    hashed = (b'{"client_op_id":"operation-0001","fields":{"n":1,"z":0},'
++              b'"replay":{"generation":"1","protocol":"processed_prefix1","sequence":"1"}}')
++    digest = hashlib.sha256(hashed).hexdigest()
++    assert wire['replay']['payload_sha256'] == digest
++    assert 'payload_sha256' not in op['replay']
++    assert verify(wire) == digest
++    wire['replay']['session'] = '10'
++    assert verify(wire) == digest
++    wire['fields']['n'] = 2
++    with pytest.raises(ValueError, match='digest mismatch'):
++        verify(wire)
++
++
++def test_jcs_utf16_order_escaping_and_number_spelling():
++    import rfc8785
++    from hermes_cli.kanban_replay_wire import freeze
++
++    wire = freeze({'client_op_id': 'operation-0001',
++                   'fields': {'\ue000': 1e30, '\U0001f600': 1e-7, 'small': 1e-6, 'large': 1e20},
++                   'replay': {'protocol': 'processed_prefix1', 'generation': '1', 'sequence': '1'}})
++    # JCS sorts UTF-16 units: the astral surrogate pair sorts BEFORE U+E000.
++    assert rfc8785.dumps(wire['fields']) == (
++        '{"large":100000000000000000000,"small":0.000001,"😀":1e-7,"\ue000":1e+30}'.encode())
++
++
++@pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf'), '\ud800', 2**53])
++def test_unrepresentable_canonical_values_refuse(value):
++    from hermes_cli.kanban_replay_wire import freeze
++
++    with pytest.raises(ValueError):
++        freeze({'fields': {'bad': value}, 'replay': {}})
++
++
++def test_predecessor_ack_is_part_of_digest():
++    from hermes_cli.kanban_replay_wire import freeze, verify
++
++    wire = freeze({'client_op_id': 'operation-0002', 'replay': {
++        'protocol': 'processed_prefix1', 'generation': '1', 'sequence': '2',
++        'ack': {'sequence': '1', 'op_id': 'operation-0001', 'payload_sha256': '0' * 64}}})
++    wire['replay']['ack']['op_id'] = 'operation-9999'
++    with pytest.raises(ValueError, match='digest mismatch'):
++        verify(wire)
+diff --git a/uv.lock b/uv.lock
+index faedde5083084c66511a5f23128429a379771782..7245fca1af810d6c2743ae0dd4bf99864310e891 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2337,6 +2337,7 @@
+     { name = "pywinpty", marker = "sys_platform == 'win32'" },
+     { name = "requests" },
+     { name = "resvg-py" },
++    { name = "rfc8785" },
+     { name = "rich" },
+     { name = "ruamel-yaml" },
+     { name = "ruamel-yaml-clib", marker = "(platform_machine in 'x86_64 aarch64 i686' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (platform_machine in 'AMD64 x86' and platform_python_implementation == 'CPython' and sys_platform == 'win32') or (platform_python_implementation == 'CPython' and sys_platform == 'darwin')" },
+@@ -2752,6 +2753,7 @@
+     { name = "reportlab", marker = "extra == 'documents'", specifier = "==5.1.0" },
+     { name = "requests", marker = "python_full_version >= '3.14'", specifier = "==2.34.2" },
+     { name = "resvg-py", marker = "python_full_version >= '3.14'", specifier = "==0.5.0" },
++    { name = "rfc8785", marker = "python_full_version >= '3.14'", specifier = "==0.1.4" },
+     { name = "rich", marker = "python_full_version >= '3.14'", specifier = "==14.3.4" },
+     { name = "ruamel-yaml", marker = "python_full_version >= '3.14'", specifier = "==0.18.16" },
+     { name = "ruamel-yaml-clib", marker = "(python_full_version >= '3.14' and platform_machine in 'x86_64 aarch64 i686' and platform_python_implementation == 'CPython' and sys_platform == 'linux') or (python_full_version >= '3.14' and platform_machine in 'AMD64 x86' and platform_python_implementation == 'CPython' and sys_platform == 'win32') or (python_full_version >= '3.14' and platform_python_implementation == 'CPython' and sys_platform == 'darwin')", specifier = "==0.2.15" },
+@@ -6002,6 +6004,15 @@
+     { url = "https://files.pythonhosted.org/packages/c4/e5/63ca2c4edf4e00657584608bee1001302bbf8c5f569340b78304f2f446cb/rfc3986-1.5.0-py2.py3-none-any.whl", hash = "sha256:a86d6e1f5b1dc238b218b012df0aa79409667bb209e58da56d0b94704e712a97", size = 31976, upload-time = "2021-05-07T23:29:25.611Z" },
+ ]
+ 
++[[package]]
++name = "rfc8785"
++version = "0.1.4"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/ef/2f/fa1d2e740c490191b572d33dbca5daa180cb423c24396b856f5886371d8b/rfc8785-0.1.4.tar.gz", hash = "sha256:e545841329fe0eee4f6a3b44e7034343100c12b4ec566dc06ca9735681deb4da", size = 14321, upload-time = "2024-09-27T16:33:31.206Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/4d/78/119878110660b2ad709888c8a1614fce7e2fab39080ab960656dc8605bf6/rfc8785-0.1.4-py3-none-any.whl", hash = "sha256:520d690b448ecf0703691c76e1a34a24ddcd4fc5bc41d589cb7c58ec651bcd48", size = 9240, upload-time = "2024-09-27T16:33:29.683Z" },
++]
++
+ [[package]]
+ name = "rich"
+ version = "14.3.4"
+-- 
+2.43.0
+

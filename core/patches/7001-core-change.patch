@@ -1,0 +1,339 @@
+From 3f38c0d2ef1ceb8cdf77c0b98ef8420419613f7e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:00:08 +0000
+Subject: [PATCH 7001] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 3f38c0d2ef1ceb8cdf77c0b98ef8420419613f7e.
+
+---
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index cf6b6ec192661bdaaea775d5c57d927568481699..c88f9e6f1ba34bc40aec025712ec800c299f729f 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -578,7 +578,10 @@
+     from hermes_cli.kanban_awaiting import _latest_park
+ 
+     found = []
++    from hermes_cli.kanban_home_transfer import frozen
+     for (task_id,) in conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
++        if frozen(conn, task_id):
++            continue
+         awaiting, reason = _latest_park(conn, task_id)
+         if not isinstance(awaiting, dict) or awaiting.get("kind") != "ci":
+             continue
+@@ -820,9 +823,14 @@
+                     del state[key]  # re-parked on something else, woken or gone
+         from hermes_cli import kanban_external_watch as external_watch
+         from hermes_cli.kanban_external_state import jitter_factor
+-        for checked, (_last, task_id, ref, hint, park_id) in enumerate(_due(conn, db, waits, now, wall)):
++        from hermes_cli.kanban_home_transfer import frozen
++        checked = 0
++        for _last, task_id, ref, hint, park_id in _due(conn, db, waits, now, wall):
++            if frozen(conn, task_id):
++                continue
+             if checked >= MAX_CARDS_PER_SWEEP or time.monotonic() >= deadline:
+                 break  # the rest are the least recently checked ones next sweep
++            checked += 1
+             rand = external_watch._rand()
+             with _LOCK:
+                 _LAST_CHECK[(db, task_id)] = _mono_now()
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index dcf906fcb38f39b62c102f601b96fb68e8bde3b3..41fb8f889ebc8bfb9d6d151f08e926dc8b855b67 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -361,7 +361,12 @@
+     pending, so the park now waits for the whole commit: one ``ci_wait_widened`` event per park, no comment."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_home_transfer import frozen
++    if frozen(conn, task_id):
++        return None
+     with kb.write_txn(conn):
++        if frozen(conn, task_id):
++            return None
+         status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if status is None or status[0] != "scheduled":
+             return None
+diff --git a/hermes_cli/kanban_hold_notices.py b/hermes_cli/kanban_hold_notices.py
+index de7e7277ea66f61efed89bef697466581d4407b3..5730207564fb36056b98c56be4dd6ed913f91f8d 100644
+--- a/hermes_cli/kanban_hold_notices.py
++++ b/hermes_cli/kanban_hold_notices.py
+@@ -87,9 +87,10 @@
+     from hermes_cli.kanban_hold_effective import current, previous
+     from hermes_cli.kanban_spend_decision import strict_episode
+     from hermes_cli.kanban_wake_check import foreign_ids
++    from hermes_cli.kanban_home_transfer import frozen
+     foreign = foreign_ids(conn)
+     for (tid,) in conn.execute("SELECT id FROM tasks WHERE status='triage'").fetchall():
+-        if tid in foreign:
++        if tid in foreign or frozen(conn, tid):
+             continue
+         try:
+             # A malformed historical cause publishes no notice: the strict read raises
+@@ -106,7 +107,7 @@
+                 continue
+             with kb.write_txn(conn):
+                 row = conn.execute('SELECT status FROM tasks WHERE id=?', (tid,)).fetchone()
+-                if row is not None and row[0] == 'triage':
++                if row is not None and row[0] == 'triage' and not frozen(conn, tid):
+                     publish(conn, tid)
+         except DispatchWriteContended:
+             raise  # Stop the pass, rather than retrying every hold against the same busy writer.
+diff --git a/tests/hermes_cli/test_home_notice_poll_custody.py b/tests/hermes_cli/test_home_notice_poll_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f348ad26acee6e036890760691a5ddaba7c5d187
+--- /dev/null
++++ b/tests/hermes_cli/test_home_notice_poll_custody.py
+@@ -0,0 +1,213 @@
++"""Expected invariants from review6084937752's real sweep probes. [daveey]"""
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_hold_notices as notices, kanban_spend_decision as decision
++from hermes_cli import kanban_ci_progress as ci, kanban_external_watch as watch
++from hermes_cli.kanban_external_adapters import github
++from tests.hermes_cli import test_home_release_candidates as sup
++from tests.hermes_cli import test_home_review_ci_sweep as cisup
++from tests.hermes_cli import test_home_probe_writer_custody as custody
++
++board = sup.board
++
++
++def _snapshot(conn, tid):
++    # Lazy empty tables have no task custody bytes; retain every nonempty row.
++    return {table: rows for table, rows in custody.snapshot(conn, tid).items() if rows}
++
++
++def _held(conn, title):
++    tid = kb.create_task(conn, title=title, assignee='default')
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT, {'reason': 'ordinary budget stop'})
++    return tid
++
++
++def _kinds(conn, tid):
++    return [r[0] for r in conn.execute('SELECT kind FROM task_events WHERE task_id=?', (tid,))]
++
++
++def _freeze(conn, tid, phase):
++    if phase == 'ordinary':
++        return
++    sup.freeze(conn, tid, 'prepared' if phase == 'aborted' else phase)
++    if phase == 'aborted':
++        from hermes_cli import kanban_home_transfer as home
++        with dbc.write_txn(conn):
++            home.abort_source(conn, dict(task=tid, source='worker-a3', destination='hub',
++                nonce='release-candidates-0001', expected_version=7, phase='aborted', rows=[]))
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', 'aborted', 'ordinary'])
++def test_hold_notice_dispatch_is_quiet_and_recovers(board, caplog, phase):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    first, neighbour = _held(board, 'first'), _held(board, 'neighbour')
++    _freeze(board, first, phase)
++    before = _snapshot(board, first)
++    for _ in range(3):
++        dispatch.dispatch_once(board, spawn_fn=lambda *a, **k: None)
++    blocked = phase in ('prepared', 'pending', 'malformed')
++    assert (decision.NOTICE in _kinds(board, first)) == (not blocked)
++    assert decision.NOTICE in _kinds(board, neighbour)
++    assert not [r for r in caplog.records if 'hold notice failed' in r.getMessage()]
++    if blocked:
++        assert _snapshot(board, first) == before
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', 'aborted', 'ordinary'])
++@pytest.mark.parametrize('job', ['running', 'succeeded'])
++def test_ci_returned_poll_skips_frozen_before_io(board, monkeypatch, caplog, phase, job):
++    first = cisup._ci_parked(board, 'first', 'o/r/pull/1')
++    neighbour = cisup._ci_parked(board, 'neighbour', 'o/r/pull/2')
++    _freeze(board, first, phase)
++    before = _snapshot(board, first)
++    polled = []
++
++    def poll(ref, *a, **kw):
++        polled.append(ref)
++        return github.Watched({'job': job, 'service': 'ok', 'detail': 'checks',
++            'terminal': job == 'succeeded'}, ci.Progress('ok', repo='o/r'), 'github_pr_checks', 'o/r')
++    monkeypatch.setattr(github, 'poll', poll)
++    for _ in range(3):
++        with ci._LOCK:
++            ci._LAST_CHECK.clear()
++            ci._JITTER.clear()
++        ci.sweep(board)
++    blocked = phase in ('prepared', 'pending', 'malformed')
++    assert ('o/r/pull/1' in polled) == (not blocked)
++    assert 'o/r/pull/2' in polled
++    assert watch.WATCH_EVENT in _kinds(board, neighbour)
++    assert (watch.WATCH_EVENT in _kinds(board, first)) == (not blocked)
++    assert not [r for r in caplog.records if 'could not record the poll' in r.getMessage()]
++    assert kb.get_task(board, neighbour).status == ('ready' if job == 'succeeded' else 'scheduled')
++    if blocked:
++        assert _snapshot(board, first) == before
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', 'aborted'])
++@pytest.mark.parametrize('lane', ['notice', 'poll'])
++def test_notice_poll_writer_entry_rechecks_custody(board, monkeypatch, caplog, phase, lane):
++    first = _held(board, 'first') if lane == 'notice' else cisup._ci_parked(board, 'first', 'o/r/pull/1')
++    neighbour = _held(board, 'neighbour') if lane == 'notice' else cisup._ci_parked(board, 'peer', 'o/r/pull/2')
++    original = kb.write_txn
++    snapshots = []
++
++    @contextmanager
++    def writer(conn, *a, **kw):
++        if not snapshots:
++            _freeze(conn, first, phase)
++            snapshots.append(_snapshot(conn, first))
++        with original(conn, *a, **kw):
++            yield
++    monkeypatch.setattr(kb, 'write_txn', writer)
++    if lane == 'notice':
++        notices.sweep(board)
++    else:
++        for tid in (first, neighbour):
++            watch.apply_poll(board, tid, {'job': 'running', 'service': 'ok'}, now=10000000000,
++                             adapter='github_pr_checks', scope='o/r')
++    assert snapshots
++    event = decision.NOTICE if lane == 'notice' else watch.WATCH_EVENT
++    assert event in _kinds(board, neighbour)
++    assert (event in _kinds(board, first)) == (phase == 'aborted')
++    if phase != 'aborted':
++        assert _snapshot(board, first) == snapshots[0]
++    assert not [r for r in caplog.records if 'hold notice failed' in r.getMessage()]
++
++
++def _release(conn, tid, phase):
++    if phase == 'prepared':
++        from hermes_cli import kanban_home_transfer as home
++        with dbc.write_txn(conn):
++            home.abort_source(conn, dict(task=tid, source='worker-a3', destination='hub',
++                nonce='release-candidates-0001', expected_version=7, phase='aborted', rows=[]))
++    else:
++        from hermes_cli import kanban_home_generation as generation
++        with dbc.write_txn(conn):
++            generation.mirror_feed(conn, tid, {'home_generation': 'release-candidates-0001',
++                                             'home_transfer_pending': None}, 9)
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending'])
++@pytest.mark.parametrize('job', ['running', 'succeeded'])
++def test_ci_callback_freeze_then_release_eventual_progress(board, monkeypatch, caplog, phase, job):
++    first = cisup._ci_parked(board, 'first', 'o/r/pull/1')
++    neighbour = cisup._ci_parked(board, 'peer', 'o/r/pull/2')
++    snapshots = []
++
++    def poll(ref, *a, **kw):
++        if ref == 'o/r/pull/1' and not snapshots:
++            _freeze(board, first, phase)
++            snapshots.append(_snapshot(board, first))
++        return github.Watched({'job': job, 'service': 'ok', 'terminal': job == 'succeeded'},
++                              ci.Progress('ok', repo='o/r'), 'github_pr_checks', 'o/r')
++    monkeypatch.setattr(github, 'poll', poll)
++    with ci._LOCK:
++        ci._LAST_CHECK.clear()
++        ci._JITTER.clear()
++    ci.sweep(board)
++    assert snapshots and _snapshot(board, first) == snapshots[0]
++    assert watch.WATCH_EVENT in _kinds(board, neighbour)
++    assert not [r for r in caplog.records if 'could not record the poll' in r.getMessage()]
++    _release(board, first, phase)
++    with ci._LOCK:
++        ci._LAST_CHECK.clear()
++        ci._JITTER.clear()
++    ci.sweep(board)
++    assert watch.WATCH_EVENT in _kinds(board, first)
++    assert kb.get_task(board, first).status == ('ready' if job == 'succeeded' else 'scheduled')
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending'])
++def test_hold_exact_release_repairs_notice_once(board, phase):
++    tid = _held(board, 'first')
++    _freeze(board, tid, phase)
++    notices.sweep(board)
++    assert decision.NOTICE not in _kinds(board, tid)
++    _release(board, tid, phase)
++    notices.sweep(board)
++    notices.sweep(board)
++    assert _kinds(board, tid).count(decision.NOTICE) == 1
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending'])
++def test_ci_selection_race_does_not_consume_healthy_budget(board, monkeypatch, phase):
++    first = cisup._ci_parked(board, 'first', 'o/r/pull/1')
++    neighbour = cisup._ci_parked(board, 'peer', 'o/r/pull/2')
++    original = ci._due
++
++    def due(*a, **kw):
++        rows = original(*a, **kw)
++        _freeze(board, first, phase)
++        return sorted(rows, key=lambda r: r[1] != first)
++    monkeypatch.setattr(ci, '_due', due)
++    monkeypatch.setattr(ci, 'MAX_CARDS_PER_SWEEP', 1)
++    polled = []
++
++    def poll(ref, *a, **kw):
++        polled.append(ref)
++        return github.Watched({'job': 'running', 'service': 'ok'}, ci.Progress('ok', repo='o/r'),
++                              'github_pr_checks', 'o/r')
++    monkeypatch.setattr(github, 'poll', poll)
++    with ci._LOCK:
++        ci._LAST_CHECK.clear()
++        ci._JITTER.clear()
++    ci.sweep(board)
++    assert polled == ['o/r/pull/2']
++    assert watch.WATCH_EVENT in _kinds(board, neighbour)
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending'])
++def test_frozen_poll_fast_path_takes_no_writer(board, monkeypatch, phase):
++    tid = cisup._ci_parked(board, 'first', 'o/r/pull/1')
++    _freeze(board, tid, phase)
++
++    def unexpected_writer(*a, **kw):
++        raise AssertionError('frozen poll took a writer')
++    monkeypatch.setattr(kb, 'write_txn', unexpected_writer)
++    assert watch.apply_poll(board, tid, {'job': 'running', 'service': 'ok'}, now=1,
++                            adapter='github_pr_checks', scope='o/r') is None
+diff --git a/tests/hermes_cli/test_home_review_ci_sweep.py b/tests/hermes_cli/test_home_review_ci_sweep.py
+index f761691b3b5c0f1881d8729e4e7c8e6da882acbe..596dd8020171b6e521ae87c10214d634d45291f1 100644
+--- a/tests/hermes_cli/test_home_review_ci_sweep.py
++++ b/tests/hermes_cli/test_home_review_ci_sweep.py
+@@ -41,7 +41,7 @@
+     first = _ci_parked(board, 'first (frozen in custody phases)', 'o/r/pull/1')
+     neighbour = _ci_parked(board, 'healthy neighbour', 'o/r/pull/2')
+     sup.freeze(board, first, phase)
+-    assert {w[0] for w in ci._ci_waits(board)} == {first, neighbour}
++    assert {w[0] for w in ci._ci_waits(board)} == ({first, neighbour} if phase is None else {neighbour})
+     snap = _snap(board, first)
+     order = []
+ 
+diff --git a/tests/hermes_cli/test_home_shared_invariant_consumers.py b/tests/hermes_cli/test_home_shared_invariant_consumers.py
+index 06e081c047ab6db8242dc48c1ea86c97dc98179c..a55940b6d4a02fd930eb4bbd763d3d65ffe73595 100644
+--- a/tests/hermes_cli/test_home_shared_invariant_consumers.py
++++ b/tests/hermes_cli/test_home_shared_invariant_consumers.py
+@@ -6,6 +6,7 @@
+ from tests.hermes_cli import test_home_release_landing_race as release_landing
+ from tests.hermes_cli import test_kanban_home_source_stop as support
+ from tests.hermes_cli import test_home_registered_checks as checks
++from tests.hermes_cli import test_home_notice_poll_custody as notice_poll
+ 
+ release_board = release_landing.release_board
+ consumer_board = consumer_cases.consumer_board
+@@ -30,3 +31,10 @@
+ test_checks_frozen_carrier_does_not_starve_peer = checks.test_checks_frozen_carrier_does_not_starve_peer
+ test_same_wall_reselects_healthy_carrier = checks.test_same_wall_reselects_healthy_carrier
+ test_raced_frozen_carrier_discards_changed_assertion_without_starving_next_wall = checks.test_raced_frozen_carrier_discards_changed_assertion_without_starving_next_wall
++test_hold_notice_dispatch_is_quiet_and_recovers = notice_poll.test_hold_notice_dispatch_is_quiet_and_recovers
++test_ci_returned_poll_skips_frozen_before_io = notice_poll.test_ci_returned_poll_skips_frozen_before_io
++test_notice_poll_writer_entry_rechecks_custody = notice_poll.test_notice_poll_writer_entry_rechecks_custody
++test_ci_callback_freeze_then_release_eventual_progress = notice_poll.test_ci_callback_freeze_then_release_eventual_progress
++test_hold_exact_release_repairs_notice_once = notice_poll.test_hold_exact_release_repairs_notice_once
++test_ci_selection_race_does_not_consume_healthy_budget = notice_poll.test_ci_selection_race_does_not_consume_healthy_budget
++test_frozen_poll_fast_path_takes_no_writer = notice_poll.test_frozen_poll_fast_path_takes_no_writer
+-- 
+2.43.0
+

@@ -1,0 +1,622 @@
+From 2ab03df1c36378c3c904c9dcba6173ca38987934 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:00:07 +0000
+Subject: [PATCH 6763] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 2ab03df1c36378c3c904c9dcba6173ca38987934.
+
+---
+diff --git a/docs/owner-release-native.md b/docs/owner-release-native.md
+index b8b3e2ccd2a87c9cb5884d0d347727044fca86a6..b7b74c83eb4b248288c63118b3ebae67b0c8f285 100644
+--- a/docs/owner-release-native.md
++++ b/docs/owner-release-native.md
+@@ -30,8 +30,40 @@
+ action**. It is accepted only against unchanged complete rows already confirmed
+ emitted on a different invocation. Supplying an unconfirmed nonce redisplays it;
+ that invocation cannot ACK its own subsequent confirmation. The reply label is
+-`acknowledged_pending_home`, but the durable intent remains `read_first_pending`.
+-No consume or HOME carrier is implemented by this slice.
++`acknowledged_pending_home`. The accepted ACK now freezes a separate delivery
++journal and advances the durable intent to `delivery_pending`. No HOME consume or
++application is implemented by this slice.
++
++## Durable canonical carrier
++
++`native_owner_release_deliveries` freezes the complete `task_events` row-upsert
++operation before networking: distinct application/intent, carrier-event/delivery
++and client-operation IDs, exact payload, HLC, timestamp and replay mode. The carrier
++is the existing `operator_call_requested` event with `carrier: owner_release` and
++`action: owner_release`; it deliberately has no generic worker caller. HOME must
++use its separate private-intent verifier, not exempt it from worker authentication.
++The ordinary operator handler currently refuses this unsupported action; publishing
++it is **not** consume/application permission. Capability advertisement stays absent.
++
++The native producer resolves its own frozen delivery before current authorization,
++TTL or comments reads. Unknown/deleted/conflicting evidence cannot resend or mint a
++new identity. Only authoritative `never_existed` with uncompacted history permits
++sending the exact stored operation. A reply loss after commit reconciles the exact
++canonical event and authenticated origin without resending. HTTP `applied` alone is
++not publication proof. A previously confirmed event disappearing fails closed.
++Terminal intent stages never send a carrier; missing/corrupt/multiple journals
++cannot silently replace it. The intent's atomic `delivery_pending` marker also
++fences loss of the delivery table/row. This is recovery integrity, not protection
++against a same-UID actor rewriting all local journals.
++
++This cut has one outstanding delivery per intent and refuses every unknown or
++multiple historical row. The protocol's later definitive stale-comments refusal +
++fresh display/ACK successor path remains unimplemented, as do private application
++result publication/read and the HOME application queue. Never overwrite a frozen
++delivery to implement that future path. Final escaped row-operation size is bounded
++at 256 Ki characters, independently of the 128 KiB source comment bound; some valid
++large/escaping-heavy inventories therefore refuse safely before the delivery/HLC
++transaction commits rather than producing a permanently unsendable carrier.
+ 
+ ## Trust and bounds
+ 
+diff --git a/hermes_cli/kanban_release_delivery.py b/hermes_cli/kanban_release_delivery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a1691c724ab73b42c8b0c7843f34c9b6fd12a4e
+--- /dev/null
++++ b/hermes_cli/kanban_release_delivery.py
+@@ -0,0 +1,170 @@
++"""Native read-ACK carrier custody. Publication never means HOME application.
++
++One outstanding delivery per application; distinct immutable row-op and event IDs
++survive reply loss. An ordinary mutable event is a carrier, not an authority proof.
++HOME must authenticate it and the private intent before consuming or applying.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++from hermes_cli import kanban_release_certificate as certificate, kanban_release_intent as intent
++
++_STAGES = {"prepared", "send_pending", "published"}
++_WIRE = {"client_op_id", "op", "table", "uid", "fields", "hlc", "frozen_replay"}
++_PAYLOAD = {"version", "carrier", "action", "request_uid", "board", "target_task_id", "home",
++            "intent", "digest", "seen_comments", "nonce"}
++_SCHEMA = """CREATE TABLE IF NOT EXISTS native_owner_release_deliveries (
++    delivery_uid TEXT PRIMARY KEY, intent_uid TEXT NOT NULL, wire TEXT NOT NULL,
++    digest TEXT NOT NULL, stage TEXT NOT NULL);
++"""
++
++
++def _saved(conn, body):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_deliveries'").fetchone():
++        return None
++    rows = conn.execute("SELECT delivery_uid,wire,digest,stage FROM native_owner_release_deliveries "
++                        "WHERE intent_uid=? LIMIT 2",
++                        (body["intent_uid"],)).fetchall()
++    if len(rows) > 1:
++        raise ValueError("ambiguous native release delivery")
++    return rows[0] if rows else None
++
++
++def _validate(wire, body):
++    if (not certificate._exact(wire, _WIRE) or wire["op"] != "upsert" or wire["table"] != "task_events"
++            or type(wire["frozen_replay"]) is not int or wire["frozen_replay"] != 1
++            or not all(intent._coordinate(wire[k]) for k in ("client_op_id", "uid"))
++            or len({wire["client_op_id"], wire["uid"], body["intent_uid"]}) != 3):
++        raise ValueError("invalid frozen release delivery wire")
++    fields = wire["fields"]
++    if (not certificate._exact(fields, {"task_id", "run_uid", "kind", "payload", "created_at"})
++            or fields["task_id"] != body["task_id"] or fields["run_uid"] is not None
++            or fields["kind"] != "operator_call_requested" or type(fields["created_at"]) is not int
++            or fields["created_at"] < 0 or not isinstance(wire["hlc"], str)):
++        raise ValueError("invalid frozen release delivery event")
++    import re
++    if re.fullmatch(r"[0-9]{13}-[0-9]{4}-" + re.escape(body["actor"]["gateway"]), wire["hlc"]) is None:
++        raise ValueError("invalid frozen release delivery clock")
++    p = certificate.parse(fields["payload"])
++    if (not certificate._exact(p, _PAYLOAD) or type(p["version"]) is not int or p["version"] != 1
++            or p["carrier"] != "owner_release" or p["action"] != "owner_release"
++            or p["request_uid"] != wire["uid"] or p["board"] != body["board"]
++            or p["target_task_id"] != body["task_id"] or p["home"] != body["home"]
++            or certificate.encode(p["intent"]) != certificate.encode(body) or p["digest"] != intent.digest(body)
++            or not isinstance(p["nonce"], str) or re.fullmatch(r"[a-f0-9]{64}", p["nonce"]) is None
++            or not certificate._comments(p["seen_comments"], body["task_id"])):
++        raise ValueError("invalid frozen release delivery payload")
++    # The string payload adds another JSON-escaping layer. Bound the FINAL op,
++    # not only its source rows, against Board's 256-Ki-character operation limit.
++    if len(certificate.encode(wire)) > 262144:
++        raise ValueError("release delivery exceeds canonical operation bound")
++    return wire
++
++
++def existing(conn, body):
++    stage = intent.stage(conn, body)  # fresh native actor, exact primary and original bytes
++    row = _saved(conn, body)
++    if row is None:
++        if stage == "delivery_pending":
++            raise ValueError("native release delivery journal missing")
++        return None
++    wire = _validate(certificate.parse(row[1]), body)
++    if (row[0] != wire["uid"] or row[1] != certificate.encode(wire)
++            or row[2] != intent.digest(wire) or row[3] not in _STAGES):
++        raise ValueError("native release delivery journal changed")
++    return wire
++
++
++def prepare(conn, body, *, nonce):
++    """Freeze the accepted read under one writer, before the first network call."""
++    from hermes_cli import kanban_db as kb, kanban_sync_client as client
++    from hermes_cli.kanban_db_sync import uuid7
++    from hermes_cli.kanban_release_read import _row
++    with kb.write_txn(conn):
++        current, captured = intent._current(conn, body)
++        old = existing(conn, body)
++        if old is not None:
++            return old  # never reinterpret an uncertain delivery using new rows
++        row = _row(conn, body)
++        if (current[3] != "read_first_pending" or row is None or row[1] != nonce
++                or row[3] is None or row[4] != 1):
++            raise ValueError("release delivery requires its exact acknowledged emitted inventory")
++        comments = json.loads(row[0])
++        if not certificate._comments(comments, body["task_id"]):
++            raise ValueError("invalid acknowledged release comment inventory")
++        uid, op_uid = uuid7(), uuid7()
++        payload = {"version": 1, "carrier": "owner_release", "action": "owner_release", "request_uid": uid,
++                   "board": body["board"], "target_task_id": body["task_id"], "home": body["home"],
++                   "intent": body, "digest": intent.digest(body), "seen_comments": comments, "nonce": nonce}
++        wire = _validate({"client_op_id": op_uid, "op": "upsert", "table": "task_events", "uid": uid,
++                          "hlc": client._next_hlc(conn, body["actor"]["gateway"]), "frozen_replay": 1,
++                          "fields": {"task_id": body["task_id"], "run_uid": None, "kind": "operator_call_requested",
++                                     "payload": certificate.encode(payload), "created_at": int(time.time())}}, body)
++        conn.execute(_SCHEMA)
++        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_native_release_delivery_active "
++                     "ON native_owner_release_deliveries(intent_uid) WHERE stage IN ('prepared','send_pending','published')")
++        conn.execute("INSERT INTO native_owner_release_deliveries VALUES (?,?,?,?,?)",
++                     (uid, body["intent_uid"], certificate.encode(wire), intent.digest(wire), "prepared"))
++        conn.execute("UPDATE native_owner_release_intents SET stage='delivery_pending' WHERE intent_uid=?",
++                     (body["intent_uid"],))
++        if captured.validated() is None:
++            raise ValueError("native release custody expired before delivery commit")
++    return wire
++
++
++def _advance(conn, body, wire, stage):
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        current, captured = intent._current(conn, body)
++        if current[3] != "delivery_pending":
++            raise ValueError("native release delivery intent is no longer pending")
++        if existing(conn, body) != wire:
++            raise ValueError("native release delivery changed before publication")
++        conn.execute("UPDATE native_owner_release_deliveries SET stage=? WHERE delivery_uid=? AND stage!='published'",
++                     (stage, wire["uid"]))
++        if captured.validated() is None:
++            raise ValueError("native release custody expired before publication commit")
++
++
++def _evidence(hub, body, wire):
++    value = hub.row_evidence(body["board"], "task_events", wire["uid"], max_response_bytes=2097152)
++    if (not isinstance(value, dict) or value.get("board") != body["board"]
++            or value.get("table") != "task_events" or value.get("uid") != wire["uid"]):
++        raise ValueError("release publication evidence coordinates differ")
++    row = value.get("row")
++    if value.get("state") == "live" and isinstance(row, dict):
++        expected = {**wire["fields"], "uid": wire["uid"], "hlc": wire["hlc"],
++                    "origin_gateway": body["actor"]["gateway"], "deleted_at": None}
++        if all(k in row and certificate.encode(row[k]) == certificate.encode(v) for k, v in expected.items()):
++            return "live"
++    if (value.get("state") == "never_existed" and row is None and value.get("tombstone") is None
++            and type(value.get("floor")) is int and value["floor"] == 0):
++        return "never_existed"
++    raise ValueError("release publication unavailable, deleted, unknown or conflicting")
++
++
++def send(conn, hub, body):
++    wire = existing(conn, body)
++    if wire is None:
++        raise ValueError("no frozen native release delivery")
++    stage = intent.stage(conn, body)
++    if stage != "delivery_pending":
++        if stage not in {"expired", "refused", "consumed", "applied"}:
++            raise ValueError("native release delivery intent is not pending")
++        return {"ok": stage not in {"expired", "refused"}, "task_id": body["task_id"], "intent_uid": body["intent_uid"],
++                "release_stage": {"applied": "consumed_or_applied", "consumed": "acknowledged_pending_home"}.get(stage, stage)}
++    evidence = _evidence(hub, body, wire)  # no writer held over HTTP
++    if evidence == "never_existed":
++        row = _saved(conn, body)
++        if row is None or row[3] == "published":
++            raise ValueError("confirmed release publication disappeared")
++        _advance(conn, body, wire, "send_pending")
++        intent.stage(conn, body)  # reauthenticate immediately before network
++        hub.ops(body["board"], [wire])
++        if _evidence(hub, body, wire) != "live":
++            raise ValueError("release publication not confirmed")
++    _advance(conn, body, wire, "published")
++    return {"ok": True, "task_id": body["task_id"], "intent_uid": body["intent_uid"],
++            "release_stage": "acknowledged_pending_home", "delivery_uid": wire["uid"], "publication_stage": "published"}
+diff --git a/hermes_cli/kanban_release_intent.py b/hermes_cli/kanban_release_intent.py
+index 191386d45b44b8e912c40876d328f25d56eeee34..9eb88ef6a3995cd43b014b7820ec46a7cde4653f 100644
+--- a/hermes_cli/kanban_release_intent.py
++++ b/hermes_cli/kanban_release_intent.py
+@@ -19,7 +19,8 @@
+     "intent_journaled_unsent": {"send_pending"},
+     "send_pending": {"authorized_pending_home", "expired", "refused"},
+     "authorized_pending_home": {"read_first_pending", "consumed", "expired", "refused"},
+-    "read_first_pending": {"consumed", "expired", "refused"},
++    "read_first_pending": {"delivery_pending", "consumed", "expired", "refused"},
++    "delivery_pending": {"consumed", "expired", "refused"},
+     "consumed": {"applied", "refused"},
+     "applied": set(), "expired": set(), "refused": set(),
+ }
+diff --git a/hermes_cli/kanban_release_native.py b/hermes_cli/kanban_release_native.py
+index bc08d09705c9ec913d372d958a5a4a3e3eceb899..0bc241e88680249422d6af0d0254efa6c1310688 100644
+--- a/hermes_cli/kanban_release_native.py
++++ b/hermes_cli/kanban_release_native.py
+@@ -26,6 +26,9 @@
+ 
+ 
+ def _send(conn, hub, body, *, seen=None):
++    from hermes_cli import kanban_release_delivery as delivery
++    if delivery.existing(conn, body) is not None:
++        return delivery.send(conn, hub, body)
+     stage = intent.stage(conn, body)  # Fresh custody, not authority from a prior read.
+     if stage in {"expired", "refused", "applied"}:
+         return {"ok": stage == "applied", "task_id": body["task_id"], "intent_uid": body["intent_uid"],
+@@ -52,7 +55,11 @@
+             raise ValueError("release journal changed after authorization")
+     if proof["state"] == "authorized":
+         from hermes_cli.kanban_release_read import prepare
+-        return prepare(conn, hub, body, seen=seen)
++        result = prepare(conn, hub, body, seen=seen)
++        if result.get("release_stage") == "acknowledged_pending_home":
++            delivery.prepare(conn, body, nonce=seen)
++            return delivery.send(conn, hub, body)
++        return result
+     # Consumption/application are not inferred from a writable event. HOME's
+     # exact result is reconciled separately; authorization only promises pending.
+     return {"ok": True, "task_id": body["task_id"], "intent_uid": body["intent_uid"],
+diff --git a/tests/hermes_cli/test_native_owner_release_cli.py b/tests/hermes_cli/test_native_owner_release_cli.py
+index 82d684e9883aaa205b4c6502eb4371fab9d94ed6..1968b7cb8e1626e5f812b9238fc3ad49cf34c916 100644
+--- a/tests/hermes_cli/test_native_owner_release_cli.py
++++ b/tests/hermes_cli/test_native_owner_release_cli.py
+@@ -28,6 +28,9 @@
+         evidence = None
+         proof_changes = {}
+         calls = []
++        carriers = []
++        carrier_rows = {}
++        drop_carrier_reply = False
+         def __init__(self, *args):
+             pass
+         def close(self):
+@@ -37,8 +40,25 @@
+             return {"owner_release": self.support}
+         def row_evidence(self, board, table, uid, **kwargs):
+             self.calls.append(("row", board, table, uid))
++            if table == "task_events":
++                row = self.carrier_rows.get(uid)
++                return {"board": board, "table": table, "uid": uid, "state": "live" if row else "never_existed",
++                        "row": row, "tombstone": None, "floor": 0}
+             return {"state": "live", "row": {"id": uid, "created_on": "foreign-home"}}
+         def ops(self, board, ops):
++            if ops[0].get("table") == "task_events":
++                wire = ops[0]
++                with kbc.connect_closing() as conn:
++                    saved = conn.execute("SELECT wire,stage FROM native_owner_release_deliveries WHERE delivery_uid=?",
++                                         (wire["uid"],)).fetchone()
++                    assert json.loads(saved[0]) == wire and saved[1] == "send_pending"
++                    assert not conn.in_transaction
++                self.carriers.append(wire)
++                self.carrier_rows[wire["uid"]] = {**wire["fields"], "uid": wire["uid"], "origin_gateway": "here",
++                                                 "hlc": wire["hlc"], "deleted_at": None, "seq": 1, "version": 1}
++                if self.drop_carrier_reply:
++                    raise OSError("carrier reply lost after commit")
++                return {"results": [{"status": "applied"}]}
+             with kbc.connect_closing() as conn:
+                 row = conn.execute("SELECT body, stage FROM native_owner_release_intents WHERE intent_uid=?", (ops[0]["intent"]["intent_uid"],)).fetchone()
+                 assert row[1] == "send_pending" and not conn.in_transaction
+diff --git a/tests/hermes_cli/test_owner_release_delivery.py b/tests/hermes_cli/test_owner_release_delivery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4800ed563e14d191e12956cb63b491d1864400af
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_delivery.py
+@@ -0,0 +1,233 @@
++"""Frozen native carrier delivery; publication is not HOME application."""
++import copy
++import json
++
++import pytest
++
++from hermes_cli import kanban_release_intent as intent
++from tests.hermes_cli import test_owner_release_read as fixtures
++
++turn = fixtures.turn
++journal = fixtures.journal
++
++
++def acknowledged(journal):
++    from hermes_cli import kanban_release_read as read
++    body = fixtures.prepared(journal)
++    hub = fixtures.Hub(body)
++    first = read.prepare(journal, hub, body, seen=None)
++    read.confirm(journal, hub, first.confirmation)
++    nonce = first["release_read"]["nonce"]
++    read.prepare(journal, hub, body, seen=nonce)
++    return body, hub, nonce
++
++
++class CarrierHub:
++    def __init__(self, conn, body):
++        self.conn, self.body = conn, body
++        self.sent, self.row = [], None
++        self.state = "never_existed"
++        self.drop = False
++
++    def row_evidence(self, board, table, uid, **kw):
++        assert not self.conn.in_transaction
++        return {"board": board, "table": table, "uid": uid, "state": self.state,
++                "row": copy.deepcopy(self.row), "tombstone": None, "floor": 0}
++
++    def ops(self, board, ops):
++        assert not self.conn.in_transaction
++        saved = self.conn.execute("SELECT wire,stage FROM native_owner_release_deliveries").fetchone()
++        assert json.loads(saved[0]) == ops[0] and saved[1] == "send_pending"
++        self.sent.append(copy.deepcopy(ops[0]))
++        wire = ops[0]
++        self.row = {**wire["fields"], "uid": wire["uid"], "origin_gateway": self.body["actor"]["gateway"],
++                    "deleted_at": None, "hlc": wire["hlc"], "seq": 1, "version": 1}
++        self.state = "live"
++        if self.drop:
++            raise OSError("reply lost after commit")
++        return {"results": [{"status": "applied"}]}
++
++
++def test_frozen_delivery_reopen_reconciles_lost_reply_before_current_comments(turn, journal):
++    from hermes_cli import kanban_db_connect as kbc, kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    frozen = delivery.prepare(journal, body, nonce=nonce)
++    assert frozen["uid"] != body["intent_uid"] != frozen["client_op_id"]
++    hub = CarrierHub(journal, body)
++    hub.drop = True
++    with pytest.raises(OSError, match="reply lost"):
++        delivery.send(journal, hub, body)
++    before = tuple(journal.execute("SELECT * FROM native_owner_release_deliveries").fetchone())
++    with kbc.connect_closing() as reopened:
++        hub.conn = reopened
++        result = delivery.send(reopened, hub, body)
++        assert result["release_stage"] == "acknowledged_pending_home"
++        assert result["publication_stage"] == "published"
++        assert result["delivery_uid"] == frozen["uid"]
++    assert len(hub.sent) == 1
++    assert intent.stage(journal, body) == "delivery_pending"
++    assert tuple(journal.execute("SELECT * FROM native_owner_release_deliveries").fetchone()) != before
++    assert delivery.prepare(journal, body, nonce=nonce) == frozen
++
++
++@pytest.mark.parametrize("failure", ["unconfirmed", "orphan_ack", "not_acknowledged", "nonce", "rows", "revoked"])
++def test_only_exact_acknowledged_read_can_freeze_delivery(turn, journal, failure):
++    from hermes_cli import kanban_release_read as read, kanban_release_delivery as delivery
++    body = fixtures.prepared(journal)
++    hub = fixtures.Hub(body)
++    first = read.prepare(journal, hub, body, seen=None)
++    nonce = first["release_read"]["nonce"]
++    if failure != "unconfirmed":
++        read.confirm(journal, hub, first.confirmation)
++    if failure not in {"unconfirmed", "not_acknowledged"}:
++        read.prepare(journal, hub, body, seen=nonce)
++    if failure == "orphan_ack":
++        journal.execute("UPDATE native_owner_release_reads SET displayed_invocation=NULL")
++        journal.commit()
++    if failure == "nonce":
++        nonce = "0" * 64
++    if failure == "rows":
++        journal.execute("UPDATE native_owner_release_reads SET rows_bytes='{}'")
++        journal.commit()
++    if failure == "revoked":
++        turn.release()
++    with pytest.raises(ValueError):
++        delivery.prepare(journal, body, nonce=nonce)
++    assert not journal.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_deliveries'").fetchone()
++
++
++@pytest.mark.parametrize("state", ["unknown", "deleted", "other"])
++def test_uncertain_or_deleted_evidence_never_resends_or_mints(turn, journal, state):
++    from hermes_cli import kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    frozen = delivery.prepare(journal, body, nonce=nonce)
++    hub = CarrierHub(journal, body)
++    hub.state = state
++    with pytest.raises(ValueError, match="publication"):
++        delivery.send(journal, hub, body)
++    assert hub.sent == []
++    assert delivery.existing(journal, body) == frozen
++
++
++@pytest.mark.parametrize("change", [{"origin_gateway": "forged"}, {"task_id": "other"}, {"run_uid": "run"},
++                                    {"payload": "{}"}, {"kind": "scope_renewed"}, {"created_at": True},
++                                    {"hlc": "changed"}, {"uid": "other"}, {"deleted_at": 1}])
++def test_canonical_publication_requires_all_frozen_fields(turn, journal, change):
++    from hermes_cli import kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    frozen = delivery.prepare(journal, body, nonce=nonce)
++    hub = CarrierHub(journal, body)
++    delivery.send(journal, hub, body)
++    hub.row.update(change)
++    with pytest.raises(ValueError, match="publication"):
++        delivery.send(journal, hub, body)
++    assert len(hub.sent) == 1
++    assert delivery.existing(journal, body) == frozen
++
++
++def test_existing_delivery_is_immutable_despite_new_ack_journal(turn, journal):
++    from hermes_cli import kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    frozen = delivery.prepare(journal, body, nonce=nonce)
++    journal.execute("UPDATE native_owner_release_reads SET nonce=?,rows_bytes='[]',acknowledged=0", ("a" * 64,))
++    journal.commit()
++    assert delivery.existing(journal, body) == frozen
++    assert delivery.prepare(journal, body, nonce="a" * 64) == frozen
++    assert journal.execute("SELECT count(*) FROM native_owner_release_deliveries").fetchone()[0] == 1
++
++
++def test_native_send_reconciles_carrier_before_mutable_authorization(turn, journal, monkeypatch):
++    from hermes_cli import kanban_release_delivery as delivery, kanban_release_native as native
++    body, _, nonce = acknowledged(journal)
++    delivery.prepare(journal, body, nonce=nonce)
++    hub = CarrierHub(journal, body)
++    def unavailable(*a, **kw):
++        pytest.fail("frozen carrier must reconcile before mutable authorization")
++    monkeypatch.setattr(native, "_proof", unavailable)
++    result = native._send(journal, hub, body)
++    assert result["publication_stage"] == "published"
++    assert len(hub.sent) == 1
++
++
++@pytest.mark.parametrize("damage", ["stage", "missing_row", "missing_table", "duplicate", "digest", "wire"])
++def test_corrupt_or_missing_delivery_cannot_mint_replacement(turn, journal, damage):
++    from hermes_cli import kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    delivery.prepare(journal, body, nonce=nonce)
++    if damage == "duplicate":
++        journal.execute("DROP INDEX idx_native_release_delivery_active")
++    statements = {
++        "stage": "UPDATE native_owner_release_deliveries SET stage='corrupt'",
++        "missing_row": "DELETE FROM native_owner_release_deliveries",
++        "missing_table": "DROP TABLE native_owner_release_deliveries",
++        "duplicate": "INSERT INTO native_owner_release_deliveries SELECT 'other',intent_uid,wire,digest,stage FROM native_owner_release_deliveries",
++        "digest": "UPDATE native_owner_release_deliveries SET digest='wrong'",
++        "wire": "UPDATE native_owner_release_deliveries SET wire='{}'",
++    }
++    journal.execute(statements[damage])
++    journal.commit()
++    with pytest.raises(ValueError):
++        delivery.existing(journal, body)
++    with pytest.raises(ValueError):
++        delivery.prepare(journal, body, nonce=nonce)
++    assert intent.stage(journal, body) == "delivery_pending"
++
++
++@pytest.mark.parametrize("stage", ["expired", "refused", "consumed", "applied"])
++def test_terminal_intent_never_resends_pending_carrier(turn, journal, stage):
++    from hermes_cli import kanban_release_delivery as delivery, kanban_release_native as native
++    body, _, nonce = acknowledged(journal)
++    delivery.prepare(journal, body, nonce=nonce)
++    if stage == "applied":
++        intent.advance(journal, body, expected="delivery_pending", stage="consumed")
++        intent.advance(journal, body, expected="consumed", stage=stage)
++    else:
++        intent.advance(journal, body, expected="delivery_pending", stage=stage)
++    hub = CarrierHub(journal, body)
++    result = native._send(journal, hub, body)
++    assert hub.sent == []
++    assert result["release_stage"] == {"applied": "consumed_or_applied", "consumed": "acknowledged_pending_home"}.get(stage, stage)
++    assert result["ok"] == (stage not in {"expired", "refused"})
++
++
++def test_final_escaped_carrier_bound_refuses_before_any_journal_or_clock_commit(turn, journal):
++    from hermes_cli import kanban_release_read as read, kanban_release_delivery as delivery
++    body = fixtures.prepared(journal)
++    hub = fixtures.Hub(body)
++    hub.value["comments"] = [fixtures.comment("é" * 60000, task=body["task_id"])]
++    first = read.prepare(journal, hub, body, seen=None)
++    read.confirm(journal, hub, first.confirmation)
++    nonce = first["release_read"]["nonce"]
++    read.prepare(journal, hub, body, seen=nonce)
++    before = journal.execute("SELECT hlc_last FROM kanban_sync_state").fetchone()[0]
++    with pytest.raises(ValueError, match="operation bound"):
++        delivery.prepare(journal, body, nonce=nonce)
++    assert not journal.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_deliveries'").fetchone()
++    assert journal.execute("SELECT hlc_last FROM kanban_sync_state").fetchone()[0] == before
++    assert intent.stage(journal, body) == "read_first_pending"
++
++
++def test_published_carrier_cannot_resend_after_disappearance(turn, journal):
++    from hermes_cli import kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    delivery.prepare(journal, body, nonce=nonce)
++    hub = CarrierHub(journal, body)
++    delivery.send(journal, hub, body)
++    hub.row, hub.state = None, "never_existed"
++    with pytest.raises(ValueError, match="disappeared"):
++        delivery.send(journal, hub, body)
++    assert len(hub.sent) == 1
++
++
++@pytest.mark.parametrize("change", [{"board": "other"}, {"table": "tasks"}, {"uid": "other"},
++                                    {"floor": 1}, {"floor": False}, {"tombstone": {}}, {"row": {}}])
++def test_absence_requires_exact_uncompacted_canonical_evidence(turn, journal, monkeypatch, change):
++    from hermes_cli import kanban_release_delivery as delivery
++    body, _, nonce = acknowledged(journal)
++    delivery.prepare(journal, body, nonce=nonce)
++    hub = CarrierHub(journal, body)
++    original = hub.row_evidence
++    monkeypatch.setattr(hub, "row_evidence", lambda *a, **kw: {**original(*a, **kw), **change})
++    with pytest.raises(ValueError, match="publication"):
++        delivery.send(journal, hub, body)
++    assert hub.sent == []
+diff --git a/tests/hermes_cli/test_owner_release_delivery_cli.py b/tests/hermes_cli/test_owner_release_delivery_cli.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8abd7c5bf89cb0872cf8fa499e4026f865a60e83
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_delivery_cli.py
+@@ -0,0 +1,62 @@
++"""Real child CLI + native socket publication; fake canonical adapter, not DO/HOME proof."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_native_owner_release_cli as fixtures
++
++turn = fixtures.turn
++transport = fixtures.transport
++
++
++def test_real_cli_ack_publishes_frozen_carrier_then_reconciles_after_reply_loss(turn, transport, monkeypatch):
++    native = fixtures.launch(monkeypatch)
++    try:
++        first = fixtures.cli(native)
++        assert first.returncode == 0, first.stderr
++        nonce = json.loads(first.stdout)["release_read"]["nonce"]
++        transport.drop_carrier_reply = True
++        lost = fixtures.cli(native, "--seen-release", nonce)
++        assert lost.returncode == 2, (lost.stdout, lost.stderr)
++        assert json.loads(lost.stdout)["outcome"] == "outcome_unknown"
++        assert len(transport.carriers) == 1
++        wire = transport.carriers[0]
++        payload = json.loads(wire["fields"]["payload"])
++        assert payload["intent"] == transport.sent[0]["intent"]
++        assert payload["carrier"] == "owner_release"
++        assert payload["seen_comments"] == [] and payload["nonce"] == nonce
++        transport.support = 0
++        def unavailable(*a, **kw):
++            pytest.fail("pending delivery must reconcile before private mutable comments/proof")
++        monkeypatch.setattr(transport, "owner_release_comments", unavailable)
++        monkeypatch.setattr(transport, "owner_release_evidence", unavailable)
++        replay = fixtures.cli(native)
++        assert replay.returncode == 0, (replay.stdout, replay.stderr)
++        value = json.loads(replay.stdout)
++        assert value["delivery_uid"] == wire["uid"] and value["publication_stage"] == "published"
++        assert value["release_stage"] == "acknowledged_pending_home"
++        assert len(transport.carriers) == 1 and len(transport.sent) == 1
++        with kbc.connect_closing() as conn:
++            assert conn.execute("SELECT stage FROM native_owner_release_deliveries").fetchone()[0] == "published"
++            assert conn.execute("SELECT count(*) FROM task_events WHERE kind='stop_released'").fetchone()[0] == 0
++    finally:
++        fixtures.close(native)
++
++
++def test_real_cli_unconfirmed_nonce_never_publishes_carrier(turn, transport, monkeypatch):
++    native = fixtures.launch(monkeypatch)
++    try:
++        from tools import origin_cli_bridge as bridge
++        args = {"board": "default", "task_id": "t_target", "episode": "00000000-0000-7000-8000-000000000002",
++                "capability_episodes": ["00000000-0000-7000-8000-000000000001"], "runs": 1,
++                "note": "complete the exact original acceptance"}
++        # Raw socket reply receives output but deliberately never confirms emission.
++        first = bridge.request(native.locator, args, operation="release")
++        nonce = first["release_read"]["nonce"]
++        second = fixtures.cli(native, "--seen-release", nonce)
++        assert second.returncode == 0, (second.stdout, second.stderr)
++        assert json.loads(second.stdout)["release_stage"] == "read_first_pending"
++        assert transport.carriers == []
++    finally:
++        fixtures.close(native)
+-- 
+2.43.0
+

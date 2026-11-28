@@ -1,0 +1,260 @@
+From 503082ee03191b75db507dee5cad5b509b1a9396 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:31:31 +0000
+Subject: [PATCH 6860] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 503082ee03191b75db507dee5cad5b509b1a9396.
+
+---
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+index 5de14df49ac658f9de8ed762c3cf79654f1908ae..2495b7bc8c1f16546afc94b865aab25386ccfc1f 100644
+--- a/hermes_cli/kanban_replay_journal.py
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -131,6 +131,36 @@
+     return True
+ 
+ 
++def parent_cleanup_hold(conn: sqlite3.Connection, *, task_id: str | None = None,
++                        remote: dict | None = None) -> str | None:
++    """Keep an issued task cache until its authenticated exact final settlement.
++
++    The sender supplies its inspected serving-Board slot only inside recover's
++    bookkeeping transaction. Ordinary cleanup has no authority to infer a final
++    outcome from local row existence or a newer sync version.
++    """
++    anchor = conn.execute('SELECT journal_id FROM kanban_sync_state LIMIT 1').fetchone()
++    if anchor is None or anchor[0] is None:
++        return None
++    _reserve(conn)
++    state, encoded = _read(conn)
++    if encoded is None:
++        return None
++    wire = json.loads(encoded)
++    if wire['table'] != 'tasks':
++        return None
++    held = wire['uid']
++    if task_id == held:
++        if remote is None or reconcile(state, remote)['action'] != 'record':
++            raise ValueError('issued parent requires final verdict')
++        saved = conn.execute('SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?', (held,)).fetchone()
++        del wire['replay']
++        if saved is None or json.loads(saved[0]) != wire:
++            raise ValueError('issued parent cache custody mismatch')
++        return None
++    return held
++
++
+ def pending_wire(conn: sqlite3.Connection) -> bytes | None:
+     """Return exact canonical bytes after validating identity, digest and ack custody."""
+     return _read(conn)[1]
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 15c3965d395b6fa928b25392d021c23e64b21c10..cd3a35f40f74f28c5701066f7f4d90b4b2935b2e 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -115,7 +115,7 @@
+                              'VALUES (?,?,?,?,?,?,?,?,?)',
+                              (pending['op_id'], 'tasks', row['row_uid'], 'upsert', json.dumps(wire['fields']),
+                               wire['hlc'], int(time() * 1000), wire.get('status_origin'), json.dumps(wire)))
+-                retire_parent(conn, row['row_uid'])
++                retire_parent(conn, row['row_uid'], remote=remote)
+             reason = f"{verdict.get('reason') or status}: {verdict.get('detail') or ''}".strip(': ')
+             if status == 'cancelled':
+                 # Reuse non-success custody so dependency/import fences also hold
+@@ -146,7 +146,7 @@
+                          (verdict['version'], row['row_uid']))
+         if row.get('_parent'):
+             from hermes_cli.kanban_sync_envelope import retire_parent
+-            retire_parent(conn, row['row_uid'])
++            retire_parent(conn, row['row_uid'], remote=remote)
+         else:
+             conn.execute('DELETE FROM kanban_sync_outbox WHERE op_id=?', (pending['op_id'],))
+         setattr(out, status, getattr(out, status) + 1)
+diff --git a/hermes_cli/kanban_sync_envelope.py b/hermes_cli/kanban_sync_envelope.py
+index a0ad8d216f69bcfaa66304f2e94a2079e9718aa7..59b8dcab8985edf5b6e3313ff923abc56f7beb67 100644
+--- a/hermes_cli/kanban_sync_envelope.py
++++ b/hermes_cli/kanban_sync_envelope.py
+@@ -1,7 +1,8 @@
+ """Durable first-send envelopes, committed by push before network I/O. [daveey]
+ 
+ Only pending transport is retained: acknowledged outbox rows are deleted normally;
+-synthetic parents are removed on acknowledgement or when their task disappears.
++unissued synthetic parents may be removed when their task disappears. An issued
++parent remains until exact final-verdict bookkeeping in the journal transaction.
+ This cannot reconstruct envelopes already transmitted by an older core.
+ """
+ from __future__ import annotations
+@@ -85,10 +86,14 @@
+     return wire
+ 
+ 
+-def retire_parent(conn: sqlite3.Connection, task_id: str) -> None:
++def retire_parent(conn: sqlite3.Connection, task_id: str, *, remote: dict | None = None) -> None:
++    from hermes_cli.kanban_replay_journal import parent_cleanup_hold
++    parent_cleanup_hold(conn, task_id=task_id, remote=remote)
+     conn.execute("DELETE FROM kanban_sync_parent_envelopes WHERE task_id=?", (task_id,))
+ 
+ 
+ def prune_parents(conn: sqlite3.Connection) -> None:
+-    conn.execute("DELETE FROM kanban_sync_parent_envelopes WHERE NOT EXISTS "
+-                 "(SELECT 1 FROM tasks WHERE id=task_id AND sync_version IS NULL)")
++    from hermes_cli.kanban_replay_journal import parent_cleanup_hold
++    held = parent_cleanup_hold(conn)
++    conn.execute("DELETE FROM kanban_sync_parent_envelopes WHERE task_id IS NOT ? AND NOT EXISTS "
++                 "(SELECT 1 FROM tasks WHERE id=task_id AND sync_version IS NULL)", (held,))
+diff --git a/tests/hermes_cli/test_kanban_replay_parent_custody.py b/tests/hermes_cli/test_kanban_replay_parent_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..32bd70fd258427a1c5eee8bae30d53c36191851e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_parent_custody.py
+@@ -0,0 +1,133 @@
++"""Parent cache cleanup cannot erase outstanding strict transport custody."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client, kanban_sync_envelope as envelopes
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++def issued_parent(conn):
++    tid = kb.create_task(conn, title='issued parent cache', assignee='worker')
++    with kbc.write_txn(conn):
++        conn.execute('DELETE FROM kanban_sync_outbox')
++    kb.add_comment(conn, tid, 'author', 'dependent child')
++    receiver = helpers.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(conn, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    return tid, receiver, journal.pending_wire(conn)
++
++
++@pytest.mark.parametrize('change', ['delete', 'version'])
++def test_prune_preserves_issued_parent_after_local_change(live, change):
++    tid, receiver, frozen = issued_parent(live)
++    saved = live.execute('SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()[0]
++    with kbc.write_txn(live):
++        if change == 'delete':
++            live.execute('DELETE FROM tasks WHERE id=?', (tid,))
++        else:
++            live.execute('UPDATE tasks SET sync_version=9 WHERE id=?', (tid,))
++        # An unrelated stale cache is still collectable.
++        live.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES ('gone-other','{}')")
++        envelopes.prune_parents(live)
++    assert live.execute('SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()[0] == saved
++    assert not live.execute("SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id='gone-other'").fetchone()
++    assert journal.pending_wire(live) == frozen
++    restarted = helpers.reopen(live)
++    try:
++        receiver.lose_reply = False
++        result = client.push(restarted, receiver, 'default', 'macbook', primary=False, max_batches=1)
++        assert result.applied == 1 and len(receiver.sent) == 1
++        assert journal.pending_wire(restarted) is None and receiver.slot['a'] == '1'
++        assert not restarted.execute('SELECT 1 FROM kanban_sync_parent_envelopes').fetchone()
++    finally:
++        restarted.close()
++
++
++def test_direct_retirement_requires_exact_final_verdict(live):
++    tid, receiver, frozen = issued_parent(live)
++    with pytest.raises(ValueError, match='issued parent requires final verdict'):
++        with kbc.write_txn(live):
++            envelopes.retire_parent(live, tid)
++    assert journal.pending_wire(live) == frozen
++    assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    receiver.lose_reply = False
++    assert client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++    assert journal.pending_wire(live) is None
++
++
++@pytest.mark.parametrize('damage', ['unconsumed', 'identity', 'binding'])
++def test_retirement_revalidates_final_slot(live, damage):
++    tid, receiver, frozen = issued_parent(live)
++    remote = dict(receiver.slot)
++    if damage == 'unconsumed':
++        remote.update(h='0', last_op_id=None, last_payload_sha256=None, last_verdict=None)
++    elif damage == 'identity':
++        remote['last_op_id'] = 'other-operation'
++        verdict = json.loads(remote['last_verdict'])
++        verdict['client_op_id'] = remote['last_op_id']
++        remote['last_verdict'] = json.dumps(verdict)
++    else:
++        remote['board_incarnation'] = 'other-board'
++    with pytest.raises(ValueError):
++        with kbc.write_txn(live):
++            envelopes.retire_parent(live, tid, remote=remote)
++    assert journal.pending_wire(live) == frozen
++    assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++
++
++def test_bound_cleanup_requires_transaction_but_can_retire_unrelated_cache(live):
++    tid, _, frozen = issued_parent(live)
++    with pytest.raises(ValueError, match='caller transaction required'):
++        envelopes.prune_parents(live)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES ('gone-other','{}')")
++        envelopes.retire_parent(live, 'gone-other')
++    assert not live.execute("SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id='gone-other'").fetchone()
++    assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    assert journal.pending_wire(live) == frozen
++
++
++@pytest.mark.parametrize('pending', [False, True])
++def test_idle_or_non_task_issuance_does_not_hold_unrelated_cache(live, pending):
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES ('gone-other','{}')")
++        if pending:
++            journal.issue(live, dict(client_op_id='comment-issued', table='task_comments', uid='gone-other', fields={}))
++        envelopes.prune_parents(live)
++    assert not live.execute('SELECT 1 FROM kanban_sync_parent_envelopes').fetchone()
++    assert (journal.pending_wire(live) is not None) == pending
++
++
++@pytest.mark.parametrize('damage', ['missing', 'changed'])
++def test_exact_final_slot_does_not_authorize_changed_parent_cache(live, damage):
++    tid, receiver, frozen = issued_parent(live)
++    with kbc.write_txn(live):
++        if damage == 'missing':
++            live.execute('DELETE FROM kanban_sync_parent_envelopes')
++        else:
++            live.execute("UPDATE kanban_sync_parent_envelopes SET wire='{}'")
++    with pytest.raises(ValueError, match='issued parent cache custody mismatch'):
++        with kbc.write_txn(live):
++            envelopes.retire_parent(live, tid, remote=receiver.slot)
++    assert journal.pending_wire(live) == frozen
++
++
++@pytest.mark.parametrize('damage', ['anchor', 'wire'])
++def test_cleanup_refuses_corrupt_bound_journal_without_deleting_cache(live, damage):
++    tid, _, _ = issued_parent(live)
++    saved = live.execute('SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()[0]
++    with kbc.write_txn(live):
++        if damage == 'anchor':
++            live.execute("UPDATE kanban_sync_state SET journal_id='different'")
++        else:
++            live.execute("UPDATE kanban_replay_sender1 SET wire=X'7b7d'")
++    with pytest.raises(ValueError):
++        with kbc.write_txn(live):
++            envelopes.prune_parents(live)
++    assert live.execute('SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()[0] == saved
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index 042130462a37f54d6849139ab4b4ac19cb769c5e..5798ed1ad3f944a39f779192da3745985bee2388 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -627,8 +627,8 @@
+     receiver = Receiver()
+     receiver.status = 'rejected'
+     retire = envelopes.retire_parent
+-    def fail_after_retirement(conn, task_id):
+-        retire(conn, task_id)
++    def fail_after_retirement(conn, task_id, **kwargs):
++        retire(conn, task_id, **kwargs)
+         raise OSError('controlled bookkeeping failure')
+     monkeypatch.setattr(envelopes, 'retire_parent', fail_after_retirement)
+     with pytest.raises(OSError, match='^controlled bookkeeping failure$'):
+-- 
+2.43.0
+

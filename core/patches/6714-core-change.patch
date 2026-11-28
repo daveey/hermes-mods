@@ -1,0 +1,103 @@
+From ce5b57f024580908e4441faef700f6a89fa05288 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:32:21 +0000
+Subject: [PATCH 6714] Producer chat-link reconciliation without display feedback
+
+Public mirror of source commit ce5b57f024580908e4441faef700f6a89fa05288.
+
+---
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index eec54c94cbd6798ce07acb744f448a68783cc1d3..f3807c77d0db4d53f88aa443a004cc7b6afd99b1 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -465,7 +465,9 @@
+     """
+     from hermes_cli.kanban_session_activity import remote_links_and_origin_rows
+     visible, origins = remote_links_and_origin_rows()
+-    return [*visible, *origins]
++    # project() expresses authoritative closure as unfinished=False, not the
++    # legacy projection's released field. Do not mutate the shared reader rows.
++    return [*visible, *({**row, "released": not row.get("unfinished", True)} for row in origins)]
+ 
+ 
+ def _plan(conn: sqlite3.Connection, board: str, gateway: str,
+diff --git a/tests/hermes_cli/test_kanban_chat_links_oscillation.py b/tests/hermes_cli/test_kanban_chat_links_oscillation.py
+index eba1a305b9cd84cbe157b71c4e1b215c48f0bcb7..f4ad273fe32a1e6c50a007b48f83c647d82bc2bc 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_oscillation.py
++++ b/tests/hermes_cli/test_kanban_chat_links_oscillation.py
+@@ -19,17 +19,26 @@
+         live.execute('DELETE FROM kanban_sync_outbox')
+     origin = dict(id=task, board='default', gateway=ME, profile='default', origin_gateway=ME,
+                   origin_profile='default', origin_session='human', session='human', via='origin',
+-                  key=f'{ME}/default/default/{task}', status='ready', released=False, unfinished=True, stale=False)
++                  key=f'{ME}/default/default/{task}', status='ready', unfinished=True, stale=False)
+     monkeypatch.setattr(activity, '_board_db_paths', lambda: [kanban_home / 'kanban.db'])
+ 
+-    def entry(stale_ok=False, *, with_rows=False):
+-        visible = activity._without_local_open_duplicates([origin], gateway=ME, profile='default')
+-        return (visible, [origin]) if with_rows else visible
++    from hermes_cli import kanban_origin_adapter, kanban_origin_ledger, profiles
++    (kanban_home / 'kanban').mkdir(exist_ok=True)
++    (kanban_home / 'kanban' / 'origin-ledger.db').touch()
++    monkeypatch.setattr(kanban_origin_adapter, '_gateway', lambda path: ME)
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(kanban_origin_ledger, 'project', lambda *a, **kw: [origin])
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(activity, '_legacy_remote_links', list)
++    activity._reset_cache_for_tests()
++
++    def reconcile():
++        activity._reset_cache_for_tests()  # fresh projection on each side of the feedback loop
++        return links.reconcile(live, 'default', ME)
+ 
+-    monkeypatch.setattr(activity, '_links_entry', entry)
+     assert activity._remote_links() == []  # the real local linked-row reader deduplicates it
+     for _ in range(4):
+-        counts = links.reconcile(live, 'default', ME)
++        counts = reconcile()
+         assert counts['changed'] == counts['released'] == 0
+         assert live.execute('SELECT released FROM task_chat_links WHERE uid=?', (uid,)).fetchone()[0] == 0
+     assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_chat_links' AND row_uid=?", (uid,)).fetchone()
+@@ -37,11 +46,11 @@
+     # Real producer transitions still apply exactly once, even while the visible
+     # projection hides this same local card. No sticky released flag or freeze.
+     for state, status in [(True, 'done'), (False, 'ready')]:
+-        origin.update(released=state, unfinished=not state, status=status)
+-        assert links.reconcile(live, 'default', ME)['changed'] == 1
++        origin.update(unfinished=not state, status=status)
++        assert reconcile()['changed'] == 1
+         assert live.execute('SELECT released FROM task_chat_links WHERE uid=?', (uid,)).fetchone()[0] == state
+         for _ in range(3):
+-            assert links.reconcile(live, 'default', ME)['changed'] == 0
++            assert reconcile()['changed'] == 0
+         assert live.execute('SELECT released FROM task_chat_links WHERE uid=?', (uid,)).fetchone()[0] == state
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_ledger_links_bulk.py b/tests/hermes_cli/test_kanban_ledger_links_bulk.py
+index e9ce131c8541d3b3560a4f423e85d4d7f9931958..687e833aa45c2f05f1226bcd6a0ea0647d45d6a2 100644
+--- a/tests/hermes_cli/test_kanban_ledger_links_bulk.py
++++ b/tests/hermes_cli/test_kanban_ledger_links_bulk.py
+@@ -110,6 +110,8 @@
+ def ledger(monkeypatch):
+     rows: list[dict] = []
+     monkeypatch.setattr("hermes_cli.kanban_session_activity._remote_links", lambda stale_ok=False: list(rows))
++    monkeypatch.setattr("hermes_cli.kanban_session_activity.remote_links_and_origin_rows",
++                        lambda stale_ok=False: (list(rows), []))
+     return rows
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_steady_links.py b/tests/hermes_cli/test_kanban_sync_steady_links.py
+index cc7181623e003524f13bba5e6257bf61540a6d62..1fb8d805f76e0f96da15592319fdcf6223e7bd61 100644
+--- a/tests/hermes_cli/test_kanban_sync_steady_links.py
++++ b/tests/hermes_cli/test_kanban_sync_steady_links.py
+@@ -45,6 +45,7 @@
+ def ledger(monkeypatch):
+     rows: list[dict] = []
+     monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: list(rows))
++    monkeypatch.setattr(ksa, "remote_links_and_origin_rows", lambda stale_ok=False: (list(rows), []))
+     return rows
+ 
+ 
+-- 
+2.43.0
+

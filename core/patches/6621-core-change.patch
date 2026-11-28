@@ -1,0 +1,159 @@
+From 8babec87510594a9e40870d78876170563c9cb44 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:29:30 +0000
+Subject: [PATCH 6621] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 8babec87510594a9e40870d78876170563c9cb44.
+
+---
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+index af107f7b27d4d7c31a092d7b665c80f3e4953603..59f44eaf5c6711c9faf46a331051014a06c65153 100644
+--- a/hermes_cli/sessions_native_source.py
++++ b/hermes_cli/sessions_native_source.py
+@@ -41,6 +41,7 @@
+         self._lock = threading.Lock()
+         self._selectors = OrderedDict()
+         self._dirty = OrderedDict()
++        self._capturing = set()
+         self._sizes, self._retry = {}, {}
+         self._failed = set()
+         self._retired = set()
+@@ -63,6 +64,7 @@
+     def _evict(self, key):
+         self._selectors.pop(key)
+         self._dirty.pop(key, None)
++        self._capturing.discard(key)
+         self._retry.pop(key, None)
+         self._failed.discard(key)
+         self._retired.add(key)
+@@ -84,7 +86,11 @@
+                     self._evict(peers[0])
+                 self._selectors[key] = (name, dict(selector))
+             self._selectors.move_to_end(key)
+-            self._dirty.setdefault(key, None)
++            # Pending HTTP reads join the capture already admitted for this key.
++            # Only real invalidation may request its trailing refresh. Keep this
++            # fence through commit: a completed reader is not yet a Ready view.
++            if key not in self._capturing:
++                self._dirty.setdefault(key, None)
+             wake = self._wake
+         if wake is not None:
+             wake()  # ChangeFeed condition only; no file descriptor writes.
+@@ -134,6 +140,7 @@
+             views = [self._selectors[key] for key in keys]
+             for key in keys:
+                 self._dirty.pop(key)
++            self._capturing.update(keys)
+         try:
+             bodies = (self.reader_many(views) if self.reader_many is not None else
+                       [self.reader(*views[0])])
+@@ -224,12 +231,14 @@
+                 self._sizes[fact.key] = size
+                 retained.append(fact)
+             self.store.publish([fact for fact in retained if fact.key in self._selectors], deleted_keys=deleted)
++            self._capturing.difference_update(fact.key for fact in facts)
+ 
+     def failure(self):
+         # Watch/publication failure (not one selector failure) invalidates all.
+         snapshot = self.store.snapshot(self.source.scope)
+         with self._lock:
+             keys = tuple(self._selectors)
++            self._capturing.clear()
+             for key in keys:
+                 self._dirty.setdefault(key, None)
+         stale = [evolve(fact, health='stale', error_code='sessions_source_failed')
+diff --git a/tests/hermes_cli/test_sessions_native_source.py b/tests/hermes_cli/test_sessions_native_source.py
+index 69201f7a9d85c0d60d9c8b6dd283432bbbf31c3c..27dbb436ac9cc45cbef8fe650d73a1cbae76f2fe 100644
+--- a/tests/hermes_cli/test_sessions_native_source.py
++++ b/tests/hermes_cli/test_sessions_native_source.py
+@@ -36,6 +36,87 @@
+     return capture
+ 
+ 
++def test_duplicate_pending_demand_does_not_recapture(source):
++    owner, clock, calls = source
++    original = owner.reader
++    selector = {'id': 'one'}
++    def read(name, selected):
++        # Another HTTP request sees Pending while this capture is running.
++        owner.demand(name, selected)
++        return original(name, selected)
++    owner.reader = read
++    owner.demand('sessions', selector)
++    capture = owner.capture(None, CaptureBudget())
++    # Publication has not happened yet: this is also the same pending work.
++    owner.demand('sessions', selector)
++    owner.commit(capture)
++    clock[0] += 1
++    second = step(owner, clock)
++    assert second.fact is None
++    assert calls == [('sessions', 'one')]
++    assert owner.store.snapshot(owner.source.scope).view('sessions', selector).encoded == b'one'
++
++
++@pytest.mark.parametrize('hint', ['during_read', 'before_commit', 'lost'])
++def test_pending_demand_preserves_real_change_and_reconciliation(source, hint):
++    owner, clock, calls = source
++    original = owner.reader
++    selector = {'id': 'one'}
++    def read(name, selected):
++        owner.demand(name, selected)
++        if hint == 'during_read':
++            owner.invalidate()
++        return original(name, selected)
++    owner.reader = read
++    owner.demand('sessions', selector)
++    capture = owner.capture(None, CaptureBudget())
++    if hint == 'before_commit':
++        owner.invalidate()
++    owner.demand('sessions', selector)
++    owner.commit(capture)
++    owner.reader = original
++    clock[0] += 1 if hint != 'lost' else 31
++    step(owner, clock)
++    assert calls == [('sessions', 'one'), ('sessions', 'one')]
++    clock[0] += 1
++    assert step(owner, clock).fact is None
++
++
++def test_pending_demand_is_released_after_publication_failure(source, monkeypatch):
++    owner, clock, calls = source
++    selector = {'id': 'one'}
++    owner.demand('sessions', selector)
++    capture = owner.capture(None, CaptureBudget())
++    def fail(*args, **kwargs):
++        raise RuntimeError('publication failed')
++    with monkeypatch.context() as patch:
++        patch.setattr(owner.store, 'publish', fail)
++        with pytest.raises(RuntimeError, match='publication failed'):
++            owner.commit(capture)
++    owner.failure()
++    clock[0] += 1
++    step(owner, clock)
++    assert calls == [('sessions', 'one'), ('sessions', 'one')]
++    # A later missing-view demand is not permanently suppressed by the fence.
++    owner.store.publish([], deleted_keys=[view_key(owner.source.scope, 'sessions', selector)])
++    owner.demand('sessions', selector)
++    step(owner, clock)
++    assert len(calls) == 3
++
++
++def test_evicted_inflight_selector_can_be_demanded_again(source):
++    owner, clock, calls = source
++    owner.max_views = 1
++    owner.demand('sessions', {'id': 'one'})
++    capture = owner.capture(None, CaptureBudget())
++    owner.demand('sessions', {'id': 'two'})
++    owner.demand('sessions', {'id': 'one'})
++    owner.commit(capture)
++    clock[0] += 1
++    step(owner, clock)
++    assert calls == [('sessions', 'one'), ('sessions', 'one')]
++
++
+ def test_hot_hints_do_not_starve_and_failure_is_per_selector(source):
+     owner, clock, calls = source
+     owner.demand('sessions', {'id': 'bad'})
+-- 
+2.43.0
+

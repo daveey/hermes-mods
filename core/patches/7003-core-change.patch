@@ -1,0 +1,297 @@
+From 88a3485d303e334ad498021542337662a77d0603 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 09:31:28 +0000
+Subject: [PATCH 7003] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 88a3485d303e334ad498021542337662a77d0603.
+
+---
+diff --git a/hermes_cli/kanban_home_owner.py b/hermes_cli/kanban_home_owner.py
+index 05eff96ea66a3c8f69fe6b57f640e03326f21a48..8f33d4ec3c753445666eb135c55a1c35084101c2 100644
+--- a/hermes_cli/kanban_home_owner.py
++++ b/hermes_cli/kanban_home_owner.py
+@@ -45,8 +45,15 @@
+     fresh nonce, local rollback of already committed protocol or lease repair.
+     """
+     identity = _identity(conn, hub, board, identity, "source")
++    args = {k: v for k, v in identity.items() if k != "task"}
++    source.validate_identity(identity["task"], **args)
++    # No protocol bytes have left yet: an absent/rolled-back Board must leave
++    # ordinary local work writable. Never infer release after a mutation send.
++    cap = hub.home_transfer_capability(board)
++    if not isinstance(cap, dict) or type(cap.get("home_transfer")) is not int or cap["home_transfer"] != 1:
++        raise ValueError("Board home-transfer capability v1 required before local preparation")
+     with dbc.write_txn(conn):
+-        source.prepare(conn, identity["task"], **{k:v for k,v in identity.items() if k != "task"})
++        source.prepare(conn, identity["task"], **args)
+     record = _advance(hub, board, identity, "prepare")
+     if record["phase"] == "prepared":
+         record = _advance(hub, board, identity, "commit")
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index a80a248035154119104e23d19c1d913a05d4d2fd..4f2d2c6edd4f73c21dcca0f55ce7fd4063938404 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -156,6 +156,18 @@
+     installed_first(conn, first)
+ 
+ 
++def validate_identity(task_id: str, *, source: str, destination: str,
++                      nonce: str, expected_version: int) -> dict:
++    """Validate the supported tuple without schema, task or network effects."""
++    if (not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", task_id)
++            or not isinstance(source, str) or not _SOURCE.fullmatch(source)
++            or destination != 'hub' or not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
++            or type(expected_version) is not int or expected_version < 1):
++        raise ValueError("invalid home preparation identity")
++    return dict(task_id=task_id, source=source, destination=destination,
++                nonce=nonce, expected_version=expected_version)
++
++
+ def prepare(conn: sqlite3.Connection, task_id: str, *, source: str, destination: str,
+             nonce: str, expected_version: int) -> dict:
+     """Fence one idle local task inside the caller's write transaction.
+@@ -171,13 +183,8 @@
+     """
+     if not conn.in_transaction:
+         raise ValueError("home preparation requires a write transaction")
+-    if (not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", task_id)
+-            or not isinstance(source, str) or not _SOURCE.fullmatch(source)
+-            or destination != 'hub' or not isinstance(nonce, str) or not _NONCE.fullmatch(nonce)
+-            or type(expected_version) is not int or expected_version < 1):
+-        raise ValueError("invalid home preparation identity")
+-    record = dict(task_id=task_id, source=source, destination=destination,
+-                  nonce=nonce, expected_version=expected_version)
++    record = validate_identity(task_id, source=source, destination=destination,
++                               nonce=nonce, expected_version=expected_version)
+     conn.execute("SAVEPOINT home_prepare")
+     try:
+         _install(conn)
+diff --git a/hermes_cli/kanban_sync_hub_routes.py b/hermes_cli/kanban_sync_hub_routes.py
+index 11504a66112ba079962664e4fdab48bda7596515..1ac70d3956d1de646d7362ae6f4464b6b85c21b4 100644
+--- a/hermes_cli/kanban_sync_hub_routes.py
++++ b/hermes_cli/kanban_sync_hub_routes.py
+@@ -72,6 +72,13 @@
+         return self._call("GET", f"/v2/boards/{quote(board, safe='')}/reviewer-allowance?"
+                           + urlencode({"task": task}), max_response_bytes=8192)
+ 
++    def home_transfer_capability(self, board: str) -> dict:
++        """Read-only protocol preflight; absence never authorizes local preparation."""
++        from urllib.parse import quote
++
++        return self._call("GET", f"/v2/boards/{quote(board, safe='')}/home-transfer/capability",
++                          max_response_bytes=8192)
++
+     def home_transfer(self, board: str, body: dict) -> dict:
+         """Cooperative handoff; exact tuple/phase retry, never legacy rehome fallback."""
+         from urllib.parse import quote
+diff --git a/tests/hermes_cli/test_home_owner_preflight.py b/tests/hermes_cli/test_home_owner_preflight.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5acea6c6a22406b8a6e140d42730b1c0c615997
+--- /dev/null
++++ b/tests/hermes_cli/test_home_owner_preflight.py
+@@ -0,0 +1,141 @@
++"""Unavailable Board protocols must not strand a new local preparation."""
++from __future__ import annotations
++
++import http.server
++import json
++import threading
++from contextlib import contextmanager
++from pathlib import Path
++from urllib.parse import quote
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_owner as owner, kanban_home_transfer as transfer
++from hermes_cli.kanban_sync_client import Hub, HubError, Identity
++from tests.hermes_cli import test_home_transfer_capture as support
++
++board = support.board
++
++
++def candidate(conn):
++    task = kb.create_task(conn, title='portable idle card')
++    with dbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage',created_on='worker-a3',sync_version=7 WHERE id=?", (task,))
++        conn.execute("UPDATE kanban_sync_state SET gateway_id='worker-a3'")
++        conn.execute('DELETE FROM kanban_sync_outbox')
++    bid = conn.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    return bid, dict(task=task, source='worker-a3', destination='hub', nonce='preflight-owner-00001', expected_version=7)
++
++
++@contextmanager
++def peer(conn, cap_status=200, cap=None, post_status=200):
++    state = dict(cap_status=cap_status, cap={'home_transfer': 1} if cap is None else cap,
++                 post_status=post_status, requests=[], frozen_at_post=[])
++
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def reply(self, status, body):
++            raw = json.dumps(body).encode()
++            self.send_response(status)
++            self.send_header('Content-Type', 'application/json')
++            self.send_header('Content-Length', str(len(raw)))
++            self.end_headers()
++            self.wfile.write(raw)
++
++        def do_GET(self):
++            state['requests'].append(('GET', self.path))
++            self.reply(state['cap_status'], state['cap'])
++
++        def do_POST(self):
++            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
++            state['requests'].append(('POST', body))
++            # A separate connection proves the freeze committed before bytes left.
++            observed = dbc.connect(Path(db_path))
++            try:
++                state['frozen_at_post'].append(transfer.frozen(observed, body['task']))
++            finally:
++                observed.close()
++            if state['post_status'] != 200:
++                self.reply(state['post_status'], {'error': 'unavailable'})
++                return
++            phase = 'prepared' if body['step'] == 'prepare' else 'committed'
++            self.reply(200, {**{k: v for k, v in body.items() if k != 'step'}, 'phase': phase, 'rows': []})
++
++        def log_message(self, *args):
++            pass
++
++    db_path = conn.execute('PRAGMA database_list').fetchone()[2]
++    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    hub = Hub(Identity(f'http://127.0.0.1:{server.server_address[1]}', 'fixture-key', 'worker-a3'))
++    try:
++        yield hub, state
++    finally:
++        hub.close()
++        server.shutdown()
++        thread.join(5)
++        server.server_close()
++        assert not thread.is_alive()
++
++
++@pytest.mark.parametrize('status,cap', [(404, {}), (405, {}), (401, {}), (503, {}),
++                                      (200, {}), (200, {'home_transfer': 0}),
++                                      (200, {'home_transfer': True}), (200, {'home_transfer': '1'}),
++                                      (200, {'home_transfer': 2})])
++def test_unavailable_protocol_never_prepares_or_sends(board, status, cap):
++    bid, ident = candidate(board)
++    before = sorted(board.iterdump())
++    with peer(board, status, cap) as (hub, state):
++        with pytest.raises((HubError, ValueError)):
++            owner.source_step(board, hub, bid, ident)
++        assert sorted(board.iterdump()) == before
++        assert not transfer.frozen(board, ident['task'])
++        assert state['requests'] == [('GET', f'/v2/boards/{quote(bid, safe="")}/home-transfer/capability')]
++    kb.add_comment(board, ident['task'], 'human', 'still writable')
++    assert kb.promote_task(board, ident['task'], actor='human')[0]
++
++
++def test_capable_peer_sees_committed_freeze_and_exact_tuple_retries(board):
++    bid, ident = candidate(board)
++    with peer(board) as (hub, state):
++        assert owner.source_step(board, hub, bid, ident)['phase'] == 'committed'
++        assert state['frozen_at_post'] == [True, True]
++        before = sorted(board.iterdump())
++        assert owner.source_step(board, hub, bid, ident)['phase'] == 'committed'
++        assert sorted(board.iterdump()) == before
++        assert [r[1] for r in state['requests'] if r[0] == 'POST'] == [
++            {**ident, 'step': step} for step in ('prepare', 'commit', 'prepare', 'commit')]
++        assert [r for r in state['requests'] if r[0] == 'GET'] == [
++            ('GET', f'/v2/boards/{quote(bid, safe="")}/home-transfer/capability')] * 2
++
++
++@pytest.mark.parametrize('post_status', [404, 503])
++def test_after_prepare_unknown_response_never_unfreezes(board, post_status):
++    bid, ident = candidate(board)
++    with peer(board, post_status=post_status) as (hub, state):
++        with pytest.raises(HubError):
++            owner.source_step(board, hub, bid, ident)
++        assert transfer.frozen(board, ident['task'])
++        assert state['frozen_at_post'] == [True]
++        before = sorted(board.iterdump())
++        state['cap_status'] = 404
++        with pytest.raises(HubError):
++            owner.source_step(board, hub, bid, ident)
++        assert sorted(board.iterdump()) == before
++        assert transfer.frozen(board, ident['task'])
++        assert len(state['frozen_at_post']) == 1
++
++
++def test_capability_is_not_reused_for_later_new_preparation(board):
++    bid, ident = candidate(board)
++    with peer(board) as (hub, state):
++        owner.source_step(board, hub, bid, ident)
++        bid2, other = candidate(board)
++        before = sorted(board.iterdump())
++        state['cap_status'] = 404
++        with pytest.raises(HubError):
++            owner.source_step(board, hub, bid2, other)
++        assert sorted(board.iterdump()) == before
++        assert not transfer.frozen(board, other['task'])
++        assert transfer.frozen(board, ident['task'])
+diff --git a/tests/hermes_cli/test_home_shared_invariant_transport.py b/tests/hermes_cli/test_home_shared_invariant_transport.py
+index 638337de150136f3fceb6424ebfc205c173d6ee9..e5cdc5646205840f262a0309357abbaedd4a0a14 100644
+--- a/tests/hermes_cli/test_home_shared_invariant_transport.py
++++ b/tests/hermes_cli/test_home_shared_invariant_transport.py
+@@ -5,6 +5,7 @@
+ from tests.hermes_cli import test_review_daily_transfer as daily
+ from tests.hermes_cli import test_home_feed_entrypoints as entry_cases
+ from tests.hermes_cli import test_review_home_feed_isolation as feed_review
++from tests.hermes_cli import test_home_owner_preflight as owner_preflight
+ from tests.hermes_cli import test_home_label_presend as presend
+ from tests.hermes_cli import test_home_quarantine_custody as quarantine_cases
+ from tests.hermes_cli import test_home_release_landing_race as release_landing
+@@ -18,6 +19,11 @@
+ configured = daily.configured
+ person = daily.person
+ 
++test_unavailable_protocol_never_prepares_or_sends = owner_preflight.test_unavailable_protocol_never_prepares_or_sends
++test_capable_peer_sees_committed_freeze_and_exact_tuple_retries = owner_preflight.test_capable_peer_sees_committed_freeze_and_exact_tuple_retries
++test_after_prepare_unknown_response_never_unfreezes = owner_preflight.test_after_prepare_unknown_response_never_unfreezes
++test_capability_is_not_reused_for_later_new_preparation = owner_preflight.test_capability_is_not_reused_for_later_new_preparation
++
+ test_conflicting_protected_row_preserves_healthy_peer = quarantine_cases.test_conflicting_protected_row_preserves_healthy_peer
+ test_quarantine_closure_races_preserve_custody = quarantine_cases.test_quarantine_closure_races_preserve_custody
+ test_uncached_containment_native_pull_keeps_neighbor_progress = certification.test_uncached_containment_native_pull_keeps_neighbor_progress
+diff --git a/website/docs/developer-guide/kanban-home-preflight.md b/website/docs/developer-guide/kanban-home-preflight.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f328699d49b6df3d9b4499cd066263bd0595da4
+--- /dev/null
++++ b/website/docs/developer-guide/kanban-home-preflight.md
+@@ -0,0 +1,31 @@
++# Cooperative home-transfer preflight
++
++The explicit `hermes_cli.kanban_home_cli` source owner must negotiate the serving
++Board before committing a new local preparation. This is dormant administrative
++maintenance, not automatic migration, permission to migrate, or a legacy rehome
++fallback.
++
++The source sends an authenticated, read-only
++`GET /v2/boards/{url-encoded-board}/home-transfer/capability` outside the local
++writer. Protocol v1 requires a JSON object with integer `home_transfer: 1`.
++Boolean, string, missing or unsupported versions do not qualify. The response is
++bounded to 8192 bytes and is not cached across calls. The companion Board must
++serve this capability only when its matching transfer and durable abort protocol
++are available. An older Board without this endpoint is intentionally unsupported;
++no local task, schema, preparation or outbox write occurs on preflight failure.
++This core change does not implement, deploy or activate the companion Board route.
++
++After successful preflight the native writer still rechecks source eligibility,
++version, drainage and immutable tuple custody. The local fence must be committed
++before the first transfer POST. A capability is readiness evidence, not a commit
++or NONCOMMIT receipt: failures after that preparation (including HTTP 404 after a
++server rollback, timeout or lost reply) retain the exact frozen attempt. They must
++not clear its marker, change nonce, or infer noncommit from network errors.
++Recovery still requires the Board's authenticated exact-tuple abort decision.
++A later failed capability probe must likewise leave existing custody untouched.
++
++Regression proof: `tests/hermes_cli/test_home_owner_preflight.py` uses real Hub
++HTTP transport and a loopback Board. It checks unavailable/malformed capability
++no-write refusal, continued ordinary local writes, native committed preparation
++visible from a second connection before POST, exact retries, capability rollback
++between calls, and unchanged custody after post-preparation errors.
+-- 
+2.43.0
+

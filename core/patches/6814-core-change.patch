@@ -1,0 +1,221 @@
+From fe5fc85db3fe0403ad4c3b8f80c42c2ba805a1b0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:50:48 +0000
+Subject: [PATCH 6814] Origin-forward refusals, queued-create wait handles and wait-check parsing
+
+Public mirror of source commit fe5fc85db3fe0403ad4c3b8f80c42c2ba805a1b0.
+
+---
+diff --git a/hermes_cli/kanban_origin_forward_wait.py b/hermes_cli/kanban_origin_forward_wait.py
+index ca09eab85db32675a2fd2fea4792d0a310be6b8e..7ef4c705045fb21e8cae60e1d11b330e13c6de88 100644
+--- a/hermes_cli/kanban_origin_forward_wait.py
++++ b/hermes_cli/kanban_origin_forward_wait.py
+@@ -22,17 +22,25 @@
+ _REFUSED = "origin_forward_binding_missing"
+ 
+ 
+-def wait_key(wake_check: Optional[str]) -> Optional[str]:
+-    """The product key a ``hermes kanban wait-check key <KEY> ...`` probe waits on, else None."""
++def wait_keys(wake_check: Optional[str]) -> list[str]:
++    """Every product key a ``hermes kanban wait-check key <KEY> ...`` probe waits on, in order.
++
++    A probe that offers an alternative (``||``, ``;``, ``|``) can fire without the lost key, so
++    it is "cannot tell" and yields no keys; only a conjunction (or a lone probe) is judged.
++    """
+     try:
+         words = shlex.split(wake_check or "")
+     except ValueError:
+-        return None
++        return []
++    if any(w in ("||", ";", "|", "&") for w in words):
++        return []
++    keys = []
+     for i in range(len(words) - 4):
+         if words[i:i + 3] == ["hermes", "kanban", "wait-check"] and words[i + 3] == "key":
+             key = words[i + 4]
+-            return key if key and not key.startswith("-") else None
+-    return None
++            if key and not key.startswith("-"):
++                keys.append(key)
++    return keys
+ 
+ 
+ def _run_uid(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+@@ -44,8 +52,8 @@
+     return row[0] if row and isinstance(row[0], str) and row[0] else None
+ 
+ 
+-def _attempts(task_id: str, key: str) -> Optional[list[tuple[str, str, dict, str]]]:
+-    """``(request id, state, result, run uid)`` per courier row creating ``key`` for this creator."""
++def _attempts(task_id: str, key: str) -> Optional[tuple[list, list]]:
++    """``(request id, state, result, run uid)`` per courier row creating ``key``: this creator's, then others'."""
+     from hermes_cli.kanban_capability_registry import hub_db_path, _ro
+     try:
+         path = hub_db_path()
+@@ -54,15 +62,15 @@
+             rows = db.execute("SELECT id,state,result,body FROM sent WHERE body LIKE '%origin-forward%'").fetchall()
+     except (sqlite3.Error, OSError):
+         return None
+-    found = []
++    found, others = [], []
+     for rid, state, raw_result, raw_body in rows:
+         try:
+             body = json.loads(raw_body)
+             args = body["args"]
+             if (body.get("coll") != "sessions" or body.get("action") != "origin-forward"
+-                    or args["creator"]["task_id"] != task_id
+                     or args["create"]["idempotency_key"] != key):
+                 continue
++            mine = args["creator"]["task_id"] == task_id
+             run_uid = args.get("run_uid")
+         except (ValueError, TypeError, KeyError, AttributeError):
+             continue  # a row we cannot attribute is neither this creator's nor evidence
+@@ -70,8 +78,8 @@
+             result = json.loads(raw_result or "{}")
+         except (ValueError, TypeError):
+             result = None
+-        found.append((str(rid), state, result if isinstance(result, dict) else {}, run_uid))
+-    return found
++        (found if mine else others).append((str(rid), state, result if isinstance(result, dict) else {}, run_uid))
++    return found, others
+ 
+ 
+ def _definitive(state, result: dict) -> bool:
+@@ -80,24 +88,38 @@
+             and result.get("status") == "rejected" and result.get("handoff_complete") is False)
+ 
+ 
++def _lost(task_id: str, key: str, run_uid: str) -> Optional[str]:
++    """The request id of this run's definitively refused creation of ``key``, else None."""
++    evidence = _attempts(task_id, key)
++    if evidence is None:
++        return None
++    attempts, others = evidence
++    if not attempts or not all(_definitive(state, result) for _, state, result, _ in attempts + others):
++        # No evidence, a recovery/in-flight/done request (even another creator's: the key may
++        # exist), or another failure: not this gate.
++        return None
++    mine = [rid for rid, _, _, uid in attempts if uid == run_uid]
++    return sorted(mine)[0] if mine else None  # none: an earlier run's refusal, possibly recovered since
++
++
+ def rejected_wait(conn: sqlite3.Connection, task_id: str, wake_check: Optional[str]) -> Optional[str]:
+     """Refusal text when this park waits on a key whose creation this run definitively failed."""
+-    key = wait_key(wake_check)
+-    if key is None:
++    keys = wait_keys(wake_check)
++    if not keys:
+         return None
+     from hermes_cli.kanban_workspace_publication import _kernel_park
+     if _kernel_park.get() == task_id:
+         return None  # mandatory kernel parks stay possible, as for the pending gate
+     run_uid = _run_uid(conn, task_id)
+-    attempts = _attempts(task_id, key) if run_uid else None
+-    if not attempts or not all(_definitive(state, result) for _, state, result, _ in attempts):
+-        return None  # no evidence, a recovery/in-flight/done request, or another failure: not this gate
+-    mine = [rid for rid, _, _, uid in attempts if uid == run_uid]
+-    if not mine:
+-        return None  # an earlier run's refusal; the owner may have recovered the key since
+-    return (f"{CODE}: this run's creation of the child with idempotency key {key} (request "
+-            f"{sorted(mine)[0]}) was definitively refused as {_REFUSED}, before any card was created, so "
+-            "`wait-check key` can never see it. Do not park on it and do not retry creation in this run. "
+-            "End the run reporting the lost child (kanban_complete or kanban_block with the refusal; the "
+-            "owning chat already holds the rejection notice), or, if the owning chat created the card "
+-            "another way, wait on that card's id instead. No origin binding was inherited, minted or changed.")
++    if not run_uid:
++        return None
++    for key in keys:
++        rid = _lost(task_id, key, run_uid)
++        if rid:
++            return (f"{CODE}: this run's creation of the child with idempotency key {key} (request "
++                    f"{rid}) was definitively refused as {_REFUSED}, before any card was created, so "
++                    "`wait-check key` can never see it. Do not park on it and do not retry creation in this run. "
++                    "End the run reporting the lost child (kanban_complete or kanban_block with the refusal; the "
++                    "owning chat already holds the rejection notice), or, if the owning chat created the card "
++                    "another way, wait on that card's id instead. No origin binding was inherited, minted or changed.")
++    return None
+diff --git a/tests/hermes_cli/test_origin_forward_rejected_wait.py b/tests/hermes_cli/test_origin_forward_rejected_wait.py
+index 07de5705af41e1a68448f04ffe8d2b05f9f3fbc8..08eda2e8a72933c1d9bf2ab08439539c949943db 100644
+--- a/tests/hermes_cli/test_origin_forward_rejected_wait.py
++++ b/tests/hermes_cli/test_origin_forward_rejected_wait.py
+@@ -195,6 +195,77 @@
+         assert 'origin_forward_rejected_wait' in (refusal('schedule', conn, task, run, wake_check=longer) or '')
+ 
+ 
++OTHER_KEY = 'bb-land:817:other'
++
++
++@pytest.mark.parametrize('order', ['lost-last', 'lost-first'])
++@pytest.mark.parametrize('how', ['schedule', 'block', 'continue'])
++def test_lost_key_in_a_conjunction_is_refused_wherever_it_sits(refused, how, order):
++    """``wait-check key OTHER && wait-check key LOST`` can never fire: the lost key is not just the first one."""
++    task, run, _ = refused
++    first, second = (wake(OTHER_KEY), wake()) if order == 'lost-last' else (wake(), wake(OTHER_KEY))
++    with kbc.connect_closing() as conn:
++        why = refusal(how, conn, task, run, wake_check=f'{first} && {second}')
++        assert 'origin_forward_rejected_wait' in (why or ''), why
++        assert KEY in why
++        assert_still_running(conn, task, run)
++
++
++@pytest.mark.parametrize('joiner', ['||', ';', '|'])
++def test_a_probe_with_an_alternative_can_fire_without_the_lost_key_so_it_still_parks(refused, joiner):
++    task, run, _ = refused
++    with kbc.connect_closing() as conn:
++        assert refusal('schedule', conn, task, run, wake_check=f'{wake(OTHER_KEY)} {joiner} {wake()}') is None
++        assert kb.get_task(conn, task).status == 'scheduled'
++
++
++def test_another_creators_completed_request_for_the_key_lifts_the_refusal(refused):
++    """The key may exist (another creator made it): never claim ``wait-check key`` can not see it."""
++    task, run, path = refused
++    journal(path, 'placement:other:done', state='done', result={}, creator=OTHER_CREATOR)
++    with kbc.connect_closing() as conn:
++        assert refusal('schedule', conn, task, run) is None
++        assert kb.get_task(conn, task).status == 'scheduled'
++
++
++def test_another_creators_inflight_request_for_the_key_lifts_the_refusal_without_a_pending_hold(refused):
++    task, run, path = refused
++    journal(path, 'placement:other:sent', state='sent', result={}, creator=OTHER_CREATOR)
++    with kbc.connect_closing() as conn:
++        assert 'origin_forward_rejected_wait' not in (refusal('schedule', conn, task, run) or '')
++
++
++def test_another_creators_own_binding_refusal_for_the_key_does_not_lift_it(refused):
++    task, run, path = refused
++    journal(path, 'placement:other:refused', creator=OTHER_CREATOR)
++    with kbc.connect_closing() as conn:
++        assert 'origin_forward_rejected_wait' in (refusal('schedule', conn, task, run) or '')
++
++
++@pytest.mark.parametrize('handoff', ['absent', 'null'])
++def test_a_refusal_without_an_explicit_incomplete_handoff_is_not_definitive(refused, handoff):
++    task, run, path = refused
++    result = {k: v for k, v in REJECTED.items() if k != 'handoff_complete'}
++    if handoff == 'null':
++        result['handoff_complete'] = None
++    journal(path, 'placement:worker:refused', task=task, result=result)
++    with kbc.connect_closing() as conn:
++        assert refusal('schedule', conn, task, run) is None
++        assert kb.get_task(conn, task).status == 'scheduled'
++
++
++def test_a_non_forward_courier_row_mentioning_the_forward_does_not_lift_the_refusal(refused):
++    """Only ``origin-forward`` requests are evidence: an unrelated action naming it is neither a recovery nor a refusal."""
++    task, run, path = refused
++    journal(path, 'placement:worker:other-action', state='done', result={}, task=task, action='create')
++    with sqlite3.connect(path) as db:
++        db.execute("UPDATE sent SET body=replace(body, '\"child\"', '\"origin-forward\"') WHERE id=?",
++                   ('placement:worker:other-action',))
++        assert db.execute("SELECT COUNT(*) FROM sent WHERE body LIKE '%origin-forward%'").fetchone()[0] == 2
++    with kbc.connect_closing() as conn:
++        assert 'origin_forward_rejected_wait' in (refusal('schedule', conn, task, run) or '')
++
++
+ @pytest.mark.parametrize('damage', ['missing', 'unreadable', 'no-table'])
+ def test_missing_or_unreadable_evidence_is_not_a_refusal(refused, damage):
+     task, run, path = refused
+-- 
+2.43.0
+

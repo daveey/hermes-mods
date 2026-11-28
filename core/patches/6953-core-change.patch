@@ -1,0 +1,332 @@
+From 4842a156be671e2a36d72fcd13ee2993b19c1652 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 20:02:01 +0000
+Subject: [PATCH 6953] Sessions capture standby child and exit-signal dispatch
+
+Public mirror of source commit 4842a156be671e2a36d72fcd13ee2993b19c1652.
+
+---
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index a572f0102beee7a909addcb16ee6afcf169bfde1..5d5f8799de24b631b8d323af95db13ea1a94b2f6 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -40,34 +40,61 @@
+     Python signal handlers).
+ 
+     A signal is never acted on inside a custody step: a spawn whose child ``prepare()`` alone owns,
+-    or a close (the reader's, or the runtime's, whose locks are not re-entrant). Every signal goes
+-    through one FIFO queue, and only the dispatcher pops it, so:
+-      * ``handler`` always enqueues first (a repeat of a still-queued signal collapses into it, as
+-        a pending signal does), then dispatches only when ``depth`` is 0;
+-      * the dispatcher holds ``depth`` above 0 while it runs, so a signal arriving inside it, its
+-        close or a previous handler is queued behind, never run inside them and never ahead of
+-        an older one; every entry it pops is delivered even when an earlier handler raised (the
+-        last exception propagates, chained), as an unqueued signal would run while it unwound;
+-      * whoever brings ``depth`` back to 0 reads the queue AFTER the decrement and dispatches it:
+-        a signal queued before the decrement is seen there; one after it dispatches itself.
+-    A thread signal mask cannot do this: a process-directed signal caught on another thread still
+-    runs its Python handler on the main thread, so masking the main thread does not defer it.
+-
+-    Contract: a previous handler must return or raise; one that blocks keeps later signals queued
+-    (exit escalation is then the supervisor's SIGKILL).
++    or a close (the reader's, or the runtime's, whose locks are not re-entrant). Every handler
++    invocation is one entry of an ordered queue (``_queue``: handler frame -> entry), so:
++      * an invocation is queued by ONE ``dict.setdefault`` keyed by its own frame: a C call, so no
++        other handler runs inside it. A handler that interrupts an outer handler invocation (at any
++        bytecode, even before that one's first line) first queues every such outer invocation, by
++        the same setdefault on the outer frame, then its own. So whichever runs first queues an
++        invocation exactly once, older invocations stay ahead, and an exit raised by the inner one
++        cannot drop the outer signal;
++      * the dispatcher runs only at ``depth`` 0 and holds ``depth`` above 0 while it runs, so a
++        signal arriving inside it, its close or a previous handler is queued behind, never run
++        inside them; it marks each entry delivered before acting, and delivers every queued entry
++        even when an earlier handler raised (the last exception propagates, chained);
++      * a delivered entry stays queued, as a tombstone, until its invocation has returned, so the
++        invocation's own setdefault cannot queue it a second time;
++      * an undelivered entry for a signal being delivered collapses into it, as a pending signal;
++      * whoever brings ``depth`` back to 0 reads the queue AFTER the decrement and dispatches it.
++    Order is CPython's handler-invocation order (it runs tripped handlers in signal-number order,
++    not kernel arrival order). A thread signal mask cannot do this: a process-directed signal caught
++    on another thread still runs its Python handler on the main thread.
++
++    A close that keeps custody (raises) is logged and the previous handler still runs: a returning
++    one resumes the interrupted code, which must not see the close's exception; the next close
++    retries. Contract: a previous handler must return or raise; one that blocks keeps later signals
++    queued (exit escalation is then the supervisor's SIGKILL).
+     """
++    _DELIVERED, _RETURNED = 1, 2
++
+     def __init__(self, previous, close):
+         self.previous, self._close = previous, close
+         self.depth = 0
+-        self.pending = []  # (signum, frame) in arrival order
++        self._queue = {}  # handler frame -> [signum, flags], invocation order
++
++    @property
++    def pending(self):
++        return [entry[0] for entry in self._queue.values() if not entry[1] & self._DELIVERED]
+ 
+     def handler(self, signum, frame):
+-        if self.previous[signum] == signal.SIG_IGN:
+-            return
+-        if all(signum != queued for queued, _ in self.pending):
+-            self.pending.append((signum, frame))
+-        if self.depth == 0:
+-            self._dispatch()
++        me = sys._getframe()
++        try:
++            outer, walk = [], frame
++            while walk is not None:  # outer handler invocations this one interrupted
++                if walk.f_code is _HANDLER_CODE and walk.f_locals.get('self') is self:
++                    outer.append(walk)
++                walk = walk.f_back
++            for invocation in reversed(outer):  # outermost (oldest) first
++                self._queue.setdefault(invocation, [invocation.f_locals['signum'], 0])
++            self._queue.setdefault(me, [signum, 0])
++            if self.depth == 0:
++                self._dispatch()
++        finally:
++            entry = self._queue.get(me)
++            if entry is not None:
++                entry[1] |= self._RETURNED
++                if entry[1] & self._DELIVERED:
++                    self._queue.pop(me, None)
+ 
+     @contextmanager
+     def deferred(self):
+@@ -79,7 +106,7 @@
+ 
+     def _leave(self):
+         self.depth -= 1
+-        if self.pending and self.depth == 0:
++        if self.depth == 0 and self._next() is not None:
+             self._dispatch()
+ 
+     def _dispatch(self):
+@@ -89,23 +116,45 @@
+         finally:
+             self._leave()
+ 
++    def _next(self):
++        for key, entry in list(self._queue.items()):
++            if not entry[1] & self._DELIVERED:
++                return key, entry
++        return None
++
+     def _deliver_queue(self):
+-        if self.pending:  # depth > 0: no handler can pop or run in between
+-            signum, frame = self.pending.pop(0)
+-            try:
+-                self._act(signum, frame)
+-            finally:
+-                self._deliver_queue()
++        found = self._next()  # depth > 0: a handler arriving now only queues
++        if found is None:
++            return
++        key, entry = found
++        signum = entry[0]
++        for other_key, other in list(self._queue.items()):  # one delivery per pending signal
++            if other[0] == signum and not other[1] & self._DELIVERED:
++                other[1] |= self._DELIVERED
++                if other[1] & self._RETURNED:
++                    self._queue.pop(other_key, None)
++        try:
++            self._act(signum, key)
++        finally:
++            self._deliver_queue()
+ 
+     def _act(self, signum, frame):
+-        handler = self.previous[signum]
++        handler = self.previous.get(signum, signal.SIG_DFL)
++        if handler == signal.SIG_IGN:
++            return
+         try:
+             self._close()
+-        finally:  # a close that keeps custody still lets the previous handler exit
+-            if callable(handler):
+-                handler(signum, frame)
+-            else:
+-                raise SystemExit(128 + signum)
++        except Exception:  # health: allow BLE001 -- signal boundary: any close failure keeps custody (next close retries); the previous handler must still run
++            import logging
++            logging.getLogger(__name__).warning(
++                'sessions capture close on signal %s kept custody', signum, exc_info=True)
++        if callable(handler):
++            handler(signum, frame)
++        else:
++            raise SystemExit(128 + signum)
++
++
++_HANDLER_CODE = _ExitSignals.handler.__code__
+ 
+ 
+ @contextmanager
+@@ -144,7 +193,10 @@
+         if threading.current_thread() is threading.main_thread():
+             for signum in _EXIT_SIGNALS:
+                 try:
+-                    previous[signum] = signal.signal(signum, stop)
++                    # Record the previous handler BEFORE installing ours: a signal handled right
++                    # after the install must find it.
++                    previous[signum] = signal.getsignal(signum)
++                    signal.signal(signum, stop)
+                 except (ValueError, OSError, RuntimeError):
+                     previous.pop(signum, None)
+         with signals.deferred():
+diff --git a/tests/hermes_cli/test_sessions_early_boot.py b/tests/hermes_cli/test_sessions_early_boot.py
+index f635d0ebaaeb89aaf10fd30fc9ba6aa7a642d938..5290010577052ee14062060ca7c8e41581787d19 100644
+--- a/tests/hermes_cli/test_sessions_early_boot.py
++++ b/tests/hermes_cli/test_sessions_early_boot.py
+@@ -289,6 +289,15 @@
+ other = signal.SIGINT if signum == signal.SIGTERM else signal.SIGTERM
+ signal.signal(signum, previous)
+ signal.signal(other, previous)
++real_signal = signal.signal
++
++def installing(sig, new):  # a signal handled right after early_sessions installs its handler
++    old = real_signal(sig, new)
++    if window == 'install' and sig == signum and new is not previous and 'signal' not in events:
++        events.append('signal')
++        os.kill(os.getpid(), signum)
++    return old
++signal.signal = installing
+ code = None
+ try:
+     with early.early_sessions(headless=True, isolated=False) as owner:
+@@ -389,3 +398,14 @@
+     seen = _boot_signal('runtime-close', signum, 'exits')
+     assert seen['events'] == ['yielded', 'signal', 'feed-closed', 'previous'] and seen['code'] == 123
+     _stopped_and_accounted_once(seen)
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('handler,code,tail', [('returns', None, ['yielded']), ('exits', 123, [])])
++def test_signal_right_after_the_handler_is_installed_reaches_the_previous_handler(handler, code, tail):
++    # The previous handler is recorded before ours is installed: a signal handled at once after
++    # the install is delivered to it (it was a KeyError and a leaked handler), and ours is removed.
++    # The reader it closed spawns nothing afterwards.
++    seen = _boot_signal('install', signal.SIGTERM, handler)
++    assert seen['events'] == ['signal', 'previous', *tail] and seen['code'] == code
++    assert seen['restored'] and seen['children'] == []
+diff --git a/tests/hermes_cli/test_sessions_exit_signals.py b/tests/hermes_cli/test_sessions_exit_signals.py
+index b35bf639bd7249cf95834107605077b2f9ab25cc..7385887f23f51a62c1c822ed9274378489fe2c29 100644
+--- a/tests/hermes_cli/test_sessions_exit_signals.py
++++ b/tests/hermes_cli/test_sessions_exit_signals.py
+@@ -17,8 +17,9 @@
+ class _Run:
+     """One dispatcher with recording previous handlers and a close that must never be re-entered
+     or interrupted by a handler."""
+-    def __init__(self, raising):
+-        self.raising, self.log, self.closing, self.inside = raising, [], False, False
++    def __init__(self, raising, close_raises=False):
++        self.raising, self.close_raises = raising, close_raises
++        self.log, self.closing, self.inside, self.armed = [], False, False, False
+         handlers: dict = {TERM: self.previous, INT: self.previous}
+         self.signals = early._ExitSignals(handlers, self.close)
+ 
+@@ -28,6 +29,8 @@
+         self.closing = True
+         self.log.append('close')
+         self.closing = False
++        if self.close_raises:
++            raise TimeoutError('custody retained; close() again')
+ 
+     def previous(self, signum, frame):
+         assert not self.closing, 'handler ran inside a close'
+@@ -41,21 +44,24 @@
+ 
+ _CODES = {fn.__code__ for fn in vars(early._ExitSignals).values() if callable(fn) and hasattr(fn, '__code__')}
+ _CODES |= {early._ExitSignals.deferred.__wrapped__.__code__}  # type: ignore[attr-defined]
++_CODES |= {_Run.close.__code__, _Run.previous.__code__}  # also inside a close and a previous handler
+ 
+ 
+ def _inject_at(boundary, run, scenario):
+-    """Run ``scenario``, delivering SIGINT at line event number ``boundary`` inside the dispatcher.
++    """Run ``scenario``, delivering SIGINT at line event number ``boundary`` inside the dispatcher,
++    with the interrupted frame, as CPython passes it. Line events include each handler's first
++    line, so the window before an outer handler queued itself is covered.
+     Returns (whether it was injected, the exception that escaped, if any)."""
+     seen, injected = [0], [False]
+ 
+     def trace(frame, event, arg):
+         if frame.f_code not in _CODES:
+             return None
+-        if event == 'line' and not injected[0] and run.signals.pending_seen:
++        if event == 'line' and not injected[0] and run.armed:
+             seen[0] += 1
+             if seen[0] == boundary:
+                 injected[0] = True
+-                run.signals.handler(INT, None)
++                run.signals.handler(INT, frame)
+         return trace
+     sys.settrace(trace)
+     try:
+@@ -71,27 +77,35 @@
+ def _held_term_then_boundary(run):
+     def scenario():
+         with run.signals.deferred():          # a custody step (prepare, close)
+-            run.signals.handler(TERM, None)   # SIGTERM arrives inside it: queued
+-            run.signals.pending_seen = True
++            run.signals.handler(TERM, sys._getframe())   # SIGTERM arrives inside it: queued
++            run.armed = True
+     return scenario
+ 
+ 
++def _term_at_depth_zero(run):
++    def scenario():
++        run.armed = True
++        run.signals.handler(TERM, sys._getframe())  # nothing held: SIGTERM is acted on at once
++    return scenario
++
++
++@pytest.mark.parametrize('make', [_held_term_then_boundary, _term_at_depth_zero], ids=['held', 'depth-zero'])
++@pytest.mark.parametrize('close_raises', [False, True], ids=['close-ok', 'close-keeps-custody'])
+ @pytest.mark.parametrize('raising', [False, True], ids=['handlers-return', 'handlers-exit'])
+-def test_a_second_signal_at_any_boundary_is_delivered_once_after_the_first(raising, monkeypatch):
+-    monkeypatch.setattr(early._ExitSignals, 'pending_seen', False, raising=False)
++def test_a_second_signal_at_any_boundary_is_delivered_once_after_the_first(make, close_raises, raising):
+     boundaries = 0
+     for boundary in range(1, 500):
+-        run = _Run(raising)
+-        injected, escaped = _inject_at(boundary, run, _held_term_then_boundary(run))
++        run = _Run(raising, close_raises)
++        injected, escaped = _inject_at(boundary, run, make(run))
+         if not injected:
+             break
+         boundaries += 1
+-        # Both delivered, each once, in arrival order, each after its own close; nothing queued.
++        # Both delivered, each once, in invocation order, each after its own close; nothing queued.
+         assert run.log == ['close', 'SIGTERM', 'close', 'SIGINT'], (boundary, run.log)
+         assert run.signals.pending == [] and run.signals.depth == 0, boundary
+         if raising:  # the later exit propagates (the earlier one is its context)
+             assert escaped is not None and escaped.code == INT, boundary
+-        else:
++        else:  # a close that kept custody never leaks into the interrupted code
+             assert escaped is None, boundary
+     assert boundaries >= 10  # the trace really walked the dispatcher
+ 
+@@ -99,18 +113,17 @@
+ def test_a_signal_while_none_is_held_acts_at_once():
+     run = _Run(raising=False)
+     run.signals.handler(TERM, None)
+-    assert run.log == ['close', 'SIGTERM'] and run.signals.depth == 0
++    assert run.log == ['close', 'SIGTERM'] and run.signals.depth == 0 and run.signals._queue == {}
+ 
+ 
+-def test_a_repeat_of_a_queued_signal_collapses_and_ignored_signals_never_queue():
++def test_a_repeat_of_a_queued_signal_collapses_and_ignored_signals_are_not_acted_on():
+     run = _Run(raising=False)
+     run.signals.previous[INT] = signal.SIG_IGN
+     with run.signals.deferred():
+         run.signals.handler(TERM, None)
+         run.signals.handler(INT, None)
+         run.signals.handler(TERM, None)
+-        assert [signum for signum, _ in run.signals.pending] == [TERM]
+-    assert run.log == ['close', 'SIGTERM']
++    assert run.log == ['close', 'SIGTERM'] and run.signals._queue == {}
+ 
+ 
+ def test_default_disposition_exits_with_the_shell_code_after_close():
+-- 
+2.43.0
+

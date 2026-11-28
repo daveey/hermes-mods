@@ -1,0 +1,275 @@
+From 346eeac35cc181bc5917718a5fb30f59f1f1137a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:48:22 +0000
+Subject: [PATCH 6935] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit 346eeac35cc181bc5917718a5fb30f59f1f1137a.
+
+---
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index 3116d8c8d944369b1fd5cb7740ee151159dc6e13..cc8393eff97367314ee103dcc41c13d0c56687ee 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -347,25 +347,30 @@
+     if count >= soft * settings['raise_ratio']:
+         _raise_fd_soft(sample, settings['max_soft'])  # Before any card I/O; warn uses original sample.
+     from hermes_cli.fd_headroom_incident import has_incident
+-    if (warn or _fd_incident.get('envelope') or _fd_status.get('last_card_id')
+-            or _fd_status.get('create_state') == 'failing' or has_incident(sample, probe=probe)):
+-        try:
++    try:
++        if (warn or _fd_incident.get('envelope') or _fd_status.get('last_card_id')
++                or _fd_status.get('create_state') == 'failing' or has_incident(sample, probe=probe)):
+             kwargs = {'probe': probe}
+             if probe_board is not None:
+                 kwargs['probe_board'] = probe_board
+             _fd_incident = _notify_fd_incident(sample, **kwargs) or {}
+-        except Exception as exc:  # health: allow BLE001 -- even unwritable reporter state cannot hide census
+-            _fd_incident.setdefault('failing_since', wall)
+-            _fd_incident.update(error=str(exc), error_class=type(exc).__name__)
++    except Exception as exc:  # health: allow BLE001 -- even unreadable discovery cannot hide census
++        _fd_incident.setdefault('failing_since', wall)
++        _fd_incident.update(error=str(exc), error_class=type(exc).__name__)
++    # A definitive receipt is private history, not an active delivery failure on
++    # a healthy sample. Preserve it for audit and producer-qualified rearm.
++    terminal_history = (_fd_incident.get('terminal')
++                        and _fd_incident.get('error_class') == 'TerminalRequest' and not warn)
++    delivery = {} if terminal_history else _fd_incident
+     from hermes_cli.fd_headroom_incident import failure_note
+-    note = failure_note(_fd_incident, now=wall)
++    note = failure_note(delivery, now=wall)
+     _fd_status.update(state='config_error' if errors else sample['state'], sampled_at=wall,
+                       count=count, soft=soft, hard=hard, ratio=count / soft,
+                       last_card_id=_fd_incident.get('task_id'),
+-                      create_state='failing' if _fd_incident.get('error') else 'ok',
+-                      failing_since=_fd_incident.get('failing_since'),
++                      create_state='failing' if delivery.get('error') else 'ok',
++                      failing_since=delivery.get('failing_since'),
+                       error_class='ConfigError' if errors else (
+-                          sample['error_class'] or _fd_incident.get('error_class')))
++                          sample['error_class'] or delivery.get('error_class')))
+     if warn or note:
+         logger.warning('fd-headroom: host=%s pid=%s role=%s count=%s soft=%s hard=%s '
+                        'census=%s slope=%.6f fd/min core=%s %s %s', sample['host'], sample['pid'],
+diff --git a/tests/hermes_cli/test_fd_headroom_birth_identity.py b/tests/hermes_cli/test_fd_headroom_birth_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..347c40fdcaefc011c70ee2f9d8045a287f93a4a0
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_birth_identity.py
+@@ -0,0 +1,83 @@
++"""Birth-qualified rearm remains safe after fork, PID reuse and bounded eviction."""
++import multiprocessing
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import fd_headroom_incident as incidents
++from tests.hermes_cli.test_fd_headroom_delivery import sample
++
++
++def _send_birth(connection):
++    try:
++        connection.send(incidents._producer())
++    finally:
++        connection.close()
++
++
++@pytest.mark.platforms('posix')
++def test_minted_parent_birth_is_renewed_after_fork(monkeypatch):
++    monkeypatch.setattr(incidents, '_producer_token', None)
++    parent_birth = incidents._producer()
++    context = multiprocessing.get_context('fork')
++    parent, child = context.Pipe(duplex=False)
++    process = context.Process(target=_send_birth, args=(child,))
++    process.start()
++    child.close()
++    try:
++        assert parent.poll(15)
++        child_birth = parent.recv()
++        assert child_birth != parent_birth
++        assert child_birth.split(':')[0] == str(process.pid)
++        assert child_birth.split(':')[1] != parent_birth.split(':')[1]
++    finally:
++        process.join(15)
++        if process.is_alive():
++            process.terminate()
++            process.join(5)
++        parent.close()
++    assert process.exitcode == 0
++
++
++def test_same_pid_new_birth_cannot_consume_old_rearm(tmp_path, monkeypatch):
++    monkeypatch.setattr(incidents, '_producer_token', None)
++    old_birth = incidents._producer()
++    path = tmp_path / 'incident.json'
++    state = {}
++    incidents._new_envelope(sample(), state, 10000, False, 'default')
++    state.update(terminal={'state': 'rejected', 'result': {'error': 'refused'}},
++                 terminal_rearmed_by=[old_birth])
++    incidents._save(path, state)
++    monkeypatch.setattr(incidents, '_producer_token', None)  # Exec/restart with reused PID.
++    assert incidents._producer() != old_birth
++    client = Mock()
++    current = incidents.report(sample(), state_path=path, client=client, now=10300)
++    assert current['envelope'] == state['envelope']
++    assert current['terminal'] == state['terminal']
++    client.create.assert_not_called()
++
++
++def test_newest_64_births_can_rearm_and_evicted_birth_cannot(tmp_path, monkeypatch):
++    path = tmp_path / 'incident.json'
++    state = {}
++    incidents._new_envelope(sample(), state, 10000, False, 'default')
++    state['terminal'] = {'state': 'rejected', 'result': {'error': 'refused'}}
++    incidents._save(path, state)
++    birth = ''
++    monkeypatch.setattr(incidents, '_producer', lambda: birth)
++    client = Mock()
++    healthy = {**sample(), 'triggered': False}
++    for index in range(70):
++        birth = f'{index}:birth'
++        current = incidents.report(healthy, state_path=path, client=client, now=10300 + index)
++    assert current['terminal_rearmed_by'] == [f'{index}:birth' for index in range(6, 70)]
++    birth = '0:birth'
++    current = incidents.report(sample(), state_path=path, client=client, now=11000)
++    assert current['envelope'] == state['envelope']
++    client.create.assert_not_called()
++    birth = '69:birth'
++    client.create.return_value = 't_0000000000000002'
++    current = incidents.report(sample(), state_path=path, client=client, now=11300)
++    client.create.assert_called_once()
++    assert current['last_terminal']['envelope'] == state['envelope']
++    assert current['task_id'] == 't_0000000000000002'
+diff --git a/tests/hermes_cli/test_fd_headroom_producer_rearm.py b/tests/hermes_cli/test_fd_headroom_producer_rearm.py
+index 20024e66dd745c73fc7aae4a743fe6a09f5c5805..1bf5ef567643c60dc280eb32ea6bcccd32e27fc5 100644
+--- a/tests/hermes_cli/test_fd_headroom_producer_rearm.py
++++ b/tests/hermes_cli/test_fd_headroom_producer_rearm.py
+@@ -92,7 +92,7 @@
+     warning = sample()
+     path = incidents._path(warning, probe)
+     path.parent.mkdir(parents=True)
+-    for state in ({}, {'error_class': 'ValueError'}, {'task_id': 't_0000000000000001', 'envelope': {}}):
++    for state in ({}, {'error_class': 'ValueError'}, {'task_id': 't_0000000000000001', 'envelope': {'id': 'resolved'}}):
+         incidents._save(path, state)
+         assert not incidents.has_incident(warning, probe=probe)
+     for state in ({'envelope': {'id': 'pending'}}, {'terminal': {'state': 'rejected'}}):
+diff --git a/tests/hermes_cli/test_fd_headroom_terminal_health.py b/tests/hermes_cli/test_fd_headroom_terminal_health.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e107e3ee51c1c14a219a2da0049d84cd4c796723
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_terminal_health.py
+@@ -0,0 +1,111 @@
++"""Terminal delivery history is not an active failure on a healthy process."""
++import json
++import logging
++from collections import deque
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import fd_headroom_incident as incidents
++from hermes_cli import kanban_sync_client as sync
++from hermes_cli import resource_limits as limits
++
++
++@pytest.fixture
++def checker(tmp_path, monkeypatch):
++    import hermes_state_guard
++    monkeypatch.setattr(hermes_state_guard, '_in_test_context', lambda: False)
++    monkeypatch.setattr(incidents, 'get_hermes_home', lambda: tmp_path)
++    monkeypatch.setattr(sync, 'load_identity', lambda: None)
++    resource = Mock(RLIMIT_NOFILE=7, RLIM_INFINITY=-1)
++    resource.getrlimit.return_value = (1000, 10000)
++    monkeypatch.setattr(limits, '_resource', resource)
++    monkeypatch.setattr(limits, '_fd_core_head', lambda: 'a' * 40)
++    monkeypatch.setattr(limits, '_fd_incident', {})
++    monkeypatch.setattr(limits, '_fd_status', {})
++    monkeypatch.setattr(limits, '_fd_last_check', None)
++    monkeypatch.setattr(limits, '_fd_samples', deque())
++    monkeypatch.setattr(limits, '_fd_interval', 300)
++    calls = []
++    def wire(identity, method, route, body, budget):
++        calls.append(method)
++        return {'request': {'state': 'rejected', 'result': {'error': 'fixture refusal'}}}
++    monkeypatch.setattr(sync, '_bounded_call', wire)
++    def check(count, now, probe=False):
++        monkeypatch.setattr(limits, '_notify_fd_incident',
++                            lambda sample, **kwargs: incidents.report(sample, now=10000 + now, **kwargs))
++        monkeypatch.setattr(limits, '_fd_snapshot', lambda soft: (count, {'classes': {'other': count}}))
++        return limits.check_fd_headroom({}, role='gateway', now=now, wall_now=10000 + now,
++                                        probe=probe, probe_board='fd-proof' if probe else None)
++    return check, calls
++
++
++def test_healthy_terminal_does_not_hide_current_storage_failure(checker, monkeypatch):
++    check, calls = checker
++    check(600, 0)
++    def denied(*args):
++        raise PermissionError('fixture denied')
++    monkeypatch.setattr(incidents, '_save', denied)
++    result = check(100, 300)
++    assert result['count'] == 100
++    status = limits.fd_headroom_status()
++    assert status['state'] == 'ok' and status['create_state'] == 'failing'
++    assert status['error_class'] == 'PermissionError'
++    assert calls == ['GET']
++
++
++@pytest.mark.parametrize('restart', [False, True])
++@pytest.mark.parametrize('probe', [False, True])
++def test_healthy_terminal_history_is_quiet_and_ok(checker, monkeypatch, caplog, restart, probe):
++    check, calls = checker
++    with caplog.at_level(logging.WARNING):
++        first = check(600, 0, probe)
++        path = incidents._path(first, probe)
++        frozen = json.loads(path.read_text())
++        if restart:
++            limits._fd_incident = {}
++            limits._fd_status.clear()
++            limits._fd_samples.clear()
++            limits._fd_last_check = None
++            monkeypatch.setattr(incidents, '_producer_token', None)
++        caplog.clear()
++        for tick in range(1, 37):
++            sample = check(100, tick * 300, probe)
++            assert sample['count'] == 100
++            status = limits.fd_headroom_status()
++            assert status['state'] == 'ok'
++            assert status['create_state'] == 'ok'
++            assert status['failing_since'] is None and status['error_class'] is None
++        assert not caplog.records, 'healthy terminal history must not emit repeated warnings'
++    current = json.loads(path.read_text())
++    assert current['terminal'] == frozen['terminal']
++    assert current['envelope'] == frozen['envelope']
++    assert calls == ['GET'], 'healthy history must not read/repost the terminal request'
++
++
++def test_triggered_terminal_still_reports_failure_without_request_retry(checker, caplog):
++    check, calls = checker
++    check(600, 0)
++    caplog.clear()
++    with caplog.at_level(logging.WARNING):
++        sample = check(600, 3900)
++    assert sample['triggered']
++    assert limits.fd_headroom_status()['create_state'] == 'failing'
++    assert limits.fd_headroom_status()['error_class'] == 'TerminalRequest'
++    assert 'card create failing since' in caplog.text
++    assert calls == ['GET']
++
++
++@pytest.mark.parametrize('probe', [False, True])
++def test_unreadable_discovery_preserves_healthy_sample(checker, probe):
++    check, calls = checker
++    sample = dict(host=limits.socket.gethostname(), role='gateway')
++    path = incidents._path(sample, probe)
++    path.mkdir(parents=True)
++    result = check(100, 0, probe)
++    assert result is not None and result['count'] == 100
++    status = limits.fd_headroom_status()
++    assert status['state'] == 'ok' and status['count'] == 100
++    assert status['error_class'] == 'IsADirectoryError'
++    assert status['create_state'] == 'failing'
++    assert calls == []
+-- 
+2.43.0
+

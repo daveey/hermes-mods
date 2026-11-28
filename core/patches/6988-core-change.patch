@@ -1,0 +1,835 @@
+From 58173dbf3d57bec134b631f1259ab02ab8a5fb04 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 13:14:23 +0000
+Subject: [PATCH 6988] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 58173dbf3d57bec134b631f1259ab02ab8a5fb04.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch_quota.py b/hermes_cli/kanban_db_dispatch_quota.py
+index 2752d284900a7f7cb28150bfe15c0b917350e029..e7e611e2cf77b9e3d810b3335c3e5475ac10d001 100644
+--- a/hermes_cli/kanban_db_dispatch_quota.py
++++ b/hermes_cli/kanban_db_dispatch_quota.py
+@@ -127,12 +127,14 @@
+             continue
+         if not _kb.unblock_task(conn, task_id):
+             continue
+-        _kb.add_comment(
+-            conn, task_id, "kanban-dispatcher",
+-            f"{RELEASE_NOTE_MARKER} Released automatically. This block was the respawn guard's "
+-            f"hold cap ({guard_reason}) on a quota/rate-limit error ({err[:200]}), which clears on its "
+-            f"own and never needed a person. Card {proof['task_id']} completed after the block, so the "
+-            f"provider is answering again; back to ready.",
+-        )
++        with _kb.write_txn(conn):
++            if not frozen(conn, task_id):
++                _kb.add_comment(
++                    conn, task_id, "kanban-dispatcher",
++                    f"{RELEASE_NOTE_MARKER} Released automatically. This block was the respawn guard's "
++                    f"hold cap ({guard_reason}) on a quota/rate-limit error ({err[:200]}), which clears on its "
++                    f"own and never needed a person. Card {proof['task_id']} completed after the block, so the "
++                    f"provider is answering again; back to ready.",
++                )
+         released.append(task_id)
+     return released
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 29926d82241efcb8653d6b9f4080219ba3e4ffd9..884163e28a2ed10d5fdca1f9f38e66818fb24d54 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -791,6 +791,7 @@
+     from hermes_cli.kanban_blocker_rows import foreign_among
+ 
+     now = int(time.time()) if now is None else int(now)
++    from hermes_cli.kanban_home_transfer import frozen
+     if interval is None:
+         interval = probe_interval_seconds()
+     probed: list[str] = []
+@@ -801,7 +802,7 @@
+             continue
+         if st.blocker_provider and due_out is not None:
+             due_out.append(now + ROUTE_RECHECK_SECONDS)
+-        ids = sorted(t for t in st.behind if task_applies(conn, st, t))
++        ids = sorted(t for t in st.behind if task_applies(conn, st, t) and not frozen(conn, t))
+         if not ids:
+             continue
+         marks = ",".join("?" * len(ids))
+@@ -824,6 +825,8 @@
+             if not kb.unblock_task(conn, tid):
+                 continue
+             with kb.write_txn(conn):
++                if frozen(conn, tid):
++                    continue
+                 kb._append_event(conn, tid, PROBE_RELEASED_EVENT, {
+                     "blocker_id": st.blocker_id, "idle_seconds": now - last})
+             probed.append(tid)
+diff --git a/hermes_cli/kanban_spend_caused_review.py b/hermes_cli/kanban_spend_caused_review.py
+index 7e4bac006a769018f89c35a9faac5bae7857f4ff..742dd8a67d7d3959d815539e7db3e9ebf0874050 100644
+--- a/hermes_cli/kanban_spend_caused_review.py
++++ b/hermes_cli/kanban_spend_caused_review.py
+@@ -53,12 +53,13 @@
+ 
+ 
+ def fenced(conn, task_id):
++    from hermes_cli.kanban_home_transfer import frozen
+     from hermes_cli.kanban_containment_guard import pending
+     from hermes_cli.kanban_stop_ended import stopped_at
+     from hermes_cli.kanban_continuation import HUMAN_BLOCK_KINDS
+     row = conn.execute("SELECT status,human_request,block_kind,current_run_id FROM tasks WHERE id=?",
+                        (task_id,)).fetchone()
+-    return (row is None or row[0] != "triage" or bool(row[1]) or row[2] in HUMAN_BLOCK_KINDS
++    return (frozen(conn, task_id) or row is None or row[0] != "triage" or bool(row[1]) or row[2] in HUMAN_BLOCK_KINDS
+             or row[3] is not None or pending(conn, task_id) or stopped_at(conn, task_id) is not None)
+ 
+ 
+@@ -174,6 +175,7 @@
+         raise Refused(prior["refused"])
+     hub = client.Hub(client.load_identity(), deadline=time.monotonic() + 90)
+     try:
++        owned = prior
+         if prior:
+             if prior["board"] != board or prior["gateway"] != hub.ident.gateway:
+                 raise Unconfirmed("frozen request belongs to another Board or gateway")
+@@ -182,7 +184,8 @@
+             capability = hub.decision_retain_capability(board)
+             if not isinstance(capability, dict) or type(capability.get("spend_review")) is not int or capability["spend_review"] != 1:
+                 raise ValueError("Board spend_review v1 unavailable")
+-            wire = journal.freeze(conn, board, hub.ident.gateway, wire)["wire"]
++            owned = journal.freeze(conn, board, hub.ident.gateway, wire)
++            wire = owned["wire"]
+         uid = wire["event_uid"]
+         fields = wire
+         digest = hashlib.sha256(json.dumps(wire, sort_keys=True, separators=(",", ":"),
+@@ -192,7 +195,11 @@
+             if not resend:
+                 raise Unconfirmed("frozen request readback pending; current holds prohibit resubmission")
+             client.push(conn, hub, board, hub.ident.gateway, primary=True)
+-            reply = hub.ops(board, [wire])
++            from hermes_cli.kanban_home_transfer import frozen as home_frozen
++            if home_frozen(conn, task_id):
++                raise Unconfirmed("home transfer owns this card; request retained without resubmission")
++            from hermes_cli import kanban_home_command as home
++            reply = hub.ops(board, [home.outbound(owned, wire)])
+             results = reply.get("results") if isinstance(reply, dict) else None
+             if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
+                     or results[0].get("client_op_id") != uid):
+@@ -230,6 +237,7 @@
+     from hermes_cli.kanban_wake_check import foreign_copy
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_spend_review_request as journal
++    from hermes_cli.kanban_home_transfer import frozen as home_frozen
+     frozen = journal.get(conn, task_id, episode)
+     try:
+         stop = decision.strict_episode(conn, task_id)
+@@ -253,6 +261,8 @@
+         result = reviewer.escalate(conn, task_id, episode, str(exc))
+         if result == "moot":
+             with kb.write_txn(conn):
++                if home_frozen(conn, task_id):
++                    return "pending"
+                 kb._append_event(conn, task_id, reviewer.ESCALATED, {"episode": episode, "reason": str(exc)})
+         return result
+     except (ValueError, OSError, RuntimeError) as exc:
+@@ -267,6 +277,8 @@
+             # moot; otherwise the frozen request stays STARTED and is due forever. Record settlement only: the
+             # newer episode's hold, routing and budget are untouched.
+             with kb.write_txn(conn):
++                if home_frozen(conn, task_id):
++                    return "pending"
+                 if reviewer.state(conn, task_id, episode) in (reviewer.QUEUED, reviewer.STARTED):
+                     kb._append_event(conn, task_id, reviewer.SETTLED, {"episode": episode,
+                                      "receipt_uid": receipt["request_uid"], "verdict": receipt["verdict"]})
+@@ -282,5 +294,7 @@
+     if release_parents(task_id, receipt) is not None:
+         settled.update(status='todo', landing=receipt['landing'])
+     with kb.write_txn(conn):
++        if home_frozen(conn, task_id):
++            return "pending"
+         kb._append_event(conn, task_id, reviewer.SETTLED, settled)
+     return "settled"  # canonical effect confirmed; normal sync, not this helper, projects clearance
+diff --git a/hermes_cli/kanban_spend_review_request.py b/hermes_cli/kanban_spend_review_request.py
+index 1a9bd7c34ba92779d0fe521c2d6d57fa7798bfb9..27c130ccff9aa426670a0d8f68db1ffca1c25135 100644
+--- a/hermes_cli/kanban_spend_review_request.py
++++ b/hermes_cli/kanban_spend_review_request.py
+@@ -45,6 +45,10 @@
+     if not keys:
+         return
+     with kb.write_txn(conn):
++        from hermes_cli.kanban_home_transfer import frozen
++        keys = [key for key in keys if not frozen(conn, key[0])]
++        if not keys:
++            return
+         if _has_closed(conn) is False:
+             conn.execute(f"ALTER TABLE {TABLE} ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
+             conn.execute(OPEN_INDEX)
+@@ -64,11 +68,17 @@
+     if conn.in_transaction:
+         raise ValueError("cannot freeze a review inside another transaction")
+     with kb.write_txn(conn):
++        prior = get(conn, wire["task"], wire["episode"])
++        if prior is not None:
++            return prior  # Immutable legacy/current wire; never enrich on replay.
++        from hermes_cli import kanban_home_command as home
++        # wait_on can install a dependency; fence its target as well as the source.
++        epoch = home.capture(conn, {**wire, "parent": wire.get("target")})
+         conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (task TEXT NOT NULL, episode TEXT NOT NULL, "
+                      "request TEXT NOT NULL, closed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task,episode))")
+         if _has_closed(conn):
+             conn.execute(OPEN_INDEX)
+-        request = {"board": board, "gateway": gateway, "wire": wire}
++        request = {"board": board, "gateway": gateway, "wire": wire, "home_generations": epoch}
+         conn.execute(f"INSERT OR IGNORE INTO {TABLE} (task, episode, request) VALUES (?,?,?)",
+                      (wire["task"], wire["episode"], json.dumps(request, ensure_ascii=False)))
+         frozen = get(conn, wire["task"], wire["episode"])
+@@ -85,6 +95,9 @@
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_spend_reviewer as reviewer
+     with kb.write_txn(conn):
++        from hermes_cli.kanban_home_transfer import frozen
++        if frozen(conn, task):
++            return
+         request = get(conn, task, episode)
+         if request is None or reviewer.state(conn, task, episode) not in (reviewer.QUEUED, reviewer.STARTED):
+             return
+@@ -114,6 +127,9 @@
+ def refuse(conn, task, episode, reason):
+     from hermes_cli import kanban_db as kb
+     with kb.write_txn(conn):
++        from hermes_cli.kanban_home_transfer import frozen
++        if frozen(conn, task):
++            return
+         request = get(conn, task, episode)
+         assert request is not None
+         request["refused"] = reason
+diff --git a/hermes_cli/kanban_sync_attachments.py b/hermes_cli/kanban_sync_attachments.py
+index eadaa12d913c1fc63f9f5809240bb354afecca7b..89cf20d63f41a8c410d84cdc564809dd5845b212 100644
+--- a/hermes_cli/kanban_sync_attachments.py
++++ b/hermes_cli/kanban_sync_attachments.py
+@@ -17,6 +17,7 @@
+ from hermes_cli import kanban_db as kb
+ from hermes_cli.kanban_db_attachment_names import _safe_attachment_name
+ from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_home_transfer import frozen
+ 
+ _log = logging.getLogger(__name__)
+ _now = time.time
+@@ -83,17 +84,25 @@
+             temporary.unlink(missing_ok=True)
+ 
+ 
+-def _record_local(conn, row, path, key):
++def _record_local(conn, row, path, key, *, data=None):
+     # stored_path is local-only. Suppress echo of the service's verified receipt.
+     # A deleted/rebound row must not be resurrected after network I/O.
+     # Read current metadata, not the pre-I/O snapshot: another writer may have
+     # cleared the path while these bytes were being verified.
+-    current = conn.execute("SELECT stored_path,blob_key FROM task_attachments WHERE uid=? "
+-                           "AND task_id=? AND size=? AND blob_key IS ?",
+-                           (row["uid"], row["task_id"], row["size"], row["blob_key"])).fetchone()
+-    if current is None or (current["stored_path"] == str(path) and current["blob_key"] == key):
+-        return
+     with write_txn(conn):
++        if frozen(conn, row["task_id"]):
++            return False
++        current = conn.execute("SELECT stored_path,blob_key FROM task_attachments WHERE uid=? "
++                               "AND task_id=? AND size=? AND blob_key IS ?",
++                               (row["uid"], row["task_id"], row["size"], row["blob_key"])).fetchone()
++        if current is None:
++            return False
++        if data is not None:
++            # Byte publication and local metadata share the custody reservation.
++            # No network is performed under this writer lock.
++            _publish_file(path, data)
++        if current["stored_path"] == str(path) and current["blob_key"] == key:
++            return True
+         previous = conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0]
+         conn.execute("UPDATE kanban_sync_state SET applying=1")
+         try:
+@@ -102,9 +111,12 @@
+                          (str(path), key, row["uid"], row["task_id"], row["size"], row["blob_key"]))
+         finally:
+             conn.execute("UPDATE kanban_sync_state SET applying=?", (previous,))
++    return True
+ 
+ 
+ def _transfer(conn, hub, board, row, *, expected_sha256=None):
++    if frozen(conn, row["task_id"]):
++        return False
+     key = row["blob_key"]
+     if expected_sha256 is not None and key and key != "sha256:" + expected_sha256:
+         raise ValueError("attachment differs from selected digest")
+@@ -120,9 +132,9 @@
+         if (not isinstance(receipt, dict) or receipt.get("blob_key") != "sha256:" + digest
+                 or receipt.get("sha256") != digest or receipt.get("size") != len(data)):
+             raise ValueError("invalid attachment storage receipt")
+-        _record_local(conn, row, path, receipt["blob_key"])
+-        return True
++        return _record_local(conn, row, path, receipt["blob_key"])
+     path = Path(row["stored_path"]) if row["stored_path"] else _destination(row, board)
++    downloaded = None
+     if path.is_file():
+         try:
+             data = _read(path, row, board)
+@@ -137,9 +149,8 @@
+         if len(data) != row["size"] or len(data) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+             raise ValueError("attachment size mismatch")
+         _valid(data, key)
+-        _publish_file(path, data)
+-    _record_local(conn, row, path, key)
+-    return True
++        downloaded = data
++    return _record_local(conn, row, path, key, data=downloaded)
+ 
+ 
+ def transfer_pending(conn, hub, board, *, limit=2):
+@@ -161,20 +172,34 @@
+         # First transfers and newly available/retryable bytes precede maintenance.
+         "ORDER BY CASE WHEN r.uid IS NULL OR r.blob_key IS NOT a.blob_key "
+         "OR (r.error IS NOT NULL AND (a.blob_key IS NOT NULL OR a.stored_path <> '')) THEN 0 ELSE 1 END, "
+-        "coalesce(r.retry_at,0),a.id LIMIT ?", (now, limit)).fetchall()
++        "coalesce(r.retry_at,0),a.id", (now,))
++    selected = []
++    try:
++        for raw in rows:
++            if len(selected) >= limit:
++                break
++            if not frozen(conn, raw["task_id"]):
++                selected.append(dict(raw))
++    finally:
++        rows.close()  # Never retain a read snapshot across network I/O / writer upgrade.
+     transferred = 0
+     stamps = []
+-    for raw in rows:
+-        row, error, done = dict(raw), None, False
++    for row in selected:
++        error, done = None, False
+         try:
+             done = _transfer(conn, hub, board, row)
+             transferred += int(done)
+         except (OSError, ValueError, HubError) as exc:
+             error = type(exc).__name__  # no remote response bodies/credentials in durable state
+             _log.warning("kanban attachment %s transfer pending (%s)", row["uid"], error)
+-        stamps.append((row["uid"], row["blob_key"], now + (600 if done else 30), error))
++        stamps.append((row["uid"], row["blob_key"], now + (600 if done else 30), error, row))
+     if stamps:
+         with write_txn(conn):
++            stamps = [stamp[:4] for stamp in stamps if not frozen(conn, stamp[4]["task_id"])
++                      and conn.execute("SELECT 1 FROM task_attachments WHERE uid=? AND task_id=? "
++                                       "AND size=? AND filename=? AND created_at=?",
++                                       (stamp[0], stamp[4]["task_id"], stamp[4]["size"],
++                                        stamp[4]["filename"], stamp[4]["created_at"])).fetchone()]
+             conn.executemany("INSERT INTO kanban_attachment_retry(uid,blob_key,attempts,retry_at,error) "
+                              "VALUES (?,?,1,?,?) ON CONFLICT(uid) DO UPDATE SET blob_key=excluded.blob_key, "
+                              "attempts=attempts+1,retry_at=excluded.retry_at,error=excluded.error", stamps)
+diff --git a/hermes_cli/kanban_triage_cleanup.py b/hermes_cli/kanban_triage_cleanup.py
+index dbad034cb8e764fca777412c261837e20e4a8c15..52f0321a3729cd71d0bda233ccc2a78f99e4c2f9 100644
+--- a/hermes_cli/kanban_triage_cleanup.py
++++ b/hermes_cli/kanban_triage_cleanup.py
+@@ -38,6 +38,9 @@
+     if tid in foreign_ids(conn) or not eligible(conn, tid):
+         return False
+     def precondition(c):
++        from hermes_cli.kanban_home_transfer import frozen
++        if frozen(c, tid):
++            return "home transfer owns this card; scratch cleanup deferred"
+         if not eligible(c, tid):
+             return "scratch cleanup conditions changed"
+         kb.add_comment(c, tid, "triage-sweep", "Archived scratch card of a finished creator: the latest comment "
+diff --git a/tests/hermes_cli/test_home_shared_consumer_custody.py b/tests/hermes_cli/test_home_shared_consumer_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..964c1666e42a4f78b2ee790282f1c729fe299e42
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_consumer_custody.py
+@@ -0,0 +1,318 @@
++"""Real-SQL regressions adapted from independent review 6057624286 probes."""
++from contextlib import contextmanager
++import hashlib
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_home_generation as generation, kanban_home_transfer as home
++from hermes_cli import kanban_shared_blockers as blockers, kanban_db_dispatch_quota as quota
++from hermes_cli import kanban_sync_attachments as attachments
++from hermes_cli import kanban_spend_reviewer as reviewer, kanban_spend_review_request as journal
++from hermes_cli import kanban_spend_caused_review as caused, kanban_spend_decision as decision
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++QUOTE = 'Finish the remaining integration and verify the acceptance tests'
++
++
++@pytest.fixture
++def consumer_board(tmp_path, monkeypatch):
++    with contextmanager(support.synced_conn)(support.kanban_home(tmp_path, monkeypatch)) as c:
++        with kb.write_txn(c):
++            c.execute("UPDATE kanban_sync_state SET gateway_id='worker-a3',mode='primary'")
++        yield c
++
++
++def card(c, tid, status='blocked', kind=None):
++    with kb.write_txn(c):
++        c.execute("INSERT INTO tasks(id,title,status,block_kind,created_at,created_on,sync_version) "
++                  "VALUES (?,?,?,?,1,'worker-a3',7)", (tid, tid, status, kind))
++    return tid
++
++
++def freeze(c, tid, phase):
++    with kb.write_txn(c):
++        if phase in ('pending', 'completed'):
++            prior = c.execute('SELECT version FROM kanban_home_generations1 WHERE task_id=?', (tid,)).fetchone()
++            generation.mirror_feed(c, tid, {'home_generation': 'fixture-generation-0001',
++                'home_transfer_pending': None if phase == 'completed' else 'fixture-generation-0001'}, prior[0] + 1 if prior else 8)
++        elif phase in ('prepared', 'aborted', 'malformed'):
++            c.execute('DELETE FROM kanban_sync_outbox')
++            record = dict(task=tid, source='worker-a3', destination='hub', nonce='fixture-transfer-0001', expected_version=7)
++            home.prepare(c, tid, source=record['source'], destination=record['destination'],
++                         nonce=record['nonce'], expected_version=7)
++            if phase == 'aborted':
++                home.abort_source(c, {**record, 'phase': 'aborted', 'rows': []})
++            if phase == 'malformed':
++                c.execute('DROP TRIGGER IF EXISTS home_prepared1_marker_update')
++                c.execute("UPDATE kanban_home_prepared1 SET source='' WHERE task_id=?", (tid,))
++
++
++def wall(c, tid, name):
++    import json
++    import time
++    with kb.write_txn(c):
++        kb._append_event(c, tid, 'blocked', {'reason': 'wall', 'blocker_id': name})
++        c.execute("INSERT INTO task_runs(task_id,started_at,ended_at,status,outcome,metadata) "
++                  "VALUES (?,?,?,'blocked','blocked',?)", (tid, int(time.time())-20,
++                  int(time.time())-10, json.dumps({'blocker_id': name})))
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', 'aborted', 'ordinary'])
++def test_frozen_ready_does_not_suppress_shared_probe(consumer_board, phase):
++    c = consumer_board
++    card(c, 't_A', 'ready'); card(c, 't_B')
++    wall(c, 't_A', 'wall'); wall(c, 't_B', 'wall')
++    freeze(c, 't_A', phase)
++    result = blockers.probe_stranded_blockers(c, interval=0)
++    assert result == ([] if phase in ('ordinary', 'aborted') else ['t_B'])
++
++
++@pytest.mark.parametrize('which', ['quota', 'shared', 'cleanup'])
++@pytest.mark.parametrize('race', [False, True])
++def test_followup_writer_race_keeps_healthy_sweep(consumer_board, monkeypatch, which, race):
++    c = consumer_board
++    for tid in ('t_A', 't_B'):
++        card(c, tid, 'triage' if which == 'cleanup' else 'blocked', 'capability')
++    if which == 'quota':
++        card(c, 't_proof', 'done')
++        with kb.write_txn(c):
++            for tid in ('t_A', 't_B'):
++                kb._append_event(c, tid, 'blocked', {'reason': 'Held in ready by the respawn guard '
++                    '(blocker_auth) for 30 min without running. Last error: quota exhausted'})
++            c.execute("INSERT INTO task_runs(task_id,started_at,ended_at,status,outcome) "
++                      "VALUES ('t_proof',1,9999999999,'completed','completed')")
++        fn = lambda: quota.release_recovered_quota_blocks(c)
++    elif which == 'shared':
++        for tid in ('t_A', 't_B'):
++            wall(c, tid, 'wall-' + tid)
++        fn = lambda: blockers.probe_stranded_blockers(c, interval=0)
++    else:
++        card(c, 't_parent', 'done')
++        with kb.write_txn(c):
++            for tid in ('t_A', 't_B'):
++                c.execute("UPDATE tasks SET workspace_kind='scratch' WHERE id=?", (tid,))
++                kb._append_event(c, tid, 'created', {'creator_task_id': 't_parent'})
++        for tid in ('t_A', 't_B'):
++            kb.add_comment(c, tid, 'worker', f'Run `hermes kanban archive {tid}`.')
++        from hermes_cli.kanban_triage_sweep import sweep_stale_triage
++        fn = lambda: sweep_stale_triage(c, older_than=0, now=9999999999)
++    hit = []
++    if race:
++        if which == 'cleanup':
++            original = kb.archive_task
++            def archive(conn, tid, **kw):
++                if tid == 't_A':
++                    hit.append(True); freeze(c, tid, 'pending')
++                return original(conn, tid, **kw)
++            monkeypatch.setattr(kb, 'archive_task', archive)
++        else:
++            original = kb.unblock_task
++            def unblock(conn, tid, *args, **kw):
++                result = original(conn, tid, *args, **kw)
++                if tid == 't_A' and result:
++                    hit.append(True); freeze(c, tid, 'pending')
++                return result
++            monkeypatch.setattr(kb, 'unblock_task', unblock)
++    fn()
++    assert bool(hit) == race
++    assert kb.get_task(c, 't_B').status == ('archived' if which == 'cleanup' else 'ready')
++    assert kb.get_task(c, 't_A').status == ('triage' if race and which == 'cleanup' else
++                                         'archived' if which == 'cleanup' else 'ready')
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'completed', 'ordinary'])
++@pytest.mark.parametrize('when', ['judge', 'capability'])
++def test_caused_review_captures_at_writer_after_fallible_work(consumer_board, monkeypatch, phase, when):
++    c = consumer_board
++    tid = card(c, 't_spend', 'triage')
++    with kb.write_txn(c):
++        kb._append_event(c, tid, 'spend_budget_triaged', {'cause': 'scope_stopped', 'reason': QUOTE})
++    ep = reviewer._current_episode(c, tid)
++    with kb.write_txn(c):
++        kb._append_event(c, tid, decision.NOTICE, {'episode': ep})
++        kb._append_event(c, tid, reviewer.STARTED, {'episode': ep})
++    sent = []
++    def transition():
++        freeze(c, tid, phase)
++    class Hub:
++        def __init__(self, *a, **kw):
++            self.ident = SimpleNamespace(gateway='worker-a3')
++        def decision_retain_capability(self, board):
++            if when == 'capability': transition()
++            return {'spend_review': 1}
++        def ops(self, board, wires):
++            sent.extend(wires)
++            return {'results': []}
++        def close(self): pass
++    def judge(ctx):
++        if when == 'judge': transition()
++        return {'decision': 'release', 'reason': 'Remaining acceptance belongs here', 'remaining_quote': QUOTE}
++    monkeypatch.setattr(reviewer, 'settings', lambda: (True, 2))
++    monkeypatch.setattr(reviewer, 'judge', judge)
++    monkeypatch.setattr(client, 'Hub', Hub)
++    monkeypatch.setattr(client, 'load_identity', lambda: None)
++    monkeypatch.setattr(client, 'push', lambda *a, **kw: None)
++    reviewer.review(c, tid, ep)
++    saved = journal.get(c, tid, ep)
++    if phase in ('prepared', 'pending'):
++        assert not saved and not sent
++    else:
++        assert saved and len(sent) == 1
++        assert sent[0].get('home_generations') == ({tid: 'fixture-generation-0001'} if phase == 'completed' else None)
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'aborted', 'ordinary'])
++@pytest.mark.parametrize('late', [False, True])
++def test_attachment_custody_skips_io_and_late_bookkeeping(consumer_board, monkeypatch, phase, late):
++    c = consumer_board
++    data = b'fixture bytes'
++    key = 'sha256:' + hashlib.sha256(data).hexdigest()
++    for tid in ('t_A', 't_B'):
++        card(c, tid, 'todo')
++        with kb.write_txn(c):
++            c.execute("INSERT INTO task_attachments(task_id,uid,filename,stored_path,size,created_at,blob_key) "
++                      "VALUES (?,?,?,'',?,1,?)", (tid, 'attachment_' + tid, 'probe.txt', len(data), key))
++    if not late: freeze(c, 't_A', phase)
++    calls = []
++    class Hub:
++        def put_attachment(self, *a): raise AssertionError('no upload')
++        def get_attachment_blob(self, board, uid):
++            calls.append(uid)
++            if late and uid == 'attachment_t_A': freeze(c, 't_A', phase)
++            return data
++    attachments.transfer_pending(c, Hub(), 'default', limit=2)
++    rows = {r['task_id']: r['stored_path'] for r in c.execute('SELECT * FROM task_attachments')}
++    blocked = phase in ('prepared', 'pending')
++    assert bool(rows['t_A']) == (not blocked)
++    assert rows['t_B']
++    assert ('attachment_t_A' in calls) == (late or not blocked)
++    if blocked:
++        assert c.execute("SELECT 1 FROM kanban_attachment_retry WHERE uid='attachment_t_A'").fetchone() is None
++
++
++def seed_request(c, tid='t_A'):
++    card(c, tid, 'triage')
++    with kb.write_txn(c):
++        kb._append_event(c, tid, 'spend_budget_triaged', {'cause': 'scope_stopped', 'reason': QUOTE})
++    ep = reviewer._current_episode(c, tid)
++    with kb.write_txn(c):
++        kb._append_event(c, tid, reviewer.STARTED, {'episode': ep})
++    wire = dict(task=tid, episode=ep, event_uid='fixture-review-request', verdict='release')
++    return ep, wire
++
++
++@pytest.mark.parametrize('action', ['freeze', 'close', 'refuse', 'escalate'])
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', 'aborted'])
++def test_review_journal_writer_entry_checks_task_column(consumer_board, monkeypatch, action, phase):
++    c = consumer_board
++    ep, wire = seed_request(c)
++    if action != 'freeze':
++        journal.freeze(c, 'board', 'worker-a3', wire)
++    original = kb.write_txn
++    hit = []
++    @contextmanager
++    def writer(conn, *a, **kw):
++        if not hit:
++            hit.append(True)
++            freeze(c, 't_A', phase)
++        with original(conn, *a, **kw):
++            yield
++    monkeypatch.setattr(kb, 'write_txn', writer)
++    before = journal.get(c, 't_A', ep)
++    if action == 'freeze':
++        if phase != 'aborted':
++            with pytest.raises(ValueError, match='home transfer'):
++                journal.freeze(c, 'board', 'worker-a3', wire)
++        else:
++            journal.freeze(c, 'board', 'worker-a3', wire)
++    elif action == 'close':
++        journal.close(c, [('t_A', ep)])
++    elif action == 'refuse':
++        journal.refuse(c, 't_A', ep, 'refused')
++    else:
++        journal.escalate_unconfirmed(c, 't_A', ep)
++    assert hit
++    if phase != 'aborted':
++        assert journal.get(c, 't_A', ep) == before
++        assert reviewer.state(c, 't_A', ep) == reviewer.STARTED
++        if before:
++            assert ('t_A', ep) in journal.open_keys(c)
++
++
++def test_existing_review_wire_is_not_enriched_or_replaced(consumer_board):
++    c = consumer_board
++    _ep, wire = seed_request(c)
++    first = journal.freeze(c, 'board', 'worker-a3', wire)
++    assert 'home_generations' not in first['wire']
++    freeze(c, 't_A', 'completed')
++    assert journal.freeze(c, 'other', 'other', {**wire, 'verdict': 'archive'}) == first
++    # Replayed legacy bytes do not silently acquire today's epoch, even while pending.
++    freeze(c, 't_A', 'pending')
++    assert journal.freeze(c, 'board', 'worker-a3', wire) == first
++
++
++@pytest.mark.parametrize('verdict', ['release', 'escalate', 'refused'])
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'ordinary'])
++def test_caused_review_late_settlement_preserves_custody(consumer_board, monkeypatch, verdict, phase):
++    c = consumer_board
++    ep, wire = seed_request(c)
++    journal.freeze(c, 'board', 'worker-a3', wire)
++    before = [tuple(r) for r in c.execute('SELECT * FROM task_events WHERE task_id=?', ('t_A',))]
++    def canonical(*args, **kwargs):
++        freeze(c, 't_A', phase)
++        if verdict == 'refused':
++            raise caused.Refused('canonical refusal')
++        return dict(verdict=verdict, reason='confirmed', request_uid=wire['event_uid'])
++    monkeypatch.setattr(caused, 'canonical', canonical)
++    result = caused.review(c, 't_A', ep, None, None)
++    if phase != 'ordinary':
++        assert result == 'pending'
++        assert [tuple(r) for r in c.execute('SELECT * FROM task_events WHERE task_id=?', ('t_A',))] == before
++        assert reviewer.state(c, 't_A', ep) == reviewer.STARTED
++    else:
++        assert result in ('settled', 'escalated')
++
++
++@pytest.mark.parametrize('seam', ['metadata', 'retry'])
++def test_attachment_writer_entry_custody_and_single_slot_peer(consumer_board, monkeypatch, seam):
++    c = consumer_board
++    data = b'fixture bytes'
++    key = 'sha256:' + hashlib.sha256(data).hexdigest()
++    for tid in ('t_A', 't_B'):
++        card(c, tid, 'todo')
++        with kb.write_txn(c):
++            c.execute("INSERT INTO task_attachments(task_id,uid,filename,stored_path,size,created_at,blob_key) "
++                      "VALUES (?,?,?,'',?,1,?)", (tid, 'attachment_' + tid, 'probe.txt', len(data), key))
++    calls = []
++    class Hub:
++        def put_attachment(self, *a): raise AssertionError('no upload')
++        def get_attachment_blob(self, board, uid):
++            calls.append(uid)
++            return data
++    original = attachments.write_txn
++    entries = []
++    @contextmanager
++    def writer(conn, *a, **kw):
++        entries.append(True)
++        # setup is done explicitly below; metadata is first, retry is third (after peer).
++        if len(entries) == (1 if seam == 'metadata' else 3):
++            freeze(c, 't_A', 'pending')
++        with original(conn, *a, **kw):
++            yield
++    attachments._setup(c)
++    monkeypatch.setattr(attachments, 'write_txn', writer)
++    attachments.transfer_pending(c, Hub(), 'default', limit=2)
++    assert home.frozen(c, 't_A')
++    assert c.execute("SELECT stored_path FROM task_attachments WHERE task_id='t_B'").fetchone()[0]
++    assert c.execute("SELECT 1 FROM kanban_attachment_retry WHERE uid='attachment_t_A'").fetchone() is None
++    if seam == 'metadata':
++        assert not c.execute("SELECT stored_path FROM task_attachments WHERE task_id='t_A'").fetchone()[0]
++    # A frozen first row must not consume the only next-round I/O slot.
++    with kb.write_txn(c):
++        c.execute("DELETE FROM kanban_attachment_retry WHERE uid='attachment_t_B'")
++    calls.clear()
++    assert attachments.transfer_pending(c, Hub(), 'default', limit=1) == 1
++
+diff --git a/tests/hermes_cli/test_home_shared_consumer_io.py b/tests/hermes_cli/test_home_shared_consumer_io.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c000c9fbb2fad60bdf8556b99b41f3ac9c88f702
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_consumer_io.py
+@@ -0,0 +1,139 @@
++"""Cross-connection and UID-indirection controls for home-custody maintenance."""
++from contextlib import closing
++import hashlib
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_sync_attachments as attachments, kanban_spend_caused_review as caused
++from hermes_cli import kanban_spend_review_request as journal, kanban_sync_client as client
++from tests.hermes_cli import test_home_shared_consumer_custody as support
++
++consumer_board = support.consumer_board
++
++
++def seed_attachments(c):
++    data = b'fixture bytes'
++    key = 'sha256:' + hashlib.sha256(data).hexdigest()
++    for tid in ('t_A', 't_B'):
++        support.card(c, tid, 'todo')
++        with kb.write_txn(c):
++            c.execute("INSERT INTO task_attachments(task_id,uid,filename,stored_path,size,created_at,blob_key) "
++                      "VALUES (?,?,?,'',?,1,?)", (tid, 'attachment_' + tid, 'probe.txt', len(data), key))
++    return data
++
++
++@pytest.mark.parametrize('change', ['pending', 'rebound', 'deleted'])
++def test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound(consumer_board, change):
++    c = consumer_board
++    data = seed_attachments(c)
++    assert c.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
++    path = c.execute('PRAGMA database_list').fetchone()[2]
++    calls = []
++    with closing(dbc.connect(Path(path))) as other:
++        class Hub:
++            def put_attachment(self, *a): raise AssertionError('no upload')
++            def get_attachment_blob(self, board, uid):
++                calls.append(uid)
++                if uid == 'attachment_t_A':
++                    if change == 'rebound':
++                        support.card(other, 't_new', 'todo')
++                    with kb.write_txn(other):
++                        if change == 'rebound':
++                            other.execute("UPDATE task_attachments SET task_id='t_new' WHERE uid=?", (uid,))
++                        elif change == 'deleted':
++                            other.execute('DELETE FROM task_attachments WHERE uid=?', (uid,))
++                    if change != 'deleted':
++                        support.freeze(other, 't_new' if change == 'rebound' else 't_A', 'pending')
++                return data
++        assert attachments.transfer_pending(c, Hub(), 'default', limit=2) == 1
++    assert calls == ['attachment_t_A', 'attachment_t_B']
++    assert c.execute("SELECT stored_path FROM task_attachments WHERE task_id='t_B'").fetchone()[0]
++    assert c.execute("SELECT 1 FROM kanban_attachment_retry WHERE uid='attachment_t_A'").fetchone() is None
++
++
++def test_publication_holds_real_writer_reservation(consumer_board, monkeypatch):
++    c = consumer_board
++    data = seed_attachments(c)
++    path = c.execute('PRAGMA database_list').fetchone()[2]
++    published = []
++    original = attachments._publish_file
++    with closing(dbc.connect(Path(path))) as other:
++        other.execute('PRAGMA busy_timeout=0')
++        def publish(destination, payload):
++            assert c.in_transaction
++            # A distinct SQLite writer cannot prepare between the check and replacement.
++            import sqlite3
++            with pytest.raises(sqlite3.OperationalError, match='locked'):
++                other.execute('BEGIN IMMEDIATE')
++            published.append(str(destination))
++            original(destination, payload)
++        monkeypatch.setattr(attachments, '_publish_file', publish)
++        class Hub:
++            def put_attachment(self, *a): raise AssertionError('no upload')
++            def get_attachment_blob(self, *a): return data
++        assert attachments.transfer_pending(c, Hub(), 'default') == 2
++    assert len(published) == 2
++
++
++@pytest.mark.parametrize('with_epoch', [False, True])
++def test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay(consumer_board, monkeypatch, with_epoch):
++    """Board spend_review WIRE/hash contract is semantic; epochs are ingress sidecars.
++
++    Source read: the Board worker revision 3ae86d90 worker/src/spend_review.ts WIRE and prepareSpendReview.
++    This is a protocol-adapter fixture, not a claim of deployed Board interoperability.
++    """
++    c = consumer_board
++    ep, _wire = support.seed_request(c)
++    if with_epoch:
++        support.freeze(c, 't_A', 'completed')
++    sent = []
++    class Hub:
++        ident = SimpleNamespace(gateway='worker-a3')
++        def decision_retain_capability(self, board): return {'spend_review': 1}
++        def ops(self, board, wires):
++            sent.extend(wires)
++            return {'results': [{'client_op_id': wires[0]['event_uid'], 'status': 'applied'}]}
++        def row_evidence(self, board, table, uid):
++            # Adapter strips the envelope before semantic prepare/hash, matching other typed intents.
++            op = {k: v for k, v in sent[0].items() if k != 'home_generations'}
++            payload = {k: op[k] for k in ('task', 'episode', 'verdict', 'reason', 'max_grants')}
++            payload.update(version=1, runs=None, quote=None, target=None, request_uid=uid,
++                request_sha256=hashlib.sha256(json.dumps(op, sort_keys=True, separators=(',', ':'),
++                    ensure_ascii=False).encode()).hexdigest(), actor_kind='system', actor_session=None,
++                actor_gateway='worker-a3', authority_kind='spend_reviewer', authority_ref='kanban-spend-reviewer')
++            row = dict(uid=uid, task_id=op['task'], kind='spend_review', version=1,
++                       origin_gateway='worker-a3', deleted_at=None, payload=json.dumps(payload))
++            return dict(board=board, table=table, uid=uid, state='live', row=row)
++        def close(self): pass
++    monkeypatch.setattr(client, 'Hub', lambda *a, **kw: Hub())
++    monkeypatch.setattr(client, 'load_identity', lambda: None)
++    monkeypatch.setattr(client, 'push', lambda *a, **kw: None)
++    fields = {'verdict': 'escalate', 'reason': 'bounded decision'}
++    assert caused.canonical(c, 't_A', ep, fields, 2)['verdict'] == 'escalate'
++    stored = journal.get(c, 't_A', ep)
++    assert 'home_generations' not in stored['wire']
++    assert sent[0].get('home_generations') == ({'t_A': 'fixture-generation-0001'} if with_epoch else None)
++    support.freeze(c, 't_A', 'completed')
++    assert caused.canonical(c, 't_A', ep, fields, 2)['verdict'] == 'escalate'
++    assert len(sent) == 1 and journal.get(c, 't_A', ep) == stored
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'completed'])
++def test_review_target_is_captured_not_just_source(consumer_board, phase):
++    c = consumer_board
++    ep, wire = support.seed_request(c)
++    support.card(c, 't_target', 'todo')
++    support.freeze(c, 't_target', phase)
++    wire = {**wire, 'verdict': 'wait_on', 'target': 't_target'}
++    if phase != 'completed':
++        with pytest.raises(ValueError, match='home transfer'):
++            journal.freeze(c, 'board', 'worker-a3', wire)
++        assert journal.get(c, 't_A', ep) is None
++    else:
++        request = journal.freeze(c, 'board', 'worker-a3', wire)
++        assert json.loads(request['home_generations']) == {'t_target': 'fixture-generation-0001'}
++
+diff --git a/tests/hermes_cli/test_home_shared_path_invariant.py b/tests/hermes_cli/test_home_shared_path_invariant.py
+index e73bbdf6b058e832e2fd260763d34fe0801128ca..f809e54438caa7f85cb816c3abcc55e307bac39d 100644
+--- a/tests/hermes_cli/test_home_shared_path_invariant.py
++++ b/tests/hermes_cli/test_home_shared_path_invariant.py
+@@ -23,6 +23,22 @@
+ from tests.hermes_cli import test_home_feed_entrypoints as entry_cases
+ from tests.hermes_cli import test_home_review_custody_repros as custody_review
+ from tests.hermes_cli import test_home_probe_writer_custody as writer_cases
++from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
++from tests.hermes_cli import test_home_shared_consumer_io as consumer_io
++
++consumer_board = consumer_cases.consumer_board
++test_frozen_ready_does_not_suppress_shared_probe = consumer_cases.test_frozen_ready_does_not_suppress_shared_probe
++test_followup_writer_race_keeps_healthy_sweep = consumer_cases.test_followup_writer_race_keeps_healthy_sweep
++test_caused_review_captures_at_writer_after_fallible_work = consumer_cases.test_caused_review_captures_at_writer_after_fallible_work
++test_attachment_custody_skips_io_and_late_bookkeeping = consumer_cases.test_attachment_custody_skips_io_and_late_bookkeeping
++test_review_journal_writer_entry_checks_task_column = consumer_cases.test_review_journal_writer_entry_checks_task_column
++test_existing_review_wire_is_not_enriched_or_replaced = consumer_cases.test_existing_review_wire_is_not_enriched_or_replaced
++test_caused_review_late_settlement_preserves_custody = consumer_cases.test_caused_review_late_settlement_preserves_custody
++test_attachment_writer_entry_custody_and_single_slot_peer = consumer_cases.test_attachment_writer_entry_custody_and_single_slot_peer
++test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound = consumer_io.test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound
++test_publication_holds_real_writer_reservation = consumer_io.test_publication_holds_real_writer_reservation
++test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay = consumer_io.test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay
++test_review_target_is_captured_not_just_source = consumer_io.test_review_target_is_captured_not_just_source
+ 
+ board = support.board
+ live = contracts.live
+-- 
+2.43.0
+

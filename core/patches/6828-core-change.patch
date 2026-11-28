@@ -1,0 +1,111 @@
+From 075f2460bc308d5ce2efcee00f218dcc5fafc01d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 17:29:27 +0000
+Subject: [PATCH 6828] Annotation holder counts custody and read sharing
+
+Public mirror of source commit 075f2460bc308d5ce2efcee00f218dcc5fafc01d.
+
+---
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 32794a74dba333ec4006af29daaed821b4769647..e69f16e9d93444ba76b4ac98265a7c56c0ac704b 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1021,7 +1021,7 @@
+             def project():
+                 with _links_lock:
+                     return _publish_links(scope, diag.timed("fingerprint", _links_fingerprint))
+-            return _revalidate.pass_links(scope, project)
++            return _revalidate.pass_links(scope, project, lambda: _links_cache.get(scope))
+         hit = _links_cache.get(scope)
+         # A warm display read still precedes ALL fingerprint and lock work.
+         if stale_ok and hit is not None:
+diff --git a/hermes_cli/kanban_session_activity_revalidate.py b/hermes_cli/kanban_session_activity_revalidate.py
+index 3321f86ed64d5112ee041b5d0b32b6433582a6e3..6ab0e938a5a428db5071a7f3b16272611127c2db 100644
+--- a/hermes_cli/kanban_session_activity_revalidate.py
++++ b/hermes_cli/kanban_session_activity_revalidate.py
+@@ -39,20 +39,25 @@
+     return parts is None or part in parts
+ 
+ 
+-def pass_links(scope: tuple[str, ...], project):
+-    """One forced links projection per holder pass. [daveey]
++def pass_links(scope: tuple[str, ...], project, published):
++    """One forced links projection per holder pass, while it is still the published one. [daveey]
+ 
+     ``force_read.links_pass`` is a dict only inside one ``kanban_annotation_host._event_refresh`` scope read. The
+     counts and each waiting source (chat-closeout) forced their own ledger projection in that pass: 480 strict
+-    projections for many forced passes on a busy serve, each under ``_links_lock`` (t_d0c5000000000005). The pass is
+-    one snapshot, as ``one_annotation_snapshot`` already is for a request: a write during it wakes the holder again.
+-    Outside a pass (the memo is None) every forced read still projects; a failed projection is never kept."""
++    projections for many forced passes on a busy serve, each under ``_links_lock`` (t_d0c5000000000005).
++    Outside a pass (the memo is None) every forced read still projects; a failed projection is never kept.
++
++    The pass's entry is shared only while ``published()`` (the scope's entry in ``_links_cache``) is that same
++    object. Once another thread has published a newer projection the forced read projects again, so a forced read
++    never returns an entry older than the published one. chat-closeout's cross-pass gate relies on that: an entry
++    that is not the one it saw under ``_links_lock`` was projected after it read its inputs (PR #4643 review)."""
+     held = getattr(force_read, "links_pass", None)
+     if held is None:
+         return project()
+-    if scope not in held:
+-        held[scope] = project()
+-    return held[scope]
++    entry = held.get(scope)
++    if entry is None or published() is not entry:
++        entry = held[scope] = project()
++    return entry
+ 
+ 
+ def revalidatable(fingerprint: tuple, wall: float) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index 1dea8e35d41605a494ece0ae00943147232b440b..c6d696264675940967d52952799ba5323fca7a6e 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -128,7 +128,13 @@
+     monkeypatch.setattr(ksa._revalidate.force_read, 'links_pass', None, raising=False)
+     monkeypatch.setattr(ksa, '_links_fingerprint', lambda: ('same',))
+     published = []
+-    monkeypatch.setattr(ksa, '_publish_links', lambda s, f: published.append(s) or (0.0, s, f, [], []))
++    monkeypatch.setattr(ksa, '_links_cache', {})
++
++    def publish(s, f):
++        published.append(s)
++        ksa._links_cache = {**ksa._links_cache, s: (0.0, s, f, [], [])}  # copy-on-publish, as _store_links does
++        return ksa._links_cache[s]
++    monkeypatch.setattr(ksa, '_publish_links', publish)
+     first, second = ksa._links_lookup(scope, False), ksa._links_lookup(scope, False)
+     assert published == [scope, scope] and first is not second
+ 
+@@ -139,6 +145,29 @@
+     assert ksa._links_lookup(('other',), False)[1] == ('other',), "another scope got this scope's projection"
+ 
+ 
++def test_a_pass_never_shares_a_links_entry_older_than_the_published_one(world, monkeypatch):
++    """PR #4643 review: chat-closeout's cross-pass gate reads its inputs under ``_links_lock`` and trusts that an
++    entry other than the one published then was projected after that read. A pass memo that outlived another
++    thread's publish handed it the counts part's older entry, which the gate could store for later passes."""
++    seen = {}
++
++    def waiting():
++        seen['counts'] = ksa._links_cache.get(SCOPE)
++        other = threading.Thread(target=lambda: ksa._publish_links(SCOPE, ksa._links_fingerprint()))
++        other.start()  # another strict reader publishes during the pass
++        other.join()
++        seen['newer'] = ksa._links_cache.get(SCOPE)
++        seen['shared'] = ksa._links_lookup(SCOPE, False)
++        seen['again'] = ksa._links_lookup(SCOPE, False)
++        return {}
++    monkeypatch.setattr(ksa, '_waiting_sources', {'fixture': waiting})
++    _refresh()
++    assert seen['counts'] is not None and seen['newer'] is not seen['counts'], 'no publish from another thread'
++    assert seen['shared'] is not seen['counts'], 'the pass shared an entry older than the published one'
++    assert seen['shared'] is not seen['newer'], 'a forced read past a foreign publish must project again'
++    assert seen['again'] is seen['shared'] and world.links == 3, 'the pass shares its own newest projection'
++
++
+ def test_a_write_to_one_source_rereads_only_the_parts_that_read_it(world):
+     _refresh()
+     assert _reads(world) == (1, 1, 1), 'the first read of a scope reads every part'
+-- 
+2.43.0
+

@@ -1,0 +1,312 @@
+From 3ea6cc6d106e7256ec31cc59c3f60d35671f578d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:56:17 +0000
+Subject: [PATCH 6608] Startup import ordering, deferred plugin API sweep and update bytecode warmup
+
+Public mirror of source commit 3ea6cc6d106e7256ec31cc59c3f60d35671f578d.
+
+---
+diff --git a/pm/dependency_imports.py b/pm/dependency_imports.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c739c7f4eb82ea469e902793571b6355af65073c
+--- /dev/null
++++ b/pm/dependency_imports.py
+@@ -0,0 +1,94 @@
++"""Keep duplicate checkout-installed wheel modules behind their managed owner.
++
++A stray ``uv pip install --target .`` must not supersede the same distribution
++in PM's committed environment. Limit this correction to exact modules claimed
++by both distributions' RECORDs, not entire top-level namespaces. Core sources,
++editable members and other namespace portions keep their original import rules.
++No local file is removed, moved, or rewritten; attestation still verifies bytes.
++"""
++from __future__ import annotations
++
++import csv
++import importlib.machinery
++import json
++from pathlib import Path, PurePosixPath
++import re
++import sys
++
++
++def _distribution_name(info: Path) -> str:
++    metadata = info / "METADATA"
++    if metadata.is_file():
++        for line in metadata.read_text(encoding="utf-8").splitlines():
++            if line.startswith("Name: "):
++                return re.sub(r"[-_.]+", "-", line[6:].strip()).lower()
++    return ""
++
++
++def _recorded_modules(info: Path) -> dict[str, str]:
++    modules: dict[str, str] = {}
++    record = info / "RECORD"
++    if not record.is_file():
++        return modules
++    with record.open(encoding="utf-8", newline="") as stream:
++        for row in csv.reader(stream):
++            if not row:
++                continue
++            path = PurePosixPath(row[0])
++            if path.is_absolute() or ".." in path.parts or path.suffix not in {".py", ".so", ".pyd"}:
++                continue
++            stem = path.name.split(".", 1)[0]
++            parts = (*path.parts[:-1], *((stem,) if stem != "__init__" else ()))
++            if parts and all(part.isidentifier() for part in parts):
++                modules[".".join(parts)] = str(path.parent.parent if stem == "__init__" else path.parent)
++    return modules
++
++
++def _duplicate_modules(project_root: Path, selected: Path) -> dict[str, str]:
++    duplicate: dict[str, set[str]] = {}
++    for info in project_root.glob("*.dist-info"):
++        name = _distribution_name(info)
++        if name:
++            duplicate.setdefault(name, set()).update(_recorded_modules(info))
++    owners: dict[str, str] = {}
++    if not duplicate:
++        return owners
++    for info in selected.glob("*.dist-info"):
++        name = _distribution_name(info)
++        if name not in duplicate:
++            continue
++        direct = info / "direct_url.json"
++        if direct.is_file() and json.loads(direct.read_text(encoding="utf-8")).get("dir_info", {}).get("editable"):
++            continue  # Source workspaces never become wheel-owned.
++        for module, parent in _recorded_modules(info).items():
++            if module in duplicate[name]:
++                owners[module] = str(selected / parent)
++    return owners
++
++
++class _DuplicateWheelFinder:
++    def __init__(self, owners: dict[str, str]):
++        self.owners = owners
++
++    def find_spec(self, fullname, path=None, target=None):
++        parent = self.owners.get(fullname)
++        if parent is None:
++            return None
++        spec = importlib.machinery.PathFinder.find_spec(fullname, [parent], target)
++        if spec is None:
++            raise ModuleNotFoundError(f"selected dependency source missing: {fullname}", name=fullname)
++        return spec
++
++
++def select_wheel_sources(project_root: Path, selected: Path) -> None:
++    """Select duplicate wheel modules before .pth execution, without evicting code."""
++    owners = _duplicate_modules(project_root, selected)
++    for name in owners:
++        module = sys.modules.get(name)
++        origin = getattr(module, "__file__", None)
++        if origin and Path(origin).resolve().is_relative_to(project_root.resolve()):
++            raise RuntimeError(f"checkout dependency already imported before PM activation: {name}")
++    sys.meta_path[:] = [entry for entry in sys.meta_path if not isinstance(entry, _DuplicateWheelFinder)]
++    if owners:
++        index = sys.meta_path.index(importlib.machinery.PathFinder)
++        sys.meta_path.insert(index, _DuplicateWheelFinder(owners))
+diff --git a/pm/environments.py b/pm/environments.py
+index 5a76fec8f46b901e55c683931d0da40ab4360864..60a3243fe32d4661fc1e9e3c4c6752b8c950f25b 100644
+--- a/pm/environments.py
++++ b/pm/environments.py
+@@ -626,6 +626,10 @@
+     sys.path[:] = [entry for entry in sys.path
+                    if Path(entry).name not in ("site-packages", "dist-packages")
+                    and Path(entry).resolve() != project_root.resolve()]
++    # Duplicate root-installed wheels do not supersede their managed sources.
++    # Match exact RECORD modules; unrelated source/namespace portions stay intact.
++    from pm.dependency_imports import select_wheel_sources
++    select_wheel_sources(project_root, selected)
+     # uv editable members are activated by .pth files, not by sys.path alone.
+     site.addsitedir(str(selected))
+     sys.path[:] = [str(project_root.resolve()), str(selected),
+diff --git a/tests/hermes_cli/test_code_attestation_deps.py b/tests/hermes_cli/test_code_attestation_deps.py
+index c04940a6c8034649afc172ca3f8f38e77283ef13..ffcc781ff8fe1ec5447f46f2698c2bb974146801 100644
+--- a/tests/hermes_cli/test_code_attestation_deps.py
++++ b/tests/hermes_cli/test_code_attestation_deps.py
+@@ -57,6 +57,38 @@
+     return json.loads(result.stdout.splitlines()[-1])
+ 
+ 
++def test_duplicate_wheel_selection_keeps_receipt_verification(tmp_path):
++    result = run(tmp_path, r"""
++        from pm.dependency_imports import select_wheel_sources
++        dist('ownership_probe', {'ownership_probe/__init__.py': b'VALUE = 7\n'})
++        info = SITE / 'ownership_probe-1.0.dist-info'
++        (info / 'METADATA').write_text('Name: ownership-probe\nVersion: 1.0\n')
++        residue = pathlib.Path('residue').resolve()
++        root_info = residue / 'ownership_probe-2.0.dist-info'
++        root_info.mkdir(parents=True)
++        (root_info / 'METADATA').write_text('Name: ownership-probe\nVersion: 2.0\n')
++        (root_info / 'RECORD').write_text('ownership_probe/__init__.py,,\n')
++        package = residue / 'ownership_probe'
++        package.mkdir()
++        (package / '__init__.py').write_text("raise AssertionError('stray bytes executed')\n")
++        BASE = set(a.unknowns())
++        assert a.register_dependency_environment(SITE)
++        select_wheel_sources(residue, SITE)
++        sys.path.insert(0, str(residue))
++        import ownership_probe
++        assert ownership_probe.VALUE == 7
++        clean = new()
++        sys.modules.pop('ownership_probe')
++        (SITE / 'ownership_probe/__init__.py').write_bytes(b'VALUE = 9\n')
++        import ownership_probe
++        print(json.dumps({'clean': clean, 'tampered': new(), 'deps': a.dependency_receipts()}))
++    """)
++    assert result['clean'] == []
++    assert any('ownership_probe' in reason for reason in result['tampered'])
++    assert 'ownership_probe-1.0' in result['deps']['dists']
++    assert result['deps']['trust'] == 'installer-receipt: trusted, not audited, no coverage'
++
++
+ def test_receipted_dependency_is_reported_never_audited(tmp_path):
+     result = run(tmp_path, r"""
+         dist('goodpkg', {'goodpkg/__init__.py':
+diff --git a/tests/pm/test_dependency_source_ownership.py b/tests/pm/test_dependency_source_ownership.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fce68d97b0229ca7ecf2e26215fe165f832178b
+--- /dev/null
++++ b/tests/pm/test_dependency_source_ownership.py
+@@ -0,0 +1,137 @@
++"""Duplicate installed wheels cannot steal committed dependency ownership."""
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++from types import ModuleType
++
++import pytest
++
++
++def _distribution(root, record="ownership_probe/yaml/__init__.py,,\n", *, editable=False):
++    info = root / "ownership_probe-1.dist-info"
++    info.mkdir(parents=True)
++    (info / "METADATA").write_text("Name: ownership-probe\nVersion: 1\n")
++    (info / "RECORD").write_text(record)
++    if editable:
++        (info / "direct_url.json").write_text(json.dumps({"dir_info": {"editable": True}}))
++    return info
++
++
++@pytest.mark.parametrize("mutate_namespace_path", [False, True])
++def test_activation_uses_managed_duplicate_without_stealing_namespace(tmp_path, monkeypatch, mutate_namespace_path):
++    from pm import environments
++
++    root = tmp_path / "repo"
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    state = environments.install_state_dir(root)
++    selected = state / "environments" / "selected" / "venv"
++    site = environments.site_packages(selected)
++    site.mkdir(parents=True)
++    root.mkdir()
++    (selected / "pyvenv.cfg").write_text("home = fixture\n")
++    (state / "facts.json").write_text(json.dumps({"schema": 1, "packages": {
++        "venv": {"environment": str(selected)},
++    }}))
++    for parent, value in ((root, "stray"), (site, "managed")):
++        package = parent / "ownership_probe" / "yaml"
++        package.mkdir(parents=True)
++        (package / "__init__.py").write_text(f"value = {value!r}\n")
++        _distribution(parent)
++    # A legitimate source portion of the same namespace must remain importable.
++    (root / "ownership_probe/source_member.py").write_text("value = 'source'\n")
++    before = (root / "ownership_probe/yaml/__init__.py").read_bytes()
++    code = (
++        "import sys; from pathlib import Path; "
++        "from pm.environments import activate_dependencies; "
++        "activate_dependencies(Path(sys.argv[1])); "
++        + ("import ownership_probe; sys.path.insert(0, sys.argv[1]); " if mutate_namespace_path else "") +
++        "import ownership_probe.yaml as yaml; from ownership_probe import source_member; "
++        "print(yaml.value); print(yaml.__file__); print(source_member.value)"
++    )
++    process = subprocess.run([sys.executable, "-c", code, str(root)],
++                             env=dict(os.environ), capture_output=True, text=True, timeout=30, check=False)
++    assert process.returncode == 0, process.stderr
++    assert process.stdout.splitlines() == ["managed", str(site / "ownership_probe/yaml/__init__.py"), "source"]
++    assert (root / "ownership_probe/yaml/__init__.py").read_bytes() == before
++
++
++@pytest.mark.parametrize("record,expected", [
++    ("ordinary.py,,\n", {"ordinary": "."}),
++    ("native.cpython-314-x86_64-linux-gnu.so,,\n", {"native": "."}),
++    ("native.cp314-win_amd64.pyd,,\n", {"native": "."}),
++    ("namespace/member/__init__.py,,\n", {"namespace.member": "namespace"}),
++    ("../outside.py,,\n/absolute.py,,\nnot-a-module.py,,\n", {}),
++    ("package-1.data/scripts/command.py,,\npackage-1.dist-info/METADATA,,\n", {}),
++    ("\nassets/logo.png,,\n", {}),
++])
++def test_only_recorded_importable_modules_are_owned(tmp_path, record, expected):
++    from pm.dependency_imports import _recorded_modules
++
++    assert _recorded_modules(_distribution(tmp_path, record)) == expected
++
++
++@pytest.mark.parametrize("editable", [False, True])
++def test_source_and_editable_ownership_survive(tmp_path, editable):
++    from pm.dependency_imports import _duplicate_modules
++
++    root, selected = tmp_path / "source", tmp_path / "selected"
++    # A managed wheel claiming tests does not take source precedence by itself.
++    _distribution(selected, "tests/__init__.py,,\n", editable=editable)
++    assert _duplicate_modules(root, selected) == {}
++    _distribution(root, "tests/__init__.py,,\n")
++    owners = _duplicate_modules(root, selected)
++    assert owners == ({} if editable else {"tests": str(selected)})
++
++
++def test_distribution_identity_and_exact_module_intersection(tmp_path):
++    from pm.dependency_imports import _duplicate_modules
++
++    root, selected = tmp_path / "source", tmp_path / "selected"
++    root_info = _distribution(root, "ownership_probe/yaml/__init__.py,,\nother_source.py,,\n")
++    _distribution(selected, "ownership_probe/yaml/__init__.py,,\nmanaged_only.py,,\n")
++    assert _duplicate_modules(root, selected) == {"ownership_probe.yaml": str(selected / "ownership_probe")}
++    (root_info / "METADATA").write_text("Name: unrelated\nVersion: 1\n")
++    assert _duplicate_modules(root, selected) == {}
++
++
++def test_missing_owned_module_refuses_source_fallback(tmp_path):
++    from pm.dependency_imports import _DuplicateWheelFinder
++
++    finder = _DuplicateWheelFinder({"ownership_probe.yaml": str(tmp_path)})
++    with pytest.raises(ModuleNotFoundError, match="selected dependency source missing") as failure:
++        finder.find_spec("ownership_probe.yaml", ["stray"])
++    assert failure.value.name == "ownership_probe.yaml"
++    assert finder.find_spec("ownership_probe") is None
++    assert finder.find_spec("core_source") is None
++
++
++def test_loaded_checkout_code_refuses_instead_of_eviction(tmp_path, monkeypatch):
++    from pm.dependency_imports import select_wheel_sources
++
++    root, selected = tmp_path / "source", tmp_path / "selected"
++    _distribution(root)
++    _distribution(selected)
++    foreign = ModuleType("ownership_probe.yaml")
++    foreign.__file__ = str(root / "ownership_probe/yaml/__init__.py")
++    monkeypatch.setitem(sys.modules, "ownership_probe.yaml", foreign)
++    with pytest.raises(RuntimeError, match="already imported before PM activation"):
++        select_wheel_sources(root, selected)
++    assert sys.modules["ownership_probe.yaml"] is foreign
++
++
++def test_repeated_install_preserves_builtin_and_foreign_finders(tmp_path, monkeypatch):
++    from importlib.machinery import BuiltinImporter, FrozenImporter, PathFinder
++    from pm.dependency_imports import _DuplicateWheelFinder, select_wheel_sources
++
++    root, selected = tmp_path / "source", tmp_path / "selected"
++    _distribution(root)
++    _distribution(selected)
++    sentinel = object()
++    monkeypatch.setattr(sys, "meta_path", [BuiltinImporter, FrozenImporter, sentinel, PathFinder])
++    select_wheel_sources(root, selected)
++    select_wheel_sources(root, selected)
++    assert sys.meta_path[:3] == [BuiltinImporter, FrozenImporter, sentinel]
++    assert isinstance(sys.meta_path[3], _DuplicateWheelFinder)
++    assert sys.meta_path[4:] == [PathFinder]
+-- 
+2.43.0
+
