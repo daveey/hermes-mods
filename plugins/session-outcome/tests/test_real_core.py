@@ -591,6 +591,7 @@ def test_compression_tip_person_wait_refreshes_the_stored_outcome(real, tmp_path
               'thread': 'https://example.com/thread/c', 'request_id': 'request-c',
               'response': 'confirm', 'next_step': 'schedule'}
     wid = json.loads(plugin.handle({'kind': 'wait', 'on': [person]}, session_id='chat'))['outcome']['on'][0]['id']
+    _drain(plugin)  # finish the queued refresh before compression opens the same DB
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.end_session('chat', end_reason='compressed')
         db.create_session('tip', source='desktop', parent_session_id='chat')
