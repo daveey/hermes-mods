@@ -80,7 +80,7 @@ def test_slow_core_keeps_ping_responsive(api, monkeypatch, method, path):
                 await asyncio.to_thread(observer.join, 5)
             assert not observer.is_alive()
             assert not errors, errors
-            assert observations == [(200, {"ok": True, "api": 1}, True, True)]
+            assert observations == [(200, {"ok": True, "api": 2}, True, True)]
             assert len(calls) == 1  # restart must not be retried or duplicated
             assert calls[0][0] == "fixture-profile"
             assert calls[0][1] != loop_thread

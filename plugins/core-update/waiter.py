@@ -33,7 +33,8 @@ def main() -> None:
     # Execute the snapshot read from the checked fd.
     source = attested_source()
     path = str(updater_path())
-    sys.argv = [path, "core-waiter"]
+    command = "core" if sys.argv[1:] == ["--update"] else "core-waiter"
+    sys.argv = [path, command]
     namespace = {"__name__": "__main__", "__file__": path, "__package__": None,
                  "__builtins__": __builtins__}
     exec(compile(source, path, "exec"), namespace)

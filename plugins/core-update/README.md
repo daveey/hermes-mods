@@ -1,74 +1,53 @@
 # core-update
 
-Same-checkout build progress/failure remains visible while the installed Desktop
-bundle is old. Ready offers clear once its installed stamp matches the target or
-has equivalent build inputs. Unknown installed identity never offers a same-HEAD
-restart. There is no local-build action or activity override.
+Local version and update backend for the titlebar [Hub panel](../../desktop-plugins/hub-status/).
+There is no footer update chip or version pill.
 
-Status-bar chip for a Hermes core update that is built in the background and applied the next
-time Desktop quits.
+The Hub shows an up-arrow for a ready/building update with pending commits. Its
+**Hermes version** section shows the running backend revision, installed Desktop
+build, target and newest-first `running..target` commit subjects/times (collapsed
+after 15). Version reads never fetch or edit Git.
 
-- **Building update…** while an updater packs the next version off to the side.
-- **Update ready — restart to apply** once a prebuilt app newer than the running checkout is
-  waiting. Clicking it starts the plugin-owned, attested apply-on-quit waiter and then quits
-  Desktop. The waiter runs the update and reopens Desktop. Restart is disabled if the
-  installed reference updater is missing or unsafe (not a regular file of this user, or
-  group/other writable).
-- Hidden otherwise (no state file, the build is what already runs, or it failed).
+**Update now** works even without a pending prebuild. It writes the standard
+30-minute `hermes_cli.core_update_force.write_force_request(..., by="hub panel")`
+intent and invokes the installed attested updater's `core` command to fetch latest.
+Busy or unknown running-turn counts require confirmation in the panel; cancel
+writes nothing. All version/update requests target the Desktop machine's **local**
+backend, independently of the selected gateway; hub history still targets the hub.
 
-## Contract
+The detached monitor publishes operation state/errors to
+`cache/core-update/hub-update.json` and updater output to `hub-update.log`. Standard
+core progress and live waiter state provide actual deferral reasons. A backend-only
+update never quits Desktop. Only a ready, restart-capable bundle serving latest
+`origin/main` whose build inputs differ from the installed bundle triggers the
+existing apply-on-quit waiter and quit/reopen flow. Unknown bundle identity does
+not authorize a quit. Concurrent windows share one installation-level monitor lock.
 
-A Restart click first atomically writes `<installation root>/core-update/restart-request`
-with `{"version":1,"requested_at":<epoch>,"expires_at":<epoch + 1800>,"by":"core-update chip"}`.
-The installation root is `$HERMES_HOME`, or its grandparent whenever its parent is named
-`profiles` (including custom homes following that layout). This is a dedicated batch-only
-intent, NOT the full-force `force-request` consumed by background drainers. Older updaters
-ignore it safely until upgraded. If writing fails, `/restart` returns `ok: false`
-with a reason and neither spawns the waiter nor quits Desktop.
-The reference updater's quit-waiter consumes this intent to skip background batching;
-ordinary quits still batch. Busy/admission safety gates are unchanged. Successful core
-apply clears requests issued before apply started; later clicks and refused applies
-retain their requests (up to the 30-minute expiry).
+## API
 
-The updater writes `$HERMES_HOME/cache/core-update/state.json`:
+Prefix `/api/plugins/core-update`:
 
-```json
-{"status": "building|ready|failed", "sha": "<commit>", "app_path": "<prebuilt Hermes.app>",
- "built_at": "<iso>", "started_at": "<iso>", "pid": 123, "error": null}
-```
+- `GET /ping`: `{ "ok": true, "api": 2 }`.
+- `GET /version`: version/status, commit subjects, turn count, force intent and progress.
+- `POST /update`: record explicit full-force intent and start the detached updater.
+- `GET /status`, `POST /restart`: retained legacy endpoints. `/restart` writes the
+  dedicated quit-only `restart-request`, not a full-force request.
 
-State is advisory, never executable configuration: legacy `waiter_cmd` is ignored,
-including when absent or malformed. `state.json` must be a regular, non-symlink
-file owned by the current uid with no group/other write permission (0600 recommended).
-Restart checks metadata on the opened fd and parses exactly one snapshot.
+The installation root is `$HERMES_HOME`, or its grandparent for `profiles/<name>`.
+The updater is always `~/.hermes/sync-runner/hermes-sync`, opened and checked as a
+regular current-uid file without group/other write permission. No browser/state
+value chooses code or arguments. `waiter.py --update` runs the fixed `core` command;
+without that flag it runs fixed `core-waiter`. The plugin never edits the checkout
+itself, and state `waiter_cmd` is ignored.
 
-`waiter.py` is launched with `/usr/bin/python3 -I`. It reads only the fixed
-`~/.hermes/sync-runner/hermes-sync`, requires a regular file of the current uid without
-group/other write, and executes the bytes read from that fd with the fixed `core-waiter`
-argument. No content hash is pinned: the updater changes often, and launchd already runs the
-same file. Threat model: state.json (and anything that can only write it) cannot select code
-or argv; a same-uid writer of the installed runner is out of scope. The updater may re-exec
-itself on interpreters lacking its dependencies, which reopens the path. Restart still quits
-Desktop if the spawned waiter later fails these checks; the sync-armed waiter normally covers
-that. This replaces the old arbitrary updater-argv extension point. This plugin does not change
-the updater's drain logic.
-
-`waiter.json` next to it (`{"pid", "state"}`) is shown in `/status` when present. The plugin never
-edits the checkout. The reference updater is a sync job that keeps a fork checkout current. It
-packs `origin/main` in a detached worktree and passes the bundle to `hermes update` through
-`HERMES_DESKTOP_PREBUILT_APP`. That env var needs the fork commit "swap in a prebuilt desktop app
-named by HERMES_DESKTOP_PREBUILT_APP" (see `core/` in this repo).
-
-API: `GET /api/plugins/core-update/status`, `POST /api/plugins/core-update/restart`, `GET /ping`.
-
-The Desktop chip always calls this machine's gateway (the `local` connection), even when another gateway (e.g.
-hermes-hub) is active: the update is for the Desktop on this machine and `/restart` quits it with osascript on the
-backend's host. It reads `/status` every 30 s only while the window is visible, and once when it is shown again. That read is
-`passive`, so it never starts or installs a local backend that is not running; the Restart click may.
+`state.json` is advisory and must be a regular, non-symlink, current-uid file with
+no group/other write permission. Ready/same-HEAD offers follow installed Desktop
+stamps/build inputs, not just checkout equality. Stale/dead waiter records are not
+presented as active deferrals. The reference updater owns draining and safety gates.
 
 ## Tests
 
 ```sh
-uv run --with pytest python -m pytest -q -p no:cacheprovider plugins/core-update/tests
-node --test plugins/core-update/tests/test_chip.mjs desktop-plugins/core-update/test/*.test.mjs   # Node >= 22
+scripts/test-all -k core-update
+node --test desktop-plugins/hub-status/test/chip.test.mjs
 ```
