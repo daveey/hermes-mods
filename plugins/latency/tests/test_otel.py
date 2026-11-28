@@ -39,6 +39,58 @@ class OpenTelemetry(API):
         self.assertEqual(first['slowest'][0]['trace_id'], sample['trace_id'])
         self.assertEqual(first['slowest'][0]['parent_span_id'], sample['parent_span_id'])
 
+    def test_legacy_otlp_round_trip_preserves_retry_identity(self):
+        otel = importlib.import_module(api.pkg().__name__+'.otel')
+        sample = dict(id='legacy-replay', metric='ui.session_switch', start=time.time()-1,
+                      dur_ms=123, host='desktop', gateway='gateway', attrs={})
+        first = self.client.post('/v1/spans', json={'spans': [sample]})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()['inserted'], 1)
+        view = self.client.get('/v1/series?metric=ui.session_switch').json()['metrics'][0]
+        canonical = view['slowest'][0]
+        replay = self.client.post('/v1/otlp/traces', json=otel.to_otlp([canonical]))
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json()['inserted'], 0)
+        self.assertEqual(self.client.post('/v1/spans', json={'spans': [sample]}).json()['inserted'], 0)
+        final = self.client.get('/v1/series?metric=ui.session_switch').json()['metrics'][0]
+        self.assertEqual(final['n'], view['n'])
+        self.assertEqual(final['slowest'], view['slowest'])
+
+    def test_export_start_failure_cannot_fail_ingestion_or_keep_stale_cache(self):
+        exporter = importlib.import_module(api.pkg().__name__+'.exporter')
+        before = self.client.get('/v1/series?metric=ui.session_switch').json()['metrics'][0]['n']
+        original_start = threading.Thread.start
+        def start(thread):
+            if thread.name == 'latency-otlp':
+                raise RuntimeError("can't start new thread")
+            return original_start(thread)
+        with patch.object(exporter, 'configured_url', return_value='http://localhost:4318/v1/traces'), \
+             patch.object(exporter, '_worker', None), \
+             patch.object(threading.Thread, 'start', start):
+            response = self.client.post('/v1/spans', json={'spans': [self.sample()]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['inserted'], 1)
+        after = self.client.get('/v1/series?metric=ui.session_switch').json()['metrics'][0]['n']
+        self.assertEqual(after, before+1)
+        self.assertEqual(self.client.post('/v1/spans', json={'spans': [self.sample()]}).status_code, 200)
+
+    def test_export_preparation_failures_are_best_effort(self):
+        exporter = importlib.import_module(api.pkg().__name__+'.exporter')
+        spans = importlib.import_module(api.pkg().__name__+'.spans')
+        sample = spans.validate_span(self.sample())
+        # No real worker/collector is started in these fault controls.
+        with patch.object(exporter, 'configured_url', return_value='http://localhost:4318/v1/traces'):
+            for target, name in ((exporter, 'to_otlp'), (exporter.threading, 'Thread')):
+                with self.subTest(fault=name), patch.object(exporter, '_worker', None), \
+                     patch.object(target, name, side_effect=RuntimeError('fault')):
+                    self.assertFalse(exporter.enqueue([sample]))
+            class Alive:
+                def is_alive(self):
+                    return True
+            with patch.object(exporter, '_worker', Alive()), \
+                 patch.object(exporter._queue, 'put_nowait', side_effect=RuntimeError('fault')):
+                self.assertFalse(exporter.enqueue([sample]))
+
     def test_prometheus_every_sampled_metric(self):
         try:
             from prometheus_client.parser import text_string_to_metric_families
@@ -95,6 +147,13 @@ class OpenTelemetry(API):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_otlp_replay_id_is_still_privacy_validated(self):
+        for event_id in ('private answer text', 'https://example.com/private', '', None, 123, 'x'*1025):
+            sample = self.sample()
+            sample['attributes']['hermes.event_id'] = event_id
+            with self.subTest(event_id=event_id):
+                self.assertEqual(self.client.post('/v1/spans', json={'spans': [sample]}).status_code, 400)
 
     def test_private_fields_invalid_ids_and_malformed_otlp_rejected(self):
         for change in ({'trace_id': '0'*32}, {'span_id': 'wrong'}, {'parent_span_id': 'f'*32},

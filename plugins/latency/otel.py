@@ -41,11 +41,13 @@ def to_legacy(value):
     if end < start:
         raise ValueError('span end precedes start')
     attrs = value.get('attributes', {})
-    if not isinstance(attrs, dict) or set(attrs) - (ATTRS.keys() | {'host.name', 'service.name', 'hermes.gateway'}):
+    if not isinstance(attrs, dict) or set(attrs) - (ATTRS.keys() | {'host.name', 'service.name', 'hermes.gateway', 'hermes.event_id'}):
         raise ValueError('unsupported OpenTelemetry attributes')
     if attrs.get('service.name') not in ('hermes-desktop', 'hermes-gateway'):
         raise ValueError('unsupported service.name')
-    result = dict(id=f'{trace}:{span}', metric=value.get('name'), start=start / 1e9,
+    # Retain the admitted legacy ID across export/replay. The ordinary sample
+    # validator still checks this identifier; never copy arbitrary attributes.
+    result = dict(id=attrs.get('hermes.event_id', f'{trace}:{span}'), metric=value.get('name'), start=start / 1e9,
                   dur_ms=(end-start) / 1e6, host=attrs.get('host.name'),
                   gateway=attrs.get('hermes.gateway', attrs.get('host.name')),
                   attrs={short: attrs[key] for key, short in ATTRS.items() if key in attrs},
@@ -120,7 +122,7 @@ def to_otlp(samples):
     resources = []
     for original in samples:
         sample = with_ids(original)
-        attrs = {'host.name': sample['host'], 'service.name': sample['service_name'], 'hermes.gateway': sample['gateway']}
+        attrs = {'host.name': sample['host'], 'service.name': sample['service_name'], 'hermes.gateway': sample['gateway'], 'hermes.event_id': sample['id']}
         attrs.update({key: sample['attrs'][short] for key, short in ATTRS.items() if short in sample['attrs']})
         span = dict(traceId=sample['trace_id'], spanId=sample['span_id'], name=sample['metric'],
                     startTimeUnixNano=sample['start_time_unix_nano'], endTimeUnixNano=sample['end_time_unix_nano'])

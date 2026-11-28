@@ -35,6 +35,21 @@ test('Ledger browser acceptance and Desktop span batching', { timeout: 90000 }, 
   })
   try {
     await page.goto(server.resolvedUrls.local[0])
+    const cardRoutes = await page.evaluate(async moduleUrl => {
+      const { openSample } = await import(moduleUrl)
+      const calls = []
+      const hook = (...args) => calls.push(args)
+      window.__hermesKanbanOpenTask = hook
+      const sample = { link: { kind: 'card', id: 'card-1', board: 'work', gateway: 'hermes-hub', profile: 'other-profile' } }
+      let refused = false
+      try { await openSample({}, sample) } catch { refused = true }
+      const oldCalls = calls.length
+      hook.supportsQualifiedOwners = true
+      await openSample({}, sample)
+      delete window.__hermesKanbanOpenTask
+      return { refused, oldCalls, calls }
+    }, '/@fs/'+fileURLToPath(new URL('../plugin.js', import.meta.url)))
+    assert.deepEqual(cardRoutes, { refused: true, oldCalls: 0, calls: [['card-1', 'work', 'hermes-hub', 'other-profile']] })
     await page.getByTestId('latency-count').filter({ hasText: '12' }).waitFor()
     assert.equal(await page.locator('.lat-chip svg path').count(), 2)
     const chip = page.getByRole('button', { name: 'Latency', exact: true })

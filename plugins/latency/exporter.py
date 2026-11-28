@@ -52,6 +52,15 @@ def _run():
 
 
 def enqueue(samples):
+    # Export is optional and lossy, including serialization/thread startup faults.
+    # No exporter exception may escape after the caller commits ingestion.
+    try:
+        return _enqueue(samples)
+    except Exception:
+        return False
+
+
+def _enqueue(samples):
     global _worker
     url = configured_url()
     if not url:
