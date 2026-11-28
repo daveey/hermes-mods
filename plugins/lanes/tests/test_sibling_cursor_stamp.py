@@ -211,6 +211,116 @@ def test_a_commit_made_visible_after_the_settle_window_is_seen(board, api, tmp_p
         proc.wait(10)
 
 
+_LATER = 1 << 62  # a capture clock far past any write: every stamp is settled
+
+
+def _wal_db(path):
+    import sqlite3
+    c = sqlite3.connect(str(path), isolation_level=None)
+    c.execute('PRAGMA journal_mode=WAL')
+    c.execute('PRAGMA wal_autocheckpoint=0')
+    c.execute('CREATE TABLE t(x)')
+    c.execute('INSERT INTO t VALUES (1)')
+    return c
+
+
+def _other(path, code):
+    import subprocess
+    import sys
+    return subprocess.run([sys.executable, '-c', 'import sqlite3,sys\n' + code, str(path)],
+                          capture_output=True, text=True, timeout=30)
+
+
+def test_stamping_keeps_a_same_process_writers_wal_lock(api, tmp_path):
+    # POSIX drops every fcntl lock a process holds on an inode when any fd for
+    # it closes; SQLite's WAL write lock lives on -shm. Stamping a sibling must
+    # never let another process take the write lock this process holds.
+    path = tmp_path / 'w.db'
+    a = _wal_db(path)
+    a.execute('BEGIN IMMEDIATE')
+    try:
+        for _ in range(3):
+            assert api._settled_stamp(str(path), now_ns=_LATER)[-1] is not None
+        r = _other(path, 'c = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)\n'
+                         'c.execute("BEGIN IMMEDIATE"); c.execute("INSERT INTO t VALUES (2)"); c.execute("COMMIT")\n'
+                         'print("ACQUIRED")')
+        assert 'ACQUIRED' not in r.stdout and 'locked' in r.stderr, r.stdout + r.stderr
+        a.execute('INSERT INTO t VALUES (3)')
+        a.execute('COMMIT')
+    finally:
+        a.close()
+
+
+def test_stamping_keeps_a_same_process_read_snapshot(api, tmp_path):
+    # A live read snapshot's read mark on -shm must keep a checkpoint from
+    # truncating the WAL under it after a stamp.
+    import sqlite3
+    path = tmp_path / 'r.db'
+    _wal_db(path).close()
+    keep = sqlite3.connect(str(path), isolation_level=None)  # keeps -shm in WAL mode
+    b = sqlite3.connect('file:%s?mode=ro' % path, uri=True, isolation_level=None)
+    try:
+        b.execute('BEGIN')
+        assert b.execute('SELECT count(*) FROM t').fetchone()[0] == 1
+        assert _other(path, 'sqlite3.connect(sys.argv[1], isolation_level=None)'
+                            '.execute("INSERT INTO t VALUES (2)")').returncode == 0
+        assert api._settled_stamp(str(path), now_ns=_LATER)[-1] is not None
+        r = _other(path, 'c = sqlite3.connect(sys.argv[1], isolation_level=None)\n'
+                         'print(c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0])')
+        assert r.stdout.strip() == '1', 'checkpoint must stay busy under the live snapshot: ' + r.stdout + r.stderr
+        assert b.execute('SELECT count(*) FROM t').fetchone()[0] == 1
+    finally:
+        b.close()
+        keep.close()
+
+
+def _fds_on(target):
+    # fds of this process on the file (an unlinked inode reads '<path> (deleted)').
+    fds = '/proc/self/fd'
+    if not os.path.isdir(fds):
+        pytest.skip('needs /proc/self/fd')
+    found = 0
+    target = os.path.realpath(target)
+    for name in os.listdir(fds):
+        try:
+            link = os.readlink(os.path.join(fds, name))
+        except OSError:
+            continue
+        found += link in (target, target + ' (deleted)')
+    return found
+
+
+def test_shm_fds_are_reused_and_released_with_the_inode(api, tmp_path):
+    # One retained fd per linked -shm inode: repeated stamps add none, and a
+    # -shm that SQLite unlinks on last close (then recreates) is let go.
+    path = tmp_path / 'x.db'
+    shm = str(path) + '-shm'
+    c = _wal_db(path)
+    first = api._settled_stamp(str(path), now_ns=_LATER)
+    base = _fds_on(shm)  # SQLite's own fd plus the one retained here
+    assert base == 2
+    for _ in range(20):
+        api._settled_stamp(str(path), now_ns=_LATER)
+    assert _fds_on(shm) == base
+    assert [e[:2] for e in api._shm_fds[shm]] == [first[-1][:2]]
+    c.close()  # last connection: checkpoint, then -wal/-shm are deleted
+    assert not os.path.exists(shm)
+    assert api._settled_stamp(str(path), now_ns=_LATER)[-1] is None
+    assert shm not in api._shm_fds, 'the unlinked inode fd is closed'
+    assert _fds_on(shm) == 0
+    import sqlite3
+    c = sqlite3.connect(str(path), isolation_level=None)
+    c.execute('INSERT INTO t VALUES (2)')
+    try:
+        again = api._settled_stamp(str(path), now_ns=_LATER)
+        new_ino = os.stat(shm).st_ino
+        assert again[-1][1] == new_ino
+        assert [e[1] for e in api._shm_fds[shm]] == [new_ino]
+        assert _fds_on(shm) == base
+    finally:
+        c.close()
+
+
 def test_a_replaced_sibling_is_reread(board, api, monkeypatch):
     kb.create_board('beta')
     meta = next(b for b in kb.list_boards() if b['slug'] == 'beta')
