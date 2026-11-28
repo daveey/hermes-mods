@@ -36,6 +36,12 @@ has no live run, and skip the PR if any check fails. A branch push's ghosts need
 real runs; otherwise `gh workflow run` where `workflow_dispatch` exists. Ghosts that can't be cancelled stay
 `queued` forever: ignore them, and don't count them as pending CI.
 
+## Inherited failures after main or a dependency changes
+
+1. Compare the failing run's checkout SHA and synthetic merge base with the commit that fixes the test. Read separately the SHA of any dependency cloned during setup: a rerun can fetch new dependency code while retaining the old PR merge tree, so it can still execute the old fixture.
+2. Do not use close/reopen as proof of a refreshed merge tree. Inspect the new job's checkout; if it still uses the old base, rebase onto current main, verify `git range-diff`, push with an explicit lease and satisfy the exact-head review policy. The check-suite gate caveat above still applies.
+3. Before refreshing a repair PR, compare its changed files with current main. If its patch already landed elsewhere, reconcile it as superseded rather than spending another full CI run on it. Reproduce remaining failures against current main and the dependency SHA actually used; a new golden mismatch is not proof that the original correction failed.
+
 ## CI refused for billing (account-wide outage)
 
 Symptom: every job fails in 1–4 s with zero steps, across all workflows and repos of the account. The cause is
