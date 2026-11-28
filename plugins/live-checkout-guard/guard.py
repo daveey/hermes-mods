@@ -955,8 +955,7 @@ def _hd_var_run_re(name: str):
     return _hd_exec_re(r"\$(?:" + re.escape(name) + r"(?!\w)|\{" + re.escape(name) + r"[}:\-+=?/%^,\[@])")
 
 
-def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False,
-                    *, update_stdin: bool = False) -> tuple:
+def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False) -> tuple:
     """(code, bodies) of shell `text`, by bash rules: the command text a shell parses, and the heredoc bodies.
 
     `code` is `text` without heredoc bodies, their terminator lines and `#` comments (a `#` that begins a word
@@ -973,9 +972,7 @@ def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False,
     `bodies` lists every other body as (text, quoted delimiter), for a guard that scans data conservatively.
     With `remote_heredocs` (a guard of this host's files only), a quoted-delimiter body that a shell reads on an ssh
     host (`_hd_remote_shell`) is in neither: it never runs or is read here.
-    Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`).
-    `update_stdin` narrows only additive updater provenance to positive stdin-shell
-    paths; default checkout-write analysis retains its conservative unknown-reader rule."""
+    Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`)."""
     if "<<" not in text and "#" not in text:
         return text, []
     out, bodies, pending, stack, subs, written, assigned = [], [], [], [], [], [], []
@@ -999,21 +996,17 @@ def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False,
             if remote_heredocs and quoted and _hd_subst_data(text, openers) \
                     and _hd_remote_shell(before, line_start, rest):
                 runs = []  # read by a shell on the ssh host: neither local code nor a local data body
-            elif (_update_hd_feeds_shell(text[line_start:op_start], rest) if update_stdin
-                  else _hd_feeds_shell(text[line_start:op_start], rest)) or (
-                      not update_stdin and not _hd_subst_data(text, openers)):
+            elif _hd_feeds_shell(text[line_start:op_start], rest) or not _hd_subst_data(text, openers):
                 runs = [body]
             else:
                 bodies.append((body, quoted))
                 runs = [] if quoted else _hd_substitutions(body)
-                if not update_stdin:
-                    written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], rest))
-                    name = _hd_assigned(text, openers)
-                    if name:
-                        assigned.append((name, body, at))
+                written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], rest))
+                name = _hd_assigned(text, openers)
+                if name:
+                    assigned.append((name, body, at))
             for run in runs:
-                sub_code, sub_bodies = _split_heredocs(run, _level + 1, remote_heredocs,
-                                                      update_stdin=update_stdin) if _level < 16 else (run, [])
+                sub_code, sub_bodies = _split_heredocs(run, _level + 1, remote_heredocs) if _level < 16 else (run, [])
                 out.append(sub_code + "\n")
                 bodies.extend(sub_bodies)
         pending.clear()
@@ -1148,8 +1141,7 @@ def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False,
                 or re.compile(r"(?:^|[;&|(`])\s*" + p, re.M).search(code, at) or _hd_file_run_re(path).search(masked, at):
             ran.append(body)
     for body in ran:
-        sub_code, sub_bodies = _split_heredocs(body, _level + 1, remote_heredocs,
-                                              update_stdin=update_stdin) if _level < 16 else (body, [])
+        sub_code, sub_bodies = _split_heredocs(body, _level + 1, remote_heredocs) if _level < 16 else (body, [])
         code += "\n" + sub_code + "\n"
         bodies.extend(sub_bodies)
     return code, bodies
@@ -1185,6 +1177,156 @@ def _lexable(text: str, lex, dropped: Optional[list] = None) -> str:
     return "\n".join(keep)
 
 # ---- end of the shared heredoc block ---------------------------------------------------------------------------
+
+
+def _update_split_heredocs(text: str, _level: int = 0) -> str:
+    """Only command text plus positive stdin-shell bodies for the additive updater rule.
+
+    Keep the shared checkout-write parser above byte-identical to its peers: it
+    intentionally promotes unknown readers and later-executed data conservatively.
+    This local projection uses the same quote/comment/delimiter lexing, but retains
+    bodies only for `_update_hd_feeds_shell` and unquoted body substitutions. No
+    written/assigned data replay or arbitrary-reader inference is added here.
+    """
+    if "<<" not in text and "#" not in text:
+        return text
+    out, pending, stack = [], [], []
+    n, i, line_start = len(text), 0, 0
+
+    def take_bodies(i: int) -> int:
+        for delim, strip_tabs, quoted, op_start, nl in pending:
+            lines = []
+            while i < n:
+                e = text.find("\n", i)
+                e = n if e < 0 else e
+                line = text[i:e]
+                i = min(e + 1, n)
+                if strip_tabs:
+                    line = line.lstrip("\t")
+                if line.rstrip("\r") == delim:
+                    break
+                lines.append(line)
+            body = "\n".join(lines)
+            if _update_hd_feeds_shell(text[line_start:op_start], text[op_start:nl]):
+                runs = [body]
+            else:
+                runs = [] if quoted else _hd_substitutions(body)
+            for run in runs:
+                out.append((_update_split_heredocs(run, _level + 1) if _level < 16 else run) + "\n")
+        pending.clear()
+        return i
+
+    while i < n:
+        c = text[i]
+        top = stack[-1] if stack else ""
+        if top == '"':
+            if c == "\\":
+                out.append(text[i:i + 2])
+                i += 2
+                continue
+            if c == '"':
+                stack.pop()
+            elif text.startswith("$((", i):
+                j = _hd_arith_end(text, i + 1)
+                out.append(text[i:j])
+                i = j
+                continue
+            elif text.startswith("$(", i):
+                stack.append(0)
+                out.append("$(")
+                i += 2
+                continue
+            elif c == "`":
+                stack.append("`")
+            out.append(c)
+            i += 1
+            continue
+        if c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        elif c == "'" or text.startswith("$'", i):
+            j = i + 1 + (c == "$")
+            while j < n and text[j] != "'":
+                j += 2 if c == "$" and text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif c == '"':
+            stack.append('"')
+            out.append(c)
+            i += 1
+        elif c == "`" and top == "`":
+            stack.pop()
+            out.append(c)
+            i += 1
+        elif c == "`":
+            stack.append("`")
+            out.append(c)
+            i += 1
+        elif isinstance(top, int) and c in "()":
+            if c == ")" and top == 0:
+                stack.pop()
+            else:
+                stack[-1] += 1 if c == "(" else -1
+            out.append(c)
+            i += 1
+        elif text.startswith("$((", i) or (text.startswith("((", i) and _hd_word_start(text, i)):
+            j = _hd_arith_end(text, i + (c == "$"))
+            out.append(text[i:j])
+            i = j
+        elif text.startswith("$(", i) or (c in "<>" and text.startswith("(", i + 1)):
+            stack.append(0)
+            out.append(text[i:i + 2])
+            i += 2
+        elif text.startswith("${", i):
+            j, depth = i + 2, 1
+            while j < n and depth:
+                if text[j] == "\\":
+                    j += 1
+                elif text[j] in "{}":
+                    depth += 1 if text[j] == "{" else -1
+                j += 1
+            out.append(text[i:j])
+            i = j
+        elif c == "#" and _hd_word_start(text, i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("<<", i) and not text.startswith("<<<", i) and (i == 0 or text[i - 1] != "<"):
+            k = i + 2
+            strip_tabs = text.startswith("-", k)
+            k += strip_tabs
+            while k < n and text[k] in " \t":
+                k += 1
+            word, quoted, w = [], False, k
+            while w < n and text[w] not in _HD_WORD_BREAK:
+                if text[w] in "'\"":
+                    e = text.find(text[w], w + 1)
+                    e = n if e < 0 else e
+                    word.append(text[w + 1:e])
+                    quoted, w = True, e + 1
+                elif text[w] == "\\":
+                    word.append(text[w + 1:w + 2])
+                    quoted, w = True, w + 2
+                else:
+                    word.append(text[w])
+                    w += 1
+            if w == k:
+                out.append("<<")
+                i += 2
+                continue
+            nl = text.find("\n", w)
+            pending.append(("".join(word), strip_tabs, quoted, i, n if nl < 0 else nl))
+            out.append(text[i:w])
+            i = w
+        elif c == "\n":
+            out.append(c)
+            i += 1
+            if pending:
+                i = take_bodies(i)
+            line_start = i
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
 
 
 def _lex(cmd: str) -> list[str]:
@@ -1767,7 +1909,7 @@ def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0,
         return _check_update_pipelines(source, cwd, depth)
     # Preserve the original decision above as a refusal floor. Add executable
     # stdin provenance without scanning the shared parser's inert data bodies.
-    executable, _data = _split_heredocs(source, update_stdin=True)
+    executable = _update_split_heredocs(source)
     if executable == _update_source(source):
         return _check_update_pipelines(executable, cwd, depth)
     return _check_update(executable, cwd, depth=depth, _prepared=True)

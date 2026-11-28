@@ -280,6 +280,10 @@ output piped through zero or more plain `cat` stages into a stdin shell is check
 too. Printer operands are concatenated before analysis, so an updater mentioned
 inside an echoed command stays data. Shell script-file operands, syntax-check mode,
 and redirected pipeline input/output do not establish that literal stdin path.
+The additive updater-only heredoc projection requires positive stdin-shell provenance;
+unknown readers and written/assigned data are not promoted to updater code. It is
+separate from the byte-identical shared checkout-write parser, whose conservative
+behavior is unchanged across the guard plugins.
 Unsupported formatting, computed producers, aliases/functions and arbitrary script
 execution remain outside this bounded lexical rule; this is not a shell sandbox.
 
