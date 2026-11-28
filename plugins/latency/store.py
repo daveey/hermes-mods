@@ -191,6 +191,12 @@ class Store:
                 new = incoming.get(identity)
                 if old and old['metric'] not in metrics:
                     raise ValueError('identity belongs to another metric')
+                if new:
+                    # Fence pre-migration append-only collectors as well: the
+                    # singleton lock serializes generations, but an old module
+                    # can acquire it later and must not count these IDs again.
+                    db.execute('INSERT OR IGNORE INTO identities VALUES (?,?)',
+                               (identity,new['start']))
                 if old == new:
                     continue
                 changed += 1
