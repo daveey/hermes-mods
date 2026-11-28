@@ -3,7 +3,7 @@
 # ../desktop-oracle.json. Needs network for pnpm's first fetch; writes only
 # under WORK.
 #   HERMES_CORE_GIT=<hermes-agent clone> WORK=<scratch dir> ./replay-oracle.sh
-# Requires Node >= 24 (Desktop's engines) and pnpm 12 on PATH.
+# Requires Node >= 26 (the pinned root's engines) and pnpm 12 on PATH.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 CORE_GIT=${HERMES_CORE_GIT:-$HOME/.hermes/hermes-agent}

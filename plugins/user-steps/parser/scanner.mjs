@@ -52333,7 +52333,7 @@ function scan(reply) {
   if (!Number.isInteger(offset) || text11.slice(last.position.end.offset).trim()) return null;
   const split = parseMarkdownIntoBlocksCached(text11);
   if (!Array.isArray(split) || split.join("") !== text11.replace(/\r\n|\r/g, "\n")) return null;
-  const content3 = split.filter((b2) => b2.trim());
+  const content3 = split;
   for (const block of content3.slice(0, -1)) if (directives(parse5(block)).doubt) return null;
   if (!finalDirective(parse5(content3.at(-1)))) return null;
   if ((reply.match(/::/g) ?? []).length !== 1) return null;

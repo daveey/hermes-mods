@@ -7,15 +7,16 @@
 
 It also records `scanner`, the source the committed scanner admits, or `null`. `../fidelity.test.mjs` replays every case through the shipped `scanner.mjs` in fresh Node processes. It requires that the scanner never admits a case Desktop does not render as exactly one final card with that source, and that every verdict equals the recorded one. A changed verdict must be re-recorded deliberately.
 
-## Cases (3767)
+## Cases (3783)
 
-- **284 synthetic cases**: 237 in `oracle/cases.mjs` plus 47 block-splitting cases in `oracle/cases-blocks.mjs` in these classes:
+- **300 synthetic cases**: 237 in `oracle/cases.mjs`, 47 block-splitting cases in `oracle/cases-blocks.mjs`, and 16 `survivors/*` cases stored directly in the fixture, in these classes:
   - control: ordinary list/prose plans, URLs, www, email, CRLF, ordered/nested lists
   - math: `$`/`$$` on and off, math in attrs, plan, items and before the ask, unclosed display, currency
   - incomplete: constructs that `tailBoundedRemend` repairs (links, images, emphasis, fences, odd dollars)
   - hidden: entities, think blocks, comments, previews
   - nested/nonfinal: directives in lists, quotes, tables, inline text, two directives, a directive followed by text
   - blocks: marked block-splitting boundaries such as HTML blocks, tables, definitions, CR-only and U+2028
+  - survivors: image references whose later definitions hide HTML/entity cues from the whole-document AST but not from the first independently parsed block; leading-HTML controls and trailing blank-line controls
 - **161 sanitized real assistant replies** (`real_replies`), each in three variants (`real_variants`): the plain reply, the reply plus an ask, and the reply plus a plan and an ask.
   - Sources: finished assistant messages from local request dumps, plus a deterministic every-13th sample of agent-authored Kanban result Markdown up to 4 KB.
   - Sanitization, done before recording by `oracle/sanitize-real.mjs` (a 2026-11-28 snapshot; its sources keep growing, so a rerun samples differently), keeps only structure:
