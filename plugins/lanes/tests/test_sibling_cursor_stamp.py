@@ -258,7 +258,8 @@ def test_stamping_keeps_a_same_process_read_snapshot(api, tmp_path):
     path = tmp_path / 'r.db'
     _wal_db(path).close()
     keep = sqlite3.connect(str(path), isolation_level=None)  # keeps -shm in WAL mode
-    b = sqlite3.connect('file:%s?mode=ro' % path, uri=True, isolation_level=None)
+    b = sqlite3.connect(str(path), isolation_level=None)
+    b.execute('PRAGMA query_only=1')
     try:
         b.execute('BEGIN')
         assert b.execute('SELECT count(*) FROM t').fetchone()[0] == 1
@@ -319,6 +320,50 @@ def test_shm_fds_are_reused_and_released_with_the_inode(api, tmp_path):
         assert _fds_on(shm) == base
     finally:
         c.close()
+
+
+def test_a_retained_fd_number_reused_elsewhere_is_never_closed(api, tmp_path):
+    # If the retained fd is closed by someone else and its number is reused by
+    # an unrelated unlinked file, the stamp must forget it, not close that fd.
+    path = tmp_path / 'y.db'
+    shm = str(path) + '-shm'
+    c = _wal_db(path)
+    try:
+        api._settled_stamp(str(path), now_ns=_LATER)
+        (fd,) = [e[2] for e in api._shm_fds[shm]]
+        os.close(fd)
+        other = tmp_path / 'foreign'
+        foreign = os.open(str(other), os.O_RDWR | os.O_CREAT)
+        if foreign != fd:
+            os.close(foreign)
+            pytest.skip('fd number not reused')
+        os.unlink(other)  # st_nlink == 0 on the foreign fd
+        try:
+            api._settled_stamp(str(path), now_ns=_LATER)
+            os.fstat(foreign)  # still open: raises if the stamp closed it
+            assert foreign not in [e[2] for e in api._shm_fds.get(shm, [])]
+        finally:
+            os.close(foreign)
+    finally:
+        c.close()
+
+
+def test_an_unlisted_boards_shm_fd_goes_once_unlinked_and_not_before(api, tmp_path):
+    # A board dropped from the listing keeps its fd while its -shm is linked
+    # (a connection here may lock it) and loses it once SQLite unlinks -shm.
+    path = tmp_path / 'z.db'
+    shm = str(path) + '-shm'
+    c = _wal_db(path)
+    api._settled_stamp(str(path), now_ns=_LATER)
+    try:
+        api._release_unlisted_shm(set())
+        assert shm in api._shm_fds and _fds_on(shm) == 2
+    finally:
+        c.close()
+    assert not os.path.exists(shm)
+    api._release_unlisted_shm(set())
+    assert shm not in api._shm_fds
+    assert _fds_on(shm) == 0
 
 
 def test_a_replaced_sibling_is_reread(board, api, monkeypatch):
