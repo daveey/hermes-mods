@@ -1713,7 +1713,9 @@ def _kill_pids(act: dict) -> list:
     if "pid" in act:
         return [act["pid"]]
     try:
-        res = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu=,rss=,etime=,args="], capture_output=True, text=True,
+        # Without wide output ps may hide a pkill -f match beyond the display
+        # width, incorrectly allowing a stop of a pinned owner's main process.
+        res = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu=,rss=,etime=,args=", "-ww"], capture_output=True, text=True,
                              timeout=5)
         table = libs()[0].parse_ps(res.stdout)
         rx = re.compile(act["pattern"])

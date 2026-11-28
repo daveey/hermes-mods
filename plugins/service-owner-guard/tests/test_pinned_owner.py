@@ -229,13 +229,17 @@ class PinnedOwner(Base):
         self.assertIsNone(self.verdict("kill -0 4242"))  # existence probe
 
     def test_pkill_matching_a_pinned_units_process_refused(self):
-        proc = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()', 'sleep 137.25'],
+        # ps must not truncate argv at the terminal width: the match can be
+        # beyond column 80, including in the scheduled publisher's environment.
+        proc = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()',
+                                 'fixture-padding-' + 'x' * 160, 'sleep 137.25'],
                                 stdin=subprocess.PIPE)
         self.addCleanup(proc.wait)
         self.addCleanup(proc.stdin.close)
         self._fake_proc(proc.pid, PINNED + ".service")
-        self.assertIn("pinned owner", self.verdict("pkill -f 'sleep 137.25'"))
-        self.assertIsNone(self.verdict("pkill -f 'sleep 999.75'"))
+        with mock.patch.dict(os.environ, {"COLUMNS": "80"}):
+            self.assertIn("pinned owner", self.verdict("pkill -f 'sleep 137.25'"))
+            self.assertIsNone(self.verdict("pkill -f 'sleep 999.75'"))
 
     def test_guard_off_switch_still_disables(self):
         with mock.patch.dict(os.environ, {"SERVICE_OWNER_GUARD": "off"}):
