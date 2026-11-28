@@ -98,6 +98,34 @@ def test_card_ask_does_not_reuse_explicit_chat_revision(tmp_path):
     assert store.requests(OWNER) == [revised]
 
 
+def test_card_ask_does_not_reuse_same_kind_revision(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    request = mirror.remote.request_for(OWNER, native_target())
+    replacement = dict(request, title='Agent-edited copy',
+                       choices=[dict(request['choices'][0], label='Something else')])
+    revised = store.revise(OWNER, request['requestId'], 1, replacement)
+    with pytest.raises(core.ActionError, match='undecided'):
+        mirror.remote.request_for(OWNER, native_target())
+    assert store.requests(OWNER) == [revised]
+
+
+def test_card_ask_refuses_generation_changed_between_membership_reads(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    reads = []
+    def cards(owner):
+        row = remote_row(hr)
+        row['card_answer_generation'] = ('a' if not reads else 'b') * 64
+        reads.append(True)
+        return [row]
+    mirror.remote.cards = cards
+    with pytest.raises(core.ActionError, match='undecided'):
+        mirror.remote.request_for(OWNER, native_target())
+    assert len(reads) == 2
+    assert len(store.requests(OWNER)) == 1
+    assert store.requests(OWNER)[0]['state'] == 'open'
+
+
 @pytest.mark.parametrize('field', ['ownerGateway', 'ownerProfile', 'board', 'task'])
 @pytest.mark.parametrize('value', ['', None, 12, '../other', 'with space'])
 def test_card_ask_identity_is_strict(tmp_path, field, value):
