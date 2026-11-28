@@ -181,6 +181,20 @@ test('same-id sessions only cover the ask on its linked gateway', () => {
   assert.deepEqual(P.uncoveredAsks(view, [b, a]), [])
 })
 
+test('worker-owned ask is covered only by its exact qualified card ref', () => {
+  const row = { id: 'ask', target: { gateway: 'worker', profile: 'work', board: 'bb' },
+    links: [{ chat_gateway: 'example', chat_profile: 'default', chat_session: 'chat' }] }
+  const view = { attention: { available: true, rows: [row] } }
+  const session = ref => ({ id: 'chat', outcome: outcome(), needs_you: [{ kind: 'card', ref }] })
+  assert.deepEqual(P.uncoveredAsks(view, [session('worker/work/bb/ask')]), [])
+  for (const ref of ['other/work/bb/ask', 'worker/default/bb/ask', 'worker/work/other/ask',
+    'worker/work/bb/other', 'bb/ask', '']) {
+    assert.deepEqual(P.uncoveredAsks(view, [session(ref)]), [row], ref)
+  }
+  const local = { ...row, target: { gateway: 'example', profile: 'default', board: 'bb' } }
+  assert.deepEqual(P.uncoveredAsks({ attention: { available: true, rows: [local] } }, [session('bb/ask')]), [])
+})
+
 test('muted and offline owners remain red fallbacks with explicit reasons', async () => {
   const row = { id: 'ask', key: 'default/ask', title: 'Choose route', links: [
     { chat_gateway: 'example', chat_profile: 'default', chat_session: 'chat' }] }

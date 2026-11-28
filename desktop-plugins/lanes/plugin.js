@@ -334,13 +334,25 @@ export function askCoverageReason(row, sessions, match = () => true) {
   return 'Chat not showing this ask in red'
 }
 
+// Remote refs carry the card owner, not the chat's gateway. Do not strip
+// prefixes: same-id cards on another gateway/profile must stay uncovered.
+export function isAskRef(row, session, ask) {
+  if (ask.kind !== 'card') return false
+  const target = row.target || {}
+  const local = `${target.board || 'default'}/${row.id}`
+  if (target.gateway && ask.ref === `${target.gateway}/${target.profile || 'default'}/${local}`) return true
+  const identity = session.outcome?.status?.identity
+  return ask.ref === local && (!target.gateway || (target.gateway === identity?.gateway &&
+    (target.profile || 'default') === identity?.profile))
+}
+
 export function uncoveredAsks(view, sessions, match = () => true) {
   if (!view?.attention?.available) return []
   // SDK rows precede plugin filters. Apply the very same registered matcher
   // before treating a chat as coverage; otherwise a lane-hidden ask disappears.
   return view.attention.rows.filter(row => sessions == null ? row.unlinked :
     !sessions.some(session => match(session) && isAskOwner(row, session) && hasRedAskCoverage(session) && (session.needs_you || []).some(ask =>
-      ask.kind === 'card' && ask.ref === `${row.target?.board || 'default'}/${row.id}`)))
+      isAskRef(row, session, ask))))
 }
 
 export function UnlinkedAsks({ ctx }) {
