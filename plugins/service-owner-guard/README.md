@@ -63,8 +63,16 @@ or argv establishes this boundary. Readable explicit owner tags/markers are
 preserved; a matched manager target is never excluded. Missing, changed, duplicate,
 failed or unsupported attestation retains the complete chain and strict refusal.
 All remaining service ancestors and every matched process retain strict environment
-and cwd/OWNER.md readers. Other platforms, cgroup layouts and remote lookups keep
-their existing behavior; this is not a general unreadable-ancestor exception.
+and cwd/OWNER.md readers. For SSH/cron/sudo/SSM chains without a user manager,
+an unreadable non-target ancestor is excluded only when stable kernel real/effective
+UID evidence places it outside the guard's UID, or its stable parent has real and
+effective UID 0. Readable owner tags/markers are preserved. Exclusion reconnects
+the chain to that ancestor's parent, so an owner above a skipped process still
+decides the verdict. Same-UID nondumpable ancestors without a privileged parent
+remain incomplete, even when renamed `systemd`. A user-manager candidate whose
+system-manager attestation is ambiguous is not downgraded to the UID fallback.
+Other platforms and remote lookups keep their existing behavior; this is not a
+general unreadable-ancestor exception.
 
 Every refusal, override and lookup failure goes to
 `~/.hermes/logs/service-owner-guard.log` (`SERVICE_OWNER_GUARD_LOG` overrides). `SERVICE_OWNER_GUARD=off` disables it.
