@@ -266,7 +266,9 @@ bounded in-process compatibility slot, held through actual completion with no
 executor queue. Retry backoff is 1/2/4/8/16/30 s;
 backoff does not reuse stale successful frames. Socket receive/heartbeat tasks remain
 independent of compute; writes have a 3 s timeout and a latest-only pending frame.
-An idle child stops after 30 s without viewers; EOF exits even during hung work.
+An idle child stops 90 s after both its last viewer left and its last job ended
+(`IDLE_CLOSE_S`, longer than the 60 s REST warm), so a viewerless warm keeps one
+child and its PR observer can finish a fill; EOF exits even during hung work.
 No service/unit or forced restart is added.
 
 Debug frames add `projector: {mode, projector_pid, source_current}`. Mode is

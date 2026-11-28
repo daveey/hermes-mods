@@ -11,6 +11,11 @@ import threading
 import time
 import uuid
 
+# Longer than DefaultWarm's 60 s interval, so a warm-only backend keeps one
+# child (with its PR observation cache and observer) instead of respawning it
+# cold every minute and cutting its background fill short.
+IDLE_CLOSE_S = 90.
+
 
 def sibling(name):
     import importlib.util
@@ -322,7 +327,12 @@ class Supervisor:
                 while not self.queue and not self.stopped:
                     if time.monotonic() - self.last_end >= self.api.MIN_PROJECT_GAP_S:
                         self.recent = None
-                    if self.process and not self.viewers and time.monotonic() - self.idle_since >= 30:
+                    # Idle counts from the later of the last viewer leaving and
+                    # the last job ending: the REST warm runs viewerless jobs,
+                    # and the child's PR observer finishes its fill after the
+                    # reply. Closing on a stale idle_since killed that fill.
+                    if (self.process and not self.viewers and time.monotonic()
+                            - max(self.idle_since, self.last_end) >= IDLE_CLOSE_S):
                         self.process.close()
                         self.process = None
                     self.cv.wait(1)
