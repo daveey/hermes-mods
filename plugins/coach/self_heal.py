@@ -3920,7 +3920,8 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
 
     Key `selfheal-backlog:<board>:<day>` (`:<n>` when closed by hand). A new day's card is created, scheduled
     clock-only to next 00:00Z + 48 h (the dead-man horizon), and only then is the previous day's card archived.
-    Every drain edits the body once. Called under the drain lock.
+    Every drain edits the body once. Cache loss adopts an open same-area/day report, including lane-held
+    triage; its admission hold and any existing clock schedule are preserved. Called under the drain lock.
     """
     state = _json_state(store, BACKLOG_REPORT_STATE)
     slot = state.get(board) or {}
@@ -3943,6 +3944,17 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
                 gen, tid = gen + 1, None
         elif slot.get("card"):
             prev, gen = slot["card"], 1  # yesterday's card: archived only after today's is scheduled
+        report_key = f"{BACKLOG_KEY}{board}:{day}"
+        owner = open_owner(board, board, key_prefix=report_key)
+        if not tid and owner:
+            tid = owner["id"]
+            rc, out, err = _run(_kanban_board_argv(board) + ["comment", tid,
+                "Self-heal: refreshed occurrence of this area's backlog report; no new card filed."], runner)
+            if rc:
+                raise RuntimeError("report occurrence comment failed: " + (err or out)[-300:])
+            state[board] = {"card": tid, "gen": gen, "day": day,
+                            "scheduled": owner["status"] == "scheduled", "prev": prev}
+            _save_json_state(store, BACKLOG_REPORT_STATE, state)
         if not tid:
             for _ in range(3):
                 key = f"{BACKLOG_KEY}{board}:{day}" + (f":{gen}" if gen > 1 else "")
@@ -3966,7 +3978,7 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
         rc, out, err = _run(_kanban_board_argv(board) + ["edit", tid, "--body", body], runner)
         if rc:
             raise RuntimeError("report edit failed: " + (err or out)[-300:])
-        if not slot.get("scheduled"):
+        if not slot.get("scheduled") and not (owner and owner["id"] == tid and owner["status"] != "ready"):
             rc, out, err = _run(_kanban_board_argv(board) + ["schedule", tid,
                 f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only",
                 "--awaiting", "clock:", "--awaiting-why",
@@ -3975,7 +3987,7 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
                 raise RuntimeError("report schedule failed: " + (err or out)[-300:])
             slot["scheduled"] = True
             _save_json_state(store, BACKLOG_REPORT_STATE, state)
-        if slot.get("prev"):
+        if slot.get("prev") and slot.get("scheduled"):
             rc, out, err = _run(_kanban_board_argv(board) + ["archive", slot["prev"]], runner)
             if rc:
                 raise RuntimeError("previous report archive failed: " + (err or out)[-300:])
@@ -4387,7 +4399,7 @@ def decide(d: dict, st: dict, now: float, cfg: Optional[dict] = None) -> dict:
     if (st.get("snooze_until") or 0) > now:
         return {"action": "skip", "why": f"snoozed until {_iso(st['snooze_until'])} (Not now)"}
     # Its card ended without a fix (stale) or the fix was declined/reverted: a new card, the same UTC day too.
-    refile_closed = bool(d.get("every_occurrence")) and status in ("stale", "declined", "reverted")
+    refile_closed = status == "stale" or (bool(d.get("every_occurrence")) and status in ("declined", "reverted"))
     if st.get("filed_day") == _utc_day(now) and status != "fixed" and not refile_closed:  # post-fix: not a duplicate
         return {"action": "skip", "why": "already filed today (<= 1 per fingerprint per UTC day)"}
     if status in ("filed", "proposed", "approved"):
@@ -5793,7 +5805,7 @@ def board_db_path(board: Optional[str], home: Optional[Path] = None) -> Optional
 
 def _owner_key_match(key: str, fp: str) -> bool:
     base = f"selfheal:{fp}"
-    return key == base or key.startswith(base + ":")
+    return key == base or key.startswith(base + ":") or key.startswith(f"{BACKLOG_KEY}{fp}:")
 
 
 _DEPLOY_KIND_RE = re.compile(r"^selfheal:[^:]+:(backport|undeployed):")
@@ -5801,11 +5813,13 @@ DEDUP_MAX_PER_DAY = 12  # occurrence comments per owner per UTC day; more only l
 DEDUP_STATE = "selfheal-dedup.json"  # <coach>/: {fp: {owner, at, day, n, sessions}}; never the lane (unfiled fps)
 
 
-def open_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] = None) -> Optional[dict]:
+def open_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] = None,
+               *, key_prefix: Optional[str] = None) -> Optional[dict]:
     """The OPEN card (status not done/archived) on the target board that owns ``fp``: idempotency key `selfheal:<fp>`
-    with any suffix (`:r2`, `:fix`, `:verify`), or a body carrying the line `fingerprint: <fp>`. Oldest first.
+    with any suffix (`:r2`, `:fix`, `:verify`), a backlog key for that fingerprint, or a body carrying the line
+    `fingerprint: <fp>`. Oldest first. ``key_prefix`` restricts this to an area's standing report key.
     -> {id, status, key, title, via: key|body} | None. A board without a DB has no owner; an unreadable one raises
-    sqlite3.Error (the caller logs it and files normally: the daily cap still bounds that)."""
+    an exception (the caller persists the occurrence for retry rather than risking a duplicate)."""
     path = board_db_path(board, home)
     if path is None or not path.exists():
         return None
@@ -5813,14 +5827,20 @@ def open_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] =
     try:
         cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
         if "idempotency_key" not in cols:
-            return None
+            raise ValueError("tasks schema cannot establish self-heal ownership")
         body = "body" in cols
         base = f"selfheal:{fp}"
         where = "idempotency_key = ? OR substr(idempotency_key, 1, ?) = ?"
         params: list = [base, len(base) + 1, base + ":"]
+        backlog = f"{BACKLOG_KEY}{fp}:"
+        where += " OR substr(idempotency_key, 1, ?) = ?"
+        params.extend([len(backlog), backlog])
         if body:
             where += " OR instr(body, ?) > 0"
             params.append(fp_line(fp))
+        if key_prefix is not None:  # standing area/day reports use the same open-owner lookup
+            where = "idempotency_key = ? OR substr(idempotency_key, 1, ?) = ?"
+            params = [key_prefix, len(key_prefix) + 1, key_prefix + ":"]
         order = "created_at, id" if "created_at" in cols else "id"
         rows = con.execute(f"SELECT id, status, idempotency_key, title, {'body' if body else 'NULL'} FROM tasks "
                            f"WHERE status NOT IN ('done', 'archived') AND ({where}) ORDER BY {order}",
@@ -5833,7 +5853,8 @@ def open_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] =
             continue
         if _DEPLOY_KIND_RE.search(str(key or "")):
             continue  # a backport/deploy check owns one host's missing fix, not the defect: a recurrence must file
-        via = "key" if _owner_key_match(str(key or ""), fp) else "body" if line.search(text or "") else None
+        via = ("key" if key_prefix is not None or _owner_key_match(str(key or ""), fp)
+               else "body" if line.search(text or "") else None)
         if via:
             return {"id": tid, "status": status, "key": key, "title": title, "via": via}
     return None
@@ -6152,9 +6173,11 @@ def _dedupe_open_owner(d: dict, fp: str, board: Optional[str], store, runner, no
             owner = (next((o for o in (open_owner(x, board, exclude=exclude) for x in ids) if o), None)
                      or (canonical_owner(d["canon_fingerprint"], board, exclude=exclude)
                          if d.get("canon_fingerprint") else None))
-        except Exception as exc:  # health: allow BLE001 -- a failed lookup must not stop filing; the daily cap holds
+        except Exception as exc:  # health: allow BLE001 -- preserve evidence until ownership is readable
             store.log({"event": "selfheal_dedup_error", "fingerprint": fp, "board": board, "error": str(exc)[:200]})
-            return None
+            return _defer_investigation(d, {"action": "deferred", "why": "open owner lookup unreadable",
+                                           "retry_at": _iso(now + MISSING_BOARD_RETRY_S),
+                                           "board": board, "stop_pass": False}, store)
     if not owner:
         return None
     memo_all = _json_state(store, DEDUP_STATE)
@@ -6191,6 +6214,11 @@ def _dedupe_open_owner(d: dict, fp: str, board: Optional[str], store, runner, no
         _save_json_state(store, DEDUP_STATE, memo_all)
     store.log({"event": "selfheal_dedup_commented", **rec, "ok": rc == 0,
                **({"error": (err or out).strip()[-200:]} if rc else {})})
+    if rc:
+        return _defer_investigation(d, {**res, "action": "deferred", "commented": False,
+                                       "why": "open owner occurrence comment failed",
+                                       "retry_at": _iso(now + MISSING_BOARD_RETRY_S),
+                                       "board": board, "stop_pass": False}, store)
     return {**res, "commented": rc == 0}
 
 
@@ -6444,14 +6472,14 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
             return adopted
     if st.get("status") == "fixed" and "fix_shas" not in st:  # fixed before fix_shas was stored: its note has them
         st = lane.update(fp, fix_shas=_logged_fix_shas(store, fp))
-    if d.get("every_occurrence") and m == "live" and hub and st.get("status") == "filed":
+    if m == "live" and hub and st.get("status") == "filed":
         # Each occurrence comments on the open card; once that card is done/archived it opens a fresh one. Read the
         # investigation card now instead of waiting for the 5-minute sync, so an occurrence never comments on a closed
         # card. `filed` only: an approved owner's receipt recovery takes the admission lock this pass already holds.
         try:
             if _reconcile_fp(lane, store, fp, st, runner, now, via="occurrence"):
                 st = lane.get(fp)
-        except Exception as exc:  # health: allow BLE001 -- advisory; sync's reconcile still runs every 5 minutes
+        except Exception as exc:  # health: allow BLE001 -- ownership dedupe below retains unreadable evidence
             store.log({"event": "selfheal_file_error", "fingerprint": fp, "error": f"occurrence reconcile: {exc}"[:300]})
     dec = decide(d, st, now, cfg)
     if dec["action"] == "stale_runtime":
@@ -6466,13 +6494,14 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                    "component": d.get("component"), "previous": st.get("fix_card"), "why": dec["why"]})
         return {"action": "skip", "why": dec["why"], "held": len(held)}
     if dec["action"] == "skip":
-        if (cfg.get("backlog_ranked", False) and m == "live" and hub
+        if (m == "live" and hub
                 and not st.get("suppressed") and (st.get("snooze_until") or 0) <= now
                 and st.get("status") in ("filed", "approved", "proposed")):
             # In particular, a CAS survivor from the create pass reaches here on
             # the next drain. Save it before skip can remove it from pending, and
             # use the existing owner/session/day comment limiter.
-            lane.retain_backlog(fp, d)
+            if cfg.get("backlog_ranked", False):
+                lane.retain_backlog(fp, d)
             commented = _dedupe_open_owner(d, fp, st.get("board"), store, runner, now)
             if commented:
                 return commented

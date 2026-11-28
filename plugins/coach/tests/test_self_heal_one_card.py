@@ -306,6 +306,91 @@ def test_done_or_archived_owner_does_not_dedupe(env, status):
     assert events(env.store, "selfheal_dedup_commented") == []
 
 
+@pytest.mark.parametrize("status", ["ready", "running", "blocked", "triage"])
+def test_tracked_repeat_folds_even_without_ranked_backlog(env, status):
+    d = defect()
+    card = file(env, d)["card"]
+    con = sqlite3.connect(env.board.db)
+    try:
+        with con:
+            con.execute("ALTER TABLE tasks ADD COLUMN block_kind TEXT")
+            con.execute("UPDATE tasks SET status=?, block_kind=? WHERE id=?",
+                        (status, "lane_gate" if status == "triage" else None, card))
+    finally:
+        con.close()
+    out = file(env, {**d, "session_id": "20261113_160000_aaaaaa"}, now=NOW + 60)
+    assert out.get("dedup") and out["card"] == card
+    assert len(env.board.creates()) == 1
+    assert env.board.comments[-1][0] == card
+
+
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_tracked_closed_owner_refiles_same_day(env, status, monkeypatch):
+    d = defect()
+    card = file(env, d)["card"]
+    con = sqlite3.connect(env.board.db)
+    try:
+        with con:
+            con.execute("UPDATE tasks SET status=? WHERE id=?", (status, card))
+    finally:
+        con.close()
+    monkeypatch.setattr(sh, "_lane_owner_lookup", lambda *a, **kw: status)
+    out = file(env, d, now=NOW + 60)
+    assert out["action"] == "filed" and out["card"] != card
+    assert len(env.board.rows()) == 2 and env.board.comments == []
+
+
+def test_backlog_fingerprint_owner_folds_held_repeat(env):
+    d = defect()
+    env.board.add("t_backlog", key=f"selfheal-backlog:{d['fingerprint']}:2026-11-12", status="triage")
+    out = file(env, d)
+    assert out.get("dedup") and out["card"] == "t_backlog"
+    assert env.board.creates() == [] and env.board.comments[-1][0] == "t_backlog"
+
+
+def test_owner_read_failure_defers_instead_of_creating(env, monkeypatch):
+    d = defect()
+    def broken(*a, **kw):
+        raise sqlite3.OperationalError("owner read unavailable")
+    monkeypatch.setattr(sh, "open_owner", broken)
+    out = file(env, d)
+    assert out["action"] == "deferred"
+    assert env.board.creates() == []
+    assert events(env.store, "selfheal_dedup_error")
+    assert (Path(env.store.root) / "selfheal_pending.sqlite").exists()
+
+
+def test_incomplete_owner_schema_defers_instead_of_creating(env):
+    con = sqlite3.connect(env.board.db)
+    try:
+        with con:
+            con.execute("ALTER TABLE tasks DROP COLUMN idempotency_key")
+    finally:
+        con.close()
+    out = file(env, defect())
+    assert out["action"] == "deferred" and env.board.creates() == []
+
+
+def test_failed_owner_comment_retains_occurrence_for_retry(env):
+    d = defect()
+    env.board.add("t_owner001", key=f"selfheal:{d['fingerprint']}", status="triage")
+    def fail_comment(argv, **kwargs):
+        if "comment" in argv:
+            return SimpleNamespace(returncode=1, stdout="", stderr="transport unavailable")
+        return env.board(argv, **kwargs)
+    out = sh.file_defect(d, store=env.store, m="live", runner=fail_comment, now=NOW, cfg=HUB, budget_fn=OPEN)
+    assert out["action"] == "deferred" and env.board.creates() == []
+    assert (Path(env.store.root) / "selfheal_pending.sqlite").exists()
+    assert file(env, d, now=NOW + 60)["commented"] is True
+
+
+def test_distinct_fingerprints_keep_separate_owners(env):
+    a, b = defect(), defect("settings button does not respond")
+    assert a["fingerprint"] != b["fingerprint"]
+    assert file(env, a)["card"] != file(env, b)["card"]
+    assert len(env.board.creates()) == 2
+
+
 def test_repeat_occurrence_comments_once_per_session_and_hour(env):
     d = defect()
     fp = d["fingerprint"]
