@@ -52325,7 +52325,8 @@ function finalDirective(tree) {
 function scan(reply) {
   if (typeof reply !== "string" || reply.length > 2e5 || reply.includes("\uE000") || reply.includes("\uE001")) return null;
   const text11 = preprocessMarkdown(reply);
-  if (preprocessWithTailRepair(reply) !== text11) return null;
+  const repaired = preprocessWithTailRepair(reply);
+  if (repaired !== text11 && repaired !== text11.replace(/[ \t\r\n]+$/, "")) return null;
   const tree = parse5(text11), whole = finalDirective(tree);
   if (!whole) return null;
   const { d: d2, node: node2, last } = whole, blocks = tree.children;

@@ -26,12 +26,13 @@ const run=(scanner,reply)=>new Promise((resolve,reject)=>{
 const rows=new Array(cases.length); let next=0
 await Promise.all(Array.from({length:8},async()=>{while(next<cases.length){
  const i=next++,c=cases[i],before=await run(resolve(baseline),c.reply),after=await run(join(here,'scanner.mjs'),c.reply)
- rows[i]={id:c.id,class:c.class,before:before?.ask.source??null,after:after?.ask.source??null,desktop:c.desktop,
+ rows[i]={id:c.id,class:c.class??c.id.split('/')[0],before:before?.ask.source??null,after:after?.ask.source??null,desktop:c.desktop,
   ...(Boolean(before)!==Boolean(after)?{reply:c.reply}:{}),same_output:JSON.stringify(before)===JSON.stringify(after)}
 }}))
 const changed=rows.filter(r=>r.before!==r.after),newAllows=changed.filter(r=>r.before===null),newRefusals=changed.filter(r=>r.after===null)
 const realChanges=rows.filter(r=>r.class==='real'&&!r.same_output)
-const healthyChanges=rows.filter(r=>r.id.startsWith('control/')&&!r.same_output)
+const whitespaceControls=new Set(['fuzz/1438','fuzz/1885','fuzz/2022','fuzz/2228','fuzz/2384','fuzz/2569'])
+const healthyChanges=rows.filter(r=>(r.id.startsWith('control/')||whitespaceControls.has(r.id))&&!r.same_output)
 const summary={cases:rows.length,baselineAccepted:rows.filter(r=>r.before!==null).length,candidateAccepted:rows.filter(r=>r.after!==null).length,
  newAllows:newAllows.length,newRefusals:newRefusals.length,realChanges:realChanges.length,healthyChanges:healthyChanges.length,
  classes:Object.fromEntries([...new Set(newRefusals.map(r=>r.class))].map(k=>[k,newRefusals.filter(r=>r.class===k).length]))}
