@@ -238,8 +238,17 @@ def test_header_and_pip_go_light_blue_only_when_every_wait_is_delivery():
 
 def test_deploy_wait_hides_hashes():
     r = waiting('deploy hermes-hub scheduled hub-core-update / mods-pull for core106bf5b0abcdef12…and mods10902a1a99aa…')
-    assert r['detail'] == 'waiting on hub deploy · 2m on remote'
+    assert r['detail'] == 'waiting on hub deploy · hermes-hub scheduled hub-core-update / mods-pull · 2m on remote'
     assert any('106bf5b0' in d for d in r['details'])
+
+
+def test_deploy_wait_names_the_pr_it_waits_on():
+    # A bare "waiting on deploy" never said which deploy; a PR ref shows its repo and number, not the URL.
+    r = waiting('deploy https://github.com/softmax-universe/babybear/pull/751')
+    assert r['detail'] == 'waiting on deploy · babybear PR #751 · 2m on remote'
+    assert r['wait_kind'] == 'deploy'
+    assert 'Waiting on: deploy https://github.com/softmax-universe/babybear/pull/751' in r['details']
+    assert any(a.get('url') == 'https://github.com/softmax-universe/babybear/pull/751' for a in r['actions'])
 
 
 def test_generic_wait_drops_urls_and_hashes_and_stays_short():

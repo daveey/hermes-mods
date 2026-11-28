@@ -422,6 +422,27 @@ def _pr_number(row, urls, on):
     return found.pop() if len(found) == 1 else ''
 
 
+def _deploy_target(row, urls, on):
+    """` · <repo> PR #N` for a deploy wait on a PR, else ` · <the producer's named target>`, else ''.
+
+    Hashes and URLs never inline (they stay in the Details `Waiting on:` line); the target is clipped short.
+    """
+    for blob in (*urls, text(row.get('pr_url'))):
+        m = re.search(r'github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)', blob)
+        if m:
+            return f' · {m[1]} PR #{m[2]}'
+    pr = _pr_number(row, urls, on)
+    if pr:
+        return f' · PR #{pr}'
+    body = flat(_HASHY.sub('', _URL.sub('', re.sub(r'^deploy\b', '', on, flags=re.I))))
+    body = re.sub(r'\s{2,}', ' ', body.replace('…', ' ')).strip(' ·:;,')
+    while (shorter := re.sub(r'\s+(?:for|and|/|·)$', '', body).strip(' ·:;,')) != body:
+        body = shorter  # a removed hash leaves its connective dangling
+    if len(body) > WAIT_MAX:
+        body = body[:WAIT_MAX - 1].rstrip() + '…'
+    return f' · {body}' if body else ''
+
+
 def wait_info(row, now, *, wire=False):
     """What a parked card waits on, as one short human phrase.
 
@@ -475,7 +496,8 @@ def wait_info(row, now, *, wire=False):
         pr = _pr_number(row, urls, on)
         phrase = 'waiting on CI' + (f' · PR #{pr}' if pr else '')
     elif head:
-        phrase = 'waiting on hub deploy' if re.search(r'\bhub\b', on, re.I) else 'waiting on deploy'
+        # Name what is being deployed: "waiting on deploy" alone does not say which PR or service it is.
+        phrase = ('waiting on hub deploy' if re.search(r'\bhub\b', on, re.I) else 'waiting on deploy') + _deploy_target(row, urls, on)
     elif primary := re.match(r'(?:producer\s+)?card\s+(t_[0-9a-f]+)\b', on, re.I):
         phrase = 'waiting on an update' if primary[1] == row.get('id') else 'waiting on parent card'
     elif re.search(r'\bt_[0-9a-f]+\b|\blocal:|\bPID\s*\d+|\S+\.service\b', on, re.I):
