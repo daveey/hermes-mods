@@ -82,7 +82,10 @@ function Detail({ ctx, row, range }) {
   return h('section', { className: 'lat-detail', id: `lat-detail-${row.id}`, 'data-testid': 'metric-detail' },
     row.n ? h(History, { row, range }) : h('p', { className: 'lat-muted' }, 'not measured yet'),
     h('div', { className: 'lat-legend' }, h('span', { style: { color: 'var(--lat-cyan)' } }, '— p90'), h('span', null, '— p50'), h('span', null, '-- target'), h('span', null, `n=${row.n}`)),
-    stages.length > 0 && h('div', null, h('div', { className: 'lat-stages', 'aria-label': 'Stage split' }, stages.map((s, i) => h('span', { key: s.name, title: `${s.name}: ${duration(s.dur_ms)}`, style: { flexGrow: s.dur_ms, background: 'var(--lat-cyan)', opacity: .35 + .6 * (i + 1) / stages.length } }))), h('div', { className: 'lat-legend' }, stages.map(s => h('span', { key: s.name }, `${s.name} ${duration(s.dur_ms)}`)))),
+    stages.length > 0 && h('div', null,
+      row.turn_trace && h('p', { className: 'lat-muted' }, row.turn_trace.trace_id ? `Latest traced turn · ${duration(row.turn_trace.end_to_end_ms)} end to end` : 'Turn stages not measured yet'),
+      h('div', { className: 'lat-stages', 'aria-label': 'Stage split' }, stages.map((s, i) => h('span', { key: s.name, 'data-measured': s.dur_ms != null, title: `${s.name}: ${s.dur_ms == null ? 'unmeasured' : duration(s.dur_ms)}`, style: { flexGrow: s.dur_ms == null ? 0 : s.dur_ms, flexBasis: s.dur_ms == null ? '8px' : 0, background: s.dur_ms == null ? 'var(--lat-line)' : 'var(--lat-cyan)', opacity: .35 + .6 * (i + 1) / stages.length } }))),
+      h('div', { className: 'lat-legend' }, stages.map(s => h('span', { key: s.name }, `${s.name} ${s.dur_ms == null ? 'unmeasured' : duration(s.dur_ms)}`)))),
     row.slowest?.length > 0 && h('div', null, h('p', { className: 'lat-muted', style: { margin: '8px 0 3px', fontSize: 11 } }, 'Slowest in this range'), row.slowest.map(s => h('div', { className: 'lat-slow', key: s.id }, h('span', { className: 'lat-value', style: { width: 52, flex: 'none' } }, duration(s.dur_ms)), h('button', { onClick: () => Promise.resolve(openSample(ctx, s)).catch(() => setError('Sample owner route is not available')) }, s.attrs?.session || s.attrs?.card || (s.attrs?.pr ? `PR #${s.attrs.pr}` : s.id)), h('time', { dateTime: new Date(s.start * 1000).toISOString() }, new Date(s.start * 1000).toLocaleString())))),
     error && h('p', { role: 'alert', className: 'lat-muted' }, error))
 }
@@ -112,6 +115,18 @@ export function makeSpan(event, crypto = globalThis.crypto) {
   return result
 }
 
+// The core emits this only after the first matching assistant prose painted.
+// Preserve its pre-send root identity; never manufacture a replacement trace.
+export function makeTurnSpans(event, crypto = globalThis.crypto) {
+  if (event?.name !== 'turn.send' || !/^[a-f0-9]{32}$/.test(event.trace_id || '') || /^0+$/.test(event.trace_id) || !/^[a-f0-9]{16}$/.test(event.root_span_id || '') || /^0+$/.test(event.root_span_id)) return []
+  const span = makeSpan({ ...event, name: 'ui.session_switch' }, crypto)
+  if (!span) return []
+  const root = { ...span, name: 'turn.send', span_id: event.root_span_id }
+  delete root.parent_span_id
+  const painted = { ...span, name: 'turn.painted', parent_span_id: root.span_id, start_time_unix_nano: root.end_time_unix_nano }
+  return [root, painted]
+}
+
 export function hubConnection(gateways = host.state.gateways.get()) {
   const list = Array.isArray(gateways) ? gateways : []
   return list.find(g => g.id === 'hermes-hub')?.id || list.find(g => g.kind !== 'local' && /\bhub\b/i.test(`${g.id} ${g.label || ''}`))?.id || null
@@ -134,7 +149,7 @@ export function spanQueue(ctx, now = Date.now) {
     const batch = queue.slice(0, 100)
     try { await hubRest(ctx, '/v1/spans', { method: 'POST', body: { spans: batch } }); queue = queue.filter(s => !batch.includes(s)); fresh() } catch { /* keep identifiers only, for at most 1h */ } finally { sending = false }
   }
-  return { add(event) { const span = makeSpan(event); if (span) { queue.push(span); fresh() } }, flush, dispose() { disposed = true }, size() { fresh(); return queue.length } }
+  return { add(event) { const spans = event?.name === 'turn.send' ? makeTurnSpans(event) : [makeSpan(event)].filter(Boolean); if (spans.length) { queue.push(...spans); fresh() } }, flush, dispose() { disposed = true }, size() { fresh(); return queue.length } }
 }
 
 function useLedger(ctx, range) {
@@ -187,10 +202,11 @@ export default {
     ctx.register({ id: 'show', area: PALETTE_AREA, data: { title: 'Show Latency', onSelect: () => window.dispatchEvent(new CustomEvent(SHOW)) } })
     const queue = spanQueue(ctx)
     const off = host.onEvent('desktop.ui_latency', event => queue.add(event.payload))
+    const offTurn = host.onEvent('desktop.turn_latency', event => queue.add(event.payload))
     const timer = setInterval(queue.flush, 5000)
     const online = () => queue.flush()
     window.addEventListener('online', online)
     queue.flush()
-    ctx.onDispose(() => { off?.(); clearInterval(timer); queue.dispose(); style.remove(); window.removeEventListener('online', online) })
+    ctx.onDispose(() => { off?.(); offTurn?.(); clearInterval(timer); queue.dispose(); style.remove(); window.removeEventListener('online', online) })
   }
 }

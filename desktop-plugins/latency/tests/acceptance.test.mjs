@@ -9,7 +9,7 @@ const root = fileURLToPath(new URL('.', import.meta.url))
 const spark = Array.from({ length: 8 }, (_, i) => ({ day: `2026-11-${20+i}`, p50: 100+i*10, p90: 300+i*10, n: 10 }))
 function fixture(range = '7d') {
   const rows = [
-    { id: 'turn_first', label: 'Turn: first reply', group: 'Using Hermes', n: 80, p50: 140, p90: 340, target_p90: 100, status: 'bad', spark, series: spark, hours: [], slowest: [{ id: 'slow-1', start: 1795800000, dur_ms: 400, attrs: { session: 'session-1' }, link: { kind: 'session', id: 'session-1', gateway: 'hermes-hub', profile: 'default' } }], stages: [{ name: 'queue', dur_ms: 40 }, { name: 'model', dur_ms: 300 }] },
+    { id: 'turn_first', label: 'Turn: first reply', group: 'Using Hermes', n: 80, p50: 140, p90: 340, target_p90: 100, status: 'bad', spark, series: spark, hours: [], slowest: [{ id: 'slow-1', start: 1795800000, dur_ms: 400, attrs: { session: 'session-1' }, link: { kind: 'session', id: 'session-1', gateway: 'hermes-hub', profile: 'default' } }], turn_trace: { trace_id: 'a'.repeat(32), end_to_end_ms: 340 }, stages: [{ name: 'Send → hub', dur_ms: 20 }, { name: 'Hub → admitted', dur_ms: null }, { name: 'Admitted → first token', dur_ms: 300 }, { name: 'First token → painted', dur_ms: 20 }] },
     { id: 'ui.session_switch', label: 'Switch session', group: 'Using Hermes', n: 0, p50: null, p90: null, target_p90: 250, status: 'none', spark: [], series: [], hours: [], slowest: [] },
     { id: 'card_queue', label: 'Card waits for worker', group: 'Cards & workers', n: 3, p50: 100, p90: 200, target_p90: 300, status: 'ok', spark: [{ p50: 0, p90: 0 }], series: [{ day: '2026-11-27', p50: 0, p90: 0 }], slowest: [] },
     { id: 'ci_core', label: 'Core CI', group: 'Ship', n: 3, p50: 100, p90: 400, target_p90: 300, status: 'warn', spark, series: spark, slowest: [] }
@@ -72,6 +72,31 @@ test('Ledger browser acceptance and Desktop span batching', { timeout: 90000 }, 
     assert.equal(await row.getAttribute('aria-expanded'), 'true')
     assert.equal(await page.getByTestId('target-line').count(), 1)
     assert.equal(await page.getByLabel('Stage split').count(), 1)
+    assert.equal(await page.locator('.lat-stages [data-measured="true"]').count(), 3)
+    assert.equal(await page.locator('.lat-stages [data-measured="false"]').count(), 1)
+    assert.equal(await page.locator('.lat-stages [data-measured="false"]').getAttribute('title'), 'Hub → admitted: unmeasured')
+    assert.match(await page.getByTestId('metric-detail').innerText(), /Latest traced turn · 340ms end to end/)
+    assert.match(await page.locator('.lat-legend').filter({ hasText: 'Hub → admitted' }).innerText(), /Hub → admitted unmeasured/)
+    const turn = await page.evaluate(() => {
+      const event = { name: 'turn.send', trace_id: 'a'.repeat(32), root_span_id: 'b'.repeat(16), parent_span_id: 'c'.repeat(16), start_ms: Date.now(), duration_ms: 123.5, body: 'PRIVATE', query: 'PRIVATE' }
+      return { spans: window.latency.makeTurnSpans(event), zeroTrace: window.latency.makeTurnSpans({ ...event, trace_id: '0'.repeat(32) }), zeroRoot: window.latency.makeTurnSpans({ ...event, root_span_id: '0'.repeat(16) }) }
+    })
+    assert.equal(turn.spans.length, 2)
+    const [rootSpan, painted] = turn.spans
+    assert.equal(rootSpan.name, 'turn.send')
+    assert.equal(painted.name, 'turn.painted')
+    assert.equal(rootSpan.trace_id, 'a'.repeat(32))
+    assert.equal(painted.trace_id, rootSpan.trace_id)
+    assert.equal(rootSpan.span_id, 'b'.repeat(16))
+    assert.equal(rootSpan.parent_span_id, undefined)
+    assert.equal(painted.parent_span_id, rootSpan.span_id)
+    assert.notEqual(painted.span_id, rootSpan.span_id)
+    assert.equal(painted.start_time_unix_nano, rootSpan.end_time_unix_nano)
+    assert.equal(painted.end_time_unix_nano, rootSpan.end_time_unix_nano)
+    assert.equal(BigInt(rootSpan.end_time_unix_nano)-BigInt(rootSpan.start_time_unix_nano), 123500000n)
+    assert.deepEqual(turn.zeroTrace, [])
+    assert.deepEqual(turn.zeroRoot, [])
+    assert(!JSON.stringify(turn).includes('PRIVATE'))
     await page.getByRole('button', { name: 'session-1', exact: true }).click()
     assert.deepEqual(await page.evaluate(() => window.opened[0]), ['session-1', { route: { connectionId: 'hermes-hub', mode: 'remote', profile: 'default', targetProfile: 'default' } }])
     const empty = page.locator('[data-metric="ui.session_switch"]')
