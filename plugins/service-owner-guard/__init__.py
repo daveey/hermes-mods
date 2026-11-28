@@ -1521,14 +1521,18 @@ def _ownership_table(table: dict, pids: list) -> dict:
     for pid in ancestors:
         if table[pid]["ppid"] != 1:
             continue
+        # A failed identity/cgroup read is unresolved evidence, not proof of
+        # an ordinary privileged child. Retain candidate custody until a
+        # complete kernel observation positively rules out the manager shape.
+        manager_candidates.add(pid)
         try:
             before = _manager_identity(pid)
             birth, ppid, uid, cgroup = before
             unit = f"user@{uid}.service"
             group = f"/user.slice/user-{uid}.slice/{unit}"
             if ppid != 1 or cgroup != f"0::{group}/init.scope":
+                manager_candidates.discard(pid)
                 continue
-            manager_candidates.add(pid)
             res = subprocess.run(
                 ["/usr/bin/systemctl", "--system", "show", unit,
                  "--property=MainPID,Id,User,ControlGroup"],
