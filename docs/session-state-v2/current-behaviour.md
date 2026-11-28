@@ -20,11 +20,22 @@ against committed expectations, never recompute expectations from another classi
 ## Executed boundaries
 
 * Core: `tests/hermes_state/session_state_v2_fixtures.py` runs the real local card selectors,
-  wait/detail hydration, card activity projection, `refresh_outcome` → `canonical_status` →
+  wait/detail hydration, `project_kanban_activity`, `refresh_outcome` → `canonical_status` →
   `reduce_status`, and persisted outcome readback. Block→unblock→reblock refreshes each episode.
   It substitutes source inventories and ambient identity, not status/ask/wait/triage classifiers.
   Process evidence deliberately lacks a host-qualified run identity; this is **unknown**, not a
   claimed live-process proof. Running-card lifecycle without executor observations is kept as such.
+* **Card-activity limitation:** the fixture does *not* drive the production board-read glue. Its
+  `_card_projection` reads a hand-made three-table board (not a `kanban_db` schema) and assembles
+  the `project_kanban_activity` count parts itself: real `_counts_on`/`_parked_on`/`_replica_bucket`,
+  `annotate`/`marker` and timer markers, but its own local bucket choice and key set instead of
+  `_read_board` → `_identity.local_keys`, and **empty execution evidence by construction** (no
+  `_collect_execution_evidence`/`assemble`). Card-activity goldens therefore pin the projection, not
+  board-to-parts reading; lanes and repair below do use real `kanban_db` boards.
+* Home isolation: both spawned producers (Desktop's `session-state-v2-producer.ts` and the mods
+  `session-state-v2.test.mjs`) run outside pytest's home fixture, so each spawner passes a fresh
+  temporary `HOME`/`HERMES_HOME` and each CLI entry binds its own disposable home before importing
+  core. A sentinel-home regression asserts that the spawned CLI writes nothing to either.
 * Desktop: `apps/desktop/src/test/session-state-v2-golden.test.tsx` consumes the real Python output,
   executes the dot store, stripe selector, rendered `SessionTabAccent`, native `turnDone` dispatch,
   browser attention/title flashing, and `fetchBlockedTasks` → grouping → rendered Blocked section.

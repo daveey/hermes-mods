@@ -124,6 +124,11 @@ def run_all():
 
 
 if __name__ == '__main__':
-    with contextlib.redirect_stdout(sys.stderr):
-        result = run_all()
+    # Spawned outside pytest's home isolation, and core imports materialize profile
+    # state: bind a disposable HOME/HERMES_HOME before run_all() imports core.
+    with tempfile.TemporaryDirectory(prefix='panel-session-v2-home-', dir=os.environ.get('TMPDIR')) as isolated:
+        os.environ['HOME'] = isolated
+        os.environ['HERMES_HOME'] = str(Path(isolated) / '.hermes')
+        with contextlib.redirect_stdout(sys.stderr):
+            result = run_all()
     print(json.dumps(result, sort_keys=True))
