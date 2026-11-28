@@ -106,6 +106,8 @@ Whole chat or project: list the cards with `hermes kanban chat-tasks <session_id
 Shares are relative, so raising one lane lowers every other lane's target. State the resulting targets from
 `show`, not your own arithmetic. To undo, set the previous values back.
 
+Shares only count on the steering gateway (the hub: a lane there is `gated`, and it excludes `kanban.admission.lanes` from shared config). Every other host's shares are reset to `shared-config.json` by each `hermes-sync` pass. When "my share keeps resetting" comes in, the write landed on a non-steering host: grep that host's `~/.hermes/logs/hermes-sync.log` for `config kanban.admission.lanes` to see the `40 → 20` revert, then run `hermes kanban lanes set` on the hub and read back `show`. Don't edit the shares in `shared-config.json`: a state contract test (`test_shared_config_excludes`) pins them and refuses the push, and the hub ignores that key anyway.
+
 ## Running as the planner
 
 The planner proposes; `apply` decides. Write one JSON list and pass it once:
