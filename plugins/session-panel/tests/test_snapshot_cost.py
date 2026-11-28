@@ -12,7 +12,7 @@ from test_snapshot_acquisition import acquisition, acquire
 from test_core_readers import api, board, kanban_db
 
 
-def test_bounded_tail_and_latest_run_match_full_canonical_history(acquisition, monkeypatch):
+def test_bounded_tail_and_latest_run_match_full_canonical_history(acquisition, monkeypatch, api):
     r, cap, m, source, store, conn = acquisition
     tid = kanban_db.create_task(conn, title='Long history', session_id='S')
     # Canonical event writer; keep final timestamps tied to exercise the id tie-break.
@@ -58,15 +58,50 @@ def test_bounded_tail_and_latest_run_match_full_canonical_history(acquisition, m
     # The bounded slim history query must not scan/deserialise the full tail.
     # Canonical execution acquisition has its own window queries: retain their
     # measured cost above, rather than pretending this adapter optimized core.
-    slim = [steps for sql, steps in queries if "kind != 'heartbeat'" in sql]
-    assert len(slim) == 1 and slim[0] < 2000
+    slim = [(sql, steps) for sql, steps in queries if "kind != 'heartbeat'" in sql]
+    # read_page prepares a LIMIT 0 name probe before its one executed page.
+    # Typed JSON packing spends more VM instructions per returned row than the
+    # old transport; statement count or a bare-reader instruction cap is not a
+    # bound on source-history work. Keep preparation separate, then measure
+    # invariance when the older history shrinks without changing the page.
+    probes = [(sql, steps) for sql, steps in slim if sql.rstrip().endswith('LIMIT 0')]
+    pages = [(sql, steps) for sql, steps in slim if not sql.rstrip().endswith('LIMIT 0')]
+    assert len(probes) <= 1 and all(steps <= 100 for _, steps in probes)
+    assert len(pages) == 1
+    assert 'ORDER BY created_at DESC, id DESC LIMIT 40' in pages[0][0]
+
+    def measured_page():
+        steps = [0]
+        def progress():
+            steps[0] += 100
+            return 0
+        conn.set_progress_handler(progress, 100)
+        try:
+            page = [dataclasses.asdict(event) for event in api._newest_events(conn, tid)]
+        finally:
+            conn.set_progress_handler(None, 0)
+        assert page == events
+        return steps[0]
+
+    large_steps = measured_page()
+    with conn:
+        conn.execute('DELETE FROM task_events WHERE task_id=? AND id NOT IN '
+                     '(SELECT id FROM task_events WHERE task_id=? ORDER BY created_at DESC,id DESC LIMIT 200)',
+                     (tid, tid))
+    small_steps = measured_page()
+    # 100-instruction quanta can straddle statement boundaries. A scan of the
+    # removed 4,801 rows cannot fit within this two-quantum tolerance.
+    assert large_steps <= small_steps + 200
     assert part.metrics['elapsed_ns'] < 2_000_000_000
     plans = [tuple(row) for row in conn.execute(
         "EXPLAIN QUERY PLAN SELECT * FROM task_events WHERE task_id=? AND kind!='heartbeat' "
         'ORDER BY created_at DESC,id DESC LIMIT 40', (tid,))]
-    assert any('INDEX' in row[3] for row in plans)
-    assert not any('TEMP B-TREE' in row[3] for row in plans)
+    packed_plans = [tuple(row) for row in conn.execute('EXPLAIN QUERY PLAN ' + pages[0][0])]
+    for plan in (plans, packed_plans):
+        assert any('INDEX' in row[3] for row in plan)
+        assert not any('TEMP B-TREE' in row[3] for row in plan)
     print(json.dumps({'history_rows': 5000, 'run_rows': 200, 'plan': plans,
+                      'large_steps': large_steps, 'small_steps': small_steps, 'packed_plan': packed_plans,
                       'metrics': m.thaw(part.metrics)}, sort_keys=True))
 
 
