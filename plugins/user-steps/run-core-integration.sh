@@ -24,6 +24,7 @@ mkdir -p "$fixtures/plugins/coach" "$fixtures/desktop-plugins"
 for plugin in user-steps ask-gate session-outcome open-asks hub-sync session-panel; do
   cp -R "$plugins/$plugin" "$fixtures/plugins/$plugin"
 done
+cp "$plugins/kanban_inventory.py" "$fixtures/plugins/kanban_inventory.py"
 cp "$plugins/coach/placement_evidence.py" "$fixtures/plugins/coach/placement_evidence.py"
 cp -R "$plugins/../desktop-plugins/user-steps" "$fixtures/desktop-plugins/user-steps"
 cd "$core"
