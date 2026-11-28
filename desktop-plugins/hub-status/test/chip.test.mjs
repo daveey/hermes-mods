@@ -70,6 +70,16 @@ test('progress preserves real deferrals and reports applying then completed sha'
   assert.equal(store.$message.get(), 'Updated to def1234567')
 })
 
+test('current operation failure beats live force marker, older failure does not', async () => {
+  let v = { running: 'abc1234567', force_request: { requested_at: 200 }, operation: { phase: 'failed', requested_at: 100, reason: 'old failure' } }
+  const store = m.createVersionStore(async o => o.path.endsWith('/ping') ? { api: 2 } : v)
+  await store.refresh()
+  assert.equal(store.$message.get(), 'Waiting for turns')
+  v.operation = { ...v.operation, requested_at: 200, reason: 'attested updater refused' }
+  await store.refresh()
+  assert.equal(store.$message.get(), 'attested updater refused')
+})
+
 test('old backend cannot receive the new update mutation', async () => {
   const calls = []
   const store = m.createVersionStore(async o => { calls.push(o); return { api: 1 } })
