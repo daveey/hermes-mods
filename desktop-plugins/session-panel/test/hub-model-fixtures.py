@@ -138,6 +138,10 @@ cases['palette_ci_stale_replica'] = f.bundle(f.task(status='scheduled', wait=dic
                                                     source='replica', stale=True, synced_at=f.NOW - 3480))
 cases['palette_mixed'] = f.bundle(f.task('t_ci', status='scheduled', wait=dict(PALETTE_CI), stale=True),
                                   f.task('t_plain', status='blocked'))
+# User screenshot shape: two uncategorised waits and one CI wait (fresh), in that display order.
+cases['palette_two_amber_one_blue'] = f.bundle(f.task('t_amber1', status='blocked'),
+                                               f.task('t_blue', status='scheduled', wait=dict(PALETTE_CI)),
+                                               f.task('t_amber2', status='blocked'))
 from test_wait_palette import stalled_cases, withdrawal_cases
 for name, b in stalled_cases():
     if not name.endswith('triage') or f.AGED:
@@ -169,9 +173,15 @@ else:
         reader = api.CoreReaders(state_db=Path(home) / 'state.db')
         reader.boards = lambda: [('default', board_path)]
         try:
+            def backdate_creation(conn, tid, at):
+                # create_task records its history at wall-clock time, after the fixture's fixed clock. Core orders
+                # lifecycle events by recorded time, so keep the fixture chronology consistent: created before entry.
+                conn.execute('UPDATE task_events SET created_at=? WHERE task_id=?', (at, tid))
+                conn.execute('UPDATE tasks SET created_at=? WHERE id=?', (at, tid))
             for age in (599, 600, 601, 6 * 86400):
                 tid = kanban_db.create_task(conn, title='Owned triage attention fixture', initial_status='running')
                 conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+                backdate_creation(conn, tid, f.NOW - age - 100)
                 conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,'{}')", (tid, f.NOW - age))
                 # Push the entry outside the bounded display tail.
                 for _ in range(45):
@@ -182,11 +192,15 @@ else:
                 assert record['detail']['task']['triage_entered_at'] == f.NOW - age
                 row = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
                 cases['composed_triage_' + str(age)] = f.bundle(row, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
+                # Same real triage card beside a live CI wait: header squares must follow each row's box colour.
+                ci = f.task('t_ci0001', status='scheduled', gateway='fixture-gateway', wait=dict(PALETTE_CI))
+                cases['composed_triage_ci_' + str(age)] = f.bundle(row, ci, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
             # Shared-blocker group: the triage parent is read through the same real
             # adapter, but only its dependants are session rows (the group owns the red).
             for age in (599, 601):
                 tid = kanban_db.create_task(conn, title='Owned triage shared stage', initial_status='running')
                 conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+                backdate_creation(conn, tid, f.NOW - age - 100)
                 conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,'{}')", (tid, f.NOW - age))
                 conn.commit()
                 record = reader.card(tid, 'default')
@@ -199,6 +213,7 @@ else:
             for age in (600, 601, 6 * 86400):
                 tid = kanban_db.create_task(conn, title='Owned stopped retained fixture', initial_status='running')
                 conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+                backdate_creation(conn, tid, f.NOW - age - 100)
                 conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,?)",
                              (tid, f.NOW - age, json.dumps({'disposition': {'reason': 'scope_stopped', 'summary': 'acceptance unmet'}})))
                 conn.commit()

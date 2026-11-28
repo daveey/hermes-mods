@@ -486,6 +486,31 @@ const box = (section, row) => ({ width: 9, height: 9, borderRadius: 2, boxSizing
 const SECTION_CATEGORY = { needs_you: 'red', stuck: 'orange', running: 'blue', ready: 'green', done: 'grey' }
 export const pipCategory = pip => pip.attention === 'triage_overdue' ? 'red' : pip.section !== 'waiting' ? SECTION_CATEGORY[pip.section] || 'grey'
   : waitCategory(pip) === 'deploy' ? 'violet' : ['agent', 'ci', 'clock', 'card'].includes(waitCategory(pip)) ? 'blue' : 'amber'
+// Row-box partitions, the same as the hub's `section_pips`: overdue triage red on any row, waiting rows by wait
+// category, everything else the section colour. Fixed order so the hub and client expiry agree.
+const WAIT_PARTITION = { agent: 'blue', ci: 'blue', clock: 'blue', card: 'blue', deploy: 'violet' }
+const PARTITION_ORDER = ['red', 'blue', 'violet', 'plain']
+const rowPartition = (section, row) => row?.attention === 'triage_overdue' ? 'red'
+  : section === 'waiting' ? WAIT_PARTITION[waitCategory(row)] || 'plain' : 'plain'
+/** One numbered square per row-box colour, each displayed row counted once. `count` is the section total
+ *  (the hub's value adjusted for withdrawn rows); any rows it counts beyond those shown read as plain. */
+export function sectionPips(section, rows, count = rows.length, label = section) {
+  const parts = {}
+  for (const row of rows) (parts[rowPartition(section, row)] ||= []).push(row)
+  const extra = count - rows.length
+  if (extra > 0) (parts.plain ||= []).push(...Array(extra).fill(null))
+  return PARTITION_ORDER.filter(part => parts[part]?.length).map(part => {
+    const members = parts[part], pip = { section, label, count: members.length }
+    if (part === 'red') pip.attention = 'triage_overdue'
+    if (part === 'blue' || part === 'violet') {
+      const kinds = members.map(waitCategory), kind = kinds.includes('agent') ? 'agent' : kinds[0]
+      pip[members.every(row => row.wait_kind) ? 'wait_kind' : 'last_wait_kind'] = kind
+    }
+    return pip
+  })
+}
+const sectionsPips = (sections, counts, sourcePips = []) => MODEL_SECTIONS.filter(([key]) => counts[key] > 0).flatMap(([section, label]) =>
+  sectionPips(section, sections[section], counts[section], sourcePips.find(p => p.section === section)?.label || label))
 // Same look as the Desktop's shared numbered card square, for Desktops whose SDK predates `CardCountSquare`.
 const SQUARE_BORDER = { red: '#ef4444', orange: '#f97316', green: '#10b981', amber: '#f59e0b', blue: '#38bdf8', grey: '#71717a', violet: '#8b5cf6' }
 /** One numbered card square: the count inside an outline in the category's colour. */
@@ -566,20 +591,11 @@ function expiryPresentation(model, sections, diagnosticExpired = false, groups =
   for (const [key] of MODEL_SECTIONS) counts[key] = Math.max(0, (counts[key] || 0) + sections[key].length - model.sections[key].length)
   const delivery = sections.waiting.length > 0 && sections.waiting.every(row => row.wait_kind)
   const waitKind = delivery ? (sections.waiting.some(row => row.wait_kind === 'agent') ? 'agent' : sections.waiting[0].wait_kind) : null
-  // The waiting square keeps its rows' shared category: last-known when some row lost live authority.
-  const lastKind = !delivery && sections.waiting.length > 0 && sections.waiting.every(waitCategory)
-    ? (sections.waiting.some(row => waitCategory(row) === 'agent') ? 'agent' : waitCategory(sections.waiting[0])) : null
   // Overdue triage is fresh operational red: it survives expiry only on rows or
   // shared-blocker groups that still claim it (a group alone can own the header's red).
   const overdue = [...sections.stuck, ...(Array.isArray(groups) ? groups : [])].some(row => row?.attention === 'triage_overdue')
-  const pips = MODEL_SECTIONS.filter(([key]) => counts[key] > 0).map(([section, label]) => {
-    // Recompute the wait category from the effective rows; never carry the source snapshot's pip category.
-    const { attention, wait_kind: _kind, last_wait_kind: _last, ...pip } = model.header.pips.find(p => p.section === section) || {}
-    return { ...pip, section, label: pip.label || label, count: counts[section],
-      ...(section === 'stuck' && overdue && attention ? { attention } : {}),
-      ...(section === 'waiting' && waitKind ? { wait_kind: waitKind } : {}),
-      ...(section === 'waiting' && lastKind ? { last_wait_kind: lastKind } : {}) }
-  })
+  // Recompute every square from the effective rows (one per row-box colour); never carry the snapshot's pips.
+  const pips = sectionsPips(sections, counts, model.header.pips)
   const withdrawnDerived = diagnosticExpired && model.header.source === 'derived' && !model.header.status &&
     !counts.needs_you && !counts.stuck && !counts.running
   const { attention, ...header } = model.header
@@ -884,7 +900,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       ] }),
       jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
       // Header counts are numbered card squares (the Desktop's shared look); the section words are the tooltip.
-      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, title: `${pip.count} ${pip.label}`, 'aria-label': `${pip.count} ${pip.label}`,
+      ...model.header.pips.map((pip, i) => jsx('span', { 'data-model-pip': pip.section, 'data-pip-category': pipCategory(pip), title: `${pip.count} ${pip.label}`, 'aria-label': `${pip.count} ${pip.label}`,
         style: { display: 'inline-flex' }, children: jsx(CountSquare, { category: pipCategory(pip), count: pip.count }) }, i)),
       // Counts are the hub's values, not row lengths, even if a test deliberately makes them disagree.
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
@@ -927,7 +943,7 @@ export function decisionPresentation(model, route) {
       decision: { request_id: row.request_id, text: modelDecisionStatus(row)?.text || 'Decision recorded; updating status…' } }))] }
   const counts = { ...model.header.counts, needs_you: model.header.counts.needs_you - moving.length,
     waiting: model.header.counts.waiting + moving.length }
-  const pips = MODEL_SECTIONS.filter(([s]) => counts[s] > 0).map(([section, label]) => ({ section, label, count: counts[section] }))
+  const pips = sectionsPips(sections, counts, model.header.pips)
   return { ...model, sections, header: { ...model.header, counts, pips,
     ...(counts.needs_you === 0 ? { label: 'Decision recorded' } : {}) } }
 }

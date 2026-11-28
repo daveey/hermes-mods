@@ -273,3 +273,23 @@ def test_an_off_list_shared_blocker_group_schedules_its_own_crossing(age):
     else:
         assert group.get('attention') != 'triage_overdue'
         assert model.triage_deadline(b, NOW) == pytest.approx(NOW + 1, abs=1e-3)
+
+
+@pytest.mark.parametrize('remote', [False, True])
+@pytest.mark.parametrize('age,red', [(599, False), (600, False), (601, True), (6 * 86400, True)])
+def test_overdue_triage_beside_a_ci_wait_paints_one_square_per_row_colour(age, red, remote):
+    """Header squares follow the row boxes: an overdue triage row is one red square, the CI wait one blue one."""
+    from test_model import task as row_task
+    b = aged(age, remote=remote)
+    ci = row_task('t_ci0001', status='scheduled',
+                  wait={'wait_state': 'external_running', 'waiting_on': 'ci example/repo PR #751', 'waiting_since': NOW - 300})
+    b['tasks'].append(ci)
+    result = model.reduce_panel(b, now=NOW, wire=True)
+    pips = [(p['section'], p.get('attention'), p.get('wait_kind'), p['count']) for p in result['header']['pips']]
+    if red:
+        assert pips == [('stuck', 'triage_overdue', None, 1), ('waiting', None, 'ci', 1)]
+    else:
+        # The agent hold and the CI wait are both blue: one square of two, live because both rows are live.
+        assert pips == [('waiting', None, 'agent', 2)]
+    assert sum(p[3] for p in pips) == 2
+    assert not result['sections']['needs_you']

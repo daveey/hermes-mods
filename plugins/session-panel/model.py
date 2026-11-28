@@ -354,6 +354,45 @@ def wait_category(v):
     return v.get('wait_kind') or v.get('last_wait_kind')
 
 
+# Row-box palette partitions (Desktop `pipCategory` paints the same pips): overdue triage red on any row,
+# and waiting rows by wait category. Order is fixed so expiry recomputation and the hub agree.
+_WAIT_PARTITION = {'agent': 'blue', 'ci': 'blue', 'clock': 'blue', 'card': 'blue', 'deploy': 'violet'}
+_PARTITION_ORDER = ('red', 'blue', 'violet', 'plain')
+
+
+def _partition(section, v):
+    if v.get('attention') == 'triage_overdue':
+        return 'red'
+    return _WAIT_PARTITION.get(wait_category(v), 'plain') if section == 'waiting' else 'plain'
+
+
+def section_pips(section, views):
+    """One numbered square per row-box colour in a section, counting each displayed row exactly once.
+
+    A waiting square carries `wait_kind` only when all of its rows hold live authority, else the
+    last-known category (`last_wait_kind`, colour only). Mixed sections show several squares (two amber
+    plus one blue, never three of one colour); their counts sum to the section count.
+    """
+    label = {'needs_you': 'needs you', 'running': 'running'}.get(section, section)
+    parts = {}
+    for v in views:
+        parts.setdefault(_partition(section, v), []).append(v)
+    pips = []
+    for part in _PARTITION_ORDER:
+        rows = parts.get(part)
+        if not rows:
+            continue
+        pip = {'section': section, 'count': len(rows), 'label': label}
+        if part == 'red':
+            pip['attention'] = 'triage_overdue'
+        elif part in ('blue', 'violet'):
+            kinds = [wait_category(v) for v in rows]
+            kind = 'agent' if 'agent' in kinds else kinds[0]
+            pip['wait_kind' if all(v.get('wait_kind') for v in rows) else 'last_wait_kind'] = kind
+        pips.append(pip)
+    return pips
+
+
 def _drop_park(v, park_lines):
     """Withdraw a row's current park attestation: exactly the park's own Details lines, never a diagnostic's."""
     v.pop('wait_reason', None)
@@ -1470,22 +1509,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         view['actions'] = [a for a in view.get('actions') or [] if not (a.get('kind') == 'open_session' and str(obj(a.get('target')).get('session')) in here)]
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
-    pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
-    # Every waiting row waits on CI or a deploy: the waiting pip and the header dot paint light blue.
+    pips = [pip for s in SECTIONS for pip in section_pips(s, sections[s])]
+    # Every waiting row waits on CI or a deploy: the header dot paints light blue (live authority only).
     delivery = counts['waiting'] > 0 and all(v.get('wait_kind') for v in sections['waiting'])
     wait_kind = 'agent' if any(v.get('wait_kind') == 'agent' for v in sections['waiting']) else next((v.get('wait_kind') for v in sections['waiting']), None)
-    # The waiting pip paints the same category as its row boxes. When every waiting row has a category but some
-    # are only last-known (stale/unknown), it carries `last_wait_kind` instead: colour, never live authority.
-    categories = [wait_category(v) for v in sections['waiting']]
-    last_kind = (None if delivery or not categories or not all(categories) else
-                 'agent' if 'agent' in categories else categories[0])
-    for pip in pips:
-        if pip['section'] == 'stuck' and aged_keys:
-            pip['attention'] = 'triage_overdue'
-        if pip['section'] == 'waiting' and delivery:
-            pip['wait_kind'] = wait_kind
-        elif pip['section'] == 'waiting' and last_kind:
-            pip['last_wait_kind'] = last_kind
     status = published_status(outcome)
     # Presentation fallback only: legacy outcome.kind is never a status envelope.
     # An unavailable outcome does not make otherwise readable panel rows unknown.

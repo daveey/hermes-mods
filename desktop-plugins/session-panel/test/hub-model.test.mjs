@@ -974,6 +974,8 @@ test('canonical approval plan, limits, permissions, exclusions and outcomes rema
 })
 // One wait colour category (user report: amber CI row beside a blue waiting square). Real reducer fixtures.
 const DELIVERY_RGB = 'rgb(56, 189, 248)', AMBER_RGB = 'rgb(210, 153, 34)'
+const waitingSquares = () => [...document.querySelectorAll('[data-model-pip="waiting"] [data-card-colour]')]
+  .map(square => [square.dataset.cardColour, square.textContent])
 const waitingSquare = () => document.querySelector('[data-model-pip="waiting"] [data-card-colour]')?.dataset.cardColour
 const rowBox = id => window.getComputedStyle(document.querySelector(`[data-panel-row$="${id}"] [data-row-pip]`) ||
   document.querySelector('[data-row-pip="waiting"]')).borderTopColor
@@ -1017,13 +1019,13 @@ test('a stale replica CI wait from the reducer paints the same category on row b
   assert.ok(document.querySelector('[data-wait-eta]') === null)
  }
 })
-test('mixed waits: each row box keeps its own category; the square is amber while any row has none', async () => {
+test('mixed waits: each row box keeps its own category and the header shows one square per colour', async () => {
  const { model, now } = publicCases.palette_mixed
  await paint(m.renderModel(model, { now }))
  assert.equal(rowBox('t_ci'), DELIVERY_RGB)
  assert.equal(rowBox('t_plain'), AMBER_RGB)
- assert.equal(waitingSquare(), 'amber')
- // Every expired row keeps its category: the square follows the rows, not the source snapshot's pip.
+ assert.deepEqual(waitingSquares(), [['blue', '1'], ['amber', '1']])
+ // Every expired row keeps its category: the squares follow the rows, not the source snapshot's pip.
  const fresh = structuredClone(publicCases.palette_ci_fresh.model)
  fresh.sections.waiting.push({ ...fresh.sections.waiting[0], key: `${fresh.sections.waiting[0].key}:agent`, id: 't_agent', wait_kind: 'agent', wait_eta: null })
  fresh.header.counts.waiting = 2; fresh.header.pips.find(p => p.section === 'waiting').count = 2
@@ -1031,6 +1033,40 @@ test('mixed waits: each row box keeps its own category; the square is amber whil
  assert.deepEqual(effective.sections.waiting.map(r => [r.wait_kind, r.last_wait_kind]), [[null, 'ci'], [null, 'agent']])
  assert.equal(effective.header.pips.find(p => p.section === 'waiting').last_wait_kind, 'agent')
  assert.equal(m.pipCategory(effective.header.pips.find(p => p.section === 'waiting')), 'blue')
+})
+test('user report: two amber rows and one blue row show amber 2 and blue 1 (3 total) fresh, unvouched, TTL-expired and collapsed', async () => {
+ const { model, now } = publicCases.palette_two_amber_one_blue
+ const before = JSON.stringify(model)
+ assert.equal(model.header.counts.waiting, 3)
+ const boxes = () => ['t_amber1', 't_blue', 't_amber2'].map(rowBox)
+ for (const [name, opts] of [['fresh', { now }], ['unvouched', { now, vouched: false }], ['ttl-expired', { now: now + 7200 }]]) {
+  await paint(m.renderModel(model, opts))
+  assert.deepEqual(boxes(), [AMBER_RGB, DELIVERY_RGB, AMBER_RGB], name)
+  assert.deepEqual(waitingSquares(), [['blue', '1'], ['amber', '2']], name)
+  assert.equal(document.querySelector('[data-model-count="waiting"]').textContent, '3', name)
+  if (name !== 'fresh') assert.equal(document.querySelector('[data-wait-eta]'), null, `${name}: no live ETA`)
+ }
+ await paint(m.renderModel(model, { now, collapsed: true, onToggle: () => {} }))
+ assert.deepEqual(waitingSquares(), [['blue', '1'], ['amber', '2']], 'collapsed header keeps the partitions')
+ const expired = m.expireNativeWaits(model, now, false)
+ assert.deepEqual(expired.header.pips.map(p => [p.section, m.pipCategory(p), p.count, p.wait_kind]),
+  [['waiting', 'blue', 1, undefined], ['waiting', 'amber', 2, undefined]])
+ assert.equal(expired.header.pips.find(p => m.pipCategory(p) === 'blue').last_wait_kind, 'ci')
+ assert.equal(expired.header.wait_kind, null)
+ assert.equal(JSON.stringify(model), before)
+})
+for (const age of [599, 600, 601]) test(`real adapter: overdue triage at ${age}s beside a CI wait: squares match row boxes, fresh then stale`, { skip: !cases[`composed_triage_ci_${age}`] }, async () => {
+ const { model, now } = cases[`composed_triage_ci_${age}`]
+ const squares = () => [...document.querySelectorAll('[data-model-pip] [data-card-colour]')].map(s => [s.dataset.cardColour, s.textContent])
+ await paint(m.renderModel(model, { now }))
+ assert.deepEqual(squares(), age > 600 ? [['red', '1'], ['blue', '1']] : [['blue', '2']])
+ assert.equal(model.sections.needs_you.length, 0, 'age never invents a human ask')
+ // Stale: overdue red is withdrawn with the snapshot (explicit unknown), the CI row keeps its last-known blue.
+ await paint(m.renderModel(model, { now, vouched: false }))
+ const stale = squares()
+ assert.ok(!stale.some(([c]) => c === 'red'), 'no fresh red from a stale snapshot')
+ assert.ok(stale.some(([c]) => c === 'blue'), 'the CI row keeps its last-known blue square')
+ assert.equal(stale.reduce((n, [, c]) => n + Number(c), 0), 2, 'each row counted once')
 })
 for (const name of ['ci', 'spend', 'triage', 'aged_triage']) test(`expired stuck ${name} never inherits a blue waiting category`, { skip: !publicCases[`palette_stuck_${name}`] }, async () => {
  const { model, now } = publicCases[`palette_stuck_${name}`]
