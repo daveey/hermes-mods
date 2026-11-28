@@ -43,7 +43,7 @@ class ReviewRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp)/'series.sqlite')
             defs = [dict(id='ci',source='github.example',start='run_started_at',end='updated_at',workflow='ci.yml')]
-            key = 'github:example:'+registry.fingerprint(defs)
+            key = 'github:example:'+registry.fingerprint(defs)+':events-v2'
             store.ingest([], key, {'at':100, 'pending':[42]})
             def fetch(path, **kw):
                 if '/runs/42' in path:
@@ -51,7 +51,7 @@ class ReviewRegressions(unittest.TestCase):
                 return {'total_count':0, 'workflow_runs':[]}
             cfg = {'example':{'repo':'example/repo'}}
             self.assertEqual(github.collect_github(tmp,store,defs,cfg,0,200,fetch=fetch),0)
-            self.assertEqual(store.cursor(key),{'at':200,'pending':[]})
+            self.assertEqual(store.cursor(key),{'at':200,'pending':[],'sweep':0})
             store.ingest([],key,{'at':200,'pending':[42]})
             def forbidden_pending(path, **kw):
                 if '/runs/42' in path:
@@ -65,16 +65,21 @@ class ReviewRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(Path(tmp)/'series.sqlite')
             defs = [dict(id='ci',source='github.example',start='run_started_at',end='updated_at',workflow='ci.yml')]
-            key = 'github:example:'+registry.fingerprint(defs)
+            key = 'github:example:'+registry.fingerprint(defs)+':events-v2'
             row = dict(id=42,run_attempt=1,path='ci.yml',created_at=github.iso(10),run_started_at=github.iso(10),updated_at=github.iso(20),status='completed',conclusion='success')
             cfg = {'example':{'repo':'example/repo'}}
             def fetch(path, **kw):
                 return row if '/runs/42' in path else {'total_count':0,'workflow_runs':[]}
             for attempt in (1,2):
                 row['run_attempt'] = attempt
+                row['updated_at'] = github.iso(20+attempt)
                 store.ingest([],key,{'at':200000,'pending':[42]})
                 self.assertEqual(github.collect_github(tmp,store,defs,cfg,0,200100,fetch=fetch),1)
-            self.assertEqual(store.view('ci',0,200100)['n'],2)
+            self.assertEqual(store.view('ci',0,200100)['n'],1)
+            row['conclusion'] = 'cancelled'
+            store.ingest([],key,{'at':200000,'pending':[42]})
+            self.assertEqual(github.collect_github(tmp,store,defs,cfg,0,200100,fetch=fetch),1)
+            self.assertEqual(store.view('ci',0,200100)['n'],0)
 
     def test_failed_github_attempt_obeys_ten_minute_cadence(self):
         with tempfile.TemporaryDirectory() as tmp:

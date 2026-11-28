@@ -61,13 +61,13 @@ class Collectors(unittest.TestCase):
             db.executescript('''CREATE TABLE tasks(id TEXT,created_at REAL,completed_at REAL);
                 CREATE TABLE task_events(id INTEGER PRIMARY KEY,task_id TEXT,kind TEXT,created_at REAL);
                 INSERT INTO tasks VALUES ('t',10,NULL);
-                INSERT INTO task_events VALUES (1,'t','claimed',20),(2,'t','decision_requested',30),(3,'t','unblocked',50);''')
+                INSERT INTO task_events VALUES (0,'t','created',10),(1,'t','claimed',20),(2,'t','decision_requested',30),(3,'t','unblocked',50);''')
             defs = [definition('queue','created','claimed','kanban')]
             store = Store(Path(tmp)/'series.sqlite')
             self.assertEqual(collectors.collect_board(path,store,defs,0,100),1)
             defs.append(definition('decision','decision_requested','unblocked','kanban'))
             from latency_fixture.registry import fingerprint
-            self.assertEqual(store.cursor('kanban:'+str(path.resolve())+':'+fingerprint(defs[:-1]))['id'],3)
+            self.assertEqual(store.cursor('kanban:'+str(path.resolve())+':'+fingerprint(defs[:-1])+':events-v2')['id'],3)
             self.assertEqual(collectors.collect_board(path,store,defs,0,100),1)
             self.assertEqual(collectors.collect_board(path,store,defs,0,100),0)
             defs.append(definition('done','created','completed','kanban'))

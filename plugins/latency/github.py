@@ -136,19 +136,29 @@ def deployment_markers(root, checkout, kind, run=subprocess.run):
     return chain, markers
 
 
+def latest_runs(rows):
+    """A rerun revises one logical run; attempt is not a second observation."""
+    found = {}
+    for row in rows:
+        old = found.get(row['id'])
+        rank = lambda r: (r.get('run_attempt', 1), r.get('updated_at') or '')
+        if old is None or rank(row) >= rank(old):
+            found[row['id']] = row
+    return found
+
+
 def github_samples(definitions, run_rows, prs, chain, markers, source, since, until, host='local', gateway='local'):
-    for row in run_rows:
-        if row.get('status') != 'completed' or row.get('conclusion') in ('skipped', 'neutral'):
+    for row in latest_runs(run_rows).values():
+        if row.get('status') != 'completed' or row.get('conclusion') not in ('success', 'failure'):
             continue
-        start, end = epoch(row.get('run_started_at')), epoch(row.get('updated_at'))
-        if start is None or not since <= epoch(row['created_at']) <= until:
+        start = epoch(row.get('run_started_at') or row.get('created_at'))
+        end = epoch(row.get('updated_at'))
+        if start is None or not since <= start <= until:
             continue
         for d in definitions:
-            if d.get('workflow') == row.get('path'):
-                result = sample(d['id'], (source, row['id'], row.get('run_attempt', 1)), start, end, host, gateway, run=row['id'])
+            if d.get('workflow') and (row.get('path') or '').endswith(d['workflow']):
+                result = sample(d['id'], (source, row['id']), start, end, host, gateway, run=row['id'])
                 if result:
-                    # Research assigns CI runs to the creation day, not start day.
-                    result['start'] = epoch(row['created_at'])
                     yield result
     for pr in prs:
         opened, merged = epoch(pr['createdAt']), epoch(pr['mergedAt'])
@@ -179,11 +189,18 @@ def collect_github(root, store, definitions, config, since, until, host='local',
         if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
             raise ValueError('Invalid repository mapping')
         from .registry import fingerprint
-        key = 'github:' + alias + ':' + fingerprint(selected)
+        key = 'github:' + alias + ':' + fingerprint(selected) + ':events-v2'
         previous = store.cursor(key) or {}
         # Retry unfinished runs regardless of age; rescan new/changed recent days.
         recent = max(since, previous.get('at', since)-86400)
-        fresh = runs(repo, recent, until, fetch) if any(d.get('workflow') for d in selected) else []
+        ci = [d for d in selected if d.get('workflow')]
+        fresh = runs(repo, recent, until, fetch) if ci else []
+        # Rotate one older creation-day per cycle to discover reruns of finished
+        # runs, which neither a recent-day overlap nor pending IDs can discover.
+        sweep = max(since, previous.get('sweep', since))
+        if ci and previous and sweep < recent:
+            fresh += runs(repo, sweep, min(sweep+86400,recent), fetch)
+        next_sweep = sweep+86400 if sweep+86400 < recent else since
         pending = previous.get('pending', [])
         pending_rows = []
         for rid in pending:
@@ -193,10 +210,18 @@ def collect_github(root, store, definitions, config, since, until, host='local',
                 if error.status != 404:
                     raise
                 # Deleted/expired runs have no terminal duration to aggregate.
-        run_rows = {(r['id'], r.get('run_attempt', 1)): r for r in [*pending_rows, *fresh]}
+        run_rows = latest_runs([*pending_rows, *fresh])
         prs = pull_requests(repo, since, fetch) if any(not d.get('workflow') for d in selected) else []
         checkout = settings.get('checkout')
         chain, markers = deployment_markers(root, Path(checkout).expanduser(), settings.get('deploy_kind', alias)) if checkout else ({}, [])
-        samples = github_samples(selected, run_rows.values(), prs, chain, markers, alias, since, until, host, gateway)
-        total += store.ingest(samples, key, {'at': until, 'pending': sorted({r['id'] for r in run_rows.values() if r['status'] != 'completed'})})
+        rows = list(github_samples(selected, run_rows.values(), prs, chain, markers, alias, since, until, host, gateway))
+        ci_ids = {d['id'] for d in ci}
+        total += store.ingest([s for s in rows if s['metric'] not in ci_ids])
+        cursor = {'at': until, 'pending': sorted({r['id'] for r in run_rows.values() if r['status'] != 'completed'}),
+                  'sweep': next_sweep}
+        if ci:
+            observed = [sample(d['id'], (alias,rid), 0, 0)['id'] for rid in set(run_rows) | set(pending) for d in ci]
+            total += store.reconcile([s for s in rows if s['metric'] in ci_ids],ci_ids,key,cursor,observed)
+        else:
+            store.ingest([],key,cursor)
     return total

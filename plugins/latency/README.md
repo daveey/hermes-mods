@@ -53,13 +53,18 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   deduplication and any-user-row boundaries match the research method. Final
   output requires nonempty text and `stop`/`end_turn`; interrupted turns are
   censored, not zero. Changed sessions are revisited for late results.
-* Board queue = task creation to first claimed event, including ineligible time.
-  Completion = creation to retained `completed_at`. Neither is useful-work CPU.
+* Board queue = first created event to first claimed event, including ineligible
+  time. Completion = first created event to last completed event, in event-ID
+  order. Task-row timestamps are not substitutes; missing event pairs stay absent.
+  Neither is useful-work CPU.
   Decision pairs match the latest request preceding an unblock, once per episode.
 * Actions runs are sliced daily and saturated slices subdivided until below the
-  1000-result cap. Completed non-skipped/non-neutral runs include failures and
-  cancellations, matching research. Duration = updated minus run-start; chart day
-  = creation. Incomplete runs are retried by ID. GitHub runs/PRs refresh every
+  1000-result cap. Only completed success/failure runs count. Duration = updated
+  minus run-start (falling back to creation); chart day = that start. Reruns revise
+  one logical run ID, not another observation. Incomplete runs are retried by ID.
+  One older creation-day is rescanned each cycle to discover reruns of completed
+  runs (a complete 30-day sweep takes at most 30 successful remote cycles).
+  GitHub runs/PRs refresh every
   ten minutes; transient 5xx failures retry with bounded exponential backoff.
   Failed scans also wait ten minutes; deleted pending runs (HTTP 404) are retired,
   while other failures retain the cursor. Lock contenders retry every minute so
@@ -76,13 +81,23 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   hours/days are partial-window comparisons, not exact arbitrary-second queries.
 * Log histogram upper-edge quantiles have at most 0.5% bucket approximation error
   before reference rounding. Histograms and dedup IDs retain 90 days; only the
-  20 slowest raw samples per metric/UTC day retain identifiers. Slowest results
+  20 slowest raw samples per metric/UTC day are exposed. Mutable board/CI
+  observations also retain minimal contribution records for 90 days so revisions
+  can retract old buckets and recover the correct slowest twenty. Slowest results
   carry `attrs.session/card/pr/run` for native navigation; PR/run repository is
   identified by the metric's configured source alias.
 * Source cursors and histograms commit transactionally. No full message text,
   PR title/body or raw tool payload is stored. Journals rotate globally across
   three 4 MiB files and expire after seven days. Best-effort local telemetry
   failures cannot mask the timed operation's exception.
+* The event-semantics-v2 migration uses fresh source cursors for a real 30-day
+  backfill. On the first successful projection, a single transaction clears only
+  legacy board/CI metric aggregates, writes corrected contributions and its
+  marker/cursor. Existing spans, state/tool, PR/deployment history and their
+  identities remain untouched. No research/probe data is imported. Migration
+  discards older affected aggregates whose raw contributions were not retained;
+  corrected observations then accumulate up to the normal 90-day retention.
+  All collection, including manual cycles, must hold `collector.lock`.
 * Optional request-stage joins keep at most 10,000 recent request IDs for one
   hour; excess in-flight requests can be lost. Retired definition cursors remain
   in this small local metadata table. Neither limit changes the shipped 17 rows,
