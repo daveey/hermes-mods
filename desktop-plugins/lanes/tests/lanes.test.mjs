@@ -327,7 +327,7 @@ test('a write goes to the gateway it is given, whatever is chosen now', async ()
   const target = source.target()
   await source.write('product', { share: 1 }, { connectionId: 'hub' })
   await source.write('infra', { share: 2 }, target)
-  assert.deepEqual(calls.slice(1), [['hub', 'PUT'], ['this-mac', 'PUT']])
+  assert.deepEqual(calls.slice(1), [['hub', 'GET'], ['hub', 'PUT'], ['this-mac', 'PUT']])
 })
 
 test('mounted: the task pill follows a remote gateway that has lanes', async () => {

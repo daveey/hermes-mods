@@ -6,7 +6,7 @@ const P = await loadPlugin()
 const graph = { total: 83, sources: [{key:'manual',count:83}], lanes:[{key:'work',count:83}],
   sinks:[{key:'dam:you',count:83,dam:true,label:'needs you',color:'#f00',hint:'server hint'}],
   edges:{sourceLane:[{from:'manual',to:'work',count:83}],laneSink:[{from:'work',to:'dam:you',count:83}]} }
-const fixture = { configured:true, totals:{running:71,open:93}, lanes:{work:{share:10,target:.7,actual:.2,drift:'server drift',
+const fixture = { configured:true, planner: { notes: [] }, totals:{running:71,open:93}, lanes:{work:{share:10,target:.7,actual:.2,drift:'server drift',
   running:7,not_ready:42,blocked_on_you:9,open:58,ready:3}},
   floor:{columns:[{key:'waiting',label:'Waiting'}],names:['work'],cells:[{lane:'work',step:'waiting',count:66,piling:true,summary:'66 server reasons',cards:[]}]},
   flow:{cards:[],lanes:{work:{}},graphs:{project:graph,source:graph}} }

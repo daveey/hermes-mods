@@ -7,7 +7,7 @@ const T0 = Date.UTC(2026, 10, 27, 0, 0) / 1000
 const cell = (i, over = {}) => ({ t: T0 + i * 1800, state: 'empty', running: 0, cap: 4, rejected: 0, rejection_unknown: false, visual: { height: 0, opacity: 1 }, ...over })
 const cellsOf = (fn = () => ({})) => Array.from({ length: 48 }, (_, i) => cell(i, fn(i)))
 
-const snapshot = (over = {}, rowOver = {}) => ({ configured: true, fleet_slots: 6, status: { run: 2, you: 1 }, totals: { not_ready: 3 },
+const snapshot = (over = {}, rowOver = {}) => ({ configured: true, planner: { notes: [] }, fleet_slots: 6, status: { run: 2, you: 1 }, totals: { not_ready: 3 },
   spend: { hour: 1.5, day: 20.25, week: 140 }, sidebar: { cost_today: 20.25, idle_lanes: [] },
   governors: { idle_total: 0, held_total: 0, fleet: [], stale_sources: [], rows: [], counts: { on: 0, off: 0 } },
   lanes: { work: { share: 20, actual: .2, target: .3, status: { run: 2, you: 1 }, governor_held: 0, not_ready: 3, waits: { parents: 3, scheduled: 0, deploy_ci: 0, triage: 0 },

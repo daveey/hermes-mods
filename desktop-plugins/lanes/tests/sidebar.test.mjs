@@ -11,7 +11,7 @@ const gate = { id: 'lane_gate', name: 'Lane gate', group: 'lane_dial', count: 64
 const hostSlots = { id: 'host_slots', name: 'Host slots', group: 'fleet_dial', count: 1, reading: 1, threshold: 1, stop: false, clears: 'a worker finishes', readings: [] }
 const governors = (extra = {}) => ({ holds: { work: [{ ...gate, count: 31 }] }, fleet: [], stale_sources: [], held_total: 31, fleet_stop: false, ...extra })
 
-const snapshot = () => ({ configured: true, status: { run: 7, you: 3 }, totals: { not_ready: 41 },
+const snapshot = () => ({ configured: true, planner: { notes: [] }, status: { run: 7, you: 3 }, totals: { not_ready: 41 },
   spend: { hour: 2.13, day: 12.34, week: 89.12 },
   sidebar: { cost_today: 12.34, idle_lanes: ['idle'] },
   governors: governors(),

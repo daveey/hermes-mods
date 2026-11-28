@@ -61,9 +61,11 @@ const useSidebarSessions = typeof sdk.useSidebarSessions === 'function' ? sdk.us
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
 // not the gateway this Desktop has in front. The source asks every connection once, by id (a request with a
-// connectionId and no profile is answered by that connection's default profile), and settles on the one that
-// steers lanes (see `steers`), else the first that answers `configured: true`; reads and writes then go to that connection by id, so they do not follow the
-// window when another gateway comes to the front. Only when the Desktop lists no connections does it fall back
+// connectionId and no profile is answered by that connection's default profile). Discovery prefers the
+// steering gateway; configured-only replies are display sources, never write authority. Warming/failed
+// candidates get a bounded re-probe before fallback, and display-only sources keep searching.
+// Reads and writes are pinned by connection id, so they do not follow the window's selected gateway.
+// Only when the Desktop lists no connections does it fall back
 // to an untagged request, which goes to whichever gateway is in front.
 // A settled gateway is kept through failures: one failed read is an error to show and retry (gateways restart
 // several times a day), and only FAILURES_BEFORE_REDISCOVERY in a row, or an answer that says lanes are no
@@ -80,6 +82,7 @@ const validRoute = (r) => r && ['connectionId', 'targetProfile'].every((k) => ty
 
 export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
   let chosen // { connectionId } | { connectionId: null } (no connections listed: whichever is in front) | undefined
+  const steering = new Map() // last observed authority, never inferred from configured/warming
   let failures = 0
   let sweptAt = -Infinity
   let unconfigured // the answer shown while no gateway has lanes
@@ -95,17 +98,35 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     failures = 0
     let first
     const unreachable = []
-    let fallback // the first configured gateway, used when none of them steers
-    for (const target of await candidates()) {
+    let fallback // display only: definitions alone never authorize a write
+    let warming
+    const pending = []
+    const probe = async (target, retry = false) => {
       try {
         const body = await ctx.rest(path, opts(target))
-        if (body?.configured === true) {
-          if (steers(body)) { chosen = target; unconfigured = undefined; return body }
-          fallback ??= { target, body }
-        } else first ??= body
-      } catch (e) { unreachable.push(String(e?.message || e).slice(0, 80)) }
+        steering.set(target.connectionId, body?.configured === true && !body?.warming && steers(body))
+        if (steering.get(target.connectionId)) { chosen = target; unconfigured = undefined; return body }
+        if (body?.warming) { warming ??= { target, body }; if (!retry) pending.push(target) }
+        else if (body?.configured === true) fallback ??= { target, body }
+        else first ??= body
+      } catch (e) {
+        steering.set(target.connectionId, false)
+        unreachable.push(String(e?.message || e).slice(0, 80))
+        if (!retry) pending.push(target)
+      }
     }
-    if (fallback) { chosen = fallback.target; unconfigured = undefined; return fallback.body }
+    for (const target of await candidates()) {
+      const body = await probe(target)
+      if (body) return body
+    }
+    // Bounded second pass before displaying a non-steering fallback. Subsequent
+    // reads repeat discovery, even when that display gateway has a live stream.
+    if (fallback) for (const target of pending) {
+      const body = await probe(target, true)
+      if (body) return body
+    }
+    const display = fallback || warming
+    if (display) { chosen = display.target; unconfigured = undefined; return display.body }
     chosen = undefined
     unconfigured = undefined // nothing to show from an older search if this one throws
     if (!first) throw Error(unreachable[0] || 'No gateway answered')
@@ -116,6 +137,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
   async function read(hours, window, expanded) {
     const path = `/v1/lanes?hours=${hours}` + (window ? `&window=${window}&expanded=${Boolean(expanded)}` : '')
     if (!chosen) return unconfigured && clock() - sweptAt < UNCONFIGURED_MS ? unconfigured : discover(path)
+    if (!steering.get(chosen.connectionId)) return discover(path)
     let body
     try {
       body = await ctx.rest(path, opts(chosen))
@@ -125,12 +147,18 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       return discover(path)
     }
     failures = 0
+    steering.set(chosen.connectionId, body?.configured === true && !body?.warming && steers(body))
     return body?.configured === true ? body : discover(path)
   }
   // `target` is the gateway chosen when Apply was pressed: every lane of that Apply goes there even if a poll
   // re-discovers meanwhile.
   async function write(lane, body, target = chosen) {
     if (!target) throw Error('No gateway with lanes configured')
+    if (!steering.has(target.connectionId)) {
+      const view = await ctx.rest('/v1/lanes?hours=6', opts(target))
+      steering.set(target.connectionId, view?.configured === true && !view?.warming && steers(view))
+    }
+    if (!steering.get(target.connectionId)) throw Error(`Lane edits require the steering gateway; ${target.connectionId || 'this gateway'} is only a display source and its values are reset by sync. Waiting for steering gateway discovery; retry shortly.`)
     return ctx.rest(`/v1/lanes/${encodeURIComponent(lane)}`, opts(target, { method: 'PUT', body }))
   }
   // Open cards by step and reason, from the gateway that steers lanes; only asked while the panel is open.
@@ -153,17 +181,25 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       const at = epoch, before = frames, previousTarget = chosen?.connectionId
       try {
         const view = await read(params.hours, params.window, params.expanded)
-        if (!disposed && at === epoch && before === frames) {
+        if (!disposed && at === epoch && (before === frames || previousTarget !== chosen?.connectionId)) {
           onView(view)
           timers.clearTimeout(warmingPoll)
-          if (view?.warming) warmingPoll = timers.setTimeout(() => { if (!disposed) void fetch() }, 1000)
+          if (view?.warming || !steering.get(chosen?.connectionId)) warmingPoll = timers.setTimeout(() => { if (!disposed) void fetch() }, 1000)
           if (redial && started && previousTarget !== chosen?.connectionId) {
             epoch += 1; off?.(); off = undefined; socket?.close(); socket = undefined
             timers.clearTimeout(watchdog); timers.clearTimeout(retry)
             void dial()
           }
         }
-      } catch (e) { if (!disposed) onView(undefined, e) }
+      } catch (e) {
+        if (!disposed) {
+          onView(undefined, e)
+          if (!steering.get(chosen?.connectionId)) {
+            timers.clearTimeout(warmingPoll)
+            warmingPoll = timers.setTimeout(() => { if (!disposed) void fetch() }, 1000)
+          }
+        }
+      }
     }
     const unavailable = () => {
       live = false; onLive(false)
@@ -182,7 +218,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       if (!live) { live = true; onLive(true); timers.clearInterval(poll); poll = undefined }
       attempt = 0
       if (frame?.view) {
-        timers.clearTimeout(warmingPoll)
+        if (steering.get(chosen?.connectionId)) timers.clearTimeout(warmingPoll)
         frames += 1; onView(frame.view)
         // version 1 is a new connection: refresh once, not on ordinary updates.
         if (frame.version === 1 && connections++ > 0) void fetch()
