@@ -47,8 +47,11 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   `focus-filter: <method> from pid N (<command>) rewritten` (peer found with lsof). The proxy drops
   `permessage-deflate` offers so it can read every message. Hidden-mode decisions use decoded complete JSON
   methods (including escaped names and fragmented frames); undecodable/non-command messages close the
-  connection instead of forwarding. `test_chrome_focus_custody.py` covers these offline boundaries and
-  legacy lock refusal, with in-memory frames and recording process doubles only.
+  connection instead of forwarding. While hidden, `Target.sendMessageToTarget` is answered with CDP error
+  `-32000`: non-flat sessions tunnel arbitrary commands past the focus filter. Use flat sessions instead;
+  shown mode forwards tunnels unchanged. `test_chrome_focus_custody.py` covers these offline boundaries,
+  nested escaped/fragmented commands, flat routing, and legacy lock refusal with in-memory frames and
+  recording process doubles only.
   Port overrides: `HERMES_CHROME_AGENT_PORT` (public),
   `HERMES_CHROME_AGENT_CHROME_PORT` (internal, default PORT+1); `HERMES_CHROME_AGENT_FOCUS_FILTER=0` puts Chrome
   straight on 9333 again (no proxy). The supervisor's own CDP connection (re-homing, passkey reveal) uses 9334;
