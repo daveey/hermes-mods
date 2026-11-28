@@ -226,7 +226,7 @@ else:
                 assert not record['detail']['task'].get('human_request')
                 row = {**record['detail']['task'], 'gateway': 'fixture-gateway', 'profile': 'default', 'board': 'default'}
                 cases['composed_triage_retained_' + str(age)] = f.bundle(row, cards={tid: record}, outcome_json=f.canonical_outcome('waiting'))
-            from test_retained_disposition import retained_bundle
+            from retained_fixture import retained_bundle
             for variant in ('settled', 'backfill', 'pending', 'newer', 'human', 'missing', 'stale'):
                 b = retained_bundle(api, conn, reader, replica=True, pending=variant == 'pending',
                                     newer=variant == 'newer', backfill=variant == 'backfill')
