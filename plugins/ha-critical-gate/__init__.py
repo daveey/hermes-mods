@@ -10,8 +10,10 @@ hook asks a configured gate command about every ``ha_call_service`` call (it als
 
 With no trusted gate, only SAFE_DOMAINS (light, media_player, climate), lock.lock,
 cover.close_cover/stop_cover/close_cover_tilt/stop_cover_tilt, alarm_control_panel's
-alarm_arm_home/alarm_arm_away/alarm_arm_night, and generic homeassistant calls with explicit
-resolved targets only in SAFE_DOMAINS remain available. Every other domain/service,
+alarm_arm_home/alarm_arm_away/alarm_arm_night, and generic homeassistant turn_on/turn_off/
+toggle/update_entity calls with explicit resolved targets only in SAFE_DOMAINS remain available.
+All other homeassistant services (including stop/restart/reloads and unknown names) require
+confirmation even with safe decoy targets. Every other domain/service,
 including unknown and raw-protocol integrations, needs confirmation and is blocked without a gate.
 Targets in entity_id and data.entity_id still override safe domains. Direct calls, batched and
 single-object calls, JSON-string arguments/calls and legacy {name, arguments} wrappers are
@@ -95,7 +97,8 @@ def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
     # Generic HA services expand indirect/implicit targets server-side. Unknown
     # nonempty selectors fail closed too, so a new HA selector cannot bypass us.
     if domain == "homeassistant":
-        return (unresolved or not targets
+        return (service not in {"turn_on", "turn_off", "toggle", "update_entity"}
+                or unresolved or not targets
                 or any(target.partition(".")[0] not in SAFE_DOMAINS for target in targets)
                 or any(value for key, value in data.items() if key not in {"entity_id", "exclude"}))
     # Never infer physical safety from an unfamiliar integration/service name.
