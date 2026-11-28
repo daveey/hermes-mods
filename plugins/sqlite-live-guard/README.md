@@ -26,15 +26,24 @@ The analyzer does not interpret `pushd`/`popd`, `builtin`, `read`, `eval`, sourc
 scripts, function definitions, `env -C`/`--chdir`, `cd -`/`CDPATH`, backticks or compound pipeline
 state precisely. The env fallback recognizes basename-qualified env, bundled
 `-iC`, unambiguous `--chdir` prefixes, and `-S`/`--split-string`, then inventories
-the command env executes. Directory-stack tildes (`~-`, `~+`, `~N`, `~+N`, `~-N`),
-`chdir`, `printf -v` and positional `set --` are also unsupported state.
+the command env executes. GNU split-string escapes/expansions (`\_`, `\c`,
+`${NAME}`) are conservatively refused rather than reinterpreted as shell shlex.
+Directory-stack tildes (`~-`, `~+`, `~N`, `~+N`, `~-N`),
+`chdir`, `printf -vNAME`, positional `set` (with or without `--`), `mapfile`/
+`readarray`, assignment tildes and implicit `PWD`/`OLDPWD` references are also
+unsupported state. Opaque wrappers retain a token-presence env/mutation backstop;
+classifying their option operands must not remove an earlier refusal.
 A second **fail-closed mutation fallback** refuses a command list
 combining these constructs with file mutation (including sqlite3 and `find -delete`)
 or write redirection, even for a
 safe non-live target. Read-only lists and quoted command data remain allowed.
 Split safe maintenance into a separate explicit-path command; use `swap_db.py`
 for live replacements. This fallback is deliberately conservative, not a claim
-that those shell constructs have been implemented.
+that those shell constructs have been implemented. `find . -delete` in HOME is
+also refused: `.` contains the protected `.hermes` directory, even if an explicit
+`-name` filter looks harmless. The bounded Python path resolver shares 8192
+resolution steps across every alias and sink; exhaustion refuses rather than
+re-entering n-ary join expressions without a work bound.
 Remote initial cwd retains unknown, login-home and Hermes-home possibilities:
 sshd normally starts in the user's home, but wrappers/init can change it. This
 protects relative `.hermes` and bare database names without consulting remote

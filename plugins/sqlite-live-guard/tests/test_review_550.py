@@ -33,7 +33,11 @@ SHELL_CASES = ENV_CASES + STATE_CASES + [
     'printf -v D %s ~/.hermes; rm -rf "$D/state.db"',
     'command /usr/bin/env -iC ~/.hermes rm -rf state.db',
     'sudo /usr/bin/env --ch ~/.hermes cp /dev/null state.db',
-    'env -C ~/.hermes bash -c "rm -rf state.db"']
+    'env -C ~/.hermes bash -c "rm -rf state.db"',
+    r"env -S '-C /home/sqlite-followup-fixture/.hermes\_rm\_-rf\_state.db'",
+    r"env --split-string='-C /home/sqlite-followup-fixture/.hermes rm\_-rf\_state.db'",
+    r"env -S '${HOME}/bin/rm -rf ~/.hermes/state.db'",
+    r"env -S '/usr/bin/printf\_hello'"]
 PYTHON_CASES = [f'import os, shutil; from pathlib import Path; shutil.rmtree({expr})' for expr in [
     "Path('~/.hermes').expanduser()", "os.path.join(os.path.expanduser('~'), '.hermes')",
     "Path.home().joinpath('.hermes')", "os.path.expanduser('~') + '/.hermes'",

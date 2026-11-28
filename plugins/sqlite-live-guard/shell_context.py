@@ -239,6 +239,17 @@ def check(text, guard, cwd="", depth=0, inherited=None, *, remote=False, in_home
         return "shell syntax exceeds the bounded live-database safety analysis; use explicit paths and swap_db.py"
 
 
+def _env_split(value, budget):
+    # GNU env -S is NOT shell shlex: \_ separates words, \c truncates,
+    # and ${NAME} expands even though the invoking shell quoted the payload.
+    # Do not reinterpret these executable forms with the wrong grammar.
+    if '\\' in value or '$' in value:
+        raise ValueError('unsupported GNU env split-string escape/expansion')
+    parts = shlex.split(value)
+    budget.spend(sum(map(len, parts)))
+    return parts
+
+
 def _env_command(argv, guard, budget):
     """Expose env's executed argv without confusing option operands with commands.
 
@@ -280,9 +291,7 @@ def _env_command(argv, guard, budget):
                 if kind in {'--chdir', '--split-string'}:
                     hazardous = True
                 if kind == '--split-string':
-                    parts = shlex.split(value)
-                    budget.spend(sum(map(len, parts)))
-                    argv = parts + argv
+                    argv = _env_split(value, budget) + argv
                 continue
             for i, letter in enumerate(option[1:], 1):
                 if letter not in 'CuSa':
@@ -290,9 +299,7 @@ def _env_command(argv, guard, budget):
                 value = option[i + 1:] or (argv.pop(0) if argv else '')
                 hazardous = hazardous or letter in 'CS'
                 if letter == 'S':
-                    parts = shlex.split(value)
-                    budget.spend(sum(map(len, parts)))
-                    argv = parts + argv
+                    argv = _env_split(value, budget) + argv
                 break  # an option with an operand consumes the bundle's tail
     return argv, hazardous
 
@@ -311,6 +318,22 @@ def _unsupported_write_context(text, guard, budget):
     for raw in segments:
         budget.spend(len(raw))
         argv = [_value(t, {}, budget) for t in raw]
+        # Preserve the prior head's token-presence backstop across opaque
+        # wrappers (nice/timeout/xargs/busybox/etc.). Option parsing below adds
+        # precision; it must never remove this refusal when a wrapper is unknown.
+        env_words = any(os.path.basename(a) == 'env' for a in argv)
+        env_options = any((a.startswith('--') and any(s.startswith(a.split('=', 1)[0])
+                          for s in ('--chdir', '--split-string')))
+                          or (a.startswith('-') and not a.startswith('--') and any(c in a[1:] for c in 'CS'))
+                          for a in argv)
+        if env_words and env_options:
+            hazardous = True
+            writing = writing or any('\\' in a or '$' in a for a in argv)
+            writing = writing or any(os.path.basename(a) in _FILES | {'sqlite3', 'sqlite3.exe', 'find',
+                'sh', 'bash', 'dash', 'zsh', 'ksh', 'xargs', 'busybox'}
+                or re.fullmatch(r'python(?:3(?:\.\d+)?)?', os.path.basename(a)) for a in argv)
+        hazardous = hazardous or any(re.search(r'(?:^|=)~(?:[+-]\d*|\d+)(?:/|$)', a)
+                                      or re.search(r'\$(?:\{)?(?:OLDPWD|PWD)\b', a) for a in argv)
         while argv and (argv[0] in _CONTROL | {"{", "}", "!", "time"}
                         or _ASSIGN.match(argv[0])):
             hazardous = hazardous or argv[0] == 'case' or argv[0].startswith('CDPATH=')
@@ -321,10 +344,10 @@ def _unsupported_write_context(text, guard, budget):
         if not argv:
             continue
         word = os.path.basename(argv[0])
-        hazardous = hazardous or word in {'pushd', 'popd', 'builtin', 'read', 'eval', 'source', '.', 'function', 'chdir'}
+        hazardous = hazardous or word in {'pushd', 'popd', 'builtin', 'read', 'mapfile', 'readarray', 'eval', 'source', '.', 'function', 'chdir'}
         hazardous = hazardous or (word == 'cd' and '-' in argv[1:])
         hazardous = hazardous or any(re.match(r'^~(?:[+-](?:\d*)|\d+)(?:/|$)', a) for a in argv[1:])
-        hazardous = hazardous or (word == 'printf' and '-v' in argv[1:]) or (word == 'set' and '--' in argv[1:])
+        hazardous = hazardous or (word == 'printf' and any(a.startswith('-v') for a in argv[1:])) or word == 'set'
         # sqlite3 and find are cwd-sensitive mutations too, not only _FILES.
         # A shell invoked by env can execute arbitrary writes in env's cwd.
         writing = (writing or word in _FILES or word in {'sqlite3', 'sqlite3.exe'}
