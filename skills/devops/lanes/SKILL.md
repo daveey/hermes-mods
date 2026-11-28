@@ -146,4 +146,4 @@ How to choose:
    nothing without a reason the user would accept.
 4. Write one `note` per lane that is off its target, saying why in plain words.
 
-The planner never changes shares, never creates cards and never archives. Those are the user's.
+The planner never changes shares or creates cards. `apply` has no archive action yet, although David wants moot held automation cards archived. Until it ships, name moot held cards in the lane `note` so the owning chat archives them (procedure above).
