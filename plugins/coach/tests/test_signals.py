@@ -2009,6 +2009,23 @@ def test_moved_off_entry_before_left_pool_timestamp_still_files_drift(tmp_path):
     assert "moved-off-entry" in got[0]["symptom"]
 
 
+@pytest.mark.parametrize("healthy_board", ["default", "healthy"])
+def test_kanban_corrupt_neighbor_preserves_healthy_signals(tmp_path, healthy_board):
+    h = tmp_path / "h"
+    db = (h / "kanban.db" if healthy_board == "default" else
+          h / "kanban" / "boards" / healthy_board / "kanban.db")
+    make_board(db, [("t_neighbor", "build the thing", None, "crashed", "worker died")] * 2)
+    bad = h / "kanban" / "boards" / "broken" / "kanban.db"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"not a sqlite database")
+    cur = {}
+    signals = sg.collect_kanban(h, cur, NOW, "hubhost")
+    assert [s["kanban"] for s in signals] == [{"board": healthy_board, "cards": ["t_neighbor"]}]
+    assert cur["kanban"] == {healthy_board: 2}
+    assert sg.collect_kanban(h, cur, NOW, "hubhost") == []
+    assert bad.read_bytes() == b"not a sqlite database"
+
+
 def test_kanban_sibling_cards_with_same_stem_and_error_are_one_signal(tmp_path):
     h = tmp_path / "h"
     err = "worker exited cleanly (rc=0) without kanban_complete — protocol violation"
