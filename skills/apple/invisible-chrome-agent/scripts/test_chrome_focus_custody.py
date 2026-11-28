@@ -278,6 +278,76 @@ class FocusFrames(unittest.TestCase):
                             self.assertEqual(result, {'id':7, 'sessionId':'S', 'result':{}})
                         self.assertEqual(len(logs), 1)
 
+    def assert_tunnel_denied(self, payload, fragmented=False, opcode=1):
+        import io
+        import json
+        upstream, client, logs = self.pump(payload, fragmented=fragmented, opcode=opcode)
+        self.assertEqual(upstream, [], 'hidden tunnel must not reach Chrome unchanged')
+        self.assertEqual(len(client), 1)
+        reply = json.loads(hca.read_frame(io.BytesIO(client[0]))[3])
+        self.assertEqual(reply['id'], 9)
+        self.assertEqual(reply['error']['code'], -32000)
+        self.assertIn('flat', reply['error']['message'])
+        self.assertNotIn('result', reply)
+        self.assertEqual(len(logs), 1)
+
+    def test_nested_bring_to_front_denied(self):
+        import json
+        payload = json.dumps({'id': 9, 'method': 'Target.sendMessageToTarget',
+                              'params': {'sessionId': 'inner', 'message': json.dumps(
+                                  {'id': 1, 'method': 'Page.bringToFront'})}}).encode()
+        self.assert_tunnel_denied(payload)
+
+    def test_nested_escaped_fragmented_create_target_denied(self):
+        import json
+        spelling = ''.join('\\u%04x' % ord(c) for c in 'Target.createTarget')
+        inner = '{"id":1,"method":"%s","params":{"url":"about:blank","focus":true}}' % spelling
+        payload = json.dumps({'id': 9, 'method': 'Target.sendMessageToTarget',
+                              'params': {'sessionId': 'inner', 'message': inner}}).encode()
+        self.assert_tunnel_denied(payload, fragmented=True)
+
+    def test_hidden_tunnel_envelope_matrix(self):
+        import io
+        import json
+        # Deny even malformed/recursive tunnels: no inner parser is trusted here.
+        for inner in ('not json', '[]', '{"method":"Target.sendMessageToTarget"}'):
+            for opcode in (1, 2):
+                with self.subTest(inner=inner, opcode=opcode):
+                    payload = json.dumps({'id': 9, 'sessionId': 'outer',
+                                          'method': 'Target.sendMessageToTarget',
+                                          'params': {'message': inner}}).replace(
+                                              'sendMessage', r'send\u004dessage').encode()
+                    upstream, client, logs = self.pump(payload, fragmented=True, opcode=opcode)
+                    self.assertEqual(upstream, [])
+                    reply = json.loads(hca.read_frame(io.BytesIO(client[0]))[3])
+                    self.assertEqual(reply['sessionId'], 'outer')
+                    self.assertEqual(reply['id'], 9)
+                    self.assertEqual(reply['error']['code'], -32000)
+
+    def test_flat_session_routing_preserved(self):
+        import io
+        import json
+        payload = b'{"id":9,"sessionId":"flat","method":"Page.bringToFront"}'
+        upstream, client, logs = self.pump(payload)
+        self.assertEqual(upstream, [])
+        self.assertEqual(json.loads(hca.read_frame(io.BytesIO(client[0]))[3]),
+                         {'id': 9, 'sessionId': 'flat', 'result': {}})
+        payload = b'{"id":9,"sessionId":"flat","method":"Runtime.enable"}'
+        upstream, client, logs = self.pump(payload)
+        self.assertEqual(hca.read_frame(io.BytesIO(upstream[0]))[3], payload)
+        self.assertEqual(client, [])
+
+    def test_shown_nonraising_tunnel_unchanged(self):
+        import io
+        import json
+        payload = json.dumps({'id': 9, 'method': 'Target.sendMessageToTarget',
+                              'params': {'sessionId': 'inner', 'message': json.dumps(
+                                  {'id': 1, 'method': 'Runtime.enable'})}}).encode()
+        upstream, client, logs = self.pump(payload, show=True)
+        self.assertEqual(hca.read_frame(io.BytesIO(upstream[0]))[3], payload)
+        self.assertEqual(client, [])
+        self.assertEqual(logs, [])
+
     def test_hidden_undecodable_complete_messages_deny(self):
         for payload in (b'not json', b'{"method":"Target.activateTarget"', b'\xff', b'[]', b'null', b'{"method":7}'):
             for fragmented in (False, True):
