@@ -170,6 +170,15 @@ def preflight(core: Any, scorer: Any, args: dict, tools: list[dict], session_id:
                 excluded.add(tid)
     hits = score(core, scorer, str(args.get('title') or ''), str(args.get('body') or ''), rows, excluded)
     declared = dispositions(str(args.get('body') or ''))
+    # An explicit archive is an action promise, even when relevance scoring did
+    # not select it. Never silently discard it or widen archive authority.
+    hit_ids = {h['id'] for h in hits}
+    unmatched_archives = [tid for tid, (action, _) in declared.items()
+                          if action == 'archive' and tid not in hit_ids]
+    if unmatched_archives:
+        return {'action': 'block', 'message': 'ask-gate: superseding_create — archive disposition is not a matched '
+                'open candidate: ' + ', '.join(unmatched_archives)
+                + '. Remove that archive declaration and use the ordinary scoped archive tool separately.'}
     missing = [h for h in hits if h['id'] not in declared]
     if missing:
         return {'action': 'block', 'message': 'ask-gate: superseding_create — reconcile these open cards:\n'
@@ -265,6 +274,26 @@ def after_create(core: Any, args: dict, result: Any, session_id: str) -> None:
     archives = pending.pop((session_id, json.dumps(args, sort_keys=True)), [])
     new_id = created_id(result)
     if not new_id:
+        value = result_dict(result)
+        # A genuinely refused create performs no cleanup. Queued remote creates
+        # and pending origin binding may already exist: retain visible debt, not
+        # an implied archive or a guessed replacement pointer.
+        if value.get('ok') or value.get('created'):
+            for path, tid, _, _ in archives:
+                refusal = ('replacement creation is not confirmed locally; cleanup NOT performed'
+                           + ' (status=' + str(value.get('status') or value.get('error') or 'unknown')
+                           + ', request=' + str(value.get('request_id') or 'unavailable') + ')')
+                core.log_event('superseding_create_archive', new_id=None, old_id=tid,
+                               archived=False, error=refusal)
+                try:
+                    from tools.kanban_tools import _handle_comment
+                    warning = result_dict(_handle_comment({'task_id': tid, 'board': board_name(Path(path)),
+                        'body': 'Supersession cleanup NOT performed: ' + refusal
+                                + '. Creator must reconcile this disposition after the original create settles.'}))
+                    if not warning.get('ok'):
+                        raise RuntimeError(str(warning.get('error') or 'comment readback unavailable'))
+                except Exception as exc:
+                    core.log_event('superseding_create_cleanup_error', old_id=tid, error=repr(exc))
         return
     for path, tid, title, body in archives:
         try:

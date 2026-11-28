@@ -51,7 +51,13 @@ Supersedes:
   Unavailable archive authority refuses the create so the owner can amend/reconcile
   instead. The write transaction rechecks status, claims and the full old title/body;
   a card that became running/claimed or changed acceptance is not archived. An
-  after-create failure is logged and a cleanup warning is posted on the new card.
+  after-create failure is logged and a scoped cleanup warning is attempted on the new
+  card. A queued remote create or pending origin binding has no confirmed replacement
+  yet: no old card is archived, every unfinished disposition is logged, and a scoped
+  warning is attempted on each old card (comment failures are logged too). The creator
+  must reconcile cleanup after that original request settles; this is not an automatic
+  deferred archive. Declaring `archive` for an ID that was not a matched open candidate
+  refuses the create; use the ordinary scoped archive tool separately instead.
 - `amend`: first make a successful `kanban_comment` this turn whose persisted body
   begins `Acceptance change:` and describes the changed acceptance. The gate reads
   that exact comment back; writing `amend` alone is not evidence.
