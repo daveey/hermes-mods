@@ -88,6 +88,30 @@ class Watch(unittest.TestCase):
         with self.assertRaises(ValueError): self.watch.add(self.root,{**good,'target_p90':12})
         self.assertEqual((self.root/'latency/metrics.local.yaml').read_bytes(),before)
 
+    def test_target_boundaries_tool_and_add_leave_registry_unchanged(self):
+        good = self.watch.propose(describe='decision_requested -> unblocked')['definition']
+        path = self.root/'latency/metrics.local.yaml'
+        invalid = (10**1000, -(10**1000), True, False, float('nan'),
+                   float('inf'), -float('inf'), 0, -1, 90*86400000+1)
+        # Both a missing registry and an existing registry must remain untouched.
+        for seeded in (False, True):
+            if seeded:
+                self.watch.add(self.root, good)
+            before = path.read_bytes() if path.exists() else None
+            for target in invalid:
+                with self.subTest(seeded=seeded, target=repr(target)):
+                    definition = {**good, 'target_p90':target}
+                    result = json.loads(self.watch.handle({'definition':definition}))
+                    self.assertIn('error', result)
+                    with self.assertRaises(ValueError):
+                        self.watch.add(self.root, definition)
+                    self.assertEqual(path.read_bytes() if path.exists() else None, before)
+        for target in (1, 1.5, 90*86400000, float(90*86400000)):
+            with self.subTest(valid_target=target):
+                result = json.loads(self.watch.handle({'definition':{**good, 'target_p90':target}}))
+                self.assertEqual(result['definition']['target_p90'], target)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_span_label_stops_on_arrival_and_uses_original_add_date(self):
         Store=importlib.import_module(api.pkg().__name__+'.store').Store
         now=1800000000

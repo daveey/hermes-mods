@@ -91,6 +91,32 @@ class API(unittest.TestCase):
         self.assertNotIn('private',response.text)
         self.assertNotIn(span['id'],{d['id'] for d in self.client.get('/v1/series').json()['metrics']})
 
+    def test_watch_target_boundaries_are_400_without_registry_mutation(self):
+        import importlib
+        watch = importlib.import_module(api.pkg().__name__+'.watch')
+        good = watch.propose(describe='decision_requested -> unblocked')['definition']
+        path = self.root/'latency/metrics.local.yaml'
+        invalid = (10**1000, -(10**1000), True, False, float('nan'),
+                   float('inf'), -float('inf'), 0, -1, 90*86400000+1)
+        for seeded in (False, True):
+            if seeded:
+                self.assertEqual(self.client.post('/v1/watch',json={'definition':good}).status_code,200)
+            before = path.read_bytes() if path.exists() else None
+            for target in invalid:
+                with self.subTest(seeded=seeded, target=repr(target)):
+                    # Raw JSON also exercises nonfinite values disallowed by httpx's encoder.
+                    raw = json.dumps({'definition':{**good, 'target_p90':target}})
+                    self.assertLess(len(raw.encode()),4096)
+                    response = self.client.post('/v1/watch',content=raw,
+                                                headers={'Content-Type':'application/json'})
+                    self.assertEqual(response.status_code,400,response.text)
+                    self.assertEqual(path.read_bytes() if path.exists() else None,before)
+        for index,target in enumerate((1,1.5,90*86400000,float(90*86400000))):
+            definition = {**good,'id':'watch.boundary.'+str(index),'target_p90':target}
+            response = self.client.post('/v1/watch',json={'definition':definition})
+            self.assertEqual(response.status_code,200,response.text)
+            self.assertEqual(response.json()['definition']['target_p90'],target)
+
     def test_15_second_cache_has_single_build(self):
         with patch.object(api,'build',return_value={'metrics':[]}) as build:
             self.assertEqual(api.cached('7d'),api.cached('7d'))
