@@ -64,6 +64,19 @@ def _remote_module():
 MISMATCH = "Request no longer matches its frozen server binding"
 
 
+def _overdue_module():
+    spec = importlib.util.spec_from_file_location('_user_steps_kanban_overdue',
+                                                  Path(__file__).with_name('kanban_overdue.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_overdue = _overdue_module()
+# Card events that can carry this producer's receipt. ``triage_park_acknowledged`` is Keep parked's.
+_RECEIPT_KINDS = ('unblocked', 'archived', 'user_steps_answer', 'triage_park_acknowledged')
+
+
 def explicit_revision(request, binding):
     """An explicit approval replacing a projected choice belongs to the owning chat."""
     projected = json.loads(binding["request"])
@@ -541,6 +554,15 @@ class Mirror:
             hr = json.loads(row.get("human_request") or "null")
         except (ValueError, TypeError):
             return None
+        if row.get("status") == "triage" and hr is None:
+            # [daveey] No human ask, parked past the overdue-triage threshold: the red the session shows
+            # gets an actionable card (Release / Archive / Keep parked) instead of nothing to click.
+            # A failure here hides only this card's overdue tile, never other asks (and fails a delivery fence).
+            try:
+                return _overdue.snapshot(self, c, row, task, owner, presentation=presentation)
+            except Exception as exc:  # noqa: BLE001 - isolate one card's optional projection
+                logging.getLogger("user-steps").warning("Overdue triage card unavailable task=%s: %s", task, exc)
+                return None
         if (
             not isinstance(hr, dict)
             or not hr.get("action")
@@ -548,23 +570,7 @@ class Mirror:
             not in ("reply", "approval", "user_terminal", "physical", "external")
         ):
             return None
-        # Prefer the creating user session; otherwise the earliest local user subscriber.
-        # A touched/watching session never gets another copy of the same card ask.
-        sid = row.get("session_id")
-        if not sid or not self.session_exists(sid):
-            try:
-                subs = c.execute(
-                    "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? "
-                    "AND platform IN ('desktop','cli','tui','web') "
-                    "AND (notifier_profile=? OR notifier_profile IS NULL) "
-                    "ORDER BY created_at,chat_id",
-                    (task, owner["profile"]),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                subs = []
-            # The local user-surface subscription is provenance even for legacy
-            # custom-source chats. Require its stored session, not a source alias.
-            sid = next((r[0] for r in subs if self.session_present(r[0])), None)
+        sid = self._ask_session(c, row, task, owner)
         if not sid or (presentation and self.tip(sid) != owner["storedSessionId"]):
             return None
         # A new identical block after an unblock is a NEW question, not an old answer replay.
@@ -584,6 +590,27 @@ class Mirror:
         if cited:
             snap['cited_set'] = cited
         return snap
+
+    def _ask_session(self, c, row, task, owner):
+        """The local user chat an ask on ``task`` belongs to, else None."""
+        # Prefer the creating user session; otherwise the earliest local user subscriber.
+        # A touched/watching session never gets another copy of the same card ask.
+        sid = row.get("session_id")
+        if not sid or not self.session_exists(sid):
+            try:
+                subs = c.execute(
+                    "SELECT chat_id FROM kanban_notify_subs WHERE task_id=? "
+                    "AND platform IN ('desktop','cli','tui','web') "
+                    "AND (notifier_profile=? OR notifier_profile IS NULL) "
+                    "ORDER BY created_at,chat_id",
+                    (task, owner["profile"]),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                subs = []
+            # The local user-surface subscription is provenance even for legacy
+            # custom-source chats. Require its stored session, not a source alias.
+            sid = next((r[0] for r in subs if self.session_present(r[0])), None)
+        return sid or None
 
     def _citations(self, c, task, hr, owner):
         if hr.get('choices'):
@@ -670,7 +697,10 @@ class Mirror:
                 or not isinstance(opt.get("value"), str)
             ):
                 raise self.core.ActionError("Card choices require label and value")
-            choices.append(dict(id=f"card-{i}", label=opt["label"], effect="answer"))
+            choices.append(dict(id=f"card-{i}", label=opt["label"], effect="answer",
+                                # Overdue-triage cards carry their own plain consequence lines.
+                                **({k: opt[k] for k in ("explain", "recommended") if k in opt}
+                                   if snap.get("overdue") else {})))
         ref = dict(
             gatewayId=snap.get('remote', {}).get('target', {}).get('ownerGateway', owner['gatewayId']),
             profile=snap.get('remote', {}).get('target', {}).get('ownerProfile', owner['profile']),
@@ -685,6 +715,9 @@ class Mirror:
         )
         markdown += (
             "\n\nSelecting an option records its value on this card and resumes it. "
+            if not snap.get("overdue") else
+            "\n\nYour choice acts on this card on its home board: Release resumes it as your release, "
+            "Archive stops it, Keep parked leaves it as is."
         )
         markdown += "Archive abandons the card." if not hr.get("choices") else ""
         markdown += " No commands run from this panel."
@@ -811,6 +844,15 @@ class Mirror:
             if len(marked) == 1:
                 recommended = f'card-{marked[0]}'
         details = '\n\n'.join(str(hr[k]) for k in ('action', 'why_human', 'scope', 'evidence') if hr.get(k))
+        if snap.get('overdue'):
+            # Overdue triage: not a human ask. The panel draws it as a red Stuck card, never in Needs you.
+            info = snap['overdue']
+            return dict(request, presentation=dict(
+                kind='kanban-overdue', question=question, details=details, recommendedChoiceId=recommended,
+                other=False, overdue=dict(entered_at=info['entered_at'], route=info['route'],
+                                          holder=info['holder'], reason=info['reason']),
+                sourceRef=dict(gatewayId=request['owner']['gatewayId'], profile=request['owner']['profile'],
+                               type='kanban', board=binding['board'], id=binding['task'])))
         note = None
         if snap.get('remote'):
             if captured is None:
@@ -1258,11 +1300,26 @@ class Mirror:
             subs = None  # _snapshot reads no subscribers then either
         positions = [x for x in ("id", "status", "idempotency_key", "human_request", "session_id", "title")
                      if x in have]
+        # Overdue-triage cards (no human ask): their newest event and created-chat links. Crossing the
+        # overdue threshold is clock-only, so it shows within the FULL_EVERY_S ceiling, not on this key.
+        try:
+            parked = [tuple(r) for r in c.execute(
+                "SELECT t.id, t.title, t.session_id, (SELECT MAX(e.id) FROM task_events e WHERE e.task_id=t.id), "
+                "(SELECT json_group_array(l.chat_session || ':' || COALESCE(l.released, 0)) FROM task_chat_links l "
+                "WHERE l.task_id=t.id AND l.kind='created') "
+                "FROM tasks t WHERE t.status='triage' AND t.human_request IS NULL ORDER BY 1")]
+        except sqlite3.OperationalError:
+            parked = None
         session_ids = {r[positions.index("session_id")] for r in rows
                        if "session_id" in positions and r[positions.index("session_id")]}
+        for _, _, sid, _, links in parked or ():
+            session_ids.update(s.rsplit(':', 1)[0] for s in json.loads(links or '[]') if s)
+            if sid:
+                session_ids.add(sid)
         subscriber_ids = {r[1] for r in (subs or []) if r[1]}
         session_ids.update(subscriber_ids)
-        return _digest([rows, subs]), tuple(sorted(session_ids)), tuple(sorted(subscriber_ids))
+        return (_digest([rows, subs, parked] if parked else [rows, subs]),
+                tuple(sorted(session_ids)), tuple(sorted(subscriber_ids)))
 
     def _reconcile(self, owner, fenced):
         """One full pass. False when anything was deferred (the next pass must not be skipped)."""
@@ -1278,7 +1335,8 @@ class Mirror:
             try:
                 with _kept(path) as c:
                     rows = c.execute(
-                        "SELECT id FROM tasks WHERE status IN ('blocked','triage') AND human_request IS NOT NULL"
+                        "SELECT id FROM tasks WHERE status IN ('blocked','triage') AND human_request IS NOT NULL "
+                        "UNION SELECT id FROM tasks WHERE status='triage' AND human_request IS NULL"
                     ).fetchall()
                     snapshots = [self._snapshot(c, r[0], owner) for r in rows]
             except (sqlite3.Error, OSError):
@@ -1517,8 +1575,8 @@ class Mirror:
             encoded([op["intent"], op["decision"]]).encode()
         ).hexdigest()
         for row in c.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind IN ('unblocked','archived','user_steps_answer') ORDER BY id DESC",
-            (binding["task"],),
+            "SELECT payload FROM task_events WHERE task_id=? AND kind IN (SELECT value FROM json_each(?)) ORDER BY id DESC",
+            (binding["task"], json.dumps(_RECEIPT_KINDS)),
         ):
             payload = json.loads(row[0] or "{}")
             if not isinstance(payload, dict):
@@ -1723,6 +1781,8 @@ class Mirror:
             old = self._receipt(c, binding, op)
             if old:
                 return old
+            if json.loads(binding['snapshot']).get('overdue'):
+                return _overdue.deliver(self, api, c, binding, op)
             request = json.loads(binding["request"])
             selected = next(
                 (
