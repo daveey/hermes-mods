@@ -28,6 +28,26 @@ Only the owning `needs_you` row presents the ask. Canonical request retirement
 removes the `your check` label; nonhuman operational dependency reasons remain.
 Desktop session-tasks consumes this backend-authored display text unchanged.
 
+## Recorded retained disposition
+
+An owner-qualified core `retained_stop` receipt with episode/event identity and
+`reason=scope_stopped` describes a settled non-success disposition, not an
+unanswered owner decision. For a triage row without a live human request, claim
+or run, the main detail is `stopped · incomplete · evidence retained · no action
+needed`. It outranks subsequent spend-review escalation copy. The adapter uses
+core's full-history, origin-ordered annotation before event-tail clipping; the
+panel never reconstructs this receipt from prose or SQL arrival order. Missing
+or superseded receipts retain ordinary pending/unknown behavior.
+
+The receipt is display-only: no lifecycle, source custody, permissions or budget
+changes, no completion or fresh execution claim. Operational overdue-triage age
+still applies, but follows the settled disposition instead of replacing it.
+`retained_disposition={text,episode_uid,event_uid}` carries the backend-authored
+historical wording across client expiry. Stale/unavailable rows and expired
+models append `last recorded disposition; current status unknown`, withdraw live
+attention/wait authority normally, and retain freshness diagnostics separately.
+A newer canonical request or execution evidence must not inherit that message.
+
 ## Overdue triage: operational red, not a human decision
 
 `hermes_cli.kanban_triage_attention` is the authoritative backend rule: a current
