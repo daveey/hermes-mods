@@ -309,7 +309,7 @@ def state_db(path):
     c.executescript('''
         CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT, parent_session_id TEXT,
             archived INTEGER DEFAULT 0, muted INTEGER DEFAULT 0, end_reason TEXT, source TEXT DEFAULT 'desktop',
-            outcome_json TEXT,
+            outcome_json TEXT, model_config TEXT,
             started_at REAL, pinned INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
             content TEXT, timestamp REAL, display_kind TEXT, display_metadata TEXT, active INTEGER DEFAULT 1);
