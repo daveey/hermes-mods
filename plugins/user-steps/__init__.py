@@ -1004,6 +1004,11 @@ def _register_clarify_early() -> None:
 
 def register(ctx) -> None:
     _require_publication_contract()
+    try:
+        from . import session_state
+    except ImportError:
+        session_state = _sib('session_state')
+    session_state.register(ctx)
     # The dashboard's _user_steps_kanban_mirror is a different, process-owned
     # lifetime. Only retire a mirror imported into THIS plugin package; never
     # look up a replacement package by its reusable sys.modules name at unload.

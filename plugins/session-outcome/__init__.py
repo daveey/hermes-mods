@@ -930,7 +930,8 @@ def provider(session_id: str) -> Optional[dict]:
     items = []
     for s in steps:
         choices = s.get("choices") or [{"label": o, "value": o} for o in s.get("options") or []]
-        items.append({"id": s["id"], "question": s.get("text", ""), "choices": choices, "state": "open"})
+        items.append({"id": s["id"], "question": s.get("text", ""), "choices": choices, "state": "open",
+                      **({'request_ref': s['request_ref']} if 'request_ref' in s else {})})
     return {"decision_items": items, "waiting_on": pending}
 
 
