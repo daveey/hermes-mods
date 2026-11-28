@@ -18,7 +18,9 @@ def test_core_integration_copies_shared_board_inventory(tmp_path):
         'plugins = pathlib.Path(sys.argv[1]).parents[1]; '
         'helper = plugins / "kanban_inventory.py"; '
         'assert helper.read_bytes() == pathlib.Path(sys.argv[2]).read_bytes(); '
-        'assert callable(runpy.run_path(str(helper))["board_db_files"])'
+        'assert callable(runpy.run_path(str(helper))["board_db_files"]); '
+        'test = runpy.run_path(str(plugins / "user-steps/tests/test_integration_layout.py")); '
+        'test["test_f3_staging_imports_real_user_steps_without_core"](plugins.parent / "layout-probe")'
     )
     runner.write_text(
         '#!/usr/bin/env bash\nset -eu\n'

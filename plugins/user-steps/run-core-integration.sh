@@ -25,6 +25,9 @@ for plugin in user-steps ask-gate session-outcome open-asks hub-sync session-pan
   cp -R "$plugins/$plugin" "$fixtures/plugins/$plugin"
 done
 cp "$plugins/kanban_inventory.py" "$fixtures/plugins/kanban_inventory.py"
+# The copied layout regression exercises the real F3 staging function too.
+mkdir -p "$fixtures/tests/integration_f3"
+cp "$plugins/../tests/integration_f3/conftest.py" "$fixtures/tests/integration_f3/conftest.py"
 cp "$plugins/coach/placement_evidence.py" "$fixtures/plugins/coach/placement_evidence.py"
 cp -R "$plugins/../desktop-plugins/user-steps" "$fixtures/desktop-plugins/user-steps"
 cd "$core"
