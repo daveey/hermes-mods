@@ -195,12 +195,176 @@ RETRY_INTERVAL = 20.0
 RETRY_WINDOW = 30 * 60.0
 
 
+class QuotaDeferred(Deferred):
+    """The guarded child refused; only local ledger recovery permits another attempt."""
+
+
+def quota_recovered(hold):
+    # Import the installed read-only predicate, never a credential-vending command.
+    # Unknown/missing evidence stays held. A generic exit75 is not proof of reserve
+    # exhaustion and therefore cannot supply a made-up bucket/reset.
+    bucket = hold.get('bucket')
+    now = time.time()
+    reset = hold.get('reset')
+    if isinstance(reset, (int, float)) and math.isfinite(reset) and now >= reset:
+        # The refusing ledger's recorded window expired. This is not an allow:
+        # the next guarded child still performs its normal fresh admission.
+        return True
+    retry_at = hold.get('retry_at')
+    if (not isinstance(bucket, str) or not isinstance(retry_at, (int, float))
+            or not math.isfinite(retry_at) or now < retry_at <= now + 300):
+        return False
+    helper = Path.home() / '.hermes/bin/github_quota.py'
+    try:
+        spec = importlib.util.spec_from_file_location('skill_quota_recovery', helper)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.reserve_ok(bucket=bucket) == 0
+    except Exception:
+        return False
+
+
+def _private_json(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return {}
+    with os.fdopen(fd) as fh:
+        stamp = os.fstat(fh.fileno())
+        if (not stat.S_ISREG(stamp.st_mode) or stamp.st_uid != os.getuid()
+                or stamp.st_mode & 0o077 or stamp.st_size > 16384):
+            raise Deferred('unsafe CI polling state')
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise Deferred('invalid CI polling state')
+    return data
+
+
+def _save_private_json(path, data):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.ci-poll-')
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            json.dump(data, fh, allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+@contextmanager
+def polling_lock(directory):
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = directory.lstat()
+    if not stat.S_ISDIR(stamp.st_mode) or stamp.st_uid != os.getuid() or stamp.st_mode & 0o077:
+        raise Deferred('unsafe CI polling directory')
+    fd = os.open(directory / '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        stamp = os.fstat(fd)
+        if not stat.S_ISREG(stamp.st_mode) or stamp.st_uid != os.getuid() or stamp.st_mode & 0o077:
+            raise Deferred('unsafe CI polling lock')
+        deadline = time.monotonic() + remaining(LOCK_WAIT)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Deferred('CI polling lock busy')
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def quota_directory():
+    # Shared by repository records/profiles on this host, not one retry worker.
+    return Path.home() / '.hermes/cache/skill-publish-quota'
+
+
+def require_quota_recovery():
+    directory = quota_directory()
+    with polling_lock(directory):
+        path = directory / 'hold.json'
+        hold = _private_json(path)
+        if hold and not quota_recovered(hold):
+            raise QuotaDeferred('CI quota recovery pending')
+        if hold:
+            path.unlink()
+
+
+def polled_main_ci(root, sha):
+    """Share only negative evidence; every green publication uses a fresh child.
+
+    The Git common directory shares state across linked publication worktrees and
+    restarted/profile retry workers. State is advisory only: never a green allow.
+    """
+    try:
+        require_quota_recovery()
+    except QuotaDeferred:
+        return 'unknown'
+    common = Path(run(root, 'rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip())
+    if not common.is_absolute():
+        common = (Path(root) / common).resolve()
+    directory = common / 'skill-ci-poll'
+    with polling_lock(directory):
+        path = directory / 'state.json'
+        state = _private_json(path)
+        now = time.time()
+        if state.get('sha') == sha and state.get('state') in {'pending', 'red', 'unknown'}:
+            due = state.get('next_at')
+            if not isinstance(due, (float, int)) or not math.isfinite(due):
+                raise Deferred('invalid CI polling deadline')
+            # A backward wall-clock step must not turn a 5-minute hint into
+            # an indefinite refusal. Never reuse implausibly future evidence.
+            if now < due <= now + 300:
+                return state['state']
+        # Lock held through request completion: contenders consume the persisted
+        # negative result, not their own child. Global quota lock also closes the
+        # race between a refusal and another repository's next child.
+        with polling_lock(quota_directory()):
+            hold_path = quota_directory() / 'hold.json'
+            hold = _private_json(hold_path)
+            if hold and not quota_recovered(hold):
+                raise QuotaDeferred('CI quota recovery pending')
+            if hold:
+                hold_path.unlink()
+            try:
+                result = latest_main_ci(root, sha)
+            except QuotaDeferred as exc:
+                match = re.search(r'--bucket\s+([A-Za-z0-9:_.-]+)', str(exc))
+                if match:
+                    reset = re.search(r'\(epoch (\d+)\)', str(exc))
+                    _save_private_json(hold_path, {'bucket': match.group(1),
+                                                  'reset': int(reset.group(1)) if reset else None,
+                                                  'retry_at': time.time() + 300})
+                    return 'unknown'
+                # An untyped transport/supervisor75 is unavailable evidence, not
+                # proven quota exhaustion. Bound it with the negative backoff;
+                # do not invent a bucket or a permanent unrecoverable hold.
+                result = 'unknown'
+        if result == 'green':
+            _save_private_json(path, {})
+            return result
+        previous = state.get('delay', 0) if state.get('sha') == sha else 0
+        if not isinstance(previous, (int, float)) or not math.isfinite(previous):
+            raise Deferred('invalid CI polling delay')
+        delay = min(300, max(60 if result == 'pending' else 120, previous * 2))
+        _save_private_json(path, {'sha': sha, 'state': result, 'delay': delay,
+                                  'next_at': time.time() + delay})
+        return result
+
+
 def latest_main_ci(root, sha):
     """Require a completed successful latest push CI run for this exact main tip."""
     try:
         p = bounded(['gh', 'run', 'list', '--branch', 'main', '--event', 'push',
                      '--commit', sha, '--limit', '100', '--json',
                      'headSha,status,conclusion,workflowName,createdAt'], cwd=root, timeout=20)
+        if p.returncode == 75:
+            raise QuotaDeferred(p.stderr.decode(errors='replace'))
         if p.returncode:
             return 'unknown'
         rows = json.loads(p.stdout)
@@ -222,6 +386,8 @@ def latest_main_ci(root, sha):
                or r['status'] in RUNNING_STATUSES for r in latest.values()):
             return 'pending'
         return 'unknown'
+    except Deferred:
+        raise
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         return 'unknown'
 
@@ -269,8 +435,9 @@ def trusted_hooks(archive):
     return str(directory)
 
 
-def publish(root, paths, *, session_id='', task_id='', ci=latest_main_ci, clock=None):
+def publish(root, paths, *, session_id='', task_id='', ci=None, clock=None):
     clock = clock or time.monotonic
+    ci = ci or polled_main_ci
     try:
         with operation_budget(WORK_BUDGET, clock):
             outcome = _publish(root, paths, session_id=session_id, task_id=task_id, ci=ci, clock=clock)
@@ -323,6 +490,7 @@ def _publish(root, paths, *, session_id, task_id, ci, clock):
             raise Refused(str(exc)) from exc
         if any(snap is None for snap in captured.values()):
             raise Refused('deletion requires reviewed publication')
+        require_quota_recovery()
         run(root, 'fetch', 'origin', 'main')
         base = run(root, 'rev-parse', 'origin/main').decode().strip()
         state = ci(root, base)
@@ -774,7 +942,7 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
     """Retry every pending record until none remain. One worker per directory (flock)."""
     directory = Path(directory) if directory else pending_dir()
     clock = clock or time.time
-    ci = ci or latest_main_ci
+    ci = ci or polled_main_ci
     if interval is None:
         interval = float(os.environ.get('HERMES_SKILL_PUBLISH_RETRY_INTERVAL') or RETRY_INTERVAL)
     counts = {'published': 0, 'kept': 0, 'dropped': 0, 'expired': 0, 'busy': 0}
@@ -871,6 +1039,23 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                     _drop(path, raw)
                     counts['expired'] += 1
                     continue
+                # A green CI observation followed by an overlap hold must not
+                # turn into a fresh CI child for every retry tick. This per-record
+                # negative hint cannot authorize publication or change custody.
+                import hashlib
+                retry_hint = directory / ('.retry-' + path.stem)
+                digest = hashlib.sha256(raw).hexdigest()
+                try:
+                    hint = _private_json(retry_hint)
+                except (OSError, ValueError):
+                    hint = {}  # Advisory damage cannot starve healthy siblings.
+                if not all(isinstance(hint.get(key, 0), (float, int))
+                           and math.isfinite(hint.get(key, 0)) for key in ('next_at', 'delay')):
+                    hint = {}
+                if (hint.get('record') == digest
+                        and clock() < hint.get('next_at', 0) <= clock() + 300):
+                    counts['kept'] += 1
+                    continue
                 try:
                     outcome = publish(root, paths, session_id=rec.get('session_id', ''),
                                       task_id=rec.get('task_id', ''), ci=ci)
@@ -885,6 +1070,10 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                     counts['kept'] += 1
                     continue
                 if deferrable(outcome):
+                    if not outcome.get('reason', '').startswith('latest main CI '):
+                        delay = min(300, max(60, hint.get('delay', 0) * 2)) if hint.get('record') == digest else 60
+                        _save_private_json(retry_hint, {'record': digest, 'delay': delay,
+                                                       'next_at': clock() + delay})
                     dirt_notice(paths, 'held', outcome.get('reason', 'unknown'), directory)
                     counts['kept'] += 1
                     continue
