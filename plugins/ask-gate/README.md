@@ -319,6 +319,25 @@ it. Tests: `tests/test_unblock_card_quality.py` (rule, L3 order incl. reconcilia
 session-panel `evidence.test.mjs` (rendered row). Older fixtures run with `ASK_GATE_UNBLOCK_BRIEF=0` from conftest;
 the switch is honoured only under pytest (`PYTEST_CURRENT_TEST`).
 
+## Ask context and acceptance (L3, no model call)
+
+`ask_context_hold` (`ask_context.py`) runs after `unblock_card_hold` on a `kanban_block` or blocked `kanban_create`
+with a `human_request`. It refuses an ask David could not resolve from its panel alone and names each gap:
+
+- context: `Situation:` plus `why_human` give two or more sentences, and `why_human` says why the agent cannot
+  (more than its `Tried:` part);
+- where: a non-decision action names the place to act (URL, numbered steps, a command or `run_in_user_terminal`,
+  a device/app); a PR or issue cited by number carries its URL or `owner/repo#N`;
+- choices: each option says what happens, and the recommended one states a size or cost (minutes, $, runs, or
+  "no further work");
+- buttons: the action or scope says what Unblock and Archive do.
+
+`acceptance_met` refuses with "acceptance met without this; complete instead" when the card's own acceptance has
+an "... or document the hold/gap with evidence" branch, unless the ask names a spend, permission or safety limit.
+Both are bounded to `ask_context.MAX_HOLDS` (3) per (session, tool, card); then the ask files and
+`ask_context_released` is logged. Fixtures are the hub asks behind t_01a21f5e47abf118 (`tests/test_ask_context.py`).
+On the 83 hub asks filed in the four days before it shipped, 33 would have been held.
+
 ## Requires compatible core before plugin rollout
 
 Registration requires `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES` with integer

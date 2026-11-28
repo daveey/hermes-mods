@@ -132,3 +132,4 @@ def _unblock_brief_off(monkeypatch):
     """Older fixtures carry human_requests without the generate-unblock-card brief; the rule has its own suite
     (test_unblock_card_quality.py), which turns it back on."""
     monkeypatch.setenv("ASK_GATE_UNBLOCK_BRIEF", "0")
+    monkeypatch.setenv("ASK_GATE_ASK_CONTEXT", "0")  # ask_context.py; its own suite is test_ask_context.py
