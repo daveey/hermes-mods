@@ -35,6 +35,8 @@ performance claim or create instrumentation work before the user adds it.
    while no measurements exist, never a fabricated zero or synthetic history.
    The link is visible in the proposal result and expanded panel row.
 
+For instrumentation verification, read `references/collector-verification.md`.
+
 If Desktop is unavailable, show the definition in text and explain that Add needs
 the enabled Latency Desktop plugin. Do not quietly write a different machine's
 registry or bypass dashboard authentication. Fix an Add failure and retry the same
