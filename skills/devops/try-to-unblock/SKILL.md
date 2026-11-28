@@ -112,13 +112,15 @@ first. Completing it promotes its waiting children. Archiving a safety-refused c
 refusing its children (see the withdrawal rule under rung g). Re-scoping or promoting a safety-refused card is
 refused.
 
-If the premise is gone, remove that ask without releasing independent holds. A stale
-human ask can coexist with a valid spend hold: use `action_request` withdrawal for its exact request ID, then
-`hermes kanban block <id> --metadata-only --human-request null '<reason>'` to clear the card's human-request
-metadata without authorizing execution. Read back both results. This does not change block kind or renew spend;
-report the remaining hold accurately rather than promoting merely to make the status look clear. Metadata-only can
-only clear or reword the ask: if the replacement changes its kind or wake settings, it is refused ("metadata-only
-cannot change kind or wake settings"). If David already did the step, unblock instead; otherwise re-block with the new ask.
+If the ask is superseded, clear it without releasing independent holds. Record the newer decision, withdraw
+only the obsolete `action_request` if present, then run
+`hermes kanban block <id> --metadata-only --human-request null '<reason>'` and read back `human_request`,
+status and current run. Metadata-only changes neither execution authority nor budget; it cannot change wake settings.
+Distinguish **approval received** from **approval applied**: an authenticated approval can remain reserved/unapplied
+while the native release gate still holds. Preserve its reservation and exact limits; clear the duplicate ask,
+not the approved operation. Unblock only after the required application is verified. Otherwise retain the hold
+and route application repair, not another approval request. Report “ask removed; work still stopped” rather than
+claiming release.
 When a parent and its child carry the same ask, keep it on the card that must finish first (the child cannot run
 before its parent) and clear the other one.
 
