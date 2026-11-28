@@ -204,6 +204,36 @@ def test_operation_reconciliation_live_monitor_waiter_and_old_receipts(tmp_path,
     assert module.reconcile_operation(core, {**operation, "expires_at": 1}, {}, tmp_path) == {}
 
 
+@pytest.mark.parametrize("blocker", ["swap", "unknown_swap", "force", "progress", "different_checkout"])
+def test_completion_requires_every_settled_identity_guard(tmp_path, monkeypatch, blocker):
+    module, core = load("version"), load("core")
+    operation = {"phase": "restarting", "target": "a" * 40}
+    result = {"applied": "a" * 40, "desktop_swap_pending": False,
+              "force_request": None, "progress": None}
+    if blocker == "swap":
+        result["desktop_swap_pending"] = True
+    elif blocker == "unknown_swap":
+        result["desktop_swap_pending"] = None
+    elif blocker == "force":
+        result["force_request"] = {"requested_at": 1}
+    elif blocker == "progress":
+        result["progress"] = {"state": "applying"}
+    else:
+        result["applied"] = "b" * 40
+    monkeypatch.setattr(module, "monitor_alive", lambda directory: True)
+    assert module.reconcile_operation(core, operation, result, tmp_path) == operation
+
+
+def test_dead_nonterminal_waiter_cannot_keep_an_operation_active(tmp_path, monkeypatch):
+    module, core = load("version"), load("core")
+    monkeypatch.setattr(module, "monitor_alive", lambda directory: False)
+    monkeypatch.setattr(core, "_pid_alive", lambda pid: False)
+    (tmp_path / "waiter.json").write_text(json.dumps({"state": "draining", "pid": 123}))
+    result = module.reconcile_operation(core, {"phase": "updating", "target": "a" * 40}, {}, tmp_path)
+    assert result["phase"] == "deferred"
+    assert "retry Update now" in result["reason"]
+
+
 def test_monitor_lock_readback(tmp_path):
     import fcntl
     module = load("version")
