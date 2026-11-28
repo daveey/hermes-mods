@@ -317,8 +317,8 @@ owner-authored comments, status changes and re-parks reset the unanswered sequen
 `wake_check_alive`, `wake_probe_unproven_notice` and the nudge's own comment/wake never count as answers.
 Keep the send times/cooldown when migrating an older probe-inclusive checkpoint.
 Nudge limits: **15/run**, **100/rolling 24 h**, separate from fix-card caps.
-Durable write-ahead pending delivery prevents crash/timeout resend; exact comment/message readback is the receipt,
-and unknown delivery stays pending for recovery, not a blind retry. `nudges-<mode>.json[l]` holds cadence/receipts;
+Durable write-ahead pending delivery prevents crash/timeout resend; exact message readback is the receipt.
+Unknown delivery stays pending, never blindly retried: read `references/delayed-nudge-receipts.md`. `nudges-<mode>.json[l]` holds cadence/receipts;
 shadow rows also go to `actions-shadow.jsonl`. Never copy live chat/card evidence into the public repository.
 
 Install merged code on the hub in shadow; adjudicate every would-nudge row from **two consecutive 15-minute
