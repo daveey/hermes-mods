@@ -202,7 +202,11 @@ def test_hermes_dispatch_arguments_cannot_execute_managed_prelude(tmp_path, argu
     old_home = os.environ.get('HOME')
     try:
         os.environ['HOME'] = str(tmp_path)
-        cmd = target_binding.command(LAUNCHER.parents[1] / 'pool_llm.py', [argument, 'arbitrary'])
+        try:
+            cmd = target_binding.command(LAUNCHER.parents[1] / 'pool_llm.py', [argument, 'arbitrary'])
+        except binding.BindingError:
+            assert not marker.exists()
+            return
     finally:
         if old_home is None:
             os.environ.pop('HOME', None)
@@ -211,6 +215,44 @@ def test_hermes_dispatch_arguments_cannot_execute_managed_prelude(tmp_path, argu
     p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20)
     assert not marker.exists(), 'managed CLI branch escaped pool dispatcher'
     assert p.returncode != 0, p.stdout
+
+
+@pytest.mark.parametrize('arguments', [['kanban', 'why'], ['update', '--post-swap', '/unused'], ['pm', 'repair']])
+def test_foreign_cli_verbs_never_enter_managed_bootstrap(tmp_path, arguments):
+    root, _, env = fixture_runtime(tmp_path)
+    marker = tmp_path / 'foreign-bootstrap'
+    path = root / 'hermes_bootstrap.py'
+    path.write_text(path.read_text() + f"\nopen({str(marker)!r}, 'w').close()\n")
+    subprocess.check_call(['/usr/bin/git', '-C', str(root), 'add', '.'])
+    subprocess.check_call(['/usr/bin/git', '-C', str(root), '-c', 'user.name=Fixture',
+                           '-c', 'user.email=fixture@example.com', 'commit', '-qm', 'bootstrap control'])
+    p = launch(env, *arguments)
+    assert not marker.exists(), 'foreign Hermes CLI verb reached managed bootstrap'
+    assert p.returncode == 2
+
+
+@pytest.mark.parametrize('arguments,expected', [(['models'], 'fixture-model'), (['ask', 'hello'], 'fixture-answer')])
+def test_actual_launcher_dispatches_pool_models_and_ask_with_mocked_adapters(tmp_path, arguments, expected):
+    root, _, env = fixture_runtime(tmp_path)
+    path = root / 'hermes_bootstrap.py'
+    path.write_text(path.read_text() + '''
+import runpy, sys
+original_run_path = runpy.run_path
+def controlled_pool(path, run_name):
+    namespace = original_run_path(path, run_name='controlled_pool')
+    scope = namespace['main'].__globals__
+    scope['managed_routes'] = lambda: {('anthropic', 'fast'): ['fixture-model']}
+    scope['complete'] = lambda *a, **k: {'text': 'fixture-answer', 'provider': 'anthropic', 'stop_reason': 'end_turn'}
+    raise SystemExit(namespace['main'](sys.argv[1:]))
+runpy.run_path = controlled_pool
+''')
+    subprocess.check_call(['/usr/bin/git', '-C', str(root), 'add', '.'])
+    subprocess.check_call(['/usr/bin/git', '-C', str(root), '-c', 'user.name=Fixture',
+                           '-c', 'user.email=fixture@example.com', 'commit', '-qm', 'controlled provider fixture'])
+    child = launch(env, *arguments)
+    assert child.returncode == 0, child.stderr
+    assert expected in child.stdout
+    assert not Path(env['HERMES_HOME']).exists()
 
 
 def test_renderer_rejects_executable_expressions():

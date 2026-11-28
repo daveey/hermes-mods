@@ -161,6 +161,10 @@ def resolve(home=None, *, _with_command=False):
 
 
 def command(module, argv):
+    # Bootstrap itself interprets Hermes verbs (read-only fast paths, repair and
+    # post-swap handoff). They are not pool commands and must not reach it.
+    if argv and argv[0] not in ('ask', 'models', 'check', 'serve', 'env', '-h', '--help'):
+        raise BindingError('not a pool command')
     bound, selected = resolve(_with_command=True)
     # The full rendered launcher is authenticated as publication DATA, never
     # executed here. Its CLI dispatch branches (--run-module, print-runtime)

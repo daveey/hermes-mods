@@ -1,4 +1,4 @@
-# Runtime selection binding (draft; not fleet-approved)
+# Runtime selection binding (source correction; not fleet approval)
 
 The launcher no longer executes `hermes --print-runtime-command`, accepts returned
 flags, or substitutes a MARK inside an otherwise arbitrary executable prelude.
@@ -60,6 +60,24 @@ ambient resolver override nonselection, routine core + Python publication update
 and real env exec. The full plugin cohort preserves mocked ask/models/provider
 routing, token serialization, real loopback auth/SDK/streaming tests. These are
 fixture claims, not installed fleet binding or full executable-closure approval.
+
+Before bootstrap, only pool verbs (`ask`, `models`, `check`, `serve`, `env`) and
+help are admitted. Hermes-only `kanban why`, `pm repair` and post-swap update
+arguments cannot enter bootstrap's special dispatch paths. This is not an
+argument allowlist for provider calls: the existing pool parser still validates
+each admitted verb, and the existing HTTP/token/provider policy is unchanged.
+
+`test_managed_bootstrap.py` optionally reads an explicit `POOL_CORE_SOURCE` Git
+checkout as data. It copies byte-identical bootstrap and PM environment-selection
+source into disposable fixtures, exercises the actual relaunch function extracted
+from its recorded source, and proves both a real reexec and executable `.pth`
+activation. Repair, attestation, locks/leases, platform preferences and credential
+owners are controlled adapters; both SQLite connect functions are fenced. This
+is not an unmodified whole-core or installed-runtime test. Public no-core CI
+skips this opt-in test; an engineering run with the explicit source is required
+for this managed integration proof. Actual launcher `ask` and `models` tests use
+controlled provider adapters and the real pool parser, with no provider/account
+operation.
 
 Before publication: collect installed launcher forms on every existing host,
 complete managed core/dependency selection provenance and service source binding,
