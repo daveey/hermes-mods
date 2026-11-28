@@ -16,6 +16,12 @@ class LinuxBoundary(Base):
         proc = self.home / 'proc'
         proc.mkdir(exist_ok=True)
         uid = os.getuid()
+        # A real Linux chain has PID 1. Retain its kernel identity so a failed
+        # manager attestation cannot be masked by an absent privileged parent.
+        init = proc / '1'
+        init.mkdir(exist_ok=True)
+        (init / 'stat').write_text('1 (init) ' + ' '.join(['S', '0'] + ['0'] * 17 + ['100'] + ['0'] * 5))
+        (init / 'status').write_text('Uid:\t0\t0\t0\t0\n')
         for pid, ppid in [(4242, manager_pid), (manager_pid, 1)]:
             root = proc / str(pid)
             root.mkdir(exist_ok=True)
