@@ -65,7 +65,8 @@ def test_real_reader_store_sibling_resolution(tmp_path, monkeypatch, db, board, 
         import hermes_state_outcome as outcome
         outcome.register_outcome_provider('same-canonical-request', lambda sid: {
             'decision_items': [{'id': requests[0]['requestId'], 'question': 'First deploy',
-                                'choices': [{'label': 'Approve', 'value': 'approve'}], 'state': 'open'}]})
+                                'choices': [{'label': 'Approve', 'value': 'approve'}], 'state': 'open',
+                                'request_ref': {'request_id': requests[0]['requestId'], **owner}}]})
         before = store.recompute('chat')
         assert {r['id'] for r in before['asks']} == {r['requestId'] for r in requests}
         key = 'default/' + tasks[0]

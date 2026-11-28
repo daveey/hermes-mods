@@ -33,6 +33,7 @@ def collect(us, session_id, legacy):
         aliases = [a['id'] for a in r['aliases'] if a['type'] == 'user_step'
                    and a['gatewayId'] == owner['gatewayId'] and a['profile'] == owner['profile']]
         opened.append({'id': aliases[0] if aliases else r['requestId'], 'text': r['title'],
+                       'request_ref': {'request_id': r['requestId'], **r['owner']},
                        'choices': [{'label': c['label'], 'value': c['id']} for c in r['choices']]})
     pending = []
     for op in operations:
