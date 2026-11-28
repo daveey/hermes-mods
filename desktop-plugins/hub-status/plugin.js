@@ -356,14 +356,15 @@ export function createVersionStore(api = options => window.hermesDesktop.api(opt
       if (!(ping?.api >= 2)) throw new Error('Version panel awaits backend activation')
       const v = await request('version', { passive: true })
       $version.set(v)
-      if (v.deferral_reason) $message.set(v.deferral_reason)
+      const operation = !v.force_request || v.operation?.requested_at >= v.force_request.requested_at ? v.operation : null
+      if (['failed', 'deferred'].includes(operation?.phase)) {
+        $message.set(operation.reason || 'Update deferred'); busy = false
+      } else if (v.deferral_reason) $message.set(v.deferral_reason)
       else if (v.progress) $message.set(v.progress.state === 'applying' ? 'Updating' : 'Waiting for turns')
       else if (v.force_request) $message.set('Waiting for turns')
-      else if (v.operation?.phase === 'updated' && v.operation.sha) {
-        $message.set(`Updated to ${v.operation.sha.slice(0, 10)}`); busy = false
-      } else if (['failed', 'deferred'].includes(v.operation?.phase)) {
-        $message.set(v.operation.reason || 'Update deferred'); busy = false
-      } else if (['updating', 'restarting'].includes(v.operation?.phase)) $message.set('Updating')
+      else if (operation?.phase === 'updated' && operation.sha) {
+        $message.set(`Updated to ${operation.sha.slice(0, 10)}`); busy = false
+      } else if (['updating', 'restarting'].includes(operation?.phase)) $message.set('Updating')
       return v
     } catch (e) { $message.set(String(e?.message || e)); return null }
   }
