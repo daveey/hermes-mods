@@ -1794,7 +1794,13 @@ def _no_progress_finding(src: Sources, chat: str, res: dict, miss: dict, cards: 
                         processes=list(res['snapshot']['processes'].values())[:10])
         variant = 'missed_twice' if twice else 'process_only'
         card, board, title = None, None, ''
-    if twice:
+    if pred.get('runtime_live'):
+        variant = 'runtime_unverified'
+        evidence.update(runtime_live=True, runtime_progress='unknown', board_silent_s=pred['board_silent_s'])
+        fix = {'kind': 'card', 'action': 'inspect current-run tool/transcript evidence for runtime progress',
+               'commands': [], 'why': 'alive but board-silent for at least four hours; runtime progress unknown; '
+                                     'do not interrupt, reclaim or infer a stall from heartbeat alone'}
+    elif twice:
         fix = {'kind': 'card', 'action': 'investigate why this session missed two consecutive progress predictions',
                'commands': [], 'why': 'second consecutive missed prediction (skill session-progress); not a human ask '
                                      'unless the next step truly needs David'}

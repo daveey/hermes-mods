@@ -145,8 +145,13 @@ For running cards, board silence does not establish runtime silence: tools and
 commits can advance on a worker without a board event. A heartbeat within five
 minutes on the exact current, still-running run defers a generic running miss as
 `runtime_activity_unobserved` and resets its consecutive-miss counter. It is not a
-progress signal or a healthy-progress claim. A full prediction window starts
-after the last fresh mark; stale, future, foreign or ended-run marks cannot defer.
+progress signal or a healthy-progress claim. Deferral ends four hours after the
+latest current-run admission or board progress event, never extended by automatic
+heartbeats or snapshot restarts. At the ceiling the scanner emits the distinct
+`runtime_unverified` investigation finding: runtime is live but its progress is
+unknown, not a proven stall. This variant does not match `missed_twice` live-rule
+selection, and does not wake or reclaim the worker. Existing configuration is not
+changed. Stale, future, foreign or ended-run marks cannot defer ordinary diagnosis.
 Legacy stuck-run/lease checks are unchanged. Full remote runtime-activity
 publication would be stronger evidence and is not supplied by this guard.
 

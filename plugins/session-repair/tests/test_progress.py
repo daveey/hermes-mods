@@ -93,6 +93,65 @@ def test_fresh_current_run_liveness_defers_board_only_miss_without_claiming_prog
     assert hits(tick(env, env.now + 100 * M), card=tid)
 
 
+def test_continuous_heartbeat_is_eventually_runtime_unverified_not_a_proven_stall(env):
+    tid = F.running_quiet(env.conn, env.now, quiet_s=0)
+    tick(env, env.now)
+    diagnosed = []
+    for minutes in range(15, 481, 15):
+        now = env.now + minutes * M
+        env.conn.execute("UPDATE task_runs SET last_heartbeat_at=? WHERE task_id=? AND status='running'",
+                         (int(now - 30), tid))
+        env.conn.commit()
+        F.event(env.conn, tid, 'heartbeat', {}, at=now - 30)
+        r = tick(env, now)
+        found = hits(r, card=tid)
+        assert not P.load_snapshot(env.home, F.CHAT)['signals']
+        if minutes < 240:
+            assert found == [], 'row-618 shape (~100min) must remain deferred'
+        elif minutes == 240:
+            assert found, 'automatic liveness must not hide board silence forever'
+        if found:
+            diagnosed.extend(found)
+            for f in found:
+                assert f['variant'] == 'runtime_unverified'
+                assert f['fix']['kind'] == 'card', 'investigate; do not wake/reclaim an active worker'
+                assert f['evidence']['runtime_live'] is True
+                assert f['evidence']['runtime_progress'] == 'unknown'
+                assert f['evidence']['board_silent_s'] >= 4 * 3600
+                assert 'runtime progress unknown' in f['summary']
+    assert diagnosed
+
+
+def test_runtime_ceiling_survives_a_snapshot_restart_and_real_progress_rearms_it(env):
+    tid = F.running_quiet(env.conn, env.now, quiet_s=4 * 3600)
+    # A new baseline must not grant another four hours to an old live run.
+    for minutes in (0, 15):
+        now = env.now + minutes * M
+        env.conn.execute("UPDATE task_runs SET last_heartbeat_at=? WHERE task_id=?", (int(now - 30), tid))
+        env.conn.commit()
+        r = tick(env, now)
+    assert hits(r, card=tid)[0]['variant'] == 'runtime_unverified'
+    F.event(env.conn, tid, 'commented', {'author': 'default', 'comment_id': 77}, at=env.now + 20 * M)
+    for minutes in (30, 61, 120):
+        now = env.now + minutes * M
+        env.conn.execute("UPDATE task_runs SET last_heartbeat_at=? WHERE task_id=?", (int(now - 30), tid))
+        env.conn.commit()
+        assert hits(tick(env, now), card=tid) == []
+    snap = P.load_snapshot(env.home, F.CHAT)
+    assert snap['cards'][tid]['prediction']['deferred'] == 'runtime_activity_unobserved'
+
+
+def test_runtime_ceiling_cannot_override_an_execution_hold():
+    now = 50_000
+    obs = _obs(held='spend_decision', runtime_liveness_at=now - 30, runtime_started_at=1)
+    cur = {'chat': 'c', 'cards': {'t': obs}, 'last_message_id': 1, 'processes': {}}
+    a = P.evaluate(None, cur, now, long_wait={})
+    obs['runtime_liveness_at'] = now + 900 - 30
+    b = P.evaluate(a['snapshot'], cur, now + 900, long_wait={})
+    assert not b['missed']
+    assert b['snapshot']['cards']['t']['prediction']['terminal'] == 'held'
+
+
 @pytest.mark.parametrize('offset', [-301, 1])
 def test_stale_or_future_heartbeat_does_not_defer_running_miss(env, offset):
     tid = F.running_quiet(env.conn, env.now)
