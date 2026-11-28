@@ -1,5 +1,21 @@
 # PanelModel v1
 
+## Live-run source refresh
+
+The legacy feed schedules a scoped source recapture for watched bundles holding
+current running-card observations before either their earliest execution lease
+(with 60 seconds of headroom) or 75% of the client freshness TTL. It does not
+extend either TTL or renew evidence from transport heartbeats. Near-expiry reads
+are rate-limited to at most one per 15 seconds per bundle; unknown, failed and
+stale source captures disarm this deadline. Source reads still determine whether
+a worker heartbeat is current, so a silent worker expires normally. No global
+quiet-chat sweep is authorized by this clock.
+
+A board-qualified `wait_for_lane_admission` actionability diagnosis can name the
+lane and next actor on a held row independently of executor evidence. This does
+not manufacture a run observation: unknown execution remains unknown, and stale
+or mismatched board diagnostics cannot supply the lane text.
+
 ## Human asks on dependency waits
 
 A downstream row waiting on another card's current human request names that

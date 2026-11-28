@@ -88,6 +88,73 @@ def test_wire_trust_is_stale_after_restore_and_ttl_and_status_reports_ages():
     assert status['visible_chats'] == {'S1': {'age_s': 61, 'computed_at': 1000}}
 
 
+def test_running_evidence_is_recaptured_before_expiry_without_other_events():
+    f, r, _, t = make()
+    r.links = {'S1': []}
+    heartbeat = {'at': t['now'] - 30}
+    def linked(ids):
+        at = heartbeat['at']
+        current = t['now'] < at + 180
+        return [{'id': 't_aaaaaa1', 'status': 'running', 'board': 'default',
+                 'execution_observations': [{'version': 1, 'state': 'running' if current else 'unknown',
+                    'identity': {'kind': 'card', 'work_id': 't_aaaaaa1', 'board': 'default',
+                                 'gateway': 'edge', 'profile': 'default', 'run_id': 'run-1'},
+                    'owner': {'gateway': 'edge', 'profile': 'default'}, 'generation_portable': True,
+                    'source_revision': str(at), 'evidence_refs': ['heartbeat:' + str(at)],
+                    'source': 'kanban.card', 'observed_at': at, 'valid_until': at + 180,
+                    'freshness': 'current' if current else 'stale'}]}]
+    r.linked = lambda ids: linked(ids) if 'S1' in ids else []
+    f.changes(['S1', 'S2'])
+    quiet_at = f.bundles['S2']['bundle']['computed_at']
+    assert f._due(t['now'])[0] == f.full_every_s * .75
+    for seconds in range(10, 601, 10):
+        t['now'] = 1000 + seconds
+        heartbeat['at'] = t['now'] - 30
+        # No file/event stamp moves. Only a scoped evidence deadline admits capture.
+        f.tick()
+        b = f.bundles['S1']['bundle']
+        assert b['tasks'][0]['execution_observations'][0]['valid_until'] > t['now']
+        assert f._bundle_fresh('S1', t['now'])
+        try:
+            import hermes_cli.execution_observations  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            assert [row['id'] for row in b['model']['sections']['running']] == ['t_aaaaaa1']
+    # Stop heartbeats altogether: retain the exact last observation source time.
+    for seconds in range(10, 241, 10):
+        t['now'] = 1600 + seconds
+        f.tick()
+    b = f.bundles['S1']['bundle']
+    assert b['tasks'][0]['execution_observations'][0]['state'] == 'unknown'
+    assert f.bundles['S2']['bundle']['computed_at'] == quiet_at
+    assert not b['model']['sections']['running']
+    assert f._running_deadlines() == {}, 'silent sources must not create a hot retry loop'
+    assert f._due(t['now'])[0] is None
+
+
+def test_running_deadline_failure_disarms_and_fresh_source_rearms():
+    f, r, _, t = make()
+    row = {'id': 't_dddddd4', 'status': 'running', 'execution_observations': [
+        {'state': 'running', 'freshness': 'current', 'valid_until': 1150}]}
+    r.links['S2'] = [row]
+    f.changes(['S2'])
+    assert f._running_deadlines() == {'S2': 1045}
+    good = r.linked
+    def fail(ids):
+        raise RuntimeError('source unavailable')
+    r.linked = fail
+    t['now'] = 1045
+    f.tick()
+    assert f._running_deadlines() == {}
+    assert not f._bundle_fresh('S2', t['now'])
+    r.linked = good
+    r.stamp += 1
+    row['execution_observations'][0]['valid_until'] = 1200
+    f.tick()
+    assert f._running_deadlines() == {'S2': 1090}
+
+
 def test_a_bundle_holds_the_lineage_cards_done_and_the_whole_chain():
     f, r, _, _ = make()
     b = f.compute('S1')
