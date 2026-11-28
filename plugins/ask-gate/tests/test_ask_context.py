@@ -224,6 +224,22 @@ def test_the_matcher_is_a_superset_of_every_earlier_version(sha):
     assert [t for t in PAST_REVIEWER_CASES if not ac._limit_named(t)] == []
 
 
+@pytest.mark.parametrize("leg,text", [
+    # Review 6095147187 (non-blocking): pin each leg of _limit_named with a probe only that leg catches, so dropping
+    # either leg turns this red.
+    ("words", "Approve invoicing the client"),
+    ("replan", "Approve broader access for the bot"),
+    ("replan", "Ack the security outage"),
+    ("replan", "Accept the data loss"),
+])
+def test_each_leg_of_the_matcher_is_pinned_by_its_own_probe(leg, text):
+    words = bool(ac._LIMIT_WORDS.search(text))
+    stems = bool(ac._LIMIT_STEMS.search(text))
+    replan = ac._replan.limit_named(text) in ("spend", "permission", "safety")
+    assert ac._limit_named(text)
+    assert (words, stems, replan) == (leg == "words", False, leg == "replan"), (words, stems, replan)
+
+
 @pytest.mark.parametrize("text", [
     "Pay the March invoice", "Raise the monthly budget to cover the overage", "Cancel the Superhuman subscription",
     # Review 6094768133 P2: money changes without a $ amount or a listed verb before the noun.
