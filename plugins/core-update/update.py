@@ -33,11 +33,13 @@ def monitor(core, run=subprocess.run, wait=None, clock=time.monotonic):
     request_path = root / "core-update/force-request"
     initial = core._read_json(request_path)
     request_at = initial.get("requested_at")
+    target = None
     path = directory / "hub-update.json"
 
     def record(phase, **extra):
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"phase": phase, "requested_at": request_at, **extra}) + "\n")
+        tmp.write_text(json.dumps({"phase": phase, "requested_at": request_at, "target": target, "expires_at": time.time() + 3600,
+                                   "finished_at": time.time() if phase in ("updated", "deferred", "failed") else None, **extra}) + "\n")
         os.replace(tmp, path)
 
     wait = wait or threading.Event().wait
@@ -50,6 +52,7 @@ def monitor(core, run=subprocess.run, wait=None, clock=time.monotonic):
         deadline = clock() + 1800
         while clock() < deadline:
             status = core.status()
+            target = core._git(core.running_checkout(), "rev-parse", "origin/main")
             if needs_quit(core, status):
                 record("restarting")
                 result = core.restart()
@@ -57,11 +60,12 @@ def monitor(core, run=subprocess.run, wait=None, clock=time.monotonic):
                     record("deferred", reason=result.get("reason") or "Desktop swap refused")
                 return
             request = core._read_json(request_path)
-            if not request and status.get("state") != "building":
-                record("updated", sha=status.get("running"))
-                return
-            if request and float(request.get("expires_at", 0)) <= time.time():
+            expires_at = (request or initial).get("expires_at")
+            if expires_at is not None and float(expires_at) <= time.time():
                 record("deferred", reason="Force request expired before the update completed")
+                return
+            if not request and status.get("state") != "building":
+                record("updated", sha=core._git(core.running_checkout(), "rev-parse", "HEAD"))
                 return
             wait(5)
         record("deferred", reason="Timed out waiting for the update or Desktop build")

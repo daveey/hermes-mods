@@ -80,6 +80,33 @@ test('current operation failure beats live force marker, older failure does not'
   assert.equal(store.$message.get(), 'attested updater refused')
 })
 
+test('terminal records always release Update now and passive polls stay passive', async () => {
+  for (const operation of [{ phase: 'updated', sha: null }, { phase: 'failed', reason: 'failure' }, { phase: 'deferred', reason: 'cooldown' }]) {
+    let posts = 0
+    let v = { running_turns: 0, force_request: { requested_at: 1 } }
+    const store = m.createVersionStore(async o => {
+      if (o.method === 'POST') { posts++; return { ok: true } }
+      assert.equal(o.passive, true)
+      return o.path.endsWith('/ping') ? { api: 2 } : v
+    })
+    await store.updateNow()
+    v = { running_turns: 0, operation }
+    await store.refresh()
+    await store.updateNow()
+    assert.equal(posts, 2)
+  }
+})
+
+test('activation clears obsolete status messages', async () => {
+  let ready = false
+  const store = m.createVersionStore(async o => o.path.endsWith('/ping') ? { api: ready ? 2 : 1 } : {})
+  await store.refresh()
+  assert.match(store.$message.get(), /activation/)
+  ready = true
+  await store.refresh()
+  assert.equal(store.$message.get(), '')
+})
+
 test('old backend cannot receive the new update mutation', async () => {
   const calls = []
   const store = m.createVersionStore(async o => { calls.push(o); return { api: 1 } })
