@@ -25,7 +25,7 @@ def hits(e):
     return e.scan_mod.red_no_ask_findings(e.sources(), only=F.CHAT)
 
 
-def card(e, kind='execution_refusal', status='triage'):
+def card(e, kind: str | None = 'execution_refusal', status='triage'):
     tid = F.card(e.conn, 'Synthetic held work', status=status, block_kind=kind)
     F.event(e.conn, tid, 'blocked', {'status': status, 'reason': 'Preserve this stop'}, at=e.now)
     return tid
@@ -198,3 +198,62 @@ def test_scan_integration(env):
     card(env)
     result = env.scan(rules=['BS-red-no-ask'])
     assert [f['id'] for f in result['findings']] == ['BS-red-no-ask']
+    assert result['red_no_ask'] == {'chats': 1, 'red_cards': 1, 'covered': 0, 'uncovered': 1}
+
+
+def test_covered_chat_counts_prove_zero_is_not_an_empty_scan(env):
+    tid = card(env)
+    env.conn.execute('UPDATE tasks SET human_request=?,block_kind=? WHERE id=?',
+                     (json.dumps(F.VALID_ASK), 'needs_input', tid))
+    env.conn.commit()
+    result = env.scan(rules=['BS-red-no-ask'])
+    assert result['findings'] == []
+    assert result['red_no_ask'] == {'chats': 1, 'red_cards': 1, 'covered': 1, 'uncovered': 0}
+
+
+def decision(env, body, parents=(), ask=None):
+    return F.card(env.conn, 'Synthetic decision', status='blocked', block_kind='needs_input', parents=parents,
+                  body=body, human_request=ask or json.dumps(F.VALID_ASK))
+
+
+def test_separate_decision_card_naming_the_held_card_covers_it(env):
+    tid = card(env)
+    decision(env, 'Decision only: follow-through work stays parked.')
+    assert hits(env), 'a decision card that names no held card covers nothing'
+    decision(env, f'Decision only: follow-through {tid} remains in triage.')
+    assert hits(env) == []
+
+
+def test_dependency_linked_decision_card_covers_its_parent(env):
+    tid = card(env)
+    decision(env, 'Decide the held work.', parents=[tid])
+    assert hits(env) == []
+
+
+def test_invalid_decision_card_naming_the_card_does_not_cover(env):
+    tid = card(env)
+    decision(env, f'About {tid}', ask='{"action":"vague"}')
+    assert hits(env)
+
+
+def test_canonical_safety_refusal_event_is_reported(env):
+    from sr_helpers import PLUGIN, load
+    tid = card(env, kind=None)
+    F.event(env.conn, tid, 'spend_budget_triaged', {'cause': 'safety_refusal'}, at=env.now)
+    f, = hits(env)
+    assert f.evidence['red_cards'][0]['execution_refusal'] is True
+    text = load('_sr_red_msg', PLUGIN / 'nudge.py').message(f.to_dict(), [])
+    assert tid in text and '"execution_refusal": true' in text
+    assert 'Safety/execution-refusal cards: no release' in text
+
+
+def test_desktop_stopped_chat_is_not_resumed(env):
+    card(env)
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                      (F.CHAT, 'user', env.scan_mod.DESKTOP_STOP_MARKER, env.now + 1))
+    env.state.commit()
+    assert hits(env) == []
+    env.state.execute('INSERT INTO messages (session_id,role,content,timestamp) VALUES (?,?,?,?)',
+                      (F.CHAT, 'user', 'carry on', env.now + 2))
+    env.state.commit()
+    assert hits(env)

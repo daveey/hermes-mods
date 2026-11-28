@@ -675,6 +675,7 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
             'handed': out.get('handed', []), 'nudge_mode': out.get('nudge_mode'),
             'nudges': out.get('nudges', []),
             'progress': (result.get('progress') or {}).get('verdicts'), 'rule_shadow': out.get('rule_shadow', []),
+            'red_no_ask': result.get('red_no_ask'), 'nudge_live_rules': out.get('nudge_live_rules', []),
         })
 
 

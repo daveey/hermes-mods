@@ -331,6 +331,10 @@ Detect stuck human chats or overdue triage cards that lack a validated ask cover
 each relevant card. An unrelated ask does not cover a retained spend/scope,
 containment, safety, lane-gated or invalid-ask card. Resolve dispatcher pseudo-chat
 custody through core's creator-chat resolver; never message the pseudo-chat.
+Coverage = the card's own valid `human_request`, a complete user-steps ask whose
+`sourceRefs` name it, or an open valid-ask decision card linked to the same chat
+that names its exact id (body/title/ask) or is its parent/child. A chat whose last
+user turn is the Desktop stop marker is never woken.
 
 Nudge the owning chat once, naming every card's status, hold and reason. The turn
 reassesses within its existing mandate or files one genuine scoped ask with a

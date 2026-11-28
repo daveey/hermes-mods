@@ -162,6 +162,8 @@ def kanban_cmd(board: str, verb: str, *args: str) -> str:
 class Sources:
     """The reads the rules need, all through the session-panel readers' query-only connections."""
 
+    red_no_ask_counts: Optional[dict] = None  # set by red_no_ask_findings for the tick summary
+
     def __init__(self, readers: Any = None, *, now: Optional[float] = None,
                  exclude_chats: Optional[Iterable[str]] = None):
         api, feedmod = load_panel()
@@ -1646,6 +1648,35 @@ def _red_ask_coverage(src: Sources, sid: str) -> tuple[set[tuple[str, str]], str
     return covered, _red_signature(state)
 
 
+def _red_decision_coverage(src: Sources, refs: set) -> set[tuple[str, str]]:
+    """Cards named by an open, valid human-ask card linked to the same chat.
+
+    A decision card filed for a held card (the hand fix this rule automates) is
+    usually a separate blocked card whose body/ask names the held card's exact id,
+    or a parent/child of it. Only an exact card id or a dependency edge counts;
+    a vague mention or an ask on another chat never covers a card.
+    """
+    from hermes_cli.kanban_open_asks import card_is_open_human_ask
+    covered: set[tuple[str, str]] = set()
+    for board, cid in sorted(refs):
+        task, conn = src.task(board, cid)
+        if task is None or conn is None:
+            raise RuntimeError('linked card unreadable')
+        hr = getattr(task, 'human_request', None)
+        if not card_is_open_human_ask(task.status, getattr(task, 'block_kind', None), hr):
+            continue
+        text = ' '.join(str(x or '') for x in (task.title, getattr(task, 'body', ''),
+                                                 hr if isinstance(hr, str) else json.dumps(hr, default=str)))
+        named = {n for _, n in refs if re.search(rf'(?<![0-9A-Za-z_]){re.escape(n)}(?![0-9A-Za-z_])', text)}
+        named |= {r[0] for r in conn.execute('SELECT parent_id FROM task_links WHERE child_id=?', (cid,))}
+        named |= {r[0] for r in conn.execute('SELECT child_id FROM task_links WHERE parent_id=?', (cid,))}
+        covered |= {(board, n) for n in named if n != cid}
+    return covered
+
+
+DESKTOP_STOP_MARKER = '[Turn stopped by Desktop before it finished.]'
+
+
 def _red_creator_chats(src: Sources, board: str, cid: str) -> set[str]:
     """Use core's read-only provenance resolver, never ensure/link a standing chat."""
     from hermes_cli.kanban_creator_chats import resolve_chats
@@ -1665,8 +1696,12 @@ def red_no_ask_findings(src: Sources, only: Optional[str] = None) -> list[Findin
 
     This is diagnosis only: retained stops, safety refusals and lane gates remain
     intact. All target reads are repeated for ``only`` pre-write revalidation.
+    ``src.red_no_ask_counts`` records what was examined so a zero-finding tick is
+    provably "all covered", not an empty scan.
     """
     out = []
+    counts = {'chats': 0, 'red_cards': 0, 'covered': 0, 'uncovered': 0}
+    src.red_no_ask_counts = counts
     try:
         c = src.state_conn()
         if c is None:
@@ -1696,6 +1731,12 @@ def red_no_ask_findings(src: Sources, only: Optional[str] = None) -> list[Findin
                                 "AND COALESCE(end_reason,'') NOT LIKE 'moved_to_gateway:%'", (sid,)).fetchone()
             if not session or session[0] == REPAIR_CHAT_TITLE or _red_chat_live(src, sid):
                 continue
+            counts['chats'] += 1
+            # A deliberate Desktop stop is not permission to resume the chat (as BS-quiet-chat).
+            stopped = c.execute("SELECT content = ? FROM messages WHERE session_id=? AND active=1 AND role='user' "
+                                "ORDER BY id DESC LIMIT 1", (DESKTOP_STOP_MARKER, sid)).fetchone()
+            if stopped and stopped[0]:
+                continue
             outcome = json.loads(session[1])
             status = outcome.get('status') or outcome
             if (status.get('coverage') or {}).get('state') == 'unknown':
@@ -1705,6 +1746,7 @@ def red_no_ask_findings(src: Sources, only: Optional[str] = None) -> list[Findin
             overdue = {str(item.get('id')) for item in items if item.get('kind') == 'card'
                        and (item.get('state') == 'triage_overdue' or item.get('triage_overdue') is True)}
             coverage, ask_sig = _red_ask_coverage(src, sid)
+            coverage = coverage | _red_decision_coverage(src, refs)
             red, states = [], {}
             for board, cid in sorted(refs):
                 if cid in ours or cid in src.copies(board):
@@ -1729,8 +1771,11 @@ def red_no_ask_findings(src: Sources, only: Optional[str] = None) -> list[Findin
                 last_event = _events(conn, cid)
                 reason = (last_event[0]['payload'].get('reason') if last_event else None)
                 states[f'{board}/{cid}'] = _red_signature({'task': raw, 'last_event': last_event})
+                counts['red_cards'] += 1
                 if valid or (board, cid) in coverage:
+                    counts['covered'] += 1
                     continue
+                counts['uncovered'] += 1
                 from hermes_cli.kanban_spend_decision import execution_refusal
                 refusal = execution_refusal(conn, cid)
                 red.append({'card': cid, 'board': board, 'status': task.status,
@@ -2264,7 +2309,8 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
     return {'scanned_at': src.now, 'duration_s': round(time.monotonic() - started, 3), 'chats': len(chats),
             'cards': len(judged), 'truncated_chats': truncated, 'excluded_chats': sorted(src.exclude_chats),
             'findings': [f.to_dict() for f in out], 'errors': src.errors[:50],
-            'error_count': len(src.errors), 'progress': progress, '_progress_snapshots': snapshots}
+            'error_count': len(src.errors), 'progress': progress, '_progress_snapshots': snapshots,
+            'red_no_ask': getattr(src, 'red_no_ask_counts', None)}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
