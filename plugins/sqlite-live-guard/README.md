@@ -24,8 +24,13 @@ then refusal), including across nested shells. Deferred successful `cd` contexts
 list boundary, while failed contexts rejoin after success-gated `&&` chains end.
 The analyzer does not interpret `pushd`/`popd`, `builtin`, `read`, `eval`, sourced
 scripts, function definitions, `env -C`/`--chdir`, `cd -`/`CDPATH`, backticks or compound pipeline
-state precisely. A second **fail-closed mutation fallback** refuses a command list
-combining these constructs with file mutation or write redirection, even for a
+state precisely. The env fallback recognizes basename-qualified env, bundled
+`-iC`, unambiguous `--chdir` prefixes, and `-S`/`--split-string`, then inventories
+the command env executes. Directory-stack tildes (`~-`, `~+`, `~N`, `~+N`, `~-N`),
+`chdir`, `printf -v` and positional `set --` are also unsupported state.
+A second **fail-closed mutation fallback** refuses a command list
+combining these constructs with file mutation (including sqlite3 and `find -delete`)
+or write redirection, even for a
 safe non-live target. Read-only lists and quoted command data remain allowed.
 Split safe maintenance into a separate explicit-path command; use `swap_db.py`
 for live replacements. This fallback is deliberately conservative, not a claim

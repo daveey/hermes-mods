@@ -239,6 +239,64 @@ def check(text, guard, cwd="", depth=0, inherited=None, *, remote=False, in_home
         return "shell syntax exceeds the bounded live-database safety analysis; use explicit paths and swap_db.py"
 
 
+def _env_command(argv, guard, budget):
+    """Expose env's executed argv without confusing option operands with commands.
+
+    GNU short options may be bundled; long options accept unambiguous prefixes.
+    A split string is data to env, not shell syntax. Bound every expansion with
+    the same analysis budget; never execute env or interpolate its variables.
+    """
+    hazardous = False
+    while argv:
+        budget.spend(1)
+        word = os.path.basename(argv[0])
+        if word != 'env':
+            if word not in guard._WRAPPERS | {'timeout'}:
+                break
+            argv = argv[1:]
+            while argv and (argv[0].startswith('-') or (word == 'timeout' and re.fullmatch(r'\d+[smhd]?', argv[0]))):
+                option = argv.pop(0)
+                if word == 'sudo' and option in {'-u', '-g', '-C', '-D', '-h', '-p', '-U', '-r', '-t'} and argv:
+                    argv.pop(0)
+            continue
+        argv = list(argv[1:])
+        while argv:
+            budget.spend(1)
+            option = argv.pop(0)
+            if option == '--':
+                break
+            if _ASSIGN.match(option) or option == '-':
+                continue
+            if not option.startswith('-'):
+                argv.insert(0, option)
+                break
+            if option.startswith('--'):
+                name, equal, value = option.partition('=')
+                matches = [s for s in ('--chdir', '--split-string', '--unset', '--ignore-environment',
+                                       '--null', '--debug', '--argv0') if s.startswith(name)]
+                kind = matches[0] if len(matches) == 1 else ''
+                if kind in {'--chdir', '--split-string', '--unset', '--argv0'}:
+                    value = value if equal else argv.pop(0) if argv else ''
+                if kind in {'--chdir', '--split-string'}:
+                    hazardous = True
+                if kind == '--split-string':
+                    parts = shlex.split(value)
+                    budget.spend(sum(map(len, parts)))
+                    argv = parts + argv
+                continue
+            for i, letter in enumerate(option[1:], 1):
+                if letter not in 'CuSa':
+                    continue
+                value = option[i + 1:] or (argv.pop(0) if argv else '')
+                hazardous = hazardous or letter in 'CS'
+                if letter == 'S':
+                    parts = shlex.split(value)
+                    budget.spend(sum(map(len, parts)))
+                    argv = parts + argv
+                break  # an option with an operand consumes the bundle's tail
+    return argv, hazardous
+
+
 def _unsupported_write_context(text, guard, budget):
     """Do not trust path/alias state across constructs we do not interpret.
 
@@ -257,18 +315,22 @@ def _unsupported_write_context(text, guard, budget):
                         or _ASSIGN.match(argv[0])):
             hazardous = hazardous or argv[0] == 'case' or argv[0].startswith('CDPATH=')
             argv = argv[1:]
-        if 'env' in argv and any(a.startswith('-C') or a.startswith('--chdir') for a in argv):
-            hazardous = True
-            writing = writing or any(a in _FILES for a in argv)
+        argv, env_hazard = _env_command(argv, guard, budget)
+        hazardous = hazardous or env_hazard
         argv = guard._strip_wrappers(argv)
         if not argv:
             continue
         word = os.path.basename(argv[0])
-        hazardous = hazardous or word in {'pushd', 'popd', 'builtin', 'read', 'eval', 'source', '.', 'function'}
+        hazardous = hazardous or word in {'pushd', 'popd', 'builtin', 'read', 'eval', 'source', '.', 'function', 'chdir'}
         hazardous = hazardous or (word == 'cd' and '-' in argv[1:])
-        hazardous = hazardous or (word == 'env' and any(a == '-C' or a.startswith('--chdir')
-                                                       or a.startswith('-C') for a in argv[1:]))
-        writing = writing or word in _FILES or any(t in {'>', '>>', '>|', '&>', '&>>', '<>'} for t in raw)
+        hazardous = hazardous or any(re.match(r'^~(?:[+-](?:\d*)|\d+)(?:/|$)', a) for a in argv[1:])
+        hazardous = hazardous or (word == 'printf' and '-v' in argv[1:]) or (word == 'set' and '--' in argv[1:])
+        # sqlite3 and find are cwd-sensitive mutations too, not only _FILES.
+        # A shell invoked by env can execute arbitrary writes in env's cwd.
+        writing = (writing or word in _FILES or word in {'sqlite3', 'sqlite3.exe'}
+                   or (word == 'find' and '-delete' in argv[1:])
+                   or (env_hazard and word in {'sh', 'bash', 'dash', 'zsh', 'ksh'})
+                   or any(t in {'>', '>>', '>|', '&>', '&>>', '<>'} for t in raw))
     if hazardous and writing:
         return 'file mutation in an unsupported shell state context; use explicit paths in a separate command and swap_db.py'
     return None
@@ -526,6 +588,10 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
         db = guard._sqlite3_argv(args)[0]
         if db is not None and guard.is_live(db, in_home, resolve_local=False):
             return guard.remote_sqlite3_refusal(argv[0], db), in_home
+    elif word == 'find' and '-delete' in args:
+        if any(guard.is_live(p, in_home, not remote) or guard.protects_directory(p, in_home, not remote)
+               or p.endswith(('.db-wal', '.db-shm', '*.db*', 'kanban.db*')) for p in args):
+            return '`find -delete` would delete live database files', in_home
     elif word == "cd":
         target = (guard._operands(args) or ["~"])[0]
         in_home = guard.directory_context(target, in_home, not remote)
