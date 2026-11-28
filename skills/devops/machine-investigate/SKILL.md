@@ -18,6 +18,8 @@ at click time. Script: `scripts/collect.py` in this skill (stdlib only). From a 
 `ssh <host> 'python3 - report --no-du' < <skill>/scripts/collect.py`.
 A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow `references/stuck-jobs.md`.
 
+For a timed-out native disk-image fixture, map `hdiutil info -plist` image-path, `hdid-pid`, owner-uid and system-entities to the exact test before touching helpers; simulator and unrelated build images must remain intact. A fresh reproduction under another existing account can distinguish an account-local failure from a shared native-service path, but HFS probe failure plus a DIHelperProxy wait does not by itself identify the blocked service. Sample only owned processes without elevated approval; do not hide a refused privileged command in another launcher. Capture reproduction output to files rather than PIPE when helpers inherit descriptors: killing the parent followed by unbounded `communicate()` can hang even after the parent exits. Bound cleanup separately and verify the exact helper and image disappear.
+
 ## Procedure
 
 1. `python3 <skill>/scripts/collect.py install-recorder --apply` (macOS: makes sure the load recorder runs here,
