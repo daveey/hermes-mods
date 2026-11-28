@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import os
+import sys
+import types
 import pathlib
 import tempfile
 import time
@@ -25,8 +27,18 @@ TABS = [
 ]
 
 
+IDENTITY = (os.getuid(), '/fixture/chrome', ('/fixture/chrome', '--user-data-dir=/h/.hermes/chrome-agent', '--remote-debugging-port=9333'), 123.0)
+
+
 class T(unittest.TestCase):
     def setUp(self):
+        module = types.SimpleNamespace(start_time_fingerprints_match=lambda a, b: abs(int(a) - int(b)) <= 200)
+        patch = mock.patch.dict(sys.modules, {'gateway.status': module})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.identity_patch = mock.patch.object(bf, '_chrome_identity', return_value=IDENTITY)
+        self.identity_patch.start()
+        self.addCleanup(self.identity_patch.stop)
         bf._browser_sessions.clear()
         bf._last_focus.clear()
         p = mock.patch.object(bf, "_tab_ledger_dir", return_value=None)   # never touch a real tab ledger
@@ -34,8 +46,17 @@ class T(unittest.TestCase):
         self.addCleanup(p.stop)
 
     def test_finds_only_main_process_under_home(self):
-        with mock.patch("os.path.realpath", side_effect=lambda p: p):
-            self.assertEqual(bf.agent_chromes("/h/.hermes", PS), [(101, 9333)])
+        self.identity_patch.stop()
+        exe = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+        images = {
+            101: (os.getuid(), exe, (exe, '--user-data-dir=/h/.hermes/chrome-agent', '--remote-debugging-port=9333'), 123.0),
+            102: (os.getuid(), exe, (exe, '--type=renderer', '--user-data-dir=/h/.hermes/chrome-agent', '--remote-debugging-port=9333'), 123.0),
+            103: (os.getuid(), exe, (exe, '--user-data-dir=/tmp/other', '--remote-debugging-port=9222'), 123.0),
+            105: (os.getuid(), exe, (exe, '--headless=new', '--user-data-dir=/h/.hermes/cache/scratch/x', '--remote-debugging-port=9336'), 123.0),
+        }
+        with mock.patch('os.path.realpath', side_effect=lambda p: p), \
+                mock.patch.object(bf, '_process_identity', side_effect=images.get):
+            self.assertEqual(bf.agent_chromes('/h/.hermes', PS), [(101, 9333)])
 
     def test_pick_tab_prefers_match_then_login(self):
         self.assertEqual(bf.pick_tab(TABS)["id"], "b")
@@ -75,7 +96,7 @@ class T(unittest.TestCase):
     def test_focus_unhides_virtual_display_chrome_before_raising(self):
         calls = []
         with mock.patch.object(bf, "_quiet", return_value=False), \
-             mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]), \
+             mock.patch.object(bf, "agent_chromes", return_value=[bf._Chrome(101, 9333, IDENTITY)]), \
              mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True), \
              mock.patch.object(bf, "_get", side_effect=lambda u: TABS if u.endswith("/json/list") else "ok"), \
              mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True), \
@@ -105,7 +126,7 @@ class T(unittest.TestCase):
         calls = []
         blank = [{"id": "z", "type": "page", "title": "about:blank", "url": "about:blank"}]
         with mock.patch.object(bf, "_quiet", return_value=False), \
-             mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]), \
+             mock.patch.object(bf, "agent_chromes", return_value=[bf._Chrome(101, 9333, IDENTITY)]), \
              mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True), \
              mock.patch.object(bf, "_get", side_effect=lambda u: blank if u.endswith("/json/list") else "ok"), \
              mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True):
@@ -123,7 +144,7 @@ class T(unittest.TestCase):
     # logged-in github.com tab and still said "I've brought the Chrome window to the front".
     def _focus_env(self, tabs, calls):
         return [mock.patch.object(bf, "_quiet", return_value=False),
-                mock.patch.object(bf, "agent_chromes", return_value=[(101, 9333)]),
+                mock.patch.object(bf, "agent_chromes", return_value=[bf._Chrome(101, 9333, IDENTITY)]),
                 mock.patch.object(bf, "_chrome_agent", side_effect=lambda c: calls.append(c) or True),
                 mock.patch.object(bf, "_get", side_effect=lambda u: tabs if u.endswith("/json/list") else "ok"),
                 mock.patch.object(bf, "activate_app", side_effect=lambda pid: calls.append("activate") or True),
@@ -267,7 +288,7 @@ class T(unittest.TestCase):
             os.environ.pop("BROWSER_CDP_URL", None)
             with mock.patch.object(bf, "_hermes_home", return_value=h):
                 self.assertIsNone(bf.remote_cdp())
-                open(os.path.join(h, "config.yaml"), "w").write("browser:\n  cdp_url: ws://10.1.2.3:9444/devtools/x\n")
+                open(os.path.join(h, "config.yaml"), "w").write("browser:\n  cdp_url: ws://10.1.2.3:9444/devtools/browser/x\n")
                 self.assertEqual(bf.remote_cdp(), "http://10.1.2.3:9444")
             os.environ["BROWSER_CDP_URL"] = "http://m:1"
             self.assertEqual(bf.remote_cdp(), "http://m:1")

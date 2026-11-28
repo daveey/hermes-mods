@@ -364,19 +364,20 @@ class Ledger:
                     lease.setdefault('restart_until', until)
 
     def reap_workers(self):
-        from chrome_agent_process import fingerprint
+        from chrome_agent_process import retired
         with self.transaction(readonly=True) as data:
             workers = {pid: started for lease in data['leases'].values()
                        for pid, started in lease.get('workers', {}).items()}
         # Process probes may invoke ps on macOS; never run them under the ledger lock.
-        current = {pid: fingerprint(int(pid)) for pid in workers}
+        gone = {pid: retired({'pid': int(pid), 'started': started})
+                for pid, started in workers.items()}
         with self.transaction() as data:
             for lease in data['leases'].values():
                 owned = lease.get('workers')
                 if not owned:
                     continue
                 for pid, started in list(owned.items()):
-                    if pid in current and workers[pid] == started and current[pid] != started:
+                    if pid in gone and workers[pid] == started and gone[pid]:
                         del owned[pid]
                 if not owned:
                     lease.setdefault('restart_until', self.clock() + self.config.orphan_s)
