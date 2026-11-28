@@ -1737,8 +1737,12 @@ def red_no_ask_findings(src: Sources, only: Optional[str] = None) -> list[Findin
                                 "ORDER BY id DESC LIMIT 1", (DESKTOP_STOP_MARKER, sid)).fetchone()
             if stopped and stopped[0]:
                 continue
-            outcome = json.loads(session[1])
+            # No stored outcome yet is not an error (core's overdue predicate still applies);
+            # an unparsable outcome still fails closed.
+            outcome = json.loads(session[1]) if session[1] is not None else {}
+            outcome = outcome if isinstance(outcome, dict) else {}
             status = outcome.get('status') or outcome
+            status = status if isinstance(status, dict) else outcome
             if (status.get('coverage') or {}).get('state') == 'unknown':
                 continue
             stuck = (status.get('presentation') or {}).get('stripe') == 'stuck'

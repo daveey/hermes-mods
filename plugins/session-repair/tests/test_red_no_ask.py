@@ -145,6 +145,17 @@ def test_unreadable_store_and_outcome_fail_closed(env):
     assert not hits(env)
 
 
+def test_missing_outcome_is_not_an_error_and_core_overdue_still_applies(env):
+    tid = card(env)
+    env.state.execute('UPDATE sessions SET outcome_json=NULL WHERE id=?', (F.CHAT,))
+    env.state.commit()
+    F.event(env.conn, tid, 'decision_retained', {}, at=env.now-900)
+    F.age_all_events(env.conn, tid, env.now-900)
+    result = env.scan()
+    assert result['error_count'] == 0, result['errors']
+    assert [f for f in result['findings'] if f['id'] == 'BS-red-no-ask']
+
+
 def test_overdue_card_even_when_other_ask_makes_chat_yellow(env):
     tid = card(env)
     env.state.execute('UPDATE sessions SET outcome_json=? WHERE id=?',
