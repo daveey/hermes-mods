@@ -215,7 +215,7 @@ otherwise restart already-settled coordination.
 
 ## Done means
 - [ ] The blocker is one concrete sentence, and its premise was re-read live this turn.
-- [ ] Every rung a–f was considered; the comment says why each one that applies failed.
+- [ ] The disposition records the successful rung and relevant failed alternatives; stop at success. Do not add a second waking comment solely to complete this checklist.
 - [ ] Readback proves either release, a valid filed human request, or removal of the stale ask while an
       independent hold remains. Distinguish metadata correction from execution authorization. Release means a
       `claimed` event after the promote: `ready` followed by `respawn_guarded active_pr` sits unclaimed until
