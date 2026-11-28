@@ -10,9 +10,14 @@ The exact `SAFE_DOMAINS` allowlist is **light, media_player, climate** (includin
 The only other no-gate exceptions are `lock.lock`; `cover.close_cover`, `cover.stop_cover`,
 `cover.close_cover_tilt`, `cover.stop_cover_tilt`; `alarm_control_panel.alarm_arm_home`,
 `alarm_control_panel.alarm_arm_away`, `alarm_control_panel.alarm_arm_night`; and generic
-`homeassistant.*` calls with explicit entity targets **only in SAFE_DOMAINS** passing the checks above.
-This includes every generic service: even `update_entity` on `sensor.*` or `lock` on `lock.*`
-needs confirmation. Direct `lock.lock`/cover close/alarm arm exceptions do not apply to generic HA calls.
+`homeassistant.turn_on`, `homeassistant.turn_off`, `homeassistant.toggle` and
+`homeassistant.update_entity` with explicit resolved entity targets **only in SAFE_DOMAINS**
+passing the checks above. Every other `homeassistant.*` service requires confirmation, with or
+without targets: `stop`, `restart`, `reload_all`, `reload_config_entry`, `reload_core_config`,
+`reload_custom_templates`, `check_config`, `set_location`, `save_persistent_states` and any
+unknown name remain blocked without a gate even with a decoy `light.x` target.
+Even `update_entity` on `sensor.*` or `lock` on `lock.*` needs confirmation.
+Direct `lock.lock`/cover close/alarm arm exceptions do not apply to generic HA calls.
 Every other domain/service needs the confirmation gate and is blocked when none is configured
 or the gate fails: this includes unknown domains, MQTT publish, Z-Wave JS, ZHA and valve services.
 Safe-domain calls targeting critical entities still undergo the existing target checks.
