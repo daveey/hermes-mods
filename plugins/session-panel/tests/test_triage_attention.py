@@ -47,10 +47,20 @@ def test_a_stopped_retained_scope_ages_red_like_every_other_triage_cause(age, re
     assert b == before
 
 
-@pytest.mark.parametrize('entry', [None, 'yesterday', -1, float('nan'), float('inf'), NOW + 20])
+@pytest.mark.parametrize('entry', [None, 'yesterday', -1, float('nan'), float('inf')])
 def test_unknown_entry_never_fabricates_age(entry):
     b = aged()
     b['cards']['t_abc123']['detail']['events'][1]['created_at'] = entry
+    result = model.reduce_panel(b, now=NOW)
+    assert not result['sections']['stuck']
+    assert 'entry time unavailable' in result['sections']['waiting'][0]['detail']
+
+
+def test_future_only_episode_never_fabricates_age():
+    # Both holds are future-dated: arrival order and chronological order agree
+    # that there is no usable entry clock at NOW.
+    b = aged(entry=NOW + 20)
+    b['cards']['t_abc123']['detail']['events'][2]['created_at'] = NOW + 21
     result = model.reduce_panel(b, now=NOW)
     assert not result['sections']['stuck']
     assert 'entry time unavailable' in result['sections']['waiting'][0]['detail']
