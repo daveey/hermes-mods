@@ -130,6 +130,67 @@ test('Ledger browser acceptance and Desktop span batching', { timeout: 90000 }, 
   } finally { await browser.close(); await server.close() }
 })
 
+test('chat proposal Add / target controls, failures and collecting panel row', { timeout: 90000 }, async () => {
+  const server = await createServer({ root, configFile: false, resolve: { alias: { '@hermes/plugin-sdk': root+'sdk.js', react: root+'node_modules/react', 'react-dom': root+'node_modules/react-dom' }, dedupe: ['react', 'react-dom'] }, server: { port: 0, host: '127.0.0.1', fs: { allow: [root+'..'] } } })
+  await server.listen()
+  let browser
+  try {
+    browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
+    const page = await browser.newPage({ viewport: { width: 664, height: 800 } })
+    const errors = [], added = []
+    page.on('pageerror', e => errors.push(e.message))
+    let fail = true
+    await page.route('**/api/**', async route => {
+      if (route.request().method() === 'POST') {
+        if (fail) { fail = false; return route.fulfill({ status: 503, json: { detail: 'retry' } }) }
+        const d = route.request().postDataJSON().definition
+        added.push(d)
+        return route.fulfill({ json: { added: true, definition: { ...d, instrumentation_card: d.kind === 'span' ? { id: 'instrument-1', board: 'default', gateway: 'hermes-hub', profile: 'default' } : undefined } } })
+      }
+      const data = fixture()
+      for (const d of added) data.groups[1].rows.push({ ...d, n: d.kind === 'derived' ? 30 : 0, p50: d.kind === 'derived' ? 10000 : null, p90: d.kind === 'derived' ? 10000 : null, status: d.kind === 'derived' ? 'ok' : 'none', collection_label: d.kind === 'span' ? 'collecting from today' : null, spark, series: spark, slowest: [] })
+      return route.fulfill({ json: data })
+    })
+    await page.goto(server.resolvedUrls.local[0])
+    await page.waitForFunction(() => !!window.renderWatch)
+    const definition = { id: 'watch.derived', label: 'Decision requested → unblocked', group: 'Cards & workers', kind: 'derived', source: 'kanban', start: 'decision_requested', end: 'unblocked', unit: 'ms', target_p90: 60000 }
+    const encode = d => Buffer.from(JSON.stringify(d)).toString('base64url')
+    const encoded = encode(definition)
+    await page.evaluate(d => window.renderWatch(d, true), encoded)
+    const card = page.getByTestId('watch-proposal')
+    await card.waitFor()
+    assert.equal(added.length, 0, 'render is inert')
+    assert(await card.getByRole('button', { name: 'Add', exact: true }).isDisabled(), 'streaming is inert')
+    assert.match(await card.innerText(), /Start[\s\S]*decision_requested[\s\S]*End[\s\S]*unblocked[\s\S]*Target p90[\s\S]*History[\s\S]*30 days/)
+    await page.evaluate(d => window.renderWatch(d), encoded)
+    await card.getByRole('button', { name: 'Change target' }).click()
+    await card.getByLabel('Target p90 (ms)').fill('0')
+    assert(await card.getByRole('button', { name: 'Add', exact: true }).isDisabled())
+    await card.getByLabel('Target p90 (ms)').fill('1500')
+    await card.getByRole('button', { name: 'Add', exact: true }).click()
+    await card.getByRole('alert').waitFor()
+    await card.getByRole('button', { name: 'Add', exact: true }).click()
+    await card.getByRole('status').waitFor()
+    assert.equal(added.length, 1)
+    assert.equal(added[0].target_p90, 1500)
+    await page.evaluate(d => window.renderWatch(d), encode({ ...definition, id: 'watch.span', label: 'Submit → unblocked', kind: 'span', source: 'spans', start: 'decision.submit' }))
+    await card.getByRole('button', { name: 'Add', exact: true }).click()
+    await card.getByRole('status').waitFor()
+    assert.match(await card.innerText(), /collecting from today/)
+    await card.getByRole('button', { name: 'Instrumentation: instrument-1' }).waitFor()
+    await page.getByRole('button', { name: 'Latency', exact: true }).click()
+    await page.locator('[data-metric="watch.span"]').waitFor()
+    assert.match(await page.locator('[data-metric="watch.span"]').innerText(), /collecting from today/)
+    await page.locator('[data-metric="watch.derived"]').click()
+    await page.getByTestId('metric-detail').waitFor()
+    assert.equal(await page.getByTestId('target-line').count(), 1)
+    const evidence = process.env.LATENCY_EVIDENCE_DIR || root+'evidence'
+    await mkdir(evidence, { recursive: true })
+    await page.screenshot({ path: evidence+'/watch-fixture.png' })
+    assert.deepEqual(errors, [])
+  } finally { if (browser) await browser.close(); await server.close() }
+})
+
 test('runtime imports stay within the real Desktop loader contract', async () => {
   const source = await readFile(new URL('../plugin.js', import.meta.url), 'utf8')
   const imports = [...source.matchAll(/from ['"]([^'"]+)['"]/g)].map(m => m[1])
