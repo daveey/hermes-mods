@@ -100,7 +100,11 @@ class LinuxBoundary(Base):
     def test_unauthenticated_manager_remains_fail_closed(self):
         for case in [dict(query_pid=4201), dict(query_rc=1), dict(bad_group=True), dict(change_birth=True)]:
             with self.subTest(case=case):
-                self.assertIn('incomplete owner observation', self.fixture(**case))
+                result = self.fixture(**case)
+                self.assertIsNotNone(result)
+                self.assertIn('incomplete owner observation', result)
 
     def test_manager_as_target_is_never_exempt(self):
-        self.assertIn('incomplete owner observation', self.fixture(manager_target=True))
+        result = self.fixture(manager_target=True)
+        self.assertIsNotNone(result)
+        self.assertIn('incomplete owner observation', result)
