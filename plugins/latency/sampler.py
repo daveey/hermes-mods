@@ -39,6 +39,8 @@ def cycle(root, store=None, now=None, include_github=True):
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
     host = socket.gethostname()
     gateway = config.get('gateway', host)
+    # No home/path-derived navigation owners: deployments opt in explicitly.
+    profile = config.get('profile')
     errors, counts = {}, {}
 
     def collect(name, fn):
@@ -51,14 +53,25 @@ def cycle(root, store=None, now=None, include_github=True):
     since = now-30*86400
     selected = [d for d in definitions if d['source'] == 'state']
     if (root/'state.db').exists() and selected:
-        collect('state', lambda: collectors.collect_state(root/'state.db', store, selected, since, now, host, gateway))
+        collect('state', lambda: collectors.collect_state(root/'state.db', store, selected, since, now, host, config.get('gateway', 'unknown'), profile))
     boards = config.get('boards')
     if boards is None:
         boards = [root/'kanban.db']
-    paths = sorted({Path(p).expanduser().resolve() for p in boards if Path(p).expanduser().exists()})
+    paths = {}
+    for entry in boards:
+        settings = entry if isinstance(entry, dict) else {'path': entry}
+        path = Path(settings['path']).expanduser().resolve()
+        if path.exists():
+            paths.setdefault(path, settings)
     selected_board = [d for d in definitions if d['source'] == 'kanban']
-    for i, path in enumerate(paths):
-        collect('kanban.'+str(i), lambda p=path: collectors.collect_board(p, store, selected_board, since, now, host, gateway))
+    for i, (path, settings) in enumerate(sorted(paths.items())):
+        # Arbitrary external databases do not inherit this home's ownership.
+        local = path == (root/'kanban.db').resolve()
+        owner_gateway = settings.get('gateway', config.get('gateway', 'unknown') if local else 'unknown')
+        owner_profile = settings.get('profile', profile if local else None)
+        board = settings.get('board')
+        collect('kanban.'+str(i), lambda p=path, g=owner_gateway, pr=owner_profile, b=board:
+                collectors.collect_board(p, store, selected_board, since, now, host, g, pr, b))
     selected_journal = [d for d in definitions if d['source'] in ('request-stages', 'desktop') or d['kind'] == 'span']
     paths = [*root.glob('cache/latency/spans-*.jsonl')]
     if any(d['source'] == 'request-stages' for d in selected_journal):

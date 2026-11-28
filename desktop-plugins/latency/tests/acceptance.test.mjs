@@ -9,9 +9,9 @@ const root = fileURLToPath(new URL('.', import.meta.url))
 const spark = Array.from({ length: 8 }, (_, i) => ({ day: `2026-11-${20+i}`, p50: 100+i*10, p90: 300+i*10, n: 10 }))
 function fixture(range = '7d') {
   const rows = [
-    { id: 'turn_first', label: 'Turn: first reply', group: 'Using Hermes', n: 80, p50: 140, p90: 340, target_p90: 100, status: 'bad', spark, series: spark, hours: [], slowest: [{ id: 'slow-1', start: 1795800000, dur_ms: 400, attrs: { session: 'session-1' }, link: { kind: 'session', route: { connectionId: 'gateway-1', profile: 'default' } } }], stages: [{ name: 'queue', dur_ms: 40 }, { name: 'model', dur_ms: 300 }] },
+    { id: 'turn_first', label: 'Turn: first reply', group: 'Using Hermes', n: 80, p50: 140, p90: 340, target_p90: 100, status: 'bad', spark, series: spark, hours: [], slowest: [{ id: 'slow-1', start: 1795800000, dur_ms: 400, attrs: { session: 'session-1' }, link: { kind: 'session', id: 'session-1', gateway: 'hermes-hub', profile: 'default' } }], stages: [{ name: 'queue', dur_ms: 40 }, { name: 'model', dur_ms: 300 }] },
     { id: 'ui.session_switch', label: 'Switch session', group: 'Using Hermes', n: 0, p50: null, p90: null, target_p90: 250, status: 'none', spark: [], series: [], hours: [], slowest: [] },
-    { id: 'card_queue', label: 'Card waits for worker', group: 'Cards & workers', n: 3, p50: 100, p90: 200, target_p90: 300, status: 'ok', spark, series: spark, slowest: [] },
+    { id: 'card_queue', label: 'Card waits for worker', group: 'Cards & workers', n: 3, p50: 100, p90: 200, target_p90: 300, status: 'ok', spark: [{ p50: 0, p90: 0 }], series: [{ day: '2026-11-27', p50: 0, p90: 0 }], slowest: [] },
     { id: 'ci_core', label: 'Core CI', group: 'Ship', n: 3, p50: 100, p90: 400, target_p90: 300, status: 'warn', spark, series: spark, slowest: [] }
   ]
   // Deliberately disagree with the row list: the chip MUST use the server count.
@@ -58,7 +58,7 @@ test('Ledger browser acceptance and Desktop span batching', { timeout: 90000 }, 
     assert.equal(await page.getByTestId('target-line').count(), 1)
     assert.equal(await page.getByLabel('Stage split').count(), 1)
     await page.getByRole('button', { name: 'session-1', exact: true }).click()
-    assert.deepEqual(await page.evaluate(() => window.opened[0]), ['session-1', { route: { connectionId: 'gateway-1', profile: 'default' } }])
+    assert.deepEqual(await page.evaluate(() => window.opened[0]), ['session-1', { route: { connectionId: 'hermes-hub', mode: 'remote', profile: 'default', targetProfile: 'default' } }])
     const empty = page.locator('[data-metric="ui.session_switch"]')
     assert.match(await empty.innerText(), /not measured yet/)
     assert.equal(await empty.locator('svg').count(), 0)
@@ -66,6 +66,11 @@ test('Ledger browser acceptance and Desktop span batching', { timeout: 90000 }, 
       await Promise.all([page.waitForResponse(r => r.url().includes('range='+range)), page.getByRole('button', { name: range, exact: true }).click()])
     }
     assert(requests.some(p => p.includes('range=90d')))
+    const sparse = page.locator('[data-metric="card_queue"]')
+    assert.equal(await sparse.locator('circle[data-observation]').count(), 2)
+    await sparse.click()
+    assert.equal(await page.locator('.lat-chart circle[data-observation]').count(), 2)
+    await row.click()
     await page.setViewportSize({ width: 664, height: 800 })
     assert(await page.locator('.lat-dialog').evaluate(e => Math.round(e.getBoundingClientRect().width)) === 640)
     assert(await page.locator('.lat-dialog').evaluate(e => e.scrollWidth <= e.clientWidth), 'no horizontal overflow in 640px panel')

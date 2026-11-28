@@ -34,12 +34,19 @@ export function pathFor(points, field, width, height, max, left = 2, top = 2) {
   }).join(' ')
 }
 
+// An isolated observation has no line segment; draw it explicitly (zero too).
+export function isolatedPoints(points, field, width, height, max, left = 2, top = 2) {
+  return points.flatMap((p, i) => p[field] != null && points[i - 1]?.[field] == null && points[i + 1]?.[field] == null
+    ? [h('circle', { key: `${field}-${i}`, 'data-observation': field, cx: left + i * (width - left - 2) / Math.max(1, points.length - 1), cy: top + (height - top - 2) * (1 - p[field] / max), r: 2, fill: field === 'p90' ? 'var(--lat-cyan)' : 'var(--lat-muted)' })] : [])
+}
+
 export function Spark({ points = [], target, width = 96, height = 22 }) {
   const max = Math.max(1, target || 0, ...points.map(p => p.p90 || 0)) * 1.1
   return h('svg', { width, height, viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': '8-day first-reply p90 history', 'data-testid': 'spark' },
     target > 0 && h('line', { x1: 0, x2: width, y1: height - 2 - target / max * (height - 4), y2: height - 2 - target / max * (height - 4), stroke: 'var(--lat-line)', strokeDasharray: '2 2' }),
     h('path', { d: pathFor(points, 'p50', width, height, max), fill: 'none', stroke: 'var(--lat-muted)', strokeWidth: 1 }),
-    h('path', { d: pathFor(points, 'p90', width, height, max), fill: 'none', stroke: 'var(--lat-cyan)', strokeWidth: 1.5 }))
+    h('path', { d: pathFor(points, 'p90', width, height, max), fill: 'none', stroke: 'var(--lat-cyan)', strokeWidth: 1.5 }),
+    isolatedPoints(points, 'p50', width, height, max), isolatedPoints(points, 'p90', width, height, max))
 }
 
 function History({ row, range }) {
@@ -52,17 +59,20 @@ function History({ row, range }) {
     h('text', { x: 590, y: Math.max(12, y(row.target_p90) - 4), textAnchor: 'end' }, `target p90 ${duration(row.target_p90)}`),
     h('path', { d: pathFor(points, 'p50', 592, 120, max, 48, 10), fill: 'none', stroke: 'var(--lat-muted)', strokeWidth: 1.2 }),
     h('path', { d: pathFor(points, 'p90', 592, 120, max, 48, 10), fill: 'none', stroke: 'var(--lat-cyan)', strokeWidth: 1.8 }),
+    isolatedPoints(points, 'p50', 592, 120, max, 48, 10), isolatedPoints(points, 'p90', 592, 120, max, 48, 10),
     points.length > 0 && [0, points.length - 1].map((i, n) => h('text', { key: n, x: n ? 590 : 48, y: 138, textAnchor: n ? 'end' : 'start' }, points[i].day || new Date(points[i].hour * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))))
 }
 
 function Dot({ status }) { return h('span', { className: 'lat-dot', 'data-status': status, title: { none: 'Not measured', ok: 'Within target', warn: 'Above target', bad: 'More than 2× target' }[status] }) }
 
 export async function openSample(ctx, sample) {
-  // Server supplies qualified owner routes / validated HTTPS PR links. Do not
-  // guess the active gateway for foreign samples or synthesize repository names.
-  if (sample.link?.kind === 'pr' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/.test(sample.link.url)) return ctx.os.openExternal(sample.link.url)
-  if (sample.link?.kind === 'session' && sample.link.route) return host.openSession(sample.attrs.session, { route: sample.link.route })
-  if (sample.attrs?.card && typeof window.__hermesKanbanOpenTask === 'function') return window.__hermesKanbanOpenTask(sample.attrs.card, sample.link?.board, sample.link?.gateway || sample.gateway, sample.link?.profile)
+  // The server supplies identity, the local registry supplies transport routes.
+  const link = sample.link
+  if (['pr', 'run'].includes(link?.kind) && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|actions\/runs)\/[1-9]\d*$/.test(link.url)) return ctx.os.openExternal(link.url)
+  const gateway = host.state.gateways.get().find(g => g.id === link?.gateway)
+  if (!gateway || !SAFE.test(link?.profile || '') || !SAFE.test(link?.id || '')) throw Error('Sample owner route is not available')
+  if (link.kind === 'session') return host.openSession(link.id, { route: { connectionId: gateway.id, mode: gateway.kind === 'local' ? 'local' : 'remote', profile: link.profile, targetProfile: link.profile } })
+  if (link.kind === 'card' && SAFE.test(link.board || '') && typeof window.__hermesKanbanOpenTask === 'function') return window.__hermesKanbanOpenTask(link.id, link.board, gateway.id, link.profile)
   throw Error('Sample owner route is not available')
 }
 
@@ -95,7 +105,7 @@ export function makeSpan(event, crypto = globalThis.crypto) {
   if (!UI_METRICS.includes(event?.name) || !Number.isFinite(event.start_ms) || !Number.isFinite(event.duration_ms) || event.duration_ms < 0 || event.duration_ms > 3600000) return null
   const id = bytes => Array.from(crypto.getRandomValues(new Uint8Array(bytes)), n => n.toString(16).padStart(2, '0')).join('')
   const attributes = { 'service.name': 'hermes-desktop', 'host.name': SAFE.test(event.host || '') && event.host.length <= 100 ? event.host : 'desktop' }
-  for (const [source, target] of [['session_id', 'hermes.session_id'], ['card_id', 'hermes.card_id'], ['pr', 'hermes.pr'], ['gateway', 'hermes.gateway']]) if (typeof event[source] === 'string' && SAFE.test(event[source])) attributes[target] = event[source]
+  for (const [source, target] of [['session_id', 'hermes.session_id'], ['card_id', 'hermes.card_id'], ['pr', 'hermes.pr'], ['gateway', 'hermes.gateway'], ['profile', 'hermes.profile'], ['board', 'hermes.board']]) if (typeof event[source] === 'string' && SAFE.test(event[source])) attributes[target] = event[source]
   const start = BigInt(Math.round(event.start_ms * 1e6))
   const result = { trace_id: /^[a-f0-9]{32}$/.test(event.trace_id || '') && !/^0+$/.test(event.trace_id) ? event.trace_id : id(16), span_id: id(8), name: event.name, start_time_unix_nano: String(start), end_time_unix_nano: String(start + BigInt(Math.round(event.duration_ms * 1e6))), attributes }
   if (/^[a-f0-9]{16}$/.test(event.parent_span_id || '') && !/^0+$/.test(event.parent_span_id)) result.parent_span_id = event.parent_span_id

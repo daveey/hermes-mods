@@ -20,7 +20,8 @@ public defaults. Create `$HERMES_HOME/latency/sources.json`, for example:
 ```json
 {
   "gateway": "gateway",
-  "boards": ["/path/to/kanban.db"],
+  "profile": "default",
+  "boards": [{"path": "/path/to/kanban.db", "gateway": "gateway", "profile": "default", "board": "work"}],
   "github": {
     "core": {"repo": "example/agent", "checkout": "/path/to/agent", "deploy_kind": "core"},
     "mods": {"repo": "example/mods", "checkout": "/path/to/mods", "deploy_kind": "mods"},
@@ -35,6 +36,21 @@ profile). Symlink aliases are deduplicated. GitHub needs the host's normal guard
 Sources are read-only Python SQLite URI connections (`mode=ro`, `query_only`).
 If the host SQLite build cannot open a WAL source read-only, collection reports
 an error rather than silently changing the mandated read mode.
+
+Slow samples in both series and Ledger responses carry a server-built `link`
+only when their owner is known. Sessions use `{kind: "session", id, gateway,
+profile}`; cards use `{kind: "card", id, gateway, profile, board}`. Desktop must
+resolve `gateway` through its connection registry, never the active connection.
+Span attributes may include safe `profile` and `board` identifiers (OTLP:
+`hermes.profile` and `hermes.board`); paths, URLs and arbitrary text remain rejected.
+The state collector preserves the explicitly configured gateway/profile. Board
+entries accept legacy path strings or objects as above; only this home's own
+`kanban.db` may inherit gateway/profile. External boards require explicit owners,
+and board names are never inferred from filenames. Old samples with missing owner
+identifiers remain readable but intentionally have no navigation link.
+GitHub samples use the metric's `github.core`, `github.mods` or `github.client`
+source alias and the corresponding configured repository to construct
+`{kind: "pr", url}` or `{kind: "run", url}` links; no repository is hardcoded.
 
 The shipped workflow selectors and initial targets are in `metrics.yaml`. Local
 definitions/overrides live in `latency/metrics.local.yaml` under a `metrics:` list.

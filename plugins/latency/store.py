@@ -44,7 +44,7 @@ def _sample(sample):
     if result['dur_ms'] < 0:
         raise ValueError('dur_ms must be nonnegative')
     attrs = sample.get('attrs', {})
-    if not isinstance(attrs, dict) or set(attrs) - {'session', 'card', 'pr', 'run', 'phase'}:
+    if not isinstance(attrs, dict) or set(attrs) - {'session', 'card', 'pr', 'run', 'phase', 'profile', 'board'}:
         raise ValueError('unsupported attrs')
     if any(not isinstance(v, str) or len(v) > 256 for v in attrs.values()):
         raise ValueError('attrs must be short strings')

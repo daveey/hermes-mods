@@ -23,7 +23,7 @@ MAX_SEGMENTS = 3
 RETENTION_SECONDS = 7 * 86400
 MAX_DURATION_MS = 90 * 86400 * 1000
 _TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]*\Z')
-_ALLOWED_ATTRS = frozenset({'session', 'card', 'pr', 'run', 'phase'})
+_ALLOWED_ATTRS = frozenset({'session', 'card', 'pr', 'run', 'phase', 'profile', 'board'})
 _LOG = logging.getLogger(__name__)
 
 
@@ -69,7 +69,7 @@ def validate_span(value, now=None):
         raise ValueError('dur_ms must be between zero and 90 days')
     attrs = value.get('attrs', {})
     if not isinstance(attrs, dict) or set(attrs) - _ALLOWED_ATTRS:
-        raise ValueError('attrs must contain only session/card/pr/run/phase identifiers')
+        raise ValueError('attrs must contain only session/card/pr/run/phase/profile/board identifiers')
     normalized = {
         'metric': _token(value.get('metric'), 'metric', 100),
         'start': start, 'dur_ms': duration,

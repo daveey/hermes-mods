@@ -1,6 +1,47 @@
 """Server-owned Ledger view model. Desktop renders numbers, never counts rows."""
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import re
+
+
+_SAFE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z')
+_REPO = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*\Z')
+
+
+def sample_link(sample, definition, sources):
+    """Resolve only explicit owner identifiers; never use the viewing gateway."""
+    attrs = sample.get('attrs', {})
+    def safe(value):
+        return isinstance(value, str) and bool(_SAFE.fullmatch(value)) and value not in ('unknown', 'local')
+    gateway, profile = sample.get('gateway'), attrs.get('profile')
+    if safe(gateway) and safe(profile):
+        if safe(attrs.get('session')):
+            return dict(kind='session', id=attrs['session'], gateway=gateway, profile=profile)
+        if safe(attrs.get('card')) and safe(attrs.get('board')):
+            return dict(kind='card', id=attrs['card'], gateway=gateway, profile=profile, board=attrs['board'])
+    source = definition.get('source', '')
+    alias = source.removeprefix('github.')
+    if source != 'github.' + alias or alias not in ('core', 'mods', 'client'):
+        return None
+    settings = sources.get('github', {}).get(alias, {})
+    repo = settings.get('repo') if isinstance(settings, dict) else None
+    if not isinstance(repo, str) or not _REPO.fullmatch(repo) or any(p in ('.', '..') for p in repo.split('/')):
+        return None
+    for attr, path, kind in (('pr', 'pull', 'pr'), ('run', 'actions/runs', 'run')):
+        number = attrs.get(attr)
+        if isinstance(number, str) and re.fullmatch(r'[1-9][0-9]*', number):
+            return dict(kind=kind, url=f'https://github.com/{repo}/{path}/{number}')
+    return None
+
+
+def enrich(row, sources):
+    slowest = []
+    for sample in row.get('slowest', []):
+        # Ignore any supplied link; only the server builds navigation targets.
+        clean = {k: v for k, v in sample.items() if k != 'link'}
+        link = sample_link(clean, row, sources)
+        slowest.append({**clean, **({'link': link} if link else {})})
+    return {**row, 'slowest': slowest}
 
 GROUPS = ('Using Hermes', 'Cards & workers', 'Ship')
 

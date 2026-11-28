@@ -3,6 +3,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import importlib
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import threading
@@ -63,6 +64,13 @@ def build(range_key, metric=None, now=None):
     if metric and metric not in {d['id'] for d in entries}:
         raise ValueError('unknown metric')
     rows = []
+    try:
+        sources = json.loads((root/'latency/sources.json').read_text())
+        if not isinstance(sources, dict) or not isinstance(sources.get('github', {}), dict):
+            sources = {}
+    except (OSError, ValueError):
+        sources = {}
+    links = importlib.import_module(pkg().__name__+'.ledger')
     for definition in entries:
         if metric and definition['id'] != metric:
             continue
@@ -72,7 +80,7 @@ def build(range_key, metric=None, now=None):
             measured = now
             store.meta_set(key, measured)
         view = store.view(definition['id'], now-({'8d': 8*86400}.get(range_key) or RANGES[range_key]), now)
-        rows.append({**definition, 'measured_since': measured, **view})
+        rows.append(links.enrich({**definition, 'measured_since': measured, **view}, sources))
     return dict(api=1, range=range_key, at=now, timezone='America/Los_Angeles',
                 quantile_relative_error=0.005, bucket_seconds=3600, metrics=rows,
                 collection=store.meta_get('last_cycle'))
