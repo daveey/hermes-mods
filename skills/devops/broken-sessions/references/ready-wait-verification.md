@@ -65,6 +65,12 @@ The hub's local kanban.db can keep showing a card as `ready`, with no spawned/ru
 - `hermes kanban dispatch --dry-run --json` returning only `skipped_locked: true`, with every list empty, is no verdict: a tick held the lock. Do not read it as "nothing to do". Do not treat it as a side-effect-free preview either: a run of it has spawned ready cards. Use `governors`, `why` and the candidate receipts to inspect.
 - A gateway shutdown writes thread stacks to `~/.hermes/logs/gateway.log`. Find the dispatcher watcher thread (`_dispatch_once_locked`) to see where a tick was stuck.
 
+## Finding the executor behind a producer wait
+
+When a worker parks on an orchestrator-only owner lookup, distinguish a natural-success proof watcher from a health-repair executor. Read the latest requesting-card comments first; an answered request needs no new wake. Search cross-gateway titles using spelling variants, then corroborate suspiciously empty results with the relevant home board's supported `hermes kanban list --json`, filtering open titles **and bodies** for the producer identity. A title-only search can miss the owner; a proof watcher or future dead-man alarm is not evidence that someone is repairing today's failure.
+
+For a large CLI inventory, redirect JSON to a task-unique scratch file and parse that file, emitting only matching ids/statuses/titles. Do not parse the terminal tool's clipped output: truncation can cut inside a JSON string and produce a misleading decode error. Read candidate cards before assigning ownership. If discovery finds no active repair executor, record that bounded finding rather than inventing one; an authorized owning chat can assign the in-goal repair to the existing delivery card, preserve its acceptance and holds, and resume it through supported admission. Verify the recorded disposition and ready/running state separately; neither establishes repaired producer health.
+
 ## Hand fix for a long ready wait (once the hub view is confirmed)
 
 1. Why nothing claims it: the per-pass refusal journal on each machine that could claim it,
