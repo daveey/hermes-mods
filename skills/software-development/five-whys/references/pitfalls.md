@@ -46,6 +46,8 @@ For pmset sleep/wake attribution, match the event-kind column, not Sleep/Wake wo
 
 When diagnosing SQLite stalls or corruption, read `references/sqlite-recovery-pitfalls.md` (transaction-lock reproduction and coordinated database recovery).
 
+- After bounding one expensive phase of a timed-out producer, compare every later phase's durable cursor/stamp with the natural execution. An end-of-batch checkpoint can replay completed input indefinitely when a later item times out. Reproduce interrupted-prefix recovery and checkpoint-write failure, preserve incomplete appended records, and use a bounded serialized drain; a fast classification batch alone does not prove whole-pass recovery. Keep live phase attribution separate from a fixture-proven progress defect.
+
 - Fixing the copy you can reach when another copy is the source of truth (a mirrored dir, a synced host, a vendored
   file). The next sync silently reverts the fix. Before editing, check what syncs into the file (rsync jobs, mtimes
   with whole-second precision, a "mirror" note). Land the fix at the source, or hand it to whoever owns the source.
