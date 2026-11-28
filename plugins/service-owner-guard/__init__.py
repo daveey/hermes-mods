@@ -1115,6 +1115,41 @@ def _strip(argv: list) -> list:
 
 def _ssh_parts(args: list) -> tuple:
     """(option args, destination, remote command) of an ssh invocation."""
+    # OpenSSH 9.x ssh.c getopt: options are scanned again after the host.
+    # Value-taking options must be consumed even when the lookup allowlist
+    # rejects them (notably -P tag), so their value cannot hide the command.
+    takes_value = set("BbcDEeFIiJLlmOoPpQRSWw")
+    i, opts, dest, ended = 0, [], "", False
+    while i < len(args):
+        arg = args[i]
+        if arg == "--" and not ended:
+            ended = True
+            i += 1
+            continue
+        if arg.startswith("-") and arg != "-":
+            if ended:
+                # An option-looking remote command after -- is unsupported.
+                # Continue extraction conservatively, but never run a lookup.
+                opts.append("--")
+            opts.append(arg)
+            i += 1
+            for offset, flag in enumerate(arg[1:], 2):
+                if flag in takes_value:
+                    if offset == len(arg) and i < len(args):
+                        opts.append(args[i])
+                        i += 1
+                    break
+            continue
+        if not dest:
+            dest = arg
+            i += 1
+            continue
+        break
+    return opts, dest, " ".join(args[i:])
+
+
+def _ssh_parts_legacy(args: list) -> tuple:
+    """Pre-hardening extraction floor; do not broaden its allowed grammar."""
     takes_value = set("BbcDEeFIiJLlmOopQRSWw")
     i, opts = 0, []
     while i < len(args):
@@ -1360,8 +1395,15 @@ def _extract(argv: list, host, depth: int, out: list) -> None:
     elif prog == "hermes":
         out.extend(_hermes(args, host, home))
     elif prog == "ssh" and depth < 3:
-        opts, dest, cmd = _ssh_parts(args)
-        _extract_text(cmd, {"dest": dest, "opts": opts}, depth + 1, out)
+        # Retain the pre-hardening extraction as a refusal floor: extending
+        # option parsing must never erase an action the old grammar exposed.
+        seen = []
+        for parts in (_ssh_parts(args), _ssh_parts_legacy(args)):
+            if parts in seen:
+                continue
+            seen.append(parts)
+            opts, dest, cmd = parts
+            _extract_text(cmd, {"dest": dest, "opts": opts}, depth + 1, out)
     elif prog == "launchctl":
         out.extend(_launchctl(args, host))
     elif prog == "systemctl":
@@ -1446,7 +1488,14 @@ def _lookup_pids(act: dict) -> dict:
     try:
         res = subprocess.run(["ps", "-Ao", "pid=,ppid=,pcpu=,rss=,etime=,args="], capture_output=True, text=True,
                              timeout=5)
+        if res.returncode or getattr(res, "truncated", False) or len(res.stdout) >= 4 * 1024 * 1024:
+            raise OSError("failed or bounded process listing")
+        lines = [line for line in res.stdout.splitlines() if line.strip()]
+        if len(lines) >= 8192 or any(len(line.split(None, 5)) != 6 for line in lines):
+            raise OSError("bounded or unreadable process rows")
         table = collect.parse_ps(res.stdout)
+        if len(table) != len(lines):
+            raise OSError("unparsed or duplicate process rows")
         if "pid" in act:
             pids = [act["pid"]] if act["pid"] in table else []
         else:
@@ -1460,15 +1509,17 @@ def _lookup_pids(act: dict) -> dict:
                 cwd = libs()[1]._cwd_of(q, run_cmd)
                 if cwd:
                     table[q]["cwd"] = cwd
-        tags = collect.env_tags(every)
+        tags = collect.env_tags(every, strict=True)
+        owners = []
         for p in pids:
-            agent = collect.owner(table, tags, p)
+            agent = collect.owner(table, tags, p, strict=True)
             if agent.get("HERMES_OWNER_CARD"):
-                return {"status": "found", "owner": agent["HERMES_OWNER_CARD"],
-                        "source": f"pid {p}: {agent.get('owner_source', 'env')}", "label": str(p)}
-        return {"status": "none"}
+                owners.append({"owner": agent["HERMES_OWNER_CARD"],
+                               "source": f"pid {p}: {agent.get('owner_source', 'env')}", "label": str(p)})
+        return dict(owners[0], status="found", owners=owners) if owners else {"status": "none"}
     except Exception as exc:
-        return {"status": "failed", "error": repr(exc)[:160]}
+        # No approval token can approve an owner we could not observe.
+        return {"status": "incomplete", "error": repr(exc)[:160]}
 
 
 def classify(tool_name: str, args: Any) -> Optional[str]:
@@ -1613,6 +1664,10 @@ def _evaluate(text: str, actions: list) -> Optional[str]:
         host = _host_name(act["host"])
         target = act["label"] if act["tool"] != "kill" or "pid" not in act else f"pid {act['pid']}"
         status = res.get("status")
+        if status == "incomplete":
+            _log(host, act, "-", "refused (incomplete owner observation)")
+            return (f"Refused: incomplete owner observation for {target} on {host} "
+                    f"({res.get('error', '?')}); every matched owner must be checked and approved.")
         if status == "found":
             # One remote lookup may match several separately owned processes. An approval
             # for the first owner must not hide a later, unapproved owner.

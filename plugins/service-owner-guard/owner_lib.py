@@ -61,19 +61,25 @@ def chain(table: dict, pid: int) -> list[int]:
     return seen
 
 
-def env_tags(pids: list[int]) -> dict[int, dict]:
+def env_tags(pids: list[int], strict: bool = False) -> dict[int, dict]:
     """Agent tags from each process's environment (ids only, never secret values)."""
     if not pids:
         return {}
     if MAC:
         res = subprocess.run(["ps", "-E", "-o", "pid=,args=", "-p", ",".join(map(str, pids))],
                              capture_output=True, text=True)
+        if strict and (res.returncode or getattr(res, "truncated", False) or
+                       set(pids) - {int(line.split()[0]) for line in res.stdout.splitlines()
+                                    if line.split() and line.split()[0].isdigit()}):
+            raise OSError("incomplete process environment listing")
         return parse_env_tags(res.stdout)
     tags = {}
     for p in pids:
         try:
             env = Path(f"/proc/{p}/environ").read_bytes().split(b"\0")
         except OSError:
+            if strict:
+                raise
             continue
         found = {k: v for k, _, v in (e.decode(errors="replace").partition("=") for e in env) if k in TAG_KEYS and v}
         if found:
@@ -97,20 +103,24 @@ def valid_owner(value: str) -> str:
     return value if re.fullmatch(r"t_[0-9a-f]+(?:@[A-Za-z0-9._-]+)?", value or "") else ""
 
 
-def read_owner_md(directory) -> tuple[str, str] | None:
+def read_owner_md(directory, strict: bool = False) -> tuple[str, str] | None:
     """(card, path) from `<directory>/OWNER.md` whose first line is `card: t_<hex>[@host]`, else None.
     Only the first line supplies ownership."""
     path = Path(directory) / "OWNER.md"
     try:
         with path.open() as f:
             first = f.readline(4096)
+    except FileNotFoundError:
+        return None
     except OSError:
+        if strict:
+            raise
         return None
     match = re.match(r"^card: (t_[0-9a-f]+)(@[A-Za-z0-9._-]+)?(?:\s|$)", first)
     return (match[1] + (match[2] or ""), str(path)) if match else None
 
 
-def owner(table: dict, tags: dict, pid: int) -> dict:
+def owner(table: dict, tags: dict, pid: int, strict: bool = False) -> dict:
     """Tags inherited from the nearest tagged ancestor. A GUI app started from a worker keeps the dead
     worker's card id for ever, so card ids count only inside a hermes process tree."""
     c = chain(table, pid)
@@ -130,7 +140,9 @@ def owner(table: dict, tags: dict, pid: int) -> dict:
             return agent
     for q in c:
         cwd = table[q].get("cwd")
-        found = read_owner_md(cwd) if cwd else None
+        if strict and not cwd:
+            raise OSError(f"unreadable cwd for pid {q}")
+        found = read_owner_md(cwd, strict=True) if cwd and strict else read_owner_md(cwd) if cwd else None
         if found:
             agent.update(HERMES_OWNER_CARD=found[0], owner_source=found[1])
             break

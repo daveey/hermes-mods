@@ -24,7 +24,14 @@ with stdlib Python 3.9+ on macOS or Linux `/proc`. PID ownership checks the proc
 ancestor process's exact cwd (not parent directories or arbitrary script paths).
 
 This is a best-effort owner guard, not a shell sandbox: dynamic PID expressions and indirect command execution
-are not resolved. `killall` matching deliberately uses pgrep's exact-name semantics rather than emulating every
+are not resolved. The supported SSH grammar is `ssh [options] destination [options] [--] command [args...]`:
+like OpenSSH, option scanning resumes after the destination and stops at the first non-option remote-command
+word. `--` ends option parsing; an option-looking token after it is unsupported, not replayed. Attached and
+clustered value options use OpenSSH 9.x's getopt arities, including `-P tag` (recognised for extraction but
+not supported for lookup). Options before and after the destination share the exact same allowlist and
+validation. Unknown option-like tokens refuse any extracted stop; this is not a complete SSH/shell grammar.
+The pre-hardening extraction is retained as an additional refusal floor.
+`killall` matching deliberately uses pgrep's exact-name semantics rather than emulating every
 platform-specific killall flag. SSH lookup argv is rebuilt from a narrow allowlist: `-i`, `-l`, `-p`
 (including attached and clustered forms), and `-o IdentityFile=`, `User=`, `Port=`, `BatchMode=yes`,
 `IdentitiesOnly=yes`, `ConnectTimeout=1..5`. Ports must be 1..65535. Harmless session/verbosity flags
@@ -39,7 +46,13 @@ and may run its own configured commands. A supported lookup failure is fail-open
 Verdicts: owner found and no `owner-approved=<card id>` in the command: refused. The owner is the caller's own
 `HERMES_KANBAN_TASK`: allowed. No owner: allowed, except `launchctl disable` and `systemctl disable|mask` (they persist
 across reboots), which need `owner-checked=none`. Lookup failed (unreachable, timeout): the same two need
-`owner-checked=none`; the others are allowed. Every refusal, override and lookup failure goes to
+`owner-checked=none`; the others are allowed. Local process kills are stricter: **every** matched owner's
+card must be the caller's own card or explicitly approved. A failed/bounded process listing (4 MiB or
+8192 rows), malformed row, unreadable process environment/cwd/owner marker, or other local lookup error
+is an incomplete observation and refuses the action even with approval/checked-none tokens. Ordinary
+unowned processes with complete observations remain allowed. These limits cannot detect an otherwise
+well-formed external truncation without a truncation indication.
+Every refusal, override and lookup failure goes to
 `~/.hermes/logs/service-owner-guard.log` (`SERVICE_OWNER_GUARD_LOG` overrides). `SERVICE_OWNER_GUARD=off` disables it.
 
 Pinned owners: a local systemd unit with a `*pinned-owner*.conf` drop-in (for example the Ask Eve gateways'
