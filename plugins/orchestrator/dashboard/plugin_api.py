@@ -241,7 +241,8 @@ def session_row(raw, sid=None):
     sid = raw.get('session_id') or raw.get('session') or source.get('id') or sid
     owner = obj(raw.get('owner'))
     route = obj(raw.get('route'))
-    key = sid if source.get('kind') == 'session' else raw.get('key') or raw.get('id') or sid
+    # A task's creator session is its navigation target, never its object identity.
+    key = raw.get('key') or raw.get('id') or sid
     result = dict(key=str(key),
                 title=raw.get('title') or sid or 'Untitled',
                 state=raw.get('state') or raw.get('status') or 'unknown',
@@ -426,9 +427,10 @@ def project(lanes, panel, requests, telemetry, sources, *, q='', lane='', invent
             machinery[row['key']] = row
         if obj(raw.get('source')).get('kind') == 'session':
             sid = row['session_id']
-            rows.setdefault(row['key'], row)
+            identity = session_key(row)
+            rows.setdefault(identity, {**row, 'key': identity})
             if raw.get('reason') == 'run':
-                rows[row['key']]['state'] = 'running'
+                rows[identity]['state'] = 'running'
     bundles = obj(panel).get('bundles', {})
     for sid, held in bundles.items():
         bundle = obj(held.get('bundle', held))

@@ -30,6 +30,7 @@ test("Chromium: geometry, sequential CDP keys, server counts, routed actions and
     const source={route:()=>route,stream:()=>()=>{},read:async q=>{const s=structuredClone(current);if(q){s.human=s.human.filter(r=>r.title.toLowerCase().includes(q.toLowerCase()));s.machinery=[];s.chains=[];s.totals.filtered={human:s.human.length,machinery:0,sessions:0,running:0}}return s}};
     let root=createRoot(document.getElementById('root'));const qc=new QueryClient({defaultOptions:{queries:{retry:false}}});
     window.render=()=>root.render(React.createElement(QueryClientProvider,{client:qc},React.createElement(FlightDeck,{ctx,source})));
+    window.refresh=async()=>{current={...current,cursor:'refresh'};await qc.invalidateQueries()};
     window.change=async()=>{current={...current,cursor:'missing',sources:[{name:'board:secondary',state:'unknown'}],totals:{...current.totals,human:null,filtered:{...current.totals.filtered,human:null}}};await qc.invalidateQueries()};
     window.hermesDesktop={api:async req=>{window.calls.push(['api',req]);if(req.path.includes('/steering'))return {steering:true};if(req.path.includes('/lanes?'))return {lanes:{work:{share:4,limits:{max_workers:8}}}};if(req.path.includes('/decisions'))return {operation:{operationId:'op'}};if(req.path.includes('/operations/'))return {operation:{operationId:'op',dispatchState:'pending'},request:{...request,resolution:{operationId:'op'}}};if(req.path.includes('/operations?'))return {operation:null};return {}}};
     window.render();
@@ -68,6 +69,30 @@ test("Chromium: geometry, sequential CDP keys, server counts, routed actions and
     });
     await page.goto("file://" + join(dir, "index.html"));
     await page.locator("[data-row=ask]").waitFor();
+    await page.locator("[data-row=ask]").focus();
+    await page.keyboard.press("ArrowDown");
+    await page.waitForFunction(() =>
+      document.querySelector("[data-row=gate]").classList.contains("cursor"),
+    );
+    assert.equal(
+      await page.evaluate(() =>
+        document.activeElement?.getAttribute("data-row"),
+      ),
+      "ask",
+    );
+    await page.evaluate(() => window.refresh());
+    await page.waitForFunction(() =>
+      document.querySelector("[data-row=gate]").classList.contains("cursor"),
+    );
+    assert.equal(
+      await page.evaluate(() =>
+        document.activeElement?.getAttribute("data-row"),
+      ),
+      "ask",
+    );
+    await page.keyboard.press("ArrowUp");
+    await page.keyboard.press("Enter");
+    await page.getByRole("button", { name: "Back", exact: true }).click();
     for (const [width, height] of [
       [1440, 900],
       [900, 760],
@@ -139,6 +164,7 @@ test("Chromium: geometry, sequential CDP keys, server counts, routed actions and
       await page.waitForFunction(
         () => document.querySelector("#fcount").textContent === "/",
       );
+      await page.locator("[data-row=build]").waitFor();
       await cdp.detach();
     }
     assert.match(

@@ -212,6 +212,29 @@ function Highlight({ text, query }) {
         value.slice(index + query.length),
       ];
 }
+function Row({ row, nested = false, query, activeKey, onPick }) {
+  return h(
+    "button",
+    {
+      type: "button",
+      className: `oc-row ${nested ? "nested" : ""} ${row.state === "running" ? "running" : row.state === "human" ? "human" : "waiting"} ${activeKey === row.key ? "cursor" : ""}`,
+      "data-row": row.key,
+      onClick: () => onPick(row),
+      children: [
+        h("span", { className: "oc-dot" }),
+        h("span", {
+          className: "oc-row-title",
+          children: [
+            h("strong", { children: h(Highlight, { text: row.title, query }) }),
+            h("small", { children: row.label || row.state }),
+          ],
+        }),
+        h("small", { children: row.route?.profile || "owner unknown" }),
+      ],
+    },
+    row.key,
+  );
+}
 export function FlightDeck({ ctx, source: supplied }) {
   const source = useRef(supplied || createSource(ctx)).current;
   const [query, setQuery] = useState(""),
@@ -339,7 +362,8 @@ export function FlightDeck({ ctx, source: supplied }) {
       }
       if (
         e.key === "Enter" &&
-        !["BUTTON", "SELECT"].includes(e.target.tagName)
+        (!["BUTTON", "SELECT"].includes(e.target.tagName) ||
+          e.target.hasAttribute("data-row"))
       ) {
         e.preventDefault();
         select(s.rows[s.cursor] || s.rows[0] || null);
@@ -384,41 +408,21 @@ export function FlightDeck({ ctx, source: supplied }) {
       setBusy(false);
     }
   };
-  function Row({ row, nested = false }) {
-    return h(
-      "button",
-      {
-        type: "button",
-        className: `oc-row ${nested ? "nested" : ""} ${row.state === "running" ? "running" : row.state === "human" ? "human" : "waiting"} ${rows[cursor]?.key === row.key ? "cursor" : ""}`,
-        "data-row": row.key,
-        onClick: () => {
-          select(row);
-          setReceipt("");
-        },
-        children: [
-          h("span", { className: "oc-dot" }),
-          h("span", {
-            className: "oc-row-title",
-            children: [
-              h("strong", {
-                children: h(Highlight, { text: row.title, query }),
-              }),
-              h("small", { children: row.label || row.state }),
-            ],
-          }),
-          h("small", { children: row.route?.profile || "owner unknown" }),
-        ],
-      },
-      row.key,
-    );
-  }
+  const rowProps = {
+    query,
+    activeKey: rows[cursor]?.key,
+    onPick: (row) => {
+      select(row);
+      setReceipt("");
+    },
+  };
   const section = (title, count, list) =>
     h("section", {
       className: "oc-section",
       children: [
         h("h2", { children: [title, h("span", { children: show(count) })] }),
         list.length
-          ? list.map((row) => h(Row, { row }, row.key))
+          ? list.map((row) => h(Row, { ...rowProps, row }, row.key))
           : h("p", {
               className: "oc-empty",
               children:
@@ -692,16 +696,18 @@ export function FlightDeck({ ctx, source: supplied }) {
                       {
                         className: "oc-chain",
                         children: [
-                          h(Row, { row: c.prerequisite }),
+                          h(Row, { ...rowProps, row: c.prerequisite }),
                           ...c.waiters.map((row) =>
-                            h(Row, { row, nested: true }, row.key),
+                            h(Row, { ...rowProps, row, nested: true }, row.key),
                           ),
                         ],
                       },
                       c.key,
                     ),
                   ),
-                  ...sessions.map((row) => h(Row, { row }, row.key)),
+                  ...sessions.map((row) =>
+                    h(Row, { ...rowProps, row }, row.key),
+                  ),
                 ],
               }),
             ],
