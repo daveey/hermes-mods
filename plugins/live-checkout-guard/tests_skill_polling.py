@@ -166,6 +166,26 @@ elif 'rev-parse' in args: print(Path(os.environ['POLL_TIP']).read_text())
         self.assertEqual(self.calls(),4)
         self.assertEqual(len(list(self.pending.glob('*.json'))),4)
 
+    def test_unwritable_advisory_hint_preserves_healthy_siblings_and_custody(self):
+        self.state.write_text('green')
+        self.records()
+        before = {p: p.read_bytes() for p in self.pending.glob('*.json')}
+        (self.pending / '.retry-0').mkdir()
+        unsafe = self.pending / '.retry-1'
+        unsafe.write_text('{}')
+        unsafe.chmod(0o644)
+        with patch.object(pub, 'require_overlap_clear', return_value={
+                'status': 'skipped', 'reason': 'open PR overlap overlap'}), \
+                patch.object(pub, 'dirt_notice', wraps=pub.dirt_notice) as notices:
+            result = pub.retry_pending(self.pending, passes=1)
+        self.assertEqual(result['kept'], 4)
+        self.assertEqual(self.calls(), 4)
+        self.assertEqual({p: p.read_bytes() for p in self.pending.glob('*.json')}, before)
+        self.assertTrue((self.pending / '.retry-2').is_file())
+        self.assertTrue((self.pending / '.retry-3').is_file())
+        self.assertTrue(any('advisory retry hint unavailable' in str(call)
+                            for call in notices.call_args_list))
+
     def test_generic75_is_backed_off_but_not_invented_quota_exhaustion(self):
         self.state.write_text('generic75')
         for _ in range(3):

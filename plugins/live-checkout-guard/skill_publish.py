@@ -1047,7 +1047,7 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                 digest = hashlib.sha256(raw).hexdigest()
                 try:
                     hint = _private_json(retry_hint)
-                except (OSError, ValueError):
+                except (OSError, ValueError, Deferred):
                     hint = {}  # Advisory damage cannot starve healthy siblings.
                 if not all(isinstance(hint.get(key, 0), (float, int))
                            and math.isfinite(hint.get(key, 0)) for key in ('next_at', 'delay')):
@@ -1070,11 +1070,17 @@ def retry_pending(directory=None, *, interval=None, ci=None, clock=None, sleep=t
                     counts['kept'] += 1
                     continue
                 if deferrable(outcome):
-                    if not outcome.get('reason', '').startswith('latest main CI '):
+                    reason = outcome.get('reason', 'unknown')
+                    if not reason.startswith('latest main CI '):
                         delay = min(300, max(60, hint.get('delay', 0) * 2)) if hint.get('record') == digest else 60
-                        _save_private_json(retry_hint, {'record': digest, 'delay': delay,
-                                                       'next_at': clock() + delay})
-                    dirt_notice(paths, 'held', outcome.get('reason', 'unknown'), directory)
+                        try:
+                            _save_private_json(retry_hint, {'record': digest, 'delay': delay,
+                                                           'next_at': clock() + delay})
+                        except (OSError, ValueError, Deferred) as exc:
+                            # Only this advisory record hint is optional. Shared
+                            # quota/CI state remains fail-closed in publish().
+                            reason += '; advisory retry hint unavailable (%s)' % type(exc).__name__
+                    dirt_notice(paths, 'held', reason, directory)
                     counts['kept'] += 1
                     continue
                 _retry_log(directory, 'retry %s %s' % (paths, outcome))
