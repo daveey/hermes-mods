@@ -1305,7 +1305,7 @@ class Mirror:
         try:
             parked = [tuple(r) for r in c.execute(
                 "SELECT t.id, t.title, t.session_id, (SELECT MAX(e.id) FROM task_events e WHERE e.task_id=t.id), "
-                "(SELECT json_group_array(l.chat_session || ':' || COALESCE(l.released, 0)) FROM task_chat_links l "
+                "(SELECT json_group_array(json_array(l.chat_gateway,l.chat_profile,l.chat_session,COALESCE(l.released,0))) FROM task_chat_links l "
                 "WHERE l.task_id=t.id AND l.kind='created') "
                 "FROM tasks t WHERE t.status='triage' AND t.human_request IS NULL ORDER BY 1")]
         except sqlite3.OperationalError:
@@ -1313,7 +1313,7 @@ class Mirror:
         session_ids = {r[positions.index("session_id")] for r in rows
                        if "session_id" in positions and r[positions.index("session_id")]}
         for _, _, sid, _, links in parked or ():
-            session_ids.update(s.rsplit(':', 1)[0] for s in json.loads(links or '[]') if s)
+            session_ids.update(s[2] for s in json.loads(links or '[]') if s[2])
             if sid:
                 session_ids.add(sid)
         subscriber_ids = {r[1] for r in (subs or []) if r[1]}
@@ -1448,6 +1448,8 @@ class Mirror:
             # Preserve a board commit whose outbox acknowledgment is still pending.
             with _kept(self._path(binding["board"])) as c:
                 delivered = self._receipt(c, binding, op)
+                if not delivered and not mismatch:
+                    delivered = _overdue.committed(self._api(), c, binding, op)
             if not delivered:
                 try:
                     self.store.retire_operation(

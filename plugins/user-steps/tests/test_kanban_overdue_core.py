@@ -38,7 +38,9 @@ def real(tmp_path, monkeypatch):
         kb.init_db(path)
         c = connect(path)
         try:
-            yield kb, c, path, core.ActionStore(tmp_path / 'actions.sqlite3'), load_module('overdue_mirror', ROOT / 'kanban_mirror.py')
+            mod = load_module('overdue_mirror', ROOT / 'kanban_mirror.py')
+            monkeypatch.setattr(mod._overdue, '_gateway', lambda mirror: 'test-gateway')
+            yield kb, c, path, core.ActionStore(tmp_path / 'actions.sqlite3'), mod
         finally:
             c.close()
     finally:
