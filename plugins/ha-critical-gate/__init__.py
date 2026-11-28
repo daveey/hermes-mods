@@ -11,11 +11,14 @@ hook asks a configured gate command about every ``ha_call_service`` call (it als
 With no trusted gate, only SAFE_DOMAINS (light, media_player, climate), lock.lock,
 cover.close_cover/stop_cover/close_cover_tilt/stop_cover_tilt, alarm_control_panel's
 alarm_arm_home/alarm_arm_away/alarm_arm_night, and generic homeassistant calls with explicit
-resolved targets that pass the existing checks remain available. Every other domain/service,
+resolved targets only in SAFE_DOMAINS remain available. Every other domain/service,
 including unknown and raw-protocol integrations, needs confirmation and is blocked without a gate.
-Targets in entity_id and data.entity_id still override safe domains. Direct calls, batched wrappers,
-JSON-string arguments/calls and legacy {name, arguments} wrappers are classified here;
-unparseable wrappers naming ha_call_service are blocked without relying on core unwrapping.
+Targets in entity_id and data.entity_id still override safe domains. Direct calls, batched and
+single-object calls, JSON-string arguments/calls and legacy {name, arguments} wrappers are
+classified here. Entry names are stripped, case-insensitive and accept an mcp__ prefix;
+misplaced names inside arguments are lifted from nested envelopes or beside call parameters.
+Nameless entries mentioning ha_call_service fail closed; explicit other tools are unaffected.
+Unparseable wrappers naming ha_call_service are blocked without relying on core unwrapping.
 
 Gate command comes ONLY from root-owned, non-agent-writable ``/etc/hermes/ha-critical-gate.json``:
 ``{"command": ["/absolute/trusted/gate"], "timeout": 25}``. Home/profile files and
@@ -92,8 +95,9 @@ def critical(domain: str, service: str, entity_id=None, data=None) -> bool:
     # Generic HA services expand indirect/implicit targets server-side. Unknown
     # nonempty selectors fail closed too, so a new HA selector cannot bypass us.
     if domain == "homeassistant":
-        return (unresolved or not targets or any(value for key, value in data.items()
-                                                if key not in {"entity_id", "exclude"}))
+        return (unresolved or not targets
+                or any(target.partition(".")[0] not in SAFE_DOMAINS for target in targets)
+                or any(value for key, value in data.items() if key not in {"entity_id", "exclude"}))
     # Never infer physical safety from an unfamiliar integration/service name.
     return domain not in SAFE_DOMAINS and service not in SAFE_SERVICES.get(domain, ())
 
@@ -224,6 +228,36 @@ def _decode(value: Any) -> Any:
     return value
 
 
+def _entry_name(value: Any) -> str:
+    name = str(value or "").strip().lower()
+    return name.removeprefix("mcp__")
+
+
+def _mentions_ha(value: Any) -> bool:
+    return TOOL in str(value).lower()
+
+
+def _classify_entry(entry: Any, run, config) -> Optional[str]:
+    if not isinstance(entry, dict):
+        return NO_GATE.format(what="unparseable Home Assistant wrapper") if _mentions_ha(entry) else None
+    name = _entry_name(entry.get("name"))
+    arguments = entry.get("arguments")
+    if not name:
+        # Mirror core's two misplaced-name envelopes without importing core.
+        inner = _decode(arguments)
+        if isinstance(inner, dict) and _entry_name(inner.get("name")) == TOOL:
+            name = _entry_name(inner["name"])
+            rest = {key: value for key, value in inner.items() if key != "name"}
+            arguments = rest.get("arguments") if set(rest) <= {"arguments"} else rest
+    if name == TOOL:
+        return classify(TOOL, arguments, run, config)
+    if not name and _mentions_ha(entry):
+        return NO_GATE.format(what="unparseable Home Assistant wrapper")
+    # Explicit other tool names are not HA calls, even when their arguments
+    # discuss ha_call_service (e.g. a kanban_complete summary).
+    return None
+
+
 def classify(tool_name: str, args: Any, run=subprocess.run, config=None) -> Optional[str]:
     if tool_name == TOOL:
         args = _decode(args)
@@ -233,22 +267,25 @@ def classify(tool_name: str, args: Any, run=subprocess.run, config=None) -> Opti
     if tool_name in WRAPPERS:
         decoded = _decode(args)
         if not isinstance(decoded, dict):
-            if isinstance(args, str) and TOOL in args:
-                return NO_GATE.format(what="unparseable Home Assistant wrapper")
-            return None
-        # Both the legacy single-call form and the batched form may be present.
-        calls = [decoded]
+            return NO_GATE.format(what="unparseable Home Assistant wrapper") if _mentions_ha(args) else None
+        # Preserve checking legacy+batch together; do not treat the batch
+        # envelope itself as a nameless entry merely mentioning its children.
+        calls = [decoded] if "calls" not in decoded or "name" in decoded or "arguments" in decoded else []
         raw_calls = decoded.get("calls")
         batch = _decode(raw_calls)
         if isinstance(batch, list):
             calls.extend(batch)
-        elif isinstance(raw_calls, str) and TOOL in raw_calls:
+        elif isinstance(batch, dict):
+            # Retain the prior JSON-single-object refusal for monotonicity.
+            if isinstance(raw_calls, str) and _mentions_ha(raw_calls):
+                return NO_GATE.format(what="unparseable Home Assistant wrapper")
+            calls.append(batch)
+        elif isinstance(raw_calls, str) and _mentions_ha(raw_calls):
             return NO_GATE.format(what="unparseable Home Assistant wrapper")
         for call in calls:
-            if isinstance(call, dict) and str(call.get("name") or "") == TOOL:
-                why = classify(TOOL, call.get("arguments"), run, config)
-                if why:
-                    return why
+            why = _classify_entry(call, run, config)
+            if why:
+                return why
     return None
 
 
