@@ -42,7 +42,9 @@ class DesktopPluginCI(unittest.TestCase):
     def test_hosted_read_only_bounded_job(self):
         code = '\n'.join(line.split('#', 1)[0] for line in self.text.splitlines())
         self.assertNotIn('self-hosted', code)
-        self.assertEqual(re.findall(r'^\s*runs-on: (.+)$', code, re.M), ['ubuntu-latest'])
+        # Pin the hosted image supported by the lockfile's Playwright build;
+        # ubuntu-latest can advance beyond its browser/dependency support matrix.
+        self.assertEqual(re.findall(r'^\s*runs-on: (.+)$', code, re.M), ['ubuntu-24.04'])
         self.assertIn('contents: read', code)
         self.assertIn('timeout-minutes: 10', code)
         self.assertNotIn('continue-on-error', code)
