@@ -36,6 +36,10 @@ Run this every time you are about to:
 
 Spend the thinking here. Write the reasoning down in the card's comments (step 5), not in your head.
 
+## Red-session unblock instructions
+
+When the user asks every red session to give unblock instructions, re-read each named held card immediately. Resolve agent-owned or already-answered advisories within existing authority, verify the disposition and report the exact card ID. Do not leave an answered advisory in triage merely because it never received lane admission. Before archiving, check reverse dependencies and preserve the unfinished delivery owner. Only genuinely human-only unresolved actions become one visible blocked request per card, with context, recommendation-first choices, consequences, and explicit unblock/archive meanings. Never convert lane pressure alone into a human-only permission ask.
+
 ## 1. Restate the blocker in one sentence
 
 "The card cannot finish because ___." Name the concrete missing thing: a credential, a click on a specific
