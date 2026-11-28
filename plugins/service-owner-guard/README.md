@@ -52,6 +52,20 @@ card must be the caller's own card or explicitly approved. A failed/bounded proc
 is an incomplete observation and refuses the action even with approval/checked-none tokens. Ordinary
 unowned processes with complete observations remain allowed. These limits cannot detect an otherwise
 well-formed external truncation without a truncation indication.
+
+On Linux cgroup v2, inaccessible metadata on the OS user manager is not inherited
+service ownership: the system manager must attest the exact `user@UID.service`
+MainPID, numeric User and ControlGroup over the system bus. Kernel UID, parent 1,
+`init.scope` cgroup and start-time identity must agree before and after the
+attestation and metadata reads. The query uses the installed absolute systemctl
+with a clean environment (no caller-selected bus/host/config endpoint). No name
+or argv establishes this boundary. Readable explicit owner tags/markers are
+preserved; a matched manager target is never excluded. Missing, changed, duplicate,
+failed or unsupported attestation retains the complete chain and strict refusal.
+All remaining service ancestors and every matched process retain strict environment
+and cwd/OWNER.md readers. Other platforms, cgroup layouts and remote lookups keep
+their existing behavior; this is not a general unreadable-ancestor exception.
+
 Every refusal, override and lookup failure goes to
 `~/.hermes/logs/service-owner-guard.log` (`SERVICE_OWNER_GUARD_LOG` overrides). `SERVICE_OWNER_GUARD=off` disables it.
 

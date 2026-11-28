@@ -1483,6 +1483,76 @@ def _lookup(act: dict) -> dict:
     return remote_lookup(prefix, spec)
 
 
+def _manager_identity(pid: int) -> tuple:
+    """Kernel birth, parent, UID and cgroup; never trust comm/argv as identity."""
+    root = PROC / str(pid)
+    fields = (root / "stat").read_text().rpartition(") ")[2].split()
+    status = (root / "status").read_text()
+    uid = re.findall(r"^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", status, re.M)
+    if len(uid) != 1 or len(set(uid[0])) != 1:
+        raise OSError("ambiguous manager uid")
+    return fields[19], int(fields[1]), int(uid[0][0]), (root / "cgroup").read_text().strip()
+
+
+def _ownership_table(table: dict, pids: list) -> dict:
+    """Stop inherited ownership at the authenticated OS user manager, not its name.
+
+    The system manager's user@UID.service MainPID is an OS launcher shared by
+    unrelated services, not their service owner. It is never excluded when it is
+    itself a signal target. Unknown/changed evidence leaves the original chain
+    intact, so the strict readers still refuse unreadable relevant ancestors.
+    """
+    if platform.system() != "Linux":
+        return table
+    collect = libs()[0]
+    boundaries = set()
+    for pid in {q for p in pids for q in collect.chain(table, p)} - set(pids):
+        if table[pid]["ppid"] != 1:
+            continue
+        try:
+            before = _manager_identity(pid)
+            birth, ppid, uid, cgroup = before
+            unit = f"user@{uid}.service"
+            group = f"/user.slice/user-{uid}.slice/{unit}"
+            if ppid != 1 or cgroup != f"0::{group}/init.scope":
+                continue
+            res = subprocess.run(
+                ["/usr/bin/systemctl", "--system", "show", unit,
+                 "--property=MainPID,Id,User,ControlGroup"],
+                capture_output=True, text=True, timeout=5,
+                env={"PATH": os.defpath, "LC_ALL": "C"})
+            lines = res.stdout.splitlines()
+            props = dict(line.split("=", 1) for line in lines)
+            expected = {"MainPID": str(pid), "Id": unit, "User": str(uid), "ControlGroup": group}
+            if (res.returncode == 0 and not getattr(res, "truncated", False) and
+                    len(lines) == len(expected) and props == expected and
+                    _manager_identity(pid) == before):
+                # Preserve any observable ownership, including the historical
+                # readable-manager case. Only the authenticated launcher's
+                # inaccessible metadata is outside the service-owner domain.
+                unreadable = False
+                try:
+                    tags = collect.env_tags([pid], strict=True)
+                except OSError:
+                    tags, unreadable = {}, True
+                if collect.valid_owner(tags.get(pid, {}).get("HERMES_OWNER_CARD", "")):
+                    continue
+                cwd = libs()[1]._cwd_of(pid, run_cmd)
+                if not cwd:
+                    unreadable = True
+                else:
+                    try:
+                        if collect.read_owner_md(cwd, strict=True):
+                            continue
+                    except OSError:
+                        unreadable = True
+                if unreadable and _manager_identity(pid) == before:
+                    boundaries.add(pid)
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            continue
+    return {pid: row for pid, row in table.items() if pid not in boundaries}
+
+
 def _lookup_pids(act: dict) -> dict:
     collect = libs()[0]
     try:
@@ -1502,6 +1572,7 @@ def _lookup_pids(act: dict) -> dict:
             rx = re.compile(act["pattern"])
             pids = [p for p, r in table.items() if p != os.getpid() and p > 1 and
                     rx.search(r["args"] if act.get("full") else os.path.basename(r["args"].split(" ")[0]))]
+        table = _ownership_table(table, pids)
         chains = {p: collect.chain(table, p) for p in pids}
         every = sorted({q for c in chains.values() for q in c})
         for q in every:
