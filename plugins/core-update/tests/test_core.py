@@ -97,6 +97,18 @@ def test_unknown_installed_identity_never_offers_same_head_restart(repo, stamp_c
     assert s["state"] == "failed" and s["error"] == "pack failed"
 
 
+def test_ready_record_is_not_itself_pending_swap_debt(repo):
+    root, home, running, ahead, app = repo
+    stamp = root / "apps/desktop/release/mac-arm64/Hermes.app/Contents/Resources/install-stamp.json"
+    stamp.parent.mkdir(parents=True)
+    stamp.write_text(json.dumps({"commit": running}))
+    _write(home, status="ready", sha=running, serves_sha=running, app_path=str(app))
+    assert core.status(home, checkout=root)["state"] == "idle"
+    # Same installed app can cover a newer backend, but that backend update is still owed.
+    _write(home, status="ready", sha=running, serves_sha=ahead, app_path=str(app))
+    assert core.status(home, checkout=root)["state"] == "ready"
+
+
 
 def test_ready_when_a_newer_build_exists(repo):
     root, home, _running, ahead, app = repo
@@ -155,26 +167,24 @@ def test_restart_starts_the_waiter_then_quits_desktop_detached(repo):
 
 
 @pytest.mark.parametrize("profile", [False, True])
-@pytest.mark.parametrize("fallback", [False, True])
-def test_restart_writes_force_before_spawning(repo, monkeypatch, profile, fallback):
-    import sys
+def test_restart_writes_restart_intent_before_spawning(repo, profile):
     root, home, _running, ahead, app = repo
     installation = home
     if profile:
         home = installation / "profiles" / "work"
         (home / "cache/core-update").mkdir(parents=True)
-    if fallback:
-        monkeypatch.setitem(sys.modules, "hermes_cli.core_update_force", None)
+
     _write(home, status="ready", sha=ahead, app_path=str(app))
     before = core.time.time()
     calls = []
 
     def spawn(cmd, **kw):
-        body = json.loads((installation / "core-update/force-request").read_text())
+        body = json.loads((installation / "core-update/restart-request").read_text())
         assert body["version"] == 1 and body["by"] == "core-update chip"
         assert before <= body["requested_at"] <= core.time.time()
         assert body["expires_at"] == body["requested_at"] + 1800
-        assert not (home / "cache/core-update/force-request").exists()
+        assert not (installation / "core-update/force-request").exists()
+        assert not (home / "cache/core-update/restart-request").exists()
         calls.append(cmd)
 
     assert core.restart(home, checkout=root, popen=spawn)["ok"]
@@ -188,28 +198,25 @@ def test_restart_force_write_failure_does_not_spawn_or_quit(repo):
     calls = []
     result = core.restart(home, checkout=root, popen=lambda *a, **kw: calls.append(a))
     assert result["ok"] is False
-    assert "force request" in result["reason"]
+    assert "restart request" in result["reason"]
     assert calls == []
 
 
-def test_restart_prefers_core_helper_and_never_falls_back_on_its_failure(repo, monkeypatch):
-    import sys
-    import types
+def test_restart_atomic_write_failure_does_not_quit(repo, monkeypatch):
     root, home, _running, ahead, app = repo
     _write(home, status="ready", sha=ahead, app_path=str(app))
     seen = []
 
-    def fail(installation, by):
-        seen.append((installation, by))
-        raise OSError("helper write denied")
+    def fail(source, target):
+        seen.append(target)
+        raise OSError("replace denied")
 
-    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
-    monkeypatch.setitem(sys.modules, "hermes_cli.core_update_force",
-                        types.SimpleNamespace(write_force_request=fail))
+    monkeypatch.setattr(core.os, "replace", fail)
     result = core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("must not quit"))
-    assert result == {"ok": False, "reason": "could not write force request: helper write denied"}
-    assert seen == [(home, "core-update chip")]
-    assert not (home / "core-update/force-request").exists()
+    assert result == {"ok": False, "reason": "could not write restart request: replace denied"}
+    assert seen == [home / "core-update/restart-request"]
+    assert not list((home / "core-update").glob("*.tmp"))
+    assert not (home / "core-update/restart-request").exists()
 
 
 def test_restart_refuses_without_a_ready_update(repo):

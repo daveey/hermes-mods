@@ -18,11 +18,12 @@ time Desktop quits.
 
 ## Contract
 
-A Restart click first atomically writes `<installation root>/core-update/force-request`
+A Restart click first atomically writes `<installation root>/core-update/restart-request`
 with `{"version":1,"requested_at":<epoch>,"expires_at":<epoch + 1800>,"by":"core-update chip"}`.
-The installation root is `$HERMES_HOME`, or its grandparent for `profiles/<name>` homes.
-It uses `hermes_cli.core_update_force.write_force_request` when available, with an
-atomic v1 fallback for older cores. If writing fails, `/restart` returns `ok: false`
+The installation root is `$HERMES_HOME`, or its grandparent whenever its parent is named
+`profiles` (including custom homes following that layout). This is a dedicated batch-only
+intent, NOT the full-force `force-request` consumed by background drainers. Older updaters
+ignore it safely until upgraded. If writing fails, `/restart` returns `ok: false`
 with a reason and neither spawns the waiter nor quits Desktop.
 The reference updater's quit-waiter consumes this intent to skip background batching;
 ordinary quits still batch. Busy/admission safety gates are unchanged. Successful core
