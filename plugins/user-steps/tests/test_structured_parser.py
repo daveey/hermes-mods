@@ -20,9 +20,9 @@ def test_portable_desktop_parser_smoke():
 
 def test_portable_desktop_fidelity():
     """Actual-Desktop differential corpus, entry point and dependency identity."""
-    result = subprocess.run(['node', str(PARSER / 'fidelity.test.mjs')], cwd=PARSER, capture_output=True, text=True, timeout=600)
+    result = subprocess.run(['node', str(PARSER / 'check-fidelity.mjs')], cwd=PARSER, capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert '3783 differential cases: 471 accepted, 0 over-accepted' in result.stdout
+    assert '3783 differential cases: 478 accepted, 0 over-accepted' in result.stdout
 
 
 def test_bundle_matches_recorded_provenance():

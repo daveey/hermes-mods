@@ -79,6 +79,10 @@ for(const i of [0,1,4])
  ok(`first-block reference doubt ${i}`,()=>assert.equal(verdict.get(`survivors/reference/${i}`),null))
 for(const id of ['blank/0','blank/1','blank/2','blank/3','blank/4','reference/2','reference/3'])
  ok(`block boundary control ${id}`,()=>assert.notEqual(verdict.get(`survivors/${id}`),null))
+// Ordinary terminal whitespace is not incomplete Markdown: Desktop can trim it.
+// These real-Desktop fuzz controls catch overly strict repair comparison.
+for(const id of ['fuzz/1438','fuzz/1885','fuzz/2022','fuzz/2228','fuzz/2384','fuzz/2569'])
+ ok(`terminal whitespace control ${id}`,()=>assert.notEqual(verdict.get(id),null))
 console.log(`${cases.length} differential cases: ${results.filter(r=>r!==null).length} accepted, ${failed.filter(f=>f.startsWith('no over-accept')).length} over-accepted`)
 
 // 2. Entry point: malformed / too-large / ordinary stdin.

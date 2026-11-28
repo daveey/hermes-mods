@@ -1,8 +1,8 @@
 // Mutation testing of scanner and dependency-identity guards.
-// mutation.test.mjs <parser dir> <work dir>
+// run-mutations.mjs <parser dir> <work dir>
 // Each mutant: copy the parser (real node_modules copy), apply ONE exact
 // textual mutation (must match exactly once), rebuild when scanner.ts changed,
-// run fidelity.test.mjs (+ smoke.mjs); a mutant survives if both exit 0.
+// run check-fidelity.mjs (+ smoke.mjs); a mutant survives if both exit 0.
 import { cpSync, mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
@@ -11,7 +11,7 @@ const S = 'scanner.ts', L = 'lockgraph.mjs'
 const MUTANTS = [
   ['C0 harness control (no-op, must survive)', S, "const parse = (text:string)", "const parse = (text:string)"],
   ['S1 drop remark-math stage', S, ".use(REMARK_PLUGINS).use([mathPlugin.remarkPlugin])", ".use(REMARK_PLUGINS)"],
-  ['S2 drop tail-repair refusal', S, "if(preprocessWithTailRepair(reply)!==text) return null", "void preprocessWithTailRepair"],
+  ['S2 drop tail-repair refusal', S, "if(repaired!==text && repaired!==text.replace(/[ \\t\\r\\n]+$/,'')) return null", "void preprocessWithTailRepair"],
   ['S3 drop block reconstruction check', S, "if(!Array.isArray(split) || split.join('')!==text.replace(/\\r\\n|\\r/g,'\\n')) return null", "if(!Array.isArray(split)) return null"],
   ['S4 no CR normalization (over-strict)', S, "split.join('')!==text.replace(/\\r\\n|\\r/g,'\\n')", "split.join('')!==text"],
   ['S5 drop earlier-block doubt', S, " for(const block of content.slice(0,-1)) if(directives(parse(block)).doubt) return null\n", ""],
@@ -19,6 +19,7 @@ const MUTANTS = [
   ['S8 drop last-block check', S, " if(!finalDirective(parse(content.at(-1) as string))) return null\n", ""],
   ['S9 last block parsed as whole text', S, "if(!finalDirective(parse(content.at(-1) as string)))", "if(!finalDirective(parse(text)))"],
 
+  ['S11 reject harmless terminal whitespace removal', S, "repaired!==text && repaired!==text.replace(/[ \\t\\r\\n]+$/,'')", "repaired!==text"],
   ['H1 drop raw-html doubt', S, "if(n.type==='html' && !SAFE_HTML.test(n.value.trim())) doubt=true", ""],
   ['H2 no comment allowance', S, "(?:<!--(?:(?!-->)[\\s\\S])*-->|<(?:br", "(?:<(?:br"],
   ['H3 no void-element allowance', S, "-->|<(?:br|hr|img|wbr)\\b[^<>]*>)$", "-->)$"],
@@ -54,7 +55,7 @@ for (const [name, file, from, to] of MUTANTS) {
     if (b.status !== 0) throw Error(`Mutation build failed (not an assertion kill): ${name}\n${b.stderr}`)
   }
   const smoke = spawnSync(process.execPath, ['smoke.mjs'], { cwd: dir, encoding: 'utf8', timeout: 120000 })
-  const fid = spawnSync(process.execPath, ['fidelity.test.mjs'], { cwd: dir, encoding: 'utf8', timeout: 600000 })
+  const fid = spawnSync(process.execPath, ['check-fidelity.mjs'], { cwd: dir, encoding: 'utf8', timeout: 600000 })
   const fails = (fid.stderr.match(/^FAIL .*/gm) ?? []).map(l => l.split(':')[0])
   const id = name.split(' ')[0]
   writeFileSync(join(work, `${id}.stdout.log`), smoke.stdout + fid.stdout)

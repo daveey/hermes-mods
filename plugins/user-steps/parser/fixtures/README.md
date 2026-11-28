@@ -5,7 +5,7 @@
 - `desktop.cards`: the directive sources rendered as `user-step` cards.
 - `desktop.card_last`: true when nothing visible follows the single card.
 
-It also records `scanner`, the source the committed scanner admits, or `null`. `../fidelity.test.mjs` replays every case through the shipped `scanner.mjs` in fresh Node processes. It requires that the scanner never admits a case Desktop does not render as exactly one final card with that source, and that every verdict equals the recorded one. A changed verdict must be re-recorded deliberately.
+It also records `scanner`, the source the committed scanner admits, or `null`. `../check-fidelity.mjs` replays every case through the shipped `scanner.mjs` in fresh Node processes. It requires that the scanner never admits a case Desktop does not render as exactly one final card with that source, and that every verdict equals the recorded one. A changed verdict must be re-recorded deliberately.
 
 ## Cases (3783)
 

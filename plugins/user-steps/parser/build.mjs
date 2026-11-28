@@ -79,7 +79,7 @@ const bundle=result.outputFiles[0].contents
 writeFileSync('scanner.mjs',bundle)
 const modules=Object.entries(hashes).sort(([a],[b])=>a.localeCompare(b)).map(([path,sha256])=>({path,sha256}))
 writeFileSync('manifest.json',JSON.stringify({schema:2,core_commit:commit,modules,bundle_sha256:hash(bundle),
- pipeline:['preprocessWithTailRepair (markdown-text.tsx): preprocessMarkdown then @assistant-ui/react-streamdown tailBoundedRemend; any change by the repair refuses',
+ pipeline:['preprocessWithTailRepair (markdown-text.tsx): preprocessMarkdown then @assistant-ui/react-streamdown tailBoundedRemend; content repair refuses (only terminal ASCII whitespace removal is equivalent)',
   'parseMarkdownIntoBlocksCached (markdown-blocks.ts, marked lexer): reconstruction must equal CR-normalized text; earlier blocks parsed alone must have no doubt; the last block alone must yield a sole final directive',
   'remark-parse',
   'REMARK_PLUGINS (markdown-text.tsx): streamdown.defaultRemarkPlugins (gfm, codeMeta), remarkTranscriptDirectives, remarkSoftBreaks',

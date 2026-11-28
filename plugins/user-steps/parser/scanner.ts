@@ -62,10 +62,11 @@ export function scan(reply:unknown):any {
  if(typeof reply !== 'string' || reply.length>200000 || reply.includes('\uE000') || reply.includes('\uE001')) return null
  const text=preprocessMarkdown(reply)
  // Desktop renders preprocessWithTailRepair(reply) for finished replies too.
- // Whenever that repair changes the text, refuse: an ask is admitted only when
- // Desktop renders exactly the unrepaired preprocessed reply, so no repair can
- // create, move, extend or close an actionable directive.
- if(preprocessWithTailRepair(reply)!==text) return null
+ // No content repair is admitted. Desktop may remove terminal ASCII
+ // whitespace; that cannot invent, move or close a directive. Keep parsing
+ // the original text through both views; their sole final card must agree.
+ const repaired=preprocessWithTailRepair(reply)
+ if(repaired!==text && repaired!==text.replace(/[ \t\r\n]+$/,'')) return null
  const tree=parse(text), whole=finalDirective(tree)
  if(!whole) return null
  const {d,node,last}=whole, blocks=tree.children
