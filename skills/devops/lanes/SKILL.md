@@ -43,7 +43,15 @@ A lane over its target: sum `task_runs` hours by `tasks.tenant` over 48 h, group
 and title topic, and `explain` a few. Source `unclassified` means no match rule caught it and it fell to the default
 lane (typically chat-filed cards); fix classification, not shares, and `reclassify` returning no changes confirms it.
 
-A lane under its target with `ready: 0` is short of cards, not slots. Say that; changing shares will not help it.
+A lane with `ready: 0` is short of cards, not slots: raising its share or the cap slider (concurrency only) starts nothing. Say that, then show where its open cards sit (`held` at the gate vs waiting on cards/CI/you).
+
+## Clearing a gate's held backlog ("why isn't more scheduled", "archive the ones that don't matter")
+
+David wants held automation cards that don't need to happen archived, not left held forever. Procedure:
+1. `lanes held --json`, group by `created_by`. Re-check each producer's condition live, not from the title: CI on that branch now (`gh run list`), worker core vs main (`hub-worker-exec all -- ...`), target card status, and whether a newer card from the same producer covers it.
+2. Admit only cards whose condition is broken now (newest card per worker/repo/incident); archive the rest (target done, condition cleared, superseded, retro/informational).
+3. Re-read `held` right before acting. A card admitted after your snapshot may already be running, and archiving it stops a live run.
+4. Use plain `hermes kanban archive <id>`; its `--reason` is operator-only for contained cards. Each call takes ~15 s, so run admits+archives as one `background=true, notify=true` script that writes `<id> <action> rc=<n> <output>` per card to a file, then read back `lanes show` for the held count.
 
 For lane-accounting repairs, distinguish scopes: `show` uses the current board's fleet replica when available, while `unclassified` and `reclassify` read the current owning board. Audit the fleet's open `other` rows, then run supported dry-run/apply on each owning board; never write the fleet replica. Read back each changed card's actual tenant after synchronization: an empty repeat dry-run or a `lane_assigned` event alone does not establish that the tenant persisted. Preserve containment and custody if a protected row reverts. A successful `lanes assign` message can accompany a `lane_assigned` event while a protected contained triage row retains its old tenant: verify the persisted tenant, record the unsuccessful move separately, and never release containment or repeatedly reassign it to make a migration count look complete. Resume a timed-out multi-card apply from per-card readbacks, skipping terminal/already-moved cards; persist receipts on disk before aggregating. The run-hour report joins runs to each card's current tenant; open-card repair intentionally leaves terminal historical cards unchanged, so quantify their residual run-hours rather than promising an immediate historical drain.
 
