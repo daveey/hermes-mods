@@ -1494,6 +1494,17 @@ def _manager_identity(pid: int) -> tuple:
     return fields[19], int(fields[1]), int(uid[0][0]), (root / "cgroup").read_text().strip()
 
 
+def _uid_identity(pid: int) -> tuple:
+    """Stable kernel identity and real/effective UIDs for a privilege boundary."""
+    root = PROC / str(pid)
+    fields = (root / "stat").read_text().rpartition(") ")[2].split()
+    uid = re.findall(r"^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$",
+                     (root / "status").read_text(), re.M)
+    if len(uid) != 1:
+        raise OSError("ambiguous process uid")
+    return fields[19], int(fields[1]), *map(int, uid[0])
+
+
 def _ownership_table(table: dict, pids: list) -> dict:
     """Stop inherited ownership at the authenticated OS user manager, not its name.
 
@@ -1505,8 +1516,9 @@ def _ownership_table(table: dict, pids: list) -> dict:
     if platform.system() != "Linux":
         return table
     collect = libs()[0]
-    boundaries = set()
-    for pid in {q for p in pids for q in collect.chain(table, p)} - set(pids):
+    boundaries, manager_candidates = set(), set()
+    ancestors = {q for p in pids for q in collect.chain(table, p)} - set(pids)
+    for pid in ancestors:
         if table[pid]["ppid"] != 1:
             continue
         try:
@@ -1516,6 +1528,7 @@ def _ownership_table(table: dict, pids: list) -> dict:
             group = f"/user.slice/user-{uid}.slice/{unit}"
             if ppid != 1 or cgroup != f"0::{group}/init.scope":
                 continue
+            manager_candidates.add(pid)
             res = subprocess.run(
                 ["/usr/bin/systemctl", "--system", "show", unit,
                  "--property=MainPID,Id,User,ControlGroup"],
@@ -1550,7 +1563,52 @@ def _ownership_table(table: dict, pids: list) -> dict:
                     boundaries.add(pid)
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             continue
-    return {pid: row for pid, row in table.items() if pid not in boundaries}
+    for pid in ancestors - manager_candidates:
+        try:
+            before = _uid_identity(pid)
+            birth, ppid, ruid, euid, suid, fsuid = before
+            if ppid != table[pid]["ppid"]:
+                continue
+            foreign_uid = ruid != os.getuid() or euid != os.getuid()
+            parent = None
+            if not foreign_uid:
+                parent = _uid_identity(ppid)
+            privileged_parent = parent is not None and parent[2:4] == (0, 0)
+            if not (foreign_uid or privileged_parent):
+                continue
+            unreadable = False
+            try:
+                tags = collect.env_tags([pid], strict=True)
+            except OSError:
+                tags, unreadable = {}, True
+            if collect.valid_owner(tags.get(pid, {}).get("HERMES_OWNER_CARD", "")):
+                continue
+            cwd = libs()[1]._cwd_of(pid, run_cmd)
+            if not cwd:
+                unreadable = True
+            else:
+                try:
+                    if collect.read_owner_md(cwd, strict=True):
+                        continue
+                except OSError:
+                    unreadable = True
+            if (unreadable and _uid_identity(pid) == before and
+                    (parent is None or _uid_identity(ppid) == parent)):
+                boundaries.add(pid)
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            continue
+    retained = {}
+    for pid, row in table.items():
+        if pid in boundaries:
+            continue
+        row = dict(row)
+        parent, seen = row["ppid"], set()
+        while parent in boundaries and parent not in seen:
+            seen.add(parent)
+            parent = table[parent]["ppid"]
+        row["ppid"] = parent
+        retained[pid] = row
+    return retained
 
 
 def _lookup_pids(act: dict) -> dict:
