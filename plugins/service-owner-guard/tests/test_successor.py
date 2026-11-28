@@ -19,8 +19,8 @@ class Successor(Base):
         def tags(pids, **kwargs):
             if second is None:
                 raise PermissionError('second owner unreadable')
-            return {4242: {'HERMES_OWNER_CARD': A},
-                    4243: {'HERMES_OWNER_CARD': second}}
+            return {pid: {'HERMES_OWNER_CARD': second if pid == 4243 else A}
+                    for pid in pids}
         result = subprocess.CompletedProcess(['ps'], rc, rows, '')
         result.truncated = bounded
         with mock.patch.object(self.g, '_pinned', return_value=('', '')), \
@@ -40,9 +40,11 @@ class Successor(Base):
 
     def test_incomplete_observations(self):
         for extra in [dict(second=None), dict(rc=1), dict(bounded=True),
-                      dict(output='4242 1 0 1024 00:10 fixturejob\nunreadable row\n')]:
+                      dict(output='4242 1 0 1024 00:10 fixturejob\nunreadable row\n'),
+                      dict(output='4242 1 0 1024 00:10 fixturejob\n4243 1 0 1024 00:10\n')]:
             with self.subTest(extra=extra):
-                self.assertIsNotNone(self.local('owner-approved=' + A, **extra))
+                self.assertIsNotNone(self.local('owner-approved=' + A +
+                                                ' owner-approved=' + B, **extra))
 
     def test_reader_errors_are_not_silent_absence(self):
         collect, lib = self.g.libs()
@@ -63,9 +65,14 @@ class Successor(Base):
                 collect.env_tags([4242, 4243], strict=True)
 
     def test_local_listing_limits(self):
-        for output in ['4242 1 0 1024 00:10 fixturejob\n' * 8192,
+        distinct = ''.join(f'{pid} 1 0 1024 00:10 fixturejob\n'
+                           for pid in range(10000, 18192))
+        for output in ['4242 1 0 1024 00:10 fixturejob\n' * 2,
+                       distinct,
                        '4242 1 0 1024 00:10 ' + 'x' * (4 * 1024 * 1024)]:
-            self.assertIsNotNone(self.local('owner-approved=' + A, output=output))
+            with self.subTest(size=len(output)):
+                self.assertIsNotNone(self.local('owner-approved=' + A +
+                                                ' owner-approved=' + B, output=output))
 
     def remote(self, text):
         with mock.patch.object(self.g, 'remote_lookup', return_value={
