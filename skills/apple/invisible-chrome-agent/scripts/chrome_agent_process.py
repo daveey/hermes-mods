@@ -43,6 +43,22 @@ def is_zombie(pid, timeout):
         return False
 
 
+def retired(identity, timeout=5):
+    """Positive retirement of a recorded generation; UNKNOWN retains custody."""
+    current = fingerprint(identity['pid'], timeout=timeout)
+    if current is not None:
+        return current != identity['started']
+    if is_zombie(identity['pid'], timeout=timeout):
+        return True
+    try:
+        os.kill(identity['pid'], 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def record(process):
     started = fingerprint(process.pid)
     if started is None:
@@ -108,12 +124,14 @@ class RecoveredProcess:
             raise ValueError('invalid child identity')
 
     def poll(self):
-        if fingerprint(self.pid) != self.started:
+        if self.returncode is None and retired({'pid': self.pid, 'started': self.started}):
             self.returncode = 0
         return self.returncode
 
     def _signal(self, sig):
-        if self.poll() is None:
+        # poll(None) includes UNKNOWN, not just a verified live process. Require
+        # the recorded generation immediately before every nonzero signal.
+        if self.poll() is None and fingerprint(self.pid) == self.started:
             try:
                 os.kill(self.pid, sig)
             except ProcessLookupError:

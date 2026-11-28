@@ -95,22 +95,100 @@ def _hermes_home() -> str:
         return os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
 
 
-def agent_chromes(home: str | None = None, ps_output: str | None = None) -> list[tuple[int, int]]:
-    """(pid, devtools port) of Chrome/Chromium main processes whose profile dir is under the Hermes home."""
+def _process_identity(pid):
+    """OS-backed image/UID/start snapshot, never inferred from ps command text.
+
+    psutil is a pinned core dependency. Missing/unreadable observations are
+    UNKNOWN and cannot authorize focus. No process is adopted or signalled.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        process = psutil.Process(pid)
+        started = process.create_time()
+        uids = process.uids()
+        if any(uid != os.getuid() for uid in uids):
+            return None
+        image = (uids.real, process.exe(), tuple(process.cmdline()), started)
+        return image if process.is_running() else None
+    except (OSError, ValueError, psutil.Error):
+        return None
+
+
+def _chrome_identity(pid, home=None):
+    image = _process_identity(pid)
+    if image is None:
+        return None
+    uid, executable, argv, started = image
+    expected = os.environ.get('HERMES_CHROME_AGENT_CHROME')
+    executables = [expected] if expected else [
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        shutil.which('google-chrome'), shutil.which('chromium'), shutil.which('chromium-browser')]
+    if uid != os.getuid() or os.path.realpath(executable) not in {
+            os.path.realpath(p) for p in executables if p} or not started:
+        return None
+    if not argv or '--' in argv[1:] or any(
+            a in ('--type', '--headless') or a.startswith(('--type=', '--headless=')) for a in argv[1:]):
+        return None
+    profiles = [a.split('=', 1)[1] for a in argv[1:] if a.startswith('--user-data-dir=')]
+    ports = [a.split('=', 1)[1] for a in argv[1:] if a.startswith('--remote-debugging-port=')]
+    if len(profiles) != 1 or len(ports) != 1 or any(
+            a in ('--user-data-dir', '--remote-debugging-port') for a in argv[1:]):
+        return None
     home = os.path.realpath(home or _hermes_home())
+    profile = os.path.realpath(profiles[0])
+    try:
+        if not os.path.isabs(profiles[0]) or os.path.commonpath((home, profile)) != home or profile == home:
+            return None
+        if not ports[0].isascii() or not ports[0].isdigit() or not 1 <= int(ports[0]) <= 65535:
+            return None
+    except (ValueError, OSError):
+        return None
+    return image
+
+
+def _same_chrome_identity(recorded, current):
+    if recorded is None or current is None or recorded[:3] != current[:3]:
+        return False
+    try:
+        from gateway.status import start_time_fingerprints_match
+        return start_time_fingerprints_match(int(recorded[3] * 100), int(current[3] * 100))
+    except (ImportError, TypeError, ValueError, OverflowError):
+        return False
+
+
+class _Chrome(tuple):
+    """Keep the verified generation with the backwards-compatible (pid, port)."""
+    identity: Any
+    def __new__(cls, pid, port, identity):
+        value = super().__new__(cls, (pid, port))
+        value.identity = identity
+        return value
+
+
+def agent_chromes(home: str | None = None, ps_output: str | None = None) -> list[_Chrome]:
+    """Verified browser processes; ps output supplies candidate PIDs only."""
     if ps_output is None:
-        ps_output = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
+        ps_output = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True, timeout=5).stdout
     found = []
     for line in ps_output.splitlines():
-        if "--type=" in line or "--headless" in line or "--remote-debugging-port=" not in line:
+        # Text is a cheap candidate filter only, never the ownership proof.
+        if '--remote-debugging-port=' not in line:
             continue
-        m_dir = re.search(r"--user-data-dir=(\S+)", line)
-        m_port = re.search(r"--remote-debugging-port=(\d+)", line)
-        if not (m_dir and m_port):
+        try:
+            pid = int(line.split()[0])
+            if pid <= 0:
+                continue
+        except (ValueError, IndexError):
             continue
-        if not os.path.realpath(m_dir.group(1)).startswith(home):
+        image = _chrome_identity(pid, home)
+        if image is None:
             continue
-        found.append((int(line.split()[0]), int(m_port.group(1))))
+        port = next(int(a.split('=', 1)[1]) for a in image[2][1:] if a.startswith('--remote-debugging-port='))
+        found.append(_Chrome(pid, port, image))
     return found
 
 
@@ -126,8 +204,29 @@ def remote_cdp() -> str | None:
                 raw = str((((yaml.safe_load(f) or {}).get("browser") or {}).get("cdp_url")) or "").strip()
         except Exception:
             raw = ""
-    m = re.match(r"^(?:https?|wss?)://([^/\s?#]+)", raw)
-    return f"http://{m.group(1)}" if m else None
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw  # configured but invalid; focus refuses it, without fallback
+    if not raw:
+        return None
+    scheme = {'ws': 'http', 'wss': 'https'}.get(parsed.scheme, parsed.scheme)
+    path = parsed.path.rstrip('/')
+    if parsed.scheme in ('ws', 'wss') and '/devtools/browser/' in path:
+        path = path.rsplit('/devtools/browser/', 1)[0]
+    # Retain even invalid configured endpoints for the caller to refuse. They
+    # must never silently fall back to an unrelated locally discovered browser.
+    return urlunsplit((scheme, parsed.netloc, path, parsed.query, parsed.fragment)) or raw
+
+
+def _cdp_url(base, suffix):
+    from urllib.parse import urlsplit, urlunsplit
+    parsed = urlsplit(base)
+    if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None or parsed.fragment):
+        raise ValueError('invalid configured CDP HTTP endpoint')
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip('/') + suffix, parsed.query, ''))
 
 
 def _get(url: str, timeout: float = 3):
@@ -197,7 +296,8 @@ def show(minutes: int | None = None) -> dict:
     """Manual show (status-bar toggle): no login watcher, stays until hidden or `minutes` pass."""
     ok = _chrome_agent(["show", "--minutes", str(minutes)] if minutes else ["show"])
     chromes = agent_chromes()
-    if ok and chromes:
+    if (ok and chromes and getattr(chromes[0], 'identity', None) is not None
+            and _same_chrome_identity(chromes[0].identity, _chrome_identity(chromes[0][0]))):
         activate_app(chromes[0][0])
     return {"shown": ok}
 
@@ -302,17 +402,29 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
     - require_login (the automatic tool-result path): the tab must be on a sign-in page."""
     if _quiet():
         return {"focused": False, "error": "quiet mode is on; not raising windows"}
-    chromes = [(p, f"http://127.0.0.1:{pt}", pt) for p, pt in agent_chromes()]
     remote = remote_cdp()
-    if remote and not any(base == remote for _, base, _ in chromes):
-        chromes.append((0, remote, 0))   # pid 0 = no local process to raise (hub / remote Chrome): CDP only
+    identities = {}
+    if remote is not None:
+        # Explicit endpoint selection wins; reject invalid configuration before
+        # any local enumeration, network call, or window side effect.
+        try:
+            _cdp_url(remote, '/json/list')
+        except (ValueError, TypeError):
+            return {'focused': False, 'error': 'invalid configured CDP HTTP endpoint'}
+        chromes = [(0, remote, 0)]
+    else:
+        local = agent_chromes()
+        identities = {p: getattr(chrome, 'identity', None) for chrome in local for p, _ in [chrome]}
+        chromes = [(p, f"http://127.0.0.1:{pt}", pt) for p, pt in local if identities[p] is not None]
     if not chromes:
         return {"focused": False, "error": "no agent-driven Chrome is running"}
     strict = bool(match or kinds or require_login)
     pid, base, port, tab, seen = chromes[0][0], chromes[0][1], chromes[0][2], None, []
     for c_pid, c_base, c_port in chromes:   # several visible agent Chromes: take the one holding the wanted tab
         try:
-            tabs = _get(f"{c_base}/json/list")
+            if c_pid and not _same_chrome_identity(identities[c_pid], _chrome_identity(c_pid)):
+                continue
+            tabs = _get(_cdp_url(c_base, '/json/list'))
         except Exception as e:
             log.debug("browser-focus: CDP list failed on %s: %s", c_port, e)
             continue
@@ -334,15 +446,20 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
             err = (f"no tab matches {want}; nothing was raised. Open that page first (browser_exec), then call "
                    "browser_focus again before telling the user it is in front")
         return {"focused": False, "error": err, "open_tabs": seen[:10]}
+    if pid and not _same_chrome_identity(identities[pid], _chrome_identity(pid)):
+        return {'focused': False, 'error': 'browser process identity changed or is unknown'}
     shown = _chrome_agent(["show", "--minutes", str(SHOW_MINUTES)]) if pid else False
     activated = False
     try:
         if tab:
-            _get(f"{base}/json/activate/{tab['id']}")
+            if pid and not _same_chrome_identity(identities[pid], _chrome_identity(pid)):
+                return {'focused': False, 'error': 'browser process identity changed or is unknown'}
+            from urllib.parse import quote
+            _get(_cdp_url(base, '/json/activate/' + quote(str(tab['id']), safe='')))
             activated = True
     except Exception as e:
         log.debug("browser-focus: CDP activate failed: %s", e)
-    app = activate_app(pid) if pid else False
+    app = activate_app(pid) if pid and _same_chrome_identity(identities[pid], _chrome_identity(pid)) else False
     if not activated and tab:
         tab = None   # never claim a tab is in front when the activate call failed
     held = None
@@ -370,7 +487,11 @@ def _visible(pid: int, shown: bool, app: bool, base: str) -> bool:
       a loopback endpoint is this host's own headless/virtual-display Chrome (agent-c8dc1f22d4)."""
     if pid:
         return bool(app) and (bool(shown) or not _chrome_agent_cli())
-    host = re.sub(r"^https?://", "", base or "").rsplit(":", 1)[0].lower()
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(base or '').hostname or '').lower()
+    except ValueError:
+        return False
     return bool(host) and host not in _LOOPBACK
 
 

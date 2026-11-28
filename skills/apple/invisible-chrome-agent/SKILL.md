@@ -51,7 +51,12 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   `-32000`: non-flat sessions tunnel arbitrary commands past the focus filter. Use flat sessions instead;
   shown mode forwards tunnels unchanged. `test_chrome_focus_custody.py` covers these offline boundaries,
   nested escaped/fragmented commands, flat routing, and legacy lock refusal with in-memory frames and
-  recording process doubles only.
+  recording process doubles only. HTTP `new` classification follows Chromium's query/fragment
+  trimming and first-slash command parsing, so noncanonical `/json/new#…` and `/json/new/…`
+  spellings cannot bypass the hidden background rewrite. `test_chrome_observation.py` supplies
+  offline UNKNOWN/dead/healthy worker controls, recovered-process retry/signal checks and HTTP
+  command variants. An unreadable worker fingerprint retains lease custody; only positive
+  retirement starts orphan grace. A recovered handle does not latch exit or send a signal on UNKNOWN.
   Port overrides: `HERMES_CHROME_AGENT_PORT` (public),
   `HERMES_CHROME_AGENT_CHROME_PORT` (internal, default PORT+1); `HERMES_CHROME_AGENT_FOCUS_FILTER=0` puts Chrome
   straight on 9333 again (no proxy). The supervisor's own CDP connection (re-homing, passkey reveal) uses 9334;
