@@ -1837,3 +1837,27 @@ test('Open session routes to the card owner gateway via host.openSession', async
   assert.equal(calls.length, 1, 'an unconnected gateway opens nothing')
  } finally { delete host.openSession; delete window.__sessionTasks }
 })
+test('a running card whose snapshot goes stale keeps a blue box and square, not amber, then recovers', async () => {
+ const base = Object.values(cases).find(c => c.model?.sections?.running?.some(r => r.kind === 'card' && !r.non_running_reason))
+ assert.ok(base, 'fixture with a running card')
+ const now = 1795281000, RUNNING_RGB = 'rgb(59, 130, 246)'
+ const model = { ...base.model, freshness: { trusted: true, computed_at: now - 360, ttl_s: 60 } }
+ const before = JSON.stringify(model)
+ const id = model.sections.running.find(r => r.kind === 'card' && !r.non_running_reason).id
+ const expired = m.expireNativeWaits(model, now, true)
+ const row = expired.sections.waiting.find(r => r.id === id)
+ assert.ok(row, 'a stale running row is no longer claimed as current running')
+ assert.equal(row.wait_kind, null, 'no live producer claim')
+ assert.equal(row.last_wait_kind, 'agent')
+ assert.match(row.detail, /^status unknown · last known: running · /)
+ assert.equal(m.waitColor(row), m.SECTION_COLOR.running)
+ assert.ok(expired.header.pips.some(p => p.section === 'waiting' && m.pipCategory(p) === 'blue'))
+ assert.equal(expired.header.wait_kind, null)
+ await paint(m.renderModel(model, { now, vouched: true }))
+ assert.equal(rowBox(id), RUNNING_RGB, 'stale running box stays blue')
+ assert.equal(document.querySelector('[data-wait-eta]'), null)
+ // Fresh again: back in the Running section with a filled blue box.
+ await paint(m.renderModel({ ...model, freshness: { ...model.freshness, computed_at: now } }, { now, vouched: true }))
+ assert.equal(window.getComputedStyle(document.querySelector(`[data-panel-row$="${id}"] [data-row-pip]`)).backgroundColor, RUNNING_RGB)
+ assert.equal(JSON.stringify(model), before)
+})
