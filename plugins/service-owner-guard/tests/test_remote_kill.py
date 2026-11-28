@@ -197,23 +197,24 @@ class RemoteKill(Base):
         free = self.home / 'free'
         free.mkdir()
         for cwd, env in [(self.work, dict(os.environ)), (free, dict(os.environ, HERMES_OWNER_CARD=OWNER))]:
-            with subprocess.Popen(['sleep', '60'], cwd=cwd, env=env) as child:
+            with subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                  stdin=subprocess.PIPE, cwd=cwd, env=env) as child:
                 try:
                     res = lookup(child.pid)
                     self.assertEqual(res.get('owner'), OWNER, res)
                     self.assertIn('OWNER.md' if cwd == self.work else 'env', res['source'])
                 finally:
-                    child.terminate()
+                    child.stdin.close()
                     child.wait()
-        with subprocess.Popen([sys.executable, '-c', "import subprocess,sys; p=subprocess.Popen(['sleep','60'], cwd=sys.argv[1]); print(p.pid, flush=True); p.wait()", str(free)], cwd=self.work, stdout=subprocess.PIPE, text=True) as parent:
+        with subprocess.Popen([sys.executable, '-c', "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import sys; sys.stdin.read()'], cwd=sys.argv[1]); print(p.pid, flush=True); p.wait()", str(free)], cwd=self.work, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as parent:
             pid = int(parent.stdout.readline())
             try:
                 res = lookup(pid)
                 self.assertEqual(res.get('owner'), OWNER, res)
                 self.assertIn('OWNER.md', res['source'])
             finally:
-                # Only the test's own fixture child; never a discovered service.
-                os.kill(pid, 15)
+                # Release only the owned input pipe; child and parent exit naturally.
+                parent.stdin.close()
                 parent.wait(timeout=10)
 
     def test_kill_refused_override_and_own_card(self):
