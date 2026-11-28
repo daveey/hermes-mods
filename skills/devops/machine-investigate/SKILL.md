@@ -15,7 +15,9 @@ metadata:
 
 You run ON the machine being investigated (the card was placed there). The card body has the panel's numbers
 at click time. Script: `scripts/collect.py` in this skill (stdlib only). From a chat on another host, pipe it in:
-`ssh <host> 'python3 - report --no-du' < <skill>/scripts/collect.py`.
+`ssh <host> 'python3 - report --no-du' < <skill>/scripts/collect.py`. From the hub, Macs (mini, mbp) are not
+ssh aliases: use `tailnet_exec` (names from `tailnet_hosts`) and read the recorder file directly with an inline
+`python3 - <<EOF` over `~/Library/Logs/mac-load-recorder/spikes-<date>.jsonl` (each row: `load`, `runnable`, `by_agent`).
 A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow `references/stuck-jobs.md`.
 
 For a timed-out native disk-image fixture, map `hdiutil info -plist` image-path, `hdid-pid`, owner-uid and system-entities to the exact test before touching helpers; simulator and unrelated build images must remain intact. A fresh reproduction under another existing account can distinguish an account-local failure from a shared native-service path, but HFS probe failure plus a DIHelperProxy wait does not by itself identify the blocked service. Sample only owned processes without elevated approval; do not hide a refused privileged command in another launcher. Capture reproduction output to files rather than PIPE when helpers inherit descriptors: killing the parent followed by unbounded `communicate()` can hang even after the parent exits. Bound cleanup separately and verify the exact helper and image disappear.
@@ -53,6 +55,12 @@ For a timed-out native disk-image fixture, map `hdiutil info -plist` image-path,
    `launchctl print gui/$UID/<label>` for its interval), systemd unit, or cron (`crontab -l`,
    `~/.hermes/cron/jobs.json`). Any ask to stop an owned service goes on its owner card, with measured cost.
    A loop spawning `gh`/`git`/`python` every few seconds may be a polling interval problem: find its job first.
+   macOS load in the hundreds with ~400 priority-4 runnable threads under `launchd_sim` (gamed, passd, suggestd…)
+   is iOS Simulator boot, i.e. CI. Hermes slots don't govern GitHub runners: list runners on the host
+   (`ps … Runner.Listener`), map each `.runner` to repo/name, read `_diag/Worker_*.log` `jobDisplayName` for
+   timing, and check `gh api repos/<r>/actions/runners` for two runners on one host sharing a `runs-on` label;
+   that lets two simulator jobs start at once. Fix by removing the shared label from the newer runner
+   (`gh api -X DELETE …/runners/<id>/labels/<label>`), comment the reversal on its owner card.
 5. For Linux package-store pressure, inventory versioned stores before choosing native GC: an installed pnpm 9 prunes v3 but leaves v10. Use an already-cached matching native binary for each supported store, with Corepack downloads and auto-pinning disabled; never force a different major onto it or directly delete store files. Verify with an isolated native-prune fixture preserving a project hardlink and foreign-version data, then compare allocated bytes live. Native file/package counts are not reclaimed disk bytes, and a successful prune does not prove the pressure threshold cleared.
 6. Disk: for a macOS disk question also follow `mac-disk-cleanup` (its repo-deletion rules and known big
    hitters); for a Linux Hermes host (the hub, or a "Low disk /autoprune" toast) read
