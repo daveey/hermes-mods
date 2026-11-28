@@ -154,6 +154,64 @@ def test_restart_starts_the_waiter_then_quits_desktop_detached(repo):
     assert all(kw["start_new_session"] for _cmd, kw in spawned)
 
 
+@pytest.mark.parametrize("profile", [False, True])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_restart_writes_force_before_spawning(repo, monkeypatch, profile, fallback):
+    import sys
+    root, home, _running, ahead, app = repo
+    installation = home
+    if profile:
+        home = installation / "profiles" / "work"
+        (home / "cache/core-update").mkdir(parents=True)
+    if fallback:
+        monkeypatch.setitem(sys.modules, "hermes_cli.core_update_force", None)
+    _write(home, status="ready", sha=ahead, app_path=str(app))
+    before = core.time.time()
+    calls = []
+
+    def spawn(cmd, **kw):
+        body = json.loads((installation / "core-update/force-request").read_text())
+        assert body["version"] == 1 and body["by"] == "core-update chip"
+        assert before <= body["requested_at"] <= core.time.time()
+        assert body["expires_at"] == body["requested_at"] + 1800
+        assert not (home / "cache/core-update/force-request").exists()
+        calls.append(cmd)
+
+    assert core.restart(home, checkout=root, popen=spawn)["ok"]
+    assert len(calls) == 2
+
+
+def test_restart_force_write_failure_does_not_spawn_or_quit(repo):
+    root, home, _running, ahead, app = repo
+    _write(home, status="ready", sha=ahead, app_path=str(app))
+    (home / "core-update").write_text("not a directory")
+    calls = []
+    result = core.restart(home, checkout=root, popen=lambda *a, **kw: calls.append(a))
+    assert result["ok"] is False
+    assert "force request" in result["reason"]
+    assert calls == []
+
+
+def test_restart_prefers_core_helper_and_never_falls_back_on_its_failure(repo, monkeypatch):
+    import sys
+    import types
+    root, home, _running, ahead, app = repo
+    _write(home, status="ready", sha=ahead, app_path=str(app))
+    seen = []
+
+    def fail(installation, by):
+        seen.append((installation, by))
+        raise OSError("helper write denied")
+
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.core_update_force",
+                        types.SimpleNamespace(write_force_request=fail))
+    result = core.restart(home, checkout=root, popen=lambda *a, **kw: pytest.fail("must not quit"))
+    assert result == {"ok": False, "reason": "could not write force request: helper write denied"}
+    assert seen == [(home, "core-update chip")]
+    assert not (home / "core-update/force-request").exists()
+
+
 def test_restart_refuses_without_a_ready_update(repo):
     root, home, _running, ahead, _app = repo
     _write(home, status="building", sha=ahead, pid=1, updated_at="2099-01-01T00:00:00+00:00")

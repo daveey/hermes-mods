@@ -18,6 +18,17 @@ time Desktop quits.
 
 ## Contract
 
+A Restart click first atomically writes `<installation root>/core-update/force-request`
+with `{"version":1,"requested_at":<epoch>,"expires_at":<epoch + 1800>,"by":"core-update chip"}`.
+The installation root is `$HERMES_HOME`, or its grandparent for `profiles/<name>` homes.
+It uses `hermes_cli.core_update_force.write_force_request` when available, with an
+atomic v1 fallback for older cores. If writing fails, `/restart` returns `ok: false`
+with a reason and neither spawns the waiter nor quits Desktop.
+The reference updater's quit-waiter consumes this intent to skip background batching;
+ordinary quits still batch. Busy/admission safety gates are unchanged. Successful core
+apply clears requests issued before apply started; later clicks and refused applies
+retain their requests (up to the 30-minute expiry).
+
 The updater writes `$HERMES_HOME/cache/core-update/state.json`:
 
 ```json
