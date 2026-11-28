@@ -16,12 +16,17 @@ def configured_url():
     try:
         from hermes_cli.config import load_config
         value = (load_config().get('latency') or {}).get('otlp_export_url', '')
-    except (ImportError, AttributeError, OSError, ValueError):
+    except Exception:
         return ''
     if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 33 for c in value):
         return ''
-    parsed = urlsplit(value)
-    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            return ''
+        # Accessing port also rejects malformed/out-of-range authorities.
+        parsed.port
+    except ValueError:
         return ''
     return value
 

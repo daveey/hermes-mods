@@ -94,7 +94,7 @@ export function LedgerPanel({ ctx, payload, range, setRange, selected, setSelect
 export function makeSpan(event, crypto = globalThis.crypto) {
   if (!UI_METRICS.includes(event?.name) || !Number.isFinite(event.start_ms) || !Number.isFinite(event.duration_ms) || event.duration_ms < 0 || event.duration_ms > 3600000) return null
   const id = bytes => Array.from(crypto.getRandomValues(new Uint8Array(bytes)), n => n.toString(16).padStart(2, '0')).join('')
-  const attributes = { 'service.name': 'hermes-desktop', 'host.name': SAFE.test(event.host || '') ? event.host : 'desktop' }
+  const attributes = { 'service.name': 'hermes-desktop', 'host.name': SAFE.test(event.host || '') && event.host.length <= 100 ? event.host : 'desktop' }
   for (const [source, target] of [['session_id', 'hermes.session_id'], ['card_id', 'hermes.card_id'], ['pr', 'hermes.pr'], ['gateway', 'hermes.gateway']]) if (typeof event[source] === 'string' && SAFE.test(event[source])) attributes[target] = event[source]
   const start = BigInt(Math.round(event.start_ms * 1e6))
   const result = { trace_id: /^[a-f0-9]{32}$/.test(event.trace_id || '') && !/^0+$/.test(event.trace_id) ? event.trace_id : id(16), span_id: id(8), name: event.name, start_time_unix_nano: String(start), end_time_unix_nano: String(start + BigInt(Math.round(event.duration_ms * 1e6))), attributes }
