@@ -52,8 +52,6 @@ _LIST_ITEM = re.compile(r"(?m)^\s*(?:[-*\u2022]|\d+[.)]|\[[ x]\])\s+\S")
 _FIN_NOUN = r"(?:invoice|subscription|budget|refund|overage|bill)s?"
 _LIMIT = re.compile(
     r"\$\s?[1-9]|\b(?:pay|payment|paying|purchase|buy|charge|spend(?:ing)?\s+(?:limit|cap)|limit\s+raise)\b|"
-    r"\b(?:approve|authori[sz]e|pay|cancel|upgrade|downgrade|renew|raise|increase|exceed|extend|issue|"
-    r"start|add|buy|purchase)\w*\s+(?:\w+\s+){0,3}?" + _FIN_NOUN + r"\b|"
     r"\b(?:grant|permission|permissions|credential|credentials|widen|admin|sudo|api\s+key|scope\s+change)\b|"
     r"\b(?:delete|destroy|destructive|irreversible|wipe|terminate|safety)\b", re.I)
 # Only the negated limit noun phrase itself ("no payment or limit increase", "does not need a permission change"):
@@ -62,8 +60,8 @@ _LIMIT = re.compile(
 _NEG_NOUN = (r"(?:payments?|pay|spend(?:ing)?|money|charges?|limit\s+(?:raises?|increases?)|permissions?|"
              r"credentials?|deletions?)(?:\s+(?:changes?|increases?|raises?|grants?))?")
 _NEGATED_LIMIT = re.compile(
-    r"\b(?:no|never|without|nor|(?:does|do|did|is|are|will|would|need|needs)\s*n[o']t\s+"
-    r"(?:requires?|needs?|involves?|requests?|includes?|be|asks?\s+for)?)\s*"
+    r"\b(?:no|never|without|nor|nothing\s+to|(?:does|do|did|is|are|will|would|need|needs|wo)\s*n[o']t\s+"
+    r"(?:requires?|needs?|involves?|requests?|includes?|be|asks?\s+for|need\s+to)?)\s*"
     r"(?:any\s+|a\s+|an\s+|new\s+|further\s+|extra\s+|additional\s+)*" + _NEG_NOUN +
     r"(?:\s*(?:,|\bor\b|\band\b|\bnor\b)\s*(?:any\s+|a\s+|an\s+|new\s+)*" + _NEG_NOUN + r")*", re.I)
 _SIZE = re.compile(
@@ -236,7 +234,41 @@ def acceptance_alternative(body: str) -> Optional[str]:
 def _limit_named(text: str) -> bool:
     """The ask changes money, permissions or safety (negated mentions such as "no payment is requested" excluded)."""
     text = _NEGATED_LIMIT.sub(" ", str(text or ""))
-    return bool(_LIMIT.search(text)) or _replan.limit_named(text) in ("spend", "permission", "safety")
+    if _LIMIT.search(text) or _financial_change(text):
+        return True
+    # _replan's spend class also counts bare invoice/subscription/budget nouns; those are judged above instead.
+    return _replan.limit_named(_FIN_NOUN_RE.sub(" ", text)) in ("spend", "permission", "safety")
+
+
+_FIN_NOUN_RE = re.compile(r"\b" + _FIN_NOUN + r"\b", re.I)
+# Around a financial noun: a changing word makes it a change; otherwise a reading word or an artifact qualifier
+# ("the invoice status", "the budget report", "the issue with the invoice") makes it subject matter. A bare noun with
+# neither ("Refund the customer", "Settle the outstanding invoice") is a change: missing a money ask costs more than
+# letting a read-only ask through to David.
+_FIN_CHANGE = re.compile(
+    r"\b(?:approv\w*|authori[sz]\w*|pay\w*|cancel\w*|upgrad\w*|downgrad\w*|renew\w*|rais\w*|increas\w*|exceed\w*|"
+    r"extend\w*|confirm\w*|settl\w*|submit\w*|process\w*|accept\w*|sign\s+off|okay|refund\w*|issu(?:e|ing)(?!\s+with)|"
+    r"buy|purchas\w*|charg\w*|terms|change|changes)\b", re.I)
+_FIN_READ_BEFORE = re.compile(
+    r"\b(?:read\w*|check\w*|see|seeing|view\w*|look\w*|inspect\w*|review\w*|find|open\w*|about|regarding|"
+    r"issue\s+with|problem\s+with|question\s+about)\b", re.I)
+_FIN_READ_AFTER = re.compile(
+    r"^\W*(?:status|link|url|page|history|number|id|details?|record|entry|email|pdf|report|summary|portal\s+page)\b",
+    re.I)
+
+
+def _financial_change(text: str) -> bool:
+    for m in _FIN_NOUN_RE.finditer(text):
+        clause_start = max(text.rfind(c, 0, m.start()) for c in ".;\n!?") + 1
+        before = " ".join(text[clause_start:m.start()].split()[-5:])
+        after_text = text[m.end():]
+        after = " ".join(re.split(r"[.;\n!?]", after_text, maxsplit=1)[0].split()[:2])
+        if _FIN_CHANGE.search(before) or _FIN_CHANGE.search(after):
+            return True
+        if _FIN_READ_BEFORE.search(before) or _FIN_READ_AFTER.search(after_text):
+            continue
+        return True
+    return False
 
 
 def acceptance_met(request: dict, body: str) -> Optional[str]:

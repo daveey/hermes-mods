@@ -112,10 +112,27 @@ def test_read_only_financial_context_does_not_exempt_the_ask(why_human, action):
 
 @pytest.mark.parametrize("text", [
     "Pay the March invoice", "Raise the monthly budget to cover the overage", "Cancel the Superhuman subscription",
+    # Review 6094768133 P2: money changes without a $ amount or a listed verb before the noun.
+    "Confirm the refund for order 4411", "Process the refund for the duplicate order",
+    "Refund the customer for the duplicate order", "Settle the outstanding invoice",
+    "Submit the invoice to the vendor portal", "Confirm the subscription renewal",
+    "Okay the budget increase for this sprint", "Sign off on the budget increase",
+    "Accept the new subscription terms",
 ])
 def test_a_financial_change_is_still_exempt(text):
     hr = dict(BILLING["human_request"], action=text + ". Unblock = do it; archive = drop it.")
     assert ac.acceptance_met(hr, BILLING["body"]) is None
+
+
+@pytest.mark.parametrize("text", [
+    # Review 6094768133 P3: read-only subject matter and negated payments are not money changes.
+    "Start by reading the invoice status", "Add the invoice link to this card",
+    "Look into the issue with the invoice", "Nothing to pay here", "You won't need to pay anything",
+])
+def test_read_only_or_negated_money_text_is_not_a_change(text):
+    hr = dict(BILLING["human_request"], why_human="Only you can do this", scope="Only this operation",
+              action=text + ". Unblock = do it; archive = drop it.")
+    assert ac.acceptance_met(hr, BILLING["body"]) is not None
 
 
 @pytest.mark.parametrize("body", [
