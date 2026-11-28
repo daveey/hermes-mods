@@ -3,17 +3,24 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire, register } from 'node:module'
 import { resolve } from 'node:path'
-import { homedir } from 'node:os'
-import { readFileSync, existsSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 const mods = fileURLToPath(new URL('../../../', import.meta.url))
 const core = process.env.HERMES_CORE_SOURCE || resolve(mods, '../core')
 const available = existsSync(resolve(core, 'tests/fixtures/session-state-v2/scenarios.json'))
 const baseline = JSON.parse(readFileSync(resolve(mods, 'plugins/session-panel/tests/session_state_v2_goldens.json'), 'utf8'))
-const actual = available ? JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3',
-  [resolve(mods, 'plugins/session-panel/tests/session_state_v2_fixtures.py')],
-  { encoding: 'utf8', env: { ...process.env, HERMES_CORE_SOURCE: core } })) : null
+// The producer runs outside pytest's home isolation: never let it touch the real ~/.hermes.
+const produce = () => {
+ const home = mkdtempSync(resolve(process.env.TMPDIR || tmpdir(), 'panel-session-v2-node-'))
+ try {
+  return JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3',
+   [resolve(mods, 'plugins/session-panel/tests/session_state_v2_fixtures.py')],
+   { encoding: 'utf8', env: { ...process.env, HERMES_CORE_SOURCE: core, HOME: home, HERMES_HOME: resolve(home, '.hermes') } }))
+ } finally { rmSync(home, { recursive: true, force: true }) }
+}
+const actual = available ? produce() : null
 
 test('shared manifest exactly covers every golden scenario', { skip: !available }, () => {
  const shared = JSON.parse(readFileSync(resolve(core, 'tests/fixtures/session-state-v2/scenarios.json')))

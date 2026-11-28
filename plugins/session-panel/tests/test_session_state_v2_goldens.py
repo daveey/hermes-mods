@@ -1,5 +1,10 @@
 """Golden manifest follows core's shared scenarios, not a second scenario list."""
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 from session_state_v2_fixtures import BASELINE, core_source, run_all
 
@@ -41,3 +46,17 @@ def test_triage_boundary_does_not_invent_human_permission(actual):
             if row.get('attention') == 'triage_overdue':
                 assert row not in case['model']['sections']['needs_you']
                 assert not any(a['kind'] == 'decide' for a in row['actions'])
+
+
+def test_spawned_producer_never_writes_the_invoking_users_home(actual, tmp_path):
+    """The Desktop-plugin test spawns this script outside pytest's home isolation."""
+    home, hermes_home = tmp_path / 'home', tmp_path / 'hermes-home'
+    home.mkdir()
+    hermes_home.mkdir()
+    env = {**os.environ, 'HOME': str(home), 'HERMES_HOME': str(hermes_home),
+           'HERMES_CORE_SOURCE': str(core_source())}
+    script = Path(__file__).with_name('session_state_v2_fixtures.py')
+    out = subprocess.run([sys.executable, str(script)], env=env, check=True, timeout=300,
+                         capture_output=True, text=True).stdout
+    assert list(home.iterdir()) == [] and list(hermes_home.iterdir()) == []
+    assert json.loads(out) == actual
