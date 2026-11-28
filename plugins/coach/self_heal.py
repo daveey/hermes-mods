@@ -8548,29 +8548,51 @@ def main(argv=None) -> int:
     return 0
 
 
-def drain(store=None, m: Optional[str] = None, filer: Optional[Callable] = None) -> list:
-    """File queued live detections that were not filed in-process (e.g. the hub was unreachable)."""
+def drain(store=None, m: Optional[str] = None, filer: Optional[Callable] = None,
+          limit: int = 100, seconds: float = 60) -> list:
+    """Drain a bounded prefix, checkpointing each completed filing before the next.
+
+    A killed/failed pass replays only its unacknowledged item, not the whole backlog.
+    The deadline is cooperative: an in-flight filer keeps its own timeout. Queue
+    writers append independently; an incomplete trailing line is never consumed.
+    """
+    import fcntl
     store = _store(store)
     q = Path(store.root) / "selfheal_queue.jsonl"
     done_p = Path(store.root) / "selfheal_queue.offset"
     if not q.exists():
         return []
-    lines = q.read_text().splitlines()
-    try:
-        off = int(done_p.read_text().strip() or 0)
-    except Exception:
-        off = 0
-    out = []
-    for line in lines[off:]:
+    with (Path(store.root) / "selfheal_queue.lock").open("a") as lock:
         try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        d = {k: r.get(k) for k in ("fingerprint", "component", "symptom", "source", "session_id")}
-        d.update(quote=r.get("evidence") or "", at=r.get("ts"), p_defect=r.get("p"), host=host_name())
-        out.append((filer or file_defect)(d, store=store, m=m))
-    done_p.write_text(str(len(lines)))
-    return out
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return []
+        try:
+            off = max(0, int(done_p.read_text().strip() or 0))
+        except (OSError, ValueError):
+            off = 0
+        out = []
+        deadline = time.monotonic() + seconds
+        with q.open() as queue:
+            for index, line in enumerate(queue):
+                if index < off:
+                    continue
+                if index - off >= limit or time.monotonic() >= deadline or not line.endswith("\n"):
+                    break
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    r = None  # retain the previous behavior for complete malformed rows
+                if isinstance(r, dict):
+                    d = {k: r.get(k) for k in ("fingerprint", "component", "symptom", "source", "session_id")}
+                    d.update(quote=r.get("evidence") or "", at=r.get("ts"), p_defect=r.get("p"), host=host_name())
+                    out.append((filer or file_defect)(d, store=store, m=m))
+                # Same-directory replace avoids a truncated cursor on interruption.
+                # Lock ownership serializes consumers, including reentrant drains.
+                tmp = done_p.with_suffix(".tmp")
+                tmp.write_text(str(index + 1))
+                os.replace(tmp, done_p)
+        return out
 
 
 # ── coach-data refresh and lane self-checks (cron-7b7df72ab4: a strict pull killed the lane for 4 days) ──
