@@ -6,8 +6,10 @@ the user to buy API credit before they tried it.
 
 ## Helper: `bin/hermes-pool-llm`
 
-Re-execs `pool_llm.py` under the Hermes runtime interpreter (`hermes --print-runtime-command`), so it works from any
-shell or venv.
+Re-execs `pool_llm.py` through the installed managed Hermes publication contract,
+without executing a PATH-selected discovery command. `binding` reports read-only
+selection provenance (no bootstrap, provider call or token read). See
+[runtime-binding.md](runtime-binding.md) for the trust boundary and exclusions.
 
 ```bash
 B=~/.hermes/plugins/pool-llm/bin/hermes-pool-llm
