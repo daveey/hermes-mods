@@ -112,9 +112,9 @@ def test_negation_removal_keeps_an_affirmative_payment(why_human, action):
     assert ac.hit(hr, BILLING["body"]) is None or ac.hit(hr, BILLING["body"])["rule"] != "acceptance_met"
 
 
-# Every case a reviewer raised on PR #549 (reviews 6094541114, 6094667454, 6094768133, 6094853169), whichever way
-# the earlier heuristics wanted it. Fail closed: each mentions money/payment/spend/billing/limits, so none may be
-# short-circuited by acceptance_met -- each takes the full context/steps/choices check instead.
+# Every case a reviewer raised on PR #549 (reviews 6094541114, 6094667454, 6094768133, 6094853169, 6094980043),
+# whichever way the earlier heuristics wanted it. Fail closed: each mentions money/payment/spend/billing/limits, so
+# none may be short-circuited by acceptance_met -- each takes the full context/steps/choices check instead.
 PAST_REVIEWER_CASES = [
     # 6094541114
     "Approve a one-time $50 payment to GitHub for this month's Actions overage",
@@ -140,6 +140,10 @@ PAST_REVIEWER_CASES = [
     "Read the status at https://github.com/settings/billing/invoices/2026-11 and reply",
     "Check the invoice issue on GitHub", "Ask Bill to confirm the rollout", "Read the subscription terms",
     "There is no invoice involved",
+    # 6094980043: inflections and currencies (substring stems, not word lists)
+    "We are rate-limited; approve raising the tier", "The API usage is capped; approve lifting it",
+    "Approve the unlimited plan", "Raise the concurrency limitation", "Approve €50 for the GPU rental",
+    "Approve a £20 top-up", "Approve USD 40 for the run", "Approve the 5k expense", "Reimburse me for the GPU hours",
 ]
 
 
