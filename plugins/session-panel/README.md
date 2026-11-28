@@ -29,6 +29,16 @@ A bundle holds what the panel would otherwise fetch itself, in the same shapes:
 | `done` | `/api/plugins/user-steps/session-cards?ids=<lineage>` rows (finished cards and settled remote receipts) |
 | `cards` | `{id: {detail, board}}`: a slim `/api/plugins/kanban/tasks/<id>` for every card on a linked card's dependency chain (open parents and card ids named in waits, parks and asks; six hops, 80 cards, stopping at running or finished cards): the task row with `wake_check` and `ready_since`, parents with status, the newest 40 events, the last run, the queue note, and `owner` for a replica card. Left out because they move without changing anything the chain shows: heartbeat events, `last_heartbeat_at`, and the read-time-stamped `execution_observations` of the queue note (the card rows in `tasks` keep the evidence the panel judges). A full detail is ~48 KB and ~700 ms on the hub; this is a few KB and under 5 ms. |
 
+## Done-row hydration cost
+
+Run-stat hydration maps canonical string card IDs back to their first original
+row once per board, rather than searching the whole chat's rows for every
+result. Duplicate IDs retain first-original/last-hydrated behavior; board scopes,
+origin-history exclusion and copy-on-hydration remain unchanged. Noncanonical
+IDs retain the legacy equality-search path. The deterministic operation-count
+regression and duplicate/legacy controls live in `tests/test_core_readers.py`.
+This bounds only remapping work, not SQL/pricing cost or whole-backend CPU.
+
 ## Owner-controlled device waits
 
 Core's wait classifier can expose a legacy scheduled device-access probe as

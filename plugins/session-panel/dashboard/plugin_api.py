@@ -1914,8 +1914,19 @@ class CoreReaders:
                 c = self.conn(Path(path)) if path is not None and Path(path).exists() else None
                 if c is not None:
                     # Copies: the listed rows can be core's memoized objects.
+                    # Preserve first-match behavior for duplicate IDs without
+                    # rescanning the chat's rows for every hydrated result.
+                    first = {}
+                    for original in rows:
+                        key = original.get('id')
+                        if not isinstance(key, str):
+                            first = None  # legacy noncanonical IDs keep equality-search semantics
+                            break
+                        first.setdefault(key, original)
                     for row in feed.with_done_run_stats([dict(r) for r in rows], c):
-                        copies[id(next(r for r in rows if r.get('id') == row.get('id')))] = row
+                        original = (first[row.get('id')] if first is not None else
+                                    next(r for r in rows if r.get('id') == row.get('id')))
+                        copies[id(original)] = row
             tasks = [copies.get(id(row), row) for row in tasks]
         except Exception:
             log.debug('session-panel feed: done run stats unavailable', exc_info=True)
