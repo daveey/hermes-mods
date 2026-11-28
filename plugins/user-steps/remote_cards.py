@@ -347,6 +347,43 @@ class Remote(DeliveryPresentation):
 
         return not unknown
 
+    def request_for(self, owner, target):
+        """Explicit tool lookup: reuse only a current producer-bound linked ask.
+
+        The caller supplies identity, never a generation, choice mapping or
+        source proof. No recorded ad-hoc operation is retroactively bound.
+        """
+        m = self.mirror
+        keys = ('ownerGateway', 'ownerProfile', 'board', 'task')
+        m.core._object(target, keys)
+        if any(not isinstance(target[k], str) or not re.fullmatch('[A-Za-z0-9_.-]+', target[k]) for k in keys):
+            raise m.core.ActionError('Invalid remote card identity')
+        try:
+            self.reconcile(owner)
+            snapshots = [s for s in self.snapshots(owner) if 'remote' in s
+                         and self._target(s['remote']['target']) == self._target(target)]
+            if len(snapshots) != 1:
+                raise m.core.ActionError('Current linked remote ask unavailable; no ad-hoc answer binding created', 409)
+            snap = snapshots[0]
+            with m.store._read() as c:
+                bindings = [dict(r) for r in c.execute(
+                    'SELECT * FROM kanban_projections WHERE namespace=? AND session=? AND board=? AND task=?',
+                    (m.store._ns(owner), owner['storedSessionId'], target['board'], target['task']))]
+            matches = []
+            for binding in bindings:
+                frozen = json.loads(binding['snapshot'])
+                if (frozen.get('remote', {}).get('target') != snap['remote']['target']):
+                    continue
+                request = m.store.get(owner, binding['request_id'])
+                if (request['state'] in ('open', 'needs_context') and not request.get('resolution')
+                        and not m.explicit_revision(request, binding)):
+                    matches.append(request)
+            if len(matches) != 1:
+                raise m.core.ActionError('No unique undecided native remote ask; do not publish a substitute', 409)
+            return matches[0]
+        except (OSError, ImportError) as exc:
+            raise m.core.ActionError('Remote ask unavailable; retry native lookup, not an ad-hoc copy', 409) from exc
+
     def _display(self, owner, rid, snap):
         with self.mirror.store._tx() as c:
             c.execute('INSERT INTO kanban_projection_display VALUES (?,?,?) '
