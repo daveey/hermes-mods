@@ -366,6 +366,25 @@ def test_an_unlisted_boards_shm_fd_goes_once_unlinked_and_not_before(api, tmp_pa
     assert _fds_on(shm) == 0
 
 
+def test_a_capture_releases_a_dropped_boards_unlinked_shm_fd(board, api, monkeypatch, tmp_path):
+    # Wiring: _capture_cursor itself runs the unlisted sweep, so a board that
+    # left the listing does not pin its unlinked -shm inode forever.
+    path = tmp_path / 'dropped.db'
+    shm = str(path) + '-shm'
+    c = _wal_db(path)
+    api._settled_stamp(str(path), now_ns=_LATER)
+    assert shm in api._shm_fds
+    _settle(api, monkeypatch)
+    api._capture_cursor()
+    assert shm in api._shm_fds, 'a linked -shm keeps its fd'
+    c.close()
+    assert not os.path.exists(shm)
+    assert _fds_on(shm) == 1
+    api._capture_cursor()
+    assert shm not in api._shm_fds
+    assert _fds_on(shm) == 0
+
+
 def test_a_replaced_sibling_is_reread(board, api, monkeypatch):
     kb.create_board('beta')
     meta = next(b for b in kb.list_boards() if b['slug'] == 'beta')
