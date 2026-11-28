@@ -10,4 +10,6 @@ For shared diagnostic coordination, request the exact scope-specific reply or la
 
 Qualify replay configuration/cache presence before selecting an optimization: an empty private home can create a hot path absent in production. Keep local-component-only results explicitly separate from production parity and live CPU savings.
 
+Resolve an agent-owned matched-control scope ambiguity explicitly once: when the approved goal already includes instrumentation and canonical shipping, a narrow shared observability prerequisite may become the genuine common product baseline after normal exact-head review, CI and ship. Keep control free of experimental telemetry, rebind both arms identically, preserve old frozen trials, and count common observation overhead; the decision grants neither a live diagnostic slot nor spend renewal. Deliver the decision to the existing implementation owner and verify the full persisted reply instead of re-parking on the same scope question.
+
 Preserve thresholds, source fences, existing spend authority and original acceptance when replanning. Distinguish task ordinal/run labels from authoritative counted spend. A replan is not a budget renewal or diagnostic-slot approval.
