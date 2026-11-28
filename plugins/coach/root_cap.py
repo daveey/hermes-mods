@@ -20,7 +20,6 @@ import ast
 import contextlib
 import datetime
 import fcntl
-import glob
 import hashlib
 import importlib.util
 import json
@@ -31,6 +30,9 @@ import sqlite3
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
+from runpy import run_path as _inventory_run_path
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 GUARDED_KEYS = ("kanban.max_in_progress",)
 CONTRACTS_FILE = "root_cap_contracts.json"
@@ -234,8 +236,11 @@ def owner_status(card, target_home):
         paths.append(pinned)
     root = str(target_home)
     paths.append(os.path.join(root, "kanban.db"))
-    paths.extend(sorted(glob.glob(os.path.join(root, "kanban", "boards", "*", "kanban.db"))))
     seen, error, existing = set(), None, 0
+    try:
+        paths.extend(str(p) for p in _board_db_files(Path(root) / "kanban" / "boards"))
+    except (OSError, sqlite3.Error) as exc:
+        raise RootCapError("kanban board unreadable") from exc
     for path in paths:
         if path in seen or not os.path.exists(path):
             continue
@@ -1722,8 +1727,11 @@ def owner_task(card, target_home):
         paths.append(pinned)
     root = str(target_home)
     paths.append(os.path.join(root, "kanban.db"))
-    paths.extend(sorted(glob.glob(os.path.join(root, "kanban", "boards", "*", "kanban.db"))))
     seen, error = set(), None
+    try:
+        paths.extend(str(p) for p in _board_db_files(Path(root) / "kanban" / "boards"))
+    except (OSError, sqlite3.Error) as exc:
+        raise RootCapError("kanban board unreadable") from exc
     for path in paths:
         if path in seen or not os.path.exists(path):
             continue

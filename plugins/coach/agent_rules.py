@@ -24,7 +24,10 @@ import uuid
 from datetime import datetime, timezone
 from collections import deque
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any, Callable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 _pr_script_spec = importlib.util.spec_from_file_location(
     '_coach_pr_script_reads', Path(__file__).with_name('pr_script_reads.py'))
@@ -3486,7 +3489,7 @@ def board_dbs() -> list:
     root = Path(os.environ.get("HERMES_KANBAN_HOME") or os.environ.get("HERMES_HOME")
                 or Path.home() / ".hermes")
     paths = [Path(os.environ["HERMES_KANBAN_DB"])] if os.environ.get("HERMES_KANBAN_DB") else [root / "kanban.db"]
-    paths += sorted((root / "kanban" / "boards").glob("*/kanban.db"))
+    paths += _board_db_files(root / "kanban" / "boards")
     return [str(p) for p in paths if p.is_file()]
 
 

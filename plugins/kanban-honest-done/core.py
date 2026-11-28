@@ -15,7 +15,10 @@ import threading
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any, Iterable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}(?:[0-9a-f]{8})?\b")  # legacy 8-hex and current 16-hex board ids
 
@@ -222,7 +225,7 @@ def board_paths(env=None) -> list[Path]:
         root, boards = home, home / "kanban" / "boards"
     out.append(root / "kanban.db")
     if boards.is_dir():
-        out.extend(sorted(p for p in boards.glob("*/kanban.db")))
+        out.extend(_board_db_files(boards))
     seen: set[str] = set()
     uniq = []
     for p in out:
@@ -1078,7 +1081,7 @@ def needs_attention(card: dict[str, Any], paths: Optional[list[Path]] = None) ->
 
 def attention_watch_paths() -> list[Path]:
     """Every file ``needs_attention`` reads, for core's event-driven holder: the boards and their Board replicas.
-    Lists files only; opens no database."""
+    Named boards are schema-validated during discovery; no task rows are read here."""
     boards = board_paths()
     return boards + replica_paths(boards)
 

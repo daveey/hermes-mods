@@ -31,7 +31,10 @@ import threading
 import time
 import types
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[2] / "kanban_inventory.py"))["board_db_files"]
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -777,11 +780,7 @@ class CoreReaders:
         if default.exists():
             found.append(('default', default))
         boards_root = home / 'kanban' / 'boards'
-        if boards_root.is_dir():
-            for child in sorted(boards_root.iterdir(), key=lambda p: p.name):
-                db = child / 'kanban.db'
-                if BOARD_ID_RE.match(child.name) and db.is_file():
-                    found.append((child.name, db))
+        found.extend((db.parent.name, db) for db in _board_db_files(boards_root))
         local = {slug for slug, _ in found}
         links = home / 'kanban' / kanban_db_sync.LINKS_DIR
         if links.is_dir():

@@ -13,7 +13,10 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 try:
     from . import core
@@ -40,7 +43,7 @@ def _state():
 def _boards() -> list[Path]:
     root = _home()
     paths = [root / "kanban.db"]
-    paths += sorted((root / "kanban" / "boards").glob("*/kanban.db"))
+    paths += _board_db_files(root / "kanban" / "boards")
     return [p for p in paths if p.is_file()]
 
 

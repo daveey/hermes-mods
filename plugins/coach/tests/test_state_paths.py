@@ -43,7 +43,12 @@ def override():
 
 def _board(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    sqlite3.connect(path).close()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE tasks(id TEXT)")
+        conn.commit()
+    finally:
+        conn.close()
     return path
 
 

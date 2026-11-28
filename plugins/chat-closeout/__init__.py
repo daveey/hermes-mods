@@ -31,7 +31,10 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any, Callable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 if __package__:
     from . import core
@@ -143,7 +146,7 @@ def board_paths() -> list[Path]:
         return list(ksa._board_db_paths())
     except Exception:
         root = _kanban_root()
-        return [p for p in [root / "kanban.db", *sorted((root / "kanban" / "boards").glob("*/kanban.db"))]
+        return [p for p in [root / "kanban.db", *_board_db_files(root / "kanban" / "boards")]
                 if p.is_file()]
 
 

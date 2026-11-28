@@ -269,10 +269,25 @@ def home() -> Path:
     return get_hermes_home()
 
 
+def is_board_db(path: Path) -> bool:
+    """Exclude archive containers and schema-less artifacts, never create a DB.
+
+    Unreadable/corrupt real boards still raise: absence of a tasks table is
+    evidence of a non-board; failure to inspect one is not evidence of absence.
+    """
+    if path.parent.name == "_archived" or not path.is_file():
+        return False
+    conn = _ro_connect(path, timeout=2)
+    try:
+        return conn.execute("select 1 from sqlite_master where type='table' and name='tasks'").fetchone() is not None
+    finally:
+        conn.close()
+
+
 def boards() -> list[Path]:
     root = home()
     paths = [root / "kanban.db"] + sorted((root / "kanban" / "boards").glob("*/kanban.db"))
-    return [p for p in paths if p.is_file()]
+    return [p for p in paths if is_board_db(p)]
 
 
 def fmt_ts(ts: float | int | None) -> str:

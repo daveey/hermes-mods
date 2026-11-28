@@ -34,7 +34,10 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 logger = logging.getLogger(__name__)
 
@@ -302,7 +305,7 @@ def board_dbs(db: str | None = None) -> list[str]:
     cands = [db] if db else []
     for r in roots:
         cands.append(str(r / "kanban.db"))
-        cands += sorted(glob.glob(str(r / "kanban" / "boards" / "*" / "kanban.db")))
+        cands += [str(p) for p in _board_db_files(r / "kanban" / "boards")]
     seen, out = set(), []
     for c in cands:
         rp = os.path.realpath(c)
@@ -317,7 +320,13 @@ def open_workspaces(db: str | None = None, skip: str | None = None) -> tuple[dic
     [boards that could not be read]). An unreadable board means "maybe in use": callers keep the tree."""
     found: dict[str, list[tuple[str, str]]] = {}
     bad = []
-    for b in board_dbs(db):
+    try:
+        boards = board_dbs(db)
+    except (OSError, sqlite3.Error) as exc:
+        # Validation now happens during discovery too. Preserve the existing
+        # unreadable-board contract instead of treating a failed inventory as empty.
+        return found, [str(getattr(exc, "board_db_path", f"board inventory unreadable: {exc}"))]
+    for b in boards:
         if skip and b == os.path.realpath(skip):
             continue
         try:
