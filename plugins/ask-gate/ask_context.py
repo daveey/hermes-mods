@@ -52,16 +52,29 @@ _LIST_ITEM = re.compile(r"(?m)^\s*(?:[-*\u2022]|\d+[.)]|\[[ x]\])\s+\S")
 # context/steps/choices check (and payment asks still go through typed approvals). Deliberately no negation or
 # "read-only" heuristics: five review rounds showed every refinement leaves a wording gap, and a mention that lets a
 # read-only ask reach David costs far less than a missed money ask.
-_LIMIT = re.compile(
-    # Money/limit: case-insensitive SUBSTRING stems, so every inflection counts ("rate-limited", "capped",
-    # "unlimited", "limitation", "subscribers", "repaid"). Over-matching ("capability", "escape") is the intended
-    # fail-closed direction. Only stems that are substrings of everyday words get a boundary: eur ("neural"),
-    # fee ("feedback").
-    r"[$€£¥]|limit|cap|quota|spend|spent|budget|pay|paid|bill|charg|cost|price|pricing|usd|gbp|jpy|\beur\b|"
-    r"\d\s?eur|eur\s?\d|credit|refund|subscri|invoice|money|purchas|overage|\bfees?\b|expens|reimburs|top[- ]?up|"
-    r"renew|licen[cs]|"
+# Union of every term any version matched; no term is ever removed (owning chat, 02:05Z). _LIMIT_WORDS is the
+# 0f4365e7 word list verbatim; _LIMIT_STEMS adds case-insensitive SUBSTRING stems, so every inflection counts
+# ("rate-limited", "capped", "unlimited", "limitation", "repaid"). Over-matching ("capability", "escape") is the
+# intended fail-closed direction; only very short or ambiguous tokens get a word boundary (eur in "neural", fee in
+# "feedback", currency codes, cent, tip, fine, eth).
+_LIMIT_WORDS = re.compile(
+    r"\$\s?\d|\b\d+(?:\.\d+)?\s?(?:usd|dollars?|eur|euros?|gbp)\b|"
+    r"\b(?:pay\w*|paid|money|spend\w*|spent|billing|bill(?:s|ed)?|invoic\w*|subscri\w*|budget\w*|refund\w*|"
+    r"overage\w*|charg\w*|purchas\w*|buy\w*|bought|price\w*|pricing|fees?|credit\s+card|card\s+on\s+file|"
+    r"limits?|quotas?|caps?|plan\s+(?:upgrade|change))\b|"
     r"\b(?:grant\w*|permissions?|credentials?|widen\w*|admin|sudo|api\s+keys?|scope\s+change)\b|"
     r"\b(?:delet\w*|destroy\w*|destructive|irreversible|wipe\w*|terminat\w*|safety)\b", re.I)
+_LIMIT_STEMS = re.compile(
+    r"[$€£¥₹₩₣₽₿]|limit|cap|quota|spend|spent|budget|pay|paid|bill|charg|cost|price|pricing|usd|gbp|jpy|\beur\b|"
+    r"\d\s?eur|eur\s?\d|credit|refund|subscri|invoice|money|purchas|overage|\bfees?\b|expens|reimburs|top[- ]?up|"
+    r"renew|licen[cs]|buy|bought|dollar|buck|card|plan|upgrad|downgrad|premium|tier|seat|trial|crypto|"
+    r"\b(?:cents?|yen|cad|aud|inr|chf|btc|eth|tips?|fines?|dues)\b|fund|deposit|donat|wire|order|checkout|"
+    r"check[\s-]out|\bcarts?\b|stripe|"
+    r"venmo|paypal|tax|stipend|salar|bonus|outlay|overrun|\brent|rental|leas|reserv|ceiling|max|threshold|"
+    r"allowance|throttl|"
+    r"\b(?:grant\w*|permissions?|credentials?|widen\w*|admin|sudo|api\s+keys?|scope\s+change)\b|"
+    r"\b(?:delet\w*|destroy\w*|destructive|irreversible|wipe\w*|terminat\w*|safety)\b", re.I)
+_LIMIT_PARTS = (_LIMIT_WORDS, _LIMIT_STEMS)
 _SIZE = re.compile(
     r"\d|~|\$|\b(?:one|two|three|four|five|ten|a\s+few|few|single|a\s+(?:minute|moment|second|click|tap|reply|"
     r"restart|run|day|week|hour))\b|\b(?:seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|clicks?|taps?)\b", re.I)
@@ -232,7 +245,8 @@ def acceptance_alternative(body: str) -> Optional[str]:
 def _limit_named(text: str) -> bool:
     """The ask mentions money, payment, spend, billing, limits, permissions or safety -- in any wording (fail closed)."""
     text = str(text or "")
-    return bool(_LIMIT.search(text)) or _replan.limit_named(text) in ("spend", "permission", "safety")
+    return any(p.search(text) for p in _LIMIT_PARTS) or \
+        _replan.limit_named(text) in ("spend", "permission", "safety")
 
 
 def acceptance_met(request: dict, body: str) -> Optional[str]:
