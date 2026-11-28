@@ -596,8 +596,13 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
             _write_json(path, state)
         out['nudge_live_rules'] = [red_rule] if red_live else []
         out['nudges'], out['nudge_mode'] = actions, nm
-        if any(a.get('outcome') == 'delivery_unknown' for a in actions):
-            out['failed'] = True
+        # A detached owner can persist its admission after this tick returns.
+        # Keep unknown deliveries visible and frozen for next-tick readback,
+        # but do not misclassify their latency as a scanner/repair failure.
+        out['pending_delivery'] = [
+            {'fingerprint': a['fingerprint'], 'mode': a.get('mode', nm),
+             'pending_at': a.get('pending_at', a.get('at'))}
+            for a in actions if a.get('outcome') == 'delivery_unknown']
         if escalations:
             path = sd / f'nudges-{nm}.json'
             state = _read_json(path, {'fps':{}, 'sent':[]})
@@ -606,9 +611,16 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
                     state['fps'][f['fingerprint']]['escalated'] = now
             _write_json(path, state)
         _write_json(sd/'last.json',{**_read_json(sd/'last.json', {}), **result,'mode':m,'nudge_mode':nm,'tick_at':now,
-                                  'handed':out['handed'],'nudges':actions})
+                                  'handed':out['handed'],'nudges':actions,
+                                  'pending_delivery':out['pending_delivery']})
         if actions:
-            out['line'] += ('; ' if out['line'] else '') + f'session-repair nudges ({nm}): {len(actions)} outcome(s)'
+            groups = {}
+            for action in actions:
+                key = (action['fingerprint'].split(':', 1)[0], action.get('mode', nm))
+                groups[key] = groups.get(key, 0) + 1
+            detail = ', '.join(f'{rule} ({action_mode}): {count}'
+                               for (rule, action_mode), count in sorted(groups.items()))
+            out['line'] += ('; ' if out['line'] else '') + f'session-repair nudges: {detail} outcome(s)'
         prog = result.get('progress') or {}
         out['progress'] = prog.get('verdicts')
         out['rule_shadow'] = [f['fingerprint'] for f in soak]
@@ -674,6 +686,7 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
             'scanned': bool(result), 'skipped': out.get('skipped'),
             'handed': out.get('handed', []), 'nudge_mode': out.get('nudge_mode'),
             'nudges': out.get('nudges', []),
+            'pending_delivery': out.get('pending_delivery', []),
             'progress': (result.get('progress') or {}).get('verdicts'), 'rule_shadow': out.get('rule_shadow', []),
             'red_no_ask': result.get('red_no_ask'), 'nudge_live_rules': out.get('nudge_live_rules', []),
         })

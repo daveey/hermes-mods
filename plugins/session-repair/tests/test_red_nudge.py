@@ -170,8 +170,14 @@ def test_normal_lane_acknowledgement_stops_escalation(harness, tmp_path):
     assert len(h.calls) == 1
 
 
-def test_run_mode_override_and_shadow_no_send(harness):
-    assert harness.tick(10000, run_mode='shadow')[2] == 'shadow'
-    assert not harness.calls
-    assert harness.tick(11000, run_mode='live')[2] == 'live'
+def test_run_mode_override_and_shadow_no_send(harness, tmp_path):
+    for mode, at in [('shadow', 10000), ('live', 11000)]:
+        actions, _, actual_mode = harness.tick(at, run_mode=mode)
+        assert actual_mode == mode
+        assert actions[0]['mode'] == mode
+        rows = [json.loads(line) for line in
+                (tmp_path / f'session-repair/nudges-{mode}.jsonl').read_text().splitlines()]
+        assert rows[-1]['mode'] == mode
+        if mode == 'shadow':
+            assert not harness.calls
     assert len(harness.calls) == 1
