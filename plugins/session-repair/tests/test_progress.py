@@ -75,6 +75,51 @@ def test_terminal_unrestricted_parent_still_predicts_promotion(env):
     assert hits(tick(env, env.now + 31 * M), card=tid)
 
 
+def test_fresh_current_run_liveness_defers_board_only_miss_without_claiming_progress(env):
+    tid = F.running_quiet(env.conn, env.now)
+    tick(env, env.now)
+    for elapsed in (31 * M, 62 * M):
+        now = env.now + elapsed
+        env.conn.execute("UPDATE task_runs SET last_heartbeat_at=? WHERE task_id=? AND status='running'",
+                         (int(now - 30), tid))
+        env.conn.commit()
+        r = tick(env, now)
+        assert hits(r, card=tid) == []
+        snap = P.load_snapshot(env.home, F.CHAT)
+        assert not snap['signals'], 'automatic liveness is not semantic progress'
+        assert snap['cards'][tid]['prediction']['deferred'] == 'runtime_activity_unobserved'
+        assert snap['cards'][tid]['misses'] == 0
+    # Once the runtime stops refreshing, ordinary overdue diagnosis still applies.
+    assert hits(tick(env, env.now + 100 * M), card=tid)
+
+
+@pytest.mark.parametrize('offset', [-301, 1])
+def test_stale_or_future_heartbeat_does_not_defer_running_miss(env, offset):
+    tid = F.running_quiet(env.conn, env.now)
+    tick(env, env.now)
+    now = env.now + 31 * M
+    env.conn.execute("UPDATE task_runs SET last_heartbeat_at=? WHERE task_id=? AND status='running'",
+                     (int(now + offset), tid))
+    env.conn.commit()
+    assert hits(tick(env, now), card=tid)
+
+
+@pytest.mark.parametrize('invalid', ['ended', 'foreign'])
+def test_ended_or_foreign_run_heartbeat_cannot_defer(env, invalid):
+    tid = F.running_quiet(env.conn, env.now)
+    other = F.card(env.conn, 'Different run owner', status='running') if invalid == 'foreign' else None
+    tick(env, env.now)
+    now = env.now + 31 * M
+    rid = env.conn.execute('SELECT current_run_id FROM tasks WHERE id=?', (tid,)).fetchone()[0]
+    env.conn.execute('UPDATE task_runs SET last_heartbeat_at=? WHERE id=?', (int(now - 30), rid))
+    if invalid == 'ended':
+        env.conn.execute("UPDATE task_runs SET status='done' WHERE id=?", (rid,))
+    else:
+        env.conn.execute('UPDATE task_runs SET task_id=? WHERE id=?', (other, rid))
+    env.conn.commit()
+    assert hits(tick(env, now), card=tid)
+
+
 def test_first_sight_is_a_baseline_and_judges_nothing(env):
     F.running_quiet(env.conn, env.now)
     r = tick(env, env.now)

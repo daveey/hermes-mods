@@ -141,6 +141,15 @@ hours; a structured `clock_only: true` deployment with a named non-URL ref and
 producer-health receipt. Probes, completion/adverse events, expired checkpoints,
 and longer windows retain diagnosis. These guards do not enable a rollout.
 
+For running cards, board silence does not establish runtime silence: tools and
+commits can advance on a worker without a board event. A heartbeat within five
+minutes on the exact current, still-running run defers a generic running miss as
+`runtime_activity_unobserved` and resets its consecutive-miss counter. It is not a
+progress signal or a healthy-progress claim. A full prediction window starts
+after the last fresh mark; stale, future, foreign or ended-run marks cannot defer.
+Legacy stuck-run/lease checks are unchanged. Full remote runtime-activity
+publication would be stronger evidence and is not supplied by this guard.
+
 `BS-long-wait` can omit only its `too_long` result while a Board-certified owner
 reassessment remains current and `now < reassess_at`. It calls core's read-only
 `kanban_owner_reassessment_replica.verified_for_event(conn, event, task, now=...)`
