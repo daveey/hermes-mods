@@ -69,6 +69,8 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   unambiguous first-parent commit prefix from successful activation log markers;
   mods deployment uses checkout HEAD reflog ancestry. A disk checkout receipt
   is not proof every running process reloaded. Missing joins stay absent.
+  Legacy core markers have no UTC offset: local parsing is ambiguous during the
+  DST fall-back hour (up to one hour); source logs cannot recover that missing bit.
 * Default ranges contain whole hourly buckets intersecting the interval. Daily
   bins use America/Los_Angeles, including DST, to match the research. Boundary
   hours/days are partial-window comparisons, not exact arbitrary-second queries.

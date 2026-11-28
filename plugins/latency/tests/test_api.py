@@ -68,7 +68,7 @@ class API(unittest.TestCase):
         self.assertEqual(self.client.post('/v1/spans',content=raw).status_code,400)
         for metric in ('unknown', 'turn_first'):
             self.assertEqual(self.client.post('/v1/spans',json={'spans':[dict(good,metric=metric)]}).status_code,400)
-        self.assertEqual(self.client.post('/v1/spans',content='['*2000+'0'+']'*2000).status_code,400)
+        self.assertEqual(self.client.post('/v1/spans',content='['*130000+'0'+']'*130000).status_code,400)
 
     def test_15_second_cache_has_single_build(self):
         with patch.object(api,'build',return_value={'metrics':[]}) as build:

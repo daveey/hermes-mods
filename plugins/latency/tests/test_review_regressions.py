@@ -53,8 +53,12 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(github.collect_github(tmp,store,defs,cfg,0,200,fetch=fetch),0)
             self.assertEqual(store.cursor(key),{'at':200,'pending':[]})
             store.ingest([],key,{'at':200,'pending':[42]})
+            def forbidden_pending(path, **kw):
+                if '/runs/42' in path:
+                    raise github.GitHubReadError(403)
+                return {'total_count':0,'workflow_runs':[]}
             with self.assertRaises(RuntimeError):
-                github.collect_github(tmp,store,defs,cfg,0,300,fetch=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('unavailable')))
+                github.collect_github(tmp,store,defs,cfg,0,300,fetch=forbidden_pending)
             self.assertEqual(store.cursor(key)['at'],200)
 
     def test_pending_revisit_and_run_attempt_identity(self):
@@ -144,8 +148,33 @@ class ReviewRegressions(unittest.TestCase):
     def test_deployment_must_follow_merge(self):
         pr = dict(number=1,createdAt=github.iso(1),mergedAt=github.iso(10),mergeCommit={'oid':'a'},baseRefName='main')
         defs = [dict(id='deploy',start='pr_merged',end='deployed')]
-        rows = list(github.github_samples(defs,[],[pr],{'a':0},[(5,0)],'example',0,20))
-        self.assertEqual(rows,[])
+        rows = list(github.github_samples(defs,[],[pr],{'a':0},[(5,0),(15,0)],'example',0,20))
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['dur_ms'],5000)
+
+    def test_stop_interrupts_lock_contender_without_acquiring(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)/'cache/latency'
+            folder.mkdir(parents=True)
+            worker = sampler.Worker(tmp)
+            waiting = threading.Event()
+            real_wait = worker.stop_event.wait
+            def wait(seconds):
+                waiting.set()
+                return real_wait(seconds)
+            with (folder/'collector.lock').open('a+') as lock, patch.object(worker.stop_event,'wait',side_effect=wait), patch.object(sampler,'cycle') as cycle:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                worker.thread.start()
+                try:
+                    self.assertTrue(waiting.wait(3))
+                    worker.stop()
+                    self.assertFalse(worker.thread.is_alive())
+                    cycle.assert_not_called()
+                finally:
+                    worker.stop_event.set()
+                    fcntl.flock(lock,fcntl.LOCK_UN)
+                    worker.thread.join(3)
 
     def test_stop_interrupts_wait_and_joins_owned_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
