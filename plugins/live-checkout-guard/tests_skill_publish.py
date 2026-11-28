@@ -505,6 +505,8 @@ printf '[{"headSha":"%s","status":"completed","conclusion":"%s","workflowName":"
                 self.assertIn('skill publication dirt', '\n'.join(skipped.output))
                 self.assertEqual(self.target.read_text(), 'published\n')
                 self.assertEqual(self.git(self.origin, 'rev-parse', 'main'), self.head)
+                # Each synchronous service transition is a new polling window.
+                (self.root / '.git/skill-ci-poll/state.json').unlink(missing_ok=True)
             with self.assertLogs(plugin.logger, level='INFO') as logs:
                 hooks['post_tool_call'](tool_name='skill_manage', args={'action': 'write_file',
                     'name': 'sample', 'file_path': 'SKILL.md'},
@@ -569,6 +571,13 @@ printf '[{"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"CI","cr
             self.assertEqual(self.target.read_text(), 'published\n')
             # CI goes green later; no further skill_manage call is made.
             state.write_text('completed success\n')
+            # Advance negative evidence at the fixture boundary, not with a
+            # production cadence override or minute-long timing sleep.
+            poll = self.root / '.git/skill-ci-poll/state.json'
+            if poll.exists():
+                observation = json.loads(poll.read_text())
+                observation['next_at'] = 0
+                poll.write_text(json.dumps(observation))
             published = lambda: self.git(self.origin, 'show', 'main:' + self.path) == 'published'
             self.assertTrue(self.wait_for(published), 'in-progress-then-green edit was never published')
             self.assertTrue(self.wait_for(lambda: not list(pending.glob('*.json'))))
