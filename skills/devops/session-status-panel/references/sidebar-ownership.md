@@ -6,6 +6,10 @@ The left session list is core Desktop, not hermes-mods `desktop-plugins`. Read t
 
 The **Blocked** sidebar section and the red row stripe have different inputs and owners. The section is `apps/desktop/src/plugins/kanban/blocked-section.tsx` (`fetchBlockedTasks` in `api.ts`). It lists every blocked card on every gateway and board, grouped by `managing_session_id` (the latest `tui` notify subscriber), else by the card's `session_id`, titled via `/session-labels` on the backend's own profile. The stripe turns red only from a visible row's `kanban_blocked`. When the section shows a card but no row is red, check the card's owner session on its home gateway (`home_gateway`; the local replica can be empty, so read the owner's DB through `tailnet_exec`). Cards created by background profiles have sessions the user's chats never show.
 
+## Historical timers and current ask authority
+
+Retained sidebar clocks are historical display evidence, not current ask authority: unknown/expired card observations must not paint a formerly blocked timer red or announce Needs you. Keep per-category uncertainty separate: an unknown deploy watch must not grey a separate fresh human ask. Test mixed-status rows alongside answered/running cards and retained/expired timers.
+
 ## Row squares, ETA readout, Background counts
 
 `apps/desktop/src/app/chat/sidebar/session-row-card-squares.tsx`: `COLOURS`, `sessionCardColours` (per-category counts from `kanban_*` session fields), `trailingColours` (flat rows drop blue and grey), `BackgroundCardSquares`, `SessionRowEtaReadout` (replaces squares only when the stripe is `external` and a card has a live `eta`; coloured sky-400).
