@@ -116,7 +116,8 @@ def test_same_daemon_recovers_or_rotates(provider, persistent, tmp_path, monkeyp
         try:
             for _ in range(2):  # same running serve instance, no restart
                 req = urllib.request.Request(f"http://127.0.0.1:{servers[0].server_port}{path}",
-                                             data=json.dumps(body).encode(), method="POST")
+                                             data=json.dumps(body).encode(), method="POST",
+                                             headers={"x-api-key": "http-fixture-token"})
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     assert resp.status == 200
                     assert json.load(resp) == {"ok": True}

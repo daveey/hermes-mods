@@ -20,7 +20,7 @@ CREDIT_ERROR_RE = re.compile(r"credit balance is too low|no credits remaining|in
 HINT = (f"{MARK} this is a paid API key out of credit; that needs no user action. Run the call on the Hermes "
         f"subscription account pool instead (Claude Max + ChatGPT accounts, rotates on limits). One call: `{HELPER} ask "
         f"--provider anthropic|openai --model <m> \"...\"`; an unmodified SDK harness: `{HELPER} serve --port 8765` then "
-        "ANTHROPIC_BASE_URL=http://127.0.0.1:8765 OPENAI_BASE_URL=http://127.0.0.1:8765/v1 (any API key). "
+        f'`eval "$({HELPER} env --port 8765)"` to export loopback URLs and the private API token. '
         f"`{HELPER} models` lists the pool's models.")
 
 _MONEY = r"(?:api\s+)?(?:credits?|credit balance|billing|funds|balance|budget|spend(?:ing)? limit|top[- ]?up)"

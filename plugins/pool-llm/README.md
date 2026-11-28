@@ -16,6 +16,7 @@ $B check                                                     # one ping per pool
 $B ask --provider anthropic --model claude-sonnet-5-5 "hi"   # text on stdout
 $B ask --provider openai --tier fast --json - < prompt.txt   # {text, provider, model, route}
 $B serve --port 8765                                         # local SDK-compatible endpoint
+eval "$($B env --port 8765)"                                # export URLs + private API token (do not log)
 ```
 
 `models` lists every eligible subscription route per provider and tier, in registry preference
@@ -39,8 +40,9 @@ the stop reason as metadata; this exit-status policy applies to `ask`, not the r
 Regression coverage: `tests/test_ask.py` exercises both CLI output modes with mocked provider
 responses, including thinking-only failures, successful answers and Codex compatibility.
 
-`serve` lets an unmodified harness use the pool: `ANTHROPIC_BASE_URL=http://127.0.0.1:8765`,
-`OPENAI_BASE_URL=http://127.0.0.1:8765/v1`, any non-empty API key. It serves Anthropic `POST /v1/messages` (Claude
+`serve` lets an unmodified harness use the pool: `eval "$(hermes-pool-llm env)"` exports
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8765`, `OPENAI_BASE_URL=http://127.0.0.1:8765/v1`,
+and `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` containing this home's private token. It serves Anthropic `POST /v1/messages` (Claude
 Code system prefix and `mcp__` tool names added for the OAuth token, tool names restored in the reply) and OpenAI
 `POST /v1/responses` on the Codex backend (unsupported keys like `max_output_tokens`
 and `temperature` dropped, `store=false`). `POST /v1/chat/completions` routes `claude*` models to Anthropic
@@ -69,9 +71,20 @@ HTTP 403 before reading JSON or accessing credentials/upstreams. Use the numeric
 loopback URL shown above; ordinary Anthropic/OpenAI SDKs supply Host automatically
 and do not supply Origin. `ask` and `check` use the library directly and are unchanged.
 
-This blocks browser simple-POST and DNS-rebinding use of subscription accounts and
-paid embeddings. It is not authentication against other local processes/users:
-keep this endpoint on loopback and do not publish it through a reverse proxy.
+After those checks, every request (including health and OPTIONS) must authenticate
+with `x-api-key: <token>` or `Authorization: Bearer <token>`. Missing, incorrect or
+conflicting credentials return a fixed HTTP 401 before reading the body or touching
+credentials/upstreams. Both headers may be supplied only with the same correct token.
+`serve` and `env` create `<HERMES_HOME>/pool-llm/serve.token` if missing (0700 directory,
+0600 exclusive/no-follow file, random `secrets.token_urlsafe(32)` contents). Existing
+tokens must be regular non-symlink files, owned by the current uid, with no group/other
+permissions; unsafe or invalid files refuse startup. Tokens persist without expiry.
+Only `env` deliberately prints the token, as shell exports; never log its output or
+enable shell tracing around it. Use the same HERMES_HOME for clients and server.
+This blocks browser/rebinding and other local users without the token, not code
+already running as your uid that can read your private files. Keep this endpoint on
+loopback and do not publish it through a reverse proxy. `ask`, `check` and `models`
+do not use HTTP and do not need the token.
 Regression coverage: `tests/test_http_boundary.py` uses real loopback HTTP with
 fake upstreams; existing ask/check and streaming tests cover client compatibility.
 
@@ -81,7 +94,7 @@ fake upstreams; existing ask/check and streaming tests cover client compatibilit
 
 ```python
 import anthropic
-client = anthropic.Anthropic(base_url="http://127.0.0.1:8765", api_key="pool")
+client = anthropic.Anthropic()  # after eval "$(hermes-pool-llm env)"; SDK reads URL + token exports
 with client.messages.stream(model="claude-haiku-5-5", max_tokens=256,
         messages=[{"role": "user", "content": "Explain server-sent events briefly."}]) as stream:
     for text in stream.text_stream:

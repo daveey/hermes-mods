@@ -6,6 +6,7 @@ subscription pool. stdlib only.
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -56,11 +57,14 @@ def parse_reply(reply: dict) -> dict:
 
 
 def call(base_url: str, body: dict, timeout: int = 180, retries: int = 4) -> tuple[dict, str]:
+    token = os.environ.get("ANTHROPIC_API_KEY")
+    if not token:
+        raise RuntimeError("Configure the private API token with hermes-pool-llm env --port 8791")
     data = json.dumps(body).encode()
     last = None
     for attempt in range(retries):
         req = urllib.request.Request(base_url.rstrip("/") + "/v1/messages", data=data, headers={
-            "content-type": "application/json", "x-api-key": "pool", "anthropic-version": "2023-06-01"})
+            "content-type": "application/json", "x-api-key": token, "anthropic-version": "2023-06-01"})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read()), resp.headers.get("x-hermes-pool-route") or ""
@@ -72,6 +76,8 @@ def call(base_url: str, body: dict, timeout: int = 180, retries: int = 4) -> tup
                     body_txt = e.read().decode()[:300]
                 except Exception:
                     pass
+                if e.code == 401:
+                    raise RuntimeError("Invalid pool token; use hermes-pool-llm env --port 8791") from None
                 if e.code == 400:
                     raise RuntimeError(f"bad request: {body_txt}") from e
             time.sleep(min(60, 5 * 2 ** attempt))

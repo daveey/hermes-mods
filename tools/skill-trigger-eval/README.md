@@ -31,6 +31,7 @@ each `tools/*` dir as its own suite. `skill-audit` points here for the measureme
 cd tools/skill-trigger-eval
 P="uv run -q --no-project --with pyyaml python trigger_eval.py"
 ~/.hermes/plugins/pool-llm/bin/hermes-pool-llm serve --port 8791 &   # once
+eval "$(~/.hermes/plugins/pool-llm/bin/hermes-pool-llm env --port 8791)" # private token + URLs; do not log
 $P index | head                                                       # the live index, as the agent sees it
 python3 mine.py ~/.hermes/state.db > /tmp/mined.json                  # optional; also over ssh on other hosts
 $P gen-cards --workers 8 --mine-db /tmp/mined.json                    # drafts into cards/ (skips existing)

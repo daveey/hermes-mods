@@ -12,7 +12,13 @@ pl = load('pool_llm')
 
 
 @pytest.fixture
-def endpoint(monkeypatch, request):
+def endpoint(monkeypatch, request, tmp_path):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    token_dir = tmp_path / 'pool-llm'
+    token_dir.mkdir(mode=0o700)
+    token_file = token_dir / 'serve.token'
+    token_file.write_text('boundary-fixture-token')
+    token_file.chmod(0o600)
     ready = threading.Event()
     servers, calls = [], []
     original = http.server.ThreadingHTTPServer
@@ -44,7 +50,7 @@ def endpoint(monkeypatch, request):
         conn = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=5)
         try:
             conn.putrequest(method, path, skip_host=True)
-            for key, value in (headers if headers is not None else [('Host', authority)]):
+            for key, value in (headers if headers is not None else [('Host', authority), ('x-api-key', 'boundary-fixture-token')]):
                 conn.putheader(key, value)
             conn.putheader('Content-Length', str(len(body)))
             conn.endheaders(body)
@@ -116,3 +122,165 @@ def test_health_still_works(endpoint):
     assert status == 200
     assert json.loads(body) == {'ok': True}
     assert endpoint.calls == []
+
+
+@pytest.mark.parametrize('auth', [[], [('x-api-key', 'wrong-presented-token')],
+    [('x-api-key', 'boundary-fixture-token'), ('Authorization', 'Bearer different-token')],
+    [('x-api-key', 'boundary-fixture-token'), ('x-api-key', 'different-token')],
+    [('Authorization', 'Basic boundary-fixture-token')],
+    [('Authorization', 'Bearer boundary-fixture-token'), ('Authorization', 'Bearer different-token')]])
+@pytest.mark.parametrize('method,path', [('POST', '/v1/messages'), ('GET', '/health'), ('OPTIONS', '/')])
+def test_auth_refused_before_body_or_provider(endpoint, auth, method, path, capsys):
+    status, body, _ = endpoint.request(method, path, [('Host', endpoint.authority)] + auth, b'not json')
+    assert status == 401
+    assert endpoint.calls == []
+    assert 'hermes-pool-llm env' in json.loads(body)['error']['message']
+    captured = capsys.readouterr()
+    for secret in ['boundary-fixture-token', 'wrong-presented-token', 'different-token']:
+        assert secret not in body.decode() + captured.out + captured.err
+
+
+@pytest.mark.parametrize('auth', [[('x-api-key', 'boundary-fixture-token')],
+    [('Authorization', 'Bearer boundary-fixture-token')],
+    [('x-api-key', 'boundary-fixture-token'), ('Authorization', 'Bearer boundary-fixture-token')]])
+def test_correct_token_served(endpoint, auth, capsys):
+    status, body, _ = endpoint.request(headers=[('Host', endpoint.authority)] + auth)
+    assert status == 200 and json.loads(body) == {'ok': True}
+    assert 'upstream' in endpoint.calls
+    captured = capsys.readouterr()
+    assert 'boundary-fixture-token' not in body.decode() + captured.out + captured.err
+
+
+@pytest.mark.parametrize('auth', [[], [('x-api-key', 'wrong-token')]])
+@pytest.mark.parametrize('path', ['/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1/embeddings'])
+def test_unauthenticated_valid_body_never_calls_upstream(endpoint, auth, path):
+    status, _, _ = endpoint.request(path=path, headers=[('Host', endpoint.authority)] + auth)
+    assert status == 401
+    assert endpoint.calls == []
+
+
+@pytest.mark.parametrize('sdk', ['anthropic', 'openai'])
+def test_real_sdks_accept_token(endpoint, sdk):
+    module = pytest.importorskip(sdk)
+    base = f'http://{endpoint.authority}'
+    if sdk == 'anthropic':
+        with module.Anthropic(base_url=base, api_key='boundary-fixture-token', max_retries=0) as client:
+            reply = client.messages.create(model='fixture', max_tokens=10, messages=[])
+    else:
+        with module.OpenAI(base_url=base + '/v1', api_key='boundary-fixture-token', max_retries=0) as client:
+            reply = client.responses.create(model='fixture', input='hello')
+    assert reply.model_dump()['ok'] is True
+    assert 'upstream' in endpoint.calls
+
+
+def test_auth_does_not_wait_for_body(endpoint):
+    conn = http.client.HTTPConnection('127.0.0.1', endpoint.server.server_port, timeout=2)
+    try:
+        conn.putrequest('POST', '/v1/messages')
+        conn.putheader('Content-Length', '999')
+        conn.endheaders()  # deliberately never send the promised body
+        response = conn.getresponse()
+        assert response.status == 401
+        response.read()
+        assert endpoint.calls == []
+    finally:
+        conn.close()
+
+
+def test_serve_creates_private_token_before_binding(monkeypatch, tmp_path, capsys):
+    import os
+    import stat
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    class Bound(Exception):
+        pass
+    def bind(*args):
+        path = tmp_path / 'pool-llm' / 'serve.token'
+        assert path.exists()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert path.stat().st_uid == os.getuid()
+        assert len(path.read_text()) >= 43
+        assert path.read_text() not in ''.join(capsys.readouterr())
+        raise Bound
+    monkeypatch.setattr(http.server, 'ThreadingHTTPServer', bind)
+    with pytest.raises(Bound):
+        pl.serve(port=0)
+
+
+@pytest.mark.parametrize('unsafe', ['mode', 'symlink', 'owner', 'directory', 'empty'])
+def test_serve_refuses_unsafe_token_before_binding(monkeypatch, tmp_path, unsafe):
+    import os
+    import stat
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    directory = tmp_path / 'pool-llm'
+    directory.mkdir(mode=0o700)
+    path = directory / 'serve.token'
+    path.write_text('private-test-token')
+    path.chmod(0o600)
+    if unsafe == 'mode':
+        path.chmod(0o644)
+    elif unsafe == 'symlink':
+        path.rename(directory / 'target')
+        path.symlink_to(directory / 'target')
+    elif unsafe == 'directory':
+        path.unlink()
+        path.mkdir(mode=0o700)
+    elif unsafe == 'empty':
+        path.write_text('')
+    else:
+        # No privilege required: real lstat/fstat metadata except the foreign uid.
+        original_lstat, original_fstat = os.lstat, os.fstat
+        def foreign(info):
+            values = list(info)
+            if stat.S_ISREG(info.st_mode):
+                values[4] = os.getuid() + 1
+            return os.stat_result(values)
+        monkeypatch.setattr(os, 'lstat', lambda *a, **kw: foreign(original_lstat(*a, **kw)))
+        monkeypatch.setattr(os, 'fstat', lambda *a, **kw: foreign(original_fstat(*a, **kw)))
+    monkeypatch.setattr(http.server, 'ThreadingHTTPServer',
+                        lambda *a: pytest.fail('unsafe token reached bind'))
+    with pytest.raises((ValueError, OSError), match='token'):
+        pl.serve(port=0)
+
+
+def test_env_real_launcher(tmp_path):
+    import os
+    import pathlib
+    import shlex
+    import stat
+    import subprocess
+    import sys
+    launcher = pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'hermes-pool-llm'
+    # Exercise the real launcher and exec protocol with a fixture runtime discovery
+    # command, so public CI needs neither core nor credentials/PM repair.
+    shim = tmp_path / 'bin'
+    shim.mkdir()
+    hermes = shim / 'hermes'
+    code = "import runpy,sys; runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+    hermes.write_text(f'#!{sys.executable}\nimport json\nprint(json.dumps({[sys.executable, "-c", code]!r}))\n')
+    hermes.chmod(0o700)
+    env = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(tmp_path / 'hermes'),
+               PATH=str(shim) + os.pathsep + os.environ.get('PATH', ''),
+               PYTHONDONTWRITEBYTECODE='1')
+    outputs = []
+    for args in [('env', '--port', '8791'), ('env',)]:
+        result = subprocess.run([sys.executable, str(launcher), *args], env=env,
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        values = dict(shlex.split(line.removeprefix('export '))[0].split('=', 1)
+                      for line in result.stdout.splitlines())
+        outputs.append(values)
+        port = '8791' if '--port' in args else '8765'
+        assert values['ANTHROPIC_BASE_URL'] == f'http://127.0.0.1:{port}'
+        assert values['OPENAI_BASE_URL'] == f'http://127.0.0.1:{port}/v1'
+        assert values['ANTHROPIC_API_KEY'] == values['OPENAI_API_KEY']
+        assert values['ANTHROPIC_API_KEY'] not in result.stderr
+    path = tmp_path / 'hermes' / 'pool-llm' / 'serve.token'
+    assert outputs[0]['ANTHROPIC_API_KEY'] == outputs[1]['ANTHROPIC_API_KEY'] == path.read_text()
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    path.chmod(0o644)
+    result = subprocess.run([sys.executable, str(launcher), 'serve', '--port', '0'],
+                            env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert 'token' in result.stderr
+    assert path.read_text() not in result.stderr + result.stdout

@@ -14,8 +14,8 @@ Must run inside the Hermes runtime (it imports ``agent.*``). From a shell or a f
   hermes-pool-llm check                                                              # one ping per pool, exit 0 = ok
   hermes-pool-llm serve --port 8765                                                  # SDK-compatible local endpoint
 
-``serve`` lets an unmodified harness use the pool: set ``ANTHROPIC_BASE_URL=http://127.0.0.1:8765`` and
-``OPENAI_BASE_URL=http://127.0.0.1:8765/v1`` (any non-empty API key). It answers Anthropic ``POST /v1/messages`` on the
+``serve`` lets an unmodified harness use the pool: run ``eval "$(hermes-pool-llm env)"`` to export
+numeric loopback URLs and this home's private API token. It answers Anthropic ``POST /v1/messages`` on the
 Claude pool and OpenAI ``POST /v1/responses`` / ``POST /v1/chat/completions`` on the Codex pool, and ``POST /v1/embeddings`` via OpenRouter. Every response carries
 ``x-hermes-pool-route`` (provider, model, account label) so a run can record the served path.
 
@@ -25,6 +25,12 @@ Library use (Hermes interpreter): ``complete(messages, provider="anthropic", mod
 from __future__ import annotations
 
 import argparse
+import hmac
+import os
+from pathlib import Path
+import secrets
+import shlex
+import stat
 import json
 import re
 import sys
@@ -520,7 +526,52 @@ def embeddings(body: dict, *, get_key: Optional[Callable[[], str]] = None, post:
     return out
 
 
+def serve_token() -> str:
+    """Load/create this home's private persistent HTTP credential, without following links."""
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    directory = home / "pool-llm"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Pin the directory for every later operation (also reject a directory symlink).
+    dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(dfd)
+        if info.st_uid != os.getuid():
+            raise ValueError("serve token directory must be owned by the current uid")
+        os.fchmod(dfd, 0o700)
+        try:
+            fd = os.open("serve.token", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=dfd)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(secrets.token_urlsafe(32))
+                stream.flush()
+                os.fsync(stream.fileno())
+        info = os.lstat("serve.token", dir_fd=dfd)
+        def validate(value):
+            if (not stat.S_ISREG(value.st_mode) or value.st_uid != os.getuid()
+                    or value.st_mode & 0o077):
+                raise ValueError("serve token must be a regular file owned by the current uid with no group/other permissions")
+        validate(info)
+        fd = os.open("serve.token", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        with os.fdopen(fd, "r", encoding="ascii") as stream:
+            opened = os.fstat(stream.fileno())
+            validate(opened)
+            if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                raise ValueError("serve token changed while opening")
+            token = stream.read(4097)
+        if not token or len(token) > 4096 or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
+            raise ValueError("serve token has invalid contents; use a private token_urlsafe token")
+        return token
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("cannot safely read/create serve token; check pool-llm/serve.token ownership and permissions") from exc
+    finally:
+        os.close(dfd)
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
+    token = serve_token().encode("ascii")
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import ipaddress
     pools: dict = {}
@@ -548,10 +599,20 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
                 self._send(403, {"error": {"type": "permission_error",
                                           "message": "local non-browser requests only"}})
                 return False
+            presented = list(self.headers.get_all("x-api-key", []))
+            for value in self.headers.get_all("Authorization", []):
+                parts = value.split()
+                presented.append(parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else "")
+            if not presented or not all(hmac.compare_digest(value.encode("utf-8"), token) for value in presented):
+                self.close_connection = True
+                self._send(401, {"error": {"type": "authentication_error",
+                    "message": "Invalid or missing pool token; use hermes-pool-llm env to configure the client"}})
+                return False
             return True
 
         def log_message(self, fmt, *args):
-            sys.stderr.write("pool-llm: " + (fmt % args) + "\n")
+            # Do not log caller-controlled request lines/headers, even on parse errors.
+            sys.stderr.write("pool-llm: HTTP request handled\n")
 
         def _send(self, code, payload, route=None):
             data = json.dumps(payload).encode()
@@ -691,7 +752,26 @@ def main(argv: Optional[list] = None) -> int:
     s = sub.add_parser("serve", help="local Anthropic/OpenAI-compatible endpoint on the pool")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8765)
+    e = sub.add_parser("env", help="print shell exports for authenticated local SDK clients (contains the token)")
+    e.add_argument("--port", type=int, default=8765)
     args = ap.parse_args(argv)
+
+    if args.cmd in ("env", "serve"):
+        try:
+            if args.cmd == "serve":
+                serve(args.host, args.port)
+            else:
+                if not 1 <= args.port <= 65535:
+                    raise ValueError("port must be between 1 and 65535")
+                token = serve_token()
+                base = f"http://127.0.0.1:{args.port}"
+                for name, value in (("ANTHROPIC_BASE_URL", base), ("ANTHROPIC_API_KEY", token),
+                                    ("OPENAI_BASE_URL", base + "/v1"), ("OPENAI_API_KEY", token)):
+                    print(f"export {name}={shlex.quote(value)}")
+        except (ValueError, OSError) as exc:
+            print(f"hermes-pool-llm: {exc}", file=sys.stderr)
+            return 2
+        return 0
 
     if args.cmd == "models":
         routes = managed_routes()
@@ -700,9 +780,6 @@ def main(argv: Optional[list] = None) -> int:
         for (p, t), models in sorted(routes.items()):
             for m in models:
                 print(f"{p:13} {t:9} {m}")
-        return 0
-    if args.cmd == "serve":
-        serve(args.host, args.port)
         return 0
     if args.cmd == "check":
         ok = True

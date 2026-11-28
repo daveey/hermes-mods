@@ -202,7 +202,8 @@ def test_codex_tools_http_400(monkeypatch):
     srv = servers[0]
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/v1/chat/completions",
-            data=json.dumps(request(model="gpt-test")).encode(), headers={"Content-Type": "application/json"})
+            data=json.dumps(request(model="gpt-test")).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer http-fixture-token"})
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(req, timeout=5)
         assert error.value.code == 400
