@@ -150,13 +150,12 @@ def verdicts(plugin_dir, commands):
     runner = load('dc_runner_' + str(abs(hash(str(plugin_dir)))), plugin_dir.parent / 'tailnet' / 'runner.py')
     result = {}
     for c in commands:
-        try:
-            local = bool(guard.check_shell(c))
-        except Exception:
-            local = True
+        # check_shell's contract is a verdict, not an exception. A crash is not
+        # a hold: the registered local hook actually allows on that boundary.
+        local = bool(guard.check_shell(c))
         try:
             tail = bool(runner.workload_reason(c))
-        except Exception:
+        except ValueError:  # documented public commands() inspection refusal
             tail = True
         result[c] = [local, tail]
     return result
