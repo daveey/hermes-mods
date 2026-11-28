@@ -264,8 +264,12 @@ class FocusFrames(unittest.TestCase):
                         if method == 'Target.createTarget':
                             self.assertEqual(client, [])
                             self.assertEqual(len(upstream), 1)
-                            result = json.loads(hca.read_frame(io.BytesIO(upstream[0]))[3])
-                            self.assertTrue(result['params']['background'])
+                            reader = io.BytesIO(upstream[0])
+                            complete = b''
+                            while reader.tell() < len(upstream[0]):
+                                complete += hca.read_frame(reader)[3]
+                            result = json.loads(complete)
+                            self.assertIs(result['params'].get('background'), True)
                             self.assertTrue(result['params']['newWindow'])
                             self.assertNotIn('focus', result['params'])
                         else:
