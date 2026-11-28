@@ -92,6 +92,7 @@ test('terminal records always release Update now and passive polls stay passive'
     await store.updateNow()
     v = { running_turns: 0, operation }
     await store.refresh()
+    assert.equal(store.$message.get(), operation.phase === 'updated' ? 'Update completed; revision unavailable' : operation.reason)
     await store.updateNow()
     assert.equal(posts, 2)
   }
