@@ -118,6 +118,54 @@ def read_repair():
     return value
 
 
+INVENTORY_LIMIT = 5000
+INVENTORY_TIMEOUT = 2.0
+
+
+async def read_inventory():
+    """Bounded canonical replica read; no direct or sibling-profile database access."""
+    value = await asyncio.wait_for(producer('hub-sync').get_sessions(
+        gateway=None, exclude=None, archived=0, limit=INVENTORY_LIMIT, projection=None),
+        timeout=INVENTORY_TIMEOUT)
+    if hasattr(value, 'body'):
+        value = json.loads(value.body)
+    return value
+
+
+def inventory_complete(value):
+    return (isinstance(value, dict) and value.get('available') is True
+            and not any(value.get(k) for k in ('warming', 'stale', 'offline_since', 'partial', 'has_more', 'truncated'))
+            and isinstance(value.get('sessions'), list)
+            and len(value['sessions']) < INVENTORY_LIMIT
+            and all(isinstance(r, dict) and all(r.get(k) for k in ('gateway', 'profile', 'id'))
+                    for r in value['sessions']))
+
+
+def canonical_inventory_rows(value):
+    # The public session-state-v2 wire lives in outcome.status (status_version 1).
+    # Reuse its canonical consumer validator, not legacy running/status flags.
+    model = producer('session-panel')._load_feed()._model()
+    result = []
+    for raw in obj(value).get('sessions', []):
+        if not isinstance(raw, dict) or not all(raw.get(k) for k in ('gateway', 'profile', 'id')):
+            continue
+        row = session_row({**raw, 'key': raw['id'], 'session_id': raw['id']})
+        outcome = raw.get('outcome')
+        if isinstance(outcome, str):
+            try:
+                outcome = json.loads(outcome)
+            except ValueError:
+                outcome = None
+        status = model.published_status(obj(outcome))
+        identity = obj(obj(status).get('identity'))
+        owned = (identity.get('gateway'), identity.get('profile'), identity.get('session_id')) == (raw['gateway'], raw['profile'], raw['id'])
+        fresh = not raw.get('stale') and not any(obj(value).get(k) for k in ('stale', 'offline_since', 'warming'))
+        row['state'] = status['kind'] if status and owned and fresh and status['coverage']['state'] == 'complete' else 'unknown'
+        row['canonical_status'] = status if owned else None
+        result.append(row)
+    return result
+
+
 async def read_sync():
     value = await producer('hub-sync').get_status()
     if hasattr(value, 'body'):
@@ -156,6 +204,7 @@ class ProducerAdapters:
     """Injection seam; defaults call canonical producer APIs, not sample data."""
     lanes = staticmethod(read_lanes)
     sessions = staticmethod(read_sessions)
+    inventory = staticmethod(read_inventory)
     requests = staticmethod(read_requests)
     repair = staticmethod(read_repair)
     sync = staticmethod(read_sync)
@@ -179,6 +228,13 @@ def obj(value):
     return value if isinstance(value, dict) else {}
 
 
+def session_key(row):
+    route = obj(row.get('route'))
+    if route.get('gatewayId') and route.get('targetProfile') and row.get('session_id'):
+        return '/'.join((route['gatewayId'], route['targetProfile'], row['session_id']))
+    return row.get('session_id') or row['key']
+
+
 def session_row(raw, sid=None):
     raw = obj(raw)
     source = obj(raw.get('source'))
@@ -186,7 +242,7 @@ def session_row(raw, sid=None):
     owner = obj(raw.get('owner'))
     route = obj(raw.get('route'))
     key = sid if source.get('kind') == 'session' else raw.get('key') or raw.get('id') or sid
-    return dict(key=str(key),
+    result = dict(key=str(key),
                 title=raw.get('title') or sid or 'Untitled',
                 state=raw.get('state') or raw.get('status') or 'unknown',
                 session_id=sid, lane=raw.get('lane'),
@@ -196,6 +252,9 @@ def session_row(raw, sid=None):
                        'gatewayId': route.get('gatewayId') or raw.get('gateway') or owner.get('gatewayId'),
                        'profile': route.get('profile') or owner.get('profile') or raw.get('profile'),
                        'targetProfile': route.get('targetProfile') or owner.get('profile') or raw.get('profile')})
+    if sid and key == sid:
+        result['key'] = session_key(result)
+    return result
 
 
 def valid_request(request, sid):
@@ -357,7 +416,7 @@ def telemetry_view(lanes, telemetry, machinery_count):
             'governors': lanes.get('governors')}
 
 
-def project(lanes, panel, requests, telemetry, sources, *, q='', lane=''):
+def project(lanes, panel, requests, telemetry, sources, *, q='', lane='', inventory=None):
     rows, human, machinery, chains = {}, {}, {}, {}
     for raw in obj(lanes).get('cards', []):
         row = session_row(raw)
@@ -367,23 +426,25 @@ def project(lanes, panel, requests, telemetry, sources, *, q='', lane=''):
             machinery[row['key']] = row
         if obj(raw.get('source')).get('kind') == 'session':
             sid = row['session_id']
-            rows.setdefault(sid, {**row, 'key': sid})
+            rows.setdefault(row['key'], row)
             if raw.get('reason') == 'run':
-                rows[sid]['state'] = 'running'
+                rows[row['key']]['state'] = 'running'
     bundles = obj(panel).get('bundles', {})
     for sid, held in bundles.items():
         bundle = obj(held.get('bundle', held))
-        previous = rows.get(sid, {})
-        row = {**previous, **session_row({**obj(bundle.get('session')), 'session_id': sid}, sid)}
+        metadata = {k: bundle[k] for k in ('gateway', 'profile', 'owner', 'route', 'title') if k in bundle}
+        current = session_row({**metadata, **obj(bundle.get('session')), 'session_id': sid}, sid)
+        previous = rows.get(current['key'], {})
+        row = {**previous, **current}
         row['route'] = {**obj(previous.get('route')), **{k: v for k, v in row['route'].items() if v is not None}}
         sections = obj(obj(bundle.get('model')).get('sections'))
-        inferred = 'running' if sections.get('running') else rows.get(sid, {}).get('state', 'unknown')
+        inferred = 'running' if sections.get('running') else previous.get('state', 'unknown')
         row['state'] = obj(bundle.get('wait')).get('wait_state') or (row['state'] if row['state'] != 'unknown' else inferred)
         if row.get('lane') is None:
-            row['lane'] = rows.get(sid, {}).get('lane')
-        rows[sid] = row
+            row['lane'] = previous.get('lane')
+        rows[row['key']] = row
         for raw in bundle.get('tasks', []):
-            task = session_row(raw, sid)
+            task = session_row({**metadata, **raw}, sid)
             wait = obj(raw.get('wait'))
             governor = raw.get('governor') or wait.get('governor')
             is_human = (wait.get('wait_state') == 'human' or raw.get('wait_state') == 'human'
@@ -401,11 +462,13 @@ def project(lanes, panel, requests, telemetry, sources, *, q='', lane=''):
             prerequisite = raw.get('prerequisite') or wait.get('prerequisite')
             if chain_waiter and not is_human and isinstance(prerequisite, dict):
                 parent = session_row(prerequisite)
-                if prerequisite.get('session_id'):
-                    parent['key'] = prerequisite['session_id']
+
                 chain = chains.setdefault(parent['key'], {'key': parent['key'], 'prerequisite': parent, 'waiters': []})
                 if task['key'] not in {r['key'] for r in chain['waiters']}:
                     chain['waiters'].append(task)
+    for row in inventory or []:
+        previous = rows.get(row['key'], {})
+        rows[row['key']] = {**previous, **row, 'lane': row.get('lane') or previous.get('lane')}
     for sid, candidates in obj(requests).items():
         if not isinstance(candidates, list):
             continue
@@ -413,17 +476,24 @@ def project(lanes, panel, requests, telemetry, sources, *, q='', lane=''):
             lineage = obj(obj(bundles.get(sid)).get('bundle', bundles.get(sid))).get('lineage', [sid])
             owner_sid = obj(request.get('owner')).get('storedSessionId')
             if owner_sid in {sid, *lineage} and valid_request(request, owner_sid):
-                row = {**rows.get(sid, session_row({}, sid)), 'key': 'request:' + request['requestId'],
+                owner = request['owner']
+                base = next((r for r in rows.values() if r['session_id'] == sid
+                             and r['route'].get('gatewayId') == owner['gatewayId']
+                             and r['route'].get('targetProfile') == owner['profile']), None)
+                row = {**(base or session_row({}, sid)), 'route': dict((base or {}).get('route', {})),
+                       'key': 'request:' + request['requestId'],
                        'session_id': owner_sid,
                        'title': request.get('title') or rows.get(sid, {}).get('title') or sid,
                        'state': 'human', 'request': request}
                 owner = request['owner']
                 row['route'].pop('connectionId', None)
                 row['route'].update(gatewayId=owner['gatewayId'], profile=owner['profile'], targetProfile=owner['profile'])
+                if inventory is not None:
+                    row['key'] = '/'.join((owner['gatewayId'], owner['profile'], row['key']))
                 human[row['key']] = row
     # A human session itself need not have a task.
     for sid, row in rows.items():
-        if row['state'] == 'human' and not any(r['session_id'] == sid for r in human.values()):
+        if row['state'] == 'human' and not any(session_key(r) == session_key(row) for r in human.values()):
             human[row['key']] = row
     for signal in machinery_signals(telemetry):
         key = signal['key']
@@ -445,13 +515,14 @@ def project(lanes, panel, requests, telemetry, sources, *, q='', lane=''):
     def matches(row):
         return (not lane or row.get('lane') == lane) and (not q or q.casefold() in (str(row.get('title', '')) + ' ' + str(row.get('session_id', ''))).casefold())
     def counts(h, m, s, filtered=False):
-        census = known.get('session-panel') and known.get('lanes') and status_complete
+        census = (known.get('session-panel') and known.get('lanes') and status_complete
+                  and known.get('session-inventory', True))
         visible_chains = [c for c in chains.values() if not filtered or matches(c['prerequisite']) or any(matches(w) for w in c['waiters'])]
         prerequisites = {c['prerequisite']['key']: c['prerequisite'] for c in visible_chains}
         return {'human': len(h) if census and known.get('user-steps') else None,
                 'machinery': len(m) if census and governors_complete and all(known.get(n) for n in ('session-repair', 'sync', 'auth')) else None,
                 'sessions': len(s) + len(prerequisites) if census else None,
-                'running': sum(r['state'] == 'running' for r in [*s, *prerequisites.values()]) if census else None}
+                'running': sum(r['state'] == 'running' for r in [*s, *prerequisites.values()]) if census and all(r['state'] != 'unknown' for r in [*s, *prerequisites.values()]) else None}
     h, m, s = list(human.values()), list(machinery.values()), list(rows.values())
     totals = counts(h, m, s)
     h, m, s = ([r for r in group if matches(r)] for group in (h, m, s))
@@ -486,6 +557,19 @@ async def snapshot(*, q='', lane='', adapter=None):
     lanes, panel, repair, sync, auth = await asyncio.gather(
         read('lanes', adapter.lanes), read('session-panel', adapter.sessions),
         read('session-repair', adapter.repair), read('sync', adapter.sync), read('auth', adapter.auth))
+    inventory = None
+    # An absent optional seam denotes an explicitly injected, scoped fixture.
+    # Defaults always require the global authority, even when offline or warming.
+    if hasattr(adapter, 'inventory'):
+        value = await read('session-inventory', adapter.inventory)
+        source = next(s for s in sources if s['name'] == 'session-inventory')
+        complete = inventory_complete(value)
+        try:
+            inventory = await _invoke(canonical_inventory_rows, value) if obj(value).get('sessions') else []
+        except Exception:
+            inventory, complete = [], False
+        if not complete:
+            source.update(state='unknown', reason='global session inventory unavailable or partial')
     # Older fixture adapters may omit telemetry; absence stays named unknown,
     # rather than falling through to a real host read from an injected fixture.
     hub, runners, subscription = await asyncio.gather(
@@ -515,7 +599,7 @@ async def snapshot(*, q='', lane='', adapter=None):
     sources.append({'name': 'governors', 'state': 'healthy' if obj(governors).get('available') else 'unknown'})
     result = project(lanes, panel, requests, {'repair': repair, 'sync': sync, 'auth': auth,
                      'hub': hub, 'runners': runners, 'subscription': subscription},
-                     sorted(sources, key=lambda s: s['name']), q=q, lane=lane)
+                     sorted(sources, key=lambda s: s['name']), q=q, lane=lane, inventory=inventory)
     result['cursor'] = hashlib.sha256(json.dumps(result, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     result['generated_at'] = time.time()
     return result
