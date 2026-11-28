@@ -51,6 +51,9 @@ gateway) plus the live cards on their dependency/awaiting chain (the session-pan
   (else 45 min) + 15 min; a merge queue within the window; an awaited card that is itself open and predicted; or a
   fresh core probe/watch receipt. A cardless chat whose processes' window is open.
 - `clock_not_due`: a clock park with a reason and a future wake (due at wake_at + 10 min, not +30 min).
+- `long_wait`: a CI/deploy/external/resource park past its deadline (or one awaiting a card this host can't read).
+  That is BS-long-wait's call (its probe/watch receipts and nudge cadence), so it is never a BS-no-progress miss: on
+  the first hub shadow pass every such "miss" was a park BS-long-wait had already judged healthy.
 - `pending`: nothing healthy, but nothing due yet (a first window).
 
 ## 3. Acceptable terminal

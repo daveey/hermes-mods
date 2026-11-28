@@ -2,6 +2,7 @@
 shadow (log only) whatever mode / nudge_mode say until config.json `shadow_rules` drops it."""
 import json
 import subprocess
+from types import SimpleNamespace
 
 from sr_helpers import PLUGIN, load
 
@@ -79,6 +80,34 @@ def test_ending_the_soak_routes_the_rule_like_any_other(tmp_path, monkeypatch):
     rows = lines(tmp_path / 'session-repair' / 'actions-shadow.jsonl')
     assert [(r['rule'], r['would']) for r in rows] == [('BS-no-progress', 'file')], 'the ordinary path took it'
     assert out['handed'] == ['BS-no-progress:default/t_00000000000000aa']
+
+
+def test_rollback_to_shadow_holds_a_pending_live_nudge_without_waking(tmp_path, monkeypatch):
+    """Review B1: a BS-no-progress nudge left pending while the rule was live must not be recovered (receipt
+    readback + owner wake) once the rule is back in shadow_rules, even on a tick with no findings."""
+    nudge = load('_sr_nudge_rollback', PLUGIN / 'nudge.py')
+    monkeypatch.setattr(run, 'load_nudge', lambda: nudge)
+    f = np_finding('nudge', 'missed_once')
+    sd = tmp_path / 'session-repair'
+    config(tmp_path, mode='live', nudge_mode='live')
+    pending = {'text': '[session-repair] No progress seen', 'at': 1000.0, 'finding': f}
+    (sd / 'nudges-live.json').write_text(json.dumps({'fps': {f['fingerprint']: {'times': [], 'pending': pending}},
+                                                     'sent': [1000.0]}))
+    touched = []
+    monkeypatch.setattr(nudge, 'receipt', lambda *a: touched.append('receipt') or {'comment_id': 5})
+    monkeypatch.setattr(nudge, 'wake_owner', lambda *a: touched.append('wake') or {'outcome': 'woken', 'event_id': 9})
+    monkeypatch.setattr(nudge, 'settle_unknown', lambda *a: touched.append('settle') or {'outcome': 'delivery_unknown'})
+    boom = Boom()
+    run.tick(home=tmp_path, scanner=scan_with([]), runner=boom, now=2000.0, run_mode='live')
+    assert touched == [] and boom.calls == []
+    state = json.loads((sd / 'nudges-live.json').read_text())
+    assert state['fps'][f['fingerprint']]['pending'] == pending, 'custody kept exactly'
+    # control: once the rule is live again the same pending delivery is recovered as before
+    config(tmp_path, mode='live', nudge_mode='live', shadow_rules=[])
+    monkeypatch.setattr(run, 'load_scan', lambda: SimpleNamespace(Sources=lambda: None))
+    run.tick(home=tmp_path, scanner=scan_with([]), runner=boom, now=3000.0, run_mode='live')
+    assert 'receipt' in touched and 'wake' in touched
+    assert 'pending' not in json.loads((sd / 'nudges-live.json').read_text())['fps'][f['fingerprint']]
 
 
 def test_malformed_shadow_rules_keeps_the_soak(tmp_path):

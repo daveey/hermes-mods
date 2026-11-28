@@ -543,7 +543,7 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
         nm = load_nudge().config_mode(home)
         actions, escalations, nm = load_nudge().process(
             nudges,home=home,now=now,scan=load_scan(),runner=runner,argv=hermes_argv(),
-            read_json=_read_json,write_json=_write_json,append=_append)
+            read_json=_read_json,write_json=_write_json,append=_append,hold=soaking)
         ordinary = [f for f in findings if (f.get('fix') or {}).get('kind')!='nudge']
         held_back = []
         allowed = live_rules(home) if m == 'live' else None

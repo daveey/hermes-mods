@@ -360,7 +360,12 @@ on all the sessions." The judgment is the [`session-progress`](../../skills/devo
   parents (dependent) or promotion by parents done + 10 min; bare process → log grows by +30 min. A carried
   prediction keeps its deadline while the card's state key is unchanged; a miss re-arms it a full window later.
 - **Verdicts** per chat: `baseline`, `progress`, `valid_red`, `healthy_running`, `healthy_wait`, `clock_not_due`,
-  `pending`, `missed_once`, `missed_twice`, `process_only`. Counts go to every `ticks.jsonl` row (`progress`).
+  `long_wait`, `pending`, `missed_once`, `missed_twice`, `process_only`. Counts go to every `ticks.jsonl` row (`progress`).
+- **Overdue producer parks are BS-long-wait's**: a CI/deploy/external/resource park (or one on a card this host
+  cannot read) past its deadline, or any park with a fresh park-bound producer receipt (core `healthy_future_park`),
+  is never a BS-no-progress miss: BS-long-wait judges it with its probe/watch receipts and nudge cadence. The chat is
+  labelled `long_wait` (or `healthy_wait`). Found in the first hub shadow pass: 18 of 18 `missed_once` were such
+  parks that BS-long-wait had already judged healthy.
 - **Rollout**: `config.json` `shadow_rules` (default `["BS-no-progress"]`) keeps the rule log-only whatever `mode`
   and `nudge_mode` say: each finding is logged to `actions-shadow.jsonl` as `outcome: rule_shadow`, `would:
   nudge|file`, every tick (no Seen mark). After 24 h of adjudicated shadow rows set `"shadow_rules": []`; then
