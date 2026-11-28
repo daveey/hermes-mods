@@ -170,6 +170,67 @@ class Semantics(unittest.TestCase):
             store.reconcile([a,b],['ci'],'v2',{},[])  # unchanged incoming still heals
             self.assertEqual(store.view('ci',0,10000)['n'],2)
 
+    def test_legacy_prior_day_same_identity_and_unrelated_day_are_healed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            def row(key, start):
+                return dict(id=key,metric='ci',start=start,dur_ms=10,host='h',gateway='g')
+            corrected = row('same',2*86400+100)
+            # Establish migration without the identity; a stale generation can
+            # then append that identity on a different UTC day.
+            store.reconcile([],['ci'],'v2',{},[])
+            store.ingest([row('same',86400+100)])
+            store.reconcile([corrected],['ci'],'v2',{},[])
+            view = store.view('ci',0,5*86400)
+            self.assertEqual(view['n'],1)
+            self.assertEqual([(s['id'],s['start']) for s in view['slowest']],
+                             [('same',corrected['start'])])
+            store.ingest([row('legacy-unmatched',4*86400+100)])
+            # No changed contribution can add the stale day to refill groups.
+            self.assertEqual(store.reconcile([corrected],['ci'],'v2',{},[]),0)
+            view = store.view('ci',0,5*86400)
+            self.assertEqual(view['n'],1)
+            self.assertEqual([(s['id'],s['start']) for s in view['slowest']],
+                             [('same',corrected['start'])])
+
+    def test_reconcile_exact_daily_top_twenty_after_revisions_and_moves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            rows = [dict(id=f'sample-{i:02}',metric='ci',start=100+i,
+                         dur_ms=i+1,host='h',gateway='g') for i in range(30)]
+            store.reconcile(rows,['ci'],'v2',{},[])
+            updated = [dict(r,start=r['start']+86400) if i%3==0 else
+                       dict(r,dur_ms=100-i) for i,r in enumerate(rows)]
+            store.reconcile(updated,['ci'],'v2',{'at':1},[])
+            for day in (0,86400):
+                expected = sorted([r for r in updated if day<=r['start']<day+86400],
+                                  key=lambda r:(-r['dur_ms'],r['id']))[:20]
+                # Inspect persisted daily groups, not view's global LIMIT 20:
+                # the latter could conceal a refill accidentally storing 21.
+                with store._connection() as db:
+                    actual = db.execute('SELECT id,start,dur FROM slow WHERE metric=? AND day=? ORDER BY dur DESC,id',
+                                        ('ci',day)).fetchall()
+                self.assertEqual(actual,[(r['id'],r['start'],r['dur_ms']) for r in expected])
+            # Refill a single >20 group too, so LIMIT 21 cannot hide behind moves.
+            store.reconcile(rows,['ci'],'v2',{'at':2},[])
+            with store._connection() as db:
+                actual = db.execute('SELECT id FROM slow WHERE metric=? AND day=0 ORDER BY dur DESC,id',('ci',)).fetchall()
+            self.assertEqual(actual,[(r['id'],) for r in sorted(rows,key=lambda r:(-r['dur_ms'],r['id']))[:20]])
+
+    def test_cross_metric_observed_identity_refuses_and_rolls_back_all_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            row = dict(id='foreign',metric='other',start=100,dur_ms=10,host='h',gateway='g')
+            store.reconcile([row],['other'],'other-source',{'at':1},[])
+            def snapshot():
+                with store._connection() as db:
+                    return {name:db.execute(f'SELECT * FROM {name} ORDER BY 1').fetchall()
+                            for name in ('hist','slow','contributions','identities','metadata','cursors')}
+            before = snapshot()
+            with self.assertRaisesRegex(ValueError,'identity belongs to another metric'):
+                store.reconcile([],['ci'],'v2',{'at':2},['foreign'])
+            self.assertEqual(snapshot(),before)
+
     def test_sweep_advances_across_successful_cycles(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
