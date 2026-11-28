@@ -87,6 +87,34 @@ test('aged parked board data keeps its status and age in the panel and task chip
 })
 
 const cases = { ...publicCases, ...privateCases }
+for (const variant of ['settled', 'backfill', 'stale', 'original']) {
+ test(`retained disposition real adapter paints settled non-success ${variant} through client expiry`, { skip: !cases[`retained_${variant}`] }, async () => {
+  const { model, now } = cases[`retained_${variant}`]
+  for (const expired of [false, true]) {
+   const shown = expired ? m.expireNativeWaits({ ...model, freshness: { computed_at: now, ttl_s: 60, trusted: true } }, now + 61, true) : model
+   await paint(m.renderModel(shown, { now: now + (expired ? 61 : 0) }))
+   const text = document.querySelector('[data-row-detail]').textContent
+   assert.ok(text.startsWith('stopped · incomplete · evidence retained · no action needed'), text)
+   assert.doesNotMatch(text, /owner has not decided|waiting on|reviewer escalated/)
+   assert.equal(shown.sections.done.length, 0)
+   if (expired || variant === 'stale') {
+    assert.match(text, /last recorded disposition; current status unknown/)
+    assert.equal(shown.sections.waiting[0].evidence_state, 'unknown')
+    assert.equal(shown.sections.waiting[0].wait_kind || null, null)
+   }
+  }
+ })
+}
+for (const variant of ['pending', 'newer', 'human', 'missing']) {
+ test(`retained disposition does not hide ${variant}`, { skip: !cases[`retained_${variant}`] }, async () => {
+  const { model, now } = cases[`retained_${variant}`]
+  await paint(m.renderModel(model, { now }))
+  const rows = Object.values(model.sections).flat()
+  assert.ok(rows.every(row => !row.retained_disposition))
+  if (variant === 'pending') assert.match(document.querySelector('[data-row-detail]').textContent, /owner has not decided/)
+  if (variant === 'human') assert.equal(model.sections.needs_you.length, 1)
+ })
+}
 for (const age of [599, 600, 601, 6 * 86400]) {
  test(`real CoreReaders -> reducer -> panel/chip: triage age ${age}`, { skip: !cases[`composed_triage_${age}`] }, async () => {
   const { model, now } = cases[`composed_triage_${age}`]

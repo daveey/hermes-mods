@@ -640,7 +640,9 @@ export function expireNativeWaits(model, now, vouched) {
     const { attention: _overdue, last_wait_kind: _category, ...old } = clockRow(row, now)  // stale evidence never claims fresh operational red
     sections.waiting.push({ ...old, reason: 'source-stale', evidence_state: 'unknown',
       // A row the reducer already made historical keeps its one "status unknown · last known:" prefix.
-      detail: /^status unknown\b/.test(str(old.detail)) ? old.detail : `status unknown · last known: ${old.detail || key}`,
+      detail: old.retained_disposition?.text
+        ? `${old.retained_disposition.text} · last recorded disposition; current status unknown`
+        : /^status unknown\b/.test(str(old.detail)) ? old.detail : `status unknown · last known: ${old.detail || key}`,
       details: ['Task source freshness: stale; read current authoritative task state before acting.'],
       actions: row.actions.filter(a => ['open_card', 'open_session', 'open_url', 'open_process'].includes(a.kind)),
       options: [], decision: old.decision, wait_kind: null, wait_eta: null, clock_text: null,

@@ -906,6 +906,27 @@ def agent_hold_text(row, bundle):
     return (cause + ' · ' if cause else '') + "waiting on this chat's agent to decide: " + reason
 
 
+RETAINED_TEXT = 'stopped · incomplete · evidence retained · no action needed'
+
+
+def retained_disposition(row, detail):
+    """Core's full-history, origin-ordered receipt, never the clipped/review event tail.
+
+    This is a recorded non-success disposition, not a current execution lease.
+    An available hydrated snapshot must explicitly carry the receipt; an older
+    listed receipt cannot fill its absence after renewal or execution.
+    """
+    source = obj(detail.get('task')) if detail else row
+    stop = obj(source.get('retained_stop'))
+    if (row.get('status') != 'triage' or source.get('status') != 'triage'
+            or stop.get('reason') != 'scope_stopped'
+            or not all(isinstance(stop.get(k), str) and stop[k] for k in ('episode_uid', 'event_uid'))
+            or any(row.get(k) or source.get(k) for k in ('current_run_id', 'claim_lock', 'claim_expires', 'human_request'))
+            or human_owned(row)):
+        return None
+    return {'text': RETAINED_TEXT, 'episode_uid': stop['episode_uid'], 'event_uid': stop['event_uid']}
+
+
 def ask(row, request=None):
     request = request or {}
     hr = obj(row.get('human_request'))
@@ -1132,6 +1153,16 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         seen.add(k)
         v = row_view(row)
+        retained = retained_disposition(row, detail)
+        if retained and not live_request(row):
+            stale = row.get('stale') or row.get('partial_source_unknown')
+            v.update(retained_disposition=retained, detail=retained['text'], evidence_state='unknown')
+            v['details'].append('Recorded scope stop; original acceptance incomplete. Evidence retained; no pending decision or execution authorized.')
+            if stale:
+                v['detail'] += ' · last recorded disposition; current status unknown'
+                v['details'].append('Task source freshness: stale or unavailable; this recorded disposition does not establish current execution.')
+            sections['waiting'].append(v)
+            continue
         parent = obj(row.get('upstream'))
         if parent.get('id'):
             v['details'].append(f'Parent card: {parent["id"]} ({parent.get("status") or "status unknown"})')
@@ -1489,7 +1520,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 source_row = rows_by_key.get(view['key'], {})
                 if triage_overdue(source_row, bundle, now):
                     view['attention'] = 'triage_overdue'
-                    view['detail'] = 'overdue triage · ' + view.get('detail', '')
+                    view['detail'] = (view.get('detail', '') + ' · overdue triage' if view.get('retained_disposition')
+                                      else 'overdue triage · ' + view.get('detail', ''))
                     aged_keys.add(view['key'])
                     if section != 'stuck':
                         views.remove(view)
