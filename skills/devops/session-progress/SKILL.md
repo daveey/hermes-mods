@@ -18,14 +18,17 @@ metadata:
 
 # Session progress: is this chat moving forward?
 
-[daveey 2026-11-27] "make a skill that measures, looks at a session, and makes sure that it is moving forward. It
-then makes predictions about what it expects to see from this session in half an hour ... if a session has
-finished cards since then, then it's making progress. If there is at least one task that is actively running or
-waiting for an external source that's actively running, then that's a good sign."
+The hub's deterministic `BS-no-progress` tick (`plugins/session-repair/progress.py`) checks chats every 15 min
+and predicts evidence due in the next window. Update this skill with any rule change.
 
-The hub's `session-repair` tick runs this judgment on every chat every 15 min (`BS-no-progress` in
-`plugins/session-repair/progress.py`, deterministic, no model call). Use this skill to judge one chat by hand, to
-read the snapshot the tick wrote, or to change the rule (change the code and this file together).
+## Report progress against the requested outcome
+
+Read current delivery state before reporting. Lead with what works, what remains unfinished, the concrete blocker
+and who acts next—not routing receipts. Name a resumed run's authorized phase: "deployment verification is running"
+is not "the migration is unstuck." Separate completed implementation, deployment, reconciliation and end-to-end
+acceptance. Treat census counts as last-verified unless freshly measured. On repeated "what is happening?" questions,
+replace renewal-by-renewal narration with the remaining acceptance and discriminating next deliverable. Cite the
+underlying refusal/error receipt before explaining a restriction; a summary label alone does not explain its cause.
 
 ## What a session is
 
