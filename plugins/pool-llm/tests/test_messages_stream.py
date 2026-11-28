@@ -90,7 +90,7 @@ def endpoint(monkeypatch):
         connections.append(conn)
         conn.request('POST', path, json.dumps({'model': 'claude-test', 'max_tokens': 64,
             'messages': [{'role': 'user', 'content': 'hello'}], 'stream': True, **extra}),
-            {'Content-Type': 'application/json'})
+            {'Content-Type': 'application/json', 'x-api-key': 'http-fixture-token'})
         return conn.getresponse()
     yield NS(request=request, plans=plans, calls=calls, streams=streams, pool=pool, clients=clients)
     for conn in connections:

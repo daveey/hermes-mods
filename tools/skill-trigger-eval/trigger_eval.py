@@ -8,7 +8,8 @@
     trigger_eval.py cost --variant a=overrides.json ...  # index tokens per format (one probe call each)
 
 Router calls go to an Anthropic-compatible endpoint: start `hermes-pool-llm serve --port 8791` and pass
---base-url http://127.0.0.1:8791 (default). Run with any Python that has PyYAML; core is only used in children.
+--base-url http://127.0.0.1:8791 (default). First eval "$(hermes-pool-llm env --port 8791)" to export
+the private ANTHROPIC_API_KEY and loopback URLs. Run with any Python that has PyYAML; core is only used in children.
 """
 from __future__ import annotations
 
@@ -316,7 +317,7 @@ def main(argv=None) -> int:
     p.add_argument("--core", default=str(render_index.DEFAULT_CORE), help="core checkout that renders the index")
     p.add_argument("--live-core", default=str(render_index.DEFAULT_CORE), help="installed core (ownership, baseline)")
     p.add_argument("--home", default=str(render_index.DEFAULT_HOME))
-    p.add_argument("--base-url", default=os.environ.get("STE_BASE_URL", "http://127.0.0.1:8791"))
+    p.add_argument("--base-url", default=os.environ.get("STE_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL", "http://127.0.0.1:8791"))
     p.add_argument("--model", default="claude-opus-5-5")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("index")

@@ -77,7 +77,7 @@ def _serve(monkeypatch):
 
 def _post(port, body):
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/embeddings", data=json.dumps(body).encode(),
-                                 headers={"content-type": "application/json"})
+                                 headers={"content-type": "application/json", "Authorization": "Bearer http-fixture-token"})
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, json.loads(r.read())
