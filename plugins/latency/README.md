@@ -143,6 +143,55 @@ fails, the minute collector can replay it. The Desktop sender owns offline
 buffering/drop after one hour. This backend does not manufacture historical UI
 samples: session-switch and new-session-ready stay null until instrumented.
 
+## Grafana-ready transport
+
+All existing legacy span clients remain supported. `POST /v1/spans` also accepts
+OpenTelemetry spans under the same `{spans:[...]}` envelope:
+
+```json
+{"trace_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","span_id":"bbbbbbbbbbbbbbbb","name":"ui.session_switch","start_time_unix_nano":"1795300000120000000","end_time_unix_nano":"1795300000962000000","attributes":{"host.name":"desktop","service.name":"hermes-desktop","hermes.session_id":"session-id"}}
+```
+
+Timestamps are decimal strings (uint64 nanoseconds, no floating-point ID/time
+loss). Trace/span IDs are nonzero lowercase 32/16 hex; `parent_span_id` is
+optional. Permitted attributes: `host.name`, `service.name`, `hermes.gateway`,
+`hermes.session_id`, `hermes.card_id`, `hermes.pr`, `hermes.run_id`, `hermes.phase`.
+Only short safe identifier strings are accepted; unknown fields are rejected.
+
+`POST /api/plugins/latency/v1/otlp/traces` accepts OTLP/HTTP JSON
+`resourceSpans[].scopeSpans[].spans[]`, including resource-level string attrs.
+It shares the same limits, validation, durable journal and aggregation path.
+Sample IDs are `trace_id:span_id` for OTel clients, preserved across both doors.
+Legacy IDs stay stable; missing trace IDs derive deterministically from event ID.
+`latency.span(..., trace_id=..., parent_span_id=...)` yields the joinable context
+and preserves it in the journal and slow samples.
+
+`GET /api/plugins/latency/v1/metrics` returns Prometheus text exposition:
+`hermes_latency_seconds_bucket{metric,host,le}`, `_sum`, `_count`, and
+`hermes_latency_p90_seconds{metric,range="24h"}`. These reconstruct retained
+rolling **90-day** histograms, not process-lifetime counters; retention and source
+reconciliation can decrease them. `_sum` reconstructs bucket upper edges (at
+most 0.5% error), because old histograms do not retain exact sums. Use the p90
+gauge for dashboards, not `rate()` on this rolling projection. Milliseconds are
+converted to seconds. Only metrics with samples are exposed.
+
+### Optional exporter — off by default
+
+The only exporter setting is `latency.otlp_export_url`, default empty. Configure
+it using `hermes config set latency.otlp_export_url <collector-url>` only when
+you intend to send identifiers off-host. Empty means no outbound request.
+The configured HTTP(S) endpoint receives OTLP JSON via a background queue of at
+most 32 batches (256 KiB each), a 2-second timeout and **no retries**. Overflow
+and transport failures drop export, never ingestion; redirects are not followed.
+No exporter credentials, URL query, prompts or response bodies are logged.
+This deliberately adds no OTel SDK dependency.
+
+`GET /v1/ledger?range=24h|7d|30d|90d` is the Desktop view model: server-owned
+ordered groups/statuses plus `chip.over_target_count`, eight calendar days of
+first-reply history and five worst-by-target metrics. Authenticated
+`/v1/events?range=...` pushes changed views and reuses canonical dashboard WS
+authentication, failing closed when it is unavailable.
+
 ## Tests
 
 Run on a pool worker: `scripts/test-all -k latency` (includes repo-guards), then
