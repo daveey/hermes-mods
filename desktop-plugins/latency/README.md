@@ -22,9 +22,19 @@ connection's default profile, not whichever chat is focused.
 ## UI span transport
 
 Listens for renderer-local SDK event `desktop.ui_latency`, whose payload is
-`{name,start_ms,duration_ms,session_id?,card_id?,pr?,host?,gateway?,trace_id?,parent_span_id?}`.
+`{name,start_ms,duration_ms,session_id?,card_id?,profile?,board?,gateway?,trace_id?,parent_span_id?}`.
 The accurate visual endpoint probes belong in core; the plugin does **not** infer
-paint from a REST response or a focused-session atom change.
+paint from a REST response or a focused-session atom change. Session switches end
+only after the matching runtime transcript commits visibly and crosses two animation
+frames; new sessions require the matching visible editable composer. Superseded,
+hidden, failed or >15-second attempts are dropped. Async completions carry an
+attempt token, so an older request cannot finish a newer click.
+
+`user-steps` uses the same optional SDK controls for `ui.decision_submit`: an actual
+user submission ends when its decision POST returns an operation recording receipt,
+not when downstream agent delivery finishes. Retries/recovery polls are not new
+click samples. Old core without these controls continues submitting normally.
+Neither request/answer text nor choice labels enter the timing payload.
 
 Web Crypto makes valid trace/span IDs with no OTel SDK dependency. Only metric IDs,
 clock values and safe identifier attributes are serialized. Batches of at most

@@ -7,6 +7,7 @@
  * Withdrawn (moot) asks leave the queue; "Not needed" withdraws an undecided ask
  * on its owner without deciding it, so nothing is sent to the agent.
  */
+import * as latencySdk from '@hermes/plugin-sdk'
 import { COMPOSER_AREAS, TRANSCRIPT_DIRECTIVE_AREA, host, useValue, MessageTextContent } from '@hermes/plugin-sdk'
 import { useEffect, useState, useRef } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -406,6 +407,22 @@ export function StepBox({ attrs, streaming, deps }) {
 }
 
 const rowStyle = { display: 'flex', flexDirection: 'column', gap: 4, padding: '6px 0', borderTop: '1px solid color-mix(in srgb, var(--border, #8884) 60%, transparent)' }
+
+// Optional on older Desktop builds. Never let telemetry change decision submission or retain answer text.
+export function decisionTiming(owner) {
+  const name = 'ui.decision_submit'
+  let token
+  try {
+    if (typeof latencySdk.startUiLatency === 'function') token = latencySdk.startUiLatency(name, {
+      gateway: owner.gatewayId, profile: owner.profile, session_id: owner.storedSessionId,
+    })
+  } catch { /* telemetry is best effort */ }
+  const invoke = method => {
+    if (token === undefined) return
+    try { latencySdk[method]?.(name, ...(method === 'completeUiLatency' ? [{}, token] : [token])) } catch { /* telemetry is best effort */ }
+  }
+  return { complete: () => invoke('completeUiLatency'), cancel: () => invoke('cancelUiLatency') }
+}
 
 // Canonical v2 decisions. The server, not composer text or card status, records authorization.
 export const requestKey = r => r?.owner?.gatewayId && r?.owner?.profile && r?.requestId
@@ -859,6 +876,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
     if (!decision) return check()
     try { rememberIntent(key, decision) } catch { update({ error: 'Cannot retain a safe retry key. Check browser storage before submitting.' }); return }
     update({ phase: 'submitting', decision, error: '' }) // synchronous shared lock prevents a double click/two tiles
+    const timing = !retry ? decisionTiming(r.owner) : null
     let posted = false
     try {
       if (retry) {
@@ -868,8 +886,10 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
       }
       const result = await call(`${BASE}/requests/${encodeURIComponent(r.requestId)}/decisions`, { ...route, method: 'POST', body: decision })
       posted = true
-      if (!currentRoute(route)) return
       if (!operationId(result?.operation)) throw Error('Missing operation receipt; outcome unknown')
+      // End on the authoritative recording receipt, before a separate delivery read (not paint).
+      timing?.complete()
+      if (!currentRoute(route)) return
       update({ operation: result.operation, phase: 'checking' })
       // Recording is authoritative even if the subsequent delivery read is slow or lost.
       // This does not promote the operation to delivered or permit a second decision.
@@ -901,6 +921,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
       } catch { /* explicit unknown below */ }
       update({ phase: 'unknown', error: `Outcome unknown: ${e.message}. Check status or retry safely.` })
     } finally {
+      timing?.cancel() // identity fenced: a failed/unknown request cannot cancel a newer click
       // The decision was recorded (the POST answered), whatever the delivery read says: the card may have changed.
       if (posted) refreshBlockedAfterAction()
     }
