@@ -3,7 +3,8 @@
 Positive values use logarithmic buckets with ratio 1.005 (upper-edge error
 at most 0.5%); zero has its own bucket. Queries select whole UTC hours
 intersecting [since, until), then label those hours in the requested timezone.
-Only identities and the slowest 20 events per metric/UTC day retain raw data.
+Only identities, mutable board/CI contributions and the slowest twenty events
+per metric/UTC day retain minimal identifier data (never transcript bodies).
 """
 from collections import defaultdict
 from contextlib import contextmanager
@@ -104,6 +105,9 @@ class Store:
                 CREATE INDEX IF NOT EXISTS slow_group ON slow(metric,day,dur);
                 CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE IF NOT EXISTS contributions(id TEXT PRIMARY KEY,
+                    metric TEXT, host TEXT, start REAL, dur REAL, sample TEXT);
+                CREATE INDEX IF NOT EXISTS contributions_day ON contributions(metric,start,dur);
             ''')
 
     @contextmanager
@@ -144,6 +148,67 @@ class Store:
                 db.execute('INSERT OR REPLACE INTO cursors VALUES (?,?)', (source, encoded_cursor))
         return inserted
 
+    def reconcile(self, samples, metrics, source, cursor, observed_ids):
+        """Replace mutable logical observations, atomically migrating legacy metrics.
+
+        Unlike append-only spans, board completions and Actions reruns can change.
+        Retain their minimal contributions so old buckets can be retracted and
+        the true daily slowest twenty rebuilt. Never clear unrelated metrics.
+        The collector singleton lock must cover source read through this commit.
+        """
+        samples = [_sample(s) for s in samples]
+        metrics = set(metrics)
+        if any(s['metric'] not in metrics for s in samples):
+            raise ValueError('sample outside reconciled metrics')
+        encoded = json.dumps(cursor, allow_nan=False)
+        incoming = {s['id']: s for s in samples}
+        observed_ids = set(observed_ids) | incoming.keys()
+        changed, groups = 0, set()
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('''CREATE TABLE IF NOT EXISTS contributions(id TEXT PRIMARY KEY,
+                metric TEXT, host TEXT, start REAL, dur REAL, sample TEXT)''')
+            db.execute('CREATE INDEX IF NOT EXISTS contributions_day ON contributions(metric,start,dur)')
+            for metric in metrics:
+                marker = 'event-semantics-v2:' + metric
+                if db.execute('SELECT 1 FROM metadata WHERE key=?', (marker,)).fetchone() is None:
+                    for table in ('hist', 'slow', 'contributions'):
+                        db.execute(f'DELETE FROM {table} WHERE metric=?', (metric,))
+                    db.execute('INSERT INTO metadata VALUES (?,?)', (marker, 'true'))
+            def adjust(s, delta):
+                hour = math.floor(s['start']/3600)*3600
+                key = (s['metric'], s['host'], hour, _bucket(s['dur_ms']))
+                if delta < 0:
+                    db.execute('UPDATE hist SET n=n-1 WHERE metric=? AND host=? AND hour=? AND bucket=?', key)
+                    db.execute('DELETE FROM hist WHERE metric=? AND host=? AND hour=? AND bucket=? AND n=0', key)
+                else:
+                    db.execute('''INSERT INTO hist VALUES (?,?,?,?,1)
+                        ON CONFLICT(metric,host,hour,bucket) DO UPDATE SET n=n+1''', key)
+                groups.add((s['metric'], math.floor(s['start']/86400)*86400))
+            for identity in observed_ids:
+                old = db.execute('SELECT sample FROM contributions WHERE id=?', (identity,)).fetchone()
+                old = json.loads(old[0]) if old else None
+                new = incoming.get(identity)
+                if old and old['metric'] not in metrics:
+                    raise ValueError('identity belongs to another metric')
+                if old == new:
+                    continue
+                changed += 1
+                if old:
+                    adjust(old, -1)
+                    db.execute('DELETE FROM contributions WHERE id=?', (identity,))
+                if new:
+                    adjust(new, 1)
+                    db.execute('INSERT INTO contributions VALUES (?,?,?,?,?,?)',
+                               (identity,new['metric'],new['host'],new['start'],new['dur_ms'],json.dumps(new,allow_nan=False)))
+            for metric, day in groups:
+                db.execute('DELETE FROM slow WHERE metric=? AND day=?', (metric,day))
+                db.execute('''INSERT INTO slow SELECT id,metric,?,start,dur,sample FROM contributions
+                    WHERE metric=? AND start>=? AND start<? ORDER BY dur DESC,id LIMIT 20''',
+                           (day,metric,day,day+86400))
+            db.execute('INSERT OR REPLACE INTO cursors VALUES (?,?)', (source,encoded))
+        return changed
+
     def cursor(self, source):
         with self._connection() as db:
             row = db.execute('SELECT value FROM cursors WHERE source=?', (source,)).fetchone()
@@ -163,7 +228,7 @@ class Store:
         cutoff = _number(now, 'now') - RETENTION_SECONDS
         with self._connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            for table, field in (('identities', 'start'), ('slow', 'start')):
+            for table, field in (('identities', 'start'), ('slow', 'start'), ('contributions', 'start')):
                 db.execute(f'DELETE FROM {table} WHERE {field} < ?', (cutoff,))
             # Keep the boundary hour: it can contain observations newer than cutoff.
             db.execute('DELETE FROM hist WHERE hour + 3600 <= ?', (cutoff,))

@@ -129,15 +129,13 @@ def board_samples(tasks, events, definitions, source_id='board', host='local', g
     for event in events:
         grouped[event['task_id']].append(event)
     for task in tasks:
-        history = sorted(grouped[task['id']], key=lambda e: (e['created_at'], e['id']))
+        history = sorted(grouped[task['id']], key=lambda e: e['id'])
         for definition in definitions:
             start_kind, end_kind = definition['start'], definition['end']
             if start_kind == 'created':
-                start = task['created_at']
-                if end_kind == 'completed':
-                    end = task.get('completed_at')
-                else:
-                    end = next((e['created_at'] for e in history if e['kind'] == end_kind), None)
+                start = next((e['created_at'] for e in history if e['kind'] == 'created'), None)
+                ends = [e['created_at'] for e in history if e['kind'] == end_kind]
+                end = (ends[-1] if end_kind == 'completed' else ends[0]) if ends else None
                 result = sample(definition['id'], (source_id, task['id']), start, end, host, gateway, card=task['id'])
                 if result:
                     yield result
@@ -156,20 +154,23 @@ def board_samples(tasks, events, definitions, source_id='board', host='local', g
 def collect_board(path, store, definitions, since, until, host='local', gateway='local'):
     source = 'kanban:' + str(Path(path).resolve())
     from .registry import fingerprint
-    cursor_key = source + ':' + fingerprint(definitions)
+    cursor_key = source + ':' + fingerprint(definitions) + ':events-v2'
     previous = store.cursor(cursor_key) or {}
     with closing(ro_connect(path)) as db:
         ceiling = db.execute('SELECT COALESCE(MAX(id),0) FROM task_events').fetchone()[0]
-        tasks = [dict(r) for r in db.execute('''SELECT DISTINCT t.id,t.created_at,t.completed_at FROM tasks t
+        tasks = [dict(r) for r in db.execute('''SELECT DISTINCT t.id FROM tasks t
              JOIN task_events e ON e.task_id=t.id WHERE e.id>? AND e.id<=?
-             AND (t.created_at>=? OR e.created_at>=?) AND t.created_at<=?''',
-                                           (previous.get('id', 0), ceiling, since, since, until))]
+             AND e.created_at>=? AND e.created_at<=?''',
+                                           (previous.get('id', 0), ceiling, since, until))]
         events = []
         for task in tasks:
             events.extend(dict(r) for r in db.execute('''SELECT id,task_id,kind,created_at FROM task_events
                 WHERE task_id=? AND created_at<=? ORDER BY created_at,id''', (task['id'], until)))
-    samples = (s for s in board_samples(tasks, events, definitions, source, host, gateway) if since <= s['start'] <= until)
-    return store.ingest(samples, cursor_key, {'id': ceiling, 'at': until})
+    samples = [s for s in board_samples(tasks, events, definitions, source, host, gateway) if since <= s['start'] <= until]
+    observed = [sample(d['id'], (source,t['id']), 0, 0)['id']
+                for t in tasks for d in definitions if d['start'] == 'created']
+    return store.reconcile(samples, [d['id'] for d in definitions], cursor_key,
+                           {'id': ceiling, 'at': until}, observed)
 
 
 def collect_journals(paths, store, definitions, until, host='local', gateway='local'):
