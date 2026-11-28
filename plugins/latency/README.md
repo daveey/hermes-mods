@@ -171,7 +171,8 @@ OpenTelemetry spans under the same `{spans:[...]}` envelope:
 Timestamps are decimal strings (uint64 nanoseconds, no floating-point ID/time
 loss). Trace/span IDs are nonzero lowercase 32/16 hex; `parent_span_id` is
 optional. Permitted attributes: `host.name`, `service.name`, `hermes.gateway`,
-`hermes.session_id`, `hermes.card_id`, `hermes.pr`, `hermes.run_id`, `hermes.phase`.
+`hermes.session_id`, `hermes.card_id`, `hermes.pr`, `hermes.run_id`, `hermes.phase`,
+`hermes.profile`, `hermes.board` and `hermes.event_id`.
 Only short safe identifier strings are accepted; unknown fields are rejected.
 
 `POST /api/plugins/latency/v1/otlp/traces` accepts OTLP/HTTP JSON
@@ -179,6 +180,10 @@ Only short safe identifier strings are accepted; unknown fields are rejected.
 It shares the same limits, validation, durable journal and aggregation path.
 Sample IDs are `trace_id:span_id` for OTel clients, preserved across both doors.
 Legacy IDs stay stable; missing trace IDs derive deterministically from event ID.
+Export carries the admitted ID as `hermes.event_id` so legacy → OTLP → ingestion
+preserves that same deduplication key, including subsequent legacy retries.
+This field passes the ordinary safe event-identifier validation, not a free-text
+attribute; native OTel clients without it continue using `trace_id:span_id`.
 `latency.span(..., trace_id=..., parent_span_id=...)` yields the joinable context
 and preserves it in the journal and slow samples.
 
@@ -198,7 +203,8 @@ it using `hermes config set latency.otlp_export_url <collector-url>` only when
 you intend to send identifiers off-host. Empty means no outbound request.
 The configured HTTP(S) endpoint receives OTLP JSON via a background queue of at
 most 32 batches (256 KiB each), a 2-second timeout and **no retries**. Overflow
-and transport failures drop export, never ingestion; redirects are not followed.
+and transport, serialization or thread-start failures drop export, never ingestion;
+cache invalidation precedes export and redirects are not followed.
 No exporter credentials, URL query, prompts or response bodies are logged.
 This deliberately adds no OTel SDK dependency.
 

@@ -72,7 +72,7 @@ export async function openSample(ctx, sample) {
   const gateway = host.state.gateways.get().find(g => g.id === link?.gateway)
   if (!gateway || !SAFE.test(link?.profile || '') || !SAFE.test(link?.id || '')) throw Error('Sample owner route is not available')
   if (link.kind === 'session') return host.openSession(link.id, { route: { connectionId: gateway.id, mode: gateway.kind === 'local' ? 'local' : 'remote', profile: link.profile, targetProfile: link.profile } })
-  if (link.kind === 'card' && SAFE.test(link.board || '') && typeof window.__hermesKanbanOpenTask === 'function') return window.__hermesKanbanOpenTask(link.id, link.board, gateway.id, link.profile)
+  if (link.kind === 'card' && SAFE.test(link.board || '') && typeof window.__hermesKanbanOpenTask === 'function' && window.__hermesKanbanOpenTask.supportsQualifiedOwners === true) return window.__hermesKanbanOpenTask(link.id, link.board, gateway.id, link.profile)
   throw Error('Sample owner route is not available')
 }
 

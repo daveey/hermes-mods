@@ -170,10 +170,10 @@ def ingest(body):
         raise ValueError('unknown or non-span metric')
     normalized = spans.append_batch(validated, root=root)
     inserted = store.ingest(normalized)
-    exporter = importlib.import_module(pkg().__name__+'.exporter')
-    exporter.enqueue(normalized)
     with _lock:
         _cache.clear()
+    exporter = importlib.import_module(pkg().__name__+'.exporter')
+    exporter.enqueue(normalized)
     return {'ok': True, 'accepted': len(normalized), 'inserted': inserted}
 
 
