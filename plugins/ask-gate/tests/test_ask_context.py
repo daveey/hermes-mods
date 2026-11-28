@@ -11,6 +11,7 @@ import copy
 import importlib.util
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -144,6 +145,39 @@ PAST_REVIEWER_CASES = [
     "We are rate-limited; approve raising the tier", "The API usage is capped; approve lifting it",
     "Approve the unlimited plan", "Raise the concurrency limitation", "Approve €50 for the GPU rental",
     "Approve a £20 top-up", "Approve USD 40 for the run", "Approve the 5k expense", "Reimburse me for the GPU hours",
+    # 6095069519: stems the substring rewrite dropped (regression), then amounts, money nouns, rent/lease, tier/seat
+    # and limit synonyms
+    "Buy a domain for the site", "Approve buying 2 more seats", "I bought the wrong tier; approve the swap",
+    "Approve 40 dollars", "Approve the card on file", "Approve the plan upgrade", "Approve the plan change",
+    "Approve ten bucks for the run", "Approve 500 cents", "Approve a 30 yen run", "Approve 200 CAD", "Approve 300 AUD",
+    "Approve 1000 INR", "Approve 50 CHF", "Approve ₩5000", "Approve the 0.5 BTC", "Approve sending 0.1 ETH",
+    "Approve funding the account", "Add funds to the account", "Wire the deposit", "Approve the deposit",
+    "Approve the donation", "Approve the tip", "Approve the order of 2 GPUs", "Check out the cart on Amazon",
+    "Approve the Stripe checkout", "Approve the Venmo", "Approve the tax", "Approve the fine", "Approve the dues",
+    "Approve the stipend", "Approve the salary", "Approve the bonus", "Approve the 5k outlay", "Approve the overrun",
+    "Rent a GPU box for a day", "Approve renting 8 H100s", "Approve the rental", "Lease an extra H100",
+    "Approve the H100 reservation", "Approve the reserved instance", "Upgrade the plan to Pro",
+    "Switch to the Team tier", "Approve the Pro tier", "Approve upgrading to the premium tier",
+    "Approve the extra seat", "Approve the trial conversion", "Raise the ceiling", "Raise the max",
+    "Raise the maximum concurrency", "Raise the rate threshold", "Approve exceeding the threshold",
+    "Increase the allowance", "Lift the throttle", "Approve the throttle increase",
+    # 6094911651 (at c8189fca, superseded by the fail-closed replan but still a reviewer round): issue + pronoun,
+    # numbered-step and semicolon asks, verbs missing after a reading word, and the noted safe-direction FPs
+    "Review the refunds and issue them", "Check the refund and issue it", "Review the invoices and issue them",
+    "Look at the refund and issue one", "Check the refund request and issue it to the customer",
+    "1) Open the invoice at https://vendor.example.com/inv/42 in Chrome. 2) Approve it",
+    "1) Open the subscription page in Chrome. 2) Cancel it", "1) Check the budget request. 2) Sign off on it",
+    "Look at the subscription page; cancel it", "Read the invoice. Then approve it",
+    "Read the invoice and wire the money to the vendor", "Review the invoice and transfer the funds",
+    "Read the bill and send the vendor the money", "Check the budget and top it up",
+    "Open the billing portal and top up the account", "Review the invoice and void it",
+    "Open the subscription page and unsubscribe", "Review the budget and bump it to 500",
+    "Look at the budget and add 200 to it", "Review the invoice status and mark it paid",
+    "Check the subscription and switch it to the annual plan", "Check the subscription and end it",
+    "Check the invoice status and confirm it looks right", "Review the budget report and accept the PR",
+    "Open the subscription page and process the logs", "Check the invoice email and reply okay",
+    "Read the budget summary and submit your notes", "Check the invoice link and raise any concerns",
+    "Read the invoice and tell me if the change log is right",
 ]
 
 
@@ -157,6 +191,37 @@ def test_every_past_reviewer_case_fails_closed(text):
         assert hit is None or hit["rule"] == "ask_context_hold"
     # Without the mention, the same ask is refused as acceptance_met: the mention alone is what keeps it.
     assert ac.acceptance_met(BILLING_TICKET, BILLING["body"]) is not None
+
+
+# Every ask_context.py this PR shipped before the current head, frozen as text (tests/fixtures/ask_context_history).
+HISTORY = ["e4eaafe4", "856f371f", "92428da5", "178462fe", "c8189fca", "0f4365e7", "1e7f0c2b"]
+
+
+def _historical(sha):
+    """Load a frozen ask_context.py; __file__ points at the live plugin dir so it finds replan.py like it did."""
+    src = (HERE / "fixtures" / "ask_context_history" / f"ask_context_{sha}.py.txt").read_text()
+    mod = types.ModuleType(f"ask_context_{sha}")
+    mod.__file__ = str(HERE.parent / "ask_context.py")
+    sys.modules[mod.__name__] = mod
+    exec(compile(src, mod.__file__ + f"@{sha}", "exec"), mod.__dict__)
+    return mod
+
+
+def _names_a_limit(mod, text):
+    if hasattr(mod, "_limit_named"):
+        return mod._limit_named(text)
+    return mod._replan.limit_named(text) in ("spend", "permission", "safety")  # e4eaafe4: _replan only
+
+
+@pytest.mark.parametrize("sha", HISTORY)
+def test_the_matcher_is_a_superset_of_every_earlier_version(sha):
+    """Owning chat 02:05Z: the check catches the union of every term ever matched; no term is ever removed."""
+    old = _historical(sha)
+    probes = PAST_REVIEWER_CASES + [BILLING["human_request"][k] for k in ("action", "why_human", "scope")]
+    lost = [t for t in probes if _names_a_limit(old, t) and not ac._limit_named(t)]
+    assert lost == [], f"{sha} named these as money/limit asks but the head does not: {lost}"
+    # And every reviewer case is named at the head, whatever the old version said.
+    assert [t for t in PAST_REVIEWER_CASES if not ac._limit_named(t)] == []
 
 
 @pytest.mark.parametrize("text", [
