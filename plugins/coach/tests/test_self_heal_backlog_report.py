@@ -118,6 +118,55 @@ def test_existing_area_report_is_adopted_after_cache_loss(env, status):
     assert len(env.board.schedules) == (1 if status == "ready" else 0)
 
 
+def test_adopted_numbered_report_retains_generation_after_closure(env):
+    day = sh._utc_day(NOW)
+    for gen in range(1, 6):
+        key = f"selfheal-backlog:default:{day}" + (f":{gen}" if gen > 1 else "")
+        env.board.add(f"t_{gen:08x}", key=key, status="scheduled" if gen == 5 else "done")
+    adopted = sh.refresh_backlog_report(env.store, NOW, runner=env.board)
+    assert adopted["ok"] and adopted["card"] == "t_00000005"
+    from sqlite_fixture import transaction
+    with transaction(env.board.db) as con:
+        con.execute("UPDATE tasks SET status='done' WHERE id=?", (adopted["card"],))
+    replacement = sh.refresh_backlog_report(env.store, NOW + 60, runner=env.board)
+    assert replacement["ok"] and replacement["card"] != adopted["card"], replacement
+    assert env.board.rows()[-1][2] == f"selfheal-backlog:default:{day}:6"
+
+
+def test_closed_collision_progress_survives_bounded_retry(env):
+    day = sh._utc_day(NOW)
+    for gen in range(1, 8):
+        key = f"selfheal-backlog:default:{day}" + (f":{gen}" if gen > 1 else "")
+        env.board.add(f"t_{gen:08x}", key=key, status="done")
+    assert not sh.refresh_backlog_report(env.store, NOW, runner=env.board)["ok"]
+    assert not sh.refresh_backlog_report(env.store, NOW + 60, runner=env.board)["ok"]
+    replacement = sh.refresh_backlog_report(env.store, NOW + 120, runner=env.board)
+    assert replacement["ok"], replacement
+    assert env.board.rows()[-1][2] == f"selfheal-backlog:default:{day}:8"
+
+
+def test_committed_schedule_lost_ack_recovers_retirement(env):
+    first = sh.refresh_backlog_report(env.store, NOW, runner=env.board)["card"]
+
+    def lost_ack(argv, **kwargs):
+        if "schedule" in argv:
+            tid = argv[argv.index("schedule") + 1]
+            from sqlite_fixture import transaction
+            with transaction(env.board.db) as con:
+                con.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
+            return SimpleNamespace(returncode=1, stdout="", stderr="ack lost after commit")
+        return env.board(argv, **kwargs)
+
+    failed = sh.refresh_backlog_report(env.store, NOW + 86400, runner=lost_ack)
+    assert not failed["ok"] and not _archives(env)
+    recovered = sh.refresh_backlog_report(env.store, NOW + 86460, runner=env.board)
+    assert recovered["ok"] and recovered["card"] == failed["card"], recovered
+    slot = sh._json_state(env.store, sh.BACKLOG_REPORT_STATE)["default"]
+    assert slot["scheduled"] is True and slot["prev"] is None
+    assert first in _archives(env)[0]
+    assert len(env.board.schedules) == 1  # no redundant schedule after confirmed commit
+
+
 def test_schedule_parser_lifecycle_retry_rotation(tmp_path, monkeypatch):
     """Create/edit/archive transport is local; schedule uses real argparse + lifecycle.
 
