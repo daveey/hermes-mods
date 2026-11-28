@@ -73,8 +73,9 @@ def test_real_panel_projection_served_without_readers_in_request_process(tmp_pat
             def ready():
                 response = client.post('/changes', json=body)
                 assert response.status_code in (200, 503)
-                return response.status_code == 200
-            wait_until(ready, timeout=30)
+                # Lanes own computation now: the first answer may precede the bundle.
+                return response.status_code == 200 and 'chat' in response.json().get('bundles', {})
+            wait_until(ready, timeout=60)
             response = client.post('/changes', json=body)
             assert response.status_code == 200
             wire = response.json()
@@ -111,20 +112,23 @@ def test_provider_drains_legacy_visibility_queue_and_bounds_subscribers(tmp_path
     direct.feed.clock = lambda: wall[0]
     monkeypatch.setattr(direct.feed, 'tick', lambda: None)
     def call(subscriber):
-        return direct({'body': {'sessions': [], 'subscriber': subscriber,
+        return direct({'body': {'sessions': [], 'subscriber': subscriber, 'visible_session': 'v-' + subscriber,
                                '_wire_identity': {'feed': 'fixture:serve', 'profile': 'default'}},
                        'accepted': time.monotonic()})
     try:
         for _ in range(300):
             call('one')
-            assert direct.feed._panel_updates.empty()
+            # Board lane owns _panel_updates; the producer must not discard them.
         for i in range(255):
             call(str(i))
         with pytest.raises(RuntimeError, match='subscriber budget'):
             call('overflow')
-        assert len(direct.feed._panel_subscribers) == 256
+        assert len(direct._leases) == 256
+        # The board lane (sole owner of _panel_subscribers) applies the enqueued leases.
+        wait_until(lambda: len(direct.feed._panel_subscribers) == 256)
         wall[0] += 100
         call('new')
-        assert set(direct.feed._panel_subscribers) == {'new'}
+        assert set(direct._leases) == {'new'}
+        wait_until(lambda: set(direct.feed._panel_subscribers) == {'new'})
     finally:
         direct.close()

@@ -82,7 +82,7 @@ def test_all_explicit_entry_points_with_populated_sources(api, worlds, tripwires
             install_id=produced.readers._home_identity()['install_id'],
             profile=produced.readers._home_identity()['profile']))
         inputs = check('populated runtime inventory boundary', lambda: produced.readers.panel_inputs('chat', ['chat']))
-        wire = check('actual provider', lambda: produced(helpers.payload_for(['chat'])))
+        wire = check('actual provider', lambda: helpers.populated(produced, lambda: helpers.payload_for(['chat'])))
         assert not failures, '\n'.join(failures)
         assert observed is not None and observed['blocked_upstream']['id'] == parent
         assert replicas and replicas[0]['title'] == 'REMOTE-DATA'

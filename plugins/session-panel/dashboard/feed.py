@@ -59,6 +59,12 @@ PRODUCER_FULL_EVERY_S = 60.0 # source-event ceiling for canonical time/courier a
 PRODUCER_PASS_BUDGET_S = 5.0 # producer time per pass before hydration; chats not reached carry to the next pass
 
 
+@dataclass(frozen=True)
+class _AcceptedRegistration:
+    sessions: tuple
+    at: float
+
+
 class _NoAccounting:
     def __enter__(self):
         return self
@@ -86,6 +92,7 @@ def accounted_pass(name):
     except ImportError:
         return _NoAccounting()
     return pass_(name)
+
 
 
 def _takes_deadline(readers: Any) -> bool:
@@ -452,11 +459,11 @@ class Feed:
             return str(v)
         return json.dumps(safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
 
-    def changes_bytes(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None):
+    def changes_bytes(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None, accepted_at=None):
         return self.changes_packet(sessions, since=since, epoch=epoch, subscriber=subscriber,
-                                   visible_session=visible_session)[0]
+                                   visible_session=visible_session, accepted_at=accepted_at)[0]
 
-    def changes_packet(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None):
+    def changes_packet(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None, accepted_at=None):
         """One immutable wire snapshot plus its exact private custody sidecars.
 
         No locks, readers, computation or JSON conversion on the HTTP read path.
@@ -465,29 +472,39 @@ class Feed:
         """
         if self._successor is not None:
             return self._current().changes_packet(sessions, since=since, epoch=epoch,
-                                                  subscriber=subscriber, visible_session=visible_session)
+                                                  subscriber=subscriber, visible_session=visible_session,
+                                                  accepted_at=accepted_at)
+        at = self.clock() if accepted_at is None else accepted_at
         if subscriber:
-            self._panel_updates.put((subscriber, visible_session, self.clock() + 75.0))
+            self._panel_updates.put((subscriber, visible_session, at + 75.0))
             self._board.set()
             lane = getattr(self, '_board_lane', None)
             if lane is not None:
                 lane.service_wake.set()
         wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
-        self._board_demands.put((wanted, self.clock() + 75.0))
+        self._board_demands.put((wanted, at + 75.0))
         lane = getattr(self, '_board_lane', None)
         if lane is not None:
             lane.service_wake.set()
-        self._registrations.put(wanted)
+        self._registrations.put(wanted if accepted_at is None else _AcceptedRegistration(wanted, at))
         readiness = getattr(self, '_facts_readiness', None)
         if readiness is not None:
             readiness.set()
         if getattr(self, '_facts_mode', False):
             self._wake.set()  # interest renewal/demand is background-only
-        current, rev, entries, header = self._wire
-        reset = epoch != current
-        if any(s not in entries for s in wanted):
+        if any(s not in self._wire[2] for s in wanted):
             self._cold.set()  # the producer computes it on its own thread, at once
             self._wake.set()
+        return self._prepared_changes_packet(wanted, since=since, epoch=epoch)
+
+    def prepared_changes_bytes(self, sessions, *, since=0, epoch=None):
+        """Read the immutable wire only; event/reset transport never renews HTTP acceptance clocks."""
+        return self._prepared_changes_packet(sessions, since=since, epoch=epoch)[0]
+
+    def _prepared_changes_packet(self, sessions, *, since=0, epoch=None):
+        wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
+        current, rev, entries, header = self._wire
+        reset = epoch != current
         selected = [entries[s] for s in wanted if s in entries and (reset or entries[s][0] > since)]
         parts = [entry[1] + b':' + entry[2] for entry in selected]
         payload = (header + b',"reset":' + (b'true' if reset else b'false')
@@ -588,13 +605,14 @@ class Feed:
         return f
 
     # ── interest ────────────────────────────────────────────────────────────
-    def watch(self, sessions: Iterable[str]) -> list[str]:
+    def watch(self, sessions: Iterable[str], *, accepted_at=None) -> list[str]:
         now = self.clock()
+        at = now if accepted_at is None else accepted_at
         wanted = [s for s in dict.fromkeys(str(s) for s in sessions if s)][:MAX_REQUEST]
         with self.lock:
             for s in wanted:
                 self._watch_tokens.setdefault(s, object())
-                self.interest[s] = now + self.interest_ttl_s
+                self.interest[s] = at + self.interest_ttl_s
             self._expire(now)
             while len(self.interest) > MAX_WATCHED:  # oldest registration first
                 s = min(self.interest, key=self.interest.get)
@@ -1480,7 +1498,11 @@ class Feed:
         with self.lock:
             for _ in range(MAX_WATCHED):
                 try:
-                    wanted = self.watch(self._registrations.get_nowait())
+                    registration = self._registrations.get_nowait()
+                    if isinstance(registration, _AcceptedRegistration):
+                        wanted = self.watch(registration.sessions, accepted_at=registration.at)
+                    else:
+                        wanted = self.watch(registration)
                 except queue.Empty:
                     break
                 cold = [s for s in wanted if s in self.interest and s not in self.bundles]

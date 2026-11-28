@@ -38,12 +38,19 @@ def test_failed_panel_capture_does_not_consume_file_change():
     assert f._panel_dirty(['S1']) == {'S1'}
 
 
-def test_missing_parent_creation_is_an_immediate_watch_event(tmp_path):
+@pytest.mark.parametrize('high_fd', [False, True])
+def test_missing_parent_creation_is_an_immediate_watch_event(tmp_path, high_fd):
+    import fcntl
+    import os
     api = api_module()
     w = api.FileWatch()
     if not w.ok or w._libc is None:
         w.close()
         pytest.skip('inotify only')
+    if high_fd:
+        original = w._fd
+        w._fd = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 1024)
+        os.close(original)
     db = tmp_path / 'late-profile' / 'user-steps' / 'actions.sqlite3'
     try:
         w.set_paths([db])

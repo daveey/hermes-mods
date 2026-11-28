@@ -366,6 +366,21 @@ def payload_for(sessions, **extra):
     return {'body': body, 'accepted': time.monotonic() - 1}
 
 
+def populated(produced, make_payload, timeout=60):
+    """Lanes own computation: the first answer can precede the bundle, so poll until a chat bundle is present."""
+    import json as _json
+    deadline = time.monotonic() + timeout
+    while True:
+        wire = produced(make_payload())
+        try:
+            has = bool(_json.loads(wire).get('bundles'))
+        except ValueError:
+            has = True
+        if has or time.monotonic() > deadline:
+            return wire
+        time.sleep(0.05)
+
+
 def test_provider_produced_payload_is_complete_home_data_and_never_ambient(api, worlds, tripwires):
     """The produced(payload) entry with a browser-shaped body: populated COMPLETE wire, not unavailable."""
     provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_explicit_acquisition_provider')
@@ -374,7 +389,7 @@ def test_provider_produced_payload_is_complete_home_data_and_never_ambient(api, 
     with launch_label_read(tripwires):
         produced = provider.open_provider({'home_context': ctx})  # import-time launch label: retained, see inventory
     try:
-        wire = produced(payload_for(['chat']))
+        wire = populated(produced, lambda: payload_for(['chat']))
         assert tripwires == []
         assert produced.readers.home_context.home == ctx.home
         text = blob(wire)
@@ -435,6 +450,57 @@ def test_snapshot_and_timing_default_to_the_explicit_home_namespace(api, worlds,
     finally:
         produced.close()
     assert tripwires == []
+
+
+def test_snapshot_identity_preserves_nonproducer_and_ambient_scope(api, worlds, monkeypatch):
+    monkeypatch.setattr(api, 'FEED_ID', 'desktop:slot')
+    monkeypatch.setattr(api, 'LAUNCH_PROFILE', 'launch')
+    monkeypatch.setattr(api, 'FEED_ROLE', 'serve-slot')
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    try:
+        assert readers.snapshot_identity() == {'feed': 'desktop:slot', 'profile': 'launch'}
+        assert 'serve-slot' in readers.snapshot_path().name
+    finally:
+        readers.release()
+    ambient = api.CoreReaders()
+    ambient.producer_snapshot_scope = True
+    try:
+        assert ambient.snapshot_identity() == {'feed': 'desktop:slot', 'profile': 'launch'}
+    finally:
+        ambient.release()
+
+
+@pytest.mark.parametrize('gateway', [None, 'fixture-gateway'])
+def test_producer_snapshot_identity_gateway_and_local_fallback(api, worlds, monkeypatch, gateway):
+    readers = api.CoreReaders(home_context=ctx_for(worlds['explicit']))
+    readers.producer_snapshot_scope = True
+    monkeypatch.setattr(readers, '_home_identity', lambda: {'gateway': gateway, 'profile': 'scoped-profile'})
+    try:
+        assert readers.snapshot_identity() == {
+            'feed': f'{gateway or "local"}:panel', 'profile': 'scoped-profile'}
+    finally:
+        readers.release()
+
+
+def test_child_snapshot_uses_authorized_home_scope_not_exec_argv(api, worlds, monkeypatch):
+    provider = load_module(ROOT / 'dashboard' / 'producer_provider.py', '_snapshot_scope_provider')
+    child_api = provider.open_provider({'home_context': ctx_for(worlds['explicit'])})
+    # open_provider owns a separate API module, just like the real exec import.
+    child = child_api.api
+    monkeypatch.setattr(child, 'FEED_ROLE', 'producer')
+    monkeypatch.setattr(child, 'FEED_ID', 'fixture:producer')
+    try:
+        assert child.save_snapshot(child_api.feed, claim=True)
+        assert child.write_timing(child_api.feed)
+        path = child_api.readers.snapshot_path()
+        assert 'producer' not in path.name
+        head = json.loads(path.read_text().splitlines()[0])
+        timing = json.loads(child_api.readers.timing_path().read_text())
+        assert head['feed'] != 'fixture:producer' and timing['feed'] == head['feed']
+        assert head['profile'] == timing['profile'] == child_api.readers._home_identity()['profile']
+        assert child.load_snapshot(readers=child_api.readers) is not None
+    finally:
+        child_api.close()
 
 
 def test_snapshot_paths_of_two_homes_with_equal_labels_do_not_collide(api, worlds, tmp_path):
@@ -553,7 +619,7 @@ def test_panel_producer_returns_populated_complete_wire(api, worlds, tripwires):
     with launch_label_read(tripwires):
         produced = provider.open_provider({'home_context': ctx})
     try:
-        wire = produced(payload_for(['chat']))
+        wire = populated(produced, lambda: payload_for(['chat']))
     finally:
         produced.close()
     assert tripwires == []

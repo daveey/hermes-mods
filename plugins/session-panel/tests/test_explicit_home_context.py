@@ -15,6 +15,20 @@ from pathlib import Path
 
 import pytest
 
+
+def _populated_wire(produced, make_payload, timeout=60):
+    """Lanes own computation: poll until the first populated bundle (the first answer may precede it)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        wire = produced(make_payload())
+        try:
+            has = bool(json.loads(wire).get("bundles"))
+        except ValueError:
+            has = True
+        if has or time.monotonic() > deadline:
+            return wire
+        time.sleep(0.05)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -370,7 +384,7 @@ def test_provider_ignores_browser_payload_home_fields(tmp_path, monkeypatch):
         }
         env_before = dict(os.environ)
         # The browser-shaped body actually enters the producer. It cannot retarget the bound home.
-        wire = produced({'body': body, 'accepted': time.monotonic() - 1})
+        wire = _populated_wire(produced, lambda: {'body': body, 'accepted': time.monotonic() - 1})
         text = wire.decode() if isinstance(wire, (bytes, bytearray)) else str(wire)
         assert 'DECOY' not in text and 'TRUSTED' in text
         assert dict(os.environ) == env_before
