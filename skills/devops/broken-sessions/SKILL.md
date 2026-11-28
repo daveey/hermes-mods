@@ -15,7 +15,7 @@ triggers:
 metadata:
   hermes:
     tags: [kanban, sessions, stuck, repair, scheduled, wake, dispatcher, notices]
-    related_skills: [kanban-red-sweep, kanban-card-churn, try-to-unblock, generate-unblock-card, hermes-workers, five-whys]
+    related_skills: [session-progress, kanban-red-sweep, kanban-card-churn, try-to-unblock, generate-unblock-card, hermes-workers, five-whys]
 ---
 
 # Broken sessions: the catalog
@@ -293,6 +293,18 @@ The Session repair chat is always excluded, by id and title. Unreadable guard in
 **Safe automatic fix** (`nudge`, area card): re-read eligibility and last message; one turn through
 `hermes chat --resume <session> --oneshot -Q -q "[session-repair] ... Are you stuck? ..."`.
 **Done when:** the chat takes a turn, resumes work or names its real wait.
+
+## BS-no-progress: a session that stopped moving forward
+
+Predictive, chat-level, owned by the [`session-progress`](../session-progress/SKILL.md) skill (its verdicts,
+predictions and snapshot format live there). **Seen as:** no card finished or changed, no progress event, no chat
+turn and no process log growth for a whole prediction window, while no other pattern names the stall.
+**Detection** (`progress.py`, per tick): compare the chat's open cards (and, for cardless chats, live background
+processes) with the previous snapshot; a due prediction with no progress signal is a miss. **Evidence:** the
+prediction (`expect`, `due_at`, `since`), the card's status/newest event/park/awaited producer, the chat's other
+predictions. **Fix:** `missed_once` / `process_only` → `nudge`; `missed_twice` (next window, same card) → fix card,
+area card. Valid human_request and containment/spend holds never miss; a card another rule flagged that tick gets no
+second finding. Soaks in shadow first (`shadow_rules`). **Done when:** the chat shows a progress signal.
 
 ### Nudge cadence and rollout (both rules)
 

@@ -44,6 +44,15 @@ def message(f, times):
     def age(n):
         n = int(n or 0)
         return f'{n//3600}h {n%3600//60}m'
+    if f.get('id') == 'BS-no-progress':
+        text = (f"[session-repair] No progress seen for {age(e.get('waited_s'))}: expected "
+                f"{plain(e.get('expect'), 220)} by now (skill session-progress). Are you stuck? If you can move, "
+                "continue now. If the wait is still right, re-park with a fresh reason/wake and a named producer. "
+                "If you can't move, block with the real reason.")
+        if times:
+            stamps = ', '.join(datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat() for t in times)
+            text += f' Nudge #{len(times)+1}; earlier nudges: {stamps}.'
+        return text[:850]
     text = (f"[session-repair] You've been waiting on {plain(e.get('kind'), 20)} {plain(e.get('ref'), 180)} for "
             f"{age(e.get('waited_s'))} (limit {age(e.get('threshold_s'))}). Live state: "
             f"{producer_line(e.get('live_producer'))}. Are you stuck? If the event happened, continue now. "
@@ -89,9 +98,25 @@ def progress(scan, src, f):
     return row[0] if row else 0
 
 
+def fresh_no_progress(scan, src, f):
+    """A BS-no-progress finding stays current while nothing it measured moved: same status, same newest event
+    (card), or same newest chat turn (chat). Its predictions are not re-run here: they need the snapshot."""
+    if f.get('card'):
+        task, c = src.task(f['board'], f['card'])
+        if not task or getattr(task, 'session_id', None) in src.exclude_chats or str(task.status) != f['evidence'].get('status'):
+            return None
+        row = c.execute('SELECT MAX(id) FROM task_events WHERE task_id=?', (f['card'],)).fetchone()
+        return f if row and row[0] == (f['evidence'].get('last_event') or {}).get('id') else None
+    return f if scan._last_message_id(src, f['chat']) == f['evidence'].get('last_message_id') else None
+
+
 def fresh(scan, f):
     # New reader scope, never the scan's transaction/cache. Re-run canonical exclusions.
     src = scan.Sources()
+    if f.get('id') == 'BS-no-progress':
+        if f.get('card') and (f['card'] in src.copies(f['board']) or f['card'] in src.ours_ids()):
+            return None, src
+        return fresh_no_progress(scan, src, f), src
     if f.get('card'):
         if f['card'] in src.copies(f['board']) or f['card'] in src.ours_ids():
             return None, src
@@ -161,7 +186,12 @@ def wake_owner(scan, src, f, rec, text):
                 return 'owner running'
             park = scan.current_park(card)
             awaited = scan.wait_producer(card, park, time.time())[0] if park else None
-            if (not park or park['id'] != f['evidence']['park_id'] or not awaited
+            if f.get('id') == 'BS-no-progress':
+                # A missed progress prediction is the evidence; any producer kind or clock may be reassessed, but
+                # only the exact park the scan measured.
+                if not park or park['id'] != f['evidence'].get('park_id'):
+                    return 'park changed'
+            elif (not park or park['id'] != f['evidence']['park_id'] or not awaited
                     or awaited['kind'] not in scan.LONG_WAIT_S
                     or scan.healthy_future_park(card, park, time.time())):
                 return 'park changed or clock wait'
