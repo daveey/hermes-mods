@@ -22,6 +22,106 @@ def remote_row(hr, **changes):
                 card_answer_generation='a' * 64, title='Choose remotely', **changes)
 
 
+def native_target(**changes):
+    return dict(ownerGateway='remote', ownerProfile='worker', board='other', task='t_remote', **changes)
+
+
+def test_card_ask_tool_returns_native_bound_request_without_ad_hoc_publication(tmp_path, monkeypatch):
+    from test_review_regressions import plugin_at
+    plugin = plugin_at(tmp_path, monkeypatch)
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    monkeypatch.setattr(plugin, '_presenter', lambda st: mirror)
+    out = json.loads(plugin.publish_action_request({'cardAsk': native_target()}, session_id=OWNER['storedSessionId']))
+    assert 'error' not in out
+    request = out['request']
+    assert request['requestId'] == mirror.remote.request_for(OWNER, native_target())['requestId']
+    assert len(store.requests(OWNER)) == 1
+    assert mirror.binding(OWNER, request['requestId'])
+    op = decide(store, request)
+    envelope = mirror.remote.envelope(op, mirror._bound(op))
+    assert envelope['args']['answer']['choice'] == 'green'
+    assert envelope['args']['answer']['generation'] == 'a' * 64
+    assert 'does not resume' in plugin.PRODUCER_SCHEMA['description']
+
+
+@pytest.mark.parametrize('change', [dict(stale=True), dict(card_answer_generation=None), dict(status='done')])
+def test_card_ask_lookup_refuses_unknown_or_closed_target(tmp_path, change):
+    mirror, store, _, hr = fixture(tmp_path)
+    row = remote_row(hr)
+    row.update(change)
+    mirror.remote.cards = lambda owner: [row]
+    with pytest.raises(core.ActionError, match='unavailable'):
+        mirror.remote.request_for(OWNER, native_target())
+    assert not store.requests(OWNER)
+
+
+@pytest.mark.parametrize('field', ['ownerGateway', 'ownerProfile', 'board', 'task'])
+def test_card_ask_identity_cannot_select_a_twin(tmp_path, field):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    target = native_target()
+    target[field] = 'other-target'
+    with pytest.raises(core.ActionError, match='unavailable'):
+        mirror.remote.request_for(OWNER, target)
+    assert len(store.requests(OWNER)) == 1  # only the real linked ask was published
+
+
+@pytest.mark.parametrize('extra', ['generation', 'choice', 'operationId', 'sourceRefs'])
+def test_card_ask_never_accepts_caller_binding_or_decision(tmp_path, extra):
+    mirror, store, _, _ = fixture(tmp_path)
+    with pytest.raises(core.ActionError):
+        mirror.remote.request_for(OWNER, dict(native_target(), **{extra: 'forged'}))
+    assert not store.requests(OWNER)
+
+
+def test_card_ask_does_not_rebind_recorded_request(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    request = mirror.remote.request_for(OWNER, native_target())
+    decide(store, request)
+    with pytest.raises(core.ActionError, match='undecided'):
+        mirror.remote.request_for(OWNER, native_target())
+    assert len(store.requests(OWNER)) == 1
+
+
+def test_card_ask_does_not_reuse_explicit_chat_revision(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    request = mirror.remote.request_for(OWNER, native_target())
+    replacement = dict(request, title='Explicit replacement scope', kind='approval',
+                       choices=[dict(id='approve', label='Approve expanded scope', effect='approve')],
+                       outcomes=dict(approve='Deliver approval to the owning chat', revise='Prepare a replacement'))
+    revised = store.revise(OWNER, request['requestId'], 1, replacement)
+    with pytest.raises(core.ActionError, match='undecided'):
+        mirror.remote.request_for(OWNER, native_target())
+    assert store.requests(OWNER) == [revised]
+
+
+@pytest.mark.parametrize('field', ['ownerGateway', 'ownerProfile', 'board', 'task'])
+@pytest.mark.parametrize('value', ['', None, 12, '../other', 'with space'])
+def test_card_ask_identity_is_strict(tmp_path, field, value):
+    mirror, store, _, _ = fixture(tmp_path)
+    target = native_target()
+    target[field] = value
+    with pytest.raises(core.ActionError, match='Invalid remote card identity'):
+        mirror.remote.request_for(OWNER, target)
+    assert not store.requests(OWNER)
+
+
+@pytest.mark.parametrize('extra', ['request', 'receipt', 'withdraw', 'decisionCard'])
+def test_card_ask_tool_cannot_mix_publication_paths(tmp_path, monkeypatch, extra):
+    from test_review_regressions import plugin_at
+    plugin = plugin_at(tmp_path, monkeypatch)
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    monkeypatch.setattr(plugin, '_presenter', lambda st: mirror)
+    out = json.loads(plugin.publish_action_request({'cardAsk': native_target(), extra: {}},
+                                                   session_id=OWNER['storedSessionId']))
+    assert 'error' in out
+    assert not store.requests(OWNER)
+
+
 @pytest.mark.parametrize('failure', ['missing-client', 'gateway', 'key-exit', 'offline', 'http'])
 def test_real_courier_refusals_and_unavailability(tmp_path, failure):
     module = load_module('courier_refusals', ROOT / 'remote_cards.py')
@@ -239,8 +339,10 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
         mirror.remote.cards = lambda owner: [dict(gateway='owner', profile='default', board='default',
             id=answer['task'], session='chat-one', status='blocked', human_request=snap['ask'],
             card_answer_generation=snap['generation'], title='Pick a plan')]
-        mirror.remote.reconcile(source)
-        request = store.requests(source)[0]
+        request = mirror.remote.request_for(source, dict(ownerGateway='owner', ownerProfile='default',
+                                                       board='default', task=answer['task']))
+        assert request == mirror.remote.request_for(source, dict(ownerGateway='owner', ownerProfile='default',
+                                                                 board='default', task=answer['task']))
         payload = dict(requestId=request['requestId'], expectedRevision=1, idempotencyKey='user-click',
                        choiceId='answer-text' if other else 'card-0',
                        revisionText='plan-a' if other else request['choices'][0]['label'])

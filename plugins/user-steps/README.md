@@ -443,6 +443,23 @@ by `tests/test_remote_card_review_{race,edges}.py`,
 `tests/test_remote_card_receipt_retirement.py` and
 `tests/test_remote_card_projection_refresh.py`.
 
+For an existing worker-homed ask, the chat can explicitly present that native
+request without publishing a second, unbound approval:
+
+```json
+{"cardAsk":{"ownerGateway":"worker","ownerProfile":"default","board":"default","task":"t_example"}}
+```
+
+Pass `cardAsk` alone to `action_request`. The tool resolves only this session's
+current linked remote ask and reuses its producer-bound request. The caller cannot
+supply a generation, choice mapping, recorded operation, or source proof. A missing,
+stale, closed, already-decided, or explicitly revised request is refused; do not
+substitute an ad-hoc copy or forward its answer via ordinary `origin-comment`
+(which is informational and does not resume a blocked card). Native recorded
+choices use the existing authenticated `card-answer` path and resume the current
+owner ask subject to generation and hold checks. This lookup does not retroactively
+bind decisions already recorded against unrelated ad-hoc requests.
+
 **Other** uses `mode: comment`: record a user-relayed comment, leave the human ask
 and lifecycle untouched, even when the text is a named choice or `archive`.
 The session panel no longer drafts answers into the chat composer. A missing

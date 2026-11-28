@@ -736,6 +736,15 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
     import json
     import uuid
     try:
+        if isinstance(args, dict) and 'cardAsk' in args:
+            # Present the server-bound remote ask, not an ad-hoc copy whose
+            # answer would only reach this chat as ordinary prose.
+            core._object(args, ('cardAsk',))
+            owner = core.server_owner(session_id)
+            out = _presenter(core.ActionStore()).remote.request_for(owner, args['cardAsk'])
+            return json.dumps({'request': _published(owner, out), 'note':
+                'Use this existing card ask unchanged. Its recorded choices go to the owner and resume '
+                'the current ask; Other is comment-only. Do not relay the answer with origin-comment.'})
         if isinstance(args, dict) and 'receipt' in args:
             # Owner receipt for a decision delivered to THIS session (or the session it was compressed from):
             # acknowledged / applied (evidence refs) / not_applied (reason). Grants nothing.
@@ -930,10 +939,15 @@ def publish_action_request(args: dict, session_id: str = '', **_) -> str:
 
 PRODUCER_SCHEMA = {
     'name': 'action_request',
-    'description': 'Publish a complete, inline ActionRequest v2 for the current session. If David already asked for this change in this chat (or standing approval covers it), do it; don\'t publish an approval. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one is a separate request; revise an existing one by its requestId and expectedRevision. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
+    'description': 'For an existing worker-homed blocked ask, call with cardAsk alone to present its native, owner-bound choices; never publish an ad-hoc copy or relay a click as an ordinary comment (that does not resume the card). Publish a complete, inline ActionRequest v2 for the current session. If David already asked for this change in this chat (or standing approval covers it), do it; don\'t publish an approval. Include exact scope, limits, exclusions, outcomes and explicit choices. No execution occurs. To replace scope, reuse requestId with expectedRevision. Never claim completeness for an inferred or missing plan. A new request with the same title as an open one is a separate request; revise an existing one by its requestId and expectedRevision. Never publish a "no decision needed" request: withdraw instead. To retire one of this session\'s undecided requests that is no longer needed (work finished, answered in chat, superseded), send only {"withdraw": {"requestId", "reason"}}; withdrawal is not a decision and grants nothing.',
     'parameters': {'type': 'object', 'additionalProperties': False,
                    'properties': {'request': {'type': 'object', 'properties': {'kind': {'type': 'string', 'enum': ['approval', 'choice', 'input', 'external_step'], 'description': 'Use choice for multi-option answers (not decision or question).'}}, 'description': 'ActionRequest v2 fields except server-owned owner, requestId, revision and resolution. Required: schemaVersion=2, kind, title, scope {markdown,complete,sourceRefs}, limits, exclusions, outcomes {revise,approve?,decline?}, limits [{key, value}] (objects, optional permissionRequired: true/false), exclusions [plain strings], choices [{id, label, effect, explain?, recommended?}] (each choice an object {id, label, effect}, effect approve/revise/decline/answer; approval needs all of approve, revise and decline; explain = one plain line on what happens if the user picks it, e.g. cost and what resumes; recommended: true on at most one choice, your pick), aliases: [] unless reusing a request\'s own refs. Identity is never the title: a new request with an open request\'s title is published as a separate request. To supply the plan for an open extracted tile, revise it by requestId and expectedRevision, or cite its user_step ref in scope.sourceRefs (each alias and sourceRef is an object {gatewayId, profile, type, id, board?} with type message, user_step or kanban (kanban requires board), never a bare card id string), state (open or needs_context).'},
                                   'requestId': {'type': 'string'}, 'expectedRevision': {'type': 'integer'},
+                                  'cardAsk': {'type': 'object', 'additionalProperties': False,
+                                              'properties': {k: {'type': 'string'} for k in
+                                                             ('ownerGateway', 'ownerProfile', 'board', 'task')},
+                                              'required': ['ownerGateway', 'ownerProfile', 'board', 'task'],
+                                              'description': 'Use alone. Get this session\'s current native remote card ask. Identity is looked up in server-owned linked cards; choices and generation cannot be supplied. Recorded choices route to the owning card automatically, subject to current-ask and hold fences. Other only records a comment.'},
                                   'decisionCard': {'type': 'object', 'additionalProperties': False,
                                                    'properties': {'board': {'type': 'string'}}, 'required': ['board'],
                                                    'description': 'Optional new dedicated blocked decision metadata card. Never an existing card ID.'},
