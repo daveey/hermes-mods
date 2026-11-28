@@ -34,6 +34,7 @@ def _no_live_subscriptions(monkeypatch):
 
 @pytest.fixture
 def relay(tmp_path, monkeypatch):
+    monkeypatch.setattr(sm.lo, "prepare", lambda *args: None)  # this fixture exercises Desktop
     sent = []
     real_write = sm.rf.atomic_write
     for sub in ("outbox", "claimed", "results"):

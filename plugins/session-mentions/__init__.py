@@ -18,6 +18,7 @@ if __package__:
     from . import relay_files as rf
     from . import board_tasks as bt
     from . import relay_human as rh
+    from . import local_owner as lo
 else:  # pytest imports this hyphen-named plugin dir without a parent package
     import importlib.util as _ilu
     from pathlib import Path as _Path
@@ -31,6 +32,7 @@ else:  # pytest imports this hyphen-named plugin dir without a parent package
     rf = _load_sibling("relay_files")
     bt = _load_sibling("board_tasks")
     rh = _load_sibling("relay_human")
+    lo = _load_sibling("local_owner")
 
 TOOLSET = "session_mentions"
 PICKUP_TIMEOUT = 30.0  # Desktop drains on the outbox push, else every ~3s; no claim by then = Desktop not running
@@ -70,7 +72,8 @@ SCHEMA = {
         "not a new turn (duplicate_pending while in flight). Without a key, sends are unchanged.\n"
         "While another Hermes window holds the target's turn the send is retried for up to 5 minutes; "
         "`status: refused` with `retry_safe: true` after that means nothing was delivered.\n"
-        "Requires the Hermes Desktop app to be running (it relays the request)."
+        "Same-gateway reads and sends use the authenticated local gateway owner when ready; "
+        "other requests require the Hermes Desktop app to be running (it relays them)."
     ),
     "parameters": {
         "type": "object",
@@ -518,12 +521,27 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
     }
     if action == "send":  # opt in: other writers of send requests (Slack follower, close-out) want the first refusal
         req.update(retry_busy=True, retry_busy_seconds=SEND_BUSY_RETRY, total_wait_seconds=SEND_TOTAL_WAIT_MAX)
+    local = lo.prepare(action, args, rf)
     if action == "send" and args.get("dedupe_key"):
         duplicate = rf.queue_send(base, req, args["dedupe_key"])
         if duplicate:
             return json.dumps(duplicate)
     else:
         rf.atomic_write(base / "outbox" / f"{rid}.json", req)
+    if local is not None:
+        # Same atomic claim as Desktop: only the winner may execute. Losing here follows
+        # the ordinary result wait; a native refusal/uncertain submit never falls through.
+        try:
+            os.replace(base / "outbox" / f"{rid}.json", base / "claimed" / f"{rid}.json")
+        except FileNotFoundError:
+            pass
+        else:
+            req["gateway_name"] = rf.gateway_name()
+            result = lo.run(local, req)
+            if result is None:  # unsupported read/resume, before any submit
+                os.replace(base / "claimed" / f"{rid}.json", base / "outbox" / f"{rid}.json")
+            else:
+                rf.write_result(rid, result, base)
     if hasattr(rf, "notify_outbox"):
         rf.notify_outbox(base)  # wake the Desktop courier now (no-op outside `hermes serve`)
 

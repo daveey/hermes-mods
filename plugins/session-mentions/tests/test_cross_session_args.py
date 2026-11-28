@@ -23,6 +23,7 @@ _spec.loader.exec_module(sm)  # type: ignore[union-attr]
 @pytest.fixture
 def relay(tmp_path, monkeypatch):
     """Fake Desktop: answer every request immediately and record what was sent."""
+    monkeypatch.setattr(sm.lo, "prepare", lambda *args: None)  # this fixture exercises Desktop
     sent = []
     real_write = sm.rf.atomic_write
     for sub in ("outbox", "claimed", "results"):

@@ -41,9 +41,41 @@ board grant fence and require the exact replica `created_on` gateway id. Listing
 local write or owner request. A missing replica is an error, not a fallback to the live table.
 Reads return `source=replica`, owner, `live=false`, file mtime (not owner liveness), and explicit
 history truncation indicators. They do not manufacture a worker capsule or live queue authority.
-Cross-session transcripts and message sending still require Desktop. Tests: `test_board_tasks.py`
+Cross-gateway transcripts and message sending still require Desktop. Same-gateway
+reads/sends can use the local owner as described below. Tests: `test_board_tasks.py`
 (entry routing regression, real SQLite read projections, target validation, owner mismatch, missing
 replica and comment refusal). This mode does not install or enable the plugin by itself.
+
+## Same-gateway owner transport
+
+`cross_session` read/send for an unqualified reference or this gateway's configured
+name/device/hostname uses its already-ready canonical gateway owner. Discovery never
+starts or restarts a service; authentication uses core's private-control session
+ticket, with the exact profile and runtime instance. Reads use the bounded,
+read-only `session.transcript` projection; sends resume then submit into the owner's
+FIFO under the original request ID. No transcript is directly written and no lease
+is stolen. Cross-gateway requests, unfiltered list and ambiguous `local`/`this-device`
+aliases retain Desktop behavior. A missing/incompatible client keeps Desktop;
+an unsupported read/resume hands the claim back only before any submit.
+
+Native and Desktop contend on the same atomic outbox rename. Only the winner
+executes. The existing worker-to-human guard runs first, and keyed native sends
+use the same gateway-wide dedupe ledger. A dropped submit ACK or a post-commit-capable
+RPC error stays `unknown`, `retry_safe=false`; it is never re-sent via Desktop.
+Only definite pre-admission refusals release a key. Reply waits poll the exact
+admission's durable result, bounded by the whole call budget. A reply-read failure
+does not erase an already confirmed admission. Results identify `transport=local_owner`.
+
+Root cause: same-gateway requests were unconditionally queued for a Desktop courier,
+so an asleep/offline Desktop prevented even local reads/sends. The earlier diagnostic
+patch explained stale couriers without changing the dependency. Detection missed the
+class because transport tests answered every request through a fake Desktop; none
+exercised an available canonical owner with no live courier. Regression tests now
+cover that boundary, claim contention, ownership refusal, dedupe and uncertainty,
+plus core-free compatibility (`test_local_owner.py`) and actual canonical authority
+admission/persisted readback (`test_local_owner_core.py`, optional installed core).
+Native socket/ticket transport has separate fixture coverage; production live proof
+must be recorded separately from these tests.
 
 ## Unreachable explicit task gateways
 
