@@ -24,11 +24,12 @@ and predicts evidence due in the next window. Update this skill with any rule ch
 ## Report progress against the requested outcome
 
 Read current delivery state before reporting. Lead with what works, what remains unfinished, the concrete blocker
-and who acts next—not routing receipts. Name a resumed run's authorized phase: "deployment verification is running"
-is not "the migration is unstuck." Separate completed implementation, deployment, reconciliation and end-to-end
-acceptance. Treat census counts as last-verified unless freshly measured. On repeated "what is happening?" questions,
-replace renewal-by-renewal narration with the remaining acceptance and discriminating next deliverable. Cite the
-underlying refusal/error receipt before explaining a restriction; a summary label alone does not explain its cause.
+and who acts next—not routing receipts. For an external wait (merge queue, CI, deploy), state when the wait began,
+how long it has lasted, what is moving or holding it, and the next check or deadline so active waiting does not look
+like a stall. Name a resumed run's authorized phase and separate implementation, deployment, reconciliation and
+acceptance. Treat census counts as last-verified unless freshly measured. On repeated status asks, state remaining
+acceptance and the next deliverable instead of renewal-by-renewal narration, and cite the underlying refusal/error
+receipt rather than a summary label.
 
 ## What a session is
 
