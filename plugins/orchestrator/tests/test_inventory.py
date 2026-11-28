@@ -92,6 +92,61 @@ def test_global_unknown_local_fallback_and_recovery(real_producers, failure):
     assert run(adapter)['cursor'] == healthy['cursor']
 
 
+@pytest.mark.parametrize('local_bundle', [False, True])
+def test_remote_decision_display_and_local_merge(real_producers, local_bundle):
+    adapter = fixture_adapter()
+    bundle = {'session': 'ask', 'gateway': 'remote', 'profile': 'work',
+              'wait': {'wait_state': 'human'}, 'tasks': []}
+    adapter.sessions = lambda: {'bundles': {'ask': {'bundle': bundle}} if local_bundle else {}}
+    adapter.requests = lambda _: {}
+    adapter.inventory = lambda: {'available': True, 'sessions': [
+        {'id': 'ask', 'gateway': 'remote', 'profile': 'work',
+         'outcome': outcome('remote', 'work', 'ask', 'decision')}]}
+    result = run(adapter)
+    assert len(result['human']) == 1
+    row = result['human'][0]
+    assert row['key'] == 'remote/work/ask' and row['state'] == 'human'
+    assert row['canonical_status']['kind'] == 'decision'
+    assert row['route']['gatewayId'] == 'remote'
+    assert row['route']['targetProfile'] == 'work'
+    assert 'request' not in row  # display classification is not action authority
+    assert result['totals']['human'] == 1
+    assert not result['sessions']
+
+
+@pytest.mark.parametrize('failure', ['missing', 'foreign', 'stale', 'coverage'])
+def test_unknown_status_counts_named_coverage_and_recovery(real_producers, failure):
+    adapter = fixture_adapter()
+    adapter.sessions = lambda: {'bundles': {}}
+    adapter.requests = lambda _: {}
+    raw = {'id': 'ask', 'gateway': 'remote', 'profile': 'work',
+           'outcome': outcome('remote', 'work', 'ask')}
+    adapter.inventory = lambda: {'available': True, 'sessions': [raw]}
+    healthy = run(adapter)
+    if failure == 'missing':
+        raw.pop('outcome')
+    elif failure == 'foreign':
+        raw['outcome']['status']['identity']['gateway'] = 'foreign'
+    elif failure == 'stale':
+        raw['stale'] = True
+    else:
+        raw['outcome']['status']['coverage']['state'] = 'unknown'
+    missing = run(adapter)
+    for totals in [missing['totals'], missing['totals']['filtered']]:
+        assert totals['human'] is None and totals['machinery'] is None
+        assert totals['running'] is None
+        assert totals['sessions'] == 1  # structural coverage is independent
+    source = next(s for s in missing['sources'] if s['name'] == 'session-inventory-status')
+    assert source['state'] == 'unknown' and 'canonical status' in source['reason']
+    assert source['missing_sessions'] == ['remote/work/ask']
+    assert missing['sessions'][0]['state'] == 'unknown'
+    raw.pop('stale', None)
+    raw['outcome'] = outcome('remote', 'work', 'ask')
+    recovered = run(adapter)
+    assert recovered['cursor'] == healthy['cursor']
+    assert api.delta(missing, recovered)['changes']['sources'] == recovered['sources']
+
+
 def test_inventory_read_is_bounded_and_uses_full_projection(monkeypatch):
     calls = []
     async def get_sessions(**kwargs):

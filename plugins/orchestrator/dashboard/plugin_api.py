@@ -161,6 +161,10 @@ def canonical_inventory_rows(value):
         owned = (identity.get('gateway'), identity.get('profile'), identity.get('session_id')) == (raw['gateway'], raw['profile'], raw['id'])
         fresh = not raw.get('stale') and not any(obj(value).get(k) for k in ('stale', 'offline_since', 'warming'))
         row['state'] = status['kind'] if status and owned and fresh and status['coverage']['state'] == 'complete' else 'unknown'
+        # Canonical decisions are human waits for placement only. Actions still
+        # require a separately validated producer request/revision/owner.
+        if row['state'] == 'decision':
+            row['state'] = 'human'
         row['canonical_status'] = status if owned else None
         result.append(row)
     return result
@@ -519,12 +523,13 @@ def project(lanes, panel, requests, telemetry, sources, *, q='', lane='', invent
     def counts(h, m, s, filtered=False):
         census = (known.get('session-panel') and known.get('lanes') and status_complete
                   and known.get('session-inventory', True))
+        status_census = census and known.get('session-inventory-status', True)
         visible_chains = [c for c in chains.values() if not filtered or matches(c['prerequisite']) or any(matches(w) for w in c['waiters'])]
         prerequisites = {c['prerequisite']['key']: c['prerequisite'] for c in visible_chains}
-        return {'human': len(h) if census and known.get('user-steps') else None,
-                'machinery': len(m) if census and governors_complete and all(known.get(n) for n in ('session-repair', 'sync', 'auth')) else None,
+        return {'human': len(h) if status_census and known.get('user-steps') else None,
+                'machinery': len(m) if status_census and governors_complete and all(known.get(n) for n in ('session-repair', 'sync', 'auth')) else None,
                 'sessions': len(s) + len(prerequisites) if census else None,
-                'running': sum(r['state'] == 'running' for r in [*s, *prerequisites.values()]) if census and all(r['state'] != 'unknown' for r in [*s, *prerequisites.values()]) else None}
+                'running': sum(r['state'] == 'running' for r in [*s, *prerequisites.values()]) if status_census and all(r['state'] != 'unknown' for r in [*s, *prerequisites.values()]) else None}
     h, m, s = list(human.values()), list(machinery.values()), list(rows.values())
     totals = counts(h, m, s)
     h, m, s = ([r for r in group if matches(r)] for group in (h, m, s))
@@ -572,6 +577,13 @@ async def snapshot(*, q='', lane='', adapter=None):
             inventory, complete = [], False
         if not complete:
             source.update(state='unknown', reason='global session inventory unavailable or partial')
+        missing = sorted(row['key'] for row in inventory if row['state'] == 'unknown')
+        status_source: dict = {'name': 'session-inventory-status',
+                         'state': 'healthy' if complete and not missing else 'unknown'}
+        if status_source['state'] == 'unknown':
+            status_source.update(reason='global canonical status coverage unavailable or partial',
+                                 missing_sessions=missing)
+        sources.append(status_source)
     # Older fixture adapters may omit telemetry; absence stays named unknown,
     # rather than falling through to a real host read from an injected fixture.
     hub, runners, subscription = await asyncio.gather(
