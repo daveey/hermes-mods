@@ -176,6 +176,16 @@ def observe_card(scan, src, card, now: float) -> dict:
                         (rid, card.id)).fetchone() if rid is not None else None
         obs['runtime_liveness_at'] = _num(run[1]) if run and run[0] == 'running' else None
         obs['runtime_started_at'] = _num(run[2]) if run and run[0] == 'running' else None
+        if run and run[0] == 'running' and obs['runtime_started_at'] is not None:
+            # Replication retains exact-run heartbeat events but can omit the
+            # mutable last_heartbeat_at column. Never borrow another run's beat
+            # or future/pre-admission evidence; this is liveness, not progress.
+            beat = c.execute("SELECT MAX(created_at) FROM task_events WHERE task_id=? AND run_id=? "
+                             "AND kind='heartbeat' AND created_at>=? AND created_at<=?",
+                             (card.id, rid, obs['runtime_started_at'], now)).fetchone()
+            candidates = [v for v in (obs['runtime_liveness_at'], _num(beat[0]) if beat else None)
+                          if v is not None and obs['runtime_started_at'] <= v <= now]
+            obs['runtime_liveness_at'] = max(candidates, default=None)
     elif card.status in ('scheduled', 'blocked', 'todo', 'triage'):
         park = scan.current_park(card)
         if park:
@@ -220,6 +230,7 @@ def observe_card(scan, src, card, now: float) -> dict:
         try:
             from hermes_cli import kanban_dispatch_skip as kds
             obs['skip'] = bool(scan._skip_explains(kds.latest(c, card.id), now))
+            obs['admission_until'] = scan.ready_admission_until(card, now)
         except Exception as e:  # noqa: BLE001
             src.error(f'progress skip {card.board}/{card.id}', e)
     elif card.status == 'review':
@@ -257,7 +268,7 @@ def predict(obs: dict, since: float, long_wait: dict) -> dict:
         return {'expect': 'a non-heartbeat event or status change', 'due_at': since + PREDICT_S}
     if st == 'ready':
         wait = READY_EXPLAINED_S if obs.get('skip') else PREDICT_S
-        return {'expect': 'a worker claims it', 'due_at': since + wait}
+        return {'expect': 'a worker claims it', 'due_at': max(since + wait, _num(obs.get('admission_until')) or 0)}
     if st == 'todo':
         if obs.get('parents_open'):
             return {'expect': 'its parents finish (they carry their own predictions)', 'due_at': None, 'dependent': True}

@@ -348,11 +348,20 @@ and fail-closed cases are also covered in `tests/test_target_reader.py`.
 ## Bounded observation and deliberate stops
 
 An age-only deploy wait with an opaque identifier, no wake probe and an unresolvable
-producer honors its explicit future checkpoint only when the whole park window is
-at most two hours. Completion or adverse watcher events override this exception;
-URL targets, probes, expired checkpoints and longer windows retain normal diagnosis.
-This prevents interrupting a short, deliberate natural-rollout observation merely
-because its opaque ID cannot be polled. It does not certify producer health.
+producer honors an explicit future checkpoint for at most two hours. A declared
+`clock_only` observation with a reason and a non-URL producer reference can span
+up to eight hours. A structured `awaiting.deploy_window` in state `blocked`, observed
+at most fifteen minutes before the park, explains a future checkpoint for at most
+24 hours (including URL references); it is pacing evidence, not producer health.
+Completion, adverse watcher events and expired checkpoints override these exceptions,
+including adverse events imported before their older-origin park.
+
+For declared external/deploy conditions with an exact wake probe and an unexpired
+backstop, missing producer visibility becomes `producer_unverified`: a monitoring
+investigation card, not an owner-continue prompt or permission to manufacture evidence.
+An exact current-park `terminal_run_reserved` takes precedence over age-only long-wait
+nudges and escalation; an older park's reservation does not protect its successor.
+No spending, safety, dependency, no-followup or unknown-delivery boundary is released.
 
 Quiet chats whose latest active user turn is the exact Desktop-stop marker are not
 resumed by this detector, even if a late tool result follows the stop. A later user
