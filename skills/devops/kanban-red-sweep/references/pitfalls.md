@@ -72,6 +72,9 @@ Reference for skill `kanban-red-sweep` (moved verbatim from SKILL.md).
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
   current human_request and block reason first (newest `blocked` event payload), so only the action changes.
 - Re-read each card's status and new events inside the script that writes to it; skip it if another chat changed it.
+- Bulk writes (comment+archive on dozens of cards): each `hermes kanban` CLI call takes seconds, so a loop inside
+  `execute_code` hits its 300 s limit and loses state. Write the ids to a file, run a shell loop via
+  `terminal(background=True, notify=True)` logging `<id> rc=$?` per card, then read back statuses.
 - A card stopped as `capability_unavailable` (or called a "guard wall" by the spend reviewer) on a push/ship guard
   refusal that says "unreadable ... retry complete reads" is usually a failed GitHub read, not a missing capability:
   the guard words a spent quota and a timed-out call the same way. Read the live call's headers
