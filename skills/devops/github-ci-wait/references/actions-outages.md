@@ -23,7 +23,14 @@ execute. GitHub refuses every remedy on it (`cancel`: "Cannot cancel a workflow 
 sha never ends. First confirm Actions is back (githubstatus.com `api/v2/summary.json`, component Actions
 operational, new runs finishing). For a PR whose current head has only ghost runs, close and reopen the PR: the
 `reopened` event refires every `pull_request` workflow (default types) on the same sha, so an exact-head review
-still holds. Never push an empty commit for it, because that voids the review. Before each close, re-check that
+still holds. Never push an empty commit for it, because that voids the review. Where push-guard land.py lands the
+PR (hermes-mods), close/reopen may not clear the gate: land.py keys CI by check suite, so an observed ghost or
+failed suite from before the reopen still refuses after the new runs pass. There, give the PR a new head instead:
+rebase onto main, push with `--force-with-lease=<branch>:<previous-head>`, verify range-diff all `=`, obtain one
+fresh exact-head review, and require green CI on the new head. Read `ci()` in the current
+`plugins/push-guard/land.py` first; a queued Actions run without a check-run entry is not itself evidence that
+this gate is blocked.
+Before each close, re-check that
 the PR is still OPEN, the head is unchanged, `autoMergeRequest` is null (closing drops auto-merge) and the head
 has no live run, and skip the PR if any check fails. A branch push's ghosts need nothing once a later push has
 real runs; otherwise `gh workflow run` where `workflow_dispatch` exists. Ghosts that can't be cancelled stay
