@@ -63,6 +63,12 @@ config keys and add `"BS-red-no-ask:uncovered_red_cards"` to `live_rules` and
 holds it and `mode: off` stops everything. Remove the override to reverse this
 scoped rollout. The live lane's exact message receipts are in `nudges-live.jsonl`;
 an admission receipt is not evidence that the original task was resolved.
+Delayed admission is recorded separately as `pending_delivery` in `last.json` and
+`ticks.jsonl`, not as a scanner error or failed tick. Frozen identities are checked
+on subsequent ticks without resending. Nudge journal rows carry their actual `mode`,
+and the tick's human-readable line groups outcomes by rule and mode, including live
+overrides while the global mode remains shadow. Pending does not mean delivered;
+use the exact message receipt before claiming success.
 
 `SESSION_REPAIR` env, else `$HERMES_HOME/session-repair/config.json` `{"mode": ...}`, default **shadow**:
 

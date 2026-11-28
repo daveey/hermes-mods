@@ -491,6 +491,7 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
         room -= 1
         write_json(path,state)
     write_json(path,state)
+    actions = [{**action, 'mode': mode} for action in actions]
     append(sd/f'nudges-{mode}.jsonl',actions)
     if mode=='shadow':
         append(sd/'actions-shadow.jsonl',actions)
