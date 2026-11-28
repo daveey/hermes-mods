@@ -27,6 +27,7 @@ Three parts:
 | BS-notice-undelivered | last message a `kanban_notice` whose close-out ended `error` / `busy`, deferred > 2 h past due, claimed > 2 h with no verdict, or never claimed > 2 h (not human-blocked); `subscription_lag` (a `tui` subscription with an event undelivered > 60 min). Never the repair chat | one close-out turn (`hermes chat --resume <id> --oneshot`) |
 | BS-long-wait | external-producer park: CI/deploy 45m, external 3h, card 4h (producer quiet 1h), resource 2h; GitHub event completed >=600s ago overrides age (producer `updatedAt`, never park age; missing timestamp cannot authorize a completion nudge); clock never | `nudge`: one owner comment plus a guarded reassessment wake (not release of a hold) |
 | BS-quiet-chat | unresolved/waiting desktop/tui chat quiet >60m within 3d, no linked card, live cron/run or open ask; never repair chat | `nudge`: one resumed chat turn |
+| BS-no-progress | per-chat progress snapshot + deterministic predictions ([`session-progress`](../../skills/devops/session-progress/SKILL.md)); a due prediction unmet with no progress signal anywhere in the chat: `missed_once`, `missed_twice` (same card, next window), `process_only` (cardless desktop/tui/cli chat whose only waits are live background processes whose logs stopped); valid human_request / containment / spend holds never miss; a card another rule flagged this tick gets no second finding | **soaks in shadow** (`shadow_rules`, default `["BS-no-progress"]`); then `missed_once`/`process_only` `nudge`, `missed_twice` fix card (24 h fingerprint dedupe) |
 
 A finding: `{id, variant, card, board, chat, title, summary, evidence, fix: {kind: auto|card|nudge, action, commands,
 why}, area: hermes|card, fingerprint}`; fingerprint = `<id>:<board>/<card>` (`<id>:chat/<session>` for a chat-level
@@ -336,7 +337,36 @@ escalation instead of a fourth nudge, with its usual card caps and open-fix dedu
 Nudge-only rollout: install merged main with `nudge_mode=shadow`, inspect all would-nudge rows from two consecutive
 15-minute ticks (about 30 minutes), record each verdict, then set `nudge_mode=live`. Verify one persisted real
 nudge and its owner's run after the recorded nudge wake (not an independent `condition_met`). Keep the older fixes' 24-hour shadow gate unchanged. Reverse by setting
-only `nudge_mode=shadow`. The tick build hash includes scan/run/nudge/producer sources.
+only `nudge_mode=shadow`. The tick build hash includes scan/run/nudge/producer/target_reader/progress sources.
+
+## BS-no-progress: progress snapshots and predictions
+
+[daveey 2026-11-27] "make a skill that measures, looks at a session, and makes sure that it is moving forward. It
+then makes predictions about what it expects to see from this session in half an hour ... run that skill in a loop
+on all the sessions." The judgment is the [`session-progress`](../../skills/devops/session-progress/SKILL.md) skill;
+`progress.py` is its deterministic implementation (no model call per session), run inside the same 15-min scan.
+
+- **Observe** (read-only, in `scan()`): every scanned chat's open cards (linked + live chain, the set the other
+  rules walk) — status, newest progress event (not heartbeats without a note, watcher/probe ticks, dispatcher skips
+  or session-repair's own comment/wake), run id, current park and its awaited producer — plus, for desktop/tui/cli
+  chats, live background processes (core `process_session_activity`) and their `output_log` mtime.
+- **Snapshot** (`run.py` persists, never the scan): `$HERMES_HOME/state/session-progress/<chat>.json` =
+  `{cards: {id: obs + prediction + misses}, processes, last_message_id, predictions: [{card|process, expect,
+  due_at}], verdict, signals}`; files idle 3 d are pruned; one older than 2 h is a new baseline.
+- **Predictions**: running/ready/other → a progress event or status change by +30 min (ready with a recorded
+  dispatcher skip: +2 h); CI/deploy park → park + `expected_s` (else 45 min) + 15 min; merge queue → position falls
+  or merges by +30 min; card park → awaited card's own prediction (never due) until it is done, then the park wakes
+  by done + 10 min; clock park → wake_at + 10 min; other external/resource → BS-long-wait's thresholds; todo → its
+  parents (dependent) or promotion by parents done + 10 min; bare process → log grows by +30 min. A carried
+  prediction keeps its deadline while the card's state key is unchanged; a miss re-arms it a full window later.
+- **Verdicts** per chat: `baseline`, `progress`, `valid_red`, `healthy_running`, `healthy_wait`, `clock_not_due`,
+  `pending`, `missed_once`, `missed_twice`, `process_only`. Counts go to every `ticks.jsonl` row (`progress`).
+- **Rollout**: `config.json` `shadow_rules` (default `["BS-no-progress"]`) keeps the rule log-only whatever `mode`
+  and `nudge_mode` say: each finding is logged to `actions-shadow.jsonl` as `outcome: rule_shadow`, `would:
+  nudge|file`, every tick (no Seen mark). After 24 h of adjudicated shadow rows set `"shadow_rules": []`; then
+  `missed_once`/`process_only` go through the nudge lane (`nudge.fresh` revalidates status + newest event, or the
+  newest chat turn) and `missed_twice` through the normal fix-card path (24 h fingerprint dedupe, card caps).
+  Reverse by restoring `shadow_rules`.
 
 ## Scheduling: Hermes cron, no-agent script
 

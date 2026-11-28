@@ -53,7 +53,8 @@ QUIET_CHAT_S = 3600
 MAX_CHATS = 1000
 
 RULES = ('BS-ready-worker-free', 'BS-overdue-wake', 'BS-unexplained-wait', 'BS-parent-done', 'BS-stuck-run',
-         'BS-review-no-reviewer', 'BS-broken-chain', 'BS-notice-undelivered', 'BS-long-wait', 'BS-quiet-chat')
+         'BS-review-no-reviewer', 'BS-broken-chain', 'BS-notice-undelivered', 'BS-long-wait', 'BS-quiet-chat',
+         'BS-no-progress')
 REPAIR_CHAT_TITLE = 'Session repair'
 REPAIR_KEY_PREFIX = 'session-repair:'
 READY_ENTRY_EVENTS = ('promoted', 'unblocked', 'continuation_woken', 'created', 'reclaimed', 'released', 'status',
@@ -1623,6 +1624,169 @@ CARD_RULES: tuple[Rule, ...] = (rule_long_wait, rule_ready_worker_free, rule_ove
                                 rule_stuck_run, rule_review_no_reviewer, rule_broken_chain)
 
 
+# ── BS-no-progress (chat level; skill session-progress) ───────────────────────────────────────────────────────────
+PROGRESS_SOURCES = ('desktop', 'tui', 'cli')   # chats a person runs: the only cardless chats judged by processes
+
+
+def load_progress():
+    key = '_session_repair_progress'
+    if key not in sys.modules:
+        spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name('progress.py'))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules[key]
+
+
+def _last_message_id(src: Sources, chat: str) -> Optional[int]:
+    """The chat's newest active message that is not session-repair's own nudge: a new chat turn is progress."""
+    c = src.state_conn()
+    if c is None:
+        return None
+    r = c.execute("SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1 "
+                  "AND NOT (role = 'user' AND content LIKE '[session-repair]%')", (chat,)).fetchone()
+    return int(r[0]) if r and r[0] is not None else None
+
+
+def _process_logs(src: Sources) -> dict[str, str]:
+    """{process id: output_log} from the process checkpoint (read-only; the registry owns the file)."""
+    try:
+        rows = json.loads((src.home() / 'processes.json').read_text())
+    except (OSError, ValueError):
+        return {}
+    return {str(r.get('session_id')): str(r.get('output_log')) for r in rows if isinstance(r, dict)
+            and r.get('session_id') and r.get('output_log')} if isinstance(rows, list) else {}
+
+
+def chat_processes(src: Sources, chats: Iterable[str]) -> dict[str, dict]:
+    """{chat: {process id: {id, command, started_at, log, log_mtime}}} for live background processes core attributes
+    to each chat (its compression lineage included), through core's own projection."""
+    chats = list(chats)
+    if not chats:
+        return {}
+    from hermes_cli.process_session_activity import annotate_background_activity
+    rows = annotate_background_activity([{'id': sid} for sid in chats])
+    logs = _process_logs(src)
+    out: dict[str, dict] = {}
+    for row in rows:
+        procs = {}
+        for p in row.get('background_processes') or ():
+            pid = str(p.get('id') or '')
+            if not pid:
+                continue
+            path = logs.get(pid)
+            try:
+                mtime = os.stat(path).st_mtime if path else None
+            except OSError:
+                mtime = None
+            procs[pid] = {'id': pid, 'command': str(p.get('command') or '')[:160], 'started_at': p.get('started_at'),
+                          'log': path, 'log_mtime': mtime}
+        if procs:
+            out[str(row.get('id'))] = procs
+    return out
+
+
+def _process_chats(src: Sources) -> set[str]:
+    """Chats a person runs that own a live background process (core's per-session counts)."""
+    from hermes_cli.process_session_activity import background_process_counts
+    owners = [sid for sid, n in background_process_counts().items() if n]
+    c = src.state_conn()
+    if c is None or not owners:
+        return set()
+    marks = ','.join('?' * len(PROGRESS_SOURCES))
+    keep = set()
+    for sid in owners:
+        r = c.execute(f'SELECT title FROM sessions WHERE id = ? AND archived = 0 AND source IN ({marks})',
+                      (sid, *PROGRESS_SOURCES)).fetchone()
+        if r and r[0] != REPAIR_CHAT_TITLE:
+            keep.add(sid)
+    return keep
+
+
+def _card_status(src: Sources) -> Callable[[str, str], Optional[str]]:
+    def lookup(board: str, cid: str) -> Optional[str]:
+        task, _c = src.task(board, cid)
+        if task is not None:
+            return str(task.status)
+        _b, state = src.find_card(cid, board)
+        return (state or {}).get('status')
+    return lookup
+
+
+def no_progress_findings(src: Sources, chat_cards: dict[str, list[tuple[str, str]]],
+                         flagged: set[str]) -> tuple[list[Finding], dict, dict]:
+    """(findings, {chat: snapshot}, {chat: verdict}). `chat_cards` = each scanned chat's open cards (linked + live
+    chain). `flagged` = `board/card` targets another rule already reported this tick: their finding is the more
+    specific one, so BS-no-progress records the miss but files nothing for them."""
+    prog = load_progress()
+    home, now = src.home(), src.now
+    cardless = sorted(_process_chats(src) - set(chat_cards) - src.exclude_chats)
+    procs = chat_processes(src, list(chat_cards) + cardless)
+    lookup = _card_status(src)
+    findings: list[Finding] = []
+    snapshots, verdicts = {}, {}
+    for chat in sorted(chat_cards) + cardless:
+        try:
+            cards = {}
+            for board, cid in chat_cards.get(chat, ()):
+                task, conn = src.task(board, cid)
+                if task is None or conn is None:
+                    continue
+                card = Card(id=cid, board=board, chat=chat, task=task, conn=conn, row=None)
+                if card.status in TERMINAL or card.ours or cid in src.ours_ids() or cid in src.copies(board):
+                    continue
+                cards[cid] = prog.observe_card(sys.modules[__name__], src, card, now)
+            cur = {'chat': chat, 'cards': cards, 'last_message_id': _last_message_id(src, chat),
+                   'processes': procs.get(chat) or {}}
+            if not cards and not cur['processes']:
+                continue
+            res = prog.evaluate(prog.load_snapshot(home, chat), cur, now, long_wait=LONG_WAIT_S, lookup_status=lookup)
+        except Exception as e:  # noqa: BLE001 -- one chat never stops the scan
+            src.error(f'BS-no-progress {chat}', e)
+            continue
+        snapshots[chat], verdicts[chat] = res['snapshot'], res['verdict']
+        for miss in res['missed']:
+            f = _no_progress_finding(src, chat, res, miss, cards)
+            if f is not None and not (f.card and f'{f.board}/{f.card}' in flagged):
+                findings.append(f)
+    return findings, snapshots, verdicts
+
+
+def _no_progress_finding(src: Sources, chat: str, res: dict, miss: dict, cards: dict) -> Optional[Finding]:
+    pred, since, now = miss['prediction'], miss['since'], src.now
+    twice = miss['misses'] >= 2
+    evidence: dict[str, Any] = {
+        'kind': 'progress', 'ref': pred['expect'], 'expect': pred['expect'], 'due_at': pred.get('due_at'),
+        'since': since, 'waited_s': int(now - since), 'threshold_s': int((pred.get('due_at') or now) - since),
+        'misses': miss['misses'], 'chat_verdict': res['verdict'],
+        'predictions': res['snapshot']['predictions'][:20],
+        'live_producer': {'state': 'no progress signal since the last snapshot'}}
+    if miss.get('card'):
+        obs = cards[miss['card']]
+        evidence.update(status=obs['status'], last_event=obs['last_event'], last_progress_event=obs['event_id'],
+                        run_id=obs['run_id'], awaited=obs['awaited'], awaited_status=obs['awaited_status'])
+        if obs.get('park'):
+            evidence.update(park_id=obs['park']['id'], park_at=obs['park']['at'], wake_at=obs['park']['wake_at'])
+        variant = 'missed_twice' if twice else 'missed_once'
+        card, board, title = miss['card'], miss['board'], obs['title']
+    else:
+        evidence.update(process=miss['process'], process_only=True, last_message_id=res['snapshot']['last_message_id'],
+                        processes=list(res['snapshot']['processes'].values())[:10])
+        variant = 'missed_twice' if twice else 'process_only'
+        card, board, title = None, None, ''
+    if twice:
+        fix = {'kind': 'card', 'action': 'investigate why this session missed two consecutive progress predictions',
+               'commands': [], 'why': 'second consecutive missed prediction (skill session-progress); not a human ask '
+                                     'unless the next step truly needs David'}
+    else:
+        fix = {'kind': 'nudge', 'action': 'ask the owner whether it is stuck and continue', 'commands': [],
+               'why': 'first missed progress prediction; guarded owner reassessment wake'}
+    return Finding(rule='BS-no-progress', card=card, board=board, chat=chat, title=title,
+                   summary=f'no progress: expected {pred["expect"]} by {_fmt_age(now - (pred.get("due_at") or now))} ago'
+                           + (' (second miss)' if twice else ''),
+                   evidence=evidence, fix=fix, variant=variant, area='card')
+
+
 # ── BS-notice-undelivered (chat level) ─────────────────────────────────────────────────────────────────────────────
 _NOTICE_SQL = """
 SELECT s.id AS sid, s.title AS title, m.id AS msg_id, m.timestamp AS ts, m.content AS content,
@@ -1820,16 +1984,21 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
             if f is not None and f.fingerprint not in findings:
                 findings[f.fingerprint] = f
 
+    chat_cards: dict[str, list[tuple[str, str]]] = {}
     for chat in sorted(chats)[:MAX_CHATS]:
         bundle = src.bundle(chat) or {}
         rows = {str(t.get('id')): t for t in bundle.get('tasks') or [] if isinstance(t, dict)}
+        mine = chat_cards.setdefault(chat, [])
         for board, cid in sorted(chats[chat]):
+            mine.append((board, cid))
             judge(board, cid, chat, rows.get(cid), None)
         live = {b for b, _ in src.boards()}
         for cid, rec in (bundle.get('cards') or {}).items():  # the chain: cards the linked ones wait on
             board = rec.get('board') or 'default'
             if (rec.get('detail') or {}).get('source') != 'live' or board not in live:
                 continue  # a replica (another gateway's card): its owner judges it
+            if (board, cid) not in mine:
+                mine.append((board, cid))
             judge(board, cid, chat, rows.get(cid), None if cid in rows else 'chain')
 
     if 'BS-long-wait' in wanted:
@@ -1868,6 +2037,20 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
         for f in quiet_chat_findings(src):
             findings.setdefault(f.fingerprint, f)
     _allot_free_workers(findings)
+    progress: dict[str, Any] = {}
+    snapshots: dict = {}
+    if 'BS-no-progress' in wanted:
+        try:
+            flagged = {f'{f.board}/{f.card}' for f in findings.values() if f.card}
+            found, snapshots, verdicts = no_progress_findings(src, chat_cards, flagged)
+            for f in found:
+                findings.setdefault(f.fingerprint, f)
+            counts: dict[str, int] = {}
+            for v in verdicts.values():
+                counts[v] = counts.get(v, 0) + 1
+            progress = {'chats': len(verdicts), 'verdicts': dict(sorted(counts.items())), 'by_chat': verdicts}
+        except Exception as e:  # noqa: BLE001
+            src.error('BS-no-progress', e)
     for f in findings.values():  # the turn comments on an open fix card instead of filing a second one
         if f.fix.get('kind') == 'card':
             open_card = src.open_fix_card(f.fingerprint)
@@ -1878,15 +2061,19 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
     return {'scanned_at': src.now, 'duration_s': round(time.monotonic() - started, 3), 'chats': len(chats),
             'cards': len(judged), 'truncated_chats': truncated, 'excluded_chats': sorted(src.exclude_chats),
             'findings': [f.to_dict() for f in out], 'errors': src.errors[:50],
-            'error_count': len(src.errors)}
+            'error_count': len(src.errors), 'progress': progress, '_progress_snapshots': snapshots}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     import argparse
     p = argparse.ArgumentParser(description='Read-only scan for broken sessions (prints findings JSON).')
     p.add_argument('--rule', action='append', choices=RULES)
+    p.add_argument('--snapshots', action='store_true', help='also print the BS-no-progress snapshots it would write')
     args = p.parse_args(argv)
-    print(json.dumps(scan(rules=args.rule), indent=2, default=str))
+    result = scan(rules=args.rule)
+    if not args.snapshots:
+        result.pop('_progress_snapshots', None)
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 

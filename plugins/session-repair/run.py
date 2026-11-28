@@ -101,6 +101,42 @@ def rule_key(f: dict) -> str:
     return f'{f.get("id")}:{f.get("variant")}'
 
 
+# Rules that stay shadow (log only) whatever `mode` / `nudge_mode` say, until config.json `shadow_rules` lists them
+# no more. A new rule soaks here first: BS-no-progress shadows 24 h before it may nudge or file (`"shadow_rules": []`).
+DEFAULT_SHADOW_RULES = frozenset({'BS-no-progress'})
+
+
+def shadow_rules(home: Optional[Path] = None) -> frozenset:
+    """config.json `shadow_rules` (rule ids), else DEFAULT_SHADOW_RULES. An unreadable value keeps the default: a
+    soak never ends because its setting was malformed."""
+    try:
+        data = json.loads(((home or hermes_home()) / 'session-repair' / 'config.json').read_text())
+    except (OSError, ValueError):
+        return DEFAULT_SHADOW_RULES
+    value = data.get('shadow_rules') if isinstance(data, dict) else None
+    if isinstance(value, list) and all(isinstance(x, str) for x in value):
+        return frozenset(x.strip() for x in value)
+    return DEFAULT_SHADOW_RULES
+
+
+def _rule_shadow(sd: Path, now: float, findings: list[dict]) -> str:
+    """Log a soaking rule's findings to actions-shadow.jsonl (every tick: the rule's own windows space them; no Seen
+    mark, so the soak sees each first and second miss). Returns the summary line."""
+    if not findings:
+        return ''
+    rows = [_row(now, 'shadow', f, would='file' if needs_card(f) else (f.get('fix') or {}).get('kind'),
+                 outcome='rule_shadow') for f in findings]
+    _append(sd / 'actions-shadow.jsonl', rows)
+    by: dict[str, int] = {}
+    for f in findings:
+        by[rule_key(f)] = by.get(rule_key(f), 0) + 1
+    return 'rule shadow: ' + ', '.join(f'{k} {v}' for k, v in sorted(by.items()))
+
+
+def load_progress():
+    return load_scan().load_progress()
+
+
 def load_scan():
     key = '_session_repair_scan'
     if key not in sys.modules:
@@ -493,7 +529,16 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
         if not held:
             return {**out,'skipped':'locked'}
         result = (scanner or (lambda: load_scan().scan()))()
-        findings = result.get('findings') or []
+        snapshots = result.pop('_progress_snapshots', None)
+        if snapshots:
+            try:
+                load_progress().persist(snapshots, home, now)
+            except Exception as e:  # noqa: BLE001 -- a lost snapshot only restarts that chat's baseline
+                result.setdefault('errors', []).append({'where': 'progress persist', 'error': f'{type(e).__name__}: {e}'[:300]})
+        soaking = shadow_rules(home)
+        soak = [f for f in result.get('findings') or [] if f.get('id') in soaking]
+        findings = [f for f in result.get('findings') or [] if f.get('id') not in soaking]
+        soak_line = _rule_shadow(sd, now, soak)
         nudges = [f for f in findings if (f.get('fix') or {}).get('kind')=='nudge']
         nm = load_nudge().config_mode(home)
         actions, escalations, nm = load_nudge().process(
@@ -531,6 +576,12 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
                                   'handed':out['handed'],'nudges':actions})
         if actions:
             out['line'] += ('; ' if out['line'] else '') + f'session-repair nudges ({nm}): {len(actions)} outcome(s)'
+        prog = result.get('progress') or {}
+        out['progress'] = prog.get('verdicts')
+        out['rule_shadow'] = [f['fingerprint'] for f in soak]
+        if soak_line:  # silent otherwise: verdict counts go to ticks.jsonl every tick
+            counts = ', '.join(f'{k} {v}' for k, v in (prog.get('verdicts') or {}).items())
+            out['line'] += ('; ' if out['line'] else '') + f'{soak_line} (BS-no-progress verdicts: {counts})'
         return out
 
 
@@ -581,7 +632,7 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
         if out.get('failed'):
             errors.append(str(out.get('line') or 'repair turn failed')[:500])
         # Include a source fingerprint so a soak cannot silently span a code change.
-        build = hashlib.sha256(b''.join((HERE / name).read_bytes() for name in ('scan.py', 'run.py', 'nudge.py', 'producer.py', 'target_reader.py'))).hexdigest()
+        build = hashlib.sha256(b''.join((HERE / name).read_bytes() for name in ('scan.py', 'run.py', 'nudge.py', 'producer.py', 'target_reader.py', 'progress.py'))).hexdigest()
         _tick_summary(state_dir(home), {
             'ts': ts, 'mode': m, 'build': build, 'chats': result.get('chats', 0),
             'cards': result.get('cards', 0), 'findings': len(result.get('findings') or []),
@@ -590,6 +641,7 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
             'scanned': bool(result), 'skipped': out.get('skipped'),
             'handed': out.get('handed', []), 'nudge_mode': out.get('nudge_mode'),
             'nudges': out.get('nudges', []),
+            'progress': (result.get('progress') or {}).get('verdicts'), 'rule_shadow': out.get('rule_shadow', []),
         })
 
 
