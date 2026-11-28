@@ -607,3 +607,58 @@ def test_card_detail_counts_failed_runs_for_the_panel(api, board, monkeypatch):
     r = readers_for(api, path, monkeypatch)
     assert r.card(cid, 'default')['detail']['task']['failed_runs'] == 4
     assert r.card(clean, 'default')['detail']['task']['failed_runs'] == 0
+
+
+def test_done_stats_remapping_has_linear_id_reads(api, tmp_path, monkeypatch):
+    """Hydration must not search the full chat's rows again for each result."""
+    reads = []
+
+    class Row(dict):
+        def get(self, key, *default):
+            if key == 'id':
+                reads.append(key)
+            return super().get(key, *default)
+
+    path = tmp_path / 'stats.db'
+    path.touch()
+    reader = api.CoreReaders(state_db=tmp_path / 'state.db')
+    monkeypatch.setattr(reader, 'boards', lambda: [('default', path)])
+    monkeypatch.setattr(reader, 'conn', lambda _: object())
+    feed = api._load_feed()
+
+    def stats(rows, conn):
+        return [{**row, 'run_stats': {'runs': 1}} for row in rows]
+
+    monkeypatch.setattr(feed, 'with_done_run_stats', stats)
+    rows = [Row(id=f't_{i}', status='done', board='default') for i in range(400)]
+    result = reader._with_run_stats(rows)
+    assert len(result) == 400 and all(row['run_stats'] == {'runs': 1} for row in result)
+    assert all('run_stats' not in row for row in rows), 'core memo rows must not be mutated'
+    assert len(reads) <= 4 * len(rows), 'a per-result linear search makes the pass quadratic'
+
+
+@pytest.mark.parametrize('key', ['t_same', None, ['legacy-unhashable']])
+def test_done_stats_duplicate_ids_preserve_first_match(api, tmp_path, monkeypatch, key):
+    path = tmp_path / 'stats.db'
+    path.touch()
+    reader = api.CoreReaders(state_db=tmp_path / 'state.db')
+    monkeypatch.setattr(reader, 'boards', lambda: [('default', path), ('other', path)])
+    monkeypatch.setattr(reader, 'conn', lambda _: object())
+
+    def stats(rows, conn):
+        return [{**row, 'run_stats': {'marker': row['marker']}} for row in rows]
+
+    monkeypatch.setattr(api._load_feed(), 'with_done_run_stats', stats)
+    rows = [
+        {'id': key, 'status': 'done', 'marker': 1},
+        {'id': key, 'status': 'archived', 'marker': 2},
+        {'id': key, 'status': 'done', 'board': 'other', 'marker': 3},
+        {'id': key, 'status': 'running', 'marker': 4},
+        {'id': key, 'status': 'done', 'source': 'origin-history', 'marker': 5},
+    ]
+    got = reader._with_run_stats(rows)
+    assert got[0]['run_stats'] == {'marker': 2}, 'first original gets last hydrated duplicate'
+    assert got[1] is rows[1] and 'run_stats' not in got[1]
+    assert got[2]['run_stats'] == {'marker': 3}, 'board scopes must stay separate'
+    assert got[3] is rows[3] and got[4] is rows[4]
+    assert all('run_stats' not in row for row in rows)
