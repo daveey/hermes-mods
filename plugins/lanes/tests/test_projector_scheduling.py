@@ -140,3 +140,42 @@ def test_late_variant_same_revision_reuses_bounded_completed_job(monkeypatch):
         assert calls[1][1] - calls[0][1] >= .29
     finally:
         release.set(); supervisor.close()
+
+
+def _wait_closed(child, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not child.closed:
+        time.sleep(.05)
+    return child.closed
+
+
+def test_viewerless_warm_child_outlives_job_for_its_observer(monkeypatch):
+    # Regression: a backend with no panel viewers still runs the 60 s REST
+    # warm through the child. idle_since was only reset when a viewer left, so
+    # a long-viewerless supervisor closed the child about one second after
+    # every warm job, killing its in-flight PR observation fill before the
+    # shared store was written; each next warm re-read the same PRs.
+    supervisor, calls, entered, release = setup_supervisor(monkeypatch)
+    client = supervisor._run.__globals__
+    monkeypatch.setitem(client, 'IDLE_CLOSE_S', .6)
+    child = supervisor._spawn(None)
+    try:
+        with supervisor.cv:
+            supervisor.idle_since = time.monotonic() - 3600
+        release.set()
+        supervisor.submit((6., '6h', False), 1, [1]).result(2)
+        ended = time.monotonic()
+        assert not _wait_closed(child, .4), 'child closed right after a viewerless job'
+        assert _wait_closed(child, 2.5), 'idle child must still close after the grace'
+        assert time.monotonic() - ended >= .6 - .05
+    finally:
+        release.set(); supervisor.close()
+
+
+def test_idle_grace_exceeds_default_warm_interval():
+    client = module('projector_client')
+    warm = module('default_warm')
+    import inspect
+    interval = inspect.signature(warm.DefaultWarm).parameters['interval'].default
+    # A warm-only backend keeps one child (and its observer) between warms.
+    assert client.IDLE_CLOSE_S > interval
