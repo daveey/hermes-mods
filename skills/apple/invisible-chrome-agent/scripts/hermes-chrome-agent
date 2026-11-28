@@ -303,7 +303,6 @@ def cdp_version(timeout=1.0, port=None):
 # rewrites those calls unless the show flag is set (`hermes-chrome-agent show`, browser_focus).
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-_RAISING = (b"createTarget", b"activateTarget", b"bringToFront")
 _SWALLOWED = ("Target.activateTarget", "Page.bringToFront")
 
 
@@ -702,17 +701,26 @@ class CDPProxy:
                     continue
                 msg_frames, msg, frames, payload = frames, payload, [], b""
                 act = None
-                if any(k in msg for k in _RAISING):
+                shown = self.show()
+                if not shown:
+                    # Decide on the decoded COMPLETE message, never raw spelling:
+                    # JSON escapes and WebSocket fragmentation must not bypass it.
                     try:
-                        act = filter_cdp_message(json.loads(msg.decode("utf-8")), self.show())
-                    except ValueError:
-                        act = None
+                        decoded = json.loads(msg.decode("utf-8"))
+                    except (ValueError, UnicodeError):
+                        break  # hidden + undecodable: close, never forward
+                    if not isinstance(decoded, dict) or not isinstance(decoded.get("method"), str):
+                        break
+                    if decoded['method'] in _SWALLOWED and 'id' not in decoded:
+                        self._rewrite(addr[1], decoded['method'])
+                        continue  # notifications have no reply, but still cannot raise
+                    act = filter_cdp_message(decoded, False)
                 if act is None:
                     up.sendall(b"".join(msg_frames))
                     continue
                 kind, out = act
                 if kind != "window":
-                    self._rewrite(addr[1], out.get("method") if kind == "forward" else json.loads(msg)["method"])
+                    self._rewrite(addr[1], decoded["method"])
                 if kind in ("forward", "window"):
                     up.sendall(encode_frame(1, json.dumps(out).encode(), mask=True))
                 else:
@@ -888,6 +896,56 @@ class FocusGuard:
         self.tries += 1
         self.returned_at = now
         return self.prev
+
+
+def _decode_procargs2(data):
+    """Decode Darwin KERN_PROCARGS2 without flattening argv into command text."""
+    argc = struct.unpack('=i', data[:4])[0]
+    executable, separator, rest = data[4:].partition(b'\0')
+    if not separator or not executable or argc < 1:
+        raise ValueError('invalid process arguments')
+    parts = rest.lstrip(b'\0').split(b'\0')
+    if len(parts) <= argc or not parts[0]:
+        raise ValueError('truncated process arguments')
+    return os.fsdecode(executable), [os.fsdecode(arg) for arg in parts[:argc]]
+
+
+def _legacy_process_image(pid):
+    """Read an OS executable/argv/uid snapshot; False if gone, None if unknown."""
+    from pathlib import Path
+    try:
+        if sys.platform == 'linux':
+            proc = Path('/proc/%d' % pid)
+            uid = proc.stat().st_uid
+            executable = os.readlink(proc / 'exe')
+            argv = (proc / 'cmdline').read_bytes()
+            if argv and argv.endswith(b'\0'):
+                return uid, executable, [os.fsdecode(arg) for arg in argv[:-1].split(b'\0')]
+        elif sys.platform == 'darwin':
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            query = libc.sysctl
+            query.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                              ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+            query.restype = ctypes.c_int
+            mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+            size = ctypes.c_size_t()
+            if query(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+                return None
+            if not 4 < size.value <= 4 * 1024 * 1024:
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            if query(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+                return None
+            executable, argv = _decode_procargs2(buffer.raw[:size.value])
+            uid = int(subprocess.check_output(['ps', '-p', str(pid), '-o', 'uid='],
+                                              text=True, timeout=5).strip())
+            return uid, executable, argv
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, struct.error, subprocess.SubprocessError):
+        return None
+    return None
 
 
 class Supervisor:
@@ -1090,29 +1148,74 @@ class Supervisor:
             elif line:
                 log("vdisplay: " + line)
 
+    def _legacy_browser_identity(self, pid):
+        """False = positively unrelated/exited; None = ambiguous; dict = owned generation."""
+        from chrome_agent_process import fingerprint
+        before = fingerprint(pid)
+        image = _legacy_process_image(pid)
+        if image is False:
+            return False
+        if image is None:
+            return None
+        uid, executable, argv = image
+        if uid != os.getuid() or os.path.realpath(executable) != os.path.realpath(CHROME):
+            return False
+        if '--' in argv[1:]:
+            return None  # no switch inference across an end-of-options marker
+        profiles = []
+        for arg in argv[1:]:
+            if arg == '--type' or arg.startswith('--type='):
+                return False  # renderer/utility, not the dedicated browser
+            if arg.startswith('--user-data-dir='):
+                profiles.append(arg.split('=', 1)[1])
+            elif arg == '--user-data-dir':
+                return None  # only the canonical single-token launch form proves ownership
+        if not profiles:
+            return False
+        if len(profiles) != 1:
+            return None
+        if os.path.realpath(profiles[0]) != os.path.realpath(PROFILE):
+            return False
+        if not before or fingerprint(pid) != before:
+            return None
+        return {'pid': pid, 'started': before, 'image': image}
+
     def _kill_stale_chrome(self):
-        """A Chrome left on our profile (previous supervisor SIGKILLed, manual launch) would swallow our
-        launch (macOS hands the request to the running instance). The profile is dedicated, so stop it."""
+        """Legacy recovery never treats a SingletonLock PID as signal authority."""
         lock = os.path.join(PROFILE, "SingletonLock")
         try:
-            pid = int(os.readlink(lock).rsplit("-", 1)[1])
-        except Exception:
+            value = os.readlink(lock)
+        except FileNotFoundError:
             return
-        if self.chrome and pid == self.chrome.pid:
+        except OSError:
+            return  # unreadable/non-symlink lock supplies no signal authority
+        try:
+            pid = int(value.rsplit('-', 1)[1])
+            if pid <= 0:
+                return
+        except (ValueError, IndexError):
+            return
+        identity = self._legacy_browser_identity(pid)
+        if identity is False or identity is None:
+            return  # refuse signalling, not startup: Chrome handles stale locks
+        # Revalidate ownership AND creation identity immediately before each
+        # nonzero signal, including escalation; PID reuse ends our authority.
+        if self._legacy_browser_identity(pid) != identity:
             return
         try:
-            os.kill(pid, 0)
-        except OSError:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
             return
-        log("stopping stale Chrome pid %d holding %s" % (pid, PROFILE))
-        os.kill(pid, signal.SIGTERM)
         for _ in range(100):
             time.sleep(0.1)
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if self._legacy_browser_identity(pid) != identity:
                 return
-        os.kill(pid, signal.SIGKILL)
+        if self._legacy_browser_identity(pid) != identity:
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
         time.sleep(0.5)
 
     def _prefs_off_savers(self):

@@ -45,7 +45,11 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   without reaching Chrome; `GET /json/activate/<id>` is answered `200 Target activated`; `PUT /json/new?<url>` becomes
   a background `Target.createTarget` and returns the new target like Chrome would. Each rewrite logs
   `focus-filter: <method> from pid N (<command>) rewritten` (peer found with lsof). The proxy drops
-  `permessage-deflate` offers so it can read every message. Port overrides: `HERMES_CHROME_AGENT_PORT` (public),
+  `permessage-deflate` offers so it can read every message. Hidden-mode decisions use decoded complete JSON
+  methods (including escaped names and fragmented frames); undecodable/non-command messages close the
+  connection instead of forwarding. `test_chrome_focus_custody.py` covers these offline boundaries and
+  legacy lock refusal, with in-memory frames and recording process doubles only.
+  Port overrides: `HERMES_CHROME_AGENT_PORT` (public),
   `HERMES_CHROME_AGENT_CHROME_PORT` (internal, default PORT+1); `HERMES_CHROME_AGENT_FOCUS_FILTER=0` puts Chrome
   straight on 9333 again (no proxy). The supervisor's own CDP connection (re-homing, passkey reveal) uses 9334;
 - every second: `Target.getTargets` → `Browser.getWindowForTarget` for every page, and `Browser.setWindowBounds` for
@@ -58,7 +62,10 @@ so iCloud Keychain passkeys work in it. A human still has to tap Touch ID for ev
   holds none). Without the grant the log says `evict: untrusted` once per run and `status` prints it too; Chrome
   re-homing is unaffected;
 - restarts dead children: Chrome relaunches with backoff and loses its tabs; vdisplay is recreated and windows
-  re-homed. Startup stops a stale profile holder before launching Chrome;
+  re-homed. A legacy stale lock is never signal authority by itself. Startup rechecks OS executable,
+  exact dedicated-profile argv, UID and process creation identity before TERM and again before KILL;
+  changed, ambiguous or unrelated identities get no signal and startup still follows the normal launch
+  path. It does not delete profile locks or infer ownership from flattened `ps command=` text;
 - runs a **focus guard** as backstop behind the filter (thread, every 0.25 s, `lsappinfo front`): when the agent Chrome becomes frontmost without
   being asked, it hands focus back to the app the user had in front and logs `focus-guard: agent Chrome took focus
   ... returned it to pid N (App)`. A CDP client causes this with a foreground `Target.createTarget` (no
