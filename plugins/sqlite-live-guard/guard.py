@@ -1618,7 +1618,8 @@ def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
             if why:
                 return why
         elif word == "find" and "-delete" in args:
-            if any(is_live(a, in_home) or a.endswith((".db-wal", ".db-shm", "*.db*", "kanban.db*")) for a in args):
+            if any(is_live(a, in_home) or protects_directory(a, in_home)
+                   or a.endswith((".db-wal", ".db-shm", "*.db*", "kanban.db*")) for a in args):
                 return "`find -delete` would delete live database files"
     return None
 
@@ -1704,15 +1705,25 @@ def _py_directory_literal(node, names, depth=0):
         return node.value
     if isinstance(node, ast.Name):
         return _py_directory_literal(names.get(node.id), names, depth + 1)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
         left = _py_directory_literal(node.left, names, depth + 1)
         right = _py_directory_literal(node.right, names, depth + 1)
-        return os.path.join(left, right) if left is not None and right is not None else None
+        if left is None or right is None or len(left) + len(right) > 8192:
+            return None
+        return os.path.join(left, right) if isinstance(node.op, ast.Div) else left + right
     if isinstance(node, ast.Call):
         fn = node.func
         name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ''
         if name == 'home' and not node.args and not node.keywords:
             return os.path.expanduser('~')
+        if name == 'expanduser' and not node.args and not node.keywords and isinstance(fn, ast.Attribute):
+            value = _py_directory_literal(fn.value, names, depth + 1)
+            return _expand(value) if value is not None else None
+        if name in {'join', 'joinpath'}:
+            parts = ([fn.value] if name == 'joinpath' and isinstance(fn, ast.Attribute) else []) + list(node.args)
+            values = [_py_directory_literal(p, names, depth + 1) for p in parts]
+            if values and all(v is not None for v in values) and sum(map(len, values)) <= 8192:
+                return os.path.join(*values)
         if name in {'str', 'Path', 'PurePath', 'fspath', 'expanduser'} and node.args:
             value = _py_directory_literal(node.args[0], names, depth + 1)
             return _expand(value) if value is not None and name == 'expanduser' else value
@@ -1768,7 +1779,8 @@ def _check_python_ast(code: str) -> Optional[str]:
             target = node.args[0]  # Path(x).replace(dst); str.replace takes two arguments
         elif isinstance(fn, ast.Attribute) and fn.attr in ("unlink", "write_bytes", "write_text", "touch") and mod not in ("os", "shutil"):
             target = fn.value  # (home / 'kanban.db-wal').unlink()
-        hit = _py_board(target, names)
+        literal = _py_directory_literal(target, names)
+        hit = (literal if literal is not None and is_live(_expand(literal), True) else None) or _py_board(target, names)
         if hit:
             return f"Python file operations on live database file {hit} ({ast.unparse(node)[:160]})"
     return None
