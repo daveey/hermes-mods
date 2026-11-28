@@ -25,6 +25,8 @@ skill has four parts: **measure**, **clean up the card**, **check the producer**
 Change only what the evidence shows failed; a spend-budget hold that correctly stopped further runs is not
 itself a platform defect.
 
+For performance acceptance churn, read `references/performance-convergence.md` before replanning.
+
 Answer the user's "why" in text as soon as step 2 is done, before any change. Then carry on.
 
 ## 0. Pick the card (when the user names none)
