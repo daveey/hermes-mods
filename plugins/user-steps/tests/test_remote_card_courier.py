@@ -85,6 +85,18 @@ def test_card_ask_does_not_rebind_recorded_request(tmp_path):
     assert len(store.requests(OWNER)) == 1
 
 
+def test_card_ask_does_not_reuse_withdrawn_unresolved_request(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    request = mirror.remote.request_for(OWNER, native_target())
+    store.withdraw(OWNER, request['requestId'], by='agent', reason='No longer needed')
+    withdrawn = store.get(OWNER, request['requestId'])
+    assert withdrawn['state'] == 'withdrawn' and not withdrawn.get('resolution')
+    with pytest.raises(core.ActionError, match='undecided'):
+        mirror.remote.request_for(OWNER, native_target())
+    assert store.requests(OWNER, include_withdrawn=True) == [withdrawn]  # no substitute ask or decision
+
+
 def test_card_ask_does_not_reuse_explicit_chat_revision(tmp_path):
     mirror, store, _, hr = fixture(tmp_path)
     mirror.remote.cards = lambda owner: [remote_row(hr)]
