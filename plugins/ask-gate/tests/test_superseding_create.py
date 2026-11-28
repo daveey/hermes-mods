@@ -141,8 +141,8 @@ def test_archive_only_after_exact_successful_create(gate, monkeypatch):
 
 
 @pytest.mark.parametrize('unconfirmed', [
-    {'ok': True, 'task_id': None, 'status': 'queued', 'request_id': 'fixture-request'},
-    {'ok': False, 'created': True, 'error': 'origin_bind_pending', 'task_id': 't_abcdef1234567890'},
+    {'ok': True, 'task_id': None, 'placed': {'status': 'queued', 'request_id': 'fixture-request'}},
+    {'ok': False, 'created': True, 'code': 'origin_bind_pending', 'task_id': 't_abcdef1234567890'},
 ])
 def test_unconfirmed_create_cleanup_is_visible(gate, monkeypatch, unconfirmed):
     kt = pytest.importorskip('tools.kanban_tools')
@@ -159,6 +159,52 @@ def test_unconfirmed_create_cleanup_is_visible(gate, monkeypatch, unconfirmed):
     assert all(not e[1]['archived'] and e[1]['error'] for e in cleanup)
     assert {c['task_id'] for c in comments} == {r['id'] for r in FIX[:2]}
     assert all('NOT performed' in c['body'] for c in comments)
+    expected_status = 'origin_bind_pending' if unconfirmed.get('code') else 'queued'
+    expected_handle = unconfirmed.get('task_id') or 'fixture-request'
+    assert all(expected_status in e[1]['error'] and expected_handle in e[1]['error'] for e in cleanup)
+    assert all(expected_status in c['body'] and expected_handle in c['body'] for c in comments)
+
+
+@pytest.mark.parametrize('confirmed', [False, True])
+@pytest.mark.parametrize('failure', ['raise', 'false'])
+def test_warning_failures_logged_and_do_not_drop_later_cards(gate, monkeypatch, confirmed, failure):
+    kt = pytest.importorskip('tools.kanban_tools')
+    args = seed(gate)
+    args['body'] += '\nSupersedes:\n' + '\n'.join(r['id'] + ': archive' for r in FIX[:2])
+    calls, events, comments = [], [], []
+    def archive(path, tid, **kw):
+        if kw:
+            calls.append(tid)
+            return 'claim changed'
+        return None
+    def comment(a):
+        comments.append(a)
+        if failure == 'raise':
+            raise RuntimeError('fixture warning refused')
+        return {'ok': False, 'error': 'fixture warning refused'}
+    monkeypatch.setattr(gate.superseding_create, 'archive_candidate', archive)
+    monkeypatch.setattr(gate.core, 'log_event', lambda event, **kw: events.append((event, kw)))
+    monkeypatch.setattr(kt, '_handle_comment', comment)
+    assert gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1') is None
+    result = {'ok': True, 'task_id': 't_abcdef1234567890'} if confirmed else {
+        'ok': True, 'task_id': None, 'placed': {'status': 'queued', 'request_id': 'fixture-request'}}
+    gate.post_tool_call(tool_name='kanban_create', args=args, result=result, session_id='s1')
+    expected = {r['id'] for r in FIX[:2]}
+    if confirmed:
+        assert set(calls) == expected
+    assert len(comments) == 2
+    assert {e[1]['old_id'] for e in events if e[0] == 'superseding_create_archive'} == expected
+    errors = [e for e in events if e[0] == 'superseding_create_cleanup_error']
+    assert {e[1]['old_id'] for e in errors} == expected
+    assert all('fixture warning refused' in e[1]['error'] for e in errors)
+
+
+def test_duplicate_nonhit_archive_not_silently_dropped(gate):
+    seed(gate)
+    tid = FIX[0]['id']
+    args = {'title': 'Sort recipes', 'body': 'Group lentils.\nSupersedes:\n' + tid + ': archive\n' + tid + ': archive'}
+    held = gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1')
+    assert held and tid in held['message']
 
 
 def test_nonmatched_archive_declaration_refused(gate):

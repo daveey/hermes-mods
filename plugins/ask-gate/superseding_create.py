@@ -67,7 +67,9 @@ def dispositions(body: str) -> dict[str, tuple[str, str]]:
         if action.lower() == 'independent' and not (reason or '').strip():
             continue
         result[tid] = (action.lower(), (reason or '').strip())
-    return {k: v for k, v in result.items() if k not in duplicates}
+    if duplicates:
+        raise ValueError('duplicate Supersedes dispositions: ' + ', '.join(sorted(duplicates)))
+    return result
 
 
 def score(core: Any, scorer: Any, title: str, body: str, rows: list[tuple],
@@ -141,7 +143,8 @@ def result_dict(value: Any) -> dict:
 
 def created_id(value: Any) -> str | None:
     value = result_dict(value)
-    if not value.get('ok') or value.get('created') is False or value.get('error'):
+    if (not value.get('ok') or value.get('created') is False or value.get('error')
+            or value.get('code') == 'origin_bind_pending'):
         return None
     tid = value.get('task_id') or (value.get('task') or {}).get('id')
     return tid if isinstance(tid, str) and re.fullmatch(r't_[0-9a-f]{8,}', tid) else None
@@ -279,10 +282,14 @@ def after_create(core: Any, args: dict, result: Any, session_id: str) -> None:
         # and pending origin binding may already exist: retain visible debt, not
         # an implied archive or a guessed replacement pointer.
         if value.get('ok') or value.get('created'):
+            placed = result_dict(value.get('placed'))
+            status = value.get('code') or value.get('status') or placed.get('status') or value.get('error') or 'unknown'
+            request = value.get('request_id') or placed.get('request_id') or 'unavailable'
+            local_id = value.get('task_id') or (value.get('task') or {}).get('id') or 'unavailable'
             for path, tid, _, _ in archives:
                 refusal = ('replacement creation is not confirmed locally; cleanup NOT performed'
-                           + ' (status=' + str(value.get('status') or value.get('error') or 'unknown')
-                           + ', request=' + str(value.get('request_id') or 'unavailable') + ')')
+                           + ' (status=' + str(status) + ', request=' + str(request)
+                           + ', local_task_id=' + str(local_id) + ')')
                 core.log_event('superseding_create_archive', new_id=None, old_id=tid,
                                archived=False, error=refusal)
                 try:
@@ -305,6 +312,11 @@ def after_create(core: Any, args: dict, result: Any, session_id: str) -> None:
         if refusal:
             # Observer hooks cannot change the successful create result. Persist a
             # truthful warning on its card rather than silently losing the cleanup.
-            from tools.kanban_tools import _handle_comment
-            _handle_comment({'task_id': new_id, 'board': args.get('board'),
-                             'body': 'Supersession cleanup NOT performed for ' + tid + ': ' + refusal})
+            try:
+                from tools.kanban_tools import _handle_comment
+                warning = result_dict(_handle_comment({'task_id': new_id, 'board': args.get('board'),
+                    'body': 'Supersession cleanup NOT performed for ' + tid + ': ' + refusal}))
+                if not warning.get('ok'):
+                    raise RuntimeError(str(warning.get('error') or 'comment readback unavailable'))
+            except Exception as exc:
+                core.log_event('superseding_create_cleanup_error', new_id=new_id, old_id=tid, error=repr(exc))
