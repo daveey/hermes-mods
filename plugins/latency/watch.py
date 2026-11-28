@@ -35,7 +35,7 @@ def validate(definition):
     if d['group'] not in GROUPS or d['unit'] != 'ms' or d['kind'] not in ('derived','span'):
         raise ValueError('invalid group, kind or unit')
     target = d['target_p90']
-    if isinstance(target,bool) or not isinstance(target,(int,float)) or not math.isfinite(target) or not 0 < target <= 90*86400000:
+    if isinstance(target,bool) or not isinstance(target,(int,float)) or not 0 < target <= 90*86400000 or not math.isfinite(target):
         raise ValueError('target_p90 must be positive finite milliseconds (at most 90 days)')
     if d['kind']=='derived':
         supported = d['source']=='kanban' and (d['start'],d['end']) in {('created','claimed'),('created','completed'),('decision_requested','unblocked')}
