@@ -110,6 +110,38 @@ class LinuxBoundary(Base):
                 self.assertIsNotNone(result)
                 self.assertIn('incomplete owner observation', result)
 
+    def test_ordinary_privileged_child_with_complete_identity_is_available(self):
+        real_read = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if path == self.home / 'proc/4200/cgroup':
+                return '0::/ordinary-session\n'
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, 'read_text', read_text):
+            self.assertIsNone(self.fixture())
+
+    def test_unreadable_manager_cgroup_retains_strict_observation(self):
+        real_read = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if path == self.home / 'proc/4200/cgroup':
+                raise PermissionError('fixture cgroup unavailable')
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, 'read_text', read_text):
+            result = self.fixture()
+        self.assertIsNotNone(result, 'unresolved manager evidence must not take UID fallback')
+        self.assertIn('incomplete owner observation', result)
+
+    def test_mixed_manager_saved_uid_retains_strict_observation(self):
+        real_read = Path.read_text
+        def read_text(path, *args, **kwargs):
+            if path == self.home / 'proc/4200/status':
+                uid = os.getuid()
+                return f'Uid:\t{uid}\t{uid}\t0\t{uid}\n'
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, 'read_text', read_text):
+            result = self.fixture()
+        self.assertIsNotNone(result, 'unresolved manager UID must not take privileged-parent fallback')
+        self.assertIn('incomplete owner observation', result)
+
     def test_manager_as_target_is_never_exempt(self):
         result = self.fixture(manager_target=True)
         self.assertIsNotNone(result)
