@@ -53,10 +53,13 @@ _LIST_ITEM = re.compile(r"(?m)^\s*(?:[-*\u2022]|\d+[.)]|\[[ x]\])\s+\S")
 # "read-only" heuristics: five review rounds showed every refinement leaves a wording gap, and a mention that lets a
 # read-only ask reach David costs far less than a missed money ask.
 _LIMIT = re.compile(
-    r"\$\s?\d|\b\d+(?:\.\d+)?\s?(?:usd|dollars?|eur|euros?|gbp)\b|"
-    r"\b(?:pay\w*|paid|money|spend\w*|spent|billing|bill(?:s|ed)?|invoic\w*|subscri\w*|budget\w*|refund\w*|"
-    r"overage\w*|charg\w*|purchas\w*|buy\w*|bought|price\w*|pricing|fees?|credit\s+card|card\s+on\s+file|"
-    r"limits?|quotas?|caps?|plan\s+(?:upgrade|change))\b|"
+    # Money/limit: case-insensitive SUBSTRING stems, so every inflection counts ("rate-limited", "capped",
+    # "unlimited", "limitation", "subscribers", "repaid"). Over-matching ("capability", "escape") is the intended
+    # fail-closed direction. Only stems that are substrings of everyday words get a boundary: eur ("neural"),
+    # fee ("feedback").
+    r"[$€£¥]|limit|cap|quota|spend|spent|budget|pay|paid|bill|charg|cost|price|pricing|usd|gbp|jpy|\beur\b|"
+    r"\d\s?eur|eur\s?\d|credit|refund|subscri|invoice|money|purchas|overage|\bfees?\b|expens|reimburs|top[- ]?up|"
+    r"renew|licen[cs]|"
     r"\b(?:grant\w*|permissions?|credentials?|widen\w*|admin|sudo|api\s+keys?|scope\s+change)\b|"
     r"\b(?:delet\w*|destroy\w*|destructive|irreversible|wipe\w*|terminat\w*|safety)\b", re.I)
 _SIZE = re.compile(
