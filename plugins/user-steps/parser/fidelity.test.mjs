@@ -38,7 +38,7 @@ fixture.real_replies.forEach((reply,i)=>{ for(const [v,suffix] of Object.entries
  cases.push({id,reply:v==='plain'?reply:reply.trimEnd()+suffix,...fixture.real[id]})
 }})
 for(const c of fuzz) cases.push({...c,...fixture.fuzz[c.id]})
-assert.equal(cases.length,3767)
+assert.equal(cases.length,3783)
 const results=await scanAll(cases.map(c=>c.reply))
 const verdict=new Map()
 cases.forEach((c,i)=>{
@@ -72,6 +72,13 @@ for(const id of ['math/display-after-list-lazy','math/display-after-prose'])
 // Healthy ordinary controls stay accepted (math, URLs, CR/CRLF, entity cue, blocks).
 for(const id of ['control/list','control/prose','control/prefix','control/url','control/www','control/email','control/angle-url','control/ordered','control/crlf','control/nested-list-plan','control/plan-code-fence','blocks/cr-only','blocks/nbsp','blocks/loose-list','blocks/setext-plan','blocks/long-plan','hidden/entity-plus-think','math/dollar-attr','math/dollar-pair-attr','math/dollar-url-attr','math/inline-in-plan','math/currency-in-plan','math/display-in-plan','math/display-in-item','math/math-fence','math/item-display'])
  ok(`control accepted ${id}`,()=>assert.notEqual(verdict.get(id),null))
+// A later image-reference definition hides HTML/entity cues in the whole
+// document's image alt, but Desktop's first block is parsed independently.
+// This kills skipping ONLY the first block, not just deleting the whole loop.
+for(const i of [0,1,4])
+ ok(`first-block reference doubt ${i}`,()=>assert.equal(verdict.get(`survivors/reference/${i}`),null))
+for(const id of ['blank/0','blank/1','blank/2','blank/3','blank/4','reference/2','reference/3'])
+ ok(`block boundary control ${id}`,()=>assert.notEqual(verdict.get(`survivors/${id}`),null))
 console.log(`${cases.length} differential cases: ${results.filter(r=>r!==null).length} accepted, ${failed.filter(f=>f.startsWith('no over-accept')).length} over-accepted`)
 
 // 2. Entry point: malformed / too-large / ordinary stdin.

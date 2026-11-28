@@ -73,14 +73,14 @@ export function scan(reply:unknown):any {
  if(!Number.isInteger(offset) || text.slice(last.position.end.offset).trim()) return null
  // Desktop renders each marked block as an independent document (marked
  // normalizes CR/CRLF to LF). Parsed alone through the same chain, no block
- // but the last non-blank one may hold doubt (an earlier directive is already
+ // but the last one may hold doubt (an earlier directive is already
  // impossible: the reply has exactly one `::`, checked below), and the last
  // block alone must still yield a sole final directive. Fence disagreements
  // between marked and micromark (e.g. a "```~" line) otherwise leave Desktop
  // rendering the ask inside a code block.
  const split=parseMarkdownIntoBlocksCached(text)
  if(!Array.isArray(split) || split.join('')!==text.replace(/\r\n|\r/g,'\n')) return null
- const content=split.filter(b=>b.trim())
+ const content=split
  for(const block of content.slice(0,-1)) if(directives(parse(block)).doubt) return null
  // With a single `::`, the last block's directive is the same source.
  if(!finalDirective(parse(content.at(-1) as string))) return null
