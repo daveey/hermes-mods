@@ -101,7 +101,10 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   Reconciliation verifies the complete per-metric histogram against retained
   contributions and repairs mismatches transactionally, including old-only
   hours and unchanged replay. This is linear in retained contributions and only
-  rewrites histogram rows on a mismatch. A pre-migration process can temporarily
+  rewrites histogram rows on a mismatch. Pruning keeps a partial boundary
+  histogram hour while contributions expire at exact timestamps, so a boundary
+  mismatch can legitimately trigger a full repair each cycle (linear scan and
+  rewrite, not a constant-time incremental path). A pre-migration process can temporarily
   append stale values after winning the lock; the next corrected source cycle
   removes them, even when the legacy attempt has no corrected counterpart.
   Reload all collector processes normally before reporting rollout complete.
