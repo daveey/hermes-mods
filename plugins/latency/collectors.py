@@ -194,7 +194,8 @@ def collect_journals(paths, store, definitions, until, host='local', gateway='lo
                     row = json.loads(line)
                     if 'metric' in row:
                         if row['metric'] in {d['id'] for d in definitions}:
-                            samples.append(row)
+                            from .store import _sample
+                            samples.append(_sample(row))
                         continue
                     key = str(row.get('boot')) + ':' + str(row['id'])
                     stages = pending.setdefault(key, {})

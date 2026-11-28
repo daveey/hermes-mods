@@ -43,10 +43,15 @@ class Collectors(unittest.TestCase):
             self.assertEqual(collectors.collect_state(path,store,defs,0,200),1)
             self.assertEqual(store.view('first',0,200)['p50']//1000,10)
             self.assertEqual(collectors.collect_state(path,store,defs,0,200),0)
+            from latency_fixture.registry import fingerprint
+            self.assertTrue(store.cursor('state:' + str(path.resolve()) + ':' + fingerprint(defs)))
             add(5, 'tool', 130, tool_call_id='c', tool_name='kanban_show')
             self.assertEqual(collectors.collect_state(path,store,defs,0,200),1)
             self.assertEqual(store.view('show',0,200)['n'],1)
             self.assertEqual(store.view('final',0,200)['n'],0)
+            defs.append(definition('first_new','typed_user','first_assistant'))
+            self.assertEqual(collectors.collect_state(path,store,defs,0,200),1)
+            self.assertEqual(store.view('first_new',0,200)['n'],1)
             db.close()
 
     def test_board_new_definition_backfills_and_completed_late(self):
@@ -61,6 +66,8 @@ class Collectors(unittest.TestCase):
             store = Store(Path(tmp)/'series.sqlite')
             self.assertEqual(collectors.collect_board(path,store,defs,0,100),1)
             defs.append(definition('decision','decision_requested','unblocked','kanban'))
+            from latency_fixture.registry import fingerprint
+            self.assertEqual(store.cursor('kanban:'+str(path.resolve())+':'+fingerprint(defs[:-1]))['id'],3)
             self.assertEqual(collectors.collect_board(path,store,defs,0,100),1)
             self.assertEqual(collectors.collect_board(path,store,defs,0,100),0)
             defs.append(definition('done','created','completed','kanban'))

@@ -73,6 +73,7 @@ def cycle(root, store=None, now=None, include_github=True):
 
 
 class Worker:
+    lock_retry_seconds = 60
     def __init__(self, root):
         self.root = Path(root)
         self.stop_event = threading.Event()
@@ -82,18 +83,24 @@ class Worker:
         folder = self.root/'cache/latency'
         folder.mkdir(parents=True, exist_ok=True)
         with (folder/'collector.lock').open('a+') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+            while not self.stop_event.is_set():
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    self.stop_event.wait(self.lock_retry_seconds)
+            else:
                 return
             store = Store(folder/'series.sqlite')
             last_github = float('-inf')
             while not self.stop_event.is_set():
                 try:
                     due = time.monotonic()-last_github >= 600
-                    result = cycle(self.root, store, include_github=due)
-                    if due and 'github' not in result['errors']:
+                    if due:
+                        # Bound failed attempts too; a source error must not
+                        # turn the ten-minute remote scan into a minute loop.
                         last_github = time.monotonic()
+                    result = cycle(self.root, store, include_github=due)
                 except Exception:
                     _log.exception('latency collector cycle failed')
                 self.stop_event.wait(60)

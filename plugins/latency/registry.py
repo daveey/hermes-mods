@@ -20,7 +20,7 @@ def load_yaml(path):
 
 
 def registry(root):
-    entries = load_yaml(Path(__file__).with_name('metrics.yaml'))['metrics']
+    entries = [*load_yaml(Path(__file__).with_name('metrics.yaml'))['metrics']]
     local = Path(root) / 'latency' / 'metrics.local.yaml'
     if local.exists():
         entries += (load_yaml(local) or {}).get('metrics', [])

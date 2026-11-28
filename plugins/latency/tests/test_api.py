@@ -62,6 +62,14 @@ class API(unittest.TestCase):
         self.assertEqual(self.client.get('/v1/series?range=forever').status_code,400)
         self.assertEqual(self.client.get('/v1/series?metric=unknown').status_code,400)
 
+    def test_body_cap_metric_allowlist_and_nested_json(self):
+        good = dict(metric='ui.session_switch',start=time.time()-1,dur_ms=1,host='desktop',gateway='gateway',attrs={})
+        raw = json.dumps({'spans':[good]}) + ' '*api.MAX_BODY
+        self.assertEqual(self.client.post('/v1/spans',content=raw).status_code,400)
+        for metric in ('unknown', 'turn_first'):
+            self.assertEqual(self.client.post('/v1/spans',json={'spans':[dict(good,metric=metric)]}).status_code,400)
+        self.assertEqual(self.client.post('/v1/spans',content='['*2000+'0'+']'*2000).status_code,400)
+
     def test_15_second_cache_has_single_build(self):
         with patch.object(api,'build',return_value={'metrics':[]}) as build:
             self.assertEqual(api.cached('7d'),api.cached('7d'))

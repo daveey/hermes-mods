@@ -25,6 +25,12 @@ def iso(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
+class GitHubReadError(RuntimeError):
+    def __init__(self, status=None):
+        super().__init__('GitHub read failed; cursor retained')
+        self.status = status
+
+
 def api(path, query=None, run=subprocess.run, sleep=time.sleep):
     args = ['gh', 'api', path]
     if query is not None:
@@ -37,7 +43,8 @@ def api(path, query=None, run=subprocess.run, sleep=time.sleep):
                 raise RuntimeError('GitHub GraphQL returned errors')
             return data
         if attempt == 3 or not re.search(r'\b5\d\d\b', result.stderr):
-            raise RuntimeError('GitHub read failed; cursor retained')
+            match = re.search(r'HTTP\s+(\d{3})', result.stderr)
+            raise GitHubReadError(int(match[1]) if match else None)
         sleep(2**attempt)
 
 
@@ -105,9 +112,10 @@ def deployment_markers(root, checkout, kind, run=subprocess.run):
     chain = {sha: i for i, sha in enumerate(git('log', '--first-parent', 'HEAD', '--format=%H'))}
     markers = []
     if kind == 'core':
-        log = Path(root) / 'logs' / 'hermes-sync.log'
-        if log.exists():
-            for line in log.open(errors='replace'):
+        for log in sorted((Path(root) / 'logs').glob('hermes-sync.log*')):
+            if not log.is_file() or log.suffix == '.gz':
+                continue
+            for line in log.read_text(errors='replace').splitlines():
                 if 'core: update exit 0:' not in line:
                     continue
                 match = re.search(r'✓ default \(pid \d+\) @ ([0-9a-f]+)', line)
@@ -116,7 +124,8 @@ def deployment_markers(root, checkout, kind, run=subprocess.run):
                 hits = [index for sha, index in chain.items() if sha.startswith(match[1])]
                 if len(hits) == 1:
                     try:
-                        markers.append((epoch(line[:19].replace(' ', 'T') + 'Z'), hits[0]))
+                        # sync log() emits host-local wall time, not UTC.
+                        markers.append((datetime.fromisoformat(line[:19]).timestamp(), hits[0]))
                     except ValueError:
                         continue
     else:
@@ -176,7 +185,14 @@ def collect_github(root, store, definitions, config, since, until, host='local',
         recent = max(since, previous.get('at', since)-86400)
         fresh = runs(repo, recent, until, fetch) if any(d.get('workflow') for d in selected) else []
         pending = previous.get('pending', [])
-        pending_rows = [fetch(f'repos/{repo}/actions/runs/{rid}') for rid in pending]
+        pending_rows = []
+        for rid in pending:
+            try:
+                pending_rows.append(fetch(f'repos/{repo}/actions/runs/{rid}'))
+            except GitHubReadError as error:
+                if error.status != 404:
+                    raise
+                # Deleted/expired runs have no terminal duration to aggregate.
         run_rows = {(r['id'], r.get('run_attempt', 1)): r for r in [*pending_rows, *fresh]}
         prs = pull_requests(repo, since, fetch) if any(not d.get('workflow') for d in selected) else []
         checkout = settings.get('checkout')

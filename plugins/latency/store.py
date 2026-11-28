@@ -92,7 +92,7 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
-            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('PRAGMA journal_mode=WAL').fetchone()
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS identities(id TEXT PRIMARY KEY, start REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS identities_start ON identities(start);
