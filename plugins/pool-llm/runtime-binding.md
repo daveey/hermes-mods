@@ -10,9 +10,11 @@ evaluating Python expressions. The template, recovery constants and publisher
 must match their Git blobs. The Python path must match its store's recorded Python
 package entry. `binding` prints paths, commit, blob IDs and SHA256 hashes only.
 
-Normal execution uses that validated script, replacing only its exact terminal
-`hermes_cli.main` tail with the absolute sibling `pool_llm.py` run_path call.
-It preserves the managed bootstrap and actual SystemExit status. Dispatch via
+Normal execution uses a fixed plugin-owned isolated bootstrap and the absolute
+sibling `pool_llm.py` run_path call. The authenticated inner launcher is DATA,
+never the executed program: its `--run-module` / `--print-runtime-command` branches
+must not interpret pool arguments. Managed `hermes_bootstrap` still owns PM
+activation and recovery; this is not a frozen dependency environment. Dispatch via
 `cProfile` is NOT used: that module catches SystemExit, hiding a token refusal's
 nonzero exit status. Routine core commits and republished Python paths require no
 private per-host pool manifest. Unsupported launcher grammars refuse; support for
@@ -33,9 +35,13 @@ all currently deployed hosts must be proven before landing this draft.
   environment, anthropic/openai/httpx and transitive SDK imports require actual PM
   selection/lock/artifact evidence. A hash of Python is identity, not authenticity.
   Same-uid mutation and an update racing resolution remain managed-host custody.
-* **Initial execution:** the helper's `/usr/bin/env python3` shebang still depends
-  on the invoking environment. This remains an explicit unresolved full-authority
-  edge in this draft, not implicitly approved by removing discovery.
+* **Initial execution:** literal `/bin/sh` → `/usr/bin/python3 -I -B -S` parses
+  selection using only OS-managed stdlib. PATH Python, cwd/user/site startup,
+  PYTHONHOME and PYTHONPATH cannot supply this resolver. Symlinked pool commands
+  resolve the plugin sibling in isolated Python, without PATH tools. OS shell,
+  Python/stdlib and loader remain separately managed platform trust. All current
+  hosts must prove that system Python exists and supports this code (>=3.9).
+  This is not a claim of fleet availability until those reads arrive.
 * **Environment:** runtime/bootstrap overrides and secret-source configuration can
   affect managed execution. Offline `binding` does not run them or prove their
   closure. Do not credit the read-only resolver as normal execution containment.

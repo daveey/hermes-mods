@@ -26,10 +26,14 @@ def fixture_runtime(tmp_path, python=None):
     (root / 'hermes_cli/_launch_template.py').write_text('def render(root, module, func):\n    return ' + repr(program) + '\n')
     (root / 'hermes_cli/_early_recovery.py').write_text('# fixture recovery; never imported\n')
     (root / 'hermes_cli/_launchers.py').write_text('# fixture publisher, no live bootstrap\n')
+    (root / 'hermes_bootstrap.py').write_text(
+        "import sqlite3,_sqlite3\n"
+        "def deny(*a,**k): raise RuntimeError('SQL prohibited')\n"
+        "sqlite3.connect=_sqlite3.connect=deny\n")
     def git(*args):
         return subprocess.check_output(['/usr/bin/git', '-C', str(root), *args], text=True).strip()
     git('init', '-q')
-    git('add', 'hermes_cli')
+    git('add', 'hermes_cli', 'hermes_bootstrap.py')
     git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', 'commit', '-qm', 'fixture')
     launcher = root / '.hermes/bin/hermes'
     launcher.parent.mkdir(parents=True)
@@ -48,7 +52,7 @@ def fixture_runtime(tmp_path, python=None):
 
 
 def launch(env, *args, launcher=LAUNCHER):
-    return subprocess.run([sys.executable, str(launcher), *args], env=env,
+    return subprocess.run([str(launcher), *args], env=env,
                           capture_output=True, text=True, timeout=20)
 
 
@@ -147,6 +151,66 @@ def test_ambient_runtime_override_cannot_retarget_published_selection(tmp_path):
     p = launch(env, 'binding')
     assert p.returncode == 0, p.stderr
     assert json.loads(p.stdout)['python'] == binding.parse_shell(launcher)[0]
+
+
+def test_initial_path_python_and_site_hooks_never_execute(tmp_path):
+    _, _, env = fixture_runtime(tmp_path)
+    poison = tmp_path / 'ambient'
+    poison.mkdir()
+    marker = tmp_path / 'ambient-executed'
+    fake = poison / 'python3'
+    fake.write_text('#!/bin/sh\n: > ' + shlex.quote(str(marker)) + '\nexit 0\n')
+    fake.chmod(0o700)
+    (poison / 'sitecustomize.py').write_text(f'open({str(marker)!r}, "w").close()\n')
+    env.update(PATH=str(poison) + os.pathsep + env.get('PATH', ''),
+               PYTHONPATH=str(poison), PYTHONHOME=str(poison))
+    target = Path(os.environ.get('POOL_INITIAL_LAUNCHER', LAUNCHER))
+    p = launch(env, 'binding', launcher=target)
+    assert not marker.exists(), 'ambient Python or startup hook executed'
+    assert p.returncode == 0, p.stderr
+    assert json.loads(p.stdout)['version'] == 1
+
+
+def test_symlinked_pool_launcher_resolves_plugin_sibling(tmp_path):
+    _, _, env = fixture_runtime(tmp_path)
+    link = tmp_path / 'pool'
+    link.symlink_to(LAUNCHER)
+    p = launch(env, 'env', launcher=link)
+    assert p.returncode == 0, p.stderr
+
+
+@pytest.mark.parametrize('argument', ['--run-module', '--print-runtime-command'])
+def test_hermes_dispatch_arguments_cannot_execute_managed_prelude(tmp_path, argument):
+    root, launcher, env = fixture_runtime(tmp_path)
+    marker = tmp_path / 'hermes-dispatch-executed'
+    selected = binding.parse_shell(launcher)
+    dispatch = (f"if sys.argv[1:2] == [{argument!r}]:\n"
+                f" open({str(marker)!r}, 'w').close()\n"
+                " raise SystemExit(0)\n")
+    selected[3] = selected[3].replace('from hermes_cli.main import main\n', dispatch + 'from hermes_cli.main import main\n')
+    launcher.write_text(binding.shell(selected))
+    (root / 'hermes_cli/_launch_template.py').write_text('def render(root,module,func):\n return ' + repr(selected[3]) + '\n')
+    subprocess.check_call(['/usr/bin/git', '-C', str(root), 'add', '.'])
+    subprocess.check_call(['/usr/bin/git', '-C', str(root), '-c', 'user.name=Fixture',
+                           '-c', 'user.email=fixture@example.com', 'commit', '-qm', 'dispatch fixture'])
+    target_binding = binding
+    if os.environ.get('POOL_COMMAND_BINDING'):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('prior_binding', os.environ['POOL_COMMAND_BINDING'])
+        target_binding = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(target_binding)
+    old_home = os.environ.get('HOME')
+    try:
+        os.environ['HOME'] = str(tmp_path)
+        cmd = target_binding.command(LAUNCHER.parents[1] / 'pool_llm.py', [argument, 'arbitrary'])
+    finally:
+        if old_home is None:
+            os.environ.pop('HOME', None)
+        else:
+            os.environ['HOME'] = old_home
+    p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20)
+    assert not marker.exists(), 'managed CLI branch escaped pool dispatcher'
+    assert p.returncode != 0, p.stdout
 
 
 def test_renderer_rejects_executable_expressions():

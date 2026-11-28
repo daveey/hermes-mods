@@ -256,7 +256,7 @@ def test_env_real_launcher(tmp_path):
     _, _, env = fixture_runtime(tmp_path)
     outputs = []
     for args in [('env', '--port', '8791'), ('env',)]:
-        result = subprocess.run([sys.executable, str(launcher), *args], env=env,
+        result = subprocess.run([str(launcher), *args], env=env,
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         shell_env = dict(env, ANTHROPIC_AUTH_TOKEN='stale-fixture-token')
@@ -276,7 +276,7 @@ def test_env_real_launcher(tmp_path):
     assert outputs[0]['ANTHROPIC_API_KEY'] == outputs[1]['ANTHROPIC_API_KEY'] == path.read_text()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     path.chmod(0o644)
-    result = subprocess.run([sys.executable, str(launcher), 'serve', '--port', '0'],
+    result = subprocess.run([str(launcher), 'serve', '--port', '0'],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode != 0
     assert 'token' in result.stderr

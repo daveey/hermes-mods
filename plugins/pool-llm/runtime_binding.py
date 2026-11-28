@@ -162,13 +162,37 @@ def resolve(home=None, *, _with_command=False):
 
 def command(module, argv):
     bound, selected = resolve(_with_command=True)
-    # Transform only the known terminal entry point, after comparing the WHOLE
-    # program with its committed renderer. Never accept a MARK-containing prelude.
-    tail = ("from hermes_cli.main import main\n"
-            "sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
-            "sys.exit(main())\n")
-    if not selected[3].endswith(tail):
-        raise BindingError('unsupported managed terminal entry point')
-    body = ("import runpy\n" + f"sys.argv = [{str(module)!r}] + sys.argv[1:]\n"
-            + f"runpy.run_path({str(module)!r}, run_name='__main__')\n")
-    return [selected[0], '-I', '-c', selected[3][:-len(tail)] + body, *argv]
+    # The full rendered launcher is authenticated as publication DATA, never
+    # executed here. Its CLI dispatch branches (--run-module, print-runtime)
+    # belong to Hermes, not the pool command. Use this plugin-owned program.
+    # Match runtime_command's isolated managed bootstrap, retaining PM's dynamic
+    # activation/update ownership without importing the CLI main dispatcher.
+    body = (
+        "import os, sys, runpy; "
+        "os.environ.pop('PYTHONHOME', None); os.environ.pop('PYTHONPATH', None); "
+        "os.environ.pop('VIRTUAL_ENV', None); "
+        f"sys.path.insert(0, {bound['core']!r}); "
+        "sys._hermes_pin_default_home = True; "
+        "import hermes_bootstrap; "
+        f"sys.argv = [{str(module)!r}] + sys.argv[1:]; "
+        f"runpy.run_path({str(module)!r}, run_name='__main__')"
+    )
+    return [selected[0], '-I', '-c', body, *argv]
+
+
+def main():
+    import sys
+    try:
+        if sys.argv[1:] == ['binding']:
+            print(json.dumps(resolve(), sort_keys=True))
+            return 0
+        selected = command(Path(__file__).resolve().with_name('pool_llm.py'), sys.argv[1:])
+    except (ValueError, OSError, KeyError, TypeError, SyntaxError):
+        print('hermes-pool-llm: installed managed runtime binding invalid', file=sys.stderr)
+        return 2
+    os.execv(selected[0], selected)
+    return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
