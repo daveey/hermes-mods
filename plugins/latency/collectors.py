@@ -166,7 +166,9 @@ def collect_board(path, store, definitions, since, until, host='local', gateway=
         for task in tasks:
             events.extend(dict(r) for r in db.execute('''SELECT id,task_id,kind,created_at FROM task_events
                 WHERE task_id=? AND created_at<=? ORDER BY created_at,id''', (task['id'], until)))
-    samples = [s for s in board_samples(tasks, events, definitions, source, host, gateway) if since <= s['start'] <= until]
+    from .store import RETENTION_SECONDS
+    samples = [s for s in board_samples(tasks, events, definitions, source, host, gateway)
+               if min(since,until-RETENTION_SECONDS) <= s['start'] <= until]
     # Board events are append-only: incoming observations revise existing values.
     # A recently archived old card is not an authoritative deletion of its retained
     # observation merely because its creation falls outside this backfill window.
