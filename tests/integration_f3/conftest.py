@@ -52,6 +52,15 @@ def pytest_configure(config):
     config.add_cleanup(cleanup)
 
 
+def stage_plugins(mods, home):
+    """Preserve the deployed sibling layout in the isolated F3 home."""
+    # ask-gate imports the shared session-panel brief parser at load time.
+    for name in ("ask-gate", "user-steps", "session-panel"):
+        shutil.copytree(mods / "plugins" / name, home / "plugins" / name,
+                        ignore=shutil.ignore_patterns("__pycache__", "tests"))
+    shutil.copy2(mods / "plugins" / "kanban_inventory.py", home / "plugins" / "kanban_inventory.py")
+
+
 @pytest.fixture
 def harness(tmp_path, monkeypatch, request):
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -71,10 +80,7 @@ def harness(tmp_path, monkeypatch, request):
         "auxiliary:\n  title_generation:\n    enabled: false\n",
         encoding="utf-8")
     mods = Path(__file__).resolve().parents[2]
-    # ask-gate imports the shared session-panel brief parser at load time.
-    for name in ("ask-gate", "user-steps", "session-panel"):
-        shutil.copytree(mods / "plugins" / name, home / "plugins" / name,
-                        ignore=shutil.ignore_patterns("__pycache__", "tests"))
+    stage_plugins(mods, home)
     token = set_hermes_home_override(home)
     manager = plugins.get_plugin_manager()
     from hermes_state import SessionDB
