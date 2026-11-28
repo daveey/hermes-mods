@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import stat
+import sys
 import importlib.util
 import time
 from pathlib import Path
@@ -183,7 +184,7 @@ def _status(st: Dict[str, Any], home: Optional[Path], checkout: Optional[Path],
         out["state"] = "ready"
         out["can_restart"] = _waiter_available()
         if not out["can_restart"]:
-            out["reason"] = "installed updater is unavailable or not attested"
+            out["reason"] = "installed updater is unavailable or fails ownership/permission checks"
     elif s == "failed":
         out["state"] = "failed"
     return out
@@ -233,7 +234,13 @@ def restart(home: Optional[Path] = None, *, popen: Callable[..., Any] = subproce
         _write_restart_force_request(home if home is not None else hermes_home())
     except Exception as exc:
         return {"ok": False, "reason": f"could not write restart request: {exc}"}
-    cmd = ["/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("waiter.py"))]
+    # A bare store Python loses the backend's dependency roots. Bootstrap this
+    # backend's managed checkout before starting the fixed plugin waiter.
+    bootstrap = ("import sys, runpy; sys.path.insert(0, sys.argv.pop(1)); "
+                 "sys._hermes_pin_default_home = True; import hermes_bootstrap; "
+                 "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')")
+    cmd = [sys.executable, "-I", "-c", bootstrap, str(running_checkout()),
+           str(Path(__file__).resolve().with_name("waiter.py"))]
     detached = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True, close_fds=True)
     popen(cmd, **detached)

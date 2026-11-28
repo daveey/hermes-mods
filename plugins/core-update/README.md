@@ -10,7 +10,8 @@ after 15). Version reads never fetch or edit Git.
 
 **Update now** works even without a pending prebuild. It writes the standard
 30-minute `hermes_cli.core_update_force.write_force_request(..., by="hub panel")`
-intent and invokes the installed attested updater's `core` command to fetch latest.
+intent and invokes the installed ownership/permission-checked updater's `core` command to fetch latest.
+These checks are not a source-review attestation.
 Busy or unknown running-turn counts require confirmation in the panel; cancel
 writes nothing. All version/update requests target the Desktop machine's **local**
 backend, independently of the selected gateway; hub history still targets the hub.
@@ -40,7 +41,19 @@ Prefix `/api/plugins/core-update`:
 
 The installation root is `$HERMES_HOME`, or its grandparent for `profiles/<name>`.
 The updater is always `~/.hermes/sync-runner/hermes-sync`, opened and checked as a
-regular current-uid file without group/other write permission. No browser/state
+regular current-uid file without group/other write permission. Parent components
+are checked through directory descriptors; symlink/foreign/writable parents are
+refused (root-owned system ancestors are allowed). The plugin supplies the opened
+snapshot to the runner. Its isolated child bootstrap must compare that snapshot's
+SHA256 before compiling a later opened runner: a concurrent runner replacement is
+a refusal, not permission to execute newer bytes. Restart bootstraps the backend's
+managed parser runtime instead of starting the system Python.
+
+This is content continuity, **not source approval or enrollment**. The companion
+state runner change is required for child/reexec continuity. Installed runner parity,
+full deciding runner behavior, exact managed-core receipt controls, live service
+configuration and the Hub renderer retain their own independent review/live gates.
+No browser/state
 value chooses code or arguments. `waiter.py --update` runs the fixed `core` command;
 without that flag it runs fixed `core-waiter`. The plugin never edits the checkout
 itself, and state `waiter_cmd` is ignored.

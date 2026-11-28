@@ -161,7 +161,10 @@ def test_restart_starts_the_waiter_then_quits_desktop_detached(repo):
     spawned = []
     r = core.restart(home, checkout=root, popen=lambda cmd, **kw: spawned.append((cmd, kw)))
     assert r == {"ok": True, "sha": ahead}
-    assert spawned[0][0] == ["/usr/bin/python3", "-I", str(Path(core.__file__).resolve().with_name("waiter.py"))]
+    command = spawned[0][0]
+    assert command[:3] == [core.sys.executable, "-I", "-c"]
+    assert "import hermes_bootstrap" in command[3]
+    assert command[4:] == [str(core.running_checkout()), str(Path(core.__file__).resolve().with_name("waiter.py"))]
     assert "osascript" in spawned[1][0][-1] and core.DESKTOP_BUNDLE_ID in spawned[1][0][-1]
     assert all(kw["start_new_session"] for _cmd, kw in spawned)
 
