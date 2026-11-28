@@ -227,8 +227,11 @@ class Store:
                     db.executemany('INSERT INTO hist VALUES (?,?,?,?,?)',
                                    [(metric,host,hour,bucket,n) for (host,hour,bucket),n in expected.items()])
                     groups.update((metric,day) for day in days)
+            # Remove every old group before any refill: the same identity can
+            # move between days, regardless of hash-dependent set iteration order.
             for metric, day in groups:
                 db.execute('DELETE FROM slow WHERE metric=? AND day=?', (metric,day))
+            for metric, day in groups:
                 db.execute('''INSERT INTO slow SELECT id,metric,?,start,dur,sample FROM contributions
                     WHERE metric=? AND start>=? AND start<? ORDER BY dur DESC,id LIMIT 20''',
                            (day,metric,day,day+86400))
