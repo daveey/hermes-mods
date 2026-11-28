@@ -1236,13 +1236,13 @@ def _command_events(text: str, _prepared: bool = False) -> Iterator[tuple[list[s
     # `"$\<nl>(cmd)"` is a substitution that the opener scan must see.
     try:
         code = _expose_substitutions(_join_continuations(text if _prepared else _split_heredocs(text)[0]), substitutions)
+        code = _join_continuations(code)
     except _AnalysisLimit:
         yield _InspectionHold(["command substitution inspection depth limit"]), set()
         return
     except _UnsupportedSubstitution:
         yield _InspectionHold(["case command substitution inspection unsupported"]), set()
         return
-    code = _join_continuations(code)
     toks = _command_lex(_lexable(code, _command_lex))
     if toks is None:
         return
@@ -1703,9 +1703,20 @@ class _ScriptLimit(Exception):
     """A recognized shell script was not completely inspected."""
 
 
+def _inspection_events(text: str, prepared: bool) -> Iterator[tuple[list[str], set[str]]]:
+    # Heredoc ownership/token inspection also decodes ANSI-C words. Preserve its
+    # typed refusal instead of letting it escape into the hook's allow fallback.
+    try:
+        code = text if prepared else _drop_ssh_heredocs(text)
+    except _UnsupportedSubstitution:
+        yield _InspectionHold(["shell syntax inspection unsupported"]), set()
+        return
+    yield from _command_events(code, prepared)
+
+
 def _scan(text: str, cwd: Optional[str], depth: int, in_script: bool,
           substitution_depth: int = 0, prepared: bool = False) -> Optional[Hit]:
-    for argv, env in _command_events(text if prepared else _drop_ssh_heredocs(text), prepared):
+    for argv, env in _inspection_events(text, prepared):
         if isinstance(argv, _InspectionHold):
             return f"{argv[0]}; use {OPT_OUT}=1 to opt out explicitly", None, cwd
         if isinstance(argv, _Substitution):
@@ -1841,7 +1852,7 @@ def note(text: str, cwd: Optional[str] = None, _prepared: bool = False,
     """Non-blocking note for a multi-file Python test run inside a Hermes core worktree, else None."""
     if _opted_out():
         return None
-    for argv, env in _command_events(text if _prepared else _drop_ssh_heredocs(text), _prepared):
+    for argv, env in _inspection_events(text, _prepared):
         if isinstance(argv, _InspectionHold):
             continue  # evaluate/check_shell already issue the policy hold
         if isinstance(argv, _Substitution):
