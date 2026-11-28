@@ -127,6 +127,20 @@ reusing core projections from an earlier episode; it does not change the card, i
 
 ## Canonical age-only owner reassessment (WIP; not rollout proof)
 
+Dependency-gated `todo` (or dependency-blocked) cards are judged against core's
+`parent_states` / `parent_blocks`, including independent restrictions on terminal
+parents. An older external-producer park does not authorize a child nudge while a
+prerequisite still blocks; the prerequisite retains its own scanner judgment.
+`BS-no-progress` uses the same predicate before predicting promotion, rather than
+assuming `done` / `archived` means execution is released.
+
+A deliberate unprobed deployment observation may retain its finite future
+checkpoint for age-only diagnosis: the original opaque-ID case is bounded to two
+hours; a structured `clock_only: true` deployment with a named non-URL ref and
+`awaiting.why` is bounded to eight hours (a batched update window). Neither is a
+producer-health receipt. Probes, completion/adverse events, expired checkpoints,
+and longer windows retain diagnosis. These guards do not enable a rollout.
+
 `BS-long-wait` can omit only its `too_long` result while a Board-certified owner
 reassessment remains current and `now < reassess_at`. It calls core's read-only
 `kanban_owner_reassessment_replica.verified_for_event(conn, event, task, now=...)`

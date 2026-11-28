@@ -201,7 +201,7 @@ def observe_card(scan, src, card, now: float) -> dict:
                 from hermes_cli import kanban_db
                 from hermes_cli import kanban_db_sync as sync
                 states = dict(kanban_db.parent_states(c, card.id, remote=sync.has_remote_parents(c)))
-                obs['parents_open'] = any(st not in SATISFIED for st in states.values()) if states else False
+                obs['parents_open'] = any(kanban_db.parent_blocks(c, pid, st) for pid, st in states.items()) if states else False
                 if states and not obs['parents_open']:
                     times = [(scan._parent_state(c, p) or {}).get('completed_at') for p in states]
                     obs['parents_done_at'] = max((x for x in times if x is not None), default=None)

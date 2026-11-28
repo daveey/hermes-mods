@@ -49,6 +49,32 @@ def running_with_event(conn, now, *, event_s):
 
 
 # ── the verdicts ─────────────────────────────────────────────────────────────────────────────────────────────────
+def test_terminal_restricted_parent_does_not_predict_promotion(env):
+    from hermes_cli import kanban_db
+    parent = F.card(env.conn, 'Archived prerequisite under an independent stop', status='archived')
+    tid = F.card(env.conn, 'Still dependency gated', status='todo')
+    env.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, tid))
+    env.conn.execute('UPDATE tasks SET completed_at=? WHERE id=?', (int(env.now - 5 * 86400), parent))
+    env.conn.commit()
+    F.event(env.conn, parent, 'decision_hold_restricted', {'cause': 'scope_stopped'}, at=env.now - 4 * 86400)
+    assert kanban_db.parent_blocks(env.conn, parent, 'archived')
+    tick(env, env.now)
+    for elapsed in (31 * M, 62 * M):
+        r = tick(env, env.now + elapsed)
+        assert hits(r, card=tid) == []  # neither missed_once nor missed_twice
+        assert P.load_snapshot(env.home, F.CHAT)['cards'][tid]['prediction']['due_at'] is None
+
+
+def test_terminal_unrestricted_parent_still_predicts_promotion(env):
+    parent = F.card(env.conn, 'Finished prerequisite', status='done')
+    tid = F.card(env.conn, 'Needs promotion', status='todo')
+    env.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, tid))
+    env.conn.execute('UPDATE tasks SET completed_at=? WHERE id=?', (int(env.now - 3600), parent))
+    env.conn.commit()
+    tick(env, env.now)
+    assert hits(tick(env, env.now + 31 * M), card=tid)
+
+
 def test_first_sight_is_a_baseline_and_judges_nothing(env):
     F.running_quiet(env.conn, env.now)
     r = tick(env, env.now)
