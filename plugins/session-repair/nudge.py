@@ -279,7 +279,9 @@ def settle_unknown(scan, src, f, history):
             'pending_at':pending['at'], 'independent_wake':wake}
 
 
-def process(findings, *, home, now, scan, runner, argv, read_json, write_json, append):
+def process(findings, *, home, now, scan, runner, argv, read_json, write_json, append, hold=frozenset()):
+    """`hold`: rules soaking in shadow (run.py `shadow_rules`). Their persisted pending deliveries keep their custody
+    untouched (no receipt readback, no wake) until the rule goes live again; their fresh findings never reach here."""
     sd = home / 'session-repair'
     mode = config_mode(home)
     path = sd / f'nudges-{mode}.json'
@@ -289,9 +291,12 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
     deadline = time.monotonic() + 300  # leave remaining candidates for the next 15-minute tick
     room = min(PER_RUN, max(0, PER_DAY-len(state['sent'])))
     # Recover frozen deliveries even if the wake has already moved the target out of scanner eligibility.
-    by_fp = {f['fingerprint']:f for f in findings}
+    by_fp = {f['fingerprint']:f for f in findings if f.get('id') not in hold}
     for fp, h in state['fps'].items():
         if h.get('pending', {}).get('finding'):
+            if h['pending']['finding'].get('id') in hold:
+                by_fp.pop(fp, None)  # custody kept as is (silent: it would otherwise print a line every tick)
+                continue
             by_fp[fp] = h['pending']['finding']
     for original in by_fp.values():
         if time.monotonic() >= deadline:

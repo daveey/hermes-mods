@@ -96,7 +96,9 @@ def test_healthy_ci_wait(env):
     # due at park + expected (BS-long-wait's 45 min for ci) + grace, not at +30 min
     assert pred['due_at'] == pytest.approx(env.now - 10 * M + 45 * M + P.CI_GRACE_S, abs=2)
     r = tick(env, env.now + 51 * M)
-    assert verdict(r) == 'missed_once' and hits(r, card=tid)
+    assert verdict(r) == 'long_wait' and hits(r) == [], 'an overdue producer park is BS-long-wait\'s to flag'
+    assert P.load_snapshot(env.home, F.CHAT)['cards'][tid]['prediction']['deferred'] == 'BS-long-wait'
+    assert [f['id'] for f in env.scan(now=env.now + 51 * M)['findings'] if f['card'] == tid] == ['BS-long-wait']
 
 
 def test_clock_park_not_due(env):
@@ -313,6 +315,32 @@ def test_replay_chat_whose_only_waits_are_two_bare_hub_processes(env, monkeypatc
     r = tick(env, t0 + 62 * M)                               # 22:17Z
     assert verdict(r, chat) == 'missed_twice'
     assert {f['fix']['kind'] for f in hits(r, chat=chat)} == {'card'}
+
+
+def test_overdue_producer_park_with_a_fresh_healthy_receipt_is_not_a_miss(env, monkeypatch):
+    """Review B2: an aged CI/probe park whose watcher keeps reporting healthy (unchanged facts, refreshed receipt)
+    is BS-long-wait's healthy producer, not a BS-no-progress miss."""
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state': 'not_resolvable', 'happened': False})
+    now = int(env.now)
+    for kind in ('ci', 'external', None):
+        tid = F.card(env.conn, f'Waiting for producer {kind}', status='scheduled')
+        F.age_all_events(env.conn, tid, now - 4000)
+        park = {'reason': 'producer', 'wake_at': now + 86400, 'wake_check': 'python3 probe.py'}
+        if kind:
+            park['awaiting'] = {'kind': kind, 'ref': 'job'}
+        F.event(env.conn, tid, 'scheduled', park, at=now - 4000)
+    def watch(at):
+        for (tid,) in env.conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
+            F.event(env.conn, tid, 'external_watch', {
+                'schema': 1, 'adapter': 'shell', 'health': 'ok', 'state': 'external_running', 'observed_at': at - 100,
+                'next_due_at': at + 800, 'every': 900, 'consecutive_failures': 0, 'failing_since': None}, at=at - 100)
+    watch(now)
+    tick(env, now)
+    for k in (1, 2, 3, 5):
+        watch(now + k * 15 * M)
+        r = tick(env, now + k * 15 * M)
+        assert hits(r) == [] and verdict(r) in ('healthy_wait', 'long_wait'), (k, verdict(r))
+        assert not [f for f in r['findings'] if f['id'] == 'BS-long-wait'], 'and BS-long-wait agrees: healthy'
 
 
 # ── the nudge lane (after the soak) ──────────────────────────────────────────────────────────────────────────────

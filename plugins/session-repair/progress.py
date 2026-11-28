@@ -263,17 +263,19 @@ def predict(obs: dict, since: float, long_wait: dict) -> dict:
                         'due_at': None, 'dependent': ref, 'wait': 'card'}
             return {'expect': f'awaited card {ref} (not readable here) finishes or the park re-parks',
                     'due_at': (wake + CLOCK_GRACE_S) if wake else since + long_wait.get('card', 4 * 3600),
-                    'wait': 'card'}
+                    'wait': 'card', 'defer': 'BS-long-wait'}
         if kind in ('ci', 'deploy'):
             expected = park.get('expected_s') or long_wait.get(kind, 2700)
             return {'expect': f'the {kind} run completes and the park wakes',
-                    'due_at': (park.get('at') or since) + expected + CI_GRACE_S, 'wait': kind}
+                    'due_at': (park.get('at') or since) + expected + CI_GRACE_S, 'wait': kind,
+                    'defer': 'BS-long-wait'}
         if kind and QUEUE_RE.search(f'{ref} {aw.get("why") or ""} {park.get("why") or ""}'):
             return {'expect': 'merge-queue position decreases or it merges', 'due_at': since + PREDICT_S,
                     'wait': 'merge_queue'}
         if kind in long_wait:
             return {'expect': f'the {kind} producer {ref} delivers and the park wakes',
-                    'due_at': (park.get('at') or since) + long_wait[kind], 'wait': kind}
+                    'due_at': (park.get('at') or since) + long_wait[kind], 'wait': kind,
+                    'defer': 'BS-long-wait'}
         if _clock(obs) and wake is not None:
             return {'expect': 'the clock wake fires', 'due_at': wake + CLOCK_GRACE_S, 'clock': True}
         if wake is not None:
@@ -345,11 +347,17 @@ def evaluate(prev: Optional[dict], cur: dict, now: float, *, long_wait: dict,
             pred['due_at'] = max(pred['due_at'], rearm)
         if not baseline and not progressed and pred.get('due_at') is not None and pred['due_at'] <= now \
                 and not pred.get('terminal'):
-            misses += 1
-            rearm = now + PREDICT_S
-            missed.append({'card': cid, 'board': o['board'], 'misses': misses, 'prediction': dict(pred),
-                           'since': since})
-            pred['due_at'] = rearm
+            if pred.get('defer') or o.get('healthy') == 'producer':
+                # An overdue producer park is BS-long-wait's to judge (its probe/watch receipts, nudge cadence and
+                # thresholds): it flags the stalled ones itself. A fresh park-bound producer receipt (core's
+                # healthy_future_park) is a healthy wait. Neither is a miss here: label the chat only.
+                pred['deferred'] = pred.get('defer') or 'healthy_producer'
+            else:
+                misses += 1
+                rearm = now + PREDICT_S
+                missed.append({'card': cid, 'board': o['board'], 'misses': misses, 'prediction': dict(pred),
+                               'since': since})
+                pred['due_at'] = rearm
         cards_out[cid] = {**o, 'key': state_key(o), 'since': since, 'misses': misses, 'rearm_at': rearm,
                           'prediction': pred}
     procs_out = {}
@@ -394,8 +402,12 @@ def classify(cards: dict, process_only: bool) -> str:
         return 'valid_red'
     if any(c.get('healthy') == 'running' for c in cards.values()):
         return 'healthy_running'
-    if process_only or any(c.get('healthy') == 'producer' or c['prediction'].get('wait') for c in cards.values()):
+    live = [c for c in cards.values() if not c['prediction'].get('deferred')]
+    if process_only or any(c.get('healthy') == 'producer' for c in cards.values()) \
+            or any(c['prediction'].get('wait') for c in live):
         return 'healthy_wait'
     if any(p.get('clock') for p in preds):
         return 'clock_not_due'
+    if any(p.get('deferred') for p in preds):
+        return 'long_wait'
     return 'pending'
