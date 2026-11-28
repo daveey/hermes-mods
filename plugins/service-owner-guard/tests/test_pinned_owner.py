@@ -229,9 +229,10 @@ class PinnedOwner(Base):
         self.assertIsNone(self.verdict("kill -0 4242"))  # existence probe
 
     def test_pkill_matching_a_pinned_units_process_refused(self):
-        proc = subprocess.Popen(["sleep", "137.25"])
+        proc = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()', 'sleep 137.25'],
+                                stdin=subprocess.PIPE)
         self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
+        self.addCleanup(proc.stdin.close)
         self._fake_proc(proc.pid, PINNED + ".service")
         self.assertIn("pinned owner", self.verdict("pkill -f 'sleep 137.25'"))
         self.assertIsNone(self.verdict("pkill -f 'sleep 999.75'"))

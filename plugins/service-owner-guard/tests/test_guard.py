@@ -224,8 +224,9 @@ class ReloadsAndRestarts(Base):
 
 class LocalKill(Base):
     def spawn(self, cwd):
-        p = subprocess.Popen(["sleep", "60"], cwd=cwd)
-        self.addCleanup(lambda: (p.kill(), p.wait()))
+        p = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], cwd=cwd,
+                             stdin=subprocess.PIPE)
+        self.addCleanup(lambda: (p.stdin.close(), p.wait()))  # EOF, never a signal
         time.sleep(0.5)
         return p
 
@@ -248,9 +249,9 @@ class LocalKill(Base):
         free = self.home / "free2"
         free.mkdir()
         parent = subprocess.Popen(
-            [sys.executable, "-c", "import subprocess,sys,time; subprocess.Popen(['sleep','60'], cwd=sys.argv[1]); time.sleep(60)",
-             str(free)], cwd=self.work)
-        self.addCleanup(lambda: (subprocess.run(["pkill", "-P", str(parent.pid)]), parent.kill(), parent.wait()))
+            [sys.executable, "-c", "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import sys; sys.stdin.read()'], cwd=sys.argv[1]); p.wait()",
+             str(free)], cwd=self.work, stdin=subprocess.PIPE)
+        self.addCleanup(lambda: (parent.stdin.close(), parent.wait()))
         time.sleep(1)
         child = int(subprocess.run(["pgrep", "-P", str(parent.pid)], capture_output=True, text=True).stdout.split()[0])
         self.assertIn(f"card {OWNER}", self.verdict(f"kill {child}"))  # child's cwd is unmarked; its parent's is marked

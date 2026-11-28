@@ -83,6 +83,15 @@ Dry run: `python3 -c "import importlib.util as u;s=u.spec_from_file_location('g'
 
 ## Tests
 
+`tests/test_linux_boundary.py` drives the actual strict environment and owner readers
+through process-I/O adapters: healthy unowned/approved/own-card controls, denied target
+observations, wrong/failed attestation, manager PID reuse and manager-as-target refusal.
+Dropping either local `strict=True` argument fails its corresponding reader-denial
+assertion. Linux process fixtures exit by closing owned stdin pipes, never cleanup
+signals. The pytest conftest denies SQLite connections before module collection and
+rejects signal attempts; the independent unittest evidence runner installs equivalent
+fences before collection.
+
 `/usr/bin/python3 -m unittest discover -s plugins/service-owner-guard/tests -v`
 
 Or use `HERMES_MODS_PYTHON=<Hermes runtime python> scripts/test-all -k service-owner-guard --hermes-core <core checkout>`.
