@@ -353,9 +353,17 @@ def _unsupported_write_context(text, guard, budget):
         writing = (writing or word in _FILES or word in {'sqlite3', 'sqlite3.exe'}
                    or (word == 'find' and '-delete' in argv[1:])
                    or (env_hazard and word in {'sh', 'bash', 'dash', 'zsh', 'ksh'})
-                   or any(t in {'>', '>>', '>|', '&>', '&>>', '<>'} for t in raw))
+                   or any(t in {'>', '>>', '>|', '&>', '&>>', '<>'}
+                          and (i + 1 == len(raw) or raw[i + 1] not in
+                               {'/dev/null', "'/dev/null'", '"/dev/null"'})
+                          for i, t in enumerate(raw)))
     if hazardous and writing:
-        return 'file mutation in an unsupported shell state context; use explicit paths in a separate command and swap_db.py'
+        return ('file mutation in an unsupported shell state context '
+                '(backticks, braces with a pipe, $PWD/$OLDPWD, ~+/~-, '
+                'set/read/mapfile/eval/source/printf -v/pushd/popd, or functions); '
+                'write file contents with the write_file tool, or run the write as its own '
+                'command with literal absolute paths and none of those constructs; '
+                'use swap_db.py for live DBs')
     return None
 
 

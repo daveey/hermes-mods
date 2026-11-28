@@ -36,7 +36,21 @@ classifying their option operands must not remove an earlier refusal.
 A second **fail-closed mutation fallback** refuses a command list
 combining these constructs with file mutation (including sqlite3 and `find -delete`)
 or write redirection, even for a
-safe non-live target. Read-only lists and quoted command data remain allowed.
+safe non-live target. A redirect to the literal `/dev/null`, `'/dev/null'` or
+`"/dev/null"` does not count as a file mutation in this fallback; other mutation
+commands in the same list still count. Read-only lists and quoted command data remain allowed.
+
+Before either shell-policy pass, the entry point strips **once**, at offset zero,
+kanban-worker-nice's exact terminal niceness prefix (optional marker line, matching
+canonical integers 1–19, and the terminating newline). This prefix only reads
+niceness, renices its own shell and redirects to `/dev/null`; it changes no analyzed
+shell/path state. Changed whitespace, mismatched integers, different redirects,
+extra commands, missing newline and later occurrences are not exempt. The real
+producer contract and corpus-wide transparency checks live in
+`tests/test_nice_prefix.py`. This does not relax an underlying refusal: for example,
+`set -euo pipefail; ls | wc -l > /tmp/n.txt` remains unsupported with or without
+that prefix.
+
 Split safe maintenance into a separate explicit-path command; use `swap_db.py`
 for live replacements. This fallback is deliberately conservative, not a claim
 that those shell constructs have been implemented. `find . -delete` in HOME is
