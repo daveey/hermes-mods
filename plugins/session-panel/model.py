@@ -853,7 +853,9 @@ def agent_hold_text(row, bundle):
             and record.get('board') == row.get('board') and not row.get('stale')
             and not row.get('partial_source_unknown') and isinstance(refs, list)
             and refs and all(isinstance(ref, str) and ref for ref in refs)):
-        return 'waiting for ' + flat(str(row.get('board') or 'default')).capitalize()[:60] + ' lane admission (' + flat(', '.join(refs))[:100] + ')'
+        tenant = obj(obj(record.get('detail')).get('task')).get('tenant')
+        lane = tenant.capitalize() + ' ' if isinstance(tenant, str) and re.fullmatch(r'[a-z][a-z0-9_-]{0,59}', tenant) else ''
+        return 'waiting for ' + lane + 'lane admission (' + flat(', '.join(refs))[:100] + ')'
     wait = obj(row.get('wait'))
     if wait.get('next_actor') and wait.get('next_action') and wait.get('waiting_on'):
         # Preserve the authoritative wait producer's actor/action. A coordinating

@@ -12,7 +12,9 @@ a worker heartbeat is current, so a silent worker expires normally. No global
 quiet-chat sweep is authorized by this clock.
 
 A board-qualified `wait_for_lane_admission` actionability diagnosis can name the
-lane and next actor on a held row independently of executor evidence. This does
+next actor on a held row independently of executor evidence. The lane name comes
+from the hydrated task's `tenant`, not its board; a missing or malformed tenant
+produces generic "waiting for lane admission" text. This does
 not manufacture a run observation: unknown execution remains unknown, and stale
 or mismatched board diagnostics cannot supply the lane text.
 

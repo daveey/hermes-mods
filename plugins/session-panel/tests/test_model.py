@@ -85,7 +85,7 @@ def header_clock_cases():
 
 def test_lane_gate_uses_board_qualified_diagnosis_without_claiming_live_execution():
     # A PRIMARY mirror has no executor evidence for this never-started card.
-    row = task(status='triage', board='project', gateway='edge', block_kind='lane_gate',
+    row = task(status='triage', board='project', tenant='hermes', gateway='edge', block_kind='lane_gate',
                execution_observations=[{'version': 1, 'state': 'unknown', 'source': 'kanban.card',
                    'identity': {'kind': 'card', 'work_id': 't_abc123', 'gateway': 'edge',
                                 'profile': 'default', 'board': 'project'},
@@ -96,8 +96,14 @@ def test_lane_gate_uses_board_qualified_diagnosis_without_claiming_live_executio
             'action': 'wait_for_lane_admission', 'owner': {'kind': 'assignee', 'refs': ['lane-planner']}}}}})
     m = model.reduce_panel(b, now=NOW)
     view = next(r for rows in m['sections'].values() for r in rows if r['id'] == row['id'])
-    assert 'waiting for Project lane admission (lane-planner)' in view['detail']
+    assert 'waiting for Hermes lane admission (lane-planner)' in view['detail']
     assert not m['sections']['running'] and not m['sections']['needs_you']
+    # A board name is never a lane; use the hydrated task's tenant or stay generic.
+    for tenant in (None, '', 'bad\nlane', 3, {'name': 'hermes'}):
+        unknown_lane = copy.deepcopy(b)
+        unknown_lane['cards'][row['id']]['detail']['task']['tenant'] = tenant
+        out = model.reduce_panel(unknown_lane, now=NOW)
+        assert 'waiting for lane admission (lane-planner)' in out['sections']['waiting'][0]['detail']
     for change in ({'board': 'foreign'}, {'board': 'project', 'stale': True}):
         bad = copy.deepcopy(b)
         bad['tasks'][0].update(change)
