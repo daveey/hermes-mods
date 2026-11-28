@@ -171,6 +171,36 @@ configured hub transport, not the currently focused chat connection.
   in this small local metadata table. Neither limit changes the shipped 17 rows,
   which do not use request-stage joins.
 
+## Accepted decision → committed unblock spans
+
+Local `kind: span, source: spans` watches with `start: decision.submit` and
+`end: unblocked` use the durable canonical decision operation's `recordedAt`
+(accepted submission, not the earlier UI click). The minute collector joins its
+operation/request/session identity through the server-owned `kanban_projections`
+binding to an **unblocked** event's `user_steps_projection.operationId`, on the
+same gateway and exact board/card. Partial answers, archive/release receipts,
+unrelated unblocks and remote operations without local canonical evidence do
+not produce samples. Missing joins are retried on later cycles for 30 days.
+
+The first collector activation establishes a durable per-watch/per-board floor;
+no decisions predating it are imported as instrumentation history. Replay is
+idempotent across restarts. Board event timestamps have whole-second precision:
+both endpoints are quantized to seconds and spans carry
+`phase: seconds_resolution` (duration uncertainty less than one second;
+same-second operations are zero). This is not subsecond UI latency. The existing
+identifier-only span validator creates stable OTLP context; only safe card,
+session, board, profile and phase identifiers enter the aggregate/slow samples.
+Source JSON is projected to identifier/timestamp leaves in read-only SQLite;
+prompts, answers, frozen requests and credentials are not copied. HTTP admission
+limits are unchanged; internal durable-source replay may be older than one hour.
+External board entries require an explicit board name, and only this home's
+canonical action store is read. Definitions remain local, not shipped defaults.
+
+`tests/test_decisions.py` exercises the real sampler, SQLite sources, series and
+Ledger HTTP view, OTLP replay, restart deduplication, privacy and negative joins.
+Live deployment is verified separately; fixture observations are never imported
+into a production Ledger.
+
 ## API v1
 
 The standard dashboard authentication applies to both routes.

@@ -64,6 +64,8 @@ def cycle(root, store=None, now=None, include_github=True):
         if path.exists():
             paths.setdefault(path, settings)
     selected_board = [d for d in definitions if d['source'] == 'kanban']
+    from . import decisions
+    selected_decisions = decisions.definitions_for(definitions)
     for i, (path, settings) in enumerate(sorted(paths.items())):
         # Arbitrary external databases do not inherit this home's ownership.
         local = path == (root/'kanban.db').resolve()
@@ -72,6 +74,11 @@ def cycle(root, store=None, now=None, include_github=True):
         board = settings.get('board')
         collect('kanban.'+str(i), lambda p=path, g=owner_gateway, pr=owner_profile, b=board:
                 collectors.collect_board(p, store, selected_board, since, now, host, g, pr, b))
+        decision_board = board or ('default' if local else None)
+        if selected_decisions and decision_board:
+            collect('decisions.'+str(i), lambda p=path, g=owner_gateway, pr=owner_profile, b=decision_board:
+                    decisions.collect(root/'user-steps/actions.sqlite3', p, b, store,
+                                      selected_decisions, now, host, g, pr))
     selected_journal = [d for d in definitions if d['source'] in ('request-stages', 'desktop') or d['kind'] == 'span']
     paths = [*root.glob('cache/latency/spans-*.jsonl')]
     if any(d['source'] == 'request-stages' for d in selected_journal):
