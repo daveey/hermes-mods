@@ -198,6 +198,8 @@ Once the cleanup card's step is done, archive it.
 Gate statuses you copied from run summaries rather than verified live are marked so in the state file, with the
 run they came from; the owner corrects them on its next run.
 
+For an automatic replan prerequisite, read `references/automatic-replan-handoff.md` before completing.
+
 ## 4. Change the producer
 
 A cleaned card whose producer is unchanged is a symptom fix. Find what wrote the card and what kept feeding it,
