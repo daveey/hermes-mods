@@ -325,6 +325,33 @@ ticks** (about 30 min), preserving rows and verdicts on the owning card. Then se
 exact comment/chat receipt and a following owner event. This shorter nudge-only gate does **not** waive the existing
 24-hour shadow gate for the other fixes. To reverse rollout, set `nudge_mode=shadow` without changing `mode`.
 
+## BS-red-no-ask: red cards with no actionable scoped ask
+
+Detect stuck human chats or overdue triage cards that lack a validated ask covering
+each relevant card. An unrelated ask does not cover a retained spend/scope,
+containment, safety, lane-gated or invalid-ask card. Resolve dispatcher pseudo-chat
+custody through core's creator-chat resolver; never message the pseudo-chat.
+
+Nudge the owning chat once, naming every card's status, hold and reason. The turn
+reassesses within its existing mandate or files one genuine scoped ask with a
+recommendation, choices and consequences. The nudge grants no authority and never
+changes a hold itself. Safety refusals explicitly prohibit release: keep or archive;
+ask only if a person has a concrete step available. Lane admission still requires
+the owner's mandate and the supported `lanes admit` path.
+
+Fingerprint: `BS-red-no-ask:chat/<session>:<sorted card ids>`. Preserve the exact
+pending message identity across unknown delivery; never repeat a nudge for that
+fingerprint merely because the owner answered. If the same cards/asks remain two
+hours after a verified settled owner response, escalate to one area-card repair
+finding. Re-read asks, linked cards and live turn state before acting.
+
+For scoped rollout with other nudges shadow, preserve existing config and add
+`BS-red-no-ask:uncovered_red_cards` to `live_rules` and `BS-red-no-ask` to
+`nudge_live_rules`; `mode` must be live and `shadow_rules` must not hold it. Remove
+that override to reverse rollout. Verify actual message receipts separately from
+original-goal progress. A covered chat remains `valid_red`; only matching uncovered
+chats lose that healthy-hold classification.
+
 ## Adding a pattern or example
 
 When the user shows a broken session (screenshot, chat id, "this one again"):

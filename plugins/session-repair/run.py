@@ -541,9 +541,29 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
         soak_line = _rule_shadow(sd, now, soak)
         nudges = [f for f in findings if (f.get('fix') or {}).get('kind')=='nudge']
         nm = load_nudge().config_mode(home)
+        config = _read_json(sd/'config.json', {})
+        allowed = live_rules(home) if m == 'live' else None
+        red_rule = 'BS-red-no-ask'
+        red_key = red_rule + ':uncovered_red_cards'
+        # Explicit, scoped rollout. Neither this override nor a malformed value can
+        # promote other nudge rules; mode=off returned before scanning.
+        override = config.get('nudge_live_rules', []) if isinstance(config, dict) else []
+        red_live = (m == 'live' and isinstance(override, list) and red_rule in override
+                    and (allowed is None or red_key in allowed or red_rule in allowed)
+                    and red_rule not in soaking)
+        split_red = red_live and nm != 'live'
         actions, escalations, nm = load_nudge().process(
             nudges,home=home,now=now,scan=load_scan(),runner=runner,argv=hermes_argv(),
-            read_json=_read_json,write_json=_write_json,append=_append,hold=soaking)
+            read_json=_read_json,write_json=_write_json,append=_append,
+            hold=soaking | ({red_rule} if split_red else set()))
+        red_escalations = []
+        if split_red:
+            red_actions, red_escalations, _ = load_nudge().process(
+                [f for f in nudges if f.get('id') == red_rule], home=home, now=now,
+                scan=load_scan(),runner=runner,argv=hermes_argv(),
+                read_json=_read_json,write_json=_write_json,append=_append,run_mode='live',
+                hold=frozenset(load_scan().RULES) - {red_rule})
+            actions += red_actions
         ordinary = [f for f in findings if (f.get('fix') or {}).get('kind')!='nudge']
         held_back = []
         allowed = live_rules(home) if m == 'live' else None
@@ -562,6 +582,19 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
             out['handed'] += extra['handed']
             out['failed'] = out.get('failed',False) or extra.get('failed',False)
             out['line'] += ('; ' if out['line'] else '') + extra['line']
+        if red_escalations:
+            extra = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':red_escalations},
+                                   now=now,run_mode='live',runner=runner)
+            out['handed'] += extra['handed']
+            out['failed'] = out.get('failed',False) or extra.get('failed',False)
+            out['line'] += ('; ' if out['line'] else '') + extra['line']
+            path = sd/'nudges-live.json'
+            state = _read_json(path, {'fps':{}, 'sent':[]})
+            for f in red_escalations:
+                if f['fingerprint'] in extra['handed']:
+                    state['fps'][f['fingerprint']]['escalated'] = now
+            _write_json(path, state)
+        out['nudge_live_rules'] = [red_rule] if red_live else []
         out['nudges'], out['nudge_mode'] = actions, nm
         if any(a.get('outcome') == 'delivery_unknown' for a in actions):
             out['failed'] = True
