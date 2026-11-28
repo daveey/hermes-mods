@@ -757,3 +757,52 @@ def test_named_dependency_uses_captured_owner_profile_not_serving_profile():
         actions = out['sections']['waiting'][0]['actions']
         assert [a['target'] for a in actions if a.get('role') == 'dependency'] == [
             {'id': parent, 'gateway': 'remote', 'profile': 'dependency-profile', 'board': 'default'}]
+
+
+def overdue_request(state='open'):
+    """The user-steps overdue-triage card for t_abc123: Release / Archive / Keep parked, no human ask."""
+    r = request(state)
+    r.update(title='Release “Test card” to run again?', presentation={
+        'kind': 'kanban-overdue', 'question': 'Release “Test card” to run again?', 'other': False,
+        'overdue': {'entered_at': NOW - 7200, 'route': 'release', 'holder': 'its own agent', 'reason': 'decision_retained'}})
+    r['scope']['markdown'] = ('**What:** “Test card” stopped itself and has sat parked for 2 h.\n'
+                              '**Why:** Reconcile the remaining allowance.\n**Cost:** a new agent run if you release it.')
+    r['choices'] = [{'id': 'card-0', 'label': 'A: Release (recommended)', 'effect': 'answer', 'explain': 'Runs it again.'},
+                    {'id': 'card-1', 'label': 'B: Archive', 'effect': 'answer', 'explain': 'Stops it for good.'},
+                    {'id': 'card-2', 'label': 'C: Keep parked', 'effect': 'answer', 'explain': 'Quiet for a day.'}]
+    return r
+
+
+def overdue_bundle(**kw):
+    b = held_bundle()
+    b['tasks'][0]['triage_entered_at'] = NOW - 7200
+    b.update(requests=[overdue_request()], **kw)
+    return b
+
+
+def test_overdue_triage_card_is_an_actionable_stuck_card_not_needs_you():
+    m = model.reduce_panel(overdue_bundle(), now=NOW)
+    assert m['sections']['needs_you'] == []
+    (card,) = m['sections']['stuck']
+    assert card['kind'] == 'overdue' and card['attention'] == 'triage_overdue' and card['id'] == 't_abc123'
+    assert [o['choice_id'] for o in card['options']] == ['card-0', 'card-1', 'card-2']
+    assert card['recommend_letter'] == 'A'
+    assert any(a['kind'] == 'open_card' and a['target']['id'] == 't_abc123' for a in card['actions'])
+    assert any(a['kind'] == 'decide' for a in card['actions'])
+    brief = '\n'.join(card['details'])
+    assert 'What:' in brief and 'Why:' in brief and 'Cost:' in brief
+    assert m['header']['counts']['stuck'] == 1 and m['header']['counts'].get('needs_you', 0) == 0
+
+
+def test_overdue_card_without_its_row_still_renders_in_stuck():
+    b = overdue_bundle()
+    b['tasks'] = []
+    m = model.reduce_panel(b, now=NOW)
+    assert [v['kind'] for v in m['sections']['stuck']] == ['overdue'] and m['sections']['needs_you'] == []
+
+
+def test_answered_overdue_card_falls_back_to_the_plain_overdue_row():
+    b = overdue_bundle()
+    b['requests'] = [overdue_request(state='answered')]
+    m = model.reduce_panel(b, now=NOW)
+    assert all(v['kind'] != 'overdue' for v in m['sections']['stuck'] + m['sections']['needs_you'])

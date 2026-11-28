@@ -76,6 +76,7 @@ for name, row in f.retiring_owner_cases().items():
                  delivery={'state': 'delivering', 'text': 'Delivery to remote not confirmed (120 min)' if unconfirmed else 'Delivering…'})
         cases[f'owner_delivery_{name}_{unconfirmed}'] = f.bundle(row, requests=[r])
         cases[f'owner_baseline_{name}'] = f.bundle(row)
+cases['overdue_triage_card'] = f.overdue_bundle()
 cases['relative_clock'] = f.bundle(f.observed(f.task('t_clock', status='running',
     current_run_started_at=f.NOW - 36 * 60, activity_at=f.NOW - 60,
     run_machine='worker', run_model='example-model', activity_kind='tool')))
