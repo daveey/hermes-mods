@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 VERSION = 1
 PREDICT_S = 30 * 60               # "what it expects to see from this session in half an hour"
 HEALTHY_RUN_S = 30 * 60           # a running card with a progress event this recent is a healthy wait
+RUNTIME_UNOBSERVED_S = 4 * 3600   # liveness cannot defer board-silence investigation indefinitely
 CLOCK_GRACE_S = 10 * 60           # a clock wake is due at wake_at + 10 min (not +30 min)
 CI_GRACE_S = 15 * 60              # a CI/deploy run is due by park + expected_s + 15 min (one tick of slack)
 AWAITED_DONE_GRACE_S = 10 * 60    # a park whose awaited card finished wakes within 10 min (scan.PARENT_DONE_S)
@@ -171,9 +172,10 @@ def observe_card(scan, src, card, now: float) -> dict:
         # event. A fresh heartbeat cannot prove progress, but equally this reader
         # cannot prove a runtime stall from board silence while that run is live.
         rid = obs['run_id']
-        run = c.execute('SELECT status,last_heartbeat_at FROM task_runs WHERE id=? AND task_id=?',
+        run = c.execute('SELECT status,last_heartbeat_at,started_at FROM task_runs WHERE id=? AND task_id=?',
                         (rid, card.id)).fetchone() if rid is not None else None
         obs['runtime_liveness_at'] = _num(run[1]) if run and run[0] == 'running' else None
+        obs['runtime_started_at'] = _num(run[2]) if run and run[0] == 'running' else None
     elif card.status in ('scheduled', 'blocked', 'todo', 'triage'):
         park = scan.current_park(card)
         if park:
@@ -357,12 +359,20 @@ def evaluate(prev: Optional[dict], cur: dict, now: float, *, long_wait: dict,
         pred = predict(o, since, long_wait)
         live_at = _num(o.get('runtime_liveness_at'))
         if o.get('status') == 'running' and live_at is not None and 0 <= now - live_at <= 300:
-            # Unknown runtime progress is not a miss and never a progress signal.
-            # Start a full observation window after the last fresh liveness mark;
-            # stale/future/foreign/ended runs cannot buy this deferral.
-            misses = 0
-            rearm = max(rearm, live_at + PREDICT_S)
-            pred['deferred'] = 'runtime_activity_unobserved'
+            # Anchor to source facts, not snapshot lifetime or refreshing liveness.
+            # After the ceiling, request investigation of the visibility gap, not
+            # a claim that a live worker is stalled. Core holds still take priority.
+            anchor = max((v for k in ('event_at', 'runtime_started_at')
+                          if (v := _num(o.get(k))) is not None), default=since)
+            ceiling = anchor + RUNTIME_UNOBSERVED_S
+            if now < ceiling:
+                misses = 0
+                rearm = max(rearm, min(live_at + PREDICT_S, ceiling))
+                pred['deferred'] = 'runtime_activity_unobserved'
+            elif not pred.get('terminal'):
+                pred.update(expect='runtime progress verification (board silence; runtime progress unknown)',
+                            due_at=ceiling, runtime_live=True, runtime_progress='unknown',
+                            board_silent_s=int(now - anchor))
         if pred.get('due_at') is not None:
             pred['due_at'] = max(pred['due_at'], rearm)
         if not baseline and not progressed and pred.get('due_at') is not None and pred['due_at'] <= now \
