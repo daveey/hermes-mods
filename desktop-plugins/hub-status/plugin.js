@@ -80,14 +80,17 @@ const CSS = `
 .hs-ftr{display:flex;justify-content:space-between;margin-top:8px;color:var(--muted-foreground);font-size:11px}
 .hs-empty{color:var(--muted-foreground);font-size:11px;padding:6px 0}
 .hs-version{margin-top:12px;padding-top:10px;border-top:1px solid var(--border)}
-.hs-version dl{display:grid;grid-template-columns:120px 1fr;gap:3px;margin:8px 0}
-.hs-version dd{margin:0;font-family:ui-monospace,monospace}
-.hs-version button{border:1px solid var(--border);border-radius:5px;padding:3px 8px;margin:6px 6px 0 0;cursor:pointer}
-.hs-commit{display:grid;grid-template-columns:62px minmax(0,1fr) 64px;gap:6px;margin:4px 0;font-size:11px}
-.hs-commit>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hs-commit time{color:var(--muted-foreground);text-align:right}
-.hs-changes{max-height:200px;overflow-y:auto;overscroll-behavior:contain;margin:4px 0;padding-right:4px;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
-.hs-version button.hs-upd{position:relative;display:block;width:100%;height:26px;margin:8px 0 0;padding:0 10px;overflow:hidden;background:transparent;color:var(--foreground);font:inherit;font-size:12px;text-align:center}
+.hs-ver-hd{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:6px}
+.hs-ver-hd b{font-size:12px;font-weight:600}
+.hs-ver-sub{color:var(--muted-foreground);font-size:11px;text-align:right}
+.hs-version button{border:1px solid var(--border);border-radius:5px;padding:3px 8px;margin:6px 6px 0 0;cursor:pointer;background:transparent;color:var(--foreground);font:inherit;font-size:11px}
+.hs-version button:hover:not(:disabled){background:color-mix(in srgb,var(--foreground) 7%,transparent)}
+.hs-changes{max-height:200px;overflow-y:auto;overscroll-behavior:contain;margin:4px 0;padding:6px 4px 6px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.hs-bullets{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.hs-bullet{display:grid;grid-template-columns:10px minmax(0,1fr);gap:6px;align-items:start;font-size:11.5px;line-height:1.38;text-wrap:pretty}
+.hs-bullet-dot{width:5px;height:5px;border-radius:50%;margin-top:5px;background:color-mix(in srgb,var(--foreground) 45%,transparent)}
+.hs-bullet[data-impact=unblock] .hs-bullet-dot{background:var(--hs-g);box-shadow:0 0 0 2px color-mix(in srgb,var(--hs-g) 22%,transparent)}
+.hs-version button.hs-upd{position:relative;display:block;width:100%;height:28px;margin:8px 0 0;padding:0 10px;overflow:hidden;background:transparent;color:var(--foreground);font:inherit;font-size:12px;font-weight:500;text-align:center}
 .hs-version button.hs-upd:disabled{cursor:default}
 .hs-upd-fill{position:absolute;inset:0 auto 0 0;background:color-mix(in srgb,var(--accent,#3fb950) 35%,transparent);transition:width .6s ease}
 .hs-upd[data-phase=done] .hs-upd-fill{background:color-mix(in srgb,#3fb950 35%,transparent)}
@@ -95,7 +98,22 @@ const CSS = `
 .hs-upd[data-indeterminate=true] .hs-upd-fill{background-image:linear-gradient(90deg,transparent,color-mix(in srgb,var(--foreground) 18%,transparent),transparent);background-size:60% 100%;background-repeat:no-repeat;animation:hs-upd-sweep 1.4s linear infinite}
 @keyframes hs-upd-sweep{from{background-position:-60% 0}to{background-position:160% 0}}
 .hs-upd-label{position:relative;font-variant-numeric:tabular-nums}
-.hs-upd-msg{margin-top:4px;font-size:11px;color:var(--muted-foreground)}
+.hs-blockers{margin-top:8px;padding:7px 8px;border:1px solid var(--border);border-radius:6px;background:color-mix(in srgb,var(--foreground) 3%,transparent)}
+.hs-blk-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;font-size:11px;color:var(--muted-foreground)}
+.hs-blk-hd b{color:var(--foreground);font-weight:600}
+.hs-version button.hs-blk-all{margin:0;padding:1px 7px;height:20px;font-size:10.5px;border-color:color-mix(in srgb,var(--hs-r) 45%,var(--border));color:var(--foreground)}
+.hs-blk-list{display:flex;flex-direction:column;gap:5px;max-height:150px;overflow-y:auto}
+.hs-blk-row{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:7px;align-items:center;padding-top:5px;border-top:1px solid color-mix(in srgb,var(--border) 65%,transparent);font-size:11px}
+.hs-blk-row:first-child{padding-top:0;border-top:0}
+.hs-blk-dot{width:6px;height:6px;border-radius:50%;background:var(--hs-y)}
+.hs-blk-row[data-kind=build] .hs-blk-dot{background:var(--accent,#3fb950)}
+.hs-blk-name{font-weight:500;line-height:1.28;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hs-blk-meta{color:var(--muted-foreground);font-size:10.5px;line-height:1.25}
+.hs-version button.hs-blk-btn{margin:0;padding:1px 7px;height:21px;font-size:10.5px;white-space:nowrap}
+.hs-version button.hs-blk-btn[data-action=stop]{border-color:color-mix(in srgb,var(--hs-r) 45%,var(--border))}
+.hs-version button.hs-blk-btn:disabled,.hs-version button.hs-blk-all:disabled{opacity:.55;cursor:default}
+.hs-confirm{margin-top:8px;padding:7px 8px;border:1px solid color-mix(in srgb,var(--hs-y) 50%,var(--border));border-radius:6px;font-size:11px;line-height:1.38}
+.hs-upd-msg{margin-top:5px;font-size:11px;color:var(--muted-foreground)}
 .hs-upd-msg[data-phase=error]{color:#f85149}
 `
 
@@ -353,11 +371,139 @@ function Band({ segments, start, end, now }) {
 
 // Updates belong to the Desktop installation, never the selected remote gateway.
 export const updatePending = s => ['ready', 'building'].includes(s?.state) && Number(s?.commits) > 0
-export const updateTooltip = s => updatePending(s) ? `Update ready · ${s.commits} commits` : null
+export const updateTooltip = s => updatePending(s) ? `Update ready · ${s.commits} ${s.commits === 1 ? 'change' : 'changes'}` : null
+
+const SHA_RE = /\b(?:(?=[0-9a-f]*\d)[0-9a-f]{7,40}|[0-9a-f]{12,40})\b/gi
+const CARD_RE = /\bt_[0-9a-z]{8,24}\b/gi
+const TAG_RE = /\s*\[[A-Za-z0-9_.-]+\]\s*/g
+const CONV_RE = /^(?:(feat|fix|perf|refactor|docs|test|tests|chore|build|ci|style|revert)(?:\(([^)]+)\))?!?\s*:\s*)/i
+const INTERNAL_RE = /^(?:test|tests|chore|ci|style)(?:\([^)]*\))?!?:\s*|^cover\b.*\b(?:clauses|branches|cases)\b|\b(?:test fixture|ratchet|lint gate)\b/i
+const GATEWAY_CENSUS_RE = /^gateway\s+(\S+)\s+pid=\d+:\s+active=(\d+)\s+units=(\d+)\s+\(([a-z_,]*)\)/
+
+export function stripHashes(text) {
+  return String(text || '')
+    .replace(TAG_RE, ' ')
+    .replace(CARD_RE, '')
+    .replace(/\bPR\s*#?\d+\b|\(#\d+\)/gi, '')
+    .replace(SHA_RE, '')
+    .replace(/\(\s*\)/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[\s:;,-]+$/, '')
+    .trim()
+}
+
+export function humanizeSubject(subject) {
+  const raw = String(subject || '').trim()
+  const internal = INTERNAL_RE.test(raw)
+  const untagged = raw.replace(TAG_RE, ' ').trim()
+  const m = CONV_RE.exec(untagged)
+  const kind = (m?.[1] || '').toLowerCase()
+  let s = stripHashes(untagged.replace(CONV_RE, ''))
+    .replace(/\bkanban\b/gi, 'task board')
+    .replace(/\bsession-state\b|\bSessionState\b/g, 'session status')
+  const lead = /^([A-Za-z][A-Za-z0-9_-]{1,24}):\s+(.+)$/.exec(s)
+  if (lead) s = lead[2]
+  if (!s) return { text: '', internal: true }
+  const low = s.toLowerCase()
+  if (kind === 'fix' || /^(fix|avoid|prevent|repair)\s+/i.test(s)) {
+    if (low.startsWith('fix ')) s = 'Fixes ' + s.slice(4)
+    else if (low.startsWith('avoid ')) s = 'Prevents ' + s.slice(6)
+    else if (low.startsWith('prevent ')) s = 'Prevents ' + s.slice(8)
+    else if (low.startsWith('repair ')) s = 'Fixes ' + s.slice(7)
+    else if (!low.startsWith('fixes ')) s = 'Fixes: ' + s[0].toLowerCase() + s.slice(1)
+  } else if (low.startsWith('wake ')) s = 'Wakes ' + s.slice(5)
+  else if (low.startsWith('retain ')) s = 'Keeps ' + s.slice(7)
+  else if (low.startsWith('preserve ')) s = 'Preserves ' + s.slice(9)
+  else if (low.startsWith('recover ')) s = 'Recovers ' + s.slice(8)
+  else s = s[0].toUpperCase() + s.slice(1)
+  return { text: s.replace(/\.$/, ''), internal }
+}
+
+/** Human-oriented bullets for "What's in the update" — never git hashes. */
+export function summaryBullets(v) {
+  if (Array.isArray(v?.summary?.bullets) && v.summary.bullets.length) {
+    return v.summary.bullets.map(stripHashes).filter(Boolean)
+  }
+  const commits = Array.isArray(v?.changes) ? v.changes : []
+  if (!commits.length) {
+    return v?.desktop_swap_pending === true ? ['Finishes updating the Hermes Desktop app when it restarts'] : []
+  }
+  const parsed = commits.map(c => humanizeSubject(c?.subject)).filter(x => x.text)
+  const visible = parsed.filter(x => !x.internal).map(x => x.text)
+  const unique = [...new Set(visible)]
+  if (unique.length) return unique.slice(0, 8)
+  const n = commits.length
+  return [`Internal reliability and test checks (${n} ${n === 1 ? 'change' : 'changes'}) — no visible workflow changes`]
+}
+
+/** Structured blockers when waiting, falling back to parsing legacy deferral_reason strings cleanly. */
+export function deriveBlockers(v) {
+  if (Array.isArray(v?.blockers)) return v.blockers
+  const active = v?.progress || v?.force_request
+  if (!active || v?.progress?.state === 'applying') return []
+  const raw = String(v?.deferral_reason || '').trim()
+  if (!raw) {
+    return v?.progress?.state === 'batching' && !v?.force_request
+      ? [{ key: 'window:batch', kind: 'window', id: 'batch', profile: 'default', label: 'Scheduled quiet update window', detail: 'Batching updates to avoid interrupting your work', action: 'force', action_label: 'Skip wait' }]
+      : []
+  }
+  const parts = raw.split(';').map(s => s.trim()).filter(Boolean)
+  const items = []
+  let hasCronOrKanban = false
+  for (const part of parts) {
+    if (part.startsWith('cron:')) {
+      const rest = part.slice(5)
+      const [profile, id] = rest.includes(':') ? rest.split(':', 2) : ['default', rest]
+      const key = `cron:${profile}:${id}`
+      if (!items.some(x => x.key === key)) {
+        items.push({ key, kind: 'cron', id, profile, label: profile === 'default' ? 'Scheduled background job' : `Scheduled background job (${profile})`, detail: 'Scheduled job · running', action: 'stop', action_label: 'Stop' })
+        hasCronOrKanban = true
+      }
+      continue
+    }
+    const gw = GATEWAY_CENSUS_RE.exec(part)
+    if (gw) {
+      const kinds = gw[4].split(',').filter(Boolean)
+      if (hasCronOrKanban && kinds.length && kinds.every(k => k === 'cron' || k === 'managed')) continue
+      const units = Number(gw[3] || gw[2] || 1)
+      items.push({ key: `gateway:${gw[1]}`, kind: 'gateway', id: gw[1], profile: 'default', label: `Background gateway finishing ${units} active ${units === 1 ? 'task' : 'tasks'}`, detail: 'Waits for in-flight step to finish', action: null, action_label: null })
+      continue
+    }
+    const clean = stripHashes(part) || part
+    items.push({ key: `reason:${clean}`, kind: 'reason', id: clean, profile: 'default', label: clean[0].toUpperCase() + clean.slice(1), detail: null, action: null, action_label: null })
+  }
+  return items
+}
+
+export function versionStatusText(v) {
+  if (!v) return 'Checking…'
+  if (v.version_status) return stripHashes(v.version_status)
+  const n = Array.isArray(v.changes) ? v.changes.length : Number(v.commits || 0)
+  if (n > 0) return `${n} ${n === 1 ? 'change' : 'changes'} ready${v.desktop_swap_pending ? ' · restarts Desktop' : ''}`
+  if (v.desktop_swap_pending) return 'Restart Desktop to finish update'
+  return 'Up to date'
+}
+
+function waitingLabel(v, blockers) {
+  if (v?.progress?.state === 'batching' && !v?.force_request) return 'Waiting for update window…'
+  if (!blockers.length) return 'Waiting for turns…'
+  if (blockers.every(b => b.kind === 'cron')) {
+    return blockers.length === 1 ? 'Waiting on 1 background job…' : `Waiting on ${blockers.length} background jobs…`
+  }
+  if (blockers.every(b => b.kind === 'turn')) {
+    return blockers.length === 1 ? 'Waiting on 1 chat turn…' : `Waiting on ${blockers.length} chat turns…`
+  }
+  if (blockers.length === 1) {
+    if (blockers[0].kind === 'build') return 'Building app update…'
+    if (blockers[0].kind === 'desktop') return 'Waiting for app restart…'
+    return 'Waiting on 1 item…'
+  }
+  return `Waiting on ${blockers.length} items…`
+}
 
 /**
  * The Update now button's progress: a stage-based bar, since the updater publishes stages, not percentages.
- *   waiting for turns 8-45% (filled along the drainer's cap when it published one) → installing 60% → restarting 85% → done 100%.
+ *   waiting 8-45% (filled along the drainer's cap when it published one) → installing 60% → restarting 85% → done 100%.
  * `phase`: idle | active | done | error. `indeterminate`: the stage has no measurable fill, so the bar sweeps.
  */
 export function updateProgress(v, busy = false) {
@@ -370,11 +516,12 @@ export function updateProgress(v, busy = false) {
     const cap = Number(p?.cap_s), el = Number(p?.state_elapsed_s)
     const frac = cap > 0 && el >= 0 ? Math.min(1, el / cap) : null
     const pct = frac === null ? 15 : Math.round(8 + 37 * frac)
-    return { phase: 'active', pct, label: p?.state === 'batching' ? 'Waiting for update window…' : 'Waiting for turns…', indeterminate: frac === null }
+    const blockers = deriveBlockers(v)
+    return { phase: 'active', pct, label: waitingLabel(v, blockers), indeterminate: frac === null }
   }
   if (operation?.phase === 'updating') return { phase: 'active', pct: 60, label: 'Installing…', indeterminate: true }
   if (busy) return { phase: 'active', pct: 4, label: 'Starting…', indeterminate: true }
-  if (operation?.phase === 'updated' && !(v?.changes?.length)) return { phase: 'done', pct: 100, label: operation.sha ? `Updated to ${operation.sha.slice(0, 10)}` : 'Updated', indeterminate: false }
+  if (operation?.phase === 'updated' && !(v?.changes?.length)) return { phase: 'done', pct: 100, label: 'Updated', indeterminate: false }
   return { phase: 'idle', pct: 0, label: 'Update now', indeterminate: false }
 }
 
@@ -383,23 +530,40 @@ export function createVersionStore(api = options => window.hermesDesktop.api(opt
   const $message = atom('')
   const $confirm = atom(null)
   const $busy = atom(false)
+  const $stopping = atom({})
   let busy = false
+  let apiLevel = 2
   const setBusy = b => { busy = b; $busy.set(b) }
+  const setStoppingKey = (key, active) => {
+    const cur = { ...$stopping.get() }
+    if (active) cur[key] = true
+    else delete cur[key]
+    $stopping.set(cur)
+  }
   const request = (path, options = {}) => api({ path: `/api/plugins/core-update/${path}`, connectionId: 'local', ...options })
+  const cancelCronFallback = item => api({
+    path: `/api/cron/jobs/${encodeURIComponent(item.id)}/cancel?profile=${encodeURIComponent(item.profile || 'default')}`,
+    method: 'POST',
+    connectionId: 'local'
+  })
   const refresh = async () => {
     try {
       const ping = await request('ping', { passive: true })
       if (!(ping?.api >= 2)) throw new Error('Version panel awaits backend activation')
+      apiLevel = Number(ping.api) || 2
       const v = await request('version', { passive: true })
       $version.set(v)
       const operation = !v.force_request || v.operation?.requested_at >= v.force_request.requested_at ? v.operation : null
       if (['failed', 'deferred'].includes(operation?.phase)) {
-        $message.set(operation.reason || 'Update deferred'); setBusy(false)
-      } else if (v.deferral_reason) $message.set(v.deferral_reason)
-      else if (v.progress) $message.set(v.progress.state === 'applying' ? 'Updating' : 'Waiting for turns')
+        $message.set(stripHashes(operation.reason || 'Update deferred') || 'Update deferred'); setBusy(false)
+      } else if (v.human_deferral) $message.set(v.human_deferral)
+      else if (v.deferral_reason) {
+        const parsed = deriveBlockers(v)
+        $message.set(parsed.length ? (parsed.length === 1 ? parsed[0].label : `${parsed[0].label} +${parsed.length - 1} more`) : (stripHashes(v.deferral_reason) || v.deferral_reason))
+      } else if (v.progress) $message.set(v.progress.state === 'applying' ? 'Updating' : 'Waiting for turns')
       else if (v.force_request) $message.set('Waiting for turns')
       else if (operation?.phase === 'updated') {
-        $message.set(operation.sha ? `Updated to ${operation.sha.slice(0, 10)}` : 'Update completed; revision unavailable'); setBusy(false)
+        $message.set('Updated'); setBusy(false)
       } else if (['updating', 'restarting'].includes(operation?.phase)) $message.set('Updating')
       else { $message.set(''); setBusy(false) }
       return v
@@ -423,7 +587,68 @@ export function createVersionStore(api = options => window.hermesDesktop.api(opt
     if (v.running_turns !== 0) $confirm.set(v.running_turns ?? 'Unknown number of')
     else await apply()
   }
-  return { $version, $message, $confirm, $busy, active: () => busy || updateProgress($version.get()).phase === 'active', refresh, updateNow, apply, cancel: () => $confirm.set(null) }
+  const stopBlocker = async item => {
+    if (!item?.action) return
+    if (item.action === 'force') { await apply(); return }
+    if (item.action === 'restart') {
+      setStoppingKey(item.key, true)
+      try {
+        const res = await request('restart', { method: 'POST' })
+        if (!res?.ok) throw new Error(res?.reason || 'Could not restart Desktop')
+        await refresh()
+      } catch (e) { $message.set(String(e?.message || e)) }
+      finally { setStoppingKey(item.key, false) }
+      return
+    }
+    if (item.action !== 'stop') return
+    setStoppingKey(item.key, true)
+    try {
+      let handled = false
+      if (apiLevel >= 3) {
+        try {
+          const res = await request('blocker', {
+            method: 'POST',
+            body: { action: 'stop', kind: item.kind, id: item.id, execution_id: item.execution_id, holder: item.holder, profile: item.profile }
+          })
+          if (res?.ok) handled = true
+        } catch { /* fall back to core cron route when mounted api predates /blocker */ }
+      }
+      if (!handled && item.kind === 'cron') {
+        await cancelCronFallback(item)
+        handled = true
+      }
+      if (!handled) throw new Error('Could not stop blocker')
+      await refresh()
+    } catch (e) { $message.set(String(e?.message || e)) }
+    finally { setStoppingKey(item.key, false) }
+  }
+  const stopAllBlockers = async () => {
+    const v = $version.get()
+    const blockers = deriveBlockers(v).filter(b => b.action === 'stop')
+    if (!blockers.length) return
+    setStoppingKey('__all__', true)
+    try {
+      let handled = false
+      if (apiLevel >= 3) {
+        try {
+          const res = await request('blocker', { method: 'POST', body: { action: 'stop_all' } })
+          if (res?.ok) handled = true
+        } catch { /* fall back per cron item */ }
+      }
+      if (!handled) {
+        await Promise.all(blockers.filter(b => b.kind === 'cron').map(cancelCronFallback))
+      }
+      if (!v?.force_request) await request('update', { method: 'POST' }).catch(() => {})
+      await refresh()
+    } catch (e) { $message.set(String(e?.message || e)) }
+    finally { setStoppingKey('__all__', false) }
+  }
+  return {
+    $version, $message, $confirm, $busy, $stopping,
+    active: () => busy || updateProgress($version.get()).phase === 'active',
+    refresh, updateNow, apply, stopBlocker, stopAllBlockers,
+    cancel: () => $confirm.set(null)
+  }
 }
 
 export function VersionSection({ store }) {
@@ -431,25 +656,67 @@ export function VersionSection({ store }) {
   const message = useValue(store.$message)
   const count = useValue(store.$confirm)
   const busy = useValue(store.$busy || { get: () => false })
+  const stopping = useValue(store.$stopping || { get: () => ({}) })
   const prog = updateProgress(v, busy)
-  const commits = v?.changes || []
-  const row = c => jsxs('div', { className: 'hs-commit', children: [
-    jsx('code', { children: c.sha.slice(0, 8) }),
-    jsx('span', { title: c.subject, children: c.subject }),
-    jsx('time', { title: c.at, children: fmtTime(Date.parse(c.at)) })
-  ] }, c.sha)
-  return jsxs('section', { className: 'hs-version', 'aria-label': 'Hermes version', children: [
-    jsx('b', { children: 'Hermes version' }),
-    jsxs('dl', { children: [
-      jsx('dt', { children: 'Running backend' }), jsx('dd', { children: v?.running?.slice(0, 10) || 'Unavailable' }),
-      jsx('dt', { children: 'Applied checkout' }), jsx('dd', { children: v?.applied?.slice(0, 10) || 'Unavailable' }),
-      jsx('dt', { children: 'Installed Desktop' }), jsx('dd', { children: v?.desktop_build?.map(s => s?.slice(0, 10)).join(', ') || 'Unavailable' }),
-      jsx('dt', { children: 'Target' }), jsx('dd', { children: v?.target?.slice(0, 10) || 'Unavailable' })
+  const bullets = summaryBullets(v)
+  const blockers = prog.phase === 'active' ? deriveBlockers(v) : []
+  const stoppable = blockers.filter(b => b.action === 'stop')
+  const forcible = blockers.filter(b => b.action === 'force')
+  const stoppingAll = !!stopping.__all__
+
+  const bulletRow = (text, i) => {
+    const isUnblock = /^(Unblocks|Resumes)\b/i.test(text)
+    return jsxs('li', {
+      className: 'hs-bullet',
+      'data-impact': isUnblock ? 'unblock' : 'change',
+      children: [
+        jsx('span', { className: 'hs-bullet-dot', 'aria-hidden': true }),
+        jsx('span', { children: text })
+      ]
+    }, i)
+  }
+
+  const blockerRow = b => {
+    const busyRow = stoppingAll || !!stopping[b.key]
+    return jsxs('div', {
+      className: 'hs-blk-row',
+      'data-kind': b.kind,
+      children: [
+        jsx('span', { className: 'hs-blk-dot', 'aria-hidden': true }),
+        jsxs('div', {
+          children: [
+            jsx('div', { className: 'hs-blk-name', title: b.label, children: b.label }),
+            b.detail ? jsx('div', { className: 'hs-blk-meta', children: b.detail }) : null
+          ]
+        }),
+        b.action ? jsx('button', {
+          type: 'button',
+          className: 'hs-blk-btn',
+          'data-action': b.action,
+          disabled: busyRow,
+          onClick: () => store.stopBlocker?.(b),
+          children: busyRow ? 'Stopping…' : (b.action_label || 'Stop')
+        }) : null
+      ]
+    }, b.key)
+  }
+
+  const showStatusMsg = message
+    && !blockers.length
+    && message.replace(/…$/, '') !== prog.label.replace(/…$/, '')
+    && !/^(Updating|Waiting for turns|Waiting on |Updated)$/.test(message)
+
+  return jsxs('section', { className: 'hs-version', 'aria-label': "What's in the update", children: [
+    jsxs('div', { className: 'hs-ver-hd', children: [
+      jsx('b', { children: "What’s in the update" }),
+      jsx('span', { className: 'hs-ver-sub', children: versionStatusText(v) })
     ] }),
-    jsx('b', { children: "What’s in the update" }),
-    commits.length
-      ? jsx('div', { className: 'hs-changes', role: 'list', 'aria-label': `${commits.length} commits in the update`, children: commits.map(row) })
-      : jsx('div', { className: 'hs-empty', children: v ? 'No new commits' : 'Loading version…' }),
+    bullets.length
+      ? jsx('div', {
+        className: 'hs-changes',
+        children: jsx('ul', { className: 'hs-bullets', 'aria-label': 'Expected changes in this update', children: bullets.map(bulletRow) })
+      })
+      : jsx('div', { className: 'hs-empty', children: v ? 'Everything is up to date' : 'Checking for updates…' }),
     jsxs('button', {
       type: 'button', className: 'hs-upd', 'data-phase': prog.phase, 'data-indeterminate': String(prog.indeterminate),
       disabled: prog.phase === 'active', 'aria-busy': prog.phase === 'active',
@@ -460,12 +727,37 @@ export function VersionSection({ store }) {
         jsx('span', { className: 'hs-upd-label', children: prog.label })
       ]
     }),
-    count !== null ? jsxs('div', { role: 'alert', children: [
-      `${count} running turn(s) on this machine. Desktop/TUI turns will pause at their next boundary; other surfaces may keep the update waiting. Non-resumable turns must be sent again. `,
-      jsx('button', { type: 'button', onClick: () => store.apply(), children: 'Confirm update' }),
-      jsx('button', { type: 'button', onClick: () => store.cancel(), children: 'Cancel' })
+    blockers.length ? jsxs('div', {
+      className: 'hs-blockers',
+      role: 'region',
+      'aria-label': 'Waiting on',
+      children: [
+        jsxs('div', { className: 'hs-blk-hd', children: [
+          jsxs('span', { children: [jsx('b', { children: 'Waiting on' }), ` · ${blockers.length} ${blockers.length === 1 ? 'item' : 'items'}`] }),
+          stoppable.length >= 2 ? jsx('button', {
+            type: 'button',
+            className: 'hs-blk-all',
+            disabled: stoppingAll,
+            onClick: () => store.stopAllBlockers?.(),
+            children: stoppingAll ? 'Stopping…' : `Stop all (${stoppable.length})`
+          }) : (!stoppable.length && forcible.length ? jsx('button', {
+            type: 'button',
+            className: 'hs-blk-all',
+            onClick: () => store.stopBlocker?.(forcible[0]),
+            children: forcible[0].action_label || 'Skip wait'
+          }) : null)
+        ] }),
+        jsx('div', { className: 'hs-blk-list', children: blockers.map(blockerRow) })
+      ]
+    }) : null,
+    count !== null ? jsxs('div', { className: 'hs-confirm', role: 'alert', children: [
+      `${count} active chat ${count === 1 ? 'turn' : 'turns'} on this Mac. Chats pause cleanly after their current step and resume automatically; background jobs finish or can be stopped below. `,
+      jsx('div', { children: [
+        jsx('button', { type: 'button', onClick: () => store.apply(), children: 'Confirm update' }),
+        jsx('button', { type: 'button', onClick: () => store.cancel(), children: 'Cancel' })
+      ] })
     ] }) : null,
-    message && message.replace(/…$/, '') !== prog.label.replace(/…$/, '') && !/^(Updating|Waiting for turns|Updated to )/.test(message)
+    showStatusMsg
       ? jsx('div', { className: 'hs-upd-msg', 'data-phase': prog.phase, role: 'status', children: message }) : null
   ] })
 }

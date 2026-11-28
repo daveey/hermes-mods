@@ -80,7 +80,7 @@ def test_slow_core_keeps_ping_responsive(api, monkeypatch, method, path):
                 await asyncio.to_thread(observer.join, 5)
             assert not observer.is_alive()
             assert not errors, errors
-            assert observations == [(200, {"ok": True, "api": 2}, True, True)]
+            assert observations == [(200, {"ok": True, "api": 3}, True, True)]
             assert len(calls) == 1  # restart must not be retried or duplicated
             assert calls[0][0] == "fixture-profile"
             assert calls[0][1] != loop_thread
@@ -147,6 +147,25 @@ def test_update_failure_is_structured(api, monkeypatch, error):
         raise error
     monkeypatch.setattr(api, "_version", lambda: SimpleNamespace(update_now=fail))
     assert api.update() == {"ok": False, "reason": str(error)}
+
+
+def test_blocker_endpoint_dispatches_and_handles_validation_errors(api, monkeypatch):
+    seen = []
+    monkeypatch.setattr(api, "_version", lambda: SimpleNamespace(resolve_blocker=lambda p: seen.append(p) or {"ok": True, "stopped": 2}))
+    app = FastAPI()
+    app.include_router(api.router)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.post("/blocker", json={"action": "stop_all"})
+            assert res.status_code == 200 and res.json() == {"ok": True, "stopped": 2}
+            assert seen == [{"action": "stop_all"}]
+
+            monkeypatch.setattr(api, "_version", lambda: SimpleNamespace(resolve_blocker=lambda _p: (_ for _ in ()).throw(ValueError("bad profile"))))
+            err = await client.post("/blocker", json={"action": "stop", "kind": "cron", "id": "x"})
+            assert err.status_code == 200 and err.json() == {"ok": False, "reason": "bad profile"}
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("path", ["/status", "/restart"])

@@ -18,5 +18,6 @@ const { createVersionStore } = await import('../../../desktop-plugins/hub-status
 const view = JSON.parse(process.argv[2])
 const store = createVersionStore(async o => o.path.endsWith('/ping') ? { api: 2 } : view)
 await store.refresh()
-assert.equal(store.$message.get(), `Updated to ${view.target.slice(0, 10)}`)
+assert.equal(store.$message.get(), 'Updated')
+assert.ok(!store.$message.get().includes(view.target.slice(0, 8)))
 console.log(store.$message.get())

@@ -1,13 +1,13 @@
-"""GET /api/plugins/core-update/status, POST /api/plugins/core-update/restart (see ../core.py)."""
+"""GET /api/plugins/core-update/{status,version,ping}, POST /{restart,update,blocker}."""
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 import sys
 import threading
-from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 
 router = APIRouter()
 _CORE = Path(__file__).resolve().parents[1] / "core.py"
@@ -48,9 +48,17 @@ def update() -> Dict[str, Any]:
         return {"ok": False, "reason": str(exc)}
 
 
+@router.post("/blocker")
+def blocker(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    try:
+        return _version().resolve_blocker(payload)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "reason": str(exc)}
+
+
 @router.get("/ping")
 async def ping() -> Dict[str, Any]:
-    return {"ok": True, "api": 2}
+    return {"ok": True, "api": 3}
 
 
 @router.get("/status")

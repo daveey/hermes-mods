@@ -24,7 +24,8 @@ const NOW = Date.UTC(2026, 10, 26, 20, 0, 0)
 test('Hub arrow follows pending build commits, not stale or current records', () => {
   for (const state of ['ready', 'building']) {
     assert.equal(m.updatePending({ state, commits: 4 }), true)
-    assert.equal(m.updateTooltip({ state, commits: 4 }), 'Update ready · 4 commits')
+    assert.equal(m.updateTooltip({ state, commits: 4 }), 'Update ready · 4 changes')
+    assert.equal(m.updateTooltip({ state, commits: 1 }), 'Update ready · 1 change')
     assert.equal(m.updatePending({ state, commits: 0 }), false)
   }
   assert.equal(m.updatePending({ state: 'idle', commits: 4 }), false)
@@ -55,7 +56,7 @@ test('Update now uses local API, confirms busy or unknown turns, cancel never wr
   }
 })
 
-test('progress preserves real deferrals and reports applying then completed sha', async () => {
+test('progress preserves real deferrals and reports applying then completed without hashes', async () => {
   let v = { running_turns: 0, running: 'abc1234567', force_request: {} }
   const store = m.createVersionStore(async o => o.path.endsWith('/ping') ? { api: 2 } : o.method === 'POST' ? { ok: true } : v)
   await store.updateNow()
@@ -67,7 +68,7 @@ test('progress preserves real deferrals and reports applying then completed sha'
   assert.equal(store.$message.get(), 'drain cooldown')
   v = { running: 'def1234567', running_turns: 0, operation: { phase: 'updated', sha: 'def1234567' } }
   await store.refresh()
-  assert.equal(store.$message.get(), 'Updated to def1234567')
+  assert.equal(store.$message.get(), 'Updated')
 })
 
 test('current operation failure beats live force marker, older failure does not', async () => {
@@ -92,7 +93,7 @@ test('terminal records always release Update now and passive polls stay passive'
     await store.updateNow()
     v = { running_turns: 0, operation }
     await store.refresh()
-    assert.equal(store.$message.get(), operation.phase === 'updated' ? 'Update completed; revision unavailable' : operation.reason)
+    assert.equal(store.$message.get(), operation.phase === 'updated' ? 'Updated' : m.stripHashes(operation.reason))
     await store.updateNow()
     assert.equal(posts, 2)
   }
@@ -355,7 +356,7 @@ test('updateProgress maps updater stages onto a monotonic bar', () => {
   assert.equal(installing.label, 'Installing…'); assert.equal(restarting.label, 'Restarting…')
   assert.ok(full.pct < installing.pct && installing.pct < restarting.pct && restarting.pct < 100)
   assert.deepEqual(m.updateProgress({ operation: { phase: 'updated', sha: 'def1234567abc' } }),
-    { phase: 'done', pct: 100, label: 'Updated to def1234567', indeterminate: false })
+    { phase: 'done', pct: 100, label: 'Updated', indeterminate: false })
   // A newer batch arriving after the update: offer it again rather than showing done.
   assert.equal(m.updateProgress({ operation: { phase: 'updated', sha: 'x' }, changes: [{}] }).phase, 'idle')
   assert.equal(m.updateProgress({ operation: { phase: 'failed', reason: 'r' } }).label, 'Retry update')
@@ -363,34 +364,107 @@ test('updateProgress maps updater stages onto a monotonic bar', () => {
   assert.equal(m.updateProgress({ force_request: { requested_at: 2 }, operation: { phase: 'failed', requested_at: 1 } }).phase, 'active')
 })
 
-test('What is in the update lists every commit in one scroll box; button carries the bar', async () => {
-  const changes = Array.from({ length: 37 }, (_, i) => ({ sha: `sha${i}`.padEnd(12, '0'), subject: `c${i}`, at: '2026-11-27T23:44:00Z' }))
-  let v = { running_turns: 0, changes }
-  const store = m.createVersionStore(async o => o.path.endsWith('/ping') ? { api: 2 } : o.method === 'POST' ? { ok: true } : v)
+const collectText = (node, out = []) => {
+  if (node == null || typeof node === 'boolean') return out
+  if (typeof node === 'string' || typeof node === 'number') { out.push(String(node)); return out }
+  if (Array.isArray(node)) { node.forEach(n => collectText(n, out)); return out }
+  if (typeof node === 'object') collectText(node.props?.children, out)
+  return out
+}
+
+test('What is in the update renders human summary bullets with zero git hashes and actionable blockers', async () => {
+  const changes = [
+    { sha: 'a61d6a3958aa', subject: 'test(kanban): make launcher parity clock-independent', at: '2026-11-28T09:32:00Z' },
+    { sha: '61a9fa1b22bb', subject: 'fix(kanban): avoid activating sync telemetry on idle passes', at: '2026-11-28T09:32:00Z' },
+    { sha: '355ef7a427cc', subject: 'fix(session-state): wake unknown dependencies on local arrival [author]', at: '2026-11-28T09:09:00Z' },
+    { sha: '081099bba0dd', subject: 'fix(kanban): retain release offers in requesting chats', at: '2026-11-28T08:49:00Z' }
+  ]
+  let v = {
+    running: '1af856a521ff',
+    applied: '1af856a521ff',
+    desktop_build: ['3c6dfbd8e0aa'],
+    target: 'a61d6a3958aa',
+    running_turns: 0,
+    changes,
+    summary: {
+      bullets: [
+        'Resumes “Switch model sessions” automatically once the update finishes',
+        'Unblocks “Resolve outside chat asks” — keeps release offers visible in requesting chats',
+        'Wakes sessions waiting on cross-gateway tasks as soon as dependencies arrive'
+      ],
+      source: 'pool-llm'
+    }
+  }
+  const calls = []
+  let apiLevel = 3
+  const store = m.createVersionStore(async o => {
+    calls.push(o)
+    if (o.path.endsWith('/ping')) return { api: apiLevel }
+    if (o.method === 'POST') return { ok: true, stopped: 1 }
+    return v
+  })
   await store.refresh()
   let tree = m.VersionSection({ store })
-  const box = findAll(tree, n => n.props?.className === 'hs-changes')
-  assert.equal(box.length, 1)
-  assert.equal(findAll(box[0], n => n.props?.className === 'hs-commit').length, 37)
-  assert.equal(findAll(tree, n => n.type === 'details').length, 0)
-  let btn = findAll(tree, n => n.props?.className === 'hs-upd')[0]
-  assert.equal(btn.props.disabled, false)
-  assert.equal(findAll(btn, n => n.props?.className === 'hs-upd-label')[0].props.children, 'Update now')
-  assert.equal(store.active(), false)
-  v = { ...v, progress: { state: 'draining', state_elapsed_s: 30, cap_s: 60 }, force_request: { requested_at: 1 } }
-  await store.updateNow()
-  assert.equal(store.active(), true)
+  const textContent = collectText(tree).join(' ')
+  for (const sha of ['1af856a5', '3c6dfbd8', 'a61d6a39', '61a9fa1b', '355ef7a4', '081099bb']) {
+    assert.ok(!textContent.includes(sha), `unexpected git hash ${sha} in rendered text: ${textContent}`)
+  }
+  assert.equal(findAll(tree, n => n.type === 'code').length, 0)
+  assert.equal(findAll(tree, n => n.type === 'dl').length, 0)
+  const bullets = findAll(tree, n => n.props?.className === 'hs-bullet')
+  assert.equal(bullets.length, 3)
+  assert.equal(bullets[0].props['data-impact'], 'unblock')
+  assert.equal(bullets[1].props['data-impact'], 'unblock')
+  assert.equal(bullets[2].props['data-impact'], 'change')
+
+  // Waiting on 3 cron blockers: names shown, Stop and Stop all wired.
+  v = {
+    ...v,
+    progress: { state: 'draining', state_elapsed_s: 30, cap_s: 120 },
+    force_request: { requested_at: 1 },
+    blockers: [
+      { key: 'cron:default:c55cc0975f38', kind: 'cron', id: 'c55cc0975f38', execution_id: 'ex1', profile: 'default', label: 'Stale ask watcher', detail: 'Scheduled job · running 4m', action: 'stop', action_label: 'Stop' },
+      { key: 'cron:default:f58038cae3fb', kind: 'cron', id: 'f58038cae3fb', execution_id: 'ex2', profile: 'default', label: 'Benchmark email sync', detail: 'Scheduled job · running 2m', action: 'stop', action_label: 'Stop' },
+      { key: 'cron:default:d527f9d70dd8', kind: 'cron', id: 'd527f9d70dd8', execution_id: 'ex3', profile: 'default', label: 'Channel request pull', detail: 'Scheduled job · running 1m', action: 'stop', action_label: 'Stop' }
+    ]
+  }
+  await store.refresh()
   tree = m.VersionSection({ store })
-  btn = findAll(tree, n => n.props?.className === 'hs-upd')[0]
-  const fill = findAll(btn, n => n.props?.role === 'progressbar')[0]
+  const btn = findAll(tree, n => n.props?.className === 'hs-upd')[0]
   assert.equal(btn.props.disabled, true)
-  assert.equal(fill.props.style.width, `${m.updateProgress(v).pct}%`)
-  assert.equal(fill.props['aria-valuenow'], m.updateProgress(v).pct)
-  // The stage message duplicates the button label, so no separate status line.
-  assert.equal(findAll(tree, n => n.props?.role === 'status').length, 0)
+  assert.equal(findAll(btn, n => n.props?.className === 'hs-upd-label')[0].props.children, 'Waiting on 3 background jobs…')
+  const stopBtns = findAll(tree, n => n.props?.className === 'hs-blk-btn')
+  assert.equal(stopBtns.length, 3)
+  const stopAllBtn = findAll(tree, n => n.props?.className === 'hs-blk-all')[0]
+  assert.equal(stopAllBtn.props.children, 'Stop all (3)')
+
+  // Click single Stop on api:3 -> hits /api/plugins/core-update/blocker
+  await stopBtns[0].props.onClick()
+  assert.ok(calls.some(c => c.path === '/api/plugins/core-update/blocker' && c.body?.action === 'stop' && c.body?.id === 'c55cc0975f38'))
+
+  // Click Stop all on api:2 (unrestarted backend) -> falls back to core /api/cron/jobs/<id>/cancel
+  apiLevel = 2
+  calls.length = 0
+  await store.refresh()
+  await stopAllBtn.props.onClick()
+  const cronCancels = calls.filter(c => c.path.startsWith('/api/cron/jobs/') && c.method === 'POST')
+  assert.equal(cronCancels.length, 3)
+
+  // Error banner still renders when operation fails
   v = { running_turns: 0, operation: { phase: 'failed', reason: 'attested updater refused' } }
   await store.refresh()
   tree = m.VersionSection({ store })
   assert.equal(findAll(tree, n => n.props?.role === 'status')[0].props.children, 'attested updater refused')
   assert.equal(store.active(), false)
+})
+
+test('legacy deferral_reason strings drop gateway daemon noise and keep English words like defaced', () => {
+  const v = {
+    progress: { state: 'draining', state_elapsed_s: 15, cap_s: 60 },
+    deferral_reason: 'cron:c55cc0975f38; cron:f58038cae3fb; gateway .hermes pid=23468: active=4 units=4 (cron,managed)'
+  }
+  const blockers = m.deriveBlockers(v)
+  assert.equal(blockers.length, 2)
+  assert.ok(blockers.every(b => b.kind === 'cron' && b.action === 'stop'))
+  assert.equal(m.stripHashes('Fix defaced layout at a61d6a3958 [author] (t_01a20505d1103ebf) PR #42'), 'Fix defaced layout at')
 })

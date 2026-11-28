@@ -151,7 +151,8 @@ def test_reopen_reconciles_swap_and_dead_monitor(tmp_path, monkeypatch):
         assert result["operation"]["sha"] == target
         rendered = subprocess.run(["node", str(BASE / "tests/reopen.mjs"), json.dumps(result)],
                                   check=True, capture_output=True, text=True, timeout=20)
-        assert "Updated to " + target[:10] in rendered.stdout
+        assert rendered.stdout.strip() == "Updated"
+        assert target[:8] not in rendered.stdout
     (directory / "hub-update.json").write_text(json.dumps({"phase": "updating", "target": "b" * 40}))
     result = module.view(tmp_path, tmp_path / "checkout")
     assert result["operation"]["phase"] == "deferred"
