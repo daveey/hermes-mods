@@ -140,7 +140,72 @@ def test_archive_only_after_exact_successful_create(gate, monkeypatch):
     assert len(calls) == 2 and all(kw['new_id'] == 't_abcdef1234567890' for _, kw in calls)
 
 
-def test_core_archive_atomic_pointer_and_claim_race(gate, monkeypatch):
+@pytest.mark.parametrize('unconfirmed', [
+    {'ok': True, 'task_id': None, 'status': 'queued', 'request_id': 'fixture-request'},
+    {'ok': False, 'created': True, 'error': 'origin_bind_pending', 'task_id': 't_abcdef1234567890'},
+])
+def test_unconfirmed_create_cleanup_is_visible(gate, monkeypatch, unconfirmed):
+    kt = pytest.importorskip('tools.kanban_tools')
+    args = seed(gate)
+    args['body'] += '\nSupersedes:\n' + '\n'.join(r['id'] + ': archive' for r in FIX[:2])
+    events, comments = [], []
+    monkeypatch.setattr(gate.superseding_create, 'archive_candidate', lambda *a, **k: None)
+    monkeypatch.setattr(gate.core, 'log_event', lambda event, **kw: events.append((event, kw)))
+    monkeypatch.setattr(kt, '_handle_comment', lambda a: comments.append(a) or {'ok': True})
+    assert gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1') is None
+    gate.post_tool_call(tool_name='kanban_create', args=args, result=unconfirmed, session_id='s1')
+    cleanup = [e for e in events if e[0] == 'superseding_create_archive']
+    assert {e[1]['old_id'] for e in cleanup} == {r['id'] for r in FIX[:2]}
+    assert all(not e[1]['archived'] and e[1]['error'] for e in cleanup)
+    assert {c['task_id'] for c in comments} == {r['id'] for r in FIX[:2]}
+    assert all('NOT performed' in c['body'] for c in comments)
+
+
+def test_nonmatched_archive_declaration_refused(gate):
+    seed(gate)
+    args = {'title': 'Sort recipes', 'body': 'Group lentils.\nSupersedes:\n' + FIX[0]['id'] + ': archive'}
+    held = gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1')
+    assert held and FIX[0]['id'] in held['message'] and 'not a matched' in held['message']
+
+
+@pytest.mark.parametrize('declaration', ['independent', 'independent: reason\n{tid}: independent: duplicate'])
+def test_invalid_single_disposition_not_masked_by_other_missing_ids(gate, declaration):
+    args = seed(gate)
+    args['body'] += '\nSupersedes:\n' + FIX[0]['id'] + ': ' + declaration.format(tid=FIX[0]['id'])
+    args['body'] += '\n' + FIX[1]['id'] + ': independent: Separate dashboard.'
+    held = gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1')
+    assert held and FIX[0]['id'] in held['message']
+    assert FIX[1]['id'] not in held['message']
+
+
+def test_amend_wrong_persisted_content_rejected(gate):
+    args = seed(gate)
+    path = _home(gate) / 'kanban.db'
+    with sqlite3.connect(path) as c:
+        c.execute('create table task_comments(id integer, task_id text, body text)')
+        c.execute('insert into task_comments values(1,?,?)', (FIX[0]['id'], 'Routine progress, not an acceptance amendment.'))
+    args['body'] += '\nSupersedes:\n' + FIX[0]['id'] + ': amend\n' + FIX[1]['id'] + ': independent: Separate dashboard.'
+    gate.post_tool_call(tool_name='kanban_comment', args={'task_id': FIX[0]['id']},
+                        result={'ok': True, 'task_id': FIX[0]['id'], 'comment_id': 1}, session_id='s1')
+    held = gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1')
+    assert held and 'successful kanban_comment' in held['message']
+
+
+def test_preflight_archive_authority_refusal(gate, monkeypatch):
+    args = seed(gate)
+    args['body'] += '\nSupersedes:\n' + FIX[0]['id'] + ': archive\n' + FIX[1]['id'] + ': independent: Separate dashboard.'
+    calls = []
+    def refuse(path, tid, **kw):
+        calls.append(tid)
+        return 'outside worker archive scope'
+    monkeypatch.setattr(gate.superseding_create, 'archive_candidate', refuse)
+    held = gate.pre_tool_call(tool_name='kanban_create', args=args, session_id='s1')
+    assert calls == [FIX[0]['id']]
+    assert held and 'outside worker archive scope' in held['message']
+
+
+@pytest.mark.parametrize('fence', ['status', 'claim_lock', 'worker_pid', 'held', 'remote_holder', 'snapshot'])
+def test_core_archive_atomic_pointer_and_claim_race(gate, monkeypatch, fence):
     import tempfile
     from contextlib import contextmanager
     kb = pytest.importorskip('hermes_cli.kanban_db')
@@ -171,13 +236,29 @@ def test_core_archive_atomic_pointer_and_claim_race(gate, monkeypatch):
             assert new in conn.execute('select body from task_comments where task_id=?', (old,)).fetchone()[0]
             racing = kb.create_task(conn, title='Claim race sidebar', body='Show GOVERNORS section', assignee='default', created_by='fixture')
             real = kb.archive_task
+            import hermes_cli.kanban_containment_connections as containment
+            import hermes_cli.kanban_remote_stop as remote
+            active = [False]
+            if fence == 'held':
+                monkeypatch.setattr(containment, 'held', lambda *a: active[0])
+            if fence == 'remote_holder':
+                monkeypatch.setattr(remote, 'remote_holder', lambda *a: active[0])
             def race(c, tid, **kw):
-                c.execute("update tasks set status='running' where id=?", (tid,))
+                active[0] = True
+                if fence == 'status':
+                    c.execute("update tasks set status='running' where id=?", (tid,))
+                elif fence == 'claim_lock':
+                    c.execute("update tasks set claim_lock='fixture-claim' where id=?", (tid,))
+                elif fence == 'worker_pid':
+                    c.execute('update tasks set worker_pid=123456 where id=?', (tid,))
+                elif fence == 'snapshot':
+                    c.execute("update tasks set body='Changed acceptance' where id=?", (tid,))
                 return real(c, tid, **kw)
             monkeypatch.setattr(kb, 'archive_task', race)
-            refusal = gate.superseding_create.archive_candidate(path, racing, new_id=new)
+            refusal = gate.superseding_create.archive_candidate(path, racing, new_id=new,
+                snapshot=('Claim race sidebar', 'Show GOVERNORS section'))
             assert refusal and 'precondition' in refusal
-            assert conn.execute('select status from tasks where id=?', (racing,)).fetchone()[0] == 'running'
+            assert conn.execute('select status from tasks where id=?', (racing,)).fetchone()[0] == ('running' if fence == 'status' else 'ready')
             assert conn.execute('select count(*) from task_comments where task_id=?', (racing,)).fetchone()[0] == 0
         finally:
             conn.close()
