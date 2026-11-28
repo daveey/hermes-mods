@@ -131,5 +131,5 @@ async def post_spans(request: Request):
         import json
         body = json.loads(raw)
         return await asyncio.to_thread(ingest, body)
-    except (ValueError, TypeError) as error:
+    except (ValueError, TypeError, RecursionError) as error:
         raise HTTPException(400, str(error)) from error

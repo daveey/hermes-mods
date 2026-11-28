@@ -61,6 +61,9 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   cancellations, matching research. Duration = updated minus run-start; chart day
   = creation. Incomplete runs are retried by ID. GitHub runs/PRs refresh every
   ten minutes; transient 5xx failures retry with bounded exponential backoff.
+  Failed scans also wait ten minutes; deleted pending runs (HTTP 404) are retired,
+  while other failures retain the cursor. Lock contenders retry every minute so
+  a slow prior reload generation cannot leave collection permanently stopped.
 * PRs are paginated in merged/updated order, including all merged PRs in the
   backfill window. PR history day = merge day. Core activation requires an exact,
   unambiguous first-parent commit prefix from successful activation log markers;
@@ -78,6 +81,10 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   PR title/body or raw tool payload is stored. Journals rotate globally across
   three 4 MiB files and expire after seven days. Best-effort local telemetry
   failures cannot mask the timed operation's exception.
+* Optional request-stage joins keep at most 10,000 recent request IDs for one
+  hour; excess in-flight requests can be lost. Retired definition cursors remain
+  in this small local metadata table. Neither limit changes the shipped 17 rows,
+  which do not use request-stage joins.
 
 ## API v1
 
