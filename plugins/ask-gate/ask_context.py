@@ -234,38 +234,45 @@ def acceptance_alternative(body: str) -> Optional[str]:
 def _limit_named(text: str) -> bool:
     """The ask changes money, permissions or safety (negated mentions such as "no payment is requested" excluded)."""
     text = _NEGATED_LIMIT.sub(" ", str(text or ""))
-    if _LIMIT.search(text) or _financial_change(text):
-        return True
-    # _replan's spend class also counts bare invoice/subscription/budget nouns; those are judged above instead.
-    return _replan.limit_named(_FIN_NOUN_RE.sub(" ", text)) in ("spend", "permission", "safety")
+    # _replan sees the full text: its own spend classes ("extra budget", "more budget") must still fire.
+    return bool(_LIMIT.search(text) or _financial_change(text)) or \
+        _replan.limit_named(text) in ("spend", "permission", "safety")
 
 
 _FIN_NOUN_RE = re.compile(r"\b" + _FIN_NOUN + r"\b", re.I)
-# Around a financial noun: a changing word makes it a change; otherwise a reading word or an artifact qualifier
-# ("the invoice status", "the budget report", "the issue with the invoice") makes it subject matter. A bare noun with
-# neither ("Refund the customer", "Settle the outstanding invoice") is a change: missing a money ask costs more than
-# letting a read-only ask through to David.
+_URL_RE = re.compile(r"\bhttps?://\S+|\b[\w-]+(?:\.[\w-]+)+/\S*", re.I)
+# A financial noun is a change when a changing word shares its sentence ("Look at the invoice, then approve it"), or
+# refund/bill is itself the verb ("refund the customer", "bill the client"). Otherwise a reading word just before it or
+# an artifact qualifier just after it ("the invoice status", "the budget report", "the issue with the invoice") makes it
+# subject matter. A bare noun with neither ("Settle the outstanding invoice") is a change: missing a money ask costs
+# more than letting a read-only ask through to David.
 _FIN_CHANGE = re.compile(
     r"\b(?:approv\w*|authori[sz]\w*|pay\w*|cancel\w*|upgrad\w*|downgrad\w*|renew\w*|rais\w*|increas\w*|exceed\w*|"
-    r"extend\w*|confirm\w*|settl\w*|submit\w*|process\w*|accept\w*|sign\s+off|okay|refund\w*|issu(?:e|ing)(?!\s+with)|"
-    r"buy|purchas\w*|charg\w*|terms|change|changes)\b", re.I)
+    r"extend\w*|confirm\w*|settl\w*|submit\w*|process\w*|accept\w*|sign\s+off|okay|refund\w*|"
+    r"issu(?:e|ing)\s+(?:a|an|the)\b|buy|purchas\w*|charg\w*|terms|change|changes)\b", re.I)
+_FIN_VERB = re.compile(
+    r"\b(?:refund|bill)(?:ed|ing|s)?\s+(?:the|it|them|him|her|a|an|this|that|our|their|my|your|every|each|"
+    r"customers?|clients?|users?|orders?)\b", re.I)
 _FIN_READ_BEFORE = re.compile(
     r"\b(?:read\w*|check\w*|see|seeing|view\w*|look\w*|inspect\w*|review\w*|find|open\w*|about|regarding|"
     r"issue\s+with|problem\s+with|question\s+about)\b", re.I)
 _FIN_READ_AFTER = re.compile(
     r"^\W*(?:status|link|url|page|history|number|id|details?|record|entry|email|pdf|report|summary|portal\s+page)\b",
     re.I)
+_SENTENCE_END = ".;\n!?"
 
 
 def _financial_change(text: str) -> bool:
+    text = _URL_RE.sub(" ", text)
     for m in _FIN_NOUN_RE.finditer(text):
-        clause_start = max(text.rfind(c, 0, m.start()) for c in ".;\n!?") + 1
-        before = " ".join(text[clause_start:m.start()].split()[-5:])
-        after_text = text[m.end():]
-        after = " ".join(re.split(r"[.;\n!?]", after_text, maxsplit=1)[0].split()[:2])
-        if _FIN_CHANGE.search(before) or _FIN_CHANGE.search(after):
+        start = max(text.rfind(c, 0, m.start()) for c in _SENTENCE_END) + 1
+        ends = [i for i in (text.find(c, m.end()) for c in _SENTENCE_END) if i >= 0]
+        end = min(ends) if ends else len(text)
+        sentence = text[start:m.start()] + " " + text[m.end():end]  # the noun itself is not its own change word
+        if _FIN_CHANGE.search(sentence) or _FIN_VERB.search(text[start:end]):
             return True
-        if _FIN_READ_BEFORE.search(before) or _FIN_READ_AFTER.search(after_text):
+        before = " ".join(text[start:m.start()].split()[-5:])
+        if _FIN_READ_BEFORE.search(before) or _FIN_READ_AFTER.search(text[m.end():end]):
             continue
         return True
     return False
