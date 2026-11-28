@@ -35,19 +35,22 @@ def setup_reader(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('same_card', [False, True])
-def test_real_reader_store_sibling_resolution(tmp_path, monkeypatch, db, board, store, same_card):
+@pytest.mark.parametrize('install_ref', [False, True])
+def test_real_reader_store_sibling_resolution(tmp_path, monkeypatch, db, board, store, same_card, install_ref):
     actions, owner, disposals = setup_reader(tmp_path, monkeypatch)
     try:
         tasks = [kb.create_task(board, title=title, assignee='worker', session_id='chat')
                  for title in (('First deploy',) if same_card else ('First deploy', 'Other deploy'))]
         for tid in tasks:
             assert kb.block_task(board, tid, kind='needs_input', human_request=harness.HUMAN_REQUEST)
+        (tmp_path / 'install_id').write_text('a' * 32 + '\n')
         identity = collect(db, 'chat')['parts']['identity']
+        ref_gateway = owner['gatewayId'] if install_ref else identity['gateway']
         action_store = actions.ActionStore(tmp_path / 'user-steps' / 'actions.sqlite3')
         requests = []
         for tid in (tasks * 2 if same_card else tasks):
             payload = request(aliases=[{'type': 'kanban', 'id': tid, 'board': 'default',
-                'gatewayId': identity['gateway'], 'profile': identity['profile']}])
+                'gatewayId': ref_gateway, 'profile': identity['profile']}])
             payload['owner'] = owner
             if same_card and requests:
                 # Alias lookup is one-to-one; independent asks may reference the
