@@ -1602,12 +1602,94 @@ def _ssh_script(args: list[str]) -> str:
     return " ".join(args[i:])
 
 
-def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0) -> Optional[str]:
+def _update_printed_script(words: list[str]) -> Optional[str]:
+    """Literal echo / printf %s output only; not a shell evaluator.
+
+    Preserve operand concatenation: scanning each quoted argument separately
+    would mistake `printf '%s' 'echo ' 'hermes update' | bash` for an updater.
+    Unsupported formats/expansions stay outside this bounded advisory rule.
+    """
+    cmd, args = os.path.basename(words[0]), words[1:]
+    if not args or any('$' in a or '`' in a for a in args):
+        return None
+    if cmd == 'echo':
+        if args[0] == '-n':
+            args = args[1:]
+        if args and args[0].startswith('-'):
+            return None
+        return ' '.join(args)
+    if cmd != 'printf':
+        return None
+    if args[0] == '--':
+        args = args[1:]
+    if not args or args[0].startswith('-'):
+        return None
+    fmt, values = args[0], args[1:]
+    # Only fixed escapes and string conversions; no %b, numeric formatting,
+    # command computation, or locale-dependent evaluation.
+    parts = re.split(r'(%s|%%|\\[nrt\\])', fmt)
+    if any('%' in p or '\\' in p for p in parts[::2]):
+        return None
+    slots = parts.count('%s')
+    rounds = max(1, (len(values) + slots - 1) // slots) if slots else 1
+    if len(fmt) * rounds + sum(map(len, values)) > 131072:
+        return None  # unsupported output size; never allocate an expanded product
+    out, at = [], 0
+    escapes = {r'\n': '\n', r'\r': '\r', r'\t': '\t', '\\\\': '\\', '%%': '%'}
+    for _ in range(rounds):
+        for part in parts:
+            if part == '%s':
+                out.append(values[at] if at < len(values) else '')
+                at += 1
+            else:
+                out.append(escapes.get(part, part))
+    return ''.join(out)
+
+
+def _check_update_pipelines(source: str, cwd: str, depth: int = 0) -> Optional[str]:
+    """Literal printer -> zero or more cat -> stdin shell, with normal wrappers.
+
+    Never reinterpret a printer merely because some later unrelated command is
+    a shell. No commands or custom helpers are executed during classification.
+    """
+    stages = _cwd_segments(_update_tokens(source))
+    for i, (seg, op) in enumerate(stages):
+        if op not in {'|', '|&'}:
+            continue
+        words, targets = _redirect_targets(seg)
+        words, _, _ = _strip_wrappers(words, cwd)
+        if targets or not words or os.path.basename(words[0]) not in {'printf', 'echo'}:
+            continue
+        for following, next_op in stages[i + 1:]:
+            # A redirect can replace the pipe's stdin or divert a stage's output.
+            if any(not isinstance(t, _Quoted) and ('<' in t or '>' in t) for t in following):
+                break
+            consumer, _ = _redirect_targets(following)
+            consumer, _, _ = _strip_wrappers(consumer, cwd)
+            if not consumer:
+                break
+            name = os.path.basename(consumer[0])
+            if name in SHELLS and all(re.fullmatch(r'-[seuxv]+|--noprofile|--norc', a)
+                                      for a in consumer[1:]):
+                script = _update_printed_script(words)
+                if script is not None:
+                    if depth > 20:
+                        return 'update inspection exceeds safe analysis depth'
+                    if why := _check_update(script, cwd, depth=depth + 1):
+                        return why
+                break
+            if name != 'cat' or len(consumer) != 1 or next_op not in {'|', '|&'}:
+                break
+    return None
+
+
+def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0,
+                  *, _prepared: bool = False) -> Optional[str]:
     """Inspect command positions, not arbitrary strings mentioning an update.
     Explicit approval is scoped to one command and its nested shell/SSH payload."""
     if depth > 20:
         return "update inspection exceeds safe analysis depth"
-    for seg in _segments(_update_tokens(_update_source(source))):
+    for seg in _segments(_update_tokens(source if _prepared else _update_source(source))):
         words, _ = _redirect_targets(seg)
         while words and words[0] in {"{", "!", "then", "do", "else", "elif", "if", "while", "until"}:
             words = words[1:]
@@ -1645,7 +1727,14 @@ def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0)
             script = args[i + 1] if i + 1 < len(args) else script
         if script and (why := _check_update(script, cwd, allowed, depth + 1)):
             return why
-    return None
+    if _prepared:
+        return _check_update_pipelines(source, cwd, depth)
+    # Preserve the original decision above as a refusal floor. Add executable
+    # stdin provenance without scanning the shared parser's inert data bodies.
+    executable, _data = _split_heredocs(source)
+    if executable == _update_source(source):
+        return _check_update_pipelines(executable, cwd, depth)
+    return _check_update(executable, cwd, depth=depth, _prepared=True)
 
 
 def _cwd_segments(toks: list[str]) -> list[tuple[list[str], str]]:
