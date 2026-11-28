@@ -1697,17 +1697,26 @@ def _py_board(node: Optional[ast.AST], names: dict, depth: int = 0) -> Optional[
     return None
 
 
-def _py_directory_literal(node, names, depth=0):
+class _PythonPathBudgetExceeded(ValueError):
+    pass
+
+
+def _py_directory_literal(node, names, depth=0, budget=None):
     """Resolve a bounded, non-executing subset of common pathlib/home expressions."""
+    if budget is None:
+        budget = [8192]
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise _PythonPathBudgetExceeded('Python path analysis step budget exhausted')
     if node is None or depth > 4:
         return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.Name):
-        return _py_directory_literal(names.get(node.id), names, depth + 1)
+        return _py_directory_literal(names.get(node.id), names, depth + 1, budget)
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
-        left = _py_directory_literal(node.left, names, depth + 1)
-        right = _py_directory_literal(node.right, names, depth + 1)
+        left = _py_directory_literal(node.left, names, depth + 1, budget)
+        right = _py_directory_literal(node.right, names, depth + 1, budget)
         if left is None or right is None or len(left) + len(right) > 8192:
             return None
         return os.path.join(left, right) if isinstance(node.op, ast.Div) else left + right
@@ -1717,15 +1726,15 @@ def _py_directory_literal(node, names, depth=0):
         if name == 'home' and not node.args and not node.keywords:
             return os.path.expanduser('~')
         if name == 'expanduser' and not node.args and not node.keywords and isinstance(fn, ast.Attribute):
-            value = _py_directory_literal(fn.value, names, depth + 1)
+            value = _py_directory_literal(fn.value, names, depth + 1, budget)
             return _expand(value) if value is not None else None
         if name in {'join', 'joinpath'}:
             parts = ([fn.value] if name == 'joinpath' and isinstance(fn, ast.Attribute) else []) + list(node.args)
-            values = [_py_directory_literal(p, names, depth + 1) for p in parts]
+            values = [_py_directory_literal(p, names, depth + 1, budget) for p in parts]
             if values and all(v is not None for v in values) and sum(map(len, values)) <= 8192:
                 return os.path.join(*values)
         if name in {'str', 'Path', 'PurePath', 'fspath', 'expanduser'} and node.args:
-            value = _py_directory_literal(node.args[0], names, depth + 1)
+            value = _py_directory_literal(node.args[0], names, depth + 1, budget)
             return _expand(value) if value is not None and name == 'expanduser' else value
     return None
 
@@ -1736,6 +1745,7 @@ def _check_python_ast(code: str) -> Optional[str]:
     except (SyntaxError, ValueError):
         return None
     names = _py_assignments(tree)
+    path_budget = [8192]  # shared across every call/alias, not reset per sink
     modules, functions = {}, {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1769,7 +1779,7 @@ def _check_python_ast(code: str) -> Optional[str]:
         elif identity == ("shutil", "rmtree"):
             target = node.args[0] if node.args else next(
                 (kw.value for kw in node.keywords if kw.arg == "path"), None)
-            value = _py_directory_literal(target, names)
+            value = _py_directory_literal(target, names, budget=path_budget)
             if value is not None and protects_directory(value, True):
                 return f"Python recursive removal of directory containing live database files {value}"
         elif identity in _PY_DELETE_FUNCS:
@@ -1779,7 +1789,7 @@ def _check_python_ast(code: str) -> Optional[str]:
             target = node.args[0]  # Path(x).replace(dst); str.replace takes two arguments
         elif isinstance(fn, ast.Attribute) and fn.attr in ("unlink", "write_bytes", "write_text", "touch") and mod not in ("os", "shutil"):
             target = fn.value  # (home / 'kanban.db-wal').unlink()
-        literal = _py_directory_literal(target, names)
+        literal = _py_directory_literal(target, names, budget=path_budget)
         hit = (literal if literal is not None and is_live(_expand(literal), True) else None) or _py_board(target, names)
         if hit:
             return f"Python file operations on live database file {hit} ({ast.unparse(node)[:160]})"
@@ -1811,7 +1821,10 @@ def _check_python_head(code: str) -> Optional[str]:
             hit = next((c for c in cands if is_live(_expand(c)) or is_quarantine(_expand(c))), None)
             if hit:
                 return f"Python file operations on live database file {hit}"
-    why = _check_python_ast(code)
+    try:
+        why = _check_python_ast(code)
+    except _PythonPathBudgetExceeded:
+        return 'Python path analysis exceeds the bounded live-database safety budget'
     if why:
         return why
     for lit in (m.group("s") for m in _PY_STR.finditer(code)):  # os.system("rm ...") / shell=True strings
