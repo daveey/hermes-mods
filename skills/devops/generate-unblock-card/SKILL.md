@@ -108,6 +108,27 @@ Fix whatever fails, then file. The `unblock_card_hold` (ask-gate, and owner-reco
 `Recommend:` or exactly one `(recommended)` choice. Put each label at the start of its own line and letter the
 options `A)`, `B)`. It can't judge clarity, so the cold read is yours.
 
+**Context and place (`ask_context_hold`).** Right after it, ask-gate refuses an ask David couldn't act on from
+the panel, naming each gap:
+- `Situation:` plus `why_human` give two or more sentences, and `why_human` says *why* you can't (more than `Tried:`);
+- a step names where to act: a URL, numbered steps `1) … 2) …`, a command for `run_in_user_terminal`, or the device/app;
+- every PR or issue cited by number carries its URL (or `owner/repo#N`), so he can look before he picks;
+- every option says what happens, and the recommended one gives a size or cost ("~2 runs, under $5", "1 minute",
+  "no further work"); "additional agent work" is no size;
+- the action says what Unblock and Archive do.
+It allows 3 holds per card, then files anyway, so fix the named gap rather than retrying unchanged.
+
+**Acceptance met (`acceptance_met`).** If the card's acceptance has a "… or document the hold/gap with evidence"
+branch, the ask is refused with "acceptance met without this; complete instead". Record what you could not
+verify and why, then `kanban_complete`. Ask only when the step changes money, permissions or safety, and name that
+limit in `why_human` (the billing watchdog t_01a21ef258f83d8d asked for a support-ticket read its acceptance didn't need).
+
+**The card always reaches a human chat.** Core links every open human ask to a chat David reads: the nearest
+real chat up the creator/parent chain, else the pinned **Needs you** chat on the hub (`kanban_owner_needs_you`).
+That chat's outcome turns red (`decision`) while the ask waits, even next to running cards. Owner chats
+(`kanban_owner_<producer>`) and worker transcripts don't count. `hermes kanban human-chats` lists gaps;
+`--apply` on the hub links them (the dispatcher also does it every minute).
+
 **Stop-or-relax asks (`replan_hold`).** A card that ends an approved goal unmet, or offers a redesign or new
 approach, is refused as a re-plan the agent owns. Before filing, get an independent feasibility review of
 untried approaches within the unchanged limits; it can find one. If none fits, name the exact acceptance limit
@@ -159,5 +180,7 @@ human_request:
 - [ ] Title and Situation use no unexplained internal terms; Situation is two sentences or fewer.
 - [ ] Each option is `A) <name ≤6 words>: <consequence>`; why_human never says "rung".
 - [ ] Every option says what happens, what it costs, and whether it is reversible; one is recommended with a reason.
+- [ ] Every PR/issue cited by number has its URL; a step names where to act (URL, numbered steps, command, device).
+- [ ] The card's acceptance really needs this step (no "or document the hold" branch covers it).
 - [ ] Unblock and Archive each map to a stated option; nothing says "reply in this chat".
 - [ ] The cold read passed before filing.
