@@ -464,7 +464,7 @@ def read_cards(board_paths: Iterable[Path], ids: Iterable[str], light: bool = Fa
     the per-card event/run subqueries and the links read. It finds and refuses exactly what the full read does: the
     full statement is still compiled (so a board the full read can't query fails the same way), just not run.
     ``failed_out`` collects each board whose read failed (such a read must never be reused)."""
-    want = sorted({str(i) for i in ids if i})
+    want = frozenset(str(i) for i in ids if i)
     found: dict[str, dict[str, Any]] = {}
     if not want:
         return found

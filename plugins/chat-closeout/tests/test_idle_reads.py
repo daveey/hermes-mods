@@ -1,5 +1,6 @@
 """Cross-pass structural reads; clocks and coverage remain outside the cache."""
 import sqlite3
+from pathlib import Path
 
 import pytest
 from test_closeout import core, plugin
@@ -62,6 +63,26 @@ def test_board_unchanged_commit_revision_survives_checkpoint(tmp_path, monkeypat
         assert len(reads()) == 2
     finally:
         writer.close()
+
+
+@pytest.mark.parametrize('light', [False, True])
+def test_card_selection_membership_is_linear(monkeypatch, light):
+    """Rows already selected by SQL must not rescan the full wanted inventory."""
+    class MeteredID(str):
+        comparisons = 0
+        __hash__ = str.__hash__
+
+        def __eq__(self, other):
+            type(self).comparisons += 1
+            return str.__eq__(self, other)
+
+    size = 512
+    ids = ['t_%04d' % i for i in range(size)]
+    rows = [dict(id=MeteredID(i), status='running', parents=[]) for i in ids]
+    monkeypatch.setattr(core, '_board_rows', lambda *args: (rows, None))
+    cards = core.read_cards([Path('/fixture/kanban.db')], ids, light=light)
+    assert len(cards) == size
+    assert MeteredID.comparisons <= size * 4
 
 
 @pytest.fixture(autouse=True)
