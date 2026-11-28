@@ -10,15 +10,25 @@ The exact `SAFE_DOMAINS` allowlist is **light, media_player, climate** (includin
 The only other no-gate exceptions are `lock.lock`; `cover.close_cover`, `cover.stop_cover`,
 `cover.close_cover_tilt`, `cover.stop_cover_tilt`; `alarm_control_panel.alarm_arm_home`,
 `alarm_control_panel.alarm_arm_away`, `alarm_control_panel.alarm_arm_night`; and generic
-`homeassistant.*` calls with explicit entity targets passing the checks above.
+`homeassistant.*` calls with explicit entity targets **only in SAFE_DOMAINS** passing the checks above.
+This includes every generic service: even `update_entity` on `sensor.*` or `lock` on `lock.*`
+needs confirmation. Direct `lock.lock`/cover close/alarm arm exceptions do not apply to generic HA calls.
 Every other domain/service needs the confirmation gate and is blocked when none is configured
 or the gate fails: this includes unknown domains, MQTT publish, Z-Wave JS, ZHA and valve services.
 Safe-domain calls targeting critical entities still undergo the existing target checks.
 
-Both `tool_call` and `mcp__tool_call` support batched `{calls: [{name, arguments}]}` and legacy
-`{name, arguments}` wrappers, JSON-string `arguments`, and `calls` encoded as a JSON string.
-Unparseable wrappers naming `ha_call_service` are blocked by the plugin itself, independently
-of core unwrapping. The hook never executes Home Assistant calls.
+Both `tool_call` and `mcp__tool_call` support batched `{calls: [{name, arguments}]}`, a
+single-object `{calls: {name, arguments}}`, and legacy `{name, arguments}` wrappers.
+Entry names are stripped and compared case-insensitively after dropping an `mcp__` prefix.
+JSON-string `arguments` and JSON-array `calls` are decoded. The two misplaced-name forms
+`{arguments: {name: "ha_call_service", arguments: {...}}}` and
+`{arguments: {...call, name: "ha_call_service"}}` are lifted when the entry has no name.
+A still-nameless entry mentioning `ha_call_service` anywhere (case-insensitive) is blocked;
+a named other tool such as `kanban_complete` may discuss `ha_call_service` without being
+mistaken for an HA call. Unparseable wrappers naming `ha_call_service` are blocked by the
+plugin itself, independently of core unwrapping. For monotonicity, the pre-existing refusal
+of a JSON-string `calls` single object mentioning HA is retained, even for safe calls: use
+an actual single object or a JSON array instead. The hook never executes Home Assistant calls.
 
 ## Trusted configuration (breaking security migration)
 
