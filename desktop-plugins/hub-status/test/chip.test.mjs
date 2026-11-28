@@ -333,3 +333,64 @@ test('titlebar keyboard: capture runs before onSelect on the tool button, and En
   press()
   assert.equal(m.isOpenForTest(), false)
 })
+
+const findAll = (node, pred, out = []) => {
+  if (!node || typeof node !== 'object') return out
+  if (Array.isArray(node)) { node.forEach(n => findAll(n, pred, out)); return out }
+  if (pred(node)) out.push(node)
+  findAll(node.props?.children, pred, out)
+  return out
+}
+
+test('updateProgress maps updater stages onto a monotonic bar', () => {
+  assert.deepEqual(m.updateProgress(null), { phase: 'idle', pct: 0, label: 'Update now', indeterminate: false })
+  assert.equal(m.updateProgress({}, true).label, 'Starting…')
+  const waitNoCap = m.updateProgress({ force_request: { requested_at: 1 } })
+  assert.equal(waitNoCap.phase, 'active'); assert.equal(waitNoCap.indeterminate, true)
+  const half = m.updateProgress({ progress: { state: 'draining', state_elapsed_s: 50, cap_s: 100 } })
+  const full = m.updateProgress({ progress: { state: 'draining', state_elapsed_s: 500, cap_s: 100 } })
+  assert.equal(half.indeterminate, false); assert.ok(half.pct > 8 && half.pct < full.pct && full.pct === 45)
+  const installing = m.updateProgress({ progress: { state: 'applying' } })
+  const restarting = m.updateProgress({ operation: { phase: 'restarting', requested_at: 1 } })
+  assert.equal(installing.label, 'Installing…'); assert.equal(restarting.label, 'Restarting…')
+  assert.ok(full.pct < installing.pct && installing.pct < restarting.pct && restarting.pct < 100)
+  assert.deepEqual(m.updateProgress({ operation: { phase: 'updated', sha: 'def1234567abc' } }),
+    { phase: 'done', pct: 100, label: 'Updated to def1234567', indeterminate: false })
+  // A newer batch arriving after the update: offer it again rather than showing done.
+  assert.equal(m.updateProgress({ operation: { phase: 'updated', sha: 'x' }, changes: [{}] }).phase, 'idle')
+  assert.equal(m.updateProgress({ operation: { phase: 'failed', reason: 'r' } }).label, 'Retry update')
+  // An older failure does not hide a live force request.
+  assert.equal(m.updateProgress({ force_request: { requested_at: 2 }, operation: { phase: 'failed', requested_at: 1 } }).phase, 'active')
+})
+
+test('What is in the update lists every commit in one scroll box; button carries the bar', async () => {
+  const changes = Array.from({ length: 37 }, (_, i) => ({ sha: `sha${i}`.padEnd(12, '0'), subject: `c${i}`, at: '2026-11-27T23:44:00Z' }))
+  let v = { running_turns: 0, changes }
+  const store = m.createVersionStore(async o => o.path.endsWith('/ping') ? { api: 2 } : o.method === 'POST' ? { ok: true } : v)
+  await store.refresh()
+  let tree = m.VersionSection({ store })
+  const box = findAll(tree, n => n.props?.className === 'hs-changes')
+  assert.equal(box.length, 1)
+  assert.equal(findAll(box[0], n => n.props?.className === 'hs-commit').length, 37)
+  assert.equal(findAll(tree, n => n.type === 'details').length, 0)
+  let btn = findAll(tree, n => n.props?.className === 'hs-upd')[0]
+  assert.equal(btn.props.disabled, false)
+  assert.equal(findAll(btn, n => n.props?.className === 'hs-upd-label')[0].props.children, 'Update now')
+  assert.equal(store.active(), false)
+  v = { ...v, progress: { state: 'draining', state_elapsed_s: 30, cap_s: 60 }, force_request: { requested_at: 1 } }
+  await store.updateNow()
+  assert.equal(store.active(), true)
+  tree = m.VersionSection({ store })
+  btn = findAll(tree, n => n.props?.className === 'hs-upd')[0]
+  const fill = findAll(btn, n => n.props?.role === 'progressbar')[0]
+  assert.equal(btn.props.disabled, true)
+  assert.equal(fill.props.style.width, `${m.updateProgress(v).pct}%`)
+  assert.equal(fill.props['aria-valuenow'], m.updateProgress(v).pct)
+  // The stage message duplicates the button label, so no separate status line.
+  assert.equal(findAll(tree, n => n.props?.role === 'status').length, 0)
+  v = { running_turns: 0, operation: { phase: 'failed', reason: 'attested updater refused' } }
+  await store.refresh()
+  tree = m.VersionSection({ store })
+  assert.equal(findAll(tree, n => n.props?.role === 'status')[0].props.children, 'attested updater refused')
+  assert.equal(store.active(), false)
+})

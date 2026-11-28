@@ -86,6 +86,17 @@ const CSS = `
 .hs-commit{display:grid;grid-template-columns:62px minmax(0,1fr) 64px;gap:6px;margin:4px 0;font-size:11px}
 .hs-commit>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hs-commit time{color:var(--muted-foreground);text-align:right}
+.hs-changes{max-height:200px;overflow-y:auto;overscroll-behavior:contain;margin:4px 0;padding-right:4px;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+.hs-version button.hs-upd{position:relative;display:block;width:100%;height:26px;margin:8px 0 0;padding:0 10px;overflow:hidden;background:transparent;color:var(--foreground);font:inherit;font-size:12px;text-align:center}
+.hs-version button.hs-upd:disabled{cursor:default}
+.hs-upd-fill{position:absolute;inset:0 auto 0 0;background:color-mix(in srgb,var(--accent,#3fb950) 35%,transparent);transition:width .6s ease}
+.hs-upd[data-phase=done] .hs-upd-fill{background:color-mix(in srgb,#3fb950 35%,transparent)}
+.hs-upd[data-phase=error]{border-color:color-mix(in srgb,#f85149 60%,var(--border))}
+.hs-upd[data-indeterminate=true] .hs-upd-fill{background-image:linear-gradient(90deg,transparent,color-mix(in srgb,var(--foreground) 18%,transparent),transparent);background-size:60% 100%;background-repeat:no-repeat;animation:hs-upd-sweep 1.4s linear infinite}
+@keyframes hs-upd-sweep{from{background-position:-60% 0}to{background-position:160% 0}}
+.hs-upd-label{position:relative;font-variant-numeric:tabular-nums}
+.hs-upd-msg{margin-top:4px;font-size:11px;color:var(--muted-foreground)}
+.hs-upd-msg[data-phase=error]{color:#f85149}
 `
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
@@ -344,11 +355,36 @@ function Band({ segments, start, end, now }) {
 export const updatePending = s => ['ready', 'building'].includes(s?.state) && Number(s?.commits) > 0
 export const updateTooltip = s => updatePending(s) ? `Update ready · ${s.commits} commits` : null
 
+/**
+ * The Update now button's progress: a stage-based bar, since the updater publishes stages, not percentages.
+ *   waiting for turns 8-45% (filled along the drainer's cap when it published one) → installing 60% → restarting 85% → done 100%.
+ * `phase`: idle | active | done | error. `indeterminate`: the stage has no measurable fill, so the bar sweeps.
+ */
+export function updateProgress(v, busy = false) {
+  const operation = v && (!v.force_request || v.operation?.requested_at >= v.force_request.requested_at) ? v.operation : null
+  const p = v?.progress
+  if (['failed', 'deferred'].includes(operation?.phase)) return { phase: 'error', pct: 0, label: 'Retry update', indeterminate: false }
+  if (operation?.phase === 'restarting') return { phase: 'active', pct: 85, label: 'Restarting…', indeterminate: true }
+  if (p?.state === 'applying') return { phase: 'active', pct: 60, label: 'Installing…', indeterminate: true }
+  if (p || v?.force_request) {
+    const cap = Number(p?.cap_s), el = Number(p?.state_elapsed_s)
+    const frac = cap > 0 && el >= 0 ? Math.min(1, el / cap) : null
+    const pct = frac === null ? 15 : Math.round(8 + 37 * frac)
+    return { phase: 'active', pct, label: p?.state === 'batching' ? 'Waiting for update window…' : 'Waiting for turns…', indeterminate: frac === null }
+  }
+  if (operation?.phase === 'updating') return { phase: 'active', pct: 60, label: 'Installing…', indeterminate: true }
+  if (busy) return { phase: 'active', pct: 4, label: 'Starting…', indeterminate: true }
+  if (operation?.phase === 'updated' && !(v?.changes?.length)) return { phase: 'done', pct: 100, label: operation.sha ? `Updated to ${operation.sha.slice(0, 10)}` : 'Updated', indeterminate: false }
+  return { phase: 'idle', pct: 0, label: 'Update now', indeterminate: false }
+}
+
 export function createVersionStore(api = options => window.hermesDesktop.api(options)) {
   const $version = atom(null)
   const $message = atom('')
   const $confirm = atom(null)
+  const $busy = atom(false)
   let busy = false
+  const setBusy = b => { busy = b; $busy.set(b) }
   const request = (path, options = {}) => api({ path: `/api/plugins/core-update/${path}`, connectionId: 'local', ...options })
   const refresh = async () => {
     try {
@@ -358,27 +394,27 @@ export function createVersionStore(api = options => window.hermesDesktop.api(opt
       $version.set(v)
       const operation = !v.force_request || v.operation?.requested_at >= v.force_request.requested_at ? v.operation : null
       if (['failed', 'deferred'].includes(operation?.phase)) {
-        $message.set(operation.reason || 'Update deferred'); busy = false
+        $message.set(operation.reason || 'Update deferred'); setBusy(false)
       } else if (v.deferral_reason) $message.set(v.deferral_reason)
       else if (v.progress) $message.set(v.progress.state === 'applying' ? 'Updating' : 'Waiting for turns')
       else if (v.force_request) $message.set('Waiting for turns')
       else if (operation?.phase === 'updated') {
-        $message.set(operation.sha ? `Updated to ${operation.sha.slice(0, 10)}` : 'Update completed; revision unavailable'); busy = false
+        $message.set(operation.sha ? `Updated to ${operation.sha.slice(0, 10)}` : 'Update completed; revision unavailable'); setBusy(false)
       } else if (['updating', 'restarting'].includes(operation?.phase)) $message.set('Updating')
-      else { $message.set(''); busy = false }
+      else { $message.set(''); setBusy(false) }
       return v
     } catch (e) { $message.set(String(e?.message || e)); return null }
   }
   const apply = async () => {
     if (busy) return
-    busy = true
+    setBusy(true)
     $confirm.set(null)
     $message.set('Waiting for turns')
     try {
       const response = await request('update', { method: 'POST' })
       if (!response?.ok) throw new Error(response?.reason || 'Update request refused')
       await refresh()
-    } catch (e) { busy = false; $message.set(String(e?.message || e)) }
+    } catch (e) { setBusy(false); $message.set(String(e?.message || e)) }
   }
   const updateNow = async () => {
     if (busy) return
@@ -387,13 +423,15 @@ export function createVersionStore(api = options => window.hermesDesktop.api(opt
     if (v.running_turns !== 0) $confirm.set(v.running_turns ?? 'Unknown number of')
     else await apply()
   }
-  return { $version, $message, $confirm, refresh, updateNow, apply, cancel: () => $confirm.set(null) }
+  return { $version, $message, $confirm, $busy, active: () => busy || updateProgress($version.get()).phase === 'active', refresh, updateNow, apply, cancel: () => $confirm.set(null) }
 }
 
 export function VersionSection({ store }) {
   const v = useValue(store.$version)
   const message = useValue(store.$message)
   const count = useValue(store.$confirm)
+  const busy = useValue(store.$busy || { get: () => false })
+  const prog = updateProgress(v, busy)
   const commits = v?.changes || []
   const row = c => jsxs('div', { className: 'hs-commit', children: [
     jsx('code', { children: c.sha.slice(0, 8) }),
@@ -409,15 +447,26 @@ export function VersionSection({ store }) {
       jsx('dt', { children: 'Target' }), jsx('dd', { children: v?.target?.slice(0, 10) || 'Unavailable' })
     ] }),
     jsx('b', { children: "What’s in the update" }),
-    commits.length ? commits.slice(0, 15).map(row) : jsx('div', { className: 'hs-empty', children: v ? 'No new commits' : 'Loading version…' }),
-    commits.length > 15 ? jsxs('details', { children: [jsx('summary', { children: `${commits.length - 15} more commits` }), ...commits.slice(15).map(row)] }) : null,
-    jsx('button', { type: 'button', onClick: () => store.updateNow(), children: 'Update now' }),
+    commits.length
+      ? jsx('div', { className: 'hs-changes', role: 'list', 'aria-label': `${commits.length} commits in the update`, children: commits.map(row) })
+      : jsx('div', { className: 'hs-empty', children: v ? 'No new commits' : 'Loading version…' }),
+    jsxs('button', {
+      type: 'button', className: 'hs-upd', 'data-phase': prog.phase, 'data-indeterminate': String(prog.indeterminate),
+      disabled: prog.phase === 'active', 'aria-busy': prog.phase === 'active',
+      onClick: () => store.updateNow(),
+      children: [
+        jsx('span', { className: 'hs-upd-fill', role: 'progressbar', 'aria-label': 'Update progress', 'aria-valuemin': 0, 'aria-valuemax': 100,
+          'aria-valuenow': prog.indeterminate ? undefined : prog.pct, style: { width: `${prog.pct}%` } }),
+        jsx('span', { className: 'hs-upd-label', children: prog.label })
+      ]
+    }),
     count !== null ? jsxs('div', { role: 'alert', children: [
       `${count} running turn(s) on this machine. Desktop/TUI turns will pause at their next boundary; other surfaces may keep the update waiting. Non-resumable turns must be sent again. `,
       jsx('button', { type: 'button', onClick: () => store.apply(), children: 'Confirm update' }),
       jsx('button', { type: 'button', onClick: () => store.cancel(), children: 'Cancel' })
     ] }) : null,
-    message ? jsx('div', { role: 'status', children: message }) : null
+    message && message.replace(/…$/, '') !== prog.label.replace(/…$/, '') && !/^(Updating|Waiting for turns|Updated to )/.test(message)
+      ? jsx('div', { className: 'hs-upd-msg', 'data-phase': prog.phase, role: 'status', children: message }) : null
   ] })
 }
 
@@ -642,7 +691,12 @@ export default {
     }
     const store = createStore(ctx)
     store.version.refresh()
-    ctx.setInterval(() => { if (!isHidden()) store.version.refresh() }, 30_000)
+    // 30 s at rest; every 2 s while an update runs so the button's bar moves.
+    let lastVersion = Date.now()
+    ctx.setInterval(() => {
+      if (isHidden()) return
+      if (store.version.active() || Date.now() - lastVersion >= 30_000) { lastVersion = Date.now(); store.version.refresh() }
+    }, 2_000)
     store.refresh()
     store.loadDay()
     ctx.setInterval(() => { if (!isHidden() || store.$poll.get().fails > 0) store.refresh() }, POLL_MS)
