@@ -102,9 +102,11 @@ created after that comment. The spend-budget window and older totals start earli
 After a budget grant, inspect actual claim diagnostics: a fresh-window grant can promote while cumulative
 claim accounting still says `spend_budget_exhausted`. Have the recorded owner reconcile the supported budget
 limit against already-counted usage plus the authorized increment; preserve history, then verify worker binding
-and fresh heartbeat, not `ready` or a leftover current_run_id. If `release` says `not_held`, inspect the ledger
-rather than repeat promotion. For `respawn_guarded active_pr`, use `hermes kanban resume <id> --reason <why this
-owner continues THAT PR>` only after observing that exact guard; a PR link alone does not establish it.
+and fresh heartbeat, not `ready` or a leftover current_run_id. If `release` says `not_held`, run
+`hermes kanban why <id>` and inspect the latest run. For reclaimed-lease triage with no remaining hold,
+use `kanban_unblock` after reading newer comments, then verify a new claim/spawn; no budget renewal is needed.
+Use `hermes kanban resume <id> --reason <why this owner continues THAT PR>` only for an observed
+`respawn_guarded active_pr` hold: a published PR alone does not make `resume` applicable.
 The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
 desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
 Never file a core card for an "orphan" release; if renew-scope is not installed yet, wait on the card shipping it. Test each option you would offer against the card
