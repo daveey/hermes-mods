@@ -300,6 +300,6 @@ def test_real_remote_direct_and_multihop_parent_actions_keep_exact_owner(graph, 
     p = f.project_board(store, chat, canonical_base=canonical(chat))
     assert p.bundle['cards'][leaf]['gateway'] == 'remote-test'
     row = next(row for row in p.bundle['model']['sections']['waiting'] if row['id'] == remote)
-    targets = [a['target'] for a in row['actions'] if a['kind'] == 'open_card']
+    targets = [dict(a['target']) for a in row['actions'] if a['kind'] == 'open_card']
     assert not p.missing_scopes
     assert {'id': leaf, 'gateway': 'remote-test', 'profile': 'default', 'board': 'default'} in targets

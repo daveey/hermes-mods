@@ -78,8 +78,26 @@ def test_external_refuses_pending_legacy_start(isolated):
 
 def test_absent_external_keeps_legacy_import_start(isolated):
     loader, starts = isolated
-    load('hermes_dashboard_plugin_external_one')
-    assert starts == ['session-panel-start']
+    current = load('hermes_dashboard_plugin_external_one')
+    if getattr(loader, 'panel_lifecycle', None) is None:
+        # Optional/older core has no lifecycle seam: preserve the original
+        # asynchronous import-start contract without pretending it is READY.
+        assert starts == ['session-panel-start']
+        # Lifecycle probing may import the lazy feed module even on an older
+        # core. It must not construct a producer before the deferred starter runs.
+        assert getattr(sys.modules.get('_session_panel_feed_core'), 'PROCESS_FEED', None) is None
+        loader.starting = None  # recorded Thread.start never launched this thread
+        return
+    # OFF readiness is synchronous on the lifecycle worker, not a deferred
+    # session-panel-start promise. The fixture records (but does not launch) lanes.
+    assert starts == ['session-panel-feed', 'session-panel-decisions', 'session-panel-board']
+    core = sys.modules['_session_panel_feed_core']
+    owner = core.PROCESS_FEED
+    assert owner is not None and not owner.stopped.is_set()
+    owner.stopped.set()
+    for name in ('_feed_thread', '_decision_thread', '_board_thread'):
+        setattr(owner, name, None)  # Thread.start was deliberately replaced above
+    assert current._retire_legacy_panel()
 
 
 def test_external_refuses_legacy_facts_registration(isolated):

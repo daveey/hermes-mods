@@ -284,21 +284,7 @@ def _register_done_check() -> bool:
         from hermes_cli import kanban_session_activity as ksa  # type: ignore
     except Exception:
         return False
-    fn = getattr(ksa, "register_done_check", None)
-    if fn is None:
-        return False
-    import inspect
-
-    try:
-        declares = "watch_paths" in inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        declares = False
-    if declares:  # the files the check reads, so the event-driven holder reruns it only when one of them moves
-        fn("kanban-honest-done", core.needs_attention,
-           watch_paths=core.attention_watch_paths, next_deadline=core.attention_next_deadline)
-    else:  # a core whose register_done_check takes no event declarations
-        fn("kanban-honest-done", core.needs_attention)
-    return True
+    return core.register_with(ksa)
 
 
 def register(ctx) -> None:
