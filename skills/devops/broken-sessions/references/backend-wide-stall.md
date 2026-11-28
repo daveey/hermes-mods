@@ -21,6 +21,26 @@ card, so a clean session-repair scan is expected here and proves nothing.
 7. A restart only clears the current queue: the same contention rebuilds under load. When offering a drained
    restart, say it relieves the queue and leaves the cause in place.
 
+## One chat shows only a spinner (no reasoning, progress appears then vanishes)
+
+Answer "what is it actually doing" from the hub logs, not from the transcript:
+
+1. Find the session id (`cross_session action=list query=<chat title>`).
+2. `grep '\[<session id>\]' ~/.hermes/logs/agent.log` and read the tail: `API call #N ... latency=` lines, `tool X
+   completed (Ns)` and `Tool X returned error` lines, and `Turn ended:` show exactly what the live turn did and
+   whether it is still going. Report those (calls, tools, errors, timings) to the user.
+3. Do not use `cross_session read` for this: an in-progress turn is not persisted until it ends, so it returns
+   `messages: []` mid-turn even while the turn is busy.
+4. `grep <session id> ~/.hermes/logs/gui.log` for `desktop_stripe_report ... reasons=` (e.g. `own_turn_active`) and
+   `startup resume ... writer pid <pid> is still alive` (the writer process owns the live turn; `ps -p <pid>`).
+5. Check `display:` in `~/.hermes/config.yaml` (`streaming`, `compact`) before calling it a client bug; defaults mean
+   no setting hides progress.
+6. Tool errors the user never saw (e.g. a `pre_tool_call plugin callback timed out` from a plugin hook) appear only
+   in agent.log; count them across sessions to tell a plugin-wide outage from this one chat.
+
+A live turn the client doesn't render is a desktop display defect (live parts lost on a background tail refresh
+or reconnect): file it with the log evidence, and tell the user the turn is alive.
+
 ## Turn start is fast, but Desktop times out (sessions "lost", no timing indicators)
 
 If step 1 shows ~1 s turn starts, the turns are fine and the Desktop's API reads are failing. Measure both ends:
