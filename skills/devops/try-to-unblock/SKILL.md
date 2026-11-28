@@ -80,14 +80,7 @@ foreign decision, not necessarily the newest comment on the card. A refused call
 success, read back state before retrying anything.
 Write the mandate for the goal ("land PR N and complete this card"), never the next step: each ship gate is new,
 so a step-sized mandate stops at every one and costs a full owner round-trip per gate. Put ship's follow-ups
-(below) inside the round, give transient infra errors (OperationalError, 5xx, database locked) 3 retries, and stop
-only on: CHANGES_REQUESTED, red required CI needing code, safety refusal, the same error 3 times, budget, or a
-finding that changes the design. Workers read "any authority refusal" literally and retain when
-the tool policy refuses a single call (e.g. `execute_code` blocked in unattended mode). A tool-policy refusal means
-switching to a supported tool (`read_file`/`search_files`/`terminal`); it is not a stop. Make the list closed,
-never ending in a catch-all such as "any other guard refusal": workers then stop when the repo's own checks
-(`scripts/check` health, lint, tests) fail on lines their round just wrote. Allow a bounded number of such
-own-line fixes inside the round instead. Never edit the mandate
+(below) inside the round. Review CHANGES, red CI, fixable findings and in-scope design corrections are work to finish, not new scope stops; obtain independent review of the revised approach and continue. Use supported tools when a single tool-policy call is refused. Keep stop conditions closed: provider safety refusal, a human-only physical step, the same error three times, or the authorized run budget; preserve independently enforced holds. Park CI/deployment waits on their actual event instead of spending status-only continuations. Never edit the mandate
 after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
 If a renewal's landing path ends in `hermes-core-wt ship`, name filing ship's reviewer card in the mandate
 (`core-wt-review-request.json`, linked as the card's parent). Ship rejects a same-card review with exit 3,
