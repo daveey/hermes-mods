@@ -13,6 +13,15 @@ The card has no unrefused provider left right now (refused providers are exclude
 - If the worker log's 429 names one model but the wall covers the whole provider, that is a quota/pacing defect:
   file it, because it holds cards routed to the provider's other, still-serving models.
 
+## `usage_accounting_pending` (card absent from `dispatch --dry-run`)
+If a `todo`/`ready` card never appears in `hermes kanban dispatch --dry-run --json`, check whether its own earlier
+runs still have unsettled token usage:
+`hermes-core-python -c "import sqlite3,sys; sys.path.insert(0,'$HOME/.hermes/hermes-agent'); from hermes_cli import kanban_usage_accounting as u; print(u.pending(sqlite3.connect('file:$HOME/.hermes/kanban.db?mode=ro',uri=True),'<id>'))"`.
+The call is `pending(conn, task_id)` and returns the run ids still owed usage. A non-empty list is the real wall.
+Only the supported accounting recovery path can settle those runs, so report it and the card that owns it.
+When `pending()` lists runs, a bump, move or re-file leaves the card held, and hand-written usage values would
+admit it with false spend.
+
 ## `worker_disk_below_floor`
 The floor is the worker's config `kanban.admission.disk_free_floor_bytes`. Run `df -h /` and
 `du -sh ~/.hermes/kanban/workspaces/*`, then look up each big card's status. Remove rebuildable build output
