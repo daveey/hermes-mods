@@ -16,11 +16,14 @@ _loader.exec_module(hca)
 
 class LegacyCustody(unittest.TestCase):
     def test_stale_unrelated_pid_still_starts_without_signalling(self):
+        import chrome_agent_process as processes
         supervisor = hca.Supervisor()
         child = mock.Mock(pid=424243)
         child.poll.return_value = None
+        image = (hca.os.getuid(), '/fixture/unrelated-worker', ['unrelated-worker'])
         with mock.patch.object(hca.os, 'readlink', return_value='fixture-host-424242'), \
-                mock.patch.object(supervisor, '_legacy_browser_identity', return_value=False, create=True), \
+                mock.patch.object(hca, '_legacy_process_image', return_value=image, create=True), \
+                mock.patch.object(processes, 'fingerprint', return_value='fixture:1'), \
                 mock.patch.object(hca.os, 'makedirs'), \
                 mock.patch.object(supervisor, '_prefs_off_savers'), \
                 mock.patch.object(hca.subprocess, 'Popen', return_value=child) as launch, \
