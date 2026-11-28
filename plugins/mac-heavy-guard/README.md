@@ -52,6 +52,12 @@ ANSI-C command fragments (`$'pytest'`, including ASCII octal/hex/Unicode escapes
 are decoded as quoted data before classification. Escaped apostrophes do not
 change continuation state. Non-ASCII escape results and `\\c` control escapes
 are conservatively held because their byte/locale behavior is not modeled.
+These typed refusals stay inside the inspection boundary during heredoc ownership
+checks and after command-substitution exposure too: local/Claude hooks return a
+hold, and public `commands()` raises its documented `ValueError`. A classifier
+exception is not counted as a successful hold by the differential harness.
+Regression coverage: `tests/test_ansi_hold.py`, including the registered hook,
+Claude exit status, public consumer, inert/ASCII controls and harness fault injection.
 Double-quoted `$((...` and expanding heredoc bodies use bash's boundary rule:
 match the pair opened by the second `(`, then require an immediately adjacent
 `)` and arithmetic-shaped contents. Otherwise the command-substitution fallback
