@@ -1495,7 +1495,19 @@ def _main_floor():
     return _MAIN_FLOOR
 
 
+# Exact request-middleware contract. Do not generalize shell syntax or strip twice:
+# every other preamble must retain the ordinary fail-closed analysis.
+_TERMINAL_NICE_PREFIX = re.compile(
+    r'\A(?:# kanban-worker-nice terminal floor\n)?'
+    r'if \[ "\$\(nice\)" -lt (?P<n>[1-9]|1[0-9]) \]; then '
+    r'renice -n (?P=n) -p "\$\{BASHPID:-\$\$\}" >/dev/null \|\| exit \$\?; fi\n')
+
+
 def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
+    # NICE-1: remove only this inert-to-path-state prefix, before BOTH analyzers.
+    match = _TERMINAL_NICE_PREFIX.match(cmd or "")
+    if match:
+        cmd = cmd[match.end():]
     # Monotone floor: refuse whenever main's decision logic refuses OR the analysis below refuses,
     # so this module can only add refusals relative to main. Fail closed if the floor cannot load.
     try:
