@@ -87,7 +87,10 @@ so a step-sized mandate stops at every one and costs a full owner round-trip per
 (below) inside the round. Review CHANGES, red CI, fixable findings and in-scope design corrections are work to finish, not new scope stops; obtain independent review of the revised approach and continue. Use supported tools when a single tool-policy call is refused. Keep stop conditions closed: provider safety refusal, a human-only physical step, the same error three times, or the authorized run budget; preserve independently enforced holds. Park CI/deployment waits on their actual event instead of spending status-only continuations. Never edit the mandate
 after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
 If a renewal's landing path ends in `hermes-core-wt ship`, name filing ship's reviewer card in the mandate
-(`core-wt-review-request.json`, linked as the card's parent). Ship rejects a same-card review with exit 3,
+(`core-wt-review-request.json`, linked as the card's parent). A worker on a non-default board cannot file it
+(`placement_unavailable`, then `board_pinned`), so it stops as same-error-three-times. The owning chat files the
+review card itself on `default` with idempotency key `core-wt-review:<repo>#<pr>:<sha>`, then releases the card to
+wait for the verdict. Ship rejects a same-card review with exit 3,
 and a nearby "no new cards" line will otherwise stall the worker on a decision request. Name ship's proof upload
 too: from a worker, ship exits 1 until its emitted pre-land proof is uploaded with the `kanban_attach` tool (CLI
 attachment writes are fenced), so list that upload plus the identical ship rerun under "not stops". Likewise ship
@@ -210,6 +213,12 @@ authority needed rather than treating every spent attempt as a new approval requ
   correcting comment. Once the source is archived, the system moves its spend-stop escalation card to triage,
   where `kanban complete` refuses it ("unknown id or terminal state"). Close it with `hermes kanban archive <id>`
   and withdraw its `action_request` asks.
+- **The answered card is homed on another gateway** (`worker-a1/default/default/t_…`) → relay the answer with a
+  plain `kanban_comment`: `relays_user_message=true` is refused on origin comments. Then read the card's status
+  back. An answer that is delivered does not resume a blocked card on a worker board, and hub `kanban_unblock` reports
+  that remote card as unknown. Unblock it on its home gateway with `~/.hermes/bin/hub-worker-exec <worker> --
+  <script>`, where the script runs `hermes kanban --board <b> unblock <id>`. Withdraw any duplicate card-derived
+  `action_request` for the same ask.
 
 ## 5. Leave a trail
 
