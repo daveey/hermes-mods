@@ -8,7 +8,8 @@ import re
 
 HEX = re.compile(r'[0-9a-f]+\Z')
 ATTRS = {'hermes.session_id': 'session', 'hermes.card_id': 'card',
-         'hermes.pr': 'pr', 'hermes.run_id': 'run', 'hermes.phase': 'phase'}
+         'hermes.pr': 'pr', 'hermes.run_id': 'run', 'hermes.phase': 'phase',
+         'hermes.profile': 'profile', 'hermes.board': 'board'}
 FIELDS = {'trace_id', 'span_id', 'parent_span_id', 'name',
           'start_time_unix_nano', 'end_time_unix_nano', 'attributes'}
 

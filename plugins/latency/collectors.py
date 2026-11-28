@@ -45,7 +45,7 @@ def text_content(row):
     return text
 
 
-def state_samples(rows, definitions, source_id='state', host='local', gateway='local'):
+def state_samples(rows, definitions, source_id='state', host='local', gateway='local', profile=None):
     """Independent pure projection, matching research's earliest-message UID dedup."""
     by_session = defaultdict(list)
     for row in rows:
@@ -81,7 +81,7 @@ def state_samples(rows, definitions, source_id='state', host='local', gateway='l
                     name = m.get('tool_name') or call[1]
                     for definition in definitions:
                         if definition['end'] == 'tool_result' and definition['start'] == name:
-                            result = sample(definition['id'], (source_id, sid, m.get('tool_call_id')), call[0], m['timestamp'], host, gateway, session=sid)
+                            result = sample(definition['id'], (source_id, sid, m.get('tool_call_id')), call[0], m['timestamp'], host, gateway, session=sid, **({'profile': profile} if profile else {}))
                             if result:
                                 yield result
         for i, user in enumerate(clean):
@@ -98,12 +98,12 @@ def state_samples(rows, definitions, source_id='state', host='local', gateway='l
                     continue
                 end = assistants[0] if definition['end'] == 'first_assistant' and assistants else (finals[-1] if definition['end'] == 'explicit_final' and finals else None)
                 if end:
-                    result = sample(definition['id'], (source_id, sid, user.get('message_uid') or user['id']), user['timestamp'], end['timestamp'], host, gateway, session=sid)
+                    result = sample(definition['id'], (source_id, sid, user.get('message_uid') or user['id']), user['timestamp'], end['timestamp'], host, gateway, session=sid, **({'profile': profile} if profile else {}))
                     if result:
                         yield result
 
 
-def collect_state(path, store, definitions, since, until, host='local', gateway='local'):
+def collect_state(path, store, definitions, since, until, host='local', gateway='local', profile=None):
     source = 'state:' + str(Path(path).resolve())
     from .registry import fingerprint
     cursor_key = source + ':' + fingerprint(definitions)
@@ -120,11 +120,12 @@ def collect_state(path, store, definitions, since, until, host='local', gateway=
                 CASE WHEN role='user' THEN content WHEN role='assistant' THEN substr(content,1,400) ELSE NULL END content,
                 tool_call_id,tool_calls,tool_name,timestamp,finish_reason,display_kind,message_uid
                 FROM messages WHERE session_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp,id''', (sid, since, until))]
-            samples.extend(state_samples(rows, definitions, source, host, gateway))
+            samples.extend(state_samples(rows, definitions, source, host, gateway, profile))
     return store.ingest(samples, cursor_key, {'id': ceiling, 'at': until})
 
 
-def board_samples(tasks, events, definitions, source_id='board', host='local', gateway='local'):
+def board_samples(tasks, events, definitions, source_id='board', host='local', gateway='local', profile=None, board=None):
+    owner = {k: v for k, v in dict(profile=profile, board=board).items() if v}
     grouped = defaultdict(list)
     for event in events:
         grouped[event['task_id']].append(event)
@@ -136,7 +137,7 @@ def board_samples(tasks, events, definitions, source_id='board', host='local', g
                 start = next((e['created_at'] for e in history if e['kind'] == 'created'), None)
                 ends = [e['created_at'] for e in history if e['kind'] == end_kind]
                 end = (ends[-1] if end_kind == 'completed' else ends[0]) if ends else None
-                result = sample(definition['id'], (source_id, task['id']), start, end, host, gateway, card=task['id'])
+                result = sample(definition['id'], (source_id, task['id']), start, end, host, gateway, card=task['id'], **owner)
                 if result:
                     yield result
             else:
@@ -145,13 +146,13 @@ def board_samples(tasks, events, definitions, source_id='board', host='local', g
                     if event['kind'] == start_kind:
                         pending = event
                     elif event['kind'] == end_kind and pending is not None:
-                        result = sample(definition['id'], (source_id, pending['id'], event['id']), pending['created_at'], event['created_at'], host, gateway, card=task['id'])
+                        result = sample(definition['id'], (source_id, pending['id'], event['id']), pending['created_at'], event['created_at'], host, gateway, card=task['id'], **owner)
                         if result:
                             yield result
                         pending = None
 
 
-def collect_board(path, store, definitions, since, until, host='local', gateway='local'):
+def collect_board(path, store, definitions, since, until, host='local', gateway='local', profile=None, board=None):
     source = 'kanban:' + str(Path(path).resolve())
     from .registry import fingerprint
     cursor_key = source + ':' + fingerprint(definitions) + ':events-v2'
@@ -167,7 +168,7 @@ def collect_board(path, store, definitions, since, until, host='local', gateway=
             events.extend(dict(r) for r in db.execute('''SELECT id,task_id,kind,created_at FROM task_events
                 WHERE task_id=? AND created_at<=? ORDER BY created_at,id''', (task['id'], until)))
     from .store import RETENTION_SECONDS
-    samples = [s for s in board_samples(tasks, events, definitions, source, host, gateway)
+    samples = [s for s in board_samples(tasks, events, definitions, source, host, gateway, profile, board)
                if min(since,until-RETENTION_SECONDS) <= s['start'] <= until]
     # Board events are append-only: incoming observations revise existing values.
     # A recently archived old card is not an authoritative deletion of its retained
