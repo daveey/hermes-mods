@@ -61,6 +61,36 @@ def test_missing_parent_creation_is_an_immediate_watch_event(tmp_path):
         w.close()
 
 
+def test_inotify_above_select_limit(tmp_path):
+    """Busy core-backed processes may allocate the watch above FD_SETSIZE."""
+    if not sys.platform.startswith('linux'):
+        pytest.skip('inotify only')
+    import fcntl
+    import os
+    import resource
+
+    api = api_module()
+    w = api.FileWatch()
+    if not w.ok or w._libc is None or resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1024:
+        w.close()
+        pytest.skip('requires inotify and fd capacity above select limit')
+    try:
+        high = fcntl.fcntl(w._fd, fcntl.F_DUPFD_CLOEXEC, 1024)
+        os.close(w._fd)
+        w._fd = high
+        db = tmp_path / 'watched.db'
+        db.write_bytes(b'initial')
+        w.set_paths([db])
+        assert not w.wait(.01)
+        db.write_bytes(b'changed')
+        assert w.wait(.2)
+        assert w.changed_paths == {db}
+        assert w.source_changed
+        assert not w.wait(.01)
+    finally:
+        w.close()
+
+
 def test_missing_sources_remain_in_watch_inventory(tmp_path):
     from types import SimpleNamespace
     import threading

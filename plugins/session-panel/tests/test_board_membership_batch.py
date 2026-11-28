@@ -126,9 +126,11 @@ def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed,
         actual = {s: (r.linked(lineage[s]), r.done(lineage[s])) for s in chats}
     assert unclocked(actual) == unclocked(baseline)
     assert [t['via'] for t in actual['S0'][0]] == [t['via'] for t in baseline['S0'][0]]
-    # Per status set, core's union hydration selects once and the pass's membership read selects once, both over
-    # the pass's ids: 4 calls for 22 chats, where the per-chat loop added one call per chat and status set (46).
-    assert calls == [union] * 4, [len(ids) for ids in calls]
+    # One membership read per status set plus, on older core, one union hydration
+    # read. Newer core hydrates via select_listed_local_tasks directly; requiring
+    # four calls would reject that optimization. Neither route may select per chat.
+    assert len(calls) in (2, 4), [len(ids) for ids in calls]
+    assert calls == [union] * len(calls), [len(ids) for ids in calls]
     # Bound the pass to two selector reads per status set, rather than pinning
     # core's internal SQL count (new annotations legitimately add fixed reads).
     # Use the same scope/connection shape so row-dependent enrichment is counted.
@@ -140,4 +142,4 @@ def test_pass_reads_membership_once_per_status_set_with_unchanged_answers(mixed,
     finally:
         c.set_trace_callback(None)
     assert control
-    assert len(statements) == 2 * len(control), (len(statements), len(control))
+    assert len(statements) == (len(calls) // 2) * len(control), (len(statements), len(control))

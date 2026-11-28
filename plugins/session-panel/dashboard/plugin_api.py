@@ -3007,8 +3007,15 @@ class FileWatch:
 
     def wait(self, timeout: float) -> bool:
         """Sleep until a watched file is written; False after `timeout` seconds without one."""
+        import math
         import select
         import struct
+        # select() rejects valid Linux descriptors >= FD_SETSIZE (usually 1024).
+        # Core-backed processes can legitimately exceed that; poll has no such cap.
+        poller = None
+        if self._kq is None:
+            poller = select.poll()
+            poller.register(self._fd, select.POLLIN)
         until = time.monotonic() + timeout
         self.changed_paths = set()
         self.source_changed = False
@@ -3029,7 +3036,8 @@ class FileWatch:
                 self.source_changed = True
                 self._arm()  # a replaced or newly created file is watched from here on
                 return True
-            if not select.select([self._fd], [], [], left)[0]:
+            assert poller is not None  # Linux branch; kqueue returned above
+            if not poller.poll(math.ceil(left * 1000)):
                 return False
             try:
                 data = os.read(self._fd, 65536)
