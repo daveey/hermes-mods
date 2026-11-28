@@ -289,7 +289,7 @@ def after_create(core: Any, args: dict, result: Any, session_id: str) -> None:
             for path, tid, _, _ in archives:
                 refusal = ('replacement creation is not confirmed locally; cleanup NOT performed'
                            + ' (status=' + str(status) + ', request=' + str(request)
-                           + ', local_task_id=' + str(local_id) + ')')
+                           + ', local_task_id=' + str(local_id) + ', gateway=' + str(placed.get('gateway') or 'local') + ')')
                 core.log_event('superseding_create_archive', new_id=None, old_id=tid,
                                archived=False, error=refusal)
                 try:

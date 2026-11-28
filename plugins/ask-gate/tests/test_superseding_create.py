@@ -141,7 +141,7 @@ def test_archive_only_after_exact_successful_create(gate, monkeypatch):
 
 
 @pytest.mark.parametrize('unconfirmed', [
-    {'ok': True, 'task_id': None, 'placed': {'status': 'queued', 'request_id': 'fixture-request'}},
+    {'ok': True, 'task_id': None, 'status': 'queued', 'placed': {'gateway': 'fixture-gateway', 'request_id': 'fixture-request'}},
     {'ok': False, 'created': True, 'code': 'origin_bind_pending', 'task_id': 't_abcdef1234567890'},
 ])
 def test_unconfirmed_create_cleanup_is_visible(gate, monkeypatch, unconfirmed):
@@ -163,6 +163,8 @@ def test_unconfirmed_create_cleanup_is_visible(gate, monkeypatch, unconfirmed):
     expected_handle = unconfirmed.get('task_id') or 'fixture-request'
     assert all(expected_status in e[1]['error'] and expected_handle in e[1]['error'] for e in cleanup)
     assert all(expected_status in c['body'] and expected_handle in c['body'] for c in comments)
+    if unconfirmed.get('placed'):
+        assert all('fixture-gateway' in c['body'] for c in comments)
 
 
 @pytest.mark.parametrize('confirmed', [False, True])
