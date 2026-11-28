@@ -3381,13 +3381,22 @@ def _backlog_queue(d: dict, store, now: float, why: str = "ranked backlog", **ex
         db.close()
     cached = json.loads(row[0]) if row else (
         (LaneState(store.root).read().get(d["fingerprint"]) or {}).get("backlog_evidence") or {})
-    for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
+    for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump", "backlog_classification_attempt"):
         if key in cached:
             d = {**d, key: cached[key]}
     if not row:  # failed classifications retry on drain, not on every occurrence
         d = backlog_classify(d)
     return _defer_investigation(d, {"action": "queued", "retry_at": _iso(now),
                                    "why": why, "stop_pass": False, **extra}, store)
+
+
+BACKLOG_CLASSIFY_MAX_CALLS = 16
+BACKLOG_CLASSIFY_SECONDS = 60  # plus at most one existing bounded in-flight pool call
+
+
+def _backlog_classification_attempt(d: dict) -> float:
+    value = d.get("backlog_classification_attempt", 0)
+    return value if type(value) in (int, float) and 0 < value < float("inf") else 0
 
 
 def backlog_classify(d: dict, judge=None) -> dict:
@@ -3431,7 +3440,7 @@ def fold_payloads(old: dict, new: dict, why: str = "", keep_old: bool = False) -
     if not why and pa.keys() <= pb.keys():
         out = {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint")}
         # A re-defer of the same evidence must preserve cached classification/manual priority.
-        for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
+        for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump", "backlog_classification_attempt"):
             if key in old:
                 out[key] = old[key]
         return out
@@ -3441,7 +3450,7 @@ def fold_payloads(old: dict, new: dict, why: str = "", keep_old: bool = False) -
     out = {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint"),
            "occurrences": merged[-PENDING_OCCURRENCES_MAX:], "occurrence_count": max(count, len(merged)),
            "backlog_parts": parts, "backlog_stats": _backlog_fold_stats(a, b, oa, ob)}
-    for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
+    for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump", "backlog_classification_attempt"):
         if key in old:
             out[key] = old[key]
     reasons = list(a.get("merge_reasons") or []) + list(b.get("merge_reasons") or []) + ([why] if why else [])
@@ -4099,9 +4108,16 @@ def _retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list
     recheck_cache: dict = {}
     try:
         rows = db.execute("SELECT fp, payload, version FROM pending WHERE retry <= ?", (now,)).fetchall()
+        rows = [(fp, json.loads(payload), version) for fp, payload, version in rows]
+        # Retry least-recently attempted classifications first. A permanently failing
+        # first row must not monopolize the next pass's circuit-breaker probe.
+        if ranked:
+            rows.sort(key=lambda row: (_backlog_classification_attempt(row[1]), row[0]))
         due = []
-        for fp, payload, version in rows:
-            d = json.loads(payload)
+        classification_failed = False
+        classification_calls = classification_deferred = 0
+        classification_deadline = time.monotonic() + BACKLOG_CLASSIFY_SECONDS
+        for fp, d, version in rows:
 
             if synthetic_user_row(d):  # before the cap-ordered pass: a denial stops that pass before late rows
                 with db:
@@ -4123,7 +4139,16 @@ def _retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list
                 out.append({"action": "skip", "why": closed})
                 continue
             if ranked:
-                classified = backlog_classify(d)
+                classified = d
+                if d.get("backlog_severity_ready"):
+                    classified = backlog_classify(d)  # cached: no pool call
+                elif (not classification_failed and classification_calls < BACKLOG_CLASSIFY_MAX_CALLS
+                      and time.monotonic() < classification_deadline):
+                    classification_calls += 1
+                    classified = {**backlog_classify(d), "backlog_classification_attempt": now}
+                    classification_failed = not classified.get("backlog_severity_ready")
+                else:
+                    classification_deferred += 1
                 if classified != d:
                     with db:
                         changed = db.execute("UPDATE pending SET payload=? WHERE fp=? AND version=?",
@@ -4137,6 +4162,9 @@ def _retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list
             else:
                 priority = _pending_priority(d)
             due.append((priority, fp, d, version))
+        if ranked:
+            store.log({"event": "selfheal_classification_batch", "attempted": classification_calls,
+                       "deferred": classification_deferred, "failed": bool(classification_failed)})
         due.sort(key=lambda r: r[0])
         for i, (_, fp, d, version) in enumerate(due):
             try:
