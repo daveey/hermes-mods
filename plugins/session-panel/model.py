@@ -1003,6 +1003,32 @@ def ask(row, request=None):
     return out
 
 
+def overdue_request(request):
+    """A user-steps overdue-triage card (no human ask), not a person's question."""
+    return obj(obj(request).get('presentation')).get('kind') == 'kanban-overdue'
+
+
+def overdue_card(row, request):
+    """The red Stuck card for overdue triage: same bound choices as an ask, never a Needs-you row."""
+    out = ask(row, request)
+    info = obj(obj(request.get('presentation')).get('overdue'))
+    out.update(kind='overdue', reason='triage-overdue', attention='triage_overdue',
+               detail='overdue triage · needs a decision: release, archive or keep parked')
+    if not row.get('id'):
+        ref = next(iter(_aliases(request)), {})
+        if ref.get('id'):
+            out.update(id=ref['id'], source='card')
+    if text(info.get('holder')):
+        out['details'].insert(0, 'Parked by ' + text(info['holder']))
+    target = next(iter(_aliases(request)), {})
+    if target.get('id') and not any(a.get('kind') == 'open_card' for a in out['actions']):
+        # The card is a link, never an id to type.
+        out['actions'].insert(0, {'kind': 'open_card', 'label': 'Open card', 'target': {
+            'id': target['id'], 'gateway': target.get('gatewayId'), 'profile': target.get('profile'),
+            'board': target.get('board') or 'default'}})
+    return out
+
+
 def _aliases(request):
     return [a for a in [*(request.get('aliases') or []), *(obj(request.get('scope')).get('sourceRefs') or [])]
             if isinstance(a, dict) and a.get('type') == 'kanban']
@@ -1307,6 +1333,11 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         matches = [(i, r) for i, r in enumerate(requests) if any(_matches(row, a, same_gateway) for a in _aliases(r))]
         live = next(((i, r) for i, r in matches if r.get('state') in ('open', 'needs_context') and not r.get('resolution')), None)
+        if live and state == 'triage' and overdue_request(live[1]):
+            # Overdue triage with no human ask: the actionable red card (Release / Archive / Keep parked).
+            # Stuck, not Needs you: needs_you stays human-ask-only.
+            used.add(live[0]); sections['stuck'].append(overdue_card(row, live[1]))
+            continue
         if human_owned(row) or (state in ('blocked', 'triage') and live):
             if live:
                 used.add(live[0]); sections['needs_you'].append(ask(row, live[1]))
@@ -1439,8 +1470,11 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             linked = [t for t in bundle.get('tasks') or [] if any(_matches({**t, 'gateway': t.get('gateway') or (bundle.get('gateway') if not t.get('remote') and t.get('source') != 'replica' else None), 'profile': t.get('profile') or bundle.get('profile'), 'board': t.get('board') or 'default'}, a, same_gateway) for a in aliases)]
             if linked and not any(human_owned(t) for t in linked):
                 continue
+            if overdue_request(r):
+                sections['stuck'].append(overdue_card({}, r))
+                continue
             sections['needs_you'].append(ask({}, r))
-    for view in sections['needs_you']:
+    for view in sections['needs_you'] + [v for v in sections['stuck'] if v.get('kind') == 'overdue']:
         for action in view['actions']:
             if action.get('kind') == 'decide':
                 # The adapter supplies install-id aliases from trusted local identity.
@@ -1517,6 +1551,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     for section, views in sections.items():
         if section != 'needs_you':
             for view in views[:]:
+                if view.get('kind') == 'overdue':
+                    aged_keys.add(view['key'])  # the card carries its own overdue attention and wording
+                    continue
                 source_row = rows_by_key.get(view['key'], {})
                 if triage_overdue(source_row, bundle, now):
                     view['attention'] = 'triage_overdue'

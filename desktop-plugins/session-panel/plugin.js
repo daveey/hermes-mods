@@ -683,7 +683,10 @@ const boundAsk = row => {
   return a ? JSON.stringify([a.owner.gatewayId, a.owner.profile || 'default', row.request_id]) : null
 }
 /** Every bound ask the model carries: what a collapsed header still counts. */
-export const modelAsks = model => Object.fromEntries((model?.sections?.needs_you || []).filter(r => r?.kind !== 'blocker')
+// Overdue-triage cards (Stuck, kind 'overdue') carry bound choices exactly like asks.
+export const askRows = model => [...(model?.sections?.needs_you || []).filter(r => r?.kind !== 'blocker'),
+  ...(model?.sections?.stuck || []).filter(r => r?.kind === 'overdue')]
+export const modelAsks = model => Object.fromEntries(askRows(model)
   .map(r => [boundAsk(r), r.request_revision]).filter(([k]) => k))
 // One combined height budget for the session-status frame (rows + decision companion). The header never scrolls.
 export const PANEL_MAX_HEIGHT = '55vh'
@@ -763,8 +766,11 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     return withMenu(row, jsxs('article', { 'data-panel-row': row.key, 'data-ask-row': row.source, 'data-ask-binding': bound || undefined,
       style: { border: '1px solid var(--border)', borderLeft: `3px solid ${SECTION_COLOR.needs_you}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
       jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }, children: [
-        jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: decision ? 'Needs your decision' : 'Needs you' }),
-        row.id && jsx('span', { 'data-ask-card': '', style: { ...muted, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }, children: row.source === 'card' ? row.id : 'question' })
+        jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: row.kind === 'overdue' ? 'Parked too long · decide' : decision ? 'Needs your decision' : 'Needs you' }),
+        // The card id is a link that opens the card, never text to retype.
+        row.id && (row.source === 'card' && ownCard(row) && onAction
+          ? jsx('button', { type: 'button', 'data-ask-card': '', 'data-card-link': '', title: 'Open card', onClick: () => onAction(row, ownCard(row)), style: { ...askLinkBtn, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }, children: row.id })
+          : jsx('span', { 'data-ask-card': '', style: { ...muted, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0 }, children: row.source === 'card' ? row.id : 'question' }))
       ] }),
       jsx('strong', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: plain(row.title) || row.id }),
       row.detail && jsx('div', { style: { ...modelSmall, ...muted }, children: row.detail }),
@@ -862,7 +868,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const next = new Set([...visited, raw.key])
     return jsxs('div', { 'data-tree-node': row.key, 'data-tree-depth': row.depth || 0,
       'data-tree-parent': row.parent || undefined, children: [
-      section === 'needs_you' && row.kind !== 'blocker' ? askRow(row, hidden) : lineRow(row, section),
+      (section === 'needs_you' && row.kind !== 'blocker') || row.kind === 'overdue' ? askRow(row, hidden) : lineRow(row, section),
       children.has(row.key) && jsx('div', { 'data-tree-guide': '', style: {
         // Desktop publishes --dt-border, not the legacy --border alias. Keep
         // geometry independent of color resolution so missing tokens cannot erase guides.
@@ -935,15 +941,19 @@ const modelDecisions = new Map()
 const provisionalDecisions = new Map()
 export function decisionPresentation(model, route) {
   if (!model) return model
-  const moving = model.sections.needs_you.filter(row => [...provisionalDecisions.values()].some(p =>
+  const moving = askRows(model).filter(row => [...provisionalDecisions.values()].some(p =>
     routeKey(p.sourceRoute) === routeKey(route) && p.key === modelDecisionKey(row)))
   if (!moving.length) return model
+  const fromStuck = moving.filter(row => row.kind === 'overdue').length
   const sections = { ...model.sections,
     needs_you: model.sections.needs_you.filter(row => !moving.includes(row)),
+    stuck: model.sections.stuck.filter(row => !moving.includes(row)),
     waiting: [...model.sections.waiting, ...moving.map(row => ({ ...row, detail: '', options: [],
+      ...(row.kind === 'overdue' ? { kind: 'card', attention: undefined } : {}),
       actions: row.actions.filter(a => a.kind !== 'decide'),
       decision: { request_id: row.request_id, text: modelDecisionStatus(row)?.text || 'Decision recorded; updating status…' } }))] }
-  const counts = { ...model.header.counts, needs_you: model.header.counts.needs_you - moving.length,
+  const counts = { ...model.header.counts, needs_you: model.header.counts.needs_you - (moving.length - fromStuck),
+    stuck: model.header.counts.stuck - fromStuck,
     waiting: model.header.counts.waiting + moving.length }
   const pips = sectionsPips(sections, counts, model.header.pips)
   return { ...model, sections, header: { ...model.header, counts, pips,

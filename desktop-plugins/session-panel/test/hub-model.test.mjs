@@ -87,6 +87,7 @@ test('aged parked board data keeps its status and age in the panel and task chip
 })
 
 const cases = { ...publicCases, ...privateCases }
+
 for (const variant of ['settled', 'backfill', 'stale', 'original']) {
  test(`retained disposition real adapter paints settled non-success ${variant} through client expiry`, { skip: !cases[`retained_${variant}`] }, async () => {
   const { model, now } = cases[`retained_${variant}`]
@@ -115,6 +116,24 @@ for (const variant of ['pending', 'newer', 'human', 'missing']) {
   if (variant === 'human') assert.equal(model.sections.needs_you.length, 1)
  })
 }
+
+test('overdue triage card renders Release / Archive / Keep parked in Stuck with a clickable card id', async () => {
+  const { model, now } = publicCases.overdue_triage_card
+  assert.equal(model.sections.needs_you.length, 0)
+  const opened = []
+  await paint(m.renderModel(model, { now, onAction: (row, action) => opened.push([row.id, action.kind]) }))
+  assert.ok(document.querySelector('[data-row-pip="stuck"]'))
+  assert.equal(document.querySelector('[data-ask-kind]').textContent, 'Parked too long · decide')
+  assert.deepEqual([...document.querySelectorAll('[data-choice-id]')].map(b => b.getAttribute('data-choice-id')),
+    ['card-0', 'card-1', 'card-2'])
+  assert.match(document.body.textContent, /Release/)
+  assert.match(document.body.textContent, /Keep parked/)
+  const link = document.querySelector('[data-card-link]')
+  assert.equal(link.textContent, 't_abc123')
+  await React.act(async () => link.click())
+  assert.deepEqual(opened, [['t_abc123', 'open_card']])
+})
+
 for (const age of [599, 600, 601, 6 * 86400]) {
  test(`real CoreReaders -> reducer -> panel/chip: triage age ${age}`, { skip: !cases[`composed_triage_${age}`] }, async () => {
   const { model, now } = cases[`composed_triage_${age}`]
