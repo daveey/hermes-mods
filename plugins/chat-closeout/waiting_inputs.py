@@ -274,6 +274,39 @@ class ReplicaWatch:
 
     _ROW_SQL = "SELECT seq, data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?"
 
+    def _selected_rows(self, conn: sqlite3.Connection, keys: list[tuple[str, str]]) -> Iterable[tuple]:
+        """Batch point reads inside the caller's existing snapshot; never retain a connection.
+
+        Only TEXT/NULL payloads cross JSON. REAL (including signed zero), BLOB,
+        oversized pages and older SQLite retain the exact original point reads.
+        The materialized page is bounded to 128 requested primary keys and one
+        MiB of raw payload before packing; no full-replica payload scan.
+        """
+        for offset in range(0, len(keys), 128):
+            out = {}
+            page = keys[offset:offset + 128]
+            values = ','.join('(?,?)' for _ in page)
+            sql = (f'WITH wanted(gw,key) AS (VALUES {values}), selected AS MATERIALIZED ('
+                   'SELECT w.gw,w.key,r.data FROM wanted w JOIN replica r '
+                   "ON r.gw=w.gw AND r.coll='tasks' AND r.key=w.key) "
+                   "SELECT CASE WHEN count(*) <= 128 AND "
+                   "coalesce(sum(typeof(data) NOT IN ('text','null')),0)=0 AND "
+                   "coalesce(sum(length(CAST(data AS BLOB))),0)<=1048576 "
+                   'THEN (SELECT json_group_array(json_array(gw,key,data)) FROM selected) END FROM selected')
+            try:
+                packed = conn.execute(sql, [v for key in page for v in key]).fetchone()[0]
+            except sqlite3.Error:
+                packed = None  # e.g. a legacy SQLite without MATERIALIZED / JSON1
+            if packed is not None:
+                for gw, key, raw in json.loads(packed):
+                    out[(gw, key)] = raw
+            else:
+                for gw, key in page:
+                    row = conn.execute(self._ROW_SQL, (gw, key)).fetchone()
+                    if row is not None:
+                        out[(gw, key)] = row[1]
+            yield from out.items()
+
     def _read_gateways(self, conn: sqlite3.Connection) -> None:
         self.gateways = {str(gw): self._scopes(data) for gw, data in conn.execute(
             "SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'")}
@@ -292,12 +325,8 @@ class ReplicaWatch:
             self.cursor[gw] = max(self.cursor.get(gw, 0), int(seq or 0))
             if _tail(key) in tails:
                 want.append((gw, key))
-        rows: dict[tuple[str, str], tuple[str, str, Any, str]] = {}
-        for gw, key in want:
-            r = conn.execute(self._ROW_SQL, (gw, key)).fetchone()
-            if r is not None:
-                rows[(gw, key)] = self._entry(key, r[1])
-        self.rows = rows
+        self.rows = {(gw, key): self._entry(key, raw)
+                     for (gw, key), raw in self._selected_rows(conn, want)}
         self._read_gateways(conn)
         self.rebuilds += 1
 
@@ -316,12 +345,13 @@ class ReplicaWatch:
                     self.rows[(gw, key)] = ("", "", None, "")  # a new batch row: read below
         if not self._agrees(probe):
             return False  # a delete, a rewrite at an older seq, a seq that went back: unknown which rows
-        for (gw, key), old in list(self.rows.items()):
-            r = conn.execute(self._ROW_SQL, (gw, key)).fetchone()
-            if r is None:
-                self.rows.pop((gw, key))
-            elif self._raw_hash(r[1]) != old[3]:
-                self.rows[(gw, key)] = self._entry(key, r[1])  # includes a rewrite in place at the same seq
+        found = set()
+        for identity, raw in self._selected_rows(conn, list(self.rows)):
+            found.add(identity)
+            if self._raw_hash(raw) != self.rows[identity][3]:
+                self.rows[identity] = self._entry(identity[1], raw)  # includes same-seq rewrites
+        for identity in self.rows.keys() - found:
+            self.rows.pop(identity)
         self._read_gateways(conn)
         self.increments += 1
         return True
