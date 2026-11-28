@@ -104,6 +104,20 @@ fake-clock unchanged-board canonical crossing/recovery, real CoreReaders → red
 → mounted panel/chip with clipped event history, and actual ordinary/Background
 sidebar dot/stripe/counters. Native pixels remain a separate passive observation.
 
+### Actionable overdue cards
+
+When user-steps supplies a current owner-bound `presentation.kind: "kanban-overdue"`
+request, the reducer emits a `kind: "overdue"` row in `stuck`, not `needs_you`.
+It carries the ordinary ask fields, exact request/revision/choice bindings, and an
+owner-qualified `open_card` action. Desktop renders the red card, its context and
+Release / Archive / Keep parked choices; the displayed card ID opens that target.
+The decision operation rechecks the frozen source snapshot on the home board.
+Release uses core's human-release route for held scopes or promotion for plain
+triage; provider-safety holds do not offer Release. Archive records a reason.
+Keep parked writes a non-executing acknowledgement: attention is quiet for 24 hours
+or until the next lifecycle event, without changing the episode's start time.
+Older core without acknowledgement support does not produce these requests.
+
 ## Delivery wait ETA
 
 Rows may carry `wait_kind: "ci" | "deploy" | "clock"` and
