@@ -80,7 +80,12 @@ def build(range_key, metric=None, now=None):
             measured = now
             store.meta_set(key, measured)
         view = store.view(definition['id'], now-({'8d': 8*86400}.get(range_key) or RANGES[range_key]), now)
-        rows.append(links.enrich({**definition, 'measured_since': measured, **view}, sources))
+        row = links.enrich({**definition, 'measured_since': measured, **view}, sources)
+        if definition['id'] == 'turn_first':
+            turns = importlib.import_module(pkg().__name__+'.turn_stages')
+            trace = turns.latest(store, now-RANGES.get(range_key, 8*86400), now)
+            row.update(turn_trace=trace, stages=trace['stages'])
+        rows.append(row)
     return dict(api=1, range=range_key, at=now, timezone='America/Los_Angeles',
                 quantile_relative_error=0.005, bucket_seconds=3600, metrics=rows,
                 collection=store.meta_get('last_cycle'))
@@ -163,13 +168,17 @@ def ingest(body):
     if not isinstance(body, dict) or set(body) != {'spans'} or not isinstance(body['spans'], list) or not 1 <= len(body['spans']) <= 200:
         raise ValueError('expected {spans: [1..200 span objects]}')
     _, definitions, store, root = services()
-    allowed = {d['id'] for d in definitions.registry(root) if d['kind'] == 'span'}
+    turns = importlib.import_module(pkg().__name__+'.turn_stages')
+    allowed = {d['id'] for d in definitions.registry(root) if d['kind'] == 'span'} | turns.METRICS
     spans = importlib.import_module(pkg().__name__+'.spans')
     validated = [spans.validate_span(sample) for sample in body['spans']]
     if any(s['metric'] not in allowed for s in validated):
         raise ValueError('unknown or non-span metric')
+    if any(s['metric'] in turns.METRICS and not turns.valid(s) for s in validated):
+        raise ValueError('invalid turn stage')
     normalized = spans.append_batch(validated, root=root)
-    inserted = store.ingest(normalized)
+    inserted = store.ingest([s for s in normalized if s['metric'] not in turns.METRICS])
+    inserted += turns.ingest(store, normalized, time.time())
     with _lock:
         _cache.clear()
     exporter = importlib.import_module(pkg().__name__+'.exporter')

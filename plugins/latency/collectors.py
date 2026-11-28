@@ -179,6 +179,7 @@ def collect_board(path, store, definitions, since, until, host='local', gateway=
 
 def collect_journals(paths, store, definitions, until, host='local', gateway='local'):
     """Persist unfinished stage pairs across files, rotation and process restarts."""
+    from . import turn_stages
     inserted = 0
     for path in sorted(map(Path, paths)):
         stat = path.stat()
@@ -188,6 +189,7 @@ def collect_journals(paths, store, definitions, until, host='local', gateway='lo
         offset = old.get('offset', 0) if old.get('inode') == stat.st_ino and old.get('offset', 0) <= stat.st_size else 0
         pending = store.meta_get('stage_pending', {})
         samples = []
+        turn_samples = []
         with path.open('rb') as stream:
             stream.seek(offset)
             while True:
@@ -198,6 +200,9 @@ def collect_journals(paths, store, definitions, until, host='local', gateway='lo
                 try:
                     row = json.loads(line)
                     if 'metric' in row:
+                        if row['metric'] in turn_stages.METRICS:
+                            from .store import _sample
+                            turn_samples.append(_sample(row))
                         if row['metric'] in {d['id'] for d in definitions}:
                             from .store import _sample
                             samples.append(_sample(row))
@@ -221,5 +226,9 @@ def collect_journals(paths, store, definitions, until, host='local', gateway='lo
         # Pending rows are a recoverable projection: save before cursor commit.
         pending = {key: stages for key, stages in pending.items() if any((s.get('utc_ns') or 0)/1e9 >= until-3600 for s in stages.values())}
         store.meta_set('stage_pending', dict(list(pending.items())[-10000:]))
+        # Commit projection before the cursor: interruption replays safely.
+        if turn_stages.ingest(store, turn_samples, until):
+            from . import exporter
+            exporter.enqueue(turn_samples)
         inserted += store.ingest(samples, source, {'inode': stat.st_ino, 'offset': offset, 'at': until})
     return inserted
