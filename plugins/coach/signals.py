@@ -69,7 +69,10 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 BACKFILL_S = 7 * 86400
 KANBAN_FAIL_WINDOW_S = 86400  # a card's failed runs count/quote only inside this window (kanban-3039493fec)
@@ -1341,8 +1344,8 @@ def _ro(db: Path):
 def board_dbs(home: Path) -> List[Tuple[str, Path]]:
     out, seen = [], set()
     for prof, h in homes(home):
-        cands = [("default", h / "kanban.db")] + [(Path(p).parent.name, Path(p)) for p in
-                                                  sorted(glob.glob(str(h / "kanban" / "boards" / "*" / "kanban.db")))]
+        cands = [("default", h / "kanban.db")] + [(p.parent.name, p) for p in
+                                                  _board_db_files(h / "kanban" / "boards")]
         for name, db in cands:
             rp = os.path.realpath(db)
             if db.is_file() and db.stat().st_size and rp not in seen:

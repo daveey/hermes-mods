@@ -35,6 +35,9 @@ import unicodedata
 import time
 from typing import Any, Callable, Optional
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 _HERE = Path(__file__).resolve().parent
 _cache_spec = importlib.util.spec_from_file_location("_coach_module_cache", _HERE / "module_cache.py")
@@ -481,7 +484,7 @@ def _board_dbs() -> list:
     env = os.environ.get("HERMES_KANBAN_DB")
     root = Path(os.environ.get("HERMES_KANBAN_HOME") or _hermes_home())
     paths = [Path(env)] if env else [root / "kanban.db"]
-    paths += sorted((root / "kanban" / "boards").glob("*/kanban.db"))
+    paths += _board_db_files(root / "kanban" / "boards")
     return [p for p in paths if p.is_file()]
 
 
@@ -5159,7 +5162,7 @@ def replay_denied_ask(days: float, home=None) -> list:
         if (isinstance(r, dict) and r.get("event") == "reply_nudge_outcome" and r.get("rule") == "denied_ask"
                 and float(r.get("ts") or 0) >= since):
             rows.append(r)
-    boards = [home / "kanban.db"] + sorted((home / "kanban" / "boards").glob("*/kanban.db"))
+    boards = [home / "kanban.db"] + _board_db_files(home / "kanban" / "boards")
 
     def card(cid: str) -> Optional[dict]:
         slug, _, tid = cid.rpartition("/")

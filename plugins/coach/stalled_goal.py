@@ -44,7 +44,10 @@ import sys
 import threading
 import time
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Callable, Iterable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 OPEN = ("todo", "ready", "triage", "blocked", "review")
 STATUS_EVENTS = ("created", "promoted", "claimed", "spawned", "completed", "blocked", "unblocked", "scheduled",
@@ -150,7 +153,7 @@ def board_dbs(h: Optional[Path] = None, replicas: bool = False) -> list:
     the default board, so it never relabels or hides the default board."""
     h = kanban_root(h)
     out = [(None, h / "kanban.db", True)]
-    out += [(p.parent.name, p, True) for p in sorted((h / "kanban" / "boards").glob("*/kanban.db"))]
+    out += [(p.parent.name, p, True) for p in _board_db_files(h / "kanban" / "boards")]
     if replicas:
         out += [(f"replica:{p.stem}", p, False) for p in sorted((h / "kanban" / "sync-shadow").glob("*.db"))]
     return [b for b in out if b[1].is_file()]

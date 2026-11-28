@@ -30,7 +30,10 @@ import re
 import threading
 import time
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Callable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 _TL = threading.local()  # detect_complaint -> handle hand-off of an untraced complaint judgment (see handle)
 
@@ -4558,7 +4561,7 @@ def session_owned_cards(session_id: Optional[str], since: float, home: Optional[
         return []
     import sqlite3
     home = hermes_home(home)
-    dbs = [(None, home / "kanban.db")] + [(p.parent.name, p) for p in sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
+    dbs = [(None, home / "kanban.db")] + [(p.parent.name, p) for p in _board_db_files(home / "kanban" / "boards")]
     marks = ",".join("?" * len(ADOPT_STATUSES))
     rows: list = []
     for board, path in dbs:
@@ -5216,8 +5219,10 @@ def _kanban_home() -> Path:
 
 
 def _board_dbs(home: Path) -> list:
+    # Recovery-holder records may live beside the damaged board itself. Keep
+    # unreadable paths for these read-only callers' existing per-board handling.
     return [(None, home / "kanban.db")] + [(p.parent.name, p) for p in
-                                           sorted((home / "kanban" / "boards").glob("*/kanban.db"))]
+                                           _board_db_files(home / "kanban" / "boards", include_unreadable=True)]
 
 
 def _proc_start(pid: int) -> Optional[str]:

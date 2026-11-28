@@ -24,7 +24,10 @@ import uuid
 import contextlib
 from contextlib import contextmanager
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Any, Callable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 try:
     from .confirmations import preceding_plan, structured_confirmation
@@ -4659,8 +4662,7 @@ def kanban_boards(root: Optional[Path] = None) -> list[tuple[str, Path]]:
     """Live boards only: `kanban/boards/_archived/...` holds retired copies, whose duplicate ids would
     make every card look ambiguous (and ambiguous ids never retire anything)."""
     r = root or kanban_root()
-    out = [("default", r / "kanban.db")] + [(p.parent.name, p) for p in sorted((r / "kanban" / "boards").glob("*/kanban.db"))
-                                            if not p.parent.name.startswith("_")]
+    out = [("default", r / "kanban.db")] + [(p.parent.name, p) for p in _board_db_files(r / "kanban" / "boards")]
     return [(b, p) for b, p in out if p.is_file()]
 
 

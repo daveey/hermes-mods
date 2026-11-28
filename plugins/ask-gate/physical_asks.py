@@ -106,7 +106,7 @@ def boards(core):
     paths.extend((root / "kanban" / "boards").glob("*/kanban.db"))
     paths.extend((root / "profiles").glob("*/kanban.db"))
     paths.extend((root / "profiles").glob("*/kanban/boards/*/kanban.db"))
-    return sorted({p.resolve() for p in paths if p.is_file()})
+    return sorted({p.resolve() for p in paths if core.is_board_db(p)})
 
 
 def preflight(core, args, own=()):

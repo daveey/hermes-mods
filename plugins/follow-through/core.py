@@ -22,7 +22,10 @@ import re
 import sqlite3
 import time
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Callable, Iterable, Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 # --- 1. obligation kept by the parent -------------------------------------------------------------------------
 _KEEP = re.compile(
@@ -98,7 +101,7 @@ def undelivered_handoff(summary: str) -> bool:
 
 
 def kanban_dbs(home: Path) -> list[Path]:
-    out = [home / "kanban.db"] + sorted((home / "kanban" / "boards").glob("*/kanban.db"))
+    out = [home / "kanban.db"] + _board_db_files(home / "kanban" / "boards")
     return [p for p in out if p.is_file()]
 
 

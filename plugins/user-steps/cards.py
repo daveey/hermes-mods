@@ -13,7 +13,10 @@ import sqlite3
 import subprocess
 from contextlib import closing
 from pathlib import Path
+from runpy import run_path as _inventory_run_path
 from typing import Optional
+
+_board_db_files = _inventory_run_path(str(Path(__file__).resolve().parents[1] / "kanban_inventory.py"))["board_db_files"]
 
 
 def _home() -> Path:
@@ -27,7 +30,7 @@ def _home() -> Path:
 def boards(h: Optional[Path] = None) -> list[tuple[str, Path]]:
     root = h or _home()
     out = [("default", root / "kanban.db")]
-    out += [(p.parent.name, p) for p in sorted((root / "kanban" / "boards").glob("*/kanban.db"))]
+    out += [(p.parent.name, p) for p in _board_db_files(root / "kanban" / "boards")]
     return [(b, p) for b, p in out if p.is_file()]
 
 
