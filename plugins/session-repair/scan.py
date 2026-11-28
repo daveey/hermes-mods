@@ -640,6 +640,47 @@ def _skip_explains(skip: Any, now: float) -> bool:
     return until > now
 
 
+def ready_admission_until(card: Card, now: float) -> Optional[float]:
+    """Read a timed, all-route admission hold in this ready episode, never CPU capacity.
+
+    Owner-chat admission observations supplement dispatcher skips on foreign lanes.
+    A later observation (including released/unknown) supersedes an earlier hold.
+    """
+    since = _ready_since(card.conn, card)
+    rows = card.conn.execute(
+        "SELECT kind,payload,created_at FROM task_events WHERE task_id=? "
+        "AND kind IN ('chat_wait_unclaimed','dispatch_skipped') "
+        "AND created_at>=? AND created_at<=? ORDER BY created_at DESC LIMIT 2",
+        (card.id, since or now, now)).fetchall()
+    if not rows or len(rows) == 2 and rows[0][2] == rows[1][2]:
+        return None
+    data = _json(rows[0][1])
+    if rows[0][0] == 'dispatch_skipped':
+        until = _num(data.get('until')) if isinstance(data, dict) else None
+        if until is not None:
+            until = until / 1000 if until > 1e12 else until
+        return until if until is not None and until > now else None
+    admission = data.get('admission') if isinstance(data, dict) else None
+    if (not isinstance(admission, dict) or admission.get('status') != 'held'
+            or admission.get('reason') != 'llm_pacing'):
+        return None
+    providers = admission.get('providers')
+    if not isinstance(providers, list) or not providers:
+        return None
+    deadlines = []
+    for provider in providers:
+        if not isinstance(provider, dict) or provider.get('state') != 'held':
+            return None
+        until = _num(provider.get('until'))
+        if until is None:
+            return None
+        until = until / 1000 if until > 1e12 else until
+        if until <= now:
+            return None
+        deadlines.append(until)
+    return min(deadlines)
+
+
 def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
     """BS-ready-worker-free: ready and unclaimed while a worker that can run it has a free slot, with no recorded
     dispatcher skip in the current ready episode (a skip of any age, or one with `until`, explains the wait)."""
@@ -674,8 +715,8 @@ def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
     except Exception as e:  # noqa: BLE001
         src.error(f'dispatch skip {card.board}/{card.id}', e)
         skip = None
-    if _skip_explains(skip, now):
-        return None  # the current ready episode has a recorded skip: the wait is explained, however old
+    if _skip_explains(skip, now) or ready_admission_until(card, now) is not None:
+        return None  # a recorded admission hold is not free model capacity
     if place.get('pool_could_run'):
         if waited < READY_UNCLAIMED_S:
             return None
@@ -1488,7 +1529,9 @@ def bounded_rollout_observation(card: Card, park: dict, awaited: dict, live: dic
 
     This is not a healthy-producer receipt. The original opaque-ID checkpoint is
     bounded to 2h; a declared clock_only batch observation with a reason may span
-    up to 8h. URLs/probes, overdue wakes, completion and adverse evidence never qualify.
+    up to 8h. An explicit blocked deploy-window checkpoint is capped at 24h;
+    it explains pacing, never establishes remote producer health. Probes,
+    overdue wakes, completion and adverse evidence never qualify.
     """
     payload = park['payload']
     wake = _num(payload.get('wake_at'))
@@ -1502,16 +1545,23 @@ def bounded_rollout_observation(card: Card, park: dict, awaited: dict, live: dic
                       and not re.search(r'://|www\.', ref, re.I)
                       and str(awaited.get('why') or '').strip()
                       and wake is not None and wake <= park['at'] + 8 * 3600)
+    raw_awaited = payload.get('awaiting')
+    blocked = raw_awaited.get('deploy_window') if isinstance(raw_awaited, dict) else None
+    observed = _num(blocked.get('observed_at')) if isinstance(blocked, dict) else None
+    declared_hold = (isinstance(blocked, dict) and blocked.get('state') == 'blocked'
+                     and observed is not None and 0 <= park['at'] - observed <= 900
+                     and str(awaited.get('why') or '').strip() and ref.strip()
+                     and wake is not None and wake <= park['at'] + 24 * 3600)
     if not (card.status == 'scheduled' and awaited.get('kind') == 'deploy'
-            and (short_opaque or declared_batch)
+            and (short_opaque or declared_batch or declared_hold)
             and not str(payload.get('wake_check') or '').strip()
             and live.get('state') == 'not_resolvable' and not live.get('happened')
             and wake is not None and park['at'] <= now < wake):
         return False
     return card.conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id=? AND id>? AND created_at>=? AND created_at<=? "
+        "SELECT 1 FROM task_events WHERE task_id=? AND created_at>=? AND created_at<=? "
         "AND kind IN ('wake_check_broken','wake_check_lost','wake_check_stale','condition_met') LIMIT 1",
-        (card.id, park['id'], park['at'], now)).fetchone() is None
+        (card.id, park['at'], now)).fetchone() is None
 
 
 def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
@@ -1535,6 +1585,13 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
             return None  # unavailable admission evidence is not a stalled-child finding
     park = current_park(card)
     if not park or healthy_future_park(card, park, src.now):
+        return None
+    try:
+        from hermes_cli import kanban_continuation as kc
+        if kc._reserved_for(c, card.id, kc.park_state(c, card.id)):
+            return None  # only the exact producer condition may spend this run
+    except Exception as e:  # noqa: BLE001
+        src.error(f'long_wait reserved {card.board}/{card.id}', e)
         return None
     awaited, wait = wait_producer(card, park, src.now)
     if not awaited or awaited['kind'] not in LONG_WAIT_S:
@@ -1580,6 +1637,24 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if not live.get('happened') and canonical_age_reassessment(card, src, park, awaited, live):
         return None  # only age; producer completion and every other rule retain their own verdict
     last = _events(c, card.id)
+    payload = park['payload']
+    declared = payload.get('awaiting')
+    if (not live.get('happened') and card.status == 'scheduled'
+            and kind in ('external', 'deploy') and isinstance(declared, dict)
+            and str(declared.get('why') or '').strip() and str(declared.get('ref') or '').strip()
+            and str(payload.get('wake_check') or '').strip()
+            and park['at'] <= src.now < (_num(payload.get('wake_at')) or 0)):
+        # The exact predicate/backstop, not elapsed producer age, owns this wait.
+        # Missing/stale monitor visibility is investigation work; it must not
+        # become an owner-continue prompt or an assertion of producer failure.
+        return _finding('BS-long-wait', card, 'producer_unverified',
+                        f'producer progress unknown: inspect monitoring for {kind} {ref}',
+                        {'kind': kind, 'ref': ref, 'waited_s': waited, 'threshold_s': threshold,
+                         'live_producer': live, 'park_id': park['id'], 'park_at': park['at'],
+                         'last_event': last[0] if last else None, 'producer_progress': 'unknown'},
+                        {'kind': 'card', 'action': 'inspect the exact producer predicate and monitoring custody',
+                         'commands': [], 'why': 'no producer-stall proof; preserve pending condition, source, '
+                         'backstop, spending limits and no-followup restrictions; monitoring repair only'})
     return _finding('BS-long-wait', card, 'event_happened' if live.get('happened') else 'too_long',
                     f'potentially stuck: {kind} {ref}, waiting {_fmt_age(waited)}',
                     {'kind': kind, 'ref': ref, 'waited_s': waited, 'threshold_s': threshold,
