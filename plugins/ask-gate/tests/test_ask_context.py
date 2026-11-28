@@ -118,6 +118,13 @@ def test_read_only_financial_context_does_not_exempt_the_ask(why_human, action):
     "Submit the invoice to the vendor portal", "Confirm the subscription renewal",
     "Okay the budget increase for this sprint", "Sign off on the budget increase",
     "Accept the new subscription terms",
+    # Review 6094853169 P2: _replan's own spend classes, refund/bill as the verb after a reading word, and a change
+    # verb further from the noun.
+    "Read the request for extra budget and reply yes or no", "Review the request for more budget",
+    "See the request for additional budget", "Check the extra budget request, then approve it",
+    "Review the new budget request and sign it", "Check the order history and refund the customer",
+    "Look up order 4411 and refund it", "Review the timesheet and bill the client",
+    "Look at the invoice, then approve it", "Open the subscription page and cancel it",
 ])
 def test_a_financial_change_is_still_exempt(text):
     hr = dict(BILLING["human_request"], action=text + ". Unblock = do it; archive = drop it.")
@@ -128,6 +135,9 @@ def test_a_financial_change_is_still_exempt(text):
     # Review 6094768133 P3: read-only subject matter and negated payments are not money changes.
     "Start by reading the invoice status", "Add the invoice link to this card",
     "Look into the issue with the invoice", "Nothing to pay here", "You won't need to pay anything",
+    # Review 6094853169 P3: URL path segments and a GitHub issue are not money changes.
+    "Read the status at https://github.com/settings/billing/invoices/2026-11 and reply",
+    "Check the invoice issue on GitHub",
 ])
 def test_read_only_or_negated_money_text_is_not_a_change(text):
     hr = dict(BILLING["human_request"], why_human="Only you can do this", scope="Only this operation",
