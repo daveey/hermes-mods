@@ -124,6 +124,14 @@ def test_valid_red(env):
         assert verdict(r) == 'valid_red' and hits(r) == []
 
 
+def test_triage_card_is_a_decision_queue_not_a_miss(env):
+    F.card(env.conn, 'Retro exact-head review awaiting triage', status='triage')
+    tick(env, env.now)
+    for k in (1, 2, 4, 8):
+        r = tick(env, env.now + k * 15 * M)
+        assert verdict(r) == 'valid_red' and hits(r) == [], k
+
+
 def test_invalid_red_is_not_terminal(env):
     tid = F.blocked_invalid_ask(env.conn, env.now)
     tick(env, env.now)

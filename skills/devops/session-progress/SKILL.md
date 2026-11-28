@@ -58,9 +58,9 @@ gateway) plus the live cards on their dependency/awaiting chain (the session-pan
 
 ## 3. Acceptable terminal
 
-`valid_red`: every open card is blocked on a **valid** `human_request` (core `needs_human`) or a deliberate core
-hold (containment, spend decision), and the rest only depend on those. A sticky block without a valid ask is not
-terminal.
+`valid_red`: every open card is blocked on a **valid** `human_request` (core `needs_human`), sits in `triage` (a
+decision queue its specifier / spend reviewer / supervisor owns), or is under a deliberate core hold (containment,
+spend decision), and the rest only depend on those. A sticky block without a valid ask is not terminal.
 
 ## 4. Anything else: not moving
 

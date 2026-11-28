@@ -365,7 +365,8 @@ on all the sessions." The judgment is the [`session-progress`](../../skills/devo
   cannot read) past its deadline, or any park with a fresh park-bound producer receipt (core `healthy_future_park`),
   is never a BS-no-progress miss: BS-long-wait judges it with its probe/watch receipts and nudge cadence. The chat is
   labelled `long_wait` (or `healthy_wait`). Found in the first hub shadow pass: 18 of 18 `missed_once` were such
-  parks that BS-long-wait had already judged healthy.
+  parks that BS-long-wait had already judged healthy. A `triage` card is a decision queue (specifier, spend
+  reviewer, supervisor), an acceptable terminal like a valid human_request (shadow pass 3: 42 such "misses").
 - **Rollout**: `config.json` `shadow_rules` (default `["BS-no-progress"]`) keeps the rule log-only whatever `mode`
   and `nudge_mode` say: each finding is logged to `actions-shadow.jsonl` as `outcome: rule_shadow`, `would:
   nudge|file`, every tick (no Seen mark). After 24 h of adjudicated shadow rows set `"shadow_rules": []`; then

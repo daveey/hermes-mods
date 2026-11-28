@@ -239,6 +239,11 @@ def predict(obs: dict, since: float, long_wait: dict) -> dict:
         return {'expect': 'the person answers the ask (valid human_request)', 'due_at': None, 'terminal': 'human'}
     if obs.get('held'):
         return {'expect': f'core hold ({obs["held"]}) is released by its owner', 'due_at': None, 'terminal': 'held'}
+    if st == 'triage':
+        # A decision queue (specifier, spend reviewer, supervisor), not a worked card: its owner decides, on its own
+        # cadence. Hub shadow pass 3 flagged 42 parked triage cards at +30 min; none was a stalled session.
+        return {'expect': 'its triage owner decides (specify, release or archive)', 'due_at': None,
+                'terminal': 'triage'}
     if st == 'running':
         return {'expect': 'a non-heartbeat event or status change', 'due_at': since + PREDICT_S}
     if st == 'ready':
