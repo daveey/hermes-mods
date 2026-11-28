@@ -154,11 +154,35 @@ def _plugin_sources():
         yield p
 
 
+# Exact source-line exceptions only: these are a vendored regex character class
+# and a Markdown reference-definition fixture, not emitted user-role notices.
+PARSER_NON_NOTICE_LINES = {
+    ('user-steps/parser/scanner.mjs', 'ps'): '        before: "[ps]",',
+    ('user-steps/parser/fixtures/oracle/fuzz.mjs', 'ref'):
+        "  '| a | b |\\n|---|---|\\n| 1 | 2 |', '| a | b |', '|---|---|', '[ref]: https://example.com/a', '[^1]: footnote text', 'See [^1] here.',",
+}
+
+
+def parser_non_notice(path, tag, line):
+    return PARSER_NON_NOTICE_LINES.get((path, tag)) == line
+
+
+def test_parser_non_notice_exceptions_are_exact():
+    for (path, tag), line in PARSER_NON_NOTICE_LINES.items():
+        assert parser_non_notice(path, tag, line)
+        assert not parser_non_notice('other/source.mjs', tag, line)
+        assert not parser_non_notice(path, tag, f'"[{tag}] user-role notice"')
+        assert not sh.SYNTHETIC_RE.match(f'[{tag}] user-role notice')
+
+
 def test_every_plugin_notice_tag_is_synthetic():
     found = {}
     for p in _plugin_sources():
-        for m in NOTICE_LIT.finditer(p.read_text(errors="replace")):
-            found.setdefault(m.group(1), str(p.relative_to(PLUGINS)))
+        rel = str(p.relative_to(PLUGINS))
+        for line in p.read_text(errors="replace").splitlines():
+            for m in NOTICE_LIT.finditer(line):
+                if not parser_non_notice(rel, m.group(1), line):
+                    found.setdefault(m.group(1), rel)
     assert {"ask-gate", "owner-wake", "chat-closeout", "coach"} <= set(found), found
     leaked = {tag: src for tag, src in found.items()
               if tag not in NOT_NOTICES and not sh.SYNTHETIC_RE.match(f"[{tag}] notice text")}
