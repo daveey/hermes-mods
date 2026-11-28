@@ -4,7 +4,8 @@
   agent work" with no size. Held.
 * t_01a211fcd5927efb (iPhone qualification): device, steps, costs and both buttons. Passes.
 * t_01a21ef258f83d8d (billing watchdog): its acceptance "verify the affected workflows or document the external
-  hold with evidence" needs no ticket read. Held as acceptance_met.
+  hold with evidence" needs no ticket read. Held as acceptance_met once its money wording is removed; verbatim, its
+  "No payment or limit increase is requested" / "Billing shows $0" fail closed and the (well-formed) ask is filed.
 """
 import copy
 import importlib.util
@@ -28,6 +29,19 @@ def fixture(name):
 UNFORGED = fixture("t_01a21bb1169deea2")
 IPHONE = fixture("t_01a211fcd5927efb")
 BILLING = fixture("billing_t_01a21ef258f83d8d")
+
+
+def _without_money_words(hr):
+    """The billing card's ticket-read ask with its money wording removed (its money mentions fail closed)."""
+    hr = copy.deepcopy(hr)
+    hr["action"] = hr["action"].replace(" No payment or limit increase is requested.", "")
+    hr["scope"] = (hr["scope"].replace("Billing shows $0 net charges and hosted tests passed.", "Hosted tests passed.")
+                   .replace("no spending, ", ""))
+    assert not ac._limit_named("\n".join(hr[k] for k in ("action", "why_human", "scope")))
+    return hr
+
+
+BILLING_TICKET = _without_money_words(BILLING["human_request"])
 
 
 @pytest.fixture(autouse=True)
@@ -57,10 +71,17 @@ def test_the_iphone_ask_passes():
 
 
 def test_the_billing_ask_is_refused_because_its_acceptance_is_met_without_it():
-    hit = ac.hit(BILLING["human_request"], BILLING["body"])
+    hit = ac.hit(BILLING_TICKET, BILLING["body"])
     assert hit and hit["rule"] == "acceptance_met"
     assert hit["message"].startswith("ask-gate: acceptance met without this; complete instead.")
     assert "document the external hold with evidence" in hit["message"]
+
+
+def test_the_verbatim_billing_ask_fails_closed_on_its_money_words():
+    """Replan (owning chat, 2026-11-28): a money mention, even negated, is never a reason to skip the full ask."""
+    assert "No payment or limit increase is requested" in BILLING["human_request"]["action"]
+    assert ac.acceptance_met(BILLING["human_request"], BILLING["body"]) is None
+    assert ac.hit(BILLING["human_request"], BILLING["body"]) is None  # well-formed: context, place, costs, buttons
 
 
 def test_an_acceptance_alternative_does_not_refuse_a_spend_or_permission_ask():
@@ -79,35 +100,59 @@ def test_explicit_money_permission_or_destructive_asks_are_exempt(text):
     assert ac.acceptance_met(hr, BILLING["body"]) is None
 
 
-def test_a_negated_payment_mention_does_not_exempt_the_billing_ask():
-    assert "No payment or limit increase is requested" in BILLING["human_request"]["action"]
-    assert ac.acceptance_met(BILLING["human_request"], BILLING["body"]) is not None
-
-
 @pytest.mark.parametrize("why_human, action", [
     ("Only you can authorize this action", "No permission change is needed, but approve a one-time $50 payment"),
     ("I am not authorized to pay $50 without your approval", "Approve it in the GitHub billing page"),
 ])
 def test_negation_removal_keeps_an_affirmative_payment(why_human, action):
     """Review 6094667454 P2: negation removal swallowed a later affirmative $50 approval and a human-only payment."""
-    hr = dict(BILLING["human_request"], why_human=why_human, scope="Only this operation",
+    hr = dict(BILLING_TICKET, why_human=why_human, scope="Only this operation",
               action=action + ". Unblock = do it; archive = drop it.")
     assert ac.acceptance_met(hr, BILLING["body"]) is None
     assert ac.hit(hr, BILLING["body"]) is None or ac.hit(hr, BILLING["body"])["rule"] != "acceptance_met"
 
 
-@pytest.mark.parametrize("why_human, action", [
-    ("Only you can read the invoice status through your signed-in browser",
-     "Open the billing support ticket and supply its latest status"),
-    ("Only you can see the subscription status page", "Read the subscription status and paste it here"),
-    ("Only you can open the budget report", "Send me this month's budget report"),
-])
-def test_read_only_financial_context_does_not_exempt_the_ask(why_human, action):
-    """Review 6094667454 P2: invoice/subscription/budget as subject matter is not a money change."""
-    hr = dict(BILLING["human_request"], why_human=why_human, scope="Only this operation",
-              action=action + ". Unblock = do it; archive = drop it.")
-    hit = ac.hit(hr, BILLING["body"])
-    assert hit and hit["rule"] == "acceptance_met"
+# Every case a reviewer raised on PR #549 (reviews 6094541114, 6094667454, 6094768133, 6094853169), whichever way
+# the earlier heuristics wanted it. Fail closed: each mentions money/payment/spend/billing/limits, so none may be
+# short-circuited by acceptance_met -- each takes the full context/steps/choices check instead.
+PAST_REVIEWER_CASES = [
+    # 6094541114
+    "Approve a one-time $50 payment to GitHub for this month's Actions overage",
+    # 6094667454: negated, and read-only subject matter
+    "No payment or limit increase is requested", "No permission change is needed, but approve a one-time $50 payment",
+    "I am not authorized to pay $50 without your approval", "Approve it in the GitHub billing page",
+    "Open the billing support ticket and supply its latest status", "Read the subscription status and paste it here",
+    "Send me this month's budget report", "Only you can read the invoice status through your signed-in browser",
+    # 6094768133: money changes without a $ amount, and read-only/negated text
+    "Pay the March invoice", "Raise the monthly budget to cover the overage", "Cancel the Superhuman subscription",
+    "Confirm the refund for order 4411", "Process the refund for the duplicate order",
+    "Refund the customer for the duplicate order", "Settle the outstanding invoice",
+    "Submit the invoice to the vendor portal", "Confirm the subscription renewal",
+    "Okay the budget increase for this sprint", "Sign off on the budget increase", "Accept the new subscription terms",
+    "Start by reading the invoice status", "Add the invoice link to this card", "Look into the issue with the invoice",
+    "Nothing to pay here", "You won't need to pay anything",
+    # 6094853169: _replan spend classes, verb order, URLs, 'issue', and the declined FPs
+    "Read the request for extra budget and reply yes or no", "Review the request for more budget",
+    "See the request for additional budget", "Check the extra budget request, then approve it",
+    "Review the new budget request and sign it", "Check the order history and refund the customer",
+    "Look up order 4411 and refund it", "Review the timesheet and bill the client",
+    "Look at the invoice, then approve it", "Open the subscription page and cancel it",
+    "Read the status at https://github.com/settings/billing/invoices/2026-11 and reply",
+    "Check the invoice issue on GitHub", "Ask Bill to confirm the rollout", "Read the subscription terms",
+    "There is no invoice involved",
+]
+
+
+@pytest.mark.parametrize("text", PAST_REVIEWER_CASES)
+def test_every_past_reviewer_case_fails_closed(text):
+    for field in ("action", "why_human", "scope"):
+        hr = dict(BILLING_TICKET)
+        hr[field] = text + ". " + hr[field]
+        assert ac.acceptance_met(hr, BILLING["body"]) is None, field
+        hit = ac.hit(hr, BILLING["body"])
+        assert hit is None or hit["rule"] == "ask_context_hold"
+    # Without the mention, the same ask is refused as acceptance_met: the mention alone is what keeps it.
+    assert ac.acceptance_met(BILLING_TICKET, BILLING["body"]) is not None
 
 
 @pytest.mark.parametrize("text", [
@@ -129,20 +174,6 @@ def test_read_only_financial_context_does_not_exempt_the_ask(why_human, action):
 def test_a_financial_change_is_still_exempt(text):
     hr = dict(BILLING["human_request"], action=text + ". Unblock = do it; archive = drop it.")
     assert ac.acceptance_met(hr, BILLING["body"]) is None
-
-
-@pytest.mark.parametrize("text", [
-    # Review 6094768133 P3: read-only subject matter and negated payments are not money changes.
-    "Start by reading the invoice status", "Add the invoice link to this card",
-    "Look into the issue with the invoice", "Nothing to pay here", "You won't need to pay anything",
-    # Review 6094853169 P3: URL path segments and a GitHub issue are not money changes.
-    "Read the status at https://github.com/settings/billing/invoices/2026-11 and reply",
-    "Check the invoice issue on GitHub",
-])
-def test_read_only_or_negated_money_text_is_not_a_change(text):
-    hr = dict(BILLING["human_request"], why_human="Only you can do this", scope="Only this operation",
-              action=text + ". Unblock = do it; archive = drop it.")
-    assert ac.acceptance_met(hr, BILLING["body"]) is not None
 
 
 @pytest.mark.parametrize("body", [
@@ -200,7 +231,7 @@ def test_the_gate_holds_a_thin_ask_then_releases_after_max_holds(gate, monkeypat
     assert all(r and r["action"] == "block" and "ask_context_hold" in r["message"] for r in seen[:ac.MAX_HOLDS])
     assert seen[-1] is None
     monkeypatch.setattr(gate, "_card_body", lambda tool, args: BILLING["body"])
-    r = gate._ask_context_hold("s2", "kanban_block", {"task_id": "t_b"}, BILLING["human_request"], card="t_b")
+    r = gate._ask_context_hold("s2", "kanban_block", {"task_id": "t_b"}, BILLING_TICKET, card="t_b")
     assert r and "acceptance met without this; complete instead" in r["message"]
     monkeypatch.setattr(gate, "_card_body", lambda tool, args: IPHONE["body"])
     assert gate._ask_context_hold("s3", "kanban_block", {"task_id": "t_i"}, IPHONE["human_request"],
