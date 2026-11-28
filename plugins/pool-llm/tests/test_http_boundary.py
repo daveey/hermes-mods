@@ -251,20 +251,12 @@ def test_env_real_launcher(tmp_path):
     import subprocess
     import sys
     launcher = pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'hermes-pool-llm'
-    # Exercise the real launcher and exec protocol with a fixture runtime discovery
-    # command, so public CI needs neither core nor credentials/PM repair.
-    shim = tmp_path / 'bin'
-    shim.mkdir()
-    hermes = shim / 'hermes'
-    code = "import runpy,sys; runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
-    hermes.write_text(f'#!{sys.executable}\nimport json\nprint(json.dumps({[sys.executable, "-c", code]!r}))\n')
-    hermes.chmod(0o700)
-    env = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(tmp_path / 'hermes'),
-               PATH=str(shim) + os.pathsep + os.environ.get('PATH', ''),
-               PYTHONDONTWRITEBYTECODE='1')
+    # Managed publication fixture; no installed-core/provider claim.
+    from test_runtime_binding import fixture_runtime
+    _, _, env = fixture_runtime(tmp_path)
     outputs = []
     for args in [('env', '--port', '8791'), ('env',)]:
-        result = subprocess.run([sys.executable, str(launcher), *args], env=env,
+        result = subprocess.run([str(launcher), *args], env=env,
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0, result.stderr
         shell_env = dict(env, ANTHROPIC_AUTH_TOKEN='stale-fixture-token')
@@ -280,11 +272,11 @@ def test_env_real_launcher(tmp_path):
         assert values['OPENAI_BASE_URL'] == f'http://127.0.0.1:{port}/v1'
         assert values['ANTHROPIC_API_KEY'] == values['OPENAI_API_KEY']
         assert values['ANTHROPIC_API_KEY'] not in result.stderr
-    path = tmp_path / 'hermes' / 'pool-llm' / 'serve.token'
+    path = pathlib.Path(env['HERMES_HOME']) / 'pool-llm' / 'serve.token'
     assert outputs[0]['ANTHROPIC_API_KEY'] == outputs[1]['ANTHROPIC_API_KEY'] == path.read_text()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     path.chmod(0o644)
-    result = subprocess.run([sys.executable, str(launcher), 'serve', '--port', '0'],
+    result = subprocess.run([str(launcher), 'serve', '--port', '0'],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode != 0
     assert 'token' in result.stderr
