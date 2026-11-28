@@ -32,6 +32,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import itertools
 import json
+import math
 import queue
 from types import MappingProxyType
 import logging
@@ -1540,8 +1541,31 @@ class Feed:
         live = [counts[s] for s in failing if counts[s] <= RETRY_STEPS]
         return self._backoff(min(live)) if live else None
 
+    def _running_deadlines(self) -> dict[str, float]:
+        """Scoped source reads before held live run evidence or its client voucher expires.
+
+        Transport beats never renew execution. Only an actual reader capture can
+        move these clocks; unknown/failed captures disarm the timer rather than
+        turning a silent executor into perpetual polling.
+        """
+        with self.lock:
+            held = [(s, h['bundle']) for s, h in self.bundles.items() if s in self.interest
+                    and s not in self.failures and not h.get('source_stale')]
+        deadlines = {}
+        for s, b in held:
+            observations = [o for row in b.get('tasks', ())
+                            for o in row.get('execution_observations', ()) if isinstance(o, dict)
+                            and o.get('state') == 'running' and o.get('freshness') == 'current'
+                            and type(o.get('valid_until')) in (int, float)
+                            and math.isfinite(o['valid_until'])]
+            if observations:
+                deadlines[s] = min(b['computed_at'] + self.full_every_s * .75,
+                                   max(b['computed_at'] + 15,
+                                       min(o['valid_until'] for o in observations) - 60))
+        return deadlines
+
     def _due(self, now: float) -> tuple:
-        """A cold, unattempted registration is due; time alone never admits DB work.
+        """Cold registration, bounded retries and held live-run expiry admit reads.
 
         Failed inputs remain unvouched until a source event or explicit request.
         Held presentation ages separately, without renewing input observations.
@@ -1572,6 +1596,10 @@ class Feed:
         if getattr(self, '_producer_carry', None) and not getattr(self, '_admission_failures', 0):
             retry_wait = 0.0  # producer work a budgeted pass did not reach runs next, not on a source write
         decide_at = getattr(self, '_decision_retry_at', None)
+        running = self._running_deadlines()
+        if running:
+            wait = max(0., min(running.values()) - now)
+            retry_wait = wait if retry_wait is None else min(wait, retry_wait)
         return (0.0 if missing else retry_wait), (None if decide_at is None else max(0.0, decide_at - now))
 
     def idle_wait(self) -> float:
@@ -1924,7 +1952,8 @@ class Feed:
             missing = any(s not in self.bundles for s in watched)
         producer_due = scoped and bool(redo or timed_producer or any(s not in self._reconcile_stamps for s in watched)
                                        or source_seen != self._producer_seen)
-        if stamps == self._stamps and not full and not retry and not panel_dirty and not missing and not producer_due:
+        running_due = {s for s, at in self._running_deadlines().items() if at <= now}
+        if stamps == self._stamps and not full and not retry and not panel_dirty and not missing and not producer_due and not running_due:
             self._publish({}, heartbeat=True)
             return 0
         # Board events are read only when a board file moved (or on the safety-net pass): state.db is written all
@@ -2001,6 +2030,7 @@ class Feed:
         source_dirty = set(dirty)  # chats whose own source inputs this pass read as changed
         dirty.update(retry)
         dirty.update(panel_dirty)
+        dirty.update(running_due)
         if scoped:
             dirty.update(self._producer_admission(watched, source_seen, redo, source_dirty, panel_dirty, now))
         if not dirty:

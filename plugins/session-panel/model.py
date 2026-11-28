@@ -840,6 +840,20 @@ def spend_overdue_text(row, bundle, now, *, wire=False):
 
 
 def agent_hold_text(row, bundle):
+    record = owned_card(row, bundle)
+    diagnostic = obj(obj(record.get('detail')).get('actionability'))
+    # Queue diagnosis is independent of executor liveness on a PRIMARY mirror.
+    # Read the hydrated board-qualified contract, not a guessed default-board
+    # event or a block_kind alone; retain execution uncertainty at the caller.
+    owner = obj(diagnostic.get('owner'))
+    refs = owner.get('refs')
+    if (row.get('block_kind') == 'lane_gate' and diagnostic.get('version') == 1
+            and owner.get('kind') == 'assignee' and diagnostic.get('action') == 'wait_for_lane_admission'
+            and diagnostic.get('task_id') == row.get('id') and diagnostic.get('status') == row.get('status')
+            and record.get('board') == row.get('board') and not row.get('stale')
+            and not row.get('partial_source_unknown') and isinstance(refs, list)
+            and refs and all(isinstance(ref, str) and ref for ref in refs)):
+        return 'waiting for ' + flat(str(row.get('board') or 'default')).capitalize()[:60] + ' lane admission (' + flat(', '.join(refs))[:100] + ')'
     wait = obj(row.get('wait'))
     if wait.get('next_actor') and wait.get('next_action') and wait.get('waiting_on'):
         # Preserve the authoritative wait producer's actor/action. A coordinating

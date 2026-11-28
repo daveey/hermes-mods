@@ -83,6 +83,28 @@ def header_clock_cases():
     return result
 
 
+def test_lane_gate_uses_board_qualified_diagnosis_without_claiming_live_execution():
+    # A PRIMARY mirror has no executor evidence for this never-started card.
+    row = task(status='triage', board='project', gateway='edge', block_kind='lane_gate',
+               execution_observations=[{'version': 1, 'state': 'unknown', 'source': 'kanban.card',
+                   'identity': {'kind': 'card', 'work_id': 't_abc123', 'gateway': 'edge',
+                                'profile': 'default', 'board': 'project'},
+                   'unknown_reason': 'adapter_error'}])
+    b = bundle(row, gateway='edge', cards={row['id']: {'board': 'project', 'detail': {
+        'source': 'live', 'task': dict(row), 'actionability': {
+            'version': 1, 'task_id': row['id'], 'status': 'triage',
+            'action': 'wait_for_lane_admission', 'owner': {'kind': 'assignee', 'refs': ['lane-planner']}}}}})
+    m = model.reduce_panel(b, now=NOW)
+    view = next(r for rows in m['sections'].values() for r in rows if r['id'] == row['id'])
+    assert 'waiting for Project lane admission (lane-planner)' in view['detail']
+    assert not m['sections']['running'] and not m['sections']['needs_you']
+    for change in ({'board': 'foreign'}, {'board': 'project', 'stale': True}):
+        bad = copy.deepcopy(b)
+        bad['tasks'][0].update(change)
+        out = model.reduce_panel(bad, now=NOW)
+        assert 'lane admission' not in ' '.join(r['detail'] for rows in out['sections'].values() for r in rows)
+
+
 def test_header_clock_cases_preserve_last_known_canonical_state():
     cases = header_clock_cases()
     for name, case in cases.items():
