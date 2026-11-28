@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, ask_context, merge_ask, desktop_reopen, access_scope, approval_reuse, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, superseding_create, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, ask_context, merge_ask, desktop_reopen, access_scope, approval_reuse, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -40,6 +40,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     pr_approval_request = _sib("pr_approval_request")
     chat_delivery = _sib("chat_delivery")
     superseding = _sib("superseding")
+    superseding_create = _sib("superseding_create")
     physical_asks = _sib("physical_asks")
     replan = _sib("replan")
     agent_condition = _sib("agent_condition")
@@ -485,6 +486,11 @@ def _record_answers(session_id: str, msg: str | None, history: list,
 
 # ---- tool log -----------------------------------------------------------------------------------------
 def post_tool_call(tool_name: str = "", args: Any = None, result: Any = None, session_id: str = "", **_: Any) -> None:
+    if tool_name == "kanban_create" and isinstance(args, dict):
+        try:
+            superseding_create.after_create(core, args, result, session_id)
+        except Exception as e:
+            core.log_event("superseding_create_cleanup_error", session=session_id, error=repr(e))
     if session_id:
         LOG.add(session_id, tool_name, args, result)
         # Keep ETA evidence for 15 minutes across turn-log resets; same session only.
@@ -1327,6 +1333,14 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
     if _off() or not isinstance(args, dict):
         return None
     try:
+        if tool_name == "kanban_create":
+            try:
+                reconciled_create = superseding_create.preflight(core, superseding, args, LOG.get(session_id), session_id)
+            except Exception as e:
+                core.log_event("superseding_create_error", session=session_id, error=repr(e))
+                return {"action": "block", "message": "ask-gate: superseding_create inventory/disposition could not be verified: " + str(e)}
+            if reconciled_create is not None:
+                return reconciled_create
         if tool_name in {"clarify", "kanban_create", "kanban_block"} and session_id:
             is_ask = (tool_name == "clarify" or args.get("human_request") is not None
                       or core.needs_checked(tool_name, args, _is_worker())[0])

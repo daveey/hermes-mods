@@ -66,7 +66,7 @@ def _load():
 
 
 @pytest.fixture
-def gate(tmp_path, monkeypatch):
+def gate(tmp_path, monkeypatch, request):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("ASK_GATE_LEDGER", str(tmp_path / "state" / "ask-ledger.sqlite"))
     # Tests select their surface explicitly; an inherited backend port must not
@@ -88,6 +88,10 @@ def gate(tmp_path, monkeypatch):
         projection.__getattr__ = lambda name: getattr(real, name)
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", projection)
     mod = _load()
+    # Each legacy rule's fixtures test its own release policy, not the independent
+    # create-time reconciliation rule. Its tests explicitly opt back into this rule.
+    if request.node.path.name != 'test_superseding_create.py':
+        monkeypatch.setattr(mod.superseding_create, 'off', lambda: True)
     monkeypatch.setattr(mod.core, "capability_sheet", lambda *a, **k: SHEET)
 
     def boom(system, user):
