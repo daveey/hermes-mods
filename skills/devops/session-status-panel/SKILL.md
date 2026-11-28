@@ -21,7 +21,7 @@ metadata:
 
 # Session status panel
 
-Compute classification and wording on the backend; render that snapshot on Desktop. For clock-only feed churn, read `references/relative-display-times.md`. The model is not permission to execute a choice. All paths below are relative to the hermes-mods repository; work in an isolated worktree, not its deployment checkout.
+Compute classification and wording on the backend; render that snapshot on Desktop. For clock-only feed churn, read `references/relative-display-times.md`. The model is not permission to execute a choice. All paths below are relative to the hermes-mods repository at `~/code/hermes-mods` (the `~/.hermes/repos/hermes-mods` copy holding this skill has no session-panel plugin); work in an isolated worktree, not its deployment checkout.
 
 ## When to Use
 
@@ -102,7 +102,7 @@ Before claiming BoardLane load reduction, read `references/aggregate-board-load.
 - For PID-pinned timing windows, verify route/birth identity and retirement journal at both boundaries plus first/last completions. A30min collector can outlive its retired target and read a static file: duration/no errors do not prove coverage. Preserve interrupted cohorts as NO_PROOF, distinct from latency FAIL; zero unchanged samples never prove success. For slow successful memo hits, read `references/memo-hit-latency.md`.
 - In live DB-open samplers, trace attachment can precede source-write observation by a warmup interval. Exclude trace opens outside the measured interval (or observe source stamps before attachment), and keep no-history opens unknown rather than inventing a >2 s lag. Report the raw orphan field and the boundary correction separately. A timing file updated only after completed passes is right-censored during a slow pass: retain its eventual completion and distinguish overlapping-pass statistics from completed publications inside the CPU window.
 
-- Match JavaScript safe-integer wire semantics in Python status-envelope validators: JSON round-trips may decode integer-valued numbers as floats, so accept finite, nonnegative integer-valued `int`/`float` values up to `9007199254740991`, but reject booleans, strings, fractions, negative/non-finite and unsafe values. Test real JSON round-trips and all three numeric fields. When testing a missing canonical status, assert the derived header source and null status separately from row text; preserve answered-ask one-line recovery/dedup assertions. Test legacy-envelope rejection separately from canonical backend-authored labels, and run the whole Desktop-plugin glob, not only producer-to-DOM fixtures.
+- Before changing status-envelope validators or missing-status tests, read `references/status-envelope-validation.md` (safe-integer wire semantics).
 
 - Keep the user-steps installation owner (`install:<id>`) separate from the courier/sync gateway name. Membership rows and authenticated `gw:<name>` request routes use the latter; ActionStore namespace/operation owner use the former. Derive each from trusted local identity and exercise a producer-to-owner integration with deliberately distinct values. Equal fixture strings conceal a protocol that never mirrors or verifies a real operation.
 
@@ -147,7 +147,7 @@ Before claiming BoardLane load reduction, read `references/aggregate-board-load.
 - Before standalone feed profiling, read `references/feed-attribution.md` (pass scope and failure gates).
 - Before exact inclusion telemetry, read `references/exact-inclusion-custody.md` (immutable wire custody, actual ASGI writes and loss accounting).
 - When expiring cached task/diagnostic rows, test header pips/counts/wake colors and collapsed presentation as well as row removal. Preserve recorded-decision coverage: `showsDecision` must match the effective rendered model, or the companion queue can suppress a status the panel erased. Retain owner-qualified read-only `open_process` inspection. Run the public dependency-only Desktop glob too; `HERMES_DESKTOP_DIR` can be a standalone React/jsdom installation, not a core checkout.
-- Before changing waiting-row layout, read `references/waiting-row-legibility.md` (native elapsed-suffix visibility).
+- Before changing waiting-row layout, read `references/waiting-row-legibility.md` (what each row must show, elapsed-suffix visibility).
 
 - When decoupling canonical decision reads from board sweeps, order and merge the two components independently; a fast decision read must not advance board `computed_at`, revive execution leases, clear carried/restored trust, or overwrite a newer component with an older batch. Test a genuinely blocked unrelated reader, forget/lineage races, resume/restore sequence continuity, unchanged-input no-churn, and read-failure retry plus heartbeat freshness exclusion. Read pending resolution through the real owner-scoped ActionStore without mirror reconciliation; keep full-sweep reconciliation as the default. Source/DOM success still requires simultaneous native operation/model proof after deployment.
 - Before capturing or judging native proof (remote answers, empty/missing-model states, disposable asks, pending/answered captures, verifier placement), read `references/native-proof.md`.
