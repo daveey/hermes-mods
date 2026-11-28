@@ -23,7 +23,7 @@ metadata:
 A broken chat has work no active producer can resolve. `plugins/session-repair` in hermes-mods scans these
 `BS-...` patterns every 15 min on the hub and sends findings to **Session repair**.
 
-Run the scanner for a stuck chat; follow the finding's fix section. If none matches, collect evidence before adding a pattern.
+First distinguish a repair request from a bounded routing acceptance check. For an explicit zero-finding, zero-action check, return only its requested result; do not scan, revive historical notices after compaction, route reviews, record outcomes, or append skill checklists. Those actions violate the acceptance boundary even when old work remains unfinished. For an actual repair request, follow the supplied finding's fix section; scan a stuck chat only when findings need discovery.
 - **Panel says "needs you" / blocked on the user, but no one asked anything**: check what core says before
   touching the card. Core's verdict is the session feed's `wait_state`/`waiting_on` (`hermes_cli.kanban_session_activity.session_tasks`)
   and, for scheduled cards, `kanban_wake_summary.wakes(conn, task)["blocks_for_human"]`. If core says agent-owned
