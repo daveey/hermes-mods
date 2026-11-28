@@ -538,6 +538,11 @@ def serve_token() -> str:
         if info.st_uid != os.getuid():
             raise ValueError("serve token directory must be owned by the current uid")
         os.fchmod(dfd, 0o700)
+        # Serialize first creation and reads on the pinned directory inode. The
+        # final file must use O_EXCL, but is empty until its creator writes it.
+        # flock is released by close (including process exit), never a stale file.
+        import fcntl
+        fcntl.flock(dfd, fcntl.LOCK_EX)
         try:
             fd = os.open("serve.token", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600, dir_fd=dfd)
@@ -562,7 +567,7 @@ def serve_token() -> str:
                 raise ValueError("serve token changed while opening")
             token = stream.read(4097)
         if not token or len(token) > 4096 or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
-            raise ValueError("serve token has invalid contents; use a private token_urlsafe token")
+            raise ValueError("serve token has invalid contents; if first creation was interrupted and the file is empty, remove pool-llm/serve.token and rerun hermes-pool-llm env; otherwise use a private token_urlsafe token")
         return token
     except (OSError, UnicodeError) as exc:
         raise ValueError("cannot safely read/create serve token; check pool-llm/serve.token ownership and permissions") from exc
@@ -765,6 +770,9 @@ def main(argv: Optional[list] = None) -> int:
                     raise ValueError("port must be between 1 and 65535")
                 token = serve_token()
                 base = f"http://127.0.0.1:{args.port}"
+                # The Anthropic SDK otherwise sends an inherited bearer as well
+                # as this API key, correctly triggering our conflict refusal.
+                print("unset ANTHROPIC_AUTH_TOKEN")
                 for name, value in (("ANTHROPIC_BASE_URL", base), ("ANTHROPIC_API_KEY", token),
                                     ("OPENAI_BASE_URL", base + "/v1"), ("OPENAI_API_KEY", token)):
                     print(f"export {name}={shlex.quote(value)}")
