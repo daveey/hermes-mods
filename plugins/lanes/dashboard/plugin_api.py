@@ -712,6 +712,53 @@ _sibling_cursors = {}  # board path -> (settled file stamp, cursor entry)
 SIBLING_SETTLE_NS = 1_000_000_000
 
 
+_shm_fds = {}  # -shm path -> [(st_dev, st_ino, fd)] held while the inode is linked
+_shm_lock = threading.Lock()
+
+
+def _shm_header(shm):
+    """(dev, ino, 48-byte wal-index header) of a -shm file, or None if absent.
+
+    SQLite holds its WAL write lock, read marks and DMS lock as fcntl locks on
+    -shm, and POSIX drops every fcntl lock a process holds on an inode when any
+    fd for that inode is closed. A live SQLite connection in this process may
+    use this -shm, so an fd opened here is never closed while the inode is
+    linked; it is kept and reused. Once fstat shows the inode unlinked, no
+    connection can still lock it (SQLite unlinks -shm only after its last
+    in-process user closes, holding the exclusive DMS lock), so it is closed.
+    """
+    with _shm_lock:
+        held = _shm_fds.get(shm, [])
+        for entry in list(held):
+            try:
+                gone = os.fstat(entry[2]).st_nlink == 0
+            except OSError:
+                # Not our fd any more: forget it, never close a reused number.
+                held.remove(entry)
+                continue
+            if gone:
+                held.remove(entry)
+                os.close(entry[2])
+        if not held:
+            _shm_fds.pop(shm, None)
+        try:
+            s = os.stat(shm)
+        except FileNotFoundError:
+            return None
+        entry = next((e for e in held if (e[0], e[1]) == (s.st_dev, s.st_ino)), None)
+        if entry is None:
+            try:
+                fd = os.open(shm, os.O_RDONLY)
+            except FileNotFoundError:
+                return None
+            f = os.fstat(fd)
+            # Keep the fd even if a replacement raced the stat: closing it
+            # could release a live connection's locks on that inode too.
+            entry = (f.st_dev, f.st_ino, fd)
+            _shm_fds.setdefault(shm, held).append(entry)
+        return entry[0], entry[1], os.pread(entry[2], 48, 0)
+
+
 def _settled_stamp(path, now_ns=None):
     """File identity of a sibling board, or None while it may still be moving."""
     stamp = []
@@ -735,18 +782,9 @@ def _settled_stamp(path, now_ns=None):
     # checksum) do change on every commit: read them so a commit that lands
     # after its last -wal write is never hidden behind an unchanged stamp.
     try:
-        fd = os.open(path + '-shm', os.O_RDONLY)
-    except FileNotFoundError:
-        stamp.append(None)
+        stamp.append(_shm_header(path + '-shm'))
     except OSError:
         return None
-    else:
-        try:
-            stamp.append(os.pread(fd, 48, 0))
-        except OSError:
-            return None
-        finally:
-            os.close(fd)
     return tuple(stamp)
 
 
