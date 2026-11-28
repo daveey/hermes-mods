@@ -37,6 +37,18 @@ def hook(monkeypatch, tmp_path):
     ('hermes update --yes', True),
     ("cat <<'EOF'\nhermes update --yes\nEOF", False),
     ("cat <<'EOF' | cat\nhermes update --yes\nEOF", False),
+    ("cat <<'EOF' | bash /dev/null\nhermes update --yes\nEOF", False),
+    ("cat <<'EOF' | bash -n\nhermes update --yes\nEOF", False),
+    ("cat <<'EOF' | bash < /dev/null\nhermes update --yes\nEOF", False),
+    ("cat <<'EOF' > /dev/null | bash\nhermes update --yes\nEOF", False),
+    ("custom-reader <<'EOF'\nhermes update --yes\nEOF", False),
+    ("cat <<'EOF' | custom-reader\nhermes update --yes\nEOF", False),
+    ("cat > s.sh <<'EOF'\nhermes update --yes\nEOF\nbash -n s.sh", False),
+    ("cat <<'EOF' | bash -c cat\nhermes update --yes\nEOF", False),
+    ("sed -n p <<'EOF'\nhermes update --yes\nEOF", False),
+    ("awk '{print}' <<'EOF'\nhermes update --yes\nEOF", False),
+    ("while read -r line; do echo \"$line\"; done <<'EOF'\nhermes update --yes\nEOF", False),
+    ("hermes kanban comment --body-file - <<'EOF'\nhermes update --yes\n`hermes update --yes`\nEOF", False),
     ("printf '%s\\n' 'hermes update --yes' | bash", True),
     ("printf 'hermes update --yes\\n' | cat | env bash -s", True),
     ("echo hermes update --yes | sh", True),
@@ -54,8 +66,11 @@ def test_registered_hook_heredoc_updater_matches_real_shell(hook, tmp_path, comm
     bindir.mkdir()
     marker = tmp_path / 'called'
     fake = bindir / 'hermes'
-    fake.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$AUDIT_MARKER"\n')
+    fake.write_text('#!/bin/sh\nif [ "$1" = update ]; then\nprintf "%s\\n" "$*" > "$AUDIT_MARKER"\nelse\n/bin/cat\nfi\n')
     fake.chmod(0o700)
+    reader = bindir / 'custom-reader'
+    reader.write_text('#!/bin/sh\n/bin/cat\n')
+    reader.chmod(0o700)
     # Explicit isolated environment; no inherited BASH_ENV or shell functions.
     result = subprocess.run(['/bin/bash', '--noprofile', '--norc'], input=command,
                             text=True, capture_output=True, timeout=5, cwd=tmp_path,

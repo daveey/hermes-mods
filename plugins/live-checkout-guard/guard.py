@@ -955,7 +955,8 @@ def _hd_var_run_re(name: str):
     return _hd_exec_re(r"\$(?:" + re.escape(name) + r"(?!\w)|\{" + re.escape(name) + r"[}:\-+=?/%^,\[@])")
 
 
-def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False) -> tuple:
+def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False,
+                    *, update_stdin: bool = False) -> tuple:
     """(code, bodies) of shell `text`, by bash rules: the command text a shell parses, and the heredoc bodies.
 
     `code` is `text` without heredoc bodies, their terminator lines and `#` comments (a `#` that begins a word
@@ -972,7 +973,9 @@ def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False) -
     `bodies` lists every other body as (text, quoted delimiter), for a guard that scans data conservatively.
     With `remote_heredocs` (a guard of this host's files only), a quoted-delimiter body that a shell reads on an ssh
     host (`_hd_remote_shell`) is in neither: it never runs or is read here.
-    Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`)."""
+    Quotes that never close leave the rest of `text` as code, unchanged (see `_lexable`).
+    `update_stdin` narrows only additive updater provenance to positive stdin-shell
+    paths; default checkout-write analysis retains its conservative unknown-reader rule."""
     if "<<" not in text and "#" not in text:
         return text, []
     out, bodies, pending, stack, subs, written, assigned = [], [], [], [], [], [], []
@@ -996,17 +999,21 @@ def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False) -
             if remote_heredocs and quoted and _hd_subst_data(text, openers) \
                     and _hd_remote_shell(before, line_start, rest):
                 runs = []  # read by a shell on the ssh host: neither local code nor a local data body
-            elif _hd_feeds_shell(text[line_start:op_start], rest) or not _hd_subst_data(text, openers):
+            elif (_update_hd_feeds_shell(text[line_start:op_start], rest) if update_stdin
+                  else _hd_feeds_shell(text[line_start:op_start], rest)) or (
+                      not update_stdin and not _hd_subst_data(text, openers)):
                 runs = [body]
             else:
                 bodies.append((body, quoted))
                 runs = [] if quoted else _hd_substitutions(body)
-                written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], rest))
-                name = _hd_assigned(text, openers)
-                if name:
-                    assigned.append((name, body, at))
+                if not update_stdin:
+                    written.extend((path, body, at) for path in _hd_written(text[line_start:op_start], rest))
+                    name = _hd_assigned(text, openers)
+                    if name:
+                        assigned.append((name, body, at))
             for run in runs:
-                sub_code, sub_bodies = _split_heredocs(run, _level + 1, remote_heredocs) if _level < 16 else (run, [])
+                sub_code, sub_bodies = _split_heredocs(run, _level + 1, remote_heredocs,
+                                                      update_stdin=update_stdin) if _level < 16 else (run, [])
                 out.append(sub_code + "\n")
                 bodies.extend(sub_bodies)
         pending.clear()
@@ -1141,7 +1148,8 @@ def _split_heredocs(text: str, _level: int = 0, remote_heredocs: bool = False) -
                 or re.compile(r"(?:^|[;&|(`])\s*" + p, re.M).search(code, at) or _hd_file_run_re(path).search(masked, at):
             ran.append(body)
     for body in ran:
-        sub_code, sub_bodies = _split_heredocs(body, _level + 1, remote_heredocs) if _level < 16 else (body, [])
+        sub_code, sub_bodies = _split_heredocs(body, _level + 1, remote_heredocs,
+                                              update_stdin=update_stdin) if _level < 16 else (body, [])
         code += "\n" + sub_code + "\n"
         bodies.extend(sub_bodies)
     return code, bodies
@@ -1646,6 +1654,34 @@ def _update_printed_script(words: list[str]) -> Optional[str]:
     return ''.join(out)
 
 
+def _update_hd_feeds_shell(prefix: str, rest: str) -> bool:
+    """Positive stdin path only; unknown readers are not an updater sandbox.
+
+    The default shared parser stays conservative for checkout writes. The additive
+    updater rule instead requires plain cat stages reaching a stdin-reading shell.
+    Its original updater pass still supplies the unchanged refusal floor.
+    """
+    header = _HD_SEPARATOR.split(prefix)[-1] + rest
+    for index, (stage, op) in enumerate(_cwd_segments(_update_tokens(header))):
+        # The first stage owns this heredoc. Any other redirection can replace
+        # stdin or divert the original body away from the downstream shell.
+        if any(('<' in t or '>' in t) and not (index == 0 and t == '<<') for t in stage):
+            return False
+        if index == 0 and '<<' in stage:
+            at = stage.index('<<')
+            stage = stage[:at] + stage[at + 2:]  # the heredoc operator and its delimiter, not argv
+        words, _ = _redirect_targets(stage)
+        words, _, _ = _strip_wrappers(words, os.getcwd())
+        if not words:
+            return False
+        name = os.path.basename(words[0])
+        if name in SHELLS and all(re.fullmatch(r'-[seuxv]+|--noprofile|--norc', a) for a in words[1:]):
+            return True
+        if name != 'cat' or len(words) != 1 or op not in {'|', '|&'}:
+            return False
+    return False
+
+
 def _check_update_pipelines(source: str, cwd: str, depth: int = 0) -> Optional[str]:
     """Literal printer -> zero or more cat -> stdin shell, with normal wrappers.
 
@@ -1731,7 +1767,7 @@ def _check_update(source: str, cwd: str, approved: bool = False, depth: int = 0,
         return _check_update_pipelines(source, cwd, depth)
     # Preserve the original decision above as a refusal floor. Add executable
     # stdin provenance without scanning the shared parser's inert data bodies.
-    executable, _data = _split_heredocs(source)
+    executable, _data = _split_heredocs(source, update_stdin=True)
     if executable == _update_source(source):
         return _check_update_pipelines(executable, cwd, depth)
     return _check_update(executable, cwd, depth=depth, _prepared=True)
