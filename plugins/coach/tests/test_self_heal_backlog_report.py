@@ -103,6 +103,21 @@ def test_closed_by_hand_report_gets_numbered_replacement(env):
     assert sh.cards_created_today("default", NOW) == 0
 
 
+@pytest.mark.parametrize("status", ["ready", "scheduled", "triage", "running", "blocked"])
+def test_existing_area_report_is_adopted_after_cache_loss(env, status):
+    day = sh._utc_day(NOW)
+    env.board.add("t_000000ff", key=f"selfheal-backlog:default:{day}:2", status=status)
+    result = sh.refresh_backlog_report(env.store, NOW, runner=env.board)
+    assert result["ok"] and result["card"] == "t_000000ff"
+    assert env.board.creates() == []
+    assert env.board.comments[-1][0] == "t_000000ff"
+    # Preserve both an existing clock schedule and lane admission holds.
+    assert len(env.board.schedules) == (1 if status == "ready" else 0)
+    assert sh.refresh_backlog_report(env.store, NOW + 60, runner=env.board)["card"] == "t_000000ff"
+    assert env.board.creates() == []
+    assert len(env.board.schedules) == (1 if status == "ready" else 0)
+
+
 def test_schedule_parser_lifecycle_retry_rotation(tmp_path, monkeypatch):
     """Create/edit/archive transport is local; schedule uses real argparse + lifecycle.
 

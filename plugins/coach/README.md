@@ -1450,9 +1450,16 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   `proposed`. Lanes filed before (no `one_card`) keep the split investigation → fix → verify until they finish.
 - **Filing dedupe**: every self-heal card body carries `fingerprint: <fp>` in its own evidence fence. Before a new
   defect card, `open_owner` reads the target board (`_kanban_root`): an open card (not done/archived) keyed
-  `selfheal:<fp>` or `selfheal:<fp>:…`, or whose body has that line on its own, gets the occurrence as a comment
-  (`selfheal_dedup_commented`; again only from a new session or after an hour, else `selfheal_dedup_held`) and
-  nothing is filed. An unreadable board logs `selfheal_dedup_error` and files (the cap still bounds it).
+  `selfheal:<fp>`, `selfheal:<fp>:…` or `selfheal-backlog:<fp>:<day>`, or whose body has that line on its own,
+  gets the occurrence as a comment, including a lane-held `triage` owner. Tracked repeat detections use this
+  path even without ranked backlog enabled (`selfheal_dedup_commented`; again only from a new session or
+  after an hour, else `selfheal_dedup_held`), and nothing is filed. A filed owner that is now done/archived is
+  reconciled immediately; the same day's next occurrence can file a fresh generation. An unreadable board logs
+  `selfheal_dedup_error` and durably defers the detection in the existing pending queue until the next pass.
+  Failed occurrence comments also retain the pending detection for retry. Standing area/day reports reuse an
+  existing open `selfheal-backlog:<board>:<day>[:<n>]` after cache loss and comment instead of creating a duplicate;
+  lane-held reports stay held and scheduled reports are never re-scheduled. The dead-man alarm's intentional
+  daily rotation is unchanged.
   The owner lookup also tries the detection's `raw_fingerprint` and, for a canonical key, any open self-heal card
   whose own evidence block canonicalizes to the same key (`via: canonical`: cards filed before canonical keys).
 - **Canonical keys** (`CANON_RULES`, `canonicalize`; machine signals only, `source == "signal"`, applied by the
