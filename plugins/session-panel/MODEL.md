@@ -84,11 +84,24 @@ goes stale or unknown (stale replica, partial owner read, aged board data, unkno
 execution evidence, or a Desktop cache that expired), the reducer and the renderer
 withdraw `wait_kind`/ETA (no live producer claim, no header dot) and keep the
 category the non-stalled waiting row last showed as `last_wait_kind`, so a known CI wait stays light
-blue with text `status unknown · last known: waiting on CI …`. The waiting pip
-carries `wait_kind` when every waiting row is live, else `last_wait_kind` when every
-waiting row has a category; any uncategorised row keeps it amber. A row with no
+blue with text `status unknown · last known: waiting on CI …`. A row with no
 known category stays amber. Session-task chips keep the same last-known delivery/
 deploy look for a stale card, without its ETA or wait line.
+
+### Header squares partition by row-box colour
+
+The header shows one numbered square per row-box colour in each nonempty section
+(model `section_pips`, Desktop `sectionPips`, fixed order red, blue, violet, plain):
+an overdue-triage row is red, a waiting row blue (`agent`/`ci`/`clock`/`card`),
+violet (`deploy`) or amber (no category), any other row its section colour. Each
+displayed row is counted once, so a section's squares sum to its count: two
+uncategorised waits beside one CI wait show amber 2 and blue 1, never amber 3. A
+blue or violet square carries `wait_kind` only when all of its rows are live, else
+`last_wait_kind` (colour only). The header dot (`header.wait_kind`) still requires
+every waiting row to be live delivery. Client expiry and recorded decisions
+recompute the same partitions from the effective rows; a stale snapshot never keeps
+a red square. A shared-blocker group is not a counted row: its overdue red shows in
+the header attention overlay, not in a square.
 
 Desktop replaces a delivery row's pip with right-aligned `waited / expected  left`
 columns when a park timestamp is present. Its one-second display clock updates
@@ -507,8 +520,9 @@ presentation, never execution/decision authority; ask bindings stay unchanged.
           "properties": {
             "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
             "count": {"type": "integer", "minimum": 1}, "label": {"type": "string"},
-            "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"]},
-            "last_wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"], "description": "Waiting pip only, when every waiting row has a live or last-known category but not all are live: colour only, no live authority."}
+            "attention": {"enum": ["triage_overdue"], "description": "Square of overdue-triage rows only (red)."},
+            "wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"], "description": "Waiting square whose rows are all live."},
+            "last_wait_kind": {"enum": ["ci", "deploy", "clock", "card", "agent"], "description": "Waiting square (blue or violet) whose rows have a category but are not all live: colour only, no live authority."}
           }
         }}
       }
@@ -576,8 +590,8 @@ attention palette. Green requires `kind=done` and complete coverage. Identity
 coordinates are nonempty strings and revision/generation are nonnegative JS-safe
 integers; boolean or string versions are unsupported. Legacy completion prose or
 `outcome_json.kind=done` alone is not canonical completion evidence.
-Counts are unique displayed rows per section; pips are nonempty counts in section
-order. Diagnostics distinguish unavailable extra inputs from a known empty source.
+Counts are unique displayed rows per section; pips are one square per row-box colour
+within each nonempty section, in section order, and sum to the section count. Diagnostics distinguish unavailable extra inputs from a known empty source.
 
 An `open_card` action has `target:{id,gateway,profile,board}`. A `decide` action
 has `request_id`, `revision`, `owner:{gatewayId,profile,storedSessionId}`. The

@@ -68,20 +68,46 @@ def test_recovery_restores_the_live_category():
         assert 'last_wait_kind' not in fresh['sections']['waiting'][0], name
 
 
-def test_mixed_waits_pip_is_amber_only_when_a_row_has_no_category():
+def waiting_pips(m):
+    return [p for p in m['header']['pips'] if p['section'] == 'waiting']
+
+
+def test_mixed_waits_get_one_square_per_row_colour_not_one_all_or_nothing_square():
+    """User report: two amber rows beside one blue row painted one amber square of 3, not amber 2 + blue 1."""
     plain = task('t_plain', status='blocked')
     stale_ci = ci_row(tid='t_ci', stale=True)
     m = model.reduce_panel(bundle(stale_ci, plain), now=NOW, projector=f.project)
     rows = {r['id']: r for r in m['sections']['waiting']}
     assert rows['t_ci']['last_wait_kind'] == 'ci'
     assert category(rows['t_plain']) is None
-    pip = waiting_pip(m)
-    assert 'wait_kind' not in pip and 'last_wait_kind' not in pip  # amber, as the uncategorised row
-    # Live CI beside a stale CI: one category for every box, carried as last-known on the pip.
+    blue, amber = waiting_pips(m)
+    assert blue == {'section': 'waiting', 'count': 1, 'label': 'waiting', 'last_wait_kind': 'ci'}  # colour only
+    assert amber == {'section': 'waiting', 'count': 1, 'label': 'waiting'}
+    assert 'wait_kind' not in m['header']
+    # Live CI beside a stale CI: one blue square, last-known because one row lost live authority.
     m = model.reduce_panel(bundle(ci_row(tid='t_live'), stale_ci), now=NOW, projector=f.project)
     assert {category(r) for r in m['sections']['waiting']} == {'ci'}
-    assert waiting_pip(m) == {**waiting_pip(m), 'last_wait_kind': 'ci'} and 'wait_kind' not in waiting_pip(m)
+    assert waiting_pips(m) == [{'section': 'waiting', 'count': 2, 'label': 'waiting', 'last_wait_kind': 'ci'}]
     assert 'wait_kind' not in m['header']
+
+
+def test_screenshot_two_amber_one_blue_counts_each_row_once():
+    rows = [task('t_amber1', status='blocked'), ci_row(tid='t_blue', stale=True), task('t_amber2', status='blocked')]
+    m = model.reduce_panel(bundle(*rows), now=NOW, projector=f.project)
+    pips = waiting_pips(m)
+    assert [(category(p), p['count']) for p in pips] == [('ci', 1), (None, 2)]
+    assert sum(p['count'] for p in pips) == m['header']['counts']['waiting'] == 3
+    # Fresh: live CI keeps live authority on its own square only; the header dot stays off (not every wait is live).
+    m = model.reduce_panel(bundle(rows[0], ci_row(tid='t_blue'), rows[2]), now=NOW, projector=f.project)
+    assert [(p.get('wait_kind'), p['count']) for p in waiting_pips(m)] == [('ci', 1), (None, 2)]
+    assert 'wait_kind' not in m['header']
+
+
+def test_live_ci_and_deploy_waits_keep_separate_blue_and_violet_squares():
+    deploy = {'wait_state': 'external_running', 'waiting_on': 'deploy hermes-hub mods-pull', 'waiting_since': NOW - 120}
+    m = model.reduce_panel(bundle(ci_row(tid='t_ci'), task('t_dep', status='scheduled', wait=deploy)), now=NOW, projector=f.project)
+    assert [(p.get('wait_kind'), p['count']) for p in waiting_pips(m)] == [('ci', 1), ('deploy', 1)]
+    assert m['header']['wait_kind'] == 'ci'  # every wait is live delivery: the header dot keeps its existing choice
 
 
 def test_a_wait_with_no_known_category_stays_uncategorised():

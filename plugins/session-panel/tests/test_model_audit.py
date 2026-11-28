@@ -231,7 +231,9 @@ def test_header_and_pip_go_light_blue_only_when_every_wait_is_delivery():
     h = header('deploy hermes-hub mods-pull')
     assert h['wait_kind'] == 'deploy' and [p.get('wait_kind') for p in h['pips'] if p['section'] == 'waiting'] == ['deploy']
     mixed = header('ci run 1', 'the result of a review')
-    assert 'wait_kind' not in mixed and all('wait_kind' not in p for p in mixed['pips'])
+    # The header dot needs every wait to be live delivery; each square paints only its own rows' colour.
+    assert 'wait_kind' not in mixed
+    assert [(p.get('wait_kind'), p['count']) for p in mixed['pips'] if p['section'] == 'waiting'] == [('ci', 1), (None, 1)]
 
 
 def test_deploy_wait_hides_hashes():
