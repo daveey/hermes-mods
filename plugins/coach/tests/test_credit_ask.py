@@ -25,6 +25,7 @@ def test_real_reply_is_flagged_before_the_judge():
     hit = rc.check(REAL_REPLY, "hows it looking", ["-> terminal(command='bash check_credits.sh')"], _no_judge)
     assert hit and hit["rule"] == "credit_ask" and hit["p"] == 1.0
     assert "hermes-pool-llm" in hit["nudge"]
+    assert 'eval "$(hermes-pool-llm env --port 8765)"' in hit['nudge']
 
 
 def test_reply_passes_when_the_turn_tried_the_pool():
