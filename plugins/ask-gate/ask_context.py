@@ -47,12 +47,25 @@ _ARTIFACT = re.compile(r"(?<![\w/])(?:PR|pull\s+request|issue)\s*#?\s*(\d{1,6})\
 _REPO_REF = re.compile(r"\b[\w.-]+/[\w.-]+\s*(?:#|\s+(?:PR|pull\s+request|issue)\s*#?\s*)(\d+)", re.I)
 _URL_NUMBER = re.compile(r"https?://\S+?/(?:pull|pulls|issues|merge_requests)/(\d+)\b", re.I)
 _LIST_ITEM = re.compile(r"(?m)^\s*(?:[-*\u2022]|\d+[.)]|\[[ x]\])\s+\S")
+# A money/permission/safety CHANGE. Financial nouns (invoice, subscription, budget, refund) count only with a verb
+# that changes them: "read the invoice status" is context, "pay the invoice" / "raise the budget" is a change.
+_FIN_NOUN = r"(?:invoice|subscription|budget|refund|overage|bill)s?"
 _LIMIT = re.compile(
-    r"\$\s?[1-9]|\b(?:pay|payment|paying|purchase|buy|charge|invoice|subscription|refund|budget|spend(?:ing)?\s+(?:limit|cap)|"
-    r"limit\s+raise)\b|\b(?:grant|permission|permissions|credential|credentials|widen|admin|sudo|api\s+key|scope\s+change)\b|"
+    r"\$\s?[1-9]|\b(?:pay|payment|paying|purchase|buy|charge|spend(?:ing)?\s+(?:limit|cap)|limit\s+raise)\b|"
+    r"\b(?:approve|authori[sz]e|pay|cancel|upgrade|downgrade|renew|raise|increase|exceed|extend|issue|"
+    r"start|add|buy|purchase)\w*\s+(?:\w+\s+){0,3}?" + _FIN_NOUN + r"\b|"
+    r"\b(?:grant|permission|permissions|credential|credentials|widen|admin|sudo|api\s+key|scope\s+change)\b|"
     r"\b(?:delete|destroy|destructive|irreversible|wipe|terminate|safety)\b", re.I)
-_NEGATED_LIMIT = re.compile(r"\b(?:no|not|without|never)\b[^.;\n]{0,40}?\b(?:payment|pay|spend(?:ing)?|money|charge|"
-                            r"limit\s+(?:raise|increase)|permission|credential|deletion|delete)\w*[^.;\n]*", re.I)
+# Only the negated limit noun phrase itself ("no payment or limit increase", "does not need a permission change"):
+# the rest of the clause stays, so "No permission change is needed, but approve a $50 payment" keeps its payment and
+# "not authorized to pay $50" (a reason only a human can pay) is not a negation of the payment.
+_NEG_NOUN = (r"(?:payments?|pay|spend(?:ing)?|money|charges?|limit\s+(?:raises?|increases?)|permissions?|"
+             r"credentials?|deletions?)(?:\s+(?:changes?|increases?|raises?|grants?))?")
+_NEGATED_LIMIT = re.compile(
+    r"\b(?:no|never|without|nor|(?:does|do|did|is|are|will|would|need|needs)\s*n[o']t\s+"
+    r"(?:requires?|needs?|involves?|requests?|includes?|be|asks?\s+for)?)\s*"
+    r"(?:any\s+|a\s+|an\s+|new\s+|further\s+|extra\s+|additional\s+)*" + _NEG_NOUN +
+    r"(?:\s*(?:,|\bor\b|\band\b|\bnor\b)\s*(?:any\s+|a\s+|an\s+|new\s+)*" + _NEG_NOUN + r")*", re.I)
 _SIZE = re.compile(
     r"\d|~|\$|\b(?:one|two|three|four|five|ten|a\s+few|few|single|a\s+(?:minute|moment|second|click|tap|reply|"
     r"restart|run|day|week|hour))\b|\b(?:seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|clicks?|taps?)\b", re.I)
