@@ -190,6 +190,86 @@ def test_completed_producer_overrides_observation_checkpoint(env, monkeypatch):
     assert long_wait_hits(env, tid)[0]['variant'] == 'event_happened'
 
 
+def test_dependency_wait_supersedes_old_external_park(env):
+    tid = F.long_wait(env.conn, env.now, kind='external', waited_s=9 * 3600)
+    parent = F.card(env.conn, 'Runner qualification', status='triage')
+    env.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, tid))
+    env.conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    env.conn.commit()
+    F.event(env.conn, tid, 'promoted_manual', {'decision': 'wait_on', 'parent': parent}, at=env.now - 600)
+    assert long_wait_hits(env, tid) == []
+
+
+def test_satisfied_dependency_does_not_hide_stale_external_park(env):
+    tid = F.long_wait(env.conn, env.now, kind='external', waited_s=9 * 3600)
+    parent = F.card(env.conn, 'Qualified runner', status='done')
+    env.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, tid))
+    env.conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    env.conn.commit()
+    assert long_wait_hits(env, tid)
+
+
+def planned_batch(env, monkeypatch, **changes):
+    return observation_wait(env, monkeypatch, **{
+        'waited_s': 11324, 'wake_in': 11100, 'clock_only': True,
+        'awaiting': {'kind': 'deploy', 'ref': 'workstation batch containing example-revision',
+                     'why': 'Named batched update observed pending; inspect after its window'},
+        **changes})
+
+
+def test_declared_bounded_batch_checkpoint_is_not_age_only_stall(env, monkeypatch):
+    assert long_wait_hits(env, planned_batch(env, monkeypatch)) == []
+
+
+@pytest.mark.parametrize('wake_in, suppressed', [(8 * 3600 - 11324, True),
+                                                (8 * 3600 - 11324 + 1, False), (0, False), (-1, False)])
+def test_declared_batch_exact_duration_and_deadline_boundary(env, monkeypatch, wake_in, suppressed):
+    assert bool(long_wait_hits(env, planned_batch(env, monkeypatch, wake_in=wake_in))) is not suppressed
+
+
+def test_dependency_lookup_failure_is_not_a_stalled_child(env, monkeypatch):
+    from hermes_cli import kanban_db
+    tid = F.long_wait(env.conn, env.now, kind='external', waited_s=9 * 3600)
+    env.conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+    env.conn.commit()
+    def unavailable(*a, **kw):
+        raise RuntimeError('unavailable dependency evidence')
+    monkeypatch.setattr(kanban_db, 'parent_states', unavailable)
+    result = env.scan(rules=['BS-long-wait'])
+    assert not [f for f in result['findings'] if f.get('card') == tid]
+    assert any('long_wait parents' in e['where'] for e in result['errors'])
+
+
+@pytest.mark.parametrize('change', [
+    {'clock_only': False}, {'wake_check': 'python3 probe.py'},
+    {'wake_at': 0}, {'wake_at': 'invalid'},
+    {'awaiting': {'kind': 'deploy', 'ref': PR, 'why': 'batch'}},
+    {'awaiting': {'kind': 'deploy', 'ref': 'batch'}},
+])
+def test_declared_batch_requires_all_evidence(env, monkeypatch, change):
+    tid = planned_batch(env, monkeypatch)
+    row = env.conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='scheduled' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+    payload = json.loads(row[1])
+    payload.update(change)
+    env.conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row[0]))
+    env.conn.commit()
+    assert long_wait_hits(env, tid)
+
+
+@pytest.mark.parametrize('kind', ['wake_check_broken', 'wake_check_lost', 'wake_check_stale', 'condition_met'])
+def test_declared_batch_never_hides_adverse_or_completed_condition(env, monkeypatch, kind):
+    tid = planned_batch(env, monkeypatch)
+    F.event(env.conn, tid, kind, {}, at=env.now - 10)
+    assert long_wait_hits(env, tid)
+
+
+def test_declared_batch_cannot_hide_completed_producer(env, monkeypatch):
+    tid = planned_batch(env, monkeypatch)
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state',
+                        lambda *a: {'state': 'done', 'happened': True, 'happened_at': env.now - 601})
+    assert long_wait_hits(env, tid)[0]['variant'] == 'event_happened'
+
+
 # ── clock-overdue class: a superseded park is backstopped by core, not unwoken ───────────────────────────────────
 def superseded_park(env, parked_s):
     """A spent park (a later run claimed the card) with no replacement park imported yet."""

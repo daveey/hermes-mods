@@ -1481,17 +1481,27 @@ def healthy_live_producer(card: Card, park: dict, awaited: dict, live: dict, src
 def bounded_rollout_observation(card: Card, park: dict, awaited: dict, live: dict, now: float) -> bool:
     """Honor a short, unprobed rollout checkpoint; an opaque ID has no pollable completion.
 
-    This is not a healthy-producer receipt. Only an age-only deploy observation with
-    an explicit <=2h checkpoint is covered, never a URL/probe, overdue wake or failure.
+    This is not a healthy-producer receipt. The original opaque-ID checkpoint is
+    bounded to 2h; a declared clock_only batch observation with a reason may span
+    up to 8h. URLs/probes, overdue wakes, completion and adverse evidence never qualify.
     """
     payload = park['payload']
     wake = _num(payload.get('wake_at'))
     ref = str(awaited.get('ref') or '')
+    short_opaque = (re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', ref)
+                    and wake is not None and wake <= park['at'] + 7200)
+    # A declared time-only batch observation can span a normal overnight update
+    # window. It is not a producer-health receipt: never extend beyond 8h, accept
+    # a pollable URL, or suppress a completed/adverse/overdue condition.
+    declared_batch = (payload.get('clock_only') is True and ref.strip()
+                      and not re.search(r'://|www\.', ref, re.I)
+                      and str(awaited.get('why') or '').strip()
+                      and wake is not None and wake <= park['at'] + 8 * 3600)
     if not (card.status == 'scheduled' and awaited.get('kind') == 'deploy'
-            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,127}', ref)
+            and (short_opaque or declared_batch)
             and not str(payload.get('wake_check') or '').strip()
             and live.get('state') == 'not_resolvable' and not live.get('happened')
-            and wake is not None and park['at'] <= now < wake <= park['at'] + 7200):
+            and wake is not None and park['at'] <= now < wake):
         return False
     return card.conn.execute(
         "SELECT 1 FROM task_events WHERE task_id=? AND id>? AND created_at>=? AND created_at<=? "
@@ -1508,6 +1518,16 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     from hermes_cli.kanban_spend_decision import pending, execution_refusal
     if _promotion_held(c, card) or pending(c, card.id) or execution_refusal(c, card.id):
         return None  # containment, spend and independent recovery holds are not execution authority
+    if card.status == 'todo' or (card.status == 'blocked' and getattr(card.task, 'block_kind', None) == 'dependency'):
+        try:
+            from hermes_cli import kanban_db
+            from hermes_cli import kanban_db_sync as sync
+            states = kanban_db.parent_states(c, card.id, remote=sync.has_remote_parents(c))
+            if any(kanban_db.parent_blocks(c, pid, st) for pid, st in states):
+                return None  # current dependency custody supersedes an older external park
+        except Exception as e:  # noqa: BLE001
+            src.error(f'long_wait parents {card.board}/{card.id}', e)
+            return None  # unavailable admission evidence is not a stalled-child finding
     park = current_park(card)
     if not park or healthy_future_park(card, park, src.now):
         return None
