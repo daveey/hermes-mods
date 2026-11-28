@@ -87,6 +87,11 @@ def consumer(owner, monkeypatch, request):
         def unreadable(*args, **kwargs):
             raise OSError('isolated unreadable notification board')
         monkeypatch.setattr(kanban_db_connect, 'connect', unreadable)
+        # A successful read-only quiet-board poll may certify health without
+        # opening a writable connection. Fail that read too: connect-only failure
+        # does not model an unreadable board on current core's idle path.
+        from tui_gateway import notification_reader
+        monkeypatch.setattr(notification_reader, 'reading', unreadable)
     stop = threading.Event()
     ready = threading.Event()
     notices = []

@@ -3936,7 +3936,7 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
             "archive this card (the next healthy drain recreates it) and stop. Never edit the backlog "
             "rows or file defects from here.\n\n" + backlog_report(store, now, board)["body"])
     tid, prev = None, slot.get("prev")
-    gen = int(slot.get("gen") or 1)
+    gen = int(slot.get("gen") or 1) if slot.get("day") == day else 1
     try:
         if slot.get("day") == day and slot.get("card"):
             tid = slot["card"]
@@ -3948,6 +3948,8 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
         owner = open_owner(board, board, key_prefix=report_key)
         if not tid and owner:
             tid = owner["id"]
+            suffix = owner["key"][len(report_key):]
+            gen = int(suffix[1:]) if suffix else 1
             rc, out, err = _run(_kanban_board_argv(board) + ["comment", tid,
                 "Self-heal: refreshed occurrence of this area's backlog report; no new card filed."], runner)
             if rc:
@@ -3970,6 +3972,10 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
                 if not _card_ended(board, tid):
                     break
                 gen, tid = gen + 1, None
+                # Retain bounded collision progress even when all three keys are closed.
+                state[board] = {"card": None, "gen": gen, "day": day,
+                                "scheduled": False, "prev": prev}
+                _save_json_state(store, BACKLOG_REPORT_STATE, state)
             if not tid:
                 raise RuntimeError("report keys returned closed cards")
             state[board] = {"card": tid, "gen": gen, "day": day, "scheduled": False, "prev": prev}
@@ -3978,6 +3984,10 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
         rc, out, err = _run(_kanban_board_argv(board) + ["edit", tid, "--body", body], runner)
         if rc:
             raise RuntimeError("report edit failed: " + (err or out)[-300:])
+        if owner and owner["id"] == tid and owner["status"] == "scheduled" and not slot.get("scheduled"):
+            # A prior schedule may have committed before its acknowledgment was lost.
+            slot["scheduled"] = True
+            _save_json_state(store, BACKLOG_REPORT_STATE, state)
         if not slot.get("scheduled") and not (owner and owner["id"] == tid and owner["status"] != "ready"):
             rc, out, err = _run(_kanban_board_argv(board) + ["schedule", tid,
                 f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only",
