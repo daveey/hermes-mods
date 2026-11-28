@@ -44,7 +44,15 @@ _PLACE = re.compile(
     r"(?:the\s+)?[A-Z][\w-]+(?:\s+[A-Z][\w-]+)*\s+app)\b", re.I)
 # A PR/issue cited by number without its repo or URL: David cannot open it from the panel.
 _ARTIFACT = re.compile(r"(?<![\w/])(?:PR|pull\s+request|issue)\s*#?\s*(\d{1,6})\b", re.I)
-_REPO_REF = re.compile(r"\b[\w.-]+/[\w.-]+\s*(?:#|\s+(?:PR|pull\s+request|issue)\s*#?\s*)\d+", re.I)
+_REPO_REF = re.compile(r"\b[\w.-]+/[\w.-]+\s*(?:#|\s+(?:PR|pull\s+request|issue)\s*#?\s*)(\d+)", re.I)
+_URL_NUMBER = re.compile(r"https?://\S+?/(?:pull|pulls|issues|merge_requests)/(\d+)\b", re.I)
+_LIST_ITEM = re.compile(r"(?m)^\s*(?:[-*\u2022]|\d+[.)]|\[[ x]\])\s+\S")
+_LIMIT = re.compile(
+    r"\$\s?[1-9]|\b(?:pay|payment|paying|purchase|buy|charge|invoice|subscription|refund|budget|spend(?:ing)?\s+(?:limit|cap)|"
+    r"limit\s+raise)\b|\b(?:grant|permission|permissions|credential|credentials|widen|admin|sudo|api\s+key|scope\s+change)\b|"
+    r"\b(?:delete|destroy|destructive|irreversible|wipe|terminate|safety)\b", re.I)
+_NEGATED_LIMIT = re.compile(r"\b(?:no|not|without|never)\b[^.;\n]{0,40}?\b(?:payment|pay|spend(?:ing)?|money|charge|"
+                            r"limit\s+(?:raise|increase)|permission|credential|deletion|delete)\w*[^.;\n]*", re.I)
 _SIZE = re.compile(
     r"\d|~|\$|\b(?:one|two|three|four|five|ten|a\s+few|few|single|a\s+(?:minute|moment|second|click|tap|reply|"
     r"restart|run|day|week|hour))\b|\b(?:seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|clicks?|taps?)\b", re.I)
@@ -176,8 +184,10 @@ def missing(request: dict) -> list[str]:
         out.append("where: the action names no place to act (URL, numbered steps, command, device or app)")
     every = "\n".join((action, scope, why))
     cited = sorted({m.group(1) for m in _ARTIFACT.finditer(every)}, key=int)
-    if cited and not _URL.search(every) and not _REPO_REF.search(every):
-        out.append("where: PR/issue " + ", ".join("#" + n for n in cited) + " is cited without its URL")
+    located = {m.group(1) for m in _URL_NUMBER.finditer(every)} | {m.group(1) for m in _REPO_REF.finditer(every)}
+    unlinked = [n for n in cited if n not in located]
+    if unlinked:
+        out.append("where: PR/issue " + ", ".join("#" + n for n in unlinked) + " is cited without its URL")
     # (c) decisions: every option names its consequence and cost
     if decision:
         details = _option_details(request)
@@ -199,12 +209,21 @@ def missing(request: dict) -> list[str]:
 
 
 def acceptance_alternative(body: str) -> Optional[str]:
-    """The card acceptance's "or document the hold" branch, quoted, else None."""
-    for m in _ACCEPT.finditer(str(body or "")):
-        clause = m.group(1)
-        if _DOC_BRANCH.search(clause):
-            return " ".join(clause.split())[:240]
-    return None
+    """The card acceptance's "or document the hold" branch, quoted, when it covers the WHOLE acceptance: a single
+    sentence with no other listed item. A doc branch on one item of several leaves the others owed. Else None."""
+    acceptances = list(_ACCEPT.finditer(str(body or "")))
+    if len(acceptances) != 1:
+        return None
+    clause = acceptances[0].group(1).strip()
+    if _LIST_ITEM.search(clause) or len(sentences(clause)) != 1 or not _DOC_BRANCH.search(clause):
+        return None
+    return " ".join(clause.split())[:240]
+
+
+def _limit_named(text: str) -> bool:
+    """The ask changes money, permissions or safety (negated mentions such as "no payment is requested" excluded)."""
+    text = _NEGATED_LIMIT.sub(" ", str(text or ""))
+    return bool(_LIMIT.search(text)) or _replan.limit_named(text) in ("spend", "permission", "safety")
 
 
 def acceptance_met(request: dict, body: str) -> Optional[str]:
@@ -212,8 +231,7 @@ def acceptance_met(request: dict, body: str) -> Optional[str]:
     quote = acceptance_alternative(body)
     if quote is None or not isinstance(request, dict):
         return None
-    text = "\n".join(str(request.get(k) or "") for k in ("action", "why_human"))
-    if _replan.limit_named(text) in ("spend", "permission", "safety"):
+    if _limit_named("\n".join(str(request.get(k) or "") for k in ("action", "why_human", "scope"))):
         return None
     return quote
 

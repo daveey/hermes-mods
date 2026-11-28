@@ -68,6 +68,43 @@ def test_an_acceptance_alternative_does_not_refuse_a_spend_or_permission_ask():
     assert ac.acceptance_met(hr, BILLING["body"]) is None
 
 
+@pytest.mark.parametrize("text", [
+    "Approve a one-time $50 payment to GitHub for this month's Actions overage.",
+    "Grant the worker read access to the billing API credentials.",
+    "Approve deleting the old hosted runner group (irreversible).",
+])
+def test_explicit_money_permission_or_destructive_asks_are_exempt(text):
+    """Review 6094541114 P2: a concrete one-time $50 payment approval was not exempted."""
+    hr = dict(BILLING["human_request"], action=text + " Unblock = do it; archive = drop it.")
+    assert ac.acceptance_met(hr, BILLING["body"]) is None
+
+
+def test_a_negated_payment_mention_does_not_exempt_the_billing_ask():
+    assert "No payment or limit increase is requested" in BILLING["human_request"]["action"]
+    assert ac.acceptance_met(BILLING["human_request"], BILLING["body"]) is not None
+
+
+@pytest.mark.parametrize("body", [
+    "Acceptance:\n- the installed build runs on the iPhone (physical check)\n- verify the logs or document the gap with "
+    "evidence",
+    "Acceptance: verify the logs or document the gap with evidence. The physical qualification on the iPhone must "
+    "also pass.",
+])
+def test_a_doc_branch_on_one_of_several_acceptance_items_is_not_met(body):
+    """Review 6094541114 P2: a documentation alternative for one item must not direct whole-card completion."""
+    assert ac.acceptance_alternative(body) is None
+    assert ac.acceptance_met(BILLING["human_request"], body) is None
+
+
+def test_an_unrelated_url_does_not_stand_in_for_a_cited_prs_link():
+    """Review 6094541114 P2: a status URL suppressed the missing link for bare PR #13."""
+    hr = copy.deepcopy(UNFORGED["human_request"])
+    hr["scope"] += "\nStatus page: https://www.githubstatus.com/"
+    assert any(m.startswith("where: PR/issue #13") for m in ac.missing(hr))
+    hr["scope"] += "\nPR: https://github.com/softmax-universe/unforged/pull/13"
+    assert not any(m.startswith("where: PR/issue") for m in ac.missing(hr))
+
+
 @pytest.mark.parametrize("action", [
     "Unblock = A; archive = B",
     "Choose whether to expand the tests/fixtures-only limit to production code. Unblock = A; archive = B",
