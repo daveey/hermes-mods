@@ -167,6 +167,13 @@ def observe_card(scan, src, card, now: float) -> dict:
     if card.status == 'running':
         at = obs['event_at']
         obs['healthy'] = 'running' if at is not None and now - at <= HEALTHY_RUN_S else None
+        # Worker tool activity is not necessarily published as a board progress
+        # event. A fresh heartbeat cannot prove progress, but equally this reader
+        # cannot prove a runtime stall from board silence while that run is live.
+        rid = obs['run_id']
+        run = c.execute('SELECT status,last_heartbeat_at FROM task_runs WHERE id=? AND task_id=?',
+                        (rid, card.id)).fetchone() if rid is not None else None
+        obs['runtime_liveness_at'] = _num(run[1]) if run and run[0] == 'running' else None
     elif card.status in ('scheduled', 'blocked', 'todo', 'triage'):
         park = scan.current_park(card)
         if park:
@@ -348,6 +355,14 @@ def evaluate(prev: Optional[dict], cur: dict, now: float, *, long_wait: dict,
         misses = int(p.get('misses') or 0) if same and not progressed else 0
         rearm = (_num(p.get('rearm_at')) or 0) if same else 0
         pred = predict(o, since, long_wait)
+        live_at = _num(o.get('runtime_liveness_at'))
+        if o.get('status') == 'running' and live_at is not None and 0 <= now - live_at <= 300:
+            # Unknown runtime progress is not a miss and never a progress signal.
+            # Start a full observation window after the last fresh liveness mark;
+            # stale/future/foreign/ended runs cannot buy this deferral.
+            misses = 0
+            rearm = max(rearm, live_at + PREDICT_S)
+            pred['deferred'] = 'runtime_activity_unobserved'
         if pred.get('due_at') is not None:
             pred['due_at'] = max(pred['due_at'], rearm)
         if not baseline and not progressed and pred.get('due_at') is not None and pred['due_at'] <= now \
@@ -413,6 +428,8 @@ def classify(cards: dict, process_only: bool) -> str:
         return 'healthy_wait'
     if any(p.get('clock') for p in preds):
         return 'clock_not_due'
+    if any(p.get('deferred') == 'runtime_activity_unobserved' for p in preds):
+        return 'runtime_activity_unobserved'
     if any(p.get('deferred') for p in preds):
         return 'long_wait'
     return 'pending'
