@@ -375,8 +375,9 @@ class Remote(DeliveryPresentation):
                 if (frozen.get('remote', {}).get('target') != snap['remote']['target']):
                     continue
                 request = m.store.get(owner, binding['request_id'])
+                public = dict(request, state=json.loads(binding['request']).get('state'))
                 if (request['state'] in ('open', 'needs_context') and not request.get('resolution')
-                        and not m.explicit_revision(request, binding)):
+                        and json.dumps(public, sort_keys=True, separators=(',', ':'), ensure_ascii=False) == binding['request']):
                     matches.append(request)
             if len(matches) != 1:
                 raise m.core.ActionError('No unique undecided native remote ask; do not publish a substitute', 409)
