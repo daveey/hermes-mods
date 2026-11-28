@@ -198,6 +198,34 @@ def _age_s(iso: Any) -> float:
         return float("inf")
 
 
+def _write_restart_force_request(home: Path) -> None:
+    """Record explicit apply-now intent at the installation root, not a profile/cache."""
+    root = home.parent.parent if home.parent.name == "profiles" else home
+    try:
+        from hermes_cli.core_update_force import write_force_request
+    except ImportError:
+        # Older cores do not expose the helper yet; preserve its atomic v1 contract.
+        import tempfile
+
+        path = root / "core-update" / "force-request"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        body = {"version": 1, "requested_at": now, "expires_at": now + 1800,
+                "by": "core-update chip"}
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=".force-request.", suffix=".tmp", delete=False) as stream:
+                tmp = Path(stream.name)
+                stream.write(json.dumps(body) + "\n")
+            os.replace(tmp, path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+    else:
+        write_force_request(root, by="core-update chip")
+
+
 def restart(home: Optional[Path] = None, *, popen: Callable[..., Any] = subprocess.Popen,
             quit_delay_s: float = 2.0, checkout: Optional[Path] = None,
             git: Callable[..., Optional[str]] = _git) -> Dict[str, Any]:
@@ -207,6 +235,10 @@ def restart(home: Optional[Path] = None, *, popen: Callable[..., Any] = subproce
     s = _status(st, home, checkout, git)
     if s["state"] != "ready" or not s["can_restart"]:
         return {"ok": False, "reason": f"no update ready (state {s['state']})"}
+    try:
+        _write_restart_force_request(home if home is not None else hermes_home())
+    except Exception as exc:
+        return {"ok": False, "reason": f"could not write force request: {exc}"}
     cmd = ["/usr/bin/python3", "-I", str(Path(__file__).resolve().with_name("waiter.py"))]
     detached = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True, close_fds=True)
