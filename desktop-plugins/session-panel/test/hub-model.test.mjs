@@ -120,12 +120,23 @@ for (const variant of ['pending', 'newer', 'human', 'missing']) {
 test('overdue triage card renders Release / Archive / Keep parked in Stuck with a clickable card id', async () => {
   const { model, now } = publicCases.overdue_triage_card
   assert.equal(model.sections.needs_you.length, 0)
-  const opened = []
-  await paint(m.renderModel(model, { now, onAction: (row, action) => opened.push([row.id, action.kind]) }))
-  assert.ok(document.querySelector('[data-row-pip="stuck"]'))
+  const opened = [], chosen = []
+  await paint(m.renderModel(model, { now,
+    onChoose: (row, option) => chosen.push([row.request_id, row.request_revision, option.choice_id]),
+    onAction: (row, action) => opened.push([row.id, action.kind]) }))
+  assert.equal(model.sections.stuck[0].kind, 'overdue')
+  const card = document.querySelector('[data-ask-row]')
+  assert.ok(card, 'overdue attention renders an actionable card, not a plain row')
+  assert.equal(window.getComputedStyle(card).borderLeftColor, 'rgb(248, 81, 73)')
   assert.equal(document.querySelector('[data-ask-kind]').textContent, 'Parked too long · decide')
-  assert.deepEqual([...document.querySelectorAll('[data-choice-id]')].map(b => b.getAttribute('data-choice-id')),
-    ['card-0', 'card-1', 'card-2'])
+  const buttons = [...document.querySelectorAll('[data-choice-letter]')]
+  assert.deepEqual(buttons.map(b => b.getAttribute('data-choice-letter')), ['A', 'B', 'C'])
+  for (const button of buttons) {
+    assert.equal(button.disabled, false)
+    await React.act(async () => button.click())
+  }
+  const row = model.sections.stuck[0]
+  assert.deepEqual(chosen, ['card-0', 'card-1', 'card-2'].map(id => [row.request_id, row.request_revision, id]))
   assert.match(document.body.textContent, /Release/)
   assert.match(document.body.textContent, /Keep parked/)
   const link = document.querySelector('[data-card-link]')
@@ -983,13 +994,14 @@ for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.sta
     const article = articles[i]
     assert.equal(article.querySelector('[data-ask-title]').textContent, row.title)
     if (row.detail) assert.ok(article.textContent.includes(row.detail))
-    if (row.details.length && section === 'needs_you') assert.deepEqual([...article.querySelectorAll('details > div')].map(e => e.textContent), row.details)
+    const actionable = section === 'needs_you' || row.kind === 'overdue'
+    if (row.details.length && actionable) assert.deepEqual([...article.querySelectorAll('details > div')].map(e => e.textContent), row.details)
     // Line rows are one line: details[] ride the title tooltip, never a Details disclosure.
-    if (section !== 'needs_you') {
-     assert.equal(article.querySelector('details'), null)
+    if (!actionable) {
+     assert.equal(!!article.querySelector('details'), false)
      assert.equal(article.querySelector('[data-ask-title]').title, [row.title, ...row.details].join('\n'))
     }
-    if (section !== 'needs_you') continue
+    if (!actionable) continue
     if (row.situation) {
      const el = article.querySelector('[data-ask-situation]')
      assert.equal(el.textContent, row.situation); assert.equal(el.style.webkitLineClamp, '3')
