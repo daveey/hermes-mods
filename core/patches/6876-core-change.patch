@@ -1,0 +1,548 @@
+From 4d20777cee7eb6ee17809f0ca03d659cd3f98d00 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:35:02 +0000
+Subject: [PATCH 6876] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 4d20777cee7eb6ee17809f0ca03d659cd3f98d00.
+
+---
+diff --git a/tests/hermes_cli/kanban_capture_client_cases.py b/tests/hermes_cli/kanban_capture_client_cases.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..48d39e51effe1d28e409ef8dbc1c2983956bcb9f
+--- /dev/null
++++ b/tests/hermes_cli/kanban_capture_client_cases.py
+@@ -0,0 +1,143 @@
++"""Actual client recovery writers, returning (storage table, SQLite rowid).
++
++Only domain rows are seeded directly. An exact shadow backup and suppressed
++domain capture model missed writes; real recovery functions insert the outbox.
++"""
++from contextlib import contextmanager
++import sqlite3
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++
++GATEWAY = "macbook"
++OUTBOX = "kanban_sync_outbox"
++
++
++
++@contextmanager
++def _gap(conn):
++    """Suppress normal domain capture while staging a recovery scenario."""
++    with kbc.write_txn(conn):
++        previous = conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0]
++        conn.execute("UPDATE kanban_sync_state SET applying=1")
++        try:
++            yield
++        finally:
++            conn.execute("UPDATE kanban_sync_state SET applying=?", (previous,))
++
++
++def _tasks(board, count=1):
++    client.ensure_identity(board, "default", GATEWAY)
++    # Fixture-only domain records represent already acknowledged local tasks.
++    # Clearing their captured operations is preparation, NOT the insertion under test.
++    tids = [kb.create_task(board, title=f"gate2 recovery {i}", assignee="worker",
++                           initial_status="running") for i in range(count)]
++    with _gap(board):
++        for tid in tids:
++            board.execute("UPDATE tasks SET sync_version=7,created_on=? WHERE id=?", (GATEWAY, tid))
++    board.execute("DELETE FROM kanban_sync_outbox")
++    return tids
++
++
++@contextmanager
++def _shadow(board):
++    assert not board.in_transaction, "backup requires committed fixture preparation"
++    shadow = sqlite3.connect(":memory:", isolation_level=None)
++    shadow.row_factory = sqlite3.Row
++    try:
++        board.backup(shadow)
++        yield shadow
++    finally:
++        shadow.close()
++
++
++def _before(board):
++    return {row[0] for row in board.execute(f"SELECT rowid FROM {OUTBOX}")}
++
++
++def _inserted(board, before, expected):
++    rows = [row for row in board.execute(
++        f"SELECT rowid,table_name,row_uid,op FROM {OUTBOX} ORDER BY rowid") if row[0] not in before]
++    assert [(row[1], row[2], row[3]) for row in rows] == expected, [tuple(r) for r in rows]
++    return [(OUTBOX, row[0]) for row in rows]
++
++
++def case_import_board(board, monkeypatch):
++    """client.import_board's explicit recovery/import INSERT (client.py:1658)."""
++    (tid,) = _tasks(board)
++    before = _before(board)
++    counts = client.import_board(board, tables=("tasks",), only={"tasks": {tid}})
++    assert counts["tasks"] == 1
++    return _inserted(board, before, [("tasks", tid, "import")])
++
++
++def case_repair_missing_children(board, monkeypatch):
++    """client.repair_missing_children's INSERT, for BOTH supported child types."""
++    parent, child = _tasks(board, 2)
++    chat_uid = "gate2-gap-chat"
++    with _shadow(board) as shadow:
++        with _gap(board):
++            board.execute("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)", (parent, child))
++            board.execute("INSERT INTO task_chat_links"
++                          "(uid,task_id,chat_gateway,chat_session,kind,created_at) "
++                          "VALUES (?,?,?,'gate2-real-session','created',1)", (chat_uid, child, GATEWAY))
++        before = _before(board)
++        client.repair_missing_children(board, shadow, GATEWAY)
++    return _inserted(board, before, [
++        ("task_links", f"{parent}>{child}", "upsert"),
++        ("task_chat_links", chat_uid, "upsert"),
++    ])
++
++
++def case_retire_lost_placeholder_links(board, monkeypatch):
++    """client.retire_lost_placeholder_links's DELETE-operation outbox INSERT."""
++    from hermes_cli import kanban_placement
++    # Match existing retirement tests; no environment-specific placement prefixes.
++    monkeypatch.setattr(kanban_placement, "config", dict)
++    (tid,) = _tasks(board)
++    uid = "gate2-lost-placeholder"
++    with _gap(board):
++        board.execute("INSERT INTO task_chat_links"
++                      "(uid,task_id,chat_gateway,chat_session,kind,created_at) "
++                      "VALUES (?,?,?,'kanban-placement-macbook','created',1)", (uid, tid, GATEWAY))
++    with _shadow(board) as shadow:
++        with _gap(board):
++            board.execute("DELETE FROM task_chat_links WHERE uid=?", (uid,))
++        # applying suppresses the ordinary delete capture and local tombstone.
++        assert board.execute("SELECT 1 FROM kanban_sync_tombstones "
++                             "WHERE table_name='task_chat_links' AND row_uid=?", (uid,)).fetchone() is None
++        before = _before(board)
++        assert client.retire_lost_placeholder_links(board, shadow, GATEWAY) == 1
++    assert board.execute("SELECT 1 FROM kanban_sync_tombstones "
++                         "WHERE table_name='task_chat_links' AND row_uid=?", (uid,)).fetchone()
++    return _inserted(board, before, [("task_chat_links", uid, "delete")])
++
++
++def case_repair_divergence_task(board, monkeypatch):
++    """Real client wrapper -> divergence.repair_divergence task INSERT (:86)."""
++    (tid,) = _tasks(board)
++    with _shadow(board) as shadow:
++        with _gap(board):
++            board.execute("UPDATE tasks SET title='gate2 uncaptured title' WHERE id=?", (tid,))
++        before = _before(board)
++        assert client.repair_divergence(board, shadow, GATEWAY) == {tid: ["title"]}
++    return _inserted(board, before, [("tasks", tid, "upsert")])
++
++
++def case_repair_divergence_run(board, monkeypatch):
++    """Real wrapper -> divergence run INSERT (:81) then task INSERT (:86)."""
++    (tid,) = _tasks(board)
++    uid = "gate2-diverged-run"
++    with _gap(board):
++        board.execute("INSERT INTO task_runs(uid,task_id,status,started_at,sync_version,summary) "
++                      "VALUES (?,?,'done',1,7,'service summary')", (uid, tid))
++    with _shadow(board) as shadow:
++        with _gap(board):
++            # A task difference is required: _diverged_runs is reached only for a
++            # task with actual unsent fields. Use title to avoid lifecycle adoption.
++            board.execute("UPDATE tasks SET title='gate2 uncaptured run task' WHERE id=?", (tid,))
++            board.execute("UPDATE task_runs SET summary='uncaptured summary' WHERE uid=?", (uid,))
++        before = _before(board)
++        assert client.repair_divergence(board, shadow, GATEWAY) == {tid: ["title", f"task_runs:{uid}"]}
++    return _inserted(board, before, [("task_runs", uid, "upsert"), ("tasks", tid, "upsert")])
+diff --git a/tests/hermes_cli/kanban_capture_synthetic_cases.py b/tests/hermes_cli/kanban_capture_synthetic_cases.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..00cbdf5e28266f6bba790d6cf1b2a3676894d2bf
+--- /dev/null
++++ b/tests/hermes_cli/kanban_capture_synthetic_cases.py
+@@ -0,0 +1,201 @@
++"""Real reserved-key and synthetic-parent capture-site scenarios. [daveey]
++
++Return (table, op_id/task_id) custody keys. Public plan/apply/advance and push
++callers execute the production INSERTs; call-through counters prove reachability.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_reserved_key as rk
++
++OUTBOX, PARENTS = "kanban_sync_outbox", "kanban_sync_parent_envelopes"
++KEY = {OUTBOX: "op_id", PARENTS: "task_id"}
++
++
++
++# --- helpers -----------------------------------------------------------------------------------------
++
++def _conn(board):
++    return board[0] if isinstance(board, tuple) else board
++
++
++def _ids(conn):
++    return ({(OUTBOX, r[0]) for r in conn.execute("SELECT op_id FROM kanban_sync_outbox")}
++            | {(PARENTS, r[0]) for r in conn.execute("SELECT task_id FROM kanban_sync_parent_envelopes")})
++
++
++def spy(monkeypatch, module, name):
++    """Call-through counter around the real function (never a replacement body)."""
++    real, calls = getattr(module, name), []
++
++    def wrapper(*a, **k):
++        calls.append(1)
++        return real(*a, **k)
++    monkeypatch.setattr(module, name, wrapper)
++    return calls
++
++
++
++def _gateway_identity(conn, gateway):
++    client.ensure_identity(conn, "default", gateway)
++
++
++# --- 1/2: reserved_key._write_receipt and ._queue_children through supported plan/apply/advance ------------
++
++def _reserved_setup(conn, monkeypatch):
++    from tests.hermes_cli import test_kanban_sync_reserved_key as t
++    _gateway_identity(conn, t.ME)
++    svc = t.StrictService()
++    tid, _other = t.bad_card(conn, svc, monkeypatch)        # reserved-key card whose ops the Board refused
++    token = t.preview(conn, svc, tid)["token"]               # rk.plan
++    return t, svc, tid, token
++
++
++def case_reserved_write_receipt(board, monkeypatch):
++    conn = _conn(board)
++    t, svc, tid, token = _reserved_setup(conn, monkeypatch)
++    calls = spy(monkeypatch, rk, "_write_receipt")
++    before = _ids(conn)
++    assert t.apply(conn, svc, tid, token)["action"] == "applied"   # rk.apply -> write_txn -> _write_receipt
++    assert calls, "_write_receipt was not reached through rk.apply"
++    receipt = rk.receipt_for_task(conn, tid)
++    new = _ids(conn) - before
++    # exactly the corrected-parent import op the function inserted (not an earlier rejected op)
++    assert new == {(OUTBOX, receipt["parent_op_id"])}, new
++    row = conn.execute("SELECT op, state, table_name FROM kanban_sync_outbox WHERE op_id=?",
++                       (receipt["parent_op_id"],)).fetchone()
++    assert tuple(row) == ("import", "pending", "tasks")
++    return sorted(new)
++
++
++def case_reserved_queue_children(board, monkeypatch):
++    conn = _conn(board)
++    t, svc, tid, token = _reserved_setup(conn, monkeypatch)
++    assert t.apply(conn, svc, tid, token)["action"] == "applied"
++    client.push(conn, svc.hub(t.ME), t.BOARD, t.ME, primary=False)      # parent accepted; its op leaves the outbox
++    receipt = rk.receipt_for_task(conn, tid)
++    assert not conn.execute("SELECT 1 FROM kanban_sync_outbox WHERE op_id=?", (receipt["parent_op_id"],)).fetchone()
++    calls = spy(monkeypatch, rk, "_queue_children")
++    before = _ids(conn)
++    report = rk.advance(conn, svc.hub(t.ME), t.BOARD, task_id=tid)[0]   # _queue_step -> _queue_children
++    assert calls and report["advanced"] and report["children_queued"] > 0, report
++    assert rk.receipt_for_task(conn, tid)["state"] == "children_queued"
++    new = _ids(conn) - before
++    manifest = {(OUTBOX, r[0]) for r in conn.execute(
++        "SELECT op_id FROM kanban_sync_key_supersession_children WHERE receipt_id=?", (receipt["receipt_id"],))}
++    assert new == manifest and len(new) == report["children_queued"], (new, manifest)
++    return sorted(new)          # NOT pushed further: acked children would be deleted
++
++
++# --- 3: compat.rejected_parent through the legacy push caller --------------------------------------------
++
++def case_rejected_parent(board, monkeypatch):
++    """A schema-refused synthetic parent materializes without claiming originality."""
++    from hermes_cli import kanban_sync_compat as compat
++    conn = _conn(board)
++    _gateway_identity(conn, "sender")
++    tid = kb.create_task(conn, title="rejected synthetic parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child needing the synthesized parent")
++    sent = []
++
++    def ops(_board, wire):
++        sent.extend(wire)
++        return {"results": [{"client_op_id": op["client_op_id"], "status": "rejected", "reason": "forbidden_field"}
++                            for op in wire]}
++    calls = spy(monkeypatch, compat, "rejected_parent")
++    before = _ids(conn)
++    client.push(conn, SimpleNamespace(ops=ops), "default", "sender", primary=False, max_batches=1)
++    assert calls, "rejected_parent was not reached through client.push"
++    parent_wire = next(op for op in sent if op["table"] == "tasks" and op["uid"] == tid)
++    new = _ids(conn) - before
++    row = conn.execute("SELECT * FROM kanban_sync_outbox WHERE row_uid=? AND table_name='tasks'", (tid,)).fetchone()
++    assert row["op_id"] == parent_wire["client_op_id"] and (OUTBOX, row["op_id"]) in new
++    assert row["wire_json"] is None and row["attempts"] == 1 and row["state"] == "rejected"
++    assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()  # nothing else is custody
++    return [(OUTBOX, row["op_id"])]
++
++
++# --- 4: replay_sender._push_strict.record through the real strict push -----------------------------------
++
++def _strict_journal(conn):
++    from hermes_cli import kanban_replay_journal as journal
++    from tests.hermes_cli.test_kanban_replay_journal import binding
++    _gateway_identity(conn, "macbook")
++    if sync_journal_id(conn) is None:
++        with kbc.write_txn(conn):
++            journal.initialize(conn, binding(),
++                               board_id=conn.execute("SELECT board_id FROM kanban_sync_state").fetchone()[0])
++
++
++def sync_journal_id(conn):
++    from hermes_cli import kanban_db_sync as sync
++    return (sync.sync_state(conn) or {}).get("journal_id")
++
++
++def case_strict_record(board, monkeypatch):
++    """Strict (journal-bound) push of a synthetic parent that the Board rejects: record() moves the exact synthetic
++    parent into the outbox (INSERT with wire_json), then marks it rejected and retires the envelope.
++    Uses the real client.push -> replay_sender.push -> _push_strict; ``record`` is a nested closure, so
++    reachability is proven structurally (row id == journal pending op, envelope retired, out.rejected == 1)."""
++    from hermes_cli import kanban_replay_journal as journal
++    from tests.hermes_cli.test_kanban_replay_sender import Receiver
++    conn = _conn(board)
++    _strict_journal(conn)
++    tid = kb.create_task(conn, title="strict rejected synthetic parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "dependent child")
++    receiver = Receiver()
++    receiver.status = "rejected"
++    before = _ids(conn)
++    result = client.push(conn, receiver, "default", "macbook", primary=False, max_batches=1)
++    assert result.rejected == 1, result
++    parent = next(op for op in receiver.sent if op["table"] == "tasks" and op["uid"] == tid)
++    new = _ids(conn) - before
++    row = conn.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (parent["client_op_id"],)).fetchone()
++    assert row is not None and (OUTBOX, row["op_id"]) in new
++    assert row["state"] == "rejected" and row["attempts"] == 1 and row["wire_json"] is not None
++    assert not conn.execute("SELECT 1 FROM kanban_sync_parent_envelopes").fetchone()  # custody moved, not duplicated
++    assert journal.pending_wire(conn) is None
++    return [(OUTBOX, row["op_id"])]
++
++
++# --- 5: envelope.parent through the legacy push caller (lost reply keeps the immutable parent) -----------
++
++def case_envelope_parent(board, monkeypatch):
++    from hermes_cli import kanban_sync_envelope as envelopes
++    from tests.hermes_cli.test_kanban_sync_envelope import LostReply
++    conn = _conn(board)
++    _gateway_identity(conn, "sender")
++    tid = kb.create_task(conn, title="envelope synthetic parent", assignee="worker")
++    with kbc.write_txn(conn):
++        conn.execute("DELETE FROM kanban_sync_outbox")
++    kb.add_comment(conn, tid, "author", "child needs parent")
++    calls = spy(monkeypatch, envelopes, "parent")
++    before = _ids(conn)
++    with pytest.raises(OSError, match="response lost"):
++        client.push(conn, LostReply(), "default", "sender", primary=False)
++    assert calls, "envelope.parent was not reached through client.push"
++    new = {i for i in _ids(conn) - before if i[0] == PARENTS}
++    assert new == {(PARENTS, tid)}, new
++    assert json.loads(conn.execute("SELECT wire FROM kanban_sync_parent_envelopes WHERE task_id=?", (tid,))
++                      .fetchone()[0])["uid"] == tid
++    return sorted(new)
++
++
++CASES = {
++    "reserved_write_receipt": case_reserved_write_receipt,
++    "reserved_queue_children": case_reserved_queue_children,
++    "rejected_parent": case_rejected_parent,
++    "strict_record": case_strict_record,
++    "envelope_parent": case_envelope_parent,
++}
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_recovery_sites.py b/tests/hermes_cli/test_kanban_sync_capture_recovery_sites.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b611292f8d4e6a298386583432f9e539d9d10bb6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_capture_recovery_sites.py
+@@ -0,0 +1,175 @@
++"""Actual recovery/synthetic writers must not invent first-capture provenance. [daveey]
++
++Certification remains dormant. New task INSERTs get immutable candidates only;
++reconstructed predecessors stay UNKNOWN. This table drives all ten recovery
++INSERT sites (including both divergence branches), three synthetic sites and
++both identity rotations. It is behavior proof, not the declaration inventory.
++"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_capture_client_cases as recovery
++from tests.hermes_cli import kanban_capture_synthetic_cases as synthetic
++from tests.hermes_cli import kanban_sync_support as support
++
++OUTBOX = 'kanban_sync_outbox'
++COLUMNS = ('capture_protocol', 'original_op_id', 'original_created_at', 'identity_state', 'exposure_history')
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _outbox(board):
++    return [dict(r) for r in board.execute('SELECT rowid,* FROM kanban_sync_outbox ORDER BY rowid')]
++
++
++def _queue_rows(board, monkeypatch):
++    # apply_sync_schema_steps repairs attached capture gaps through _queue_rows.
++    client.ensure_identity(board, 'default', 'macbook')
++    tid = kb.create_task(board, title='capture gap', assignee='worker')
++    sync.drop_triggers(board)
++    row_id = board.execute("INSERT INTO task_comments(task_id,author,body,created_at) VALUES (?,'a','gap',1)",
++                           (tid,)).lastrowid
++    board.execute('DELETE FROM kanban_sync_outbox')
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    sync.install_or_remove(board, path)
++    rows = _outbox(board)
++    uid = board.execute('SELECT uid FROM task_comments WHERE id=?', (row_id,)).fetchone()[0]
++    assert len(rows) == 1 and rows[0]['table_name'] == 'task_comments' and rows[0]['row_uid'] == uid
++    return [(OUTBOX, rows[0]['rowid'])]
++
++
++def _compat(board, monkeypatch, *, virtual=False):
++    from hermes_cli import kanban_sync_compat as compat
++    tid = kb.create_task(board, title='retained predecessor', assignee='worker', body='kept local')
++    row = _outbox(board)[0]
++    wire = {'fields': json.loads(row['fields']), 'hlc': '1-0-macbook'}
++    field = 'workspace_kind' if virtual else 'body'
++    assert field in wire['fields']
++    answer = {'status': 'rejected', 'reason': 'forbidden_field', 'detail': f'not writable on tasks: {field}'}
++    with kbc.write_txn(board):
++        assert compat.enqueue_retry(board, row, wire, answer)
++    rows = [r for r in _outbox(board) if r['op_id'] != row['op_id'] and r['table_name'] == 'tasks']
++    assert len(rows) == 1 and rows[0]['row_uid'] == tid
++    assert field not in json.loads(rows[0]['fields'])
++    return [(OUTBOX, rows[0]['rowid'])]
++
++
++def _drop_virtual(board, monkeypatch):
++    return _compat(board, monkeypatch, virtual=True)
++
++
++def _restore(board, monkeypatch):
++    from hermes_cli import kanban_sync_compat as compat
++    from hermes_cli import kanban_sync_omissions as omissions
++    tid = kb.create_task(board, title='restore predecessor', assignee='worker', body='local held value')
++    original = _outbox(board)[0]
++    wire = {'fields': json.loads(original['fields']), 'hlc': '1-0-macbook'}
++    with kbc.write_txn(board):
++        assert compat.enqueue_retry(board, original, wire,
++                                    {'reason': 'forbidden_field', 'detail': 'not writable on tasks: body'})
++    before = {r['op_id'] for r in _outbox(board)}
++    omissions.reconcile_page(board, 'tasks', [{'uid': tid, 'body': 'remote capability hint'}])
++    rows = [r for r in _outbox(board) if r['op_id'] not in before]
++    assert len(rows) == 1 and rows[0]['op'] == 'restore'
++    assert json.loads(rows[0]['fields']) == {'body': 'local held value'}
++    return [(OUTBOX, rows[0]['rowid'])]
++
++
++def _synthetic_case(board, monkeypatch, name):
++    pairs = synthetic.CASES[name](board, monkeypatch)
++    return [(table, board.execute(f'SELECT rowid FROM {table} WHERE {synthetic.KEY[table]}=?',
++                                 (key,)).fetchone()[0]) for table, key in pairs]
++
++
++def _rotate(board, monkeypatch, *, transient=False, prior='original'):
++    from hermes_cli.kanban_containment_outbox import strip_lifecycle
++    client.ensure_identity(board, 'default', 'macbook')
++    tid = kb.create_task(board, title='rotation', assignee='worker')
++    board.execute('DELETE FROM kanban_sync_outbox')
++    # Synthetic future certified and legacy fixtures exercise retention, not activation.
++    history = json.dumps({'protocol': 'exposure1', 'coverage': 'unknown', 'certified': False,
++                          'exposures': [{'principal': 'opaque-old-epoch'}]})
++    protocol, original, created, state = ('capture1', 'old-operation', 123, 'original')
++    if prior == 'candidate':
++        protocol, state = 'capture_candidate1', None
++    elif prior == 'unknown':
++        protocol, original, created, state = None, None, None, None
++    fields = json.dumps({'title': 'keep', 'status': 'ready'})
++    board.execute('INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at,'
++                  'capture_protocol,original_op_id,original_created_at,identity_state,exposure_history) '
++                  "VALUES ('old-operation','tasks',?,'upsert',?,'',123,?,?,?,?,?)",
++                  (tid, fields, protocol, original, created, state, history))
++    if transient:
++        def refuse(_board, ops):
++            return {'results': [{'client_op_id': o['client_op_id'], 'status': 'rejected',
++                                 'reason': 'storage_error'} for o in ops]}
++        result = client.push(board, SimpleNamespace(ops=refuse), 'default', 'macbook',
++                             primary=False, max_batches=1)
++        assert result.deferred == 1 and result.rejected == 0
++    else:
++        with kbc.write_txn(board):
++            strip_lifecycle(board, tid)
++    rows = _outbox(board)
++    assert len(rows) == 1 and rows[0]['op_id'] != 'old-operation'
++    assert tuple(rows[0][c] for c in COLUMNS) == (protocol, original, created, 'ambiguous', history)
++    if not transient:
++        assert json.loads(rows[0]['fields']) == {'title': 'keep'}
++    return [(OUTBOX, rows[0]['rowid'])]
++
++
++CASES = {
++    'queue_rows': _queue_rows,
++    'import_board': recovery.case_import_board,
++    'repair_missing_children': recovery.case_repair_missing_children,
++    'retire_lost_placeholder_links': recovery.case_retire_lost_placeholder_links,
++    'enqueue_retry': _compat,
++    'drop_virtual': _drop_virtual,
++    'repair_divergence_tasks': recovery.case_repair_divergence_task,
++    'repair_divergence_runs': recovery.case_repair_divergence_run,
++    'queue_restore': _restore,
++    **{name: None for name in synthetic.CASES},
++    'strip_lifecycle': None,
++    'legacy_transient': None,
++}
++
++
++@pytest.mark.parametrize('site', CASES)
++def test_uncertain_predecessor_never_becomes_a_new_capture(board, monkeypatch, site):
++    if site in synthetic.CASES:
++        rows = _synthetic_case(board, monkeypatch, site)
++    elif site in ('strip_lifecycle', 'legacy_transient'):
++        rows = _rotate(board, monkeypatch, transient=site == 'legacy_transient')
++    else:
++        rows = CASES[site](board, monkeypatch)
++    assert rows, site
++    if site not in ('strip_lifecycle', 'legacy_transient'):
++        for table, rowid in rows:
++            row = board.execute(f"SELECT {','.join(COLUMNS)} FROM {table} WHERE rowid=?", (rowid,)).fetchone()
++            assert row is not None and tuple(row) == (None,) * len(COLUMNS), (site, tuple(row))
++    # Genuine-new task INSERT remains the contrasting dormant candidate path.
++    tid = kb.create_task(board, title='genuinely new intent', assignee='worker')
++    row = board.execute('SELECT * FROM kanban_sync_outbox WHERE row_uid=? AND table_name=\'tasks\'', (tid,)).fetchone()
++    assert tuple(row[c] for c in COLUMNS[:4]) == ('capture_candidate1', row['op_id'], row['created_at'], None)
++    assert json.loads(row['exposure_history']) == {
++        'protocol': 'exposure1', 'coverage': 'candidate', 'certified': False, 'exposures': []}
++
++
++@pytest.mark.parametrize('transient', [False, True], ids=['strip_lifecycle', 'legacy_transient'])
++@pytest.mark.parametrize('prior', ['candidate', 'unknown'])
++def test_rotation_preserves_dormant_or_missing_history(board, monkeypatch, transient, prior):
++    _rotate(board, monkeypatch, transient=transient, prior=prior)
+-- 
+2.43.0
+

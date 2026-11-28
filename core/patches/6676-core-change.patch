@@ -1,0 +1,254 @@
+From c991f5b287a71ab426359ac697a30ff346d943be Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 04:09:56 +0000
+Subject: [PATCH 6676] Code-attestation inventory cost, diagnostics and quiet-start review records
+
+Public mirror of source commit c991f5b287a71ab426359ac697a30ff346d943be.
+
+---
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index b1685f68e8d06e652851ad103e4ca7998765d4ca..626febdf81838c6c7f5a6e6bef5fc7d2a4c391f4 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -624,7 +624,7 @@
+         self._generation = 0
+         self._units = []
+         self._known = {}  # identity-keyed strong references: no id recycling
+-        self._pending = deque()  # FIFO of [module code, producer code, settled]
++        self._pending = deque()  # FIFO of [kind, payload, settled, result, verdicts] (see _enqueue)
+         self._pending_index = {}  # id(nested code) -> its pending entry (entry holds the reference)
+         self._settler = None
+         self._stopping = self._exit_hooked = False
+@@ -954,21 +954,36 @@
+     def _deferred_origin(self, descriptor, codes):
+         """Queue a generator's origin, fixed to the modules executed so far.
+ 
+-        Each caller is marked now as executed-by-now or not, so a module that
+-        executes later can never vouch for this call. The marked callers are
+-        read after exactly their own comparison.
++        Each caller is bound now to the one execution that can vouch for it: the
++        component it already compared clean under, or the pending execution that
++        owns it, whose own outcome is read once it settles. A later execution of
++        the same code object can never vouch for this call.
+         """
+         index, known = self._pending_index, self._known
+-        marks = tuple((code, id(code) in index or id(code) in known) for code in codes)
+-        return self._enqueue(["origin", (descriptor, marks), False, None])
++        marks = []
++        for code in codes:
++            entry = index.get(id(code))
++            if entry is not None:
++                # The newest execution decides (as the inline ledger's last write does).
++                if entry[4] is None:
++                    entry[4] = {}
++                entry[4].setdefault(id(code), [code, None])
++                marks.append((code, entry))
++                continue
++            attested = known.get(id(code))
++            if attested is not None and attested[0] is code:
++                marks.append((code, attested[1]))
++                break  # decided at the call; nothing below it is consulted
++            marks.append((code, None))
++        return self._enqueue(["origin", (descriptor, tuple(marks)), False, None, None])
+ 
+     def _settled_origin(self, descriptor, marks):
+-        for code, executed in marks:
+-            if executed:
+-                self._settle_code(code)
+-                known = self._known.get(id(code))
+-                if known is not None and known[0] is code:
+-                    return known[1]
++        for code, mark in marks:
++            if isinstance(mark, list):
++                self._settle_entry(mark)
++                mark = mark[4][id(code)][1]  # that execution's verdict, not a later one's
++            if mark is not None:
++                return mark
+             if not self._interpreter_code(code):
+                 return self._generated_origin(descriptor, None, code.co_filename)
+         return self._generated_origin(descriptor, None, "<top>")
+@@ -1053,10 +1068,8 @@
+         code = args[0]
+         if isinstance(origin, list):
+             if isinstance(code, CodeType):
+-                entry = self._enqueue(
+-                    ["generated", (descriptor, site, code, source, filename, mode, origin), False, None])
+-                for nested in _codes(code):
+-                    self._pending_index.setdefault(id(nested), entry)
++                self._own(code, self._enqueue(
++                    ["generated", (descriptor, site, code, source, filename, mode, origin), False, None, None]))
+                 return True
+             self._settle_entry(origin)
+             origin = origin[3]
+@@ -1627,13 +1640,25 @@
+         if not isinstance(code, CodeType) or os.getpid() != self._pid:
+             self._observe(code, producer)
+             return
+-        entry = self._enqueue(["module", (code, getattr(producer, "f_code", None)), False, None])
++        self._own(code, self._enqueue(["module", (code, getattr(producer, "f_code", None)), False, None, None]))
++
++    def _own(self, code, entry):
++        """Index ``code`` under its newest pending execution.
++
++        An earlier pending execution of the same code object is settled first, so
++        executions of one code object are always compared in the order they ran.
++        """
+         index = self._pending_index
+         for nested in _codes(code):
+-            index.setdefault(id(nested), entry)
++            earlier = index.get(id(nested))
++            if earlier is not None and earlier is not entry:
++                self._settle_entry(earlier)
++            index[id(nested)] = entry
+ 
+     def _enqueue(self, entry):
+-        # [kind, payload, settled, result]; the payload holds every code reference.
++        # [kind, payload, settled, result, verdicts]; the payload holds every code
++        # reference. ``verdicts`` is {id(code): [code, component or None]} for the
++        # callers a pending origin bound to this execution, filled when it settles.
+         if len(self._pending) >= MAX_PENDING:
+             self._settle()
+         self._pending.append(entry)
+@@ -1707,6 +1732,14 @@
+             raise
+         finally:
+             self._tls.busy = busy
++            if entry[4]:
++                # What this execution established, read before any later execution
++                # of the same code object can be compared.
++                known = self._known
++                for verdict in entry[4].values():
++                    attested = known.get(id(verdict[0]))
++                    if attested is not None and attested[0] is verdict[0]:
++                        verdict[1] = attested[1]
+ 
+     def _settle_code(self, code):
+         """Settle the pending module that owns ``code`` before its identity is read."""
+diff --git a/tests/hermes_cli/test_code_attestation_deferral.py b/tests/hermes_cli/test_code_attestation_deferral.py
+index 45543fe1234ad4c6830308db92432d08a129a514..2ffa63393d0d8f91f4aebdd3cb71e5b38532b3b2 100644
+--- a/tests/hermes_cli/test_code_attestation_deferral.py
++++ b/tests/hermes_cli/test_code_attestation_deferral.py
+@@ -205,6 +205,120 @@
+     assert deferred == inline
+ 
+ 
++LATE_BUILDER = r'''
++        builder = (b'from dataclasses import dataclass\n'
++                   b'def build():\n    @dataclass\n    class Late:\n        number: int = 3\n    return Late\n')
++'''
++
++
++def _both(tmp_path, body):
++    inline = _run(tmp_path, 'inline', LATE_BUILDER + body, defer=False)
++    deferred = _run(tmp_path, 'deferred', LATE_BUILDER + body, defer=True)
++    return inline, deferred
++
++
++def test_reexecution_after_registration_cannot_vouch_for_an_earlier_generation(tmp_path):
++    # The first execution is settled alone (unrooted) at registration; the same code
++    # object then runs again under the root. The generation belongs to the first.
++    inline, deferred = _both(tmp_path, r'''
++        late = pathlib.Path('late').resolve(); late.mkdir()
++        (late / 'm.py').write_bytes(builder)
++        code = compile(builder, str(late / 'm.py'), 'exec')
++        ns = {'__name__': 'fixture_m'}
++        exec(code, ns)
++        ns['build']()
++        a.register_component_root('late', late, 'plugin', digests={'m.py': hashlib.sha256(builder).hexdigest()})
++        exec(code, ns)
++        print(json.dumps(ledger()))
++    ''')
++    assert any(x.startswith('generated-origin-unknown:') for x in inline['unknowns'])
++    assert not [u for u in inline['units'] if u[3]]
++    assert deferred == inline
++
++
++def test_reexecution_after_an_identity_read_cannot_vouch_for_an_earlier_generation(tmp_path):
++    # The first execution fails its comparison when an identity read settles it alone.
++    inline, deferred = _both(tmp_path, r'''
++        a._components['reviewed'][2]['m.py'] = hashlib.sha256(builder).hexdigest()
++        (p / 'm.py').write_bytes(builder + b'# drift\n')
++        code = compile(builder, str(p / 'm.py'), 'exec')
++        ns = {'__name__': 'fixture_m'}
++        exec(code, ns)
++        ns['build']()
++        a.attest_code(ns['build'].__code__)
++        (p / 'm.py').write_bytes(builder)
++        exec(code, ns)
++        print(json.dumps(ledger()))
++    ''')
++    assert any(x.startswith('generated-origin-unknown:') for x in inline['unknowns'])
++    assert not [u for u in inline['units'] if u[3]]
++    assert deferred == inline
++
++
++def test_generation_is_judged_by_the_execution_present_at_the_call(tmp_path):
++    # Repeated executions of one code object with generations between them and no
++    # read until the end: each generation keeps the verdict it had at its call.
++    inline, deferred = _both(tmp_path, r'''
++        late = pathlib.Path('late').resolve(); late.mkdir()
++        path = late / 'm.py'
++        path.write_bytes(builder)
++        code = compile(builder, str(path), 'exec')
++        ns = {'__name__': 'fixture_m'}
++        exec(code, ns)          # first execution: unrooted
++        ns['build']()           # unknown origin
++        exec(code, ns)          # second execution, still unrooted; the first is compared first
++        ns['build']()           # unknown origin
++        owed = len(a._pending)
++        a.register_component_root('late', late, 'plugin', digests={'m.py': hashlib.sha256(builder).hexdigest()})
++        exec(code, ns)          # third execution: clean
++        ns['build']()           # attested origin
++        exec(code, ns)
++        ns['build']()
++        print(json.dumps(dict(ledger(), owed=owed)))
++    ''')
++    assert inline.pop('owed') == 0 and deferred.pop('owed') >= 2
++    assert len([x for x in inline['unknowns'] if x.startswith('generated-origin-unknown:')]) == 1
++    assert len([u for u in inline['units'] if 'dataclass' in u[3]]) == 2
++    assert deferred == inline
++
++
++def test_later_clean_execution_cannot_vouch_while_everything_is_still_pending(tmp_path):
++    # Nothing is settled between the two executions: the skewed first execution is
++    # compared against the repaired file, as inline would have seen it skewed.
++    inline, deferred = _both(tmp_path, r'''
++        a._components['reviewed'][2]['m.py'] = hashlib.sha256(builder).hexdigest()
++        path = p / 'm.py'
++        code = compile(builder + b'X = 1\n', str(path), 'exec')
++        path.write_bytes(builder)
++        ns = {'__name__': 'fixture_m'}
++        exec(code, ns)          # executed code differs from the reviewed source
++        ns['build']()
++        clean = compile(builder, str(path), 'exec')
++        exec(clean, ns)
++        ns['build']()
++        print(json.dumps(ledger()))
++    ''')
++    assert len([x for x in inline['unknowns'] if x.startswith('generated-origin-unknown:')]) == 1
++    assert len([u for u in inline['units'] if 'dataclass' in u[3]]) >= 1
++    assert deferred == inline
++
++
++def test_caller_attested_at_the_call_keeps_that_verdict(tmp_path):
++    inline, deferred = _both(tmp_path, r'''
++        a._components['reviewed'][2]['m.py'] = hashlib.sha256(builder).hexdigest()
++        (p / 'm.py').write_bytes(builder)
++        code = compile(builder, str(p / 'm.py'), 'exec')
++        ns = {'__name__': 'fixture_m'}
++        exec(code, ns)
++        assert a.attest_code(ns['build'].__code__)
++        ns['build']()
++        print(json.dumps(ledger()))
++    ''')
++    assert len([u for u in inline['units'] if 'dataclass' in u[3]]) >= 1
++    assert not inline['unknowns']
++    assert deferred == inline
++
++
+ def test_exit_with_a_backlog_does_not_hang_on_the_settler(tmp_path):
+     result = _run(tmp_path, 'exit', r'''
+         ca.SETTLE_DELAY = 0.0
+-- 
+2.43.0
+

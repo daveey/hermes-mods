@@ -1,0 +1,360 @@
+From 22c066e675aa881641fee8c98c090936b9c6ad91 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:14:01 +0000
+Subject: [PATCH 6991] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 22c066e675aa881641fee8c98c090936b9c6ad91.
+
+---
+diff --git a/hermes_cli/kanban_home_feed.py b/hermes_cli/kanban_home_feed.py
+index 9c54017bd6d8ecef7afc4053f47a04ede470478e..41f0dbb0e36975cfa64444f555b3727cdf73c720 100644
+--- a/hermes_cli/kanban_home_feed.py
++++ b/hermes_cli/kanban_home_feed.py
+@@ -30,8 +30,9 @@
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_prepared1'").fetchone():
+         return False
+     from hermes_cli.kanban_home_abort import predicate
++    from hermes_cli.kanban_home_finalized import predicate as finalized
+     return bool(conn.execute('SELECT 1 FROM kanban_home_prepared1 p WHERE NOT EXISTS '
+-                             '(SELECT 1 FROM kanban_home_finalized1 f WHERE f.task_id=p.task_id AND f.nonce=p.nonce) '
++                             f'(SELECT 1 FROM kanban_home_finalized1 f WHERE {finalized()}) '
+                              f'AND NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {predicate("p")}) LIMIT 1').fetchone())
+ 
+ 
+@@ -54,8 +55,9 @@
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_prepared1'").fetchone():
+         return False
+     from hermes_cli.kanban_home_abort import aborted
++    from hermes_cli.kanban_home_finalized import predicate as finalized
+     return any(conn.execute('SELECT 1 FROM kanban_home_prepared1 p WHERE task_id=? AND NOT EXISTS '
+-                            '(SELECT 1 FROM kanban_home_finalized1 f WHERE f.task_id=p.task_id AND f.nonce=p.nonce)',
++                            f'(SELECT 1 FROM kanban_home_finalized1 f WHERE {finalized()})',
+                             (tid,)).fetchone() and not aborted(conn, tid) and frozen(conn, tid)
+                for tid in ids if isinstance(tid, str))
+ 
+diff --git a/hermes_cli/kanban_home_finalized.py b/hermes_cli/kanban_home_finalized.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b383d5ca44401dba4720f0a902b943d9fba34146
+--- /dev/null
++++ b/hermes_cli/kanban_home_finalized.py
+@@ -0,0 +1,54 @@
++"""Structural SQL release authority shared by dormant home-custody consumers.
++
++A scoped receipt is not enough: the unique related manifest must include the
++single canonical task/home/version row. This predicate also protects stores
++containing malformed receipts written by earlier dormant code. [daveey]
++"""
++from __future__ import annotations
++
++
++def predicate(prepared: str = "p", receipt: str = "f") -> str:
++    """Trusted internal SQL aliases only; no connection-local UDF is required."""
++    from hermes_cli.kanban_db_sync import SYNCED_TABLES
++
++    p, f = prepared, receipt
++    raw = f"{f}.receipt"
++    tables = ",".join("'" + t.replace("'", "''") + "'" for t in SYNCED_TABLES)
++    # CASE protects json_each/extract from malformed persisted JSON and from
++    # array scalars (json_each.value for a string is not itself JSON text).
++    manifest = f"""CASE WHEN json_valid({raw}) THEN
++        json_type({raw}) IS 'object'
++        AND json_extract({raw},'$.task') IS {p}.task_id
++        AND json_extract({raw},'$.source') IS {p}.source
++        AND json_extract({raw},'$.destination') IS {p}.destination
++        AND json_extract({raw},'$.nonce') IS {p}.nonce
++        AND {f}.nonce IS {p}.nonce
++        AND json_type({raw},'$.expected_version') IS 'integer'
++        AND json_extract({raw},'$.expected_version') IS {p}.expected_version
++        AND json_extract({raw},'$.phase') IS 'materialized'
++        AND json_type({raw},'$.rows') IS 'array'
++        AND json_array_length({raw},'$.rows') > 0
++        AND json_extract({raw},'$.rows[0].table') IS 'tasks'
++        AND json_extract({raw},'$.rows[0].uid') IS {p}.task_id
++        AND json_extract({raw},'$.rows[0].fields.id') IS {p}.task_id
++        AND json_extract({raw},'$.rows[0].fields.created_on') IS {p}.destination
++        AND json_type({raw},'$.rows[0].fields.version') IS 'integer'
++        AND json_extract({raw},'$.rows[0].fields.version') IS {p}.expected_version + 1
++        AND json_extract({raw},'$.rows[0].fields.deleted_at') IS NULL
++        AND NOT EXISTS(SELECT 1 FROM json_each({raw},'$.rows') r WHERE NOT
++            CASE WHEN r.type IS 'object' THEN
++                json_extract(r.value,'$.table') IN ({tables})
++                AND json_type(r.value,'$.uid') IS 'text'
++                AND json_type(r.value,'$.fields') IS 'object'
++                AND CASE json_extract(r.value,'$.table')
++                    WHEN 'tasks' THEN r.key=0 AND json_extract(r.value,'$.uid') IS {p}.task_id
++                        AND json_extract(r.value,'$.fields.id') IS {p}.task_id
++                    WHEN 'task_links' THEN {p}.task_id IN
++                        (json_extract(r.value,'$.fields.parent_id'),json_extract(r.value,'$.fields.child_id'))
++                    ELSE json_extract(r.value,'$.fields.task_id') IS {p}.task_id END
++            ELSE 0 END IS 1)
++        AND (SELECT count(*) FROM json_each({raw},'$.rows')) =
++            (SELECT count(*) FROM (SELECT json_extract(r.value,'$.table'),json_extract(r.value,'$.uid')
++                FROM json_each({raw},'$.rows') r WHERE r.type IS 'object' GROUP BY 1,2))
++        ELSE 0 END"""
++    return f"({f}.task_id={p}.task_id AND ({manifest}) IS 1)"
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index d9a89f7a1a38a572c896ca96c172159b174fe32d..f365c90f1da53b89ab15b42d9a3adbec5026b2ad 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -12,6 +12,7 @@
+ import sqlite3
+ 
+ from hermes_cli import kanban_home_abort as abort
++from hermes_cli import kanban_home_finalized as finalized
+ 
+ _SOURCE = re.compile(r"worker-[a-z0-9-]{1,24}\Z")
+ _NONCE = re.compile(r"[A-Za-z0-9._:-]{16,128}\Z")
+@@ -45,6 +46,16 @@
+             AND json_type(NEW.receipt,'$.expected_version') IS 'integer')
+         BEGIN SELECT RAISE(ABORT, 'home finalization scope mismatch'); END""")
+     abort.install(conn)
++    valid = finalized.predicate('p', 'NEW')
++    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_finalized1_manifest
++        BEFORE INSERT ON kanban_home_finalized1
++        WHEN NOT EXISTS(SELECT 1 FROM {_TABLE} p WHERE {valid})
++        BEGIN SELECT RAISE(ABORT, 'home finalization manifest invalid'); END""")
++    # This append-only cache contains authenticated transport proof, not task
++    # effects. Its own cache-write/immutability guards remain installed. Native
++    # apply still defers the protected event without touching prepared custody.
++    for action in ('insert', 'update', 'delete'):
++        conn.execute(f'DROP TRIGGER IF EXISTS home_prepared1_containment_canonical_receipts_{action}')
+     # Include local-only task custody (wake/ask probes, subscriptions, private
+     # restriction records), not just the rows sent by sync. Discover task_id
+     # tables from this board's real schema, retaining guards across sync detach.
+@@ -52,7 +63,7 @@
+     for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+         quoted = '"' + table.replace('"', '""') + '"'
+         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({quoted})")}
+-        if "task_id" in columns and table not in (_TABLE, "kanban_home_finalized1", "kanban_home_aborted1"):
++        if "task_id" in columns and table not in (_TABLE, "kanban_home_finalized1", "kanban_home_aborted1", "containment_canonical_receipts"):
+             related[table] = columns
+     for table in ("tasks", "task_links", *sorted(related)):
+         quoted = '"' + table.replace('"', '""') + '"'
+@@ -96,10 +107,12 @@
+                         tests.append(f"task_id IN (SELECT {old_id} FROM {quoted} WHERE {' OR '.join(conflicts)})")
+             cond = " OR ".join(tests)
+             trigger = '"home_prepared1_' + table.replace('"', '""') + '_' + action.lower() + '"'
++            # Replace old presence-only release checks on dormant stores.
++            conn.execute(f'DROP TRIGGER IF EXISTS {trigger}')
++            valid = finalized.predicate(_TABLE)
+             conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {trigger}
+                 BEFORE {action} ON {quoted} WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE ({cond})
+-                    AND NOT EXISTS(SELECT 1 FROM kanban_home_finalized1 f
+-                                   WHERE f.task_id={_TABLE}.task_id AND f.nonce={_TABLE}.nonce)
++                    AND NOT EXISTS(SELECT 1 FROM kanban_home_finalized1 f WHERE {valid})
+                     AND NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {abort.predicate()}))
+                 BEGIN SELECT RAISE(ABORT, 'home transfer prepared'); END""")
+     # Upgrade the earlier task+nonce-only guard on existing dormant stores.
+@@ -203,7 +216,9 @@
+         return False
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_home_finalized1'").fetchone():
+         return True
+-    final = conn.execute("SELECT nonce,receipt FROM kanban_home_finalized1 WHERE task_id=?", (task_id,)).fetchone()
++    valid = finalized.predicate()
++    final = conn.execute(f"SELECT f.nonce,f.receipt FROM kanban_home_finalized1 f JOIN {_TABLE} p "
++                         f"ON p.task_id=f.task_id WHERE p.task_id=? AND {valid}", (task_id,)).fetchone()
+     if not final:
+         return True
+     try:
+diff --git a/tests/hermes_cli/test_home_certification_finalization.py b/tests/hermes_cli/test_home_certification_finalization.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7e63fc37cb8b2254650ee0499d620b4a156a70f
+--- /dev/null
++++ b/tests/hermes_cli/test_home_certification_finalization.py
+@@ -0,0 +1,173 @@
++"""Authenticated evidence transport and fully scoped finalization custody."""
++import copy
++import sqlite3
++import json
++from dataclasses import asdict
++import pytest
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc, kanban_db_sync as sync
++from hermes_cli import kanban_home_transfer as transfer, kanban_containment_replica as replica
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli import test_kanban_containment_replica as custody
++from tests.hermes_cli.test_review_home_feed_isolation import change
++board = support.board
++
++@pytest.mark.parametrize('prepared', [False, True])
++def test_uncached_containment_native_pull_keeps_neighbor_progress(board, monkeypatch, prepared):
++    target, _, stop, _, hub = custody.scenario(board)
++    sync.set_identity(board, 'fixture', 'worker-a3')
++    replica.install(board)
++    peer = kb.create_task(board, title='healthy')
++    with dbc.write_txn(board):
++        board.execute("UPDATE tasks SET created_on='worker-a3',sync_version=7 WHERE id=?", (target,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        if prepared:
++            record = support.record(board, target)
++            transfer.prepare(board, target, source='worker-a3', destination='hub', nonce=record['nonce'], expected_version=7)
++    assert not board.execute('SELECT 1 FROM containment_canonical_receipts WHERE task_id=?',(target,)).fetchone()
++    rows = [custody.event(stop, hub, 1), change(board, peer, 4, 2, title='progress')]
++    monkeypatch.setattr(client.acw, 'changes_page', lambda *a: dict(changes=[asdict(ch) for ch in rows], next=2, more=False))
++    monkeypatch.setattr(client, 'discard_replica_writes', lambda *a: None)
++    client.pull(board, hub, 'fixture', observers=False)
++    assert kb.get_task(board, peer).title == 'progress'
++
++@pytest.mark.parametrize('rows', [[], [{}]])
++def test_scoped_malformed_finalization_preserves_sql_fence(board, rows):
++    target, record = support.prepared(board)
++    malformed = {**record, 'rows': rows}
++    import sqlite3
++    try:
++        with dbc.write_txn(board):
++            board.execute('INSERT INTO kanban_home_finalized1(task_id,nonce,receipt) VALUES (?,?,?)',
++                          (target, record['nonce'], json.dumps(malformed)))
++    except sqlite3.Error:
++        pass
++    assert transfer.frozen(board, target)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='invalid custody release' WHERE id=?",(target,))
++
++
++@pytest.mark.parametrize('late', [False, True])
++@pytest.mark.parametrize('upgrade', [False, True])
++def test_certification_caches_only_proof_then_replays_after_exact_abort(board, monkeypatch, late, upgrade):
++    from hermes_cli import kanban_home_feed as feed
++    target, _, stop, _, hub = custody.scenario(board)
++    sync.set_identity(board, 'fixture', 'worker-a3')
++    replica.install(board)
++    peer = kb.create_task(board, title='healthy')
++    with dbc.write_txn(board):
++        board.execute("UPDATE tasks SET created_on='worker-a3',sync_version=7 WHERE id=?", (target,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++    record = support.record(board, target)
++    before = tuple(board.execute('SELECT * FROM tasks WHERE id=?', (target,)).fetchone())
++    events = [tuple(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?', (target,))]
++
++    def prepare():
++        with dbc.write_txn(board):
++            transfer.prepare(board, target, source='worker-a3', destination='hub', nonce=record['nonce'], expected_version=7)
++            if upgrade:
++                # Reconstruct the previous installed cache-table trigger, then
++                # exercise the real dormant installer upgrade in this transaction.
++                board.execute("CREATE TRIGGER home_prepared1_containment_canonical_receipts_insert "
++                              "BEFORE INSERT ON containment_canonical_receipts "
++                              "BEGIN SELECT RAISE(ABORT,'home transfer prepared'); END")
++                transfer._install(board)
++
++    original = hub.row_evidence
++    def fetch(*args):
++        proof = original(*args)
++        if late and not transfer.frozen(board, target):
++            prepare()
++        return proof
++    monkeypatch.setattr(hub, 'row_evidence', fetch)
++    if not late:
++        prepare()
++    rows = [custody.event(stop, hub, 1), change(board, peer, 4, 2, title='progress')]
++    page = dict(changes=[asdict(ch) for ch in rows], next=2, more=False)
++    monkeypatch.setattr(client.acw, 'changes_page', lambda *a: page)
++    monkeypatch.setattr(client, 'discard_replica_writes', lambda *a: None)
++    client.pull(board, hub, 'fixture', observers=False)
++    assert kb.get_task(board, peer).title == 'progress'
++    assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (target,)).fetchone()) == before
++    assert [tuple(r) for r in board.execute('SELECT * FROM task_events WHERE task_id=?', (target,))] == events
++    assert sync.sync_state(board)['cursor'] == 2 and feed.pending(board)
++    cached = tuple(board.execute('SELECT * FROM containment_canonical_receipts WHERE task_id=?', (target,)).fetchone())
++    assert cached[-1] == json.dumps(hub.events[stop['event_uid']], sort_keys=True, separators=(',', ':'))
++    # Transport proof may be appended only by the authenticated cache seam.
++    with pytest.raises(sqlite3.IntegrityError, match='containment_pending'):
++        with dbc.write_txn(board):
++            board.execute('INSERT INTO containment_canonical_receipts VALUES (?,?,?,?,?,?,?)', ('uncertified', *cached[1:]))
++    for query in ('DELETE FROM containment_canonical_receipts WHERE uid=?',
++                  "UPDATE containment_canonical_receipts SET payload='{}' WHERE uid=?"):
++        with pytest.raises(sqlite3.IntegrityError, match='containment_pending'):
++            with dbc.write_txn(board):
++                board.execute(query, (cached[0],))
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='no task authority' WHERE id=?", (target,))
++    # Exact authoritative noncommit releases only the home preparation. The
++    # retained protected event still enters ordinary containment verification.
++    with dbc.write_txn(board):
++        transfer.abort_source(board, {**record, 'phase': 'aborted', 'rows': []})
++    page.update(changes=[])
++    client.pull(board, hub, 'fixture', observers=False)
++    assert not feed.pending(board)
++    assert board.execute('SELECT kind FROM task_events WHERE uid=?', (stop['event_uid'],)).fetchone()[0] == 'contained'
++    from hermes_cli.kanban_containment_connections import held
++    assert held(board, target)
++
++
++def malformed_manifest(record, fault):
++    value = copy.deepcopy(record)
++    row = value['rows'][0]
++    rows = {
++        'empty': [], 'empty-object': [{}], 'scalar': ['not-json'],
++        'duplicate': [row, copy.deepcopy(row)],
++        'unknown-table': [row, dict(table='unknown', uid='other', fields=dict(task_id=record['task']))],
++        'unrelated': [row, dict(table='task_comments', uid='other', fields=dict(task_id='other'))],
++        'missing-fields': [dict(table=row['table'], uid=row['uid'])],
++    }
++    if fault in rows:
++        value['rows'] = rows[fault]
++    else:
++        row['fields'][fault] = {'version': True, 'created_on': 'worker-a2', 'deleted_at': 1}[fault]
++    return value
++
++
++@pytest.mark.parametrize('fault', ['empty', 'empty-object', 'scalar', 'duplicate', 'unknown-table',
++                                   'unrelated', 'missing-fields', 'version', 'created_on', 'deleted_at'])
++@pytest.mark.parametrize('historical', [False, True])
++def test_manifest_guard_and_persisted_malformed_upgrade_stay_closed(board, fault, historical):
++    from hermes_cli import kanban_home_feed as feed
++    target, record = support.prepared(board)
++    raw = json.dumps(malformed_manifest(record, fault))
++    with dbc.write_txn(board):
++        if historical:
++            # Simulate the old install accepting a fully scoped malformed row;
++            # leave it intact across upgrade: invalid history is not authority.
++            board.execute('DROP TRIGGER home_finalized1_manifest')
++            board.execute('INSERT INTO kanban_home_finalized1 VALUES (?,?,?)', (target, record['nonce'], raw))
++            transfer._install(board)
++        else:
++            with pytest.raises(sqlite3.IntegrityError, match='home finalization manifest invalid'):
++                board.execute('INSERT INTO kanban_home_finalized1 VALUES (?,?,?)', (target, record['nonce'], raw))
++    assert transfer.frozen(board, target) and feed.active(board)
++    ch = change(board, target, 8, 1, title='no authority')
++    assert feed.blocked(board, ch)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='invalid release' WHERE id=?", (target,))
++    assert board.execute('SELECT created_on,sync_version FROM tasks WHERE id=?', (target,)).fetchone()[:] == ('worker-a3', 7)
++
++
++def test_legitimate_atomic_stop_and_ordinary_peer_still_work(board):
++    target, record = support.prepared(board)
++    peer = kb.create_task(board, title='ordinary')
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++        transfer.finalize_source(board, record)
++        board.execute("UPDATE tasks SET title='peer progress' WHERE id=?", (peer,))
++    assert kb.get_task(board, peer).title == 'peer progress'
++    assert board.execute('SELECT created_on,sync_version FROM tasks WHERE id=?', (target,)).fetchone()[:] == ('hub', 8)
++
+diff --git a/tests/hermes_cli/test_home_shared_path_invariant.py b/tests/hermes_cli/test_home_shared_path_invariant.py
+index f809e54438caa7f85cb816c3abcc55e307bac39d..383198757108c75bf82703eece6d49886aff70d5 100644
+--- a/tests/hermes_cli/test_home_shared_path_invariant.py
++++ b/tests/hermes_cli/test_home_shared_path_invariant.py
+@@ -25,6 +25,15 @@
+ from tests.hermes_cli import test_home_probe_writer_custody as writer_cases
+ from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
+ from tests.hermes_cli import test_home_shared_consumer_io as consumer_io
++from tests.hermes_cli import test_home_certification_finalization as certification
++
++# Existing cache tables and exact-scope persisted malformed receipts must be in
++# the first gate, not masked by post-prepare DDL or an earlier scope refusal.
++test_uncached_containment_native_pull_keeps_neighbor_progress = certification.test_uncached_containment_native_pull_keeps_neighbor_progress
++test_scoped_malformed_finalization_preserves_sql_fence = certification.test_scoped_malformed_finalization_preserves_sql_fence
++test_certification_caches_only_proof_then_replays_after_exact_abort = certification.test_certification_caches_only_proof_then_replays_after_exact_abort
++test_manifest_guard_and_persisted_malformed_upgrade_stay_closed = certification.test_manifest_guard_and_persisted_malformed_upgrade_stay_closed
++test_legitimate_atomic_stop_and_ordinary_peer_still_work = certification.test_legitimate_atomic_stop_and_ordinary_peer_still_work
+ 
+ consumer_board = consumer_cases.consumer_board
+ test_frozen_ready_does_not_suppress_shared_probe = consumer_cases.test_frozen_ready_does_not_suppress_shared_probe
+-- 
+2.43.0
+

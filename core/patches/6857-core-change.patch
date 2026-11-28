@@ -1,0 +1,639 @@
+From 23447d561a60e7e737a7506d2ff97864a1fb5d15 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:31:16 +0000
+Subject: [PATCH 6857] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 23447d561a60e7e737a7506d2ff97864a1fb5d15.
+
+---
+diff --git a/docs/kanban-replay-deferred-observation.md b/docs/kanban-replay-deferred-observation.md
+index 01d622efe0df1e3cb0f8a801fa1a1c2127de59b3..74c9ba3f38bacc139245f54f1d1d786445a37747 100644
+--- a/docs/kanban-replay-deferred-observation.md
++++ b/docs/kanban-replay-deferred-observation.md
+@@ -2,20 +2,33 @@
+ 
+ Status: proposed sender/receiver read contract extending section 7 for draft PR4077,
+ **pending independent review, not implemented or advertised by the serving Board.**
+-A bounded sender tracer now records ordinary already-known task handoffs atomically
++A bounded sender tracer records ordinary already-known task handoffs atomically
+ with transport settlement, exposing task/origin references through
+-`kanban_replay_deferred.pending`. At a full local 16-record handoff set, the sender
+-now obtains a complete capability-gated task membership read outside the writer
+-transaction, validates Board/caller/task identity and every entry, and retires only
+-absent unchanged pre-read captures atomically with exact handoff/prune/settlement.
+-Unavailable or invalid reads preserve custody; newer captures during the read survive.
+-This is a capacity-recovery tracer, not the general observation poller. Fair rotation,
+-fingerprint episode tracking, diagnostic delivery and synthetic-parent reconciliation
+-remain open; this is not complete deferred support. An observed absence never marks
+-status applied; the newly settled historical handoff stays visible until ordinary
+-observation retirement is integrated.
+-Captured status/HLC in that local record describe the requested handoff, not current
+-server queue evidence or proof that status applied.
++`kanban_replay_deferred.pending`. A full local 16-record handoff set first obtains
++a capability-gated complete membership read so exact settlement can recover capacity.
++
++After successful transport/ack, the bound-journal push now polls at most one tracked
++task using the same proposed read contract, outside writer transactions. Indexed
++per-table successor lookups and a durable cursor rotate across tracked tasks even
++when a read is unavailable. A per-task read token rejects older concurrent replies
++without discarding unrelated task reads. The observer atomically stores all validated
++entries (including other gateways) and retires only absent unchanged pre-read handoff
++instances. A bounded random capture token also protects an identical status/HLC
++recapture, including migration from the earlier nullable-token schema. No token is
++an operation ID or result ledger.
++
++`kanban_replay_observation.observed` exposes the **last successful complete** reads;
++these records can be stale and carry no freshness or reachable-time guarantee yet.
++Unavailable/invalid reads preserve them and handoff custody. Read/storage failures
++are diagnostic warnings and do not fail already-acknowledged transport. The capacity
++read can occur in addition to the ordinary one-task poll. A separately obtained
++complete empty poll may retire the historical handoff without claiming application.
++
++Fingerprint episode timing, five-minute owner diagnostic delivery and synthetic-parent
++reconciliation remain open; this is not complete deferred support. Observed absence
++never marks status applied or updates sync_version. Captured status/HLC in a handoff
++record describe the requested handoff, not current server queue evidence or proof
++that status applied.
+ The approved spec requires observation but does not specify this new read surface.
+ This document does not enable replay, migrate
+ slots, add a writer, or authorize cancellation. The approved post-collection design
+diff --git a/hermes_cli/kanban_replay_deferred.py b/hermes_cli/kanban_replay_deferred.py
+index 153450278fa4c5508e6137f1e04ac7947b5f4b5e..3b50f55cf7020679dc1680674ec914bb0f4df8f9 100644
+--- a/hermes_cli/kanban_replay_deferred.py
++++ b/hermes_cli/kanban_replay_deferred.py
+@@ -23,27 +23,47 @@
+             not isinstance(wire.get('fields', {}).get('status'), str) or
+             reference != dict(task=wire['uid'], origin=wire['status_origin'])):
+         raise ValueError('deferred reference does not match issued status')
+-    conn.execute(_SCHEMA)
++    install(conn)
+     key = (board_incarnation, wire['uid'], wire['status_origin'])
+     if membership is not None:
+         origins, observed = membership
+-        # Retire only the pre-read capture: a newer handoff during I/O is not
+-        # evidence covered by that observation, even when it reuses an origin.
+-        for row in observed:
+-            if row['origin'] not in origins:
+-                conn.execute('DELETE FROM kanban_replay_deferred1 '
+-                             'WHERE board_incarnation=? AND task=? AND origin=? AND status=? AND hlc=?',
+-                             (*key[:2], row['origin'], row['status'], row['hlc']))
++        retire_absent(conn, board_incarnation, wire['uid'], origins, observed)
+     exists = conn.execute('SELECT 1 FROM kanban_replay_deferred1 '
+                           'WHERE board_incarnation=? AND task=? AND origin=?', key).fetchone()
+     count = conn.execute('SELECT COUNT(*) FROM kanban_replay_deferred1 '
+                          'WHERE board_incarnation=? AND task=?', key[:2]).fetchone()[0]
+     if not exists and count >= 16:
+         raise ValueError('deferred custody requires fresh membership reconciliation')
+-    conn.execute('INSERT INTO kanban_replay_deferred1 VALUES (?,?,?,?,?) '
++    from uuid import uuid4
++    conn.execute('INSERT INTO kanban_replay_deferred1 '
++                 '(board_incarnation,task,origin,status,hlc,capture_token) VALUES (?,?,?,?,?,?) '
+                  'ON CONFLICT(board_incarnation,task,origin) DO UPDATE SET '
+-                 'status=excluded.status,hlc=excluded.hlc',
+-                 (*key, wire['fields']['status'], wire['hlc']))
++                 'status=excluded.status,hlc=excluded.hlc,capture_token=excluded.capture_token',
++                 (*key, wire['fields']['status'], wire['hlc'], uuid4().hex))
++
++
++def install(conn):
++    """Add a bounded recapture token without changing visible handoff fields."""
++    conn.execute(_SCHEMA)
++    if 'capture_token' not in {row[1] for row in conn.execute('PRAGMA table_info(kanban_replay_deferred1)')}:
++        conn.execute('ALTER TABLE kanban_replay_deferred1 ADD COLUMN capture_token TEXT')
++
++
++def captures(conn, board, task):
++    """Snapshot exact handoff instances before I/O, including identical recaptures."""
++    install(conn)
++    return [dict(row) for row in conn.execute('SELECT * FROM kanban_replay_deferred1 '
++                                              'WHERE board_incarnation=? AND task=?', (board, task))]
++
++
++def retire_absent(conn, board, task, origins, observed):
++    """A complete read may retire only unchanged pre-read capture instances."""
++    for row in observed:
++        if row['origin'] not in origins:
++            conn.execute('DELETE FROM kanban_replay_deferred1 '
++                         'WHERE board_incarnation=? AND task=? AND origin=? AND status=? AND hlc=? '
++                         'AND capture_token IS ?',
++                         (board, task, row['origin'], row['status'], row['hlc'], row['capture_token']))
+ 
+ 
+ def validate_membership(reply, local, task):
+diff --git a/hermes_cli/kanban_replay_observation.py b/hermes_cli/kanban_replay_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..641a0ac456cf7424da3f9e24fcc15b794aa0888d
+--- /dev/null
++++ b/hermes_cli/kanban_replay_observation.py
+@@ -0,0 +1,127 @@
++"""Bounded current deferred membership reads; no row-success inference. [daveey]
++
++The future origin_pending1 read is capability gated. One task is visited per push,
++with durable rotation even on failure. Five-minute episode diagnostics remain a
++separate consumer; these observations never resolve business custody.
++"""
++from urllib.parse import quote
++from uuid import uuid4
++
++from hermes_cli import kanban_replay_deferred as deferred
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli.kanban_db_connect import write_txn
++
++
++_SCHEMA = '''CREATE TABLE IF NOT EXISTS kanban_replay_observation1 (
++    board_incarnation TEXT NOT NULL, task TEXT NOT NULL, origin TEXT NOT NULL,
++    hlc TEXT NOT NULL, gateway TEXT NOT NULL, run TEXT, status TEXT NOT NULL,
++    evidence_sha256 TEXT NOT NULL, PRIMARY KEY(board_incarnation,task,origin)
++)'''
++_CURSOR = '''CREATE TABLE IF NOT EXISTS kanban_replay_observation_cursor1 (
++    id INTEGER PRIMARY KEY CHECK(id=1), task TEXT NOT NULL, ticket INTEGER NOT NULL
++)'''
++_READS = '''CREATE TABLE IF NOT EXISTS kanban_replay_observation_reads1 (
++    board_incarnation TEXT NOT NULL, task TEXT NOT NULL, token TEXT NOT NULL,
++    PRIMARY KEY(board_incarnation,task)
++)'''
++
++
++def observed(conn):
++    """Last valid complete task reads; possibly stale, never freshness/timing proof."""
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
++                        "AND name='kanban_replay_observation1'").fetchone():
++        return []
++    return [dict(row) for row in conn.execute('SELECT * FROM kanban_replay_observation1 '
++                                              'ORDER BY board_incarnation,task,origin')]
++
++
++def _binding(local):
++    return tuple(local[key] for key in ('board_incarnation', 'gateway_principal', 'journal_id', 'generation'))
++
++
++def _candidate(conn, board, after):
++    candidates = []
++    for table in ('kanban_replay_deferred1', 'kanban_replay_observation1'):
++        row = conn.execute(f'SELECT task FROM {table} WHERE board_incarnation=? AND task>? '
++                            'ORDER BY task LIMIT 1', (board, after)).fetchone()
++        if row:
++            candidates.append(row[0])
++    return min(candidates) if candidates else None
++
++
++def _reserve(conn, local):
++    with write_txn(conn):
++        conn.execute(_SCHEMA)
++        conn.execute(_CURSOR)
++        conn.execute(_READS)
++        deferred.install(conn)
++        previous = conn.execute('SELECT task,ticket FROM kanban_replay_observation_cursor1 WHERE id=1').fetchone()
++        board = local['board_incarnation']
++        task = _candidate(conn, board, previous['task'] if previous else '') or _candidate(conn, board, '')
++        if task is None:
++            return None
++        ticket = previous['ticket'] + 1 if previous else 1
++        conn.execute('INSERT INTO kanban_replay_observation_cursor1 VALUES (1,?,?) '
++                     'ON CONFLICT(id) DO UPDATE SET task=excluded.task,ticket=excluded.ticket', (task, ticket))
++        token = uuid4().hex
++        conn.execute('INSERT INTO kanban_replay_observation_reads1 VALUES (?,?,?) '
++                     'ON CONFLICT(board_incarnation,task) DO UPDATE SET token=excluded.token', (board, task, token))
++        captures = deferred.captures(conn, board, task)
++        return task, token, captures
++
++
++def _store(conn, local, task, reply, captures):
++    conn.execute('DELETE FROM kanban_replay_observation1 WHERE board_incarnation=? AND task=?',
++                 (local['board_incarnation'], task))
++    for entry in reply['entries']:
++        conn.execute('INSERT INTO kanban_replay_observation1 VALUES (?,?,?,?,?,?,?,?)',
++                     (local['board_incarnation'], task, entry['origin'], entry['hlc'], entry['gateway'],
++                      entry['run'], entry['status'], entry['evidence_sha256']))
++    origins = {entry['origin'] for entry in reply['entries']}
++    deferred.retire_absent(conn, local['board_incarnation'], task, origins, captures)
++
++
++def after_push(conn, hub, root, local, cap):
++    """An optional read/storage failure must not fail already committed transport."""
++    import logging
++    import sqlite3
++    log = logging.getLogger(__name__)
++    try:
++        result = observe_one(conn, hub, root, local, cap)
++    except sqlite3.Error as exc:
++        log.warning('Deferred observation storage unavailable: %s', exc)
++        return
++    if result['status'] == 'unavailable' and result.get('task'):
++        log.warning('Deferred observation unavailable for %s: %s', result['task'], result.get('reason', 'unknown'))
++
++
++def _release(conn, board, task, token):
++    conn.execute('DELETE FROM kanban_replay_observation_reads1 '
++                 'WHERE board_incarnation=? AND task=? AND token=?', (board, task, token))
++
++
++def observe_one(conn, hub, root, local, cap):
++    """Observe at most one tracked task outside the writer; failure never means empty."""
++    from hermes_cli.kanban_sync_client import HubError
++    if cap.get('deferred_observation') != 'origin_pending1':
++        return dict(status='unavailable')
++    reserved = _reserve(conn, local)
++    if reserved is None:
++        return dict(status='idle')
++    task, token, captures = reserved
++    try:
++        reply = hub._call('GET', root + 'deferred?task=' + quote(task, safe=''))
++        deferred.validate_membership(reply, local, task)
++    except (OSError, ValueError, HubError) as exc:
++        with write_txn(conn):
++            _release(conn, local['board_incarnation'], task, token)
++        return dict(status='unavailable', task=task, reason=str(exc)[:500])
++    with write_txn(conn):
++        current = conn.execute('SELECT token FROM kanban_replay_observation_reads1 '
++                               'WHERE board_incarnation=? AND task=?', (local['board_incarnation'], task)).fetchone()
++        if current is None or current['token'] != token or _binding(journal.snapshot(conn)) != _binding(local):
++            _release(conn, local['board_incarnation'], task, token)
++            return dict(status='superseded', task=task)
++        _store(conn, local, task, reply, captures)
++        _release(conn, local['board_incarnation'], task, token)
++    return dict(status='observed', task=task)
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 1ab9a71aadaa91f4eaef0d0952252bace8fa3d52..3e619a9ec926ed129b9bb4227769f7c1fe167f4f 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -85,6 +85,8 @@
+                   if item['board_incarnation'] == current['board_incarnation'] and item['task'] == wire['uid']]
+         if len(active) < 16 or cap.get('deferred_observation') != 'origin_pending1':
+             return None
++        with write_txn(conn):
++            active = deferred.captures(conn, current['board_incarnation'], wire['uid'])
+         source()  # Frozen source must still exist before any reconciliation read.
+         reply = hub._call('GET', root + 'deferred?task=' + quote(wire['uid'], safe=''))
+         return deferred.validate_membership(reply, current, wire['uid']), active
+@@ -200,4 +202,6 @@
+         if remote != expected:
+             raise ValueError('ack readback mismatch')
+         reconcile(settled, remote)
++    from hermes_cli.kanban_replay_observation import after_push
++    after_push(conn, hub, root, settled, cap)
+     return out
+diff --git a/tests/hermes_cli/test_kanban_replay_deferred_capacity.py b/tests/hermes_cli/test_kanban_replay_deferred_capacity.py
+index 780f7560442fb1993805b720c02319ddce4f275e..39da69f2245b41c2eeedb1dc73c75e19e1e10959 100644
+--- a/tests/hermes_cli/test_kanban_replay_deferred_capacity.py
++++ b/tests/hermes_cli/test_kanban_replay_deferred_capacity.py
+@@ -18,12 +18,13 @@
+         self.conn = conn
+         self.reads = 0
+         self.reply = {}
++        self.task = None
+ 
+     def _call(self, method, path, body=None):
+         if '/deferred?task=' in path:
+             assert method == 'GET' and not self.conn.in_transaction
+             self.reads += 1
+-            assert path.endswith(quote(json.loads(journal.pending_wire(self.conn))['uid'], safe=''))
++            assert path.endswith(quote(self.task, safe=''))
+             return self.reply
+         return super()._call(method, path, body)
+ 
+@@ -31,6 +32,7 @@
+ def full(conn):
+     tid = helpers.intent(conn)
+     receiver = Observation(conn)
++    receiver.task = tid
+     receiver.slot.update(h='1', a='1', last_op_id=journal.snapshot(conn)['last_op_id'],
+         last_payload_sha256=journal.snapshot(conn)['last_payload_sha256'],
+         last_verdict=journal.snapshot(conn)['last_verdict'])
+@@ -54,7 +56,7 @@
+ def test_full_stale_handoffs_refresh_before_exact_settlement_without_resend(live):
+     tid, receiver, wire = full(live)
+     result = helpers.push(live, receiver)
+-    assert receiver.reads == 1 and result.deferred == 1 and len(receiver.sent) == 1
++    assert receiver.reads == 2 and result.deferred == 1 and len(receiver.sent) == 1
+     assert deferred.pending(live) == [dict(board_incarnation=receiver.slot['board_incarnation'],
+         task=tid, origin=wire['status_origin'], status='done', hlc=wire['hlc'])]
+     assert journal.pending_wire(live) is None and receiver.slot['a'] == '2'
+@@ -110,11 +112,14 @@
+ 
+     def race(method, path, body=None):
+         reply = original(method, path, body)
+-        if '/deferred?task=' in path:
++        if '/deferred?task=' in path and receiver.reads == 1:
+             with kbc.write_txn(live):
+                 newer = dict(wire, status_origin='prior-origin-0', hlc='newer-captured-hlc')
+                 deferred.handoff(live, newer, dict(deferred=dict(task=wire['uid'], origin='prior-origin-0')),
+                                  receiver.slot['board_incarnation'])
++            # The later ordinary poll sees the newer remote obligation too.
++            receiver.reply = dict(reply, entries=reply['entries'] + [dict(reply['entries'][0],
++                                  origin='prior-origin-0', hlc='newer-captured-hlc')])
+         return reply
+ 
+     receiver._call = race
+@@ -153,10 +158,10 @@
+ 
+ 
+ def test_complete_empty_membership_never_marks_status_success(live):
+-    tid, receiver, wire = full(live)
++    tid, receiver, _ = full(live)
+     receiver.reply['entries'] = []
+     assert helpers.push(live, receiver).deferred == 1
+-    # Retain the historical handoff until the normal diagnostic poller is wired;
++    # A separate complete post-settlement read retires the diagnostic reference;
+     # absence is not application and no remote/current-row status is synthesized.
+-    assert [row['origin'] for row in deferred.pending(live)] == [wire['status_origin']]
++    assert receiver.reads == 2 and deferred.pending(live) == []
+     assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 7
+diff --git a/tests/hermes_cli/test_kanban_replay_observation.py b/tests/hermes_cli/test_kanban_replay_observation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6cb51a84329d18c2f4d43a93dd12e4e318e7574
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_observation.py
+@@ -0,0 +1,289 @@
++"""Production push with controlled future membership reads, not live Board proof."""
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_replay_deferred as deferred
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_replay_observation as observation
++from tests.hermes_cli import test_kanban_replay_deferred as helpers
++
++live = helpers.live
++
++
++class Observing(helpers.Deferred):
++    def __init__(self):
++        super().__init__()
++        self.reads = []
++        self.entries = []
++        self.failure = None
++        self.on_read = lambda: None
++
++    def _call(self, method, path, body=None):
++        if '/deferred?task=' not in path:
++            return super()._call(method, path, body)
++        from urllib.parse import unquote
++        task = unquote(path.split('?task=')[1])
++        self.reads.append(task)
++        self.on_read()
++        if self.failure:
++            raise self.failure
++        return dict(protocol='origin_pending1', board_incarnation=self.slot['board_incarnation'],
++                    gateway_principal=self.slot['gateway_principal'], task=task, complete=True,
++                    entries=self.entries)
++
++
++def entry(origin='remote-origin', digest='a' * 64):
++    return dict(origin=origin, hlc='1:0:remote', gateway='other-gateway', run=None,
++                status='done', evidence_sha256=digest)
++
++
++def seed(conn, task='task/a', origin='captured-origin'):
++    wire = dict(table='tasks', op='upsert', uid=task, status_origin=origin,
++                fields=dict(status='done'), hlc='1:0:local')
++    with kbc.write_txn(conn):
++        deferred.handoff(conn, wire, dict(deferred=dict(task=task, origin=origin)),
++                         journal.snapshot(conn)['board_incarnation'])
++    return wire
++
++
++def poll(conn, receiver):
++    local = journal.snapshot(conn)
++    return observation.observe_one(conn, receiver, '/v2/boards/default/replay/', local,
++                                   dict(deferred_observation=receiver.observation))
++
++
++def test_actual_push_observes_after_ack_without_claiming_row_success(live):
++    task = helpers.intent(live)
++    receiver = Observing()
++    receiver.slot.update(h='1', a='1', last_op_id=journal.snapshot(live)['last_op_id'],
++                         last_payload_sha256=journal.snapshot(live)['last_payload_sha256'],
++                         last_verdict=journal.snapshot(live)['last_verdict'])
++    receiver.entries = [entry()]
++    result = helpers.push(live, receiver)
++    assert result.deferred == 1 and receiver.slot['a'] == '2'
++    assert receiver.reads == [task]
++    assert observation.observed(live) == [dict(board_incarnation=receiver.slot['board_incarnation'],
++                                              task=task, **entry())]
++    assert deferred.pending(live) == []  # old origin absent, NOT a successful status
++    assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (task,)).fetchone()[0] == 7
++    assert journal.pending_wire(live) is None and len(receiver.sent) == 1
++
++
++def test_unavailable_observer_does_not_block_origin_event_transport(live, caplog):
++    helpers.intent(live)
++    receiver = Observing()
++    state = journal.snapshot(live)
++    receiver.slot.update(h='1', a='1', last_op_id=state['last_op_id'],
++                         last_payload_sha256=state['last_payload_sha256'], last_verdict=state['last_verdict'])
++    receiver.failure = OSError('read offline')
++    assert helpers.push(live, receiver).deferred == 1
++    assert 'Deferred observation unavailable' in caplog.text
++    assert len(deferred.pending(live)) == 1
++    # Keep capability/read behavior, return an ordinary verdict for the origin event.
++    original = receiver._call
++
++    def event_reply(method, path, body=None):
++        if path.endswith('/ops'):
++            return helpers.helpers.Receiver._call(receiver, method, path, body)
++        return original(method, path, body)
++    receiver._call = event_reply
++    assert helpers.push(live, receiver).applied == 1
++    assert receiver.sent[-1]['table'] == 'task_events' and receiver.slot['a'] == '3'
++    assert len(deferred.pending(live)) == 1
++
++
++def test_observer_storage_failure_does_not_fail_already_acked_push(live, monkeypatch, caplog):
++    import sqlite3
++    helpers.intent(live)
++    receiver = Observing()
++    state = journal.snapshot(live)
++    receiver.slot.update(h='1', a='1', last_op_id=state['last_op_id'],
++                         last_payload_sha256=state['last_payload_sha256'], last_verdict=state['last_verdict'])
++
++    def fail(*args):
++        raise sqlite3.OperationalError('observation busy')
++    monkeypatch.setattr(observation, '_store', fail)
++    assert helpers.push(live, receiver).deferred == 1
++    assert receiver.slot['a'] == '2' and journal.pending_wire(live) is None
++    assert len(deferred.pending(live)) == 1 and observation.observed(live) == []
++    assert 'observation busy' in caplog.text
++
++
++def test_empty_membership_retires_diagnostic_not_transport_or_version(live):
++    seed(live)
++    before = journal.snapshot(live)
++    assert poll(live, Observing())['status'] == 'observed'
++    assert deferred.pending(live) == observation.observed(live) == []
++    assert journal.snapshot(live) == before
++
++
++@pytest.mark.parametrize('failure', [OSError('offline'), ValueError('partial'), None])
++def test_unavailable_or_invalid_read_keeps_custody_and_previous_observation(live, failure):
++    seed(live)
++    receiver = Observing()
++    receiver.entries = [entry('captured-origin')]
++    assert poll(live, receiver)['status'] == 'observed'
++    before = observation.observed(live)
++    receiver.failure = failure
++    receiver.entries = [dict(entry(), evidence_sha256='invalid')]
++    result = poll(live, receiver)
++    assert result['status'] == 'unavailable'
++    assert observation.observed(live) == before and len(deferred.pending(live)) == 1
++
++
++def test_capability_loss_does_not_read_or_retire(live):
++    seed(live)
++    receiver = Observing()
++    receiver.observation = None
++    assert poll(live, receiver)['status'] == 'unavailable'
++    assert receiver.reads == [] and len(deferred.pending(live)) == 1
++
++
++def test_rotation_persists_across_reopen_and_failed_tasks_do_not_starve(live):
++    for task in ['a', 'b', 'c']:
++        seed(live, task)
++    receiver = Observing()
++    receiver.failure = OSError('unavailable task')
++    assert poll(live, receiver)['task'] == 'a'
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    live.close()
++    reopened = kbc.connect(path)
++    try:
++        assert [poll(reopened, receiver)['task'] for _ in range(3)] == ['b', 'c', 'a']
++        assert receiver.reads == ['a', 'b', 'c', 'a']
++    finally:
++        reopened.close()
++
++
++def test_new_same_origin_capture_during_io_survives_absence(live):
++    wire = seed(live)
++    receiver = Observing()
++
++    def capture():
++        with kbc.write_txn(live):
++            deferred.handoff(live, dict(wire, hlc='2:0:local'),
++                             dict(deferred=dict(task=wire['uid'], origin=wire['status_origin'])),
++                             receiver.slot['board_incarnation'])
++    receiver.on_read = capture
++    assert poll(live, receiver)['status'] == 'observed'
++    assert deferred.pending(live)[0]['hlc'] == '2:0:local'
++
++
++def test_legacy_capture_migration_preserves_fields_and_fences_identical_recapture(live):
++    local = journal.snapshot(live)
++    with kbc.write_txn(live):
++        live.execute(deferred._SCHEMA)
++        live.execute('INSERT INTO kanban_replay_deferred1 VALUES (?,?,?,?,?)',
++                     (local['board_incarnation'], 'task/a', 'captured-origin', 'done', '1:0:local'))
++    before = deferred.pending(live)
++    receiver = Observing()
++    receiver.on_read = lambda: seed(live)
++    assert poll(live, receiver)['status'] == 'observed'
++    assert deferred.pending(live) == before
++    assert live.execute('SELECT capture_token FROM kanban_replay_deferred1').fetchone()[0]
++
++
++def test_identical_recapture_after_read_snapshot_is_not_retired(live):
++    wire = seed(live)
++    receiver = Observing()
++
++    def recapture():
++        with kbc.write_txn(live):
++            live.execute('DELETE FROM kanban_replay_deferred1')
++            deferred.handoff(live, wire, dict(deferred=dict(task=wire['uid'], origin=wire['status_origin'])),
++                             receiver.slot['board_incarnation'])
++    receiver.on_read = recapture
++    poll(live, receiver)
++    assert len(deferred.pending(live)) == 1
++
++
++def test_overlapping_different_task_reads_both_commit(live):
++    seed(live, 'a')
++    seed(live, 'b')
++    first = Observing()
++    first.entries = [entry('first')]
++    second = Observing()
++    second.entries = [entry('second')]
++    first.on_read = lambda: poll(live, second)
++    assert poll(live, first)['status'] == 'observed'
++    assert [(row['task'], row['origin']) for row in observation.observed(live)] == [('a', 'first'), ('b', 'second')]
++
++
++def test_newer_unfinished_same_task_reservation_blocks_older_reply(live):
++    seed(live)
++    receiver = Observing()
++    receiver.entries = [entry()]
++    receiver.on_read = lambda: observation._reserve(live, journal.snapshot(live))
++    assert poll(live, receiver)['status'] == 'superseded'
++    assert observation.observed(live) == [] and len(deferred.pending(live)) == 1
++
++
++def test_newer_poll_wins_over_late_old_response(live):
++    seed(live)
++    old = Observing()
++    old.entries = [entry(digest='a' * 64)]
++    newer = Observing()
++    newer.entries = [entry(digest='b' * 64)]
++    old.on_read = lambda: poll(live, newer)
++    assert poll(live, old)['status'] == 'superseded'
++    assert observation.observed(live)[0]['evidence_sha256'] == 'b' * 64
++
++
++def test_binding_change_during_read_cannot_write_observation(live, monkeypatch):
++    seed(live)
++    receiver = Observing()
++    original = journal.snapshot
++    saved = original(live)
++    receiver.on_read = lambda: monkeypatch.setattr(journal, 'snapshot', lambda conn: dict(saved, generation='2'))
++    assert poll(live, receiver)['status'] == 'superseded'
++    assert observation.observed(live) == [] and len(deferred.pending(live)) == 1
++
++
++def test_observed_remote_only_membership_remains_polled_and_replaced(live):
++    seed(live)
++    receiver = Observing()
++    receiver.entries = [entry()]
++    poll(live, receiver)
++    assert deferred.pending(live) == []
++    receiver.entries = [entry(digest='b' * 64)]
++    poll(live, receiver)
++    assert len(receiver.reads) == 2 and observation.observed(live)[0]['evidence_sha256'] == 'b' * 64
++    receiver.entries = []
++    poll(live, receiver)
++    assert observation.observed(live) == []
++    assert poll(live, receiver)['status'] == 'idle'
++    assert len(receiver.reads) == 3
++
++
++def test_reservation_work_is_bounded_with_large_tracked_task_set(live):
++    local = journal.snapshot(live)
++    with kbc.write_txn(live):
++        live.execute(deferred._SCHEMA)
++        live.executemany('INSERT INTO kanban_replay_deferred1 VALUES (?,?,?,?,?)',
++                         [(local['board_incarnation'], f'task-{i:04d}', 'origin', 'done', 'hlc')
++                          for i in range(500)])
++    # Warm lazy schema creation before measuring the indexed selection work.
++    observation._reserve(live, local)
++    steps = []
++    live.set_progress_handler(lambda: steps.append(100) or 0, 100)
++    try:
++        assert observation._reserve(live, local)[0] == 'task-0001'
++    finally:
++        live.set_progress_handler(None, 0)
++    assert sum(steps) < 2000
++
++
++def test_observation_and_retirement_rollback_together(live, monkeypatch):
++    seed(live)
++    receiver = Observing()
++    original = observation._store
++
++    def fail(*args):
++        original(*args)
++        raise ValueError('after observation store')
++    monkeypatch.setattr(observation, '_store', fail)
++    with pytest.raises(ValueError, match='after observation store'):
++        poll(live, receiver)
++    assert observation.observed(live) == [] and len(deferred.pending(live)) == 1
+-- 
+2.43.0
+

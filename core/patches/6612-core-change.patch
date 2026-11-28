@@ -1,0 +1,133 @@
+From 90529d52e4e53b81c0caeae741367271177a6d8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 07:55:35 +0000
+Subject: [PATCH 6612] Profile resource custody and retirement before deletion
+
+Public mirror of source commit 90529d52e4e53b81c0caeae741367271177a6d8b.
+
+---
+diff --git a/hermes_state_dbfile.py b/hermes_state_dbfile.py
+index 60e021a8b36acdf0de19d35066f42dd062797f36..abb06a6dbe3a9ca5681d3748e0608f214b70be1d 100644
+--- a/hermes_state_dbfile.py
++++ b/hermes_state_dbfile.py
+@@ -1082,8 +1082,10 @@
+ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
+     """Acquire the cross-process lock for path.quarantine.lock."""
+     import platform
++    from hermes_constants import mkdir_under_hermes_home
++
+     lock_path = path.with_name(path.name + ".quarantine.lock")
+-    lock_path.parent.mkdir(parents=True, exist_ok=True)
++    mkdir_under_hermes_home(lock_path.parent)
+     handle = lock_path.open("a+b")
+     acquired = False
+     try:
+diff --git a/hermes_state_readpool.py b/hermes_state_readpool.py
+index 4e5813eae0b26ae7276c78401e8afa90b1a74253..94c0d9c969cca8b7174e8bf7a106fd8bcdd88707 100644
+--- a/hermes_state_readpool.py
++++ b/hermes_state_readpool.py
+@@ -241,6 +241,22 @@
+ _read_budgets_lock = threading.Lock()
+ 
+ 
++def live_instances_under(root: Path) -> list["SessionDB"]:
++    """Pin all initialized handles under a home, including unshared/read-only owners.
++
++    Snapshot under the membership locks, but never close there: close unregisters itself.
++    """
++    from hermes_state_common import path_is_under
++
++    with _read_budgets_lock:
++        budgets = [budget for path, budget in _read_budgets.items() if path_is_under(Path(path), root)]
++    instances = []
++    for budget in budgets:
++        with budget._lock:
++            instances.extend(budget._members)
++    return instances
++
++
+ def _read_budget_key(db_path) -> str:
+     """Canonicalise a db path so two spellings share one budget."""
+     try:
+diff --git a/hermes_state_registry.py b/hermes_state_registry.py
+index 3eebf6a146a64fe2fadf75b53f103069c027d669..bdadb841b3b32052e8f7b50ba54ff26d2de4e42b 100644
+--- a/hermes_state_registry.py
++++ b/hermes_state_registry.py
+@@ -409,6 +409,13 @@
+             _retired.pop(id(generation.db), None)
+     closed = _teardown_swept_generations(generations, teardown_barriers, active_teardowns)
+     _close_kept_readers(root)
++    # Not every owner uses acquire(): cross-profile serve readers and plugin helpers
++    # also construct SessionDB directly. Their pooled readers and writer descriptors
++    # must retire before rmtree, not linger until GC or a process restart.
++    from hermes_state_readpool import live_instances_under
++    for db in live_instances_under(root):
++        if not db._shared_registry_owned:
++            _close_quietly(db, "Error closing unshared profile SessionDB")
+     _release_header_probes_under(root)
+     return closed
+ 
+diff --git a/tests/hermes_state/test_profile_delete_handles.py b/tests/hermes_state/test_profile_delete_handles.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..261090c9d92c89fc2d05e5e4731b795894f64dc8
+--- /dev/null
++++ b/tests/hermes_state/test_profile_delete_handles.py
+@@ -0,0 +1,55 @@
++"""Profile retirement must include bare and read-only handles, not just shared writers."""
++import shutil
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_dbfile import quarantine_cross_process_lock
++from hermes_state_registry import acquire, close_all_under
++
++
++def test_release_includes_unshared_and_readonly_handles(tmp_path):
++    home = tmp_path / 'retiring'
++    home.mkdir()
++    shared = acquire(home / 'state.db')
++    bare = SessionDB(home / 'state.db')
++    reader = SessionDB(home / 'state.db', read_only=True)
++    bystander = SessionDB(tmp_path / 'bystander.db')
++    try:
++        close_all_under(home)
++        assert shared._conn is None
++        assert bare._conn is None
++        assert reader._conn is None
++        assert bystander._conn is not None
++        # A replacement must not encounter our own deleted-WAL descriptors.
++        shutil.rmtree(home)
++        home.mkdir()
++        replacement = acquire(home / 'state.db')
++        try:
++            replacement.create_session('replacement', source='cli', model='test')
++            assert replacement.get_session('replacement') is not None
++        finally:
++            replacement.close()
++    finally:
++        close_all_under(home)
++        bare.close()
++        reader.close()
++        bystander.close()
++
++
++@pytest.mark.parametrize('deleted', [False, True])
++def test_quarantine_poll_does_not_recreate_missing_profile(tmp_path, monkeypatch, deleted):
++    from hermes_constants import mark_named_profile_deleted
++
++    root = tmp_path / 'hermes'
++    root.mkdir()
++    (root / 'config.yaml').write_text('{}')
++    monkeypatch.setenv('HERMES_HOME', str(root))
++    home = root / 'profiles' / 'absent'
++    if deleted:
++        mark_named_profile_deleted(home)
++    for _ in range(3):
++        with pytest.raises(FileNotFoundError):
++            with quarantine_cross_process_lock(home / 'state.db'):
++                pytest.fail('a retired home acquired a quarantine lock')
++        assert not home.exists()
+-- 
+2.43.0
+

@@ -1,0 +1,500 @@
+From a008437308213a56b8420339f63371aa4325e37a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:09:00 +0000
+Subject: [PATCH 6956] TUI turn-start outcome publishing and status counts agreement
+
+Public mirror of source commit a008437308213a56b8420339f63371aa4325e37a.
+
+---
+diff --git a/hermes_cli/kanban_counts_agreement.py b/hermes_cli/kanban_counts_agreement.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b548f9fe1753b27c6b0ca0ac53b6fdabb9fb1a0
+--- /dev/null
++++ b/hermes_cli/kanban_counts_agreement.py
+@@ -0,0 +1,130 @@
++"""Bounded sidebar-count agreement for a session outcome's empty card list. [daveey]
++
++``hermes_state_outcome._read_card_items`` refuses an empty card list unless the sidebar counts agree that the
++chat has no open work. Those counts are a single-flight recompute (``_counts_flight``) that can itself wait on
++the remote projection (``_links_lock``), for many seconds on a busy hub. The user-steps controls refresh runs on
++one worker thread per process, so it parked there and a withdrawn ask kept its red ``human_ask`` envelope until
++some unrelated refresh ran (t_01a21c00a2e628c8).
++
++Here the recompute runs on one background thread per origin scope. A caller waits for it at most ``WAIT_S``. On
++timeout it raises ``CountsPending``: the card source is then unknown coverage (never done, never a human ask) and
++the caller's ``on_published`` callback runs once that recompute settles, so the chat refreshes again with no
++other trigger. A stale snapshot is never used: zero open work from an outdated snapshot is not agreement.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++from collections.abc import Callable, Hashable
++
++logger = logging.getLogger(__name__)
++
++WAIT_S = 1.0
++
++
++class _Flight:
++    __slots__ = ("callbacks", "done", "error", "result")
++
++    def __init__(self) -> None:
++        self.done = threading.Event()
++        self.result: tuple[dict[str, int], dict[str, int]] | None = None
++        self.error: BaseException | None = None
++        self.callbacks: dict[Hashable, Callable[[], object]] = {}
++
++
++_lock = threading.Lock()
++_flights: dict[tuple, _Flight] = {}
++
++
++class CountsPending(RuntimeError):
++    """The published counts are not fresh for the current fingerprint and the caller may not wait."""
++
++
++def fresh_open_counts() -> tuple[dict[str, int], dict[str, int]]:
++    """``(active, blocked)`` exactly as ``_all_counts`` would return them without entering ``_counts_flight``:
++    the published snapshot when it is fresh for this scope and fingerprint, else ``CountsPending``. Never a stale
++    snapshot: zero open work from an outdated one is not agreement."""
++    import time
++
++    from hermes_cli import kanban_session_activity as ksa
++
++    scope = ksa._origin_scope()
++    fingerprint = ksa._activity_fingerprint()
++    with ksa._cache_lock:
++        ksa._count_scopes.restore_locked(scope)
++        if ksa._revalidate.counts_fresh(scope, fingerprint, time.monotonic()):
++            result = ksa._cached_count_result(False, False)
++            return result[0], result[1]
++    raise CountsPending("kanban counts are recomputing")
++
++
++def _run(scope: tuple, flight: _Flight) -> None:
++    from hermes_cli import kanban_session_activity as ksa
++
++    try:
++        # The public readers, so the blocking callers' semantics (and their test doubles) are unchanged.
++        flight.result = (ksa.active_task_counts(), ksa.blocked_task_counts())
++    except BaseException as exc:  # health: allow BLE001 -- replayed to the waiters, never swallowed
++        flight.error = exc
++    finally:
++        with _lock:
++            flight.done.set()
++            if _flights.get(scope) is flight:
++                del _flights[scope]
++            callbacks = list(flight.callbacks.values())
++            flight.callbacks.clear()
++        for callback in callbacks:
++            try:
++                callback()
++            except Exception:  # health: allow BLE001 -- one chat's retry never stops the others
++                logger.warning("kanban count agreement: deferred refresh failed", exc_info=True)
++
++
++def agreed_counts(wait_s: float = WAIT_S, *, key: Hashable | None = None,
++                  on_published: Callable[[], object] | None = None) -> tuple[dict[str, int], dict[str, int]]:
++    """``(active, blocked)`` from a fresh snapshot, or from a recompute that settled within ``wait_s``.
++
++    Otherwise ``CountsPending``; ``on_published`` (deduplicated by ``key``) then runs once that recompute settles,
++    on its thread. A recompute failure is re-raised to every waiter that saw it settle."""
++    from agent.memory_provider import spawn_context_thread
++    from hermes_cli import kanban_session_activity as ksa
++
++    try:
++        return fresh_open_counts()
++    except CountsPending:
++        pass
++    scope = ksa._origin_scope()
++    start = False
++    with _lock:
++        flight = _flights.get(scope)
++        if flight is None:
++            flight = _flights[scope] = _Flight()
++            start = True
++    if start:  # outside ``_lock``: the recompute's settle path takes it
++        # Shared by every waiter of this scope: never custody of the first caller's local-work scope.
++        try:
++            spawn_context_thread(_run, name="kanban-counts-agreement", args=(scope, flight), passive=True).start()
++        except BaseException as exc:  # health: allow BLE001 -- settle the flight, never leave it pending forever
++            with _lock:
++                flight.error = exc
++                flight.done.set()
++                if _flights.get(scope) is flight:
++                    del _flights[scope]
++            raise
++    flight.done.wait(max(0.0, wait_s))
++    with _lock:
++        if not flight.done.is_set():
++            if on_published is not None:
++                flight.callbacks.setdefault(key if key is not None else on_published, on_published)
++            raise CountsPending("kanban counts are recomputing")
++    if flight.error is not None:
++        raise flight.error
++    if flight.result is None:  # unreachable: a settled flight carries a result or an error
++        raise CountsPending("kanban count recompute settled without a result")
++    return flight.result
++
++
++def _reset_for_tests() -> None:
++    with _lock:
++        _flights.clear()
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index c80cc943daee7461cb3d3f54514003219851621d..2db10e95f93f932ef30fa48fb5991c31fc7e45d7 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -20,6 +20,8 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import contextvars
++import functools
+ import json
+ import logging
+ import sqlite3
+@@ -351,6 +353,46 @@
+     return memo[key]
+ 
+ 
++# [daveey] The refresh in progress, for the empty card list's count agreement (``kanban_counts_agreement``): where
++# to run it again once a recompute that outlasted the bounded wait settles. ``_agreement_blocking`` marks that
++# deferred run, which is already on the recompute's own thread and may wait for the counts as before.
++_agreement_target: ContextVar[Optional[dict]] = ContextVar("session_outcome_agreement_target", default=None)
++_agreement_blocking: ContextVar[bool] = ContextVar("session_outcome_agreement_blocking", default=False)
++
++
++def _agreement_counts() -> tuple[dict[str, int], dict[str, int]]:
++    from hermes_cli import kanban_session_activity as ksa
++
++    if _agreement_blocking.get():
++        return ksa.active_task_counts(), ksa.blocked_task_counts()
++    from hermes_cli.kanban_counts_agreement import WAIT_S, CountsPending, agreed_counts
++
++    target = _agreement_target.get()
++    if target is None:
++        return agreed_counts(WAIT_S)
++    try:  # one bounded wait per refresh: a fence retry inside it does not wait again
++        return agreed_counts(0.0 if target["pending"] else WAIT_S, key=target["key"], on_published=target["retry"])
++    except CountsPending:
++        target["pending"] = True
++        raise
++
++
++def _deferred_refresh(db_path: Optional[Path], sid: str) -> None:
++    """The chat's refresh again after the count recompute settled (trigger ``card_change``, which carries no
++    turn conclusion). A caller-supplied store is reopened by path: the caller's handle may be closed by now."""
++    token = _agreement_blocking.set(True)
++    try:
++        if db_path is None:
++            refresh_outcomes_quietly([sid], "card_change")
++            return
++        from hermes_state import SessionDB
++
++        with SessionDB(db_path=db_path) as handle:
++            refresh_outcomes_quietly([sid], "card_change", db=handle)
++    finally:
++        _agreement_blocking.reset(token)
++
++
+ def _read_card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+     """(decision items, waits) from the cards these chats created or shepherd: a card parked on a
+     validated ``human_request`` is a decision, every other open card is a wait."""
+@@ -362,8 +404,7 @@
+     if not cards:
+         # The display list may be a stale-empty projection while the sidebar counts
+         # already know about open work. Absence is not completion without agreement.
+-        from hermes_cli.kanban_session_activity import active_task_counts, blocked_task_counts
+-        active, blocked = active_task_counts(), blocked_task_counts()
++        active, blocked = _agreement_counts()
+         if any(active.get(sid, 0) or blocked.get(sid, 0) for sid in ids):
+             raise ValueError("kanban card list is empty but sidebar counts retain open work")
+     for card in cards:
+@@ -988,7 +1029,16 @@
+     from hermes_state_session_status_snapshot import refresh
+ 
+     with _db_scope(db) as handle:  # [daveey] also reduces and fence-publishes the canonical ``status`` envelope
+-        return refresh(handle, sid, trigger, frozenset(concluding_turn or ()))
++        if _agreement_blocking.get():
++            return refresh(handle, sid, trigger, frozenset(concluding_turn or ()))
++        raw_path = getattr(handle, "db_path", None) if db is not None else None
++        path = Path(raw_path) if isinstance(raw_path, (str, Path)) else None
++        retry = functools.partial(contextvars.copy_context().run, _deferred_refresh, path, sid)
++        token = _agreement_target.set({"key": (str(path), sid), "pending": False, "retry": retry})
++        try:
++            return refresh(handle, sid, trigger, frozenset(concluding_turn or ()))
++        finally:
++            _agreement_target.reset(token)
+ 
+ 
+ def get_outcome(sid: str, *, db: Any = None) -> Optional[dict[str, Any]]:
+diff --git a/tests/hermes_state/test_session_status_counts_agreement.py b/tests/hermes_state/test_session_status_counts_agreement.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..499a9a9a247738e15c7d3afed5cb8d7adb3d6755
+--- /dev/null
++++ b/tests/hermes_state/test_session_status_counts_agreement.py
+@@ -0,0 +1,259 @@
++"""Controls-change publication while the sidebar counts recompute is held (t_01a21c00a2e628c8). [daveey]
++
++A withdrawn ask must leave the canonical envelope promptly even when an unrelated count recompute holds
++``_counts_flight`` and a projection holds ``_links_lock``: the empty card list's count agreement may not park
++the (single, per-process) controls refresh worker. Unknown coverage stays fail-closed, never done, and the chat
++refreshes again by itself once the recompute settles. Everything here goes through the real ``refresh_outcome``
++entry point, real locks and a real board; nothing mocks ``_card_items``.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import threading
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from hermes_cli import kanban_session_activity as ksa
++from hermes_state import SessionDB
++
++BOUND_S = 3.0  # publication bound while the locks stay held (the agreement waits at most ~1 s)
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    path = tmp_path / "kanban.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, session_id TEXT,"
++                     " block_kind TEXT, human_request TEXT)")
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [path])
++    monkeypatch.setattr(ksa, "_hub_db_path", lambda: None)
++    ksa._reset_cache_for_tests()
++    yield path
++    ksa._reset_cache_for_tests()
++
++
++@pytest.fixture
++def state_db(tmp_path, board):
++    so._reset_hooks_for_tests()
++    path = tmp_path / "state.db"
++    with SessionDB(db_path=path) as handle:
++        handle.create_session("chat", source="desktop")
++        handle.append_message("chat", role="user", content="please fix the flaky test")
++        handle.append_message("chat", role="assistant", content="ok")
++    yield path
++    so._reset_hooks_for_tests()
++
++
++class Controls:
++    """A user-steps-shaped controls provider: an open ask until withdrawn and resolved in the ledger."""
++
++    def __init__(self):
++        self.open = True
++
++    def __call__(self, sid):
++        if self.open:
++            return {"decision_items": [{"id": "approval", "question": "Deploy?"}]}
++        return {}
++
++
++def controls_refresh(path, trigger="notice"):
++    """What ``ControlsRefresher._run`` does: its own SessionDB, the quiet refresh."""
++    with SessionDB(db_path=path) as handle:
++        return so.refresh_outcomes_quietly(["chat"], trigger, db=handle)
++
++
++def stored_status(path):
++    with SessionDB(db_path=path, read_only=True) as handle:
++        return (so.get_outcome("chat", db=handle) or {}).get("status") or {}
++
++
++def unrelated_write(path):
++    """Another chat's card: the fingerprint moves, so the published counts are no longer fresh."""
++    with sqlite3.connect(path) as conn:
++        conn.execute("INSERT INTO tasks VALUES (?, 'other', 'done', 'other-chat', NULL, NULL)",
++                     (f"t_{time.monotonic_ns()}",))
++
++
++class Held:
++    """Real ``_counts_flight`` (an unrelated recompute) and ``_links_lock`` (a projection), held by other threads."""
++
++    def __init__(self):
++        self.release = threading.Event()
++        self.threads = []
++
++    def __enter__(self):
++        for lock in (ksa._counts_flight, ksa._links_lock):
++            ready = threading.Event()
++
++            def hold(lock=lock, ready=ready):
++                with lock:
++                    ready.set()
++                    self.release.wait(30)
++
++            thread = threading.Thread(target=hold, daemon=True)
++            thread.start()
++            assert ready.wait(5)
++            self.threads.append(thread)
++        return self
++
++    def __exit__(self, *exc):
++        self.release.set()
++        for thread in self.threads:
++            thread.join(10)
++
++
++def wait_for(predicate, timeout):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        value = predicate()
++        if value:
++            return value
++        time.sleep(0.02)
++    return predicate()
++
++
++def is_ask(status):
++    return status.get("kind") == "decision" or (status.get("presentation") or {}).get("stripe") == "stuck"
++
++
++def is_done(status):
++    return (status.get("kind"), (status.get("presentation") or {}).get("stripe"),
++            (status.get("coverage") or {}).get("state")) == ("done", "done", "complete")
++
++
++def withdrawn(path):
++    status = stored_status(path)
++    return None if is_ask(status) else status
++
++
++def test_withdrawn_ask_leaves_the_envelope_while_counts_and_links_are_held(state_db, board):
++    controls = Controls()
++    so.register_outcome_provider("user-steps", controls)
++    assert controls_refresh(state_db) == 1
++    assert is_ask(stored_status(state_db))  # warm: the ask is published, the projection exists
++    unrelated_write(board)
++    with Held():
++        controls.open = False  # withdrawal plus the final ledger resolve
++        worker = threading.Thread(target=controls_refresh, args=(state_db,), daemon=True)
++        started = time.monotonic()
++        worker.start()
++        status = wait_for(lambda: withdrawn(state_db), BOUND_S)
++        elapsed = time.monotonic() - started
++        assert status, f"withdrawn ask still published after {elapsed:.2f}s with the count flight held"
++        assert not is_done(status), "unknown count agreement must never publish done"
++        assert status["coverage"]["state"] == "unknown"
++        worker.join(BOUND_S)
++        assert not worker.is_alive(), "the controls worker stayed parked on the held count flight"
++    # No further trigger: the settled recompute re-runs this chat's refresh.
++    assert wait_for(lambda: is_done(stored_status(state_db)), 10), stored_status(state_db)
++
++
++def test_retained_open_work_stays_unknown_after_the_deferred_refresh(state_db, board, monkeypatch):
++    """Negative control: an empty list that the settled counts contradict is never done."""
++    with sqlite3.connect(board) as conn:
++        conn.execute("INSERT INTO tasks VALUES ('t_open', 'open', 'running', 'chat', NULL, NULL)")
++    ksa._reset_cache_for_tests()
++    controls = Controls()
++    so.register_outcome_provider("user-steps", controls)
++    controls_refresh(state_db)
++    monkeypatch.setattr(ksa, "session_outcome_tasks", lambda *a, **k: [])  # the stale-empty display list
++    deferred = threading.Event()
++    real_deferred = so._deferred_refresh
++
++    def observed(*args):
++        try:
++            real_deferred(*args)
++        finally:
++            deferred.set()
++
++    monkeypatch.setattr(so, "_deferred_refresh", observed)
++    unrelated_write(board)
++    with Held():
++        controls.open = False
++        controls_refresh(state_db)
++        held = stored_status(state_db)
++        assert not is_ask(held) and not is_done(held)
++    assert deferred.wait(10), "the settled recompute did not re-run the chat's refresh"
++    status = stored_status(state_db)
++    assert not is_done(status)
++    assert status["coverage"]["state"] == "unknown"
++
++
++def test_unreadable_counts_under_contention_fail_closed(state_db, board, monkeypatch):
++    """Negative control: no snapshot and a failing recompute is unknown, not done, then recovers."""
++    controls = Controls()
++    controls.open = False
++    so.register_outcome_provider("user-steps", controls)
++    ksa._reset_cache_for_tests()
++    calls = []
++
++    def boom():
++        calls.append(1)
++        raise sqlite3.OperationalError("counts unavailable")
++
++    real = ksa.active_task_counts
++    monkeypatch.setattr(ksa, "active_task_counts", boom)
++    controls_refresh(state_db)
++    status = stored_status(state_db)
++    assert calls and not is_done(status) and status["coverage"]["state"] == "unknown"
++    monkeypatch.setattr(ksa, "active_task_counts", real)
++    controls_refresh(state_db)
++    assert is_done(stored_status(state_db))
++
++
++def test_uncontended_agreement_publishes_done_in_the_same_refresh(state_db, board):
++    """Control: without contention the bounded wait sees the recompute and the first refresh is final."""
++    controls = Controls()
++    so.register_outcome_provider("user-steps", controls)
++    controls_refresh(state_db)
++    unrelated_write(board)
++    controls.open = False
++    controls_refresh(state_db)
++    assert is_done(stored_status(state_db))
++
++
++class InlineThread:
++    """The inline ``threading.Thread`` double several gateway suites install."""
++
++    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
++        self._target, self._args, self._kwargs = target, args, kwargs or {}
++
++    def start(self):
++        if self._target is not None:
++            self._target(*self._args, **self._kwargs)
++
++
++def test_inline_thread_double_settles_without_deadlock(state_db, board, monkeypatch):
++    """The recompute starts outside the flight lock: an inline start runs its settle path re-entrantly."""
++    controls = Controls()
++    so.register_outcome_provider("user-steps", controls)
++    controls_refresh(state_db)
++    unrelated_write(board)
++    controls.open = False
++    monkeypatch.setattr(threading, "Thread", InlineThread)
++    controls_refresh(state_db)
++    assert is_done(stored_status(state_db))
++
++
++def test_failed_thread_start_settles_the_flight(state_db, board, monkeypatch):
++    """A recompute that cannot start is a read failure (unknown), and the next refresh starts a new one."""
++    from hermes_cli import kanban_counts_agreement as agreement
++
++    controls = Controls()
++    controls.open = False
++    so.register_outcome_provider("user-steps", controls)
++
++    class NoThread(InlineThread):
++        def start(self):
++            raise RuntimeError("can't start new thread")
++
++    monkeypatch.setattr(threading, "Thread", NoThread)
++    controls_refresh(state_db)
++    assert stored_status(state_db)["coverage"]["state"] == "unknown"
++    assert agreement._flights == {}
++    monkeypatch.setattr(threading, "Thread", InlineThread)
++    controls_refresh(state_db)
++    assert is_done(stored_status(state_db))
+-- 
+2.43.0
+

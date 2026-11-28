@@ -1,0 +1,512 @@
+From 0818f9f0c89a2bfe4db6cdc39e345b76025e70f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 04:15:11 +0000
+Subject: [PATCH 6858] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 0818f9f0c89a2bfe4db6cdc39e345b76025e70f4.
+
+---
+diff --git a/docs/kanban-replay-deferred-observation.md b/docs/kanban-replay-deferred-observation.md
+index 74c9ba3f38bacc139245f54f1d1d786445a37747..262beb6bbaf8f21e5b20a18b5573609836e117e3 100644
+--- a/docs/kanban-replay-deferred-observation.md
++++ b/docs/kanban-replay-deferred-observation.md
+@@ -18,13 +18,24 @@
+ an operation ID or result ledger.
+ 
+ `kanban_replay_observation.observed` exposes the **last successful complete** reads;
+-these records can be stale and carry no freshness or reachable-time guarantee yet.
++these records can be stale and carry no freshness guarantee.
+ Unavailable/invalid reads preserve them and handoff custody. Read/storage failures
+ are diagnostic warnings and do not fail already-acknowledged transport. The capacity
+ read can occur in addition to the ordinary one-task poll. A separately obtained
+ complete empty poll may retire the historical handoff without claiming application.
+ 
+-Fingerprint episode timing, five-minute owner diagnostic delivery and synthetic-parent
++The production observer now stores active fingerprint episodes alongside each
++validated membership read. It conservatively accumulates prior-success completion
++to next-success request-start intervals of at most 60 seconds, excluding request
++latency. Process/monotonic-clock identity, a shared durable interruption token and
++consumed per-task sampling baselines fence failed or overlapping reads. Evidence
++change starts a new episode; complete absence retires it. Accumulated age saturates
++at 300 seconds. `kanban_replay_episodes.diagnostics` exposes due active entries with
++task/origin/fingerprint and retained queue evidence; it is **not a delivery receipt**
++or proof that the current queue is still unresolved. These are controlled-clock,
++future-contract tests, not live reachable-service observations.
++
++Owner diagnostic delivery and delivered-episode deduplication, plus synthetic-parent
+ reconciliation remain open; this is not complete deferred support. Observed absence
+ never marks status applied or updates sync_version. Captured status/HLC in a handoff
+ record describe the requested handoff, not current server queue evidence or proof
+@@ -149,6 +160,16 @@
+ The existing owner delivers the dependency or an authorized superseding lifecycle
+ operation; separate business-control review is required for explicit cancellation.
+ 
++Before I/O, reservation consumes the task's previous sampling baseline while
++retaining its durable age/evidence. Settlement may use that saved baseline only
++after the existing per-task read-token and journal-binding checks. A crash or failed
++store therefore cannot leave a reusable baseline. Failure/capability loss also
++changes the shared singleton sampling epoch (and a process-local epoch), so another
++reader does not connect a sample across that known failure. If SQLite is wholly
++unavailable before reservation, durable invalidation itself may fail: log the
++failure, break this process's baseline and preserve custody. This does not certify
++concurrent-writer admission; the sender's single-writer gate remains unfinished.
++
+ ## Required implementation proof (still open)
+ 
+ Receiver: real authenticated HTTP/DO tests for empty/current/full-16 queues,
+diff --git a/hermes_cli/kanban_replay_episodes.py b/hermes_cli/kanban_replay_episodes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a659576531fac28e9cacdb46a605a333e7a72feb
+--- /dev/null
++++ b/hermes_cli/kanban_replay_episodes.py
+@@ -0,0 +1,84 @@
++"""Active fingerprint episodes and due diagnostics, not notice delivery. [daveey]"""
++import os
++from time import monotonic_ns
++from uuid import uuid4
++
++
++_EPOCH = uuid4().hex
++_CLOCK = '''CREATE TABLE IF NOT EXISTS kanban_replay_episode_clock1 (
++    id INTEGER PRIMARY KEY CHECK(id=1), token TEXT NOT NULL
++)'''
++_SCHEMA = '''CREATE TABLE IF NOT EXISTS kanban_replay_episode1 (
++    board_incarnation TEXT NOT NULL, task TEXT NOT NULL, origin TEXT NOT NULL,
++    evidence_sha256 TEXT NOT NULL, reachable_ms INTEGER NOT NULL,
++    sample_token TEXT NOT NULL, completed_ms INTEGER NOT NULL,
++    PRIMARY KEY(board_incarnation,task,origin)
++)'''
++
++
++def sample():
++    """A process-local clock never connects samples across restart or fork."""
++    return str(os.getpid()), monotonic_ns() // 1_000_000
++
++
++def epoch(conn):
++    token = conn.execute('SELECT token FROM kanban_replay_episode_clock1 WHERE id=1').fetchone()
++    return _EPOCH, token[0] if token else None
++
++
++def interrupt(conn):
++    """Invalidate shared sampling without discarding age or failing original work."""
++    import logging
++    import sqlite3
++    from hermes_cli.kanban_db_connect import write_txn
++    global _EPOCH
++    _EPOCH = uuid4().hex
++    try:
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_replay_episode_clock1'").fetchone():
++            return
++        with write_txn(conn):
++            conn.execute('INSERT INTO kanban_replay_episode_clock1 VALUES (1,?) '
++                         'ON CONFLICT(id) DO UPDATE SET token=excluded.token', (_EPOCH,))
++    except sqlite3.Error as exc:
++        # A reserved task's durable baseline was already consumed before I/O.
++        # If storage is wholly unavailable, only this process can be invalidated.
++        logging.getLogger(__name__).warning('Deferred sampling interruption unavailable: %s', exc)
++
++
++def begin(conn, board, task):
++    """Consume <=16 prior baselines before I/O, including cross-process failures."""
++    conn.execute(_SCHEMA)
++    conn.execute(_CLOCK)
++    previous = {row['origin']: dict(row) for row in conn.execute(
++        'SELECT * FROM kanban_replay_episode1 WHERE board_incarnation=? AND task=?', (board, task))}
++    conn.execute("UPDATE kanban_replay_episode1 SET sample_token='' WHERE board_incarnation=? AND task=?",
++                 (board, task))
++    return previous
++
++
++def replace(conn, board, task, entries, started, finished, previous):
++    """Atomically replace <=16 episodes alongside their complete membership read."""
++    conn.execute('DELETE FROM kanban_replay_episode1 WHERE board_incarnation=? AND task=?', (board, task))
++    for entry in entries:
++        old = previous.get(entry['origin'])
++        elapsed = 0
++        if old and old['evidence_sha256'] == entry['evidence_sha256']:
++            elapsed = old['reachable_ms']
++            gap = started[1] - old['completed_ms']
++            if (old['sample_token'] == started[0] == finished[0] and
++                    0 <= gap <= 60000 and finished[1] >= started[1]):
++                elapsed = min(300000, elapsed + gap)
++        conn.execute('INSERT INTO kanban_replay_episode1 VALUES (?,?,?,?,?,?,?)',
++                     (board, task, entry['origin'], entry['evidence_sha256'], elapsed,
++                      finished[0], finished[1]))
++
++
++def diagnostics(conn):
++    """Due current episodes with actionable queue evidence; not delivery receipts."""
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
++                        "AND name='kanban_replay_episode1'").fetchone():
++        return []
++    return [dict(row) for row in conn.execute(
++        'SELECT o.*,e.reachable_ms FROM kanban_replay_episode1 e '
++        'JOIN kanban_replay_observation1 o USING(board_incarnation,task,origin,evidence_sha256) '
++        'WHERE e.reachable_ms>=300000 ORDER BY e.board_incarnation,e.task,e.origin')]
+diff --git a/hermes_cli/kanban_replay_observation.py b/hermes_cli/kanban_replay_observation.py
+index 641a0ac456cf7424da3f9e24fcc15b794aa0888d..01431c1c99b6e6b546b47f241491267cfa6d95c8 100644
+--- a/hermes_cli/kanban_replay_observation.py
++++ b/hermes_cli/kanban_replay_observation.py
+@@ -8,9 +8,12 @@
+ from uuid import uuid4
+ 
+ from hermes_cli import kanban_replay_deferred as deferred
++from hermes_cli import kanban_replay_episodes as episodes
+ from hermes_cli import kanban_replay_journal as journal
+ from hermes_cli.kanban_db_connect import write_txn
+ 
++_sample = episodes.sample
++
+ 
+ _SCHEMA = '''CREATE TABLE IF NOT EXISTS kanban_replay_observation1 (
+     board_incarnation TEXT NOT NULL, task TEXT NOT NULL, origin TEXT NOT NULL,
+@@ -67,10 +70,11 @@
+         conn.execute('INSERT INTO kanban_replay_observation_reads1 VALUES (?,?,?) '
+                      'ON CONFLICT(board_incarnation,task) DO UPDATE SET token=excluded.token', (board, task, token))
+         captures = deferred.captures(conn, board, task)
+-        return task, token, captures
++        previous_episodes = episodes.begin(conn, board, task)
++        return task, token, captures, previous_episodes
+ 
+ 
+-def _store(conn, local, task, reply, captures):
++def _store(conn, local, task, reply, captures, started, finished, previous_episodes):
+     conn.execute('DELETE FROM kanban_replay_observation1 WHERE board_incarnation=? AND task=?',
+                  (local['board_incarnation'], task))
+     for entry in reply['entries']:
+@@ -79,6 +83,7 @@
+                       entry['run'], entry['status'], entry['evidence_sha256']))
+     origins = {entry['origin'] for entry in reply['entries']}
+     deferred.retire_absent(conn, local['board_incarnation'], task, origins, captures)
++    episodes.replace(conn, local['board_incarnation'], task, reply['entries'], started, finished, previous_episodes)
+ 
+ 
+ def after_push(conn, hub, root, local, cap):
+@@ -89,6 +94,7 @@
+     try:
+         result = observe_one(conn, hub, root, local, cap)
+     except sqlite3.Error as exc:
++        episodes.interrupt(conn)
+         log.warning('Deferred observation storage unavailable: %s', exc)
+         return
+     if result['status'] == 'unavailable' and result.get('task'):
+@@ -104,24 +110,33 @@
+     """Observe at most one tracked task outside the writer; failure never means empty."""
+     from hermes_cli.kanban_sync_client import HubError
+     if cap.get('deferred_observation') != 'origin_pending1':
++        episodes.interrupt(conn)
+         return dict(status='unavailable')
+     reserved = _reserve(conn, local)
+     if reserved is None:
+         return dict(status='idle')
+-    task, token, captures = reserved
++    task, token, captures, previous_episodes = reserved
++    started = _sampling_point(conn, local)
+     try:
+         reply = hub._call('GET', root + 'deferred?task=' + quote(task, safe=''))
+         deferred.validate_membership(reply, local, task)
+     except (OSError, ValueError, HubError) as exc:
++        episodes.interrupt(conn)
+         with write_txn(conn):
+             _release(conn, local['board_incarnation'], task, token)
+         return dict(status='unavailable', task=task, reason=str(exc)[:500])
++    finished = _sampling_point(conn, local)
+     with write_txn(conn):
+         current = conn.execute('SELECT token FROM kanban_replay_observation_reads1 '
+                                'WHERE board_incarnation=? AND task=?', (local['board_incarnation'], task)).fetchone()
+         if current is None or current['token'] != token or _binding(journal.snapshot(conn)) != _binding(local):
+             _release(conn, local['board_incarnation'], task, token)
+             return dict(status='superseded', task=task)
+-        _store(conn, local, task, reply, captures)
++        _store(conn, local, task, reply, captures, started, finished, previous_episodes)
+         _release(conn, local['board_incarnation'], task, token)
+     return dict(status='observed', task=task)
++
++
++def _sampling_point(conn, local):
++    process, milliseconds = _sample()
++    return repr((process, episodes.epoch(conn), _binding(local))), milliseconds
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 3e619a9ec926ed129b9bb4227769f7c1fe167f4f..15c3965d395b6fa928b25392d021c23e64b21c10 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -31,7 +31,12 @@
+     if (sync.sync_state(conn) or {}).get('journal_id') is not None:
+         if primary or before_head:
+             raise ValueError('tracer push mode not integrated')
+-        return _push_strict(conn, hub, board, gateway, max_batches=max_batches)
++        try:
++            return _push_strict(conn, hub, board, gateway, max_batches=max_batches)
++        except (OSError, ValueError, client.HubError):
++            from hermes_cli.kanban_replay_episodes import interrupt
++            interrupt(conn)
++            raise
+     return client._push_legacy(conn, hub, board, gateway, primary=primary,
+                                max_batches=max_batches, before_head=before_head, seen=seen)
+ 
+diff --git a/tests/hermes_cli/test_kanban_replay_episodes.py b/tests/hermes_cli/test_kanban_replay_episodes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b46bd182cc739de49e05fd176679f83a33ab5e8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_episodes.py
+@@ -0,0 +1,256 @@
++"""Controlled future reads: reachable episodes are not delivered owner notices."""
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_replay_episodes as episode_api
++from hermes_cli import kanban_replay_observation as observation
++from hermes_cli import kanban_replay_journal as journal
++from tests.hermes_cli import test_kanban_replay_observation as helpers
++
++live = helpers.live
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    state = ['process-one', 1000]
++    monkeypatch.setattr(observation, '_sample', lambda: tuple(state), raising=False)
++    return state
++
++
++def episodes(conn):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_replay_episode1'").fetchone():
++        return []
++    return [dict(row) for row in conn.execute('SELECT * FROM kanban_replay_episode1 ORDER BY task,origin')]
++
++
++def setup(conn):
++    helpers.seed(conn)
++    receiver = helpers.Observing()
++    receiver.entries = [helpers.entry()]
++    return receiver
++
++
++def test_actual_observer_tracks_unchanged_evidence_until_due_without_success(live, clock):
++    receiver = setup(live)
++    before = journal.snapshot(live)
++    helpers.poll(live, receiver)
++    assert len(episodes(live)) == 1
++    assert episodes(live)[0]['reachable_ms'] == 0
++    assert episode_api.diagnostics(live) == []
++    for _ in range(5):
++        clock[1] += 60000
++        helpers.poll(live, receiver)
++    row = episodes(live)[0]
++    assert row['reachable_ms'] == 300000 and row['evidence_sha256'] == 'a' * 64
++    assert episode_api.diagnostics(live) == [dict(board_incarnation=receiver.slot['board_incarnation'],
++                                                 task='task/a', **helpers.entry(), reachable_ms=300000)]
++    # No repeated due record, unbounded age or operation ledger.
++    clock[1] += 60000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 300000
++    assert len(episodes(live)) == 1 and journal.snapshot(live) == before
++
++
++def test_due_episode_survives_database_reopen_without_duplicate_records(live, clock):
++    from pathlib import Path
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    for _ in range(5):
++        clock[1] += 60000
++        helpers.poll(live, receiver)
++    before = episode_api.diagnostics(live)
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    live.close()
++    reopened = kbc.connect(path)
++    try:
++        clock[0] = 'replacement-process'
++        clock[1] += 10000
++        helpers.poll(reopened, receiver)
++        assert episode_api.diagnostics(reopened) == before and len(episodes(reopened)) == 1
++    finally:
++        reopened.close()
++
++
++@pytest.mark.parametrize('interrupt', ['offline', 'invalid', 'capability', 'restart', 'long-gap', 'regression'])
++def test_interrupted_sampling_never_counts_gap_or_erases_accumulated_time(live, clock, interrupt):
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 30000
++    clock[1] += 10000
++    receiver.failure = {'offline': OSError('offline'), 'invalid': ValueError('bad read')}.get(interrupt)
++    receiver.observation = None if interrupt == 'capability' else 'origin_pending1'
++    if interrupt in ('offline', 'invalid', 'capability'):
++        helpers.poll(live, receiver)
++    receiver.failure = None
++    receiver.observation = 'origin_pending1'
++    clock[0] = 'new-process' if interrupt == 'restart' else clock[0]
++    clock[1] += {'long-gap': 60001, 'regression': -50000}.get(interrupt, 0)
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 30000
++    clock[1] += 10000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 40000
++
++
++def test_evidence_change_and_absence_reset_only_active_diagnostic_episode(live, clock):
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 60000
++    helpers.poll(live, receiver)
++    before = journal.snapshot(live)
++    receiver.entries = [helpers.entry(digest='b' * 64)]
++    clock[1] += 60000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['evidence_sha256'] == 'b' * 64
++    assert episodes(live)[0]['reachable_ms'] == 0
++    receiver.entries = []
++    helpers.poll(live, receiver)
++    assert episodes(live) == [] and journal.snapshot(live) == before
++    assert episode_api.diagnostics(live) == []
++
++
++def test_read_latency_is_not_reachable_observation_time(live, clock):
++    receiver = setup(live)
++    receiver.on_read = lambda: clock.__setitem__(1, clock[1] + 20000)
++    helpers.poll(live, receiver)  # finishes at 21000
++    clock[1] += 10000
++    helpers.poll(live, receiver)  # starts 31000, finishes 51000
++    assert episodes(live)[0]['reachable_ms'] == 10000
++
++
++@pytest.mark.parametrize('defect', ['epoch', 'clock'])
++def test_inflight_sampling_interrupt_cannot_add_elapsed_time(live, clock, defect):
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    helpers.poll(live, receiver)
++    clock[1] += 10000
++
++    def interrupt():
++        if defect == 'epoch':
++            episode_api.interrupt(live)
++        else:
++            clock[1] -= 1
++    receiver.on_read = interrupt
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 30000
++
++
++def test_late_same_task_read_cannot_replace_episode_or_add_time(live, clock):
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    newer = helpers.Observing()
++    newer.entries = [helpers.entry(digest='b' * 64)]
++    receiver.on_read = lambda: helpers.poll(live, newer)
++    assert helpers.poll(live, receiver)['status'] == 'superseded'
++    assert episodes(live)[0]['evidence_sha256'] == 'b' * 64
++    assert episodes(live)[0]['reachable_ms'] == 0
++
++
++def test_episode_and_membership_storage_rollback_together(live, clock, monkeypatch):
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    before = episodes(live)
++    original = observation._store
++
++    def fail(*args):
++        original(*args)
++        raise ValueError('after episode storage')
++    monkeypatch.setattr(observation, '_store', fail)
++    receiver.entries = [helpers.entry(digest='b' * 64)]
++    clock[1] += 30000
++    with pytest.raises(ValueError, match='after episode storage'):
++        helpers.poll(live, receiver)
++    # Reservation consumes only the sampling baseline before I/O; semantic state
++    # still rolls back and a failed storage attempt cannot age the next sample.
++    assert episodes(live) == [dict(row, sample_token='') for row in before]
++    assert observation.observed(live)[0]['evidence_sha256'] == 'a' * 64
++
++
++def test_post_ack_sqlite_failure_breaks_sampling_without_losing_age(live, clock, monkeypatch, caplog):
++    import sqlite3
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    helpers.poll(live, receiver)
++    original = observation._store
++
++    def fail(*args):
++        original(*args)
++        raise sqlite3.OperationalError('episode storage unavailable')
++    monkeypatch.setattr(observation, '_store', fail)
++    clock[1] += 10000
++    assert helpers.helpers.push(live, receiver).sent == 0
++    assert 'episode storage unavailable' in caplog.text
++    monkeypatch.setattr(observation, '_store', original)
++    clock[1] += 10000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 30000
++
++
++def test_each_origin_has_independent_fingerprint_and_timing(live, clock):
++    receiver = setup(live)
++    receiver.entries = [helpers.entry(f'origin-{i}') for i in range(16)]
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    receiver.entries[0] = helpers.entry('origin-0', digest='b' * 64)
++    helpers.poll(live, receiver)
++    assert len(episodes(live)) == 16
++    assert {row['origin']: row['reachable_ms'] for row in episodes(live)} == {
++        f'origin-{i}': 0 if i == 0 else 30000 for i in range(16)}
++
++
++def test_failed_push_capability_request_interrupts_reachable_sampling(live, clock):
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    helpers.poll(live, receiver)
++    original = receiver._call
++
++    def offline(method, path, body=None):
++        if path.endswith('/capability'):
++            raise OSError('capability offline')
++        return original(method, path, body)
++    receiver._call = offline
++    clock[1] += 10000
++    with pytest.raises(OSError, match='capability offline'):
++        helpers.helpers.push(live, receiver)
++    receiver._call = original
++    clock[1] += 10000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 30000
++
++
++def _other_process_failure(path):
++    from pathlib import Path
++    conn = kbc.connect(Path(path))
++    try:
++        receiver = helpers.Observing()
++        receiver.failure = OSError('other process offline')
++        assert helpers.poll(conn, receiver)['status'] == 'unavailable'
++    finally:
++        conn.close()
++
++
++def test_other_process_failed_read_breaks_shared_sampling_baseline(live, clock):
++    import multiprocessing
++    receiver = setup(live)
++    helpers.poll(live, receiver)
++    clock[1] += 30000
++    helpers.poll(live, receiver)
++    path = live.execute('PRAGMA database_list').fetchone()[2]
++    child = multiprocessing.get_context('spawn').Process(target=_other_process_failure, args=(path,))
++    child.start()
++    try:
++        child.join(30)
++        assert child.exitcode == 0
++    finally:
++        if child.is_alive():
++            child.kill()
++            child.join()
++    clock[1] += 10000
++    helpers.poll(live, receiver)
++    assert episodes(live)[0]['reachable_ms'] == 30000
+-- 
+2.43.0
+

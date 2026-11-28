@@ -1,0 +1,520 @@
+From 90be1a9c82911ea9ae76ba83ef9a98c45f8d6c40 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 13:24:50 +0000
+Subject: [PATCH 6819] Policy-config interning: exact-byte storage and opt-in rollout
+
+Public mirror of source commit 90be1a9c82911ea9ae76ba83ef9a98c45f8d6c40.
+
+---
+diff --git a/docs/designs/policy-config-storage.md b/docs/designs/policy-config-storage.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2b429bea3974c23e5eaf56b43cc3dad6170b2dd
+--- /dev/null
++++ b/docs/designs/policy-config-storage.md
+@@ -0,0 +1,67 @@
++# Frozen local-policy configuration storage: reader-compatible stage
++
++This change is **not enabled in production**. New receipts stay inline. It does not
++resolve the historical Kanban WAL pin or attribute a read-pool denial. It is a
++readers-first schema foundation for eliminating measured exact-byte duplication.
++
++## Evidence and causal boundary
++
++A large-store probe counted hundreds of millions of UTF-8 config bytes across thousands of receipts;
++a few hundred distinct byte strings totalled tens of millions of bytes. Deduplication can remove
++hundreds of millions of duplicate payload bytes. These are logical payload bytes, not a
++claim about physical file reclamation. Messages and FTS dominate the original
++16 GB store and are untouched. Session retention already exists; the change
++must not be described as discovering absent retention.
++
++Why repeated metadata grows: creation freezes a complete policy configuration
++per session, including repeated automation launches. The receipt is the restore
++and exact-retry authority, so deleting it early changes custody. Exact-byte
++config interning removes duplication without changing its lifetime or values.
++The original format had no shared-storage representation. Tests previously
++assumed an inline config and therefore did not exercise ref-only comparisons,
++branching, last-reference deletion, or recovery with independently missing rows.
++
++## Representation and invariants
++
++`state_meta` holds versioned blob and per-owner reference keys. `config_json`
++becomes `config_ref_v1` only when the transaction owner explicitly passes
++`intern=True`; the default remains inline. All other policy values, including
++`request_json`, are unchanged. Hashing uses exact UTF-8 bytes, not parsed JSON.
++Reads verify the hash. Standalone receipt reads join the receipt and blob in one
++statement: two SELECTs on a pooled autocommit connection are not one snapshot.
++Mutations retain the existing receipt format; branches acquire their own ref.
++Retirement removes the blob only after its last owner reference is removed.
++No helper commits the caller's transaction; savepoints roll back partial stores.
++
++Recovery copies receipt/blob/ref rows independently, including in salvage mode.
++It must not trust copied refs: a skipped ref could make deletion of another
++owner remove a still-needed blob. Finalization rebuilds refs from the surviving
++validated receipts before returning a verified output. Missing/corrupt blobs
++fail recovery closed, retaining the separate output for inspection. This is not
++live-store repair and never substitutes config defaults for lost frozen bytes.
++
++## Rollout gates (not implemented activation)
++
++1. Land reader, consumer, retirement and recovery support through independent
++   exact-head review, required CI and canonical ship. Leave writes inline.
++2. Independently verify the installed revision AND every process that can read
++   local policies. Old in-memory readers cannot decode this format. Deployment
++   of files alone is insufficient. Do not force a restart under another
++   experiment's custody; obtain the existing owner's ordinary custody return.
++3. A later activation change must supply an explicit disabled-by-default switch
++   at the creation writer and a bounded, resumable conversion through the
++   existing owner transaction. No schema-init migration or periodic sweeper.
++   Preserve unknown/live admissions, logical/physical targets, exact retries,
++   quarantine and malformed-receipt refusal semantics.
++4. Before rollback to an old reader, drain incompatible readers/writers and
++   hydrate all ref receipts through the new owner, storing them inline. Verify
++   zero ref-only receipts before allowing old code. Do not simply flip binaries.
++5. Measure production table/index dbstat before/after and the original WAL/pool
++   acceptance window only after authorized activation. VACUUM is not required
++   by this representation and must not stall a live backend.
++
++Open gates: mutation/clause proof and complete consumer coverage, activation
++switch, bounded conversion/rollback tooling, process compatibility evidence,
++production measurements, and the independently unresolved WAL/pool incident.
++Do not present a passing disposable-fixture dbstat comparison as production
++reclaim or this compatibility stage as a shipped producer remediation.
+diff --git a/gateway/session_profile_selection.py b/gateway/session_profile_selection.py
+index a51f967de40a769fda0c572d03abeb402a83300c..392a3e8ac0fb131071fac482f7996839c70fd0ee 100644
+--- a/gateway/session_profile_selection.py
++++ b/gateway/session_profile_selection.py
+@@ -90,7 +90,8 @@
+     from agent.model_routing_switch_intent import record_in_transaction, relocate_in_transaction
+     from hermes_state_local import POLICY_PREFIX
+     from hermes_state_local_lineage import local_physical_target
+-    from hermes_state_runtime import _epoch, _json
++    from hermes_state_runtime import _epoch
++    from hermes_state_policy_config import decode_receipt, replace_receipt
+     provider = (config.get('model') or {}).get('provider') or ''
+     expected = json.loads(json.dumps(asdict(policy)))
+     released = json.loads(json.dumps(asdict(released_pick(policy, model)))) if ended else None
+@@ -100,14 +101,13 @@
+         receipt = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                                (POLICY_PREFIX + ref.session_id,)).fetchone()
+         row = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (ref.session_id,)).fetchone()
+-        saved = json.loads(receipt[0]) if receipt is not None else None
++        saved = decode_receipt(conn, receipt[0]) if receipt is not None else None
+         if saved is None or saved['policy'] != expected or row is None or row[0] != generation:
+             raise RuntimeStoreError('revision_conflict')
+         physical = local_physical_target(conn, ref.session_id)
+         if released is not None:
+             saved['policy'] = released
+-            conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+-                         (_json(saved), POLICY_PREFIX + ref.session_id))
++            replace_receipt(conn, ref.session_id, saved)
+         # Remember the pick the receipt now holds: after an end that is the RELEASED policy, which the
+         # next turn's *expected* is, so an unchanged selection there is not mistaken for a new one.
+         current = released if released is not None else expected
+diff --git a/hermes_cli/session_recovery.py b/hermes_cli/session_recovery.py
+index 8c9e9c7b1033d4c8ea13092e89fb2db03382e7da..d16434345f5b09d1bfd7985e92d9442ba1e35e53 100644
+--- a/hermes_cli/session_recovery.py
++++ b/hermes_cli/session_recovery.py
+@@ -1006,6 +1006,8 @@
+     fts_keys = tuple(key for key in _GENERATED_META_KEYS if key.startswith("fts_"))
+     placeholders = ", ".join("?" for _ in fts_keys)
+     with _immediate_transaction(destination):
++        from hermes_state_policy_config import reconcile_recovered_references
++        result['policy_config_references'] = reconcile_recovered_references(destination)
+         destination.execute(f"DELETE FROM state_meta WHERE key IN ({placeholders})", fts_keys)
+         destination.execute(
+             "INSERT INTO state_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+diff --git a/hermes_state_local.py b/hermes_state_local.py
+index 348d8c0b975662c25b79dc3a7b096c22629d2b31..d9356bc2f9aad8d81b3e1d3abbcc9ed737b7cc1a 100644
+--- a/hermes_state_local.py
++++ b/hermes_state_local.py
+@@ -33,7 +33,8 @@
+         old = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+         if old is not None:
+             try:
+-                saved = json.loads(old[0])
++                from hermes_state_policy_config import decode_receipt
++                saved = decode_receipt(conn, old[0])
+                 same = all(saved[k] == receipt[k] for k in (
+                     'profile_id', 'principal_id', 'request_id', 'session_id', 'route'))
+                 same = same and same_create_retry(saved['policy'], receipt['policy']['request_json'], request)
+@@ -168,7 +169,12 @@
+     gone += [key for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?',
+                                                 (API_DECLARED_PREFIX + '*',)) if value in targets]
+     gone += [API_BINDING_PREFIX + sid for sid in targets]
+-    conn.executemany('DELETE FROM state_meta WHERE key=?', [(key,) for key in gone])
++    from hermes_state_policy_config import delete_receipt
++    for key in gone:
++        if key.startswith(POLICY_PREFIX):
++            delete_receipt(conn, key[len(POLICY_PREFIX):])
++        else:
++            conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+ 
+ 
+ def moved_receipts(conn, target_ids=None):
+@@ -193,8 +199,10 @@
+     """Retire *owners*' local receipts (creation policy and legacy binding): the row they guarded now
+     belongs to a messaging lane, which restores it from its route like any other platform session."""
+     from hermes_state_local_migration import LEGACY_PREFIX
+-    conn.executemany('DELETE FROM state_meta WHERE key IN (?,?)',
+-                     [(POLICY_PREFIX + owner, LEGACY_PREFIX + owner) for owner in owners])
++    from hermes_state_policy_config import delete_receipt
++    for owner in owners:
++        delete_receipt(conn, owner)
++        conn.execute('DELETE FROM state_meta WHERE key=?', (LEGACY_PREFIX + owner,))
+ 
+ 
+ def handoff_head(db, session_id):
+diff --git a/hermes_state_local_lineage.py b/hermes_state_local_lineage.py
+index d6c26730b277d97c50298fde75f1e5d9f96f5d8b..b53faf9a417b86913e1389fa7b983bbfd3cb86cb 100644
+--- a/hermes_state_local_lineage.py
++++ b/hermes_state_local_lineage.py
+@@ -61,9 +61,10 @@
+ 
+ def _commit_local_target(conn, receipt, routed):
+     """Store *receipt* and its route's entry *routed* and bump the logical revision, in one transaction."""
++    from hermes_state_policy_config import replace_receipt
+     conn.execute("UPDATE gateway_routing SET entry_json=? WHERE scope='' AND session_key=?",
+                  (_json(routed), receipt['route']))
+-    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(receipt), POLICY_PREFIX + receipt['session_id']))
++    replace_receipt(conn, receipt['session_id'], receipt)
+     conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (receipt['session_id'],))
+ 
+ 
+@@ -81,7 +82,8 @@
+             raise RuntimeStoreError('storage_unavailable')
+         return
+     try:
+-        receipt = json.loads(raw[0])
++        from hermes_state_policy_config import decode_receipt
++        receipt = decode_receipt(conn, raw[0])
+         if (receipt['session_id'] != logical_id or receipt['entry']['session_id'] != parent_session_id
+                 or receipt['principal_id'] != parent['user_id'] or receipt['route'] != parent['session_key']):
+             raise RuntimeStoreError('storage_unavailable')
+@@ -157,7 +159,8 @@
+     def write(conn):
+         _epoch(conn, epoch)
+         saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
+-        receipt = json.loads(saved[0])
++        from hermes_state_policy_config import decode_receipt
++        receipt = decode_receipt(conn, saved[0])
+         if receipt != expected:
+             return
+         adoptable = adoptable_compression(conn, receipt)
+diff --git a/hermes_state_local_quarantine.py b/hermes_state_local_quarantine.py
+index a9c0638e92cea1c1b6ca10fa4fc40cd8af6c781f..68172dda332c872edfca26aa0ad7dd0b317bd5ce 100644
+--- a/hermes_state_local_quarantine.py
++++ b/hermes_state_local_quarantine.py
+@@ -1,9 +1,8 @@
+ """Terminal, fail-closed quarantine of an invalid stored local policy."""
+-import json
+ import time
+ 
+ from hermes_state_local import POLICY_PREFIX
+-from hermes_state_runtime import RuntimeStoreError, _epoch, _json
++from hermes_state_runtime import RuntimeStoreError, _epoch
+ 
+ 
+ def quarantine_local_policy(db, *, epoch, session_id, expected, error_type):
+@@ -18,13 +17,19 @@
+         row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+         if row is None:
+             raise RuntimeStoreError('storage_unavailable')
+-        saved = json.loads(row[0])
++        from hermes_state_policy_config import decode_receipt
++        saved = decode_receipt(conn, row[0])
+         if saved.get('quarantine') is not None:
+             return False
+         if saved != expected:
+             raise RuntimeStoreError('admission_conflict')
+-        saved['quarantine'] = {'reason': 'invalid_stored_policy', 'error_type': error_type,
++        quarantine = {'reason': 'invalid_stored_policy', 'error_type': error_type,
+                                'at': time.time()}
+-        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(saved), key))
++        # Metadata-only edit: preserve the stored representation and its reference.
++        import json
++        from hermes_state_runtime import _json
++        stored = json.loads(row[0])
++        stored['quarantine'] = quarantine
++        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(stored), key))
+         return True
+     return db._execute_write(write)
+diff --git a/hermes_state_mutation_branch.py b/hermes_state_mutation_branch.py
+index 52e5acc3bc5ff3a6c3687e34bf0ec5f17d826d15..d357d9e25da97e609d0f4ecfbe41b93034b7665f 100644
+--- a/hermes_state_mutation_branch.py
++++ b/hermes_state_mutation_branch.py
+@@ -54,7 +54,8 @@
+                        (POLICY_PREFIX + session_id,)).fetchone()
+     if row is None:
+         raise RuntimeStoreError('runtime_coordination_required')
+-    saved = json.loads(row[0])
++    from hermes_state_policy_config import decode_receipt, store_receipt
++    saved = decode_receipt(conn, row[0])
+     target = validate_local_lineage(conn, saved)
+     require_idle(db, conn, list({session_id, target}))
+     # Late: the routing entry/key are gateway types (the gateway imports this store at module level).
+@@ -100,5 +101,5 @@
+     receipt['picks'] = sorted(picks_on(conn, session_id))
+     conn.execute("INSERT INTO gateway_routing(scope,session_key,entry_json,updated_at) VALUES('',?,?,?)",
+                  (route, _json(entry.to_dict()), now.timestamp()))
+-    conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (POLICY_PREFIX + child, _json(receipt)))
++    store_receipt(conn, child, receipt, intern='config_ref_v1' in json.loads(row[0])['policy'])
+     return {session_id}, {'branched_session_id': child, 'copied_messages': len(ids)}
+diff --git a/hermes_state_mutation_prepared.py b/hermes_state_mutation_prepared.py
+index 91073284d0e78c0a430bc72c25d386e94d354657..bfe1e26560005b8a20bfb1464eadb20eb74f2f9d 100644
+--- a/hermes_state_mutation_prepared.py
++++ b/hermes_state_mutation_prepared.py
+@@ -13,7 +13,8 @@
+     row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
+     if row is None:
+         raise RuntimeStoreError('runtime_coordination_required')
+-    saved = json.loads(row[0])
++    from hermes_state_policy_config import load_receipt
++    saved = load_receipt(conn, session_id)
+     target = validate_local_lineage(conn, saved)
+     require_target_advanceable(db, conn, list({session_id, target}))
+     revision = conn.execute('SELECT runtime_revision FROM sessions WHERE id=?', (target,)).fetchone()[0]
+@@ -31,11 +32,11 @@
+ 
+ def _commit_policy(db, conn, session_id, prepared):
+     """Write the prepared policy over the snapshot it was derived from and bump the generation."""
+-    from hermes_state_runtime import _json
++    from hermes_state_policy_config import replace_receipt
+     snapshot = validate_prepared(db, conn, session_id, prepared)
+     saved = snapshot['receipt']
+     saved['policy'] = prepared['policy']
+-    conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(saved), POLICY_PREFIX + session_id))
++    replace_receipt(conn, session_id, saved)
+     conn.execute('UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id=?', (session_id,))
+     generation = conn.execute('SELECT runtime_generation FROM sessions WHERE id=?', (session_id,)).fetchone()[0]
+     return snapshot, generation
+diff --git a/hermes_state_policy_config.py b/hermes_state_policy_config.py
+index 062dbdc04ad713492f50e6b15566fa21bad3b745..0d724df8fe994e8df69d2aa9e9ebb5fb164a2c7a 100644
+--- a/hermes_state_policy_config.py
++++ b/hermes_state_policy_config.py
+@@ -142,6 +142,41 @@
+         raise
+ 
+ 
++def reconcile_recovered_references(conn):
++    """Rebuild derived refs from recovered owners before any GC can trust them.
++
++    Recovery may salvage receipt/blob/ref rows independently. Ref rows are not
++    evidence of completeness. Validate every surviving receipt before changing
++    any reference; unreadable custody fails the separate-output recovery closed.
++    """
++    if not conn.in_transaction:
++        raise RuntimeStoreError('runtime_coordination_required')
++    present = conn.execute('SELECT 1 FROM state_meta WHERE key GLOB ? OR key GLOB ? LIMIT 1',
++                           (BLOB_PREFIX + '*', REF_PREFIX + '*')).fetchone()
++    if present is None:
++        present = conn.execute(
++            "SELECT 1 FROM state_meta WHERE key GLOB ? AND CASE WHEN json_valid(value) "
++            "THEN json_type(value,'$.policy.config_ref_v1') IS NOT NULL ELSE 0 END LIMIT 1",
++            (POLICY_PREFIX + '*',)).fetchone()
++    if present is None:
++        return 0
++    refs = []
++    for key, raw in conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',)):
++        decoded = decode_receipt(conn, raw)
++        digest = _digest(decoded['policy']['config_json']) if _reference(json.loads(raw)) is not None else None
++        if digest is not None:
++            refs.append((REF_PREFIX + digest + ':' + key[len(POLICY_PREFIX):], digest))
++    # The caller's recovery transaction owns all writes; no live-store migration.
++    conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (REF_PREFIX + '*',))
++    conn.executemany('INSERT INTO state_meta(key,value) VALUES(?,?)', refs)
++    return len(refs)
++
++
++def replace_receipt(conn, session_id, receipt):
++    """Replace hydrated values while retaining this owner's storage format."""
++    store_receipt(conn, session_id, receipt, intern=_stored_reference(conn, session_id) is not None)
++
++
+ def delete_receipt(conn, session_id):
+     """Delete a receipt and its last reference on its owner's delete transaction."""
+     digest = _stored_reference(conn, session_id)
+diff --git a/tests/gateway/test_policy_config_profile.py b/tests/gateway/test_policy_config_profile.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..16fe4b8e2cc314cabc004395b20a3313501df18b
+--- /dev/null
++++ b/tests/gateway/test_policy_config_profile.py
+@@ -0,0 +1,27 @@
++"""Followed profile selection compares hydrated frozen policies."""
++import pytest
++
++from tests.gateway import test_bot_chat_follow_entry as helpers
++from tests.gateway import test_bot_chat_managed_follow as managed
++from hermes_state_local import local_receipt
++from hermes_state_policy_config import store_receipt
++
++home = helpers.home
++_state_db_in_profile = managed._state_db_in_profile
++
++
++@pytest.mark.asyncio
++async def test_interned_profile_selection_compares_exact_frozen_policy(home, monkeypatch):
++    from gateway.session_profile_selection import commit_selection
++    store, db, authority, owner, ref, _built = helpers._bot_chat_owner(home, monkeypatch)
++    try:
++        await helpers._open(authority, ref)
++        original = local_receipt(db, ref.session_id)
++        db._execute_write(lambda conn: store_receipt(conn, ref.session_id, original, intern=True))
++        policy, config, model, ended = helpers._selection_inputs(authority, ref)
++        commit_selection(authority, ref, policy, config, model,
++                         db.get_session(ref.session_id)['runtime_generation'], ended=ended)
++        assert local_receipt(db, ref.session_id)['policy'] == original['policy']
++    finally:
++        await owner.close()
++        store.close_all_db_handles()
+diff --git a/tests/hermes_cli/test_session_recovery_policy_config.py b/tests/hermes_cli/test_session_recovery_policy_config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dab2c6bc3fd1113cbc7b9555746b20354cdebb9
+--- /dev/null
++++ b/tests/hermes_cli/test_session_recovery_policy_config.py
+@@ -0,0 +1,47 @@
++"""Actual recovery reconstructs reference custody from surviving policy receipts."""
++from contextlib import closing
++import sqlite3
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_policy_config import BLOB_PREFIX, REF_PREFIX, delete_receipt, load_receipt, store_receipt
++from hermes_cli.session_recovery import recover_session_database
++
++
++def test_recovery_rebuilds_missing_ref_before_last_owner_gc(tmp_path):
++    source, output = tmp_path / 'source.db', tmp_path / 'recovered.db'
++    receipt = {'policy': {'config_json': ' {"snow":"雪"} ', 'request_json': '{}'}}
++    with closing(SessionDB(source)) as db:
++        def write(conn):
++            store_receipt(conn, 'one', receipt, intern=True)
++            store_receipt(conn, 'two', receipt, intern=True)
++            conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (REF_PREFIX + '*:two',))
++        db._execute_write(write)
++    report = recover_session_database(source, output, allow_partial=True)
++    assert report['verified'], report
++    with closing(sqlite3.connect(output)) as conn:
++        conn.execute('BEGIN IMMEDIATE')
++        delete_receipt(conn, 'one')
++        assert load_receipt(conn, 'two') == receipt
++        assert len(conn.execute('SELECT key FROM state_meta WHERE key GLOB ?', (BLOB_PREFIX + '*',)).fetchall()) == 1
++        delete_receipt(conn, 'two')
++        assert conn.execute('SELECT key FROM state_meta WHERE key GLOB ? OR key GLOB ?',
++                            (BLOB_PREFIX + '*', REF_PREFIX + '*')).fetchall() == []
++
++
++@pytest.mark.parametrize('damage', ['missing_blob', 'corrupt_blob', 'missing_blob_and_refs'])
++def test_recovery_refuses_unreadable_policy_config(tmp_path, damage):
++    from hermes_state_runtime import RuntimeStoreError
++    source, output = tmp_path / 'source.db', tmp_path / 'recovered.db'
++    with closing(SessionDB(source)) as db:
++        def write(conn):
++            store_receipt(conn, 'one', {'policy': {'config_json': '{}'}}, intern=True)
++            if damage == 'corrupt_blob':
++                conn.execute('UPDATE state_meta SET value=? WHERE key GLOB ?', ('wrong', BLOB_PREFIX + '*'))
++            else:
++                conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (BLOB_PREFIX + '*',))
++            if damage == 'missing_blob_and_refs':
++                conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (REF_PREFIX + '*',))
++        db._execute_write(write)
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        recover_session_database(source, output, allow_partial=True)
+diff --git a/tests/hermes_state/test_policy_config_consumers.py b/tests/hermes_state/test_policy_config_consumers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aff24140f8afae3c472fb37dde1558ea0948aa7f
+--- /dev/null
++++ b/tests/hermes_state/test_policy_config_consumers.py
+@@ -0,0 +1,90 @@
++"""Frozen-policy consumers must see exact hydrated values, not storage refs."""
++from contextlib import closing
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_local import commit_local_session, local_receipt, retire_local_receipts, release_receipts
++from hermes_state_policy_config import BLOB_PREFIX, REF_PREFIX, store_receipt
++import hermes_state_runtime as rt
++from tests.hermes_state.test_target_advance_fence import _local_session
++
++
++@pytest.fixture
++def interned(tmp_path):
++    with closing(SessionDB(tmp_path / 'state.db')) as db:
++        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
++        sid = _local_session(db, epoch, tmp_path)
++        original = local_receipt(db, sid)
++        db._execute_write(lambda conn: store_receipt(conn, sid, original, intern=True))
++        yield db, epoch, sid, original
++
++
++def _assert_no_blobs(db):
++    with db._read_ctx() as conn:
++        assert conn.execute('SELECT 1 FROM state_meta WHERE key GLOB ? OR key GLOB ?',
++                            (BLOB_PREFIX + '*', REF_PREFIX + '*')).fetchall() == []
++
++
++def test_interned_create_retry_returns_exact_frozen_policy(interned):
++    db, epoch, sid, original = interned
++    assert commit_local_session(db, epoch=epoch, receipt=original) == original
++    assert local_receipt(db, sid) == original
++
++
++def test_interned_compression_adoption_uses_hydrated_expected_receipt(interned):
++    from hermes_state_local_lineage import adopt_untracked_compression
++    from tests.gateway.test_local_receipt_untracked_compression import _compact_like_0_22_2
++    db, epoch, sid, original = interned
++    _compact_like_0_22_2(db, sid, 'child')
++    adopt_untracked_compression(db, epoch=epoch, session_id=sid, expected=original)
++    saved = local_receipt(db, sid)
++    assert saved['entry']['session_id'] == 'child'
++    assert saved['policy'] == original['policy']
++
++
++def test_interned_prepared_snapshot(interned):
++    from hermes_state_mutation_prepared import local_snapshot
++    db, _epoch, sid, original = interned
++    snapshot = db._execute_write(lambda conn: local_snapshot(db, conn, sid))
++    assert snapshot['receipt'] == original
++
++
++def test_interned_quarantine(interned):
++    from hermes_state_local_quarantine import quarantine_local_policy
++    db, epoch, sid, original = interned
++    assert quarantine_local_policy(db, epoch=epoch, session_id=sid, expected=original, error_type='ValueError')
++    saved = local_receipt(db, sid)
++    assert saved['policy'] == original['policy']
++    assert saved['quarantine']['error_type'] == 'ValueError'
++
++
++def test_interned_prepared_update_retires_previous_blob(interned):
++    from hermes_state_mutation_prepared import _commit_policy, local_snapshot
++    db, _epoch, sid, original = interned
++    changed = {**original['policy'], 'config_json': '{"changed":true}'}
++    def update(conn):
++        snapshot = local_snapshot(db, conn, sid)
++        _commit_policy(db, conn, sid, {'snapshot': snapshot, 'policy': changed})
++    db._execute_write(update)
++    assert local_receipt(db, sid)['policy'] == changed
++    db._execute_write(lambda conn: release_receipts(conn, [sid]))
++    _assert_no_blobs(db)
++
++
++def test_interned_branch_has_independent_reference(interned):
++    from hermes_state_mutation_branch import branch_in_transaction
++    db, _epoch, sid, original = interned
++    _, result = db._execute_write(lambda conn: branch_in_transaction(db, conn, sid, {}))
++    child = result['branched_session_id']
++    db._execute_write(lambda conn: retire_local_receipts(conn, [sid]))
++    assert local_receipt(db, child)['policy'] == original['policy']
++    db._execute_write(lambda conn: release_receipts(conn, [child]))
++    _assert_no_blobs(db)
++
++
++@pytest.mark.parametrize('remove', [retire_local_receipts, release_receipts])
++def test_interned_retirement(interned, remove):
++    db, _epoch, sid, _original = interned
++    db._execute_write(lambda conn: remove(conn, [sid]))
++    _assert_no_blobs(db)
+-- 
+2.43.0
+

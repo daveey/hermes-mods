@@ -1,0 +1,330 @@
+From 61d1ef1834a7f198780d9eda279bd719c35fc4ac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 08:05:21 +0000
+Subject: [PATCH 6756] Origin-forward refusals, queued-create wait handles and wait-check parsing
+
+Public mirror of source commit 61d1ef1834a7f198780d9eda279bd719c35fc4ac.
+
+---
+diff --git a/hermes_cli/kanban_origin_creation.py b/hermes_cli/kanban_origin_creation.py
+index d183d7fba5345e057ab66d5b62c34a8bb1cbb412..bab0c33b4750cdd10501ce240998a248787aab2d 100644
+--- a/hermes_cli/kanban_origin_creation.py
++++ b/hermes_cli/kanban_origin_creation.py
+@@ -13,6 +13,10 @@
+ from hermes_cli.kanban_origin import OriginError
+ 
+ 
++class OriginCreateRefused(OriginError):
++    """A deterministic refusal proven before this origin request can insert a task."""
++
++
+ def _json(value):
+     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+ 
+@@ -201,6 +205,14 @@
+             if (creator != expected_creator or _primary_scope(conn) != primary or binding is None
+                     or binding["owner"] != creator or binding["origin"] != intent["origin"]):
+                 raise OriginError("origin_creator_unproven", "creator lacks an owner-local native attestation")
++        # Exact historical replay above wins even if a parent has since vanished.
++        # Validate under the same write lock, before calling code that can insert
++        # a task. Generic exceptions (including postcommit ValueError) prove no
++        # such absence and must retain the owner's pending semantics.
++        missing = kb._missing_task_ids(conn, options["parents"])
++        if missing:
++            from hermes_cli.kanban_dependency_validation import missing_dependency_error
++            raise OriginCreateRefused("origin_parent_unknown", str(missing_dependency_error(missing)))
+         task_id = kb.create_task(conn, **options, placement_checked=True,  # courier retains owner placement
+                                  settle_owner_chat=False)  # its origin chat is linked below, then required
+         marker = {"binding_id": "binding-" + secrets.token_hex(16), "version": 1,
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index cb39cc65baf2e96d5fa3518d467c27f699eaa943..f76c482a8607364ad3e9ab2eae80e42c90713992 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -122,7 +122,10 @@
+     from hermes_cli.kanban_create_authority import CreateAuthorityRefused
+     from hermes_cli.kanban_origin import OriginError
+     from hermes_cli.kanban_runs_on_capabilities import PlacementCapabilityMismatch
++    from hermes_cli.kanban_origin_creation import OriginCreateRefused
+     from tools.registry import tool_error
++    if isinstance(exc, OriginCreateRefused):
++        return tool_error(str(exc), code=exc.code, created=False, handoff_complete=False)
+     if isinstance(exc, OriginError):
+         return tool_error(str(exc), code=exc.code, handoff_complete=False)
+     if isinstance(exc, PlacementCapabilityMismatch):
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 8f9879a164efb4c9e7a66fb860d79729dac2a39f..a3f4040b0122ad716449aab6e652c893aac515c4 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1310,6 +1310,16 @@
+     prior = remote_state(rid)
+     if foreign_origin and prior == "rejected" and _forward_binding_retry(rid, options, origin_gateway, origin_profile, origin_session,
+                                                 creator, run_uid):
++        from hermes_cli.kanban_owner_chat import PREFIX
++        if str(origin_session).startswith(PREFIX):
++            # A new executor run is not evidence that this historical producer
++            # acquired forwarding custody. Keep its exact definitive refusal,
++            # not an endless series of newly salted unsupported requests.
++            return {"ok": False, "request_id": rid, "fatal": True,
++                    "code": "origin_forward_binding_missing",
++                    "error": "origin_forward_binding_missing: standing owner lacks authenticated custody; "
++                             "repair custody on the origin gateway and explicitly replan the create; "
++                             "the original request remains rejected and unchanged"}
+         # Only a definitive pre-create binding refusal permits a later authenticated run's new envelope.
+         # Keep the product key on the wire; receiver creation idempotency still arbitrates duplicate deliveries.
+         rid = request_id(self_gw, {**transport_args, "idempotency_key": f"{transport_args.get('idempotency_key') or rid}:run:{run_uid}"},
+diff --git a/tests/hermes_cli/test_origin_create_validation.py b/tests/hermes_cli/test_origin_create_validation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..645423e1f973ea7162f2c808ca9bb0274a2fe6d0
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_create_validation.py
+@@ -0,0 +1,70 @@
++"""Definitive pre-insert refusals must not hide behind write uncertainty."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_origin_owner as helpers
++
++world = helpers.world
++
++
++def _counts():
++    with kbc.connect_closing() as conn:
++        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++        return {table: conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] if table in tables else 0
++                for table in ('tasks', 'task_links', 'task_events', 'origin_creation_intents', 'kanban_notify_subs')}
++
++
++def test_foreign_parent_is_terminal_without_partial_writes(world, monkeypatch, capsys):
++    from hermes_cli.kanban_dependency_validation import missing_dependency_error
++
++    world['args']['create']['parents'] = ['t_foreign_parent']
++    frozen = json.dumps(world, sort_keys=True)
++    before = _counts()
++    for _ in range(2):
++        result = helpers.invoke(world, monkeypatch, capsys)
++        assert result.get('status') == 'rejected', result
++        assert result['code'] == 'origin_parent_unknown'
++        assert str(missing_dependency_error(['t_foreign_parent'])) in result['error']
++        assert result['created'] is False and result['handoff_complete'] is False
++        assert _counts() == before
++        assert json.dumps(world, sort_keys=True) == frozen
++
++
++def test_exact_committed_replay_precedes_current_parent_validation(world, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title='Parent', settle_owner_chat=False)
++    world['args']['create']['parents'] = [parent]
++    first = helpers.invoke(world, monkeypatch, capsys)
++    assert first.get('created') is True, first
++    with kbc.connect_closing() as conn:
++        conn.execute('DELETE FROM task_links WHERE parent_id=?', (parent,))
++        conn.execute('DELETE FROM tasks WHERE id=?', (parent,))
++        conn.commit()
++    before = _counts()
++    second = helpers.invoke(world, monkeypatch, capsys)
++    assert second['origin_creation'] == first['origin_creation']
++    assert _counts() == before
++    assert before['tasks'] == 1
++
++
++@pytest.mark.parametrize('failure', [ValueError, RuntimeError])
++def test_postcommit_exception_is_pending_and_exact_retry_creates_once(world, monkeypatch, capsys, failure):
++    original = kb.create_task
++
++    def lost_reply(*args, **kwargs):
++        result = original(*args, **kwargs)
++        if kwargs.get('origin_intent') is not None:
++            raise failure('reply lost after committed origin create')
++        return result
++
++    with monkeypatch.context() as patch:
++        patch.setattr(kb, 'create_task', lost_reply)
++        result = helpers.invoke(world, monkeypatch, capsys)
++    assert result == {'status': 'pending', 'code': 'origin_dispatch_pending', 'handoff_complete': False}
++    before = _counts()
++    assert before['tasks'] == before['origin_creation_intents'] == 1
++    replay = helpers.invoke(world, monkeypatch, capsys)
++    assert replay.get('created') is True, replay
++    assert _counts() == before
+diff --git a/tests/hermes_cli/test_standing_owner_retry.py b/tests/hermes_cli/test_standing_owner_retry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e6875121ec2e5203383bb08d71e586813e7f6e4c
+--- /dev/null
++++ b/tests/hermes_cli/test_standing_owner_retry.py
+@@ -0,0 +1,47 @@
++"""A rejected standing owner is not repaired merely by starting another run."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++from tests.hermes_cli import test_kanban_forward_retry_boundary as helpers
++
++
++@pytest.mark.parametrize('synthetic', [True, False])
++def test_later_run_keeps_synthetic_binding_refusal_without_another_send(tmp_path, monkeypatch, synthetic):
++    session = 'kanban_owner_pressure' if synthetic else 's1'
++    options = {'idempotency_key': 'product-key'}
++    original_id = kp.request_id('w', options, session, options)
++    result, body = helpers._history()
++    body['args']['origin']['session'] = session
++    path = tmp_path / 'hub.db'
++    with sqlite3.connect(path) as db:
++        db.execute('CREATE TABLE sent (id TEXT PRIMARY KEY, state TEXT, result TEXT, body TEXT)')
++        db.execute('INSERT INTO sent VALUES (?,?,?,?)', (
++            original_id, 'rejected', json.dumps(result), json.dumps(body)))
++    monkeypatch.setattr(kp.reg, 'hub_db_path', lambda: path)
++    monkeypatch.setattr(kp, 'hub_carries_options', lambda cli: True)
++    calls = []
++
++    def send(argv):
++        calls.append(argv)
++        return 0, '', ''
++
++    monkeypatch.setattr(kp, 'hub_runner', send)
++    before = path.read_bytes()
++    for run in ('run-2', 'run-3'):
++        out = kp.create_remote(options, target='hub', self_gw='w', origin_session=session,
++                               origin_profile='default', cfg={}, origin_gateway='hub',
++                               creator=helpers.CREATOR, run_uid=run)
++        if synthetic:
++            assert out.get('ok') is False, out
++            assert out['fatal'] is True
++            assert out['request_id'] == original_id
++            assert out['code'] == 'origin_forward_binding_missing'
++            assert 'custody' in out['error']
++        else:
++            assert out.get('ok') is True, out
++            assert out['request_id'] != original_id
++    assert len(calls) == (0 if synthetic else 2)
++    assert path.read_bytes() == before
+diff --git a/tests/tools/test_standing_owner_placement.py b/tests/tools/test_standing_owner_placement.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e48f5904e31bc00eb284af8fd2bc08dd7f0ce540
+--- /dev/null
++++ b/tests/tools/test_standing_owner_placement.py
+@@ -0,0 +1,95 @@
++"""Standing owner discovery is fallback routing, never forwarding custody."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from tests.tools import test_kanban_cross_board_creator_chats as helpers
++from tests.tools.test_kanban_worker_created_chats import WORKER
++from tools import kanban_tools as tools
++
++home = helpers.home
++placed = helpers.placed
++
++
++def test_real_owner_is_not_displaced_by_replica(placed, monkeypatch):
++    from hermes_cli import kanban_creator_chats as chats
++    from tests.tools.test_kanban_worker_created_chats import CHAT
++
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title='Actual owner', session_id=WORKER, settle_owner_chat=False)
++        helpers._link(conn, creator, 'here', None, CHAT)
++    monkeypatch.setattr(chats, '_replica_chats', lambda *a: [
++        {'chat_gateway': 'origin', 'chat_profile': 'default', 'chat_session': helpers.FOREIGN_CHAT}])
++    helpers._place(creator, monkeypatch)
++    assert placed == [{'target': 'hub', 'origin_session': CHAT, 'origin_profile': 'default'}]
++
++
++def test_empty_local_discovery_preserves_replica_standing_origin(home, monkeypatch):
++    from hermes_cli import kanban_creator_chats as chats
++    from tools.kanban_tools_placement import _placement_origin
++
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title='No local links', session_id=WORKER, settle_owner_chat=False)
++        monkeypatch.setattr(chats, '_replica_chats', lambda *a: [
++            {'chat_gateway': 'origin', 'chat_profile': 'default', 'chat_session': 'kanban_owner_pressure'}])
++        assert _placement_origin(conn, creator, WORKER) == {
++            'session_id': 'kanban_owner_pressure', 'origin_profile': 'default', 'origin_gateway': 'origin'}
++
++
++@pytest.mark.parametrize('replica_kind', ['real', 'standing', 'absent'])
++def test_standing_owner_placement_uses_real_replica_before_forward(home, monkeypatch, replica_kind):
++    from hermes_cli import kanban_creator_chats as chats, kanban_placement as kp
++    from hermes_cli.kanban_origin_forward import authorize
++    from hermes_cli import kanban_owner_chat as owner
++    from hermes_state import SessionDB
++
++    sid = owner.session_id('worker pressure')
++    with SessionDB(home / 'state.db') as state:
++        state.create_session(sid, source='desktop')
++    with kbc.connect_closing() as conn:
++        creator = kb.create_task(conn, title='Picked up creator', session_id=WORKER, settle_owner_chat=False)
++        helpers._link(conn, creator, 'stale-worker', 'default', sid)
++    chosen = helpers.FOREIGN_CHAT if replica_kind == 'real' else owner.session_id('projected')
++    replica = [] if replica_kind == 'absent' else [
++        {'chat_gateway': 'origin', 'chat_profile': 'default', 'chat_session': chosen}]
++    monkeypatch.setattr(chats, '_replica_chats', lambda *a: replica)
++    monkeypatch.setattr(kp, 'decide', lambda *a, **k: {'where': 'hub', 'why': 'test'})
++    monkeypatch.setenv('HERMES_KANBAN_TASK', creator)
++    monkeypatch.setenv('HERMES_SESSION_ID', WORKER)
++    monkeypatch.setenv('HERMES_SESSION_KEY', WORKER)
++    from hermes_cli import kanban_placement_provenance as provenance
++    monkeypatch.setattr(provenance, 'forwarding_authority', lambda *a, **k: {
++        'creator': {'gateway': 'origin', 'profile': 'default', 'board': 'default', 'task_id': creator},
++        'run_uid': 'run-1'})
++    sent = []
++
++    def forward(args, *, target, origin_session, origin_profile, self_gw, origin_gateway, creator, run_uid, **kw):
++        sent.append((origin_gateway, origin_profile, origin_session))
++        binding = {'binding_id': 'native-' + creator['task_id'], 'version': 1, 'publication_version': 1,
++                   'origin': {'gateway': 'origin', 'profile': 'default', 'session': helpers.FOREIGN_CHAT},
++                   'owner': creator, 'task_record_key': 'default/default/' + creator['task_id']}
++        try:
++            authorize(ledger=home / 'absent-ledger.db', origin={
++                'gateway': origin_gateway, 'profile': origin_profile, 'session': origin_session},
++                creator=creator, gateway=origin_gateway, profile='default', sender='gw:here', run_uid=run_uid,
++                lease={'task_id': creator['task_id'], 'holder': 'here', 'run_uid': run_uid, 'expires': 2000},
++                now_ms=1000, session_exists=lambda _: True,
++                native_lookup=lambda o, c: binding if o == binding['origin'] else None)
++        except ValueError as exc:
++            return {'ok': False, 'fatal': True, 'error': str(exc)}
++        return {'ok': True, 'request_id': 'placement:here:regression', 'queued_only': True}
++
++    monkeypatch.setattr(kp, 'create_remote', forward)
++    for _ in range(2):
++        out = json.loads(tools._handle_create({'title': 'Child', 'assignee': 'default', 'requires': []}))
++        if replica_kind == 'real':
++            assert out.get('ok') is True, out
++        else:
++            assert out.get('created') is False, out
++            assert 'origin_forward_binding_missing' in out['error']
++    expected = ('origin', 'default', helpers.FOREIGN_CHAT) if replica_kind == 'real' else ('stale-worker', 'default', sid)
++    assert sent == [expected, expected]
++    with kbc.connect_closing() as conn:
++        assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
++    assert not (home / 'absent-ledger.db').exists()
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 897566084c43ef35a451135476575c8a4bc09127..c1f6d0744d3b5af6ff36a83d2b47273c562a204c 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -97,11 +97,13 @@
+         self_gw = reg.self_gateway()
+         has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
+         owners = resolve_chats(conn, creator_task_id) if has_links else []
+-        if not owners:
+-            # Pickup carries the task, not foreign chat links. Discover its existing
+-            # owner in the board shadow, just as creator inheritance does. This is
+-            # only a route: the origin gateway still authenticates creator/run custody.
+-            owners = _replica_chats(conn, creator_task_id)
++        from hermes_cli.kanban_owner_chat import PREFIX
++        if all(o["chat_session"].startswith(PREFIX) for o in owners):
++            # Match inherit_chats: a picked-up standing fallback must not hide
++            # the real owner on the shadow. Neither lookup supplies authority.
++            replica = _replica_chats(conn, creator_task_id)
++            if not owners or not all(o["chat_session"].startswith(PREFIX) for o in replica):
++                owners = replica
+         foreign = None
+         for owner in owners:
+             gateway, session = owner["chat_gateway"], owner["chat_session"]
+-- 
+2.43.0
+

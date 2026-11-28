@@ -1,0 +1,111 @@
+From d5f56e62bd00f4352757fdbf2a38d24cc8114797 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:02:47 +0000
+Subject: [PATCH 6663] Small fixes and test-harness hardening
+
+Public mirror of source commit d5f56e62bd00f4352757fdbf2a38d24cc8114797.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 0686b211e1000b688d7aa7203d9b15c61d2da773..7f051046a456dabc3964dc4775883de69520c040 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1392,12 +1392,16 @@
+     path = _main_db_file(conn)
+     if path and Path(path).parent.name == SHADOW_DIR:
+         return
++    # Primary files also receive paged canonical tasks. A versioned task is
++    # not evidence of pre-ledger local execution, even outside sync-shadow.
++    # Preserve unversioned legacy backfill and never rewrite existing custody.
++    unversioned = " AND sync_version IS NULL" if "sync_version" in _column_names(conn, "tasks") else ""
+     with write_txn(conn):
+         inflight = conn.execute(
+             "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+             "       max_runtime_seconds, last_heartbeat_at, started_at "
+             "FROM tasks "
+-            "WHERE status = 'running' AND current_run_id IS NULL"
++            "WHERE status = 'running' AND current_run_id IS NULL" + unversioned
+         ).fetchall()
+         for row in inflight:
+             started = row["started_at"] or int(time.time())
+diff --git a/tests/hermes_cli/test_kanban_sync_shadow_backfill.py b/tests/hermes_cli/test_kanban_sync_shadow_backfill.py
+index eb5300a01b3e0d22c84204168f5fc0c7710b4274..bc7e3e37d2c8032ed514b54eef2a950385d8699c 100644
+--- a/tests/hermes_cli/test_kanban_sync_shadow_backfill.py
++++ b/tests/hermes_cli/test_kanban_sync_shadow_backfill.py
+@@ -1,5 +1,9 @@
+ """A paged replica is not a legacy executor missing its run ledger."""
+ 
++from pathlib import Path
++
++import pytest
++
+ from hermes_cli import kanban_db_connect as connect
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as client
+@@ -7,6 +11,7 @@
+ 
+ kanban_home = fixtures.kanban_home
+ live = fixtures.live
++local = fixtures.local
+ svc = fixtures.svc
+ 
+ 
+@@ -46,7 +51,43 @@
+         replica.close()
+ 
+ 
+-def test_primary_legacy_backfill_still_preserves_local_executor(live):
++def test_primary_remote_task_before_run_page_does_not_invent_run(live):
++    """A primary's foreign task projection is not pre-ledger local execution."""
++    sync.apply_remote_changes(live, [sync.RemoteChange(
++        1, "tasks", "t_primary_paged", "upsert",
++        {"title": "paged primary", "status": "running", "created_at": 1,
++         "started_at": 2, "assignee": "default", "created_on": fixtures.OTHER},
++        59, "", fixtures.OTHER,
++    )], new_cursor=1, observers=False)
++    before = [tuple(row) for row in live.execute("SELECT * FROM kanban_sync_outbox")]
++    db_file = connect._main_db_file(live)
++    assert db_file is not None
++    path = Path(db_file)
++    connect._INITIALIZED_PATHS.discard(str(path.resolve()))
++    with connect.connect(path):
++        pass  # exercise the real cold primary initialization/backfill
++    assert live.execute("SELECT current_run_id FROM tasks WHERE id='t_primary_paged'").fetchone()[0] is None
++    assert live.execute("SELECT COUNT(*) FROM task_runs WHERE task_id='t_primary_paged'").fetchone()[0] == 0
++    assert [tuple(row) for row in live.execute("SELECT * FROM kanban_sync_outbox")] == before
++    sync.apply_remote_changes(live, [sync.RemoteChange(
++        2, "task_runs", "primary-canonical-run", "upsert",
++        {"task_id": "t_primary_paged", "profile": "default", "status": "done",
++         "started_at": 2, "ended_at": 3, "outcome": "completed"},
++        1, "", fixtures.OTHER,
++    ), sync.RemoteChange(
++        3, "tasks", "t_primary_paged", "upsert",
++        {"current_run_uid": "primary-canonical-run", "status": "done"},
++        60, "", fixtures.OTHER,
++    )], new_cursor=3, observers=False, local_pending_wins=True)
++    row = live.execute("SELECT r.uid,r.ended_at FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
++                       "WHERE t.id='t_primary_paged'").fetchone()
++    assert tuple(row) == ("primary-canonical-run", 3)
++    assert [tuple(row) for row in live.execute("SELECT * FROM kanban_sync_outbox")] == before
++
++
++@pytest.mark.parametrize("connection_fixture", ["local", "live"])
++def test_primary_legacy_backfill_still_preserves_local_executor(request, connection_fixture):
++    live = request.getfixturevalue(connection_fixture)
+     with connect.write_txn(live):
+         live.execute("INSERT INTO tasks (id,title,status,created_at,started_at,assignee,claim_lock,claim_expires) "
+                      "VALUES ('t_legacy','legacy','running',1,2,'default','executor',9000000000)")
+@@ -54,6 +95,9 @@
+     row = live.execute("SELECT r.status,r.claim_lock,r.claim_expires,r.started_at FROM tasks t "
+                        "JOIN task_runs r ON r.id=t.current_run_id WHERE t.id='t_legacy'").fetchone()
+     assert tuple(row) == ("running", "executor", 9000000000, 2)
+-    assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid='t_legacy'").fetchone()
++    if connection_fixture == "live":
++        assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid='t_legacy'").fetchone()
++    else:
++        assert "sync_version" not in connect._column_names(live, "tasks")
+     connect._backfill_legacy_inflight_runs(live)
+     assert live.execute("SELECT COUNT(*) FROM task_runs WHERE task_id='t_legacy'").fetchone()[0] == 1
+-- 
+2.43.0
+

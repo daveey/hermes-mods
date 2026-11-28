@@ -1,0 +1,139 @@
+From 6f5c340e4d070420273cbb415c878846ddb2ee0a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:01:26 +0000
+Subject: [PATCH 6871] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 6f5c340e4d070420273cbb415c878846ddb2ee0a.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_replay_historical.py b/tests/hermes_cli/test_kanban_replay_historical.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ca168cbb4057554eb15653da1489f6482cecdfe
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_historical.py
+@@ -0,0 +1,122 @@
++"""Spec §5 / §11.6: prefix coverage is not a historical delivery receipt."""
++from pathlib import Path
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as sender
++
++live = sender.live
++
++
++def custody(conn):
++    return {
++        'journal': journal.snapshot(conn),
++        'wire': journal.pending_wire(conn),
++        'outbox': [tuple(row) for row in conn.execute('SELECT * FROM kanban_sync_outbox ORDER BY op_id')],
++        'tasks': [tuple(row) for row in conn.execute('SELECT * FROM tasks ORDER BY id')],
++        'omissions': [tuple(row) for row in conn.execute('SELECT * FROM kanban_sync_omissions')],
++    }
++
++
++def advanced_slot(receiver, *, same_identity=False, missing_verdict=False):
++    # The sender's copied DB still owns seq1; the serving stream has processed seq2.
++    receiver.slot.update(h='2', a='1')
++    if not same_identity:
++        receiver.slot.update(last_op_id='later-operation', last_payload_sha256='b' * 64)
++    receiver.slot['last_verdict'] = (None if missing_verdict else json.dumps(dict(
++        client_op_id=receiver.slot['last_op_id'], status='applied', version=999)))
++
++
++@pytest.mark.parametrize('primary', [False, True])
++@pytest.mark.parametrize('same_identity', [False, True])
++def test_restored_seq_below_prefix_cannot_settle_even_with_matching_current_row(live, primary, same_identity):
++    tid = kb.create_task(live, title='restored intent', assignee='worker')
++    receiver = sender.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    saved = custody(live)
++    path = live.execute('PRAGMA database_list').fetchone()[2]
++    live.close()
++    conn = kbc.connect(Path(path))
++    advanced_slot(receiver, same_identity=same_identity)
++    receiver.calls.clear()
++    # A plausible matching current value must never be consulted as history.
++    receiver.row_evidence = lambda *args: pytest.fail('current row used to invent historical delivery')
++    try:
++        with pytest.raises(ValueError, match='server cursor gap'):
++            client.push(conn, receiver, 'default', 'macbook', primary=primary, max_batches=1)
++        assert custody(conn) == saved
++        assert journal.snapshot(conn)['pending']['sequence'] == '1'
++        assert conn.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++        assert receiver.slot['a'] == '1'
++        assert receiver.calls == ['capability', 'inspect']
++        assert len(receiver.sent) == 1
++    finally:
++        conn.close()
++
++
++class HistoricalReply(sender.Receiver):
++    def __init__(self, enrich):
++        super().__init__()
++        self.enrich = enrich
++
++    def _call(self, method, path, body=None):
++        if not path.endswith('/ops'):
++            return super()._call(method, path, body)
++        self.calls.append('ops')
++        op, = body['ops']
++        self.sent.append(op)
++        advanced_slot(self)
++        response = dict(client_op_id=op['client_op_id'], status='already_processed', h='2',
++                        reason='historical_outcome_unavailable', consumed=False, outcome_unknown=True)
++        if self.enrich:
++            response.update(row=dict(uid=op['uid'], title='matching current row'), version=999,
++                            result=dict(status='applied'))
++        return dict(protocol='processed_prefix1', results=[response])
++
++
++@pytest.mark.parametrize('primary', [False, True])
++@pytest.mark.parametrize('enrich', [False, True])
++def test_historical_reply_after_send_is_not_prune_ack_or_success(live, primary, enrich, monkeypatch):
++    from hermes_cli import kanban_replica_lag as lag
++    tid = kb.create_task(live, title='stale restore race', assignee='worker')
++    receiver = HistoricalReply(enrich)
++    receiver.row_evidence = lambda *args: pytest.fail('current read after unknown historical outcome')
++    published = []
++    monkeypatch.setattr(lag, 'acked', lambda *args: published.append(args))
++    with pytest.raises(ValueError, match='server cursor gap'):
++        client.push(live, receiver, 'default', 'macbook', primary=primary, max_batches=1)
++    pending = journal.snapshot(live)['pending']
++    assert pending['sequence'] == '1'
++    assert journal.snapshot(live)['settled'] == '0'
++    row = live.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (pending['op_id'],)).fetchone()
++    assert row['state'] == 'pending'
++    assert journal.pending_wire(live) is not None
++    assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++    assert receiver.slot['a'] == '1'
++    assert receiver.calls == ['capability', 'inspect', 'session', 'ops', 'inspect']
++    assert published == []
++
++
++@pytest.mark.parametrize('primary', [False, True])
++def test_missing_retained_verdict_does_not_fall_back_to_current_success(live, primary):
++    kb.create_task(live, title='missing historical verdict', assignee='worker')
++    receiver = sender.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    before = custody(live)
++    receiver.slot['last_verdict'] = None
++    receiver.row_evidence = lambda *args: pytest.fail('missing verdict replaced with current success')
++    receiver.calls.clear()
++    with pytest.raises(ValueError, match='invalid retained verdict'):
++        client.push(live, receiver, 'default', 'macbook', primary=primary, max_batches=1)
++    assert custody(live) == before
++    assert receiver.calls == ['capability', 'inspect']
++    assert receiver.slot['a'] == '0'
++    assert len(receiver.sent) == 1
+-- 
+2.43.0
+

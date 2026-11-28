@@ -1,0 +1,335 @@
+From e534354f9d64d3c43aec1cfadc263c952ff19e65 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:05:45 +0000
+Subject: [PATCH 6617] Profile resource custody and retirement before deletion
+
+Public mirror of source commit e534354f9d64d3c43aec1cfadc263c952ff19e65.
+
+---
+diff --git a/hermes_profile_resources.py b/hermes_profile_resources.py
+index 134681a61bd34acbffbbdce196b835af256b0a45..442a3d3f29dae6fbdf8d2aefea8e0c73d6b6accf 100644
+--- a/hermes_profile_resources.py
++++ b/hermes_profile_resources.py
+@@ -8,7 +8,9 @@
+ """
+ from __future__ import annotations
+ 
++import atexit
+ import logging
++import os
+ import sqlite3
+ from pathlib import Path
+ import threading
+@@ -36,6 +38,33 @@
+     return stat.st_dev, stat.st_ino
+ 
+ 
++def _lease_path_matches(path: Path, handle) -> bool:
++    try:
++        current = path.stat()
++    except FileNotFoundError:
++        return False
++    opened = os.fstat(handle.fileno())
++    return (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
++
++
++def _unlink_lease(path: Path, handle) -> None:
++    if not _lease_path_matches(path, handle):
++        return
++    try:
++        path.unlink(missing_ok=True)
++    except PermissionError:
++        if os.name != 'nt':
++            raise
++        # Windows disallows unlinking an open CRT file. After closing, any other
++        # open handle still prevents deletion; a pre-lock opener revalidates too.
++        handle.close()
++        try:
++            path.unlink(missing_ok=True)
++        except PermissionError:
++            return  # Still open elsewhere; the next acquisition sweeps it.
++
++
++
+ class ProfileResourceLease:
+     """One writer and its pooled readers; acknowledgement follows the last close."""
+ 
+@@ -44,6 +73,7 @@
+ 
+         self.home = home
+         self._lock = threading.Lock()
++        self._finish_lock = threading.Lock()
+         self._refs = 1
+         self._owner_released = False
+         self._retired = False
+@@ -54,20 +84,26 @@
+         self.identity = _identity(home)
+         directory = _lease_directory(home)
+         directory.mkdir(parents=True, exist_ok=True)
+-        self.path = directory / uuid.uuid4().hex
+-        self.handle = self.path.open('x+', encoding='utf-8')
+-        try:
+-            if not _try_acquire_file_lock(self.handle):
+-                raise RuntimeError(f'Cannot lock resource lease for {home}')
+-            # Admission after lock publication: a deleter either sees this lock or
+-            # its tombstone makes us refuse before SQLite can open anything.
+-            assert_named_profile_home_live(home)
+-            if _identity(home) != self.identity:
+-                raise FileNotFoundError(f'Profile home changed during resource admission: {home}')
+-        except BaseException:
+-            self.handle.close()
+-            self.path.unlink(missing_ok=True)
+-            raise
++        _resources_unowned(home)  # Reclaim unlocked residue, never another live owner.
++        while True:
++            self.path = directory / uuid.uuid4().hex
++            self.handle = self.path.open('x+', encoding='utf-8')
++            try:
++                if not _try_acquire_file_lock(self.handle):
++                    raise RuntimeError(f'Cannot lock resource lease for {home}')
++                # A sweeper may have locked/unlinked our file before we locked it.
++                # Do not open SQLite with an invisible lease (even if its name was replaced).
++                if not _lease_path_matches(self.path, self.handle):
++                    self.handle.close()
++                    continue
++                assert_named_profile_home_live(home)
++                if _identity(home) != self.identity:
++                    raise FileNotFoundError(f'Profile home changed during resource admission: {home}')
++            except BaseException:
++                _unlink_lease(self.path, self.handle)
++                self.handle.close()
++                raise
++            break
+         with _lock:
+             _leases.add(self)
+         try:
+@@ -75,8 +111,8 @@
+         except BaseException:
+             with _lock:
+                 _leases.discard(self)
++            _unlink_lease(self.path, self.handle)
+             self.handle.close()
+-            self.path.unlink(missing_ok=True)
+             raise
+ 
+     def retired(self) -> bool:
+@@ -113,6 +149,10 @@
+         _tick.set()
+ 
+     def finish_if_drained(self) -> None:
++        with self._finish_lock:
++            self._finish_if_drained()
++
++    def _finish_if_drained(self) -> None:
+         self.retry_closes()
+         with self._lock:
+             if self._refs or self.handle.closed:
+@@ -127,8 +167,8 @@
+             return
+         if not release_profile_pread_fds(self.home):
+             return
++        _unlink_lease(self.path, self.handle)
+         self.handle.close()  # the only positive acknowledgement is an actual close
+-        self.path.unlink(missing_ok=True)
+         with _lock:
+             _leases.discard(self)
+ 
+@@ -260,17 +300,40 @@
+         paths = list(directory.iterdir())
+     except FileNotFoundError:
+         return True
++    unowned = True
+     for path in paths:
+         try:
+             handle = path.open('r+', encoding='utf-8')
+         except FileNotFoundError:
+             continue
+         with handle:
+-            if not _try_acquire_file_lock(handle):
+-                return False
+-        # Do not unlink here: the opener may still be between creation and lock
+-        # acquisition. Its post-lock tombstone check is the admission barrier.
+-    return True
++            if _try_acquire_file_lock(handle):
++                # Keep the lock through unlink. A pre-lock opener must revalidate
++                # its inode after acquisition before it may open SQLite.
++                _unlink_lease(path, handle)
++            else:
++                unowned = False
++    return unowned
++
++
++def _cleanup_drained_at_exit() -> None:
++    # Daemon monitor may not get another tick after an explicit db.close().
++    # Release diagnostic-only owners, but never acknowledge unclosed SQLite.
++    with _probe_lock:
++        probes = list(_probe_owners.values())
++        _probe_owners.clear()
++    for owner in probes:
++        owner.lease.release_owner()
++    with _lock:
++        leases = list(_leases)
++    for lease in leases:
++        try:
++            lease.finish_if_drained()
++        except (OSError, RuntimeError):
++            logger.exception('Cannot clean drained profile resource lease at exit')
++
++
++atexit.register(_cleanup_drained_at_exit)
+ 
+ 
+ def wait_profile_resources(home: Path, *, timeout: float = 60.0) -> bool:
+diff --git a/tests/hermes_state/test_profile_lease_cleanup.py b/tests/hermes_state/test_profile_lease_cleanup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b876c969e684d5b9057b3f826a493f1541506356
+--- /dev/null
++++ b/tests/hermes_state/test_profile_lease_cleanup.py
+@@ -0,0 +1,144 @@
++"""Lease garbage collection must preserve the pre-SQLite publication barrier."""
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++from tests.hermes_state import test_profile_retirement_custody as helpers
++
++
++def test_exit_cleanup_does_not_acknowledge_unclosed_sqlite(profile_home):
++    from hermes_constants import mark_named_profile_deleted
++    from hermes_profile_resources import _cleanup_drained_at_exit, _resources_unowned, wait_profile_resources
++    db = helpers.SessionDB(profile_home / 'state.db')
++    try:
++        _cleanup_drained_at_exit()
++        assert db._profile_lease.path.exists()
++        assert db._conn.execute('SELECT 1').fetchone()[0] == 1
++        assert not _resources_unowned(profile_home)
++    finally:
++        db.close()
++    mark_named_profile_deleted(profile_home)
++    assert wait_profile_resources(profile_home, timeout=10)
++
++profile_home = helpers.profile_home
++
++
++def _check_unlink_permissions(tmp_path, monkeypatch, foreign_open):
++    import hermes_profile_resources as resources
++    path = tmp_path / 'lease'
++    handle = path.open('x+')
++    original = Path.unlink
++
++    def guarded_unlink(self, **kwargs):
++        if not handle.closed or foreign_open:
++            raise PermissionError('open file')
++        return original(self, **kwargs)
++
++    monkeypatch.setattr(Path, 'unlink', guarded_unlink)
++    try:
++        if os.name != 'nt':
++            with pytest.raises(PermissionError):
++                resources._unlink_lease(path, handle)
++            assert not handle.closed
++        else:
++            resources._unlink_lease(path, handle)
++            assert handle.closed
++            assert path.exists() == foreign_open
++    finally:
++        handle.close()
++
++
++@pytest.mark.platforms('posix')
++def test_unlink_posix_permissions_propagate(tmp_path, monkeypatch):
++    _check_unlink_permissions(tmp_path, monkeypatch, False)
++
++
++@pytest.mark.platforms('windows')
++@pytest.mark.parametrize('foreign_open', [False, True])
++def test_unlink_windows_open_file_fallback(tmp_path, monkeypatch, foreign_open):
++    _check_unlink_permissions(tmp_path, monkeypatch, foreign_open)
++
++
++@pytest.mark.platforms('posix')
++def test_unlink_preserves_replacement_path(tmp_path):
++    from hermes_profile_resources import _unlink_lease
++    path = tmp_path / 'lease'
++    with path.open('x+') as handle:
++        path.unlink()
++        path.write_text('replacement')
++        _unlink_lease(path, handle)
++        assert path.read_text() == 'replacement'
++
++
++def _child(home, body):
++    code = '''
++from pathlib import Path
++import os
++import sys
++from hermes_state import SessionDB
++from hermes_profile_resources import ProfileResourceLease
++home = Path(sys.argv[1])
++''' + body
++    result = subprocess.run([sys.executable, '-c', code, str(home)],
++                            cwd=Path(__file__).resolve().parents[2],
++                            env=dict(os.environ), capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++
++
++def test_clean_close_exit_removes_lease_files(profile_home):
++    for _ in range(3):
++        _child(profile_home, "db = SessionDB(home / 'state.db')\ndb.close()\n")
++        directory = profile_home.parent / '.resource-leases' / profile_home.name
++        assert list(directory.iterdir()) == []
++
++
++def test_next_acquisition_reclaims_crash_residue_but_keeps_live_owner(profile_home):
++    from hermes_profile_resources import ProfileResourceLease
++    live = ProfileResourceLease(profile_home)
++    try:
++        for _ in range(3):
++            _child(profile_home, 'lease = ProfileResourceLease(home)\nos._exit(0)\n')
++        replacement = ProfileResourceLease(profile_home)
++        try:
++            assert live.path.exists()
++            assert set(live.path.parent.iterdir()) == {live.path, replacement.path}
++        finally:
++            replacement.release_owner()
++            replacement.finish_if_drained()
++    finally:
++        live.release_owner()
++        live.finish_if_drained()
++
++
++@pytest.mark.platforms('posix')
++@pytest.mark.parametrize('replacement', [False, True])
++def test_opener_retries_if_sweep_unlinks_before_lock(profile_home, monkeypatch, replacement):
++    from gateway import status
++    from hermes_profile_resources import ProfileResourceLease, _resources_unowned
++    original = status._try_acquire_file_lock
++    swept = []
++
++    def interleaved(handle):
++        path = Path(handle.name)
++        if not swept:
++            swept.append(path)
++            assert _resources_unowned(profile_home)
++            assert not path.exists()
++            if replacement:
++                path.write_text('replacement')
++        return original(handle)
++
++    monkeypatch.setattr(status, '_try_acquire_file_lock', interleaved)
++    lease = ProfileResourceLease(profile_home)
++    try:
++        assert lease.path != swept[0]
++        assert lease.path.exists()
++        if replacement:
++            assert swept[0].read_text() == 'replacement'
++        assert not _resources_unowned(profile_home)
++    finally:
++        lease.release_owner()
++        lease.finish_if_drained()
+-- 
+2.43.0
+

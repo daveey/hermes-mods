@@ -1,0 +1,338 @@
+From 47248c52cddcd2462c439eabaf5646cf84b2fdcf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 14:29:07 +0000
+Subject: [PATCH 6966] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 47248c52cddcd2462c439eabaf5646cf84b2fdcf.
+
+---
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index aec3b8c1ce199d1489f1002385dfcf37368766f3..85cd0907a6f6e55b18048d3a87ae5e37355a2d8b 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -487,6 +487,8 @@
+         _add_column_if_missing(conn, table, column, ddl)
+     from hermes_cli.kanban_sync_capture_storage import install as install_capture_storage
+     install_capture_storage(conn)
++    from hermes_cli.kanban_home_generation import install as install_home_generation
++    install_home_generation(conn)
+     for table in _UID_TABLES:
+         conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uid ON {table}(uid)")
+     # task_runs.sync_version joins the board's run-bookkeeping covering index.
+@@ -618,14 +620,16 @@
+     return f"{ref}.uid"
+ 
+ 
+-def _outbox_insert(table: str, op: str, row_uid: str, fields_sql: str, base_version: str = "NULL") -> str:
++def _outbox_insert(table: str, op: str, row_uid: str, fields_sql: str, base_version: str = "NULL", *, ref: str = "NEW") -> str:
++    from hermes_cli.kanban_home_generation import capture_sql
+     return (
+-        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+-        f"VALUES ({_UUID7_SQL}, '{table}', {row_uid}, '{op}', {fields_sql}, {base_version}, '', {_NOW_MS_SQL});"
++        "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at, home_generations) "
++        f"VALUES ({_UUID7_SQL}, '{table}', {row_uid}, '{op}', {fields_sql}, {base_version}, '', {_NOW_MS_SQL}, {capture_sql(table, ref)});"
+     )
+ 
+ 
+ def _insert_trigger(table: str, columns: list[str]) -> str:
++    from hermes_cli.kanban_home_generation import capture_sql
+     name = f"kanban_sync_{table}_ins"
+     if table in _UID_TABLES:
+         uid = _UUID7_SQL
+@@ -636,8 +640,8 @@
+         fields = "json_object(" + ", ".join(f"'{_wire_name(table, c)}', json({_wire_value(table, c, 's')})" for c in columns) + ")"
+         body = (
+             f"UPDATE {table} SET uid = {uid} WHERE id = NEW.id AND uid IS NULL; {prelude}"
+-            "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at) "
+-            f"SELECT {_UUID7_SQL}, '{table}', s.uid, 'upsert', {fields}, NULL, '', {_NOW_MS_SQL} "
++            "INSERT INTO kanban_sync_outbox (op_id, table_name, row_uid, op, fields, base_version, hlc, created_at, home_generations) "
++            f"SELECT {_UUID7_SQL}, '{table}', s.uid, 'upsert', {fields}, NULL, '', {_NOW_MS_SQL}, {capture_sql(table, 's')} "
+             f"FROM {table} AS s WHERE s.id = NEW.id;"
+         )
+     else:
+@@ -677,7 +681,7 @@
+         when += " AND EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)"
+     uid = _row_uid_sql(table, "OLD")
+     body = (
+-        _outbox_insert(table, "delete", uid, "'{}'")
++        _outbox_insert(table, "delete", uid, "'{}'", ref="OLD")
+         + " INSERT OR REPLACE INTO kanban_sync_tombstones (table_name, row_uid, deleted_at) "
+         f"VALUES ('{table}', {uid}, {_NOW_MS_SQL});"
+     )
+diff --git a/hermes_cli/kanban_home_generation.py b/hermes_cli/kanban_home_generation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..47299298dc9c69be501a821666466f588630cd13
+--- /dev/null
++++ b/hermes_cli/kanban_home_generation.py
+@@ -0,0 +1,50 @@
++"""Capture-time administrative-home epochs; no production activation API yet.
++
++A generation is replay protection, NOT authority to execute or release a hold.
++Only native row capture stamps it. Repairs, synthetic parents and legacy pending
++rows stay unknown: consulting today's mirror at send time would bless old writes.
++The cooperating Board protocol must be deployed before installing any generation.
++[daveey]
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from hermes_cli.sqlite_util import add_column_if_missing
++
++
++def install(conn: sqlite3.Connection) -> None:
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_home_generations1 "
++                 "(task_id TEXT PRIMARY KEY, nonce TEXT NOT NULL)")
++    add_column_if_missing(conn, "kanban_sync_outbox", "home_generations", "home_generations TEXT")
++    # Keep this independent from removable sync capture triggers. Do not retrofit
++    # a generation onto an extant pending op even if its source row now has one.
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS home_generation1_outbox_immutable
++        BEFORE UPDATE OF home_generations ON kanban_sync_outbox
++        WHEN NEW.home_generations IS NOT OLD.home_generations
++        BEGIN SELECT RAISE(ABORT, 'captured home generation is immutable'); END""")
++
++
++def capture_sql(table: str, ref: str) -> str:
++    """SQL evaluated within the native capture, including old delete identities."""
++    if table == "tasks":
++        ids = f"{ref}.id"
++    elif table == "task_links":
++        ids = f"{ref}.parent_id,{ref}.child_id"
++    else:
++        ids = f"{ref}.task_id"
++    return ("(SELECT NULLIF(json_group_object(task_id,nonce),'{}') "
++            f"FROM kanban_home_generations1 WHERE task_id IN ({ids}))")
++
++
++def add_captured(row: dict, wire: dict) -> dict:
++    """Never read the current task or generation store while building an envelope."""
++    raw = row.get("home_generations")
++    if raw is not None:
++        value = json.loads(raw)
++        if not isinstance(value, dict) or not value or any(not isinstance(k, str) or not isinstance(v, str)
++                                                        for k, v in value.items()):
++            raise ValueError("invalid captured home generation")
++        wire = {**wire, "home_generations": value}
++    return wire
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 589f150bcaf979e93a7f4a528bcabdfb3bdb6bb6..b2fd97e3d8b559a0b5c1a8e598a5acb4a57996c1 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -40,7 +40,7 @@
+             else:
+                 ids = [f"{ref}.task_id" for ref in refs]
+             tests = [f"task_id IN ({','.join(ids)})"]
+-            if action == "INSERT" and table in related:
++            if action == "INSERT":
+                 # REPLACE's implicit deletion need not fire DELETE triggers.
+                 # Every unique identity matters, not only conventional id/uid.
+                 # A private custody row may be keyed by an episode or compound
+@@ -66,7 +66,9 @@
+                         parts.append(f'{name}{coll}=NEW.{name}{coll}')
+                     conflicts.append('(' + ' AND '.join(parts) + ')')
+                 if conflicts:
+-                    tests.append(f"task_id IN (SELECT task_id FROM {quoted} WHERE {' OR '.join(conflicts)})")
++                    old_ids = ("id",) if table == "tasks" else ("parent_id", "child_id") if table == "task_links" else ("task_id",)
++                    for old_id in old_ids:
++                        tests.append(f"task_id IN (SELECT {old_id} FROM {quoted} WHERE {' OR '.join(conflicts)})")
+             cond = " OR ".join(tests)
+             trigger = '"home_prepared1_' + table.replace('"', '""') + '_' + action.lower() + '"'
+             conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {trigger}
+diff --git a/hermes_cli/kanban_sync_envelope.py b/hermes_cli/kanban_sync_envelope.py
+index 59b8dcab8985edf5b6e3313ff923abc56f7beb67..8b6d4f3f8cf9880bc041a09ceaf20bee2d9cf75d 100644
+--- a/hermes_cli/kanban_sync_envelope.py
++++ b/hermes_cli/kanban_sync_envelope.py
+@@ -49,7 +49,8 @@
+             return wire
+         # Explicit lifecycle/schema repair can replace an op's identity in place.
+         # Its former envelope belongs to the retired id, never the replacement.
+-    wire = build()
++    from hermes_cli.kanban_home_generation import add_captured
++    wire = add_captured(row, build())
+     if not supported:
+         return gate_reassessment(row, wire, reassessment)  # old Worker: retain legacy per-attempt rebuild/strip
+     from hermes_cli.kanban_sync_status_origin import add_origin, freezeable
+diff --git a/tests/hermes_cli/test_home_transfer_capture.py b/tests/hermes_cli/test_home_transfer_capture.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3322e05ab1f337cd225f7f46a2d3df83db3436f5
+--- /dev/null
++++ b/tests/hermes_cli/test_home_transfer_capture.py
+@@ -0,0 +1,145 @@
++"""A later home generation never upgrades already captured/serialized intent."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_envelope as envelope
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    yield from support.synced_conn(home)
++
++
++def generation(conn, task, nonce):
++    with kbc.write_txn(conn):
++        # Disposable source mirror of a future authenticated committed handoff.
++        # No production migration or activation API exists in this slice.
++        conn.execute("CREATE TABLE IF NOT EXISTS kanban_home_generations1(task_id TEXT PRIMARY KEY, nonce TEXT NOT NULL)")
++        conn.execute("INSERT OR REPLACE INTO kanban_home_generations1 VALUES (?,?)", (task, nonce))
++
++
++def captured(conn, table, uid=None):
++    row = conn.execute("SELECT * FROM kanban_sync_outbox WHERE table_name=? "
++                       + ("AND row_uid=? " if uid is not None else "") + "ORDER BY rowid DESC LIMIT 1",
++                       (table, uid) if uid is not None else (table,)).fetchone()
++    return dict(row)
++
++
++def wire(conn, row):
++    return envelope.outbound(conn, row, lambda: {"client_op_id": row["op_id"], "op": row["op"],
++        "table": row["table_name"], "uid": row["row_uid"], "fields": json.loads(row["fields"]), "hlc": "100-0-test"})
++
++
++def test_late_handoff_does_not_certify_old_intent_but_new_native_capture_carries_generation(board):
++    task = kb.create_task(board, title="source before handoff")
++    kb.add_comment(board, task, "actor", "old capture")
++    old = captured(board, "task_comments")
++    generation(board, task, "committed-nonce-0001")
++    with kbc.write_txn(board):
++        old_wire = wire(board, old)
++    assert "home_generations" not in old_wire
++    kb.add_comment(board, task, "actor", "new capture")
++    new = captured(board, "task_comments")
++    with kbc.write_txn(board):
++        new_wire = wire(board, new)
++    assert new_wire.get("home_generations") == {task: "committed-nonce-0001"}
++    assert "home_generations" not in old_wire
++
++
++def test_resend_preserves_captured_generation_not_current_mirror(board):
++    task = kb.create_task(board, title="first generation")
++    generation(board, task, "committed-nonce-0001")
++    kb.add_comment(board, task, "actor", "pending intent")
++    row = captured(board, "task_comments")
++    generation(board, task, "committed-nonce-0002")
++    with kbc.write_txn(board):
++        first = wire(board, row)
++    assert first.get("home_generations") == {task: "committed-nonce-0001"}
++    with kbc.write_txn(board):
++        assert wire(board, row) == first
++
++
++def test_manual_reconstruction_never_gains_current_generation(board):
++    task = kb.create_task(board, title="source")
++    generation(board, task, "committed-nonce-0001")
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                      "VALUES('reconstructed','tasks',?,'upsert','{\"title\":\"historical\"}','',1)", (task,))
++        row = captured(board, "tasks", task)
++        assert "home_generations" not in wire(board, row)
++
++
++@pytest.mark.parametrize("table, columns, values", [
++    ("tasks", "id,title,status,created_at", "?,'after handoff','todo',1"),
++    ("task_comments", "task_id,author,body,created_at", "?,'actor','after handoff',1"),
++    ("task_events", "task_id,kind,payload,created_at", "?,'diagnostic','{}',1"),
++    ("task_runs", "task_id,profile,status,started_at", "?,'default','done',1"),
++    ("task_attachments", "task_id,filename,stored_path,size,created_at", "?,'proof.txt','fixture-only',0,1"),
++    ("task_chat_links", "task_id,chat_gateway,chat_profile,chat_session,kind,created_at", "?,'hub','default','fixture','shepherd',1"),
++])
++def test_each_native_insert_captures_at_the_writer_transaction(board, table, columns, values):
++    task = kb.create_task(board, title="before handoff")
++    generation(board, task, "committed-nonce-0001")
++    if table == "tasks":
++        # Exercise native tasks insertion without a conflicting source row.
++        with kbc.write_txn(board):
++            board.execute("UPDATE kanban_sync_state SET applying=1")
++            board.execute("DELETE FROM tasks WHERE id=?", (task,))
++            board.execute("UPDATE kanban_sync_state SET applying=0")
++    with kbc.write_txn(board):
++        board.execute(f"INSERT INTO {table}({columns}) VALUES ({values})", (task,))
++    row = captured(board, table)
++    assert json.loads(row["home_generations"]) == {task: "committed-nonce-0001"}
++    with kbc.write_txn(board):
++        assert wire(board, row)["home_generations"] == {task: "committed-nonce-0001"}
++
++
++def test_native_task_update_and_delete_keep_epoch_after_source_row_disappears(board):
++    task = kb.create_task(board, title="before handoff")
++    generation(board, task, "committed-nonce-0001")
++    with kbc.write_txn(board):
++        board.execute("UPDATE tasks SET title='new intent' WHERE id=?", (task,))
++    update = captured(board, "tasks", task)
++    assert json.loads(update["home_generations"]) == {task: "committed-nonce-0001"}
++    with kbc.write_txn(board):
++        board.execute("DELETE FROM tasks WHERE id=?", (task,))
++    delete = captured(board, "tasks", task)
++    assert delete["op"] == "delete"
++    with kbc.write_txn(board):
++        assert wire(board, delete)["home_generations"] == {task: "committed-nonce-0001"}
++
++
++def test_pending_generation_cannot_be_rewritten_to_the_current_epoch(board):
++    import sqlite3
++    task = kb.create_task(board, title="source")
++    row = captured(board, "tasks", task)
++    generation(board, task, "committed-nonce-0001")
++    with pytest.raises(sqlite3.IntegrityError, match="captured home generation is immutable"):
++        with kbc.write_txn(board):
++            board.execute("UPDATE kanban_sync_outbox SET home_generations=? WHERE op_id=?",
++                          (json.dumps({task: "committed-nonce-0001"}), row["op_id"]))
++    assert captured(board, "tasks", task)["home_generations"] is None
++
++
++def test_link_capture_binds_both_endpoints_and_delete_keeps_the_generation(board):
++    parent = kb.create_task(board, title="parent")
++    child = kb.create_task(board, title="child")
++    generation(board, parent, "committed-parent-001")
++    generation(board, child, "committed-child-0001")
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)", (parent, child))
++    linked = captured(board, "task_links")
++    with kbc.write_txn(board):
++        assert wire(board, linked).get("home_generations") == {parent: "committed-parent-001", child: "committed-child-0001"}
++        board.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (parent, child))
++    deleted = captured(board, "task_links")
++    assert deleted["op"] == "delete"
++    with kbc.write_txn(board):
++        assert wire(board, deleted).get("home_generations") == {parent: "committed-parent-001", child: "committed-child-0001"}
+diff --git a/tests/hermes_cli/test_kanban_home_transfer_fence.py b/tests/hermes_cli/test_kanban_home_transfer_fence.py
+index 873483a73caa0da94366c988c1bd0e405b80645b..06358ef8c12b23293fe21ab79f253c5ad1073879 100644
+--- a/tests/hermes_cli/test_kanban_home_transfer_fence.py
++++ b/tests/hermes_cli/test_kanban_home_transfer_fence.py
+@@ -170,6 +170,24 @@
+             board.execute(sql, (tid,))
+ 
+ 
++def test_tasks_unique_identity_replace_cannot_delete_a_prepared_old_card(board):
++    tid = seed(board)
++    with kbc.write_txn(board):
++        # Current core's idempotency index is nonunique. Model a real UNIQUE
++        # identity explicitly: a nonconflicting REPLACE would only INSERT.
++        board.execute("CREATE UNIQUE INDEX transfer_fixture_task_identity ON tasks(idempotency_key)")
++        board.execute("UPDATE tasks SET idempotency_key='prepared-unique-key' WHERE id=?", (tid,))
++        board.execute("DELETE FROM kanban_sync_outbox")
++        prepare(board, tid)
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    # Raw extant SQLite clients do not execute the Python replace guard.
++    with sqlite3.connect(path) as other:
++        with pytest.raises(sqlite3.IntegrityError, match="home transfer prepared"):
++            other.execute("INSERT OR REPLACE INTO tasks(id,title,status,created_at,idempotency_key) "
++                          "VALUES('different-task','wrong identity','todo',1,'prepared-unique-key')")
++    assert board.execute("SELECT id FROM tasks WHERE idempotency_key='prepared-unique-key'").fetchone()[0] == tid
++
++
+ def test_private_custody_primary_key_replacement_checks_the_old_task(board):
+     tid = seed(board)
+     other = kb.create_task(board, title="unprepared")
+-- 
+2.43.0
+

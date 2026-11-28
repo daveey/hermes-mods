@@ -1,0 +1,356 @@
+From 303dd65deec82b88b16a0843ba080a664c99ba2c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:49:11 +0000
+Subject: [PATCH 6967] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 303dd65deec82b88b16a0843ba080a664c99ba2c.
+
+---
+diff --git a/hermes_cli/kanban_home_source_stop.py b/hermes_cli/kanban_home_source_stop.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..193794b9eafbec2707fb891cfcef7f844e7099f1
+--- /dev/null
++++ b/hermes_cli/kanban_home_source_stop.py
+@@ -0,0 +1,117 @@
++"""Durable source STOP, called only with an authenticated Board handoff reply.
++
++No network or activation caller exists yet. A dictionary is not authentication:
++production orchestration must obtain it through the gateway-pinned Board RPC.
++Only the administrative home and version change; local probe/origin/file custody
++stays here. A later worker execution still needs its ordinary real Board lease.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++
++def _receipt(conn: sqlite3.Connection, record: dict) -> tuple[dict, dict, str]:
++    from hermes_cli import kanban_db_sync as sync
++
++    if not isinstance(record, dict) or record.get("phase") not in ("materialized", "complete"):
++        raise ValueError("destination materialization is not acknowledged")
++    task = record.get("task")
++    prepared = conn.execute("SELECT task_id,source,destination,nonce,expected_version "
++                            "FROM kanban_home_prepared1 WHERE task_id=?", (task,)).fetchone()
++    keys = ("task", "source", "destination", "nonce", "expected_version")
++    if (not prepared or tuple(prepared) != tuple(record.get(k) for k in keys)
++            or type(record.get("expected_version")) is not int):
++        raise ValueError("source stop identity changed")
++    state = conn.execute("SELECT gateway_id FROM kanban_sync_state").fetchall()
++    if len(state) != 1 or state[0][0] != record["source"]:
++        raise ValueError("source stop is not on the source gateway")
++    rows = record.get("rows")
++    if (not isinstance(rows, list) or not rows or any(not isinstance(r, dict) for r in rows)
++            or any(not isinstance(r.get("table"), str) or not isinstance(r.get("uid"), str) for r in rows)
++            or len({(r["table"], r["uid"]) for r in rows}) != len(rows)):
++        raise ValueError("source stop needs the full unique manifest")
++    for row in rows:
++        table, uid, fields = row.get("table"), row.get("uid"), row.get("fields")
++        if table not in sync.SYNCED_TABLES or not isinstance(uid, str) or not isinstance(fields, dict):
++            raise ValueError("source stop manifest invalid")
++        related = (uid == task and fields.get("id") == task if table == "tasks" else
++                   task in (fields.get("parent_id"), fields.get("child_id")) if table == "task_links" else
++                   fields.get("task_id") == task)
++        if not related:
++            raise ValueError("source stop manifest identity changed")
++    first = rows[0]
++    if (first["table"] != "tasks" or first["uid"] != task or sum(r["table"] == "tasks" for r in rows) != 1
++            or first["fields"].get("created_on") != record["destination"]
++            or type(first["fields"].get("version")) is not int
++            or first["fields"]["version"] != record["expected_version"] + 1
++            or first["fields"].get("deleted_at") is not None):
++        raise ValueError("source stop canonical home or version changed")
++    payload = {k: record[k] for k in keys}
++    payload.update(phase="materialized", rows=rows)
++    return payload, first["fields"], json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def finalize_source(conn: sqlite3.Connection, record: dict) -> dict:
++    """Atomically install epoch, stop local ownership and retain original custody.
++
++    Savepoint rollback includes the release receipt. A crash cannot commit an
++    unfenced old home or a new epoch without the matching immutable receipt.
++    An exact retry after an unknown result never rewrites a newer local row.
++    """
++    from hermes_cli import kanban_db_sync as sync, kanban_home_generation as generation
++
++    if not conn.in_transaction:
++        raise ValueError("source stop requires a write transaction")
++    conn.execute("SAVEPOINT home_source_stop")
++    try:
++        payload, fields, encoded = _receipt(conn, record)
++        task, nonce = payload["task"], payload["nonce"]
++        old = conn.execute("SELECT nonce,receipt FROM kanban_home_finalized1 WHERE task_id=?", (task,)).fetchone()
++        if old:
++            if tuple(old) != (nonce, encoded):
++                raise ValueError("source stop receipt changed")
++            current = conn.execute("SELECT created_on,sync_version FROM tasks WHERE id=?", (task,)).fetchone()
++            epoch = conn.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone()
++            if (not current or current[0] != payload["destination"] or type(current[1]) is not int
++                    or current[1] < fields["version"] or not epoch or epoch[0] != nonce):
++                raise ValueError("source stop receipt is not materialized locally")
++        else:
++            current = conn.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
++            if (not current or current["created_on"] != payload["source"]
++                    or current["sync_version"] != payload["expected_version"]):
++                raise ValueError("source stop local home or version changed")
++            # A home move must not incidentally replay events or overwrite any
++            # business value. Prove every captured task field against the reply.
++            for column in sync.captured_columns(conn, "tasks"):
++                wire = sync._wire_name("tasks", column)
++                value = current[column]
++                if ("tasks", column) in sync.REF_COLUMNS:
++                    run = conn.execute("SELECT uid FROM task_runs WHERE id=?", (value,)).fetchone()
++                    value = run[0] if run else None
++                if wire not in fields or sync._from_wire(fields[wire]) != value:
++                    raise ValueError(f"source stop changed task field: {column}")
++            for table in ("kanban_sync_outbox", "kanban_sync_parent_envelopes", "kanban_sync_omissions"):
++                if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
++                    raise ValueError("source stop requires drained pending custody")
++            generation.install(conn)
++            epoch = conn.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (task,)).fetchone()
++            if epoch and epoch[0] != nonce:
++                raise ValueError("source stop generation changed")
++            # This receipt is the sole local release condition. Receipt, epoch
++            # and home update share ONE write transaction: no peer can capture
++            # intent between the receipt insertion and epoch installation.
++            conn.execute("INSERT INTO kanban_home_finalized1(task_id,nonce,receipt) VALUES (?,?,?)", (task, nonce, encoded))
++            if not epoch:
++                conn.execute("INSERT INTO kanban_home_generations1(task_id,nonce) VALUES (?,?)", (task, nonce))
++            applying = conn.execute("SELECT applying FROM kanban_sync_state").fetchone()[0]
++            conn.execute("UPDATE kanban_sync_state SET applying=1")
++            conn.execute("UPDATE tasks SET created_on=?,sync_version=? WHERE id=?",
++                         (payload["destination"], fields["version"], task))
++            conn.execute("UPDATE kanban_sync_state SET applying=?", (applying,))
++    except BaseException:
++        conn.execute("ROLLBACK TO home_source_stop")
++        conn.execute("RELEASE home_source_stop")
++        raise
++    conn.execute("RELEASE home_source_stop")
++    return {"task": payload["task"], "nonce": payload["nonce"], "phase": "stopped_local"}
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index b2fd97e3d8b559a0b5c1a8e598a5acb4a57996c1..08d994244040d865ad92aaf1341bae33b44e545e 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -20,6 +20,28 @@
+     conn.execute(f"""CREATE TABLE IF NOT EXISTS {_TABLE} (
+         task_id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL,
+         nonce TEXT NOT NULL, expected_version INTEGER NOT NULL)""")
++    conn.execute("""CREATE TABLE IF NOT EXISTS kanban_home_finalized1 (
++        task_id TEXT PRIMARY KEY, nonce TEXT NOT NULL, receipt TEXT NOT NULL,
++        CHECK(json_valid(receipt) AND json_extract(receipt,'$.task') IS task_id
++            AND json_extract(receipt,'$.nonce') IS nonce
++            AND json_extract(receipt,'$.phase') IS 'materialized'
++            AND json_type(receipt,'$.rows') IS 'array'))""")
++    for action in ("UPDATE", "DELETE"):
++        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_finalized1_{action.lower()}
++            BEFORE {action} ON kanban_home_finalized1
++            BEGIN SELECT RAISE(ABORT, 'home finalization immutable'); END""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS home_finalized1_insert
++        BEFORE INSERT ON kanban_home_finalized1
++        WHEN EXISTS(SELECT 1 FROM kanban_home_finalized1 WHERE task_id=NEW.task_id)
++        BEGIN SELECT RAISE(ABORT, 'home finalization immutable'); END""")
++    conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_finalized1_scope
++        BEFORE INSERT ON kanban_home_finalized1
++        WHEN NOT EXISTS(SELECT 1 FROM {_TABLE} p WHERE p.task_id=NEW.task_id AND p.nonce=NEW.nonce
++            AND p.source IS json_extract(NEW.receipt,'$.source')
++            AND p.destination IS json_extract(NEW.receipt,'$.destination')
++            AND p.expected_version IS json_extract(NEW.receipt,'$.expected_version')
++            AND json_type(NEW.receipt,'$.expected_version') IS 'integer')
++        BEGIN SELECT RAISE(ABORT, 'home finalization scope mismatch'); END""")
+     # Include local-only task custody (wake/ask probes, subscriptions, private
+     # restriction records), not just the rows sent by sync. Discover task_id
+     # tables from this board's real schema, retaining guards across sync detach.
+@@ -27,7 +49,7 @@
+     for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+         quoted = '"' + table.replace('"', '""') + '"'
+         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({quoted})")}
+-        if "task_id" in columns and table != _TABLE:
++        if "task_id" in columns and table not in (_TABLE, "kanban_home_finalized1"):
+             related[table] = columns
+     for table in ("tasks", "task_links", *sorted(related)):
+         quoted = '"' + table.replace('"', '""') + '"'
+@@ -72,7 +94,9 @@
+             cond = " OR ".join(tests)
+             trigger = '"home_prepared1_' + table.replace('"', '""') + '_' + action.lower() + '"'
+             conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {trigger}
+-                BEFORE {action} ON {quoted} WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE {cond})
++                BEFORE {action} ON {quoted} WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE ({cond})
++                    AND NOT EXISTS(SELECT 1 FROM kanban_home_finalized1 f
++                                   WHERE f.task_id={_TABLE}.task_id AND f.nonce={_TABLE}.nonce))
+                 BEGIN SELECT RAISE(ABORT, 'home transfer prepared'); END""")
+     for action in ("UPDATE", "DELETE"):
+         conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_prepared1_marker_{action.lower()}
+@@ -133,3 +157,10 @@
+         raise
+     conn.execute("RELEASE home_prepare")
+     return {"phase": "prepared_local", **record}
++
++
++def finalize_source(conn: sqlite3.Connection, record: dict) -> dict:
++    """Stop local ownership after the authenticated destination materialization ACK."""
++    from hermes_cli.kanban_home_source_stop import finalize_source as finish
++
++    return finish(conn, record)
+diff --git a/tests/hermes_cli/test_kanban_home_source_stop.py b/tests/hermes_cli/test_kanban_home_source_stop.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a22b7e262d0ffda8e877b205ae157d24b06102a3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_home_source_stop.py
+@@ -0,0 +1,152 @@
++"""Source STOP changes home, not evidence, probe custody or execution authority."""
++from __future__ import annotations
++
++import copy
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from hermes_cli import kanban_home_transfer as transfer
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++
++board = support.board
++
++
++def record(conn, tid) -> dict:
++    row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    fields = {sync._wire_name("tasks", col): row[col] for col in sync.captured_columns(conn, "tasks")}
++    fields.update(id=tid, uid=tid, created_on="hub", version=8, deleted_at=None)
++    return dict(task=tid, source="worker-a3", destination="hub", nonce="source-stop-000001",
++                expected_version=7, phase="materialized", rows=[dict(table="tasks", uid=tid, fields=fields)])
++
++
++def prepared(conn):
++    tid = support.seed(conn)
++    kb.add_comment(conn, tid, "actor", "retained history")
++    with kbc.write_txn(conn):
++        conn.execute("INSERT INTO task_wake_checks(task_id,cmd,every,next_at) VALUES (?,'source-only-probe',120,1)", (tid,))
++        conn.execute("DELETE FROM kanban_sync_outbox")
++        reply = record(conn, tid)
++        transfer.prepare(conn, tid, source=reply["source"], destination=reply["destination"],
++                         nonce=reply["nonce"], expected_version=reply["expected_version"])
++    return tid, reply
++
++
++def test_source_stop_installs_epoch_and_changes_home_without_erasing_probe_history(board):
++    tid, reply = prepared(board)
++    before = tuple(board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    children = [tuple(r) for r in board.execute("SELECT * FROM task_comments WHERE task_id=?", (tid,))]
++    probes = [tuple(r) for r in board.execute("SELECT * FROM task_wake_checks WHERE task_id=?", (tid,))]
++    with kbc.write_txn(board):
++        assert transfer.finalize_source(board, reply) == dict(task=tid,nonce=reply["nonce"],phase="stopped_local")
++    row = board.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
++    names = [r[1] for r in board.execute("PRAGMA table_info(tasks)")]
++    changed = {k for k, a, b in zip(names, before, tuple(row)) if a != b}
++    assert changed == {"created_on", "sync_version"}
++    assert row["created_on"] == "hub" and row["sync_version"] == 8
++    assert [tuple(r) for r in board.execute("SELECT * FROM task_comments WHERE task_id=?", (tid,))] == children
++    assert [tuple(r) for r in board.execute("SELECT * FROM task_wake_checks WHERE task_id=?", (tid,))] == probes
++    assert board.execute("SELECT count(*) FROM kanban_sync_outbox").fetchone()[0] == 0
++    assert board.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?", (tid,)).fetchone()[0] == reply["nonce"]
++    # Retained foreign probe custody can write a wake later; capture has the new
++    # epoch, not permission to execute without the usual Board lease/hold gates.
++    kb.add_comment(board, tid, "actor", "fresh post-stop evidence")
++    captures = board.execute("SELECT home_generations FROM kanban_sync_outbox WHERE table_name='task_comments'").fetchall()
++    assert captures and all(json.loads(r[0]) == {tid:reply["nonce"]} for r in captures)
++
++
++def test_retry_survives_reopen_and_never_rewinds_later_native_state(board):
++    tid, reply = prepared(board)
++    with kbc.write_txn(board):
++        transfer.finalize_source(board, reply)
++        board.execute("UPDATE tasks SET title='later real work',sync_version=9 WHERE id=?", (tid,))
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    with sqlite3.connect(path) as other:
++        other.row_factory = sqlite3.Row
++        other.execute("BEGIN IMMEDIATE")
++        assert transfer.finalize_source(other, {**reply,"phase":"complete"})["phase"] == "stopped_local"
++        other.commit()
++        assert other.execute("SELECT title,sync_version FROM tasks WHERE id=?", (tid,)).fetchone()[:] == ("later real work",9)
++
++
++@pytest.mark.parametrize("change", [
++    {"phase":"committed"}, {"nonce":"another-stop-000001"}, {"expected_version":True},
++    {"source":"worker-a2"}, {"destination":"worker-a2"}, {"rows":[]},
++])
++def test_nonmatching_or_unacknowledged_stop_keeps_the_source_fenced(board, change):
++    tid, reply = prepared(board)
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError):
++            transfer.finalize_source(board, {**reply,**change})
++    with pytest.raises(sqlite3.IntegrityError,match="home transfer prepared"):
++        with kbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='must stay fenced' WHERE id=?", (tid,))
++    assert board.execute("SELECT count(*) FROM kanban_home_finalized1").fetchone()[0] == 0
++
++
++def test_same_tuple_but_changed_business_fields_is_not_home_only(board):
++    tid, reply = prepared(board)
++    bad = copy.deepcopy(reply)
++    bad["rows"][0]["fields"]["status"] = "done"
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError,match="changed task field: status"):
++            transfer.finalize_source(board,bad)
++    assert board.execute("SELECT created_on FROM tasks WHERE id=?",(tid,)).fetchone()[0] == "worker-a3"
++
++
++def test_crash_after_receipt_before_home_update_rolls_back_epoch_and_release(board):
++    tid, reply = prepared(board)
++    with kbc.write_txn(board):
++        board.execute("CREATE TRIGGER fail_home_stop BEFORE UPDATE OF created_on ON tasks "
++                      "BEGIN SELECT RAISE(ABORT,'injected stop failure'); END")
++        with pytest.raises(sqlite3.IntegrityError,match="injected stop failure"):
++            transfer.finalize_source(board,reply)
++    assert board.execute("SELECT count(*) FROM kanban_home_finalized1").fetchone()[0] == 0
++    assert board.execute("SELECT count(*) FROM kanban_home_generations1 WHERE task_id=?",(tid,)).fetchone()[0] == 0
++    assert board.execute("SELECT created_on FROM tasks WHERE id=?",(tid,)).fetchone()[0] == "worker-a3"
++    with pytest.raises(sqlite3.IntegrityError,match="home transfer prepared"):
++        with kbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='still fenced' WHERE id=?",(tid,))
++    with kbc.write_txn(board):
++        board.execute("DROP TRIGGER fail_home_stop")
++        transfer.finalize_source(board,reply)
++
++
++@pytest.mark.parametrize("raw", ["not-json", "{}", '{"phase":"materialized","rows":[]}'])
++def test_malformed_receipt_cannot_release_a_matching_nonce(board, raw):
++    tid, reply = prepared(board)
++    with pytest.raises(sqlite3.Error):
++        with kbc.write_txn(board):
++            board.execute("INSERT INTO kanban_home_finalized1(task_id,nonce,receipt) VALUES (?,?,?)",
++                          (tid,reply["nonce"],raw))
++    with pytest.raises(sqlite3.IntegrityError,match="home transfer prepared"):
++        with kbc.write_txn(board):
++            board.execute("UPDATE tasks SET title='still prepared' WHERE id=?",(tid,))
++
++
++def test_source_stop_is_atomically_visible_to_an_existing_peer(board):
++    tid, reply = prepared(board)
++    path = board.execute("PRAGMA database_list").fetchone()[2]
++    with sqlite3.connect(f"file:{path}?mode=ro",uri=True) as peer:
++        with kbc.write_txn(board):
++            transfer.finalize_source(board,reply)
++            assert peer.execute("SELECT created_on FROM tasks WHERE id=?",(tid,)).fetchone()[0] == "worker-a3"
++            assert peer.execute("SELECT count(*) FROM kanban_home_finalized1").fetchone()[0] == 0
++            assert peer.execute("SELECT count(*) FROM kanban_home_generations1 WHERE task_id=?",(tid,)).fetchone()[0] == 0
++        assert peer.execute("SELECT created_on FROM tasks WHERE id=?",(tid,)).fetchone()[0] == "hub"
++        assert peer.execute("SELECT nonce FROM kanban_home_generations1 WHERE task_id=?",(tid,)).fetchone()[0] == reply["nonce"]
++        assert peer.execute("SELECT nonce FROM kanban_home_finalized1 WHERE task_id=?",(tid,)).fetchone()[0] == reply["nonce"]
++
++
++@pytest.mark.parametrize("sql", ["DELETE FROM kanban_home_finalized1 WHERE task_id=?",
++    "UPDATE kanban_home_finalized1 SET nonce='another-epoch' WHERE task_id=?",
++    "INSERT OR REPLACE INTO kanban_home_finalized1 SELECT * FROM kanban_home_finalized1 WHERE task_id=?"])
++def test_completed_custody_receipt_is_immutable(board,sql):
++    tid,reply=prepared(board)
++    with kbc.write_txn(board):
++        transfer.finalize_source(board,reply)
++    with pytest.raises(sqlite3.IntegrityError,match="finalization immutable"):
++        with kbc.write_txn(board):
++            board.execute(sql,(tid,))
+-- 
+2.43.0
+

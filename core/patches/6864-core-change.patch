@@ -1,0 +1,223 @@
+From cce93f5220c47d09943fbcfa5a8e8ce23c7cace8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:07:55 +0000
+Subject: [PATCH 6864] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit cce93f5220c47d09943fbcfa5a8e8ce23c7cace8.
+
+---
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index cd3a35f40f74f28c5701066f7f4d90b4b2935b2e..d0397d521121b82a079748f4ae7229271f473ab3 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -29,10 +29,11 @@
+     from hermes_cli import kanban_sync_client as client
+     client.refuse_if_schema_ahead(conn)
+     if (sync.sync_state(conn) or {}).get('journal_id') is not None:
+-        if primary or before_head:
++        if primary:
+             raise ValueError('tracer push mode not integrated')
+         try:
+-            return _push_strict(conn, hub, board, gateway, max_batches=max_batches)
++            return _push_strict(conn, hub, board, gateway, max_batches=max_batches,
++                                before_head=before_head, seen={} if seen is None else seen)
+         except (OSError, ValueError, client.HubError):
+             from hermes_cli.kanban_replay_episodes import interrupt
+             interrupt(conn)
+@@ -41,7 +42,7 @@
+                                max_batches=max_batches, before_head=before_head, seen=seen)
+ 
+ 
+-def _push_strict(conn, hub, board, gateway, *, max_batches):
++def _push_strict(conn, hub, board, gateway, *, max_batches, before_head, seen):
+     from hermes_cli import kanban_sync_client as client
+     root = f'/v2/boards/{quote(board, safe="")}/replay/'
+     out = client.PushResult()
+@@ -156,8 +157,9 @@
+         from time import time
+         rows = []
+         if journal.pending_wire(conn) is None:
+-            rows, _, _ = select_pending(conn, hub, board, {}, now=int(time()), limit=1, before_head=False,
++            rows, _, _ = select_pending(conn, hub, board, seen, now=int(time()), limit=1, before_head=before_head,
+                                         hold_rejected=True)
++
+         membership = refresh_capacity()
+         with write_txn(conn):
+             decision = journal.recover(conn, remote, record)
+@@ -187,8 +189,16 @@
+                     intent = envelopes.outbound(conn, row, lambda: strip_stale_push(conn, wire_ops.translate(
+                         client._full_row_if_unseen(conn, row), client._next_hlc(conn, gateway))), supported=True)
+                 encoded = journal.issue(conn, intent)
+-            source()  # Validate retained source custody on RETRY as well as final recovery.
++            row = source()  # Validate retained source custody on RETRY as well as final recovery.
+         wire = json.loads(encoded)
++        if before_head:
++            # Issuance is not permission to overwrite an unread run end or terminal
++            # task. Judge even saved unissued envelopes by their frozen wire.
++            from hermes_cli.kanban_sync_backlog import sendable_before_head
++            candidate = dict(row, fields=wire.get('fields', {}))
++            allowed, _ = sendable_before_head(conn, hub, board, [candidate], seen)
++            if not allowed:
++                break
+         wire['replay']['session'] = remote['session']
+         hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
+         out.sent += 1
+diff --git a/tests/hermes_cli/test_kanban_replay_before_head.py b/tests/hermes_cli/test_kanban_replay_before_head.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..03a65d7ac0d095a9da55e3ba994f951b20186936
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_before_head.py
+@@ -0,0 +1,137 @@
++"""Pre-head selection/recovery through the real bound-journal push entry."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++def run_intent(conn):
++    tid = kb.create_task(conn, title='pre-head parent', assignee='worker')
++    with kbc.write_txn(conn):
++        conn.execute('UPDATE tasks SET sync_version=2 WHERE id=?', (tid,))
++        conn.execute('DELETE FROM kanban_sync_outbox')
++        conn.execute("INSERT INTO task_runs(task_id,status,started_at,uid) VALUES (?,'running',1,'run-pre-head')", (tid,))
++    return tid
++
++
++def push(conn, receiver, *, before_head=True, seen=None):
++    return client.push(conn, receiver, 'default', 'macbook', primary=False,
++                       before_head=before_head, seen=seen, max_batches=1)
++
++
++def test_pre_head_sends_safe_task_without_legacy_fallback(live):
++    tid = kb.create_task(live, title='safe create before head', assignee='worker')
++    receiver = helpers.Receiver()
++    result = push(live, receiver)
++    assert result.applied == 1 and receiver.sent[0]['uid'] == tid
++    assert receiver.slot['a'] == '1' and journal.pending_wire(live) is None
++
++
++def test_pre_head_holds_unissued_run_without_allocating(live):
++    run_intent(live)
++    receiver = helpers.Receiver()
++    result = push(live, receiver)
++    assert result.sent == result.applied == 0 and not receiver.sent
++    assert journal.snapshot(live)['pending'] is None
++    assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_runs'").fetchone()
++    assert push(live, receiver, before_head=False).applied == 1
++
++
++@pytest.mark.parametrize('committed', [False, True])
++def test_pre_head_reopen_records_known_run_but_holds_uncertain_retry(live, committed):
++    run_intent(live)
++    receiver = helpers.Receiver() if committed else helpers.PrecommitFailure()
++    receiver.lose_reply = True
++    with pytest.raises(OSError):
++        push(live, receiver, before_head=False)
++    frozen = journal.pending_wire(live)
++    assert json.loads(frozen)['table'] == 'task_runs'
++    restarted = helpers.reopen(live)
++    resumed = helpers.Receiver()
++    resumed.slot = dict(receiver.slot)
++    try:
++        result = push(restarted, resumed)
++        assert result.sent == 0 and not resumed.sent
++        if committed:
++            assert result.applied == 1 and resumed.slot['a'] == '1'
++            assert journal.pending_wire(restarted) is None
++        else:
++            assert result.applied == 0 and resumed.slot['a'] == '0'
++            assert journal.pending_wire(restarted) == frozen
++            assert push(restarted, resumed, before_head=False).applied == 1
++            assert len(resumed.sent) == 1
++    finally:
++        restarted.close()
++
++
++def test_pre_head_reuses_round_terminal_read_cache(live):
++    tid = kb.create_task(live, title='stale wake before head', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('UPDATE tasks SET sync_version=2 WHERE id=?', (tid,))
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks'")
++    class Terminal(helpers.Receiver):
++        reads = 0
++        def row_evidence(self, board, table, uid):
++            assert not live.in_transaction
++            self.reads += 1
++            return {'row': {'uid': uid, 'status': 'done'}}
++    receiver = Terminal()
++    seen = {}
++    for _ in range(2):
++        assert push(live, receiver, seen=seen).sent == 0
++    assert receiver.reads == 1 and seen == {tid: True}
++    assert journal.pending_wire(live) is None and not receiver.sent
++
++
++def test_pre_head_retry_checks_frozen_status_not_rewritten_source_fields(live):
++    tid = kb.create_task(live, title='frozen stale wake', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('UPDATE tasks SET sync_version=2 WHERE id=?', (tid,))
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks'")
++    receiver = helpers.PrecommitFailure()
++    with pytest.raises(OSError):
++        push(live, receiver, before_head=False)
++    frozen = journal.pending_wire(live)
++    wire = json.loads(frozen)
++    assert wire['fields']['status'] not in ('done', 'archived', 'running')
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_outbox SET fields=? WHERE op_id=?",
++                     (json.dumps({'status': 'done'}), wire['client_op_id']))
++    class Terminal(helpers.Receiver):
++        def row_evidence(self, board, table, uid):
++            assert not live.in_transaction
++            return {'row': {'uid': uid, 'status': 'done'}}
++    resumed = Terminal()
++    resumed.slot = dict(receiver.slot)
++    assert push(live, resumed).sent == 0
++    assert not resumed.sent and journal.pending_wire(live) == frozen
++    assert push(live, resumed, before_head=False).applied == 1
++
++
++def test_pre_head_checks_saved_unissued_envelope_before_transmission(live):
++    from hermes_cli import kanban_sync_envelope as envelopes
++    from hermes_cli import kanban_sync_wire as wire_ops
++    tid = kb.create_task(live, title='saved unissued wake', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('UPDATE tasks SET sync_version=2 WHERE id=?', (tid,))
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name!='tasks'")
++        row = dict(live.execute('SELECT * FROM kanban_sync_outbox').fetchone())
++        saved = envelopes.outbound(live, row, lambda: wire_ops.translate(row, client._next_hlc(live, 'macbook')))
++        live.execute('UPDATE kanban_sync_outbox SET fields=? WHERE op_id=?',
++                     (json.dumps({'status': 'done'}), row['op_id']))
++    class Terminal(helpers.Receiver):
++        def row_evidence(self, board, table, uid):
++            assert not live.in_transaction
++            return {'row': {'uid': uid, 'status': 'done'}}
++    receiver = Terminal()
++    assert push(live, receiver).sent == 0
++    assert not receiver.sent
++    issued = json.loads(journal.pending_wire(live))
++    issued.pop('replay')
++    assert issued == saved
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index 5798ed1ad3f944a39f779192da3745985bee2388..96a3ccf702564221b0d4e589fb200ab100c4adfc 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -771,7 +771,7 @@
+     assert journal.snapshot(live)['settled'] == '1'
+ 
+ 
+-@pytest.mark.parametrize('flag', ['primary', 'before_head'])
++@pytest.mark.parametrize('flag', ['primary'])
+ def test_unintegrated_push_modes_refuse_before_network(live, flag):
+     kb.create_task(live, title='mode custody', assignee='worker')
+     receiver = Receiver()
+-- 
+2.43.0
+

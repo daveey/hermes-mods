@@ -1,0 +1,88 @@
+From 192d76006b66e8eee34de2329b6b1f240a5ef2d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:54:25 +0000
+Subject: [PATCH 6730] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 192d76006b66e8eee34de2329b6b1f240a5ef2d7.
+
+---
+diff --git a/tests/tui_gateway/test_kanban_notice_idle_probe.py b/tests/tui_gateway/test_kanban_notice_idle_probe.py
+index 4df0c5911097578d00344078ef96e55edf413848..7640f809d7e07238a6cf42ec1c0c1bfc4caa2b98 100644
+--- a/tests/tui_gateway/test_kanban_notice_idle_probe.py
++++ b/tests/tui_gateway/test_kanban_notice_idle_probe.py
+@@ -106,6 +106,56 @@
+     assert texts == [] and begins == []
+ 
+ 
++def test_loaded_poll_only_walks_pending_kind_and_inflight_candidates(monkeypatch):
++    """A global board hint must not replay the chat's entire historical subscription set."""
++    tid = _task()
++    _poll([])
++    with contextlib.closing(kbc.connect()) as conn:
++        with kb.write_txn(conn):
++            conn.executemany(
++                "INSERT INTO kanban_notify_subs(task_id, platform, chat_id, thread_id, created_at, last_event_id) "
++                "VALUES (?, 'tui', ?, '', 0, 0)",
++                [(f"quiet-{n}", KEY) for n in range(300)],
++            )
++            for n in range(300):
++                kb._append_event(conn, f"quiet-{n}", "commented", {})
++    listed, claimed = [], []
++    real_list, real_claim = kbn.list_notify_subs, kbn.claim_unseen_events_for_sub
++
++    def listing(*args, **kwargs):
++        rows = real_list(*args, **kwargs)
++        listed.append([row["task_id"] for row in rows])
++        return rows
++
++    def claiming(*args, **kwargs):
++        claimed.append(kwargs["task_id"])
++        return real_claim(*args, **kwargs)
++
++    monkeypatch.setattr(kbn, "list_notify_subs", listing)
++    monkeypatch.setattr(kbn, "claim_unseen_events_for_sub", claiming)
++    _event(tid, "blocked")
++    texts, _ = _poll([])
++    assert len(texts) == 1 and tid in texts[0]
++    assert listed == [[tid]], "quiet/silent-only subscriptions must stay inside SQLite"
++    assert claimed == [tid]
++    # Even with no unseen event, own in-flight custody remains eligible until ACK.
++    listed.clear()
++    claimed.clear()
++    assert _poll([])[0] == []
++    assert listed == [[tid]] and claimed == [tid]
++
++
++def test_loaded_poll_keeps_unseen_silent_notify_kinds_eligible(monkeypatch):
++    """Unblocked has no text but must still advance and settle the cursor."""
++    tid = _task()
++    _poll([])
++    eid = _event(tid, "unblocked")
++    assert _poll([])[0] == []
++    sub = _sub(tid)
++    assert sub["last_event_id"] == eid
++    assert sub["inflight_from"] is None
++
++
+ def test_an_unsubscribed_row_claims_nothing_without_the_write_lock():
+     tid = _task()
+     _event(tid, "blocked")
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index adb4ade9347a5a977a612db7778db7c91099b0db..371904f1fc016cff6c610de0ddd9878e289395c1 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -811,7 +811,10 @@
+     chats = chat_lineage(session_key, _session_lineage)  # its local rows may sit on the lineage root
+     with contextlib.closing(conn):
+         try:
+-            subs = _kbn.list_notify_subs(conn, platform="tui", chat_id=session_key)
++            # A global deliverable-event hint also wakes chats with only historical rows. Keep quiet and
++            # silent-only rows inside SQLite; in-flight rows stay eligible for clock/liveness recovery.
++            subs = _kbn.list_notify_subs(conn, platform="tui", chat_id=session_key, pending_only=True,
++                                         pending_kinds={"tui": _KANBAN_NOTIFY_KINDS})
+         except Exception:
+             return []
+         if subs:
+-- 
+2.43.0
+

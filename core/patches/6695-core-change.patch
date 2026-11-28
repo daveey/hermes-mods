@@ -1,0 +1,180 @@
+From 63521c00ff1e247718be81bb239698602c711b1d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:14:02 +0000
+Subject: [PATCH 6695] Absent-session ACKs, expired claims and fanout custody
+
+Public mirror of source commit 63521c00ff1e247718be81bb239698602c711b1d.
+
+---
+diff --git a/tests/tui_gateway/test_remote_change_absence_retry.py b/tests/tui_gateway/test_remote_change_absence_retry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ec2c7621b97f1c3e2901965e05c8ba8e2f2d78a
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_change_absence_retry.py
+@@ -0,0 +1,88 @@
++"""A newly local destination retains refresh custody until its ACK commits."""
++import pytest
++
++from tests.tui_gateway import test_remote_change_absence as helpers
++from tui_gateway import notice_fanout as nf, notice_fanout_state as state
++from tui_gateway.unloaded_diagnostics import Admission
++
++remote = helpers.remote
++absent = helpers.absent
++
++
++@pytest.mark.parametrize('failure', ['false', 'exception', 'ack'])
++def test_appearance_retry_survives_until_refresh_and_ack(absent, monkeypatch, failure):
++    assert not absent['run']().incomplete
++    prior_memo = nf._remote_memo
++    absent['available'] = True
++    absent['clock'][0] += 60
++    calls = []
++    def refresh(*args, **kwargs):
++        calls.append(1)
++        if failure == 'exception':
++            raise OSError('refresh unavailable')
++        return failure != 'false'
++    monkeypatch.setattr('hermes_state_outcome.refresh_outcomes_quietly', refresh)
++    ack = state.ack_remote
++    if failure == 'ack':
++        monkeypatch.setattr(state, 'ack_remote', lambda rows: False)
++    with Admission(absent['clock'][0], maintenance=True):
++        assert absent['run']().incomplete
++    assert nf._remote_memo is None
++    # A failed recovery is pending work, not a cached absence subject to 60s maintenance.
++    # Pending custody must also defeat a retained memo from before recovery began.
++    nf._remote_memo = prior_memo
++    absent['clock'][0] += 1
++    assert absent['run']().incomplete
++    assert len(calls) == 2
++    assert nf._remote_memo is None
++    monkeypatch.setattr(state, 'ack_remote', ack)
++    monkeypatch.setattr('hermes_state_outcome.refresh_outcomes_quietly', lambda *a, **k: calls.append(1) or True)
++    absent['clock'][0] += 1
++    assert not absent['run']().incomplete
++    assert len(calls) == 3
++    assert absent['acks'][-1] == {'missing': frozenset({('owner/board/card', 'blocked')})}
++    assert nf._remote_memo is not None
++    # Successful durable ACK clears custody: neither retry nor maintenance refreshes again.
++    absent['clock'][0] += 1
++    absent['run']()
++    absent['clock'][0] += 60
++    with Admission(absent['clock'][0], maintenance=True):
++        absent['run']()
++    assert len(calls) == 3
++    assert not nf._remote_pending
++
++
++def test_unavailable_absence_recheck_retries_before_next_maintenance(absent):
++    absent['run']()
++    absent['unavailable'] = True
++    absent['clock'][0] += 60
++    with Admission(absent['clock'][0], maintenance=True):
++        assert absent['run']().incomplete
++    assert nf._remote_memo is None
++    absent['unavailable'] = False
++    absent['available'] = True
++    absent['clock'][0] += 1
++    assert not absent['run']().incomplete
++    assert absent['remote']['calls'].count('refresh') == 1
++    assert absent['opened'] == ['missing', 'missing', 'missing']
++    assert not nf._remote_pending
++
++
++@pytest.mark.parametrize('removed', [False, True])
++def test_pending_recovery_uses_latest_snapshot(absent, removed):
++    absent['run']()
++    absent['available'] = True
++    absent['remote']['refreshed'] = False
++    absent['clock'][0] += 60
++    with Admission(absent['clock'][0], maintenance=True):
++        assert absent['run']().incomplete
++    if removed:
++        absent['remote']['cards'].clear()
++    else:
++        absent['remote']['cards'][0]['status'] = 'running'
++    absent['remote']['refreshed'] = True
++    absent['clock'][0] += 1
++    assert not absent['run']().incomplete
++    expected = None if removed else frozenset({('owner/board/card', 'running')})
++    assert absent['acks'][-1] == {'missing': expected}
++    assert not nf._remote_pending
+diff --git a/tests/tui_gateway/test_remote_change_diagnostics.py b/tests/tui_gateway/test_remote_change_diagnostics.py
+index 1b7d54bbab6e99789b2b9428f9b36dca4a75d15b..4b40887528cbd9b98ab57c8bb1a5cdc7b0989d67 100644
+--- a/tests/tui_gateway/test_remote_change_diagnostics.py
++++ b/tests/tui_gateway/test_remote_change_diagnostics.py
+@@ -18,6 +18,7 @@
+     monkeypatch.setattr(nf, '_remote_memo', None)
+     monkeypatch.setattr(nf, '_remote_absent', {})
+     monkeypatch.setattr(nf, '_remote_absent_warned', set())
++    monkeypatch.setattr(nf, '_remote_pending', set())
+     monkeypatch.setattr(activity, '_origin_scope', lambda: ('gw', 'default'))
+     monkeypatch.setattr(fact_links_health, 'pending', lambda origin: controls['health'])
+     monkeypatch.setattr(nf, '_remote_inputs_key', lambda: (('base',), []))
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 686faea06a3838470759e5caf55bec4ba8ddc19a..27f802bb372344d7683a2e1e0637098eb321b282 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -52,6 +52,7 @@
+ _not_hosted_logged: set[tuple[str, str]] = set()
+ _remote_absent: dict[str, tuple[object, float]] = {}
+ _remote_absent_warned: set[tuple[str, object]] = set()
++_remote_pending: set[str] = set()  # absence rechecks retain custody through refresh AND durable ACK
+ _BLOCKED_LINE = re.compile(r"Kanban (t_[0-9A-Za-z_]+) blocked")
+ _TASK_ID = re.compile(r"Kanban (t_[0-9A-Za-z_]+)")
+ 
+@@ -62,6 +63,7 @@
+     _not_hosted_logged.clear()
+     _remote_absent.clear()
+     _remote_absent_warned.clear()
++    _remote_pending.clear()
+     from tui_gateway import notice_fanout_state
+     notice_fanout_state.reset_for_tests()
+ 
+@@ -448,7 +450,7 @@
+             remote_retry(out, 'initial_poll_failed')
+             inputs = None
+     memo = _remote_memo
+-    if not diagnostic.test('health_pending', health_generation is not None) and not absent_due and inputs is not None \
++    if not diagnostic.test('health_pending', health_generation is not None) and not absent_due and not _remote_pending and inputs is not None \
+             and not diagnostic.test('no_memo', memo is None) \
+             and not diagnostic.test('inputs_changed', memo[0] != inputs[0]) \
+             and not diagnostic.check('ledger_changed', lambda: memo[1] != _ledger_content_key(inputs[1])) \
+@@ -480,6 +482,8 @@
+                     acked[chat] = snapshot.get(chat)
+                 continue
+             observed.trigger = ('snapshot_diff' if previous.get(chat) != snapshot.get(chat) else 'health_forced')
++            if chat in _remote_absent:
++                _remote_pending.add(chat)
+             tip, skipped, observed.result = _refresh_remote_chat(chat, snapshot.get(chat), session_db, out, now)
+             if observed.result not in ('acked_refreshed', 'acked_intentionally_skipped'):
+                 continue
+@@ -490,12 +494,14 @@
+             observed.result = 'acked_refreshed' if skipped is None else 'acked_intentionally_skipped'
+     diagnostic.cert_active = True
+     committed = state.ack_remote(acked)
++    if committed:
++        _remote_pending.difference_update(acked)
+     _prune_remote_absent(snapshot, committed)
+     if not committed:
+         remote_retry(out, 'refresh_failed')
+     recovered_all = notice_links_health.recover_into(out, origin, health_generation, set(previous.keys() | snapshot.keys()), origin_db)
+     diagnostic.cert = ('ack_failed' if not committed else 'inputs_unavailable' if inputs is None else 'not_all_acked')
+-    if committed and inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
++    if committed and not _remote_pending and inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
+         _certify_remote(inputs, polled, known, diagnostic)
+     diagnostic.cert_active = False
+     diagnostic.health = 'exception'
+@@ -530,7 +536,7 @@
+ 
+ 
+ def _remote_unchanged(chat, previous, snapshot, health_generation, absent_due):
+-    return (previous.get(chat) == snapshot.get(chat) and chat not in absent_due
++    return (previous.get(chat) == snapshot.get(chat) and chat not in absent_due and chat not in _remote_pending
+             and (health_generation is None or chat in _remote_absent))
+ 
+ 
+-- 
+2.43.0
+

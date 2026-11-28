@@ -1,0 +1,193 @@
+From b1ce6c95313362297cb0600448eb5453270af1fc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:07:05 +0000
+Subject: [PATCH 6604] Spend-review lease allowance consumer, decision liveness and budget fences
+
+Public mirror of source commit b1ce6c95313362297cb0600448eb5453270af1fc.
+
+---
+diff --git a/hermes_cli/kanban_spend_reviewer.py b/hermes_cli/kanban_spend_reviewer.py
+index 721946f0f025ece6b8a0a93b785a91f69c76c17e..5e5b4b2b42914344d2a102863b986dc5c2f9f934 100644
+--- a/hermes_cli/kanban_spend_reviewer.py
++++ b/hermes_cli/kanban_spend_reviewer.py
+@@ -310,7 +310,6 @@
+ 
+ def start_due(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
+     """Queue the backlog and start every due review this process has room for. Returns started task ids."""
+-    from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_wake_check import foreign_ids
+     from hermes_cli import kanban_spend_review_request as journal
+     cfg = settings()
+@@ -348,15 +347,41 @@
+             if (db, task_id) in _INFLIGHT:
+                 continue
+             _INFLIGHT.add((db, task_id))
++        _start_reserved(conn, db, task_id, episode, attempts, now)
++        started.append(task_id)
++    return started
++
++
++def _start_reserved(conn, db: str, task_id: str, episode: str, attempts: int, now: int) -> None:
++    """Transfer the reserved slot to the target, or cancel it even on dispatch write contention."""
++    from hermes_cli import kanban_db as kb
++    entered = cancelled = handed_off = False
++    thread = None
++
++    def target():
++        nonlocal entered
++        with _LOCK:
++            if cancelled:
++                return  # start may raise while a native thread is still waiting to enter
++            entered = True
++        _run(db, task_id, episode)
++
++    try:
+         with kb.write_txn(conn):
+             kb._append_event(conn, task_id, STARTED, {"episode": episode, "attempt": attempts + 1,
+                                                       "deadline": now + LEASE_SECONDS})
+-        thread = threading.Thread(target=contextvars.copy_context().run, args=(_run, db, task_id, episode),
++        thread = threading.Thread(target=contextvars.copy_context().run, args=(target,),
+                                   name=f"spend-review-{task_id}", daemon=True)
+         thread.start()
+-        _THREADS.append(thread)
+-        started.append(task_id)
+-    return started
++        handed_off = True
++    finally:
++        with _LOCK:
++            if not handed_off and not entered:
++                cancelled = True
++                _INFLIGHT.discard((db, task_id))
++            elif thread is not None:
++                # An interrupted start does not revoke a target already doing work.
++                _THREADS.append(thread)
+ 
+ 
+ def wait_for_reviews(timeout: float = TIMEOUT + 30) -> None:
+diff --git a/tests/hermes_cli/test_kanban_spend_review_start.py b/tests/hermes_cli/test_kanban_spend_review_start.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..87c402b4c1179dcfe22aa3e82ad432148f893d0b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_review_start.py
+@@ -0,0 +1,118 @@
++"""Startup failure must not strand reviewer capacity or release live custody."""
++from __future__ import annotations
++
++import contextvars
++import threading
++import types
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_reviewer as reviewer
++from hermes_cli.kanban_dispatch_storage import DispatchWriteContended
++from tests.hermes_cli import test_kanban_spend_reviewer as helpers
++
++kanban_home = helpers.kanban_home
++
++
++@pytest.fixture(autouse=True)
++def isolate_registry(monkeypatch):
++    monkeypatch.setattr(reviewer, "_INFLIGHT", set())
++    monkeypatch.setattr(reviewer, "_THREADS", [])
++
++
++@pytest.mark.parametrize("failure", ["write", "construct", "start", "late_start"])
++def test_failed_start_releases_slot_and_can_retry(kanban_home, spend_reviewer, monkeypatch, failure):
++    calls = []
++    delayed = []
++    real_txn = kb.write_txn
++
++    @contextmanager
++    def contended(conn):
++        raise DispatchWriteContended()
++        yield  # pragma: no cover
++
++    class Broken:
++        def __init__(self, target, args, **kwargs):
++            if failure == "construct":
++                raise RuntimeError("construction failed")
++            self.call = lambda: target(*args)
++
++        def start(self):
++            if failure == "late_start":
++                delayed.append(self.call)
++            raise RuntimeError("start failed")
++
++        def is_alive(self):
++            return False
++
++    with kbc.connect_closing() as conn:
++        tid, episode = helpers._stopped(conn)
++        assert reviewer.state(conn, tid, episode) == reviewer.QUEUED
++        now = int(reviewer.time.time())
++        assert reviewer._due(conn, now, set()) == [(tid, episode, 0)]
++        monkeypatch.setattr(reviewer, "queue_backlog", lambda *a, **kw: None)
++        monkeypatch.setattr(reviewer, "_run", lambda *a: calls.append(a))
++        monkeypatch.setattr(reviewer, "threading", types.SimpleNamespace(Thread=Broken))
++        if failure == "write":
++            monkeypatch.setattr(kb, "write_txn", contended)
++        with pytest.raises((DispatchWriteContended, RuntimeError)):
++            reviewer.start_due(conn, now=now)
++        key = (reviewer._db_path(conn), tid)
++        assert key not in reviewer._INFLIGHT
++        assert not reviewer._THREADS
++        assert not calls
++        monkeypatch.setattr(kb, "write_txn", real_txn)
++        monkeypatch.setattr(reviewer, "threading", types.SimpleNamespace(Thread=helpers._Inline))
++        assert reviewer.start_due(conn, now=now + reviewer.LEASE_SECONDS + 1) == [tid]
++        assert len(calls) == 1
++        for call in delayed:
++            call()  # an uncertain native start must not run after cancellation
++        assert len(calls) == 1
++        assert key in reviewer._INFLIGHT  # late canceled target cannot discard successor custody
++
++
++def test_exception_after_target_entry_retains_live_custody(kanban_home, spend_reviewer, monkeypatch):
++    entered, finish = threading.Event(), threading.Event()
++    threads = []
++    marker = contextvars.ContextVar("review-start-test", default="missing")
++    observed = []
++
++    def run(db, tid, episode):
++        observed.append(marker.get())
++        entered.set()
++        try:
++            assert finish.wait(5)
++        finally:
++            with reviewer._LOCK:
++                reviewer._INFLIGHT.discard((db, tid))
++
++    class StartedThenRaised(threading.Thread):
++        def start(self):
++            super().start()
++            threads.append(self)
++            assert entered.wait(5)
++            raise RuntimeError("interrupted after target entered")
++
++    monkeypatch.setattr(reviewer, "_run", run)
++    monkeypatch.setattr(reviewer, "threading", types.SimpleNamespace(Thread=StartedThenRaised))
++    with kbc.connect_closing() as conn:
++        tid, _ = helpers._stopped(conn)
++        key = (reviewer._db_path(conn), tid)
++        token = marker.set("owning profile")
++        try:
++            with pytest.raises(RuntimeError):
++                reviewer.start_due(conn)
++            assert key in reviewer._INFLIGHT
++            assert threads[0] in reviewer._THREADS
++            assert observed == ["owning profile"]
++            assert reviewer.start_due(conn, now=int(reviewer.time.time()) + reviewer.LEASE_SECONDS + 1) == []
++        finally:
++            marker.reset(token)
++            finish.set()
++            for thread in threads:
++                thread.join(5)
++        assert key not in reviewer._INFLIGHT
++        assert not threads[0].is_alive()
+-- 
+2.43.0
+

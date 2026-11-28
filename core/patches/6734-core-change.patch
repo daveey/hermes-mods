@@ -1,0 +1,291 @@
+From 04cb914504878e1e057735f3cfdf56f51d8aeedf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:50:54 +0000
+Subject: [PATCH 6734] TUI turn-start outcome publishing and status counts agreement
+
+Public mirror of source commit 04cb914504878e1e057735f3cfdf56f51d8aeedf.
+
+---
+diff --git a/tests/gateway/test_turn_start_outcome.py b/tests/gateway/test_turn_start_outcome.py
+index 257b186d3b9539103c4cca3b52cdb6b6063f3096..cc4398fae312d593c758683a1e38d284d5ed8f00 100644
+--- a/tests/gateway/test_turn_start_outcome.py
++++ b/tests/gateway/test_turn_start_outcome.py
+@@ -33,7 +33,18 @@
+     if path == "tui":
+         monkeypatch.setattr(server, "_session_profile_runtime_scope", lambda session: nullcontext())
+         monkeypatch.setattr(server, "_session_db", lambda session: nullcontext(object()))
++        from hermes_cli.local_work_threads import TrackedThread
++        workers = []
++
++        def tracked(**kwargs):
++            worker = TrackedThread(**kwargs)
++            workers.append(worker)
++            return worker
++
++        monkeypatch.setattr("hermes_cli.local_work_threads.TrackedThread", tracked)
+         refresh_turn_start_outcome({"session_key": "start"})
++        workers[0].join(2)
++        assert not workers[0].is_alive()
+     else:
+         refresh_gateway_turn_start_outcome(SimpleNamespace(_session_db=object()), SimpleNamespace(session_id="start"))
+     assert "unavailable fixture store" in caplog.text
+diff --git a/tests/tui_gateway/test_turn_outcome_refresh.py b/tests/tui_gateway/test_turn_outcome_refresh.py
+index be6035e6835fb6d0b81c9a35dcb51272062306d4..8790d702c6b7951870d9494f4740c86608f2ae26 100644
+--- a/tests/tui_gateway/test_turn_outcome_refresh.py
++++ b/tests/tui_gateway/test_turn_outcome_refresh.py
+@@ -81,6 +81,8 @@
+     }.items():
+         monkeypatch.setattr(server, name, stub)
+     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
++    # This suite asserts deterministic publication contents, not off-thread timing.
++    monkeypatch.setattr("hermes_cli.local_work_threads.TrackedThread", _ImmediateThread)
+     # These turn lifecycle fixtures have no linked cards; ImmediateThread cannot
+     # execute the board reader's asynchronous refresher (which requires args).
+     monkeypatch.setattr(so, "_live_work", lambda *args: ([], [], False))
+diff --git a/tests/tui_gateway/test_turn_start_nonblocking.py b/tests/tui_gateway/test_turn_start_nonblocking.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fa156f48f384f4c006166eae77ff41b49de6e0f3
+--- /dev/null
++++ b/tests/tui_gateway/test_turn_start_nonblocking.py
+@@ -0,0 +1,80 @@
++"""Turn-start publication must not put board projection locks on the prompt thread."""
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.local_work_threads import TrackedThread
++from tui_gateway import server, turn_outcome
++from tests.tui_gateway import test_turn_outcome_refresh as helpers
++
++# Keep the existing prompt harness; only the outcome worker is a real thread.
++db = helpers.db
++turn_env = helpers.turn_env
++
++
++@pytest.mark.parametrize("lock_name", ["_counts_flight", "_links_lock"])
++def test_run_body_invokes_agent_while_projection_locked(turn_env, db, lock_name):
++    turn_env.setattr("hermes_cli.local_work_threads.TrackedThread", TrackedThread)
++    held, entered, published, invoked = (threading.Event() for _ in range(4))
++    release = threading.Event()
++    lock = getattr(activity, lock_name)
++    scope = ("turn-start-test",)
++    turn_env.setattr(activity, "_origin_scope", lambda: scope)
++    turn_env.setattr(activity, "_activity_fingerprint", lambda: ())
++    turn_env.setattr(activity._revalidate, "counts_fresh", lambda *a: False)
++    turn_env.setattr(activity, "_recompute_all_counts", lambda *a, **k: ())
++    turn_env.setattr(activity._revalidate, "forced", lambda *a: True)
++    turn_env.setattr(activity, "_links_fingerprint", lambda: ())
++    turn_env.setattr(activity, "_publish_links", lambda *a: ())
++
++    def hold():
++        with lock:
++            held.set()
++            release.wait(60)
++
++    def refresh(sid, trigger, **kwargs):
++        if trigger == "turn_start":
++            entered.set()
++            if lock_name == "_counts_flight":
++                activity._all_counts()
++            else:
++                activity._links_lookup(scope, False)
++            published.set()
++
++    turn_env.setattr(helpers.so, "refresh_outcome", refresh)
++    agent = helpers._Agent("row-nonblocking", db, helpers.SUMMARY)
++    session = helpers._session(agent)
++    db.create_session(agent.session_id, source="desktop")
++    invoke = server._invoke_agent
++
++    def observe(*a, **kw):
++        invoked.set()
++        return invoke(*a, **kw)
++
++    turn_env.setattr(server, "_invoke_agent", observe)
++    # turn_env replaces threading.Thread with an inline prompt harness. Use the
++    # real stdlib class so lock ownership and acceptance timing remain physical.
++    from hermes_cli.local_work_threads import _RealThread
++    holder = _RealThread(target=hold)
++    prompt = _RealThread(target=lambda: server._run_prompt_submit(
++        "rid", "ui-outcome-nonblocking", session, "work"))
++    holder.start()
++    assert held.wait(1)
++    started = time.monotonic()
++    prompt.start()
++    try:
++        assert entered.wait(1)
++        assert invoked.wait(0.8), "board projection blocked the prompt before agent invocation"
++        assert time.monotonic() - started < 1
++        assert not published.is_set()
++        # Keep the actual lock unavailable for the requested 60-second trial.
++        holder.join(61)
++        assert not holder.is_alive()
++        assert published.wait(2), "admitted refresh was lost after projection unlocked"
++    finally:
++        release.set()
++        holder.join(2)
++        prompt.join(3)
++    assert not prompt.is_alive()
+diff --git a/tests/tui_gateway/test_turn_start_scheduling.py b/tests/tui_gateway/test_turn_start_scheduling.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c18a11df5a5855d60cce73534f2d5d9fbef857c
+--- /dev/null
++++ b/tests/tui_gateway/test_turn_start_scheduling.py
+@@ -0,0 +1,89 @@
++"""Scheduling contracts independent of expensive outcome source collection."""
++from types import SimpleNamespace
++
++from tui_gateway import server, turn_outcome
++
++
++def test_start_refresh_coalesces_and_freezes_profile_and_sid(monkeypatch, tmp_path):
++    calls, queued = [], []
++    monkeypatch.setattr(server, "_session_home", lambda s: s["profile_home"])
++    monkeypatch.setattr(turn_outcome, "_refresh_session_outcome",
++                        lambda session, *args: calls.append((session["profile_home"], args)))
++
++    class Queued:
++        def __init__(self, target, **kw):
++            self.target = target
++            assert kw["daemon"] is True
++            assert kw["source"] == "tui.turn_start_outcome"
++
++        def start(self):
++            queued.append(self.target)
++
++    monkeypatch.setattr("hermes_cli.local_work_threads.TrackedThread", Queued)
++    home = tmp_path / "one"
++    session = {"session_key": "fallback", "profile_home": home}
++    agent = SimpleNamespace(session_id="admitted")
++    try:
++        turn_outcome.refresh_turn_start_outcome(session, agent)
++        turn_outcome.refresh_turn_start_outcome(session, agent)
++        assert len(queued) == 1
++        session["profile_home"] = tmp_path / "two"
++        turn_outcome.refresh_turn_start_outcome(session, agent)
++        assert len(queued) == 2, "same SID in another profile is independent"
++        agent.session_id = "replacement"
++        for publish in queued[:]:
++            publish()
++        assert calls == [(str(home), ("admitted", "turn_start", frozenset())),
++                         (str(session["profile_home"]), ("admitted", "turn_start", frozenset()))]
++        turn_outcome.refresh_turn_start_outcome(session, agent)
++        assert len(queued) == 3
++        queued[-1]()
++        turn_outcome.refresh_turn_start_outcome({})
++        assert len(queued) == 3
++    finally:
++        turn_outcome._start_refresh_pending.clear()
++
++
++def test_start_failure_is_best_effort_and_does_not_poison_retry(monkeypatch, tmp_path, caplog):
++    monkeypatch.setattr(server, "_session_home", lambda s: tmp_path)
++    attempts = []
++
++    class Rejected:
++        def __init__(self, **kw):
++            pass
++
++        def start(self):
++            attempts.append(1)
++            raise RuntimeError("admission refused")
++
++    monkeypatch.setattr("hermes_cli.local_work_threads.TrackedThread", Rejected)
++    session = {"session_key": "retry-scheduling"}
++    turn_outcome.refresh_turn_start_outcome(session)
++    turn_outcome.refresh_turn_start_outcome(session)
++    assert attempts == [1, 1]
++    assert (str(tmp_path), "retry-scheduling") not in turn_outcome._start_refresh_pending
++    assert "outcome scheduling failed" in caplog.text
++
++
++def test_refresh_failure_releases_coalescing_slot(monkeypatch, tmp_path):
++    queued = []
++    monkeypatch.setattr(server, "_session_home", lambda s: tmp_path)
++
++    class Queued:
++        def __init__(self, target, **kw):
++            self.target = target
++
++        def start(self):
++            queued.append(self.target)
++
++    def fail(*a):
++        raise ValueError("collector failure")
++
++    monkeypatch.setattr("hermes_cli.local_work_threads.TrackedThread", Queued)
++    monkeypatch.setattr(turn_outcome, "_refresh_session_outcome", fail)
++    import pytest
++    session = {"session_key": "collector-retry"}
++    turn_outcome.refresh_turn_start_outcome(session)
++    with pytest.raises(ValueError, match="collector failure"):
++        queued.pop()()
++    assert (str(tmp_path), "collector-retry") not in turn_outcome._start_refresh_pending
+diff --git a/tui_gateway/turn_outcome.py b/tui_gateway/turn_outcome.py
+index c75ce43014e0b7bb6537ed44db40a9fdfe0d2118..aefe5b0ef5294c7935ebb780b73a3baaffe0a3d0 100644
+--- a/tui_gateway/turn_outcome.py
++++ b/tui_gateway/turn_outcome.py
+@@ -8,8 +8,12 @@
+ from __future__ import annotations
+ 
+ import logging
++import threading
+ from typing import Optional
+ 
++_start_refresh_lock = threading.Lock()
++_start_refresh_pending: set[tuple[str, str]] = set()
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -58,10 +62,42 @@
+ 
+ 
+ def refresh_turn_start_outcome(session: dict, agent=None) -> None:
+-    """Publish admitted live evidence without discounting this turn's marker or lease."""
++    """Schedule admitted live evidence; board projection must never gate the prompt.
++
++    Coalesce by profile home + admitted SID. Capture both before handing off: the
++    cached session/agent may be reused or compressed while a projection is stuck.
++    The worker reads current evidence, so a delayed start cannot resurrect an
++    ended turn. Turn-end publication retains its existing synchronous ordering.
++    """
+     sid = turn_sid(session, agent)
+-    if sid:
+-        _refresh_session_outcome(session, sid, "turn_start", frozenset())
++    if not sid:
++        return
++    from hermes_cli.local_work_threads import TrackedThread
++    from tui_gateway import server
++
++    snapshot = session.copy()
++    home = server._session_home(snapshot)
++    snapshot["profile_home"] = str(home)
++    key = (str(home), sid)
++    with _start_refresh_lock:
++        if key in _start_refresh_pending:
++            return
++        _start_refresh_pending.add(key)
++
++    def publish():
++        try:
++            _refresh_session_outcome(snapshot, sid, "turn_start", frozenset())
++        finally:
++            with _start_refresh_lock:
++                _start_refresh_pending.discard(key)
++
++    try:
++        TrackedThread(target=publish, name="turn-start-outcome", daemon=True,
++                      home=home, source="tui.turn_start_outcome").start()
++    except Exception:  # health: allow BLE001 -- rejected background admission must not abort the prompt
++        with _start_refresh_lock:
++            _start_refresh_pending.discard(key)
++        logger.warning("turn_start outcome scheduling failed for %s", sid, exc_info=True)
+ 
+ 
+ def _refresh_session_outcome(session: dict, sid: str, trigger: str, concluding: frozenset) -> None:
+-- 
+2.43.0
+

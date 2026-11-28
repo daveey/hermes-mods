@@ -1,0 +1,761 @@
+From 21fe391643a0cc48253c435bccf0ce2c94b27359 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:42:45 +0000
+Subject: [PATCH 6995] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 21fe391643a0cc48253c435bccf0ce2c94b27359.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 7f051046a456dabc3964dc4775883de69520c040..dde4986832144dc8fb627550ee179af3471b8c28 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1903,6 +1903,7 @@
+ 
+     from hermes_cli import kanban_annotation_mutation as annotation_mutation
+     from hermes_cli import kanban_sync_status_origin as status_origin
++    from hermes_cli import kanban_home_schema as home_schema
+ 
+     # [daveey] Dispatch cancellation is a BaseException: a contended COMMIT must still roll back.
+     from hermes_cli.kanban_dispatch_storage import DispatchWriteContended as _DispatchWriteContended
+@@ -1910,6 +1911,7 @@
+     boundary.execute("BEGIN IMMEDIATE")
+     opt_in = bool(boundary.no_retry or boundary.done is not None)
+     try:
++        home_schema_before = home_schema.begin(conn)
+         annotation_scope = annotation_mutation.arm(conn)
+         _local_status_wake.arm(conn)  # [daveey] record this txn's status changes for the awaited-card wake
+         origin_armed = status_origin.arm(conn)
+@@ -1928,6 +1930,7 @@
+     else:
+         try:
+             status_origin.bind(conn, origin_armed)
++            home_schema_after = home_schema.finish(conn, home_schema_before)
+             boundary.execute("COMMIT")
+         except (Exception, _DispatchWriteContended):
+             # COMMIT exhausted retries with the txn still open; roll back so the
+@@ -1946,6 +1949,7 @@
+             # queue locally; the Board lease falls back to server expiry.
+             _run_end_lease.flush(conn, committed=False)
+             boundary.raise_pending()
++        home_schema.committed(conn, home_schema_after)
+         annotation_mutation.flush(conn, annotation_scope)
+         from hermes_cli.fact_source_signal import publish_commit
+         publish_commit(_main_db_file(conn))
+diff --git a/hermes_cli/kanban_home_schema.py b/hermes_cli/kanban_home_schema.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..337e6028c252297231491237c7a11bbab7c3e3ea
+--- /dev/null
++++ b/hermes_cli/kanban_home_schema.py
+@@ -0,0 +1,122 @@
++"""Atomic lazy-schema coverage for dormant home preparation. [daveey]
++
++Native outer write_txn owns persistent custody DDL as well as DML. Existing
++per-table SQL triggers still reject ordinary statements, including raw clients.
++For a newly created table, this boundary rejects protected rows before COMMIT
++and installs durable triggers on empty/healthy-only tables in that same writer.
++
++This is cooperative committed-state fencing, not hostile-SQL sandboxing. Native
++writers must not end their own transaction, manipulate schema_version, remove
++and recreate guards, or publish effects from uncommitted work. TEMP/attached
++custody and arbitrary external DDL writers are outside this protocol.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_cli import kanban_home_abort as abort
++from hermes_cli import kanban_home_finalized as finalized
++
++_TABLE = 'kanban_home_prepared1'
++_EXEMPT = {_TABLE, 'kanban_home_finalized1', 'kanban_home_aborted1',
++           'containment_canonical_receipts'}
++_RESTRICTIVE = {'containment_sync_quarantine', 'containment_sync_quarantine_tasks'}
++
++
++def _quote(name):
++    return '"' + name.replace('"', '""') + '"'
++
++
++def _installed(conn):
++    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone())
++
++
++def _active(conn):
++    valid = finalized.predicate('p')
++    return (f'SELECT p.task_id FROM {_TABLE} p WHERE NOT EXISTS('
++            f'SELECT 1 FROM kanban_home_finalized1 f WHERE {valid}) AND NOT EXISTS('
++            f'SELECT 1 FROM kanban_home_aborted1 a WHERE {abort.predicate("p")})')
++
++
++def _tables(conn):
++    tables = {}
++    names = list(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))
++    for (name,) in names:
++        if name in _EXEMPT:
++            continue
++        columns = {r[1] for r in conn.execute(f'PRAGMA table_info({_quote(name)})')}
++        if name in ('tasks', 'task_links') or 'task_id' in columns:
++            tables[name] = columns
++    return tables
++
++
++def _covered(conn, table):
++    actions = ('update', 'delete') if table in _RESTRICTIVE else ('insert', 'update', 'delete')
++    return all(conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name=? AND name=?",
++                            (table, f'home_prepared1_{table}_{action}')).fetchone() for action in actions)
++
++
++def _identities(conn, tables):
++    # Index definitions matter: a new UNIQUE key changes REPLACE's deletion set.
++    # Auto-index SQL is NULL, but table SQL carries its declared constraints.
++    guards = {f'home_prepared1_{table}_{action}' for table in tables
++              for action in ('insert', 'update', 'delete')}
++    return {(r[0], r[1]): (r[2], r[3]) for r in conn.execute(
++        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE type IN ('table','index','trigger')")
++        if r[2] in tables and (r[0] != 'trigger' or r[1] in guards)}
++
++
++def _cover(conn):
++    tables = _tables(conn)
++    missing = [name for name in tables if not _covered(conn, name)]
++    active = _active(conn)
++    for name in missing:
++        if name in _RESTRICTIVE:
++            continue  # restrictive append is deliberately allowed; its immutable guard still installs
++        columns = ('id',) if name == 'tasks' else ('parent_id', 'child_id') if name == 'task_links' else ('task_id',)
++        condition = ' OR '.join(f'{_quote(col)} IN ({active})' for col in columns)
++        if conn.execute(f'SELECT 1 FROM {_quote(name)} WHERE {condition} LIMIT 1').fetchone():
++            raise sqlite3.IntegrityError('home transfer prepared: uncovered custody table')
++    if missing:
++        from hermes_cli.kanban_home_transfer import _install
++        _install(conn)
++    return tables
++
++
++def begin(conn):
++    """Called under the outer BEGIN reservation, before application statements."""
++    if not _installed(conn):
++        return None
++    version = conn.execute('PRAGMA schema_version').fetchone()[0]
++    cached = getattr(conn, '_home_schema_committed', None)
++    if cached is not None and cached[0] == version:
++        return cached
++    tables = _cover(conn)
++    return conn.execute('PRAGMA schema_version').fetchone()[0], _identities(conn, tables)
++
++
++def finish(conn, before):
++    """Fail closed before COMMIT; all failures use write_txn's ordinary rollback."""
++    if not _installed(conn):
++        if before is not None:
++            raise sqlite3.IntegrityError('home transfer prepared: preparation schema removed')
++        return
++    version = conn.execute('PRAGMA schema_version').fetchone()[0]
++    if before is not None and before[0] == version:
++        return before
++    tables = _tables(conn)
++    if before is not None and conn.execute(_active(conn) + ' LIMIT 1').fetchone():
++        current = _identities(conn, tables)
++        if any(current.get(key) != value for key, value in before[1].items()):
++            raise sqlite3.IntegrityError('home transfer prepared: guarded schema changed')
++        old_tables = {value[0] for value in before[1].values()}
++        if any(key not in before[1] and value[0] in old_tables for key, value in current.items()):
++            raise sqlite3.IntegrityError('home transfer prepared: guarded identity changed')
++    tables = _cover(conn)
++    return conn.execute('PRAGMA schema_version').fetchone()[0], _identities(conn, tables)
++
++
++def committed(conn, snapshot):
++    """Cache only a successful COMMIT, never speculative/savepoint schema cookies."""
++    if hasattr(conn, '__dict__'):
++        conn._home_schema_committed = snapshot
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 69619aea0db38a5917d4b95d8533257dbbfe578a..70284a68c4291e856bf1cd251e3af2215044fb8a 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -159,6 +159,10 @@
+     Refusals roll back this helper even when caught by a caller which commits.
+     Outbox drainage is conservative across the entire board, including rejected
+     custody and synthetic parents. This does not attest remote receipt/drainage.
++    Persistent schema and custody writers use native outer write_txn: its lazy
++    schema boundary registers later tables atomically or rejects their prepared
++    rows before COMMIT. See kanban_home_schema for the cooperative DDL contract;
++    this helper does not sandbox arbitrary SQLite schema-changing clients.
+     """
+     if not conn.in_transaction:
+         raise ValueError("home preparation requires a write transaction")
+diff --git a/tests/hermes_cli/test_home_lazy_schema_boundary.py b/tests/hermes_cli/test_home_lazy_schema_boundary.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b38c0e93d50f7a59462ee6aa0c3a401a39678df
+--- /dev/null
++++ b/tests/hermes_cli/test_home_lazy_schema_boundary.py
+@@ -0,0 +1,117 @@
++"""Writer/savepoint/rollback controls for dormant late-schema registration. [daveey]"""
++import sqlite3
++
++import pytest
++from hermes_cli import kanban_db_connect as dbc
++from tests.hermes_cli import test_home_lazy_schema_custody as lazy
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++from tests.hermes_cli import test_kanban_home_source_stop as stop
++
++board = support.board
++
++
++def test_nested_late_insert_cannot_escape_outer_commit(board):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            with dbc.write_txn(board, allow_nested=True):
++                lazy.late(board)
++                board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('nested', task, 'late'))
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='late_custody'").fetchone()
++    assert not board.in_transaction
++
++
++def test_nested_schema_rollback_does_not_leave_speculative_coverage(board):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++        with pytest.raises(ValueError, match='fixture rollback'):
++            with dbc.write_txn(board, allow_nested=True):
++                lazy.late(board)
++                raise ValueError('fixture rollback')
++    # Reusing the rolled-back schema cookie for a different table is not a cache hit.
++    with dbc.write_txn(board):
++        lazy.late(board, 'other_custody')
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute('INSERT INTO other_custody VALUES (?,?,?)', ('protected', task, 'late'))
++
++
++def test_rolled_back_first_install_does_not_poison_next_schema(board):
++    task = support.seed(board)
++    with pytest.raises(ValueError, match='fixture rollback'):
++        with dbc.write_txn(board):
++            support.prepare(board, task)
++            lazy.late(board)
++            raise ValueError('fixture rollback')
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++        lazy.late(board, 'other_custody')
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute('INSERT INTO other_custody VALUES (?,?,?)', ('protected', task, 'late'))
++
++
++@pytest.mark.parametrize('settle', ['abort', 'finalize'])
++def test_exact_settlement_allows_new_custody_table(board, settle):
++    from hermes_cli import kanban_home_transfer as transfer
++    task = support.seed(board)
++    record = stop.record(board, task)
++    with dbc.write_txn(board):
++        support.prepare(board, task, nonce=record['nonce'])
++    with dbc.write_txn(board):
++        if settle == 'abort':
++            transfer.abort_source(board, {**record, 'phase': 'aborted', 'rows': []})
++        else:
++            transfer.finalize_source(board, record)
++        lazy.late(board)
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('settled', task, 'allowed'))
++    assert board.execute('SELECT value FROM late_custody').fetchone()[0] == 'allowed'
++
++
++def test_healthy_new_table_has_replace_and_update_sql_guards(board):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++        lazy.late(board)
++    # No native wrapper is needed after registration: the durable SQL fence acts.
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'late'))
++    with dbc.write_txn(board):
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('healthy', 'other-task', 'original'))
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        board.execute('INSERT OR REPLACE INTO late_custody VALUES (?,?,?)', ('healthy', task, 'late'))
++    assert tuple(board.execute('SELECT * FROM late_custody').fetchone()) == ('healthy', 'other-task', 'original')
++
++
++def test_noop_writer_does_not_reinstall_schema_or_scan_custody(board, monkeypatch):
++    from hermes_cli import kanban_home_schema as schema
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++    version = board.execute('PRAGMA schema_version').fetchone()[0]
++    def unexpected(*args):
++        raise AssertionError('unchanged committed schema must not be rediscovered')
++    monkeypatch.setattr(schema, '_tables', unexpected)
++    with dbc.write_txn(board):
++        board.execute('SELECT 1')
++    assert board.execute('PRAGMA schema_version').fetchone()[0] == version
++
++
++@pytest.mark.parametrize('action', ['update', 'delete'])
++def test_removed_existing_custody_trigger_is_not_silently_adopted(board, action):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        lazy.late(board)
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'original'))
++        support.prepare(board, task)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute(f'DROP TRIGGER home_prepared1_late_custody_{action}')
++            if action == 'delete':
++                board.execute('DELETE FROM late_custody')
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        board.execute("UPDATE late_custody SET value='late'")
++    assert tuple(board.execute('SELECT * FROM late_custody').fetchone()) == ('protected', task, 'original')
+diff --git a/tests/hermes_cli/test_home_lazy_schema_custody.py b/tests/hermes_cli/test_home_lazy_schema_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c468ab97167f905311018666aa3875ccc936584
+--- /dev/null
++++ b/tests/hermes_cli/test_home_lazy_schema_custody.py
+@@ -0,0 +1,109 @@
++"""Late task-table custody at the native committed writer boundary. [daveey]"""
++from pathlib import Path
++import sqlite3
++
++import pytest
++from hermes_cli import kanban_db_connect as dbc, kanban_home_transfer as transfer
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++
++board = support.board
++
++
++def late(conn, table='late_custody'):
++    conn.execute(f'CREATE TABLE {table} (episode TEXT PRIMARY KEY, task_id TEXT NOT NULL, value TEXT)')
++
++
++@pytest.mark.parametrize('same_writer', [False, True])
++def test_late_table_protected_insert_rolls_back(board, same_writer):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++    if not same_writer:
++        with dbc.write_txn(board):
++            late(board)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            if same_writer:
++                late(board)
++            board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'late'))
++    assert transfer.frozen(board, task)
++    if same_writer:
++        assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='late_custody'").fetchone()
++    else:
++        assert board.execute('SELECT * FROM late_custody').fetchall() == []
++
++
++def test_prepare_and_late_ddl_same_transaction_are_atomic(board):
++    task = support.seed(board)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            support.prepare(board, task)
++            late(board)
++            board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'late'))
++    assert not transfer.frozen(board, task)
++    assert not board.execute("SELECT 1 FROM sqlite_master WHERE name='late_custody'").fetchone()
++
++
++def test_healthy_lazy_table_commits_then_reopen_has_full_sql_guards(board):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++        late(board)
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('healthy', 'other-task', 'original'))
++    path = Path(board.execute('PRAGMA database_list').fetchone()[2])
++    reopened = dbc.connect(path)
++    try:
++        for sql, args in [
++            ('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'late')),
++            ('UPDATE late_custody SET task_id=?', (task,)),
++        ]:
++            with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++                with dbc.write_txn(reopened):
++                    reopened.execute(sql, args)
++        assert tuple(reopened.execute('SELECT * FROM late_custody').fetchone()) == ('healthy', 'other-task', 'original')
++    finally:
++        reopened.close()
++
++
++def test_real_lazy_notice_writer_cannot_commit_prepared_custody(board):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_wake_unproven import note_check
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        kb._append_event(board, task, 'scheduled', {'wake_at': 9999999999, 'wake_check': 'probe', 'probe_host': 'worker-a2'})
++        board.execute("UPDATE tasks SET status='scheduled',sync_version=7 WHERE id=?", (task,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        support.prepare(board, task)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            note_check(board, task, 'probe', '', 100)
++
++
++@pytest.mark.parametrize('change', ['drop', 'alter', 'index'])
++def test_existing_guarded_identity_cannot_change_while_prepared(board, change):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        late(board)
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'original'))
++        support.prepare(board, task)
++    sql = {
++        'drop': 'DROP TABLE late_custody',
++        'alter': 'ALTER TABLE late_custody ADD COLUMN extra TEXT',
++        'index': 'CREATE UNIQUE INDEX late_value ON late_custody(value)',
++    }[change]
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute(sql)
++    assert tuple(board.execute('SELECT * FROM late_custody').fetchone()) == ('protected', task, 'original')
++
++
++def test_existing_custody_before_first_prepare_remains_valid(board):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        late(board)
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'original'))
++        support.prepare(board, task)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            board.execute('DELETE FROM late_custody')
++    assert tuple(board.execute('SELECT * FROM late_custody').fetchone()) == ('protected', task, 'original')
+diff --git a/tests/hermes_cli/test_home_shared_invariant_consumers.py b/tests/hermes_cli/test_home_shared_invariant_consumers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a25e6a7ddb759af7d88b9309d8df49ac0d0209a9
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_invariant_consumers.py
+@@ -0,0 +1,28 @@
++"""Shared home invariant: consumers partition; run all partitions before review."""
++from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
++from tests.hermes_cli import test_home_shared_consumer_io as consumer_io
++from tests.hermes_cli import test_home_review_contracts as contracts
++from tests.hermes_cli import test_review_daily_transfer as daily
++from tests.hermes_cli import test_home_release_landing_race as release_landing
++from tests.hermes_cli import test_kanban_home_source_stop as support
++
++release_board = release_landing.release_board
++consumer_board = consumer_cases.consumer_board
++board = support.board
++live = contracts.live
++conn = daily.conn
++configured = daily.configured
++person = daily.person
++
++test_frozen_ready_does_not_suppress_shared_probe = consumer_cases.test_frozen_ready_does_not_suppress_shared_probe
++test_followup_writer_race_keeps_healthy_sweep = consumer_cases.test_followup_writer_race_keeps_healthy_sweep
++test_caused_review_captures_at_writer_after_fallible_work = consumer_cases.test_caused_review_captures_at_writer_after_fallible_work
++test_attachment_custody_skips_io_and_late_bookkeeping = consumer_cases.test_attachment_custody_skips_io_and_late_bookkeeping
++test_review_journal_writer_entry_checks_task_column = consumer_cases.test_review_journal_writer_entry_checks_task_column
++test_existing_review_wire_is_not_enriched_or_replaced = consumer_cases.test_existing_review_wire_is_not_enriched_or_replaced
++test_caused_review_late_settlement_preserves_custody = consumer_cases.test_caused_review_late_settlement_preserves_custody
++test_attachment_writer_entry_custody_and_single_slot_peer = consumer_cases.test_attachment_writer_entry_custody_and_single_slot_peer
++test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound = consumer_io.test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound
++test_publication_holds_real_writer_reservation = consumer_io.test_publication_holds_real_writer_reservation
++test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay = consumer_io.test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay
++test_review_target_is_captured_not_just_source = consumer_io.test_review_target_is_captured_not_just_source
+diff --git a/tests/hermes_cli/test_home_shared_invariant_late_writers.py b/tests/hermes_cli/test_home_shared_invariant_late_writers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..39ba5a66a01048e17319a0d977cfdc8c788482fd
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_invariant_late_writers.py
+@@ -0,0 +1,25 @@
++"""Shared home invariant: latest late-writer review families; run every partition."""
++from tests.hermes_cli import test_home_review_late_wakes as late
++from tests.hermes_cli import test_home_review_wake_producers as producers
++from tests.hermes_cli import test_home_review_ci_sweep as ci
++from tests.hermes_cli import test_home_review_block_branches as block
++from tests.hermes_cli import test_home_review_protect_drain as protect
++from tests.hermes_cli import test_home_review_label_capture as label
++from tests.hermes_cli import test_home_review_epoch_replace as epoch
++
++board = late.board
++live = epoch.live
++
++test_p1_release_place_parent_done_then_frozen = late.test_p1_release_place_parent_done_then_frozen
++test_p2_wake_parks_human_invariant = late.test_p2_wake_parks_human_invariant
++test_p2b_wake_due_continuations = late.test_p2b_wake_due_continuations
++test_p3_wake_skip_branch_writes = late.test_p3_wake_skip_branch_writes
++test_p4_ci_progress_apply = producers.test_p4_ci_progress_apply
++test_p5_shared_blocker_clear_late_freeze = producers.test_p5_shared_blocker_clear_late_freeze
++test_ci_sweep_frozen_card_then_healthy_neighbour = ci.test_ci_sweep_frozen_card_then_healthy_neighbour
++test_p6_block_branch_exception = block.test_p6_block_branch_exception
++test_p7_cli_bulk_block = block.test_p7_cli_bulk_block
++test_prepare_refuses_pending_protect_custody = protect.test_prepare_refuses_pending_protect_custody
++test_foreign_memo_new_reservation_checks_local_custody = label.test_foreign_memo_new_reservation_checks_local_custody
++test_real_label_push_refuses_before_capture_or_network = label.test_real_label_push_refuses_before_capture_or_network
++test_replace_cannot_rebind_captured_epoch_without_changing_request_bytes = epoch.test_replace_cannot_rebind_captured_epoch_without_changing_request_bytes
+diff --git a/tests/hermes_cli/test_home_shared_invariant_liveness.py b/tests/hermes_cli/test_home_shared_invariant_liveness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a761eefcce55d44d866dbdddcacbd36dfe35f973
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_invariant_liveness.py
+@@ -0,0 +1,42 @@
++"""Shared home invariant: liveness partition; run all partitions before review."""
++from tests.hermes_cli import test_review_4300_ask as ask
++from tests.hermes_cli import test_home_review_boundaries as boundaries
++from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
++from tests.hermes_cli import test_home_review_contracts as contracts
++from tests.hermes_cli import test_home_review_custody_repros as custody_review
++from tests.hermes_cli import test_review_daily_transfer as daily
++from tests.hermes_cli import test_review_4300_nonce as nonce
++from tests.hermes_cli import test_home_release_landing_race as release_landing
++from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli import test_home_probe_writer_custody as writer_cases
++
++release_board = release_landing.release_board
++consumer_board = consumer_cases.consumer_board
++board = support.board
++live = contracts.live
++conn = daily.conn
++configured = daily.configured
++person = daily.person
++
++test_prepared_probe_does_not_starve_due_neighbour = boundaries.test_prepared_probe_does_not_starve_due_neighbour
++test_owner_rejects_unsupported_identity_before_fencing_or_network = boundaries.test_owner_rejects_unsupported_identity_before_fencing_or_network
++test_stop_accepts_wire_millisecond_timestamp = contracts.test_stop_accepts_wire_millisecond_timestamp
++test_stop_rejects_real_timestamp_change_and_rolls_back = contracts.test_stop_rejects_real_timestamp_change_and_rolls_back
++test_old_local_park_does_not_become_silent_at_home_transition = contracts.test_old_local_park_does_not_become_silent_at_home_transition
++test_transfer_liveness_grace_is_bounded_and_survives_reopen = contracts.test_transfer_liveness_grace_is_bounded_and_survives_reopen
++test_post_transfer_alive_extends_observation_not_baseline = contracts.test_post_transfer_alive_extends_observation_not_baseline
++test_explicit_remote_probe_keeps_existing_silence_contract = contracts.test_explicit_remote_probe_keeps_existing_silence_contract
++test_new_park_cannot_borrow_historical_transfer_grace = contracts.test_new_park_cannot_borrow_historical_transfer_grace
++test_pending_transfer_never_installs_liveness_grace = contracts.test_pending_transfer_never_installs_liveness_grace
++test_pending_renewal_uses_public_refusal_contract = contracts.test_pending_renewal_uses_public_refusal_contract
++test_pending_renewal_command_returns_structured_refusal = contracts.test_pending_renewal_command_returns_structured_refusal
++test_deleted_label_target_terminates_delivery = contracts.test_deleted_label_target_terminates_delivery
++test_aborted_nonce_cannot_be_reused_for_new_version = nonce.test_aborted_nonce_cannot_be_reused_for_new_version
++test_transferred_hostless_ask_gets_fresh_observation_window = ask.test_transferred_hostless_ask_gets_fresh_observation_window
++test_pending_drops_inflight_result_without_probe_mutation = custody_review.test_pending_drops_inflight_result_without_probe_mutation
++test_backfill_skips_pending_ask_and_restores_neighbor = custody_review.test_backfill_skips_pending_ask_and_restores_neighbor
++test_reconcile_rechecks_custody_after_selection = custody_review.test_reconcile_rechecks_custody_after_selection
++test_late_results_preserve_all_local_tables_and_healthy_neighbor = writer_cases.test_late_results_preserve_all_local_tables_and_healthy_neighbor
++test_reconcile_writer_entry_race_keeps_local_tables = writer_cases.test_reconcile_writer_entry_race_keeps_local_tables
++test_backfill_respects_completed_historical_host_and_unknown_custody = writer_cases.test_backfill_respects_completed_historical_host_and_unknown_custody
++test_late_probe_followup_cannot_record_decision_recovery = writer_cases.test_late_probe_followup_cannot_record_decision_recovery
+diff --git a/tests/hermes_cli/test_home_shared_invariant_operators.py b/tests/hermes_cli/test_home_shared_invariant_operators.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..84ffb35a5326f8c780eea0c2620954bcd3b3421c
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_invariant_operators.py
+@@ -0,0 +1,31 @@
++"""Shared home invariant: operators partition; run all partitions before review."""
++from tests.hermes_cli import test_home_release_auxiliary as auxiliary_cases
++from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
++from tests.hermes_cli import test_home_review_contracts as contracts
++from tests.hermes_cli import test_review_daily_transfer as daily
++from tests.hermes_cli import test_home_release_operators as operator_cases
++from tests.hermes_cli import test_home_release_landing_race as release_landing
++from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli import test_home_release_sweeps as sweep_cases
++
++release_board = release_landing.release_board
++consumer_board = consumer_cases.consumer_board
++board = support.board
++live = contracts.live
++conn = daily.conn
++configured = daily.configured
++person = daily.person
++
++test_release_landing_retry_preserves_decision = release_landing.test_release_landing_retry_preserves_decision
++test_daily_release_skips_prepared = daily.test_daily_release_skips_prepared
++test_quota_and_hold_release_refuse_before_external_reads = operator_cases.test_quota_and_hold_release_refuse_before_external_reads
++test_review_preparation_skips_before_reading_park = operator_cases.test_review_preparation_skips_before_reading_park
++test_triage_cap_and_contained_prelude_create_no_children = operator_cases.test_triage_cap_and_contained_prelude_create_no_children
++test_containment_resume_refuses_before_bootstrap = operator_cases.test_containment_resume_refuses_before_bootstrap
++test_notice_never_reads_placement_or_writes_frozen_target = auxiliary_cases.test_notice_never_reads_placement_or_writes_frozen_target
++test_stranded_producers_do_not_refile_or_escalate = auxiliary_cases.test_stranded_producers_do_not_refile_or_escalate
++test_spend_promote_and_review_queue_refuse_before_accounting = auxiliary_cases.test_spend_promote_and_review_queue_refuse_before_accounting
++test_stop_ended_preserves_transfer_custody = auxiliary_cases.test_stop_ended_preserves_transfer_custody
++test_recovery_requester_skips_before_creating_any_child = auxiliary_cases.test_recovery_requester_skips_before_creating_any_child
++test_preclaim_accounting_is_write_free_for_transfers = sweep_cases.test_preclaim_accounting_is_write_free_for_transfers
++test_spend_reviewer_due_and_grant_exclude_transfer = sweep_cases.test_spend_reviewer_due_and_grant_exclude_transfer
+diff --git a/tests/hermes_cli/test_home_shared_invariant_schema.py b/tests/hermes_cli/test_home_shared_invariant_schema.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..28baab88fe8d4a5057c1d543b630fb931d1643e9
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_invariant_schema.py
+@@ -0,0 +1,19 @@
++"""Shared home invariant: native late-schema boundary; run every partition."""
++from tests.hermes_cli import test_home_lazy_schema_custody as custody
++from tests.hermes_cli import test_home_lazy_schema_boundary as boundary
++
++board = custody.board
++
++test_late_table_protected_insert_rolls_back = custody.test_late_table_protected_insert_rolls_back
++test_prepare_and_late_ddl_same_transaction_are_atomic = custody.test_prepare_and_late_ddl_same_transaction_are_atomic
++test_healthy_lazy_table_commits_then_reopen_has_full_sql_guards = custody.test_healthy_lazy_table_commits_then_reopen_has_full_sql_guards
++test_real_lazy_notice_writer_cannot_commit_prepared_custody = custody.test_real_lazy_notice_writer_cannot_commit_prepared_custody
++test_existing_guarded_identity_cannot_change_while_prepared = custody.test_existing_guarded_identity_cannot_change_while_prepared
++test_existing_custody_before_first_prepare_remains_valid = custody.test_existing_custody_before_first_prepare_remains_valid
++test_nested_late_insert_cannot_escape_outer_commit = boundary.test_nested_late_insert_cannot_escape_outer_commit
++test_nested_schema_rollback_does_not_leave_speculative_coverage = boundary.test_nested_schema_rollback_does_not_leave_speculative_coverage
++test_rolled_back_first_install_does_not_poison_next_schema = boundary.test_rolled_back_first_install_does_not_poison_next_schema
++test_exact_settlement_allows_new_custody_table = boundary.test_exact_settlement_allows_new_custody_table
++test_healthy_new_table_has_replace_and_update_sql_guards = boundary.test_healthy_new_table_has_replace_and_update_sql_guards
++test_noop_writer_does_not_reinstall_schema_or_scan_custody = boundary.test_noop_writer_does_not_reinstall_schema_or_scan_custody
++test_removed_existing_custody_trigger_is_not_silently_adopted = boundary.test_removed_existing_custody_trigger_is_not_silently_adopted
+diff --git a/tests/hermes_cli/test_home_shared_invariant_transport.py b/tests/hermes_cli/test_home_shared_invariant_transport.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..638337de150136f3fceb6424ebfc205c173d6ee9
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_invariant_transport.py
+@@ -0,0 +1,32 @@
++"""Shared home invariant: transport partition; run all partitions before review."""
++from tests.hermes_cli import test_home_certification_finalization as certification
++from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
++from tests.hermes_cli import test_home_review_contracts as contracts
++from tests.hermes_cli import test_review_daily_transfer as daily
++from tests.hermes_cli import test_home_feed_entrypoints as entry_cases
++from tests.hermes_cli import test_review_home_feed_isolation as feed_review
++from tests.hermes_cli import test_home_label_presend as presend
++from tests.hermes_cli import test_home_quarantine_custody as quarantine_cases
++from tests.hermes_cli import test_home_release_landing_race as release_landing
++from tests.hermes_cli import test_kanban_home_source_stop as support
++
++release_board = release_landing.release_board
++consumer_board = consumer_cases.consumer_board
++board = support.board
++live = contracts.live
++conn = daily.conn
++configured = daily.configured
++person = daily.person
++
++test_conflicting_protected_row_preserves_healthy_peer = quarantine_cases.test_conflicting_protected_row_preserves_healthy_peer
++test_quarantine_closure_races_preserve_custody = quarantine_cases.test_quarantine_closure_races_preserve_custody
++test_uncached_containment_native_pull_keeps_neighbor_progress = certification.test_uncached_containment_native_pull_keeps_neighbor_progress
++test_scoped_malformed_finalization_preserves_sql_fence = certification.test_scoped_malformed_finalization_preserves_sql_fence
++test_certification_caches_only_proof_then_replays_after_exact_abort = certification.test_certification_caches_only_proof_then_replays_after_exact_abort
++test_manifest_guard_and_persisted_malformed_upgrade_stay_closed = certification.test_manifest_guard_and_persisted_malformed_upgrade_stay_closed
++test_legitimate_atomic_stop_and_ordinary_peer_still_work = certification.test_legitimate_atomic_stop_and_ordinary_peer_still_work
++test_healthy_feed_progress_during_handoff = feed_review.test_healthy_feed_progress_during_handoff
++test_actual_delivery_retry_distinguishes_presend_failure_from_legacy = presend.test_actual_delivery_retry_distinguishes_presend_failure_from_legacy
++test_poison_or_slow_replay_cannot_abort_independent_incoming_page = entry_cases.test_poison_or_slow_replay_cannot_abort_independent_incoming_page
++test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody = entry_cases.test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody
++test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write = entry_cases.test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write
+diff --git a/tests/hermes_cli/test_home_shared_path_invariant.py b/tests/hermes_cli/test_home_shared_path_invariant.py
+index 86608a56aa9cdaf6cb0fed03ad461399d458894f..7dec54827c37879038337b48b180c55ae423d603 100644
+--- a/tests/hermes_cli/test_home_shared_path_invariant.py
++++ b/tests/hermes_cli/test_home_shared_path_invariant.py
+@@ -1,4 +1,4 @@
+-"""Single transfer-isolation gate: mixed states plus every prior reviewer regression."""
++"""Shared home invariant: mixed states; run with every companion partition."""
+ from __future__ import annotations
+ 
+ import pytest
+@@ -12,101 +12,31 @@
+ from tests.hermes_cli import test_kanban_home_source_stop as support
+ from tests.hermes_cli import test_home_review_contracts as contracts
+ from tests.hermes_cli import test_review_daily_transfer as daily
+-from tests.hermes_cli import test_home_review_boundaries as boundaries
+-from tests.hermes_cli import test_review_4300_nonce as nonce
+-from tests.hermes_cli import test_review_4300_ask as ask
+ from tests.hermes_cli import test_review_home_feed_isolation as feed_review
+-from tests.hermes_cli import test_home_label_presend as presend
+-from tests.hermes_cli import test_home_release_operators as operator_cases
+-from tests.hermes_cli import test_home_release_auxiliary as auxiliary_cases
+-from tests.hermes_cli import test_home_release_sweeps as sweep_cases
+-from tests.hermes_cli import test_home_feed_entrypoints as entry_cases
+-from tests.hermes_cli import test_home_review_custody_repros as custody_review
+ from tests.hermes_cli import test_home_probe_writer_custody as writer_cases
+ from tests.hermes_cli import test_home_shared_consumer_custody as consumer_cases
+-from tests.hermes_cli import test_home_shared_consumer_io as consumer_io
+-from tests.hermes_cli import test_home_certification_finalization as certification
+-from tests.hermes_cli import test_home_quarantine_custody as quarantine_cases
+ from tests.hermes_cli import test_home_release_landing_race as release_landing
+ 
+-release_board = release_landing.release_board
+-test_release_landing_retry_preserves_decision = release_landing.test_release_landing_retry_preserves_decision
+ 
+-test_conflicting_protected_row_preserves_healthy_peer = quarantine_cases.test_conflicting_protected_row_preserves_healthy_peer
+-test_quarantine_closure_races_preserve_custody = quarantine_cases.test_quarantine_closure_races_preserve_custody
+ 
+ # Existing cache tables and exact-scope persisted malformed receipts must be in
+ # the first gate, not masked by post-prepare DDL or an earlier scope refusal.
+-test_uncached_containment_native_pull_keeps_neighbor_progress = certification.test_uncached_containment_native_pull_keeps_neighbor_progress
+-test_scoped_malformed_finalization_preserves_sql_fence = certification.test_scoped_malformed_finalization_preserves_sql_fence
+-test_certification_caches_only_proof_then_replays_after_exact_abort = certification.test_certification_caches_only_proof_then_replays_after_exact_abort
+-test_manifest_guard_and_persisted_malformed_upgrade_stay_closed = certification.test_manifest_guard_and_persisted_malformed_upgrade_stay_closed
+-test_legitimate_atomic_stop_and_ordinary_peer_still_work = certification.test_legitimate_atomic_stop_and_ordinary_peer_still_work
+ 
+-consumer_board = consumer_cases.consumer_board
+-test_frozen_ready_does_not_suppress_shared_probe = consumer_cases.test_frozen_ready_does_not_suppress_shared_probe
+-test_followup_writer_race_keeps_healthy_sweep = consumer_cases.test_followup_writer_race_keeps_healthy_sweep
+-test_caused_review_captures_at_writer_after_fallible_work = consumer_cases.test_caused_review_captures_at_writer_after_fallible_work
+-test_attachment_custody_skips_io_and_late_bookkeeping = consumer_cases.test_attachment_custody_skips_io_and_late_bookkeeping
+-test_review_journal_writer_entry_checks_task_column = consumer_cases.test_review_journal_writer_entry_checks_task_column
+-test_existing_review_wire_is_not_enriched_or_replaced = consumer_cases.test_existing_review_wire_is_not_enriched_or_replaced
+-test_caused_review_late_settlement_preserves_custody = consumer_cases.test_caused_review_late_settlement_preserves_custody
+-test_attachment_writer_entry_custody_and_single_slot_peer = consumer_cases.test_attachment_writer_entry_custody_and_single_slot_peer
+-test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound = consumer_io.test_network_callback_real_other_connection_cannot_abort_peer_or_stamp_rebound
+-test_publication_holds_real_writer_reservation = consumer_io.test_publication_holds_real_writer_reservation
+-test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay = consumer_io.test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay
+-test_review_target_is_captured_not_just_source = consumer_io.test_review_target_is_captured_not_just_source
+ 
+-board = support.board
+-live = contracts.live
+-conn = daily.conn
+-configured = daily.configured
+-person = daily.person
+ 
+ # Explicit exports keep the original independently reproduced reviewer probes
+ # unchanged and collect all five rounds in this single first-run gate.
+-test_prepared_probe_does_not_starve_due_neighbour = boundaries.test_prepared_probe_does_not_starve_due_neighbour
+-test_owner_rejects_unsupported_identity_before_fencing_or_network = boundaries.test_owner_rejects_unsupported_identity_before_fencing_or_network
+-test_stop_accepts_wire_millisecond_timestamp = contracts.test_stop_accepts_wire_millisecond_timestamp
+-test_stop_rejects_real_timestamp_change_and_rolls_back = contracts.test_stop_rejects_real_timestamp_change_and_rolls_back
+-test_old_local_park_does_not_become_silent_at_home_transition = contracts.test_old_local_park_does_not_become_silent_at_home_transition
+-test_transfer_liveness_grace_is_bounded_and_survives_reopen = contracts.test_transfer_liveness_grace_is_bounded_and_survives_reopen
+-test_post_transfer_alive_extends_observation_not_baseline = contracts.test_post_transfer_alive_extends_observation_not_baseline
+-test_explicit_remote_probe_keeps_existing_silence_contract = contracts.test_explicit_remote_probe_keeps_existing_silence_contract
+-test_new_park_cannot_borrow_historical_transfer_grace = contracts.test_new_park_cannot_borrow_historical_transfer_grace
+-test_pending_transfer_never_installs_liveness_grace = contracts.test_pending_transfer_never_installs_liveness_grace
+-test_pending_renewal_uses_public_refusal_contract = contracts.test_pending_renewal_uses_public_refusal_contract
+-test_pending_renewal_command_returns_structured_refusal = contracts.test_pending_renewal_command_returns_structured_refusal
+-test_deleted_label_target_terminates_delivery = contracts.test_deleted_label_target_terminates_delivery
+-test_aborted_nonce_cannot_be_reused_for_new_version = nonce.test_aborted_nonce_cannot_be_reused_for_new_version
+-test_transferred_hostless_ask_gets_fresh_observation_window = ask.test_transferred_hostless_ask_gets_fresh_observation_window
+-test_daily_release_skips_prepared = daily.test_daily_release_skips_prepared
+-test_healthy_feed_progress_during_handoff = feed_review.test_healthy_feed_progress_during_handoff
+-test_actual_delivery_retry_distinguishes_presend_failure_from_legacy = presend.test_actual_delivery_retry_distinguishes_presend_failure_from_legacy
+ # Auxiliary boundaries are part of the same gate, not a later reviewer surprise.
+-test_quota_and_hold_release_refuse_before_external_reads = operator_cases.test_quota_and_hold_release_refuse_before_external_reads
+-test_review_preparation_skips_before_reading_park = operator_cases.test_review_preparation_skips_before_reading_park
+-test_triage_cap_and_contained_prelude_create_no_children = operator_cases.test_triage_cap_and_contained_prelude_create_no_children
+-test_containment_resume_refuses_before_bootstrap = operator_cases.test_containment_resume_refuses_before_bootstrap
+-test_notice_never_reads_placement_or_writes_frozen_target = auxiliary_cases.test_notice_never_reads_placement_or_writes_frozen_target
+-test_stranded_producers_do_not_refile_or_escalate = auxiliary_cases.test_stranded_producers_do_not_refile_or_escalate
+-test_spend_promote_and_review_queue_refuse_before_accounting = auxiliary_cases.test_spend_promote_and_review_queue_refuse_before_accounting
+-test_stop_ended_preserves_transfer_custody = auxiliary_cases.test_stop_ended_preserves_transfer_custody
+-test_recovery_requester_skips_before_creating_any_child = auxiliary_cases.test_recovery_requester_skips_before_creating_any_child
+-test_preclaim_accounting_is_write_free_for_transfers = sweep_cases.test_preclaim_accounting_is_write_free_for_transfers
+-test_spend_reviewer_due_and_grant_exclude_transfer = sweep_cases.test_spend_reviewer_due_and_grant_exclude_transfer
+-test_poison_or_slow_replay_cannot_abort_independent_incoming_page = entry_cases.test_poison_or_slow_replay_cannot_abort_independent_incoming_page
+-test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody = entry_cases.test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody
+-test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write = entry_cases.test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write
+-test_pending_drops_inflight_result_without_probe_mutation = custody_review.test_pending_drops_inflight_result_without_probe_mutation
+-test_backfill_skips_pending_ask_and_restores_neighbor = custody_review.test_backfill_skips_pending_ask_and_restores_neighbor
+-test_reconcile_rechecks_custody_after_selection = custody_review.test_reconcile_rechecks_custody_after_selection
+-test_late_results_preserve_all_local_tables_and_healthy_neighbor = writer_cases.test_late_results_preserve_all_local_tables_and_healthy_neighbor
+-test_reconcile_writer_entry_race_keeps_local_tables = writer_cases.test_reconcile_writer_entry_race_keeps_local_tables
+-test_backfill_respects_completed_historical_host_and_unknown_custody = writer_cases.test_backfill_respects_completed_historical_host_and_unknown_custody
+-test_late_probe_followup_cannot_record_decision_recovery = writer_cases.test_late_probe_followup_cannot_record_decision_recovery
+ 
+ 
++release_board = release_landing.release_board
++consumer_board = consumer_cases.consumer_board
++board = support.board
++live = contracts.live
++conn = daily.conn
++configured = daily.configured
++person = daily.person
++
+ def mixed(conn, status, setup=None):
+     """One board containing every interval, not separate homogeneous fixtures."""
+     from hermes_cli.kanban_home_generation import mirror_feed
+-- 
+2.43.0
+

@@ -1,0 +1,138 @@
+From db748879e5d4d25cba3667e996695fd66b12b479 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 12:19:10 +0000
+Subject: [PATCH 6602] Truthful non-running reasons and refusal provenance
+
+Public mirror of source commit db748879e5d4d25cba3667e996695fd66b12b479.
+
+---
+diff --git a/hermes_cli/kanban_nonrunning_reason.py b/hermes_cli/kanban_nonrunning_reason.py
+index 6590f17320bb2ae3c2a21f757103399aaaf32595..b9cd651eab3e31252842b049fbd8012e02d162aa 100644
+--- a/hermes_cli/kanban_nonrunning_reason.py
++++ b/hermes_cli/kanban_nonrunning_reason.py
+@@ -184,6 +184,10 @@
+         return {**value, 'non_running_reason': _unknown_reason('lifecycle_reason_unobserved')}
+     local = _current_reason(row, source)
+     remote = source.get('remote_non_running_reason')
++    if isinstance(remote, dict) and remote.get('unknown_reason') == 'dispatcher_evidence_conflict':
++        # Qualified contradictory observers are not simple remote absence. A
++        # separate local observation cannot turn that contradiction into fact.
++        return {**value, 'non_running_reason': remote}
+     if isinstance(remote, dict) and remote.get('freshness') == 'current':
+         if local.get('freshness') == 'current' and (local['code'], local['disposition']) != (remote['code'], remote['disposition']):
+             local = _unknown_reason('dispatcher_evidence_conflict')
+diff --git a/hermes_cli/kanban_nonrunning_transport.py b/hermes_cli/kanban_nonrunning_transport.py
+index ce7ab37d59b756583bb56deaef45e8fb1d8c2de4..4170d76dfa135d26e6e75208f44c95144912d86b 100644
+--- a/hermes_cli/kanban_nonrunning_transport.py
++++ b/hermes_cli/kanban_nonrunning_transport.py
+@@ -14,6 +14,16 @@
+ from hermes_cli.kanban_nonrunning_reason import _unknown_reason, describe
+ 
+ 
++def _decoded_detail(payload):
++    """Restore typed producer provenance only after carrier qualification."""
++    from hermes_cli.kanban_db_sync import ClaimDeferral
++    detail, origin = payload.get('detail'), payload.get('origin')
++    if isinstance(detail, str) and isinstance(origin, str):
++        # JSON loses the producer's str-subclass attributes.
++        return ClaimDeferral(detail, origin)
++    return detail
++
++
+ _UNSET = object()
+ 
+ 
+@@ -163,8 +173,9 @@
+                     continue
+                 reason = _unknown_reason('dispatcher_evidence_stale')
+                 if all(epoch(t) for t in (at, until, now)) and at <= now < min(until, at + 180):
+-                    reason = (describe(p.get('reason'), p.get('detail'))
+-                              if isinstance(p.get('reason'), str) and (p.get('detail') is None or isinstance(p.get('detail'), str))
++                    detail = _decoded_detail(p)
++                    reason = (describe(p.get('reason'), detail)
++                              if isinstance(p.get('reason'), str) and (detail is None or isinstance(detail, str))
+                               else _unknown_reason('dispatcher_evidence_unclassified'))
+                     if reason['disposition'] == 'unknown':
+                         reason = _unknown_reason('dispatcher_evidence_unclassified')
+diff --git a/tests/hermes_cli/test_kanban_nonrunning_review.py b/tests/hermes_cli/test_kanban_nonrunning_review.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f58440c81a41ba428b4a6768c96f15d0b8d82356
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_nonrunning_review.py
+@@ -0,0 +1,73 @@
++"""Composed regressions from the independent truthful-state review."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_capacity_evidence as cap
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_nonrunning_transport as transport
++from hermes_cli import kanban_execution_source as source
++from tests.hermes_cli import test_kanban_nonrunning_transport as helpers
++
++svc = helpers.svc
++gws = helpers.gws
++
++
++@pytest.mark.parametrize('code', ['lease_held', 'offline', 'denied'])
++@pytest.mark.parametrize('origin', [sync.ORIGIN_BOARD, sync.ORIGIN_LOCAL, None])
++def test_board_refusal_origin_survives_serialization(gws, code, origin):
++    home, worker, tid = helpers.prepared(gws)
++    worker.enter()
++    captured = cap.capture(worker.conn)
++    detail = sync.ClaimDeferral(code, origin) if origin is not None else code
++    result = dispatch.DispatchResult(claim_deferred=[(tid, detail)])
++    assert skips.record_tick(worker.conn, result, captured=captured, machine=worker.name) == 1
++    worker.round()
++    home.round()
++    home.enter()
++    why = transport.read(home.conn, [tid], board='default', now=captured['observed_at'] + 1)[tid]
++    if origin == sync.ORIGIN_BOARD:
++        assert why['code'] == code, why
++        assert why['freshness'] == 'current', why
++        assert why['scope'] == 'observing_dispatcher'
++        assert why['observer'] == worker.name
++    else:
++        assert why['freshness'] == 'unknown', why
++
++
++@pytest.mark.parametrize('remote_conflict', [False, True])
++def test_remote_conflict_survives_local_snapshot_composition(gws, remote_conflict):
++    home, worker, tid = helpers.prepared(gws)
++    if remote_conflict:
++        at = helpers.publish(worker, tid)
++        home.round()
++        home.enter()
++        event = home.conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='dispatch_skipped'", (tid,)).fetchone()
++        payload = json.loads(event[0])
++        payload['detail'] = 'capacity'
++        payload['non_running_v1']['observer'] = 'other-worker'
++        # Feed-shaped disposable-store reducer control, NOT service auth proof.
++        with kb.write_txn(home.conn):
++            kb._append_event(home.conn, tid, 'dispatch_skipped', payload)
++            home.conn.execute("UPDATE task_events SET origin_gateway='other-worker' WHERE id=(SELECT max(id) FROM task_events)")
++        remote = transport.read(home.conn, [tid], board='default', now=at + 1)[tid]
++        assert remote['unknown_reason'] == 'dispatcher_evidence_conflict', remote
++    else:
++        home.enter()
++        at = cap.capture(home.conn)['observed_at']
++    captured = cap.capture(home.conn, now=at + 1)
++    result = dispatch.DispatchResult(claim_deferred=[(tid, 'capacity')])
++    assert cap.record(home.conn, result, board='default', machine=home.name, now=at + 1, captured=captured)
++    with source.transaction(home.conn):
++        sources = source.assemble(home.conn, [tid], board='default', gateway=home.name, profile='default', observed_at=at + 2)
++    why = source.raw({'id': tid}, sources[tid])['non_running_reason']
++    if remote_conflict:
++        assert why['freshness'] == 'unknown', why
++        assert why['unknown_reason'] == 'dispatcher_evidence_conflict', why
++        assert why['actor'] == 'unknown'
++    else:
++        assert why['code'] == 'capacity', why
++        assert why['freshness'] == 'current', why
+-- 
+2.43.0
+

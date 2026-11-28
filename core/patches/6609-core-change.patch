@@ -1,0 +1,155 @@
+From f95a25d42e0f1d16066e620ebc0c45d65d549192 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:13:07 +0000
+Subject: [PATCH 6609] Startup import ordering, deferred plugin API sweep and update bytecode warmup
+
+Public mirror of source commit f95a25d42e0f1d16066e620ebc0c45d65d549192.
+
+---
+diff --git a/pm/dependency_imports.py b/pm/dependency_imports.py
+index c739c7f4eb82ea469e902793571b6355af65073c..2a3b0578643264353c4d044b61d67fe168062c74 100644
+--- a/pm/dependency_imports.py
++++ b/pm/dependency_imports.py
+@@ -15,6 +15,11 @@
+ import re
+ import sys
+ 
++_IMPORT_SUFFIXES = tuple(sorted(
++    (*importlib.machinery.SOURCE_SUFFIXES, *importlib.machinery.EXTENSION_SUFFIXES),
++    key=len, reverse=True,
++))
++
+ 
+ def _distribution_name(info: Path) -> str:
+     metadata = info / "METADATA"
+@@ -35,9 +40,12 @@
+             if not row:
+                 continue
+             path = PurePosixPath(row[0])
+-            if path.is_absolute() or ".." in path.parts or path.suffix not in {".py", ".so", ".pyd"}:
++            if path.is_absolute() or ".." in path.parts:
++                continue
++            suffix = next((s for s in _IMPORT_SUFFIXES if path.name.endswith(s)), None)
++            if suffix is None:
+                 continue
+-            stem = path.name.split(".", 1)[0]
++            stem = path.name[:-len(suffix)]
+             parts = (*path.parts[:-1], *((stem,) if stem != "__init__" else ()))
+             if parts and all(part.isidentifier() for part in parts):
+                 modules[".".join(parts)] = str(path.parent.parent if stem == "__init__" else path.parent)
+@@ -86,8 +94,10 @@
+     for name in owners:
+         module = sys.modules.get(name)
+         origin = getattr(module, "__file__", None)
+-        if origin and Path(origin).resolve().is_relative_to(project_root.resolve()):
+-            raise RuntimeError(f"checkout dependency already imported before PM activation: {name}")
++        if origin:
++            loaded = Path(origin).resolve()
++            if loaded.is_relative_to(project_root.resolve()) and not loaded.is_relative_to(selected.resolve()):
++                raise RuntimeError(f"checkout dependency already imported before PM activation: {name}")
+     sys.meta_path[:] = [entry for entry in sys.meta_path if not isinstance(entry, _DuplicateWheelFinder)]
+     if owners:
+         index = sys.meta_path.index(importlib.machinery.PathFinder)
+diff --git a/tests/hermes_cli/test_doctor_command_install.py b/tests/hermes_cli/test_doctor_command_install.py
+index a79a53ccdabf468b8f4c5a0d8b233126d4efc3c5..8b2aa7016323f4756e5d2b8d822664f948653fb0 100644
+--- a/tests/hermes_cli/test_doctor_command_install.py
++++ b/tests/hermes_cli/test_doctor_command_install.py
+@@ -48,7 +48,7 @@
+         "hermes", "hermes_bootstrap.py", "hermes_constants.py", "hermes_cli/__init__.py",
+         "hermes_agent/__init__.py", "hermes_agent/compat/__init__.py", "hermes_agent/compat/finder.py",
+         "hermes_agent/compat/moves.py",
+-        "pm/environments.py", "pm/filesystem.py", "hermes_cli/runtime_state.py",
++        "pm/environments.py", "pm/dependency_imports.py", "pm/filesystem.py", "hermes_cli/runtime_state.py",
+         "hermes_cli/_early_recovery.py", "hermes_cli/_parser.py",
+         "hermes_cli/venv_sync.py", "hermes_cli/steward.py", "hermes_cli/stderr_timestamp.py",
+         "hermes_cli/launch_malloc.py",
+diff --git a/tests/hermes_cli/test_source_launcher_publication.py b/tests/hermes_cli/test_source_launcher_publication.py
+index 07f355f57ad9bfa80fa31964d8d5e318185e3f14..78138e8c0ae76809da410aa678875dfe06710b98 100644
+--- a/tests/hermes_cli/test_source_launcher_publication.py
++++ b/tests/hermes_cli/test_source_launcher_publication.py
+@@ -20,7 +20,7 @@
+     "hermes_cli/_launch_template.py",
+     "hermes_agent/__init__.py", "hermes_agent/compat/__init__.py", "hermes_agent/compat/finder.py",
+     "hermes_agent/compat/moves.py",
+-    "pm/environments.py", "pm/filesystem.py", "pm/paths.py", "hermes_cli/runtime_state.py",
++    "pm/environments.py", "pm/dependency_imports.py", "pm/filesystem.py", "pm/paths.py", "hermes_cli/runtime_state.py",
+     "hermes_cli/_early_recovery.py", "hermes_cli/_parser.py",
+     "hermes_cli/venv_sync.py", "hermes_cli/steward.py", "hermes_cli/launch_malloc.py",
+     "hermes_cli/stderr_timestamp.py",
+diff --git a/tests/pm/test_dependency_source_ownership.py b/tests/pm/test_dependency_source_ownership.py
+index 0fce68d97b0229ca7ecf2e26215fe165f832178b..f657a0a8b95b18325579467073897fbe5ef38f9f 100644
+--- a/tests/pm/test_dependency_source_ownership.py
++++ b/tests/pm/test_dependency_source_ownership.py
+@@ -1,4 +1,5 @@
+ """Duplicate installed wheels cannot steal committed dependency ownership."""
++from importlib.machinery import EXTENSION_SUFFIXES
+ import json
+ import os
+ from pathlib import Path
+@@ -20,16 +21,19 @@
+ 
+ 
+ @pytest.mark.parametrize("mutate_namespace_path", [False, True])
+-def test_activation_uses_managed_duplicate_without_stealing_namespace(tmp_path, monkeypatch, mutate_namespace_path):
++@pytest.mark.parametrize("nested_environment", [False, True])
++def test_activation_uses_managed_duplicate_without_stealing_namespace(
++    tmp_path, monkeypatch, mutate_namespace_path, nested_environment,
++):
+     from pm import environments
+ 
+     root = tmp_path / "repo"
+-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    root.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str((root if nested_environment else tmp_path) / "home"))
+     state = environments.install_state_dir(root)
+     selected = state / "environments" / "selected" / "venv"
+     site = environments.site_packages(selected)
+     site.mkdir(parents=True)
+-    root.mkdir()
+     (selected / "pyvenv.cfg").write_text("home = fixture\n")
+     (state / "facts.json").write_text(json.dumps({"schema": 1, "packages": {
+         "venv": {"environment": str(selected)},
+@@ -48,6 +52,7 @@
+         "activate_dependencies(Path(sys.argv[1])); "
+         + ("import ownership_probe; sys.path.insert(0, sys.argv[1]); " if mutate_namespace_path else "") +
+         "import ownership_probe.yaml as yaml; from ownership_probe import source_member; "
++        "activate_dependencies(Path(sys.argv[1])); "
+         "print(yaml.value); print(yaml.__file__); print(source_member.value)"
+     )
+     process = subprocess.run([sys.executable, "-c", code, str(root)],
+@@ -59,8 +64,8 @@
+ 
+ @pytest.mark.parametrize("record,expected", [
+     ("ordinary.py,,\n", {"ordinary": "."}),
+-    ("native.cpython-314-x86_64-linux-gnu.so,,\n", {"native": "."}),
+-    ("native.cp314-win_amd64.pyd,,\n", {"native": "."}),
++    ("not.a.module.py,,\n", {}),
++    (f"native{EXTENSION_SUFFIXES[0]},,\n", {"native": "."}),
+     ("namespace/member/__init__.py,,\n", {"namespace.member": "namespace"}),
+     ("../outside.py,,\n/absolute.py,,\nnot-a-module.py,,\n", {}),
+     ("package-1.data/scripts/command.py,,\npackage-1.dist-info/METADATA,,\n", {}),
+@@ -135,3 +140,21 @@
+     assert sys.meta_path[:3] == [BuiltinImporter, FrozenImporter, sentinel]
+     assert isinstance(sys.meta_path[3], _DuplicateWheelFinder)
+     assert sys.meta_path[4:] == [PathFinder]
++
++
++@pytest.mark.parametrize("metadata_file,contents", [
++    ("METADATA", bytes([255])),
++    ("direct_url.json", b"{broken"),
++])
++def test_malformed_ownership_evidence_refuses_without_changing_finders(tmp_path, monkeypatch, metadata_file, contents):
++    from pm.dependency_imports import select_wheel_sources
++
++    root, selected = tmp_path / "source", tmp_path / "selected"
++    _distribution(root)
++    info = _distribution(selected)
++    (info / metadata_file).write_bytes(contents)
++    original = list(sys.meta_path)
++    monkeypatch.setattr(sys, "meta_path", original.copy())
++    with pytest.raises((UnicodeError, ValueError)):
++        select_wheel_sources(root, selected)
++    assert sys.meta_path == original
+-- 
+2.43.0
+

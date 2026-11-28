@@ -1,0 +1,179 @@
+From d2d0762ec8ec9bd28d8b62d6911f97aea92f8514 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:55:19 +0000
+Subject: [PATCH 6659] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit d2d0762ec8ec9bd28d8b62d6911f97aea92f8514.
+
+---
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 99dcf0b40d81fc7fb79c6b991502c54654dffb0d..6d5bae2b70b88009ad3a3fbc4bacde13e3f6a33e 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -937,13 +937,19 @@
+         replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+         rebuilt = False
+         generation = lag.pull_started(path)  # done only below: a failed pull leaves this gateway's pushes lagging
++        from hermes_cli import kanban_sync_replica_unfreeze as unfreeze
++        repair_stop = not diagnostic and unfreeze.needed(replica, path)
+         try:
++            if repair_stop:
++                unfreeze.begin(path)
++                raise Resync('replica consumed changes while stop-frozen')
+             pulled = pull(replica, hub, slug, observers=False, max_pages=max_pages)
+         except Resync as exc:
+             if diagnostic:
+                 raise
+             before = acw.statuses(replica, getattr(exc, "status_changed", None))  # read before the file goes
+-            _log.warning("kanban sync: %s replica cursor below the retention floor; rebuilding from a snapshot", slug)
++            reason = 'consumed changes while stop-frozen' if repair_stop else 'cursor below the retention floor'
++            _log.warning("kanban sync: %s replica %s; rebuilding from a snapshot", slug, reason)
+             from hermes_cli import kanban_sync_quarantine as quarantine
+             quarantine.save_rebuild(replica, path)
+             stack.close()
+@@ -952,9 +958,8 @@
+             replica = stack.enter_context(connection(path, lambda: open_shadow(slug, gateway)))
+             rebuilt = True
+             pulled = Pulled(resync(replica, hub, slug, observers=False), status_changed=acw.rebuilt(before, replica))
+-        if not diagnostic and not pulled.more:
+-            from hermes_cli.kanban_sync_replica_unfreeze import unfreeze
+-            unfreeze(replica, hub, slug, path)
++            if repair_stop:
++                unfreeze.finish(path)  # only a complete fresh snapshot certifies recovery
+         if not diagnostic:
+             from hermes_cli.kanban_sync_closure_backfill import backfill
+             pulled.status_changed.update(backfill(replica, hub, slug))
+diff --git a/hermes_cli/kanban_sync_replica_unfreeze.py b/hermes_cli/kanban_sync_replica_unfreeze.py
+index 9fb425ec3edb2f61b5a958fc91a19b783ef78439..ab88c8b769a818e4afabadf67337779e85d27878 100644
+--- a/hermes_cli/kanban_sync_replica_unfreeze.py
++++ b/hermes_cli/kanban_sync_replica_unfreeze.py
+@@ -1,19 +1,15 @@
+-"""One-time rebuild of replicas that froze stopped cards against the feed. [daveey]
++"""One-time full rebuild of replicas that consumed changes while stop-frozen. [daveey]
+ 
+-Before ``kanban_stop_sync.frozen_change`` skipped replicas, a pulled copy (``sync-shadow/<board>.db``) dropped every
+-feed change for a card holding an ``administrative_stop_restricted`` event, while its cursor advanced. The feed
+-never resends those changes, so such a replica keeps the stopped card's status as of the stop (a stopped card
+-stayed ``scheduled`` after its home archived it). A snapshot resync re-delivers every row; it runs once per replica
+-that holds a stop event, and a marker beside the file records it.
++A snapshot upserts live rows but cannot recover consumed deletions in a populated
++replica. Use the retention-rebuild path, preserving quarantine and invalidating
++pooled descriptors. Persist intent before discarding the old replica so failures
++retry even when the new database has not yet received its stop event.
+ """
+ from __future__ import annotations
+ 
+-import logging
+ import sqlite3
+ from pathlib import Path
+-from typing import Any
+ 
+-_log = logging.getLogger(__name__)
+ SUFFIX = ".stop-unfrozen"
+ 
+ 
+@@ -21,19 +17,22 @@
+     return path.with_name(path.name + SUFFIX)
+ 
+ 
++def _pending(path: Path) -> Path:
++    return path.with_name(path.name + SUFFIX + ".pending")
++
++
+ def needed(replica: sqlite3.Connection, path: Path) -> bool:
+     from hermes_cli.kanban_stop_ended import KIND
+     if _marker(path).exists():
+         return False
+-    return replica.execute("SELECT 1 FROM task_events WHERE kind = ? LIMIT 1", (KIND,)).fetchone() is not None
++    return _pending(path).exists() or replica.execute(
++        "SELECT 1 FROM task_events WHERE kind = ? LIMIT 1", (KIND,)).fetchone() is not None
++
++
++def begin(path: Path) -> None:
++    _pending(path).write_text("pending\n", encoding="utf-8")
+ 
+ 
+-def unfreeze(replica: sqlite3.Connection, hub: Any, slug: str, path: Path) -> int:
+-    """Resync ``replica`` from the Board snapshot once when it may hold frozen cards; returns rows read."""
+-    from hermes_cli import kanban_sync_client as ksc
+-    if not needed(replica, path):
+-        return 0
+-    count = ksc.resync(replica, hub, slug, observers=False)
++def finish(path: Path) -> None:
+     _marker(path).write_text("done\n", encoding="utf-8")
+-    _log.warning("kanban sync: %s replica held stopped cards frozen against the feed; resynced %d rows", slug, count)
+-    return count
++    _pending(path).unlink(missing_ok=True)
+diff --git a/tests/hermes_cli/test_kanban_stop_sync.py b/tests/hermes_cli/test_kanban_stop_sync.py
+index 96892dcdac5e20b158d6953b9151addb57842bd7..b22d124cfb7769cff65846e85cc1fd5ad7c04167 100644
+--- a/tests/hermes_cli/test_kanban_stop_sync.py
++++ b/tests/hermes_cli/test_kanban_stop_sync.py
+@@ -155,10 +155,61 @@
+         service._put(board, 'tasks', target, {'status': 'archived', 'title': 'M5'}, ME, None, '9999999999999-0000-hub')
+         path = ksc.shadow_path(BOARD)
+         assert unfreeze.needed(replica, path)
+-        assert unfreeze.unfreeze(replica, hub, BOARD, path) > 0
+-        assert kb.get_task(replica, target).status == 'archived'
+-        assert not unfreeze.needed(replica, path)
+-        assert unfreeze.unfreeze(replica, hub, BOARD, path) == 0
++        replica.close()
++        with ksc._pulled_replica(BOARD, hub, ME) as (rebuilt, pulled, changed):
++            assert pulled > 0 and changed
++            assert kb.get_task(rebuilt, target).status == 'archived'
++            assert not unfreeze.needed(rebuilt, path)
++        with ksc._pulled_replica(BOARD, hub, ME) as (_, _, changed):
++            assert not changed
+     finally:
+         replica.close()
+         ksc.shadow_path(BOARD).with_name(ksc.shadow_path(BOARD).name + unfreeze.SUFFIX).unlink(missing_ok=True)
++
++
++def test_replica_rebuild_removes_consumed_link_delete(shadow, monkeypatch):
++    from hermes_cli import kanban_stop_sync
++    from hermes_cli import kanban_sync_replica_unfreeze as unfreeze
++    service = FakeService()
++    hub = service.hub(ME)
++    target, replica = _replica_after_stop(shadow, service, hub)
++    path = ksc.shadow_path(BOARD)
++    try:
++        board = service.board(BOARD)
++        uid = next(u for u in board['rows']['task_links'] if target in u.split('>'))
++        parent, child = uid.split('>')
++        board['rows']['task_links'][uid]['deleted_at'] = 1
++        service._emit(board, 'task_links', uid, 'delete', None, ME, None)
++        with monkeypatch.context() as patch:
++            patch.setattr(kanban_stop_sync, 'is_replica', lambda conn: False)
++            ksc.pull(replica, hub, BOARD, observers=False)
++        query = 'SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?'
++        assert replica.execute(query, (parent, child)).fetchone()
++        replica.close()
++        with ksc._pulled_replica(BOARD, hub, ME) as (rebuilt, _, changed):
++            assert changed
++            assert rebuilt.execute(query, (parent, child)).fetchone() is None
++            assert not unfreeze.needed(rebuilt, path)
++    finally:
++        replica.close()
++        path.with_name(path.name + unfreeze.SUFFIX).unlink(missing_ok=True)
++
++
++def test_replica_failed_rebuild_does_not_mark_done(shadow, monkeypatch):
++    from hermes_cli import kanban_sync_replica_unfreeze as unfreeze
++    service = FakeService()
++    hub = service.hub(ME)
++    _, replica = _replica_after_stop(shadow, service, hub)
++    replica.close()
++    path = ksc.shadow_path(BOARD)
++    with monkeypatch.context() as patch:
++        def fail(*args, **kwargs):
++            raise RuntimeError('snapshot unavailable')
++        patch.setattr(hub, 'snapshot_page', fail)
++        with pytest.raises(RuntimeError, match='snapshot unavailable'):
++            with ksc._pulled_replica(BOARD, hub, ME):
++                pytest.fail('failed rebuild must not publish')
++    assert not path.with_name(path.name + unfreeze.SUFFIX).exists()
++    with ksc._pulled_replica(BOARD, hub, ME) as (rebuilt, pulled, _):
++        assert pulled > 0
++        assert rebuilt.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] > 0
+-- 
+2.43.0
+

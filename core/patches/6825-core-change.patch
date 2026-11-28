@@ -1,0 +1,102 @@
+From 914a974adf3f512efae7db1a0236063b5725f308 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 15:15:49 +0000
+Subject: [PATCH 6825] Policy-config interning: exact-byte storage and opt-in rollout
+
+Public mirror of source commit 914a974adf3f512efae7db1a0236063b5725f308.
+
+---
+diff --git a/hermes_cli/session_recovery.py b/hermes_cli/session_recovery.py
+index d16434345f5b09d1bfd7985e92d9442ba1e35e53..dc94c5bfaace5a7d6be741f1a88728ac59706eba 100644
+--- a/hermes_cli/session_recovery.py
++++ b/hermes_cli/session_recovery.py
+@@ -1007,7 +1007,13 @@
+     placeholders = ", ".join("?" for _ in fts_keys)
+     with _immediate_transaction(destination):
+         from hermes_state_policy_config import reconcile_recovered_references
+-        result['policy_config_references'] = reconcile_recovered_references(destination)
++        from hermes_state_runtime import RuntimeStoreError
++        try:
++            result['policy_config_references'] = reconcile_recovered_references(destination)
++        except RuntimeStoreError as exc:
++            # Preserve fail-closed custody while exposing the recovery API's
++            # typed failure to CLI callers; never leak config payloads in errors.
++            raise SessionRecoveryError('policy config custody could not be verified') from exc
+         destination.execute(f"DELETE FROM state_meta WHERE key IN ({placeholders})", fts_keys)
+         destination.execute(
+             "INSERT INTO state_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+diff --git a/tests/hermes_cli/test_session_recovery_policy_config.py b/tests/hermes_cli/test_session_recovery_policy_config.py
+index 0f9c698fa4d3911a736dd905fe5da14f6392b9e5..43b747b651ca79803914b8a4ed08e63cf7982ae6 100644
+--- a/tests/hermes_cli/test_session_recovery_policy_config.py
++++ b/tests/hermes_cli/test_session_recovery_policy_config.py
+@@ -1,5 +1,7 @@
+ """Actual recovery reconstructs reference custody from surviving policy receipts."""
+ from contextlib import closing
++from types import SimpleNamespace
++import hashlib
+ import sqlite3
+ import pytest
+ 
+@@ -47,7 +49,7 @@
+ 
+ @pytest.mark.parametrize('damage', ['missing_blob', 'corrupt_blob', 'missing_blob_and_refs'])
+ def test_recovery_refuses_unreadable_policy_config(tmp_path, damage):
+-    from hermes_state_runtime import RuntimeStoreError
++    from hermes_cli.session_recovery import SessionRecoveryError
+     source, output = tmp_path / 'source.db', tmp_path / 'recovered.db'
+     with closing(SessionDB(source)) as db:
+         def write(conn):
+@@ -59,5 +61,49 @@
+             if damage == 'missing_blob_and_refs':
+                 conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (REF_PREFIX + '*',))
+         db._execute_write(write)
+-    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++    with pytest.raises(SessionRecoveryError, match='policy config custody could not be verified') as caught:
+         recover_session_database(source, output, allow_partial=True)
++    from hermes_state_runtime import RuntimeStoreError
++    assert isinstance(caught.value.__cause__, RuntimeStoreError)
++
++
++@pytest.mark.parametrize('damage', ['missing_blob', 'corrupt_blob', 'malformed_legacy'])
++@pytest.mark.parametrize('allow_partial', [False, True])
++def test_recover_cli_reports_unreadable_policy_custody(tmp_path, capsys, damage, allow_partial):
++    from hermes_cli.sessions_cmd import _cmd_recover
++    source, output = tmp_path / 'source.db', tmp_path / 'recovered.db'
++    with closing(SessionDB(source)) as db:
++        def write(conn):
++            store_receipt(conn, 'one', {'policy': {'config_json': '{}'}}, intern=True)
++            if damage == 'missing_blob':
++                conn.execute('DELETE FROM state_meta WHERE key GLOB ?', (BLOB_PREFIX + '*',))
++            elif damage == 'corrupt_blob':
++                conn.execute('UPDATE state_meta SET value=? WHERE key GLOB ?', ('wrong', BLOB_PREFIX + '*'))
++            else:
++                # Even partial salvage cannot prove a malformed receipt does not
++                # own one of the recovered blobs. Refuse before rebuilding/GC.
++                conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
++                             ('gateway.local_policy.v1:legacy', 'not json'))
++        db._execute_write(write)
++    before = hashlib.sha256(source.read_bytes()).digest()
++    result = _cmd_recover(SimpleNamespace(source=source, output=output, allow_partial=allow_partial))
++    assert result == 1
++    text = capsys.readouterr().out
++    assert 'Error: session recovery failed: policy config custody could not be verified' in text
++    assert 'source database was not replaced or deleted' in text
++    assert 'verified at:' not in text
++    assert not output.with_name(output.name + '.recovery.json').exists()
++    assert hashlib.sha256(source.read_bytes()).digest() == before
++
++
++def test_recover_cli_preserves_malformed_inline_only_legacy(tmp_path, capsys):
++    from hermes_cli.sessions_cmd import _cmd_recover
++    source, output = tmp_path / 'source.db', tmp_path / 'recovered.db'
++    with closing(SessionDB(source)) as db:
++        db._execute_write(lambda conn: conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
++                                                   ('gateway.local_policy.v1:legacy', 'not json')))
++    assert _cmd_recover(SimpleNamespace(source=source, output=output, allow_partial=True)) == 0
++    assert 'verified at:' in capsys.readouterr().out
++    with closing(sqlite3.connect(output)) as conn:
++        assert conn.execute('SELECT value FROM state_meta WHERE key=?',
++                            ('gateway.local_policy.v1:legacy',)).fetchone()[0] == 'not json'
+-- 
+2.43.0
+

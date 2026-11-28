@@ -1,0 +1,307 @@
+From dc0624720cc713e8c194a9b9bd0bae0a07881a5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:18:18 +0000
+Subject: [PATCH 6741] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit dc0624720cc713e8c194a9b9bd0bae0a07881a5f.
+
+---
+diff --git a/hermes_cli/kanban_candidate_receipts.py b/hermes_cli/kanban_candidate_receipts.py
+index 866b2ac61f8f465100e4983c9abc5c983ef90f82..8a8670928c3aa640f79b57e13b6d741e28073d54 100644
+--- a/hermes_cli/kanban_candidate_receipts.py
++++ b/hermes_cli/kanban_candidate_receipts.py
+@@ -209,7 +209,8 @@
+     from hermes_cli.kanban_governors import tick as governor_tick
+     state = sync_state(conn)
+     worker = str(state['gateway_id']) if state else socket.gethostname()
+-    with collect(worker=worker) as capture, governor_tick(conn, caps):
++    from hermes_cli.kanban_lane_samples import observe as observe_lanes
++    with collect(worker=worker) as capture, governor_tick(conn, caps), observe_lanes(conn, dry_run=dry_run):
+         yield
+     if not dry_run:
+         try:
+diff --git a/hermes_cli/kanban_lane_samples.py b/hermes_cli/kanban_lane_samples.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..76057d42621ea2cc87fcc7b50912ab38f0495063
+--- /dev/null
++++ b/hermes_cli/kanban_lane_samples.py
+@@ -0,0 +1,125 @@
++"""Minute occupancy observations; advisory only, never consulted by admission. [daveey]"""
++from collections import Counter
++from contextlib import contextmanager
++from contextvars import ContextVar
++import logging
++import sqlite3
++import time
++
++from hermes_cli import kanban_lanes as lanes
++
++_current = ContextVar("lane_sample", default=None)
++_log = logging.getLogger(__name__)
++RETENTION = 8 * 86400
++
++
++def rejected(ids, names, default):
++    """Only real cap-filter decisions inside an admitted dispatcher pass count."""
++    capture = _current.get()
++    if capture is not None:
++        for task_id in ids:
++            lane = names.get(task_id, default)
++            if lane in capture:
++                capture[lane].add(task_id)
++
++
++@contextmanager
++def observe(conn, *, dry_run=False):
++    pol = lanes.safe_policy()
++    if dry_run or pol is None or pol.shadow:
++        yield
++        return
++    try:
++        counts = lanes._running(conn, pol)
++    except (sqlite3.Error, OSError):
++        _log.warning("lane occupancy census unavailable", exc_info=True)
++        yield
++        return
++    capture = {name: set() for name in pol.lanes}
++    token = _current.set(capture)
++    try:
++        yield
++    finally:
++        _current.reset(token)
++        # Instrumentation failure cannot change dispatch's admission result.
++        try:
++            record(conn, pol, counts, capture)
++        except (sqlite3.Error, OSError):
++            _log.warning("lane occupancy sample unavailable", exc_info=True)
++
++
++def record(conn, pol, counts, capture, *, now=None):
++    minute = int(time.time() if now is None else now) // 60 * 60
++    ready = Counter(pol.lane_of(r[0]) for r in conn.execute(
++        "SELECT tenant FROM tasks WHERE status='ready' AND claim_lock IS NULL"))
++    conn.execute("CREATE TABLE IF NOT EXISTS lane_samples ("
++                 "ts INTEGER NOT NULL, lane TEXT NOT NULL, running INTEGER NOT NULL, cap INTEGER, "
++                 "ready INTEGER NOT NULL, rejected INTEGER NOT NULL, PRIMARY KEY(ts,lane))")
++    conn.executemany(
++        "INSERT INTO lane_samples VALUES (?,?,?,?,?,?) ON CONFLICT(ts,lane) DO UPDATE SET "
++        # Preserve the occupancy/cap pair that witnessed rejection, even if the
++        # lane drains or its cap changes later in this minute. Otherwise keep peak occupancy.
++        "running=CASE WHEN excluded.rejected>0 OR (lane_samples.rejected=0 AND "
++        "excluded.running>=lane_samples.running) THEN excluded.running ELSE lane_samples.running END, "
++        "cap=CASE WHEN excluded.rejected>0 OR (lane_samples.rejected=0 AND "
++        "excluded.running>=lane_samples.running) THEN excluded.cap ELSE lane_samples.cap END, "
++        "ready=MAX(lane_samples.ready,excluded.ready), rejected=lane_samples.rejected+excluded.rejected",
++        [(minute, name, counts[name], spec.max_workers, ready[name], len(capture[name]))
++         for name, spec in pol.lanes.items()])
++    conn.execute("DELETE FROM lane_samples WHERE ts < ?", (minute - RETENTION,))
++
++
++def ticks(conn, pol, *, window_s=86400, count=48, now=None):
++    """Return None on pre-samples cores; missing observed buckets retain unknown data.
++
++    Within a bucket choose the peak observed occupancy state, retaining its cap.
++    Historical run overlap supplies occupancy only, never a historical cap or zero rejections.
++    """
++    if not 1 <= count <= 336 or not 0 < window_s <= RETENTION:
++        raise ValueError("invalid occupancy window")
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lane_samples'").fetchone():
++        return None
++    now = int(time.time() if now is None else now)
++    width = window_s / count
++    start = now - window_s
++    out = {name: [dict(t=int(start + i * width), state='unknown', running=None, cap=None,
++                       rejected=None) for i in range(count)] for name in pol.lanes}
++    observed = {}
++    for row in conn.execute("SELECT ts,lane,running,cap,rejected FROM lane_samples WHERE ts>=? AND ts<=? ORDER BY ts",
++                            (int(start) // 60 * 60, now)):
++        ts, name, running, cap, rejects = row
++        if name not in out:
++            continue
++        index = max(0, min(count - 1, int((ts - start) / width)))
++        state = ('rejecting' if cap is not None and running >= cap and rejects else
++                 'full' if running > 0 and cap is not None and running >= cap else
++                 'partial' if running else 'empty')
++        rank = {'empty': 0, 'partial': 1, 'full': 2, 'rejecting': 3}
++        tick = out[name][index]
++        tick['rejected'] = (tick['rejected'] or 0) + rejects
++        if tick['state'] == 'unknown' or rank[state] >= rank[tick['state']]:
++            tick.update(state=state, running=running, cap=cap)
++        observed[(name, index)] = True
++    # Sweep real run endpoints per historical bucket: counting overlapping runs
++    # would overstate concurrency when several sequential jobs share a bucket.
++    endpoints = {name: [] for name in pol.lanes}
++    for tenant, began, ended in conn.execute(
++            "SELECT t.tenant,r.started_at,COALESCE(r.ended_at,?) FROM task_runs r "
++            "JOIN tasks t ON t.id=r.task_id WHERE r.started_at<? AND COALESCE(r.ended_at,?)>?",
++            (now, now, now, start)):
++        endpoints[pol.lane_of(tenant)].append((max(start, began), min(now, ended)))
++    for name, spans in endpoints.items():
++        for index, tick in enumerate(out[name]):
++            if (name, index) in observed:
++                continue
++            left, right = start + index * width, start + (index + 1) * width
++            events = [(max(left, a), 1) for a, b in spans if a < right and b > left]
++            events += [(min(right, b), -1) for a, b in spans if a < right and b > left]
++            running = peak = 0
++            for _, delta in sorted(events):
++                running += delta
++                peak = max(peak, running)
++            # No run is not proof the dispatcher observed an empty lane.
++            if events:
++                tick.update(state='partial', running=peak, rejection_unknown=True)
++    return out
+diff --git a/hermes_cli/kanban_lane_workers.py b/hermes_cli/kanban_lane_workers.py
+index 5eb52c89ff1434cc4c279c5ece5ed27513dbf12e..e893cb64df6c6d2cc82a326f2c23621ab19db5b2 100644
+--- a/hermes_cli/kanban_lane_workers.py
++++ b/hermes_cli/kanban_lane_workers.py
+@@ -39,4 +39,6 @@
+     names, _alarms = lanes._candidate_lanes(conn, pol, [row["id"] for row in rows])
+     full = {name for name, spec in pol.lanes.items()
+             if spec.max_workers is not None and counts[name] >= spec.max_workers}
++    from hermes_cli.kanban_lane_samples import rejected
++    rejected([row["id"] for row in rows if names.get(row["id"], pol.default) in full], names, pol.default)
+     return [row for row in rows if names.get(row["id"], pol.default) not in full]
+diff --git a/tests/hermes_cli/test_kanban_lane_samples.py b/tests/hermes_cli/test_kanban_lane_samples.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c2eaf1950a99626c338e28046fcd20f22fe0b62
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lane_samples.py
+@@ -0,0 +1,134 @@
++"""Occupancy telemetry from the real dispatcher candidate filter, not invented states."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_lane_samples as samples, kanban_lanes as lanes
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++person = base.person
++
++
++@pytest.mark.parametrize('running,cap,ready,state', [
++    (0, 2, 0, 'empty'), (1, 2, 0, 'partial'), (1, 1, 0, 'full'),
++    (1, 1, 1, 'rejecting'), (0, 0, 1, 'rejecting'), (1, None, 1, 'partial')])
++def test_real_candidate_filter_observes_states(conn, configured, monkeypatch, running, cap, ready, state):
++    mapping = copy.deepcopy(base.LANES)
++    mapping['myapp']['max_workers'] = cap
++    configured(mapping)
++    monkeypatch.setattr(samples.time, 'time', lambda: 12000)
++    for i in range(running):
++        tid = base._ready_in(conn, 'myapp', f'running {i}')
++        assert kb.claim_task(conn, tid)
++    for i in range(ready):
++        base._ready_in(conn, 'myapp', f'ready {i}')
++    with samples.observe(conn):
++        rows = lane_rows(conn, 'ready')
++    observed = conn.execute("SELECT * FROM lane_samples WHERE lane='myapp'").fetchone()
++    assert observed['running'] == running
++    assert observed['cap'] == cap
++    assert observed['rejected'] == (ready if state == 'rejecting' else 0)
++    tick = samples.ticks(conn, lanes.policy(), now=12030, window_s=60, count=1)['myapp'][0]
++    assert tick['state'] == state
++    assert len(rows) == (0 if state == 'rejecting' else ready)
++
++
++@pytest.mark.parametrize('running,cap,ready,state', [
++    (0, 2, 0, 'empty'), (1, 2, 0, 'partial'), (1, 1, 0, 'full'), (1, 1, 1, 'rejecting')])
++def test_dispatch_once_records_states(conn, configured, running, cap, ready, state):
++    mapping = copy.deepcopy(base.LANES)
++    mapping['myapp']['max_workers'] = cap
++    configured(mapping)
++    for i in range(running):
++        first = base._ready_in(conn, 'myapp', f'running {i}')
++        assert kb.claim_task(conn, first)
++    for i in range(ready):
++        base._ready_in(conn, 'myapp', f'waiting {i}')
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    result = dispatch_once(conn, spawn_fn=lambda *_a, **_k: pytest.fail('cap must prevent spawn'),
++                           max_spawn=2, max_in_progress=10, reconcile_orphans=False)
++    assert not result.spawned
++    row = conn.execute("SELECT * FROM lane_samples WHERE lane='myapp'").fetchone()
++    assert row['running'] == running
++    assert row['rejected'] == ready
++    tick = samples.ticks(conn, lanes.policy(), now=row['ts'] + 30, window_s=60, count=1)['myapp'][0]
++    assert tick['state'] == state
++
++
++def test_reads_and_dry_runs_never_write(conn, configured):
++    with samples.observe(conn, dry_run=True):
++        lane_rows(conn, 'ready')
++    assert samples.ticks(conn, lanes.policy()) is None
++    lane_rows(conn, 'ready')
++    assert samples.ticks(conn, lanes.policy()) is None
++
++
++def test_minute_aggregation_retention_and_missing(conn, configured):
++    pol = lanes.policy()
++    counts = dict.fromkeys(pol.lanes, 0)
++    capture = {name: set() for name in pol.lanes}
++    samples.record(conn, pol, counts, capture, now=0)
++    capture['myapp'].add('first')
++    samples.record(conn, pol, counts, capture, now=samples.RETENTION + 120)
++    capture['myapp'].add('second')
++    samples.record(conn, pol, counts, capture, now=samples.RETENTION + 130)
++    rows = conn.execute("SELECT * FROM lane_samples WHERE lane='myapp'").fetchall()
++    assert len(rows) == 1
++    assert rows[0]['rejected'] == 3
++    ticks = samples.ticks(conn, pol, now=samples.RETENTION + 140, window_s=240, count=4)['myapp']
++    assert ticks[0]['state'] == 'unknown'
++    assert ticks[0]['running'] is None
++    assert ticks[-1]['state'] == 'empty'
++
++
++def test_rejection_survives_drain_in_same_minute(conn, configured):
++    mapping = copy.deepcopy(base.LANES)
++    mapping['myapp']['max_workers'] = 1
++    configured(mapping)
++    pol = lanes.policy()
++    counts = dict.fromkeys(pol.lanes, 0)
++    counts['myapp'] = 1
++    capture = {n: set() for n in pol.lanes}
++    capture['myapp'].add('waiting')
++    samples.record(conn, pol, counts, capture, now=120)
++    counts['myapp'] = 0
++    capture['myapp'].clear()
++    samples.record(conn, pol, counts, capture, now=130)
++    tick = samples.ticks(conn, pol, now=150, window_s=60, count=1)['myapp'][0]
++    assert tick['state'] == 'rejecting'
++    assert (tick['running'], tick['cap'], tick['rejected']) == (1, 1, 1)
++
++
++def test_shadow_and_unconfigured_do_not_write(conn, configured):
++    configured(lane_shadow=True)
++    with samples.observe(conn):
++        lane_rows(conn, 'ready')
++    assert samples.ticks(conn, lanes.policy()) is None
++    configured({})
++    with samples.observe(conn):
++        pass
++    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='lane_samples'").fetchone()
++
++
++def test_backfill_uses_peak_not_sum_and_keeps_rejections_unknown(conn, configured):
++    first = base._ready_in(conn, 'myapp', 'first')
++    second = base._ready_in(conn, 'myapp', 'second')
++    for tid, start, end in [(first, 100, 110), (second, 110, 120)]:
++        assert kb.claim_task(conn, tid)
++        conn.execute('UPDATE tasks SET status=\'done\' WHERE id=?', (tid,))
++        conn.execute('UPDATE task_runs SET started_at=?,ended_at=? WHERE task_id=?', (start, end, tid))
++    pol = lanes.policy()
++    samples.record(conn, pol, dict.fromkeys(pol.lanes, 0), {n: set() for n in pol.lanes}, now=240)
++    ticks = samples.ticks(conn, pol, now=300, window_s=300, count=3)['myapp']
++    assert ticks[0]['state'] == 'unknown'
++    assert ticks[1] == dict(t=100, state='partial', running=1, cap=None, rejected=None, rejection_unknown=True)
++    assert ticks[2]['state'] == 'empty'
++
++
++@pytest.mark.parametrize('window,count', [(0, 48), (9999999, 48), (60, 0), (60, 337)])
++def test_invalid_window(conn, configured, window, count):
++    with pytest.raises(ValueError):
++        samples.ticks(conn, lanes.policy(), window_s=window, count=count)
+-- 
+2.43.0
+

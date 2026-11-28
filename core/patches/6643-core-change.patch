@@ -1,0 +1,103 @@
+From e891b51ea1986cd548303a23d7503d0aafac8d49 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:01:41 +0000
+Subject: [PATCH 6643] Scoped model quota walls
+
+Public mirror of source commit e891b51ea1986cd548303a23d7503d0aafac8d49.
+
+---
+diff --git a/hermes_cli/kanban_quota_probe.py b/hermes_cli/kanban_quota_probe.py
+index 79f0f0af87b8c944bbd51a0e26b150f4072eed04..18fca8f644e1e654994ce4fcd7214040e239032b 100644
+--- a/hermes_cli/kanban_quota_probe.py
++++ b/hermes_cli/kanban_quota_probe.py
+@@ -82,7 +82,7 @@
+     """The model the episode's run was routed to (its receipt), else the episode's recorded model."""
+     from hermes_cli.kanban_quota_receipt import _owned_receipt
+     owned = _owned_receipt(conn, task_id, state['run_id'])
+-    model = owned[0].get('route_model') if owned else None
++    model = state.get('wall_model') or (owned[0].get('route_model') if owned else None)
+     return model if isinstance(model, str) and model else state.get('model')
+ 
+ 
+@@ -90,8 +90,15 @@
+     """``provider -> Verdict._asdict()`` for every provider *walls* name (``kanban_quota_episode._providers``)."""
+     from hermes_cli.kanban_quota_episode import _providers
+     verdict = verdict or live_verdict
+-    names = sorted({provider for wall in walls for provider in _providers(wall)})
+-    return {provider: verdict(provider, model)._asdict() for provider in names}
++    targets = sorted({(provider, wall.get('wall_model') or model) for wall in walls for provider in _providers(wall)},
++                     key=lambda target: (target[0], str(target[1])))
++    found = {}
++    for provider, candidate in targets:
++        value = verdict(provider, candidate)._asdict()
++        # One serving model cannot release another model's confirmed/unknown wall.
++        if provider not in found or found[provider]['state'] == 'headroom' or value['state'] == 'walled':
++            found[provider] = value
++    return found
+ 
+ 
+ def contradicted(exc, *, verdict=None):
+diff --git a/tests/hermes_cli/test_kanban_model_quota_walls.py b/tests/hermes_cli/test_kanban_model_quota_walls.py
+index 8fd27898540d0fd4ad472a9cf7804edd2c9500ef..f2f14b33da8bc9809c20963e7605249e7beee81f 100644
+--- a/tests/hermes_cli/test_kanban_model_quota_walls.py
++++ b/tests/hermes_cli/test_kanban_model_quota_walls.py
+@@ -152,3 +152,15 @@
+     assert set(pw.active_walls()) == {f'{P}/{A}'}
+     assert quota.decision(conn, task, base=(B, P, 'default')) == (None, None)
+     assert quota.decision(conn, task, base=('class:standard', 'auto', 'default')) == (None, (B, P))
++
++
++@pytest.mark.parametrize('state', ['walled', 'unknown'])
++def test_release_probes_every_scoped_model_before_releasing_provider(state):
++    from hermes_cli import kanban_quota_probe as probe
++    seen = []
++    def verdict(provider, model):
++        seen.append((provider, model))
++        return probe.Verdict(state if model == A else 'headroom', model)
++    found = probe.verdicts([{'provider': P, 'wall_model': m} for m in (A, B)], B, verdict)
++    assert set(seen) == {(P, A), (P, B)}
++    assert found[P]['state'] == state
+diff --git a/tests/hermes_cli/test_kanban_quota_auth_churn.py b/tests/hermes_cli/test_kanban_quota_auth_churn.py
+index 74b8f5e8e3b361253739b935f91acc4834fbdfaf..ba8c5c7e0fff6a0f496f8c06b14bdff8b91f8b78 100644
+--- a/tests/hermes_cli/test_kanban_quota_auth_churn.py
++++ b/tests/hermes_cli/test_kanban_quota_auth_churn.py
+@@ -62,7 +62,7 @@
+ 
+ def _held(conn):
+     tid = kb.create_task(conn, title='held deep card', assignee='a')
+-    reap(conn, tid, text=f'Subscription quota unavailable for anthropic/claude-opus-5-5; resets at {RESET}',
++    reap(conn, tid, text=f'Provider-wide quota unavailable for anthropic; resets at {RESET}',
+          fields={'failure_reason': 'rate_limit', 'failure_resets_at': RESET})
+     walls.record_wall('anthropic', RESET - NOW)
+     assert hold_until(conn, tid) == RESET
+diff --git a/tests/hermes_cli/test_kanban_quota_episode_walls.py b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+index 2e936859302eec67ab278df8bf6105ee48eef6cf..954564c90837f421a7c5a92e279369e024a1521b 100644
+--- a/tests/hermes_cli/test_kanban_quota_episode_walls.py
++++ b/tests/hermes_cli/test_kanban_quota_episode_walls.py
+@@ -22,8 +22,7 @@
+ 
+ 
+ def _codex_wall(reset) -> dict[str, Any]:
+-    return dict(text=f'SubscriptionQuotaUnavailable: Subscription quota unavailable for '
+-                f'openai-codex/gpt-6-astra; resets at {reset}.0',
++    return dict(text=f'Provider-wide quota unavailable for openai-codex; resets at {reset}.0',
+                 fields={'failure_reason': 'rate_limit', 'failure_retryable': True,
+                         'failure_resets_at': float(reset),
+                         'route_provider': 'openai-codex', 'route_model': 'gpt-6-astra'})
+diff --git a/tests/hermes_cli/test_kanban_ratio_routing.py b/tests/hermes_cli/test_kanban_ratio_routing.py
+index 41209b00312e1d87efce431f2918e5a0db16c9c8..aa8a86579a7de29c9abff5927295f4ac6d79216b 100644
+--- a/tests/hermes_cli/test_kanban_ratio_routing.py
++++ b/tests/hermes_cli/test_kanban_ratio_routing.py
+@@ -522,7 +522,8 @@
+         assert pin_tests._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'default+ratio:anthropic'
+         clock[0] += 10  # inside the run's doubling backoff: the live pool serving fable never lifts that part
+         ratio.begin_tick(conn)
+-        assert _route(conn, tid) == (*ASTRA, 'default+ratio:anthropic+quota_reroute')
++        # A model-specific Fable wall leaves its same-class Opus sibling eligible.
++        assert _route(conn, tid) == ('claude-opus-5-5', 'anthropic', 'default+ratio:anthropic+quota_reroute')
+ 
+ 
+ def test_start_counts_are_this_hosts_default_starts_in_the_window(hub):
+-- 
+2.43.0
+

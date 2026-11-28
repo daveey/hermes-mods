@@ -1,0 +1,338 @@
+From 85c40a2bad21872d87ec00f455ff459329842a17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:21:17 +0000
+Subject: [PATCH 6975] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 85c40a2bad21872d87ec00f455ff459329842a17.
+
+---
+diff --git a/hermes_cli/kanban_home_abort.py b/hermes_cli/kanban_home_abort.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ea50750bac4c46f959490191622644b658df6a7d
+--- /dev/null
++++ b/hermes_cli/kanban_home_abort.py
+@@ -0,0 +1,75 @@
++"""Durable exact-attempt noncommit receipts; never timeout-based release. [daveey]
++
++The owner obtains these only by authenticated Board abort RPC. Board atomically
++refuses abort after commit and remembers the negative decision against delayed
++prepare/commit packets. This local ledger does not release any other restriction.
++"""
++from __future__ import annotations
++
++import json
++
++_KEYS = ('task', 'source', 'destination', 'nonce', 'expected_version')
++
++
++def predicate(prepared: str = 'kanban_home_prepared1') -> str:
++    return (f'a.task_id={prepared}.task_id AND a.nonce={prepared}.nonce '
++            f"AND json_extract(a.receipt,'$.source') IS {prepared}.source "
++            f"AND json_extract(a.receipt,'$.destination') IS {prepared}.destination "
++            f"AND json_extract(a.receipt,'$.expected_version') IS {prepared}.expected_version")
++
++
++def install(conn):
++    conn.execute("""CREATE TABLE IF NOT EXISTS kanban_home_aborted1 (
++        nonce TEXT PRIMARY KEY, task_id TEXT NOT NULL, receipt TEXT NOT NULL,
++        CHECK(json_valid(receipt) AND json_extract(receipt,'$.task') IS task_id
++          AND json_extract(receipt,'$.nonce') IS nonce AND json_extract(receipt,'$.phase') IS 'aborted'
++          AND json_type(receipt,'$.rows') IS 'array' AND json_array_length(receipt,'$.rows') IS 0))""")
++    for action in ('UPDATE', 'DELETE'):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS home_aborted1_{action.lower()} BEFORE {action} ON kanban_home_aborted1 "
++                     "BEGIN SELECT RAISE(ABORT,'home abort immutable'); END")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS home_aborted1_insert BEFORE INSERT ON kanban_home_aborted1
++        WHEN EXISTS(SELECT 1 FROM kanban_home_aborted1 WHERE nonce=NEW.nonce)
++          OR NOT EXISTS(SELECT 1 FROM kanban_home_prepared1 p WHERE p.task_id=NEW.task_id AND p.nonce=NEW.nonce
++            AND p.source IS json_extract(NEW.receipt,'$.source')
++            AND p.destination IS json_extract(NEW.receipt,'$.destination')
++            AND p.expected_version IS json_extract(NEW.receipt,'$.expected_version')
++            AND json_type(NEW.receipt,'$.expected_version') IS 'integer')
++          OR EXISTS(SELECT 1 FROM kanban_home_finalized1 WHERE task_id=NEW.task_id)
++        BEGIN SELECT RAISE(ABORT,'home abort scope or immutable custody'); END""")
++    conn.execute("""CREATE TRIGGER IF NOT EXISTS home_finalized1_not_aborted BEFORE INSERT ON kanban_home_finalized1
++        WHEN EXISTS(SELECT 1 FROM kanban_home_aborted1 WHERE task_id=NEW.task_id AND nonce=NEW.nonce)
++        BEGIN SELECT RAISE(ABORT,'home transfer already aborted'); END""")
++
++
++def aborted(conn, task_id):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_aborted1'").fetchone():
++        return False
++    return bool(conn.execute('SELECT 1 FROM kanban_home_prepared1 WHERE task_id=? '
++        f'AND EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {predicate()})', (task_id,)).fetchone())
++
++
++def abort_source(conn, record):
++    """Persist a trusted transport response, not caller-asserted failure prose."""
++    if not conn.in_transaction:
++        raise ValueError('home abort requires writer transaction')
++    if (not isinstance(record, dict) or record.get('phase') != 'aborted' or record.get('rows') != []
++            or type(record.get('expected_version')) is not int):
++        raise ValueError('home abort decision shape mismatch')
++    state = conn.execute('SELECT gateway_id FROM kanban_sync_state').fetchall()
++    if len(state) != 1 or state[0][0] != record.get('source'):
++        raise ValueError('home abort is not on the source gateway')
++    row = conn.execute('SELECT task_id,source,destination,nonce,expected_version FROM kanban_home_prepared1 WHERE task_id=?',
++                       (record.get('task'),)).fetchone()
++    if row is None or tuple(row) != tuple(record.get(k) for k in _KEYS):
++        raise ValueError('home abort decision scope mismatch')
++    if conn.execute('SELECT 1 FROM kanban_home_finalized1 WHERE task_id=?', (record['task'],)).fetchone():
++        raise ValueError('home transfer already finalized')
++    raw = json.dumps(record, sort_keys=True, separators=(',', ':'))
++    old = conn.execute('SELECT receipt FROM kanban_home_aborted1 WHERE nonce=?', (record['nonce'],)).fetchone()
++    if old:
++        if old[0] != raw:
++            raise ValueError('home abort decision changed')
++    else:
++        conn.execute('INSERT INTO kanban_home_aborted1(nonce,task_id,receipt) VALUES (?,?,?)',
++                     (record['nonce'], record['task'], raw))
++    return {'task': record['task'], 'nonce': record['nonce'], 'phase': 'aborted_local'}
+diff --git a/hermes_cli/kanban_home_owner.py b/hermes_cli/kanban_home_owner.py
+index 60759df2dd3bc9336b6193417cc9da94a764eefe..b4b508eb7a848d6c16ee15f615a234e51659908c 100644
+--- a/hermes_cli/kanban_home_owner.py
++++ b/hermes_cli/kanban_home_owner.py
+@@ -12,7 +12,7 @@
+ from hermes_cli.kanban_sync_client import Hub
+ 
+ _KEYS = ("task", "source", "destination", "nonce", "expected_version")
+-_PHASES = ("prepared", "committed", "materialized", "complete")
++_PHASES = ("prepared", "committed", "materialized", "complete", "aborted")
+ 
+ 
+ def _identity(conn, hub: Hub, board: str, identity: dict, actor: str) -> dict:
+@@ -50,6 +50,10 @@
+     record = _advance(hub, board, identity, "prepare")
+     if record["phase"] == "prepared":
+         record = _advance(hub, board, identity, "commit")
++    if record["phase"] == "aborted":
++        with dbc.write_txn(conn):
++            source.abort_source(conn, record)
++        return record
+     if record["phase"] in ("materialized", "complete"):
+         with dbc.write_txn(conn):
+             source.finalize_source(conn, record)
+@@ -65,7 +69,7 @@
+     """
+     identity = _identity(conn, hub, board, identity, "destination")
+     record = _advance(hub, board, identity, "read")
+-    if record["phase"] in ("prepared", "complete"):
++    if record["phase"] in ("prepared", "complete", "aborted"):
+         # A complete response is historical custody, not a request to re-import
+         # an old manifest over later legitimate execution. Native eligibility
+         # releases only when the newer authenticated STOP feed arrives.
+@@ -73,3 +77,17 @@
+     with dbc.write_txn(conn):
+         rows = destination.materialize(conn, record)
+     return _advance(hub, board, identity, "materialize", rows)
++
++
++def reconcile_precommit(conn, hub: Hub, board: str, identity: dict) -> dict:
++    """Request a durable Board NONCOMMIT decision for this exact attempt.
++
++    Never infer a refusal from an exception/timeout or clear a local marker. If
++    a commit won (including a lost reply), Board refuses abort and we stay frozen.
++    If abort won, delayed packets for that tuple can never commit afterward.
++    """
++    identity = _identity(conn, hub, board, identity, "source")
++    record = _advance(hub, board, identity, "abort")
++    with dbc.write_txn(conn):
++        source.abort_source(conn, record)
++    return record
+diff --git a/hermes_cli/kanban_home_source_stop.py b/hermes_cli/kanban_home_source_stop.py
+index 423b8723916105add0e7f756333219539a06cd0e..8634ea721ee2c9c790bd2e8f67a41e42747fad2d 100644
+--- a/hermes_cli/kanban_home_source_stop.py
++++ b/hermes_cli/kanban_home_source_stop.py
+@@ -67,6 +67,9 @@
+     try:
+         payload, fields, encoded = _receipt(conn, record)
+         task, nonce = payload["task"], payload["nonce"]
++        from hermes_cli.kanban_home_abort import aborted
++        if aborted(conn, task):
++            raise ValueError("home transfer already aborted")
+         old = conn.execute("SELECT nonce,receipt FROM kanban_home_finalized1 WHERE task_id=?", (task,)).fetchone()
+         if old:
+             if tuple(old) != (nonce, encoded):
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index 5d99fc003fe17ea3bbaab1df2d58e08e61950a3d..f5121c955d9e3a775dabf23189b1b76088490f0e 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -11,6 +11,8 @@
+ import re
+ import sqlite3
+ 
++from hermes_cli import kanban_home_abort as abort
++
+ _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
+ _NONCE = re.compile(r"[A-Za-z0-9._:-]{16,128}\Z")
+ _TABLE = "kanban_home_prepared1"
+@@ -42,6 +44,7 @@
+             AND p.expected_version IS json_extract(NEW.receipt,'$.expected_version')
+             AND json_type(NEW.receipt,'$.expected_version') IS 'integer')
+         BEGIN SELECT RAISE(ABORT, 'home finalization scope mismatch'); END""")
++    abort.install(conn)
+     # Include local-only task custody (wake/ask probes, subscriptions, private
+     # restriction records), not just the rows sent by sync. Discover task_id
+     # tables from this board's real schema, retaining guards across sync detach.
+@@ -49,7 +52,7 @@
+     for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+         quoted = '"' + table.replace('"', '""') + '"'
+         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({quoted})")}
+-        if "task_id" in columns and table not in (_TABLE, "kanban_home_finalized1"):
++        if "task_id" in columns and table not in (_TABLE, "kanban_home_finalized1", "kanban_home_aborted1"):
+             related[table] = columns
+     for table in ("tasks", "task_links", *sorted(related)):
+         quoted = '"' + table.replace('"', '""') + '"'
+@@ -96,11 +99,14 @@
+             conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {trigger}
+                 BEFORE {action} ON {quoted} WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE ({cond})
+                     AND NOT EXISTS(SELECT 1 FROM kanban_home_finalized1 f
+-                                   WHERE f.task_id={_TABLE}.task_id AND f.nonce={_TABLE}.nonce))
++                                   WHERE f.task_id={_TABLE}.task_id AND f.nonce={_TABLE}.nonce)
++                    AND NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {abort.predicate()}))
+                 BEGIN SELECT RAISE(ABORT, 'home transfer prepared'); END""")
+     for action in ("UPDATE", "DELETE"):
++        condition = ("WHEN NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE a.task_id=OLD.task_id AND a.nonce=OLD.nonce)"
++                     if action == "DELETE" else "")
+         conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_prepared1_marker_{action.lower()}
+-            BEFORE {action} ON {_TABLE}
++            BEFORE {action} ON {_TABLE} {condition}
+             BEGIN SELECT RAISE(ABORT, 'home transfer preparation immutable'); END""")
+     conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_prepared1_marker_insert
+         BEFORE INSERT ON {_TABLE} WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE task_id=NEW.task_id)
+@@ -130,6 +136,9 @@
+         _install(conn)
+         old = conn.execute(f"SELECT task_id,source,destination,nonce,expected_version FROM {_TABLE} WHERE task_id=?",
+                            (task_id,)).fetchone()
++        if old and tuple(old) != tuple(record.values()) and abort.aborted(conn, task_id):
++            conn.execute(f"DELETE FROM {_TABLE} WHERE task_id=?", (task_id,))
++            old = None
+         if old:
+             if tuple(old) != tuple(record.values()):
+                 raise ValueError("home preparation identity changed")
+@@ -178,6 +187,8 @@
+     row = conn.execute(f"SELECT task_id,source,destination,nonce,expected_version FROM {_TABLE} WHERE task_id=?", (task_id,)).fetchone()
+     if not row:
+         return False
++    if abort.aborted(conn, task_id):
++        return False
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_home_finalized1'").fetchone():
+         return True
+     final = conn.execute("SELECT nonce,receipt FROM kanban_home_finalized1 WHERE task_id=?", (task_id,)).fetchone()
+@@ -204,3 +215,8 @@
+     from hermes_cli.kanban_home_source_stop import finalize_source as finish
+ 
+     return finish(conn, record)
++
++
++def abort_source(conn: sqlite3.Connection, record: dict) -> dict:
++    """Record only an exact authenticated Board noncommit decision."""
++    return abort.abort_source(conn, record)
+diff --git a/tests/hermes_cli/test_home_abort.py b/tests/hermes_cli/test_home_abort.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e7f4efa39afee4be23252d6a8e2c4ab15b2171c
+--- /dev/null
++++ b/tests/hermes_cli/test_home_abort.py
+@@ -0,0 +1,100 @@
++"""Only a scoped durable Board negative decision releases a preparation. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc
++from hermes_cli import kanban_home_transfer as source
++from tests.hermes_cli import test_kanban_home_source_stop as support
++
++board = support.board
++
++
++def decision(reply):
++    return {**reply, 'phase': 'aborted', 'rows': []}
++
++
++def test_abort_retains_history_and_probes_and_survives_reopen(board):
++    task, reply = support.prepared(board)
++    before = tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
++    with dbc.write_txn(board):
++        source.abort_source(board, decision(reply))
++    assert not source.frozen(board, task)
++    assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()) == before
++    assert board.execute('SELECT cmd FROM task_wake_checks WHERE task_id=?', (task,)).fetchone()[0] == 'source-only-probe'
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with sqlite3.connect(path) as other:
++        other.row_factory = sqlite3.Row
++        other.execute('BEGIN IMMEDIATE')
++        source.abort_source(other, decision(reply))
++        other.commit()
++        assert not source.frozen(other, task)
++    kb.add_comment(board, task, 'actor', 'ordinary work after proven noncommit')
++
++
++@pytest.mark.parametrize('change', [{'nonce': 'wrong-nonce-000000'}, {'expected_version': True},
++    {'source': 'worker-a2'}, {'destination': 'worker-a2'}, {'phase': 'prepared'}, {'phase': 'complete'}, {'rows': [{}]}])
++def test_unknown_or_wrong_scope_never_unfreezes(board, change):
++    task, reply = support.prepared(board)
++    with dbc.write_txn(board), pytest.raises(ValueError):
++        source.abort_source(board, {**decision(reply), **change})
++    assert source.frozen(board, task)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        kb.add_comment(board, task, 'actor', 'still frozen')
++
++
++def test_old_abort_cannot_release_new_attempt_or_authorize_stop(board):
++    task, reply = support.prepared(board)
++    with dbc.write_txn(board):
++        source.abort_source(board, decision(reply))
++        fresh = {**decision(reply), 'nonce': 'fresh-retry-0000001'}
++        source.prepare(board, task, **{k: fresh[k] for k in ('source','destination','nonce','expected_version')})
++    assert source.frozen(board, task)
++    with dbc.write_txn(board), pytest.raises(ValueError):
++        source.abort_source(board, decision(reply))
++    assert source.frozen(board, task)
++    with dbc.write_txn(board), pytest.raises(ValueError):
++        source.finalize_source(board, reply)
++    assert board.execute('SELECT created_on FROM tasks WHERE id=?', (task,)).fetchone()[0] == 'worker-a3'
++
++
++def test_abort_custody_is_immutable_and_cannot_finalize_after_abort(board):
++    task, reply = support.prepared(board)
++    with dbc.write_txn(board):
++        source.abort_source(board, decision(reply))
++    with dbc.write_txn(board), pytest.raises(ValueError):
++        source.finalize_source(board, reply)
++    for query in ['DELETE FROM kanban_home_aborted1', "UPDATE kanban_home_aborted1 SET receipt='{}'"]:
++        with dbc.write_txn(board), pytest.raises(sqlite3.IntegrityError, match='immutable'):
++            board.execute(query)
++    assert not source.frozen(board, task)
++
++
++@pytest.mark.parametrize('fault', ['missing_rows', 'wrong_scope', 'wrong_nonce', 'boolean_version'])
++def test_partial_sql_custody_cannot_release_a_preparation(board, fault):
++    task, reply = support.prepared(board)
++    receipt = decision(reply)
++    if fault == 'missing_rows':
++        del receipt['rows']
++    elif fault == 'wrong_scope':
++        receipt['source'] = 'worker-a2'
++    elif fault == 'wrong_nonce':
++        receipt['nonce'] = 'foreign-nonce-000001'
++    else:
++        receipt['expected_version'] = True
++    with dbc.write_txn(board), pytest.raises(sqlite3.IntegrityError):
++        board.execute('INSERT INTO kanban_home_aborted1(task_id,nonce,receipt) VALUES (?,?,?)',
++                      (task, reply['nonce'], json.dumps(receipt)))
++    assert source.frozen(board, task)
++
++
++def test_abort_never_releases_a_finalized_source(board):
++    _task, reply = support.prepared(board)
++    with dbc.write_txn(board):
++        source.finalize_source(board, reply)
++    with dbc.write_txn(board), pytest.raises(ValueError, match='already finalized'):
++        source.abort_source(board, decision(reply))
++    assert board.execute('SELECT COUNT(*) FROM kanban_home_aborted1').fetchone()[0] == 0
+-- 
+2.43.0
+

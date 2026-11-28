@@ -1,0 +1,312 @@
+From 2148bde29cc3b3a58839d8d5bf4366c51da52e11 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:32:47 +0000
+Subject: [PATCH 6753] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit 2148bde29cc3b3a58839d8d5bf4366c51da52e11.
+
+---
+diff --git a/hermes_cli/kanban_dependency_wait_clock.py b/hermes_cli/kanban_dependency_wait_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..14ced669662a1d869de01a5f2549038c94a12fa8
+--- /dev/null
++++ b/hermes_cli/kanban_dependency_wait_clock.py
+@@ -0,0 +1,107 @@
++"""Read-only dependency wait episodes for todo cards. No task-age or polling clocks."""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from hermes_cli.kanban_actionability_creation import EPISODE_EXITS
++from hermes_cli.kanban_actionability_selection import LANDINGS
++from hermes_cli.kanban_wait_info import epoch_s
++
++
++def _data(raw):
++    try:
++        value = json.loads(raw or '{}')
++    except (TypeError, ValueError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def describe(park, park_kind, since):
++    """Project only the dependency payload verified by the graph reader."""
++    payload = park if isinstance(park, dict) else _data(park)
++    parents = payload.get('parents') if park_kind == 'dependency_wait' else None
++    if not isinstance(parents, list) or not parents or not all(isinstance(p, str) and p for p in parents):
++        return None
++    return {'wait_state': 'waiting', 'waiting_on': 'card ' + ', '.join(parents),
++            'waiting_since': epoch_s(since), 'agent_owned': False,
++            'agent_owned_certain': True, 'premise': None}
++
++
++def episode(events, *, parents_now):
++    """Replay semantic entries/edge changes only; repeated links and dependency parks are not new episodes.
++
++    A created event seeds graph/status evidence but is never an elapsed-time fallback. A later explicit
++    dependency entry dates the first wait. An exit clears the clock even if history then becomes incomplete.
++    """
++    parents, phase, since = set(), None, None
++    for kind, raw, at in events:
++        payload = _data(raw)
++        if kind == 'created':
++            recorded = payload.get('parents')
++            parents = set(recorded) if isinstance(recorded, list) and all(isinstance(p, str) for p in recorded) else set()
++            phase, since = payload.get('status'), None
++        elif kind in ('linked', 'unlinked'):
++            parent = payload.get('parent')
++            if not isinstance(parent, str):
++                since = None
++                continue
++            changed = (parent not in parents) if kind == 'linked' else (parent in parents)
++            if kind == 'linked':
++                parents.add(parent)
++            else:
++                parents.discard(parent)
++            if changed and phase == 'todo':
++                since = epoch_s(at) if parents else None
++        elif (kind == 'dependency_wait' or
++              (kind in ('unblocked', 'status', *LANDINGS) and payload.get('status') == 'todo') or
++              (kind == 'claim_rejected' and payload.get('reason') == 'parents_not_done')):
++            if phase != 'todo' or since is None:
++                since = epoch_s(at)
++            phase = 'todo'
++        elif kind in EPISODE_EXITS or kind in ('status', 'gave_up', 'block_loop_detected'):
++            phase, since = payload.get('status'), None
++    return since if phase == 'todo' and parents == set(parents_now) else None
++
++
++def overlay(conn, parked, events):
++    """Add todo rows only when a current parent actually gates them; unknown history stays undated.
++
++    Use core's parent-state resolver so local parents and stored remote-parent mirrors follow readiness.
++    This is presentation evidence, never permission to release/execute a card.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_table_columns import table_columns
++    from hermes_state_page_pack import read_rows
++
++    ids = [tid for tid, row in parked.items() if row[0] == 'todo']
++    if not ids:
++        return
++    history = {tid: [] for tid in ids}
++    kinds = sorted(EPISODE_EXITS | set(LANDINGS) | {'created', 'linked', 'unlinked', 'dependency_wait',
++                                                  'status', 'gave_up', 'block_loop_detected', 'claim_rejected'})
++    marks = ','.join('?' for _ in kinds)
++    try:
++        columns = table_columns(conn, 'task_events')
++        live = ' AND deleted_at IS NULL' if 'deleted_at' in columns else ''
++        for tid, kind, raw, at in read_rows(conn,
++                'SELECT task_id,kind,payload,created_at FROM task_events '
++                f'WHERE task_id IN (SELECT value FROM json_each(?)) AND kind IN ({marks}){live} ORDER BY created_at,id',
++                (json.dumps(ids), *kinds), 4):
++            history[tid].append((kind, raw, at))
++    except sqlite3.Error:
++        pass  # Old/incomplete boards still name dependencies, without inventing a start time.
++    for tid in ids:
++        try:
++            states = kb.parent_states(conn, tid)
++        except sqlite3.Error:
++            parked.pop(tid)
++            events.pop(tid, None)
++            continue  # No graph evidence, not proof of a dependency wait.
++        parents = [pid for pid, status in states if kb.parent_blocks(conn, pid, status)]
++        if not parents:
++            parked.pop(tid)
++            events.pop(tid, None)
++            continue
++        events[tid] = ('dependency_wait', {'parents': parents},
++                       episode(history[tid], parents_now=[pid for pid, _status in states]))
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index db97355f0b89b20901f4e421c9d7f43cdea80e15..61dc3bbe936563b73ca225421651e12a7cbb87b8 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -71,7 +71,7 @@
+     parked: dict[str, tuple] = {}
+     for tid, status, kind, request, awaiting in read_rows(conn,
+             f"SELECT {pick} FROM tasks t WHERE t.id IN (SELECT value FROM json_each(?)) "
+-            "AND t.status IN ('scheduled', 'blocked', 'triage')", (json.dumps(ids),), 5):
++            "AND t.status IN ('scheduled', 'blocked', 'triage', 'todo')", (json.dumps(ids),), 5):
+         parked[str(tid)] = (status, kind, request, awaiting)
+     if not parked:
+         return {}, {}
+@@ -87,6 +87,8 @@
+             events[str(tid)] = (kind, payload, at)
+     except sqlite3.Error:  # board predates task_events
+         pass
++    from hermes_cli.kanban_dependency_wait_clock import overlay as dependency_overlay
++    dependency_overlay(conn, parked, events)
+     if replica is ...:
+         _overlay_contained(conn, parked, events)
+     else:
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 5fc314b474a0bf7d4cd0b45340cbe4bf8b2311b4..9bb1751388df5594252752ad23cfc174bd83c235 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -365,7 +365,20 @@
+ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park: Any = None,
+              park_kind: Any = None, since: Any = None, awaiting: Any = None, reason: Any = None,
+              now: Optional[float] = None) -> Optional[dict[str, Any]]:
+-    """Wait info for one card, or None when it is not parked (running, ready, review, todo, done).
++    """Canonical wait projection, including reader-verified todo dependency episodes."""
++    if status == 'todo':
++        from hermes_cli.kanban_dependency_wait_clock import describe as dependency_wait
++        return dependency_wait(park, park_kind, since)
++    return _describe_parked(status, block_kind=block_kind, human=human, park=park, park_kind=park_kind,
++                            since=since, awaiting=awaiting, reason=reason, now=now)
++
++
++def _describe_parked(status: Any, *, block_kind: Any = None, human: bool = False, park: Any = None,
++             park_kind: Any = None, since: Any = None, awaiting: Any = None, reason: Any = None,
++             now: Optional[float] = None) -> Optional[dict[str, Any]]:
++    """Wait info for one card, or None when it is not parked (running, ready, review, done).
++
++    Todo requires a reader-verified dependency payload; an ordinary todo row has no wait clock.
+ 
+     ``park`` is the newest park event's payload (dict or JSON text) and ``park_kind`` its event kind; ``since``
+     when the card parked (defaults to nothing: no age, never stalled). ``awaiting`` overrides the payload's.
+diff --git a/tests/hermes_cli/test_kanban_dependency_wait_clock.py b/tests/hermes_cli/test_kanban_dependency_wait_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be105adca287f48632a304aeb44c2b0ed992afa6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_dependency_wait_clock.py
+@@ -0,0 +1,134 @@
++"""Stored dependency lifecycle -> canonical wait reader; no injected wait annotations."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli.kanban_session_wait_rows import _local_wait_info
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
++    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
++    conn = kbc.connect(tmp_path / 'board.db')
++    yield conn
++    conn.close()
++
++
++def create(conn, title, **kwargs):
++    return kb.create_task(conn, title=title, assignee='default', **kwargs)
++
++
++def stamp(conn, tid, kind):
++    return conn.execute('SELECT created_at FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1',
++                        (tid, kind)).fetchone()[0]
++
++
++def wait(conn, tid):
++    return _local_wait_info(conn, [tid], now=2000000000).get(tid)
++
++
++def test_creation_dependency_clock_is_source_event_not_task_age(board):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    board.execute('ALTER TABLE tasks ADD COLUMN ready_since INTEGER')
++    board.execute('UPDATE tasks SET created_at=1, ready_since=2 WHERE id=?', (child,))
++    board.commit()
++    info = wait(board, child)
++    assert info is not None
++    assert info['waiting_since'] == stamp(board, child, 'dependency_wait')
++    assert info['waiting_on'] == 'card ' + parent
++    assert info['agent_owned'] is False
++    assert info == _local_wait_info(board, [child], now=2000000120)[child]
++
++
++def test_effective_edge_change_resets_but_duplicate_link_and_comment_do_not(board, monkeypatch):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    initial = stamp(board, child, 'dependency_wait')
++    monkeypatch.setattr(kb.time, 'time', lambda: initial + 60)
++    kb.link_tasks(board, parent, child)
++    assert wait(board, child)['waiting_since'] == initial
++    other = create(board, 'Other')
++    monkeypatch.setattr(kb.time, 'time', lambda: initial + 120)
++    kb.link_tasks(board, other, child)
++    assert wait(board, child)['waiting_since'] == initial + 120
++    monkeypatch.setattr(kb.time, 'time', lambda: initial + 180)
++    kb.unlink_tasks(board, other, child)
++    kb.add_comment(board, child, 'fixture', 'Unrelated comment', system=True)
++    assert wait(board, child)['waiting_since'] == initial + 180
++
++
++def test_recovery_clears_clock_and_new_wait_does_not_reuse_old_episode(board, monkeypatch):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    initial = stamp(board, child, 'dependency_wait')
++    kb.unlink_tasks(board, parent, child)
++    assert wait(board, child) is None
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == 'ready'
++    assert wait(board, child) is None
++    monkeypatch.setattr(kb.time, 'time', lambda: initial + 180)
++    kb.link_tasks(board, parent, child)
++    assert kb.get_task(board, child).status == 'todo'
++    assert wait(board, child)['waiting_since'] == initial + 180
++
++
++def test_missing_episode_history_stays_undated_and_no_parent_is_not_wait(board):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    board.execute('DELETE FROM task_events WHERE task_id=?', (child,))
++    board.commit()
++    assert wait(board, child)['waiting_since'] is None
++    kb.unlink_tasks(board, parent, child)
++    assert kb.get_task(board, child).status == 'ready'
++    assert wait(board, child) is None
++
++
++def test_parent_completion_then_invalidation_starts_new_episode(board, monkeypatch):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    initial = stamp(board, child, 'dependency_wait')
++    assert kb.complete_task(board, parent, result='Acceptance verified')
++    kb.recompute_ready(board)
++    assert wait(board, child) is None
++    monkeypatch.setattr(kb.time, 'time', lambda: initial + 300)
++    # Match the reopen surface's row flip; the descendant invalidation below is the real producer.
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?", (parent,))
++    kb.invalidate_descendants_for_parent_reopen(board, parent, author='fixture')
++    assert kb.get_task(board, child).status == 'todo'
++    assert wait(board, child)['waiting_since'] == initial + 300
++
++
++def test_graph_without_matching_history_is_not_dated_from_old_wait(board):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    other = create(board, 'Unrecorded parent')
++    board.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', (other, child))
++    board.commit()
++    assert wait(board, child)['waiting_since'] is None
++
++
++def test_unblock_dependency_entry_does_not_reuse_old_episode(board, monkeypatch):
++    parent = create(board, 'Parent')
++    child = create(board, 'Child', parents=[parent])
++    initial = stamp(board, child, 'dependency_wait')
++    kb.unlink_tasks(board, parent, child)
++    assert kb.block_task(board, child, kind='transient', reason='Fixture source unavailable')
++    kb.link_tasks(board, parent, child)
++    monkeypatch.setattr(kb.time, 'time', lambda: initial + 300)
++    assert kb.unblock_task(board, child)
++    assert wait(board, child)['waiting_since'] == initial + 300
++
++
++def test_claim_parent_recheck_dates_new_dependency_episode(board, monkeypatch):
++    parent = create(board, 'Parent')
++    assert kb.complete_task(board, parent, result='Acceptance verified')
++    child = create(board, 'Child', parents=[parent])
++    entry = stamp(board, child, 'created') + 300
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='todo', completed_at=NULL WHERE id=?", (parent,))
++    monkeypatch.setattr(kb.time, 'time', lambda: entry)
++    assert kb.claim_task(board, child) is None
++    assert kb.get_task(board, child).status == 'todo'
++    assert wait(board, child)['waiting_since'] == entry
+-- 
+2.43.0
+

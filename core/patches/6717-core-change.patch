@@ -1,0 +1,96 @@
+From fb4cc4d946df5556cf291dbb5e313dd72812d650 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:10:34 +0000
+Subject: [PATCH 6717] Producer chat-link reconciliation without display feedback
+
+Public mirror of source commit fb4cc4d946df5556cf291dbb5e313dd72812d650.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_chat_links_containment.py b/tests/hermes_cli/test_kanban_chat_links_containment.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cb72b0d81eef113a8e6fbd3db2707a4773f25a8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_chat_links_containment.py
+@@ -0,0 +1,79 @@
++"""Every reconcile write branch must preserve containment, including audit receipts."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_placement import DEFAULT_CREATOR_SESSION
++from tests.hermes_cli.test_kanban_chat_links import ME, kanban_home as kanban_home, live as live  # noqa: PLC0414
++
++
++@pytest.mark.parametrize('held', [True, False], ids=['held', 'ordinary'])
++@pytest.mark.parametrize('branch', ['owner', 'insert', 'close', 'reopen', 'placeholder', 'headless', 'machine'])
++def test_reconcile_containment_write_branches(live, kanban_home, monkeypatch, branch, held):
++    task = kb.create_task(live, title='candidate', assignee='worker', session_id='placement')
++    session = DEFAULT_CREATOR_SESSION if branch == 'placeholder' else 'human'
++    if branch in ('headless', 'machine'):
++        session = branch
++    link = dict(uid=links.link_uid(task, ME, 'default', session, 'shepherd'), task_id=task,
++                chat_gateway=ME, chat_profile='default', chat_session=session,
++                kind='shepherd', released=int(branch == 'close'), created_at=1)
++    if branch == 'owner':
++        link.update(chat_gateway='hub', uid=links.link_uid(task, 'hub', 'default', session, 'shepherd'))
++    want = {link['uid']: link} if branch in ('insert', 'close', 'reopen') else {}
++    # Inject producer observations only: the real planner, writer reservation,
++    # held predicate, SQLite capture triggers and receipt writer stay in use.
++    monkeypatch.setattr(links, '_local_links', lambda conn, gateway: want.copy())
++    monkeypatch.setattr(links, '_owner_written_releases', lambda *a: {})
++    monkeypatch.setattr(links, '_owner_hub_links', lambda *a: [link] if branch == 'owner' else [])
++    monkeypatch.setattr(links, '_worker_shepherds',
++                        lambda sessions, *a: {'headless'} & set(sessions))
++    monkeypatch.setattr('hermes_cli.kanban_db_notify.machine_sessions',
++                        lambda gateway, sessions, **kw: {'machine'} & set(sessions))
++    with kbc.write_txn(live):
++        if branch not in ('owner', 'insert'):
++            initial = {**link, 'released': 1 - link['released'] if branch in ('close', 'reopen') else 0}
++            live.execute('INSERT INTO task_chat_links '
++                         '(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) '
++                         'VALUES (:uid,:task_id,:chat_gateway,:chat_profile,:chat_session,:kind,:released,:created_at)',
++                         initial)
++        if held:
++            # Marker-only custody is deliberately fail-closed, just as the live
++            # archived rows were; do not install a SQL refusal that masks a missing guard.
++            live.execute("UPDATE tasks SET containment_episode='retained-episode' WHERE id=?", (task,))
++        live.execute('DELETE FROM kanban_sync_outbox')
++
++    def snapshot():
++        return ([tuple(r) for r in live.execute('SELECT * FROM task_chat_links ORDER BY uid')],
++                [tuple(r) for r in live.execute('SELECT * FROM kanban_sync_outbox ORDER BY op_id')])
++
++    before = snapshot()
++    repairs = kanban_home / 'kanban' / 'repairs'
++    expected = dict(added=0, changed=0, released=0, retired=0)
++    if not held:
++        counter = {'owner': 'added', 'insert': 'added', 'close': 'changed', 'reopen': 'changed',
++                   'placeholder': 'retired', 'headless': 'retired', 'machine': 'released'}[branch]
++        expected[counter] = 1
++    assert links.reconcile(live, 'default', ME, ledger=False) == expected
++    after = snapshot()
++    if held:
++        assert after == before  # complete persisted rows AND captured outbox stay unchanged
++    else:
++        rows = live.execute('SELECT released FROM task_chat_links WHERE uid=?', (link['uid'],)).fetchall()
++        assert [r[0] for r in rows] == ([] if branch in ('placeholder', 'headless') else
++                                      [1 if branch in ('close', 'machine') else 0])
++        assert len(after[1]) == 1  # actual captured mutation, not just reported counters
++    receipts = list(repairs.glob('machine-links-*.json'))
++    if branch == 'machine' and not held:
++        assert len(receipts) == 1
++        assert [r['uid'] for r in json.loads(receipts[0].read_text())['released']] == [link['uid']]
++    else:
++        assert receipts == []  # a skipped machine release must not claim an audit effect
++    for _ in range(3):
++        assert links.reconcile(live, 'default', ME, ledger=False) == dict(added=0, changed=0, released=0, retired=0)
++        assert snapshot() == after
++    assert list(repairs.glob('machine-links-*.json')) == receipts
+-- 
+2.43.0
+

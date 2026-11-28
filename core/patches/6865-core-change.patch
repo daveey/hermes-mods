@@ -1,0 +1,318 @@
+From 98fe7ccbc6854985388aaa3ee71d576b1472a5f3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:27:22 +0000
+Subject: [PATCH 6865] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 98fe7ccbc6854985388aaa3ee71d576b1472a5f3.
+
+---
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 91ac7e3d52dcbae56791baf317304a010875e886..acc7f33580ad17020501bc30e496fcc78fb45fbf 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1340,6 +1340,7 @@
+     conn: sqlite3.Connection, changes: Sequence[RemoteChange], *, new_cursor: int, board: Optional[str] = None,
+     observers: bool = True, local_pending_wins: bool = False,
+     keep: Optional[Callable[[sqlite3.Connection, RemoteChange], bool]] = None,
++    allow_nested: bool = False,
+ ) -> ApplyResult:
+     """Apply one feed page in ONE transaction, then fire local observers.
+ 
+@@ -1352,14 +1353,18 @@
+     ``observers=False`` (a shadow copy) applies the rows and fires nothing. ``local_pending_wins`` (the feed
+     pull and the snapshot rebuild) keeps every task field that has an unanswered local edit in the outbox, read
+     in the same transaction as the apply. ``keep`` (the live-file rebuild sweep) is asked about each change inside
+-    that transaction; a change it refuses is skipped. [daveey]"""
++    that transaction; a change it refuses is skipped. ``allow_nested`` is only for
++    observer-free projection inside an owning settlement transaction; its savepoint
++    is not durable until that caller commits. [daveey]"""
++    if allow_nested and observers:
++        raise ValueError('nested remote projection requires observers=False')
+     from hermes_cli.kanban_sync_apply_schema import page_writer
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     from hermes_cli import kanban_containment_replica as containment
+     from hermes_cli.kanban_sync_apply_budget import check_budget, transaction_budget
+     containment.prepare_apply(conn, changes)
+     with page_writer(conn, (*SYNCED_TABLES, "kanban_sync_outbox", "kanban_sync_state"),
+-                     cache=bool(changes) and keep is None), transaction_budget(conn):
++                     cache=bool(changes) and keep is None, allow_nested=allow_nested), transaction_budget(conn):
+         result.revision_before = _repair_revision(conn)
+         # Serialize with set_mode(off): a feed fetched before detach must not
+         # overwrite locally held custody after the detach transaction commits.
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index d0397d521121b82a079748f4ae7229271f473ab3..52b001642c8b66577ebcd3da87a985978370091a 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -79,6 +79,29 @@
+         return dict(row)
+ 
+     membership = None
++    current_row = None
++
++    def refresh_current_row():
++        """Read current state separately; never enrich the historical slot verdict."""
++        decision = reconcile(journal.snapshot(conn), remote)
++        if decision['action'] != 'record':
++            return None
++        verdict = decision['verdict']
++        if verdict['status'] not in ('applied', 'merged') or verdict.get('version'):
++            return None
++        row = source()
++        if not row.get('_parent'):
++            return None
++        evidence = hub.row_evidence(board, 'tasks', row['row_uid'])
++        state = evidence.get('row')
++        if (evidence.get('board') != board or evidence.get('table') != 'tasks' or
++                evidence.get('uid') != row['row_uid'] or evidence.get('state') != 'live' or
++                type(evidence.get('head')) is not int or evidence['head'] < 0 or
++                not isinstance(state, dict) or state.get('uid') != row['row_uid'] or
++                type(state.get('version')) is not int or state['version'] <= 0 or
++                state.get('deleted_at') is not None):
++            raise ValueError('synthetic parent current row unavailable')
++        return client._row_change('tasks', state)
+ 
+     def refresh_capacity():
+         from hermes_cli import kanban_replay_deferred as deferred
+@@ -138,7 +161,16 @@
+         if status not in ('applied', 'merged'):
+             raise ValueError('tracer final disposition requires custody integration')
+         if row.get('_parent') and not verdict.get('version'):
+-            raise ValueError('synthetic parent authoritative version unavailable')
++            if current_row is None or current_row.uid != row['row_uid']:
++                raise ValueError('synthetic parent authoritative version unavailable')
++            # Project the separately read current image with normal pending-wins
++            # and version guards. Do not pretend its version was the old result's.
++            cursor = (sync.sync_state(conn) or {}).get('cursor', 0)
++            if conn.execute("SELECT 1 FROM kanban_sync_tombstones WHERE table_name='tasks' AND row_uid=?",
++                            (row['row_uid'],)).fetchone():
++                raise ValueError('synthetic parent current projection held by local deletion')
++            sync.apply_remote_changes(conn, [current_row], new_cursor=cursor, board=board,
++                                      observers=False, local_pending_wins=True, allow_nested=True)
+         if verdict.get('version') and row['table_name'] == 'tasks':
+             conn.execute('UPDATE tasks SET sync_version=MAX(COALESCE(sync_version,0),?) WHERE id=?',
+                          (verdict['version'], row['row_uid']))
+@@ -161,6 +193,7 @@
+                                         hold_rejected=True)
+ 
+         membership = refresh_capacity()
++        current_row = refresh_current_row()
+         with write_txn(conn):
+             decision = journal.recover(conn, remote, record)
+             if decision['action'] == 'record':
+@@ -204,6 +237,7 @@
+         out.sent += 1
+         remote = hub._call('GET', root + 'inspect')['slot']
+         membership = refresh_capacity()
++        current_row = refresh_current_row()
+         with write_txn(conn):
+             decision = journal.recover(conn, remote, record)
+         if decision['action'] != 'record':
+diff --git a/hermes_cli/kanban_sync_apply_schema.py b/hermes_cli/kanban_sync_apply_schema.py
+index 69f0ed9939a0b9835e09a978c87ba5fdd4615e2a..bd3624810b8124c92dc00c7992bbce8e615704e0 100644
+--- a/hermes_cli/kanban_sync_apply_schema.py
++++ b/hermes_cli/kanban_sync_apply_schema.py
+@@ -31,7 +31,7 @@
+ 
+ 
+ @contextmanager
+-def page_writer(conn, tables, *, cache):
++def page_writer(conn, tables, *, cache, allow_nested=False):
+     """Keep the existing atomic page; cache only immutable schema, never outbox/row state.
+ 
+     A rare concurrent migration refreshes the fixed-size schema snapshot under the
+@@ -42,7 +42,7 @@
+     prepared = _prepare(conn, tables) if cache else None
+     token = _SCHEMA.set(prepared)
+     try:
+-        with write_txn(conn):
++        with write_txn(conn, allow_nested=allow_nested):
+             if prepared is not None and conn.execute('PRAGMA schema_version').fetchone()[0] != prepared.version:
+                 prepared = _prepare(conn, tables)
+                 _SCHEMA.set(prepared)
+diff --git a/tests/hermes_cli/test_kanban_replay_current_row.py b/tests/hermes_cli/test_kanban_replay_current_row.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6e93bbd17a3e294a604df709e815dbe578e97aa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_current_row.py
+@@ -0,0 +1,159 @@
++"""Current-row recovery is not an invented historical replay result. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++class CurrentRow(helpers.Receiver):
++    def __init__(self, conn):
++        super().__init__()
++        self.conn = conn
++        self.evidence = None
++        self.reads = 0
++
++    def _call(self, method, path, body=None):
++        result = super()._call(method, path, body)
++        if path.endswith('/ops'):
++            verdict = json.loads(self.slot['last_verdict'])
++            verdict.pop('version')
++            self.slot['last_verdict'] = json.dumps(verdict)
++        return result
++
++    def row_evidence(self, board, table, uid):
++        assert not self.conn.in_transaction, 'network read must not reserve the writer'
++        self.reads += 1
++        return self.evidence
++
++
++def issued_parent(conn):
++    tid = kb.create_task(conn, title='synthetic original', assignee='worker')
++    with kbc.write_txn(conn):
++        conn.execute('DELETE FROM kanban_sync_outbox')
++    kb.add_comment(conn, tid, 'author', 'dependent child')
++    receiver = CurrentRow(conn)
++    # Commit a versionless result, then lose inspection before local recording.
++    original = receiver._call
++
++    def lose_inspect(method, path, body=None):
++        if path.endswith('/inspect') and receiver.sent:
++            raise OSError('lost committed result')
++        return original(method, path, body)
++
++    receiver._call = lose_inspect
++    with pytest.raises(OSError, match='lost committed result'):
++        client.push(conn, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    receiver._call = original
++    receiver.evidence = dict(board='default', table='tasks', uid=tid, state='live',
++                             head=91, floor=0, feed_floor=0, tombstone=None,
++                             row=dict(uid=tid, id=tid, title='current remote title',
++                                      body='remote body', status='todo', version=19))
++    return tid, receiver
++
++
++@pytest.mark.parametrize('newer_pending', [False, True])
++@pytest.mark.parametrize('status', ['applied', 'merged'])
++def test_versionless_parent_recovers_current_row_after_reopen_without_resend(live, newer_pending, status):
++    tid, receiver = issued_parent(live)
++    retained = json.loads(receiver.slot['last_verdict'])
++    retained['status'] = status
++    receiver.slot['last_verdict'] = json.dumps(retained)
++    frozen_verdict = receiver.slot['last_verdict']
++    restarted = helpers.reopen(live)
++    receiver.conn = restarted
++    try:
++        if newer_pending:
++            with kbc.write_txn(restarted):
++                restarted.execute('UPDATE tasks SET title=? WHERE id=?', ('new local title', tid))
++        cursor = restarted.execute('SELECT cursor FROM kanban_sync_state').fetchone()[0]
++        result = client.push(restarted, receiver, 'default', 'macbook', primary=False, max_batches=1)
++        assert getattr(result, status) == 1 and result.sent == 0 and len(receiver.sent) == 1
++        row = restarted.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++        assert row['title'] == ('new local title' if newer_pending else 'current remote title')
++        assert row['body'] == 'remote body' and row['sync_version'] == 19
++        assert restarted.execute('SELECT cursor FROM kanban_sync_state').fetchone()[0] == cursor
++        assert journal.snapshot(restarted)['last_verdict'] == frozen_verdict
++        assert 'version' not in json.loads(frozen_verdict)
++        assert journal.pending_wire(restarted) is None and receiver.slot['a'] == '1'
++        assert not restarted.execute('SELECT 1 FROM kanban_sync_parent_envelopes').fetchone()
++        assert restarted.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_comments'").fetchone()
++        assert receiver.reads == 1
++    finally:
++        restarted.close()
++
++
++@pytest.mark.parametrize('target,key,value', [
++    ('evidence', 'board', 'foreign'), ('evidence', 'uid', 'foreign'),
++    ('row', 'uid', 'foreign'), ('row', 'version', True),
++    ('evidence', 'head', True), ('evidence', 'state', 'unknown'),
++])
++def test_unusable_current_row_keeps_exact_transport_and_child_custody(live, target, key, value):
++    tid, receiver = issued_parent(live)
++    targets = dict(evidence=receiver.evidence, row=receiver.evidence['row'])
++    targets[target][key] = value
++    frozen = journal.pending_wire(live)
++    with pytest.raises(ValueError):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert journal.pending_wire(live) == frozen and journal.snapshot(live)['settled'] == '0'
++    assert receiver.slot['a'] == '0' and len(receiver.sent) == 1
++    assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_comments'").fetchone()
++
++
++def test_projection_failure_rolls_back_image_verdict_and_parent_retirement(live, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    tid, receiver = issued_parent(live)
++    frozen = journal.pending_wire(live)
++    original = sync.apply_remote_changes
++
++    def fail_after_projection(*args, **kwargs):
++        original(*args, **kwargs)
++        raise OSError('projection failed after savepoint release')
++
++    monkeypatch.setattr(sync, 'apply_remote_changes', fail_after_projection)
++    with pytest.raises(OSError, match='projection failed'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    row = live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++    assert row['title'] == 'synthetic original' and row['sync_version'] is None
++    assert journal.pending_wire(live) == frozen and journal.snapshot(live)['settled'] == '0'
++    assert receiver.slot['a'] == '0' and len(receiver.sent) == 1
++    assert live.execute('SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id=?', (tid,)).fetchone()
++    monkeypatch.setattr(sync, 'apply_remote_changes', original)
++    assert client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++    assert len(receiver.sent) == 1
++
++
++def test_local_tombstone_cannot_silently_skip_current_projection_and_release_parent(live):
++    tid, receiver = issued_parent(live)
++    with kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_sync_tombstones VALUES ('tasks',?,1)", (tid,))
++    frozen = journal.pending_wire(live)
++    try:
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    except ValueError:
++        pass
++    assert journal.pending_wire(live) == frozen, 'skipped projection released unresolved parent'
++    assert journal.snapshot(live)['settled'] == '0' and receiver.slot['a'] == '0'
++
++
++def test_current_read_never_regresses_a_newer_pulled_image(live):
++    from hermes_cli import kanban_db_sync as sync
++    tid, receiver = issued_parent(live)
++    # A later feed image won before the recovery read's older response arrived.
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_state SET applying=1')
++        live.execute("UPDATE tasks SET title='newer feed', sync_version=30 WHERE id=?", (tid,))
++        live.execute('UPDATE kanban_sync_state SET applying=0')
++    assert client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++    row = live.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++    assert row['title'] == 'newer feed' and row['sync_version'] == 30
++    assert journal.pending_wire(live) is None
++    with kbc.write_txn(live):
++        with pytest.raises(ValueError, match='observers=False'):
++            sync.apply_remote_changes(live, [], new_cursor=0, allow_nested=True)
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index 96a3ccf702564221b0d4e589fb200ab100c4adfc..2c50609886122b9d95f82e461f92d7c71e3cec8b 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -693,9 +693,13 @@
+                 verdict.pop('version')
+                 self.slot['last_verdict'] = json.dumps(verdict)
+             return result
++
++        def row_evidence(self, board, table, uid):
++            return dict(board=board, table=table, uid=uid, state='unknown', row=None, head=10)
++
+     receiver = MissingVersion()
+     for _ in range(2):
+-        with pytest.raises(ValueError, match='^synthetic parent authoritative version unavailable$'):
++        with pytest.raises(ValueError, match='^synthetic parent current row unavailable$'):
+             client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
+         assert journal.snapshot(live)['pending'] is not None
+         assert receiver.slot['a'] == '0'
+-- 
+2.43.0
+

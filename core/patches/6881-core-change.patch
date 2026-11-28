@@ -1,0 +1,398 @@
+From 51a41a9ad51f1402218e2e29970d00067b769468 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:37:41 +0000
+Subject: [PATCH 6881] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 51a41a9ad51f1402218e2e29970d00067b769468.
+
+---
+diff --git a/docs/kanban-replay-sender-admission.md b/docs/kanban-replay-sender-admission.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fad2961da061e3ef29b604987f8d7767972d71d9
+--- /dev/null
++++ b/docs/kanban-replay-sender-admission.md
+@@ -0,0 +1,61 @@
++# Sender admission: local exclusion is not migration readiness
++
++This is the dormant C sender slice. It does not activate certification, install
++writer gates on a live board, or establish that old processes have drained.
++
++## Public entry and detach
++
++`kanban_sync_client.push` exports the replay sender's public entry. Its callers
++include the ordinary sync round and direct retain, source-artifact, scope-renewal
++and priority publication paths. The round lock alone does not serialize those
++direct callers' HTTP sessions.
++
++The public entry now acquires a distinct, nonblocking per-board sender lock before
++transport selection and holds it through all session, send, settlement and ACK
++work. A round may hold its own round lock and then acquire this sender lock.
++Detach acquires round then sender before changing persisted mode and removing
++capture triggers. Contention raises `SyncRoundBusy`; it neither waits on network
++I/O nor mutates custody. A preopened connection attempting to send after detach
++commits is refused before any peer call. Nonpersistent boards cannot send.
++
++These are two different locks, not recursive admission. No process-local bypass,
++runtime write hook, SQLite authorizer or reentrant writer reservation was added.
++Older code that does not acquire the new lock remains an external-drain problem.
++
++## Evidence
++
++`test_kanban_replay_sender_process` spawns an independent process using the real
++production Hub and a loopback HTTP peer. The peer accepts a session, or accepts an
++operation, and withholds its HTTP response. While that child remains alive in the
++exchange, a competing public sender and detach are each refused, with no competing
++peer calls and an unchanged current database image. Releasing the response lets
++the original child complete; a later round-held push and detach both progress.
++The peer is controlled test infrastructure, not proof of the deployed receiver.
++
++`test_kanban_sync_writer_process` preopens a separate process's SQLite connection,
++then activates the existing gate in a disposable fixture. Missing and lower
++revision functions refuse writes, preserving the database image; a matching
++revision proceeds. This proves database downgrade refusal, not that a fleet's old
++processes or already-read network bytes have drained.
++
++The existing stale-session takeover control now invokes the internal strict
++engine for its deliberately unfenced predecessor and the public entry for its
++successor. Its fake peer injects the stale-session refusal; it is not independent
++receiver-implementation proof. Exact pending-wire identity and settlement checks
++remain intact.
++
++## Remaining C acceptance
++
++- Implement/prove the migration owner's old-process and in-flight drainage gate,
++  including an admission revision that distinguishes the complete sender contract
++  from previously installed revision-1 cores. The revision-1 fixture alone is not
++  readiness and cannot revoke bytes held in an older process's memory.
++- Deliver due unresolved deferred diagnostics to the existing owner with a durable
++  delivery receipt and episode/evidence deduplication across restart. Current
++  `episodes.diagnostics` only lists due rows. Courier exit 3 means queued, not
++  delivered. Discover and reuse a supported delivery/readback contract before
++  wiring this consumer; do not invent a successful response or business resolution.
++- Preserve C's dormant activation boundary. D's aggregate fault/throughput and
++  condition-mutation audit, fresh independent exact-head review, required CI and
++  canonical ship still follow C. Receiver, integration, rollout and live proof
++  remain with their existing ordered owners.
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 84d2abf27e840d9dcdc6503bde338904c0d6d28b..aec3b8c1ce199d1489f1002385dfcf37368766f3 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -744,11 +744,11 @@
+         raise ValueError(f"unknown kanban sync mode {mode!r}")
+     if mode == "off":
+         from pathlib import Path
+-        from hermes_cli.kanban_sync_guard import board_sync_lock
++        from hermes_cli.kanban_sync_guard import board_sync_lock, sender_lock
+         path = _db_key(conn)
+         if path is None:
+             raise ValueError("detach requires an on-disk board")
+-        with board_sync_lock(Path(path)):
++        with board_sync_lock(Path(path)), sender_lock(Path(path)):
+             _set_mode(conn, mode)
+     else:
+         _set_mode(conn, mode)
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 61427a8f5aab9e61af7211bb1fabd0f3cf9343e4..57f3ba26982b763d28a09e8b5df2e5b33153ceb1 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -40,11 +40,25 @@
+ 
+ 
+ def push(conn, hub, board, gateway, *, primary, max_batches=25, before_head=False, seen=None):
++    """Serialize the complete session/send, not only individual SQL writes."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_sync_guard import sender_lock
++    path = _main_db_file(conn)
++    if path is None:
++        raise ValueError('sender requires an on-disk board')
++    with sender_lock(path):
++        return _push(conn, hub, board, gateway, primary=primary, max_batches=max_batches,
++                     before_head=before_head, seen=seen)
++
++
++def _push(conn, hub, board, gateway, *, primary, max_batches, before_head, seen):
+     """Select only the journal-bound transport; never auto-enroll or fall back."""
+     from hermes_cli import kanban_sync_client as client
+     client.refuse_if_schema_ahead(conn)
+     from hermes_cli.kanban_replay_admission import guard
+     guard(conn)
++    if (sync.sync_state(conn) or {}).get('mode') == 'off':
++        raise ValueError('sync is detached; sender disabled')
+     if (sync.sync_state(conn) or {}).get('journal_id') is not None:
+         from hermes_cli import kanban_replay_existence as existence
+         existence.guard(conn)
+diff --git a/hermes_cli/kanban_sync_guard.py b/hermes_cli/kanban_sync_guard.py
+index 943b6b5b36b1feb2de8b83abc7d4bb8acde76e46..857bb642901ff8dcc194703f506ffa00c9745ca4 100644
+--- a/hermes_cli/kanban_sync_guard.py
++++ b/hermes_cli/kanban_sync_guard.py
+@@ -4,7 +4,23 @@
+ 
+ 
+ class SyncRoundBusy(RuntimeError):
+-    """A sync round or detach already owns this board's synchronization fence."""
++    """A sync round, sender or detach already owns this board's fence."""
++
++
++@contextmanager
++def sender_lock(path: Path | str):
++    """Own the full send/session, including direct callers outside sync rounds.
++
++    Separate from the round lock: a round calls push while holding its own lock.
++    Detach acquires round then sender, never the reverse. No nested admission or
++    process-local bypass is supported. Old processes still require explicit drain.
++    """
++    from hermes_cli.kanban_db_connect import _dispatch_tick_lock
++    canonical = Path(path).resolve()
++    with _dispatch_tick_lock(canonical.with_name(canonical.name + ".sender")) as held:
++        if not held:
++            raise SyncRoundBusy("board sender is busy; retry after it finishes")
++        yield
+ 
+ 
+ @contextmanager
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index 3fa2c3727b3c5b7f2fe0d828fd00dbde4b54b3ed..c69da77bf806b2629d1c3b67d0b76dfc13c63664 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -359,7 +359,11 @@
+         restarted.close()
+ 
+ 
+-def test_two_connections_takeover_sends_same_pending_and_fences_predecessor(live):
++def test_unfenced_predecessor_takeover_keeps_same_pending_and_fences_stale_session(live):
++    # Exercise the receiver-session defense against bytes from an older sender
++    # without local admission. Public push now refuses an overlapping local sender;
++    # that does not remove the protocol obligation to reject stale remote bytes.
++    from hermes_cli.kanban_replay_sender import _push_strict
+     kb.create_task(live, title='two sender takeover', assignee='worker')
+     path = Path(live.execute('PRAGMA database_list').fetchone()[2])
+     successor = kbc.connect(path)
+@@ -382,7 +386,8 @@
+     receiver = Takeover()
+     try:
+         with pytest.raises(ValueError, match='^stream_session_stale$'):
+-            client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++            _push_strict(live, receiver, 'default', 'macbook', primary=False,
++                         max_batches=1, before_head=False, seen={})
+         assert receiver.successor_result.applied == 1
+         assert len(receiver.sent) == 1
+         stale, sent = receiver.stale_attempt, receiver.sent[0]
+diff --git a/tests/hermes_cli/test_kanban_replay_sender_process.py b/tests/hermes_cli/test_kanban_replay_sender_process.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f889ba3afae0cd6b96e13d1d0f9c1456349a8fa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_sender_process.py
+@@ -0,0 +1,140 @@
++"""Independent-process sender occupancy through a real HTTP session. [daveey]"""
++import json
++import multiprocessing
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync, kanban_sync_client as client
++from hermes_cli.kanban_sync_guard import SyncRoundBusy, board_sync_lock
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++def _send(path, url, results):
++    conn = kbc.connect(path)
++    try:
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'macbook'))
++        result = client.push(conn, hub, 'default', 'macbook', primary=False, max_batches=1)
++        results.put(('ok', result.applied))
++    except (OSError, ValueError, RuntimeError, client.HubError) as exc:
++        results.put(('error', str(exc)))
++        raise
++    finally:
++        conn.close()
++
++
++class Peer:
++    def __init__(self, stage):
++        self.receiver = helpers.Receiver()
++        self.entered = threading.Event()
++        self.release = threading.Event()
++        peer = self
++
++        class Handler(BaseHTTPRequestHandler):
++            def do_GET(self):
++                self.reply('GET')
++
++            def do_POST(self):
++                self.reply('POST')
++
++            def reply(self, method):
++                assert self.headers.get('Authorization') == 'Bearer fixture-key'
++                length = int(self.headers.get('Content-Length', '0'))
++                body = json.loads(self.rfile.read(length)) if length else None
++                data = json.dumps(peer.receiver._call(method, self.path, body)).encode()
++                if self.path.endswith('/' + stage):
++                    peer.entered.set()
++                    assert peer.release.wait(30), 'parent did not release real HTTP response'
++                self.send_response(200)
++                self.send_header('Content-Type', 'application/json')
++                self.send_header('Content-Length', str(len(data)))
++                self.end_headers()
++                self.wfile.write(data)
++
++            def log_message(self, *args):
++                pass
++
++        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++        self.thread = threading.Thread(target=self.server.serve_forever)
++        self.thread.start()
++
++    def close(self):
++        self.release.set()
++        self.server.shutdown()
++        self.server.server_close()
++        self.thread.join(10)
++        assert not self.thread.is_alive()
++
++
++@pytest.mark.parametrize('action', ['push', 'detach'])
++@pytest.mark.parametrize('stage', ['session', 'ops'])
++def test_process_in_http_session_excludes_other_sender_and_detach(live, action, stage):
++    kb.create_task(live, title='one sender', assignee='worker')
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    peer = Peer(stage)
++    ctx = multiprocessing.get_context('spawn')
++    results = ctx.Queue()
++    proc = ctx.Process(target=_send, args=(path, f'http://127.0.0.1:{peer.server.server_port}', results))
++    proc.start()
++    other = helpers.Receiver()
++    try:
++        assert peer.entered.wait(30), 'child never reached the real HTTP boundary'
++        assert proc.is_alive()
++        before = list(live.iterdump())
++        with pytest.raises(SyncRoundBusy):
++            if action == 'push':
++                client.push(live, other, 'default', 'macbook', primary=False, max_batches=1)
++            else:
++                sync.set_mode(live, 'off')
++        assert other.calls == []
++        assert list(live.iterdump()) == before
++        peer.release.set()
++        proc.join(30)
++        assert proc.exitcode == 0
++        assert results.get(timeout=5) == ('ok', 1)
++        assert len(peer.receiver.sent) == 1
++        # The normal round already holds its distinct round lock. No recursive
++        # lock or bypass token is needed to enter the sender after drainage.
++        with board_sync_lock(path):
++            client.push(live, peer.receiver, 'default', 'macbook', primary=False, max_batches=1)
++        sync.set_mode(live, 'off')
++    finally:
++        peer.release.set()
++        if proc.is_alive():
++            proc.terminate()
++        proc.join(10)
++        results.close()
++        results.join_thread()
++        peer.close()
++
++
++def test_detached_preopened_sender_does_not_publish(live):
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    preopened = kbc.connect(path)
++    receiver = helpers.Receiver()
++    try:
++        sync.set_mode(live, 'off')
++        before = list(live.iterdump())
++        with pytest.raises(ValueError, match='detached'):
++            client.push(preopened, receiver, 'default', 'macbook', primary=False)
++        assert receiver.calls == []
++        assert list(live.iterdump()) == before
++    finally:
++        preopened.close()
++
++
++def test_sender_refuses_nonpersistent_board_before_any_io():
++    import sqlite3
++    conn = sqlite3.connect(':memory:')
++    receiver = helpers.Receiver()
++    try:
++        with pytest.raises(ValueError, match='on-disk board'):
++            client.push(conn, receiver, 'default', 'macbook', primary=False)
++        assert receiver.calls == []
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_sync_writer_process.py b/tests/hermes_cli/test_kanban_sync_writer_process.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7eb48126b499c234e5c6344ab0ec826545f14142
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_writer_process.py
+@@ -0,0 +1,64 @@
++"""Independent old-writer DB refusal; not an external-process drain receipt."""
++import multiprocessing
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_writer_gate as gate
++from tests.hermes_cli import test_kanban_sync_writer_gate as helpers
++
++board = helpers.board
++
++
++def _writer(path, revision, channel):
++    conn = sqlite3.connect(path, isolation_level=None)  # noqa: kanban-lockguard -- old-writer fixture
++    try:
++        if revision is not None:
++            conn.create_function('replay_writer_revision', 0, lambda: revision)
++        conn.execute('SELECT count(*) FROM tasks').fetchone()
++        channel.send('preopened')
++        assert channel.recv() == 'write'
++        try:
++            conn.execute("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_child','child','todo',1)")
++        except sqlite3.Error as exc:
++            channel.send(('refused', str(exc)))
++        else:
++            channel.send(('written', None))
++    finally:
++        conn.close()
++        channel.close()
++
++
++@pytest.mark.parametrize('revision', [None, 0, 1])
++def test_preopened_independent_writer_checks_persisted_minimum(board, revision):
++    path, conn = board
++    ctx = multiprocessing.get_context('spawn')
++    parent, child = ctx.Pipe()
++    proc = ctx.Process(target=_writer, args=(path, revision, child))
++    proc.start()
++    child.close()
++    try:
++        assert parent.poll(30), 'child did not open its independent SQLite connection'
++        assert parent.recv() == 'preopened'
++        with kbc.write_txn(conn):
++            gate.activate(conn)  # Disposable fixture only, never a deployment.
++        before = list(conn.iterdump())
++        parent.send('write')
++        assert parent.poll(30), 'child did not report its write outcome'
++        outcome, detail = parent.recv()
++        proc.join(10)
++        assert proc.exitcode == 0
++        if revision == 1:
++            assert outcome == 'written'
++            assert conn.execute("SELECT title FROM tasks WHERE id='t_child'").fetchone()[0] == 'child'
++        else:
++            assert outcome == 'refused'
++            assert ('replay_writer_revision' if revision is None else 'revision too old') in detail
++            assert list(conn.iterdump()) == before
++        assert conn.execute('SELECT minimum FROM replay_writer_gate1').fetchone()[0] == 1
++    finally:
++        parent.close()
++        if proc.is_alive():
++            proc.terminate()
++        proc.join(10)
+-- 
+2.43.0
+

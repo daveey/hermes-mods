@@ -1,0 +1,295 @@
+From b0c95af29011b5b8e13243b32cb31fdc49ebc9a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 20:03:42 +0000
+Subject: [PATCH 6631] Certified park ingress ordering in Kanban sync push
+
+Public mirror of source commit b0c95af29011b5b8e13243b32cb31fdc49ebc9a8.
+
+---
+diff --git a/tests/hermes_cli/test_kanban_owner_reassessment_mutation_gaps.py b/tests/hermes_cli/test_kanban_owner_reassessment_mutation_gaps.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8db9f7be21ad6d8efe9fe81694678b15f5c4d696
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_reassessment_mutation_gaps.py
+@@ -0,0 +1,278 @@
++"""Mutation-audit gap tests for PR4549 f6aef84 (certified park ingress ordering).
++
++Each test names the single-clause production mutant it exists to kill.
++"""
++import json
++import sqlite3
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_owner_reassessment as r
++from hermes_cli import kanban_owner_reassessment_transport as transport
++from hermes_cli import kanban_sync_evidence_order as eo
++from hermes_cli import kanban_sync_parent_order as ordering
++from tests.hermes_cli.test_kanban_owner_reassessment_board_compat import BASE_CAP
++from tests.hermes_cli.test_kanban_owner_reassessment_transport import _park_only, lifecycle, worker
++
++
++def _group(conn, ctx, cap, evidence):
++    """Actual lifecycle capture: certificate status op, bound park event, and one other evidence-group member."""
++    status, park = _park_only(conn, ctx, cap, evidence)
++    other, = [dict(x) for x in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE table_name='task_events' AND evidence_uid=? AND row_uid!=?",
++        (park['row_uid'], park['row_uid']))]
++    return status, park, other
++
++
++def _ids(rows):
++    return [x['op_id'] for x in rows]
++
++
++def _reinsert_after(conn, status, decoy):
++    """Make ``decoy`` physically precede ``status`` so an unqualified LIMIT 1 would pick it."""
++    cols = list(status)
++    with kb.write_txn(conn):
++        conn.execute('DELETE FROM kanban_sync_outbox WHERE op_id=?', (status['op_id'],))
++        for row in (decoy, status):
++            conn.execute(f"INSERT INTO kanban_sync_outbox ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
++                         [row[c] for c in cols])
++
++
++# ---------------------------------------------------------------- pending_park_parent
++
++@pytest.mark.parametrize('variant', ['status-is-found', 'wrong-table', 'wrong-op'])
++def test_pending_park_parent_only_resolves_for_a_park_event_upsert(worker, monkeypatch, variant):
++    """Kills ppp_table_drop, ppp_op_drop (guard clauses)."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, _ = _group(conn, ctx, cap, evidence)
++            row = {**park, **({'table_name': 'task_runs'} if variant == 'wrong-table' else {}),
++                   **({'op': 'delete'} if variant == 'wrong-op' else {})}
++            hit = transport.pending_park_parent(conn, row)
++            if variant == 'status-is-found':
++                assert hit is not None and hit['op_id'] == status['op_id']
++            else:
++                assert hit is None
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize('decoy', ['other-table', 'other-op', 'other-task', 'other-origin'])
++def test_pending_park_parent_query_is_exact_even_when_a_lookalike_sorts_first(worker, monkeypatch, decoy):
++    """Kills ppp_sql_table_drop, ppp_sql_op_drop, ppp_sql_rowuid_drop, ppp_sql_origin_drop."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, _ = _group(conn, ctx, cap, evidence)
++            change = {'other-table': {'table_name': 'task_events'}, 'other-op': {'op': 'delete'},
++                      'other-task': {'row_uid': 'some-other-task'},
++                      'other-origin': {'status_origin': 'some-other-origin'}}[decoy]
++            _reinsert_after(conn, status, {**status, 'op_id': 'decoy-' + decoy, **change})
++            rowid = dict(conn.execute('SELECT op_id, rowid FROM kanban_sync_outbox WHERE op_id IN (?,?)',
++                                      ('decoy-' + decoy, status['op_id'])).fetchall())
++            assert rowid['decoy-' + decoy] < rowid[status['op_id']]  # lookalike really sorts first
++            hit = transport.pending_park_parent(conn, park)
++            assert hit is not None and hit['op_id'] == status['op_id']
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++def test_pending_park_parent_requires_journal_bound_receipt(worker, monkeypatch):
++    """Kills ppp_bound_check_drop: an op whose origin matches but whose receipt is not the journaled one is no parent."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, _ = _group(conn, ctx, cap, evidence)
++            assert transport.pending_park_parent(conn, park)['op_id'] == status['op_id']
++            fields = json.loads(status['fields'])
++            fields['owner_reassessment_v1']['issuer'] = {'run_uid': 'forged'}
++            with kb.write_txn(conn):
++                conn.execute('UPDATE kanban_sync_outbox SET fields=? WHERE op_id=?',
++                             (json.dumps(fields), status['op_id']))
++            assert transport.pending_park_parent(conn, park) is None
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++# ---------------------------------------------------------------- bound_park_uid (unit, in-memory journal)
++
++def _unit(task_id='task', receipt_task='task', journal_task='task', status='scheduled', table='tasks',
++          journal=True, fields=None, drop_row_uid=False, receipt_extra=None):
++    conn = sqlite3.connect(':memory:')
++    receipt = {'park_event': {'uid': 'park'}, 'task_id': receipt_task, **(receipt_extra or {})}
++    if journal:
++        r.ensure_schema(conn)
++        conn.execute(f'INSERT INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?)',
++                     ('park', journal_task, 'episode', json.dumps(receipt), 1))
++    row = {'table_name': table, 'row_uid': task_id, 'status_origin': 'park', 'evidence_uid': 'park',
++           'fields': json.dumps({'status': status, 'owner_reassessment_v1': receipt}) if fields is None else fields}
++    if drop_row_uid:
++        del row['row_uid']
++    return conn, row
++
++
++def test_bound_park_uid_unit_baseline():
++    conn, row = _unit()
++    assert transport.bound_park_uid(conn, row) == 'park'
++
++
++def test_bound_park_uid_refuses_an_empty_uid_even_if_every_field_agrees():
++    """Kills bp_uid_present: '' is not an event identity."""
++    conn = sqlite3.connect(':memory:')
++    r.ensure_schema(conn)
++    receipt = {'park_event': {'uid': ''}, 'task_id': 'task'}
++    conn.execute(f'INSERT INTO {r.PENDING_TABLE} VALUES (?,?,?,?,?)', ('', 'task', 'episode', json.dumps(receipt), 1))
++    row = {'table_name': 'tasks', 'row_uid': 'task', 'status_origin': '', 'evidence_uid': '',
++           'fields': json.dumps({'status': 'scheduled', 'owner_reassessment_v1': receipt})}
++    assert transport.bound_park_uid(conn, row) is None
++
++
++@pytest.mark.parametrize('kw', [
++    {'status': 'ready'},                    # bp_status_sched
++    {'table': 'task_events'},               # bp_table_tasks
++    {'receipt_task': 'other'},              # bp_taskid_eq (receipt names another task, journal agrees with receipt)
++    {'journal_task': 'other'},              # bp_saved_taskid_query (journal row filed under another task)
++    {'fields': '{not json'},                # bp_except_value
++    {'fields': '[1]'},                      # bp_except_attr
++    {'journal': False},                     # bp_except_sqlite (no journal table)
++    {'receipt_task': None, 'drop_row_uid': True},  # bp_except_key (row without row_uid)
++], ids=lambda kw: ','.join(kw))
++def test_bound_park_uid_refuses_each_broken_binding_without_raising(kw):
++    kw = dict(kw)
++    if 'receipt_task' in kw and kw['receipt_task'] is None:
++        conn, row = _unit(receipt_task=None, journal_task='task', drop_row_uid=True)
++    else:
++        conn, row = _unit(**kw)
++    assert transport.bound_park_uid(conn, row) is None
++
++
++# ---------------------------------------------------------------- firsts
++
++def test_firsts_default_is_legacy_and_certified_only_exempts_exact_park(worker, monkeypatch):
++    """Kills fi_default_reassess_true and fi_filter_uid."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, other = _group(conn, ctx, cap, evidence)
++            assert set(_ids(eo.firsts(conn, status))) == {park['op_id'], other['op_id']}  # no kwarg: ordinary order
++            assert _ids(eo.firsts(conn, status, reassessment=True)) == [other['op_id']]  # other evidence still first
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++def test_firsts_exemption_is_scoped_to_task_events_and_tolerates_sparse_frozen_wire(worker, monkeypatch):
++    """Kills fi_filter_table and fi_frozen_get."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, other = _group(conn, ctx, cap, evidence)
++            twin = {**park, 'op_id': 'twin-run', 'table_name': 'task_runs'}  # same uid, not the park event
++            cols = list(twin)
++            with kb.write_txn(conn):
++                conn.execute(f"INSERT INTO kanban_sync_outbox ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
++                             [twin[c] for c in cols])
++                conn.execute("UPDATE kanban_sync_outbox SET wire_json='{}' WHERE op_id=?", (status['op_id'],))
++            status['wire_json'] = '{}'
++            first = _ids(eo.firsts(conn, status, reassessment=True))
++            assert 'twin-run' in first and other['op_id'] in first and park['op_id'] not in first
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++# ---------------------------------------------------------------- reassessment_supported / select_pending snapshot
++
++def test_reassessment_supported_rejects_bool_and_none():
++    """Kills rs_type_int (True == 1) and rs_bool_cap (None capability)."""
++    assert not ordering.reassessment_supported({'owner_reassessment_v1': True})
++    assert not ordering.reassessment_supported(None)
++
++
++def test_explicit_empty_snapshot_means_unsupported_and_is_not_reread(worker, monkeypatch):
++    """Kills sp_cap_none_check: an empty (falsy) per-batch snapshot must not trigger a second capability read."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, _other = _group(conn, ctx, cap, evidence)
++            reads = []
++            hub = SimpleNamespace(status_origin_capability=lambda board: reads.append(1) or {
++                **BASE_CAP, 'owner_reassessment_v1': 1})
++            rows, _, _ = ordering.select_pending(conn, hub, 'default', {}, now=int(time.time()), limit=100,
++                                                 before_head=False, origin_cap={})
++            ids = _ids(rows)
++            assert reads == []
++            assert ids.index(park['op_id']) < ids.index(status['op_id'])  # ordinary evidence-first order
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++# ---------------------------------------------------------------- parent_first certificate dependency
++
++def _fifo(status, park, other):
++    return [park, status, other]  # park captured ahead of its status op in this batch
++
++
++def test_park_pulls_the_certificates_own_evidence_ahead_of_the_certificate(worker, monkeypatch):
++    """Kills pf_required_append and pf_dep_flag."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, other = _group(conn, ctx, cap, evidence)
++            ids = _ids(ordering.parent_first(conn, _fifo(status, park, other), int(time.time()), 10, reassessment=True))
++            assert ids.index(other['op_id']) < ids.index(status['op_id']) < ids.index(park['op_id']), ids
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++@pytest.mark.parametrize('block', ['backoff', 'not-allowed', 'quarantined'])
++def test_park_is_held_when_certificates_own_evidence_or_certificate_cannot_go(worker, monkeypatch, block):
++    """Kills pf_dep_anycheck, pf_dep_allowed, pf_sendable."""
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, other = _group(conn, ctx, cap, evidence)
++            now, allowed = int(time.time()), None
++            if block == 'backoff':
++                with kb.write_txn(conn):
++                    conn.execute('UPDATE kanban_sync_outbox SET retry_after=? WHERE op_id=?',
++                                 (now + 3600, other['op_id']))
++                other['retry_after'] = now + 3600
++            elif block == 'not-allowed':
++                allowed = {park['op_id'], status['op_id']}
++            else:
++                from hermes_cli import kanban_sync_quarantine as q
++                real = q.sendable
++                monkeypatch.setattr(q, 'sendable', lambda c, rows, **kw: [
++                    x for x in real(c, rows, **kw) if x['op_id'] != status['op_id']])
++            ids = _ids(ordering.parent_first(conn, _fifo(status, park, other), now, 10, allowed=allowed,
++                                             reassessment=True))
++            assert park['op_id'] not in ids, ids
++            if block != 'quarantined':
++                assert status['op_id'] not in ids, ids
++    lifecycle._turn(worker, monkeypatch, body)
++
++
++# ---------------------------------------------------------------- one-capability snapshot through push()
++
++@pytest.mark.parametrize('first_read_certified', [True, False], ids=['certified-then-flip', 'unsupported-then-flip'])
++def test_push_uses_one_capability_snapshot_for_selection_and_serialization(worker, monkeypatch, first_read_certified):
++    """Kills cl_cap_arg_drop: a Board flip between two reads must not split ordering from the wire shape."""
++    from copy import deepcopy
++
++    from hermes_cli import kanban_sync_client as client
++
++    def body(cap, ctx, agent, evidence):
++        with kbc.connect_closing() as conn:
++            status, park, _other = _group(conn, ctx, cap, evidence)
++            reads, calls = [], []
++
++            def read(board):
++                reads.append(1)
++                on = first_read_certified if len(reads) == 1 else not first_read_certified
++                return {**BASE_CAP, **({'owner_reassessment_v1': 1} if on else {})}
++
++            def capture(board, batch):
++                calls.extend(deepcopy(batch))
++                raise OSError('test transport capture: no Board acceptance simulated')
++
++            hub = SimpleNamespace(ops=capture, status_origin_capability=read)
++            with pytest.raises(OSError, match='test transport capture'):
++                client.push(conn, hub, 'default', 'here', primary=True, max_batches=1)
++            assert len(reads) == 1
++            ids = [op['client_op_id'] for op in calls]
++            sent, = [op for op in calls if op['client_op_id'] == status['op_id']]
++            if first_read_certified:
++                assert 'owner_reassessment_v1' in sent['fields']
++                assert ids.index(status['op_id']) < ids.index(park['op_id'])
++            else:
++                assert 'owner_reassessment_v1' not in sent['fields']
++                assert ids.index(park['op_id']) < ids.index(status['op_id'])
++    lifecycle._turn(worker, monkeypatch, body)
+-- 
+2.43.0
+

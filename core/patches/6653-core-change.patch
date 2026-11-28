@@ -1,0 +1,151 @@
+From b4c26443b56aa823a7577c1d7b2da8cc2297d120 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 23:33:20 +0000
+Subject: [PATCH 6653] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit b4c26443b56aa823a7577c1d7b2da8cc2297d120.
+
+---
+diff --git a/plugins/kanban/dashboard/board_incremental.py b/plugins/kanban/dashboard/board_incremental.py
+index aeff83b8b557f2b37246e26e739e913d8b9db3f6..5b82bc8658358578621fdb4bec31837a32b21c87 100644
+--- a/plugins/kanban/dashboard/board_incremental.py
++++ b/plugins/kanban/dashboard/board_incremental.py
+@@ -220,13 +220,13 @@
+     return cards, parsed, raws
+ 
+ 
+-def _diagnostics(conn, cards, by_id, prev, affected, diagnostic_inputs, br):
++def _diagnostics(conn, cards, by_id, prev, affected, changed, diagnostic_inputs, br):
+     """Use the freshly read task rows even for unmarked ready/done bookkeeping."""
+     diag_rows = [by_id[tid] for tid, (task, _fields) in cards.items() if task.status != "archived"]
+     if not diag_rows:
+         return None, {}
+-    # All displayed marks/runs and graph contexts are bounded by open rows plus
+-    # the done cap. Event histories alone are selectively re-read.
++    # Neighbour changes refresh graph context, not the neighbour's own histories.
++    # Keep the original P2 set for exact event/run mutation checks.
+     old_graph = prev["diag_inputs"][3] if prev["diag_inputs"] else {}
+     ids = [r["id"] for r in diag_rows]
+     refresh = [tid for tid in ids if tid in affected or tid not in old_graph]
+@@ -234,7 +234,7 @@
+     if refresh:
+         graphs.update(kanban_db.task_graph_contexts(conn, refresh))
+     return br._incremental_diag_inputs(conn, diag_rows, prev["_memo"]["diag"], diagnostic_inputs,
+-                                       graphs=graphs, event_changed=affected)
++                                       graphs=graphs, event_changed=changed)
+ 
+ 
+ def _pickers(conn, prev, changed):
+@@ -283,7 +283,7 @@
+     cards, parsed, raws = parsed_cards
+     affected = _affected(conn, cards, pcards, changed)
+     extras = _extras(conn, cards, pcards, affected, br)
+-    diag_inputs, memo_diag = _diagnostics(conn, cards, by_id, prev, affected, diagnostic_inputs, br)
++    diag_inputs, memo_diag = _diagnostics(conn, cards, by_id, prev, affected, changed, diagnostic_inputs, br)
+     latest = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+     tenants, assignees = _pickers(conn, prev, changed)
+     return {
+diff --git a/tests/plugins/test_kanban_board_neighbor_history.py b/tests/plugins/test_kanban_board_neighbor_history.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb9d194ee6901328e9654d6f4ad56b64e2d172f5
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_neighbor_history.py
+@@ -0,0 +1,95 @@
++"""Graph invalidation must not scan an unchanged neighbour's histories."""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from plugins.kanban.dashboard import board_read as br
++from tests.plugins.test_kanban_board_incremental import board as board  # noqa: PLC0414 -- pytest fixture reexport
++from tests.plugins.test_kanban_board_delta import conn as conn  # noqa: PLC0414 -- pytest fixture reexport
++from tests.plugins.test_kanban_board_incremental import _cold, _read, _stable
++
++
++@pytest.mark.parametrize("sealed", [False, True])
++def test_child_edit_refreshes_graph_not_parent_history(board, monkeypatch, sealed):
++    conn = kbc.connect()
++    try:
++        parent = kb.create_task(conn, title="parent", assignee="worker")
++        child = kb.create_task(conn, title="child", assignee="worker")
++        kb.link_tasks(conn, parent, child)
++        for i in range(40):
++            conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'note', ?, ?)",
++                         (parent, str(i), i))
++        conn.commit()
++        _read(board)
++        if sealed:
++            conn.execute("UPDATE tasks SET title='seal parent' WHERE id=?", (parent,))
++            conn.commit()
++            _read(board)
++        scanned, graphs = [], []
++        for name in ("_same_event_histories", "extend_histories"):
++            real = getattr(br, name)
++
++            def observe(c, histories, real=real):
++                scanned.extend(histories)
++                return real(c, histories)
++
++            monkeypatch.setattr(br, name, observe)
++        real_rows = br._rows_by_task
++
++        def rows(c, table, ids):
++            scanned.extend(ids)
++            return real_rows(c, table, ids)
++
++        monkeypatch.setattr(br, "_rows_by_task", rows)
++        real_graph = kb.task_graph_contexts
++        monkeypatch.setattr(kb, "task_graph_contexts",
++                            lambda c, ids: graphs.extend(ids) or real_graph(c, ids))
++        body = None
++        for i in range(3):
++            scanned.clear()
++            graphs.clear()
++            conn.execute("UPDATE tasks SET title=? WHERE id=?", (f"child {i}", child))
++            conn.commit()
++            body = _stable(_read(board))
++            assert parent in graphs
++            assert parent not in scanned, scanned
++        assert body == _cold(board)
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("mutation", ["update", "replace", "heartbeat", "delete"])
++def test_own_history_mutations_still_reach_delta(conn, mutation):
++    from tests.plugins.test_kanban_board_delta import Board, _same
++
++    parent = kb.create_task(conn, title="parent", assignee="worker")
++    child = kb.create_task(conn, title="child", assignee="worker")
++    kb.link_tasks(conn, parent, child)
++    for i in range(40):
++        conn.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, 'note', ?, ?)",
++                     (parent, str(i), i))
++    conn.commit()
++    view = Board(conn)
++    view.full()
++    old = view.rows["diag_inputs"][1][parent]
++    event_id = old[0]["id"]
++    if mutation == "update":
++        conn.execute("UPDATE task_events SET payload='new payload' WHERE id=?", (event_id,))
++    elif mutation == "replace":
++        conn.execute("INSERT OR REPLACE INTO task_events(id,task_id,kind,payload,created_at) "
++                     "VALUES (?,?,'note','replacement',0)", (event_id, parent))
++    elif mutation == "delete":
++        conn.execute("DELETE FROM task_events WHERE id=?", (event_id,))
++    else:
++        conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) "
++                     "VALUES (?,'heartbeat','{}',100)", (parent,))
++    conn.execute("UPDATE tasks SET title='child changed too' WHERE id=?", (child,))
++    conn.commit()
++    view.refresh()
++    fresh = view.rows["diag_inputs"][1][parent]
++    assert [dict(r) for r in fresh] != [dict(r) for r in old]
++    cold = view.cold()["diag_inputs"][1][parent]
++    assert [dict(r) for r in fresh] == [dict(r) for r in cold]
++    _same(view)
+-- 
+2.43.0
+

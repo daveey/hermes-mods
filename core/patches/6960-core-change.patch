@@ -1,0 +1,132 @@
+From 56c8f6824f40561754a6adbcff7dbc239fc2d3b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:50:53 +0000
+Subject: [PATCH 6960] TUI turn-start outcome publishing and status counts agreement
+
+Public mirror of source commit 56c8f6824f40561754a6adbcff7dbc239fc2d3b7.
+
+---
+diff --git a/tests/hermes_state/test_session_status_counts_agreement.py b/tests/hermes_state/test_session_status_counts_agreement.py
+index e8ef69cc6c5a5490f1326fe34bcb8a39c2628a71..3e36062d0b55e9cb5b55ee61d4bcdb73fc44b858 100644
+--- a/tests/hermes_state/test_session_status_counts_agreement.py
++++ b/tests/hermes_state/test_session_status_counts_agreement.py
+@@ -285,10 +285,12 @@
+ 
+ 
+ def _turn_end_under_contention(state_db, board, monkeypatch, *, held_by, concluding_holder,
+-                               first_card_change=False):
++                               first_card_change: bool | str = False, then_concluding=None):
+     """A turn_end refresh that hits the held counts while ``held_by``'s turn lease is still taken; returns the
+     status published once every deferred refresh ran (review 6092548112). With ``first_card_change`` an
+-    identity-free card_change defers into the SAME held flight first, so the turn_end must not dedupe behind it."""
++    identity-free card_change defers into the SAME held flight first, so the turn_end must not dedupe behind it.
++    With ``then_concluding`` a second turn_end, concluding that holder's turn, defers into the same flight after
++    the first, so the two turn_ends must not dedupe behind each other (review 6093458194)."""
+     controls = Controls()
+     so.register_outcome_provider("user-steps", controls)
+     controls_refresh(state_db)
+@@ -304,16 +306,21 @@
+     monkeypatch.setattr(so, "_deferred_refresh", observed)
+     with SessionDB(db_path=state_db) as handle:
+         assert handle.try_acquire_session_turn_lease("chat", held_by, ttl_seconds=300.0)
+-    expected = ["card_change", "turn_end"] if first_card_change else ["turn_end"]
++    expected = (["card_change"] if first_card_change else []) + ["turn_end"] * (2 if then_concluding else 1)
+     try:
+         unrelated_write(board)
+         with Held():
+             controls.open = False
+             with SessionDB(db_path=state_db) as handle:
+-                if first_card_change:
+-                    so.refresh_outcome("chat", "card_change", db=handle)
++                if first_card_change:  # True: identity-free; a holder name: the same identity as the turn_end
++                    so.refresh_outcome("chat", "card_change", db=handle, concluding_turn=(
++                        so.turn_identity(lease_holder=first_card_change) if isinstance(first_card_change, str)
++                        else None))
+                 so.refresh_outcome("chat", "turn_end", db=handle,
+                                    concluding_turn=so.turn_identity(lease_holder=concluding_holder))
++                if then_concluding:
++                    so.refresh_outcome("chat", "turn_end", db=handle,
++                                       concluding_turn=so.turn_identity(lease_holder=then_concluding))
+             held = stored_status(state_db)
+             assert not is_done(held) and held["coverage"]["state"] == "unknown", held
+             assert replayed == [], "a deferred refresh ran before the held flight settled"
+@@ -357,3 +364,76 @@
+                                                               concluding_holder="turn-1", first_card_change=True)
+     assert not is_done(status) and status.get("kind") == "running", status
+     assert replayed == expected, replayed
++
++
++def test_a_same_flight_card_change_with_the_same_identity_does_not_swallow_the_turn_end(state_db, board,
++                                                                                        monkeypatch):
++    """The trigger dimension of the dedup key: a card_change carrying turn-1's identity (which only a turn_end
++    discounts) and the turn_end concluding turn-1 defer into one flight; both replay and the chat is done (a key
++    without the trigger replays only the card_change, which still counts turn-1's lease as running)."""
++    status, (replayed, expected) = _turn_end_under_contention(state_db, board, monkeypatch, held_by="turn-1",
++                                                              concluding_holder="turn-1", first_card_change="turn-1")
++    assert is_done(status), status
++    assert replayed == expected, replayed
++
++
++def test_a_same_flight_second_turn_end_is_not_swallowed_by_the_first(state_db, board, monkeypatch):
++    """Two turn_ends deferred into one held flight differ only by concluding identity: turn-1's, then turn-2's
++    while turn-2's lease is still taken. Both replay in order, and the last discounts turn-2's own lease, so the
++    chat is done (a key without the concluding identity replays only turn-1's and stays running)."""
++    status, (replayed, expected) = _turn_end_under_contention(state_db, board, monkeypatch, held_by="turn-2",
++                                                              concluding_holder="turn-1", then_concluding="turn-2")
++    assert is_done(status), status
++    assert replayed == expected, replayed
++
++
++def _chat_db(path, sid):
++    with SessionDB(db_path=path) as handle:
++        handle.create_session(sid, source="desktop")
++        handle.append_message(sid, role="user", content="please fix the flaky test")
++        handle.append_message(sid, role="assistant", content="ok")
++
++
++def _status_of(path, sid):
++    with SessionDB(db_path=path, read_only=True) as handle:
++        return (so.get_outcome(sid, db=handle) or {}).get("status") or {}
++
++
++def test_a_same_flight_refresh_of_another_chat_or_db_is_not_swallowed(state_db, board, tmp_path, monkeypatch):
++    """The other two identity dimensions of the dedup key: card_changes for a second chat in the same state db
++    and for the same chat id in a second state db defer into one held flight with this chat's. Each replays once
++    and each chat is done (a key without the sid or without the db path replays only the first of them)."""
++    other_db = tmp_path / "other" / "state.db"
++    other_db.parent.mkdir()
++    _chat_db(other_db, "chat")
++    _chat_db(state_db, "chat-b")
++    targets = [(state_db, "chat"), (state_db, "chat-b"), (other_db, "chat")]
++    controls = Controls()
++    so.register_outcome_provider("user-steps", controls)
++    for path, sid in targets:
++        with SessionDB(db_path=path) as handle:
++            so.refresh_outcomes_quietly([sid], "notice", db=handle)
++    replayed = []
++    real_deferred = so._deferred_refresh
++
++    def observed(path, sid, trigger="card_change", concluding=frozenset()):
++        try:
++            real_deferred(path, sid, trigger, concluding)
++        finally:
++            replayed.append((str(path), sid))
++
++    monkeypatch.setattr(so, "_deferred_refresh", observed)
++    unrelated_write(board)
++    with Held():
++        controls.open = False
++        for path, sid in targets:
++            with SessionDB(db_path=path) as handle:
++                so.refresh_outcome(sid, "card_change", db=handle)
++        for path, sid in targets:
++            held = _status_of(path, sid)
++            assert not is_done(held) and held["coverage"]["state"] == "unknown", (path, sid, held)
++        assert replayed == [], "a deferred refresh ran before the held flight settled"
++    wait_for(lambda: len(replayed) >= len(targets), 10)
++    for path, sid in targets:
++        assert is_done(_status_of(path, sid)), (path, sid, _status_of(path, sid))
++    assert replayed == [(str(path), sid) for path, sid in targets], replayed
+-- 
+2.43.0
+

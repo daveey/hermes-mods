@@ -1,0 +1,133 @@
+From ff73bb8bc1fe2e935a42839522bd16792d6f7ab9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:15:26 +0000
+Subject: [PATCH 6781] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit ff73bb8bc1fe2e935a42839522bd16792d6f7ab9.
+
+---
+diff --git a/tests/hermes_cli/test_owner_release_readers.py b/tests/hermes_cli/test_owner_release_readers.py
+index 290e5bfc59bbaf31f8c78ba9903dbb8e5dd7a5a8..68eda5c70d5730d5def1790ef9273df9a995c36e 100644
+--- a/tests/hermes_cli/test_owner_release_readers.py
++++ b/tests/hermes_cli/test_owner_release_readers.py
+@@ -9,9 +9,11 @@
+ from hermes_cli import kanban_scope_renewal as renewal, kanban_spend_decision as decision
+ from hermes_cli import kanban_release as release, kanban_release_application as applied
+ from tests.hermes_cli import test_owner_release_application as helpers
++from tests.hermes_cli import test_kanban_release as legacy
+ 
+ proof = helpers.proof
+ store = helpers.store
++board = legacy.board
+ 
+ 
+ def prepare(conn, receipt):
+@@ -237,6 +239,105 @@
+     assert _private_reason(conn, task, Reader(conn)) is None
+ 
+ 
++@pytest.mark.parametrize('origin', ['home', 'foreign'])
++def test_consumed_only_erased_import_is_legacy_indistinguishable(proof, store, origin, monkeypatch):
++    """Damaged imported SQL fixture, NOT a demonstrated production ingress exploit."""
++    from hermes_cli import kanban_db_context as context, kanban_release_replica as replica
++    from hermes_cli.kanban_actionability_sources import Reader, _private_reason
++    conn, _ = store
++    prepare(conn, proof)
++    assert replica.verified_consumption(conn, 'consume-1') == proof
++    assert conn.execute(f'SELECT COUNT(*) FROM {applied.TABLE}').fetchone()[0] == 0
++    assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='owner_release_executor_receipts'").fetchone() is None
++    # Keep only the old capability, its release and subsequent placement decision;
++    # remove unrelated scope evidence in this defensive fixture, not production.
++    conn.execute("DELETE FROM task_events WHERE uid NOT IN ('older-1','release-old','promote-1')")
++    body, note = 'Legacy-shaped imported mandate', 'Imported release note'
++    conn.execute("INSERT INTO task_comments VALUES (1,'comment-1','t_target',?)", (body,))
++    event = dict(conn.execute("SELECT * FROM task_events WHERE uid='release-old'").fetchone())
++    payload = {k: v for k, v in json.loads(event['payload']).items()
++               if not k.startswith('owner_release_') and k != 'consume_uid'}
++    payload.update(mandate_comment_uid='comment-1', mandate_body_sha256=renewal.digest(body), note=note)
++    conn.execute("UPDATE task_events SET payload=?,origin_gateway=? WHERE uid='release-old'",
++                 (json.dumps(payload), origin))
++    event.update(payload=json.dumps(payload), origin_gateway=origin)
++    assert not applied.native_record(payload)
++    assert not applied.native_release(conn, event, payload)
++    assert applied.verified_release(conn, event) is None
++    assert renewal.covered(conn, 't_target') == frozenset()
++    assert applied.verified_application(conn, 'intent-1') is None
++    # Central legacy readers do not authenticate HOME provenance; actionability
++    # independently does. Consumption has no effect UID to distinguish this row.
++    record = release._release_event(conn, 't_target')
++    mandate = release.current_mandate(conn, 't_target')
++    assert record is not None and record['note'] == note
++    assert mandate is not None and mandate['body'] == body
++    assert release.released_by(conn, 't_target', note) == 't_target'
++    task = dict(conn.execute('SELECT * FROM tasks').fetchone())
++    assert _private_reason(conn, task, Reader(conn)) == (None if origin == 'home' else 'restriction_unattributable')
++    monkeypatch.setattr(context._kb, 'list_comments', lambda *_: [])
++    lines = []
++    context._ctx_release(lines, conn, 't_target', now=105)
++    text = '\n'.join(lines)
++    assert body in text and 'comment 1' in text
++    assert '## Release mandate (governs this run)' in text
++    assert 'intent intent-1' not in text
++    assert replica.verified_consumption(conn, 'consume-1') == proof
++
++
++def test_genuine_human_release_after_pending_native_consume(proof, board):
++    from hermes_cli import kanban_db as kb, kanban_db_context as context, kanban_db_sync as sync
++    from hermes_cli import kanban_release_intent as intent, kanban_release_replica as replica
++    from hermes_cli.kanban_actionability_sources import Reader, _private_reason
++    tid = kb.create_task(board, title='Pending native consume then human capability release', assignee='default')
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(board, tid, decision.EVENT, {'cause': 'capability_unavailable'})
++    sync.apply_sync_schema_steps(board)
++    board.commit()
++    if not board.execute('SELECT 1 FROM kanban_sync_state').fetchone():
++        board.execute("INSERT INTO kanban_sync_state (board_id,gateway_id,hlc_last,mode) VALUES ('example','home','','shadow')")
++        board.commit()
++    sync.set_identity(board, 'example', 'home')
++    sync.set_mode(board, 'off')
++    # This local legacy-writer control must not contact a canonical HOME peer.
++    # The task was created before sync identity; preserve its legitimate HOME.
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET created_on='home' WHERE id=?", (tid,))
++    # Synthetic historical consumption certificate in a disposable real board;
++    # the subsequent human operation below is the actual supported writer.
++    proof['intent'].update(task_id=tid)
++    proof['digest'] = intent.digest(proof['intent'])
++    proof['consume'].update(task=tid, digest=proof['digest'])
++    payload = json.loads(proof['renewal']['payload'])
++    payload.update(owner_release_digest=proof['digest'])
++    proof['renewal'].update(task_id=tid, payload=json.dumps(payload))
++    replica._store(board, proof)
++    board.commit()
++    before = replica.verified_consumption(board, 'consume-1')
++    assert before == proof
++    assert release.current_mandate(board, tid) is None
++    note = 'Genuine subsequent operator release'
++    out = legacy.run(board, tid, note=note)
++    assert out['ok'] and out['outcome'] == 'released', out
++    record = release._release_event(board, tid)
++    assert record is not None and record['authority_kind'] == 'human'
++    mandate = release.current_mandate(board, tid)
++    assert mandate is not None and mandate['comment_id'] == out['mandate_comment']
++    assert release.released_by(board, tid, note) == tid
++    task = dict(board.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone())
++    assert _private_reason(board, task, Reader(board)) is None
++    lines = []
++    context._ctx_release(lines, board, tid)
++    text = '\n'.join(lines)
++    assert mandate['body'] in text and 'a human operator' in text
++    assert f"comment {out['mandate_comment']}" in text and 'intent intent-1' not in text
++    assert replica.verified_consumption(board, 'consume-1') == before
++    assert applied.verified_application(board, 'intent-1') is None
++    task = kb.get_task(board, tid)
++    assert task is not None and task.status == 'ready'
++
++
+ def test_applied_never_authorizes_a_later_triage_repair(proof, store, monkeypatch):
+     from hermes_cli import kanban_decided_triage as maintenance
+     from hermes_cli import kanban_containment_guard, kanban_goal_recovery, kanban_resume_requester, kanban_wake_check
+-- 
+2.43.0
+

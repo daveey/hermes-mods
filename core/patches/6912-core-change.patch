@@ -1,0 +1,261 @@
+From 9b3425e8ba7db7d6c617c0148d34743e8a70846f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:49:37 +0000
+Subject: [PATCH 6912] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 9b3425e8ba7db7d6c617c0148d34743e8a70846f.
+
+---
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 1406211cdf9f51dc4dbd3181a89e82358ffe409d..e6d8b22d49f21a55fa43386f095a13d2242c6773 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -57,7 +57,7 @@
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+ from hermes_cli.kanban_replay_sender import PushResult, ReplayFault, push
+ from hermes_cli.kanban_sync_compat import REASSESSMENT_REFUSALS, TRANSIENT_REASONS, transient_rejection  # re-exported compatibility seam
+-from hermes_cli.kanban_sync_hub_transport import peer_closed as _peer_closed
++from hermes_cli.kanban_sync_hub_transport import peer_closed as _peer_closed, decode_json
+ from hermes_cli.kanban_sync_hub_transport import BoundedRedirects, BoundedResponseError, read_response
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+ from hermes_cli.kanban_sync_bounded_probe import DeadlineRequests as _DeadlineRequests, schedstat, watch_written
+@@ -412,7 +412,7 @@
+                     if status == 410:
+                         raise Resync(text)
+                     raise HubError(status, text)
+-                return json.loads(raw or b"{}")
++                return decode_json(raw)
+             except Exception as exc:  # health: allow BLE001 -- stamps diagnostics, then re-raises the same error
+                 note_attempt(exc, self.deadline, started, time.monotonic())
+                 raise
+diff --git a/hermes_cli/kanban_sync_hub_transport.py b/hermes_cli/kanban_sync_hub_transport.py
+index b35cabb4de4b4f3704f160cad303a8fee0e2c8a8..1454b5832a25dde007c771ae3c9af2730141b6c7 100644
+--- a/hermes_cli/kanban_sync_hub_transport.py
++++ b/hermes_cli/kanban_sync_hub_transport.py
+@@ -1,4 +1,19 @@
+-"""Socket observation for the Board's kept-alive HTTP transport. [daveey]"""
++"""Socket observation and response decoding for Board HTTP transports. [daveey]"""
++import json
++
++
++def decode_json(raw):
++    """Malformed reply bytes are a board-local failure, not a retry signal.
++
++    Keep decoding separate from application validation: arbitrary ValueError
++    raised by a caller must not be mistaken for a broken HTTP response.
++    """
++    from hermes_cli.kanban_sync_client import HubError
++    try:
++        return json.loads(raw or b"{}")
++    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
++        # Do not include raw bytes: replies may carry private Board contents.
++        raise HubError(502, 'invalid JSON response') from exc
+ 
+ import urllib.request
+ 
+diff --git a/hermes_cli/kanban_sync_hub_urlopen.py b/hermes_cli/kanban_sync_hub_urlopen.py
+index f1ad02390b40e94cfba352dd8ad3dbc7427d6977..ba42d531a34778d3d4795301ddacc38b7329da07 100644
+--- a/hermes_cli/kanban_sync_hub_urlopen.py
++++ b/hermes_cli/kanban_sync_hub_urlopen.py
+@@ -24,7 +24,7 @@
+     try:
+         try:
+             with open_request(req, timeout=timeout) as resp:
+-                return client.json.loads(client.read_response(resp, max_response_bytes) or b"{}")
++                return client.decode_json(client.read_response(resp, max_response_bytes))
+         except client.urllib.error.HTTPError as exc:
+             with exc:
+                 text = client.read_response(exc, max_response_bytes, deterministic=False).decode("utf-8", "replace")[:500]
+diff --git a/tests/hermes_cli/test_kanban_replay_legacy_capability.py b/tests/hermes_cli/test_kanban_replay_legacy_capability.py
+index f0e86ea7d638d61c182353e490f34b8c7d3dd8ab..873883028f427b3de07f27e60e9552239ffb3677 100644
+--- a/tests/hermes_cli/test_kanban_replay_legacy_capability.py
++++ b/tests/hermes_cli/test_kanban_replay_legacy_capability.py
+@@ -19,8 +19,10 @@
+ from tests.hermes_cli import kanban_sync_support as support
+ 
+ 
+-@pytest.mark.parametrize('capability', [None, [], 'unsupported', {}])
+-def test_legacy_malformed_capability_does_not_abort_later_board(tmp_path, monkeypatch, capability):
++@pytest.mark.parametrize('proxied', [False, True])
++@pytest.mark.parametrize('capability', [None, [], 'unsupported', {}, b'{', b'\xff'])
++def test_legacy_malformed_capability_does_not_abort_later_board(tmp_path, monkeypatch, capability, proxied):
++    monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
+     home = support.kanban_home(tmp_path, monkeypatch)
+     support.write_sync_config(home, True)
+     broken_path = home / 'kanban.db'
+@@ -30,6 +32,7 @@
+     kb.create_task(conn, title='legacy capability isolation', assignee='worker')
+     pending = conn.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0]
+     assert pending > 0
++    custody = [dict(row) for row in conn.execute('SELECT * FROM kanban_sync_outbox')]
+ 
+     healthy_path = Path(tmp_path) / 'healthy.db'
+     with kbc.connect(healthy_path) as healthy:
+@@ -40,7 +43,7 @@
+ 
+     class Handler(BaseHTTPRequestHandler):
+         def reply(self, body):
+-            data = json.dumps(body).encode()
++            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+             self.send_response(200)
+             self.send_header('Content-Length', str(len(data)))
+             self.end_headers()
+@@ -74,12 +77,28 @@
+     try:
+         results = client.sync_all_once(hub, boards=[('default', broken_path), ('healthy', healthy_path)])
+         assert [r.board for r in results] == ['default', 'healthy']
+-        assert results[0].error is None
+         assert results[1].error is None
+         assert any(method == 'GET' and path.endswith('/default/replay/capability') for method, path in seen)
+-        assert any(method == 'POST' and path.endswith('/default/ops') for method, path in seen)
++        assert any('/default/changes?' in path for _method, path in seen)
+         assert any('/healthy/' in path for _method, path in seen)
+-        assert conn.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] == 0
++        if isinstance(capability, bytes):
++            assert results[0].error
++            assert 'HubError' in results[0].error and 'invalid JSON response' in results[0].error
++            assert not any(method == 'POST' for method, _path in seen)
++            retained = [dict(row) for row in conn.execute('SELECT * FROM kanban_sync_outbox')]
++            assert len(retained) == len(custody)
++            for before, after in zip(custody, retained):
++                # Legacy freezing and failure diagnostics legitimately advance;
++                # source identity, payload and pending disposition do not.
++                for key in before.keys() - {'wire_json', 'attempts', 'last_error'}:
++                    assert after[key] == before[key], key
++                assert after['attempts'] > before['attempts']
++                assert 'invalid JSON response' in after['last_error']
++
++        else:
++            assert results[0].error is None
++            assert any(method == 'POST' and path.endswith('/default/ops') for method, path in seen)
++            assert conn.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] == 0
+     finally:
+         hub.close()
+         server.shutdown()
+diff --git a/tests/hermes_cli/test_kanban_replay_raw_replies.py b/tests/hermes_cli/test_kanban_replay_raw_replies.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..92c3a9a794e649c9ba799af12cf546fd0f7a7ef7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_raw_replies.py
+@@ -0,0 +1,118 @@
++"""Raw JSON/encoding failures are typed transport failures, never replayed.
++
++Exercise both HTTP implementations and the real multi-board strict sender.
++"""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli.test_kanban_replay_http_session import AckReceiver, serving
++
++live = helpers.live
++
++
++@pytest.mark.parametrize('proxied', [False, True])
++@pytest.mark.parametrize('raw', [b'{', b'\xff', b'{}'])
++@pytest.mark.parametrize('method', ['GET', 'POST'])
++def test_response_decode_failure_is_typed_and_not_retried(live, monkeypatch, proxied, raw, method):
++    monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
++    with serving(live, AckReceiver(), encode_reply=lambda path, reply: raw) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'macbook'))
++        try:
++            if raw == b'{}':
++                assert hub._call(method, '/v2/boards/default/replay/capability') == {}
++            else:
++                with pytest.raises(client.HubError, match='invalid JSON response') as caught:
++                    hub._call(method, '/v2/boards/default/replay/capability')
++                assert caught.value.status == 502
++                assert isinstance(caught.value.__cause__, (json.JSONDecodeError, UnicodeDecodeError))
++            assert len(requests) == 1
++        finally:
++            hub.close()
++
++
++@pytest.mark.parametrize('proxied', [False, True])
++@pytest.mark.parametrize('raw', [b'{', b'\xff'])
++@pytest.mark.parametrize('endpoint', ['capability', 'inspect', 'session'])
++def test_strict_raw_reply_preserves_custody_and_other_board_progress(live, tmp_path, monkeypatch,
++                                                                   proxied, raw, endpoint):
++    monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
++    kb.create_task(live, title='strict raw reply', assignee='worker')
++    broken_path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    custody = [row[0] for row in live.execute('SELECT op_id FROM kanban_sync_outbox ORDER BY op_id')]
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++    peer = AckReceiver()
++    original = peer._call
++
++    def route(method, path, body=None):
++        if '/changes?' in path:
++            return dict(changes=[], next=0, head=0, more=False)
++        return original(method, path, body)
++
++    def encode(path, reply):
++        return raw if path.endswith('/replay/' + endpoint) else json.dumps(reply).encode()
++
++    peer._call = route
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    with serving(live, peer, encode_reply=encode) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'macbook'))
++        try:
++            results = client.sync_all_once(hub, boards=[('default', broken_path), ('healthy', healthy_path)])
++            assert [result.board for result in results] == ['default', 'healthy']
++            assert results[0].error and 'HubError' in results[0].error
++            assert 'invalid JSON response' in results[0].error
++            assert results[1].error is None
++            assert any('/default/changes?' in path for _, path, _, _ in requests)
++            assert any('/healthy/changes?' in path for _, path, _, _ in requests)
++            assert [row[0] for row in live.execute(
++                'SELECT op_id FROM kanban_sync_outbox ORDER BY op_id')] == custody
++        finally:
++            hub.close()
++
++
++@pytest.mark.parametrize('proxied', [False, True])
++@pytest.mark.parametrize('raw', [b'{', b'\xff'])
++@pytest.mark.parametrize('endpoint', ['ops', 'ack'])
++def test_strict_mutation_decode_failure_keeps_durable_progress(live, monkeypatch, proxied, raw, endpoint):
++    monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
++    kb.create_task(live, title='strict unreadable mutation reply', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name != 'tasks'")
++    peer = AckReceiver()
++    broken = [True]
++
++    def encode(path, reply):
++        return raw if broken[0] and path.endswith('/replay/' + endpoint) else json.dumps(reply).encode()
++
++    with serving(live, peer, encode_reply=encode) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'macbook'))
++        try:
++            with pytest.raises(client.HubError, match='invalid JSON response'):
++                client.push(live, hub, 'default', 'macbook', primary=False)
++            assert sum(path.endswith('/replay/' + endpoint) for _, path, _, _ in requests) == 1
++            if endpoint == 'ops':
++                assert journal.pending_wire(live) is not None
++                assert live.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] > 0
++            else:
++                assert journal.snapshot(live)['settled'] == '1'
++            # Reconciliation may observe the already-applied mutation/ACK; it
++            # must not re-send that operation after the unreadable answer.
++            broken[0] = False
++            client.push(live, hub, 'default', 'macbook', primary=False)
++            assert sum(path.endswith('/replay/ops') for _, path, _, _ in requests) == 1
++            assert journal.pending_wire(live) is None
++            assert journal.snapshot(live)['settled'] == '1'
++        finally:
++            hub.close()
+-- 
+2.43.0
+

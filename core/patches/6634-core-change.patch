@@ -1,0 +1,97 @@
+From f583625e2dd97bd1881acdf89fbb8e64aaa2d2d6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:45:33 +0000
+Subject: [PATCH 6634] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit f583625e2dd97bd1881acdf89fbb8e64aaa2d2d6.
+
+---
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 635d4d7241aeb5883dadc13f3f1d76f6aa4b84d4..7b4781fc7d135400a5d77e8d898d18673a62b3c5 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -178,7 +178,10 @@
+     the payload, so they are ranked on a narrow read and never fetched whole (4.2k of the hub's 4.4k
+     rows: parsing them was half of every board read). Same order as the done column below:
+     completed_at DESC NULLS LAST, id DESC, on the values Task.from_row parses."""
+-    done = kanban_db.list_task_rows(conn, status="done", columns="rowid AS _rowid, id, completed_at", **filters)
++    # This prepass re-ranks by normalized completion below; dispatcher priority
++    # order only adds recursive dependency walks over the entire done history.
++    done = kanban_db.list_task_rows(conn, status="done", columns="rowid AS _rowid, id, completed_at",
++                                   order_by="completed-desc", **filters)
+     done_cap = int(done_limit or 0)
+     done_ids = frozenset(kanban_db._lossy_text(r["id"]) for r in done)
+     if not 0 < done_cap < len(done):
+diff --git a/tests/plugins/test_kanban_done_selector_cost.py b/tests/plugins/test_kanban_done_selector_cost.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7da342d51eb09e8eba10bd7e3859c8a0b7f5ef4
+--- /dev/null
++++ b/tests/plugins/test_kanban_done_selector_cost.py
+@@ -0,0 +1,64 @@
++"""The done-window prepass must not traverse dispatcher dependency graphs."""
++import sqlite3
++from unittest import mock
++
++import pytest
++
++from plugins.kanban.dashboard import board_read
++
++
++@pytest.fixture
++def history():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript("""
++        CREATE TABLE tasks(id TEXT PRIMARY KEY, status TEXT, priority INTEGER,
++            created_at INTEGER, completed_at, tenant TEXT, workflow_template_id TEXT,
++            current_step_key TEXT);
++        CREATE TABLE task_links(parent_id TEXT, child_id TEXT);
++        CREATE INDEX links_parent ON task_links(parent_id);
++    """)
++    stamps = (100, 200, None, "2026-01-01T00:00:00", "bad", b"300", 200.75)
++    conn.executemany("INSERT INTO tasks VALUES (?, 'done', ?, ?, ?, ?, 'flow', 'step')", [
++        (f"d{i:04}", i % 10, i, stamps[i % len(stamps)], "one" if i % 2 else "two")
++        for i in range(1000)])
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, 999, 0, NULL, 'one', 'flow', 'step')", [
++        ("waiter", "ready"), ("leaf", "blocked"), ("archived", "archived")])
++    conn.executemany("INSERT INTO task_links VALUES (?, 'waiter')", [(f"d{i:04}",) for i in range(1000)])
++    conn.execute("INSERT INTO task_links VALUES ('waiter', 'leaf')")
++    conn.commit()
++    yield conn
++    conn.close()
++
++
++@pytest.mark.parametrize("cap", [0, 3, 10000])
++@pytest.mark.parametrize("tenant", [None, "one", "absent"])
++def test_done_window_keeps_normalized_ranking_without_dispatch_graph(history, cap, tenant):
++    filters = dict(tenant=tenant, include_archived=False,
++                   workflow_template_id="flow", current_step_key="step")
++    real = board_read.kanban_db.list_task_rows
++
++    def legacy(*args, **kwargs):
++        kwargs.pop("order_by", None)
++        return real(*args, **kwargs)
++
++    with mock.patch.object(board_read.kanban_db, "list_task_rows", side_effect=legacy):
++        expected = board_read._done_state(history, filters, cap)
++    recursive = []
++
++    def authorize(action, _a, _b, _database, _trigger):
++        if action == sqlite3.SQLITE_RECURSIVE:
++            recursive.append(action)
++        return sqlite3.SQLITE_OK
++
++    history.set_authorizer(authorize)
++    actual = board_read._done_state(history, filters, cap)
++    history.set_authorizer(None)
++    assert actual == expected
++    assert not recursive, "done-window ranking traversed the discarded dispatcher dependency order"
++    if tenant != "absent" and cap == 3:
++        assert actual[2] == (1000 if tenant is None else 500)
++        assert len(actual[1]) == 3
++        # ISO time outranks numeric, malformed and NULL stamps after Python coercion.
++        assert all(row[0] == "2026-01-01T00:00:00" for row in history.execute(
++            f"SELECT completed_at FROM tasks WHERE rowid IN ({','.join('?' * 3)})", actual[1]))
+-- 
+2.43.0
+

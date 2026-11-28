@@ -1,0 +1,1068 @@
+From 93262b338b307b70a09fc8e8cbd115faa1f03bb4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:30:02 +0000
+Subject: [PATCH 6624] Annotation holder counts custody and read sharing
+
+Public mirror of source commit 93262b338b307b70a09fc8e8cbd115faa1f03bb4.
+
+---
+diff --git a/hermes_cli/kanban_annotation_counts.py b/hermes_cli/kanban_annotation_counts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ed26e1bbc77d11a0f92184c79369b04032e0fa48
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_counts.py
+@@ -0,0 +1,127 @@
++"""Holder-only counts with source-owned age; never publish reuse as a new exact read. [daveey]"""
++from __future__ import annotations
++
++import copy
++import threading
++from dataclasses import dataclass
++
++from hermes_cli.kanban_counts_scopes import CountSnapshot
++
++MAX_SCOPES = 64
++_entries: dict[tuple, Source] = {}
++_use = threading.local()
++
++
++@dataclass(frozen=True)
++class Source:
++    snapshot: CountSnapshot
++    key: object
++    mono: float
++    wall: float
++    raw: tuple
++    token: object
++
++
++def _detach(value):
++    return CountSnapshot(copy.deepcopy(tuple(value)), copy.deepcopy(value.execution))
++
++
++def read_at(scope):
++    source = _entries.get(scope)
++    return None if source is None else source.mono
++
++
++def needs_read(scope):
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_session_activity as ksa
++
++    source = _entries.get(scope)
++    return (source is None or not 0 <= ksa.time.monotonic() - source.mono < host.STRICT_REFRESH_AGE_S
++            or source.wall > ksa.time.time() or source.token != host._mutation.current(scope))
++
++
++def begin(scope, keys):
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_session_activity as ksa
++
++    clear_use()
++    _use.scope, _use.keys = scope, keys
++    _use.started, _use.token = ksa.time.monotonic(), host._mutation.current(scope)
++
++
++def clear_use():
++    _use.scope, _use.keys, _use.source, _use.reused = None, None, None, False
++    _use.started, _use.token = None, None
++
++
++def reused():
++    return bool(getattr(_use, 'reused', False))
++
++
++def observed_at(default):
++    source = getattr(_use, 'source', None)
++    return min(default, source.wall) if source is not None else default
++
++
++def _valid(keys):
++    receipt = getattr(keys, 'receipt', None)
++    return keys is not None and (receipt is None or receipt.valid())
++
++
++def read(reader):
++    from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_annotation_parts as parts
++    from hermes_cli import kanban_session_activity as ksa
++
++    scope = ksa._origin_scope()
++    if getattr(ksa._revalidate.force_read, 'scope', None) != scope:
++        return reader()
++    keys = getattr(_use, 'keys', None) if getattr(_use, 'scope', None) == scope else None
++    source = _entries.get(scope)
++    now, wall = ksa.time.monotonic(), ksa.time.time()
++    token = host._mutation.current(scope)
++    if (source is not None and not ksa._revalidate.forced(scope, parts.COUNTS)
++            and keys is not None and _valid(keys) and keys[parts.COUNTS] == source.key and token == source.token
++            and 0 <= now - source.mono < host.STRICT_REFRESH_AGE_S and source.wall <= wall):
++        value = _detach(source.snapshot)
++        if _valid(keys):
++            _use.source, _use.reused = source, True
++            return value
++    # An unforced/missing/expired receipt cannot borrow the request cache's age.
++    forced = ksa._revalidate.force_read.parts
++    content_only = ksa._revalidate.force_read.content_only_boards
++    if needs_read(scope):
++        ksa._revalidate.force_read.content_only_boards = False
++    ksa._revalidate.force_read.parts = frozenset(forced or ()) | {parts.COUNTS}
++    started = wall
++    try:
++        value = reader()
++    finally:
++        ksa._revalidate.force_read.parts = forced
++        ksa._revalidate.force_read.content_only_boards = content_only
++    _entries.pop(scope, None)
++    raw = getattr(value, 'source', None)
++    started_mono = getattr(_use, 'started', None)
++    if (raw is not None and raw[0] == scope and raw[3] and keys is not None and _valid(keys)
++            and started_mono is not None and raw[1] >= started_mono
++            and token == getattr(_use, 'token', None)):
++        age = ksa.time.monotonic() - raw[1]
++        source_wall = min(started, ksa.time.time() - age)
++        if age >= 0 and source_wall <= ksa.time.time():
++            source = Source(_detach(value), keys[parts.COUNTS], raw[1], source_wall, raw, token)
++            while len(_entries) >= MAX_SCOPES:
++                evicted = next(iter(_entries))
++                failed(evicted)
++                parts._seen.pop(evicted, None)
++            _entries[scope] = source
++            _use.source = source
++    return value
++
++
++def failed(scope):
++    _entries.pop(scope, None)
++
++
++def reset():
++    _entries.clear()
++    clear_use()
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 3cb73f73961573163c0dbacf3d96d9b218a9c14a..8c0b54ae43ae5d4c1eb406924ab279fa45045f27 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -360,7 +360,9 @@
+     attention, frozen. Every helper is looked up on that module (tests replace them there)."""
+     from hermes_cli import kanban_session_activity as _ksa
+ 
+-    snapshot = _parts.measured(_parts.COUNTS, lambda: _ksa._all_counts(include_snapshot=True))
++    from hermes_cli import kanban_annotation_counts as counts
++
++    snapshot = _parts.measured(_parts.COUNTS, lambda: counts.read(lambda: _ksa._all_counts(include_snapshot=True)))
+     active, blocked, unseen, remote_stale, waiting, parked, held, stalled, remote_keys = snapshot[:9]
+     execution = getattr(snapshot, "execution", {})
+     extra = _parts.measured(_parts.WAITING, lambda: _parts.waiting(_ksa._extra_waiting))
+@@ -383,6 +385,32 @@
+     return frozen
+ 
+ 
++def refresh_locked(scope: tuple[str, ...], read_at: float | None = None) -> tuple:
++    """Read and publish under the caller's annotation lock, retaining count-source age."""
++    from hermes_cli import kanban_annotation_counts as holder_counts
++    from hermes_cli import kanban_session_activity as ksa
++
++    ksa._annotate_flight_scope, ksa._annotate_flight_result = scope, None
++    read_at = ksa.time.time() if read_at is None else read_at
++    prepared = prepare(scope)
++    try:
++        if getattr(ksa._revalidate.force_read, 'scope', None) != scope:
++            holder_counts.clear_use()
++        try:
++            value = ksa._read_annotation_parts()
++        finally:
++            finish(scope)
++        ksa._bounded.record(scope, value, holder_counts.observed_at(read_at))
++        ksa._last_annotation[scope] = value
++        ksa._annotate_flight_result = value
++        if not holder_counts.reused():
++            ksa._annotation_copy.published(scope, value)
++        publish(scope, prepared, value)
++        return value
++    finally:
++        holder_counts.clear_use()
++
++
+ # -- adopt --------------------------------------------------------------------------------------------------------
+ 
+ def waiting_identity() -> tuple[list, bool]:
+@@ -546,6 +574,10 @@
+     fingerprint and revalidatable. ``read_at`` = when those counts were read (never the later wall time)."""
+     from hermes_cli import kanban_session_activity as _ksa
+ 
++    from hermes_cli import kanban_annotation_counts as counts
++
++    if counts.reused():
++        return False  # retained counts cannot acknowledge a new raw fingerprint or mutation token
+     if prepared is None or prepared[2] is None:
+         return False
+     full, wall, (digest, _complete), token, display_identity, narrow, watch = prepared
+@@ -713,8 +745,11 @@
+             # counts are also read once their last read is ``STRICT_REFRESH_AGE_S`` old, so the published
+             # ``read_at`` is renewed before exact adopters drop the copy at ``_COUNTS_MAX_AGE_S``.
+             # The age is this scope's own: the active count slot belongs to whichever scope was read last.
+-            with _ksa._cache_lock:
+-                read_at = _ksa._count_scopes.read_at_locked(scope)
++            from hermes_cli import kanban_annotation_counts as counts
++            read_at = counts.read_at(scope)
++            if read_at is None:
++                with _ksa._cache_lock:
++                    read_at = _ksa._count_scopes.read_at_locked(scope)
+             if lost:
+                 _parts.failed(scope)
+             clock = len(_holder_ctx.deadlines) != len(pending)
+@@ -747,6 +782,7 @@
+                 _event_ready.add(scope)
+                 return min(_clock_deadlines[scope], default=None)
+             finally:
++                counts.clear_use()
+                 _holder_ctx.deadlines = None
+                 _ksa._revalidate.force_read.scope = None
+                 _ksa._revalidate.force_read.parts = None
+diff --git a/hermes_cli/kanban_annotation_hub_key.py b/hermes_cli/kanban_annotation_hub_key.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..636a7a6740b00d5be259b7fac29fe08edf00d93b
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_hub_key.py
+@@ -0,0 +1,134 @@
++"""Outer annotation-only heartbeat equivalence with whole-pass commit custody.
++
++Inner authoritative fingerprints remain literal. Any replica commit across a
++read refuses certification, including unrelated/session commits. This deliberately
++conservative fence must not be replaced by semantic endpoint equality.
++"""
++from __future__ import annotations
++
++import json
++import math
++import sqlite3
++import time
++from dataclasses import dataclass
++from pathlib import Path
++
++from hermes_cli import kanban_scope_heartbeat as hb
++from hermes_cli.kanban_annotation_reader import _file_fence
++
++
++def _stamp(conn, path):
++    if conn.in_transaction:
++        raise ValueError('publication fence requires an unpinned connection')
++    return (_file_fence(path), conn.execute('PRAGMA data_version').fetchone()[0],
++            conn.total_changes, conn.execute('PRAGMA schema_version').fetchone()[0])
++
++
++@dataclass(frozen=True)
++class Receipt:
++    path: Path
++    conn: sqlite3.Connection
++    stamp: tuple
++
++    def valid(self):
++        from hermes_cli import kanban_session_activity as ksa
++
++        try:
++            with ksa.cached_ro(self.path, busy_budget=0) as conn:
++                return conn is self.conn and _stamp(conn, self.path) == self.stamp
++        except (sqlite3.Error, OSError, ValueError):
++            return False
++
++
++def _unique(pairs):
++    value = {}
++    for key, item in pairs:
++        if key in value:
++            raise ValueError('duplicate JSON member')
++        value[key] = item
++    return value
++
++
++def _gateway(gw, key, seq, raw, now):
++    literal = ('literal', gw, key, seq, raw)
++    if key != 'info':
++        return literal
++    try:
++        info = json.loads(raw, object_pairs_hook=_unique)
++        if not isinstance(info, dict) or info.get('gateway') != gw:
++            return literal
++        scopes = info.get('task_scopes')
++        if not isinstance(scopes, list):
++            return literal
++        identities = [(s.get('profile'), s.get('board')) for s in scopes if isinstance(s, dict)
++                      and isinstance(s.get('profile'), str) and isinstance(s.get('board'), str)]
++        counts = {ident: identities.count(ident) for ident in identities}
++        # Typed outer structure makes a normalized leaf unlike any literal JSON value.
++        normalized = []
++        changed = False
++        for scope in scopes:
++            if not isinstance(scope, dict):
++                normalized.append(('literal', scope))
++                continue
++            ident = scope.get('profile'), scope.get('board')
++            eligible = (isinstance(ident[0], str) and isinstance(ident[1], str)
++                        and counts.get(ident) == 1 and scope.get('state') == 'ok'
++                        and hb.fresh(scope.get('observed_at'), now, hb.scope_window(info)))
++            normalized.append(('fresh', {k: v for k, v in scope.items() if k != 'observed_at'})
++                              if eligible else ('literal', scope))
++            changed |= eligible
++        if not changed:
++            return literal
++        outer = {k: v for k, v in info.items() if k != 'task_scopes'}
++        return ('normalized', gw, key, json.dumps([outer, normalized], sort_keys=True, allow_nan=False,
++                                                separators=(',', ':')))
++    except (TypeError, ValueError, OverflowError, RecursionError):
++        return literal
++
++
++def _counts_meta(rows, now):
++    """Counts discard raw sync provenance; Cards/links emphatically do not.
++
++    Keep unknown metadata literal. These known pull/staging counters are not
++    selected by either remote projection. Preserve both readers' freshness
++    semantics by normalizing ONLY their joint finite, nonfuture fresh region,
++    with no offline row. Existing clock deadlines and renewal remain owned by
++    actual reads, never refreshed by this probe.
++    """
++    bookkeeping = {'cursor', 'head', 'watch_last_event'}
++    offline = any(row[0] == 'offline_since' for row in rows)
++    out = []
++    for key, kind, value in rows:
++        if key in bookkeeping or key.startswith('staged_at:'):
++            continue
++        if key == 'last_ok' and not offline and kind in ('text', 'real', 'integer'):
++            try:
++                last_ok = float(value)
++                if math.isfinite(last_ok) and last_ok > 0 and 0 <= now - last_ok <= 180:
++                    out.append(('counts-fresh-last-ok',))
++                    continue
++            except (TypeError, ValueError, OverflowError):
++                pass
++        out.append(('literal', key, kind, value))
++    return tuple(out)
++
++
++def capture(path: Path, now: float | None = None):
++    """One semantic snapshot and its original raw receipt; never bless a later stamp."""
++    from hermes_cli import kanban_session_activity as ksa
++
++    now = time.time() if now is None else now
++    with ksa.cached_ro(path, busy_budget=0) as conn:
++        start = _stamp(conn, path)
++        conn.execute('BEGIN')
++        try:
++            tasks = tuple(tuple(r) for r in conn.execute(
++                "SELECT coll,COUNT(*),MAX(seq),TOTAL(seq) FROM replica WHERE coll='tasks' GROUP BY coll"))
++            gateways = tuple(_gateway(*r, now) for r in conn.execute(
++                "SELECT gw,key,seq,data FROM replica WHERE coll='gateway' ORDER BY gw,key"))
++            meta = tuple(tuple(r) for r in conn.execute("SELECT k,typeof(v),v FROM meta ORDER BY k"))
++        finally:
++            conn.rollback()
++        if _stamp(conn, path) != start:
++            raise ValueError('replica changed while acquiring annotation key')
++        return (str(path), start[0], tasks, gateways, _counts_meta(meta, now)), Receipt(path, conn, start)
+diff --git a/hermes_cli/kanban_annotation_parts.py b/hermes_cli/kanban_annotation_parts.py
+index 05e5808f988aa4481cce9f071f1e3dc4b336fb05..d0753c0ad1dffed2985363b254f8d90daf4c5a5a 100644
+--- a/hermes_cli/kanban_annotation_parts.py
++++ b/hermes_cli/kanban_annotation_parts.py
+@@ -97,6 +97,9 @@
+     dbs, files = host._watch_paths(scope)
+     discovery, _dirs = host._discovery_paths()
+     keyed = {str(p) for p in ksa._board_db_paths()} | {str(p) for p in ksa._replica_paths()}
++    hub = ksa._hub_db_path()
++    if hub is not None:
++        keyed.add(str(hub))  # covered by the transactional hub key, including literal metadata
+     from hermes_cli import kanban_annotation_lineage as lineage
+     from hermes_constants import get_hermes_home
+ 
+@@ -152,6 +155,12 @@
+     return values + ((ksa._hub_content_signature(hub),) if hub is not None else ())
+ 
+ 
++class _Keys(dict):
++    """The raw receipt is publication custody, not part of semantic equality."""
++
++    receipt: object = None
++
++
+ def keys(scope: tuple[str, ...]) -> dict[str, object] | None:
+     """One key per part, read now in ``scope``'s context; None when the inputs cannot be vouched for."""
+     from hermes_cli import kanban_session_activity as ksa
+@@ -159,15 +168,22 @@
+ 
+     wall = time.time()
+     local = [(str(p), revision.content_keys(p)) for p in ksa._board_db_paths()]
++    from hermes_cli import kanban_annotation_hub_key as hub_key_reader
++
+     hub = ksa._hub_db_path()
+-    hub_key = (ksa._hub_content_signature(hub),) if hub is not None else ()
+-    fingerprints = {part: tuple((path, values[part]) for path, values in local) + hub_key
++    hub_value, receipt = hub_key_reader.capture(hub, wall) if hub is not None else (None, None)
++    hub_key = (hub_value,) if hub is not None else ()
++    raw_hub = (ksa._hub_content_signature(hub),) if hub is not None else ()
++    fingerprints = {part: tuple((path, values[part]) for path, values in local)
++                    + (hub_key if part == COUNTS else raw_hub)
+                     for part in (COUNTS, LINKS, ATTENTION)}
+     shadows = _part_fingerprint(COUNTS, shadows=True)
+     ledger = ksa._origin_ledger_fingerprint()
+     plain = _plain_key(scope)
+-    return {COUNTS: (fingerprints[COUNTS], shadows, ledger, plain), LINKS: (fingerprints[LINKS], ledger),
+-            ATTENTION: (fingerprints[ATTENTION], _done_key(scope, wall)), WAITING: _waiting_key()}
++    result = _Keys({COUNTS: (fingerprints[COUNTS], shadows, ledger, plain), LINKS: (fingerprints[LINKS], ledger),
++                    ATTENTION: (fingerprints[ATTENTION], _done_key(scope, wall)), WAITING: _waiting_key()})
++    result.receipt = receipt
++    return result
+ 
+ 
+ def plan(scope: tuple[str, ...], *, clock: bool, renew: bool = False) -> tuple[frozenset, dict[str, object] | None]:
+@@ -180,6 +196,10 @@
+     except Exception:  # health: allow BLE001 -- an unreadable key is a change: every part reads
+         log.debug("kanban annotation part keys unavailable", exc_info=True)
+         now = None
++    from hermes_cli import kanban_annotation_counts as counts
++
++    counts.begin(scope, now)
++    renew = renew or counts.needs_read(scope)
+     before = _seen.get(scope)
+     if clock or now is None or before is None:
+         return ALL, now
+@@ -190,6 +210,10 @@
+ def done(scope: tuple[str, ...], now: dict[str, object] | None) -> None:
+     """The read planned with ``now`` completed: its forced parts answered those keys."""
+     _seen.pop(scope, None)
++    receipt = getattr(now, 'receipt', None)
++    if receipt is not None and not receipt.valid():
++        failed(scope)
++        return  # a racing result cannot authorize heartbeat-normalized suppression
+     if now is not None:
+         while len(_seen) >= _MAX_SCOPES:
+             del _seen[next(iter(_seen))]
+@@ -200,6 +224,8 @@
+     """A holder read of ``scope`` raised: nothing is vouched for."""
+     _seen.pop(scope, None)
+     _waiting.pop(scope, None)
++    from hermes_cli import kanban_annotation_counts as counts
++    counts.failed(scope)
+ 
+ 
+ def measured(part: str, read):
+@@ -219,3 +245,5 @@
+ def reset() -> None:
+     _seen.clear()
+     _waiting.clear()
++    from hermes_cli import kanban_annotation_counts as counts
++    counts.reset()
+diff --git a/hermes_cli/kanban_counts_scopes.py b/hermes_cli/kanban_counts_scopes.py
+index d5dee57d571652ff7244abab8e2a877ac2df05fb..b1b119948c7cf04c2fb2c9d603c55540ad800030 100644
+--- a/hermes_cli/kanban_counts_scopes.py
++++ b/hermes_cli/kanban_counts_scopes.py
+@@ -17,6 +17,7 @@
+ class CountSnapshot(tuple):
+     """Keep the legacy nine-part read shape, with evidence bound to that generation."""
+     execution: dict
++    source: tuple | None = None
+ 
+     def __new__(cls, values, execution):
+         snapshot = super().__new__(cls, values)
+@@ -79,9 +80,13 @@
+     counts = ksa._cache[1:5]
+     if include_snapshot:
+         parked, held = ksa._parked_cache[0]
+-        return CountSnapshot((*counts, dict(ksa._waiting_cache[0]), parked, held, ksa._stalled_cache[0],
+-                              ksa._identity.merge_keys(ksa._remote_keys_cache[0], ksa._local_keys_cache[0])),
+-                             ksa._execution_cache[0])
++        snapshot = CountSnapshot((*counts, dict(ksa._waiting_cache[0]), parked, held, ksa._stalled_cache[0],
++                                  ksa._identity.merge_keys(ksa._remote_keys_cache[0], ksa._local_keys_cache[0])),
++                                 ksa._execution_cache[0])
++        # Source custody is captured under the same lock as the returned maps.
++        snapshot.source = (ksa._cache_scope, ksa._cache_read_at, ksa._cache_fingerprint,
++                           ksa._cache_revalidatable, ksa._cache_generation)
++        return snapshot
+     return (*counts, dict(ksa._waiting_cache[0])) if include_waiting else counts
+ 
+ 
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index e5043fa690cfdb7d6b6366a0b742f05ceef401b0..68512855420c9ec62fc4923778667722e0d3f2d2 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1770,21 +1770,7 @@
+ @_la.accounted("annotation.refresh")
+ def _refresh_annotation_locked(scope: tuple[str, ...], read_at: float | None = None) -> tuple:
+     """Read this scope's parts and publish them. Caller holds ``_annotate_refresh_lock``."""
+-    global _annotate_flight_scope, _annotate_flight_result
+-    _annotate_flight_scope = scope
+-    _annotate_flight_result = None
+-    read_at = time.time() if read_at is None else read_at
+-    prepared = _host_copy.prepare(scope)  # [daveey] the inputs this read answers, for the host copy
+-    try:
+-        parts = _read_annotation_parts()
+-    finally:
+-        _host_copy.finish(scope)
+-    _bounded.record(scope, parts, read_at)
+-    _last_annotation[scope] = parts
+-    _annotate_flight_result = parts
+-    _annotation_copy.published(scope, parts)  # [daveey] a restart serves it while its first read runs
+-    _host_copy.publish(scope, prepared, parts)  # other processes adopt it instead of reading again
+-    return parts
++    return _host_copy.refresh_locked(scope, read_at)
+ 
+ 
+ @_la.accounted("annotation.poll")
+diff --git a/tests/hermes_cli/test_annotation_counts_custody.py b/tests/hermes_cli/test_annotation_counts_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ca41a72497df1d8235372578563187d9b18632d
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_counts_custody.py
+@@ -0,0 +1,216 @@
++"""Own-source holder receipts: request generations cannot renew retained evidence."""
++from __future__ import annotations
++
++import copy
++import time
++from dataclasses import replace
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_annotation_counts as counts
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_annotation_parts as holders
++
++world = holders.world
++
++
++@pytest.fixture
++def clock(world, monkeypatch):
++    wall, mono = time.time(), time.monotonic()
++    state = {'offset': 0.0}
++    fake = SimpleNamespace(time=lambda: wall + state['offset'], monotonic=lambda: mono + state['offset'])
++    monkeypatch.setattr(ksa, 'time', fake)
++    monkeypatch.setattr(host, 'time', fake)
++    monkeypatch.setattr(parts, 'time', fake)
++    original = host._inputs_now
++    def inputs(scope):
++        local, full, _wall, fp = original(scope)
++        return local, full, fake.time(), fp
++    monkeypatch.setattr(host, '_inputs_now', inputs)
++    return state, fake
++
++
++def test_requests_cannot_extend_own_source_renewal(world, clock, monkeypatch):
++    state, fake = clock
++    saved = []
++    monkeypatch.setattr(host._disk, 'save_host', lambda scope, digest, at, value, **kw: saved.append((at, value)) or True)
++    holders._refresh()
++    first = counts._entries[holders.SCOPE]
++    assert first.snapshot.execution and saved
++    for delta in (31.0, 62.0, 93.0):
++        state['offset'] = delta
++        with ksa._annotate_refresh_lock:
++            ksa._refresh_annotation_locked(holders.SCOPE)
++        shared_generation = ksa._cache_generation
++        old_reads = world.counts
++        world.declared.write_text(str(delta))
++        holders._refresh()
++        source = counts._entries[holders.SCOPE]
++        assert source.mono == fake.monotonic()
++        assert source.raw[4] > shared_generation
++        assert world.counts == old_reads + 1
++        assert saved[-1][0] == pytest.approx(fake.time())
++        assert ksa._bounded.read_at(holders._published()) == pytest.approx(source.wall)
++    assert counts._entries[holders.SCOPE].mono - first.mono == 93.0
++
++
++def test_reuse_never_restamps_exact_restart_or_local_source(world, clock, monkeypatch):
++    state, _ = clock
++    saved, restarted = [], []
++    monkeypatch.setattr(host._disk, 'save_host', lambda *a, **kw: saved.append((a, kw)) or True)
++    monkeypatch.setattr(ksa._annotation_copy, 'published', lambda *a: restarted.append(a))
++    holders._refresh()
++    source = counts._entries[holders.SCOPE]
++    original_execution = copy.deepcopy(source.snapshot.execution)
++    assert original_execution
++    # An ordinary request changes neither holder custody nor its source date.
++    state['offset'] = 5.0
++    with ksa._annotate_refresh_lock:
++        ksa._refresh_annotation_locked(holders.SCOPE)
++    assert counts._entries[holders.SCOPE] is source
++    saved.clear()
++    restarted.clear()
++    world.flagged = False
++    world.declared.write_text('attention-only')
++    before = world.counts
++    holders._refresh()
++    result = holders._published()
++    assert world.counts == before and result[10] == {}
++    assert result[11] == original_execution
++    assert counts._entries[holders.SCOPE] is source
++    assert ksa._bounded.read_at(result) == source.wall
++    assert saved == [] and restarted == []
++    assert not counts.reused(), 'per-read custody leaked beyond refresh finally'
++
++
++def test_detached_full_snapshot_and_execution_do_not_alias_requests(world):
++    holders._refresh()
++    source = counts._entries[holders.SCOPE]
++    assert source.snapshot.execution
++    original = copy.deepcopy(source.snapshot.execution)
++    ksa._execution_cache[0].clear()
++    assert source.snapshot.execution == original
++    assert source.snapshot.execution is not ksa._execution_cache[0]
++    # Mutating a returned detached object cannot change the next use.
++    forced, _keys = parts.plan(holders.SCOPE, clock=False)
++    ksa._revalidate.force_read.scope = holders.SCOPE
++    ksa._revalidate.force_read.parts = forced
++    try:
++        value = counts.read(lambda: pytest.fail('unexpected actual read'))
++        assert tuple(value) == tuple(source.snapshot) and value.execution == original
++        value.execution.clear()
++        again = counts.read(lambda: pytest.fail('unexpected actual read'))
++        assert again.execution == original
++    finally:
++        ksa._revalidate.force_read.scope = None
++        ksa._revalidate.force_read.parts = None
++        counts.clear_use()
++
++
++@pytest.mark.parametrize('operation', ['failed', 'reset', 'evicted', 'incomplete'])
++def test_missing_or_failed_receipt_forces_even_without_other_changes(world, operation):
++    holders._refresh()
++    before = world.counts
++    if operation == 'failed':
++        parts.failed(holders.SCOPE)
++    elif operation == 'reset':
++        counts.reset()
++    elif operation == 'evicted':
++        counts._entries.pop(holders.SCOPE)
++    else:
++        counts._entries.pop(holders.SCOPE)
++        ksa._cache_revalidatable = False
++    holders._refresh()
++    assert world.counts == before + 1
++    assert holders.SCOPE in counts._entries
++
++
++@pytest.mark.parametrize('kind', ['mono-backward', 'wall-backward', 'mutation', 'deadline', 'lost'])
++def test_invalid_clock_mutation_or_coverage_never_reuses(world, clock, kind):
++    _state, fake = clock
++    holders._refresh()
++    source = counts._entries[holders.SCOPE]
++    actions = {
++        'mono-backward': lambda: counts._entries.update({holders.SCOPE: replace(source, mono=fake.monotonic() + 1)}),
++        'wall-backward': lambda: counts._entries.update({holders.SCOPE: replace(source, wall=fake.time() + 1)}),
++        'mutation': lambda: host._mutation.record(holders.SCOPE),
++        'deadline': lambda: host._clock_deadlines.update({holders.SCOPE: [fake.time() - 1]}),
++        'lost': lambda: None,
++    }
++    actions[kind]()
++    before = world.counts
++    if kind == 'lost':
++        host._event_refresh(SimpleNamespace(replace=lambda *a, **kw: None, coverage_lost=True, control_only=False))
++    else:
++        holders._refresh()
++    assert world.counts == before + 1
++
++
++def test_read_failure_clears_receipt_context_and_later_forces(world, monkeypatch):
++    holders._refresh()
++    before = world.counts
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    original = ksa._all_counts
++    def fail(**kwargs):
++        raise RuntimeError('fixture read failure')
++    monkeypatch.setattr(ksa, '_all_counts', fail)
++    holders._refresh()
++    assert holders.SCOPE not in counts._entries
++    assert not counts.reused() and getattr(counts._use, 'source', None) is None
++    monkeypatch.setattr(ksa, '_all_counts', original)
++    holders._refresh()
++    assert world.counts == before + 1 and holders._published()[0] == {}
++
++
++def test_late_older_request_flight_cannot_certify_new_plan(world, clock, monkeypatch):
++    state, _fake = clock
++    holders._refresh()
++    fields = {name: getattr(ksa, name) for name in ksa._count_scopes._FIELDS}
++    boxes = {name: getattr(ksa, name)[0] for name in ksa._count_scopes._BOXES}
++    state['offset'] = 1.0
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    class LateFlight:
++        def __enter__(self):
++            # A request read A before this plan B but completes publication now.
++            for name, value in fields.items():
++                setattr(ksa, name, value)
++            for name, value in boxes.items():
++                getattr(ksa, name)[0] = value
++            ksa._counts_generation += 1
++            ksa._cache_generation = ksa._counts_generation
++
++        def __exit__(self, *args):
++            return False
++    original = ksa._counts_flight
++    monkeypatch.setattr(ksa, '_counts_flight', LateFlight())
++    holders._refresh()  # actual _all_counts generation-advanced shortcut returns A
++    assert holders._published()[0] == {'s1': 1}, 'fixture did not hit the late-flight shortcut'
++    assert holders.SCOPE not in counts._entries, 'pre-plan A was certified under plan B'
++    monkeypatch.setattr(ksa, '_counts_flight', original)
++    holders._refresh()
++    assert holders._published()[0] == {}
++    assert holders.SCOPE in counts._entries
++
++
++@pytest.mark.parametrize('cause', ['missing', 'mutation', 'future'])
++def test_receipt_driven_read_disables_content_only_board_shortcut(world, clock, monkeypatch, cause):
++    _state, fake = clock
++    holders._refresh()
++    source = counts._entries[holders.SCOPE]
++    actions = {
++        'missing': lambda: counts._entries.pop(holders.SCOPE),
++        'mutation': lambda: host._mutation.record(holders.SCOPE),
++        'future': lambda: counts._entries.update({holders.SCOPE: replace(source, wall=fake.time() + 1)}),
++    }
++    actions[cause]()
++    seen = []
++    original = ksa._recompute_all_counts
++    def read(*args, **kwargs):
++        seen.append(ksa._revalidate.force_read.content_only_boards)
++        return original(*args, **kwargs)
++    monkeypatch.setattr(ksa, '_recompute_all_counts', read)
++    holders._refresh()
++    assert seen == [False]
+diff --git a/tests/hermes_cli/test_annotation_counts_metadata.py b/tests/hermes_cli/test_annotation_counts_metadata.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc10675aa07e1dd24cb0bef432a46947ed896260
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_counts_metadata.py
+@@ -0,0 +1,107 @@
++"""Counts-only metadata equivalence: raw Cards provenance must remain literal."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_hub_key as hk
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_annotation_heartbeat_fence as fence
++from tests.hermes_cli import test_kanban_annotation_parts as holders
++from tests.hermes_cli import test_kanban_replica_read_memo as legacy
++
++world = fence.world
++replica = fence.replica
++hub = legacy.hub
++
++
++@pytest.mark.parametrize('heartbeat', [False, True])
++def test_compound_session_metadata_suppresses_counts_with_real_watch_shape(world, replica, monkeypatch, record_property, heartbeat):
++    path, conn, beat = replica
++    # Compare snapshot values at one instant; fresh reads stamp local observation time.
++    # The existing holder renewal bounds are unchanged by this experiment.
++    legacy.fake_clock(monkeypatch, lambda: 1000.0)
++    import types
++    monkeypatch.setattr(hk, 'time', types.SimpleNamespace(time=lambda: 1000.0))
++    from hermes_cli import kanban_annotation_parts as parts
++    monkeypatch.setattr(parts, 'time', types.SimpleNamespace(time=lambda: 1000.0))
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: path)
++    paths = host._watch_paths
++    monkeypatch.setattr(host, '_watch_paths', lambda scope: ([*paths(scope)[0], str(path)], paths(scope)[1]))
++    conn.execute("INSERT INTO meta VALUES('last_ok',?)", (str(ksa.time.time() - 1),))
++    for key in ['cursor', 'head', 'staged_at:sessions', 'watch_last_event']:
++        conn.execute('INSERT INTO meta VALUES(?,?)', (key, '0'))
++    beat(fence.info(999.0))
++    holders._refresh()
++    expected = holders._published()
++    before = world.counts
++    start = time.thread_time()
++    for index in range(12):
++        conn.execute('BEGIN')
++        conn.execute('INSERT INTO sessions VALUES(?)', (index,))
++        for key in ['cursor', 'head', 'staged_at:sessions', 'watch_last_event']:
++            conn.execute('UPDATE meta SET v=? WHERE k=?', (str(index + 1), key))
++        conn.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(ksa.time.time()),))
++        conn.commit()
++        if heartbeat:
++            beat(fence.info(999.0 + (index + 1) / 100))
++        holders._refresh()
++        assert holders._published() == expected
++    result = {'writes': 12, 'actual_count_reads': world.counts-before, 'cpu_s': time.thread_time()-start}
++    record_property('metadata_work', json.dumps(result))
++    assert world.counts == before, result
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    holders._refresh()
++    assert world.counts == before + 1 and holders._published()[0] == {}
++
++
++@pytest.mark.parametrize('value', ['1001', '819', 'nan', 'inf', 'oops', '', None])
++def test_last_ok_nonfresh_literal_boundary(replica, value):
++    path, conn, _ = replica
++    conn.execute("INSERT INTO meta VALUES('last_ok','999')")
++    first, _ = hk.capture(path, 1000)
++    conn.execute("UPDATE meta SET v=? WHERE k='last_ok'", (value,))
++    assert hk.capture(path, 1000)[0] != first
++
++
++def test_fresh_last_ok_is_counts_equivalent_but_other_meta_is_literal(replica):
++    path, conn, _ = replica
++    conn.execute("INSERT INTO meta VALUES('last_ok','999')")
++    first, receipt = hk.capture(path, 1000)
++    conn.execute("UPDATE meta SET v='1000' WHERE k='last_ok'")
++    assert hk.capture(path, 1000)[0] == first
++    assert not receipt.valid()
++    conn.execute("INSERT INTO meta VALUES('unknown_future_dependency','one')")
++    assert hk.capture(path, 1000)[0] != first
++    conn.execute("DELETE FROM meta WHERE k='unknown_future_dependency'")
++    conn.execute("INSERT INTO meta VALUES('offline_since','0')")
++    assert hk.capture(path, 1000)[0] != first
++
++
++def test_actual_legacy_cards_provenance_changes_but_full_count_snapshot_does_not(hub, monkeypatch):
++    path, put, _, clock = hub
++    put('t_one')
++    with sqlite3.connect(path) as conn:
++        conn.execute('UPDATE replica SET updated_at=0')
++    # Real legacy projection and all actual count derivation; no fake Cards output.
++    monkeypatch.setattr(ksa, '_read_local_pairs_into', lambda *args: set())
++    monkeypatch.setattr(ksa, '_remote_cards', lambda *args: ksa._read_remote_links(path))
++    scope = ('counts-metadata-contract', 'default')
++    fingerprint = ('fixture-inputs',)
++    first_cards = ksa._read_remote_links(path)
++    first = ksa._recompute_all_counts(scope, time.monotonic(), fingerprint,
++                                    include_waiting=True, include_snapshot=True, wall=clock['now'])
++    assert first_cards and first_cards[0]['synced_at'] == 1000.0
++    with sqlite3.connect(path) as conn:
++        conn.execute("UPDATE meta SET v='1002' WHERE k='last_ok'")
++    clock['now'] = 1002.5
++    second_cards = ksa._read_remote_links(path, now=clock['now'])
++    second = ksa._recompute_all_counts(scope, time.monotonic(), fingerprint,
++                                     include_waiting=True, include_snapshot=True, wall=clock['now'])
++    assert second_cards[0]['synced_at'] == 1002.0
++    assert first_cards != second_cards
++    assert first == second  # counters, IDs and timer/external markers
++    assert first.execution == second.execution  # attribute, not part of tuple equality
++    assert first.execution, 'execution oracle must not be vacuous'
+diff --git a/tests/hermes_cli/test_annotation_counts_races.py b/tests/hermes_cli/test_annotation_counts_races.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..723bca0e15c4578b35b946aeba3708926db27e75
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_counts_races.py
+@@ -0,0 +1,67 @@
++"""Raw receipt races cannot certify a normalized holder COUNTS memo."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_annotation_counts as counts
++from hermes_cli import kanban_annotation_hub_key as hk
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_annotation_counts_custody as custody
++from tests.hermes_cli import test_annotation_heartbeat_fence as fence
++from tests.hermes_cli import test_kanban_annotation_parts as holders
++
++world = custody.world
++clock = custody.clock
++replica = fence.replica
++
++
++def test_aba_during_detached_reuse_forces_read_and_refuses_certificate(world, clock, replica, monkeypatch):
++    _state, fake = clock
++    path, _conn, beat = replica
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: path)
++    beat(fence.info(fake.time() - 1))
++    holders._refresh()
++    original = counts._detach
++    before = world.counts
++    fired = []
++    def crossing(value):
++        result = original(value)
++        if not fired:
++            fired.append(True)
++            beat(fence.info(fake.time() + 10))
++            beat(fence.info(fake.time() - 1))
++        return result
++    monkeypatch.setattr(counts, '_detach', crossing)
++    world.declared.write_text('attention')
++    holders._refresh()
++    assert fired and world.counts == before + 1
++    assert holders.SCOPE not in parts._seen and holders.SCOPE not in counts._entries
++    holders._refresh()
++    assert world.counts == before + 2 and holders.SCOPE in counts._entries
++
++
++def test_original_receipt_rejects_main_file_replacement(replica, tmp_path):
++    path, _conn, _beat = replica
++    _key, receipt = hk.capture(path, fence.NOW)
++    replacement = tmp_path / 'replacement.db'
++    with sqlite3.connect(replacement) as conn:
++        conn.execute('CREATE TABLE other(value)')
++    path.rename(tmp_path / 'old-hub.db')
++    replacement.replace(path)
++    assert not receipt.valid()
++
++
++def test_acquisition_rejects_aba_before_returning_key(replica, monkeypatch):
++    path, _conn, beat = replica
++    original = hk._stamp
++    calls = []
++    def racing(conn, target):
++        calls.append(True)
++        if len(calls) == 2:
++            beat(fence.info(fence.NOW + 10))
++            beat(fence.info())
++        return original(conn, target)
++    monkeypatch.setattr(hk, '_stamp', racing)
++    with pytest.raises(ValueError, match='changed while acquiring'):
++        hk.capture(path, fence.NOW)
+diff --git a/tests/hermes_cli/test_annotation_heartbeat_fence.py b/tests/hermes_cli/test_annotation_heartbeat_fence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9a3c413189365bfadfb1fb8c7ceaa4d2d7edb7c
+--- /dev/null
++++ b/tests/hermes_cli/test_annotation_heartbeat_fence.py
+@@ -0,0 +1,123 @@
++"""Outer-only heartbeat keys retain a same-connection publication fence."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_annotation_hub_key as hk
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_annotation_parts as holders
++
++world = holders.world
++NOW = 1000.0
++
++
++def info(beat=999.0):
++    return {'gateway': 'owner', 'task_scopes': [
++        {'profile': 'default', 'board': 'default', 'state': 'ok', 'observed_at': beat}],
++        'scope_heartbeat_period_s': 200.0}
++
++
++@pytest.fixture
++def replica(tmp_path):
++    path = tmp_path / 'hub.db'
++    conn = sqlite3.connect(path, isolation_level=None)
++    conn.executescript("""PRAGMA journal_mode=WAL;
++        CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,seq INTEGER,data TEXT);
++        CREATE TABLE meta(k TEXT PRIMARY KEY,v TEXT);
++        INSERT INTO meta VALUES('gateway','self');
++        INSERT INTO replica VALUES('owner','tasks','default/default/t1',1,'{}');
++        INSERT INTO replica VALUES('owner','gateway','info',2,'{}');
++        CREATE TABLE sessions(n INTEGER);
++    """)
++    def beat(value):
++        conn.execute("UPDATE replica SET data=?,seq=seq+1 WHERE coll='gateway'", (json.dumps(value),))
++    beat(info())
++    yield path, conn, beat
++    conn.close()
++    ksa._reset_cache_for_tests()
++
++
++def test_fresh_heartbeat_only_is_stable_but_raw_inner_signature_moves(replica):
++    path, _, beat = replica
++    a, receipt = hk.capture(path, NOW)
++    assert receipt.valid()
++    raw = ksa._hub_content_signature(path)
++    beat(info(1000.0))
++    b, _ = hk.capture(path, NOW)
++    assert a == b
++    assert raw != ksa._hub_content_signature(path)
++    assert not receipt.valid()
++
++
++@pytest.mark.parametrize('change', ['future', 'stale', 'period', 'unknown', 'duplicate', 'state', 'board'])
++def test_non_equivalent_gateway_evidence_moves_key(replica, change):
++    path, _, beat = replica
++    a, _ = hk.capture(path, NOW)
++    changed = info()
++    scope = changed['task_scopes'][0]
++    actions = {
++        'future': lambda: scope.update(observed_at=NOW + 1),
++        'stale': lambda: scope.update(observed_at=NOW - 501),
++        'period': lambda: changed.update(scope_heartbeat_period_s=201.0),
++        'unknown': lambda: scope.update(new_field=True),
++        'duplicate': lambda: changed['task_scopes'].append(dict(scope)),
++        'state': lambda: scope.update(state='error'),
++        'board': lambda: scope.update(board='other'),
++    }
++    actions[change]()
++    beat(changed)
++    assert hk.capture(path, NOW)[0] != a
++
++
++def test_freshness_is_rechecked_without_database_commit(replica):
++    path, _, _ = replica
++    fresh, _ = hk.capture(path, NOW)
++    assert hk.capture(path, NOW + 499)[0] == fresh
++    assert hk.capture(path, NOW + 500)[0] != fresh
++    assert hk.capture(path, 998.0)[0] != fresh
++
++
++def test_raw_receipt_rejects_session_only_commit_and_gateway_aba(replica):
++    path, conn, beat = replica
++    a, original = hk.capture(path, NOW)
++    conn.execute('INSERT INTO sessions VALUES(1)')
++    assert not original.valid()
++    _, start = hk.capture(path, NOW)
++    beat(info(NOW + 5))
++    middle, _ = hk.capture(path, NOW)
++    beat(info())
++    assert hk.capture(path, NOW)[0] == a and middle != a
++    assert not start.valid()
++
++
++@pytest.mark.parametrize('middle', [998.0, 1005.0])
++def test_real_holder_rejects_consumed_aba_and_forces_next_read(world, replica, monkeypatch, middle):
++    path, _, beat = replica
++    monkeypatch.setattr(ksa, '_hub_db_path', lambda: path)
++    # Keep all holder deadlines and renewal rules real; only the wall clock is frozen.
++    monkeypatch.setattr(hk.time, 'time', lambda: NOW)
++    read = ksa._recompute_all_counts
++    calls = []
++    def crossing(*args, **kwargs):
++        calls.append(True)
++        if len(calls) == 1:
++            beat(info(middle))
++            value = read(*args, **kwargs)
++            beat(info())
++            return value
++        return read(*args, **kwargs)
++    monkeypatch.setattr(ksa, '_recompute_all_counts', crossing)
++    holders._refresh()
++    assert holders.SCOPE not in parts._seen, 'racing result received a normalized certificate'
++    holders._refresh()
++    assert len(calls) == 2, 'a matching late probe certified the rejected result'
++    holders._refresh()
++    assert len(calls) == 2
++    beat(info(1000.0))
++    holders._refresh()
++    assert len(calls) == 2, 'fresh heartbeat caused a full read'
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    holders._refresh()
++    assert len(calls) == 3 and holders._published()[0] == {}
+diff --git a/tests/hermes_cli/test_kanban_annotation_parts.py b/tests/hermes_cli/test_kanban_annotation_parts.py
+index 5f9bab2bb7cef4cce463f866fe32628b77689ec5..6588d0702a5638803db86c9384ac12df88f8ffb6 100644
+--- a/tests/hermes_cli/test_kanban_annotation_parts.py
++++ b/tests/hermes_cli/test_kanban_annotation_parts.py
+@@ -280,9 +280,11 @@
+     _refresh()
+     assert world.counts == 1
+     monkeypatch.setattr(host, 'STRICT_REFRESH_AGE_S', 5.0)
+-    with ksa._cache_lock:  # this scope's counts were read a while ago
+-        ksa._cache_read_at -= 10.0
+-        ksa._count_scopes.remember_locked()
++    # Holder custody owns its source age independently of the shared request cache.
++    from dataclasses import replace
++    from hermes_cli import kanban_annotation_counts as counts
++    source = counts._entries[SCOPE]
++    counts._entries[SCOPE] = replace(source, mono=source.mono - 10.0, wall=source.wall - 10.0)
+     monkeypatch.setattr(ksa, '_origin_scope', lambda: ('annotation-parts-test', 'other'))
+     ksa._all_counts()  # another profile's poll now owns the active count slot, read just now
+     assert world.counts == 2
+-- 
+2.43.0
+

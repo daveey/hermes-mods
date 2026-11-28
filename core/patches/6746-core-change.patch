@@ -1,0 +1,563 @@
+From c37b892558399cf7f20757a6829729f2003e60b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:43:35 +0000
+Subject: [PATCH 6746] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit c37b892558399cf7f20757a6829729f2003e60b1.
+
+---
+diff --git a/hermes_cli/goal_session_activity.py b/hermes_cli/goal_session_activity.py
+index 93db80c04a14fde6d23fa50633aa703f826c787f..c8aeb8bf2f73c757d8739920cb96ba95c0b2f100 100644
+--- a/hermes_cli/goal_session_activity.py
++++ b/hermes_cli/goal_session_activity.py
+@@ -24,8 +24,9 @@
+ import os
+ import sqlite3
+ import threading
++from contextlib import contextmanager
+ from pathlib import Path
+-from typing import Any, Iterable
++from typing import Any, Iterable, Iterator
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -104,6 +105,43 @@
+ 
+ def active_goal_sessions() -> frozenset[str]:
+     """Session ids (across every profile) whose standing goal is still active."""
++    shared = getattr(_block, "reads", None)
++    if shared is None:
++        return _active_goal_sessions()[0]
++    paths = frozenset(_state_db_paths())
++    if paths in shared:
++        return shared[paths]
++    ids, certified = _active_goal_sessions()
++    if certified:
++        shared[paths] = ids
++    return ids
++
++
++# [daveey] Set by ``one_goal_read``: ``frozenset(state.db paths) -> answer`` this block already read. Every
++# profile's home scope sees the same stores (its own plus the root's profiles), so the projects tree's 13
++# per-profile annotations and the sidebar's slices asked the same question of the same files per response,
++# and each ask re-stamped every store (``_db_stamp``, a large share of the tree's samples, t_d0c500000000000a).
++# One answer per response, like ``kanban_external_activity.one_board_read``; a read that failed on any store is
++# not shared, so the next call in the block retries it.
++_block = threading.local()
++
++
++@contextmanager
++def one_goal_read() -> Iterator[None]:
++    """Every ``active_goal_sessions`` call in this block (this thread) answers from one read of the stores."""
++    if getattr(_block, "reads", None) is not None:
++        yield
++        return
++    _block.reads = {}
++    try:
++        yield
++    finally:
++        _block.reads = None
++
++
++def _active_goal_sessions() -> tuple[frozenset[str], bool]:
++    """``(active ids, every store read cleanly)``."""
++    certified = True
+     with _cache_lock:
+         paths = _state_db_paths()
+         for removed in _cache.keys() - set(paths):
+@@ -126,8 +164,9 @@
+             except (OSError, sqlite3.Error) as exc:
+                 # Never certify errors; the next request retries even without a write.
+                 _cache.pop(path, None)
++                certified = False
+                 _log.debug("goal activity read failed for %s: %s", path, exc)
+-        return frozenset(ids)
++        return frozenset(ids), certified
+ 
+ 
+ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8d597b451b572125aad6765dc4ebda58255616d1..a4bdbc3f358a8d7706f6b5c1c9aede67a09c6792 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1861,7 +1861,8 @@
+         return
+     _annotation_scope.reads, _annotation_scope.attention, _annotation_scope.links = [], None, None
+     try:
+-        with _external_activity.one_board_read():
++        from hermes_cli.goal_session_activity import one_goal_read
++        with _external_activity.one_board_read(), one_goal_read():
+             yield
+     finally:
+         _annotation_scope.reads = _annotation_scope.attention = _annotation_scope.links = None
+diff --git a/hermes_cli/profile_session_scan_cache.py b/hermes_cli/profile_session_scan_cache.py
+index 3efc5161413869c022f587025b250aa9b895ccc0..e1b34317eb678a568d66b0c9eb5962f7080e3e57 100644
+--- a/hermes_cli/profile_session_scan_cache.py
++++ b/hermes_cli/profile_session_scan_cache.py
+@@ -49,7 +49,9 @@
+         # Include identity to notice a file replacement between the two probes.
+         return entry, (identity, version)
+ 
+-    def read(self, home, key, scan):
++    def read(self, home, key, scan, clone=copy.deepcopy):
++        """``scan()``, or a ``clone`` of its stored result while ``home``'s state.db has not committed since.
++        ``clone`` copies everything a caller may mutate, both ways (default: a deep copy)."""
+         if home is None:
+             return scan()
+         path = (Path(home) / 'state.db').absolute()
+@@ -62,7 +64,7 @@
+         cached = queries.get(key)
+         if cached is not None and cached[0] == before:
+             queries.move_to_end(key)
+-            return copy.deepcopy(cached[1])
++            return clone(cached[1])
+         # Invalidate before scanning, including when a failed scan returns None.
+         for old in [k for k, value in queries.items() if value[0] != before]:
+             del queries[old]
+@@ -73,7 +75,7 @@
+             self._drop(path)
+             return result
+         if result is not None and after_entry is entry and before == after:
+-            queries[key] = (before, copy.deepcopy(result))
++            queries[key] = (before, clone(result))
+             queries.move_to_end(key)
+             while len(queries) > self.max_queries:
+                 queries.popitem(last=False)
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 4bb136ad4575b1dde85787268830a4f738ba5435..128ef4fc52573a50a2bee0440d989387637dcaf8 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -412,6 +412,17 @@
+ 
+ _PROFILE_SESSION_SCAN_LOCK = threading.Lock()
+ _PROFILE_SESSION_SCAN_CACHE = ProfileSessionScanCache()
++# [daveey] The project tree's rows per profile, on their own lock: a tree scan of a large store must not hold up
++# ``/api/profiles/sessions``' scans (t_d0c500000000000a).
++_PROJECT_TREE_SCAN_LOCK = threading.Lock()
++_PROJECT_TREE_SCAN_CACHE = ProfileSessionScanCache()
++
++
++def _clone_tree_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Copy ``project_tree_rows`` for one response: annotation and tree building stamp these dicts, and their only
++    container values are small lists (``_lineage_ids``). Much cheaper than a deep copy of a large page."""
++    return [{k: (copy.deepcopy(v) if isinstance(v, (list, dict, set)) else v) for k, v in row.items()}
++            for row in rows]
+ 
+ 
+ def _read_serial_profile_db(name, home, errors, read, cache_key):
+@@ -770,20 +781,45 @@
+     from tui_gateway import server as gateway_server
+     out: list[tuple[str, Optional[dict[str, Any]]]] = []
+     for name, home in _scoped_profile_targets(log_label, profile):
+-        def _read(db, home=home):
+-            with _hermes_home_scope(home):
+-                tree, _active_id = gateway_server._build_project_tree(
+-                    db, preview_limit=preview_limit, hydrate=False,
+-                    session_limit=session_limit, include_discovered=False)
+-                return tree
+         failed: list[dict[str, str]] = []
+-        tree = _read_profile_db(name, home, failed, _read)
++        tree = _profile_project_tree(gateway_server, name, home, failed, preview_limit, session_limit)
+         if errors is not None:
+             errors.extend(failed)
+         out.append((name, None if failed else (tree or {"projects": [], "scoped_session_ids": []})))
+     return out
+ 
+ 
++def _profile_project_tree(gateway_server, name, home, failed, preview_limit, session_limit):
++    """One profile's tree. Its session rows are a pure projection of its state.db (and config, in the key), so they
++    are kept until that store commits [daveey]: most stores are idle between the Desktop's tree
++    refreshes, yet every response re-ranked and re-projected each one (a large page, t_d0c500000000000a). The
++    activity annotation and the build run on every response; only the store read is reused."""
++    with _hermes_home_scope(home):
++        key = gateway_server.project_tree_rows_key(session_limit)
++
++    def scan():
++        def read(db):
++            with _hermes_home_scope(home):
++                return gateway_server.project_tree_rows(db, session_limit)
++        return _read_profile_db(name, home, failed, read)
++
++    with _PROJECT_TREE_SCAN_LOCK:
++        rows = _PROJECT_TREE_SCAN_CACHE.read(home, key, scan, clone=_clone_tree_rows)
++    if rows is None:  # no state.db yet (an empty tree), or the read failed (``failed`` says so)
++        return None
++    try:
++        with _hermes_home_scope(home):
++            tree, _active_id = gateway_server._build_project_tree(
++                None, preview_limit=preview_limit, hydrate=False,
++                session_limit=session_limit, include_discovered=False, rows=rows)
++        return tree
++    except Exception as exc:  # health: allow BLE001 -- _read_profile_db's boundary: a broken profile drops out alone
++        _log.debug("project tree build failed for profile %s", name, exc_info=True)
++        _warn_profile_read_error(name, exc)
++        failed.append({"profile": name, "error": str(exc)})
++        return None
++
++
+ from hermes_cli import projects_fact_routes
+ 
+ 
+@@ -808,10 +844,12 @@
+     scoped_session_ids: list[str] = []
+     errors: list[dict[str, str]] = []
+ 
++    from hermes_cli.goal_session_activity import one_goal_read
+     from hermes_cli.kanban_external_activity import one_board_read
+ 
+-    # One read of each (root-pinned) board's external state for every profile's annotation in this response.
+-    with one_board_read():
++    # One read of each (root-pinned) board's external state, and of every store's goals, for every profile's
++    # annotation in this response.
++    with one_board_read(), one_goal_read():
+         trees = profile_project_trees(
+             preview_limit, session_limit, errors, log_label="GET /api/profiles/projects/tree", profile=profile)
+     for name, tree in trees:
+diff --git a/tests/hermes_cli/test_goal_session_activity.py b/tests/hermes_cli/test_goal_session_activity.py
+index 62abee4941d2511f498e76a23933e7d18051a098..cba613c98dca83fef160a8b3ebd64e4881c00797 100644
+--- a/tests/hermes_cli/test_goal_session_activity.py
++++ b/tests/hermes_cli/test_goal_session_activity.py
+@@ -225,3 +225,89 @@
+     assert gsa.active_goal_sessions() == {"old"}
+     monkeypatch.setenv("HERMES_HOME", str(other))
+     assert gsa.active_goal_sessions() == {"new"}
++
++
++# --- one response reads the stores' goals once (t_d0c500000000000a) -------------------------------------------------
++
++def _counting_scans(monkeypatch):
++    calls = []
++    real = gsa._db_stamp
++
++    def stamp(path):
++        calls.append(path)
++        return real(path)
++
++    monkeypatch.setattr(gsa, "_db_stamp", stamp)
++    return calls
++
++
++def test_every_ask_in_one_block_shares_one_read_even_across_a_commit(home, monkeypatch):
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    _make_state_db(home / "profiles" / "work" / "state.db", {})
++    stamps = _counting_scans(monkeypatch)
++    with gsa.one_goal_read():
++        assert gsa.active_goal_sessions() == {"s"}
++        first = len(stamps)
++        with sqlite3.connect(path) as conn:  # a commit mid-response
++            conn.execute("UPDATE state_meta SET value=? WHERE key='goal:s'",
++                         (json.dumps({"goal": "g", "status": "done"}),))
++        for _ in range(12):  # the projects tree's per-profile annotations
++            assert gsa.active_goal_sessions() == {"s"}
++        assert len(stamps) == first, "one response must stamp each store once, however many rows sets ask"
++    # Notification loss would keep answering {"s"} until some later commit.
++    assert gsa.active_goal_sessions() == set()
++
++
++def test_a_failed_read_in_a_block_is_not_shared(home, monkeypatch):
++    _make_state_db(home / "state.db", {"s": {"goal": "g", "status": "active"}})
++    real = gsa._read_active
++    calls = []
++
++    def flaky(path):
++        calls.append(path)
++        if len(calls) == 1:
++            raise sqlite3.OperationalError("database is locked")
++        return real(path)
++
++    monkeypatch.setattr(gsa, "_read_active", flaky)
++    with gsa.one_goal_read():
++        assert gsa.active_goal_sessions() == set()
++        assert gsa.active_goal_sessions() == {"s"}, "the next ask in the block retries a failed read"
++        assert gsa.active_goal_sessions() == {"s"}
++    assert len(calls) == 2
++
++
++def test_blocks_nest_and_another_thread_reads_on_its_own(home, monkeypatch):
++    import threading
++
++    path = home / "state.db"
++    _make_state_db(path, {"s": {"goal": "g", "status": "active"}})
++    with gsa.one_goal_read():
++        assert gsa.active_goal_sessions() == {"s"}
++        with sqlite3.connect(path) as conn:
++            conn.execute("DELETE FROM state_meta WHERE key='goal:s'")
++        with gsa.one_goal_read():
++            assert gsa.active_goal_sessions() == {"s"}, "a nested block shares the outer block's read"
++        assert gsa.active_goal_sessions() == {"s"}, "the inner block's end does not drop the outer one's read"
++        seen = []
++        worker = threading.Thread(target=lambda: seen.append(gsa.active_goal_sessions()))
++        worker.start()
++        worker.join()
++        assert seen == [set()], "a block is this thread's response only"
++
++
++def test_a_different_store_set_is_not_answered_from_another_sets_read(home, monkeypatch):
++    _make_state_db(home / "state.db", {"s": {"goal": "g", "status": "active"}})
++    with gsa.one_goal_read():
++        assert gsa.active_goal_sessions() == {"s"}
++        _make_state_db(home / "profiles" / "work" / "state.db", {"w": {"goal": "g", "status": "active"}})
++        assert gsa.active_goal_sessions() == {"s", "w"}
++
++
++def test_annotation_snapshot_opens_one_goal_read():
++    from hermes_cli import kanban_session_activity as ksa
++
++    with ksa.one_annotation_snapshot():
++        assert gsa._block.reads == {}
++    assert getattr(gsa._block, "reads", None) is None
+diff --git a/tests/hermes_cli/test_project_tree_scan_reuse.py b/tests/hermes_cli/test_project_tree_scan_reuse.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb1f9406c6f4f0065e961756bbc993c47708515b
+--- /dev/null
++++ b/tests/hermes_cli/test_project_tree_scan_reuse.py
+@@ -0,0 +1,164 @@
++"""The all-profiles project tree reads each store's rows once per commit (t_d0c500000000000a). [daveey]
++
++Most profile stores are idle between the Desktop's tree refreshes, yet each response re-ranked and
++re-projected every store's large page. The rows are a pure projection of the store (plus its config, in the
++key), so they are kept until that store commits; the activity annotation and the tree build still run on every
++response.
++"""
++from __future__ import annotations
++
++import pytest
++
++from tests.hermes_cli import test_profiles_sidebar_scope as sidebar
++
++profiles_on_disk = sidebar.profiles_on_disk
++_seed_session = sidebar._seed_session
++
++
++@pytest.fixture(autouse=True)
++def _cold(monkeypatch):
++    from hermes_cli.web_routers import profiles
++
++    monkeypatch.setattr(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 0.0)
++    kept = getattr(profiles, "_PROJECT_TREE_SCAN_CACHE", None)
++    if kept is not None:
++        kept.clear()
++    yield
++    if kept is not None:
++        kept.clear()
++
++
++@pytest.fixture
++def hooks():
++    """``hooks["after"](name)`` runs after a store's page is read; ``hooks["before"](name)`` before (may raise)."""
++    return {"before": lambda name: None, "after": lambda name: None}
++
++
++@pytest.fixture
++def scans(monkeypatch, profiles_on_disk, hooks):
++    """Profile names whose session page the tree read from their store, in order."""
++    from pathlib import Path
++
++    import hermes_state
++
++    real = hermes_state.SessionDB.list_sessions_rich
++    names = {str(Path(home) / "state.db"): name for name, home in profiles_on_disk.items()}
++    seen: list[str] = []
++
++    def counting(self, *args, **kwargs):
++        name = names.get(str(Path(self.db_path)))
++        if name is None or kwargs.get("limit") != 2000:  # only the tree's page, not other readers
++            return real(self, *args, **kwargs)
++        hooks["before"](name)
++        seen.append(name)
++        rows = real(self, *args, **kwargs)
++        hooks["after"](name)
++        return rows
++
++    monkeypatch.setattr(hermes_state.SessionDB, "list_sessions_rich", counting)
++    return seen
++
++
++def _tree():
++    from hermes_cli.web_routers import profiles
++
++    return profiles.get_profiles_projects_tree()
++
++
++def _session_ids(payload) -> set[str]:
++    return {m["id"] for p in payload["projects"] for m in p["sessionMembership"]}
++
++
++def _stable(value):
++    """``value`` without the per-response annotation clock (``kanban_observed_at`` is when it was stamped)."""
++    if isinstance(value, dict):
++        return {k: _stable(v) for k, v in value.items() if k != "kanban_observed_at"}
++    if isinstance(value, list):
++        return [_stable(v) for v in value]
++    return value
++
++
++def test_an_idle_store_is_not_read_again_and_its_commit_is_seen_by_the_next_response(profiles_on_disk, scans):
++    for name, home in profiles_on_disk.items():
++        _seed_session(home, f"{name}-chat", source="cli")
++    first = _tree()
++    assert _session_ids(first) == {"default-chat", "worker-chat"}
++    assert sorted(scans) == ["default", "worker"]
++
++    scans.clear()
++    assert _stable(_tree()) == _stable(first), "an unchanged store answers the same tree"
++    assert scans == [], "no store committed, so none is read again"
++
++    _seed_session(profiles_on_disk["worker"], "worker-new", source="cli")
++    # Notification loss would serve the old rows until some later commit.
++    assert _session_ids(_tree()) == {"default-chat", "worker-chat", "worker-new"}
++    assert scans == ["worker"], "only the store that committed is read again"
++
++
++def test_activity_is_stamped_on_every_response_and_never_leaks_into_the_kept_rows(profiles_on_disk, scans, monkeypatch):
++    from tui_gateway import server as gateway_server
++
++    _seed_session(profiles_on_disk["default"], "chat", source="cli")
++    live: set[str] = {"chat"}
++
++    def annotate(rows):
++        for row in rows:
++            if row["id"] in live:
++                row["turn_live"] = True
++        return rows
++
++    monkeypatch.setattr(gateway_server, "_annotate_tree_activity", annotate)
++
++    def stamped(payload):
++        rows = [s for p in payload["projects"] for s in p.get("previewSessions") or []]
++        return {s["id"]: s.get("turn_live", False) for s in rows}
++
++    assert stamped(_tree()) == {"chat": True}
++    live.clear()  # the turn ended without a state.db commit the tree's rows read
++    assert stamped(_tree()) == {"chat": False}, "a stamp from an earlier response must not survive in the kept rows"
++    assert scans == ["default"]
++
++
++def test_a_config_change_without_a_commit_is_seen(profiles_on_disk, scans):
++    home = profiles_on_disk["worker"]
++    _seed_session(home, "worker-chat", source="cli")
++    _seed_session(home, "worker-bot", source="telegram")
++    assert {"worker-chat", "worker-bot"} <= _session_ids(_tree())
++
++    (home / "config.yaml").write_text("sessions:\n  sidebar_exclude_sources: [telegram]\n", encoding="utf-8")
++    ids = _session_ids(_tree())
++    assert "worker-chat" in ids and "worker-bot" not in ids, "the store's sidebar policy is part of the key"
++
++
++def test_a_commit_during_the_read_is_not_kept(profiles_on_disk, scans, hooks):
++    home = profiles_on_disk["worker"]
++    _seed_session(home, "worker-chat", source="cli")
++    raced: list[bool] = []
++
++    def race(name):
++        if name == "worker" and not raced:
++            raced.append(True)
++            _seed_session(home, "worker-raced", source="cli")  # commits after the page was read
++
++    hooks["after"] = race
++    assert "worker-raced" not in _session_ids(_tree())
++    assert "worker-raced" in _session_ids(_tree()), "a read that raced a commit must not be served again"
++
++
++def test_a_failed_read_is_reported_and_retried(profiles_on_disk, scans, hooks):
++    for name, home in profiles_on_disk.items():
++        _seed_session(home, f"{name}-chat", source="cli")
++    fail = [True]
++
++    def flaky(name):
++        if fail[0] and name == "worker":
++            raise RuntimeError("worker store is unreadable")
++
++    hooks["before"] = flaky
++    payload = _tree()
++    assert [e["profile"] for e in payload["errors"]] == ["worker"]
++    assert _session_ids(payload) == {"default-chat"}
++    fail[0] = False
++    payload = _tree()
++    assert payload["errors"] == []
++    assert _session_ids(payload) == {"default-chat", "worker-chat"}, "a failure is never kept"
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index fe896c4deab5279f4de017e1e857b8f2890f1985..0eab384540acc007136f1afbbd13b73f19bbc6a2 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -451,19 +451,35 @@
+     return sessions
+ 
+ 
+-def _project_tree_inputs(
+-    db, session_limit: int, *, include_discovered: bool
+-) -> tuple[list[dict], list[dict], list[dict], str | None]:
+-    """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
+-    ``include_discovered`` is the zero-session-repo overview tier; drill-in skips it (and
+-    the distinct-cwd scan + git probes) on that per-turn path."""
++def project_tree_rows_key(session_limit: int) -> tuple:
++    """[daveey] Everything besides ``state.db`` that ``project_tree_rows`` reads (this store's config), so a caller
++    can keep its answer keyed on the store's commits plus this. Read under the caller's home scope."""
++    return ("project_tree_rows", session_limit, tuple(_project_tree_excluded_sources()),
++            tuple(_project_tree_automated_sources()))
++
++
++def project_tree_rows(db, session_limit: int) -> list[dict]:
++    """[daveey] The tree's session rows before activity annotation: a pure projection of ``db`` and
++    ``project_tree_rows_key``. Fresh dicts the caller may stamp."""
+     # compact_rows: selecting the system-prompt blob only to drop it costs tens of MB of reads.
+     rows = db.list_sessions_rich(
+         limit=session_limit, offset=0, order_by_last_active=True, min_message_count=1,
+         include_children=False, exclude_sources=_project_tree_excluded_sources(),
+         include_archived=False, compact_rows=True)
+     automated = _project_tree_automated_sources()
+-    sessions = _annotate_tree_activity([_project_tree_row(r, automated) for r in rows])
++    return [_project_tree_row(r, automated) for r in rows]
++
++
++def _project_tree_inputs(
++    db, session_limit: int, *, include_discovered: bool, rows: list[dict] | None = None
++) -> tuple[list[dict], list[dict], list[dict], str | None]:
++    """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
++    ``include_discovered`` is the zero-session-repo overview tier; drill-in skips it (and
++    the distinct-cwd scan + git probes) on that per-turn path. ``rows`` [daveey]: this store's
++    ``project_tree_rows`` when the caller already holds them (then ``db`` is only read for discovery)."""
++    if rows is None:
++        rows = project_tree_rows(db, session_limit)
++    sessions = _annotate_tree_activity(rows)
+     # Parallel-warm the git cache so build_tree's resolver doesn't cold-probe each cwd in turn.
+     git_probe.warm_roots(s["cwd"] for s in sessions if s.get("cwd"))
+     from hermes_cli import projects_db as pdb
+@@ -496,12 +512,13 @@
+ 
+ 
+ def _project_tree_from_inputs(
+-    db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool, builder
++    db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool, builder,
++    rows: list[dict] | None = None,
+ ) -> tuple[dict, str | None]:
+     """Gather normalized inputs once for canonical rendering or detached capture."""
+     _DIR_EXISTS_CACHE.clear()
+     sessions, projects, discovered, active_id = _project_tree_inputs(
+-        db, session_limit, include_discovered=include_discovered)
++        db, session_limit, include_discovered=include_discovered, rows=rows)
+     # Normalize copies, not persisted rows: aliases must share ownership and lane identities.
+     def paths(row: dict, *keys: str) -> dict:
+         return {**row, **{k: _canonical_workspace_path(str(row.get(k) or "")) for k in keys}}
+@@ -524,11 +541,14 @@
+     return tree, active_id
+ 
+ 
+-def _build_project_tree(db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool):
+-    """Legacy builder; keep the direct caller contract and one canonical render."""
++def _build_project_tree(db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool,
++                        rows: list[dict] | None = None):
++    """Legacy builder; keep the direct caller contract and one canonical render. ``rows``: see
++    ``_project_tree_inputs``."""
+     from tui_gateway import project_tree
+     return _project_tree_from_inputs(db, preview_limit=preview_limit, hydrate=hydrate,
+-        session_limit=session_limit, include_discovered=include_discovered, builder=project_tree.build_tree)
++        session_limit=session_limit, include_discovered=include_discovered, builder=project_tree.build_tree,
++        rows=rows)
+ 
+ 
+ def _capture_project_tree(db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool):
+-- 
+2.43.0
+

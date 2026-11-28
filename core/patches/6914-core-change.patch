@@ -1,0 +1,213 @@
+From 9c105dbac21881ebf131e53d23f42985369d394b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 06:36:25 +0000
+Subject: [PATCH 6914] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 9c105dbac21881ebf131e53d23f42985369d394b.
+
+---
+diff --git a/hermes_cli/kanban_sync_attachment_http.py b/hermes_cli/kanban_sync_attachment_http.py
+index b1f9dfc426197b0180b0df6254d06643fd5322c1..3ad0f6c7364a95983d63cee95af88922bfdc550f 100644
+--- a/hermes_cli/kanban_sync_attachment_http.py
++++ b/hermes_cli/kanban_sync_attachment_http.py
+@@ -51,7 +51,11 @@
+     if len(data) > KANBAN_ATTACHMENT_MAX_BYTES:
+         raise ValueError("attachment exceeds size limit")
+     body = _request(hub, "PUT", _path(board, uid) + "/blobs/" + digest, data, 4096)
+-    return json.loads(body)
++    from hermes_cli.kanban_sync_client import HubError
++    try:
++        return json.loads(body)
++    except (ValueError, RecursionError) as exc:
++        raise HubError(502, "invalid JSON response") from exc
+ 
+ 
+ def download(hub, board: str, uid: str) -> bytes:
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index e6d8b22d49f21a55fa43386f095a13d2242c6773..d02819c92de48c51ea41427121c5b4ee2ac7c5e1 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -452,7 +452,7 @@
+                 raise
+             try:
+                 res = json.loads(exc.detail)
+-            except ValueError:
++            except (ValueError, RecursionError):
+                 raise exc from None
+             if not isinstance(res, dict) or not res.get("reason"):
+                 raise
+diff --git a/hermes_cli/kanban_sync_hub_transport.py b/hermes_cli/kanban_sync_hub_transport.py
+index 1454b5832a25dde007c771ae3c9af2730141b6c7..ef27bb055923376459fe0d6298512efc36e52b5d 100644
+--- a/hermes_cli/kanban_sync_hub_transport.py
++++ b/hermes_cli/kanban_sync_hub_transport.py
+@@ -11,7 +11,7 @@
+     from hermes_cli.kanban_sync_client import HubError
+     try:
+         return json.loads(raw or b"{}")
+-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
++    except (ValueError, RecursionError) as exc:
+         # Do not include raw bytes: replies may carry private Board contents.
+         raise HubError(502, 'invalid JSON response') from exc
+ 
+diff --git a/tests/hermes_cli/test_kanban_replay_legacy_capability.py b/tests/hermes_cli/test_kanban_replay_legacy_capability.py
+index 873883028f427b3de07f27e60e9552239ffb3677..4adca191293776885da2782f211e5d1e08269d77 100644
+--- a/tests/hermes_cli/test_kanban_replay_legacy_capability.py
++++ b/tests/hermes_cli/test_kanban_replay_legacy_capability.py
+@@ -20,7 +20,11 @@
+ 
+ 
+ @pytest.mark.parametrize('proxied', [False, True])
+-@pytest.mark.parametrize('capability', [None, [], 'unsupported', {}, b'{', b'\xff'])
++@pytest.mark.parametrize('capability', [
++    None, [], 'unsupported', {}, b'{', b'\xff',
++    pytest.param(b'[' * 100000 + b'0' + b']' * 100000, id='depth-limit'),
++    pytest.param(b'9' * 100000, id='integer-limit'),
++])
+ def test_legacy_malformed_capability_does_not_abort_later_board(tmp_path, monkeypatch, capability, proxied):
+     monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
+     home = support.kanban_home(tmp_path, monkeypatch)
+diff --git a/tests/hermes_cli/test_kanban_replay_raw_replies.py b/tests/hermes_cli/test_kanban_replay_raw_replies.py
+index 92c3a9a794e649c9ba799af12cf546fd0f7a7ef7..ea93f00d5df83e4a36c0e41290519a98740995e8 100644
+--- a/tests/hermes_cli/test_kanban_replay_raw_replies.py
++++ b/tests/hermes_cli/test_kanban_replay_raw_replies.py
+@@ -18,6 +18,12 @@
+ 
+ live = helpers.live
+ 
++BAD_REPLIES = [
++    b'{', b'\xff',
++    pytest.param(b'[' * 100000 + b'0' + b']' * 100000, id='depth-limit'),
++    pytest.param(b'9' * 100000, id='integer-limit'),
++]
++
+ 
+ @pytest.mark.parametrize('proxied', [False, True])
+ @pytest.mark.parametrize('raw', [b'{', b'\xff', b'{}'])
+@@ -40,12 +46,15 @@
+ 
+ 
+ @pytest.mark.parametrize('proxied', [False, True])
+-@pytest.mark.parametrize('raw', [b'{', b'\xff'])
+-@pytest.mark.parametrize('endpoint', ['capability', 'inspect', 'session'])
++@pytest.mark.parametrize('raw', BAD_REPLIES)
++@pytest.mark.parametrize('endpoint', ['capability', 'inspect', 'session', 'ops', 'ack'])
+ def test_strict_raw_reply_preserves_custody_and_other_board_progress(live, tmp_path, monkeypatch,
+                                                                    proxied, raw, endpoint):
+     monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
+     kb.create_task(live, title='strict raw reply', assignee='worker')
++    if endpoint in ('ops', 'ack'):
++        with kbc.write_txn(live):
++            live.execute("DELETE FROM kanban_sync_outbox WHERE table_name != 'tasks'")
+     broken_path = Path(live.execute('PRAGMA database_list').fetchone()[2])
+     custody = [row[0] for row in live.execute('SELECT op_id FROM kanban_sync_outbox ORDER BY op_id')]
+     healthy_path = tmp_path / 'healthy.db'
+@@ -71,19 +80,27 @@
+         try:
+             results = client.sync_all_once(hub, boards=[('default', broken_path), ('healthy', healthy_path)])
+             assert [result.board for result in results] == ['default', 'healthy']
+-            assert results[0].error and 'HubError' in results[0].error
+-            assert 'invalid JSON response' in results[0].error
++            if endpoint in ('ops', 'ack'):
++                # The next cooperative send can inspect and reconcile the
++                # already-applied mutation. That is success, not a lost fault.
++                assert results[0].error is None
++                assert journal.pending_wire(live) is None
++                assert journal.snapshot(live)['settled'] == '1'
++                assert sum(path.endswith('/replay/ops') for _, path, _, _ in requests) == 1
++            else:
++                assert results[0].error and 'HubError' in results[0].error
++                assert 'invalid JSON response' in results[0].error
++                assert [row[0] for row in live.execute(
++                    'SELECT op_id FROM kanban_sync_outbox ORDER BY op_id')] == custody
+             assert results[1].error is None
+             assert any('/default/changes?' in path for _, path, _, _ in requests)
+             assert any('/healthy/changes?' in path for _, path, _, _ in requests)
+-            assert [row[0] for row in live.execute(
+-                'SELECT op_id FROM kanban_sync_outbox ORDER BY op_id')] == custody
+         finally:
+             hub.close()
+ 
+ 
+ @pytest.mark.parametrize('proxied', [False, True])
+-@pytest.mark.parametrize('raw', [b'{', b'\xff'])
++@pytest.mark.parametrize('raw', BAD_REPLIES)
+ @pytest.mark.parametrize('endpoint', ['ops', 'ack'])
+ def test_strict_mutation_decode_failure_keeps_durable_progress(live, monkeypatch, proxied, raw, endpoint):
+     monkeypatch.setattr(client.Hub, '_proxied', staticmethod(lambda parts: proxied))
+diff --git a/tests/hermes_cli/test_kanban_reply_parse_limits.py b/tests/hermes_cli/test_kanban_reply_parse_limits.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f08c700c9cb18473029c26f7f09aaea9614e9cbc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_reply_parse_limits.py
+@@ -0,0 +1,68 @@
++"""Every secondary reply parser contains decoder limits, not application errors."""
++import pytest
++
++from hermes_cli import kanban_sync_attachment_http as attachments
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_hub_transport as transport
++
++
++@pytest.mark.parametrize('failure', [RecursionError, ValueError])
++def test_attachment_reply_decoder_failure_is_typed(monkeypatch, failure):
++    raw = b'fixture-reply'
++    monkeypatch.setattr(attachments, '_request', lambda *args, **kwargs: raw)
++    original = transport.json.loads
++    error = failure('decoder resource limit')
++
++    def decode(value, *args, **kwargs):
++        if value == raw:
++            raise error
++        return original(value, *args, **kwargs)
++
++    monkeypatch.setattr(transport.json, 'loads', decode)
++    with pytest.raises(client.HubError, match='invalid JSON response') as caught:
++        attachments.upload(None, 'default', 'attachment', 'digest', b'payload')
++    assert caught.value.status == 502
++    assert caught.value.__cause__ is error
++
++
++@pytest.mark.parametrize('failure', [RecursionError, ValueError])
++def test_session_conflict_reply_keeps_original_fault(monkeypatch, failure):
++    hub = client.Hub(client.Identity('http://127.0.0.1:1', 'fixture-key', 'macbook'))
++    raw = 'fixture-conflict'
++    refusal = client.HubError(409, raw)
++    original = transport.json.loads
++
++    def call(*args, **kwargs):
++        raise refusal
++
++    def decode(value, *args, **kwargs):
++        if value == raw:
++            raise failure('decoder resource limit')
++        return original(value, *args, **kwargs)
++
++    monkeypatch.setattr(hub, '_call', call)
++    monkeypatch.setattr(transport.json, 'loads', decode)
++    try:
++        with pytest.raises(client.HubError) as caught:
++            hub.sessions('default', {})
++        assert caught.value is refusal
++    finally:
++        hub.close()
++
++
++def test_attachment_application_valueerror_is_not_a_reply_fault(monkeypatch):
++    error = ValueError('request construction failed')
++
++    def request(*args, **kwargs):
++        raise error
++
++    monkeypatch.setattr(attachments, '_request', request)
++    with pytest.raises(ValueError) as caught:
++        attachments.upload(None, 'default', 'attachment', 'digest', b'payload')
++    assert caught.value is error
++
++
++def test_attachment_empty_reply_remains_invalid(monkeypatch):
++    monkeypatch.setattr(attachments, '_request', lambda *args, **kwargs: b'')
++    with pytest.raises(client.HubError, match='invalid JSON response'):
++        attachments.upload(None, 'default', 'attachment', 'digest', b'payload')
+-- 
+2.43.0
+

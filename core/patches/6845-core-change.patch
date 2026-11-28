@@ -1,0 +1,366 @@
+From 2766be06d28559e7478f04b15646f672264e5c0a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:58:50 +0000
+Subject: [PATCH 6845] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 2766be06d28559e7478f04b15646f672264e5c0a.
+
+---
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..29368fee40ca7cb5a673fb69c75f28e0b9a71714
+--- /dev/null
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -0,0 +1,107 @@
++"""W=1 production push entry for already bound strict journals. [daveey]
++
++No enrollment or activation. Until migration/provenance and all custody paths are
++finished this is a task-upsert tracer only; other intents stop without deletion.
++"""
++import json
++from dataclasses import dataclass
++from urllib.parse import quote
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli.kanban_db_connect import write_txn
++from hermes_cli.kanban_replay_reconcile import reconcile
++
++
++@dataclass
++class PushResult:
++    sent: int = 0
++    applied: int = 0
++    merged: int = 0
++    rejected: int = 0
++    deferred: int = 0
++
++
++def push(conn, hub, board, gateway, *, primary, max_batches=25, before_head=False, seen=None):
++    """Select only the journal-bound transport; never auto-enroll or fall back."""
++    from hermes_cli import kanban_sync_client as client
++    client.refuse_if_schema_ahead(conn)
++    if (sync.sync_state(conn) or {}).get('journal_id') is not None:
++        if primary or before_head:
++            raise ValueError('tracer push mode not integrated')
++        return _push_strict(conn, hub, board, gateway, max_batches=max_batches)
++    return client._push_legacy(conn, hub, board, gateway, primary=primary,
++                               max_batches=max_batches, before_head=before_head, seen=seen)
++
++
++def _push_strict(conn, hub, board, gateway, *, max_batches):
++    from hermes_cli import kanban_sync_client as client
++    root = f'/v2/boards/{quote(board, safe="")}/replay/'
++    out = client.PushResult()
++    local = journal.snapshot(conn)
++    cap = hub._call('GET', root + 'capability')
++    if (cap.get('processed_prefix') is not True or
++            cap.get('board_incarnation') != local['board_incarnation'] or
++            cap.get('gateway_principal') != local['gateway_principal']):
++        raise ValueError('replay capability unavailable')
++    remote = hub._call('GET', root + 'inspect')['slot']
++    reconcile(local, remote)  # inspect before authenticated full-state session CAS
++    identity = dict(board_incarnation=local['board_incarnation'], journal_id=local['journal_id'])
++    remote = hub._call('POST', root + 'session', dict(identity, expected=remote))['slot']
++
++    def record(verdict):
++        pending = journal.snapshot(conn)['pending']
++        if verdict['client_op_id'] != pending['op_id']:
++            raise ValueError('source verdict identity mismatch')
++        row = conn.execute('SELECT * FROM kanban_sync_outbox WHERE op_id=?', (pending['op_id'],)).fetchone()
++        if row is None:
++            raise ValueError('issued source custody missing')
++        wire = json.loads(journal.pending_wire(conn))
++        del wire['replay']
++        if row['wire_json'] is None or json.loads(row['wire_json']) != wire:
++            raise ValueError('issued source custody changed')
++        status = verdict['status']
++        if status not in ('applied', 'merged'):
++            raise ValueError('tracer final disposition requires custody integration')
++        if verdict.get('version'):
++            conn.execute('UPDATE tasks SET sync_version=MAX(COALESCE(sync_version,0),?) WHERE id=?',
++                         (verdict['version'], row['row_uid']))
++        conn.execute('DELETE FROM kanban_sync_outbox WHERE op_id=?', (pending['op_id'],))
++        setattr(out, status, getattr(out, status) + 1)
++
++    for _ in range(max_batches):
++        with write_txn(conn):
++            decision = journal.recover(conn, remote, record)
++            if decision['action'] == 'record':
++                break  # recovery settles exactly one; no newly selected intent this turn
++            encoded = journal.pending_wire(conn)
++            if encoded is None:
++                rows = [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox WHERE state='pending' "
++                                                      "ORDER BY created_at,rowid LIMIT 1")]
++                if not rows:
++                    break
++                row = rows[0]
++                if row['table_name'] != 'tasks' or row['op'] != 'upsert':
++                    raise ValueError('tracer requires task upsert head')
++                from hermes_cli import kanban_sync_envelope as envelopes
++                from hermes_cli import kanban_sync_wire as wire_ops
++                from hermes_cli.kanban_terminal_guard import strip_stale_push
++                intent = envelopes.outbound(conn, row, lambda: strip_stale_push(conn, wire_ops.translate(
++                    client._full_row_if_unseen(conn, row), client._next_hlc(conn, gateway))), supported=True)
++                encoded = journal.issue(conn, intent)
++        wire = json.loads(encoded)
++        wire['replay']['session'] = remote['session']
++        hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
++        out.sent += 1
++        remote = hub._call('GET', root + 'inspect')['slot']
++        with write_txn(conn):
++            decision = journal.recover(conn, remote, record)
++        if decision['action'] != 'record':
++            break
++    settled = journal.snapshot(conn)
++    if settled['settled'] != '0' and remote['a'] != settled['settled']:
++        remote = hub._call('POST', root + 'ack', dict(identity, session=remote['session'],
++            generation=settled['generation'], ack=dict(sequence=settled['settled'],
++                op_id=settled['last_op_id'], payload_sha256=settled['last_payload_sha256'])))['slot']
++        reconcile(settled, remote)
++    return out
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 512e0825e80b97028796abf6adf6a2d2c1ef4599..4e93e6c0d91bd3fff2ddd1c91f8036672b9628dd 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -55,6 +55,7 @@
+ from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
++from hermes_cli.kanban_replay_sender import PushResult, push
+ from hermes_cli.kanban_sync_compat import REASSESSMENT_REFUSALS, TRANSIENT_REASONS, transient_rejection  # re-exported compatibility seam
+ from hermes_cli.kanban_sync_hub_transport import peer_closed as _peer_closed
+ from hermes_cli.kanban_sync_hub_transport import BoundedRedirects, BoundedResponseError, read_response
+@@ -618,15 +619,6 @@
+     return out
+ 
+ 
+-@dataclass
+-class PushResult:
+-    sent: int = 0
+-    applied: int = 0
+-    merged: int = 0
+-    rejected: int = 0
+-    deferred: int = 0
+-
+-
+ def _within_batch(conn: sqlite3.Connection, rows: list[dict], wire: list[dict],
+                   gateway: str) -> tuple[list[dict], list[dict], list[tuple[dict, str]]]:
+     """``(rows, wire, parents)`` trimmed so parents + rows fit one request. The Board refuses more than PUSH_BATCH
+@@ -642,7 +634,7 @@
+     return rows, wire, parents
+ 
+ 
+-def push(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
++def _push_legacy(conn: sqlite3.Connection, hub: Hub, board: str, gateway: str, *, primary: bool,
+          max_batches: int = MAX_BATCHES_PER_ROUND, before_head: bool = False,
+          seen: Optional[dict] = None) -> PushResult:
+     """Drain pending outbox rows in FIFO batches. A transport failure leaves them pending (retried next round).
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab8aa0f61d23a6063957bcfb9a86f2c70d865a55
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -0,0 +1,199 @@
++"""Real outbox tracer; controlled serving-Board replies, not live rollout proof."""
++import json
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_replay_journal import binding
++
++
++class Receiver:
++    """Control reply shapes from Board.replayInspect/replayControl; W=1 fixture."""
++    def __init__(self):
++        self.slot = dict(binding(), mode='STRICT', session='1', h='0', a='0', last_verdict=None)
++        self.calls = []
++        self.sent = []
++        self.lose_reply = False
++        self.supported = True
++        self.status = 'applied'
++
++    def _call(self, method, path, body=None):
++        action = path.rsplit('/', 1)[-1]
++        self.calls.append(action)
++        if action == 'capability':
++            return dict(processed_prefix=self.supported, board_incarnation=self.slot['board_incarnation'],
++                        gateway_principal=self.slot['gateway_principal'])
++        if action == 'inspect':
++            return {'slot': dict(self.slot)}
++        if action == 'session':
++            assert body['expected'] == self.slot
++            self.slot['session'] = str(int(self.slot['session']) + 1)
++            return {'slot': dict(self.slot)}
++        if action == 'ack':
++            assert body['ack'] == dict(sequence=self.slot['h'], op_id=self.slot['last_op_id'],
++                                       payload_sha256=self.slot['last_payload_sha256'])
++            self.slot['a'] = self.slot['h']
++            return {'slot': dict(self.slot)}
++        assert action == 'ops' and '/replay/' in path
++        assert body['journal_id'] == self.slot['journal_id']
++        op, = body['ops']
++        assert op['replay']['session'] == self.slot['session']
++        self.sent.append(op)
++        self.slot.update(h=op['replay']['sequence'], last_op_id=op['client_op_id'],
++                         last_payload_sha256=op['replay']['payload_sha256'],
++                         last_verdict=json.dumps(dict(client_op_id=op['client_op_id'], status=self.status, version=7)))
++        if self.lose_reply:
++            raise OSError('reply lost after commit')
++        return {'protocol': 'processed_prefix1', 'results': []}
++
++    def ops(self, *args):
++        pytest.fail('bound replay journal fell back to legacy transport')
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    client.ensure_identity(conn, 'default', 'macbook')
++    with kbc.write_txn(conn):
++        journal.initialize(conn, binding(), board_id=conn.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0])
++    yield conn
++    conn.close()
++
++
++def test_real_outbox_is_issued_sent_recovered_and_pruned(live):
++    tid = kb.create_task(live, title='tracer', assignee='worker')
++    receiver = Receiver()
++    result = client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert result.applied == 1
++    assert receiver.sent[0]['uid'] == tid
++    assert journal.snapshot(live)['settled'] == '1'
++    assert journal.pending_wire(live) is None
++    assert not live.execute('SELECT 1 FROM kanban_sync_outbox WHERE op_id=?',
++                            (receiver.sent[0]['client_op_id'],)).fetchone()
++    assert receiver.calls == ['capability', 'inspect', 'session', 'ops', 'inspect', 'ack']
++    assert receiver.slot['a'] == '1'
++    assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 7
++
++
++def test_lost_response_recovers_exact_verdict_without_resending(live):
++    kb.create_task(live, title='lost response', assignee='worker')
++    receiver = Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError, match='reply lost'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    frozen = journal.pending_wire(live)
++    assert frozen is not None
++    receiver.lose_reply = False
++    result = client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert result.applied == 1 and len(receiver.sent) == 1
++    assert journal.pending_wire(live) is None
++
++
++def test_capability_loss_retains_custody_and_never_uses_legacy(live):
++    kb.create_task(live, title='cap lost', assignee='worker')
++    receiver = Receiver()
++    receiver.supported = False
++    with pytest.raises(ValueError, match='replay capability unavailable'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert live.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0] > 0
++    assert journal.pending_wire(live) is None and not receiver.sent
++
++
++def test_production_hub_authenticates_and_drains_over_http(live):
++    receiver = Receiver()
++    authorizations = []
++
++    class Handler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            self.reply('GET')
++
++        def do_POST(self):
++            self.reply('POST')
++
++        def reply(self, method):
++            auth = self.headers.get('Authorization')
++            authorizations.append(auth)
++            if auth != 'Bearer fixture-key':
++                self.send_error(401)
++                return
++            length = int(self.headers.get('Content-Length', '0'))
++            body = json.loads(self.rfile.read(length)) if length else None
++            data = json.dumps(receiver._call(method, self.path, body)).encode()
++            self.send_response(200)
++            self.send_header('Content-Type', 'application/json')
++            self.send_header('Content-Length', str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++        def log_message(self, *args):
++            pass
++
++    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    thread = threading.Thread(target=server.serve_forever)
++    thread.start()
++    hub = client.Hub(client.Identity(f'http://127.0.0.1:{server.server_port}', 'fixture-key', 'macbook'))
++    try:
++        kb.create_task(live, title='HTTP tracer', assignee='worker')
++        result = client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
++        assert result.applied == 1 and receiver.slot['a'] == '1'
++        assert len(authorizations) == 6 and set(authorizations) == {'Bearer fixture-key'}
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=5)
++        assert not thread.is_alive()
++
++
++@pytest.mark.parametrize('defect', ['missing', 'changed'])
++def test_source_loss_or_changed_frozen_envelope_retains_journal(live, defect):
++    kb.create_task(live, title='source custody', assignee='worker')
++    receiver = Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    frozen = journal.pending_wire(live)
++    op_id = journal.snapshot(live)['pending']['op_id']
++    with kbc.write_txn(live):
++        if defect == 'missing':
++            live.execute('DELETE FROM kanban_sync_outbox WHERE op_id=?', (op_id,))
++        else:
++            live.execute("UPDATE kanban_sync_outbox SET wire_json='{}' WHERE op_id=?", (op_id,))
++    receiver.lose_reply = False
++    with pytest.raises(ValueError, match='issued source custody'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert journal.pending_wire(live) == frozen
++    assert journal.snapshot(live)['settled'] == '0'
++    assert receiver.slot['a'] == '0' and len(receiver.sent) == 1
++
++
++@pytest.mark.parametrize('status', ['rejected', 'cancelled', 'deferred'])
++def test_unintegrated_disposition_stays_in_custody_without_ack(live, status):
++    kb.create_task(live, title='final custody', assignee='worker')
++    receiver = Receiver()
++    receiver.status = status
++    for _ in range(2):
++        with pytest.raises(ValueError, match='tracer final disposition requires custody integration'):
++            client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++        assert journal.snapshot(live)['pending'] is not None
++        assert journal.snapshot(live)['settled'] == '0'
++        assert receiver.slot['a'] == '0'
++    assert len(receiver.sent) == 1
++
++
++@pytest.mark.parametrize('flag', ['primary', 'before_head'])
++def test_unintegrated_push_modes_refuse_before_network(live, flag):
++    kb.create_task(live, title='mode custody', assignee='worker')
++    receiver = Receiver()
++    options = dict(primary=False, max_batches=1)
++    options[flag] = True
++    with pytest.raises(ValueError, match='tracer push mode not integrated'):
++        client.push(live, receiver, 'default', 'macbook', **options)
++    assert not receiver.calls and journal.pending_wire(live) is None
++
+-- 
+2.43.0
+

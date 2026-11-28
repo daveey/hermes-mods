@@ -1,0 +1,131 @@
+From e6249e452b821f2a05782075e24dabaf2f5c332f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:56:27 +0000
+Subject: [PATCH 6684] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit e6249e452b821f2a05782075e24dabaf2f5c332f.
+
+---
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 8a45bae0d2f11f8da3a9828b683144f4695885ca..64385964b58775aaf3d3b5f47e6c2314cf05d516 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -174,6 +174,12 @@
+     _block(row, trigger or 'Named finite producer and recovery condition',
+            trigger or 'Repair the missing wake/producer through existing scheduling APIs',
+            action='repair_lifecycle_contract' if row['violations'] else 'wait_for_named_producer')
++    # The producer's own words say what the park waits FOR; the clock/probe/producer trigger is only the next
++    # check. Keep them apart so a timer never stands in for the prerequisite.
++    why = ' '.join(str(awaiting.get('why') or '').split())
++    if why and trigger:
++        row['blocker']['prerequisite'] = why
++        row['instruction'] = f'Waiting on: {why}. Next check: {trigger}'
+ 
+ 
+ def project(facts: dict, *, now: int) -> dict:
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 519e892f899a5e795b1b23dca2d4031e0c218987..b29846cdd55cb182b2d85b5b532b56b44d0a8c69 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -397,7 +397,7 @@
+         if awaited["kind"] == "clock":
+             # A declared window (a soak, a cooldown, a release slot): the clock produces it.
+             label = _clock_label(wake_at) if wake_at else "a declared window"
+-            return out("scheduled", label + (f" ({awaited['why'][:80]})" if awaited["why"] else ""), False,
++            return out("scheduled", label + (f" ({awaited['why'][:200]})" if awaited["why"] else ""), False,
+                        eta="clock")
+         return out("scheduled:no_producer", f"{awaited['kind'] or 'something'} with no named producer", True)
+     found = producer_from_wake_check(payload.get("wake_check"))
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index f2734980f16c11eef32db3343efb54dabb3a4c67..c6b97dcd809d59f6dfa4dcad7063de780e9d94e6 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -33,6 +33,10 @@
+     (None, {}, None, 'repair_lifecycle_contract', 'scheduled_wake_missing', 'Repair the missing'),
+     (1000, {}, None, 'repair_lifecycle_contract', 'recovery_trigger_missing', 'Repair the missing'),
+     (1000, {'kind': 'clock'}, None, 'wait_for_named_producer', None, 'Recorded clock reaches 1000'),
++    (1000, {'kind': 'clock', 'why': 'Event watch on named owners; backstop at nightly rollout'}, None,
++     'wait_for_named_producer', None, 'Recorded clock reaches 1000'),
++    (1000, {'kind': 'clock', 'why': 'Natural hub update'}, 'probe-ready', 'wait_for_named_producer', None,
++     'Recorded condition probe succeeds: probe-ready'),
+     (1000, {'kind': 'ci', 'ref': 'run-17'}, None, 'wait_for_named_producer', None, 'Recorded ci producer run-17'),
+     (1000, {'kind': 'external', 'why': 'Vendor reply'}, None, 'wait_for_named_producer', None, 'Vendor reply'),
+     (1000, {}, 'probe-ready', 'wait_for_named_producer', None, 'Recorded condition probe succeeds: probe-ready'),
+@@ -43,8 +47,13 @@
+     row = project(facts, now=1000)
+     assert row['action'] == action
+     assert trigger in row['blocker']['trigger']
++    why = ' '.join(str(awaiting.get('why') or '').split())
+     assert row['blocker']['prerequisite'] == (
+-        'Named finite producer and recovery condition' if violation else row['blocker']['trigger'])
++        'Named finite producer and recovery condition' if violation else why or row['blocker']['trigger'])
++    if why and not violation:
++        # The reason leads; the timer/probe/producer is only the next check, never the prerequisite.
++        assert row['instruction'] == f"Waiting on: {why}. Next check: {row['blocker']['trigger']}"
++        assert row['blocker']['prerequisite'] != row['blocker']['trigger']
+     assert ('scheduled_wake_missing' in row['violations']) == (violation == 'scheduled_wake_missing')
+     assert ('recovery_trigger_missing' in row['violations']) == (violation is not None)
+     assert row['escalation']['at'] == (1600 if wake else None)
+diff --git a/tests/hermes_cli/test_kanban_actionability_wait_reason.py b/tests/hermes_cli/test_kanban_actionability_wait_reason.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..53ca0cc3ff1f94bde181f535784810b4f43105af
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_wait_reason.py
+@@ -0,0 +1,54 @@
++"""A schedule's actionability names what it waits FOR; the wake clock is only the next check. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wait_info as kwi
++from hermes_cli.kanban_actionability_cli import report
++from hermes_cli.kanban_actionability_sources import describe
++from hermes_cli.kanban_db_connect import connect
++
++T0 = 1_800_000_000
++WHY = 'Event watch on named original owners; backstop at the nightly rollout window 10:30Z'
++
++
++def _row(conn, tid, now):
++    return next(r for r in report(conn, now=now)['rows'] if r['task_id'] == tid)
++
++
++def _park(conn, monkeypatch, awaiting, wake='2027-01-15T08:01:40Z'):
++    monkeypatch.setattr('time.time', lambda: T0)
++    tid = kb.create_task(conn, title='parked', assignee='default')
++    assert kb.schedule_task(conn, tid, reason=f'SCHEDULED_UNTIL={wake} awaiting natural hub update then live '
++                            'measurements', awaiting=awaiting, clock_only=True)
++    return tid
++
++
++def test_clock_park_with_why_names_prerequisite_not_only_timer(tmp_path, monkeypatch):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = _park(conn, monkeypatch, {'kind': 'clock', 'why': WHY})
++        row = _row(conn, tid, T0 + 10)
++        assert row['instruction'].startswith(f'Waiting on: {WHY}. Next check: Recorded clock reaches ')
++        assert row['blocker']['prerequisite'] == WHY
++        assert 'Recorded clock reaches' in row['blocker']['trigger']
++        assert row['blocker']['prerequisite'] != row['blocker']['trigger']
++        assert describe(conn, tid, now=T0 + 10)['blocker']['prerequisite'] == WHY
++
++
++def test_wake_into_todo_clears_the_old_reason(tmp_path, monkeypatch):
++    with connect(tmp_path / 'kanban.db') as conn:
++        tid = _park(conn, monkeypatch, {'kind': 'clock', 'why': WHY})
++        parent = kb.create_task(conn, title='late prerequisite', assignee='default')
++        kb.link_tasks(conn, parent, tid)
++        assert kc.wake_due_continuations(conn, now=5_000_000_000) == [tid]
++        assert kb.get_task(conn, tid).status == 'todo'
++        row = _row(conn, tid, T0 + 500)
++        assert WHY not in row['instruction'] and WHY not in str(row['blocker'])
++
++
++def test_wait_label_carries_the_full_reason(monkeypatch):
++    park = {'awaiting': {'kind': 'clock', 'why': WHY}, 'wake_at': T0 + 600}
++    wait = kwi.describe('scheduled', park=park, since=T0, now=T0 + 10)
++    assert wait['waiting_on'].endswith(f'({WHY})')
++    assert kwi.describe('scheduled', park={'awaiting': {'kind': 'clock'}, 'wake_at': T0 + 600},
++                        since=T0, now=T0 + 10)['waiting_on'].endswith('UTC')
+-- 
+2.43.0
+

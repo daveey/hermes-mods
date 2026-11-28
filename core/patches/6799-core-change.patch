@@ -1,0 +1,129 @@
+From 132ef3381098ca58faf63f751466c21686d23b6c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 14:01:06 +0000
+Subject: [PATCH 6799] PR-guard comment provenance and soft duplicate check handling
+
+Public mirror of source commit 132ef3381098ca58faf63f751466c21686d23b6c.
+
+---
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 6cca9499c5c56121f1dbdc3387bc8c5a4091d293..e9c142f18cadeca315b4691902c4c90a8d374fe3 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -331,11 +331,19 @@
+             data = json.loads(payload)
+         except (ValueError, TypeError):
+             return None
+-        if not isinstance(data, dict) or type(data.get("comment_id")) is not int \
++        if not isinstance(data, dict) \
+                 or not isinstance(data.get("author"), str) or type(data.get("len")) is not int:
+             return None
+         at = _kb._to_epoch(created_at)
+-        out.append((data, at, _event_row_id(rows, at, data)))
++        row_id = _event_row_id(rows, at, data)
++        if type(data.get("comment_id")) is not int:
++            # Portable system producers omit host-local ids. Accept only their unique
++            # UID match, not an accidental legacy author/time/length match.
++            uid = data.get("comment_uid")
++            if "comment_id" in data or not isinstance(uid, str) or not uid \
++                    or len(getattr(rows, "uids", {}).get(uid, [])) != 1:
++                return None
++        out.append((data, at, row_id))
+     return out
+ 
+ 
+@@ -347,7 +355,7 @@
+     events = _comment_events(conn, task_id)
+     if events is None:
+         return None
+-    hits = {row for data, _at, row in events if data["comment_id"] == comment_id}
++    hits = {row for data, _at, row in events if data.get("comment_id") == comment_id}
+     if len(hits) != 1 or None in hits:
+         return None
+     return hits.pop()
+diff --git a/tests/hermes_cli/test_kanban_pr_uid_only_event.py b/tests/hermes_cli/test_kanban_pr_uid_only_event.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b3e739401bb15b8794e7f7381deed042dbc5ab2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_uid_only_event.py
+@@ -0,0 +1,77 @@
++"""Portable UID-only system comments must not poison unrelated PR provenance."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from tests.hermes_cli import test_kanban_pr_replica_comment_uid as helpers
++
++kanban_home = helpers.kanban_home
++open_pr = helpers.open_pr
++pytestmark = pytest.mark.usefixtures("kanban_home", "open_pr")
++
++
++def _uid_only(conn, tid, cid, uid):
++    helpers._replicate_with_uid(conn, tid, cid, uid, len_delta=0)
++    for eid, payload in conn.execute(
++        "SELECT id,payload FROM task_events WHERE task_id=? AND kind='commented'", (tid,)
++    ).fetchall():
++        data = json.loads(payload)
++        if data.get("comment_id") == cid:
++            del data["comment_id"]
++            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(data), eid))
++
++
++@pytest.mark.parametrize("uid", ["portable-system-note", "", None])
++def test_historical_uid_only_event_does_not_poison_wake(monkeypatch, uid):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid, _ = helpers._owner_parked(conn, monkeypatch, now)
++        cid = kb.add_comment(conn, tid, "kanban-spend-reviewer", "historical system decision")
++        _uid_only(conn, tid, cid, uid)
++        kb.add_comment(conn, tid, "kanban-dispatcher", f"Woken: the job finished: succeeded ({helpers.URL}).")
++        expected = None if uid else "active_pr"
++        assert prs.active_pr_reason(conn, tid, now + 700) == expected
++
++
++@pytest.mark.parametrize("fault", ["missing-row", "duplicate-uid", "malformed-id", "bad-author", "bad-length"])
++def test_uid_only_unreadable_provenance_stays_closed(monkeypatch, fault):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid, _ = helpers._owner_parked(conn, monkeypatch, now)
++        cid = kb.add_comment(conn, tid, "system", "historical decision")
++        _uid_only(conn, tid, cid, "system-uid")
++        eid, payload = conn.execute(
++            "SELECT id,payload FROM task_events WHERE task_id=? AND kind='commented' ORDER BY id DESC LIMIT 1", (tid,)
++        ).fetchone()
++        data = json.loads(payload)
++        overrides = {
++            "missing-row": {"comment_uid": "unknown"},
++            "malformed-id": {"comment_id": False},
++            "bad-author": {"author": None},
++            "bad-length": {"len": "19"},
++            "duplicate-uid": {},
++        }
++        data.update(overrides[fault])
++        if fault == "duplicate-uid":
++            conn.execute("UPDATE task_comments SET uid='system-uid' WHERE task_id=?", (tid,))
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(data), eid))
++        kb.add_comment(conn, tid, "kanban-dispatcher", f"Woken: the job finished: succeeded ({helpers.URL}).")
++        assert prs._comment_events(conn, tid) is None
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
++
++
++def test_uid_only_own_publication_still_holds(monkeypatch):
++    now = int(time.time())
++    monkeypatch.setattr(time, "time", lambda: now)
++    with kbc.connect() as conn:
++        tid, run_id = helpers._owner_parked(conn, monkeypatch, now)
++        cid = helpers._worker_comment(conn, tid, run_id, monkeypatch, "Opened https://github.com/example/project/pull/99")
++        _uid_only(conn, tid, cid, "portable-owner-note")
++        assert prs.active_pr_reason(conn, tid, now + 700) == "active_pr"
++        assert prs._local_comment_id(conn, tid, cid) is None
+-- 
+2.43.0
+

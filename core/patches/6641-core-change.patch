@@ -1,0 +1,549 @@
+From 88da4c4a2f460966ce27f82b9ac0eacf51cc08a6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:59:08 +0000
+Subject: [PATCH 6641] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 88da4c4a2f460966ce27f82b9ac0eacf51cc08a6.
+
+---
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index e670774f456110f0ab4a9c9e522e9028329e56fe..8ad324e21428b3ed200e2aacdfef421c16f1a16c 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -203,7 +203,7 @@
+ 
+ 
+ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float,
+-                       local_only: bool = False) -> dict:
++                       local_only: bool = False, read: dict | None = None) -> dict:
+     """Attach owner evidence during the collector's existing read transaction.
+ 
+     The collector must call this on the owner, never on a replica. A completion
+@@ -212,33 +212,42 @@
+     judge-success receipt; unavailable judges never supply release evidence.
+     Explicit-home callers set local_only: upstream presentation is confined to
+     this connection, never an implicitly discovered process-home shadow.
++    ``read`` carries this card's rows when the caller already read them in this same transaction
++    (``kanban_origin_local._prefetch``): the task row, its markers, its latest completed/archived/withdrawn
++    events and its latest run. Every check below is unchanged; only the keyed reads are skipped.
+     """
+     if not conn.in_transaction:
+         raise ValueError('origin_observation_snapshot_required')
+-    row = conn.execute(
++    row = read['row'] if read is not None else conn.execute(
+         "SELECT status,completed_at,current_run_id,goal_mode,completion_contract FROM tasks WHERE id=?",
+         (task['id'],)).fetchone()
+     if row is None or row[0] != task.get('status'):
+         raise ValueError('origin_observation_task_changed')
+     supplied = task.get('origin_bindings', [])
+-    has_intents = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone()
+-    authoritative = [json.loads(r[0]) for r in conn.execute(
+-        'SELECT binding_json FROM origin_creation_intents WHERE task_id=?', (task['id'],))] if has_intents else []
++    if read is not None:
++        authoritative = read['markers']
++    else:
++        has_intents = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='origin_creation_intents'").fetchone()
++        authoritative = [json.loads(r[0]) for r in conn.execute(
++            'SELECT binding_json FROM origin_creation_intents WHERE task_id=?', (task['id'],))] if has_intents else []
+     if (not isinstance(supplied, list) or any(not isinstance(m, dict) for m in supplied)
+             or sorted(_json({k: v for k, v in m.items() if k != 'publication_version'}) for m in supplied)
+             != sorted(_json(m) for m in authoritative)
+             or any(m.get('owner') != {**{k: task.get(k) for k in ('gateway', 'profile', 'board')},
+                                        'task_id': task['id']} for m in authoritative)):
+         raise ValueError('origin_observation_binding_changed')
+-    event = conn.execute(
+-        "SELECT id,run_id,created_at,payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+-        (task['id'],)).fetchone()
+-    run = conn.execute(
+-        "SELECT id,status,outcome,ended_at,summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+-        (task['id'],)).fetchone()
+-    archived = conn.execute(
+-        "SELECT id,payload FROM task_events WHERE task_id=? AND kind='archived' ORDER BY id DESC LIMIT 1",
+-        (task['id'],)).fetchone() if row[0] == 'archived' and event else None
++    if read is not None:
++        event, run, archived = read['event'], read['run'], read['archived']
++    else:
++        event = conn.execute(
++            "SELECT id,run_id,created_at,payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
++            (task['id'],)).fetchone()
++        run = conn.execute(
++            "SELECT id,status,outcome,ended_at,summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++            (task['id'],)).fetchone()
++        archived = conn.execute(
++            "SELECT id,payload FROM task_events WHERE task_id=? AND kind='archived' ORDER BY id DESC LIMIT 1",
++            (task['id'],)).fetchone() if row[0] == 'archived' and event else None
+     verified, legacy, terminal = completion_verdict(
+         task['id'], row, event, run, archived,
+         # [daveey] By uid, else id; a replayed legacy completion binds its run's receipt (kanban_completion_refs).
+@@ -258,7 +267,7 @@
+     if (ask := publish_ask(conn, task)) is not None:
+         payload['ask_notice'] = ask
+     from hermes_cli.kanban_withdrawal_notice import publish
+-    withdrawal = publish(conn, task)
++    withdrawal = publish(conn, task) if read is None else publish(conn, task, latest=(read['withdrawn'],))
+     if withdrawal is not None:
+         from hermes_cli.kanban_withdrawal_recipients import published
+         payload['withdrawal_notice'] = withdrawal
+@@ -632,6 +641,8 @@
+             from hermes_cli.kanban_origin_batch import task_rows, lookup
+             task_snapshot = task_rows(source, (b for _, b, *_ in obligations
+                                                if (b['origin']['gateway'], b['origin']['profile']) == (gateway, profile))) if fresh else {}
++            from hermes_cli.kanban_origin_batch import _enabled as batched
++            own: dict | None = {} if batched() else None  # id(binding) -> this pass's same-owner observation
+             for raw, binding, resolved, payload, version, released in obligations:
+                 origin, owner = binding['origin'], binding['owner']
+                 if (origin['gateway'], origin['profile']) != (gateway, profile):
+@@ -679,9 +690,21 @@
+                 if final is None:
+                     continue
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+-                    from hermes_cli.kanban_origin_local import observe_local_binding
+-                    local = (observe_local_binding(binding, profile=profile, now=now) if home is None else
+-                             observe_local_binding(binding, profile=profile, now=now, home=home))
++                    from hermes_cli import kanban_origin_local
++                    if own is None:
++                        observe = kanban_origin_local.observe_local_binding
++                        local = (observe(binding, profile=profile, now=now) if home is None else
++                                 observe(binding, profile=profile, now=now, home=home))
++                    else:
++                        if not own:
++                            # [daveey] Every same-owner card in one snapshot and one batched read per board, at the
++                            # first one reached: many cards cost thousands of statements per projection.
++                            mine = [b for _, b, *_ in obligations
++                                    if (b['origin']['gateway'], b['origin']['profile']) == (gateway, profile)
++                                    and (b['owner']['gateway'], b['owner']['profile']) == (gateway, profile)]
++                            own.update(zip(map(id, mine), kanban_origin_local.observe_local_bindings(
++                                mine, profile=profile, now=now, home=home)))
++                        local = own[id(binding)]
+                     # An unreadable local authority must not fall back to a stale
+                     # own replica, even one which previously proved completion.
+                     current = local is not None
+diff --git a/hermes_cli/kanban_origin_local.py b/hermes_cli/kanban_origin_local.py
+index 19046162ab0bbc058923ec49fad583517222f929..47531bdea2cf7a6f4223d97c364689c8d8d3468c 100644
+--- a/hermes_cli/kanban_origin_local.py
++++ b/hermes_cli/kanban_origin_local.py
+@@ -3,21 +3,16 @@
+ import json
+ import sqlite3
+ 
++_READ_ERRORS = (OSError, sqlite3.Error, ValueError, TypeError)
+ 
+-def observe_local_binding(binding: dict, *, profile: str, now: float, home=None) -> dict | None:
+-    """Never infer an owner from an ID or release a receipt without its marker.
+ 
+-    Caller has already matched the trusted local gateway and profile. Shared or
+-    overridden board locations are ambiguous and cannot authorize this overlay.
+-    """
++def _owner_db(owner: dict, *, profile: str, home):
++    """The owner board's database when this profile unambiguously owns it, else None."""
+     from hermes_constants import get_hermes_home
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_origin import _ro
+-    from hermes_cli.kanban_origin_ledger import observe_owner_task
+     from hermes_cli.profiles import get_active_profile_name
+ 
+     from pathlib import Path
+-    owner = binding['owner']
+     explicit = home is not None
+     home = Path(home).resolve() if explicit else get_hermes_home().resolve()
+     board = owner['board']
+@@ -30,6 +25,22 @@
+     if not explicit and (profile != get_active_profile_name()
+                          or kb.kanban_home().resolve() != home or kb.kanban_db_path(board).resolve() != expected):
+         return None
++    return expected
++
++
++def observe_local_binding(binding: dict, *, profile: str, now: float, home=None) -> dict | None:
++    """Never infer an owner from an ID or release a receipt without its marker.
++
++    Caller has already matched the trusted local gateway and profile. Shared or
++    overridden board locations are ambiguous and cannot authorize this overlay.
++    """
++    from hermes_cli.kanban_origin import _ro
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++
++    owner = binding['owner']
++    expected = _owner_db(owner, profile=profile, home=home)
++    if expected is None:
++        return None
+     try:
+         with closing(_ro(expected)) as conn:
+             conn.row_factory = sqlite3.Row
+@@ -43,6 +54,102 @@
+             if marker not in markers:
+                 return None
+             task = {**dict(row), **owner, 'id': owner['task_id'], 'origin_bindings': markers}
+-            return observe_owner_task(conn, task, now=now, local_only=explicit)
+-    except (OSError, sqlite3.Error, ValueError, TypeError):
++            return observe_owner_task(conn, task, now=now, local_only=home is not None)
++    except _READ_ERRORS:
+         return None
++
++
++_LATEST_EVENT = ("SELECT e.task_id,{fields} FROM json_each(?) AS wanted CROSS JOIN task_events AS e"
++                 " ON e.id=(SELECT MAX(id) FROM task_events WHERE kind='{kind}' AND task_id=wanted.value)")
++
++
++def _prefetch(conn: sqlite3.Connection, ids: list[str]) -> dict:
++    """Every row ``observe_local_binding`` reads once per card, for all of ``ids``, in this snapshot. [daveey]
++
++    Each query keeps the requested ids outermost (``CROSS JOIN``) and reaches the latest row per card with one
++    index seek, the same row ``ORDER BY id DESC LIMIT 1`` returns. Markers keep rowid order, as the keyed read.
++    """
++    wanted = json.dumps(ids)
++    tasks = {r['id']: r for r in conn.execute(
++        'SELECT t.* FROM json_each(?) AS wanted CROSS JOIN tasks AS t ON t.id=wanted.value', (wanted,))}
++    markers: dict[str, list[str]] = {}
++    for task_id, raw in conn.execute(
++            'SELECT i.task_id,i.binding_json FROM json_each(?) AS wanted CROSS JOIN origin_creation_intents AS i'
++            ' ON i.task_id=wanted.value ORDER BY i.rowid', (wanted,)):
++        markers.setdefault(task_id, []).append(raw)
++    completed = {r[0]: tuple(r)[1:] for r in conn.execute(
++        _LATEST_EVENT.format(fields='e.id,e.run_id,e.created_at,e.payload', kind='completed'), (wanted,))}
++    runs = {r[0]: tuple(r)[1:] for r in conn.execute(
++        'SELECT r.task_id,r.id,r.status,r.outcome,r.ended_at,r.summary FROM json_each(?) AS wanted'
++        ' CROSS JOIN task_runs AS r ON r.id=(SELECT MAX(id) FROM task_runs WHERE task_id=wanted.value)', (wanted,))}
++    closed = json.dumps([t for t, r in tasks.items() if r['status'] == 'archived'])
++    archived, withdrawn = ({r[0]: tuple(r)[1:] for r in conn.execute(
++        _LATEST_EVENT.format(fields=fields, kind=kind), (closed,))} if closed != '[]' else {}
++        for fields, kind in (('e.id,e.payload', 'archived'), ('e.id,e.created_at,e.payload', 'request_withdrawn')))
++    return {'tasks': tasks, 'markers': markers, 'completed': completed, 'runs': runs, 'archived': archived,
++            'withdrawn': withdrawn}
++
++
++def _observe_prefetched(conn, binding: dict, read: dict, *, now: float, explicit: bool) -> dict | None:
++    from hermes_cli.kanban_origin_ledger import observe_owner_task
++
++    owner = binding['owner']
++    task_id = owner['task_id']
++    row = read['tasks'].get(task_id)
++    if row is None:
++        return None
++    # Decoded per binding: two obligations on one card never share a mutable marker list.
++    markers = [json.loads(raw) for raw in read['markers'].get(task_id, ())]
++    marker = {k: v for k, v in binding.items() if k != 'publication_version'}
++    if marker not in markers:
++        return None
++    task = {**dict(row), **owner, 'id': task_id, 'origin_bindings': markers}
++    event = read['completed'].get(task_id)
++    try:
++        state = tuple(row[k] for k in ('status', 'completed_at', 'current_run_id', 'goal_mode', 'completion_contract'))
++    except IndexError as exc:  # a schema without one of these columns fails the keyed read the same way
++        raise sqlite3.OperationalError(str(exc)) from None
++    return observe_owner_task(conn, task, now=now, local_only=explicit, read={
++        'row': state,
++        'markers': [json.loads(raw) for raw in read['markers'].get(task_id, ())],
++        'event': event, 'run': read['runs'].get(task_id),
++        'archived': read['archived'].get(task_id) if row['status'] == 'archived' and event else None,
++        'withdrawn': read['withdrawn'].get(task_id)})
++
++
++def observe_local_bindings(bindings: list[dict], *, profile: str, now: float, home=None) -> list[dict | None]:
++    """``observe_local_binding`` for many bindings: one snapshot and one batched read per owner board. [daveey]
++
++    A large board: many same-owner obligations cost thousands of statements per links projection (each card its own
++    snapshot and ten keyed reads), every one a GIL hand-off inside the Desktop backend. The answer for each binding
++    is what the single-card read returns in that snapshot. A card whose read fails here, and every card after it,
++    is read alone again, so a broken shared handle is never the reason a card reads unknown.
++    """
++    from hermes_cli.kanban_origin import _ro
++
++    out: list[dict | None] = [None] * len(bindings)
++    boards: dict[tuple, list[int]] = {}
++    for index, binding in enumerate(bindings):
++        boards.setdefault((binding['owner']['board'], binding['owner']['profile']), []).append(index)
++    for indexes in boards.values():
++        expected = _owner_db(bindings[indexes[0]]['owner'], profile=profile, home=home)
++        if expected is None:
++            continue
++        alone = list(indexes)
++        try:
++            with closing(_ro(expected)) as conn:
++                conn.row_factory = sqlite3.Row
++                conn.execute('BEGIN')
++                read = _prefetch(conn, sorted({bindings[i]['owner']['task_id'] for i in indexes}))
++                while alone:
++                    try:
++                        out[alone[0]] = _observe_prefetched(conn, bindings[alone[0]], read, now=now,
++                                                            explicit=home is not None)
++                    except (ValueError, TypeError):
++                        out[alone[0]] = None
++                    alone.pop(0)
++        except (*_READ_ERRORS, IndexError):
++            pass
++        for index in alone:
++            out[index] = observe_local_binding(bindings[index], profile=profile, now=now, home=home)
++    return out
+diff --git a/hermes_cli/kanban_withdrawal_notice.py b/hermes_cli/kanban_withdrawal_notice.py
+index 7471ab0127bca8e6b37e3d44802d187d36f624cc..6d19ca7fef3be9cfd37ecf2e680131d6d26f23f1 100644
+--- a/hermes_cli/kanban_withdrawal_notice.py
++++ b/hermes_cli/kanban_withdrawal_notice.py
+@@ -5,11 +5,14 @@
+ import math
+ 
+ 
+-def publish(conn, task: dict) -> dict | None:
+-    """Read inside the collector snapshot; never infer withdrawal from status."""
++def publish(conn, task: dict, *, latest: tuple | None = None) -> dict | None:
++    """Read inside the collector snapshot; never infer withdrawal from status.
++
++    ``latest`` is ``(row,)`` when the caller already read this card's latest ``request_withdrawn`` event
++    ``(id, created_at, payload)`` in this snapshot (row None when it has none)."""
+     if task.get("status") != "archived":
+         return None
+-    row = conn.execute(
++    row = latest[0] if latest is not None else conn.execute(
+         "SELECT id,created_at,payload FROM task_events WHERE task_id=? "
+         "AND kind='request_withdrawn' ORDER BY id DESC LIMIT 1", (task["id"],)).fetchone()
+     if row is None:
+diff --git a/tests/hermes_cli/test_kanban_origin_local_batch.py b/tests/hermes_cli/test_kanban_origin_local_batch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7f83d3cd1e32b8bf7ebb5c67e4fb3997f06b63b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_local_batch.py
+@@ -0,0 +1,166 @@
++"""Same-owner obligations are read in one batched pass, with the single-card read's exact answers."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_origin as origin, kanban_origin_local as local, kanban_origin_ledger as ledger
++from tests.hermes_cli import test_kanban_local_origin_projection as support
++
++world = support.world
++board = support.board
++
++STATES = ('ready', 'done', 'done_archived', 'archived', 'withdrawn', 'blocked', 'scheduled', 'raw_done',
++          'missing_marker', 'wrong_marker', 'goal_done')
++
++
++def _withdraw(conn, tid, _binding):
++    kb._append_event(conn, tid, 'request_withdrawn', {'notice_version': 1, 'recipients': [{'chat': 'c'}]})
++
++
++def _block(conn, tid, _binding):
++    assert kb.block_task(conn, tid, reason='Which region?', kind='needs_input')
++
++
++def _wrong_marker(conn, tid, binding):
++    marker = {**binding, 'origin': {**binding['origin'], 'session': 'unrelated'}}
++    marker.pop('publication_version')
++    conn.execute('UPDATE origin_creation_intents SET binding_json=? WHERE task_id=?', (json.dumps(marker), tid))
++
++
++def _goal_done(conn, tid, _binding):
++    assert kb.complete_task(conn, tid, summary='Built and tested')
++    conn.execute('UPDATE tasks SET goal_mode=1 WHERE id=?', (tid,))
++
++
++CHANGES = {
++    'withdrawn': _withdraw, 'blocked': _block, 'wrong_marker': _wrong_marker, 'goal_done': _goal_done,
++    'scheduled': lambda conn, tid, _: conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,)),
++    'raw_done': lambda conn, tid, _: conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,)),
++    'missing_marker': lambda conn, tid, _: conn.execute('DELETE FROM origin_creation_intents WHERE task_id=?', (tid,)),
++}
++
++
++def seed(world, monkeypatch, states):
++    from hermes_cli import profiles
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    path, replica, template = world
++    template['origin']['gateway'] = 'owner'
++    tasks = {}
++    for i, state in enumerate(states):
++        with kbc.connect_closing() as conn:
++            tid = kb.create_task(conn, title=f'Build {i}', assignee='default', completion_contract='local-only',
++                                 origin_intent={'request_id': f'batch-create-{i:03d}',
++                                                'owner': {'gateway': 'owner', 'profile': 'default', 'board': 'default'},
++                                                'origin': template['origin']})
++            binding = json.loads(conn.execute('SELECT binding_json FROM origin_creation_intents WHERE task_id=?',
++                                              (tid,)).fetchone()[0])
++        binding['publication_version'] = 3
++        support.publish(world[1], binding)
++        support.accept((path, replica, binding), gateway='owner', request_id=f'batch-accept-{i:03d}')
++        tasks[tid] = (state, binding)
++    # Lifecycle changes only after every card exists.
++    for tid, (state, binding) in tasks.items():
++        with kbc.connect_closing() as conn:
++            if state in ('done', 'done_archived', 'missing_marker', 'wrong_marker'):
++                assert kb.complete_task(conn, tid, summary='Built and tested')
++            if state in ('done_archived', 'archived', 'withdrawn'):
++                assert kb.archive_task(conn, tid)
++            CHANGES.get(state, lambda *_: None)(conn, tid, binding)
++    return {tid: state for tid, (state, _) in tasks.items()}
++
++
++def project(world, monkeypatch, flag):
++    monkeypatch.setenv('HERMES_ORIGIN_BATCH_READS', flag)
++    return ledger.project(world[0], replica=None, gateway='owner', profile='default', now=5000)
++
++
++def count_board_statements(monkeypatch):
++    seen = []
++    original_open = origin._open_ro
++    def opener(path):
++        conn = original_open(path)
++        if path == kb.kanban_db_path('default'):
++            conn.set_trace_callback(seen.append)
++        return conn
++    monkeypatch.setattr(origin, '_open_ro', opener)
++    return seen
++
++
++def test_batched_pass_matches_single_card_reads_for_every_state(world, board, monkeypatch):
++    tasks = seed(world, monkeypatch, STATES)
++    single = project(world, monkeypatch, '0')
++    batched = project(world, monkeypatch, '1')
++    assert json.dumps(batched, sort_keys=True) == json.dumps(single, sort_keys=True)
++    by_state = {tasks[row['id']]: row for row in batched}
++    assert set(by_state) == set(STATES)
++    assert {s: by_state[s]['status'] for s in STATES} == {
++        'ready': 'ready', 'done': 'done', 'done_archived': 'archived', 'archived': 'archived',
++        'withdrawn': 'archived', 'blocked': 'blocked', 'scheduled': 'scheduled', 'raw_done': 'unknown',
++        'missing_marker': 'unknown', 'wrong_marker': 'unknown', 'goal_done': 'unknown'}
++    assert not by_state['done']['unfinished'] and not by_state['done_archived']['unfinished']
++    assert by_state['archived']['closed_uncompleted'] and by_state['goal_done']['unfinished']
++
++
++def test_batched_pass_statement_count_does_not_grow_with_cards(world, board, monkeypatch):
++    seed(world, monkeypatch, ('done', 'done_archived', 'archived', 'withdrawn') * 4)
++    seen = count_board_statements(monkeypatch)
++    single = project(world, monkeypatch, '0')
++    per_card = len(seen)
++    del seen[:]
++    batched = project(world, monkeypatch, '1')
++    assert batched == single and len(batched) == 16
++    assert per_card >= 16 * 7
++    # One snapshot (BEGIN, ROLLBACK) and six batched reads, plus the published recipients of each of the four
++    # withdrawn cards.
++    assert len(seen) <= 8 + 4, [s[:90] for s in seen]
++
++
++@pytest.mark.parametrize('fault', ['prefetch', 'second_card', 'second_card_value'])
++def test_failed_batched_read_falls_back_to_single_card_reads(world, board, monkeypatch, fault):
++    seed(world, monkeypatch, ('ready', 'done', 'blocked', 'archived'))
++    single = project(world, monkeypatch, '0')
++    if fault == 'prefetch':
++        def broken(conn, ids):
++            raise sqlite3.OperationalError('database is locked')
++        monkeypatch.setattr(local, '_prefetch', broken)
++    else:
++        original, calls = local._observe_prefetched, []
++        def flaky(conn, binding, read, **kw):
++            calls.append(binding['owner']['task_id'])
++            if len(calls) == 2:
++                raise sqlite3.OperationalError('disk I/O error') if fault == 'second_card' else ValueError('bad')
++            return original(conn, binding, read, **kw)
++        monkeypatch.setattr(local, '_observe_prefetched', flaky)
++    alone = []
++    original_single = local.observe_local_binding
++    def observe(binding, **kw):
++        alone.append(binding['owner']['task_id'])
++        return original_single(binding, **kw)
++    monkeypatch.setattr(local, 'observe_local_binding', observe)
++    batched = project(world, monkeypatch, '1')
++    if fault == 'second_card_value':
++        # A card's own bad evidence is that card's unknown, as in the single-card read; nothing is re-read.
++        assert alone == []
++        assert [r['status'] for r in batched] == [s if i != 1 else 'unknown'
++                                                  for i, s in enumerate(r['status'] for r in single)]
++    else:
++        assert batched == single
++        assert len(alone) == (4 if fault == 'prefetch' else 3)
++
++
++def test_two_obligations_on_one_card_each_get_their_own_answer(world, board, monkeypatch):
++    tasks = seed(world, monkeypatch, ('done', 'ready'))
++    done = next(t for t, s in tasks.items() if s == 'done')
++    with sqlite3.connect(world[0]) as conn:
++        key, _digest, raw, resolved, task, version, released = conn.execute(
++            'SELECT * FROM origin_obligations WHERE binding_json LIKE ?', (f'%{done}%',)).fetchone()
++        # A second accepted obligation whose marker the owner board does not hold: same card, unknown.
++        other = {**json.loads(raw), 'binding_id': 'binding-other'}
++        conn.execute('INSERT INTO origin_obligations VALUES (?,?,?,?,?,?,?)',
++                     (key + 'x', ledger.binding_hash(other), ledger._json(other), resolved, task, version, released))
++    single = project(world, monkeypatch, '0')
++    batched = project(world, monkeypatch, '1')
++    assert batched == single
++    assert sorted(r['status'] for r in batched if r['id'] == done) == ['done', 'unknown']
+diff --git a/tests/hermes_cli/test_kanban_origin_local_read_pass.py b/tests/hermes_cli/test_kanban_origin_local_read_pass.py
+index 5d1630622199d59fd76efbcd31edb9312bac9160..30a63f23303ca2429ddcdfc4ca7d75b785ac8f96 100644
+--- a/tests/hermes_cli/test_kanban_origin_local_read_pass.py
++++ b/tests/hermes_cli/test_kanban_origin_local_read_pass.py
+@@ -46,35 +46,48 @@
+             opened.append(conn)
+         return conn
+     monkeypatch.setattr(origin, '_open_ro', opener)
+-    original = local.observe_local_binding
+     visited = []
+-    def observe(binding, **kw):
+-        result = original(binding, **kw)
+-        visited.append(binding['owner']['task_id'])
++    def mutate_after_first(task_id):
++        visited.append(task_id)
+         if len(visited) == 1:
+-            # The previous borrow must release its snapshot before this commit.
++            # A single-card borrow must release its snapshot before this commit; the batched pass keeps the one
++            # snapshot it read every card in.
+             with kbc.connect_closing() as conn:
+                 if change == 'blocked':
+                     conn.execute("UPDATE tasks SET status='blocked' WHERE id != ?", (visited[0],))
+                 else:
+                     conn.execute('DELETE FROM origin_creation_intents WHERE task_id != ?', (visited[0],))
++    original = local.observe_local_binding
++    def observe(binding, **kw):
++        result = original(binding, **kw)
++        mutate_after_first(binding['owner']['task_id'])
+         return result
+     monkeypatch.setattr(local, 'observe_local_binding', observe)
++    original_prefetched = local._observe_prefetched
++    def observe_prefetched(conn, binding, read, **kw):
++        result = original_prefetched(conn, binding, read, **kw)
++        mutate_after_first(binding['owner']['task_id'])
++        return result
++    monkeypatch.setattr(local, '_observe_prefetched', observe_prefetched)
+     rows = ledger.project(world[0], replica=None, gateway='owner', profile='default')
+     assert len(rows) == len(tasks) == 3
+     by_id = {row['id']: row for row in rows}
+     assert by_id[visited[0]]['status'] == 'ready'
+-    assert {by_id[tid]['status'] for tid in visited[1:]} == ({'blocked'} if change == 'blocked' else {'unknown'})
++    changed = {'blocked'} if change == 'blocked' else {'unknown'}
++    # One pass is one snapshot when batched: a commit during the pass is the next projection's news.
++    assert {by_id[tid]['status'] for tid in visited[1:]} == ({'ready'} if flag == '1' else changed)
+     assert len(opened) == (1 if flag == '1' else 3)
+     for conn in opened:
+         with pytest.raises(sqlite3.ProgrammingError):
+             conn.execute('SELECT 1')
+     # The next call cannot reuse the prior call's connection or observations.
+     monkeypatch.setattr(local, 'observe_local_binding', original)
++    monkeypatch.setattr(local, '_observe_prefetched', original_prefetched)
+     with kbc.connect_closing() as conn:
+         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (visited[0],))
+     again = ledger.project(world[0], replica=None, gateway='owner', profile='default')
+     assert next(row for row in again if row['id'] == visited[0])['status'] == 'running'
++    assert {row['status'] for row in again if row['id'] != visited[0]} == changed
+     assert len(opened) == (2 if flag == '1' else 6)
+ 
+ 
+@@ -89,11 +102,11 @@
+         opened.append(conn)
+         return conn
+     monkeypatch.setattr(origin, '_open_ro', opener)
+-    original = local.observe_local_binding
+-    def fail_after_borrow(binding, **kw):
+-        original(binding, **kw)
++    original = local.observe_local_bindings
++    def fail_after_borrow(bindings, **kw):
++        original(bindings, **kw)
+         raise ValueError('projection_failure')
+-    monkeypatch.setattr(local, 'observe_local_binding', fail_after_borrow)
++    monkeypatch.setattr(local, 'observe_local_bindings', fail_after_borrow)
+     with pytest.raises(ValueError, match='projection_failure'):
+         ledger.project(world[0], replica=None, gateway='owner', profile='default')
+     assert len(opened) == 2
+-- 
+2.43.0
+

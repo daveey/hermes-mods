@@ -1,0 +1,1575 @@
+From 0546192ecef2973f6e9c74f6578383b87766a432 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 11:28:36 +0000
+Subject: [PATCH 6596] Stage-local unloaded-notification diagnostic receipts
+
+Public mirror of source commit 0546192ecef2973f6e9c74f6578383b87766a432.
+
+---
+diff --git a/docs/designs/unloaded-diagnostics.md b/docs/designs/unloaded-diagnostics.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4af98566455ef38a8712c3e650cc8f7edc2a56f
+--- /dev/null
++++ b/docs/designs/unloaded-diagnostics.md
+@@ -0,0 +1,66 @@
++# Unloaded notification diagnostics
++
++These are **observations**, not scheduling inputs. No eligibility, retry interval,
++settlement, expiry, wake, cadence or memo-lifetime policy is changed. Receipts use
++`hermes_cli.loop_accounting`; all label vocabularies are finite literals in
++`tui_gateway/unloaded_diagnostics.py` and
++`gateway/notification_retry_provenance.py`. Unknown values never become metric
++names. Registry capacity overflow remains the existing `_overflow` counter.
++
++## Units and conservation
++
++All metric names start with `unloaded.diag.`:
++
++| Family | Unit / meaning |
++| --- | --- |
++| `host.primary.<admission>` | One per actual `unloaded.host_pass`, including exceptions; lexical per-thread CPU overlay |
++| `host.exit.{complete,exception,unknown}` | One per host pass |
++| `host.due.{fact,retry,due,maintenance,unknown}` | Nonexclusive admission flags |
++| `host.fact.<kind>` | Source-kind observations consumed by actual action admission; kinds are health, TaskFact, SourceState, SessionFact, ChatWaitingFact, reset, unknown |
++| `retry.site.<reason>` | Actual local card-change incompletion site |
++| `remote.call.<outcome>` | One per entered remote-change call |
++| `remote.miss.<test>.<status>` | Independent evaluated miss tests; true, false, not_evaluated or unknown |
++| `remote.chat.trigger.<trigger>` | One per chat actually iterated |
++| `remote.chat.result.<result>` | One per chat actually iterated |
++| `remote.chat.flag.health_pending` | Independent health observation on iterated chats |
++| `remote.cert.<outcome>` | One certification-stage receipt per entered remote call; unreached is not_attempted |
++| `remote.cert.flag.<failure>` | Independent simultaneous prints_none / after_poll_none / cursor_moved flags, or unknown |
++| `remote.health.<outcome>` | One health-stage receipt per entered remote call; unreached is not_reached |
++| `remote_notices.fallback.<reason>` | One per actual remote-notices accounting fallback |
++| `remote_notices.pending_detail.<detail>` | Optional bounded downstream subreason for other_pending |
++| `instrumentation.unknown` | Invalid family, without fabricating a remote invocation |
++
++Absent overflow, sum primary runs = host-pass runs = sum host exits;
++sum remote call outcomes = sum certification outcomes = sum health outcomes;
++sum chat triggers = sum chat results = actual iterated chats;
++sum remote-notices primary reasons = actual remote-notices fallbacks.
++Nonpending change/skip accounting does not emit a fallback.
++
++Host primary precedence is fact > retry deadline > subpass due_at > maintenance >
++unknown. Within retry/due, choose earliest deadline then lexical bounded subpass
++and reason. Simultaneous flags stay separate. Raw wake hints and catch-up role
++transitions are not fact provenance. Facts track the actual delta kinds consumed
++by ActionWake; missing provenance is unknown. Retry/due provenance is optional on
++reports/results and does not alter `next_due` or immediate retry(0).
++
++Primary CPU wraps the actual host function lexically, including early returns and
++BaseException. It is a partition **overlay**: never add it to parent CPU or nested
++subpass CPU. Parent/partition instrumentation overhead differs slightly; compare
++partition CPU across admission reasons, not the overhead difference to the parent.
++Count equality requires no registry overflow.
++
++Remote refreshed means attempted refresh, not memo certification. The second
++poll still occurs after fingerprint collection even if prints are None. Existing
++per-board cursor comparisons, seed/ack behavior and health acknowledgement order
++remain intact. Unevaluated short-circuit tests are never reported false. Health,
++certification, chat and call receipts are different units.
++
++## Proof surface
++
++Canonical tests enter real scheduler, host wrapper, gates, card fanout and remote
++fanout paths using isolated fake fact stores and SQLite fixtures. Diagnostic test
++fixtures export `counter_snapshot` JUnit properties for reproducible raw stage
++snapshots. Use a distinct `--junitxml` path for each file; canonical per-file workers
++would overwrite a shared path. Supplement composed tests with static vocabulary,
++legacy fake-report signatures, deterministic deadline ties, overflow and context
++isolation controls. Existing accounting/scheduler/fanout consumers remain required.
+diff --git a/gateway/kanban_notification_schedule.py b/gateway/kanban_notification_schedule.py
+index 3e337883307328fe74a919f85583d53f222298b4..a3bc33701b630f3e18081f308b2706cd97f3f902 100644
+--- a/gateway/kanban_notification_schedule.py
++++ b/gateway/kanban_notification_schedule.py
+@@ -5,6 +5,7 @@
+ until a fact wake. This object never owns a claim, cursor or delivery receipt.
+ """
+ from dataclasses import dataclass
++from gateway.notification_retry_provenance import earliest, origin
+ 
+ 
+ class BoundActions:
+@@ -27,6 +28,8 @@
+         self.links_health = HealthWatch(wake)
+         self.native = native
+         self.native_action = None
++        self.admission_sources = ()
++        self.deadline_sources = ()
+ 
+     @property
+     def legacy(self):
+@@ -53,6 +56,7 @@
+         return self.native_action.due(legacy_due=legacy_due) or now >= self.retry_at
+ 
+     def due(self, now: float, *, legacy_due: bool) -> bool:
++        self.admission_sources = ()
+         bindings = self.watch.snapshot()
+         owners = {owner for _home, owner in bindings}
+         self.was_bound = self.was_bound or bool(owners)
+@@ -82,11 +86,23 @@
+         # Consume every pending bit, not just the first true action.
+         changed = [action.due(legacy_due=legacy_due) for action in self.actions.values()]
+         health_changed = self.links_health.due({str(home) for home, _owner in bindings})
++        self.admission_sources = tuple(source for action, due in zip(self.actions.values(), changed) if due
++                                       for source in getattr(action, 'diagnostic_sources', ('unknown',)))
++        if health_changed:
++            self.admission_sources += ('health',)
+         return any(changed) or health_changed or now >= self.retry_at
+ 
+     def settled(self, report, now: float, interval: float) -> None:
+         self.retry_at = report.next_due(now, interval)
+         self.retry_floor = report.pending
++        sources = []
++        if report.pending:
++            sources.append(('retry', now + interval, *(getattr(report, 'retry_origin', None) or ('unknown', 'unknown'))))
++        for category, entry in (('retry', getattr(report, 'retry_deadline', None)),
++                                ('due', getattr(report, 'due_deadline', None))):
++            if entry is not None:
++                sources.append((category, *entry))
++        self.deadline_sources = tuple(sources)
+ 
+     def close(self) -> None:
+         if self.native_action is not None:
+@@ -104,12 +120,21 @@
+ 
+     pending: bool = False
+     deadline: float = float("inf")
++    retry_origin: tuple | None = None
++    retry_deadline: tuple | None = None
++    due_deadline: tuple | None = None
+ 
+-    def retry(self) -> None:
++    def retry(self, subpass='unknown', reason='unknown') -> None:
+         self.pending = True
++        source = origin(subpass, reason)
++        self.retry_origin = source if self.retry_origin is None else min(self.retry_origin, source)
+ 
+-    def due_at(self, deadline: float) -> None:
++    def due_at(self, deadline: float, subpass='unknown', reason='unknown', *, cause='due') -> None:
+         self.deadline = min(self.deadline, deadline)
++        if cause == 'retry':
++            self.retry_deadline = earliest(self.retry_deadline, deadline, subpass, reason)
++        else:
++            self.due_deadline = earliest(self.due_deadline, deadline, subpass, reason)
+ 
+     def next_due(self, now: float, interval: float) -> float:
+         return min(self.deadline, now + interval if self.pending else float("inf"))
+diff --git a/gateway/notification_retry_provenance.py b/gateway/notification_retry_provenance.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..994ebdbaaabd03c7f7595b05a08b81f8f5d8165d
+--- /dev/null
++++ b/gateway/notification_retry_provenance.py
+@@ -0,0 +1,14 @@
++"""Finite diagnostic vocabulary for existing notification retry obligations."""
++SUBPASSES = ('card_change_pass', 'remote_card_change', 'remote_notices', 'notices', 'delegation',
++             'killed_notices', 'guarantee_pass', 'unknown')
++REASONS = ('enumeration_failed', 'set_cursor_failed', 'top_gt_cursor', 'board_error', 'remote_error',
++           'pending', 'exception', 'unknown')
++
++
++def origin(subpass='unknown', reason='unknown'):
++    return (subpass if subpass in SUBPASSES else 'unknown', reason if reason in REASONS else 'unknown')
++
++
++def earliest(current, deadline, subpass='unknown', reason='unknown'):
++    candidate = (deadline, *origin(subpass, reason))
++    return candidate if current is None else min(current, candidate)
+diff --git a/tests/tui_gateway/test_remote_change_diagnostics.py b/tests/tui_gateway/test_remote_change_diagnostics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..90abfdbf5b88da3183be7fbc9580bbc57a62ce71
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_change_diagnostics.py
+@@ -0,0 +1,255 @@
++"""Stage-local receipts exercise the real remote fanout, never live stores."""
++import contextlib
++import json
++
++import pytest
++
++from hermes_cli import fact_links_health, kanban_session_activity as activity
++from hermes_cli import loop_accounting as la
++from tui_gateway import notice_fanout as nf, notice_fanout_state as state, notice_links_health
++
++
++@pytest.fixture
++def remote(monkeypatch, record_property):
++    la.reset()
++    controls = dict(previous={}, cards=[], health=None, seed=True, ack=True, prints={},
++                    polls=[{'board': (set(), 10)}, {'board': (set(), 10)}], recovered=True,
++                    skipped=None, refreshed=True, db=object(), calls=[])
++    monkeypatch.setattr(nf, '_remote_memo', None)
++    monkeypatch.setattr(activity, '_origin_scope', lambda: ('gw', 'default'))
++    monkeypatch.setattr(fact_links_health, 'pending', lambda origin: controls['health'])
++    monkeypatch.setattr(nf, '_remote_inputs_key', lambda: (('base',), []))
++    monkeypatch.setattr(nf, '_ledger_content_key', lambda ledger: ())
++    def poll(*args):
++        controls['calls'].append('poll')
++        result = controls['polls'].pop(0)
++        if isinstance(result, BaseException):
++            raise result
++        return result
++    monkeypatch.setattr(nf, '_poll_boards', poll)
++    monkeypatch.setattr(nf, '_remote_boards_quiet', lambda *args: True)
++    monkeypatch.setattr(activity, '_remote_cards', lambda *a, **k: controls['cards'])
++    monkeypatch.setattr(state, 'load_remote', lambda **k: controls['previous'])
++    monkeypatch.setattr(state, 'seed_remote', lambda snapshot: controls['seed'])
++    monkeypatch.setattr(state, 'ack_remote', lambda acked: controls['ack'])
++    monkeypatch.setattr(notice_links_health, 'recover_into', lambda *a: controls['recovered'])
++    def prints(*args):
++        controls['calls'].append('prints')
++        return controls['prints']
++    monkeypatch.setattr(nf, '_known_prints', prints)
++    monkeypatch.setattr(nf, 'chat_skip_reason', lambda *a: controls['skipped'])
++    monkeypatch.setattr('hermes_state_outcome.refresh_outcomes_quietly', lambda *a, **k: controls['refreshed'])
++    monkeypatch.setattr(fact_links_health, 'acknowledge', lambda *a, **k: controls['calls'].append(('health', k['complete'])))
++    @contextlib.contextmanager
++    def opener(chat):
++        yield controls['db'], chat
++    controls['run'] = lambda: nf._remote_change_pass(opener)
++    yield controls
++    record_property('counter_snapshot', json.dumps(la.counters(), sort_keys=True))
++    la.reset()
++
++
++def runs(family):
++    prefix = 'unloaded.diag.remote.' + family + '.'
++    return {key[len(prefix):]: row['runs'] for key, row in la.counters().items()
++            if key.startswith(prefix) and '.' not in key[len(prefix):]}
++
++
++def conservation(chats=0, calls=1):
++    for family in ('call', 'cert', 'health'):
++        assert sum(runs(family).values()) == calls, (family, la.counters())
++    for family in ('chat.trigger', 'chat.result'):
++        assert sum(runs(family).values()) == chats, (family, la.counters())
++
++
++@pytest.mark.parametrize(('after', 'cert'), [({'board': (set(), 10)}, 'certified'),
++                                         (None, 'after_poll_none'), ({'board': (set(), 11)}, 'cursor_moved')])
++def test_empty_projection_certification(remote, after, cert):
++    remote['polls'][1] = after
++    assert remote['run']() == []
++    assert runs('cert') == {cert: 1}
++    assert runs('call') == {'refreshed': 1}
++    assert remote['calls'] == ['poll', 'prints', 'poll', ('health', True)]
++    assert (nf._remote_memo is not None) == (cert == 'certified')
++    conservation()
++
++
++@pytest.mark.parametrize(('seed', 'health', 'terminal'), [(True, None, 'seed_only'),
++                                                       (False, None, 'seed_failed'), (True, 1, 'refreshed')])
++def test_seed_variants(remote, seed, health, terminal):
++    remote.update(previous=None, seed=seed, health=health)
++    remote['run']()
++    assert runs('call') == {terminal: 1}
++    assert runs('cert') == {('certified' if terminal == 'refreshed' else 'not_attempted'): 1}
++    assert runs('health') == {('complete_true' if terminal == 'refreshed' else 'not_reached'): 1}
++    conservation()
++
++
++def test_memo_hit_short_circuit(remote):
++    nf._remote_memo = (('base',), (), {'board': 10}, {})
++    remote['run']()
++    assert runs('call') == {'memo_hit': 1}
++    assert runs('cert') == {'not_attempted': 1}
++    assert runs('health') == {'not_reached': 1}
++    assert remote['calls'] == ['poll']
++    conservation()
++
++
++@pytest.mark.parametrize(('kind', 'result'), [('ok', 'acked_refreshed'), ('skip', 'acked_intentionally_skipped'),
++                                          ('db', 'db_none'), ('refresh', 'refresh_failed'), ('error', 'exception')])
++def test_chat_results(remote, monkeypatch, kind, result):
++    remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='chat')]
++    if kind == 'skip':
++        remote['skipped'] = 'archived'
++    if kind == 'db':
++        remote['db'] = None
++    if kind == 'refresh':
++        remote['refreshed'] = False
++    if kind == 'error':
++        def fail(*args):
++            raise RuntimeError('chat failure')
++        monkeypatch.setattr(nf, 'chat_skip_reason', fail)
++    remote['run']()
++    assert runs('chat.trigger') == {'snapshot_diff': 1}
++    assert runs('chat.result') == {result: 1}
++    assert runs('cert') == {('certified' if kind in ('ok', 'skip') else 'not_all_acked'): 1}
++    conservation(chats=1)
++
++
++@pytest.mark.parametrize('health', [None, 1])
++def test_equal_chat_trigger_and_independent_health(remote, health):
++    remote.update(previous={'chat': frozenset()}, health=health)
++    # Absent versus empty are different in production, so use a real equal snapshot.
++    remote['previous'] = {'chat': frozenset({('owner/board/card', 'blocked')})}
++    remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='chat')]
++    remote['run']()
++    assert runs('chat.trigger') == {('unchanged_skip' if health is None else 'health_forced'): 1}
++    assert runs('chat.result') == {('unchanged_skip' if health is None else 'acked_refreshed'): 1}
++    assert runs('health') == {('no_generation' if health is None else 'complete_true'): 1}
++    conservation(chats=1)
++
++
++def test_prints_none_still_polls_and_preserves_overlapping_flags(remote):
++    remote.update(prints=None)
++    remote['polls'][1] = None
++    remote['run']()
++    assert runs('cert') == {'prints_none': 1}
++    assert runs('cert.flag') == {'prints_none': 1, 'after_poll_none': 1}
++    assert remote['calls'] == ['poll', 'prints', 'poll', ('health', True)]
++    conservation()
++
++
++@pytest.mark.parametrize('step', ['cards', 'load', 'ack', 'prints', 'poll', 'health'])
++def test_exceptions_are_terminal_once(remote, monkeypatch, step):
++    def fail(*a, **k):
++        raise RuntimeError(step)
++    targets = {'cards': (activity, '_remote_cards'), 'load': (state, 'load_remote'),
++               'ack': (state, 'ack_remote'), 'prints': (nf, '_known_prints'),
++               'health': (fact_links_health, 'acknowledge')}
++    if step == 'cards':
++        def cards(*a, **k):
++            yield from ()
++            raise RuntimeError(step)
++        monkeypatch.setattr(activity, '_remote_cards', cards)
++    elif step == 'poll':
++        remote['polls'][1] = RuntimeError(step)
++    else:
++        target, name = targets[step]
++        monkeypatch.setattr(target, name, fail)
++    with pytest.raises(RuntimeError, match=step):
++        remote['run']()
++    assert runs('call') == {'exception': 1}
++    assert runs('cert') == {'exception': 1}
++    assert runs('health') == {('exception' if step == 'health' else 'not_reached'): 1}
++    conservation()
++
++
++@pytest.mark.parametrize(('failure', 'cert'), [('inputs', 'inputs_unavailable'), ('initial_poll', 'inputs_unavailable'),
++                                            ('ack', 'ack_failed')])
++def test_certification_precedence_and_input_failures(remote, monkeypatch, failure, cert):
++    if failure == 'inputs':
++        def fail():
++            raise OSError('input unavailable')
++        monkeypatch.setattr(nf, '_remote_inputs_key', fail)
++    if failure == 'initial_poll':
++        remote['polls'][0] = None
++    if failure == 'ack':
++        remote['ack'] = False
++    out = remote['run']()
++    assert out.incomplete
++    assert runs('cert') == {cert: 1}
++    assert runs('call') == {'refreshed': 1}
++    assert runs('miss.inputs_error') == {('true' if failure == 'inputs' else 'false'): 1}
++    assert runs('miss.initial_poll_failed') == {('not_evaluated' if failure == 'inputs' else
++                                              'true' if failure == 'initial_poll' else 'false'): 1}
++    assert 'prints' not in remote['calls']
++    conservation()
++
++
++@pytest.mark.parametrize('miss', ['health_pending', 'no_memo', 'inputs_changed', 'ledger_changed', 'boards_not_quiet'])
++def test_evaluated_miss_and_short_circuit_receipts(remote, monkeypatch, miss):
++    nf._remote_memo = (('base',), (), {'board': 10}, {})
++    if miss == 'health_pending':
++        remote['health'] = 1
++    if miss == 'no_memo':
++        nf._remote_memo = None
++    if miss == 'inputs_changed':
++        nf._remote_memo = (('old-base',), (), {'board': 10}, {})
++    if miss == 'ledger_changed':
++        nf._remote_memo = (('base',), ('old-ledger',), {'board': 10}, {})
++    if miss == 'boards_not_quiet':
++        monkeypatch.setattr(nf, '_remote_boards_quiet', lambda *a: False)
++    remote['run']()
++    chain = ['health_pending', 'no_memo', 'inputs_changed', 'ledger_changed', 'boards_not_quiet']
++    for index, name in enumerate(chain):
++        expected = 'false' if index < chain.index(miss) else 'true' if name == miss else 'not_evaluated'
++        assert runs('miss.' + name) == {expected: 1}
++    conservation()
++
++
++@pytest.mark.parametrize('reason', ['ledger_changed', 'boards_not_quiet'])
++def test_evaluated_failure_is_unknown_not_unevaluated(remote, monkeypatch, reason):
++    nf._remote_memo = (('base',), (), {'board': 10}, {})
++    def fail(*a):
++        raise OSError('evaluated')
++    target = {'ledger_changed': '_ledger_content_key', 'boards_not_quiet': '_remote_boards_quiet'}[reason]
++    monkeypatch.setattr(nf, target, fail)
++    with pytest.raises(OSError, match='evaluated'):
++        remote['run']()
++    assert runs('miss.' + reason) == {'unknown': 1}
++    conservation()
++
++
++@pytest.mark.parametrize(('prints', 'after', 'cert', 'flag'), [
++    (None, {'board': (set(), 11)}, 'prints_none', 'cursor_moved'),
++    (None, {}, 'prints_none', 'unknown'),
++    ({}, {'board': (set(), 10), 'extra': (set(), 999)}, 'certified', None),
++])
++def test_simultaneous_flags_and_real_per_board_comparison(remote, prints, after, cert, flag):
++    remote['prints'] = prints
++    remote['polls'][1] = after
++    remote['run']()
++    assert runs('cert') == {cert: 1}
++    if flag is not None:
++        assert runs('cert.flag')[flag] == 1
++    conservation()
++
++
++def test_changed_snapshot_and_moved_cursor_are_separate_units(remote):
++    remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='chat')]
++    remote['polls'][1] = {'board': (set(), 11)}
++    remote['health'] = 1
++    remote['run']()
++    assert runs('chat.trigger') == {'snapshot_diff': 1}
++    assert runs('chat.flag') == {'health_pending': 1}
++    assert runs('cert') == {'cursor_moved': 1}
++    conservation(chats=1)
++
++
++def test_health_false_is_not_failed_memo_certification(remote):
++    remote['health'] = 1
++    remote['recovered'] = False
++    remote['run']()
++    assert runs('cert') == {'certified': 1}
++    assert runs('health') == {'complete_false': 1}
++    conservation()
+diff --git a/tests/tui_gateway/test_unloaded_diagnostic_contracts.py b/tests/tui_gateway/test_unloaded_diagnostic_contracts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..210540e47ce63840ff8efd21be5f0a0fe1154b39
+--- /dev/null
++++ b/tests/tui_gateway/test_unloaded_diagnostic_contracts.py
+@@ -0,0 +1,103 @@
++"""Static vocabulary and compatibility boundaries supplement composed path tests."""
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.kanban_notification_schedule import PassReport
++from gateway.notification_retry_provenance import earliest, origin
++from hermes_cli import loop_accounting as la
++from tui_gateway import unloaded_diagnostics as d
++from tui_gateway.notice_fanout_result import FanoutResult
++
++
++@pytest.fixture(autouse=True)
++def reset():
++    la.reset()
++    yield
++    la.reset()
++
++
++@pytest.mark.parametrize('source', ['health', 'TaskFact', 'SourceState', 'SessionFact', 'ChatWaitingFact', 'reset'])
++def test_known_fact_kinds_are_distinct_primary_fact_sources(source):
++    admission = d.Admission(10, sources=[source, 'unknown'], deadlines=[('retry', 1, 'notices', 'pending')])
++    with admission:
++        assert d.host_accounted(lambda: 5)() == 5
++    counters = la.counters()
++    assert counters['unloaded.diag.host.primary.fact']['runs'] == 1
++    assert counters['unloaded.diag.host.fact.' + source]['runs'] == 1
++    assert counters['unloaded.diag.host.fact.unknown']['runs'] == 1
++    assert counters['unloaded.diag.host.due.fact']['runs'] == 1
++    assert counters['unloaded.diag.host.due.retry']['runs'] == 1
++
++
++def test_unknown_fact_and_future_deadline_do_not_invent_fact_or_due_admission():
++    admission = d.Admission(10, sources=['private-id'], deadlines=[('due', 11, 'notices', 'pending')])
++    assert admission.primary == 'unknown'
++    assert admission.facts == ('unknown',)
++    assert admission.flags == {'unknown'}
++    with admission:
++        d.host_accounted(lambda: None)()
++    assert 'unloaded.diag.host.primary.unknown' in la.counters()
++    assert not any('private-id' in key for key in la.counters())
++
++
++def test_nested_contexts_and_unobserved_fallback_are_isolated():
++    d.fallback_reason('outside')
++    with d.Fallback() as outer:
++        d.fallback_reason('woken')
++        with d.Fallback() as inner:
++            d.fallback_reason('other_pending', 'unsettled')
++        assert (inner.reason, inner.detail) == ('other_pending', 'unsettled')
++        assert (outer.reason, outer.detail) == ('woken', 'unknown')
++    with d.Admission(0, sources=['health']):
++        with d.Admission(0, maintenance=True):
++            d.host_accounted(lambda: None)()
++        d.host_accounted(lambda: None)()
++    d.host_accounted(lambda: None)()
++    for label in ('maintenance', 'fact', 'unknown'):
++        assert la.counters()['unloaded.diag.host.primary.' + label]['runs'] == 1
++
++
++def test_unknown_labels_cannot_expand_registry_or_fabricate_remote_call():
++    d.emit('private-family', 'private-label')
++    d.emit('host.due', 'private-label')
++    assert set(la.counters()) == {'unloaded.diag.instrumentation.unknown', 'unloaded.diag.host.due.unknown'}
++
++
++def test_default_stage_unknowns_and_chat_exception_conserve():
++    with d.RemoteCall():
++        pass
++    with d.Chat():
++        pass
++    with pytest.raises(KeyboardInterrupt):
++        with d.Chat():
++            raise KeyboardInterrupt()
++    counters = la.counters()
++    for suffix in ('remote.call.unknown', 'remote.cert.not_attempted', 'remote.health.not_reached'):
++        assert counters['unloaded.diag.' + suffix]['runs'] == 1
++    assert counters['unloaded.diag.remote.chat.result.unknown']['runs'] == 1
++    assert counters['unloaded.diag.remote.chat.result.exception']['runs'] == 1
++    assert counters['unloaded.diag.remote.chat.trigger.unknown']['runs'] == 2
++
++
++def test_old_report_and_result_contracts_remain_callable():
++    calls = []
++    old = SimpleNamespace(retry=lambda: calls.append('retry'), due_at=lambda deadline: calls.append(deadline))
++    d.retry_report(old, 'notices', 'pending')
++    d.due_report(old, 12, 'notices', 'pending', cause='retry')
++    assert calls == ['retry', 12]
++    report = PassReport()
++    d.retry_report(report, 'notices', 'pending')
++    d.retry_report(report, 'card_change_pass', 'remote_error')
++    d.due_report(report, 8, 'notices', 'pending')
++    d.due_report(report, 7, 'notices', 'pending', cause='retry')
++    assert report.retry_origin == ('card_change_pass', 'remote_error')
++    assert report.due_deadline == (8, 'notices', 'pending')
++    assert report.retry_deadline == (7, 'notices', 'pending')
++    result = FanoutResult()
++    result += [('session', 1)]
++    result.absorb(FanoutResult())
++    assert list(result) == [('session', 1)]
++    assert result.retry_origin is None
++    assert origin('private-id', 'private-id') == ('unknown', 'unknown')
++    assert earliest((1, 'notices', 'pending'), 2, 'card_change_pass', 'remote_error') == (1, 'notices', 'pending')
+diff --git a/tests/tui_gateway/test_unloaded_diagnostics.py b/tests/tui_gateway/test_unloaded_diagnostics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6a23111efd7f94e55be0448a4a39388359e0e86
+--- /dev/null
++++ b/tests/tui_gateway/test_unloaded_diagnostics.py
+@@ -0,0 +1,148 @@
++"""Real scheduler admission and lexical host CPU partition controls."""
++import json
++
++import pytest
++
++from gateway.kanban_notification_schedule import PassReport
++from hermes_cli import loop_accounting as la
++from hermes_cli.fact_contract import Fact, FactKey
++from hermes_cli.fact_fake import FakeStore
++from tests.tui_gateway import test_notification_facts as helpers
++from tui_gateway import kanban_unloaded as unloaded, kanban_unloaded_gates as gates
++from tui_gateway import kanban_unloaded_schedule as schedule_module, notification_facts
++from tui_gateway.notice_fanout_result import FanoutResult
++from tui_gateway import unloaded_diagnostics as diagnostic
++
++
++def metric(family):
++    prefix = 'unloaded.diag.' + family + '.'
++    return {k[len(prefix):]: v for k, v in la.counters().items() if k.startswith(prefix)}
++
++
++@pytest.fixture
++def scheduler(monkeypatch, record_property):
++    store = FakeStore()
++    helpers.ready_siblings(store)
++    owner = notification_facts.bind(store, helpers.SCOPE, '/canonical/r5')
++    owner.report_ready()
++    store.activate(helpers.SCOPE)
++    store.drain()
++    now, cpu = [0.0], [0.0]
++    monkeypatch.setattr(schedule_module.time, 'monotonic', lambda: now[0])
++    monkeypatch.setattr(la, '_thread_time', lambda: cpu[0])
++    schedule = schedule_module.UnloadedSchedule(lambda: None, 30)
++    la.reset()
++    yield store, owner, schedule, now, cpu
++    record_property('counter_snapshot', json.dumps(la.counters(), sort_keys=True))
++    schedule.close()
++    owner.close()
++    la.reset()
++
++
++@pytest.mark.parametrize(('fact', 'retry', 'due', 'maintenance', 'primary'), [
++    (True, True, True, True, 'fact'),
++    (False, True, True, True, 'retry.card_change_pass.top_gt_cursor'),
++    (False, False, True, True, 'due.notices.unknown'),
++    (False, False, False, True, 'maintenance'),
++    (False, False, False, False, 'unknown'),
++])
++def test_scheduler_overlapping_admission_and_actual_host_cpu(scheduler, monkeypatch, fact, retry, due, maintenance, primary):
++    store, _owner, schedule, now, cpu = scheduler
++    monkeypatch.setattr(unloaded, '_host_pass', lambda *a, **k: None)
++    schedule.run('host', unloaded.host_pass)  # consume membership catch-up
++    now[0] = 40
++    schedule.next_legacy = 30 if maintenance else 100
++    sources = []
++    if retry:
++        sources.extend([('retry', 39, 'notices', 'pending'),
++                        ('retry', 38, 'card_change_pass', 'top_gt_cursor')])
++    if due:
++        sources.append(('due', 37, 'notices', 'unknown'))
++    schedule.gate.deadline_sources = tuple(sources)
++    schedule.gate.retry_at = min((source[1] for source in sources), default=float('inf'))
++    if fact:
++        store.publish([Fact(FactKey(helpers.SCOPE, 'SourceState', 'board'), 1)])
++        store.drain()
++    elif not retry and not due:
++        # A role transition admits a known-legacy branch, not an invented fact.
++        schedule.role = 'previous'
++    def work(*a, **k):
++        cpu[0] += 7
++        return 42  # ordinary early return is not GeneratorExit
++    monkeypatch.setattr(unloaded, '_host_pass', work)
++    la.reset()
++    schedule.run('host', unloaded.host_pass)
++    assert {k: v['runs'] for k, v in metric('host.primary').items()} == {primary: 1}
++    assert metric('host.primary')[primary]['cpu_s'] == 7
++    assert la.counters()['unloaded.host_pass']['cpu_s'] == 7
++    assert metric('host.exit')['complete']['runs'] == 1
++    flags = metric('host.due')
++    for label, enabled in [('fact', fact), ('retry', retry), ('due', due), ('maintenance', maintenance)]:
++        assert (label in flags) == enabled
++    assert sum(row['runs'] for row in metric('host.primary').values()) == la.counters()['unloaded.host_pass']['runs']
++
++
++@pytest.mark.parametrize('exception', [RuntimeError('host'), KeyboardInterrupt('host')])
++def test_host_exceptions_include_cpu_and_preserve_identity(scheduler, monkeypatch, exception):
++    _, _, schedule, _, cpu = scheduler
++    def fail(*a, **k):
++        cpu[0] += 11
++        raise exception
++    monkeypatch.setattr(unloaded, '_host_pass', fail)
++    with pytest.raises(type(exception)) as raised:
++        schedule.run('host', unloaded.host_pass)
++    assert raised.value is exception
++    assert sum(row['cpu_s'] for row in metric('host.primary').values()) == 11
++    assert sum(row['runs'] for row in metric('host.primary').values()) == 1
++    assert metric('host.exit')['exception']['runs'] == 1
++    assert la.counters()['unloaded.host_pass']['error_kinds'] == {type(exception).__name__: 1}
++
++
++def test_deadlines_propagate_earliest_and_ties_without_changing_behavior(scheduler):
++    _, _, schedule, now, _ = scheduler
++    now[0] = 50
++    result = FanoutResult()
++    result.retry(0, subpass='card_change_pass', reason='top_gt_cursor')
++    result.retry(2, subpass='card_change_pass', reason='set_cursor_failed')
++    other = FanoutResult()
++    other.retry(0, subpass='card_change_pass', reason='board_error')
++    result.absorb(other)
++    assert result.next_deadline == 50
++    assert result.retry_origin == (50, 'card_change_pass', 'board_error')
++    report = PassReport()
++    with gates.scheduling(report):
++        assert gates.run('card_change_pass', lambda: result, live=set()) is result
++    assert report.pending
++    assert report.deadline == 50
++    assert report.next_due(50, 30) == 50
++    schedule.gate.settled(report, 50, 30)
++    assert schedule.gate.retry_at == 50
++    admission = diagnostic.Admission(50, deadlines=schedule.gate.deadline_sources)
++    assert admission.primary == 'retry.card_change_pass.board_error'
++    # Same deadline, lexical subpass first, then reason.
++    tied = diagnostic.Admission(50, deadlines=[('retry', 50, 'notices', 'pending'),
++                                              ('retry', 50, 'card_change_pass', 'remote_error')])
++    assert tied.primary == 'retry.card_change_pass.remote_error'
++
++
++def test_unknown_deadline_and_direct_host_are_explicit(scheduler, monkeypatch):
++    _, _, schedule, now, _ = scheduler
++    monkeypatch.setattr(unloaded, '_host_pass', lambda *a, **k: None)
++    unloaded.host_pass()
++    assert metric('host.primary')['unknown']['runs'] == 1
++    la.reset()
++    now[0] = 5
++    schedule.gate.retry_at = 4
++    schedule.next_legacy = 20
++    schedule.run('host', unloaded.host_pass)
++    assert metric('host.primary')['retry.unknown.unknown']['runs'] == 1
++
++
++def test_static_label_and_registry_overflow_are_visible(monkeypatch):
++    la.reset()
++    diagnostic.emit('remote.call', 'private-card-identifier')
++    assert metric('remote.call') == {'unknown': la.counters()['unloaded.diag.remote.call.unknown']}
++    monkeypatch.setattr(la, 'MAX_NAMES', 1)
++    diagnostic.emit('remote.cert', 'certified')
++    assert la.counters()['_overflow']['runs'] == 1
++    la.reset()
+diff --git a/tests/tui_gateway/test_unloaded_gate_diagnostics.py b/tests/tui_gateway/test_unloaded_gate_diagnostics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..79e1d5f1dfafb997f0506c5cdb10598490fe7619
+--- /dev/null
++++ b/tests/tui_gateway/test_unloaded_gate_diagnostics.py
+@@ -0,0 +1,118 @@
++"""Fallback counters follow the first actual conservative gate return."""
++import contextlib
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_origin, kanban_reader_retention, loop_accounting as la
++from tui_gateway import kanban_remote_notices as remote, kanban_replica_observer
++from tui_gateway import kanban_unloaded_gates as gates
++
++
++@pytest.fixture
++def gate(tmp_path, monkeypatch, record_property):
++    ledger = tmp_path / 'ledger.db'
++    conn = sqlite3.connect(ledger)
++    conn.execute('CREATE TABLE notices(session, ref, state, holder_pid, holder_start, delivered)')
++    conn.commit()
++    controls = dict(token=1, me=False, alive=True, liveness=[], cards=[], fingerprint=True)
++    monkeypatch.setattr(kanban_origin, '_hub_db', lambda: tmp_path / 'shadow.db')
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('gw',))
++    stamp = SimpleNamespace(ident='source', generation=1, signature=1)
++    monkeypatch.setattr(kanban_replica_observer, 'fingerprint', lambda path: stamp if controls['fingerprint'] else None)
++    monkeypatch.setattr(remote, '_woken', set())
++    monkeypatch.setattr(remote, 'ledger_path', lambda: ledger)
++    monkeypatch.setattr(kanban_reader_retention, 'reader', lambda path: contextlib.closing(sqlite3.connect(path)))
++    monkeypatch.setattr(gates, '_revision', lambda conn: 1)
++    monkeypatch.setattr(remote, '_holder_is_me', lambda pid: controls['me'])
++    def alive(pid, start):
++        controls['liveness'].append((pid, start))
++        return controls['alive']
++    monkeypatch.setattr(remote, '_holder_alive', alive)
++    monkeypatch.setattr(gates, '_replica_token', lambda *a: controls['token'])
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda *a: (controls['cards'], {}))
++    gates.reset_for_tests()
++    la.reset()
++    yield controls, conn
++    record_property('counter_snapshot', json.dumps(la.counters(), sort_keys=True))
++    conn.close()
++    gates.reset_for_tests()
++    la.reset()
++
++
++def reasons():
++    prefix = 'unloaded.diag.remote_notices.fallback.'
++    return {k[len(prefix):]: v['runs'] for k, v in la.counters().items() if k.startswith(prefix)}
++
++
++@pytest.mark.parametrize('branch', ['woken', 'self_holder', 'dead_holder', 'held_with_report', 'no_token',
++                                  'other_pending', 'probe_error', 'admission_bypassed', 'unknown'])
++def test_actual_fallback_reasons_conserve(gate, monkeypatch, branch):
++    controls, conn = gate
++    if branch == 'woken':
++        remote._woken.add('chat')
++    if branch in ('self_holder', 'dead_holder', 'held_with_report'):
++        conn.execute("INSERT INTO notices VALUES ('chat','gw/card','done',123,1,0)")
++        conn.commit()
++        controls.update(me=branch == 'self_holder', alive=branch != 'dead_holder')
++    if branch == 'no_token':
++        controls['token'] = None
++    if branch == 'other_pending':
++        controls['fingerprint'] = False
++    if branch == 'probe_error':
++        def fail(*a):
++            raise OSError('probe failed')
++        monkeypatch.setattr(gates, '_replica_token', fail)
++    if branch == 'unknown':
++        monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs())
++    calls = []
++    with gates.scheduling(SimpleNamespace(retry=lambda: None, due_at=lambda deadline: None)):
++        assert gates.run('remote_notices', lambda: calls.append('work') or [], live=set(),
++                         every_store=branch != 'admission_bypassed') == []
++    assert calls == ['work']
++    assert reasons() == {branch: 1}
++    assert sum(reasons().values()) == la.counters()['unloaded.remote_notices']['fallbacks']
++    if branch == 'other_pending':
++        assert la.counters()['unloaded.diag.remote_notices.pending_detail.identity_unknown']['runs'] == 1
++    if branch == 'self_holder':
++        assert controls['liveness'] == []
++    if branch in ('dead_holder', 'held_with_report'):
++        assert controls['liveness'] == [(123, 1)]
++
++
++def test_nonpending_change_and_skip_are_not_fallbacks(gate):
++    calls = []
++    for _ in range(2):
++        gates.run('remote_notices', lambda: calls.append('work') or [], live=set())
++    assert calls == ['work']
++    assert reasons() == {}
++    row = la.counters()['unloaded.remote_notices']
++    assert (row['runs'], row['fallbacks'], row['changes'], row['skips']) == (2, 0, 1, 1)
++
++
++@pytest.mark.parametrize('detail', ['snapshot_changed', 'no_ledger', 'unsettled', 'chat_reactivated'])
++def test_other_pending_details_follow_real_downstream_decisions(gate, monkeypatch, tmp_path, detail):
++    controls, _conn = gate
++    controls['cards'] = [('owner', 'card', {}, [])]
++    monkeypatch.setattr(remote, '_notice_state', lambda *a: 'done')
++    if detail == 'snapshot_changed':
++        from tui_gateway import kanban_replica_observer
++        stamps = iter([SimpleNamespace(ident=(1,), generation=0, signature=()), None])
++        monkeypatch.setattr(kanban_replica_observer, 'fingerprint', lambda *a: next(stamps))
++    if detail == 'no_ledger':
++        monkeypatch.setattr(remote, 'ledger_path', lambda: tmp_path / 'absent')
++    if detail == 'unsettled':
++        monkeypatch.setattr(gates, '_cards_settled', lambda *a, **k: False)
++    if detail == 'chat_reactivated':
++        def settled(*a, parked, **k):
++            parked.add(('default', 'chat'))
++            return True
++        monkeypatch.setattr(gates, '_cards_settled', settled)
++        gates.run('remote_notices', list, live=set())
++        la.reset()
++        monkeypatch.setattr(gates, '_chat_inert', lambda *a: False)
++    gates.run('remote_notices', list, live=set())
++    assert reasons() == {'other_pending': 1}
++    assert la.counters()['unloaded.diag.remote_notices.pending_detail.' + detail]['runs'] == 1
+diff --git a/tests/tui_gateway/test_unloaded_retry_diagnostics.py b/tests/tui_gateway/test_unloaded_retry_diagnostics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f9d1d2fb4e6aafa810f31a81a81cb9b17858cd8
+--- /dev/null
++++ b/tests/tui_gateway/test_unloaded_retry_diagnostics.py
+@@ -0,0 +1,42 @@
++"""Actual card fanout retry-site provenance, with unchanged immediate deadlines."""
++import sqlite3
++import pytest
++
++from tui_gateway import notice_fanout as fanout
++from tui_gateway.notice_fanout_result import FanoutResult
++
++
++@pytest.mark.parametrize('reason', ['enumeration_failed', 'set_cursor_failed', 'top_gt_cursor', 'board_error', 'remote_error'])
++def test_real_retry_sites_preserve_earliest_deadline(monkeypatch, tmp_path, reason):
++    from hermes_cli import kanban_db, kanban_db_connect
++    from tui_gateway import notice_fanout_result, notice_fanout_state
++    conn = sqlite3.connect(':memory:')
++    conn.execute('CREATE TABLE task_events(id INTEGER)')
++    conn.execute('INSERT INTO task_events VALUES(2)')
++    monkeypatch.setattr(fanout, '_board_slugs', lambda kb: ['board'])
++    monkeypatch.setattr(fanout, '_board_idle', lambda *a: False)
++    monkeypatch.setattr(fanout, '_changed_tasks', lambda *a: ([], 1))
++    monkeypatch.setattr(fanout, '_fan_out_changes', lambda *a: [])
++    monkeypatch.setattr(fanout, '_remote_change_pass', lambda *a: FanoutResult())
++    monkeypatch.setattr(kanban_db, 'kanban_db_path', lambda slug: tmp_path / slug)
++    monkeypatch.setattr(kanban_db_connect, 'connect', lambda **k: conn)
++    monkeypatch.setattr(notice_fanout_state, 'set_cursor', lambda *a: True)
++    monkeypatch.setattr(notice_fanout_result.time, 'monotonic', lambda: 100)
++    if reason != 'top_gt_cursor':
++        conn.execute('DELETE FROM task_events')
++    if reason == 'set_cursor_failed':
++        monkeypatch.setattr(notice_fanout_state, 'set_cursor', lambda *a: False)
++    def fail(*a):
++        raise OSError(reason)
++    if reason == 'enumeration_failed':
++        monkeypatch.setattr(fanout, '_board_slugs', fail)
++    if reason == 'board_error':
++        monkeypatch.setattr(fanout, '_changed_tasks', fail)
++    if reason == 'remote_error':
++        monkeypatch.setattr(fanout, '_remote_change_pass', fail)
++    result = fanout.card_change_pass(session_db=lambda *a: None)
++    assert result.incomplete
++    assert result.next_deadline == (100 if reason == 'top_gt_cursor' else 101)
++    assert result.retry_origin == (result.next_deadline, 'card_change_pass', reason)
++    conn.close()
++    assert list(result) == []
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 767acedea5081891a5d97d8003fd7d8c76999b66..ee509f202a90e79f1938ce8f11f1556a82da17ef 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -60,6 +60,7 @@
+ 
+ from tui_gateway import wake_slots
+ from hermes_cli import loop_accounting as _la
++from tui_gateway.unloaded_diagnostics import host_accounted
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -771,7 +772,7 @@
+     return sweep_remote_notices(live_ids=live_ids, waker=_RemoteWaker(wake_turn, _spawn_thread, grace_s), **kwargs)
+ 
+ 
+-@_la.accounted("unloaded.host_pass")
++@host_accounted
+ def host_pass(grace: float = GRACE_S, *, every_store: bool = True) -> None:
+     """Everything this loop does for the whole install; run by the ``kanban-unloaded`` lease holder only.
+     ``every_store=False`` (kill switch, lease failed open: every process runs this) retries killed-subagent
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index 635eef7cb3c4d5cacf2733a0b229be5ee7e2b4fe..ea8a0af454df96df0c7426c14c6a0d66600f7bfc 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -17,6 +17,7 @@
+ import time
+ 
+ from hermes_cli import loop_accounting as accounting
++from tui_gateway.unloaded_diagnostics import Fallback, due_report, emit, fallback_reason, holder_pending, retry_report
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -345,6 +346,7 @@
+     me = gateway_names()[0]
+     stamp = fingerprint(path)
+     if not me or stamp is None:
++        fallback_reason('other_pending', 'identity_unknown')
+         return Inputs()
+     # Commit counters are deliberately excluded, but replacement, observer recovery and same-inode restore
+     # signals must still retire a semantic proof. A normal checkpoint may conservatively rearm it too.
+@@ -365,6 +367,7 @@
+     epoch = (identity, _remote_memo.get('clock_epoch', 0))
+     with remote._woken_lock:
+         if remote._woken:
++            fallback_reason('woken')
+             return Inputs()
+     ledger = remote.ledger_path()
+     ledger_stamp = None
+@@ -379,10 +382,11 @@
+             # (t_48c41072e7cba68d).
+             for row in conn.execute('SELECT session, ref, state, holder_pid, holder_start FROM notices '
+                                     'WHERE delivered=0 AND holder_pid IS NOT NULL').fetchall():
+-                if remote._holder_is_me(row[3]) or not remote._holder_alive(row[3], row[4]):
++                if holder_pending(remote, row):
+                     return Inputs()
+                 held.add(tuple(row))
+             if held and _schedule_report.get() is not None:
++                fallback_reason('held_with_report')
+                 return Inputs()  # foreign holder death must retain its recovery timer
+     # The key is what the pass would read, not the replica's commit counter: the hub's replica commits several
+     # task-row writes a second, and almost none touches a card this host owes a notice for (t_48c41072e7cba68d).
+@@ -391,6 +395,7 @@
+     # skipped. Unreadable = unknown = hot.
+     token = _replica_token(path, me)
+     if token is None:
++        fallback_reason('no_token')
+         return Inputs()
+     memo_key = (str(path), me, token, str(ledger), ledger_stamp, live, epoch, frozenset(held))
+     hit = _remote_memo.get('inputs')
+@@ -398,6 +403,7 @@
+         # An archived chat un-archiving moves no replica row, no ledger row: re-read each parked chat per probe.
+         if all(_chat_inert(profile, sid) for profile, sid in hit[2]):
+             return hit[1]
++        fallback_reason('other_pending', 'chat_reactivated')
+         return Inputs()
+     _remote_memo.pop('inputs', None)
+     # The sweep's cards are a function of the replica rows the token certifies: a ledger commit (the sweep's own
+@@ -416,6 +422,7 @@
+         after = fingerprint(path)
+         if after is None or (getattr(after, 'ident', None), getattr(after, 'generation', None),
+                              getattr(after, 'signature', None)) != identity or _replica_token(path, me) != token:
++            fallback_reason('other_pending', 'snapshot_changed')
+             return Inputs()
+         _remote_memo['cards'] = (cards_key, cards)
+     watch = _replica_watch.get(str(path))
+@@ -424,11 +431,13 @@
+     parked: set = set()
+     if ledger_stamp is None:
+         if cards:
++            fallback_reason('other_pending', 'no_ledger')
+             return Inputs()
+     else:
+         with reader(ledger) as conn:
+             if cards and not _cards_settled(conn, cards, live, str(Path(path).resolve()),
+                                             held=frozenset((r[0], r[1], r[2]) for r in held), parked=parked):
++                fallback_reason('other_pending', 'unsettled')
+                 return Inputs()
+     digest = hashlib.sha256()
+     digest.update(repr((token, epoch)).encode())
+@@ -643,31 +652,34 @@
+         if kind in ('delegation', 'killed_notices'):
+             return _session_empty(kind)
+     except Exception:  # health: allow BLE001 -- admission failure must retain the recovery path
++        fallback_reason('probe_error')
+         logger.debug('unloaded %s admission unavailable', kind, exc_info=True)
+     return Inputs()
+ 
+ 
+ def run(kind: str, work, *args, live: set[str], every_store: bool = True, **kwargs):
+     """Each pass owns its key; pending/busy/slots never acquire a skip stamp."""
+-    with accounting.pass_('unloaded.' + kind) as count:
++    with accounting.pass_('unloaded.' + kind) as count, Fallback() as diagnostic:
+         report = _schedule_report.get()
+         if report is not None and kind == 'card_change_pass':
+             try:
+                 result = work(*args, **kwargs)
+             except Exception:  # health: allow BLE001 -- retain retry before propagating to the existing host boundary
+-                report.retry()
++                retry_report(report, kind, 'exception')
+                 raise
+             if not getattr(result, 'quiet', False):
+-                report.retry()
++                source = getattr(result, 'retry_origin', None)
++                retry_report(report, *(source[1:] if source is not None else (kind, 'unknown')))
+             if getattr(result, 'next_deadline', None) is not None:
+-                report.due_at(result.next_deadline)
++                source = getattr(result, 'retry_origin', None)
++                due_report(report, result.next_deadline, *(source[1:] if source is not None else (kind, 'unknown')), cause='retry')
+             return result
+         inputs = probe(kind, every_store=every_store, live=live) if every_store else Inputs()
+         if report is not None:
+             if inputs.pending:
+-                report.retry()
++                retry_report(report, kind, 'pending')
+             else:
+-                report.due_at(time.monotonic() + max(0.0, inputs.due - time.time()))
++                due_report(report, time.monotonic() + max(0.0, inputs.due - time.time()), kind)
+         key = (frozenset(live), every_store, inputs.key)
+         previous = _last.get(kind)
+         if (not inputs.pending and previous is not None and previous[0] == key
+@@ -677,6 +689,10 @@
+         # Forget BEFORE work. A raised operation must not leave an earlier stamp.
+         _last.pop(kind, None)
+         count.fallback() if inputs.pending else count.change()
++        if kind == 'remote_notices' and inputs.pending:
++            emit('remote_notices.fallback', diagnostic.reason if every_store else 'admission_bypassed')
++            if every_store and diagnostic.reason == 'other_pending':
++                emit('remote_notices.pending_detail', diagnostic.detail)
+         try:
+             result = work(*args, **kwargs)
+         except Exception:  # health: allow BLE001 -- never turn failed work into an idle scheduling certificate
+diff --git a/tui_gateway/kanban_unloaded_schedule.py b/tui_gateway/kanban_unloaded_schedule.py
+index e3ba2a047ada6347cc0ed087d898aa8a6f2fdf20..cbce8b98658bc2f024303aac98f0d988acf2f893 100644
+--- a/tui_gateway/kanban_unloaded_schedule.py
++++ b/tui_gateway/kanban_unloaded_schedule.py
+@@ -1,6 +1,7 @@
+ """Fact admission for unloaded work, separate from the install-wide lease."""
+ from gateway.kanban_notification_schedule import BoundActions, PassReport
+ from tui_gateway.kanban_unloaded_gates import scheduling
++from tui_gateway.unloaded_diagnostics import Admission
+ import time
+ 
+ 
+@@ -17,6 +18,10 @@
+         self.role = role
+         # Read before due(): an empty membership resets retry_at.
+         report_due = now >= self.gate.retry_at
++        deadlines = getattr(self.gate, 'deadline_sources', ())
++        if report_due and not deadlines:
++            deadlines = (('retry', self.gate.retry_at, 'unknown', 'unknown'),)
++        maintenance_due = now >= self.next_legacy
+         due = self.gate.due(now, legacy_due=now >= self.next_legacy)
+         if not due and report_due and not self.gate.was_bound and not self.gate.actions:
+             # Never-bound work is the legacy executor; its reported deadline is
+@@ -30,7 +35,7 @@
+             return
+         report = PassReport()
+         try:
+-            with scheduling(report):
++            with Admission(now, getattr(self.gate, 'admission_sources', ()), deadlines, maintenance_due), scheduling(report):
+                 work(*args, **kwargs)
+         except Exception:  # health: allow BLE001 -- preserve the timer before the existing loop logs the failure
+             report.retry()
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 2ae7913f6799bb4305792e20927ec2eac3cdc49f..ae33cf4de2e838b7904e412e7d31f99936a9e3ea 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -400,16 +400,25 @@
+ 
+ def _remote_change_pass(session_db: Callable, origin_db: Optional[Callable] = None) -> FanoutResult:
+     """Observe the same remote projection as outcomes; failed reads never mean cards finished."""
++    from tui_gateway.unloaded_diagnostics import RemoteCall
++    with RemoteCall() as diagnostic:
++        return _remote_change_observed(session_db, origin_db, diagnostic)
++
++
++def _remote_change_observed(session_db, origin_db, diagnostic):
+     global _remote_memo
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli import fact_links_health
+     from tui_gateway import notice_links_health
++    from tui_gateway.unloaded_diagnostics import Chat, emit
+     origin = activity._origin_scope()
+     health_generation = fact_links_health.pending(origin)
+-    out = FanoutResult()
++    out = FanoutResult(subpass='remote_card_change')
+     try:
+         inputs = _remote_inputs_key()
++        diagnostic.test('inputs_error', False)
+     except Exception:  # health: allow BLE001 -- an unreadable input is unknown: run the pass
++        diagnostic.test('inputs_error', True)
+         logger.debug("remote card-change inputs unavailable", exc_info=True)
+         out.retry()
+         inputs = None
+@@ -421,13 +430,18 @@
+         except Exception:  # health: allow BLE001 -- unknown is hot
+             logger.debug("remote card-change boards unavailable", exc_info=True)
+             polled = None
++        diagnostic.test('initial_poll_failed', polled is None)
+         if polled is None:
+             out.retry()
+             inputs = None
+     memo = _remote_memo
+-    if health_generation is None and inputs is not None and memo is not None and memo[0] == inputs[0] and memo[1] == _ledger_content_key(inputs[1]) \
+-            and _remote_boards_quiet(inputs[0], polled, memo[3]):
++    if not diagnostic.test('health_pending', health_generation is not None) and inputs is not None \
++            and not diagnostic.test('no_memo', memo is None) \
++            and not diagnostic.test('inputs_changed', memo[0] != inputs[0]) \
++            and not diagnostic.check('ledger_changed', lambda: memo[1] != _ledger_content_key(inputs[1])) \
++            and not diagnostic.check('boards_not_quiet', lambda: not _remote_boards_quiet(inputs[0], polled, memo[3])):
+         _remote_memo = (memo[0], memo[1], {slug: polled[slug][1] for slug in polled}, memo[3])
++        diagnostic.call = 'memo_hit'
+         return out
+     _remote_memo = None
+     from hermes_state_outcome import refresh_outcomes_quietly
+@@ -447,47 +461,87 @@
+     if previous is None:
+         if not state.seed_remote(snapshot):
+             out.retry()
++            diagnostic.call = 'seed_failed'
+             return out
+         if health_generation is None:
++            diagnostic.call = 'seed_only'
+             return out
+         previous = {}  # first source publication must also repair retained unknown outcomes
+     acked: dict[str, Optional[frozenset[tuple[str, str]]]] = {}
+     for chat in sorted(previous.keys() | snapshot.keys()):
+-        if health_generation is None and previous.get(chat) == snapshot.get(chat):
+-            continue
+-        try:
+-            with session_db(chat) as (db, tip):
+-                if db is None:
+-                    out.retry()
+-                    continue
+-                skipped = chat_skip_reason(db, chat)
+-                if skipped is None and not refresh_outcomes_quietly([tip], "card_change", db=db):
+-                    out.retry()
+-                    continue
+-        except Exception:  # health: allow BLE001 -- retain failed chat invalidations and continue other chats
+-            out.retry()
+-            logger.warning("remote card-change outcome failed for chat %s", chat, exc_info=True)
+-            continue
+-        # Acknowledge only a successful refresh or an intentionally skipped chat.
+-        acked[chat] = snapshot.get(chat)
+-        out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
+-                    "status": None, "skipped": skipped, "source": "remote"})
++        with Chat() as observed:
++            if health_generation is not None:
++                emit('remote.chat.flag', 'health_pending')
++            if health_generation is None and previous.get(chat) == snapshot.get(chat):
++                observed.trigger = observed.result = 'unchanged_skip'
++                continue
++            observed.trigger = ('snapshot_diff' if previous.get(chat) != snapshot.get(chat) else 'health_forced')
++            try:
++                with session_db(chat) as (db, tip):
++                    if db is None:
++                        observed.result = 'db_none'
++                        out.retry()
++                        continue
++                    skipped = chat_skip_reason(db, chat)
++                    if skipped is None and not refresh_outcomes_quietly([tip], "card_change", db=db):
++                        observed.result = 'refresh_failed'
++                        out.retry()
++                        continue
++            except Exception:  # health: allow BLE001 -- retain failed chat invalidations and continue other chats
++                observed.result = 'exception'
++                out.retry()
++                logger.warning("remote card-change outcome failed for chat %s", chat, exc_info=True)
++                continue
++            # Acknowledge only a successful refresh or an intentionally skipped chat.
++            acked[chat] = snapshot.get(chat)
++            out.append({"board": None, "task_id": None, "chat_id": chat, "session_id": tip,
++                        "status": None, "skipped": skipped, "source": "remote"})
++            observed.result = 'acked_refreshed' if skipped is None else 'acked_intentionally_skipped'
+     committed = state.ack_remote(acked)
+     if not committed:
+         out.retry()
+     recovered_all = notice_links_health.recover_into(out, origin, health_generation, set(previous.keys() | snapshot.keys()), origin_db)
++    diagnostic.cert = ('ack_failed' if not committed else 'inputs_unavailable' if inputs is None else 'not_all_acked')
+     if committed and inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
+-        # Only certify a projection if its cursor stayed still THROUGH fingerprint collection. A later
+-        # fingerprint must not describe a write the projection never saw.
+-        prints = _known_prints(inputs[0], known)
+-        after = _poll_boards(inputs[0], {slug: polled[slug][1] for slug in polled})
+-        if prints is not None and after is not None and all(after[slug][1] == polled[slug][1] for slug in polled):
+-            _remote_memo = (inputs[0], _ledger_content_key(inputs[1]), {slug: polled[slug][1] for slug in polled}, prints)
+-    fact_links_health.acknowledge(origin, health_generation,
+-                                  complete=committed and recovered_all and (previous.keys() | snapshot.keys()) <= acked.keys())
++        _certify_remote(inputs, polled, known, diagnostic)
++    diagnostic.health = 'exception'
++    complete = committed and recovered_all and (previous.keys() | snapshot.keys()) <= acked.keys()
++    fact_links_health.acknowledge(origin, health_generation, complete=complete)
++    diagnostic.health = 'no_generation' if health_generation is None else ('complete_true' if complete else 'complete_false')
++    diagnostic.call = 'refreshed'
+     return out
+ 
+ 
++def _certify_remote(inputs, polled, known, diagnostic):
++    """Observe the original post-fingerprint cursor certification, without an early return."""
++    global _remote_memo
++    from tui_gateway.unloaded_diagnostics import emit
++    prints = _known_prints(inputs[0], known)
++    after = _poll_boards(inputs[0], {slug: polled[slug][1] for slug in polled})
++    if prints is None:
++        emit('remote.cert.flag', 'prints_none')
++    if after is None:
++        emit('remote.cert.flag', 'after_poll_none')
++    stable = None
++    if after is not None:
++        if prints is not None:
++            stable = all(after[slug][1] == polled[slug][1] for slug in polled)
++        else:
++            # Independent flags must not introduce an exception on a path whose
++            # decisive comparison was originally short-circuited by prints=None.
++            try:
++                stable = all(after[slug][1] == polled[slug][1] for slug in polled)
++            except (KeyError, TypeError, IndexError):
++                emit('remote.cert.flag', 'unknown')
++        if stable is False:
++            emit('remote.cert.flag', 'cursor_moved')
++    diagnostic.cert = ('prints_none' if prints is None else 'after_poll_none' if after is None
++                       else 'cursor_moved' if not stable else 'unknown')
++    if prints is not None and after is not None and stable:
++        _remote_memo = (inputs[0], _ledger_content_key(inputs[1]), {slug: polled[slug][1] for slug in polled}, prints)
++        diagnostic.cert = 'certified'
++
++
+ def _board_slugs(kb: Any) -> list[str]:
+     """Enumerate without turning an unavailable roster into an empty success."""
+     unique: dict[str, str] = {}
+@@ -510,6 +564,7 @@
+     from hermes_cli import kanban_db as _kb
+     from hermes_cli import kanban_db_connect as _kbc
+     from tui_gateway import kanban_unloaded as ku
++    from tui_gateway.unloaded_diagnostics import local_retry
+     session_db = session_db or ku.find_session_db
+     if hosted is None:
+         hosted = ku.chat_hosted_here if session_db is ku.find_session_db else lambda chat: None
+@@ -519,7 +574,7 @@
+     except Exception:  # health: allow BLE001 -- roster failure is an explicit outstanding action obligation
+         logger.warning("card-change board enumeration failed", exc_info=True)
+         boards = []
+-        done.retry()
++        local_retry(done, 'enumeration_failed')
+     for slug in boards:
+         try:
+             ident = str(_kb.kanban_db_path(slug).resolve())
+@@ -530,16 +585,16 @@
+                 tids, cursor = _changed_tasks(conn, ident)
+                 done += _fan_out_changes(conn, _kb, session_db, slug, tids, hosted)
+                 if not state.set_cursor(ident, cursor):
+-                    done.retry()
++                    local_retry(done, 'set_cursor_failed')
+                 top = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+                 if top > cursor:
+-                    done.retry(0.0)
++                    local_retry(done, 'top_gt_cursor', 0.0)
+         except Exception:
+-            done.retry()
++            local_retry(done, 'board_error')
+             logger.warning("card-change outcome pass failed on board %s", slug, exc_info=True)
+     try:
+         done.absorb(_remote_change_pass(session_db))
+     except Exception:  # health: allow BLE001 -- isolate the replica source and report failed reads
+-        done.retry()
++        local_retry(done, 'remote_error')
+         logger.warning("remote card-change outcome pass failed", exc_info=True)
+     return done
+diff --git a/tui_gateway/notice_fanout_result.py b/tui_gateway/notice_fanout_result.py
+index ecf791e78b9996f15e33a98119882fdb1e169c3a..640c13d888530e893b943bda02997a616d713877 100644
+--- a/tui_gateway/notice_fanout_result.py
++++ b/tui_gateway/notice_fanout_result.py
+@@ -3,6 +3,8 @@
+ 
+ import time
+ 
++from gateway.notification_retry_provenance import earliest, origin
++
+ 
+ class FanoutResult(list[dict]):
+     """Legacy row list plus explicit retry obligations in monotonic seconds.
+@@ -11,20 +13,23 @@
+     and retain ``next_deadline`` even when this list is falsey.
+     """
+ 
+-    def __init__(self):
++    def __init__(self, *, subpass='unknown'):
+         super().__init__()
+         self.incomplete = False
+         self.next_deadline: float | None = None
++        self.retry_origin = None
++        self.subpass = origin(subpass)[0]
+ 
+     @property
+     def quiet(self) -> bool:
+         """The pass drained its captured inputs, whether or not it acted."""
+         return not self.incomplete
+ 
+-    def retry(self, delay: float = 1.0) -> None:
++    def retry(self, delay: float = 1.0, *, subpass=None, reason='unknown') -> None:
+         self.incomplete = True
+         deadline = time.monotonic() + delay
+         self.next_deadline = deadline if self.next_deadline is None else min(self.next_deadline, deadline)
++        self.retry_origin = earliest(self.retry_origin, deadline, self.subpass if subpass is None else subpass, reason)
+ 
+     def absorb(self, other: FanoutResult) -> None:
+         self.extend(other)
+@@ -33,3 +38,5 @@
+             if other.next_deadline is not None:
+                 self.next_deadline = (other.next_deadline if self.next_deadline is None
+                                       else min(self.next_deadline, other.next_deadline))
++            if other.retry_origin is not None:
++                self.retry_origin = earliest(self.retry_origin, *other.retry_origin)
+diff --git a/tui_gateway/notification_facts.py b/tui_gateway/notification_facts.py
+index ed0dc1eccfb62ecf0f81ab71db5a4fb708af925c..00a5058d9fb97b7ad5d257239bcd72481e0cb099 100644
+--- a/tui_gateway/notification_facts.py
++++ b/tui_gateway/notification_facts.py
+@@ -90,14 +90,20 @@
+         self.wake = wake
+         self.pending = True
+         self.closed = False
++        self.pending_sources = {'unknown'}
++        self.diagnostic_sources = ()
+ 
+     def due(self, *, legacy_due: bool) -> bool:
+         with self.owner.lock:
++            self.diagnostic_sources = ()
+             if self.closed:
+                 return False
+             if self.owner.mode == "legacy":
+                 return legacy_due
+             pending, self.pending = self.pending, False
++            if pending:
++                self.diagnostic_sources = tuple(sorted(self.pending_sources))
++                self.pending_sources.clear()
+             return pending
+ 
+     @property
+@@ -149,6 +155,12 @@
+             actions = tuple(self.actions)
+             for action in actions:
+                 action.pending = True
++                kinds = {fact.key.kind for fact in delta.upserts} | {key.kind for key in delta.deletes}
++                action.pending_sources.update(kind if kind in KINDS else 'unknown' for kind in kinds)
++                if delta.reset:
++                    action.pending_sources.add('reset')
++                if delta.health:
++                    action.pending_sources.add('health')
+         from tui_gateway.notification_loaded_f import signal
+         signal(self.profile_home, delta)
+         for action in actions:
+@@ -175,6 +187,7 @@
+                 actions = tuple(self.actions)
+                 for action in actions:
+                     action.pending = True
++                    action.pending_sources.add('unknown')
+             if mode == "facts":
+                 self.subscription = self.v1.subscribe(
+                     self.scope, KINDS, None, None, lambda delta: self._signal(token, delta))
+diff --git a/tui_gateway/unloaded_diagnostics.py b/tui_gateway/unloaded_diagnostics.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..25eebcb63f83584d6fd34b8876fd01ebe4bd22ff
+--- /dev/null
++++ b/tui_gateway/unloaded_diagnostics.py
+@@ -0,0 +1,213 @@
++"""Bounded, stage-local unloaded receipts; no delivery or scheduling decisions.
++
++All names below are static. Metrics are overlays, never additive parent CPU.
++The shared accounting registry reports capacity overflow as ``_overflow``.
++"""
++from contextvars import ContextVar
++from functools import wraps
++
++from gateway.notification_retry_provenance import REASONS, SUBPASSES, origin
++from hermes_cli import loop_accounting as accounting
++
++
++LABELS = {
++    'instrumentation': ('unknown', 'overflow'),
++    'retry.site': ('enumeration_failed', 'set_cursor_failed', 'top_gt_cursor', 'board_error', 'remote_error', 'unknown'),
++    'host.exit': ('complete', 'exception', 'unknown'),
++    'host.due': ('fact', 'retry', 'due', 'maintenance', 'unknown'),
++    'host.fact': ('health', 'TaskFact', 'SourceState', 'SessionFact', 'ChatWaitingFact', 'reset', 'unknown'),
++    'host.primary': ('fact', 'maintenance', 'unknown') + tuple(
++        category + '.' + subpass + '.' + reason
++        for category in ('retry', 'due') for subpass in SUBPASSES for reason in REASONS),
++    'remote_notices.fallback': ('woken', 'self_holder', 'dead_holder', 'held_with_report', 'no_token',
++                                'probe_error', 'other_pending', 'admission_bypassed', 'unknown'),
++    'remote_notices.pending_detail': ('identity_unknown', 'chat_reactivated', 'snapshot_changed',
++                                      'no_ledger', 'unsettled', 'unknown'),
++    'remote.call': ('memo_hit', 'seed_only', 'seed_failed', 'refreshed', 'exception', 'unknown'),
++    'remote.cert': ('not_attempted', 'ack_failed', 'inputs_unavailable', 'not_all_acked', 'prints_none',
++                    'after_poll_none', 'cursor_moved', 'certified', 'exception', 'unknown'),
++    'remote.health': ('not_reached', 'no_generation', 'complete_true', 'complete_false', 'exception', 'unknown'),
++    'remote.chat.trigger': ('snapshot_diff', 'health_forced', 'unchanged_skip', 'unknown'),
++    'remote.chat.result': ('unchanged_skip', 'db_none', 'refresh_failed', 'exception', 'acked_refreshed',
++                           'acked_intentionally_skipped', 'unknown'),
++    'remote.chat.flag': ('health_pending', 'unknown'),
++    'remote.cert.flag': ('prints_none', 'after_poll_none', 'cursor_moved', 'unknown'),
++}
++MISS = ('inputs_error', 'initial_poll_failed', 'health_pending', 'no_memo', 'inputs_changed',
++        'ledger_changed', 'boards_not_quiet', 'unknown')
++for _miss in MISS:
++    LABELS['remote.miss.' + _miss] = ('true', 'false', 'not_evaluated', 'unknown')
++
++
++def emit(family, label):
++    """Unknown labels cannot grow the shared registry or expose caller identities."""
++    if family not in LABELS:
++        family, label = 'instrumentation', 'unknown'
++    if label not in LABELS[family]:
++        label = 'unknown'
++    accounting.record('unloaded.diag.' + family + '.' + label, outer=False)
++
++
++class RemoteCall:
++    """One lexical remote invocation; nested unreached stages keep their own units."""
++    def __init__(self):
++        self.call = 'unknown'
++        self.cert = 'not_attempted'
++        self.health = 'not_reached'
++        self.miss = {}
++
++    def test(self, reason, value):
++        self.miss[reason] = bool(value)
++        return value
++
++    def check(self, reason, predicate):
++        self.miss[reason] = 'unknown'
++        return self.test(reason, predicate())
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, kind, exc, tb):
++        if kind is not None:
++            self.call = self.cert = 'exception'
++        emit('remote.call', self.call)
++        emit('remote.cert', self.cert)
++        emit('remote.health', self.health)
++        for reason in MISS:
++            value = self.miss.get(reason)
++            label = 'not_evaluated' if value is None else ('unknown' if value == 'unknown' else ('true' if value else 'false'))
++            emit('remote.miss.' + reason, label)
++
++
++class Chat:
++    """Only instantiate for a chat actually reached by the projection union loop."""
++    def __init__(self):
++        self.trigger = self.result = 'unknown'
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, kind, exc, tb):
++        if kind is not None:
++            self.result = 'exception'
++        emit('remote.chat.trigger', self.trigger)
++        emit('remote.chat.result', self.result)
++
++
++_fallback = ContextVar('unloaded_fallback_diagnostic', default=None)
++
++
++class Fallback:
++    """Pass-local observation without changing the frozen Inputs public contract."""
++    def __enter__(self):
++        self.reason = 'unknown'
++        self.detail = 'unknown'
++        self.token = _fallback.set(self)
++        return self
++
++    def __exit__(self, kind, exc, tb):
++        _fallback.reset(self.token)
++
++
++def fallback_reason(reason, detail='unknown'):
++    observation = _fallback.get()
++    if observation is not None:
++        observation.reason = reason
++        observation.detail = detail
++
++
++def holder_pending(remote, row):
++    """Preserve the original short-circuited liveness decision and its first cause."""
++    if remote._holder_is_me(row[3]):
++        fallback_reason('self_holder')
++        return True
++    if not remote._holder_alive(row[3], row[4]):
++        fallback_reason('dead_holder')
++        return True
++    return False
++
++
++_admission = ContextVar('unloaded_host_admission', default=None)
++
++
++class Admission:
++    def __init__(self, now, sources=(), deadlines=(), maintenance=False):
++        self.facts = tuple(source if source in LABELS['host.fact'] else 'unknown' for source in sources)
++        self.flags = set()
++        if sources:
++            self.flags.add('fact' if any(source != 'unknown' for source in self.facts) else 'unknown')
++        candidates = [(category, deadline, *origin(subpass, reason))
++                      for category, deadline, subpass, reason in deadlines if deadline <= now]
++        self.flags.update(entry[0] for entry in candidates)
++        if maintenance:
++            self.flags.add('maintenance')
++        self.primary = 'unknown'
++        if 'fact' in self.flags:
++            self.primary = 'fact'
++        else:
++            for category in ('retry', 'due'):
++                entries = sorted(entry[1:] for entry in candidates if entry[0] == category)
++                if entries:
++                    self.primary = category + '.' + '.'.join(entries[0][1:])
++                    break
++            else:
++                if maintenance:
++                    self.primary = 'maintenance'
++
++    def __enter__(self):
++        self.token = _admission.set(self)
++        return self
++
++    def __exit__(self, kind, exc, tb):
++        _admission.reset(self.token)
++
++
++def host_accounted(fn):
++    """Lexical contexts encompass actual host work, early returns and BaseException.
++
++    Primary CPU is a partition overlay enclosing the same host work. Parent and
++    partition instrumentation overhead differs; neither is additive with nested work.
++    """
++    @wraps(fn)
++    def wrapped(*args, **kwargs):
++        admission = _admission.get()
++        primary = admission.primary if admission is not None else 'unknown'
++        name = 'unloaded.diag.host.primary.' + primary
++        with accounting.pass_('unloaded.host_pass'), accounting.pass_(name):
++            if admission is not None:
++                for flag in admission.flags:
++                    emit('host.due', flag)
++                for source in admission.facts:
++                    emit('host.fact', source)
++            outcome = 'unknown'
++            try:
++                result = fn(*args, **kwargs)
++                outcome = 'complete'
++                return result
++            except BaseException:
++                outcome = 'exception'
++                raise
++            finally:
++                emit('host.exit', outcome)
++    return wrapped
++
++
++def local_retry(result, reason, delay=1.0):
++    emit('retry.site', reason)
++    result.retry(delay, subpass='card_change_pass', reason=reason)
++
++
++def retry_report(report, subpass='unknown', reason='unknown'):
++    from gateway.kanban_notification_schedule import PassReport
++    if isinstance(report, PassReport):
++        report.retry(subpass, reason)
++    else:
++        report.retry()
++
++
++def due_report(report, deadline, subpass='unknown', reason='unknown', *, cause='due'):
++    from gateway.kanban_notification_schedule import PassReport
++    if isinstance(report, PassReport):
++        report.due_at(deadline, subpass, reason, cause=cause)
++    else:
++        report.due_at(deadline)
+-- 
+2.43.0
+

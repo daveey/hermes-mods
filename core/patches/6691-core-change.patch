@@ -1,0 +1,863 @@
+From 4f26cef5d34ba9c6ed04a46aa4aa5909222fa799 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 03:15:58 +0000
+Subject: [PATCH 6691] Absent-session ACKs, expired claims and fanout custody
+
+Public mirror of source commit 4f26cef5d34ba9c6ed04a46aa4aa5909222fa799.
+
+---
+diff --git a/gateway/notification_retry_provenance.py b/gateway/notification_retry_provenance.py
+index 994ebdbaaabd03c7f7595b05a08b81f8f5d8165d..1f03a8fbf9383db354d5c2691c5e84f15e9c8a1d 100644
+--- a/gateway/notification_retry_provenance.py
++++ b/gateway/notification_retry_provenance.py
+@@ -2,6 +2,7 @@
+ SUBPASSES = ('card_change_pass', 'remote_card_change', 'remote_notices', 'notices', 'delegation',
+              'killed_notices', 'guarantee_pass', 'unknown')
+ REASONS = ('enumeration_failed', 'set_cursor_failed', 'top_gt_cursor', 'board_error', 'remote_error',
++           'inputs_error', 'initial_poll_failed', 'seed_failed', 'db_none', 'refresh_failed',
+            'pending', 'exception', 'unknown')
+ 
+ 
+diff --git a/tests/tui_gateway/test_remote_absent_expired_claims.py b/tests/tui_gateway/test_remote_absent_expired_claims.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4b854cd577e268c8988e3d82740ec8920ad223d
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_absent_expired_claims.py
+@@ -0,0 +1,187 @@
++"""R5 T1–T9: expired absent-ref claims retain session and alias custody."""
++import contextlib
++import logging
++import sqlite3
++
++import pytest
++
++from tui_gateway import kanban_remote_notices as notices
++
++NOW = 1_800_000_000.25
++HOUR = 3600
++REF = 'worker/default/default/t_expired'
++STATE = 'blocked@1799712000'
++CHAT = 'chat'
++
++
++@pytest.fixture
++def claim(tmp_path, monkeypatch):
++    ledger = tmp_path / 'ledger.db'
++    source = tmp_path / 'replica.db'
++    monkeypatch.setattr(notices.time, 'time', lambda: NOW)
++    monkeypatch.setattr(notices, '_holder_is_me', lambda pid: pid == 1)
++    monkeypatch.setattr(notices, '_holder_alive', lambda pid, start: pid == 2)
++    with contextlib.closing(notices._ledger(ledger)) as conn, conn:
++        conn.execute('CREATE TABLE observations (source TEXT, ref TEXT, state TEXT, first_seen, PRIMARY KEY(source,ref,state))')
++        conn.execute('INSERT INTO observations VALUES (?,?,?,?)', (str(source), REF, STATE, NOW - 80 * HOUR))
++        conn.execute('INSERT INTO notices (session,ref,state,at,delivered,holder_pid,holder_start,notice_key) '
++                     'VALUES (?,?,?,?,0,3,30,?)', (CHAT, REF, STATE, NOW - HOUR, 'original-key'))
++    return ledger, source
++
++
++def run(claim, states=None):
++    ledger, source = claim
++    return notices._settle_stale_claims(states or {}, source, ledger)
++
++
++def row(claim):
++    with contextlib.closing(notices._ledger(claim[0])) as conn:
++        return dict(conn.execute('SELECT * FROM notices WHERE session=? AND ref=? AND state=?',
++                                 (CHAT, REF, STATE)).fetchone())
++
++
++def execute(claim, sql, args=()):
++    with sqlite3.connect(claim[0]) as conn:
++        conn.execute(sql, args)
++
++
++def test_T1_expired_absent_claim_settles_once_with_warning(claim, caplog):
++    with caplog.at_level(logging.WARNING, logger=notices.__name__):
++        assert run(claim) == 1
++        assert run(claim) == 0
++    result = row(claim)
++    assert (result['delivered'], result['settled'], result['holder_pid'], result['holder_start']) == (notices.SETTLED, 'expired', None, None)
++    assert result['notice_key'] == 'original-key'
++    with sqlite3.connect(claim[0]) as conn:
++        assert conn.execute('SELECT replica,profile,session,notice_id,reason FROM swept').fetchall() == [
++            (str(claim[1]), 'default', CHAT, 'original-key', 'expired')]
++    warnings = [r for r in caplog.records if r.name == notices.__name__ and r.levelno == logging.WARNING]
++    assert len(warnings) == 1
++    assert all(value in warnings[0].getMessage() for value in (REF, STATE, CHAT, 't_expired'))
++
++
++@pytest.mark.parametrize(('state_age', 'observation_age', 'settled'), [(80, 7, False), (7, 80, True)])
++def test_T2_observation_not_state_clock(claim, state_age, observation_age, settled):
++    execute(claim, 'UPDATE notices SET at=?', (NOW - state_age * HOUR,))
++    execute(claim, 'UPDATE observations SET first_seen=?', (NOW - observation_age * HOUR,))
++    assert run(claim) == int(settled)
++    assert row(claim)['delivered'] == (notices.SETTLED if settled else 0)
++
++
++@pytest.mark.parametrize(('extra', 'settled'), [(0, False), (1, True)])
++def test_T3_late_window_strict_boundary_fractional_origin(claim, extra, settled):
++    execute(claim, 'UPDATE observations SET first_seen=?', (NOW - notices.LATE_MAX_S - extra,))
++    assert run(claim) == int(settled)
++
++
++@pytest.mark.parametrize('bad', [None, 'old', '123', b'old', float('inf'), float('-inf'), float('nan')])
++def test_T4_unknown_seeded_malformed_observation_retained(claim, bad):
++    execute(claim, 'UPDATE observations SET first_seen=?', (bad,))
++    before = row(claim)
++    assert run(claim) == 0
++    assert row(claim) == before
++
++
++@pytest.mark.parametrize('missing', ['table', 'exact', 'all'])
++def test_T4_missing_observations_keep_claim(claim, missing):
++    if missing == 'table':
++        execute(claim, 'DROP TABLE observations')
++    elif missing == 'exact':
++        execute(claim, 'UPDATE observations SET ref=?', ('hub/default/default/t_expired',))
++    else:
++        execute(claim, 'DELETE FROM observations')
++    before = row(claim)
++    assert run(claim) == 0
++    assert row(claim) == before
++
++
++@pytest.mark.parametrize('pid', [1, 2])
++def test_T5_self_and_live_holder_unchanged(claim, pid):
++    execute(claim, 'UPDATE notices SET holder_pid=?', (pid,))
++    before = row(claim)
++    assert run(claim) == 0
++    assert row(claim) == before
++
++
++def test_T6_present_same_state_retains_existing_path(claim):
++    before = row(claim)
++    assert run(claim, {REF: (STATE, {})}) == 0
++    assert row(claim) == before
++
++
++def test_T6_swept_insert_failure_rolls_back(claim, monkeypatch, caplog):
++    def fail(*args):
++        raise sqlite3.OperationalError('injected swept failure')
++    monkeypatch.setattr(notices, '_swept_row', fail)
++    before = row(claim)
++    assert run(claim) == 0
++    assert row(claim) == before
++    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
++
++
++@pytest.mark.parametrize('young', [NOW - 7 * HOUR, None, NOW - 80 * HOUR])
++def test_T7_existing_alias_keeps_its_own_clock_through_real_persist(claim, young):
++    from tui_gateway import kanban_remote_observations as observations
++    ledger, source = claim
++    execute(claim, 'INSERT INTO observations VALUES (?,?,?,?)',
++            (str(source), 'hub/default/default/t_expired', STATE, young))
++    # _persist must not retroactively replace a pre-existing younger alias with the old minimum.
++    execute(claim, 'CREATE TABLE observation_sources (source TEXT PRIMARY KEY)')
++    execute(claim, 'INSERT INTO observation_sources VALUES (?)', (str(source),))
++    task = {'id': 't_expired', 'status': 'blocked', 'updated_at': 1799712000,
++            'human_request': {'action': 'reply'}}
++    # Exercise insert-only alias persistence with the actual state, not a made-up minimum reducer.
++    monkey_state = observations._notice_state(task)
++    execute(claim, 'UPDATE observations SET state=?', (monkey_state,))
++    execute(claim, 'UPDATE notices SET state=?', (monkey_state,))
++    observations._persist(str(source), [('hub', 'default/default/t_expired', task)], ledger, NOW)
++    assert run(claim) == (1 if young == NOW - 80 * HOUR else 0)
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute('SELECT first_seen FROM observations WHERE ref=?',
++                            ('hub/default/default/t_expired',)).fetchone()[0] == young
++
++
++@pytest.mark.parametrize('dimension', ['source', 'board', 'profile'])
++def test_T8_different_scope_same_task_id_retained(claim, dimension):
++    source = str(claim[1]) + ('-other' if dimension == 'source' else '')
++    profile = 'other' if dimension == 'profile' else 'default'
++    board = 'other' if dimension == 'board' else 'default'
++    alias = f'hub/{profile}/{board}/t_expired'
++    execute(claim, 'INSERT INTO observations VALUES (?,?,?,?)', (source, alias, STATE, NOW - 80 * HOUR))
++    before = row(claim)
++    assert run(claim) == 0
++    assert row(claim) == before
++
++
++def test_T9_writer_lock_acquired_before_decisive_read(claim, monkeypatch):
++    """An actual peer writer must fail after BEGIN and before the observation SELECT."""
++    real_ledger = notices._ledger
++    evidence = []
++    class Connection:
++        def __init__(self, conn):
++            self.conn = conn
++        def execute(self, sql, parameters=()):
++            if sql.startswith('SELECT') and 'observations' in sql:
++                with sqlite3.connect(claim[0], timeout=0) as peer:
++                    try:
++                        peer.execute('INSERT OR IGNORE INTO observations VALUES (?,?,?,?)',
++                                     (str(claim[1]), 'hub/default/default/t_expired', STATE, NOW - HOUR))
++                    except sqlite3.OperationalError as error:
++                        assert 'locked' in str(error)
++                        evidence.append('blocked')
++                    else:
++                        evidence.append('inserted')
++            return self.conn.execute(sql, parameters)
++        def __getattr__(self, name):
++            return getattr(self.conn, name)
++        def __enter__(self):
++            self.conn.__enter__()
++            return self
++        def __exit__(self, *args):
++            return self.conn.__exit__(*args)
++    monkeypatch.setattr(notices, '_ledger', lambda path: Connection(real_ledger(path)))
++    assert run(claim) == 1
++    assert evidence and set(evidence) == {'blocked'}
++    # Once the settlement commits, an unrelated healthy writer progresses normally.
++    execute(claim, 'INSERT INTO observations VALUES (?,?,?,?)',
++            (str(claim[1]), 'hub/default/default/t_healthy', STATE, NOW))
+diff --git a/tests/tui_gateway/test_remote_change_absence.py b/tests/tui_gateway/test_remote_change_absence.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5c75d94233b86cb577a8f8c8619565f6ac8d0da
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_change_absence.py
+@@ -0,0 +1,143 @@
++"""A1–A5: a proven absent destination is an ACK, not a one-second obligation."""
++import contextlib
++import logging
++
++import pytest
++
++from hermes_cli import fact_links_health
++from tests.tui_gateway import test_remote_change_diagnostics as helpers
++from tui_gateway import kanban_unloaded as ku, notice_fanout as nf, notice_fanout_state as state
++
++remote = helpers.remote
++
++
++class Lookup(tuple):
++    def __new__(cls, db=None, tip=None, *, unavailable=False):
++        result = super().__new__(cls, (db, tip))
++        result.unavailable = unavailable
++        return result
++
++
++@pytest.fixture
++def absent(remote, monkeypatch):
++    nf._reset_for_tests()
++    clock = [1000.25]
++    monkeypatch.setattr('time.monotonic', lambda: clock[0])
++    controls = {'available': False, 'unavailable': False, 'opened': [], 'acks': [], 'clock': clock}
++    remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='missing')]
++    remote['polls'] = [{'board': (set(), 10)}] * 30
++
++    @contextlib.contextmanager
++    def opener(chat):
++        controls['opened'].append(chat)
++        yield Lookup(remote['db'] if controls['available'] or chat == 'present' else None,
++                     chat, unavailable=controls['unavailable'])
++
++    def ack(acked):
++        controls['acks'].append(dict(acked))
++        for chat, cards in acked.items():
++            if cards is None:
++                remote['previous'].pop(chat, None)
++            else:
++                remote['previous'][chat] = cards
++        return True
++
++    monkeypatch.setattr(state, 'ack_remote', ack)
++    controls['run'] = lambda: nf._remote_change_pass(opener)
++    controls['remote'] = remote
++    return controls
++
++
++def test_A1_proven_absence_acked_certified_warning_once(absent, caplog):
++    with caplog.at_level(logging.WARNING, logger=nf.__name__):
++        result = absent['run']()
++        assert not result.incomplete
++        assert [(row['chat_id'], row['skipped']) for row in result] == [('missing', 'no_local_session')]
++        assert absent['acks'] == [{'missing': frozenset({('owner/board/card', 'blocked')})}]
++        assert helpers.runs('cert') == {'certified': 1}
++        assert helpers.runs('chat.result') == {'acked_intentionally_skipped': 1}
++        assert absent['remote']['calls'].count('refresh') == 0
++        absent['run']()
++        absent['clock'][0] += 60
++        absent['run']()
++    warnings = [r for r in caplog.records if r.name == nf.__name__ and r.levelno == logging.WARNING]
++    assert len(warnings) == 1
++    assert 'missing' in warnings[0].getMessage()
++
++
++def test_A2_store_unavailable_retains_retry_without_ack(absent):
++    absent['unavailable'] = True
++    result = absent['run']()
++    assert result.incomplete
++    assert absent['acks'] == [{}]
++    assert helpers.runs('chat.result') == {'db_none': 1}
++    assert helpers.runs('cert') == {'not_all_acked': 1}
++    assert absent['remote']['calls'].count('refresh') == 0
++
++
++def test_A3_later_session_only_rechecked_at_maintenance(absent):
++    assert not absent['run']().incomplete
++    absent['available'] = True
++    absent['clock'][0] += 1
++    absent['run']()
++    absent['clock'][0] += 58.999
++    absent['run']()
++    assert absent['opened'] == ['missing']
++    assert absent['remote']['calls'].count('refresh') == 0
++    absent['clock'][0] = 1060.25
++    assert not absent['run']().incomplete
++    assert absent['opened'] == ['missing', 'missing']
++    assert absent['remote']['calls'].count('refresh') == 1
++
++
++def test_A4_snapshot_change_rechecks_before_maintenance(absent, caplog):
++    absent['run']()
++    absent['remote']['cards'][0]['status'] = 'running'
++    # A real input invalidation makes the remote memo miss.
++    nf._remote_memo = None
++    absent['clock'][0] += 1
++    with caplog.at_level(logging.WARNING, logger=nf.__name__):
++        result = absent['run']()
++    assert not result.incomplete
++    assert absent['opened'] == ['missing', 'missing']
++    assert absent['acks'][-1] == {'missing': frozenset({('owner/board/card', 'running')})}
++    assert len([r for r in caplog.records if r.name == nf.__name__ and r.levelno == logging.WARNING]) == 2
++
++
++def test_A5_absence_does_not_force_other_chat_on_two_retry_passes(absent, monkeypatch):
++    remote = absent['remote']
++    remote['cards'][0]['origin_session'] = 'present'
++    remote['health'] = 1
++    def health_ack(origin, generation, *, complete):
++        if complete:
++            remote['health'] = None
++    monkeypatch.setattr(fact_links_health, 'acknowledge', health_ack)
++    assert not absent['run']().incomplete
++    assert remote['health'] is None
++    # Force ordinary projection passes, as if unrelated host work invalidated the memo.
++    for _ in range(2):
++        absent['clock'][0] += 1
++        nf._remote_memo = None
++        assert not absent['run']().incomplete
++    assert absent['opened'] == ['missing', 'present']
++    assert remote['calls'].count('refresh') == 1
++    assert helpers.runs('chat.trigger') == {'snapshot_diff': 2, 'unchanged_skip': 4}
++    assert helpers.runs('health') == {'complete_true': 1, 'no_generation': 2}
++
++
++@pytest.mark.parametrize('failure', ['raise', 'none', 'healthy'])
++def test_A2_real_finder_reports_open_failures(monkeypatch, failure):
++    from tui_gateway import server
++    monkeypatch.setattr(server, '_readopt_wake_profiles', lambda: [None, 'second'])
++    class Store:
++        def get_session(self, chat):
++            return None
++    @contextlib.contextmanager
++    def profile_db(scope, **kwargs):
++        if scope is None and failure == 'raise':
++            raise OSError('store unavailable')
++        yield None if scope is None and failure == 'none' else Store()
++    monkeypatch.setattr(server, '_profile_db', profile_db)
++    with ku.find_session_db('missing') as lookup:
++        assert tuple(lookup) == (None, None)
++        assert lookup.unavailable is (failure != 'healthy')
+diff --git a/tests/tui_gateway/test_remote_change_diagnostics.py b/tests/tui_gateway/test_remote_change_diagnostics.py
+index bc365d1bd069537e87d3e4cc1999bde66f9ef53a..429bfe00b8e50ea2c16f5a54cd42bce6df1ca157 100644
+--- a/tests/tui_gateway/test_remote_change_diagnostics.py
++++ b/tests/tui_gateway/test_remote_change_diagnostics.py
+@@ -45,7 +45,8 @@
+     monkeypatch.setattr(fact_links_health, 'acknowledge', lambda *a, **k: controls['calls'].append(('health', k['complete'])))
+     @contextlib.contextmanager
+     def opener(chat):
+-        yield controls['db'], chat
++        from tui_gateway.kanban_unloaded import SessionLookup
++        yield SessionLookup(controls['db'], chat, unavailable=controls.get('unavailable', True))
+     controls['run'] = lambda: nf._remote_change_pass(opener)
+     yield controls
+     record_property('counter_snapshot', json.dumps(la.counters(), sort_keys=True))
+@@ -100,24 +101,28 @@
+ 
+ 
+ @pytest.mark.parametrize(('kind', 'result'), [('ok', 'acked_refreshed'), ('skip', 'acked_intentionally_skipped'),
+-                                          ('db', 'db_none'), ('refresh', 'refresh_failed'), ('error', 'exception')])
++                                          ('db', 'acked_intentionally_skipped'), ('unavailable', 'db_none'),
++                                          ('refresh', 'refresh_failed'), ('error', 'exception')])
+ def test_chat_results(remote, monkeypatch, kind, result):
+     remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='chat')]
+     if kind == 'skip':
+         remote['skipped'] = 'archived'
+-    if kind == 'db':
++    if kind in ('db', 'unavailable'):
+         remote['db'] = None
++        remote['unavailable'] = kind == 'unavailable'
+     if kind == 'refresh':
+         remote['refreshed'] = False
+     if kind == 'error':
+         def fail(*args):
+             raise RuntimeError('chat failure')
+         monkeypatch.setattr(nf, 'chat_skip_reason', fail)
+-    remote['run']()
++    result_rows = remote['run']()
+     assert runs('chat.trigger') == {'snapshot_diff': 1}
+     assert runs('chat.result') == {result: 1}
+     assert remote['calls'].count('refresh') == (1 if kind in ('ok', 'refresh') else 0)
+-    assert runs('cert') == {('certified' if kind in ('ok', 'skip') else 'not_all_acked'): 1}
++    assert runs('cert') == {('certified' if kind in ('ok', 'skip', 'db') else 'not_all_acked'): 1}
++    if kind in ('db', 'unavailable'):
++        assert result_rows.incomplete is (kind == 'unavailable')
+     conservation(chats=1)
+ 
+ 
+diff --git a/tests/tui_gateway/test_remote_change_retry_reasons.py b/tests/tui_gateway/test_remote_change_retry_reasons.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b5429e3effdf36b928588c7456f1e472d9da4b7
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_change_retry_reasons.py
+@@ -0,0 +1,50 @@
++"""Remote retry sites identify every armed occurrence, including simultaneous faults."""
++import pytest
++
++from hermes_cli import loop_accounting as accounting
++from tests.tui_gateway import test_remote_change_diagnostics as helpers
++from tui_gateway import notice_fanout as fanout, notice_fanout_state as state
++from tui_gateway.notice_fanout_result import FanoutResult
++
++remote = helpers.remote
++
++
++@pytest.mark.parametrize('failure', ['inputs_error', 'initial_poll_failed', 'seed_failed', 'db_none',
++                                    'refresh_failed', 'exception', 'ack_failed', 'simultaneous'])
++def test_C_retry_site_reasons_partition_armed_retries(remote, monkeypatch, failure):
++    armed = []
++    original = FanoutResult.retry
++    def retry(self, *args, **kwargs):
++        armed.append(kwargs.get('reason', 'unknown'))
++        return original(self, *args, **kwargs)
++    monkeypatch.setattr(FanoutResult, 'retry', retry)
++    def fail(*args, **kwargs):
++        raise OSError('injected fault')
++    if failure in ('inputs_error', 'simultaneous'):
++        monkeypatch.setattr(fanout, '_remote_inputs_key', fail)
++    if failure == 'initial_poll_failed':
++        remote['polls'][0] = None
++    if failure == 'seed_failed':
++        remote.update(previous=None, seed=False)
++    if failure in ('db_none', 'refresh_failed', 'exception', 'simultaneous'):
++        remote['cards'] = [dict(board='board', id='card', key='owner/board/card', status='blocked', session='chat')]
++    if failure in ('db_none', 'simultaneous'):
++        remote['db'] = None
++    if failure == 'refresh_failed':
++        remote['refreshed'] = False
++    if failure == 'exception':
++        monkeypatch.setattr(fanout, 'chat_skip_reason', fail)
++    if failure == 'ack_failed':
++        monkeypatch.setattr(state, 'ack_remote', lambda *args: False)
++    result = remote['run']()
++    expected = ['inputs_error', 'db_none'] if failure == 'simultaneous' else [
++        'refresh_failed' if failure == 'ack_failed' else failure]
++    assert armed == expected
++    assert result.incomplete
++    prefix = 'unloaded.diag.remote.retry.'
++    reasons = {key[len(prefix):]: value['runs'] for key, value in accounting.counters().items() if key.startswith(prefix)}
++    assert reasons == {reason: expected.count(reason) for reason in expected}
++    assert sum(reasons.values()) == len(armed)
++    assert result.retry_origin[1] == 'remote_card_change'
++    assert result.retry_origin[2] in expected
++    assert result.retry_origin[2] != 'unknown'
+diff --git a/tui_gateway/kanban_remote_expired_claims.py b/tui_gateway/kanban_remote_expired_claims.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6620868e3b5dfad7805015898a4f67705fc6024e
+--- /dev/null
++++ b/tui_gateway/kanban_remote_expired_claims.py
+@@ -0,0 +1,97 @@
++"""Conservative expiry of an absent remote ref's abandoned delivery claim."""
++from __future__ import annotations
++
++import math
++import re
++import sqlite3
++
++
++def _key(ref):
++    if not isinstance(ref, str):
++        return None
++    parts = ref.split('/')
++    if len(parts) != 4 or not all(parts) or not re.fullmatch(r't_[A-Za-z0-9_]+', parts[-1]):
++        return None
++    return '/'.join(parts[1:])
++
++
++def _expired_observation(conn, row, source, now, remote):
++    """Prove every alias in moved_claim's broader identity is expired and in scope."""
++    key = _key(row['ref'])
++    if key is None:
++        return None
++    task_id = key.rsplit('/', 1)[-1]
++    suffix = '/' + task_id
++    observations = conn.execute('SELECT source,ref,first_seen FROM observations WHERE state=? '
++                                'AND substr(ref,-length(?))=?',
++                                (row['state'], suffix, suffix)).fetchall()
++    exact = False
++    latest = None
++    observed_refs = set()
++    for observation in observations:
++        seen = observation['first_seen']
++        if observation['source'] != source or _key(observation['ref']) != key:
++            return None
++        if type(seen) not in (int, float) or not math.isfinite(seen):
++            return None
++        if remote._late_verdict(now, seen) != 'expired':
++            return None
++        exact |= observation['ref'] == row['ref']
++        observed_refs.add(observation['ref'])
++        latest = seen if latest is None else max(latest, seen)
++    if not exact:
++        return None
++    aliases = conn.execute('SELECT ref,holder_pid,holder_start FROM notices WHERE session=? AND state=? '
++                           'AND substr(ref,-length(?))=?',
++                           (row['session'], row['state'], suffix, suffix)).fetchall()
++    for alias in aliases:
++        if _key(alias['ref']) != key or alias['ref'] not in observed_refs:
++            return None
++        if remote._holder_is_me(alias['holder_pid']) or remote._holder_alive(alias['holder_pid'], alias['holder_start']):
++            return None
++    return latest
++
++
++def settle_absent(conn, selected, states, source, now):
++    """One guarded settlement; no source I/O, waits or ambient lookups inside the transaction.
++
++    Observations are insert-only. A future same-source/key alias inherits their
++    expired clock (or unknown), rather than acquiring a new delivery window.
++    Existing incompatible scopes veto settlement; arbitrary later ledger reset or
++    corruption is outside this proof. No mutation is committed without swept.
++    """
++    from tui_gateway import kanban_remote_notices as remote
++
++    committed = False
++    try:
++        conn.execute('BEGIN IMMEDIATE')
++        row = conn.execute('SELECT session,ref,state,holder_pid,holder_start,notice_key,delivered FROM notices '
++                           'WHERE session=? AND ref=? AND state=?',
++                           (selected['session'], selected['ref'], selected['state'])).fetchone()
++        if row is None or row['delivered'] != 0 or row['holder_pid'] != selected['holder_pid'] \
++                or row['holder_start'] != selected['holder_start'] or row['ref'] in states:
++            return 0
++        if remote._holder_is_me(row['holder_pid']) or remote._holder_alive(row['holder_pid'], row['holder_start']):
++            return 0
++        latest = _expired_observation(conn, row, str(source), now, remote)
++        if latest is None:
++            return 0
++        profile, notice_id = remote._stale_notice_id(row, {})
++        changed = conn.execute(
++            "UPDATE notices SET delivered=?,holder_pid=NULL,holder_start=NULL,legacy_seen=1,settled='expired', "
++            'notice_key=IFNULL(notice_key,?) WHERE session=? AND ref=? AND state=? AND delivered=0 '
++            'AND holder_pid IS ? AND holder_start IS ?',
++            (remote.SETTLED, notice_id, row['session'], row['ref'], row['state'], row['holder_pid'], row['holder_start']))
++        if changed.rowcount != 1:
++            return 0
++        remote._swept_row(conn, (str(source), profile, row['session'], notice_id), 'expired')
++        conn.commit()
++        committed = True
++    except (sqlite3.Error, OSError, TypeError, ValueError):
++        remote.logger.debug('remote kanban absent-claim expiry unavailable', exc_info=True)
++        return 0
++    finally:
++        if not committed and conn.in_transaction:
++            conn.rollback()
++    remote._log_dropped({'id': row['ref'].rsplit('/', 1)[-1]}, row['ref'], row['state'], row['session'], latest, now)
++    return 1
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 3504264669effc79a0a5c00ffc31cc2ad3b81d71..a3d8d3f0087d6bf8e60e080724be1419083d1a88 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1242,7 +1242,7 @@
+     return profile, key or f"remote:{row['ref']}:{row['state']}:{profile}:{sid}"
+ 
+ 
+-def _settle_stale_claims(states: dict, path, ledger) -> int:
++def _settle_stale_claims(states: dict, path, ledger, *, now=None) -> int:
+     """Settle in-flight claims nobody can finish: the holder is dead AND the card left the notice's state. [daveey]
+ 
+     ``collect`` and the sweep only walk cards that are terminal NOW, so a claim whose holder died after the card
+@@ -1255,7 +1255,9 @@
+     it) and a card missing from the replica (partial sync) are left alone. Never raises.
+     """
+     from tui_gateway.remote_sweep_projection import CompactTask
++    from tui_gateway.kanban_remote_expired_claims import settle_absent
+ 
++    now = time.time() if now is None else now
+     try:
+         conn = _ledger(ledger)
+         try:
+@@ -1265,7 +1267,10 @@
+             settled = 0
+             for row in claims:
+                 current = states.get(str(row["ref"]))
+-                if current is None or current[0] == row["state"]:
++                if current is None:
++                    settled += settle_absent(conn, row, states, path, now)
++                    continue
++                if current[0] == row["state"]:
+                     continue
+                 if _holder_is_me(row["holder_pid"]) or _holder_alive(row["holder_pid"], row["holder_start"]):
+                     continue
+@@ -1676,7 +1681,7 @@
+         logger.debug("remote kanban observation failed; defer notices", exc_info=True)
+         return []
+     _load_swept(ledger)
+-    _settle_stale_claims(states, path, ledger)
++    _settle_stale_claims(states, path, ledger, now=now)
+     delivered: list[dict] = []
+     swept: list = []
+     counts: dict = {}
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index ee509f202a90e79f1938ce8f11f1556a82da17ef..70eeb7151294be2fab18702a07c97634f74695a8 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -213,6 +213,20 @@
+     return None if unavailable else False
+ 
+ 
++class SessionLookup(tuple):
++    """Backward-compatible (db, tip) pair with explicit absence evidence.
++
++    A missing store or failed read leaves absence unknown; finding a session in
++    another store still supplies a usable destination.
++    """
++    unavailable: bool
++
++    def __new__(cls, db=None, tip=None, *, unavailable=False):
++        result = super().__new__(cls, (db, tip))
++        result.unavailable = unavailable
++        return result
++
++
+ @contextlib.contextmanager
+ def find_session_db(chat_id: str) -> Iterator[tuple[Any, Optional[str]]]:
+     """Yield ``(writable SessionDB, lineage tip id)`` for the store holding ``chat_id``, or ``(None, None)``.
+@@ -222,19 +236,23 @@
+     from tui_gateway import server
+     with contextlib.ExitStack() as stack:
+         found: tuple[Any, Optional[str]] = (None, None)
++        unavailable = False
+         for profile in server._readopt_wake_profiles():
+             scope = contextlib.ExitStack()
+             try:
+                 db = scope.enter_context(server._profile_db({"profile": profile} if profile else None, writer=True))
+-                if db is not None and db.get_session(chat_id) is not None:
++                if db is None:
++                    unavailable = True
++                elif db.get_session(chat_id) is not None:
+                     found = (db, db.get_compression_tip(chat_id) or chat_id)
+                     stack.push(scope.pop_all())  # held open until the caller's block ends
+                     break
+             except Exception:
++                unavailable = True
+                 logger.debug("kanban unloaded sweep: profile %s store unavailable", profile, exc_info=True)
+             with contextlib.suppress(Exception):
+                 scope.close()
+-        yield found
++        yield SessionLookup(*found, unavailable=unavailable and found[0] is None)
+ 
+ 
+ def wake_turn(session_id: str, text: str, metadata: dict) -> str:
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 1cdc293e04cdefeb8d59ddf79bdfe0298c485751..942a32e86ad3032670731bbc6f526328da29ee5d 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -30,6 +30,7 @@
+ import logging
+ import re
+ import sqlite3
++import time
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+@@ -48,6 +49,8 @@
+ )
+ MAX_EVENTS_PER_PASS = 2000
+ _not_hosted_logged: set[tuple[str, str]] = set()
++_remote_absent: dict[str, tuple[object, float]] = {}
++_remote_absent_warned: set[tuple[str, object]] = set()
+ _BLOCKED_LINE = re.compile(r"Kanban (t_[0-9A-Za-z_]+) blocked")
+ _TASK_ID = re.compile(r"Kanban (t_[0-9A-Za-z_]+)")
+ 
+@@ -56,6 +59,8 @@
+     global _remote_memo
+     _remote_memo = None
+     _not_hosted_logged.clear()
++    _remote_absent.clear()
++    _remote_absent_warned.clear()
+     from tui_gateway import notice_fanout_state
+     notice_fanout_state.reset_for_tests()
+ 
+@@ -410,17 +415,19 @@
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_cli import fact_links_health
+     from tui_gateway import notice_links_health
+-    from tui_gateway.unloaded_diagnostics import Chat, emit
++    from tui_gateway.unloaded_diagnostics import Chat, emit, remote_retry
+     origin = activity._origin_scope()
+     health_generation = fact_links_health.pending(origin)
+     out = FanoutResult(subpass='remote_card_change')
++    now = time.monotonic()
++    absent_due = {chat for chat, (_, checked) in _remote_absent.items() if now >= checked + 60.0}
+     try:
+         inputs = _remote_inputs_key()
+         diagnostic.test('inputs_error', False)
+     except Exception:  # health: allow BLE001 -- an unreadable input is unknown: run the pass
+         diagnostic.test('inputs_error', True)
+         logger.debug("remote card-change inputs unavailable", exc_info=True)
+-        out.retry()
++        remote_retry(out, 'inputs_error')
+         inputs = None
+     polled = None
+     if inputs is not None:
+@@ -432,10 +439,10 @@
+             polled = None
+         diagnostic.test('initial_poll_failed', polled is None)
+         if polled is None:
+-            out.retry()
++            remote_retry(out, 'initial_poll_failed')
+             inputs = None
+     memo = _remote_memo
+-    if not diagnostic.test('health_pending', health_generation is not None) and inputs is not None \
++    if not diagnostic.test('health_pending', health_generation is not None) and not absent_due and inputs is not None \
+             and not diagnostic.test('no_memo', memo is None) \
+             and not diagnostic.test('inputs_changed', memo[0] != inputs[0]) \
+             and not diagnostic.check('ledger_changed', lambda: memo[1] != _ledger_content_key(inputs[1])) \
+@@ -444,7 +451,6 @@
+         diagnostic.call = 'memo_hit'
+         return out
+     _remote_memo = None
+-    from hermes_state_outcome import refresh_outcomes_quietly
+     from tui_gateway import notice_fanout_state as state
+     from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+     current: dict[str, set[tuple[str, str]]] = {}
+@@ -460,7 +466,7 @@
+     previous = state.load_remote(strict=True)
+     if previous is None:
+         if not state.seed_remote(snapshot):
+-            out.retry()
++            remote_retry(out, 'seed_failed')
+             diagnostic.call = 'seed_failed'
+             return out
+         if health_generation is None:
+@@ -472,25 +478,14 @@
+         with Chat() as observed:
+             if health_generation is not None:
+                 emit('remote.chat.flag', 'health_pending')
+-            if health_generation is None and previous.get(chat) == snapshot.get(chat):
++            if _remote_unchanged(chat, previous, snapshot, health_generation, absent_due):
+                 observed.trigger = observed.result = 'unchanged_skip'
++                if health_generation is not None and chat in _remote_absent:
++                    acked[chat] = snapshot.get(chat)
+                 continue
+             observed.trigger = ('snapshot_diff' if previous.get(chat) != snapshot.get(chat) else 'health_forced')
+-            try:
+-                with session_db(chat) as (db, tip):
+-                    if db is None:
+-                        observed.result = 'db_none'
+-                        out.retry()
+-                        continue
+-                    skipped = chat_skip_reason(db, chat)
+-                    if skipped is None and not refresh_outcomes_quietly([tip], "card_change", db=db):
+-                        observed.result = 'refresh_failed'
+-                        out.retry()
+-                        continue
+-            except Exception:  # health: allow BLE001 -- retain failed chat invalidations and continue other chats
+-                observed.result = 'exception'
+-                out.retry()
+-                logger.warning("remote card-change outcome failed for chat %s", chat, exc_info=True)
++            tip, skipped, observed.result = _refresh_remote_chat(chat, snapshot.get(chat), session_db, out, now)
++            if observed.result not in ('acked_refreshed', 'acked_intentionally_skipped'):
+                 continue
+             # Acknowledge only a successful refresh or an intentionally skipped chat.
+             acked[chat] = snapshot.get(chat)
+@@ -499,8 +494,9 @@
+             observed.result = 'acked_refreshed' if skipped is None else 'acked_intentionally_skipped'
+     diagnostic.cert_active = True
+     committed = state.ack_remote(acked)
++    _prune_remote_absent(snapshot, committed)
+     if not committed:
+-        out.retry()
++        remote_retry(out, 'refresh_failed')
+     recovered_all = notice_links_health.recover_into(out, origin, health_generation, set(previous.keys() | snapshot.keys()), origin_db)
+     diagnostic.cert = ('ack_failed' if not committed else 'inputs_unavailable' if inputs is None else 'not_all_acked')
+     if committed and inputs is not None and all(previous.get(c) == snapshot.get(c) or c in acked for c in previous.keys() | snapshot.keys()):
+@@ -514,6 +510,48 @@
+     return out
+ 
+ 
++def _prune_remote_absent(snapshot, committed):
++    if committed:
++        for chat in _remote_absent.keys() - snapshot.keys():
++            del _remote_absent[chat]
++
++
++def _remote_unchanged(chat, previous, snapshot, health_generation, absent_due):
++    return (previous.get(chat) == snapshot.get(chat) and chat not in absent_due
++            and (health_generation is None or chat in _remote_absent))
++
++
++def _refresh_remote_chat(chat, entry, session_db, out, now):
++    """Return an ACK outcome only after a refresh or a proven intentional skip."""
++    from hermes_state_outcome import refresh_outcomes_quietly
++    from tui_gateway.unloaded_diagnostics import remote_retry
++
++    try:
++        with session_db(chat) as lookup:
++            db, tip = lookup
++            if db is None:
++                if getattr(lookup, 'unavailable', True):
++                    remote_retry(out, 'db_none')
++                    return None, None, 'db_none'
++                skipped = 'no_local_session'
++                _remote_absent[chat] = (entry, now)
++                warning_key = (chat, entry)
++                if warning_key not in _remote_absent_warned:
++                    logger.warning("remote card-change: no_local_session for chat %s", chat)
++                    _remote_absent_warned.add(warning_key)
++            else:
++                _remote_absent.pop(chat, None)
++                skipped = chat_skip_reason(db, chat)
++            if db is not None and skipped is None and not refresh_outcomes_quietly([tip], "card_change", db=db):
++                remote_retry(out, 'refresh_failed')
++                return None, None, 'refresh_failed'
++    except Exception:  # health: allow BLE001 -- retain the invalidation and continue other chats
++        remote_retry(out, 'exception')
++        logger.warning("remote card-change outcome failed for chat %s", chat, exc_info=True)
++        return None, None, 'exception'
++    return tip, skipped, 'acked_refreshed' if skipped is None else 'acked_intentionally_skipped'
++
++
+ def _certify_remote(inputs, polled, known, diagnostic):
+     """Observe the original post-fingerprint cursor certification, without an early return."""
+     global _remote_memo
+diff --git a/tui_gateway/unloaded_diagnostics.py b/tui_gateway/unloaded_diagnostics.py
+index 9b93c36ef7df42193eb1264963fe7e477b9c0704..9898e68cddb11835aeea70a064c346c85d5d5b35 100644
+--- a/tui_gateway/unloaded_diagnostics.py
++++ b/tui_gateway/unloaded_diagnostics.py
+@@ -24,6 +24,7 @@
+     'remote_notices.pending_detail': ('identity_unknown', 'chat_reactivated', 'snapshot_changed',
+                                       'no_ledger', 'unsettled', 'unknown'),
+     'remote.call': ('memo_hit', 'seed_only', 'seed_failed', 'refreshed', 'exception', 'unknown'),
++    'remote.retry': ('inputs_error', 'initial_poll_failed', 'seed_failed', 'db_none', 'refresh_failed', 'exception', 'unknown'),
+     'remote.cert': ('not_attempted', 'ack_failed', 'inputs_unavailable', 'not_all_acked', 'prints_none',
+                     'after_poll_none', 'cursor_moved', 'certified', 'exception', 'unknown'),
+     'remote.health': ('not_reached', 'no_generation', 'complete_true', 'complete_false', 'exception', 'unknown'),
+@@ -202,6 +203,11 @@
+     result.retry(delay, subpass='card_change_pass', reason=reason)
+ 
+ 
++def remote_retry(result, reason):
++    emit('remote.retry', reason)
++    result.retry(subpass='remote_card_change', reason=reason)
++
++
+ def retry_report(report, subpass='unknown', reason='unknown'):
+     from gateway.kanban_notification_schedule import PassReport
+     if isinstance(report, PassReport):
+-- 
+2.43.0
+

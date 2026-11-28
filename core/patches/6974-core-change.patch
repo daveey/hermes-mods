@@ -1,0 +1,238 @@
+From bd70c0483f0d6bd49661ecd3303564d0513ca658 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:08:51 +0000
+Subject: [PATCH 6974] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit bd70c0483f0d6bd49661ecd3303564d0513ca658.
+
+---
+diff --git a/hermes_cli/kanban_containment_canonical.py b/hermes_cli/kanban_containment_canonical.py
+index b257795d578e96de02c58be480265b5ea5528dff..ecb9323e570ef79ab6f38dc30e5909a5c6f2aff2 100644
+--- a/hermes_cli/kanban_containment_canonical.py
++++ b/hermes_cli/kanban_containment_canonical.py
+@@ -11,6 +11,7 @@
+ from collections.abc import Mapping
+ from typing import Any
+ 
++from hermes_cli import kanban_home_command as home
+ from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ from hermes_cli.kanban_containment_policy import identity
+ from hermes_cli.kanban_containment_state import _payload, _release, _stop, _uid, fingerprint
+@@ -89,6 +90,7 @@
+     conn.execute("CREATE TABLE IF NOT EXISTS containment_delivery ("
+                  "request_uid TEXT PRIMARY KEY, board TEXT NOT NULL, gateway TEXT NOT NULL, "
+                  "op_json TEXT NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0)")
++    home.install(conn, 'containment_delivery')
+ 
+ 
+ def stage(conn: sqlite3.Connection, *, board: str, gateway: str, op: dict) -> str:
+@@ -110,11 +112,21 @@
+         if prior and tuple(prior) != (board, gateway, raw):
+             raise ContainmentRefused("request identity already binds different containment bytes")
+         if not prior:
+-            conn.execute("INSERT INTO containment_delivery(request_uid,board,gateway,op_json) VALUES (?,?,?,?)",
+-                         (request, board, gateway, raw))
++            epoch = home.capture(conn, op)
++            conn.execute("INSERT INTO containment_delivery(request_uid,board,gateway,op_json,home_generations) VALUES (?,?,?,?,?)",
++                         (request, board, gateway, raw, epoch))
+     return request
+ 
+ 
++def outbound(conn: sqlite3.Connection, request: str, op: dict) -> dict:
++    """Read the immutable capture sidecar, including legacy NULL; never today's epoch."""
++    row = conn.execute('SELECT op_json,home_generations FROM containment_delivery WHERE request_uid=?',
++                       (request,)).fetchone()
++    if row is None or json.loads(row[0]) != op:
++        raise ContainmentRefused('containment operation differs from durable request')
++    return home.outbound({'home_generations': row[1]}, op)
++
++
+ def deliver(conn: sqlite3.Connection, hub: Any, *, request: str) -> dict:
+     """Send/recover one durable request; success requires exact canonical readback.
+ 
+@@ -136,7 +148,7 @@
+     if confirmed < 0:
+         raise ContainmentRefused("Board previously refused this exact containment request")
+     if not confirmed:
+-        response = hub.ops(board, [op])
++        response = hub.ops(board, [outbound(conn, request, op)])
+         results = response.get("results") if isinstance(response, dict) else None
+         if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
+                 or results[0].get("client_op_id") != request):
+diff --git a/hermes_cli/kanban_containment_terminal_remote.py b/hermes_cli/kanban_containment_terminal_remote.py
+index 466168194aec291ed6ced276310c954b7e587e0f..cdf36d85f39dcf1131aaaf2af415d1527d8313f9 100644
+--- a/hermes_cli/kanban_containment_terminal_remote.py
++++ b/hermes_cli/kanban_containment_terminal_remote.py
+@@ -122,8 +122,9 @@
+     op = {"op": "archive", "task": task, "client_op_id": uid, **({"archive_metadata": meta} if meta else {}),
+           **({"human_operator": human_op} if human_op else {})}
+     with kb.write_txn(conn):
+-        conn.execute("INSERT INTO containment_delivery(request_uid,board,gateway,op_json,confirmed) VALUES (?,?,?,?,0)",
+-                     (uid, board, gateway, json.dumps(op, sort_keys=True, separators=(",", ":"))))
++        epoch = canonical.home.capture(conn, op)
++        conn.execute("INSERT INTO containment_delivery(request_uid,board,gateway,op_json,confirmed,home_generations) VALUES (?,?,?,?,0,?)",
++                     (uid, board, gateway, json.dumps(op, sort_keys=True, separators=(",", ":")), epoch))
+     return uid, op, 0
+ 
+ 
+@@ -215,7 +216,7 @@
+                                          "archive yet; nothing was changed. Retry after the Board deployment")
+         request, op, confirmed = _request(conn, board, hub.ident.gateway, task, meta, human_op)
+         if not confirmed:
+-            response = hub.ops(board, [op])
++            response = hub.ops(board, [canonical.outbound(conn, request, op)])
+             results = response.get("results") if isinstance(response, dict) else None
+             if (not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict)
+                     or results[0].get("client_op_id") != request):
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+index 860b7149565ba328d64424c1afea160e4c2b1856..b1ed7f49c7a7d91a8c02f2c6d8ede1c2c9d1d9e5 100644
+--- a/hermes_cli/kanban_scope_renewal_cli.py
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -170,7 +170,16 @@
+         wire = {"client_op_id": event_uid, "op": "renew_scope", "task": task_id, "event_uid": event_uid,
+                 "episode": payload["episode"], "mandate_comment_uid": payload["mandate_comment_uid"],
+                 "mandate_body": body, "payload": {"version": 1, **audit}}
+-        results = hub.ops(board, [wire]).get("results", [])
++        # The identity above is NEW, not a durable/replayed command. Capture
++        # against the same read snapshot even for a read-only foreign replica.
++        from hermes_cli import kanban_home_command as home
++        snapshot = evidence if evidence is not None else conn
++        snapshot.execute('SAVEPOINT renewal_home_capture')
++        try:
++            epoch = home.capture(snapshot, wire)
++        finally:
++            snapshot.execute('RELEASE renewal_home_capture')
++        results = hub.ops(board, [home.outbound({'home_generations': epoch}, wire)]).get("results", [])
+         if len(results) != 1 or results[0].get("client_op_id") != event_uid or results[0].get("status") != "applied":
+             reply = results[0] if len(results) == 1 else {}
+             raise RenewalRefused(str(reply.get("reason") or "board_rejected"),
+diff --git a/tests/hermes_cli/test_home_containment_capture.py b/tests/hermes_cli/test_home_containment_capture.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..351604d131c9fbcf51e08bfaa6335c3255cf3239
+--- /dev/null
++++ b/tests/hermes_cli/test_home_containment_capture.py
+@@ -0,0 +1,69 @@
++"""Containment intent keeps its original epoch without changing attested bytes. [daveey]"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_containment_canonical as canonical
++from hermes_cli import kanban_containment_terminal_remote as terminal
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from tests.hermes_cli import test_kanban_failure_transport as fixtures
++from tests.hermes_cli.test_home_typed_capture import mirror
++
++live = fixtures.live
++
++
++def stage(conn, kind, task, actor):
++    if kind == 'archive':
++        return terminal._request(conn, 'default', 'fixture', task)[0]
++    op = {'op': kind, 'task': task, 'actor_task': actor, 'actor_run_uid': sync.uuid7(),
++          'client_op_id': sync.uuid7(), 'event_uid': sync.uuid7(), 'payload': {'fixture': True}}
++    return canonical.stage(conn, board='default', gateway='fixture', op=op)
++
++
++@pytest.mark.parametrize('kind', ['contain', 'resume_contained', 'archive'])
++@pytest.mark.parametrize('epoch', [None, 'original-home-epoch'])
++def test_original_custody_and_legacy_null_survive_retry(live, kind, epoch):
++    task, _ = fixtures._running(live)
++    actor, _ = fixtures._running(live)
++    if epoch:
++        mirror(live, task, epoch)
++        mirror(live, actor, epoch)
++    request = stage(live, kind, task, actor)
++    raw = live.execute('SELECT op_json FROM containment_delivery WHERE request_uid=?', (request,)).fetchone()[0]
++    assert 'home_generations' not in json.loads(raw)
++    assert 'home_generations' in {r[1] for r in live.execute('PRAGMA table_info(containment_delivery)')}
++    stored = live.execute('SELECT home_generations FROM containment_delivery WHERE request_uid=?', (request,)).fetchone()[0]
++    expected = {task: epoch, **({actor: epoch} if kind != 'archive' else {})} if epoch else None
++    assert (json.loads(stored) if stored else None) == expected
++    mirror(live, task, 'new-home-epoch', pending=1)
++    mirror(live, actor, 'new-home-epoch', pending=1)
++    if kind == 'archive':
++        assert terminal._request(live, 'default', 'fixture', task)[0] == request
++    else:
++        assert canonical.stage(live, board='default', gateway='fixture', op=json.loads(raw)) == request
++    assert canonical.outbound(live, request, json.loads(raw)).get('home_generations') == expected
++    assert live.execute('SELECT op_json FROM containment_delivery WHERE request_uid=?', (request,)).fetchone()[0] == raw
++    if kind != 'archive':
++        sent = []
++        hub = SimpleNamespace(ident=SimpleNamespace(gateway='fixture'), ops=lambda b, ops: sent.extend(ops) or {})
++        with pytest.raises(canonical.DeliveryUnknown):
++            canonical.deliver(live, hub, request=request)
++        assert sent == [canonical.outbound(live, request, json.loads(raw))]
++
++
++@pytest.mark.parametrize('kind', ['contain', 'resume_contained', 'archive'])
++@pytest.mark.parametrize('frozen_ref', ['task', 'actor'])
++def test_new_containment_intent_refuses_pending_reference(live, kind, frozen_ref):
++    if kind == 'archive' and frozen_ref == 'actor':
++        return  # Archive has no actor-task reference.
++    task, _ = fixtures._running(live)
++    actor, _ = fixtures._running(live)
++    mirror(live, task if frozen_ref == 'task' else actor, 'original-home-epoch', pending=1)
++    canonical._schema(live)
++    with pytest.raises(ValueError, match='home transfer pending'):
++        stage(live, kind, task, actor)
++    assert live.execute('SELECT COUNT(*) FROM containment_delivery').fetchone()[0] == 0
+diff --git a/tests/hermes_cli/test_kanban_containment_terminal_remote.py b/tests/hermes_cli/test_kanban_containment_terminal_remote.py
+index 9f063eddf8148770c32989f19be3c9051f86adef..bf1622cdad9847b33830b01ddfe20a7cbf45b386 100644
+--- a/tests/hermes_cli/test_kanban_containment_terminal_remote.py
++++ b/tests/hermes_cli/test_kanban_containment_terminal_remote.py
+@@ -116,6 +116,20 @@
+     assert hub.posts == [] and hub.closed
+ 
+ 
++def test_archive_retries_original_captured_epoch_not_current_mirror(synced_conn, monkeypatch):
++    from tests.hermes_cli.test_home_typed_capture import mirror
++    hub = setup(synced_conn, monkeypatch)
++    mirror(synced_conn, hub.target, 'archive-original-epoch')
++    hub.fail = True
++    with pytest.raises(TimeoutError):
++        kb.archive_task(synced_conn, hub.target)
++    mirror(synced_conn, hub.target, 'archive-new-epoch')
++    with pytest.raises(TimeoutError):
++        kb.archive_task(synced_conn, hub.target)
++    assert hub.posts[0] == hub.posts[1]
++    assert hub.posts[0][0]['home_generations'] == {hub.target: 'archive-original-epoch'}
++
++
+ def test_unknown_archive_recovers_same_request(synced_conn, monkeypatch):
+     hub = setup(synced_conn, monkeypatch)
+     hub.fail = True
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_synced.py b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+index 3c6fc23693aefaa358e31b6104b3117e5b0808f9..a64de61b59734297360a02d2c50666d235909f7b 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal_synced.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+@@ -74,6 +74,22 @@
+                      ancestry=[{'HERMES_SESSION_ID': CHAT}])
+ 
+ 
++@pytest.mark.parametrize('pending', [False, True])
++def test_new_renewal_captures_home_at_identity_creation(live, monkeypatch, pending):
++    from tests.hermes_cli.test_home_typed_capture import mirror
++    hub = Hub({'decision_retain': 1, 'scope_renewal': 1})
++    tid, episode, comment = stopped(live, monkeypatch, hub)
++    mirror(live, tid, 'renewal-capture-epoch', pending=int(pending))
++    if pending:
++        with pytest.raises(ValueError, match='home transfer pending'):
++            renew(live, tid, episode, comment)
++        assert not hub.sent
++    else:
++        renew(live, tid, episode, comment)
++        assert hub.sent[0].get('home_generations') == {tid: 'renewal-capture-epoch'}
++        assert 'home_generations' not in hub.sent[0]['payload']
++
++
+ def test_board_applies_and_the_exact_event_is_projected(live, monkeypatch):
+     hub = Hub({'decision_retain': 1, 'scope_renewal': 1})
+     tid, episode, comment = stopped(live, monkeypatch, hub)
+-- 
+2.43.0
+

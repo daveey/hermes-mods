@@ -1,0 +1,234 @@
+From 4b651c512154ed87ac410baf995e845eb63e2c87 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:58:02 +0000
+Subject: [PATCH 6963] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit 4b651c512154ed87ac410baf995e845eb63e2c87.
+
+---
+diff --git a/hermes_cli/kanban_triage_attention.py b/hermes_cli/kanban_triage_attention.py
+index f14f8a61f5014d90d3ece90c87e7a368b132c9be..de820296c90f2fb9d1e55e7d1e0762dd42ea9d51 100644
+--- a/hermes_cli/kanban_triage_attention.py
++++ b/hermes_cli/kanban_triage_attention.py
+@@ -69,6 +69,20 @@
+     return value if isinstance(value, dict) else {}
+ 
+ 
++def _event_order(event):
++    """Display chronology: timestamp, consistent UUIDv7 precision, then stable ID.
++
++    Same-second UUID order follows kanban_sync_divergence; backfilled UUIDs do
++    not represent origin time. This does not grant lifecycle authority.
++    """
++    from hermes_cli.kanban_shared_blocker_fence import consistent_uid_milliseconds
++
++    at = event['created_at']
++    ms = consistent_uid_milliseconds(event.get('uid'), int(at))
++    identity = event.get('id')
++    return at, at * 1000 if ms is None else ms, identity if type(identity) is int else 0
++
++
+ def current_entry(row):
+     """First event in the current consecutive triage episode, else unknown.
+ 
+@@ -79,13 +93,15 @@
+         return None
+     if 'triage_entered_at' in row:
+         return _epoch(row['triage_entered_at'])
++    events = [event for event in row.get('events') or () if isinstance(event, dict)
++              and landing(event.get('kind'), _obj(event.get('payload'))) is not None]
++    # Imported histories have arrival IDs, not lifecycle order. An invalid lifecycle
++    # clock cannot be positioned safely; do not sort it before an exit and invent age.
++    if any(_epoch(event.get('created_at')) is None for event in events):
++        return None
+     phase, entered = None, None
+-    for event in row.get('events') or ():
+-        if not isinstance(event, dict):
+-            continue
++    for event in sorted(events, key=_event_order):
+         landed = landing(event.get('kind'), _obj(event.get('payload')))
+-        if landed is None:
+-            continue
+         if landed == 'triage' and phase != 'triage':
+             entered = _epoch(event.get('created_at'))
+         elif landed != 'triage':
+@@ -123,17 +139,21 @@
+     # so no schema probe. A board without the event columns reads as unknown entry, never a fabricated age.
+     if targets:
+         try:
+-            found = conn.execute(
+-                'SELECT task_id, kind, created_at, payload FROM task_events '
++            cursor = conn.execute(
++                'SELECT * FROM task_events '
+                 'WHERE task_id IN (SELECT value FROM json_each(?)) '
+                 'AND kind IN (SELECT value FROM json_each(?)) ORDER BY id',
+-                (json.dumps(sorted(targets)), json.dumps(LIFECYCLE_KINDS))).fetchall()
++                (json.dumps(sorted(targets)), json.dumps(LIFECYCLE_KINDS)))
++            # Legacy unsynced schemas lack uid. Capture optional portable identity
++            # without another schema query or turning those working boards unknown.
++            columns = [column[0] for column in cursor.description]
++            found = [dict(zip(columns, values)) for values in cursor.fetchall()]
+         except sqlite3.OperationalError as exc:
+             if 'no such' not in str(exc):
+                 raise
+             found = ()
+-        for tid, kind, at, payload in found:
+-            events[str(tid)].append({'kind': kind, 'created_at': at, 'payload': payload})
++        for event in found:
++            events[str(event['task_id'])].append(event)
+     for row in rows:
+         row['triage_entered_at'] = current_entry({'status': row.get('status'), 'events': events.get(str(row['id']), ())})
+     return rows
+diff --git a/tests/hermes_cli/test_kanban_triage_import_order.py b/tests/hermes_cli/test_kanban_triage_import_order.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..defd5b61a407172aeef2c4c6447779a4d522db42
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_triage_import_order.py
+@@ -0,0 +1,106 @@
++"""Arrival order after rehoming is not the lifecycle clock (display only)."""
++import copy
++import json
++import math
++import sqlite3
++import uuid
++
++import pytest
++
++from hermes_cli import kanban_triage_attention as attention
++
++NOW = 1_800_000_000
++
++
++def event(kind, at, *, uid=None, identity=0, **payload):
++    return dict(kind=kind, created_at=at, payload=payload, uid=uid, id=identity)
++
++
++def v7(at_ms):
++    return str(uuid.UUID(int=(at_ms << 80) | (7 << 76) | (2 << 62)))
++
++
++def entry(events, *, stored=False, uid_column=True):
++    row = {'id': 't_imported', 'status': 'triage', 'events': events}
++    if not stored:
++        return attention.current_entry(row)
++    with sqlite3.connect(':memory:') as conn:
++        conn.execute('CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, '
++                     'payload TEXT, created_at REAL' + (', uid TEXT)' if uid_column else ')'))
++        for item in events:
++            values = ['t_imported', item['kind'], json.dumps(item['payload']), item['created_at']]
++            if uid_column:
++                values.append(item.get('uid'))
++            conn.execute('INSERT INTO task_events (task_id,kind,payload,created_at' +
++                         (',uid' if uid_column else '') + ') VALUES (' + ','.join('?' for _ in values) + ')', values)
++        return attention.annotate(conn, [row])[0]['triage_entered_at']
++
++
++@pytest.mark.parametrize('stored,uid_column', [(False, True), (True, True), (True, False)])
++@pytest.mark.parametrize('age', [600, 601, 6 * 86400])
++def test_rehomed_older_history_arrives_after_current_hold(stored, uid_column, age):
++    at = NOW - age
++    events = [event('spend_budget_triaged', at), event('decision_retained', at + 1),
++              event('created', at - 200, status='ready'), event('claimed', at - 30),
++              event('spawned', at - 29)]
++    original = copy.deepcopy(events)
++    entered = entry(events, stored=stored, uid_column=uid_column)
++    assert entered == at
++    assert attention.overdue({'status': 'triage', 'triage_entered_at': entered}, now=NOW) is (age > 600)
++    assert events == original
++
++
++@pytest.mark.parametrize('stored', [False, True])
++def test_portable_milliseconds_beat_remapped_same_second_ids(stored):
++    at = NOW - 601
++    events = [event('contained', at, uid=v7(at * 1000 + 800), identity=1),
++              event('spawned', at, uid=v7(at * 1000 + 100), identity=2)]
++    assert entry(events, stored=stored) == at
++    # A real later exit followed by re-entry starts fresh, even delivered backwards.
++    events[:0] = [event('decision_retained', NOW - 1), event('unblocked', NOW - 2)]
++    assert entry(events, stored=stored) == NOW - 1
++
++
++@pytest.mark.parametrize('uid', [None, 'invalid', str(uuid.UUID(int=1)), v7((NOW + 100) * 1000)])
++def test_absent_or_backfilled_uid_retains_stable_timestamp_ties(uid):
++    at = NOW - 601
++    events = [event('spawned', at, uid=uid), event('contained', at, uid=uid)]
++    assert entry(events) == at
++    assert entry(list(reversed(events))) is None
++
++
++@pytest.mark.parametrize('invalid', [None, True, '100', 0, -1, math.inf, math.nan])
++def test_invalid_lifecycle_clock_cannot_move_before_exit_and_fabricate_age(invalid):
++    events = [event('spawned', NOW - 800), event('contained', invalid),
++              event('decision_retained', NOW - 700)]
++    assert entry(events) is None
++    assert entry(list(reversed(events))) is None
++
++
++def test_local_ids_break_timestamp_ties_without_uuid_precision():
++    at = NOW - 601
++    events = [event('contained', at, identity=2), event('spawned', at, identity=1)]
++    assert entry(events) == at
++
++
++def test_consistent_straddle_precision_stays_inside_recorded_second():
++    at = NOW - 601
++    events = [event('contained', at, uid=v7((at + 1) * 1000 + 400)),
++              event('spawned', at, uid=v7(at * 1000 + 900))]
++    assert entry(events) == at
++    # Timestamp is primary even when the UUID was minted across the next second.
++    events.append(event('unblocked', at + 1, uid=v7((at + 1) * 1000 + 100)))
++    assert entry(events) is None
++
++
++def test_non_lifecycle_missing_time_does_not_poison_episode():
++    events = [event('contained', NOW - 601), event('heartbeat', None)]
++    assert entry(events) == NOW - 601
++
++
++def test_fractional_times_and_future_clocks_preserve_existing_meaning():
++    assert entry([event('contained', NOW - 601.5), event('spawned', NOW - 601.8)]) == NOW - 601.5
++    row = {'status': 'triage', 'events': [event('contained', NOW + 1), event('spawned', NOW)]}
++    assert attention.current_entry(row) == NOW + 1
++    assert not attention.overdue(row, now=NOW)
++    assert attention.next_transition(row, now=NOW) is None
+diff --git a/tests/tui_gateway/test_triage_attention.py b/tests/tui_gateway/test_triage_attention.py
+index 4ca7cc8063ec31e1ae29cdc82d04c343f0b233a8..b82fe82ea20463909b249aaaee1ab33b723c1a62 100644
+--- a/tests/tui_gateway/test_triage_attention.py
++++ b/tests/tui_gateway/test_triage_attention.py
+@@ -18,6 +18,10 @@
+ 
+ def hold(tid, entered, payload=None):
+     with contextlib.closing(kbc.connect()) as conn:
++        # This fixture creates through the real writer, then installs an older test
++        # episode. Its creation must precede that episode in origin chronology too.
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='created' AND created_at>=?",
++                     (entered - 1, tid, entered))
+         conn.execute("UPDATE tasks SET status='triage',block_kind='decision_pending' WHERE id=?", (tid,))
+         conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,?)",
+                      (tid, entered, json.dumps(payload or {})))
+@@ -45,12 +49,21 @@
+     assert 'needs_you' not in row
+ 
+ 
++@pytest.mark.parametrize('imported', [False, True], ids=['local_order', 'rehomed_arrival_order'])
+ @pytest.mark.parametrize('payload', [None, STOPPED], ids=['held', 'retained_stop'])
+-def test_natural_threshold_refreshes_existing_canonical_without_card_mutation(db, monkeypatch, payload):
++def test_natural_threshold_refreshes_existing_canonical_without_card_mutation(db, monkeypatch, payload, imported):
+     now = [1_800_000_000.]
+     monkeypatch.setattr(fanout.time, 'time', lambda: now[0])
+     tid = helpers._card(done=False)
+     hold(tid, now[0] - 599, payload)
++    if imported:
++        # Prior-home rows can arrive after the destination already has the hold.
++        # Real reader/adapter/fanout must not mistake arrival IDs for episode order.
++        with contextlib.closing(kbc.connect()) as conn:
++            conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'spawned',?,'{}')",
++                         (tid, now[0] - 620))
++            conn.commit()
++        activity._reset_cache_for_tests()
+     opener = helpers._opener(db)
+     helpers.so.refresh_outcome(helpers.CHAT, 'card_change', db=db)
+     first = fanout.card_change_pass(session_db=opener)
+-- 
+2.43.0
+

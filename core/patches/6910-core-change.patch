@@ -1,0 +1,168 @@
+From b93541c20c23f7593f80a726f5176eabf1376d3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 23:17:00 +0000
+Subject: [PATCH 6910] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit b93541c20c23f7593f80a726f5176eabf1376d3d.
+
+---
+diff --git a/hermes_cli/kanban_replay_existence.py b/hermes_cli/kanban_replay_existence.py
+index 81989d6594d9e4354130e48f0eb8ece89a6b1ad0..1eb3760254992fefbf8699870a5886f3300aa62b 100644
+--- a/hermes_cli/kanban_replay_existence.py
++++ b/hermes_cli/kanban_replay_existence.py
+@@ -113,7 +113,7 @@
+     """Explicit retry clears only a fault still bound to the exact pending slot."""
+     if not reason.strip():
+         raise ValueError('owner recovery reason required')
+-    with write_txn(conn):
++    with write_txn(conn, allow_nested=True):
+         held = fault(conn)
+         state = journal.snapshot(conn)
+         pending = state['pending']
+diff --git a/hermes_cli/kanban_replay_recovery.py b/hermes_cli/kanban_replay_recovery.py
+index 892b04396b336e3bdacf47ec97053fa778413c46..f638526661a8dbbb35e83c20084100a8f6c862fa 100644
+--- a/hermes_cli/kanban_replay_recovery.py
++++ b/hermes_cli/kanban_replay_recovery.py
+@@ -155,9 +155,22 @@
+ def resume(conn, expected_op, reason):
+     if not reason.strip():
+         raise ValueError('owner recovery reason required')
+-    with write_txn(conn):
++    with write_txn(conn, allow_nested=True):
+         held = fault(conn)
+         if held is None or expected_op != held['op_id'] or _bound(held) != _identity(journal.snapshot(conn)):
+             raise ValueError('transport recovery identity changed; inspect without discarding custody')
+         conn.execute('DELETE FROM kanban_replay_transport_fault1 WHERE id=1')
+     return dict(action='retry_exact', op_id=expected_op, reason=reason[:500])
++
++
++def resume_all(conn, expected_op, reason):
++    """Release all same-operation retry holds atomically, or preserve every hold."""
++    from hermes_cli import kanban_replay_existence as existence
++    with write_txn(conn):
++        row_hold = existence.fault(conn)
++        transport_hold = fault(conn)
++        if row_hold is not None:
++            existence.resume(conn, expected_op, reason)
++        if transport_hold is not None or row_hold is None:
++            resume(conn, expected_op, reason)
++    return dict(action='retry_exact', op_id=expected_op, reason=reason[:500])
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index a4173f0cf76098b6c8ea704774dd9c363d7255da..0012cd7a3baec085d2468ad3643e5dc25eab7a85 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -352,12 +352,10 @@
+ 
+ 
+ def _replay_resume(args: argparse.Namespace) -> int:
+-    from hermes_cli.kanban_replay_existence import resume, fault
+     from hermes_cli import kanban_replay_recovery as recovery
+     conn = kbc.connect(_path(_board(args)))
+     try:
+-        report = (resume(conn, args.expect, args.reason) if fault(conn)
+-                  else recovery.resume(conn, args.expect, args.reason))
++        report = recovery.resume_all(conn, args.expect, args.reason)
+     except ValueError as exc:
+         print(str(exc))
+         return 2
+diff --git a/tests/hermes_cli/test_kanban_replay_overlap_resume.py b/tests/hermes_cli/test_kanban_replay_overlap_resume.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..60c96fbe7a10ec2717690b9dba10b8717f4d2663
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_overlap_resume.py
+@@ -0,0 +1,92 @@
++"""Independent exact-head review regression: overlapping recovery episodes."""
++from argparse import ArgumentParser
++from pathlib import Path
++import pytest
++from hermes_cli import kanban_replay_existence as existence
++from hermes_cli import kanban_replay_recovery as recovery
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_cli as cli
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_parser import build_parser
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++from tests.hermes_cli import test_kanban_replay_current_row as current
++live = helpers.live
++
++@pytest.mark.parametrize('refusal', ['none', 'wrong_expect', 'transport_identity', 'row_identity', 'no_reason',
++                                   'existence_only', 'transport_only', 'no_fault'])
++def test_resume_clears_same_identity_overlapping_faults(live, monkeypatch, refusal):
++    now = [1000.0]
++    monkeypatch.setattr(existence, 'time', lambda: now[0])
++    monkeypatch.setattr(recovery, 'time', lambda: now[0])
++    _, receiver = current.issued_parent(live)
++    original_row = receiver.row_evidence
++    def unavailable(*args):
++        raise OSError('current row unavailable')
++    receiver.row_evidence = unavailable
++    with pytest.raises(existence.CurrentRowHold):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    row_fault = existence.fault(live)
++    assert row_fault and not row_fault['paused']
++    now[0] = row_fault['retry_after']
++    original_call = receiver._call
++    def broken_inspect(method, path, body=None):
++        if path.endswith('/inspect'):
++            raise OSError('inspection unavailable')
++        return original_call(method, path, body)
++    receiver._call = broken_inspect
++    held = None
++    for _ in range(8):
++        with pytest.raises(OSError):
++            client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++        held = recovery.fault(live)
++        assert held is not None
++        now[0] = held['retry_after']
++        if held['paused']:
++            break
++    assert held is not None and held['paused'] and held['op_id'] == row_fault['op_id']
++    frozen = journal.pending_wire(live)
++    receiver._call = original_call
++    receiver.row_evidence = original_row
++    path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    monkeypatch.setattr(cli, '_path', lambda board: path)
++    parser = ArgumentParser()
++    build_parser(parser.add_subparsers())
++    args = parser.parse_args(['kanban', '--board', 'default', 'sync', 'replay-resume',
++                             '--expect', held['op_id'], '--reason', 'both services repaired', '--json'])
++    if refusal in ('existence_only', 'no_fault'):
++        live.execute('DELETE FROM kanban_replay_transport_fault1')
++    if refusal in ('transport_only', 'no_fault'):
++        live.execute('DELETE FROM kanban_replay_existence_fault1')
++    live.commit()
++    if refusal == 'no_fault':
++        assert cli.cmd_sync(args) == 2
++        assert journal.pending_wire(live) == frozen
++        return
++    if refusal not in ('none', 'existence_only', 'transport_only'):
++        table = None
++        if refusal == 'wrong_expect':
++            args.expect = 'different-operation'
++        elif refusal == 'no_reason':
++            args.reason = ' '
++        else:
++            table = ('kanban_replay_transport_fault1' if refusal == 'transport_identity'
++                     else 'kanban_replay_existence_fault1')
++            live.execute(f"UPDATE {table} SET generation='different-generation'")
++            live.commit()
++        row_before, transport_before = existence.fault(live), recovery.fault(live)
++        assert cli.cmd_sync(args) == 2
++        assert existence.fault(live) == row_before
++        assert recovery.fault(live) == transport_before
++        assert journal.pending_wire(live) == frozen
++        if refusal in ('transport_identity', 'row_identity'):
++            assert table is not None
++            live.execute(f'UPDATE {table} SET generation=?', (held['generation'],))
++            live.commit()
++        args.expect, args.reason = held['op_id'], 'both services repaired'
++    assert cli.cmd_sync(args) == 0
++    assert journal.pending_wire(live) == frozen
++    assert existence.fault(live) is None
++    assert recovery.fault(live) is None
++    # Successful explicit same-identity resume must permit the repaired sender.
++    result = client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert result.applied == 1
+-- 
+2.43.0
+

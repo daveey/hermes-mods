@@ -1,0 +1,399 @@
+From 3256c808bf43e068a042cd525bc4497b39f9c3ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:02:55 +0000
+Subject: [PATCH 6949] Sessions capture standby child and exit-signal dispatch
+
+Public mirror of source commit 3256c808bf43e068a042cd525bc4497b39f9c3ab.
+
+---
+diff --git a/hermes_cli/sessions_capture_process.py b/hermes_cli/sessions_capture_process.py
+index 40e7e10b09f7dd7309d2ef65d7a90fa7d9dcf503..059d4f5f1c43aa2d791d5777d7f632c45d26d3e1 100644
+--- a/hermes_cli/sessions_capture_process.py
++++ b/hermes_cli/sessions_capture_process.py
+@@ -58,22 +58,30 @@
+ 
+ 
+ class _Standby:
+-    __slots__ = ('child', 'cpu_s', 'generation', 'recorded', 'spawned')
++    __slots__ = ('accounted', 'child', 'cpu_s', 'generation', 'retiring', 'spawned')
+ 
+     def __init__(self, child, spawned):
+-        self.child, self.spawned, self.generation = child, spawned, _generation()
+-        self.cpu_s, self.recorded = None, False
++        self.child, self.spawned, self.generation, self.cpu_s = child, spawned, None, None
++        # Retirement can be entered twice: by two threads, or by a signal handler's close() on the
++        # thread already retiring it. ``retiring`` makes other threads wait and lets the same thread
++        # through; ``accounted`` is a lock used as an atomic flag (taken once, never blocked on).
++        self.retiring, self.accounted = threading.RLock(), threading.Lock()
+ 
+ 
+ class CaptureProcess:
+     """One active child at a time; close cancels it, and a later capture gets a fresh child.
+ 
+     ``prepare`` may spawn one standby ahead of the first capture; it serves at most one request.
++
++    ``prepare`` and ``close`` run on the main thread at boot and shutdown, where a SIGTERM/SIGINT
++    handler may call ``close`` in the middle of either. So neither holds ``_lock`` across a spawn or
++    a child stop, and the lock is re-entrant: a handler arriving inside one of their short locked
++    sections runs a whole ``close`` there instead of waiting for the thread it interrupted.
+     """
+     def __init__(self, *, seconds=5, max_bytes=MAX_RESPONSE, command=None):
+         self.seconds, self.max_bytes = seconds, min(max_bytes, MAX_RESPONSE)
+         self.command = command
+-        self._lock = threading.Lock()
++        self._lock = threading.RLock()
+         self._child = None
+         self._standby = None
+         self._closed = False
+@@ -92,33 +100,39 @@
+         with self._lock:
+             if self._closed or self._standby is not None or self._child is not None:
+                 return
+-            spawned = time.monotonic()
+-            try:
+-                child = self._spawn()
+-            except OSError:
+-                return
+-            try:
+-                self._standby = _Standby(child, spawned)
+-            except BaseException:
+-                _la.record('sessions.capture.child', cpu_s=_child_cpu(child.pid) or 0.0,
+-                           wall_s=time.monotonic() - spawned, skipped=True, outer=False)
+-                _stop(child)
+-                raise
+-
+-    def _discard_standby(self):
+-        """Retire the unused standby (caller holds the lock): one ``skipped`` record, then the same
+-        custody as any child. A group that does not stop keeps the standby owned for the next try."""
+-        standby = self._standby
+-        if standby is None:
++        # Spawned with the lock free (see the class docstring); what happened meanwhile is settled below.
++        spawned = time.monotonic()
++        try:
++            child = self._spawn()
++        except OSError:
+             return
+-        if not standby.recorded:
+-            # A standby poll() already reaped lost its counters: use the sample taken before that.
+-            cpu_s = _child_cpu(standby.child.pid) if standby.child.returncode is None else standby.cpu_s
+-            standby.recorded = True
+-            _la.record('sessions.capture.child', cpu_s=cpu_s or 0.0, wall_s=time.monotonic() - standby.spawned,
+-                       skipped=True, fallback=cpu_s is None, outer=False)
+-        _stop(standby.child)
+-        self._standby = None
++        standby, kept = _Standby(child, spawned), False
++        try:
++            standby.generation = _generation()
++            with self._lock:
++                if self._standby is None and self._child is None:  # a capture may have started meanwhile
++                    self._standby = standby
++            # Published BEFORE _closed is read, while close() sets _closed before it reads _standby:
++            # whichever way a close() interleaved, it saw this standby or this line sees it closed.
++            kept = self._standby is standby and not self._closed
++        finally:
++            if not kept:
++                self._retire(standby)
++
++    def _retire(self, standby):
++        """Retire an unused standby: one ``skipped`` record, then the same custody as any child.
++        A group that does not stop keeps the standby owned for the next try. Safe to enter again
++        while it runs (see ``_Standby``): the second entry finishes the stop and records nothing."""
++        with standby.retiring:
++            if standby.accounted.acquire(blocking=False):
++                # A standby poll() already reaped lost its counters: use the sample taken before that.
++                cpu_s = _child_cpu(standby.child.pid) if standby.child.returncode is None else standby.cpu_s
++                _la.record('sessions.capture.child', cpu_s=cpu_s or 0.0, wall_s=time.monotonic() - standby.spawned,
++                           skipped=True, fallback=cpu_s is None, outer=False)
++            _stop(standby.child)
++        with self._lock:
++            if self._standby is standby:
++                self._standby = None
+ 
+     def __call__(self, name, selector):
+         return self._request({'name': name, 'selector': selector})
+@@ -163,7 +177,7 @@
+                         and standby.generation == _generation()):
+                     child, self._standby = standby.child, None
+                 else:
+-                    self._discard_standby()
++                    self._retire(standby)
+             if child is None:
+                 try:
+                     child = self._spawn()
+@@ -214,7 +228,7 @@
+     def close(self):
+         with self._lock:
+             self._closed = True
+-            child = self._child
++            child, standby = self._child, self._standby
+         try:
+             if child is not None:  # its own request accounts it
+                 if child.poll() is None:
+@@ -226,8 +240,10 @@
+                     if self._child is child:
+                         self._child = None
+         finally:
+-            with self._lock:  # attempted even when the active child's custody is retained
+-                self._discard_standby()
++            # Attempted even when the active child's custody is retained. Outside the lock: a signal
++            # handler's close() arriving mid-stop then finishes this same retirement instead of blocking.
++            if standby is not None:
++                self._retire(standby)
+ 
+ 
+ def _stop(child):
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 0c7367eb3cf4b09655d86d36a185b079dd25eaab..0f8673f03e4dd07f198a1c4d134181d9bcd798fa 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -54,6 +54,8 @@
+     reader = CaptureProcess()
+     owner = None
+     previous = {}
++    preparing = False
++    held = []
+ 
+     def close():
+         (reader if owner is None else owner).close()
+@@ -62,6 +64,11 @@
+         handler = previous[signum]
+         if handler == signal.SIG_IGN:
+             return
++        if preparing:
++            # The standby is mid-spawn: the reader does not own the child yet, so a close() now would
++            # miss it and an exit raised from here would orphan it. Acted on once prepare() returns.
++            held.append((signum, frame))
++            return
+         close()
+         if callable(handler):
+             handler(signum, frame)
+@@ -78,7 +85,13 @@
+                     previous[signum] = signal.signal(signum, stop)
+                 except (ValueError, OSError, RuntimeError):
+                     previous.pop(signum, None)
+-        reader.prepare()
++        preparing = True
++        try:
++            reader.prepare()
++        finally:
++            preparing = False
++            if held:
++                stop(*held[0])
+         from hermes_cli.sessions_native_startup import SessionsRuntime
+         from hermes_cli.web_routers import profiles
+ 
+diff --git a/tests/hermes_cli/test_sessions_capture_standby.py b/tests/hermes_cli/test_sessions_capture_standby.py
+index 5b525712387a203da2ffffc126b7c6962c04ca81..04274592eb818aa9d1706f7c4403a37b276ec2dc 100644
+--- a/tests/hermes_cli/test_sessions_capture_standby.py
++++ b/tests/hermes_cli/test_sessions_capture_standby.py
+@@ -252,6 +252,90 @@
+     capture.close()
+ 
+ 
++def bounded(scenario):
++    """Run ``scenario`` on its own thread, so a self-deadlock fails the test instead of hanging it."""
++    errors = []
++
++    def run():
++        try:
++            scenario()
++        except BaseException as error:  # health: allow BLE001 -- re-raised on the test thread below
++            errors.append(error)
++    thread = threading.Thread(target=run, daemon=True)
++    thread.start()
++    thread.join(10)
++    assert not thread.is_alive(), 'the reader deadlocked on its own lock'
++    if errors:
++        raise errors[0]
++
++
++def test_close_reentered_during_the_spawn_retires_the_child_prepare_was_bringing_up(spawns, monkeypatch):
++    # What a signal handler's close() does when it runs on the thread that is inside prepare().
++    children, stopped = spawns
++    capture = CaptureProcess(command=command(PID_FRAME))
++    spawn = module.spawn_owned
++
++    def closing(*args, **kwargs):
++        child = spawn(*args, **kwargs)
++        capture.close()
++        return child
++    monkeypatch.setattr(module, 'spawn_owned', closing)
++    before = stat()
++    bounded(capture.prepare)
++    assert capture._standby is None and len(children) == 1  # no standby on a closed reader
++    assert children[0].poll() is not None and children[0].pid in stopped
++    assert delta(before, 'runs') == 1 and delta(before, 'skips') == 1
++    capture.prepare()
++    capture.close()
++    assert len(children) == 1 and delta(before, 'runs') == 1
++    with pytest.raises(CaptureUnavailable, match='closed'):
++        capture('sessions', {})
++
++
++def test_close_reentered_while_it_retires_the_standby_stops_and_accounts_it_once(spawns, monkeypatch):
++    children, stopped = spawns
++    capture = CaptureProcess(command=command(PID_FRAME))
++    capture.prepare()
++    standby = children[0]
++    kill, entered = module.kill_process_tree, []
++
++    def reentering(proc, **kwargs):
++        if not entered:  # the standby is still alive: the inner close() has all of the work to do
++            entered.append(proc.poll())
++            capture.close()
++        return kill(proc, **kwargs)
++    monkeypatch.setattr(module, 'kill_process_tree', reentering)
++    before = stat()
++    bounded(capture.close)
++    assert entered == [None] and capture._standby is None and len(children) == 1
++    assert standby.poll() is not None and standby.pid in stopped
++    assert delta(before, 'runs') == 1 and delta(before, 'skips') == 1 and delta(before, 'errors') == 0
++
++
++def test_capture_that_starts_while_the_standby_spawns_keeps_one_active_child(spawns, monkeypatch):
++    children, stopped = spawns
++    capture = CaptureProcess(seconds=30, command=command('import time; time.sleep(30)'))
++    spawn, threads = module.spawn_owned, []
++
++    def racing(*args, **kwargs):
++        child = spawn(*args, **kwargs)
++        if not threads:  # prepare()'s spawn: a capture takes the reader before the standby is published
++            threads.append(threading.Thread(target=lambda: pytest.raises(CaptureUnavailable, capture, 'sessions', {})))
++            threads[0].start()
++            wait_until(lambda: capture._child is not None, what='capture racing the standby spawn')
++        return child
++    monkeypatch.setattr(module, 'spawn_owned', racing)
++    before = stat()
++    capture.prepare()
++    assert capture._standby is None and capture._child is children[1]
++    assert children[0].poll() is not None and children[0].pid in stopped  # the late standby is not kept
++    assert delta(before, 'runs') == 1 and delta(before, 'skips') == 1
++    capture.close()
++    threads[0].join(5)
++    assert not threads[0].is_alive() and len(children) == 2
++    assert delta(before, 'runs') == 2
++
++
+ def test_every_spawned_child_is_accounted_exactly_once(spawns, monkeypatch):
+     children, _ = spawns
+     before = stat()
+diff --git a/tests/hermes_cli/test_sessions_early_boot.py b/tests/hermes_cli/test_sessions_early_boot.py
+index 4cddd7ddbfc212f39536eb1f5fa85601326010a8..6138ce1796e680e420bba378b96f98362d4ad2b7 100644
+--- a/tests/hermes_cli/test_sessions_early_boot.py
++++ b/tests/hermes_cli/test_sessions_early_boot.py
+@@ -219,3 +219,112 @@
+         assert signal.getsignal(signum) is previous
+     finally:
+         signal.signal(signum, original)
++
++
++# The real CaptureProcess under the real handler, with a real signal sent to this process from
++# inside one of the reader's two slow steps. Only admission, the profile lookup, the runtime (its
++# close closes the reader, as the real one does) and the worker's command are stand-ins.
++BOOT_SIGNAL = '''
++import faulthandler, json, os, signal, sys
++from types import SimpleNamespace
++faulthandler.dump_traceback_later(20, exit=True)  # a deadlock ends as a traceback, not a hang
++window, signum, handler = sys.argv[1], int(sys.argv[2]), sys.argv[3]
++from hermes_cli import (isolated_scope, loop_accounting, process_identity, proof_home, update_proxy_env,
++                        sessions_capture_process as capture, sessions_early_boot as early,
++                        sessions_native_startup as native)
++from hermes_cli.web_routers import profiles
++proof_home.assert_backend_home = lambda **kw: None
++update_proxy_env.restore_user_proxy_env = lambda: None
++process_identity.is_desktop_owned_backend = lambda: False
++isolated_scope.record_launch_scope = lambda **kw: None
++profiles._profile_targets = lambda reason: [('default', '/unused')]
++native.SessionsRuntime = lambda profiles, targets, *, capture_reader: SimpleNamespace(
++    start_background=lambda: None, close=capture_reader.close)
++capture.runtime_command = lambda root, module: [sys.executable, '-I', '-c', 'import sys; sys.stdin.buffer.read()']
++capture._generation = lambda: 'boot'
++events, children, stopped = [], [], []
++spawn, kill_tree, survivors = capture.spawn_owned, capture.kill_process_tree, capture.stop_owned_group_survivors
++
++def spawned(*args, **kwargs):
++    children.append(spawn(*args, **kwargs))
++    if window == 'prepare':  # the child exists and prepare() has not been handed it yet
++        events.append('signal')
++        os.kill(os.getpid(), signum)
++        events.append('spawned')
++    return children[-1]
++
++def killing(proc, **kwargs):
++    if window == 'close' and 'signal' not in events:  # close() is retiring the standby, still alive
++        events.append('signal')
++        os.kill(os.getpid(), signum)
++    return kill_tree(proc, **kwargs)
++
++def stopping(pid, **kwargs):
++    stopped.append(pid)
++    return survivors(pid, **kwargs)
++
++def previous(sig, frame):
++    events.append('previous')
++    if handler == 'exits':
++        raise SystemExit(123)
++capture.spawn_owned, capture.kill_process_tree, capture.stop_owned_group_survivors = spawned, killing, stopping
++signal.signal(signum, previous)
++code = None
++try:
++    with early.early_sessions(headless=True, isolated=False) as owner:
++        events.append('yielded')
++except SystemExit as stop:
++    code = stop.code
++faulthandler.cancel_dump_traceback_later()
++counted = loop_accounting.counters().get('sessions.capture.child', {})
++print(json.dumps({'events': events, 'code': code, 'restored': signal.getsignal(signum) is previous,
++                  'children': [child.pid for child in children], 'stopped': stopped,
++                  'alive': [child.pid for child in children if child.poll() is None],
++                  'runs': counted.get('runs', 0), 'skips': counted.get('skips', 0)}))
++'''
++
++
++def _boot_signal(window, signum, handler):
++    import json
++    import os
++    import subprocess
++    from hermes_cli._startup_fast import project_root_str
++    done = subprocess.run([sys.executable, '-c', BOOT_SIGNAL, window, str(int(signum)), handler],
++                          cwd=project_root_str(), env=dict(os.environ, HERMES_FACTS_SESSIONS='1'),
++                          capture_output=True, text=True, timeout=120, check=False)
++    assert done.returncode == 0, done.stderr[-3000:]  # a deadlock exits 1 with every thread's stack
++    return json.loads(done.stdout.splitlines()[-1])
++
++
++def _stopped_and_accounted_once(seen):
++    assert len(seen['children']) == 1 and not seen['alive']
++    assert seen['children'][0] in seen['stopped']
++    assert seen['runs'] == 1 and seen['skips'] == 1
++    assert seen['restored']
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('signum', [signal.SIGTERM, signal.SIGINT])
++def test_signal_while_the_standby_spawns_stops_the_child_and_chains(signum):
++    seen = _boot_signal('prepare', signum, 'exits')
++    # The spawn finishes, so the reader owns the child before the signal is acted on.
++    assert seen['events'] == ['signal', 'spawned', 'previous'] and seen['code'] == 123
++    _stopped_and_accounted_once(seen)
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('signum', [signal.SIGTERM, signal.SIGINT])
++def test_signal_while_close_retires_the_standby_stops_the_child_and_chains(signum):
++    seen = _boot_signal('close', signum, 'exits')
++    assert seen['events'] == ['yielded', 'signal', 'previous'] and seen['code'] == 123
++    _stopped_and_accounted_once(seen)
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('window,events', [('prepare', ['signal', 'spawned', 'previous', 'yielded']),
++                                           ('close', ['yielded', 'signal', 'previous'])])
++def test_signal_whose_previous_handler_returns_leaves_no_child_behind(window, events):
++    # The interrupted step runs on afterwards: it must neither hang nor stop or account the child again.
++    seen = _boot_signal(window, signal.SIGTERM, 'returns')
++    assert seen['events'] == events and seen['code'] is None
++    _stopped_and_accounted_once(seen)
+-- 
+2.43.0
+

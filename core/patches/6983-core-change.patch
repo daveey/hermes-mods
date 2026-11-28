@@ -1,0 +1,857 @@
+From 247ca9466d22316bdf7e8512e503db53ae195d9b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 05:31:00 +0000
+Subject: [PATCH 6983] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 247ca9466d22316bdf7e8512e503db53ae195d9b.
+
+---
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 4f57b43c6658e08dfa70d1eda87f5b4a639229c1..35a21545eb694af0e53233cb305e96484e53a2d3 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -1333,6 +1333,7 @@
+     # A cooperative home manifest is inert history, not a newly originating
+     # task/event. SQL admission/certification remains active in this mode.
+     historical_import: bool = False
++    deferred: int = 0  # durable source-feed custody, not a dropped/skipped row
+ 
+ 
+ def _repair_revision(conn: sqlite3.Connection) -> Optional[int]:
+@@ -1352,6 +1353,7 @@
+     observers: bool = True, local_pending_wins: bool = False,
+     keep: Optional[Callable[[sqlite3.Connection, RemoteChange], bool]] = None,
+     allow_nested: bool = False,
++    home_replay_id: Optional[int] = None,
+ ) -> ApplyResult:
+     """Apply one feed page in ONE transaction, then fire local observers.
+ 
+@@ -1373,7 +1375,10 @@
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     from hermes_cli import kanban_containment_replica as containment
+     from hermes_cli.kanban_sync_apply_budget import check_budget, transaction_budget
+-    containment.prepare_apply(conn, changes)
++    from hermes_cli import kanban_home_feed as home_feed
++    home_active = home_feed.active(conn)
++    containment.prepare_apply(conn, [ch for ch in changes if not home_feed.blocked(conn, ch)]
++                              if home_active else changes)
+     with page_writer(conn, (*SYNCED_TABLES, "kanban_sync_outbox", "kanban_sync_state"),
+                      cache=bool(changes) and keep is None, allow_nested=allow_nested), transaction_budget(conn):
+         result.revision_before = _repair_revision(conn)
+@@ -1381,17 +1386,24 @@
+         # overwrite locally held custody after the detach transaction commits.
+         if board_mode(conn) == "off":
+             raise RuntimeError("apply_remote_changes: kanban sync is not enabled on this board")
+-        if changes:
++        deferred_path = home_active or home_feed.active(conn)
++        if changes or home_replay_id is not None:
+             conn.execute("UPDATE kanban_sync_state SET applying = 1")
+             own = _state(conn)["gateway_id"]
++            applied_page = home_feed.replay(conn, own, result, _apply_one, home_replay_id) if home_replay_id is not None else []
+             for change in changes:
+                 check_budget()
+                 if keep is not None and not keep(conn, change):
+                     result.skipped += 1
+                     continue
+-                with containment.projection(conn, change):
+-                    _apply_one(conn, change, own, result)
+-            retained = containment.restore_page(conn, changes)
++                if deferred_path:
++                    if home_feed.run(conn, change, own, result, _apply_one):
++                        applied_page.append(change)
++                else:
++                    with containment.projection(conn, change):
++                        _apply_one(conn, change, own, result)
++                    applied_page.append(change)
++            retained = containment.restore_page(conn, applied_page)
+             result.hooks = [hook for hook in result.hooks if hook[1] not in retained]
+             if result.left_terminal or result.reopened:  # a wake never reopens a done card [daveey]
+                 from hermes_cli.kanban_terminal_guard import enforce_after_apply
+diff --git a/hermes_cli/kanban_home_feed.py b/hermes_cli/kanban_home_feed.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c54017bd6d8ecef7afc4053f47a04ede470478e
+--- /dev/null
++++ b/hermes_cli/kanban_home_feed.py
+@@ -0,0 +1,170 @@
++"""Bounded durable feed custody while a source awaits authenticated STOP.
++
++This queue conveys no release authority. Exact prepared-row SQL fences remain
++installed; replay re-enters the ordinary native apply/containment path. [daveey]
++"""
++from __future__ import annotations
++
++import copy
++import json
++import sqlite3
++from dataclasses import asdict
++
++MAX_ROWS = 4096
++MAX_BYTES = 16 * 1024 * 1024
++REPLAY_LIMIT = 16
++_TABLE = 'kanban_home_feed1'
++
++
++def present(conn) -> bool:
++    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (_TABLE,)).fetchone())
++
++
++def pending(conn) -> bool:
++    return present(conn) and bool(conn.execute(f'SELECT 1 FROM {_TABLE} LIMIT 1').fetchone())
++
++
++def active(conn) -> bool:
++    if pending(conn):
++        return True
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_prepared1'").fetchone():
++        return False
++    from hermes_cli.kanban_home_abort import predicate
++    return bool(conn.execute('SELECT 1 FROM kanban_home_prepared1 p WHERE NOT EXISTS '
++                             '(SELECT 1 FROM kanban_home_finalized1 f WHERE f.task_id=p.task_id AND f.nonce=p.nonce) '
++                             f'AND NOT EXISTS(SELECT 1 FROM kanban_home_aborted1 a WHERE {predicate("p")}) LIMIT 1').fetchone())
++
++
++def blocked(conn, change) -> bool:
++    """Preflight ordinary identities, including deletes and old link endpoints.
++
++    The savepoint/SQL fence below remains the final check for unusual conflicting
++    unique identities; no Python identity check can replace that fence.
++    """
++    from hermes_cli.kanban_home_transfer import frozen
++    ids = {change.fields.get('task_id'), change.fields.get('parent_id'), change.fields.get('child_id')}
++    if change.table == 'tasks':
++        ids.add(change.uid)
++    elif change.table in ('task_comments', 'task_events', 'task_runs', 'task_attachments', 'task_chat_links'):
++        row = conn.execute(f'SELECT task_id FROM {change.table} WHERE uid=?', (change.uid,)).fetchone()
++        if row:
++            ids.add(row[0])
++    # A post-STOP pending generation blocks local intent, not authenticated feed.
++    # Only an unreleased preparation requires deferral of the native feed itself.
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_prepared1'").fetchone():
++        return False
++    from hermes_cli.kanban_home_abort import aborted
++    return any(conn.execute('SELECT 1 FROM kanban_home_prepared1 p WHERE task_id=? AND NOT EXISTS '
++                            '(SELECT 1 FROM kanban_home_finalized1 f WHERE f.task_id=p.task_id AND f.nonce=p.nonce)',
++                            (tid,)).fetchone() and not aborted(conn, tid) and frozen(conn, tid)
++               for tid in ids if isinstance(tid, str))
++
++
++def _install(conn):
++    # No task_id column: this is transport custody, not a mutable business row.
++    conn.execute(f'CREATE TABLE IF NOT EXISTS {_TABLE} (id INTEGER PRIMARY KEY, table_name TEXT NOT NULL, '
++                 'row_uid TEXT NOT NULL, wire TEXT NOT NULL UNIQUE, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)')
++    from hermes_cli.sqlite_util import add_column_if_missing
++    add_column_if_missing(conn, _TABLE, 'last_error', 'last_error TEXT')
++    conn.execute(f'CREATE INDEX IF NOT EXISTS home_feed1_row ON {_TABLE}(table_name,row_uid,id)')
++
++
++def _store(conn, ch, result):
++    _install(conn)
++    wire = json.dumps(dict(change=asdict(ch), local_pending_wins=result.local_pending_wins),
++                      sort_keys=True, separators=(',', ':'), allow_nan=False)
++    if conn.execute(f'SELECT 1 FROM {_TABLE} WHERE wire=?', (wire,)).fetchone():
++        return
++    count, size = conn.execute(f'SELECT count(*),COALESCE(sum(length(CAST(wire AS BLOB))),0) FROM {_TABLE}').fetchone()
++    if count >= MAX_ROWS or size + len(wire.encode('utf-8')) > MAX_BYTES:
++        raise ValueError('home deferred feed custody capacity exceeded')
++    conn.execute(f'INSERT INTO {_TABLE}(table_name,row_uid,wire) VALUES (?,?,?)', (ch.table, ch.uid, wire))
++
++
++def _predecessor(conn, ch, rowid):
++    return present(conn) and conn.execute(
++        f'SELECT 1 FROM {_TABLE} WHERE table_name=? AND row_uid=? AND id<? LIMIT 1',
++        (ch.table, ch.uid, rowid if rowid is not None else 9223372036854775807)).fetchone()
++
++
++def run(conn, ch, own, result, apply, *, rowid=None):
++    """Rollback one prepared-row effect, then retain its exact wire before cursor ACK."""
++    from hermes_cli import kanban_containment_replica as containment
++    if blocked(conn, ch) or _predecessor(conn, ch, rowid):
++        if rowid is None:
++            _store(conn, ch, result)
++        result.deferred += 1
++        return False
++    before = copy.deepcopy(vars(result))
++    conn.execute('SAVEPOINT home_feed_row')
++    try:
++        containment.prepare_apply(conn, [ch])
++        with containment.projection(conn, ch):
++            apply(conn, ch, own, result)
++    except sqlite3.IntegrityError as exc:
++        conn.execute('ROLLBACK TO home_feed_row')
++        if str(exc) != 'home transfer prepared':
++            raise
++        vars(result).clear()
++        vars(result).update(before)
++        if rowid is None:
++            _store(conn, ch, result)
++        result.deferred += 1
++        return False
++    finally:
++        conn.execute('RELEASE home_feed_row')
++    if rowid is not None:
++        conn.execute(f'DELETE FROM {_TABLE} WHERE id=?', (rowid,))
++    return True
++
++
++def replay(conn, own, result, apply, rowid):
++    """Replay exactly one retained wire in its own bounded writer reservation."""
++    from hermes_cli.kanban_db_sync import RemoteChange
++    row = conn.execute(f'SELECT wire FROM {_TABLE} WHERE id=?', (rowid,)).fetchone()
++    if not row:
++        return []
++    value = json.loads(row[0])
++    ch = RemoteChange(**value['change'])
++    old = result.local_pending_wins
++    result.local_pending_wins = value['local_pending_wins']
++    try:
++        if run(conn, ch, own, result, apply, rowid=rowid):
++            return [ch]
++        conn.execute(f'UPDATE {_TABLE} SET attempts=attempts+1 WHERE id=?', (rowid,))
++        return []
++    finally:
++        result.local_pending_wins = old
++
++
++def drain(conn, *, board=None, observers=True):
++    """Only the native pull calls this, separately from incoming-page admission.
++
++    Each attempt has the existing 250ms feed VM/Python budget; a poison or slow
++    retained row stays durable and cannot abort the independent incoming page.
++    Failures retain exact wire bytes and a bounded diagnostic, never authority.
++    """
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_db_connect import write_txn
++    from hermes_cli.kanban_sync_apply_budget import apply_page
++    if not pending(conn):
++        return {}
++    rows = conn.execute(f'SELECT id FROM {_TABLE} ORDER BY attempts,id LIMIT ?', (REPLAY_LIMIT,)).fetchall()
++    changed = {}
++    for (rowid,) in rows:
++        try:
++            cursor = int((sync.sync_state(conn) or {}).get('cursor') or 0)
++            result = apply_page(conn, [], new_cursor=cursor, board=board, observers=observers, home_replay_id=rowid)
++            changed.update(result.status_changed)
++        except Exception as exc:  # health: allow BLE001 -- retain poison replay without starving the native feed
++            # The failed reservation has rolled back before this independent
++            # small diagnostic write. Never mutate/drop the captured wire.
++            error = f'{type(exc).__name__}: {exc}'[:1000]
++            with write_txn(conn):
++                _install(conn)
++                prior = conn.execute(f'SELECT last_error FROM {_TABLE} WHERE id=?', (rowid,)).fetchone()
++                conn.execute(f'UPDATE {_TABLE} SET attempts=attempts+1,last_error=? WHERE id=?', (error, rowid))
++            if prior is not None and prior[0] != error:
++                import logging
++                logging.getLogger(__name__).warning('home feed replay retained row=%s error_type=%s', rowid, type(exc).__name__)
++    return changed
+diff --git a/hermes_cli/kanban_sync_apply_budget.py b/hermes_cli/kanban_sync_apply_budget.py
+index 63e6acee1b129a1664a00da6c5d689d65e5b668f..e27783508aeeabb9d06389597cd681f7e5e8d177 100644
+--- a/hermes_cli/kanban_sync_apply_budget.py
++++ b/hermes_cli/kanban_sync_apply_budget.py
+@@ -107,7 +107,9 @@
+     from hermes_cli import kanban_containment_replica as containment
+     # Establish conservative holds for every certified receipt before any prefix
+     # can publish readiness. Releases remain held until their event is applied.
+-    containment.prepare_apply(conn, changes)
++    from hermes_cli import kanban_home_feed as home_feed
++    containment.prepare_apply(conn, [ch for ch in changes if not home_feed.blocked(conn, ch)]
++                              if home_feed.active(conn) else changes)
+     return _apply_page(conn, changes, new_cursor=new_cursor, **kwargs)
+ 
+ 
+@@ -118,7 +120,7 @@
+     # A feed is strictly ordered; snapshots/repair sequences use the atomic API.
+     ordered = all(a.seq < b.seq for a, b in pairwise(changes))
+     result = sync.ApplyResult(cursor=new_cursor)
+-    offset, size = 0, MAX_ROWS
++    offset, size = 0, 1 if kwargs.get('home_replay_id') is not None else MAX_ROWS
+     while offset < len(changes) or (not changes and offset == 0):
+         service_pushes()
+         batch = changes[offset:offset + size]
+@@ -137,6 +139,7 @@
+         finally:
+             _LIMIT.reset(token)
+         result.applied += applied.applied
++        result.deferred += applied.deferred
+         result.skipped += applied.skipped
+         result.skipped_echo += applied.skipped_echo
+         result.status_changed.update(applied.status_changed)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index c476cbe988091ea012b0f355f16caa4715df938e..2f699cb6f0685515df54bc92c152e3e14a2563ce 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -827,6 +827,9 @@
+     from hermes_cli.kanban_sync_apply_budget import apply_page, service_pushes
+     changed: dict[str, str] = {}  # status changes applied, for the parks that name those cards
+     discard_replica_writes(conn, hub, board)  # a replica's outbox is never sent: its ops would mask the feed
++    from hermes_cli.kanban_home_feed import drain as drain_home_feed
++    if max_pages is None or max_pages > 0:
++        changed.update(drain_home_feed(conn, board=board, observers=observers))
+     cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+     while True:
+         if max_pages is not None and pages >= max_pages:
+diff --git a/tests/hermes_cli/test_home_feed_custody.py b/tests/hermes_cli/test_home_feed_custody.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bb0ee6a542206a39706ba28d118d43c36626658
+--- /dev/null
++++ b/tests/hermes_cli/test_home_feed_custody.py
+@@ -0,0 +1,145 @@
++"""Durable source-feed custody, replay, fairness and unchanged SQL fences."""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc, kanban_db_sync as sync
++from hermes_cli import kanban_home_feed as feed, kanban_home_transfer as transfer
++from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli.test_review_home_feed_isolation import change
++
++board = support.board
++
++
++def handoff(conn, tid, record, seq, *, complete=False):
++    return change(conn, tid, 9 if complete else 8, seq, created_on='hub',
++                  home_generation=record['nonce'], home_transfer_pending=None if complete else record['nonce'])
++
++
++def test_durable_exact_wire_replayed_by_real_idle_pull_after_stop(board, monkeypatch):
++    from hermes_cli import kanban_sync_client as client
++    task, record = support.prepared(board)
++    cursor = sync.sync_state(board)['cursor']
++    commit = handoff(board, task, record, cursor+1)
++    complete = handoff(board, task, record, cursor+2, complete=True)
++    before = tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
++    result = sync.apply_remote_changes(board, [commit, complete], new_cursor=cursor+2, observers=False)
++    assert result.deferred == 2
++    wires = [r[0] for r in board.execute('SELECT wire FROM kanban_home_feed1 ORDER BY id')]
++    assert json.loads(wires[0])['change']['fields']['home_transfer_pending'] == record['nonce']
++    assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()) == before
++    with dbc.write_txn(board), pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        board.execute("UPDATE tasks SET title='still fenced' WHERE id=?", (task,))
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    # A new native connection, not an in-memory queue or the source caller's state.
++    with dbc.connect_closing(Path(path)) as reopened:
++        assert [r[0] for r in reopened.execute('SELECT wire FROM kanban_home_feed1 ORDER BY id')] == wires
++        with dbc.write_txn(reopened):
++            transfer.finalize_source(reopened, record)
++        hub = client.Hub(client.Identity('http://127.0.0.1:1', 'fixture-key', 'worker-a3'))
++        monkeypatch.setattr(client.acw, 'changes_page', lambda *a: dict(changes=[], next=cursor+2, more=False))
++        monkeypatch.setattr(client, 'discard_replica_writes', lambda *a: None)
++        pulled = client.pull(reopened, hub, 'default', observers=False)
++        assert pulled == 0
++        assert not feed.pending(reopened)
++        assert reopened.execute('SELECT sync_version FROM tasks WHERE id=?', (task,)).fetchone()[0] == 9
++        assert not transfer.frozen(reopened, task)
++        assert not reopened.execute('SELECT 1 FROM kanban_sync_outbox').fetchone()
++        # Replay once only, including on later idle polls.
++        before_changes = reopened.total_changes
++        client.pull(reopened, hub, 'default', observers=False)
++        assert reopened.total_changes == before_changes
++
++
++def test_atomic_capacity_failure_keeps_cursor_and_healthy_row_retryable(board, monkeypatch):
++    task, record = support.prepared(board)
++    peer = kb.create_task(board, title='unchanged')
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++    cursor = sync.sync_state(board)['cursor']
++    monkeypatch.setattr(feed, 'MAX_ROWS', 0)
++    rows = [change(board, peer, 4, cursor+1, title='remote'), handoff(board, task, record, cursor+2)]
++    with pytest.raises(ValueError, match='custody capacity'):
++        sync.apply_remote_changes(board, rows, new_cursor=cursor+2, observers=False)
++    assert sync.sync_state(board)['cursor'] == cursor
++    assert kb.get_task(board, peer).title == 'unchanged'
++    assert not feed.pending(board)
++    monkeypatch.setattr(feed, 'MAX_ROWS', 4096)
++    sync.apply_remote_changes(board, rows, new_cursor=cursor+2, observers=False)
++    assert kb.get_task(board, peer).title == 'remote'
++    assert feed.pending(board)
++
++
++def test_row_savepoint_fallback_retains_wire_not_partial_effects(board, monkeypatch):
++    task, record = support.prepared(board)
++    peer = kb.create_task(board, title='independent')
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++    cursor = sync.sync_state(board)['cursor']
++    # Force the SQL fallback rather than relying solely on Python identity checks.
++    monkeypatch.setattr(feed, 'blocked', lambda *a: False)
++    result = sync.apply_remote_changes(board, [handoff(board, task, record, cursor+1),
++                                             change(board, peer, 4, cursor+2, title='progress')],
++                                       new_cursor=cursor+2, observers=False)
++    assert result.deferred == 1 and kb.get_task(board, peer).title == 'progress'
++    assert not board.execute('SELECT 1 FROM kanban_home_generations1 WHERE task_id=?', (task,)).fetchone()
++    assert len(list(board.execute('SELECT wire FROM kanban_home_feed1'))) == 1
++
++
++def test_unrelated_integrity_error_is_not_treated_as_transfer_deferral(board):
++    task, record = support.prepared(board)
++    peer = kb.create_task(board, title='independent')
++    cursor = sync.sync_state(board)['cursor']
++    with dbc.write_txn(board):
++        board.execute("CREATE TRIGGER unrelated_fault BEFORE UPDATE ON tasks WHEN NEW.id='" + peer +
++                      "' BEGIN SELECT RAISE(ABORT,'unrelated constraint'); END")
++    with pytest.raises(sqlite3.IntegrityError, match='unrelated constraint'):
++        sync.apply_remote_changes(board, [handoff(board, task, record, cursor+1),
++                                         change(board, peer, 4, cursor+2, title='fail')],
++                                  new_cursor=cursor+2, observers=False)
++    assert sync.sync_state(board)['cursor'] == cursor
++    assert not feed.pending(board)
++
++
++def test_bounded_retry_does_not_starve_released_row_behind_frozen_row(board, monkeypatch):
++    first, first_record = support.prepared(board)
++    second = kb.create_task(board, title='second')
++    with dbc.write_txn(board):
++        board.execute("UPDATE tasks SET created_on='worker-a3',sync_version=7 WHERE id=?", (second,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        record = support.record(board, second)
++        record['nonce'] = 'second-replay-000001'
++        transfer.prepare(board, second, source='worker-a3', destination='hub', nonce=record['nonce'], expected_version=7)
++    cursor = sync.sync_state(board)['cursor']
++    sync.apply_remote_changes(board, [handoff(board, first, first_record, cursor+1),
++                                     handoff(board, second, record, cursor+2)], new_cursor=cursor+2, observers=False)
++    with dbc.write_txn(board):
++        transfer.finalize_source(board, record)
++    monkeypatch.setattr(feed, 'REPLAY_LIMIT', 1)
++    feed.drain(board, observers=False)
++    assert board.execute('SELECT count(*) FROM kanban_home_feed1').fetchone()[0] == 2
++    feed.drain(board, observers=False)
++    assert board.execute('SELECT count(*) FROM kanban_home_feed1').fetchone()[0] == 1
++    assert json.loads(board.execute('SELECT wire FROM kanban_home_feed1').fetchone()[0])['change']['uid'] == first
++    assert transfer.frozen(board, first)
++
++
++@pytest.mark.parametrize('kind', ['delete', 'child', 'link'])
++def test_related_identity_is_deferred_including_deletes(board, kind):
++    task, _record = support.prepared(board)
++    cursor = sync.sync_state(board)['cursor']
++    if kind == 'delete':
++        ch = sync.RemoteChange(cursor+1, 'tasks', task, 'delete', {}, 8, '2000-0-server', 'server')
++    else:
++        fields = dict(task_id=task, author='remote', body='retained', created_at=1) if kind == 'child' else dict(parent_id=task, child_id=task)
++        ch = sync.RemoteChange(cursor+1, 'task_comments' if kind == 'child' else 'task_links',
++                               'deferred-child-0001', 'upsert', fields, 1, '2000-0-server', 'server')
++    result = sync.apply_remote_changes(board, [ch], new_cursor=cursor+1, observers=False)
++    assert result.deferred == 1
++    assert json.loads(board.execute('SELECT wire FROM kanban_home_feed1').fetchone()[0])['change']['op'] == ch.op
++    assert kb.get_task(board, task) is not None
+diff --git a/tests/hermes_cli/test_home_feed_entrypoints.py b/tests/hermes_cli/test_home_feed_entrypoints.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cda6754d71509516eaf0d63162ce8817fa7a54e
+--- /dev/null
++++ b/tests/hermes_cli/test_home_feed_entrypoints.py
+@@ -0,0 +1,89 @@
++"""Native pull owns bounded replay; admin/repair calls never consume it."""
++from dataclasses import asdict
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc, kanban_db_sync as sync
++from hermes_cli import kanban_home_feed as feed, kanban_home_transfer as transfer
++from hermes_cli import kanban_sync_client as client, kanban_sync_apply_budget as budget
++from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli.test_home_feed_custody import handoff
++from tests.hermes_cli.test_review_home_feed_isolation import change
++
++board = support.board
++
++
++def retained(conn):
++    tid, record = support.prepared(conn)
++    cursor = sync.sync_state(conn)['cursor']
++    sync.apply_remote_changes(conn, [handoff(conn, tid, record, cursor+1)], new_cursor=cursor+1, observers=False)
++    with dbc.write_txn(conn):
++        transfer.finalize_source(conn, record)
++    wire = conn.execute('SELECT wire FROM kanban_home_feed1').fetchone()[0]
++    return tid, record, cursor+1, wire
++
++
++def pull(conn, monkeypatch, rows, cursor):
++    hub = client.Hub(client.Identity('http://127.0.0.1:1', 'fixture-key', 'worker-a3'))
++    page = dict(changes=[asdict(ch) for ch in rows], next=cursor, more=False)
++    monkeypatch.setattr(client.acw, 'changes_page', lambda *a: page)
++    monkeypatch.setattr(client, 'discard_replica_writes', lambda *a: None)
++    return client.pull(conn, hub, 'default', observers=False)
++
++
++@pytest.mark.parametrize('fault', ['sql', 'budget'])
++def test_poison_or_slow_replay_cannot_abort_independent_incoming_page(board, monkeypatch, fault):
++    tid, _, cursor, wire = retained(board)
++    peer = kb.create_task(board, title='healthy')
++    with dbc.write_txn(board):
++        board.execute('DELETE FROM kanban_sync_outbox')
++        if fault == 'sql':
++            board.execute("CREATE TRIGGER poisoned_replay BEFORE UPDATE ON tasks WHEN NEW.id='" + tid +
++                          "' BEGIN SELECT RAISE(ABORT,'poisoned replay'); END")
++    if fault == 'budget':
++        apply = sync.apply_remote_changes
++        def slow(conn, changes, **kwargs):
++            if kwargs.get('home_replay_id') is not None:
++                raise budget.ApplyBudgetExceeded('retained one-row reservation exceeded')
++            return apply(conn, changes, **kwargs)
++        monkeypatch.setattr(sync, 'apply_remote_changes', slow)
++    assert pull(board, monkeypatch, [change(board, peer, 4, cursor+1, title='progress')], cursor+1) == 1
++    assert kb.get_task(board, peer).title == 'progress'
++    assert sync.sync_state(board)['cursor'] == cursor+1
++    row = board.execute('SELECT wire,attempts,last_error FROM kanban_home_feed1').fetchone()
++    assert row[0] == wire and row[1] == 1
++    assert ('IntegrityError' if fault == 'sql' else 'ApplyBudgetExceeded') in row[2]
++    assert board.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] == 8
++
++
++def test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody(board, monkeypatch):
++    tid, _, cursor, wire = retained(board)
++    row = board.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++    sync.apply_remote_changes(board, [], new_cursor=cursor, observers=False, local_pending_wins=True)
++    peer = kb.create_task(board, title='admin-selected')
++    sync.apply_remote_changes(board, [change(board, peer, 4, cursor+1)], new_cursor=cursor+1,
++                              observers=False, keep=lambda conn, ch: False)
++    assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == tuple(row)
++    assert board.execute('SELECT wire,attempts FROM kanban_home_feed1').fetchone()[:] == (wire, 0)
++    pull(board, monkeypatch, [], cursor+1)
++    assert not feed.pending(board)
++
++
++def test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write(board):
++    from hermes_cli import kanban_containment_replica as replica
++    from tests.hermes_cli import test_kanban_containment_replica as custody
++    target, _, stop, _, hub = custody.scenario(board)
++    sync.set_identity(board, 'fixture', 'worker-a3')
++    with dbc.write_txn(board):
++        board.execute("UPDATE tasks SET created_on='worker-a3',sync_version=7 WHERE id=?", (target,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        record = support.record(board, target)
++        transfer.prepare(board, target, source='worker-a3', destination='hub', nonce=record['nonce'], expected_version=7)
++    before = tuple(board.execute('SELECT * FROM tasks WHERE id=?', (target,)).fetchone())
++    peer = kb.create_task(board, title='healthy')
++    rows = [custody.event(stop, hub, 1), change(board, peer, 4, 2, title='progress')]
++    replica.certify_page(board, hub, 'fixture', rows)
++    result = budget.apply_page(board, rows, new_cursor=2, board='fixture', observers=False)
++    assert result.deferred == 1 and kb.get_task(board, peer).title == 'progress'
++    assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (target,)).fetchone()) == before
++    assert feed.pending(board)
+diff --git a/tests/hermes_cli/test_home_shared_path_invariant.py b/tests/hermes_cli/test_home_shared_path_invariant.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b78ad1a67695b82e09b2bff3910da808c229775d
+--- /dev/null
++++ b/tests/hermes_cli/test_home_shared_path_invariant.py
+@@ -0,0 +1,265 @@
++"""Single transfer-isolation gate: mixed states plus every prior reviewer regression."""
++from __future__ import annotations
++
++import pytest
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc, kanban_db_sync as sync
++from hermes_cli import kanban_home_transfer as transfer
++from hermes_cli import kanban_lanes as lanes, kanban_triage_sweep as sweep
++from hermes_cli import kanban_block_policy as policy, kanban_shared_blockers as blockers
++from hermes_cli import kanban_spend_decision as decision, kanban_spend_reviewer as spend_review
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++from hermes_cli.kanban_db_dispatch_quota import clear_quota_error
++from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli import test_home_review_contracts as contracts
++from tests.hermes_cli import test_review_daily_transfer as daily
++from tests.hermes_cli import test_home_review_boundaries as boundaries
++from tests.hermes_cli import test_review_4300_nonce as nonce
++from tests.hermes_cli import test_review_4300_ask as ask
++from tests.hermes_cli import test_review_home_feed_isolation as feed_review
++from tests.hermes_cli import test_home_label_presend as presend
++from tests.hermes_cli import test_home_release_operators as operator_cases
++from tests.hermes_cli import test_home_release_auxiliary as auxiliary_cases
++from tests.hermes_cli import test_home_release_sweeps as sweep_cases
++from tests.hermes_cli import test_home_feed_entrypoints as entry_cases
++
++board = support.board
++live = contracts.live
++conn = daily.conn
++configured = daily.configured
++person = daily.person
++
++# Explicit exports keep the original independently reproduced reviewer probes
++# unchanged and collect all five rounds in this single first-run gate.
++test_prepared_probe_does_not_starve_due_neighbour = boundaries.test_prepared_probe_does_not_starve_due_neighbour
++test_owner_rejects_unsupported_identity_before_fencing_or_network = boundaries.test_owner_rejects_unsupported_identity_before_fencing_or_network
++test_stop_accepts_wire_millisecond_timestamp = contracts.test_stop_accepts_wire_millisecond_timestamp
++test_stop_rejects_real_timestamp_change_and_rolls_back = contracts.test_stop_rejects_real_timestamp_change_and_rolls_back
++test_old_local_park_does_not_become_silent_at_home_transition = contracts.test_old_local_park_does_not_become_silent_at_home_transition
++test_transfer_liveness_grace_is_bounded_and_survives_reopen = contracts.test_transfer_liveness_grace_is_bounded_and_survives_reopen
++test_post_transfer_alive_extends_observation_not_baseline = contracts.test_post_transfer_alive_extends_observation_not_baseline
++test_explicit_remote_probe_keeps_existing_silence_contract = contracts.test_explicit_remote_probe_keeps_existing_silence_contract
++test_new_park_cannot_borrow_historical_transfer_grace = contracts.test_new_park_cannot_borrow_historical_transfer_grace
++test_pending_transfer_never_installs_liveness_grace = contracts.test_pending_transfer_never_installs_liveness_grace
++test_pending_renewal_uses_public_refusal_contract = contracts.test_pending_renewal_uses_public_refusal_contract
++test_pending_renewal_command_returns_structured_refusal = contracts.test_pending_renewal_command_returns_structured_refusal
++test_deleted_label_target_terminates_delivery = contracts.test_deleted_label_target_terminates_delivery
++test_aborted_nonce_cannot_be_reused_for_new_version = nonce.test_aborted_nonce_cannot_be_reused_for_new_version
++test_transferred_hostless_ask_gets_fresh_observation_window = ask.test_transferred_hostless_ask_gets_fresh_observation_window
++test_daily_release_skips_prepared = daily.test_daily_release_skips_prepared
++test_healthy_feed_progress_during_handoff = feed_review.test_healthy_feed_progress_during_handoff
++test_actual_delivery_retry_distinguishes_presend_failure_from_legacy = presend.test_actual_delivery_retry_distinguishes_presend_failure_from_legacy
++# Auxiliary boundaries are part of the same gate, not a later reviewer surprise.
++test_quota_and_hold_release_refuse_before_external_reads = operator_cases.test_quota_and_hold_release_refuse_before_external_reads
++test_review_preparation_skips_before_reading_park = operator_cases.test_review_preparation_skips_before_reading_park
++test_triage_cap_and_contained_prelude_create_no_children = operator_cases.test_triage_cap_and_contained_prelude_create_no_children
++test_containment_resume_refuses_before_bootstrap = operator_cases.test_containment_resume_refuses_before_bootstrap
++test_notice_never_reads_placement_or_writes_frozen_target = auxiliary_cases.test_notice_never_reads_placement_or_writes_frozen_target
++test_stranded_producers_do_not_refile_or_escalate = auxiliary_cases.test_stranded_producers_do_not_refile_or_escalate
++test_spend_promote_and_review_queue_refuse_before_accounting = auxiliary_cases.test_spend_promote_and_review_queue_refuse_before_accounting
++test_stop_ended_preserves_transfer_custody = auxiliary_cases.test_stop_ended_preserves_transfer_custody
++test_recovery_requester_skips_before_creating_any_child = auxiliary_cases.test_recovery_requester_skips_before_creating_any_child
++test_preclaim_accounting_is_write_free_for_transfers = sweep_cases.test_preclaim_accounting_is_write_free_for_transfers
++test_spend_reviewer_due_and_grant_exclude_transfer = sweep_cases.test_spend_reviewer_due_and_grant_exclude_transfer
++test_poison_or_slow_replay_cannot_abort_independent_incoming_page = entry_cases.test_poison_or_slow_replay_cannot_abort_independent_incoming_page
++test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody = entry_cases.test_admin_repair_and_keep_filtered_apply_never_replay_unrelated_custody
++test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write = entry_cases.test_real_budget_wrapper_defers_certified_prepared_containment_before_any_marker_write
++
++
++def mixed(conn, status, setup=None):
++    """One board containing every interval, not separate homogeneous fixtures."""
++    from hermes_cli.kanban_home_generation import mirror_feed
++    cards = {}
++    for phase in ('prepared', 'frozen', 'aborted', 'committed', 'pending', 'ordinary'):
++        tid = kb.create_task(conn, title=phase)
++        with dbc.write_txn(conn):
++            conn.execute('UPDATE tasks SET status=?,created_on=\'worker-a3\',sync_version=7 WHERE id=?', (status, tid))
++            conn.execute("UPDATE kanban_sync_state SET gateway_id='worker-a3'")
++            if setup is not None:
++                setup(conn, tid)
++            conn.execute('DELETE FROM kanban_sync_outbox')
++            record = support.record(conn, tid)
++            record['nonce'] = 'invariant-' + tid
++            if phase not in ('ordinary', 'pending'):
++                transfer.prepare(conn, tid, source='worker-a3', destination='hub', nonce=record['nonce'], expected_version=7)
++            actions = {
++                'aborted': lambda: transfer.abort_source(conn, {**record, 'phase': 'aborted', 'rows': []}),
++                'committed': lambda: transfer.finalize_source(conn, record),
++                'pending': lambda: mirror_feed(conn, tid, {'home_generation': record['nonce']}, 8),
++                'frozen': lambda: corrupt_marker(conn, tid),
++            }
++            actions.get(phase, lambda: None)()
++        cards[phase] = tid
++    return cards
++
++
++def snapshot(conn, ids):
++    return {tid: (tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()),
++                  [tuple(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=? ORDER BY id', (tid,))])
++            for tid in ids}
++
++
++def corrupt_marker(conn, tid):
++    conn.execute('DROP TRIGGER IF EXISTS home_prepared1_marker_update')
++    conn.execute("UPDATE kanban_home_prepared1 SET source='' WHERE task_id=?", (tid,))
++
++
++def setup_spend(conn, tid):
++    kb._append_event(conn, tid, decision.EVENT, {'reason': 'ordinary budget stop'})
++    episode = spend_review.episode_of(decision.pending_episode(conn, tid))
++    kb._append_event(conn, tid, spend_review.QUEUED, {'episode': episode})
++
++
++def case_feed(board, monkeypatch, cards, normal, frozen, before, operation):
++    cursor = sync.sync_state(board)['cursor']
++    rows = [feed_review.change(board, tid, 9, cursor+i+1, title='native feed edit') for i, tid in enumerate(cards.values())]
++    from hermes_cli.kanban_sync_apply_budget import apply_page
++    result = apply_page(board, rows, new_cursor=cursor+len(rows), observers=False)
++    assert result.deferred == 2
++    assert sync.sync_state(board)['cursor'] == cursor+len(rows)
++    for tid in normal:
++        assert kb.get_task(board, tid).title == 'native feed edit'
++    assert snapshot(board, frozen[:2]) == {tid: before[tid] for tid in frozen[:2]}
++
++
++def case_readiness(board, monkeypatch, cards, normal, frozen, before, operation):
++    kb.recompute_ready(board)
++
++
++def case_dispatch(board, monkeypatch, cards, normal, frozen, before, operation):
++    assert {r['id'] for r in lane_rows(board, 'ready')} == set(normal)
++
++
++def case_promote(board, monkeypatch, cards, normal, frozen, before, operation):
++    calls = {
++        'promote': lambda tid: kb.promote_task(board, tid, actor='test')[0],
++        'unblock': lambda tid: kb.unblock_task(board, tid),
++        'reopen': lambda tid: kb.reopen_review_task(board, tid),
++        'admit': lambda tid: lanes.admit(board, tid, actor='test', reason='capacity'),
++    }
++    for tid in cards.values():
++        assert bool(calls[operation](tid)) == (tid in normal)
++
++
++def case_stale(board, monkeypatch, cards, normal, frozen, before, operation):
++    assert set(sweep.sweep_stale_triage(board, older_than=0)) == set(normal)
++
++
++def case_agent_block(board, monkeypatch, cards, normal, frozen, before, operation):
++    with dbc.write_txn(board):
++        for tid in normal:
++            board.execute("UPDATE tasks SET block_kind='transient',human_request=? WHERE id=?",
++                          ('{"action":"old ask"}' if operation == 'standing' else None, tid))
++    if operation == 'standing':
++        monkeypatch.setattr(policy, 'standing_ask_error', lambda *a: ('test', 'premise gone', {}))
++        assert set(policy.sweep_standing_asks(board)) == set(normal)
++    else:
++        assert set(policy.sweep_agent_owned_blocks(board, grace=0)) == set(normal)
++
++
++def case_quota(board, monkeypatch, cards, normal, frozen, before, operation):
++    for tid in cards.values():
++        clear_quota_error(board, tid, 'quota wall')
++    assert all(kb.get_task(board, tid).last_failure_error is None for tid in normal)
++
++
++def case_spend_review(board, monkeypatch, cards, normal, frozen, before, operation):
++    monkeypatch.setattr(spend_review, 'settings', lambda: (True, 5))
++    assert {tid for tid, _, _ in spend_review._due(board, 9999999999, set())} == set(normal)
++
++
++def case_spend_hold(board, monkeypatch, cards, normal, frozen, before, operation):
++    from hermes_cli import kanban_spend_budget as budget, kanban_no_progress as progress
++    seen = []
++    target = progress if operation == 'no_progress' else budget
++    seam = 'decide' if operation == 'no_progress' else 'card_limits'
++    original = getattr(target, seam)
++    def observed(conn, tid, *args, **kwargs):
++        seen.append(tid)
++        return original(conn, tid, *args, **kwargs)
++    monkeypatch.setattr(target, seam, observed)
++    for tid in cards.values():
++        target.hold(board, tid)
++    assert set(seen) == set(normal)
++
++
++def case_recovery(board, monkeypatch, cards, normal, frozen, before, operation):
++    from hermes_cli import kanban_resume_requester as requester, kanban_resume_exec as rx
++    seen = []
++    original = rx.exhaustion_refusal
++    def eligible(conn, tid, *args, **kwargs):
++        seen.append(tid)
++        return original(conn, tid, *args, **kwargs)
++    monkeypatch.setattr(rx, 'exhaustion_refusal', eligible)
++    requester.ensure_recovery_cards(board)
++    assert set(seen) == set(normal)
++
++
++def case_release(board, monkeypatch, cards, normal, frozen, before, operation):
++    from hermes_cli import kanban_release as release
++    for tid in cards.values():
++        result = release.release(board, tid, writer=('human', None, 'human'), runs=1)
++        assert (result.get('refusal') == 'home_transfer') == (tid in frozen)
++
++
++def case_renew(board, monkeypatch, cards, normal, frozen, before, operation):
++    from hermes_cli import kanban_scope_renewal as renewal
++    for tid in cards.values():
++        with pytest.raises(renewal.RenewalRefused) as exc:
++            renewal.renew_local(board, tid, episode='absent', comment_id=1, reason='mandate',
++                                actor=renewal.Actor('human', None, 'human', None))
++        assert (exc.value.code == 'home_transfer') == (tid in frozen)
++
++
++def case_shared_clear(board, monkeypatch, cards, normal, frozen, before, operation):
++    state = blockers.BlockerState(blocker_id='fixture', cleared_by=('other', 1), cleared_at=10,
++                                 cleared_via='run', behind=dict.fromkeys(cards.values(), 1))
++    monkeypatch.setattr(blockers, 'blocker_states', lambda *a, **k: {'fixture': state})
++    blockers.release_cleared_blockers(board)
++    assert {r[0] for r in board.execute('SELECT task_id FROM task_events WHERE kind=?',
++                                      (blockers.CLEARED_EVENT,))} == set(normal)
++
++
++CASES = {
++    'feed': case_feed, 'readiness': case_readiness, 'dispatch': case_dispatch,
++    'promote': case_promote, 'unblock': case_promote, 'reopen': case_promote, 'admit': case_promote,
++    'stale': case_stale, 'agent_block': case_agent_block, 'standing': case_agent_block,
++    'quota': case_quota, 'spend_review': case_spend_review, 'spend_hold': case_spend_hold,
++    'no_progress': case_spend_hold, 'recovery': case_recovery, 'release': case_release,
++    'renew': case_renew, 'shared_clear': case_shared_clear,
++}
++
++
++@pytest.mark.parametrize('operation', CASES)
++def test_mixed_states_never_abort_or_delay_normal_cards(board, monkeypatch, operation):
++    status = {'readiness': 'todo', 'dispatch': 'ready', 'reopen': 'review', 'unblock': 'blocked',
++              'agent_block': 'blocked', 'standing': 'blocked', 'quota': 'ready', 'shared_clear': 'ready'}.get(operation, 'triage')
++    setup = {
++        'spend_review': setup_spend,
++        'recovery': lambda conn, tid: kb._append_event(conn, tid, 'continuation_exhausted', {}),
++        'quota': lambda conn, tid: conn.execute("UPDATE tasks SET last_failure_error='quota wall' WHERE id=?", (tid,)),
++        'admit': lambda conn, tid: conn.execute('UPDATE tasks SET block_kind=? WHERE id=?', (lanes.GATE_KIND, tid)),
++    }.get(operation)
++    cards = mixed(board, status, setup)
++    frozen = [cards[k] for k in ('prepared', 'frozen', 'committed', 'pending')]
++    normal = [cards[k] for k in ('ordinary', 'aborted')]
++    before = snapshot(board, frozen)
++    CASES[operation](board, monkeypatch, cards, normal, frozen, before, operation)
++    if operation != 'feed':
++        assert snapshot(board, frozen) == before
++    if operation in ('readiness', 'promote', 'unblock', 'reopen', 'stale', 'admit'):
++        assert all(kb.get_task(board, tid).status == 'ready' for tid in normal)
++
++
++def test_daily_reset_on_mixed_board_releases_both_normal_controls(conn, configured):
++    board = conn
++    daily.limits(configured, cards_per_day=100)
++    def setup(conn, tid):
++        conn.execute('UPDATE tasks SET tenant=?,block_kind=? WHERE id=?', ('myapp', lanes.GATE_KIND, tid))
++        kb._append_event(conn, tid, lanes.GATED, {'reason': 'limit:cards_per_day'})
++    cards = mixed(board, 'triage', setup)
++    frozen = [cards[k] for k in ('prepared', 'frozen', 'committed', 'pending')]
++    before = snapshot(board, frozen)
++    kb.recompute_ready(board)
++    assert snapshot(board, frozen) == before
++    for phase in ('ordinary', 'aborted'):
++        assert kb.get_task(board, cards[phase]).status == 'ready'
+diff --git a/tests/hermes_cli/test_review_home_feed_isolation.py b/tests/hermes_cli/test_review_home_feed_isolation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9613292c33c5cc1a45dadc1b26d02af06c3e95b
+--- /dev/null
++++ b/tests/hermes_cli/test_review_home_feed_isolation.py
+@@ -0,0 +1,40 @@
++"""Review fixture: a transfer must not prevent unrelated feed progress."""
++import pytest
++from hermes_cli import kanban_db as kb, kanban_db_connect as dbc, kanban_db_sync as sync
++from hermes_cli import kanban_home_transfer as transfer
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_home_source_stop as stop
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    yield from support.synced_conn(home)
++
++def change(conn, tid, version, seq, **extra):
++    row = conn.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
++    fields = {sync._wire_name('tasks', c): row[c] for c in sync.captured_columns(conn, 'tasks')}
++    fields.update(id=tid, uid=tid, version=version, deleted_at=None, **extra)
++    return sync.RemoteChange(seq=seq, table='tasks', uid=tid, op='upsert', fields=fields,
++                             version=version, hlc='2000-0-server', origin_gateway='server')
++
++@pytest.mark.parametrize('stopped', [False, True])
++def test_healthy_feed_progress_during_handoff(board, stopped):
++    tid, reply = stop.prepared(board)
++    other = kb.create_task(board, title='unrelated')
++    with dbc.write_txn(board):
++        board.execute('UPDATE tasks SET sync_version=3 WHERE id=?', (other,))
++        board.execute('DELETE FROM kanban_sync_outbox')
++        if stopped:
++            transfer.finalize_source(board, reply)
++    cursor = board.execute('SELECT cursor FROM kanban_sync_state').fetchone()[0]
++    rows = [change(board, other, 4, cursor+1, title='remote edit'),
++            change(board, tid, 8, cursor+2, created_on='hub', home_generation=reply['nonce'],
++                   home_transfer_pending=reply['nonce'])]
++    try:
++        sync.apply_remote_changes(board, rows, new_cursor=cursor+2, observers=False)
++    except Exception:
++        assert board.execute('SELECT title FROM tasks WHERE id=?', (other,)).fetchone()[0] == 'unrelated'
++        assert board.execute('SELECT cursor FROM kanban_sync_state').fetchone()[0] == cursor
++        raise
++    assert board.execute('SELECT title FROM tasks WHERE id=?', (other,)).fetchone()[0] == 'remote edit'
++    assert transfer.frozen(board, tid)
+-- 
+2.43.0
+

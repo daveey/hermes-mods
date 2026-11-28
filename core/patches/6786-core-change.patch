@@ -1,0 +1,302 @@
+From cf4691e902d6a8dd6fc14b7132dacb46328f65f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:48:03 +0000
+Subject: [PATCH 6786] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit cf4691e902d6a8dd6fc14b7132dacb46328f65f0.
+
+---
+diff --git a/tests/hermes_cli/test_owner_release_core_boundaries.py b/tests/hermes_cli/test_owner_release_core_boundaries.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..38cadcea4c5a0992f6f842a6f5338367f84727f5
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_core_boundaries.py
+@@ -0,0 +1,179 @@
++"""Independent guard regressions through journal, private-cache and read entry paths."""
++import copy
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_release_intent as intent
++from hermes_cli import kanban_release_read as read
++from hermes_cli import kanban_release_replica as replica
++from tests.hermes_cli import test_owner_release_intent as journals
++from tests.hermes_cli import test_owner_release_read as reads
++from tests.hermes_cli import test_owner_release_certificate as certificates
++
++turn = journals.turn
++journal = journals.journal
++proof = certificates.proof
++store = certificates.store
++
++
++def journal_rows(conn):
++    return [tuple(row) for row in conn.execute("SELECT * FROM native_owner_release_intents")]
++
++
++@pytest.mark.parametrize("mode", ["shadow", "off"])
++def test_existing_journal_cannot_be_read_after_primary_loss(turn, journal, mode):
++    body = intent.prepare(journal, journals.action(), gate=journals.gate())
++    before = journal_rows(journal)
++    sync.set_mode(journal, mode)
++    with pytest.raises(ValueError):
++        intent.stage(journal, body)
++    assert journal_rows(journal) == before
++
++
++def test_stage_rechecks_custody_after_journal_read(turn, journal, monkeypatch):
++    body = intent.prepare(journal, journals.action(), gate=journals.gate())
++    before = journal_rows(journal)
++    saved = intent._saved
++
++    def revoked(*args, **kwargs):
++        row = saved(*args, **kwargs)
++        turn.release()
++        return row
++
++    monkeypatch.setattr(intent, "_saved", revoked)
++    with pytest.raises(ValueError):
++        intent.stage(journal, body)
++    assert journal_rows(journal) == before
++
++
++def test_stage_rejects_boolean_version_even_with_equal_integer_value(turn, journal):
++    body = intent.prepare(journal, journals.action(), gate=journals.gate())
++    with pytest.raises(ValueError):
++        intent.stage(journal, {**body, "version": True})
++    assert intent.stage(journal, body) == "intent_journaled_unsent"
++
++
++@pytest.mark.parametrize("change", [
++    {"note": "x" * 2001}, {"note": " "}, {"note": 1},
++    {"capability_episodes": [f"cap-{i}" for i in range(33)]},
++    {"capability_episodes": ["bad coordinate"]},
++])
++def test_action_bounds_fail_before_admission(turn, journal, change):
++    request = journals.gate()
++    with pytest.raises(ValueError):
++        intent.prepare(journal, journals.action(**change), gate=request)
++    assert request.finish()["outcome"] == "no_board_commit"
++    assert not journal.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()
++
++
++def test_resume_rejects_uid_column_drift_with_coherent_body_and_digest(turn, journal):
++    body = intent.prepare(journal, journals.action(), gate=journals.gate())
++    journal.execute("UPDATE native_owner_release_intents SET intent_uid='different-column-uid'")
++    journal.commit()
++    before = journal_rows(journal)
++    with pytest.raises(ValueError):
++        intent.prepare(journal, journals.action(), gate=journals.gate())
++    assert journal_rows(journal) == before
++    assert json.loads(before[0][2]) == body
++
++
++def expire(conn, body):
++    conn.execute("UPDATE native_owner_release_intents SET stage='expired' WHERE intent_uid=?", (body["intent_uid"],))
++    conn.commit()
++
++
++@pytest.mark.parametrize("missing", [False, True])
++def test_acknowledgement_never_adopts_a_different_successor(turn, journal, missing):
++    first = intent.prepare(journal, journals.action(), gate=journals.gate())
++    expire(journal, first)
++    second = intent.prepare(journal, journals.action(), gate=journals.gate(), expired_intent=first["intent_uid"])
++    if missing:
++        journal.execute("DELETE FROM native_owner_release_retries")
++        journal.commit()
++    else:
++        expire(journal, second)
++        intent.prepare(journal, journals.action(), gate=journals.gate(), expired_intent=second["intent_uid"])
++    before = journal_rows(journal)
++    with pytest.raises(ValueError):
++        intent.prepare(journal, journals.action(), gate=journals.gate(), expired_intent=first["intent_uid"])
++    assert journal_rows(journal) == before
++
++
++def rebind_proof(proof):
++    """Keep all cross-field hashes/identities coherent around the guard under test."""
++    digest = intent.digest(proof["intent"])
++    proof["digest"] = proof["consume"]["digest"] = digest
++    payload = json.loads(proof["renewal"]["payload"])
++    payload.update(owner_release_digest=digest, actor_gateway=proof["intent"]["actor"]["gateway"],
++                   request_uid=proof["consume"]["client_op_id"])
++    proof["renewal"]["uid"] = proof["consume"]["client_op_id"]
++    proof["renewal"]["payload"] = json.dumps(payload)
++
++
++@pytest.mark.parametrize("fault", ["self-home", "same-operation", "boolean-renewal", "float-renewal"])
++def test_private_certification_refuses_coherent_invalid_proofs_without_cache(proof, store, fault):
++    conn, _ = store
++    if fault == "self-home":
++        proof["intent"]["actor"]["gateway"] = proof["intent"]["home"]
++    elif fault == "same-operation":
++        proof["consume"]["client_op_id"] = proof["intent"]["intent_uid"]
++    else:
++        proof["renewal"]["version"] = True if fault == "boolean-renewal" else 1.0
++    rebind_proof(proof)
++    with pytest.raises(ValueError):
++        replica.certify(conn, certificates.Hub(proof), "example", task="t_target", intent_uid="intent-1")
++    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (replica.TABLE,)).fetchone()
++
++
++@pytest.mark.parametrize("stage", ["intent_journaled_unsent", "send_pending", "delivery_pending", "consumed", "applied", "expired", "refused"])
++def test_read_prepare_never_reopens_other_stages(turn, journal, stage):
++    body = reads.prepared(journal)
++    journal.execute("UPDATE native_owner_release_intents SET stage=?", (stage,))
++    journal.commit()
++    before = journal_rows(journal)
++    with pytest.raises(ValueError):
++        read.prepare(journal, reads.Hub(body), body, seen=None)
++    assert journal_rows(journal) == before
++    assert not journal.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_reads'").fetchone()
++
++
++@pytest.mark.parametrize("stage", ["authorized_pending_home", "delivery_pending", "consumed", "applied", "expired", "refused"])
++def test_display_confirmation_never_confirms_after_stage_change(turn, journal, stage):
++    body = reads.prepared(journal)
++    hub = reads.Hub(body)
++    shown = read.prepare(journal, hub, body, seen=None)
++    journal.execute("UPDATE native_owner_release_intents SET stage=?", (stage,))
++    journal.commit()
++    before = tuple(journal.execute("SELECT * FROM native_owner_release_reads").fetchone())
++    with pytest.raises(ValueError):
++        read.confirm(journal, hub, shown.confirmation)
++    assert tuple(journal.execute("SELECT * FROM native_owner_release_reads").fetchone()) == before
++    assert intent.stage(journal, body) == stage
++
++
++def test_display_confirmation_requires_exact_parent_type_not_duck_fields(turn, journal):
++    body = reads.prepared(journal)
++    hub = reads.Hub(body)
++    shown = read.prepare(journal, hub, body, seen=None)
++    fake = SimpleNamespace(**vars(shown.confirmation))
++    before = tuple(journal.execute("SELECT * FROM native_owner_release_reads").fetchone())
++    with pytest.raises(ValueError):
++        read.confirm(journal, hub, fake)
++    assert tuple(journal.execute("SELECT * FROM native_owner_release_reads").fetchone()) == before
++    assert read.confirm(journal, hub, shown.confirmation)["display_confirmed"]
++
++
++def test_private_inventory_requires_exact_unnormalized_intent_bytes(turn, journal):
++    body = intent.prepare(journal, journals.action(capability_episodes=["cap-a", "cap-b"]), gate=journals.gate())
++    intent.advance(journal, body, expected="intent_journaled_unsent", stage="send_pending")
++    intent.advance(journal, body, expected="send_pending", stage="authorized_pending_home")
++    hub = reads.Hub(body)
++    hub.value["intent"] = copy.deepcopy(body)
++    hub.value["intent"]["capability_episodes"].reverse()
++    assert intent.validate(hub.value["intent"]) == body
++    with pytest.raises(ValueError):
++        read.prepare(journal, hub, body, seen=None)
++    assert not journal.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_reads'").fetchone()
+diff --git a/tests/hermes_cli/test_owner_release_home_refusal.py b/tests/hermes_cli/test_owner_release_home_refusal.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..39c2169c6c80c72cfc11b86b3da5ca95495f2b8e
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_home_refusal.py
+@@ -0,0 +1,100 @@
++"""HOME tick: a typed release Refusal during final freeze holds only that row.
++
++Real HOME queue (``operator.apply_incoming`` -> ``home.tick``) and the real
++``kanban_release_final_home.process`` run. The single seam is ``kanban_release_final.freeze``:
++the shared operator fixture's ``tasks`` schema cannot satisfy the real assembly/``_budget_plan``
++(no ``lease_holder`` column), so freeze is replaced to raise the real ``Refusal`` (or an
++unexpected ``RuntimeError``). Not real DO/assembly proof; mocked Board adapter.
++"""
++from __future__ import annotations
++
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_operator_call as operator
++from hermes_cli import kanban_release as release, kanban_release_final as final
++from hermes_cli import kanban_release_certificate as certificate, kanban_release_intent as intent
++from tests.hermes_cli import test_owner_release_home as helpers
++from tests.hermes_cli.test_owner_release_home_recovery import synced_cache, winning_receipt
++
++fleet = helpers.fleet
++home = helpers.home
++queued = helpers.queued
++
++FINAL_TABLES = ("owner_release_applied_receipts", "owner_release_applications")
++
++
++def _final_effects(h):
++    c = h.f.h
++    names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    out = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in FINAL_TABLES if t in names}
++    out["events"] = [tuple(r) for r in c.execute("SELECT * FROM task_events ORDER BY id")]
++    out["task"] = tuple(c.execute("SELECT * FROM tasks WHERE id=?", (h.f.target,)).fetchone())
++    out["budget"] = c.execute("SELECT COUNT(*) FROM task_events WHERE kind LIKE '%budget%'").fetchone()[0]
++    return out
++
++
++def _sibling(h):
++    """A second, independent observed delivery on the same real queue."""
++    b = {**h.body, "intent_uid": "intent-sibling", "note": "Sibling goal"}
++    p = {**h.payload, "request_uid": "delivery-sibling", "intent": b, "digest": intent.digest(b)}
++    ev = {**h.event, "uid": "delivery-sibling", "payload": certificate.encode(p)}
++    with kb.write_txn(h.f.rep):
++        h.f.rep.execute("INSERT INTO task_events (uid,task_id,kind,payload,created_at) VALUES (?,?,?,?,?)",
++                        tuple(ev[k] for k in ("uid", "task_id", "kind", "payload", "created_at")))
++    hub = h.hub
++    events = {h.event["uid"]: h.event, "delivery-sibling": ev}
++    bodies = {h.body["intent_uid"]: h.body, "intent-sibling": b}
++    hub.row_evidence = lambda board, table, uid, **kw: (hub.outside() or dict(
++        board="default", table="task_events", uid=uid, state="live", row=copy.deepcopy(events[uid])))
++    hub.owner_release_evidence = lambda board, uid, *a, **kw: (hub.outside() or dict(
++        version=1, intent=bodies[uid], digest=intent.digest(bodies[uid]), state=hub.state))
++
++
++def _pending_apply(h):
++    operator.apply_incoming(h.f.h)
++    h.hub.winner, h.hub.state = winning_receipt(h), "consumed"
++    synced_cache(h)
++    operator.apply_incoming(h.f.h)
++    assert queued(h)["stage"] == "consumed_pending_apply"
++
++
++def test_typed_refusal_in_final_freeze_holds_row_and_sibling_progresses(home, monkeypatch):
++    h = home
++    _pending_apply(h)
++    _sibling(h)
++    h.hub.state = "authorized"
++    before = _final_effects(h)
++    seen = []
++
++    def refuse(conn, proof, **kw):
++        seen.append(kw["delivery_uid"])
++        raise release.Refusal("budget_limit_in_force", "typed refusal during final freeze")
++
++    monkeypatch.setattr(final, "freeze", refuse)
++    operator.apply_incoming(h.f.h)  # must not raise
++    assert seen == ["delivery-home"], "real final_home.process never reached final.freeze"
++    assert queued(h)["stage"] == "consumed_pending_apply"
++    assert _final_effects(h) == before
++    sibling = h.f.h.execute("SELECT stage FROM owner_release_home_queue WHERE delivery_uid='delivery-sibling'").fetchone()
++    assert sibling["stage"] == "consume_pending"
++    assert len(h.hub.calls) == 2  # original consume + sibling consume; no final POST
++
++
++def test_unexpected_runtime_error_in_final_freeze_escapes_and_closes_hub(home, monkeypatch):
++    h = home
++    _pending_apply(h)
++    closed = []
++    h.hub.close = lambda: closed.append(True)
++    before = _final_effects(h)
++
++    def boom(conn, proof, **kw):
++        raise RuntimeError("unexpected final failure")
++
++    monkeypatch.setattr(final, "freeze", boom)
++    with pytest.raises(RuntimeError, match="unexpected final failure"):
++        h.subject.tick(h.f.h, h.f.rep, "hub", "default")
++    assert closed == [True]
++    assert queued(h)["stage"] == "consumed_pending_apply"
++    assert _final_effects(h) == before
+-- 
+2.43.0
+

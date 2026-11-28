@@ -1,0 +1,424 @@
+From 0ff9e514fed846e78d91f8dcf8eedb0f30abf4f8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 15:54:50 +0000
+Subject: [PATCH 6833] Code-attestation inventory cost, diagnostics and quiet-start review records
+
+Public mirror of source commit 0ff9e514fed846e78d91f8dcf8eedb0f30abf4f8.
+
+---
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index 37e32cc57f1bf73d1ec5718f1926a0843da3b0f5..9a2f351d88a10ed70792e8981d106942dd8ad4fb 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -26,7 +26,7 @@
+ 
+ # Load the stdlib-only observer before an audit ledger can be activated. A lazy
+ # import inside its first inventory would itself change the observed code graph.
+-from hermes_cli.code_inventory_diagnostics import inventory_modules
++from hermes_cli.code_inventory_diagnostics import InventoryObservation, inventory_modules
+ 
+ if TYPE_CHECKING:
+     from hermes_cli.code_attestation_snapshot import DiagnosticSnapshot
+@@ -761,9 +761,10 @@
+ 
+     def quiet_unknown_partition(self, *, inventory=False):
+         """Blocking and informational unknowns, from one locked ledger observation."""
+-        with self._lock:
++        with InventoryObservation(self, enabled=inventory) as diagnostics:
+             if inventory:
+-                self.unknowns()
++                self._settle()
++                self._inventory_modules(diagnostics=diagnostics)
+             else:
+                 self.latched_unknowns()
+             extension = self._extension_unknowns - self._blocking_unknowns
+@@ -1168,8 +1169,8 @@
+         from hermes_cli.code_attestation_inventory import inventory_modules
+         return inventory_modules(self, deadline=deadline, progress=progress)
+ 
+-    def _inventory_modules(self, *, deadline=None):
+-        return inventory_modules(self, deadline=deadline)
++    def _inventory_modules(self, *, deadline=None, diagnostics=None):
++        return inventory_modules(self, deadline=deadline, diagnostics=diagnostics)
+ 
+     def _audit(self, event, args):
+         if event not in ("compile", "exec", "import", "ctypes.dlopen") or getattr(self._tls, "busy", False):
+@@ -1852,9 +1853,9 @@
+                 "interpreter": dict(self.interpreter_identity)}
+ 
+     def unknowns(self):
+-        with self._lock:
++        with InventoryObservation(self) as diagnostics:
+             self._settle()
+-            self._inventory_modules()
++            self._inventory_modules(diagnostics=diagnostics)
+             return tuple(sorted(self._unknown))
+ 
+     def integrity_observation(self, *, deadline=None):
+@@ -1866,14 +1867,10 @@
+         if deadline is not None and self.__dict__.get("_pending"):
+             self._demand.set()  # even a reader that is already out of budget is waiting
+         _check_inventory_deadline(deadline)
+-        acquired = (self._lock.acquire() if deadline is None else
+-                    self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())))
+-        if not acquired:
+-            raise TimeoutError('code attestation inventory budget exhausted')
+-        try:
++        with InventoryObservation(self, deadline=deadline) as diagnostics:
+             self._settle(deadline=deadline)
+             _check_inventory_deadline(deadline)
+-            self._inventory_modules(deadline=deadline)
++            self._inventory_modules(deadline=deadline, diagnostics=diagnostics)
+             _check_inventory_deadline(deadline)
+             if getattr(self, '_reviewed_plugins', None):
+                 from hermes_cli.plugin_review_records import verify_registered
+@@ -1882,8 +1879,6 @@
+             return {"core_root": str(self.core_root), "boot_sha": self.boot_sha,
+                     "route": self.route, "generation": self._generation,
+                     "unknowns": tuple(sorted(self._unknown))}
+-        finally:
+-            self._lock.release()
+ 
+     def latched_unknowns(self):
+         """The latched unknowns without a module inventory (cheap: polled while measuring)."""
+diff --git a/hermes_cli/code_inventory_diagnostics.py b/hermes_cli/code_inventory_diagnostics.py
+index 1e4cebacdc77e9c60df6b3f3fc15d2aaa1b38bb4..c7d4069cb84a3a6c3f48a4889316c22d301f24da 100644
+--- a/hermes_cli/code_inventory_diagnostics.py
++++ b/hermes_cli/code_inventory_diagnostics.py
+@@ -52,34 +52,54 @@
+                 except Exception:  # health: allow BLE001 -- preserve the operation's exact exception/result
+                     self.enabled = False
+ 
++    def stop(self, completed):
++        self.outcome = 'completed' if completed else 'aborted'
++        self.total = None
++        if self.enabled:
++            try:
++                self.total = monotonic_ns() - self.begin[0], thread_time_ns() - self.begin[1]
++            except Exception:  # health: allow BLE001 -- optional clocks cannot replace inventory failure
++                self.enabled = False
++
+     def finish(self):
+         if not self.enabled:
+             return
+         try:
+-            total = monotonic_ns() - self.begin[0], thread_time_ns() - self.begin[1]
++            total = getattr(self, 'total', None)
++            if total is None:
++                total = monotonic_ns() - self.begin[0], thread_time_ns() - self.begin[1]
+             stages = {key: (row[0], row[1] / 1_000_000, row[2] / 1_000_000)
+                       for key, row in self.stages.items()}
+             stages['modules'] = (self.count,
+                 max(0, total[0] - sum(r[1] for r in self.stages.values())) / 1_000_000,
+                 max(0, total[1] - sum(r[2] for r in self.stages.values())) / 1_000_000)
+             self.sink.info('code_inventory pid=%d thread=%d request_ns=%d modules=%d '
+-                        'wall_ms=%.3f cpu_ms=%.3f stages=%s', os.getpid(),
++                        'wall_ms=%.3f cpu_ms=%.3f outcome=%s stages=%s', os.getpid(),
+                         threading.get_ident(), self.begin[0], self.count,
+-                        total[0] / 1_000_000, total[1] / 1_000_000, stages)
++                        total[0] / 1_000_000, total[1] / 1_000_000,
++                        getattr(self, 'outcome', 'completed'), stages)
+         except Exception:  # health: allow BLE001 S110 -- an optional sink/clock failure must never replace an inventory result; no recursive logging
+             pass
+ 
+ 
+-def inventory_modules(ledger, *, deadline=None):
++def inventory_modules(ledger, *, deadline=None, diagnostics=None):
+     from hermes_cli.code_attestation import MAX_UNITS, _check_inventory_deadline
+ 
+-    diagnostics = InventoryDiagnostics()
++    if diagnostics is not None:
++        diagnostics.scanned = True
++        if diagnostics.enabled:
++            try:
++                diagnostics.begin = monotonic_ns(), thread_time_ns()
++            except Exception:  # health: allow BLE001 -- timing failure cannot stop the inventory
++                diagnostics.enabled = False
++    completed = False
+     try:
+         # Recheck every mutable filename and freshly resolve every path, including
+         # unchanged module identities. This is timing, not a cache or trust shortcut.
+         for name, module in ledger._module_snapshot():
+             _check_inventory_deadline(deadline)
+-            diagnostics.count += 1
++            if diagnostics is not None:
++                diagnostics.count += 1
+             filename = getattr(module, '__file__', None)
+             ledger._module_file(name, filename, diagnostics=diagnostics)
+             key = (name, id(module))
+@@ -91,5 +111,35 @@
+                 continue
+             ledger._modules[key] = identity
+             ledger._generation += 1
++        completed = True
+     finally:
+-        diagnostics.finish()
++        if diagnostics is not None:
++            diagnostics.stop(completed)
++
++
++class InventoryObservation:
++    """Only the outer ledger reader may look up or emit to a logging sink.
++
++    Nested/private inventories remain fully verified but uninstrumented. Timing
++    starts inside the scan and stops before release; logging runs only off-lock.
++    """
++    def __init__(self, ledger, *, deadline=None, enabled=True):
++        self.lock = ledger._lock
++        self.deadline = deadline
++        owned = getattr(self.lock, '_is_owned', None)
++        self.diagnostics = InventoryDiagnostics() if enabled and callable(owned) and not owned() else None
++
++    def __enter__(self):
++        # Keep the existing shared-deadline acquisition semantics.
++        from time import monotonic
++
++        acquired = (self.lock.acquire() if self.deadline is None else
++                    self.lock.acquire(timeout=max(0.0, self.deadline - monotonic())))
++        if not acquired:
++            raise TimeoutError('code attestation inventory budget exhausted')
++        return self.diagnostics
++
++    def __exit__(self, _kind, _value, _traceback):
++        self.lock.release()
++        if self.diagnostics is not None and getattr(self.diagnostics, 'scanned', False):
++            self.diagnostics.finish()
+diff --git a/tests/hermes_cli/test_code_inventory_diagnostics.py b/tests/hermes_cli/test_code_inventory_diagnostics.py
+index aeb0fd641f5dd172d7a4b8d9dc4debe57e0aa755..1796410f31ccfebf6162e6027da4e22db4e9e467 100644
+--- a/tests/hermes_cli/test_code_inventory_diagnostics.py
++++ b/tests/hermes_cli/test_code_inventory_diagnostics.py
+@@ -4,6 +4,7 @@
+ from pathlib import Path
+ import subprocess
+ import sys
++import threading
+ 
+ import pytest
+ 
+@@ -37,7 +38,9 @@
+     module.__file__ = str(tmp_path / 'not-secret-in-log.py')
+     ledger._module_snapshot = lambda: (('not-secret-in-log', module),)
+     with caplog.at_level(logging.INFO, logger='hermes_cli.code_inventory_diagnostics'):
+-        ledger._inventory_modules()
++        ledger._lock = threading.RLock()
++        with diagnostics.InventoryObservation(ledger) as timer:
++            ledger._inventory_modules(diagnostics=timer)
+     assert ledger._modules == {('not-secret-in-log', id(module)): (module, module.__file__)}
+     assert ledger._generation == 1
+     rows = [r for r in caplog.records if r.name == 'hermes_cli.code_inventory_diagnostics']
+@@ -71,7 +74,9 @@
+ 
+         monkeypatch.setattr(target, name, delayed)
+     with caplog.at_level(logging.INFO, logger=diagnostics.__name__):
+-        ledger._inventory_modules()
++        ledger._lock = threading.RLock()
++        with diagnostics.InventoryObservation(ledger) as timer:
++            ledger._inventory_modules(diagnostics=timer)
+     row = next(r for r in caplog.records if r.name == diagnostics.__name__)
+     assert row.args[2:6] == (10_000_000_000, 1, 12000.0, 600.0)
+     assert row.args[-1] == {'resolve': (1, 3000.0, 100.0), 'owner': (1, 4000.0, 200.0),
+diff --git a/tests/hermes_cli/test_inventory_diagnostics_lock_order.py b/tests/hermes_cli/test_inventory_diagnostics_lock_order.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dba33133852b01cb80a441d02b3399eb4ff000c
+--- /dev/null
++++ b/tests/hermes_cli/test_inventory_diagnostics_lock_order.py
+@@ -0,0 +1,196 @@
++"""Observer logging must stay outside the public ledger lock boundary."""
++import logging
++import os
++import threading
++import subprocess
++import sys
++import time
++from pathlib import Path
++from types import ModuleType
++
++import pytest
++
++from hermes_cli import code_attestation as ca
++from hermes_cli import code_inventory_diagnostics as diagnostics
++
++
++def ledger_fixture(tmp_path):
++    ledger = object.__new__(ca.Attestation)
++    ledger._lock = threading.RLock()
++    ledger._tls = threading.local()
++    ledger._pid = os.getpid()
++    ledger._components = {}
++    ledger._stdlib = tmp_path
++    ledger._modules = {}
++    ledger._generation = 0
++    ledger._unknown = set()
++    ledger._extension_unknowns = set()
++    ledger._blocking_unknowns = set()
++    ledger.core_root = tmp_path
++    ledger.boot_sha = 'fixture'
++    ledger.route = None
++    ledger._module_snapshot = lambda: ()
++    ledger._settle = lambda **_kwargs: None
++    return ledger
++
++
++@pytest.mark.parametrize('entry', ['integrity_observation', 'unknowns', 'partition'])
++def test_sink_lookup_enablement_and_emit_are_outside_ledger_lock(tmp_path, monkeypatch, entry):
++    ledger = ledger_fixture(tmp_path)
++    events = []
++
++    class Sink:
++        def isEnabledFor(self, _level):
++            assert not ledger._lock._is_owned(), 'enablement under ledger lock'
++            events.append('enabled')
++            return True
++
++        def info(self, *_args):
++            assert not ledger._lock._is_owned(), 'emit under ledger lock'
++            events.append('emit')
++
++    def getter(_name):
++        assert not ledger._lock._is_owned(), 'lookup under ledger lock'
++        events.append('lookup')
++        return Sink()
++
++    monkeypatch.setattr(diagnostics, 'logger', None)
++    fake_logging = ModuleType('logging')
++    fake_logging.getLogger = getter
++    fake_sys = ModuleType('observer_sys')
++    fake_sys.modules = {'logging': fake_logging}
++    monkeypatch.setattr(diagnostics, 'sys', fake_sys)
++    if entry == 'partition':
++        ledger.quiet_unknown_partition(inventory=True)
++    else:
++        getattr(ledger, entry)()
++    assert events == ['lookup', 'enabled', 'emit']
++
++
++def test_nested_public_read_never_logs_under_outer_ledger_lock(tmp_path, monkeypatch):
++    ledger = ledger_fixture(tmp_path)
++
++    def forbidden(*_args):
++        raise AssertionError('nested reader consulted logging')
++
++    monkeypatch.setattr(diagnostics, 'InventoryDiagnostics', forbidden)
++    with ledger._lock:
++        assert ledger.unknowns() == ()
++        assert ledger.integrity_observation()['unknowns'] == ()
++        assert ledger.quiet_unknown_partition(inventory=True) == ([], [])
++
++
++def test_completed_row_excludes_time_after_scan_and_before_emit(tmp_path, monkeypatch, caplog):
++    ledger = ledger_fixture(tmp_path)
++    clocks = [100, 10]
++    monkeypatch.setattr(diagnostics, 'monotonic_ns', lambda: clocks[0])
++    monkeypatch.setattr(diagnostics, 'thread_time_ns', lambda: clocks[1])
++    with caplog.at_level(logging.INFO, logger=diagnostics.__name__):
++        with diagnostics.InventoryObservation(ledger) as timer:
++            ledger._inventory_modules(diagnostics=timer)
++            clocks[0] += 20_000_000
++            clocks[1] += 10_000_000
++    row = next(r for r in caplog.records if r.name == diagnostics.__name__)
++    assert 'outcome=completed' in row.getMessage()
++    assert row.args[4:6] == (0.0, 0.0)
++
++
++def test_no_inventory_partition_does_not_consult_logging(tmp_path, monkeypatch):
++    ledger = ledger_fixture(tmp_path)
++
++    def forbidden(*_args):
++        raise AssertionError('cheap partition consulted logging')
++
++    monkeypatch.setattr(diagnostics, 'InventoryDiagnostics', forbidden)
++    assert ledger.quiet_unknown_partition() == ([], [])
++
++
++def test_deadline_aborted_inventory_emits_one_partial_row_and_preserves_exception(tmp_path, monkeypatch, caplog):
++    ledger = ledger_fixture(tmp_path)
++    module = ModuleType('first')
++    ledger._module_snapshot = lambda: (('first', module), ('second', module))
++    original = TimeoutError('original inventory deadline')
++    checks = []
++
++    def check(_deadline):
++        checks.append(None)
++        # Public entry, after settlement, first module, then second module.
++        if len(checks) == 4:
++            raise original
++
++    monkeypatch.setattr(ca, '_check_inventory_deadline', check)
++    with caplog.at_level(logging.INFO, logger=diagnostics.__name__):
++        with pytest.raises(TimeoutError) as raised:
++            ledger.integrity_observation(deadline=time.monotonic() + 60)
++    assert raised.value is original
++    rows = [r for r in caplog.records if r.name == diagnostics.__name__]
++    assert len(rows) == 1
++    assert 'outcome=aborted' in rows[0].getMessage()
++    assert 'modules=1' in rows[0].getMessage()
++
++
++@pytest.mark.parametrize('mode', ['module_lock', 'handler_lock'])
++def test_logging_holder_can_enter_real_audit_during_inventory(tmp_path, monkeypatch, mode):
++    if os.environ.get('HERMES_INVENTORY_LOCK_PROBE') != mode:
++        result = subprocess.run(
++            [sys.executable, '-m', 'pytest', '-q',
++             str(Path(__file__).resolve()) + '::test_logging_holder_can_enter_real_audit_during_inventory[' + mode + ']'],
++            env={**os.environ, 'HERMES_INVENTORY_LOCK_PROBE': mode},
++            capture_output=True, text=True, timeout=25, check=False)
++        assert result.returncode == 0, result.stdout + result.stderr
++        return
++    ledger = ledger_fixture(tmp_path)
++    holding_log = threading.Event()
++    in_inventory = threading.Event()
++    audit_entered = threading.Event()
++    done = threading.Event()
++    errors = []
++    handler = logging.NullHandler()
++    log_lock = logging._lock if mode == 'module_lock' else handler.lock
++    if log_lock is None:
++        handler.createLock()
++        # NullHandler deliberately has no lock; use the ordinary handler lock.
++        handler = logging.Handler()
++        log_lock = handler.lock
++
++    def settle(**_kwargs):
++        in_inventory.set()
++        assert holding_log.wait(5)
++        assert audit_entered.wait(5)
++
++    ledger._settle = settle
++    monkeypatch.setattr(diagnostics, 'logger', None if mode == 'module_lock' else diagnostics.logger)
++    sink = diagnostics.logger
++    if mode == 'handler_lock':
++        monkeypatch.setattr(sink, 'isEnabledFor', lambda _level: True)
++        monkeypatch.setattr(sink, 'info', lambda *_args: handler.acquire() or handler.release())
++
++    def holder():
++        try:
++            with log_lock:
++                holding_log.set()
++                assert in_inventory.wait(5)
++                audit_entered.set()
++                ledger._audit('import', ('inventory_sentinel', None))
++            done.set()
++        except BaseException as exc:
++            errors.append(exc)
++
++    # Run public observation first: logging enablement may legitimately wait for
++    # another logging holder, but must not own the ledger during that wait.
++    def observe():
++        try:
++            ledger.integrity_observation()
++        except BaseException as exc:
++            errors.append(exc)
++
++    a = threading.Thread(target=observe, daemon=True)
++    b = threading.Thread(target=holder, daemon=True)
++    a.start()
++    assert in_inventory.wait(5)
++    b.start()
++    a.join(6)
++    b.join(6)
++    assert not a.is_alive() and not b.is_alive(), 'logging/ledger inversion deadlocked'
++    assert done.is_set()
++    assert errors == []
+-- 
+2.43.0
+

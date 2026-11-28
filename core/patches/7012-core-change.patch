@@ -1,0 +1,120 @@
+From 294181ce4a3d4d8ff88cf4e6c094320eed743bdd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:05:16 +0000
+Subject: [PATCH 7012] Attested acceptance continuations for budgeted lane planning
+
+Public mirror of source commit 294181ce4a3d4d8ff88cf4e6c094320eed743bdd.
+
+---
+diff --git a/hermes_cli/kanban_acceptance_continuations.py b/hermes_cli/kanban_acceptance_continuations.py
+index 37e2d6154466674ade2a9cfc120f520a7dcd0d4f..e7592fb4add70267024104ccac45f1b6430bf398 100644
+--- a/hermes_cli/kanban_acceptance_continuations.py
++++ b/hermes_cli/kanban_acceptance_continuations.py
+@@ -89,20 +89,27 @@
+     _, original = _created(conn, parent_id)
+     if original.get("source_body_sha256") != _body(parent):
+         raise ValueError("acceptance_continuations: unchanged original creation scope required")
++    from hermes_cli import kanban_foreign_card as foreign
+     items, seen = [], set()
+-    for item in raw["items"]:
+-        if (not isinstance(item, dict) or set(item) != {"card", "criterion"}
+-                or not isinstance(item["card"], str) or item["card"] in seen
+-                or not isinstance(item["criterion"], str) or not 16 <= len(item["criterion"].strip()) <= 2000
+-                or item["criterion"] not in (parent["body"] or "")):
+-            raise ValueError("acceptance_continuations: unique child and literal source criterion required")
+-        child = conn.execute("SELECT * FROM tasks WHERE id=?", (item["card"],)).fetchone()
+-        uid = _lineage(conn, parent_id, item["card"])
+-        if (child is None or not uid
+-                or child["status"] in ("done", "archived") or _hold(conn, child)):
+-            raise ValueError("acceptance_continuations: open unprotected created dependency required")
+-        seen.add(item["card"])
+-        items.append({**item, "created_uid": uid, "scope_sha256": _scope(child)})
++    # A Board-synced live file is partial: a pool worker's live file holds its claimed parent, but children it
++    # created are origin-forwarded and live only in this same board's read-only replica (as _verify_created_cards).
++    with foreign.open_replica(foreign._live_db_file(conn)) as replica:
++        for item in raw["items"]:
++            if (not isinstance(item, dict) or set(item) != {"card", "criterion"}
++                    or not isinstance(item["card"], str) or item["card"] in seen
++                    or not isinstance(item["criterion"], str) or not 16 <= len(item["criterion"].strip()) <= 2000
++                    or item["criterion"] not in (parent["body"] or "")):
++                raise ValueError("acceptance_continuations: unique child and literal source criterion required")
++            src = conn
++            child = conn.execute("SELECT * FROM tasks WHERE id=?", (item["card"],)).fetchone()
++            if child is None and replica is not None:
++                src, child = replica, replica.execute("SELECT * FROM tasks WHERE id=?", (item["card"],)).fetchone()
++            uid = _lineage(src, parent_id, item["card"])
++            if (child is None or not uid
++                    or child["status"] in ("done", "archived") or _hold(src, child)):
++                raise ValueError("acceptance_continuations: open unprotected created dependency required")
++            seen.add(item["card"])
++            items.append({**item, "created_uid": uid, "scope_sha256": _scope(child)})
+     return {"version": 1, "source_body_sha256": _body(parent), "run_uid": run["uid"], "items": items}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_acceptance_continuations.py b/tests/hermes_cli/test_kanban_acceptance_continuations.py
+index 41f9996768f372261752902ca2c80af9d26061a7..ee0d7f706101fc8cc65a11b797c8dc4279a23fb3 100644
+--- a/tests/hermes_cli/test_kanban_acceptance_continuations.py
++++ b/tests/hermes_cli/test_kanban_acceptance_continuations.py
+@@ -288,3 +288,59 @@
+     conn.commit()
+     result = next(c for c in candidates(conn) if c["card"] == child)
+     assert not result["eligible"] and "creator dependency missing" in result["reason"]
++
++
++def _partial_live_file(conn, tmp_path, monkeypatch, *, link=True):
++    """A Board-synced pool worker: its live file holds the claimed parent, while the child its run created was
++    origin-forwarded and exists only in this board's replica (live fixture t_d0c5000000000014 shape)."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_foreign_card as foreign
++    parent = kb.create_task(conn, title="Preserve chat ownership", body=f"Acceptance:\n- {CRITERION}.",
++                            assignee="default", created_by="user")
++    assert kb.claim_task(conn, parent, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    run = kb.get_task(conn, parent).current_run_id
++    bootstrap(conn)
++    path = tmp_path / "sync-shadow" / "default.db"
++    path.parent.mkdir()
++    replica = kbc.connect(db_path=path)
++    conn.commit()
++    conn.backup(replica)
++    child = kb.create_task(replica, title="Verify painted Desktop sidebar grouping (read-only)",
++                           body=f"Read-only acceptance verification: {CRITERION}.", assignee="default",
++                           created_by="default", creator_task_id=parent, parents=[parent] if link else ())
++    bootstrap(replica)
++    replica.commit()
++    replica.close()
++    live = foreign._live_db_file(conn)
++    monkeypatch.setattr(foreign, "replica_path", lambda db_path: path if db_path == live else None)
++    assert kb.get_task(conn, child) is None  # the live file lacks it: only the replica has the child
++    declaration = {"version": 1, "source_body_sha256": hashlib.sha256(kb.get_task(conn, parent).body.encode()).hexdigest(),
++                   "items": [{"card": child, "criterion": CRITERION}]}
++    return parent, child, run, {"acceptance_continuations": declaration}, path
++
++
++def test_pool_worker_attests_replica_only_child(conn, configured, tmp_path, monkeypatch):
++    from hermes_cli.kanban_acceptance_continuations import _created
++    parent, child, run, metadata, path = _partial_live_file(conn, tmp_path, monkeypatch)
++    assert kb.complete_task(conn, parent, summary="Backend delivered; renderer remains.", metadata=metadata,
++                            expected_run_id=run)
++    proof = json.loads(conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='completed'",
++                                    (parent,)).fetchone()[0])["acceptance_continuations"]
++    from hermes_cli import kanban_db_connect as kbc
++    replica = kbc.connect(db_path=path)
++    try:
++        assert proof["items"][0]["card"] == child
++        assert proof["items"][0]["created_uid"] == _created(replica, child)[0]
++    finally:
++        replica.close()
++
++
++@pytest.mark.parametrize("case", ["unlinked", "no_replica"])
++def test_replica_lookup_keeps_lineage_and_fails_closed(conn, configured, tmp_path, monkeypatch, case):
++    from hermes_cli import kanban_foreign_card as foreign
++    parent, _child, run, metadata, _ = _partial_live_file(conn, tmp_path, monkeypatch, link=case != "unlinked")
++    if case == "no_replica":
++        monkeypatch.setattr(foreign, "replica_path", lambda db_path: None)
++    with pytest.raises(ValueError, match="created dependency"):
++        kb.complete_task(conn, parent, summary="done", metadata=metadata, expected_run_id=run)
++    assert kb.get_task(conn, parent).status == "running"
+-- 
+2.43.0
+

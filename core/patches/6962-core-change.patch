@@ -1,0 +1,317 @@
+From 03df4b879ad53039f48ecb22d09b3ca0a92b3368 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:45:05 +0000
+Subject: [PATCH 6962] Desktop session identity across gateway renames, clarify attention and first send
+
+Public mirror of source commit 03df4b879ad53039f48ecb22d09b3ca0a92b3368.
+
+---
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx
+index 719c4a520266ed028acb24652200f107480f4cec..3f980687153529260507e336c4977926ca172efc 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-submit.restore-scoping.test.tsx
+@@ -1,11 +1,12 @@
+ import { useStore } from '@nanostores/react'
+ import { act, cleanup, render, waitFor } from '@testing-library/react'
+ import { startTransition, Suspense, useLayoutEffect, useRef } from 'react'
+-import { afterEach, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { createSessionRpcDispatcher } from '@/app/contrib/session-rpc-dispatcher'
+ import { NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '@/app/routes'
+ import { usePromptActions } from '@/app/session/hooks/use-prompt-actions'
++import { CHAT_MODEL_LOADING_RETRY_TIMEOUT_MS } from '@/app/session/hooks/use-prompt-actions/utils'
+ import { useSessionActions } from '@/app/session/hooks/use-session-actions'
+ import { useSessionStateCache } from '@/app/session/hooks/use-session-state-cache'
+ import {
+@@ -668,3 +669,151 @@
+   expect($unlistedSessionOwnerRows.get().map(row => row.id)).toContain('stored-B')
+   warn.mockRestore()
+ })
++
++const LOADING = '400: Chat model is still loading; retry when it is ready'
++
++// A hub whose session.create answers `onCreate(callNumber)` (throw to refuse) and whose prompt.submit
++// answers `onSubmit`.
++const mockHub = (onCreate: (call: number) => void, onSubmit: (call: number, params: Record<string, unknown>) => unknown) => {
++  const calls = { create: 0, submit: 0, params: [] as Record<string, unknown>[] }
++
++  vi.mocked(requestGatewayForAgent).mockImplementation(async (_connection, _profile, method, params) => {
++    if (method === 'session.create') {
++      calls.create += 1
++      onCreate(calls.create)
++
++      return { session_id: 'rt-B', stored_session_id: 'stored-B', info: {} }
++    }
++
++    if (method === 'prompt.submit') {
++      calls.submit += 1
++      calls.params.push(params as Record<string, unknown>)
++
++      return await onSubmit(calls.submit, params as Record<string, unknown>)
++    }
++
++    // Closing the orphaned session after a drift abort.
++    if (method === 'session.close') {
++      return {}
++    }
++
++    throw new Error(`unexpected ${method}`)
++  })
++
++  return calls
++}
++
++it('waits out a hub still loading its chat model on session.create, then delivers the first send', async () => {
++  stashSessionDraft(null, 'first message before the session exists', [])
++  $newChatRoute.set({ connectionId: 'connection-create-loading', profile: 'default' })
++
++  const calls = mockHub(
++    call => {
++      if (call === 1) {
++        throw new Error(LOADING)
++      }
++    },
++    (_call, params) => ({ status: 'started', session_id: 'rt-B', submission_id: params.submission_id })
++  )
++
++  seed({}, null)
++  act(() => handles.submit.submitDraft())
++  await waitFor(() => expect(calls.submit).toBe(1), { timeout: 8_000 })
++  expect(calls.create).toBe(2)
++  expect(window.localStorage.getItem('hermes:composer-draft-retry:v1:stored-B')).toBeNull()
++}, 15_000)
++
++it('does not yank the user back to the new chat when they switch away while session.create waits out the loading hub', async () => {
++  stashSessionDraft(null, 'first message while I wander off', [])
++  $newChatRoute.set({ connectionId: 'connection-create-switch', profile: 'default' })
++
++  const calls = mockHub(
++    call => {
++      if (call === 1) {
++        // The user opens chat A while the hub is still loading, then the retry succeeds.
++        act(() => navigate('A'))
++        throw new Error(LOADING)
++      }
++    },
++    (_call, params) => ({ status: 'started', session_id: 'rt-B', submission_id: params.submission_id })
++  )
++
++  seed({}, null)
++  act(() => handles.submit.submitDraft())
++  await waitFor(() => expect(calls.create).toBe(2), { timeout: 8_000 })
++  await act(async () => {
++    await new Promise(resolve => setTimeout(resolve, 50))
++  })
++
++  // The drift baseline is the one captured at send: the switch aborts the send and the user stays on A.
++  expect(calls.submit).toBe(0)
++  expect(route).toBe('stored-A')
++  expect($selectedStoredSessionId.get()).toBe('stored-A')
++  expect($activeSessionId.get()).toBe('rt-A')
++}, 15_000)
++
++describe('a hub that never finishes loading its chat model', () => {
++  let nowOffset = 0
++  let nowSpy: ReturnType<typeof vi.spyOn>
++
++  beforeEach(() => {
++    nowOffset = 0
++    const realNow = Date.now.bind(Date)
++    nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + nowOffset)
++  })
++
++  afterEach(() => {
++    nowSpy.mockRestore()
++  })
++
++  it('stops waiting at the deadline and parks the first send as a retry draft', async () => {
++    stashSessionDraft(null, 'first message the loading hub never takes', [])
++    $newChatRoute.set({ connectionId: 'connection-deadline', profile: 'default' })
++
++    const calls = mockHub(
++      () => {},
++      () => {
++        // The wait budget is spent as soon as the first refusal arrives.
++        nowOffset = CHAT_MODEL_LOADING_RETRY_TIMEOUT_MS + 1_000
++        throw new Error(LOADING)
++      }
++    )
++
++    seed({}, null)
++    act(() => handles.submit.submitDraft())
++    await waitFor(() => expect(window.localStorage.getItem('hermes:composer-draft-retry:v1:stored-B')).not.toBeNull())
++    // Past the deadline the refusal is final: exactly one attempt, no endless wait.
++    expect(calls.submit).toBe(1)
++    expect(outboxKeys()).toEqual([])
++    expect($unlistedSessionOwnerRows.get().map(row => row.id)).toContain('stored-B')
++  }, 15_000)
++
++  it('retries an identityless resend after a definite loading refusal instead of calling it unsafe', async () => {
++    stashSessionDraft(null, 'first message to a backend without submission ids', [])
++    $newChatRoute.set({ connectionId: 'connection-legacy', profile: 'default' })
++
++    const calls = mockHub(
++      () => {},
++      call => {
++        if (call === 1) {
++          // Pre-admission refusal of `submission_id`: the client falls back to an identityless write.
++          throw Object.assign(new Error('invalid params'), { code: 4094 })
++        }
++
++        if (call === 2) {
++          throw new Error(LOADING)
++        }
++
++        return { status: 'started', session_id: 'rt-B' }
++      }
++    )
++
++    seed({}, null)
++    act(() => handles.submit.submitDraft())
++    await waitFor(() => expect(calls.submit).toBe(3), { timeout: 8_000 })
++    expect(calls.params[0]).toHaveProperty('submission_id')
++    expect(calls.params[1]).not.toHaveProperty('submission_id')
++    expect(calls.params[2]).not.toHaveProperty('submission_id')
++    expect(window.localStorage.getItem('hermes:composer-draft-retry:v1:stored-B')).toBeNull()
++  }, 15_000)
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx b/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx
+index e6b88cde483c112e28ecd078daa03bd51e197ded..8b660d8311c02fc8a9e7ef5236b894dab48a408d 100644
+--- a/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/draft-rows.test.tsx
+@@ -6,7 +6,7 @@
+ 
+ const state = vi.hoisted(() => ({ focus: vi.fn(), reveal: vi.fn(), note: vi.fn() }))
+ vi.mock('@/components/pane-shell/tree/store', () => ({ revealTreePane: state.reveal, noteActiveTreeGroup: state.note }))
+-vi.mock('@/i18n', () => ({ useI18n: () => ({ t: { sidebar: { nav: { 'new-session': 'New session' } } } }) }))
++vi.mock('@/i18n', () => ({ useI18n: () => ({ t: { sidebar: { nav: { 'new-session': 'New session', 'unsent-retry': 'Not sent – retry:' } } } }) }))
+ vi.mock('@/store/session-states', () => ({ $sessionTiles: atom([]), focusOpenSession: state.focus }))
+ vi.mock('@/store/session-focus', () => ({ $focusedStoredSessionId: atom(null), $focusedSessionIsTile: atom(false) }))
+ vi.mock('@/store/session', () => ({
+@@ -24,6 +24,7 @@
+ vi.mock('@/store/composer', () => ({
+   $draftTitles: atom({}),
+   $freshDraftKey: atom('__new__:test'),
++  draftKey: (scope: string | null | undefined) => scope ?? '__new__',
+   takeSessionDraft: () => ({ text: '', attachments: [] })
+ }))
+ vi.mock('@/store/projects', async () => {
+@@ -243,4 +244,22 @@
+     rerender(view({ filter: ['__no_project__'] }))
+     expect(rows()).toHaveLength(1)
+   })
++
++  it('lists a chat whose first send the hub never accepted as unsent even with no tile open', () => {
++    window.localStorage.setItem(
++      'hermes:composer-draft-retry:v1:parked',
++      JSON.stringify({ id: 'sub-1', text: 'my first words', attachmentIds: [] })
++    )
++    $unlistedSessionOwnerRows.set([makeSessionInfo({ id: 'parked' })])
++    render(view())
++    const parked = document.querySelector('[data-sidebar-draft-id="parked"]')
++    expect(parked?.textContent).toBe('Not sent – retry: New session')
++    window.localStorage.removeItem('hermes:composer-draft-retry:v1:parked')
++  })
++
++  it('does not list an unlisted stub without a retry draft or a tile', () => {
++    $unlistedSessionOwnerRows.set([makeSessionInfo({ id: 'plain' })])
++    render(view())
++    expect(document.querySelectorAll('[data-sidebar-draft-id]')).toHaveLength(0)
++  })
+ })
+diff --git a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+index 25f01f572df912cf3b0e1e0232584fdadbe2d514..2f455a1ae58f3dff8e5e84dbbfc1f72442c90a28 100644
+--- a/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
++++ b/apps/desktop/src/app/chat/sidebar/draft-rows.tsx
+@@ -130,7 +130,7 @@
+         type="button"
+       >
+         <span className="truncate">
+-          {row.unsent ? 'Not sent \u2013 retry: ' : ''}
++          {row.unsent ? `${t.sidebar.nav['unsent-retry'] ?? 'Not sent \u2013 retry:'} ` : ''}
+           {titles[row.id] || t.sidebar.nav['new-session']}
+         </span>
+       </button>
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index efc5e3c47d9d8b99a825727716e89c77207a83b3..6e5ea33bb75d39b48bc43007c1f541c2bcab9928 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -1042,13 +1042,9 @@
+         let createdId: null | string
+ 
+         try {
+-          // A hub still loading its chat model refuses the create too: wait it out instead of
+-          // failing a first send the user cannot see again.
+-          createdId = await withSessionBusyRetry(() =>
+-            createBackendSessionForSend(bubbleText, {
+-              onComposerScopeAssigned: options?.onComposerScopeAssigned
+-            })
+-          )
++          createdId = await createBackendSessionForSend(bubbleText, {
++            onComposerScopeAssigned: options?.onComposerScopeAssigned
++          })
+         } catch (err) {
+           dropOptimistic(null)
+           releaseBusy()
+diff --git a/apps/desktop/src/app/session/hooks/use-session-actions/session-create-request.ts b/apps/desktop/src/app/session/hooks/use-session-actions/session-create-request.ts
+index fa95c3e9893ca7c8b8bdd4229ce5d388f27726a5..737b9e07678c9953dc2de8361d210017b62604da 100644
+--- a/apps/desktop/src/app/session/hooks/use-session-actions/session-create-request.ts
++++ b/apps/desktop/src/app/session/hooks/use-session-actions/session-create-request.ts
+@@ -17,6 +17,8 @@
+ } from '@/store/session'
+ import type { SessionCreateResponse } from '@/types/hermes'
+ 
++import { withSessionBusyRetry } from '../use-prompt-actions/utils'
++
+ type RequestGateway = <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+ 
+ /** A backend predating a `session.create` field rejects the whole create at
+@@ -74,7 +76,7 @@
+     }
+   }
+ 
+-  return create(params)
++  return withSessionBusyRetry(() => create(params))
+ }
+ 
+ // `session.create` params from the current profile + sticky-UI model/effort/fast,
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 8187049c6782ca725fdd3d979e451cafda43bca3..964ff745d38d56ab04ad6cb379b93ecde1fd0da9 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -3251,6 +3251,7 @@
+     profileRail: 'Profile rail',
+     nav: {
+       'new-session': 'New session',
++      'unsent-retry': 'Not sent – retry:',
+       capabilities: 'Capabilities',
+       messaging: 'Messaging',
+       artifacts: 'Artifacts',
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index 1a60880556bff24bc17595cd8a4c3f0fb9020ff2..e090260ecba57f1fa7c927c0129e0bb927d78c0c 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -2405,5 +2405,6 @@
+   "assistant.thread.errorCodes.core_update_forced_stop.title": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "updates.stages.backup": ["ar","ja","ru","zh","zh-hant"],
+   "updates.backupProgress": ["ar","ja","ru","zh","zh-hant"],
+-  "updates.backupChecking": ["ar","ja","ru","zh","zh-hant"]
++  "updates.backupChecking": ["ar","ja","ru","zh","zh-hant"],
++  "sidebar.nav.unsent-retry": ["ar","de","es","fr","ja","ru","zh","zh-hant"]
+ }
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 1cb62f95b4d3fe0d1d4b23b399183de1e0f5a1e9..d10c1ace0e10eceabc9b529a39ac8245d56f0976 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -4850,6 +4850,7 @@
+     "sidebar.nav.cron",
+     "sidebar.nav.messaging",
+     "sidebar.nav.new-session",
++    "sidebar.nav.unsent-retry",
+     "sidebar.newSessionIn",
+     "sidebar.noFilterMatches",
+     "sidebar.noMatch",
+-- 
+2.43.0
+

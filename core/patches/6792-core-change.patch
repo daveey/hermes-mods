@@ -1,0 +1,200 @@
+From b862496915f3f72a3ccf2a75737341b747ade793 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 12:01:13 +0000
+Subject: [PATCH 6792] Origin-forward refusals, queued-create wait handles and wait-check parsing
+
+Public mirror of source commit b862496915f3f72a3ccf2a75737341b747ade793.
+
+---
+diff --git a/hermes_cli/kanban_origin_forward_run_end.py b/hermes_cli/kanban_origin_forward_run_end.py
+index be1b7b3dc2431886e08f0e495959ab6c3cdb9cfd..5f4a590e3e150153e38007addaad599aa81ed83f 100644
+--- a/hermes_cli/kanban_origin_forward_run_end.py
++++ b/hermes_cli/kanban_origin_forward_run_end.py
+@@ -16,7 +16,7 @@
+ _RESERVED = 'origin_forward_reserved'
+ 
+ 
+-def reserve(conn, task_id, run_uid, request_id):
++def reserve(conn, task_id, run_uid, request_id, *, submission_id=None):
+     """Commit an obligation under the same writer lock as ordinary run endings.
+ 
+     Called before starting the courier subprocess. A concurrent ending either
+@@ -31,11 +31,36 @@
+                            'AND r.uid=? AND r.ended_at IS NULL', (task_id, run_uid)).fetchone()
+         if row is None:
+             raise ValueError('origin_forward_submit_run_ended: no request submitted')
++        token = submission_id or request_id
+         found = conn.execute('SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=? '
+-                             "AND json_extract(payload,'$.request_id')=?",
+-                             (task_id, row[0], _RESERVED, request_id)).fetchone()
++                             "AND COALESCE(json_extract(payload,'$.submission_id'),json_extract(payload,'$.request_id'))=?",
++                             (task_id, row[0], _RESERVED, token)).fetchone()
+         if not found:
+-            kb._append_event(conn, task_id, _RESERVED, {'request_id': request_id}, run_id=row[0])
++            kb._append_event(conn, task_id, _RESERVED,
++                             {'request_id': request_id, 'submission_id': token}, run_id=row[0])
++        return row[0], token
++
++
++def settle_unsubmitted(conn, task_id, reservation, request_id, rc, error):
++    """Release only this attempt after a known pre-enqueue refusal and a readable absent row."""
++    prefixes = ('canonical_home_schema_unavailable:', 'canonical_home_origin_required:',
++                'origin_creator_required:', 'origin_assignee_required:', 'origin_request_invalid:',
++                'origin_forward_creator_required:', 'create_option_unsupported:')
++    if not ((rc == 2 and error.startswith(prefixes)) or
++            (rc == 127 and error.startswith('hub_exec_failed:'))):
++        return
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_capability_registry import hub_db_path, _ro
++    with kb.write_txn(conn):
++        try:
++            with closing(_ro(hub_db_path())) as db:
++                if db.execute('SELECT 1 FROM sent WHERE id=?', (request_id,)).fetchone():
++                    return
++        except (sqlite3.Error, OSError):
++            return  # Unknown delivery is still an obligation.
++        run_id, token = reservation
++        kb._append_event(conn, task_id, 'origin_forward_not_submitted',
++                         {'request_id': request_id, 'submission_id': token}, run_id=run_id)
+ 
+ 
+ def _pending(identity):
+@@ -55,8 +80,17 @@
+     row = conn.execute('SELECT uid FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
+     if not row or not row[0]:
+         return
+-    reservations = {json.loads(event[0])['request_id'] for event in conn.execute(
+-        'SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=?', (task_id, run_id, _RESERVED))}
++    events = [(kind, json.loads(raw)) for kind, raw in conn.execute(
++        'SELECT kind,payload FROM task_events WHERE task_id=? AND run_id=? AND kind IN (?,?) ORDER BY id',
++        (task_id, run_id, _RESERVED, 'origin_forward_not_submitted'))]
++    active = {}
++    for kind, event in events:
++        token = event.get('submission_id', event['request_id'])
++        if kind == _RESERVED:
++            active[token] = event['request_id']
++        else:
++            active.pop(token, None)
++    reservations = set(active.values())
+     from hermes_cli.kanban_capability_registry import hub_db_path, _ro
+     path = hub_db_path()
+     try:
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index dcc0cff824a7d3cd56cb144031ba581c70241cd5..55e2c60eb1d8dad25a58a17c927ee25ee389e775 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -1232,7 +1232,9 @@
+         p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+-    except (OSError, subprocess.TimeoutExpired) as exc:
++    except OSError as exc:
++        return 127, "", 'hub_exec_failed: ' + str(exc)
++    except subprocess.TimeoutExpired as exc:
+         return 127, "", str(exc)
+ 
+ 
+@@ -1350,10 +1352,15 @@
+                 argv += ["--creator-" + flag, value]
+     else:
+         argv += ["--origin-session", ""]
++    reservation = None
+     if foreign_origin and conn is not None:
++        from uuid import uuid4
+         from hermes_cli.kanban_origin_forward_run_end import reserve
+-        reserve(conn, creator['task_id'], run_uid, rid)
++        reservation = reserve(conn, creator['task_id'], run_uid, rid, submission_id=uuid4().hex)
+     rc, out, err = hub_runner(argv)
++    if reservation is not None:
++        from hermes_cli.kanban_origin_forward_run_end import settle_unsubmitted
++        settle_unsubmitted(conn, creator['task_id'], reservation, rid, rc, err or out)
+     if rc == 0:
+         return {"ok": True, "request_id": rid, "queued_only": False, "retry": prior is not None}
+     if rc == 3:  # hub unreachable after the liveness check: queued, sent on the next sync (durable)
+diff --git a/tests/hermes_cli/test_origin_forward_run_end.py b/tests/hermes_cli/test_origin_forward_run_end.py
+index eab3a6bb8a7ae28e71c7306d87b46b169ef6d316..1eb5d73e115a70fed558696e272c687cc61ecf56 100644
+--- a/tests/hermes_cli/test_origin_forward_run_end.py
++++ b/tests/hermes_cli/test_origin_forward_run_end.py
+@@ -168,6 +168,79 @@
+                                     creator=body['args']['creator'], run_uid='run-current', cfg={}, conn=conn)
+ 
+ 
++@pytest.mark.parametrize('reason', [
++    'canonical_home_schema_unavailable: core validation refused; nothing queued',
++    'origin_request_invalid: invalid qualified identity or request ID',
++    'origin_assignee_required: supply --assignee for tracked creation',
++    'origin_forward_creator_required: foreign origins require creator owner and run',
++    'create_option_unsupported: unsupported option',
++])
++def test_prequeue_refusal_releases_reservation(pending, monkeypatch, reason):
++    from hermes_cli import kanban_placement as placement
++    task, run, path, body = pending
++    with sqlite3.connect(path) as db:
++        db.execute('DELETE FROM sent')
++    monkeypatch.setattr(placement, 'hub_carries_options', lambda cli: True)
++    monkeypatch.setattr(placement, 'remote_state', lambda rid: None)
++    monkeypatch.setattr(placement, 'hub_runner', lambda argv: (2, '', reason))
++    with kbc.connect_closing() as conn:
++        result = placement.create_remote({'title': 'child', 'assignee': 'default'}, target='hub', self_gw='worker',
++                                         origin_session='chat', origin_profile='default', origin_gateway='hub',
++                                         creator=body['args']['creator'], run_uid='run-current', cfg={}, conn=conn)
++        assert not result['ok']
++        assert kb.complete_task(conn, task, summary='submit clearly refused', expected_run_id=run)
++
++
++def test_exec_failure_releases_reservation(pending, monkeypatch):
++    from hermes_cli import kanban_placement as placement
++    task, run, path, body = pending
++    with sqlite3.connect(path) as db:
++        db.execute('DELETE FROM sent')
++    monkeypatch.setattr(placement, 'hub_carries_options', lambda cli: True)
++    monkeypatch.setattr(placement, 'remote_state', lambda rid: None)
++    with kbc.connect_closing() as conn:
++        out = placement.create_remote({'title': 'child', 'assignee': 'default'}, target='hub', self_gw='worker',
++                                      origin_session='chat', origin_profile='default', origin_gateway='hub',
++                                      creator=body['args']['creator'], run_uid='run-current', cfg={}, conn=conn,
++                                      hub_cli=str(path.parent / 'missing-hub-cli'))
++        assert not out['ok'] and out['rc'] == 127
++        assert kb.complete_task(conn, task, summary='exec never started', expected_run_id=run)
++
++
++@pytest.mark.parametrize('case', ['timeout', 'unknown', 'queued', 'unreadable', 'concurrent', 'retry'])
++def test_uncertain_or_other_submission_still_holds_run(pending, monkeypatch, case):
++    from hermes_cli import kanban_placement as placement
++    from hermes_cli.kanban_origin_forward_run_end import reserve
++    task, run, path, body = pending
++    with sqlite3.connect(path) as db:
++        db.execute('DELETE FROM sent')
++    monkeypatch.setattr(placement, 'hub_carries_options', lambda cli: True)
++    monkeypatch.setattr(placement, 'remote_state', lambda rid: None)
++    reason = 'origin_request_invalid: invalid qualified identity or request ID'
++    def courier(argv):
++        rid = argv[argv.index('--id') + 1]
++        if case == 'queued':
++            with sqlite3.connect(path) as db:
++                db.execute('INSERT INTO sent VALUES(?,?,?,?)', (rid, 'sent', '{}', json.dumps(body)))
++        if case == 'unreadable':
++            path.write_bytes(b'not a database')
++        if case == 'concurrent':
++            with kbc.connect_closing() as other:
++                reserve(other, task, 'run-current', rid, submission_id='another-attempt')
++        return (127, '', 'timed out') if case == 'timeout' else (2, '', 'unknown' if case == 'unknown' else reason)
++    monkeypatch.setattr(placement, 'hub_runner', courier)
++    kwargs = dict(target='hub', self_gw='worker', origin_session='chat', origin_profile='default',
++                  origin_gateway='hub', creator=body['args']['creator'], run_uid='run-current', cfg={})
++    with kbc.connect_closing() as conn:
++        placement.create_remote({'title': 'child', 'assignee': 'default'}, conn=conn, **kwargs)
++        if case == 'retry':
++            monkeypatch.setattr(placement, 'hub_runner', lambda argv: (3, '', 'queued offline'))
++            placement.create_remote({'title': 'child', 'assignee': 'default'}, conn=conn, **kwargs)
++        with pytest.raises(ValueError, match='origin_forward_(pending|evidence_unavailable)'):
++            kb.complete_task(conn, task, summary='must remain alive', expected_run_id=run)
++        assert kb.latest_run(conn, task).ended_at is None
++
++
+ def test_unreadable_courier_is_not_absence(pending):
+     task, run, path, _ = pending
+     path.write_bytes(b'not a database')
+-- 
+2.43.0
+

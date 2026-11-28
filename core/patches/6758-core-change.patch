@@ -1,0 +1,516 @@
+From 604d494af530b017b2e1b0d02346540d9d399da0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 09:17:27 +0000
+Subject: [PATCH 6758] Native owner release: journaled HOME application (dormant until Board support)
+
+Public mirror of source commit 604d494af530b017b2e1b0d02346540d9d399da0.
+
+---
+diff --git a/hermes_cli/kanban_origin_cli_gate.py b/hermes_cli/kanban_origin_cli_gate.py
+index 04db2cdce008dfdb68e23f7b0527657cba343092..6b299b9f58d5725ccbe0bd9c6c1b9054d1a6e68e 100644
+--- a/hermes_cli/kanban_origin_cli_gate.py
++++ b/hermes_cli/kanban_origin_cli_gate.py
+@@ -8,6 +8,10 @@
+ 
+ from hermes_cli.kanban_origin_admission import AdmissionRefused
+ 
++_RELEASE_STAGES = (
++    "intent_journaled_unsent", "authorized_pending_home", "read_first_pending", "consumed_or_applied",
++)
++
+ 
+ class LaunchGate:
+     def __init__(self):
+@@ -15,11 +19,13 @@
+         self._accepting = True
+         self._requests = []
+ 
+-    def dispatch(self):
++    def dispatch(self, *, operation="create"):
++        if operation not in ("create", "release"):
++            raise ValueError("unknown native CLI operation")
+         with self._lock:
+             if not self._accepting:
+                 raise AdmissionRefused("CLI launch retired before dispatch")
+-            request = RequestGate(self)
++            request = RequestGate(self, operation)
+             self._requests.append(request)
+             return request
+ 
+@@ -31,17 +37,25 @@
+ 
+ 
+ class RequestGate:
+-    def __init__(self, launch):
++    def __init__(self, launch, operation="create"):
+         self._launch = launch
++        self._operation = operation
++        self._intent_uid = None
++        self._release_stage = None
+         self._admitted = None
+         self._finished = False
+         self._verified = False
+ 
+-    def admit(self, task_id):
++    def admit(self, task_id, *, intent_uid=None):
+         with self._launch._lock:
+             if not self._launch._accepting or self._admitted is not None or self._finished:
+                 raise AdmissionRefused("CLI launch retired or request already admitted/finished")
++            if self._operation == "release" and (not isinstance(intent_uid, str) or not intent_uid):
++                raise AdmissionRefused("release admission requires an exact intent")
++            if self._operation == "create" and intent_uid is not None:
++                raise AdmissionRefused("creation admission cannot journal a release intent")
+             self._admitted = task_id
++            self._intent_uid = intent_uid
+ 
+     def finish(self, result=None):
+         """A failed/absent reply cannot undo an admission or establish rollback."""
+@@ -49,16 +63,25 @@
+             if self._finished:
+                 raise AdmissionRefused("CLI request already finished")
+             self._finished = True
+-            self._verified = (self._admitted is not None and isinstance(result, dict)
+-                              and result.get("ok") is True and result.get("task_id") == self._admitted)
++            if (self._admitted is not None and isinstance(result, dict)
++                    and result.get("ok") is True and result.get("task_id") == self._admitted):
++                self._verified = True
++                if self._operation == "release":
++                    self._verified = (result.get("intent_uid") == self._intent_uid
++                                      and result.get("release_stage") in _RELEASE_STAGES)
++                    if self._verified:
++                        self._release_stage = result["release_stage"]
+             return self._report()
+ 
+     def _report(self):
+         # Called only under the launch lock.
+         if self._verified:
+-            outcome = "created"
++            outcome = self._release_stage if self._operation == "release" else "created"
+         elif self._admitted is not None:
+             outcome = "outcome_unknown"
+         else:
+             outcome = "no_board_commit"
+-        return {"outcome": outcome, "task_id": self._admitted, "finished": self._finished}
++        report = {"outcome": outcome, "task_id": self._admitted, "finished": self._finished}
++        if self._operation == "release":
++            report.update(operation="release", intent_uid=self._intent_uid)
++        return report
+diff --git a/hermes_cli/kanban_release_intent.py b/hermes_cli/kanban_release_intent.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfd46397e32531b293627369df348ce3c803020a
+--- /dev/null
++++ b/hermes_cli/kanban_release_intent.py
+@@ -0,0 +1,120 @@
++"""Frozen native-owner release intents; no subprocess-supplied caller identity.
++
++The local journal is not HOME release authority. Only the authenticated Board
++operation may authorize these bytes; retaining them makes an uncertain send
++recoverable without inventing a successor request or episode.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import sqlite3
++
++_COORDINATE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,200}\Z")
++_ACTION = {"board", "task_id", "home", "episode", "capability_episodes", "runs", "note"}
++_INTENT = _ACTION | {"version", "intent_uid", "actor"}
++_ACTOR = {"gateway", "profile", "session"}
++
++
++def encode(value: dict) -> str:
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
++
++
++def digest(value: dict) -> str:
++    return hashlib.sha256(encode(value).encode("utf-8")).hexdigest()
++
++
++def _coordinate(value) -> bool:
++    return isinstance(value, str) and _COORDINATE.fullmatch(value) is not None
++
++
++def _action(value: dict) -> dict:
++    if not isinstance(value, dict) or set(value) != _ACTION:
++        raise ValueError("release action accepts only its exact bounded fields, never caller or journal identity")
++    if not all(_coordinate(value[k]) for k in ("board", "task_id", "home", "episode")):
++        raise ValueError("release action has an invalid coordinate")
++    if type(value["runs"]) is not int or not 1 <= value["runs"] <= 9007199254740991:
++        raise ValueError("release runs must be a positive wire-safe integer")
++    if not isinstance(value["note"], str) or not value["note"].strip() or len(value["note"]) > 2000:
++        raise ValueError("release intent needs a nonempty bounded note")
++    selected = value["capability_episodes"]
++    if (not isinstance(selected, list) or len(selected) > 32
++            or not all(_coordinate(e) for e in selected)):
++        raise ValueError("release historical capability selection must be a bounded coordinate list")
++    if len(selected) != len(set(selected)) or value["episode"] in selected:
++        raise ValueError("release historical selection must be unique and exclude the current episode")
++    return {**value, "capability_episodes": sorted(selected)}
++
++
++def validate(value: dict) -> dict:
++    """Parse untrusted transport bytes; validation itself grants no authority."""
++    if not isinstance(value, dict) or set(value) != _INTENT or type(value["version"]) is not int or value["version"] != 1:
++        raise ValueError("invalid release intent version or fields")
++    actor = value["actor"]
++    if (not _coordinate(value["intent_uid"]) or not isinstance(actor, dict) or set(actor) != _ACTOR
++            or not all(_coordinate(actor[k]) for k in _ACTOR)):
++        raise ValueError("invalid release intent identity")
++    action = _action({k: value[k] for k in _ACTION})
++    return {**action, "version": 1, "intent_uid": value["intent_uid"], "actor": dict(actor)}
++
++
++def _saved(conn: sqlite3.Connection, key: str):
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone():
++        return None
++    return conn.execute("SELECT intent_uid, body, digest FROM native_owner_release_intents WHERE action_key=?", (key,)).fetchone()
++
++
++def _resume(row, action, actor):
++    try:
++        body = validate(json.loads(row[1]))
++    except (ValueError, TypeError, KeyError) as exc:
++        raise ValueError("release journal is malformed; no new authority was issued") from exc
++    if body["actor"] != actor:
++        raise ValueError("release journal actor differs from the live native chat")
++    if (row[0] != body["intent_uid"] or row[2] != digest(body)
++            or {k: body[k] for k in _ACTION} != action or row[1] != encode(body)):
++        raise ValueError("release journal identity or bytes changed; no new authority was issued")
++    return body
++
++
++def prepare(conn: sqlite3.Connection, action: dict, *, gate) -> dict:
++    """Journal or resume under fresh parent custody; admit before the first write.
++
++    The parent resolves HOME and board before calling. The child cannot select
++    an existing journal UID, actor or delivery watermark through this schema.
++    No networking occurs here. A committed journal is inert without a fresh
++    live capture of the exact same originating chat on every subsequent send.
++    A revocation after the final validation can still leave an inert journal;
++    this is not release authority and every later network send must revalidate.
++    """
++    from agent.origin_turn_custody import CapturedOrigin, origin
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_origin_native import _primary_scope
++    from hermes_cli.kanban_db_sync import uuid7
++
++    qualified = origin()
++    if qualified is None:
++        raise ValueError("release requires live native owning-chat custody")
++    captured = CapturedOrigin(qualified)
++    action = _action(action)
++    key = digest(action)
++    with kb.write_txn(conn):
++        if _primary_scope(conn) != (qualified["gateway"], qualified["profile"], action["board"]):
++            raise ValueError("native release journal requires its exact local primary board")
++        row = _saved(conn, key)
++        body = (_resume(row, action, qualified) if row is not None
++                else validate({**action, "version": 1, "intent_uid": uuid7(), "actor": qualified}))
++        if captured.validated() is None:
++            raise ValueError("native release custody expired before journal admission")
++        gate.admit(action["task_id"], intent_uid=body["intent_uid"])
++        if row is None:
++            conn.execute("""CREATE TABLE IF NOT EXISTS native_owner_release_intents (
++                action_key TEXT PRIMARY KEY, intent_uid TEXT UNIQUE NOT NULL,
++                body TEXT NOT NULL, digest TEXT NOT NULL, stage TEXT NOT NULL
++            )""")
++            conn.execute("INSERT INTO native_owner_release_intents VALUES (?,?,?,?,?)",
++                         (key, body["intent_uid"], encode(body), digest(body), "intent_journaled_unsent"))
++        if captured.validated() is None:
++            raise ValueError("native release custody expired before journal commit")
++    return body
+diff --git a/tests/hermes_cli/test_origin_cli_release_gate.py b/tests/hermes_cli/test_origin_cli_release_gate.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9a740d4c422a9a3821b0acb6c5cc35124dc5c0b
+--- /dev/null
++++ b/tests/hermes_cli/test_origin_cli_release_gate.py
+@@ -0,0 +1,96 @@
++"""Release admission reports are not creation or execution receipts."""
++import pytest
++
++from hermes_cli.kanban_origin_admission import AdmissionRefused
++from hermes_cli.kanban_origin_cli_gate import LaunchGate
++
++
++@pytest.mark.parametrize("stage", [
++    "intent_journaled_unsent", "authorized_pending_home", "read_first_pending", "consumed_or_applied",
++])
++def test_release_stage_is_preserved_without_claiming_creation(stage):
++    launch = LaunchGate()
++    request = launch.dispatch(operation="release")
++    request.admit("target", intent_uid="intent-a")
++    result = {"ok": True, "task_id": "target", "intent_uid": "intent-a", "release_stage": stage}
++    assert request.finish(result) == {
++        "operation": "release", "outcome": stage, "task_id": "target", "intent_uid": "intent-a", "finished": True,
++    }
++    assert launch.retire()[0]["outcome"] == stage
++
++
++def test_create_contract_is_unchanged():
++    launch = LaunchGate()
++    request = launch.dispatch()
++    assert launch.retire() == [{"outcome": "no_board_commit", "task_id": None, "finished": False}]
++    with pytest.raises(AdmissionRefused):
++        request.admit("task")
++    launch = LaunchGate()
++    request = launch.dispatch()
++    request.admit("task")
++    assert request.finish({"ok": True, "task_id": "task"}) == {
++        "outcome": "created", "task_id": "task", "finished": True,
++    }
++
++
++@pytest.mark.parametrize("result", [None, [], {},
++    {"ok": True, "task_id": "target", "intent_uid": "wrong", "release_stage": "read_first_pending"},
++    {"ok": True, "task_id": "wrong", "intent_uid": "intent-a", "release_stage": "read_first_pending"},
++    {"ok": True, "task_id": "target", "intent_uid": "intent-a", "release_stage": "created"},
++    {"ok": True, "task_id": "target", "intent_uid": "intent-a"},
++    {"ok": 1, "task_id": "target", "intent_uid": "intent-a", "release_stage": "consumed_or_applied"},
++    {"ok": False, "task_id": "target", "intent_uid": "intent-a", "release_stage": "consumed_or_applied"},
++    {"ok": True, "task_id": "target", "intent_uid": "intent-a", "release_stage": []},
++    {"ok": True, "task_id": "target", "intent_uid": "intent-a", "release_stage": {}},
++])
++def test_release_uncertain_reply_cannot_become_created_or_pending(result):
++    request = LaunchGate().dispatch(operation="release")
++    request.admit("target", intent_uid="intent-a")
++    report = request.finish(result)
++    assert report == {"operation": "release", "outcome": "outcome_unknown", "task_id": "target",
++                      "intent_uid": "intent-a", "finished": True}
++
++
++@pytest.mark.parametrize("operation", ["unknown", "", None, 1, [], {}])
++def test_unknown_operation_does_not_gain_admission(operation):
++    launch = LaunchGate()
++    with pytest.raises((ValueError, TypeError)):
++        launch.dispatch(operation=operation)
++    assert launch.retire() == []
++
++
++def test_release_retirement_before_journal_refuses_admission():
++    launch = LaunchGate()
++    request = launch.dispatch(operation="release")
++    assert launch.retire() == [{"operation": "release", "outcome": "no_board_commit", "task_id": None,
++                               "intent_uid": None, "finished": False}]
++    with pytest.raises(AdmissionRefused):
++        request.admit("target", intent_uid="intent-a")
++
++
++def test_release_retirement_after_admission_does_not_claim_rollback():
++    launch = LaunchGate()
++    request = launch.dispatch(operation="release")
++    request.admit("target", intent_uid="intent-a")
++    assert launch.retire()[0]["outcome"] == "outcome_unknown"
++    with pytest.raises(AdmissionRefused):
++        request.admit("target", intent_uid="intent-b")
++    assert request.finish({"ok": True, "task_id": "target", "intent_uid": "intent-a",
++                           "release_stage": "read_first_pending"})["outcome"] == "read_first_pending"
++    with pytest.raises(AdmissionRefused):
++        request.finish()
++
++
++@pytest.mark.parametrize("intent", [None, "", 0, [], {}])
++def test_release_requires_exact_intent_before_journal_admission(intent):
++    launch = LaunchGate()
++    request = launch.dispatch(operation="release")
++    with pytest.raises(AdmissionRefused):
++        request.admit("target", intent_uid=intent)
++    assert request.finish()["outcome"] == "no_board_commit"
++
++
++def test_release_success_without_admission_does_not_prove_commit():
++    request = LaunchGate().dispatch(operation="release")
++    assert request.finish({"ok": True, "task_id": "target", "intent_uid": "intent-a",
++                           "release_stage": "consumed_or_applied"})["outcome"] == "no_board_commit"
+diff --git a/tests/hermes_cli/test_owner_release_intent.py b/tests/hermes_cli/test_owner_release_intent.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..23adb16cf691a137b938cc118f65ac922bf42e55
+--- /dev/null
++++ b/tests/hermes_cli/test_owner_release_intent.py
+@@ -0,0 +1,182 @@
++"""Native release journals bind uncertain network retries to one live originating chat."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_release_intent as intent, kanban_db_connect as kbc
++from hermes_cli.kanban_origin_cli_gate import LaunchGate
++from tests.hermes_cli import test_origin_native_admission as fixtures
++
++turn = fixtures.turn
++
++
++@pytest.fixture
++def journal(turn):
++    with kbc.connect_closing() as conn:
++        yield conn
++
++
++def action(**changes):
++    return {"board": "default", "task_id": "t_target", "home": "elsewhere", "episode": "episode-now",
++            "capability_episodes": ["cap-old"], "runs": 1, "note": "continue exact scope", **changes}
++
++
++def gate():
++    return LaunchGate().dispatch(operation="release")
++
++
++def test_native_journal_freezes_actor_and_ids_before_first_network(turn, journal):
++    saved = intent.prepare(journal, action(), gate=gate())
++    row = journal.execute("SELECT * FROM native_owner_release_intents").fetchone()
++    assert json.loads(row["body"]) == saved
++    assert saved["actor"] == {"gateway": "here", "profile": "default", "session": turn.agent.session_id}
++    assert saved["version"] == 1 and saved["intent_uid"]
++    assert row["digest"] == intent.digest(saved)
++    assert row["stage"] == "intent_journaled_unsent"
++    assert not journal.in_transaction
++
++
++def test_exact_native_resume_reuses_every_byte_and_identity(turn, journal):
++    first = intent.prepare(journal, action(), gate=gate())
++    before = tuple(journal.execute("SELECT * FROM native_owner_release_intents").fetchone())
++    second = intent.prepare(journal, action(), gate=gate())
++    assert second == first
++    assert tuple(journal.execute("SELECT * FROM native_owner_release_intents").fetchone()) == before
++    assert journal.execute("SELECT COUNT(*) FROM native_owner_release_intents").fetchone()[0] == 1
++
++
++def test_retirement_before_admission_writes_no_journal(turn, journal):
++    launch = LaunchGate()
++    request = launch.dispatch(operation="release")
++    launch.retire()
++    with pytest.raises(ValueError, match="retired"):
++        intent.prepare(journal, action(), gate=request)
++    assert journal.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()[0] == 0
++
++
++def test_revoked_native_turn_cannot_read_or_resend_journal(turn, journal):
++    intent.prepare(journal, action(), gate=gate())
++    before = tuple(journal.execute("SELECT * FROM native_owner_release_intents").fetchone())
++    turn.release()
++    with pytest.raises(ValueError, match="native"):
++        intent.prepare(journal, action(), gate=gate())
++    assert tuple(journal.execute("SELECT * FROM native_owner_release_intents").fetchone()) == before
++
++
++@pytest.mark.parametrize("changes", [{"actor": {"session": "forged"}}, {"writer": "human"},
++    {"intent_uid": "chosen"}, {"session": "forged"}, {"seen": 123}, {"runs": True}, {"runs": 0},
++    {"episode": ""}, {"capability_episodes": ["cap-old", "cap-old"]},
++    {"capability_episodes": ["episode-now"]}, {"capability_episodes": "cap-old"}, {"note": ""},
++])
++def test_child_identity_and_malformed_actions_never_enter_journal(turn, journal, changes):
++    with pytest.raises(ValueError):
++        intent.prepare(journal, action(**changes), gate=gate())
++    assert journal.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()[0] == 0
++
++
++def test_no_native_custody_even_with_forged_environment(turn, journal, monkeypatch):
++    turn.release()
++    monkeypatch.setenv("HERMES_SESSION_ID", "owning-chat")
++    monkeypatch.setenv("HERMES_ORIGIN_GATEWAY", "local")
++    with pytest.raises(ValueError, match="native"):
++        intent.prepare(journal, action(), gate=gate())
++    assert journal.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()[0] == 0
++
++
++def test_new_episode_does_not_reuse_old_identity(turn, journal):
++    old = intent.prepare(journal, action(), gate=gate())
++    new = intent.prepare(journal, action(episode="episode-next"), gate=gate())
++    assert old["intent_uid"] != new["intent_uid"]
++    assert old["episode"] == "episode-now" and new["episode"] == "episode-next"
++
++
++def test_stale_saved_actor_cannot_be_replayed_by_current_native_chat(turn, journal):
++    intent.prepare(journal, action(), gate=gate())
++    row = journal.execute("SELECT * FROM native_owner_release_intents").fetchone()
++    body = json.loads(row["body"])
++    body["actor"]["session"] = "different-chat"
++    journal.execute("UPDATE native_owner_release_intents SET body=?, digest=?", (intent.encode(body), intent.digest(body)))
++    journal.commit()
++    with pytest.raises(ValueError, match="actor"):
++        intent.prepare(journal, action(), gate=gate())
++
++
++def test_corrupt_journal_is_not_repaired_by_reissuing_authority(turn, journal):
++    intent.prepare(journal, action(), gate=gate())
++    journal.execute("UPDATE native_owner_release_intents SET digest='wrong'")
++    journal.commit()
++    with pytest.raises(ValueError, match="journal"):
++        intent.prepare(journal, action(), gate=gate())
++    assert journal.execute("SELECT COUNT(*) FROM native_owner_release_intents").fetchone()[0] == 1
++
++
++def test_journal_survives_connection_loss_without_reissuing_identity(turn):
++    with kbc.connect_closing() as first:
++        saved = intent.prepare(first, action(), gate=gate())
++    with kbc.connect_closing() as recovered:
++        assert intent.prepare(recovered, action(), gate=gate()) == saved
++        assert recovered.execute("SELECT COUNT(*) FROM native_owner_release_intents").fetchone()[0] == 1
++
++
++def test_delegated_child_cannot_resume_native_parent_intent(turn, journal):
++    from agent.delegation_context import delegated_child_context
++    intent.prepare(journal, action(), gate=gate())
++    before = tuple(journal.execute("SELECT * FROM native_owner_release_intents").fetchone())
++    with delegated_child_context(), pytest.raises(ValueError, match="native"):
++        intent.prepare(journal, action(), gate=gate())
++    assert tuple(journal.execute("SELECT * FROM native_owner_release_intents").fetchone()) == before
++
++
++@pytest.mark.parametrize("when", ["before_admit", "before_commit"])
++def test_turn_revocation_during_journal_rolls_back_all_bytes(turn, journal, monkeypatch, when):
++    from agent.origin_turn_custody import CapturedOrigin
++    validated = CapturedOrigin.validated
++    calls = []
++    def revoke(captured):
++        calls.append(None)
++        if len(calls) == (1 if when == "before_admit" else 2):
++            turn.release()
++        return validated(captured)
++    monkeypatch.setattr(CapturedOrigin, "validated", revoke)
++    request = gate()
++    with pytest.raises(ValueError, match="native"):
++        intent.prepare(journal, action(), gate=request)
++    assert not journal.in_transaction
++    assert journal.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()[0] == 0
++    assert request.finish()["outcome"] == ("no_board_commit" if when == "before_admit" else "outcome_unknown")
++
++
++def test_creation_gate_cannot_admit_release_journal(turn, journal):
++    request = LaunchGate().dispatch()
++    with pytest.raises(ValueError, match="creation"):
++        intent.prepare(journal, action(), gate=request)
++    assert request.finish()["outcome"] == "no_board_commit"
++    assert journal.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("wrong_store", ["nonprimary", "other_board"])
++def test_journal_requires_exact_primary_board(turn, journal, wrong_store):
++    if wrong_store == "nonprimary":
++        with sqlite3.connect(":memory:") as conn, pytest.raises(ValueError, match="primary"):
++            intent.prepare(conn, action(), gate=gate())
++        return
++    with pytest.raises(ValueError, match="primary"):
++        intent.prepare(journal, action(board="other"), gate=gate())
++    assert journal.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='native_owner_release_intents'").fetchone()[0] == 0
++
++
++def test_late_revocation_can_leave_only_an_inert_journal(turn, journal, monkeypatch):
++    from contextlib import contextmanager
++    from hermes_cli import kanban_db as kb
++    write = kb.write_txn
++    @contextmanager
++    def revoke_before_commit(*args, **kwargs):
++        with write(*args, **kwargs):
++            yield
++            turn.release()
++    monkeypatch.setattr(kb, "write_txn", revoke_before_commit)
++    saved = intent.prepare(journal, action(), gate=gate())
++    assert journal.execute("SELECT intent_uid FROM native_owner_release_intents").fetchone()[0] == saved["intent_uid"]
++    with pytest.raises(ValueError, match="native"):
++        intent.prepare(journal, action(), gate=gate())
+-- 
+2.43.0
+

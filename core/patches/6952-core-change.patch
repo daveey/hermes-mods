@@ -1,0 +1,325 @@
+From f895279093ac93c5fcca3bd579f0037a570e9822 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 19:28:34 +0000
+Subject: [PATCH 6952] Sessions capture standby child and exit-signal dispatch
+
+Public mirror of source commit f895279093ac93c5fcca3bd579f0037a570e9822.
+
+---
+diff --git a/hermes_cli/sessions_capture_process.py b/hermes_cli/sessions_capture_process.py
+index 96a1e31f1b3f69b077590de571f8457bb445f313..9f7c495bae1f9d9da7057018d244a4516a38e2eb 100644
+--- a/hermes_cli/sessions_capture_process.py
++++ b/hermes_cli/sessions_capture_process.py
+@@ -83,7 +83,12 @@
+         "custody retained; close() again".
+     ``_lock`` is never held while a standby is stopped, and ``standby.retiring`` is never held while
+     ``_lock`` is taken, so the two never nest. The SIGTERM/SIGINT handler of ``early_sessions`` does
+-    not interrupt ``prepare`` or ``close``: it blocks those signals across them (see there).
++    not run inside ``prepare`` or ``close``: it queues across them (``_ExitSignals``).
++
++    Caller contract: ``prepare`` and ``close`` are serialized by their caller (``early_sessions``
++    runs both on the main thread). A ``close`` that overlaps a ``prepare`` on another thread does
++    not wait for it: the child that call is still spawning is retired by ``prepare`` itself, which
++    raises if it cannot stop it (custody retained in ``_retiring``: ``close()`` again).
+     """
+     def __init__(self, *, seconds=5, max_bytes=MAX_RESPONSE, command=None):
+         self.seconds, self.max_bytes = seconds, min(max_bytes, MAX_RESPONSE)
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 3fb0ce48da454f9aeeba5d89a0c9b1e1e284d7b1..a572f0102beee7a909addcb16ee6afcf169bfde1 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -35,6 +35,79 @@
+ _EXIT_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+ 
+ 
++class _ExitSignals:
++    """SIGTERM/SIGINT custody for the early sessions reader (main thread only, where CPython runs
++    Python signal handlers).
++
++    A signal is never acted on inside a custody step: a spawn whose child ``prepare()`` alone owns,
++    or a close (the reader's, or the runtime's, whose locks are not re-entrant). Every signal goes
++    through one FIFO queue, and only the dispatcher pops it, so:
++      * ``handler`` always enqueues first (a repeat of a still-queued signal collapses into it, as
++        a pending signal does), then dispatches only when ``depth`` is 0;
++      * the dispatcher holds ``depth`` above 0 while it runs, so a signal arriving inside it, its
++        close or a previous handler is queued behind, never run inside them and never ahead of
++        an older one; every entry it pops is delivered even when an earlier handler raised (the
++        last exception propagates, chained), as an unqueued signal would run while it unwound;
++      * whoever brings ``depth`` back to 0 reads the queue AFTER the decrement and dispatches it:
++        a signal queued before the decrement is seen there; one after it dispatches itself.
++    A thread signal mask cannot do this: a process-directed signal caught on another thread still
++    runs its Python handler on the main thread, so masking the main thread does not defer it.
++
++    Contract: a previous handler must return or raise; one that blocks keeps later signals queued
++    (exit escalation is then the supervisor's SIGKILL).
++    """
++    def __init__(self, previous, close):
++        self.previous, self._close = previous, close
++        self.depth = 0
++        self.pending = []  # (signum, frame) in arrival order
++
++    def handler(self, signum, frame):
++        if self.previous[signum] == signal.SIG_IGN:
++            return
++        if all(signum != queued for queued, _ in self.pending):
++            self.pending.append((signum, frame))
++        if self.depth == 0:
++            self._dispatch()
++
++    @contextmanager
++    def deferred(self):
++        self.depth += 1
++        try:
++            yield
++        finally:
++            self._leave()
++
++    def _leave(self):
++        self.depth -= 1
++        if self.pending and self.depth == 0:
++            self._dispatch()
++
++    def _dispatch(self):
++        self.depth += 1
++        try:
++            self._deliver_queue()
++        finally:
++            self._leave()
++
++    def _deliver_queue(self):
++        if self.pending:  # depth > 0: no handler can pop or run in between
++            signum, frame = self.pending.pop(0)
++            try:
++                self._act(signum, frame)
++            finally:
++                self._deliver_queue()
++
++    def _act(self, signum, frame):
++        handler = self.previous[signum]
++        try:
++            self._close()
++        finally:  # a close that keeps custody still lets the previous handler exit
++            if callable(handler):
++                handler(signum, frame)
++            else:
++                raise SystemExit(128 + signum)
++
++
+ @contextmanager
+ def early_sessions(*, headless, isolated):
+     # Preserve legacy/embedded/non-Linux ordering and the supported rollback.
+@@ -57,60 +130,13 @@
+     reader = CaptureProcess()
+     owner = None
+     previous = {}
+-    # Signal custody. The handler never acts inside a custody step (a spawn whose child prepare()
+-    # alone owns, or a close: the reader's, or the runtime's, whose locks are not re-entrant). It
+-    # queues the signal instead, and the step that brings ``depth`` back to 0 delivers the queue.
+-    # A thread signal mask cannot do this: CPython runs Python handlers on the main thread whichever
+-    # thread the kernel picked, so a mask on the main thread alone does not defer them.
+-    depth = [0]
+-    pending = []  # (signum, frame), arrival order; a repeat of a queued signal collapses into it
+-
+-    @contextmanager
+-    def deferred():
+-        depth[0] += 1
+-        try:
+-            yield
+-        finally:
+-            depth[0] -= 1
+-            # Read after the decrement: a signal queued before it is seen here; one arriving after
+-            # it acts at once (and drains the queue itself).
+-            if depth[0] == 0:
+-                drain()
+-
+-    def drain():
+-        # Each queued signal runs even when an earlier handler raised, as an unqueued second signal
+-        # would while the first one's exit unwinds; the last exception propagates, chained.
+-        if pending and depth[0] == 0:
+-            signum, frame = pending.pop(0)
+-            try:
+-                act(signum, frame)
+-            finally:
+-                drain()
++    signals = _ExitSignals(previous, lambda: (reader if owner is None else owner).close())
++    stop = signals.handler
+ 
+     def close():
+-        with deferred():
++        with signals.deferred():
+             (reader if owner is None else owner).close()
+ 
+-    def act(signum, frame):
+-        handler = previous[signum]
+-        with deferred():
+-            try:
+-                close()
+-            finally:  # a close that keeps custody still lets the previous handler exit
+-                if callable(handler):
+-                    handler(signum, frame)
+-                else:
+-                    raise SystemExit(128 + signum)
+-
+-    def stop(signum, frame):
+-        if previous[signum] == signal.SIG_IGN:
+-            return
+-        if depth[0]:
+-            if all(signum != queued for queued, _ in pending):
+-                pending.append((signum, frame))
+-            return
+-        act(signum, frame)
+-
+     try:
+         # signal.signal is illegal off the main thread (serve_update_wait and
+         # other cmd_dashboard harnesses). CPython delivers signals to the main
+@@ -121,7 +147,7 @@
+                     previous[signum] = signal.signal(signum, stop)
+                 except (ValueError, OSError, RuntimeError):
+                     previous.pop(signum, None)
+-        with deferred():
++        with signals.deferred():
+             reader.prepare()
+         from hermes_cli.sessions_native_startup import SessionsRuntime
+         from hermes_cli.web_routers import profiles
+diff --git a/tests/hermes_cli/test_sessions_exit_signals.py b/tests/hermes_cli/test_sessions_exit_signals.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b35bf639bd7249cf95834107605077b2f9ab25cc
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_exit_signals.py
+@@ -0,0 +1,133 @@
++"""Exit-signal custody of the early sessions reader, under a signal at every line boundary.
++
++CPython runs a Python signal handler between bytecodes of the main thread. These tests stand in a
++line-level trace for that: a second signal is delivered at each line event inside the dispatcher
++(one boundary per run), and the invariants are checked for every boundary.
++"""
++import signal
++import sys
++
++import pytest
++
++from hermes_cli import sessions_early_boot as early
++
++TERM, INT = signal.SIGTERM, signal.SIGINT
++
++
++class _Run:
++    """One dispatcher with recording previous handlers and a close that must never be re-entered
++    or interrupted by a handler."""
++    def __init__(self, raising):
++        self.raising, self.log, self.closing, self.inside = raising, [], False, False
++        handlers: dict = {TERM: self.previous, INT: self.previous}
++        self.signals = early._ExitSignals(handlers, self.close)
++
++    def close(self):
++        assert not self.closing, 'close re-entered'
++        assert not self.inside, 'close run inside a previous handler'
++        self.closing = True
++        self.log.append('close')
++        self.closing = False
++
++    def previous(self, signum, frame):
++        assert not self.closing, 'handler ran inside a close'
++        assert not self.inside, 'handler ran inside another handler'
++        self.inside = True
++        self.log.append(signal.Signals(signum).name)
++        self.inside = False
++        if self.raising:
++            raise SystemExit(signum)
++
++
++_CODES = {fn.__code__ for fn in vars(early._ExitSignals).values() if callable(fn) and hasattr(fn, '__code__')}
++_CODES |= {early._ExitSignals.deferred.__wrapped__.__code__}  # type: ignore[attr-defined]
++
++
++def _inject_at(boundary, run, scenario):
++    """Run ``scenario``, delivering SIGINT at line event number ``boundary`` inside the dispatcher.
++    Returns (whether it was injected, the exception that escaped, if any)."""
++    seen, injected = [0], [False]
++
++    def trace(frame, event, arg):
++        if frame.f_code not in _CODES:
++            return None
++        if event == 'line' and not injected[0] and run.signals.pending_seen:
++            seen[0] += 1
++            if seen[0] == boundary:
++                injected[0] = True
++                run.signals.handler(INT, None)
++        return trace
++    sys.settrace(trace)
++    try:
++        scenario()
++        escaped = None
++    except SystemExit as error:
++        escaped = error
++    finally:
++        sys.settrace(None)
++    return injected[0], escaped
++
++
++def _held_term_then_boundary(run):
++    def scenario():
++        with run.signals.deferred():          # a custody step (prepare, close)
++            run.signals.handler(TERM, None)   # SIGTERM arrives inside it: queued
++            run.signals.pending_seen = True
++    return scenario
++
++
++@pytest.mark.parametrize('raising', [False, True], ids=['handlers-return', 'handlers-exit'])
++def test_a_second_signal_at_any_boundary_is_delivered_once_after_the_first(raising, monkeypatch):
++    monkeypatch.setattr(early._ExitSignals, 'pending_seen', False, raising=False)
++    boundaries = 0
++    for boundary in range(1, 500):
++        run = _Run(raising)
++        injected, escaped = _inject_at(boundary, run, _held_term_then_boundary(run))
++        if not injected:
++            break
++        boundaries += 1
++        # Both delivered, each once, in arrival order, each after its own close; nothing queued.
++        assert run.log == ['close', 'SIGTERM', 'close', 'SIGINT'], (boundary, run.log)
++        assert run.signals.pending == [] and run.signals.depth == 0, boundary
++        if raising:  # the later exit propagates (the earlier one is its context)
++            assert escaped is not None and escaped.code == INT, boundary
++        else:
++            assert escaped is None, boundary
++    assert boundaries >= 10  # the trace really walked the dispatcher
++
++
++def test_a_signal_while_none_is_held_acts_at_once():
++    run = _Run(raising=False)
++    run.signals.handler(TERM, None)
++    assert run.log == ['close', 'SIGTERM'] and run.signals.depth == 0
++
++
++def test_a_repeat_of_a_queued_signal_collapses_and_ignored_signals_never_queue():
++    run = _Run(raising=False)
++    run.signals.previous[INT] = signal.SIG_IGN
++    with run.signals.deferred():
++        run.signals.handler(TERM, None)
++        run.signals.handler(INT, None)
++        run.signals.handler(TERM, None)
++        assert [signum for signum, _ in run.signals.pending] == [TERM]
++    assert run.log == ['close', 'SIGTERM']
++
++
++def test_default_disposition_exits_with_the_shell_code_after_close():
++    run = _Run(raising=False)
++    run.signals.previous[TERM] = signal.SIG_DFL
++    with pytest.raises(SystemExit) as exit_info:
++        run.signals.handler(TERM, None)
++    assert exit_info.value.code == 128 + TERM and run.log == ['close']
++
++
++def test_a_close_that_keeps_custody_still_lets_the_previous_handler_run():
++    run = _Run(raising=True)
++
++    def failing():
++        run.log.append('close')
++        raise TimeoutError('custody retained')
++    run.signals._close = failing
++    with pytest.raises(SystemExit):
++        run.signals.handler(TERM, None)
++    assert run.log == ['close', 'SIGTERM'] and run.signals.depth == 0
+-- 
+2.43.0
+

@@ -1,0 +1,158 @@
+From e5133405daebf30a7e8ff97da60374753c8c766a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 18:27:36 +0000
+Subject: [PATCH 6993] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit e5133405daebf30a7e8ff97da60374753c8c766a.
+
+---
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 660824bf4c546d04a476b17394daafc25fa6a3bc..6cea32147626524b42674bcef0a3888f6c612b21 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -65,6 +65,11 @@
+ 
+ def apply_block_update(conn, task_id, expected_run_id, kind, new_status, set_sql, params, payload):
+     """Capture review scope and release the claim in the caller's transaction."""
++    from hermes_cli.kanban_home_transfer import frozen
++    # Release decisions may commit before dependency placement starts its own writer.
++    # Raise inside that writer so all preliminary park effects roll back as well.
++    if frozen(conn, task_id):
++        raise ValueError("home transfer owns this card; block deferred")
+     if kind == "dependency":
+         evidence = checkpoint(conn, task_id, expected_run_id)
+         if evidence:
+diff --git a/tests/hermes_cli/test_home_release_landing_race.py b/tests/hermes_cli/test_home_release_landing_race.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..82ea9803118599d6afed8a95c99dc5a0e0785393
+--- /dev/null
++++ b/tests/hermes_cli/test_home_release_landing_race.py
+@@ -0,0 +1,110 @@
++"""Public release keeps committed decisions recoverable across custody races."""
++import contextlib
++
++import pytest
++from hermes_cli import kanban_db as kb, kanban_release as rel
++from hermes_cli.kanban_home_transfer import frozen
++from tests.hermes_cli import test_home_release_candidates as sup
++from tests.hermes_cli.test_kanban_release import spend_stopped, HUMAN
++board = sup.board
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', None])
++@pytest.mark.parametrize('diagnostic', [False, True])
++def test_release_parent_landing_race(board, monkeypatch, phase, diagnostic):
++    if diagnostic:
++        # Diagnostic only: isolate the missing writer-entry refusal. Not a shipped fix.
++        from hermes_cli import kanban_dependency_review as dep
++        original_update = dep.apply_block_update
++        def guarded_update(conn, task, *args, **kwargs):
++            assert conn.in_transaction
++            if frozen(conn, task):
++                raise ValueError('home transfer owns this card; release deferred')
++            return original_update(conn, task, *args, **kwargs)
++        monkeypatch.setattr(dep, 'apply_block_update', guarded_update)
++    tid = spend_stopped(board)
++    parent = kb.create_task(board, title='open parent')
++    kb.link_tasks(board, parent, tid)
++    original = rel._place
++    captured = {}
++    def racing(conn, task, *args):
++        assert not conn.in_transaction
++        assert rel._release_event(conn, task) is not None
++        sup.freeze(conn, task, phase)
++        captured['task'] = tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone())
++        captured['events'] = list(map(tuple, conn.execute('SELECT * FROM task_events WHERE task_id=?', (task,))))
++        return original(conn, task, *args)
++    monkeypatch.setattr(rel, '_place', racing)
++    try:
++        out = rel.release(board, tid, writer=HUMAN)
++    finally:
++        if phase:
++            assert frozen(board, tid)
++            assert rel._release_event(board, tid) is not None
++            assert tuple(board.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()) == captured['task']
++            assert list(map(tuple, board.execute('SELECT * FROM task_events WHERE task_id=?', (tid,)))) == captured['events']
++    assert out['outcome'] == ('refused' if phase else 'waiting_on_parents')
++
++
++release_board = sup.board
++
++
++def _snapshot(conn, task):
++    return (tuple(conn.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()),
++            list(map(tuple, conn.execute('SELECT * FROM task_events WHERE task_id=?', (task,)))),
++            list(map(tuple, conn.execute('SELECT * FROM task_comments WHERE task_id=?', (task,)))))
++
++
++@pytest.mark.parametrize('phase', ['prepared', 'pending', 'malformed', None])
++@pytest.mark.parametrize('seam', ['placement', 'writer'])
++def test_release_landing_retry_preserves_decision(release_board, monkeypatch, phase, seam):
++    from hermes_cli import kanban_dependency_review as dep, kanban_db_connect as dbc
++    from hermes_cli import kanban_home_transfer as transfer
++    conn = release_board
++    tid = spend_stopped(conn)
++    parent = kb.create_task(conn, title='unfinished parent')
++    kb.link_tasks(conn, parent, tid)
++    module, name = (rel, '_place') if seam == 'placement' else (dep, 'apply_block_update')
++    original = getattr(module, name)
++    captured = {}
++
++    def racing(c, task, *args, **kwargs):
++        assert c.in_transaction == (seam == 'writer')
++        assert rel._release_event(c, task) is not None
++        if seam == 'placement':
++            sup.freeze(c, task, phase)
++        else:
++            # Install at the actual writer entry, using the same reservation.
++            with monkeypatch.context() as m:
++                m.setattr(dbc, 'write_txn', lambda c: contextlib.nullcontext())
++                sup.freeze(c, task, phase)
++        captured['snapshot'] = _snapshot(c, task)
++        if phase == 'prepared':
++            captured['record'] = dict(c.execute('SELECT * FROM kanban_home_prepared1 WHERE task_id=?', (task,)).fetchone())
++        return original(c, task, *args, **kwargs)
++
++    with monkeypatch.context() as m:
++        m.setattr(module, name, racing)
++        out = rel.release(conn, tid, writer=HUMAN)
++    decision = rel._release_event(conn, tid)
++    assert decision is not None
++    if phase:
++        assert out['outcome'] == 'refused'
++        assert out['refusal'] == 'dependency_wait_refused'
++        assert 'decision is recorded, rerun to finish' in out['message']
++        # Same-writer injected preparation rolls back with the refused park.
++        if seam == 'placement':
++            assert _snapshot(conn, tid) == captured['snapshot']
++            before = _snapshot(conn, tid)
++            assert rel.release(conn, tid, writer=HUMAN)['refusal'] == 'home_transfer'
++            assert _snapshot(conn, tid) == before
++            if phase != 'prepared':
++                return
++            with dbc.write_txn(conn):
++                transfer.abort_source(conn, {**captured['record'], 'task': tid, 'phase': 'aborted', 'rows': []})
++        out = rel.release(conn, tid, writer=HUMAN)
++    assert out['outcome'] == 'waiting_on_parents'
++    assert rel._release_event(conn, tid) == decision
++    events = list(conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind=?", (tid, rel.RELEASED)))
++    assert len(events) == 1
++    assert rel.release(conn, tid, writer=HUMAN)['outcome'] == 'already_released'
++
+diff --git a/tests/hermes_cli/test_home_shared_path_invariant.py b/tests/hermes_cli/test_home_shared_path_invariant.py
+index 795d1fcfb0c7b12a3762b81c28262edbb5852655..86608a56aa9cdaf6cb0fed03ad461399d458894f 100644
+--- a/tests/hermes_cli/test_home_shared_path_invariant.py
++++ b/tests/hermes_cli/test_home_shared_path_invariant.py
+@@ -27,6 +27,10 @@
+ from tests.hermes_cli import test_home_shared_consumer_io as consumer_io
+ from tests.hermes_cli import test_home_certification_finalization as certification
+ from tests.hermes_cli import test_home_quarantine_custody as quarantine_cases
++from tests.hermes_cli import test_home_release_landing_race as release_landing
++
++release_board = release_landing.release_board
++test_release_landing_retry_preserves_decision = release_landing.test_release_landing_retry_preserves_decision
+ 
+ test_conflicting_protected_row_preserves_healthy_peer = quarantine_cases.test_conflicting_protected_row_preserves_healthy_peer
+ test_quarantine_closure_races_preserve_custody = quarantine_cases.test_quarantine_closure_races_preserve_custody
+-- 
+2.43.0
+

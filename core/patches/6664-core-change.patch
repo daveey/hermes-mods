@@ -1,0 +1,414 @@
+From 92c938da989e2ac880eee2a3535cfe68348efb2a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:10:49 +0000
+Subject: [PATCH 6664] Origin-forward refusals, queued-create wait handles and wait-check parsing
+
+Public mirror of source commit 92c938da989e2ac880eee2a3535cfe68348efb2a.
+
+---
+diff --git a/hermes_cli/kanban_creation_home.py b/hermes_cli/kanban_creation_home.py
+index 0f8813263817ab741804879a4be7e093b6713892..9f0c9f80b4deec7738fbbe4ed6a853c8b15ac765 100644
+--- a/hermes_cli/kanban_creation_home.py
++++ b/hermes_cli/kanban_creation_home.py
+@@ -107,7 +107,11 @@
+     labels = args['runs_on']
+     request = fields['placed']['request_id']
+     state = f'Created on {target} as {tid}.' if tid else f'Creation request {request} is queued for {target}; task ID pending.'
+-    return {'task_id': tid, 'status': status or ('created' if tid else 'queued'), **fields,
++    out = {'task_id': tid, 'status': status or ('created' if tid else 'queued'), **fields,
+             'runs_where': 'board', 'runs_on': labels,
+             'note': f'{state} Administrative home is shared; execution is constrained by runs_on={labels}. '
+                     'Do not repeat creation; an identical retry uses the same request.'}
++    if not tid:
++        from hermes_cli.kanban_creation_wait import queued_wait
++        out.update(queued_wait(args, target, out['note']))
++    return out
+diff --git a/hermes_cli/kanban_creation_wait.py b/hermes_cli/kanban_creation_wait.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..909bc90d4d913a92e3bf30fb5117150de90afed3
+--- /dev/null
++++ b/hermes_cli/kanban_creation_wait.py
+@@ -0,0 +1,13 @@
++"""A queued creation's executable wait handle and bounded fallback guidance."""
++from __future__ import annotations
++
++import shlex
++
++
++def queued_wait(args, target, note):
++    """Return a quoted argv probe, never a SQL literal that looks like a secret."""
++    if key := args.get("idempotency_key"):
++        return {"wake_check": shlex.join(["hermes", "kanban", "wait-check", "key", key, "--gateway", target]),
++                "note": note + " To wait for this card, park with kanban_schedule using exactly this wake_check; "
++                "never a constant probe (`sleep 1; exit 1`) or a clock_only park."}
++    return {"note": note + " Park at most 2 h without a probe, then find the id with `hermes-hub requests`."}
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 613fa567e5f48c469bc5b14a2b909415969247ba..5c40c4ddf7f89605036f1807938c2694f34e203e 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -398,11 +398,11 @@
+              help="Restrict to tasks with this current_step_key"),
+     ], aliases=["ls"], help="List tasks"),
+     _cmd("wait-check", [
+-        _arg("check", choices=("task", "board-empty", "capability-owner"),
+-             help="task <id> | board-empty <slug> | capability-owner <hermes-hub request id[,id...]>"),
+-        _arg("target", help="Task id (task), board slug (board-empty) or owner request ids (capability-owner)"),
++        _arg("check", choices=("task", "key", "board-empty", "capability-owner"),
++             help="task <id> | key <idempotency_key> | board-empty <slug> | capability-owner <hermes-hub request id[,id...]>"),
++        _arg("target", help="Task id (task), idempotency key (key), board slug (board-empty) or owner request ids"),
+         _arg("--gateway", default=None, help="Gateway to read via ssh (e.g. hub); omit for this machine"),
+-        _arg("--board", default=None, help="Board slug for `task` (default board if omitted)"),
++        _arg("--board", default=None, help="Board slug for `task` or `key` (default board if omitted)"),
+         _arg("--until", default=None,
+              help="Comma-separated statuses that count as met (default: done,review,blocked,triage,parked-agent,archived "
+                   "-- a tracker wakes when its owner finishes, wants review, blocks, goes to triage, or parks on "
+diff --git a/hermes_cli/kanban_wait_check.py b/hermes_cli/kanban_wait_check.py
+index 72a137a8db546c332acdd446b06853303c339a09..cf9c578cf3ee0bb3373e047d9267a8255d31cb4b 100644
+--- a/hermes_cli/kanban_wait_check.py
++++ b/hermes_cli/kanban_wait_check.py
+@@ -9,6 +9,7 @@
+ 
+     hermes kanban wait-check task t_x [--gateway hub] [--board SLUG] [--until done,review,blocked,triage,scheduled,archived]
+                                      [--from running]
++    hermes kanban wait-check key PRODUCT_KEY [--gateway hub] [--board SLUG] [--until done] [--from review]
+     hermes kanban wait-check board-empty SLUG [--gateway hub]
+ """
+ from __future__ import annotations
+@@ -89,6 +90,13 @@
+             if not rows:
+                 return 2, f"error: {target} not found"
+             return _verdict(board, target, rows[0][0], source=source, until=until, since=since)
++        if kind == "key":
++            from hermes_cli.kanban_wait_key import source_for_key
++            source, rows = source_for_key(board, target)
++            if not rows:
++                return 1, "queued card not found yet"
++            target, status = rows[0][:2]
++            return _verdict(board, target, status, source=source, until=until, since=since)
+         if kind == "board-empty":
+             n = _query(_db(target), "select count(*) from tasks where status not in ('done','archived')")[0][0]
+             return (0 if n == 0 else 1), f"{target} open={n}"
+@@ -206,8 +214,11 @@
+     try:
+         p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_TIMEOUT}", host, remote],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace",
+-                           timeout=15 if kind == "task" else SSH_TIMEOUT + 15, check=False)
++                           timeout=15 if kind in ("task", "key") else SSH_TIMEOUT + 15, check=False)
+     except (OSError, subprocess.TimeoutExpired) as exc:
++        if kind == "key":
++            from hermes_cli.kanban_wait_key import unreachable
++            return unreachable(gateway, target, board=board, until=until, since=since)
+         if kind == "task":
+             return _unreachable_task(gateway, target, board=board, until=until, since=since,
+                                      live_timeout=25 - (time.monotonic() - started))
+@@ -218,13 +229,16 @@
+     # identity, freshness (rc3), missing/error (rc2), and orphan evidence; it
+     # never upgrades a cached observation to a live authoritative read.
+     restricted = p.returncode == 2 and p.stderr.strip().startswith("hub-read: refused:")
++    if (p.returncode == 255 or restricted) and kind == "key":
++        from hermes_cli.kanban_wait_key import unreachable
++        return unreachable(gateway, target, board=board, until=until, since=since)
+     if (p.returncode == 255 or restricted) and kind == "task":
+         return _unreachable_task(gateway, target, board=board, until=until, since=since,
+                                  live_timeout=25 - (time.monotonic() - started))
+     out = (p.stdout + p.stderr).strip()
+-    if p.returncode == 0 and since and kind == "task":
++    if p.returncode == 0 and since and kind in ("task", "key"):
+         words = (p.stdout or "").split()
+-        if len(words) >= 2 and words[0] == target and words[1] in set(since):
++        if len(words) >= 2 and (kind == "key" or words[0] == target) and words[1] in set(since):
+             return 1, f"{out} (unchanged since park)"
+     if p.returncode in (0, 1, 3):  # 3: the remote read a stale replica of a third gateway
+         return p.returncode, out
+diff --git a/hermes_cli/kanban_wait_key.py b/hermes_cli/kanban_wait_key.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..10b11c816cba82fa48f731ed276a384359197727
+--- /dev/null
++++ b/hermes_cli/kanban_wait_key.py
+@@ -0,0 +1,55 @@
++"""Resolve queued product keys using read-only Board observations."""
++from __future__ import annotations
++
++import time
++
++
++def source_for_key(board, key, *, replica_only=False):
++    from hermes_cli import kanban_wait_check as wait
++    from hermes_cli.kanban_db_sync import board_slug_for_path
++    from hermes_cli.kanban_sync_client import shadow_path
++    from hermes_cli.kanban_replica_freshness import FRESH_SECONDS
++
++    live = wait._db(board)
++    shadow = shadow_path(board_slug_for_path(str(live)))
++    paths = (shadow,) if replica_only else (live, shadow)
++    found = []
++    readable = False
++    for path in paths:
++        if not path.exists():
++            continue
++        if replica_only:
++            state = wait._query(path, 'select pulled_at from kanban_sync_state limit 1')
++            pulled = state[0][0] if state else None
++            if not isinstance(pulled, (int, float)) or not 0 <= time.time() - pulled <= FRESH_SECONDS:
++                raise ValueError('Board key replica is stale')
++        rows = wait._query(path, 'select id,status,created_at from tasks where idempotency_key=? '
++                                 'order by created_at desc,id desc limit 1', (key,))
++        readable = True
++        if rows:
++            found.append((path, rows))
++    if not readable:
++        raise ValueError('no readable Board for key lookup')
++    if not found:
++        return live, []
++    return max(found, key=lambda item: (item[1][0][2], item[1][0][0]))
++
++
++def unreachable(gateway, key, *, board, until, since):
++    """A restricted hub key can still read the same fresh Board shadow as task waits.
++
++    Other gateway boards cannot be inferred from this gateway's Board shadow.
++    A missing/stale/unreadable observation is cannot-tell, never pending.
++    """
++    from hermes_cli import kanban_wait_check as wait
++    try:
++        if wait.current_gateway(gateway) != 'hub':
++            raise ValueError('remote key lookup unavailable')
++        source, rows = source_for_key(board, key, replica_only=True)
++        if not rows:
++            return 1, 'queued card not found yet (board replica)'
++        target, status = rows[0][:2]
++        return wait._verdict(board, target, status, source=source, until=until, since=since,
++                             note=' (board replica)')
++    except Exception as exc:  # health: allow BLE001 -- failed observations are cannot-tell
++        return 2, f'error: {exc}'
+diff --git a/tests/hermes_cli/test_kanban_wait_key.py b/tests/hermes_cli/test_kanban_wait_key.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4cc89664f7e8229173c1d806f74e5eab4aac812
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wait_key.py
+@@ -0,0 +1,125 @@
++"""Queued create keys are wait handles, not shell/SQL fragments."""
++import argparse
++import shlex
++import sqlite3
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_wait_check as wait
++
++KEY = "core-wt-review:repo#4557:abc' ; $(false)"
++
++
++@pytest.fixture
++def cards(tmp_path, monkeypatch):
++    path = tmp_path / 'cards.db'
++    db = sqlite3.connect(path)
++    db.execute('CREATE TABLE tasks(id TEXT, status TEXT, idempotency_key TEXT, created_at INTEGER)')
++    db.commit()
++    monkeypatch.setattr(wait, '_db', lambda board: path)
++    from hermes_cli import kanban_sync_client
++    monkeypatch.setattr(kanban_sync_client, 'shadow_path', lambda slug: tmp_path / 'absent.db')
++    yield db
++    db.close()
++
++
++def put(db, status, *, tid='new', created=2, key=KEY):
++    db.execute('INSERT INTO tasks VALUES(?,?,?,?)', (tid, status, key, created))
++    db.commit()
++
++
++@pytest.mark.parametrize('status,expected', [(None, 1), ('running', 1), ('done', 0), ('archived', 0)])
++def test_key_status(cards, status, expected):
++    if status:
++        put(cards, status)
++    rc, text = wait.check_local('key', KEY)
++    assert rc == expected, text
++    if status:
++        assert text.split()[:2] == ['new', status]
++
++
++def test_newest_card_wins(cards):
++    put(cards, 'done', tid='old', created=1)
++    put(cards, 'running')
++    assert wait.check_local('key', KEY)[0] == 1
++
++
++def test_until_and_from_are_task_rules(cards):
++    put(cards, 'running')
++    assert wait.check_local('key', KEY, until=('done',))[0] == 1
++    assert wait.check_local('key', KEY, until=('running',))[0] == 0
++    assert wait.check_local('key', KEY, until=('running',), since=('running',))[0] == 1
++
++
++def test_unreadable_is_not_pending(cards):
++    cards.execute('DROP TABLE tasks')
++    cards.commit()
++    assert wait.check_local('key', KEY)[0] == 2
++
++
++def test_remote_key_argv_reads_selected_board(cards, monkeypatch, capsys):
++    put(cards, 'done')
++    calls = []
++
++    def ssh(argv, **kwargs):
++        calls.append((argv, kwargs))
++        inner = shlex.split(argv[-1].split('; ', 1)[1])
++        assert inner[:4] == ['hermes', 'kanban', 'wait-check', 'key']
++        assert inner[4] == KEY
++        assert inner[inner.index('--board') + 1] == 'reviews'
++        rc, text = wait.check_local('key', inner[4], board='reviews', until=('done',))
++        return subprocess.CompletedProcess(argv, rc, text, '')
++
++    monkeypatch.setattr(wait.subprocess, 'run', ssh)
++    args = argparse.Namespace(check='key', target=KEY, gateway='remote', board='reviews', until='done', since='')
++    assert wait.run(args) == 0
++    args.since = 'done'
++    assert wait.run(args) == 1
++    assert all(not kwargs.get('shell') for _, kwargs in calls)
++    assert 'unchanged since park' in capsys.readouterr().out
++
++
++def test_key_parser():
++    from hermes_cli.kanban import build_parser
++    parser = argparse.ArgumentParser()
++    build_parser(parser.add_subparsers(dest='command'))
++    args = parser.parse_args(['kanban', 'wait-check', 'key', KEY, '--gateway', 'hub', '--board', 'reviews'])
++    assert (args.check, args.target, args.gateway, args.board) == ('key', KEY, 'hub', 'reviews')
++
++
++@pytest.mark.parametrize('age,expected', [(0, 0), (100000, 2)])
++def test_restricted_hub_key_uses_only_fresh_board_shadow(cards, tmp_path, monkeypatch, age, expected):
++    import time
++    from hermes_cli import kanban_sync_client
++    shadow = tmp_path / 'shadow.db'
++    db = sqlite3.connect(shadow)
++    try:
++        db.executescript('CREATE TABLE tasks(id TEXT,status TEXT,idempotency_key TEXT,created_at INTEGER);'
++                         'CREATE TABLE kanban_sync_state(pulled_at REAL);')
++        db.execute('INSERT INTO kanban_sync_state VALUES(?)', (time.time() - age,))
++        put(db, 'done')
++    finally:
++        db.close()
++    monkeypatch.setattr(kanban_sync_client, 'shadow_path', lambda slug: shadow)
++    monkeypatch.setattr(wait.subprocess, 'run', lambda *a, **kw:
++                        subprocess.CompletedProcess(a, 2, '', 'hub-read: refused: command'))
++    assert wait.check_remote('hub', 'key', KEY)[0] == expected
++    assert wait.check_remote('hub', 'key', 'missing')[0] == (1 if age == 0 else 2)
++    assert wait.check_remote('foreign', 'key', KEY)[0] == 2
++    if not age:
++        assert wait.check_remote('hub', 'key', KEY, until=('running',))[0] == 1
++        assert wait.check_remote('hub', 'key', KEY, since=('done',))[0] == 1
++
++
++def test_newer_shadow_card_beats_older_live_card(cards, tmp_path, monkeypatch):
++    from hermes_cli import kanban_sync_client
++    put(cards, 'done', tid='old', created=1)
++    shadow = tmp_path / 'shadow.db'
++    cards.backup(db := sqlite3.connect(shadow))
++    try:
++        put(db, 'running')
++    finally:
++        db.close()
++    monkeypatch.setattr(kanban_sync_client, 'shadow_path', lambda slug: shadow)
++    assert wait.check_local('key', KEY)[0] == 1
+diff --git a/tests/tools/test_kanban_queued_wait_key.py b/tests/tools/test_kanban_queued_wait_key.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c99ecbe383d0bf7e7c67cd738a6b2f1097cc258
+--- /dev/null
++++ b/tests/tools/test_kanban_queued_wait_key.py
+@@ -0,0 +1,66 @@
++"""A forwarded queued create returns an executable, lossless park handle."""
++import json
++import shlex
++
++import pytest
++
++from tools import kanban_tools as kt
++from hermes_cli import kanban_creation_home as home
++from hermes_cli import kanban_placement as placement
++from tests.hermes_cli import test_kanban_wait_replica as fixtures
++
++board = fixtures.board
++KEY = "core-wt-review:example-org/hermes#4557:b30ca0e9d74c262c099f4a7c11bec8e2c33ea602"
++
++
++@pytest.fixture(params=[False, True], ids=['legacy-route', 'canonical-home'])
++def queued(monkeypatch, request):
++    monkeypatch.setattr(home, 'prepare', lambda view, **kw:
++                        (True if request.param else None, {**view, 'runs_on': ['pool:worker']},
++                         {'where': 'hub', 'why': 'test'}))
++    monkeypatch.setattr(kt, '_forwarding_fields', lambda *a: {})
++    monkeypatch.setattr(placement, 'create_remote', lambda *a, **kw: {
++        'ok': True, 'request_id': 'request-queued', 'queued_only': True})
++
++    def create(key):
++        args = {'title': 'Review queued change'}
++        if key is not None:
++            args['idempotency_key'] = key
++        raw, _ = kt._place_remote(args, assignee='default', skills=None, parents=None,
++                                  project_id=None, session_id=None)
++        out = json.loads(raw)
++        assert out['status'] == 'queued', out
++        return out
++    return create
++
++
++@pytest.mark.parametrize('key', [KEY, "review:quotes ' and spaces ; $(false)"])
++def test_queued_handle(queued, key):
++    out = queued(key)
++    assert out['wake_check'] == 'hermes kanban wait-check key ' + shlex.quote(key) + ' --gateway hub'
++    assert shlex.split(out['wake_check']) == ['hermes', 'kanban', 'wait-check', 'key', key, '--gateway', 'hub']
++    assert 'using exactly this wake_check' in out['note']
++    assert 'never a constant probe (`sleep 1; exit 1`) or a clock_only park' in out['note']
++
++
++def test_keyless_queue_has_bounded_lookup_note(queued):
++    out = queued(None)
++    assert 'wake_check' not in out
++    assert 'at most 2 h without a probe' in out['note']
++    assert 'hermes-hub requests' in out['note']
++
++
++def test_schedule_stores_returned_handle_unchanged(queued, board, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    conn, tid = board
++    cmd = queued(KEY)['wake_check']
++    monkeypatch.setenv('HERMES_KANBAN_TASK', tid)
++    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(kb.get_task(conn, tid).current_run_id))
++    monkeypatch.setenv('HERMES_KANBAN_WAKE_DRYRUN', '0')
++    out = json.loads(kt._handle_schedule({
++        'reason': 'SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting for queued review',
++        'wake_check': cmd, 'check_every': 120,
++        'awaiting': {'kind': 'external', 'ref': 'request-queued', 'why': 'hub courier creates the review'},
++    }))
++    assert out.get('status') == 'scheduled', out
++    assert conn.execute('SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()[0] == cmd
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 5eff49885739b8e69275b64f19883d37398df258..45719d29d232227484f2295f580bb11824a65743 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1514,7 +1514,7 @@
+                 f"creation key are refused; without one they may duplicate. Its task id appears when {target} applies it "
+                 + (kbd_words.CHAT_TASKS_HEAD + kbd_words.CHAT_TASKS_SEP if session_id else "(")
+                 + "`hermes-hub requests`).")
+-        return _ok(task_id=None, status="queued", **fields, runs_where=target, note=note), None
++        return _ok(task_id=None, status="queued", **fields, runs_where=target, **kbd_words.queued_wait(args, target, note)), None
+     except Exception as exc:
+         logger.warning("kanban placement failed", exc_info=True)
+         if home is not None or origin_gateway:
+diff --git a/tools/kanban_tools_board_delivery.py b/tools/kanban_tools_board_delivery.py
+index cfa155629400e5287a2da62d597640cd8da965ed..db0bd75cd791f60cdaa47f9529ed05e8bfa627f0 100644
+--- a/tools/kanban_tools_board_delivery.py
++++ b/tools/kanban_tools_board_delivery.py
+@@ -7,6 +7,7 @@
+ 
+ # The owner's answer is defined once, where the owner writes it (PR #2157 review). [daveey]
+ from hermes_cli.kanban_origin_creation import OWNER_WRITTEN
++from hermes_cli.kanban_creation_wait import queued_wait as queued_wait  # noqa: PLC0414 -- public result helper reexport
+ 
+ logger = logging.getLogger(__name__)
+ 
+-- 
+2.43.0
+

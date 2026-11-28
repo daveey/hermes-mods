@@ -1,0 +1,319 @@
+From 66a96950d042b1cf810deb5e9fb3063f3abb04ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:57:58 +0000
+Subject: [PATCH 6702] Spend-review lease allowance consumer, decision liveness and budget fences
+
+Public mirror of source commit 66a96950d042b1cf810deb5e9fb3063f3abb04ae.
+
+---
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index 8ecc17b895528457473cce5afd3729a3dcd73b34..e13b74a2a49aa15d5ca348ee7a67394ebe4048aa 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -242,10 +242,12 @@
+                  cache_read_tokens: Optional[int] = None, by: str, reason: str,
+                  seen: Optional[int] = None, board: Optional[str] = None,
+                  writer_kind: Optional[str] = None, cache_read_writer_kind: Optional[str] = None,
+-                 runs_writer_kind: Optional[str] = None) -> dict:
++                 runs_writer_kind: Optional[str] = None, standalone: bool = False) -> dict:
+     """Give ``task_id`` its own limits (0 = no limit; None = the board's), recorded as a ``spend_budget_set``
+     event and a comment naming ``by`` and ``reason``. Both None clears the override. Replacing a spend-stop
+     decision requires ``seen`` to acknowledge its comment, checked atomically even after promotion.
++    ``standalone`` fences CLI edits on undecided restricted stops under this same writer; the validated
++    release composition leaves it unset because it records the decision separately.
+     For cards meant to run indefinitely (standing shepherds), set explicitly, never inferred from a title."""
+     from hermes_cli import kanban_db as kb
+ 
+@@ -269,7 +271,9 @@
+     with kb.write_txn(conn):
+         if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+             raise ValueError(f"unknown task {task_id}")
+-        from hermes_cli.kanban_spend_override_fence import check
++        from hermes_cli.kanban_spend_override_fence import check, require_decision
++        if standalone:
++            require_decision(conn, task_id)
+         if episode := check(conn, task_id, seen=seen, board=board):
+             payload['episode'] = episode
+         window = limit_window(conn, task_id)
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index 430c9de529ff2ef4bac08bcc44a40283c9d5f3da..33f60392ce7e8bb843459f00a5ff160db66f7931 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -11,6 +11,8 @@
+ the printed spend is historical, not deducted from that fresh allowance. Other
+ limits include recorded spend in the current window, so one at or below that spend is refused (it would
+ stop the card at once); restricted history never resets.
++An undecided restricted-history stop refuses standalone changes: use ``release`` to record its decision,
++not a limit-only write that leaves ``stop_undecided`` in force. Reads remain available.
+ """
+ from __future__ import annotations
+ 
+@@ -154,6 +156,7 @@
+         if changing:
+             from hermes_cli.kanban_comment_writer import cli_comment_writer
+             from hermes_cli.kanban_release_comments import UNREAD_EXIT, UnreadComments
++            from hermes_cli.kanban_spend_override_fence import StopDecisionRequired
+             writer = cli_comment_writer()
+             seen, board = getattr(args, 'seen_comment_id', None), getattr(args, 'board', None)
+             carried: dict = {}
+@@ -164,7 +167,12 @@
+                 seen, carried = gate
+             try:
+                 ksb.set_override(conn, tid, runs=runs, cache_read_tokens=cache, by=_actor(), reason=args.reason,
+-                                 seen=seen, board=board, writer_kind=writer[0], **carried)
++                                 seen=seen, board=board, writer_kind=writer[0], standalone=True, **carried)
++            except StopDecisionRequired as exc:
++                if getattr(args, "json", False):
++                    print(json.dumps({"ok": False, "error": "stop_decision_required", "message": str(exc)}))
++                    return 1
++                return _err(str(exc))
+             except UnreadComments as exc:
+                 return _err(str(exc), UNREAD_EXIT)
+         lim = ksb.card_limits(conn, tid, ksb.limits())
+diff --git a/hermes_cli/kanban_spend_override_fence.py b/hermes_cli/kanban_spend_override_fence.py
+index 572697894f4a20a1b50318bad44e5cd6b83edda2..87bb1af9c15d461bdc058c8129e9d84ef9a5462d 100644
+--- a/hermes_cli/kanban_spend_override_fence.py
++++ b/hermes_cli/kanban_spend_override_fence.py
+@@ -13,6 +13,20 @@
+ from hermes_cli.kanban_sync_divergence import _event_order
+ 
+ 
++class StopDecisionRequired(ValueError):
++    """A standalone limit write cannot settle a restricted-history stop."""
++
++
++def require_decision(conn, task_id):
++    """Inside the budget writer: release owns its composition; standalone CLI edits do not."""
++    from hermes_cli import kanban_spend_decision as decision
++    if decision.pending(conn, task_id) and decision.restricted_floor(conn, task_id) is not None:
++        raise StopDecisionRequired(
++            f"stop_decision_required: {task_id} still needs a stop decision; no budget was changed. "
++            f"Use `hermes kanban release {task_id}` from the owning chat or a human terminal "
++            "to validate and record the decision. Its --runs specifies additional runs, not an absolute limit.")
++
++
+ def check(conn, task_id, *, seen=None, board=None):
+     """Under the budget writer lock; return the latest stop identity, or None.
+ 
+diff --git a/tests/hermes_cli/test_kanban_allowance_observation_boundaries.py b/tests/hermes_cli/test_kanban_allowance_observation_boundaries.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d3f348b81ecb3cef4cb309202045a6fd6c30ab4e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_allowance_observation_boundaries.py
+@@ -0,0 +1,93 @@
++"""Unmask individual observation validation predicates; malformed diagnostics never grant authority."""
++from dataclasses import replace
++
++import pytest
++
++from hermes_cli import kanban_allowance_observation as observation
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_allowance_observation as reads
++from tests.hermes_cli import test_kanban_allowance_supersession as supersession
++from tests.hermes_cli import test_kanban_spend_allowance as fixtures
++
++kanban_home = fixtures.kanban_home
++primary = fixtures.primary
++
++
++@pytest.mark.parametrize('changes', [
++    {'runs': 10, 'used': 10, 'remaining': False},
++    {'runs': 10, 'used': True, 'remaining': 9},
++    {'runs': 10.0, 'used': 10, 'remaining': 0},
++    {'runs': 11, 'used': 11, 'remaining': 0},
++    {'runs': 10, 'used': -1, 'remaining': 11},
++    {'runs': 10, 'used': 11, 'remaining': -1},
++    {'home': 7}, {'episode': True},
++])
++def test_consistent_arithmetic_does_not_mask_invalid_types_or_bounds(primary, monkeypatch, changes):
++    tid, uid = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid, **changes))
++    assert observation.read(primary, tid) is None
++
++
++def test_wrong_outer_board_with_valid_allowance_is_unknown(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    reply = reads._reply(primary, tid, uid)
++    reply['board'] = 'wrong'
++    reads._hub(monkeypatch, primary, reply)
++    assert observation.read(primary, tid) is None
++
++
++@pytest.mark.parametrize('data', [[], 'active', 7])
++def test_board_state_nonobject_is_unknown_not_an_exception(primary, monkeypatch, data):
++    tid, _ = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, {'board': fixtures.sync.sync_state(primary)['board_id'], 'allowance': data})
++    assert observation.board_state(primary, tid) is None
++
++
++def test_board_state_missing_allowance_key_with_correct_board_is_unknown(primary, monkeypatch):
++    tid, _ = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, {'board': fixtures.sync.sync_state(primary)['board_id']})
++    assert observation.board_state(primary, tid) is None
++
++
++def test_missing_observation_and_budget_have_explicit_empty_results(primary):
++    tid = kb.create_task(primary, title='No allowance', assignee='default')
++    assert observation.current(primary, tid, None) is False
++    assert observation._budget(primary, tid) is None
++
++
++def test_missing_sync_identity_after_expected_preflight_never_opens_transport(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    calls = reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid))
++    real = fixtures.allowance.expected
++
++    def losing_identity(conn, task):
++        want = real(conn, task)
++        assert want is not None
++        with fixtures.kbc.write_txn(conn):
++            conn.execute('DELETE FROM kanban_sync_state')
++        return want
++
++    monkeypatch.setattr(fixtures.allowance, 'expected', losing_identity)
++    assert observation.read(primary, tid) is None
++    assert calls == []
++
++
++def test_observation_current_requires_exact_board_and_surviving_identity(primary, monkeypatch):
++    tid, uid = fixtures._released(primary)
++    reads._hub(monkeypatch, primary, reads._reply(primary, tid, uid))
++    seen = observation.read(primary, tid)
++    assert seen is not None
++    assert observation.current(primary, tid, seen)
++    assert not observation.current(primary, tid, replace(seen, board='wrong'))
++    with fixtures.kbc.write_txn(primary):
++        primary.execute('DELETE FROM kanban_sync_state')
++    assert not observation.current(primary, tid, seen)
++
++
++def test_stuck_observation_loses_identity_without_exception(primary, monkeypatch):
++    tid, _, _ = supersession._decided(primary, monkeypatch)
++    seen = observation.stuck(primary, tid)
++    assert seen is not None and observation.still_stuck(primary, tid, seen)
++    with fixtures.kbc.write_txn(primary):
++        primary.execute('DELETE FROM kanban_sync_state')
++    assert observation.still_stuck(primary, tid, seen) is False
+diff --git a/tests/hermes_cli/test_kanban_budget_decision_liveness.py b/tests/hermes_cli/test_kanban_budget_decision_liveness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b21e33945f699f841bc343d948eca4caf05336e5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_budget_decision_liveness.py
+@@ -0,0 +1,114 @@
++"""Standalone limits must not masquerade as a decision on a renewed restricted stop."""
++import contextlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_spend_budget_cli as cli
++from tests.hermes_cli import test_kanban_release as releases
++from tests.hermes_cli import test_kanban_scope_renewal as scope
++
++board = scope.board
++
++
++def renewed(board, monkeypatch):
++    tid, _, episode = scope.stopped(board, monkeypatch)
++    # The synthetic stopped run made no model call; settle its accounting through the real result event.
++    run_id = board.execute('SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC', (tid,)).fetchone()[0]
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'worker_result', {'usage_final': True, 'exit_code': 0, 'usage': {
++            'input_tokens': 0, 'output_tokens': 0, 'cache_read_tokens': 0, 'cache_write_tokens': 0}}, run_id=run_id)
++    scope.link(board, tid)
++    comment = scope.mandate(board, tid)
++    scope.renew(board, tid, episode, comment)
++    assert decision.pending(board, tid)
++    assert not decision.execution_restricted(board, tid)
++    assert decision.restricted_floor(board, tid) is not None
++    return tid
++
++
++@pytest.mark.parametrize('flags', [('--runs', '59'), ('--exempt',), ('--clear',)])
++def test_owner_budget_after_renewal_refuses_without_writes(board, monkeypatch, flags):
++    tid = renewed(board, monkeypatch)
++    before = releases.written(board, tid)
++    rc, error = releases.spend_budget(board, monkeypatch, tid, *flags, '--reason', 'continue goal')
++    assert rc == 1
++    assert 'stop_decision_required' in error
++    assert f'hermes kanban release {tid}' in error
++    assert 'additional runs' in error
++    assert releases.written(board, tid) == before
++    assert budget.card_override(board, tid) is None
++    assert decision.pending(board, tid)
++    # The owning chat uses the actual validated release composition, not a bare budget append.
++    out = releases.as_owner(board, tid, runs=7)
++    assert out['ok'], out
++    assert out['outcome'] == 'released'
++    assert not decision.pending(board, tid)
++    from hermes_cli.kanban_actionability_sources import describe
++    assert 'private_hold' not in describe(board, tid)['violations']
++    assert budget.hold(board, tid) is None
++    assert not kb._spend_claim.claim_check(board, tid)()
++    assert not kb._containment.held(board, tid)
++    assert not kb.admission_hold_set(tid)
++    assert kb.claim_task(board, tid, claimer='fixture-claim') is not None, kb.get_task(board, tid)
++
++
++def test_budget_read_on_renewed_stop_stays_read_only(board, monkeypatch):
++    tid = renewed(board, monkeypatch)
++    before = releases.written(board, tid)
++    rc, error = releases.spend_budget(board, monkeypatch, tid, '--json')
++    assert rc == 0, error
++    assert releases.written(board, tid) == before
++    assert decision.pending(board, tid)
++
++
++def test_ordinary_stop_and_completed_scope_decision_allow_budget_edits(board, monkeypatch):
++    tid = releases.spend_stopped(board)
++    rc, error = releases.spend_budget(board, monkeypatch, tid, '--runs', '59', '--reason', 'ordinary')
++    assert rc == 0, error
++    scoped = renewed(board, monkeypatch)
++    out = releases.as_owner(board, scoped, runs=7)
++    assert out['ok'], out
++    prior = budget.card_override(board, scoped)
++    assert prior is not None
++    rc, error = releases.spend_budget(board, monkeypatch, scoped, '--runs', '59', '--reason', 'decided',
++                                     '--seen', str(prior['decision_comment']['comment_id']))
++    assert rc == 0, error
++
++
++def test_stop_arriving_at_budget_writer_is_refused(board, monkeypatch):
++    tid = kb.create_task(board, title='Race with budget writer', assignee='default')
++    real = kb.write_txn
++    inserted = False
++
++    @contextlib.contextmanager
++    def stopping(conn, *args, **kwargs):
++        nonlocal inserted
++        if not inserted:
++            inserted = True
++            with real(conn):
++                kb._append_event(conn, tid, decision.EVENT, {'cause': 'scope_stopped', 'reason': 'scope ended'})
++        with real(conn, *args, **kwargs) as transaction:
++            yield transaction
++
++    monkeypatch.setattr(kb, 'write_txn', stopping)
++    rc, error = releases.spend_budget(board, monkeypatch, tid, '--runs', '59', '--reason', 'racing')
++    assert rc == 1 and 'stop_decision_required' in error
++    assert budget.card_override(board, tid) is None
++    assert not board.execute('SELECT 1 FROM task_comments WHERE task_id=?', (tid,)).fetchone()
++
++
++def test_json_refusal_is_structured_and_keeps_budget(board, monkeypatch, capsys):
++    import argparse
++    tid = renewed(board, monkeypatch)
++    args = argparse.Namespace(task_id=tid, runs=59, cache_read_tokens=None, exempt=False, clear=False,
++                              reason='continue goal', json=True)
++    before = releases.written(board, tid)
++    assert cli.command(args) == 1
++    reply = json.loads(capsys.readouterr().out)
++    assert reply['ok'] is False and reply['error'] == 'stop_decision_required'
++    assert f'hermes kanban release {tid}' in reply['message']
++    assert releases.written(board, tid) == before
+-- 
+2.43.0
+

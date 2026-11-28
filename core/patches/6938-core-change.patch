@@ -1,0 +1,777 @@
+From afeff50d1d85e551e733f3d212d094a916ddf413 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 19:21:57 +0000
+Subject: [PATCH 6938] Attested acceptance continuations for budgeted lane planning
+
+Public mirror of source commit afeff50d1d85e551e733f3d212d094a916ddf413.
+
+---
+diff --git a/docs/kanban-acceptance-continuations.md b/docs/kanban-acceptance-continuations.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..10512ca946a91cef002e3f0b6a4206e762f98864
+--- /dev/null
++++ b/docs/kanban-acceptance-continuations.md
+@@ -0,0 +1,90 @@
++# Required acceptance continuations
++
++Lane gates continue to hold unsolicited improvements. Finishing a parent, matching its title,
++or writing a completion receipt does **not** authorize a child. A required continuation has a
++separate explicit executor attestation, accepted only during the parent's owned, genuinely
++claimed completion. This attributes the necessity decision to that executor; it is not a
++classifier that claims to establish semantic necessity from prose.
++
++## Producer
++
++New `created` events contain the writer-generated `source_body_sha256` of the original body.
++The completing executor may supply this optional metadata:
++
++```json
++{
++  "acceptance_continuations": {
++    "version": 1,
++    "source_body_sha256": "<copy the original created event's body digest>",
++    "items": [{"card": "<created child id>", "criterion": "<verbatim original acceptance criterion>"}]
++  }
++}
++```
++
++The parent body must still match its original creation digest. The criterion must be a literal
++nonblank excerpt, at least 16 characters, of that body. The executor explicitly attests that the
++child is REQUIRED to finish that original criterion, not an optional improvement. A child can
++have been created while the parent was running; it is reevaluated after genuine completion.
++Up to 16 distinct children are allowed. An invalid declaration refuses the whole completion
++transaction, without ending its run or recording partial authority. Omit the declaration when
++completing work that has no eligible required continuation.
++
++The canonical completed event stores the producer-generated run UID, child-created event UID,
++and child scope fingerprint. Editing run metadata cannot add or change an attestation.
++`completion_receipt`, `verified_cards`, `followup_card`, renderer metadata and done-parent
++status remain insufficient. Historical creation without the original-body digest is not
++backfilled. Missing portable run/event identities defer; local-only portable-identity bootstrap
++is separate from admission. No PR is required: local-only acceptance work uses the same protocol.
++
++## Existing planner
++
++`hermes kanban lanes held --json` adds `continuation` to each held card. It provides
++`eligible`, `reason`, `next_actor`, and the source completion identity. The projection is
++advisory: apply repeats the checks under its write transaction.
++
++Extend the **existing** lane planner's prompt (do not add a watcher) with this rule:
++
++> Before ordinary breakage/cross-lane admissions, inspect each held card's `continuation`.
++> When and only when `continuation.eligible` is true, propose `admit_continuation`, oldest
++> first, citing its source parent/completion. Missing/false evidence is not permission to
++> infer a continuation from title, prose, age or done-parent status. Retain the returned
++> next-actor/reason for deferred continuations; do not create a human ask. Apply one plan once.
++> Ordinary improvements stay held. The existing budgets, pauses, never-admit policy and
++> independent restrictions remain binding; never fall back to manual admit after refusal.
++
++The action is part of the existing public budgeted apply path:
++
++```json
++[{"action":"admit_continuation","card":"<child>","reason":"required original acceptance from <parent>"}]
++```
++
++No existing planner may be switched to this action until its installed core exposes the typed
++candidate projection. Older cores safely lack that evidence and should leave those cards held.
++The change does not alter shares, daily limits, pause states, user-only permissions or scope.
++
++## Revalidation and deferral
++
++Apply requires the authenticated creator dependency, genuine completed parent run and canonical
++completion event, unchanged parent body and child scope, satisfied prerequisites, a never-run
++child held solely at the lane gate, and no independent ask, containment/quarantine, refusal or
++scope/safety/spend restriction. Creation namespace is not execution ownership: synchronized
++pool execution can attest hub-created cards on the same board. No cross-board authority is
++inferred or fetched. Missing board evidence defers to the existing owner.
++
++The existing lane budget/daily dollar and card limits and never-admit policy apply; budget
++usage is read again under the admission lock. Exactly one ordinary budgeted admission event is
++appended, carrying the source completion UID in its reason. Retrying after restart cannot admit
++the same child again. No original request, creation, completion or admission record is rewritten.
++
++## Verification
++
++Run `./scripts/run_tests.sh tests/hermes_cli/test_kanban_acceptance_continuations.py`.
++This exercises the real completion producer and `lanes held` -> public `lanes apply` CLI,
++renderer-shaped required verification, pre-completion reevaluation, restart idempotence,
++budget exhaustion/stale plan state, unsolicited siblings, forged and missing evidence,
++changed scope, independent holds and malformed-history deferral.
++
++Deployment acceptance additionally needs the naturally installed revision, the existing
++planner's actual prompt, and a controlled hidden side-effect-free eligible fixture plus a
++negative control with cleanup readbacks. Source tests or a successful deployment command alone
++are not that live proof.
+diff --git a/hermes_cli/kanban_acceptance_continuations.py b/hermes_cli/kanban_acceptance_continuations.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa1f92a3e38c2949f110252ccc252df49ee659dd
+--- /dev/null
++++ b/hermes_cli/kanban_acceptance_continuations.py
+@@ -0,0 +1,176 @@
++"""Explicit executor attestations of required acceptance; never infer necessity from prose.
++
++Only canonical completion of an owned claimed run admits a declaration. The body
++reference validates attribution, not semantic truth. Lane admission remains a
++separate, budgeted transaction; this never renews scope or clears another hold.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++
++KEY = "acceptance_continuations"
++_SCOPE = ("title", "body", "tenant", "assignee", "workspace_kind", "workspace_path", "branch_name",
++          "project_id", "skills", "requires", "runs_on", "completion_contract", "review_required",
++          "goal_mode", "goal_max_turns", "model_override", "provider_override", "max_runtime_seconds")
++
++
++def _digest(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++
++
++def _body(row):
++    return hashlib.sha256((row["body"] or "").encode()).hexdigest()
++
++
++def source_digest(conn, task_id):
++    return _body(conn.execute("SELECT body FROM tasks WHERE id=?", (task_id,)).fetchone())
++
++
++def _scope(row):
++    return _digest({k: row[k] for k in _SCOPE if k in row.keys()})
++
++
++def _object(payload):
++    try:
++        value = json.loads(payload or "{}")
++    except (TypeError, ValueError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _created(conn, child):
++    row = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
++                       (child,)).fetchone()
++    return (row["uid"] if "uid" in row.keys() else None, _object(row["payload"])) if row else (None, {})
++
++
++def _lineage(conn, parent, child):
++    uid, created = _created(conn, child)
++    linked = conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (parent, child)).fetchone()
++    return uid if created.get("creator_task_id") == parent and linked else None
++
++
++def _hold(conn, row):
++    from hermes_cli.kanban_containment_connections import refusal
++    from hermes_cli.kanban_spend_decision import pending, execution_restricted
++    from hermes_cli.kanban_refusal_receipt import restricted
++    if row["human_request"]:
++        return "existing human/physical ask; named human owns that step"
++    if why := refusal(conn, row["id"]):
++        return f"existing protection: {why}; existing protection owner must resolve it"
++    if restricted(conn, row["id"]) or execution_restricted(conn, row["id"]) or pending(conn, row["id"]):
++        return "scope/safety/spend restriction; existing decision owner must resolve it"
++    # This new path only admits never-executed children. No new run window is granted.
++    if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (row["id"],)).fetchone():
++        return "child already has execution history; creator must disposition remaining work"
++    return None
++
++
++def prepare(conn, parent_id, metadata, expected_run_id, *, force=False):
++    """Called inside complete_task's transaction, before ending the run. Returns writer-owned evidence."""
++    if not isinstance(metadata, dict) or KEY not in metadata:
++        return None
++    raw = metadata[KEY]
++    parent = conn.execute("SELECT * FROM tasks WHERE id=?", (parent_id,)).fetchone()
++    run = conn.execute("SELECT * FROM task_runs WHERE task_id=? AND id=?", (parent_id, expected_run_id)).fetchone()
++    claimed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='claimed' AND run_id=?",
++                           (parent_id, expected_run_id)).fetchone()
++    if (force or expected_run_id is None or parent is None or parent["current_run_id"] != expected_run_id
++            or run is None or run["ended_at"] is not None or not claimed or "uid" not in run.keys() or not run["uid"]):
++        raise ValueError("acceptance_continuations: current owned genuinely claimed run required")
++    if (not isinstance(raw, dict) or set(raw) != {"version", "source_body_sha256", "items"}
++            or type(raw["version"]) is not int or raw["version"] != 1
++            or raw["source_body_sha256"] != _body(parent)
++            or not isinstance(raw["items"], list) or not 1 <= len(raw["items"]) <= 16):
++        raise ValueError("acceptance_continuations: exact parent body digest and v1 items required")
++    _, original = _created(conn, parent_id)
++    if original.get("source_body_sha256") != _body(parent):
++        raise ValueError("acceptance_continuations: unchanged original creation scope required")
++    items, seen = [], set()
++    for item in raw["items"]:
++        if (not isinstance(item, dict) or set(item) != {"card", "criterion"}
++                or not isinstance(item["card"], str) or item["card"] in seen
++                or not isinstance(item["criterion"], str) or not 16 <= len(item["criterion"].strip()) <= 2000
++                or item["criterion"] not in (parent["body"] or "")):
++            raise ValueError("acceptance_continuations: unique child and literal source criterion required")
++        child = conn.execute("SELECT * FROM tasks WHERE id=?", (item["card"],)).fetchone()
++        uid = _lineage(conn, parent_id, item["card"])
++        if (child is None or not uid
++                or child["status"] in ("done", "archived") or _hold(conn, child)):
++            raise ValueError("acceptance_continuations: open unprotected created dependency required")
++        seen.add(item["card"])
++        items.append({**item, "created_uid": uid, "scope_sha256": _scope(child)})
++    return {"version": 1, "source_body_sha256": _body(parent), "run_uid": run["uid"], "items": items}
++
++
++def check(conn, child_id):
++    """Read-only current evidence; apply calls it again under its write lock. Returns reason and source."""
++    from hermes_cli import kanban_lanes as lanes
++    child = conn.execute("SELECT * FROM tasks WHERE id=?", (child_id,)).fetchone()
++    # Like ordinary lanes apply, this acts on this board's synchronized rows; creation
++    # namespace is not executor custody (a pool worker can run a hub-created card).
++    if child is None:
++        return "board evidence unavailable; owning board must evaluate", None
++    if why := _hold(conn, child):
++        return why, None
++    if not conn.execute(f"SELECT 1 FROM tasks WHERE id=? AND {lanes.HELD}", (child_id,)).fetchone():
++        return "not held solely at a lane gate; existing lifecycle owner acts next", None
++    _, created = _created(conn, child_id)
++    parent_id = created.get("creator_task_id")
++    parent = conn.execute("SELECT * FROM tasks WHERE id=?", (parent_id,)).fetchone() if isinstance(parent_id, str) else None
++    if parent is None or not _lineage(conn, parent_id, child_id):
++        return "authenticated creator dependency missing; creator must attest required acceptance", None
++    if parent["status"] != "done":
++        return "creator parent not genuinely complete; planner reevaluates after completion", None
++    if conn.execute("SELECT 1 FROM task_links l JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=? "
++                    "AND t.status!='done'", (child_id,)).fetchone():
++        return "unsatisfied or archived dependency; dependency owner acts next", None
++    event = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
++                         (parent_id,)).fetchone()
++    run = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (parent_id,)).fetchone()
++    if not event or not run or event["run_id"] != run["id"] or run["outcome"] != "completed":
++        return "latest genuine completion missing; creator must disposition acceptance", None
++    proof = _object(event["payload"]).get(KEY)
++    if (not isinstance(proof, dict) or type(proof.get("version")) is not int or proof.get("version") != 1
++            or "uid" not in run.keys() or not run["uid"] or "uid" not in event.keys() or not event["uid"]
++            or proof.get("run_uid") != run["uid"] or not isinstance(proof.get("items"), list)
++            or not all(isinstance(i, dict) for i in proof["items"])):
++        return "typed completion attestation missing; creator must explicitly attest or request manual admission", None
++    if proof.get("source_body_sha256") != _body(parent):
++        return "parent acceptance changed; creator must disposition changed scope", None
++    item = next((i for i in proof.get("items", []) if i.get("card") == child_id), None)
++    if not item or item.get("created_uid") != _lineage(conn, parent_id, child_id):
++        return "required acceptance evidence missing; unsolicited work stays held for creator", None
++    if item.get("scope_sha256") != _scope(child):
++        return "child scope changed; creator must disposition changed scope", None
++    return None, {"parent": parent_id, "completed_uid": event["uid"], "run_uid": run["uid"]}
++
++
++def candidates(conn, rows=None):
++    """Every local held card has an explicit next actor/reason, not a fabricated human ask."""
++    from hermes_cli import kanban_lanes as lanes
++    out = []
++    for row in lanes.held(conn) if rows is None else rows:
++        why, source = check(conn, row["id"])
++        out.append({"card": row["id"], "lane": row["tenant"], "eligible": why is None,
++                    "next_actor": "lane-planner" if why is None else f"existing-owner:{row['id']}",
++                    "reason": why or "typed required acceptance; existing lane budget and holds still apply",
++                    "source": source})
++    return out
++
++
++def admit(conn, pol, action, row, state):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_lanes as lanes
++    from hermes_cli.kanban_lanes_plan import _admit_locked
++    with kb.write_txn(conn, allow_nested=True):
++        why, source = check(conn, row["id"])
++        if why:
++            return why
++        if pol.lanes[pol.lane_of(row["tenant"])].paused:
++            return "lane paused; user owns resumption"
++        lane = pol.lane_of(row["tenant"])
++        state["used"][lane] = lanes.admitted_today(conn, lane, now=state["now"])
++        return _admit_locked(conn, pol, {**action, "reason": f"{action['reason']} (completion {source['completed_uid']})"},
++                             row, state)
+diff --git a/hermes_cli/kanban_completion_receipt.py b/hermes_cli/kanban_completion_receipt.py
+index ec1b347c6d5be8fea51b2eb21fe8a84781617107..1c7a717dfebb43805d0a46b00d8ceba3b2ce48a3 100644
+--- a/hermes_cli/kanban_completion_receipt.py
++++ b/hermes_cli/kanban_completion_receipt.py
+@@ -242,18 +242,20 @@
+     """
+     import json
+ 
+-    prior = None
++    stored = {}
+     if run_id is not None:
+         row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+         try:
+             stored = json.loads(row[0]) if row and row[0] else {}
+         except (TypeError, ValueError):
+             stored = {}
+-        prior = stored.get("completion_receipt") if isinstance(stored, dict) else None
+-    if "completion_receipt" in metadata and metadata["completion_receipt"] != prior:
+-        raise ReceiptEditRefused("completion_receipt: only kanban complete admits a receipt; "
+-                                 "edit keeps the admitted one (omit completion_receipt)")
+-    edited = {k: v for k, v in metadata.items() if k != "completion_receipt"}
+-    if prior is not None:
+-        edited["completion_receipt"] = prior
++    edited = dict(metadata)
++    for key in ("completion_receipt", "acceptance_continuations"):
++        prior = stored.get(key) if isinstance(stored, dict) else None
++        if key in metadata and metadata[key] != prior:
++            raise ReceiptEditRefused(f"{key}: only kanban complete admits this evidence; "
++                                     f"edit keeps the admitted one (omit {key})")
++        edited.pop(key, None)
++        if prior is not None:
++            edited[key] = prior
+     return edited
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 1dbd7cefdbf99bf931adbfa27ae13745cc7d73d0..4035bdcec2f23550dcd3dd3023e1bca989190219 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1792,7 +1792,7 @@
+     append_event(conn, task_id, kind, payload, run_id=run_id)
+ 
+ 
+-from hermes_cli.kanban_db_run import _end_run
++from hermes_cli.kanban_db_run import _end_run, _claim_is_live
+ 
+ 
+ def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+@@ -2386,12 +2386,6 @@
+         )
+ 
+ 
+-def _claim_is_live(trow) -> bool:
+-    """True when a ``running`` task's claim still protects a run: its spawned worker exists (PID + start-time
+-    fingerprint). TTL is not consulted: the process is the liveness authority (``reclaim_stale_tasks`` extends it)."""
+-    return bool(trow["status"] == "running" and trow["claim_lock"] is not None
+-                and trow["worker_pid"] and _worker_alive(trow["worker_pid"], trow["worker_started_at"]))
+-
+ 
+ @source_receipt_preflight  # workspace_source: the ending's receipt (published/unchanged/retained), S6
+ def complete_task(
+@@ -2449,6 +2443,8 @@
+         if not _parents_satisfied(conn, task_id):
+             return False
+         receipt_admission.recheck(conn, task_id, receipt_owners)
++        from hermes_cli.kanban_acceptance_continuations import prepare as prepare_continuations
++        continuations = prepare_continuations(conn, task_id, metadata, expected_run_id, force=force)
+         validate_repair_completion(conn, task_id, observation=repair_observation)
+         from hermes_cli.kanban_goal_receipt import record as record_goal
+         goal_event_id = record_goal(conn, task_id, goal_verification, (summary or result or '').strip())
+@@ -2503,6 +2499,8 @@
+             event_summary = _REVIEW_APPROVED_NOTE
+         from hermes_cli.kanban_db_completion_payload import completed_event_payload
+         completion_payload = completed_event_payload(result, event_summary, verified_cards, metadata, acceptance)
++        if continuations is not None:
++            completion_payload['acceptance_continuations'] = continuations
+         if isinstance(metadata, dict) and "completion_receipt" in metadata:
+             completion_payload["completion_receipt_admission"] = 1
+         if goal_event_id is not None:
+diff --git a/hermes_cli/kanban_db_creation.py b/hermes_cli/kanban_db_creation.py
+index 855d0a15f25c121b7e8d6286623c9fdba0496f42..eb98ca45f38648e20e2627aa7575557be97b944f 100644
+--- a/hermes_cli/kanban_db_creation.py
++++ b/hermes_cli/kanban_db_creation.py
+@@ -78,6 +78,7 @@
+                    creation_receipt=None, board=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_consent import snapshot
++    from hermes_cli.kanban_acceptance_continuations import source_digest
+ 
+     source = conn.execute("SELECT created_by, session_id, priority FROM tasks WHERE id=?", (task_id,)).fetchone()
+     kb._append_event(conn, task_id, "created", {
+@@ -104,6 +105,7 @@
+         "placement_policy": placement_policy,
+         "priority": source[2],
+         "consent_stops": snapshot(conn, task_id, creator_task_id),
++        "source_body_sha256": source_digest(conn, task_id),
+     })
+     from hermes_cli.kanban_fairness_creation import stage
+     stage(conn, task_id, creator_task_id=creator_task_id, board=board, receipt=creation_receipt)
+diff --git a/hermes_cli/kanban_db_run.py b/hermes_cli/kanban_db_run.py
+index 2318b3860de0c8e3f68eea823001bd89facd0d4a..384a5621d8318939a98591dc2148b20571eb350c 100644
+--- a/hermes_cli/kanban_db_run.py
++++ b/hermes_cli/kanban_db_run.py
+@@ -5,6 +5,14 @@
+ import time
+ from typing import Optional
+ 
++
++def _claim_is_live(trow) -> bool:
++    """True when a ``running`` task's claim still protects a run: its spawned worker exists (PID + start-time
++    fingerprint). TTL is not consulted: the process is the liveness authority (``reclaim_stale_tasks`` extends it)."""
++    from hermes_cli import kanban_db as kb
++    return bool(trow["status"] == "running" and trow["claim_lock"] is not None
++                and trow["worker_pid"] and kb._worker_alive(trow["worker_pid"], trow["worker_started_at"]))
++
+ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+     row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index 0b894c599ff4f147defe0320a57261ddc3767a1d..36e68fbe5307c791ecd07bc81649d1f68047eccf 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -81,17 +81,22 @@
+     return 0
+ 
+ 
+-def _cards(args, rows) -> int:
++def _cards(args, rows, *, continuations=None) -> int:
+     data = [{"id": r["id"], "title": r["title"], "lane": r["tenant"], "priority": r["priority"],
+              "created_at": r["created_at"], "created_by": r["created_by"]} for r in rows]
++    if continuations is not None:
++        for card in data:
++            card["continuation"] = continuations[card["id"]]
+     if not _json_out(args, data):
+         print("\n".join(f"{c['id']}  [{c['lane']}]  {c['title']}" for c in data) or "none")
+     return 0
+ 
+ 
+ def _held(args) -> int:
++    from hermes_cli.kanban_acceptance_continuations import candidates
+     with kbc.connect_closing() as conn:
+-        return _cards(args, lanes.held(conn, args.lane)[:args.limit])
++        rows = lanes.held(conn, args.lane)[:args.limit]
++        return _cards(args, rows, continuations={c["card"]: c for c in candidates(conn, rows)})
+ 
+ 
+ def _unclassified(args) -> int:
+diff --git a/hermes_cli/kanban_lanes_plan.py b/hermes_cli/kanban_lanes_plan.py
+index 73eabf4f3efbdad1ef50bdf96d25a38a784d062a..1bc7b8570a41b6b65f2876e5f3a65e984b738473 100644
+--- a/hermes_cli/kanban_lanes_plan.py
++++ b/hermes_cli/kanban_lanes_plan.py
+@@ -138,7 +138,13 @@
+     return None
+ 
+ 
+-_HANDLERS = {"admit": _admit, "merge": _merge, "reprioritize": _reprioritize, "relane": _relane}
++def _admit_continuation(conn, pol, action, row, state):
++    from hermes_cli.kanban_acceptance_continuations import admit
++    return admit(conn, pol, action, row, state)
++
++
++_HANDLERS = {"admit": _admit, "admit_continuation": _admit_continuation,
++             "merge": _merge, "reprioritize": _reprioritize, "relane": _relane}
+ 
+ 
+ def apply(conn, actions, *, now: Optional[float] = None, dry_run: bool = False, actor: str = ACTOR) -> dict:
+diff --git a/tests/hermes_cli/test_kanban_acceptance_continuations.py b/tests/hermes_cli/test_kanban_acceptance_continuations.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..41f9996768f372261752902ca2c80af9d26061a7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_acceptance_continuations.py
+@@ -0,0 +1,290 @@
++"""Required acceptance continuation uses the real completion producer and budgeted apply."""
++import hashlib
++import json
++import pytest
++from hermes_cli.kanban_containment_connections import bootstrap
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli import kanban_lanes_plan as plan
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++person = base.person
++CRITERION = "Verify actual Desktop sidebar grouping if accessible"
++
++
++def _renderer(conn, *, declaration=True):
++    parent = kb.create_task(conn, title="Preserve chat ownership", body=f"Acceptance:\n- {CRITERION}.",
++                            assignee="default", created_by="user", workspace_path="/src/hermes-agent")
++    assert kb.claim_task(conn, parent, ttl_seconds=900, claimer=f"{kb._host_prefix()}:1")
++    run = kb.get_task(conn, parent).current_run_id
++    child = kb.create_task(conn, title="Verify painted Desktop sidebar grouping (read-only)",
++                           body=f"Read-only acceptance verification: {CRITERION}. No clicks or focus changes.",
++                           assignee="default", created_by="default", creator_task_id=parent, parents=[parent],
++                           workspace_path="/src/hermes-agent")
++    bootstrap(conn)  # public local identity bootstrap; production synced boards already carry portable UIDs
++    metadata = {"followup_card": child, "renderer": "unverified_backend_only"}
++    if declaration:
++        metadata["acceptance_continuations"] = {
++            "version": 1,
++            "source_body_sha256": hashlib.sha256(kb.get_task(conn, parent).body.encode()).hexdigest(),
++            "items": [{"card": child, "criterion": CRITERION}],
++        }
++    return parent, child, run, metadata
++
++
++def test_renderer_required_continuation_real_completion_apply_once(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    assert kb.get_task(conn, child).block_kind == lanes.GATE_KIND
++    assert kb.complete_task(conn, parent, summary="Backend delivered; renderer acceptance carried by child.",
++                            metadata=metadata, created_cards=[child], expected_run_id=run)
++    bootstrap(conn)
++    action = {"action": "admit_continuation", "card": child, "reason": "required original acceptance"}
++    result = plan.apply(conn, [action])
++    assert result["applied"] == [action], result
++    assert kb.get_task(conn, child).status == "ready"
++    assert lanes.admitted_today(conn, "hermes") == 1
++    assert not plan.apply(conn, [action])["applied"]
++    assert lanes.admitted_today(conn, "hermes") == 1
++    event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='completed'", (parent,)).fetchone()
++    assert json.loads(event[0])["acceptance_continuations"]["version"] == 1
++
++
++def test_actual_held_producer_then_public_cli_apply(conn, configured, capsys, tmp_path):
++    from tests.hermes_cli.test_kanban_lanes_plan import cli
++    parent, child, run, metadata = _renderer(conn)
++    assert cli("lanes", "held", "--json") == 0
++    before = json.loads(capsys.readouterr().out)[0]["continuation"]
++    assert not before["eligible"] and "parent not genuinely complete" in before["reason"]
++    assert kb.complete_task(conn, parent, summary="Backend delivered; renderer remains.", metadata=metadata,
++                            expected_run_id=run)
++    bootstrap(conn)
++    assert cli("lanes", "held", "--json") == 0
++    candidate = json.loads(capsys.readouterr().out)[0]["continuation"]
++    assert candidate["eligible"] and candidate["source"]["parent"] == parent
++    actions = [{"action": "admit_continuation", "card": child, "reason": "required acceptance"}]
++    path = tmp_path / "plan.json"
++    path.write_text(json.dumps(actions))
++    assert cli("lanes", "apply", str(path), "--json") == 0
++    assert json.loads(capsys.readouterr().out)["applied"] == actions
++
++
++def _complete(conn, parent, run, metadata):
++    assert kb.complete_task(conn, parent, summary="Backend delivered; original acceptance remains on child.",
++                            metadata=metadata, expected_run_id=run)
++    bootstrap(conn)
++
++
++def _admit(conn, child):
++    return plan.apply(conn, [{"action": "admit_continuation", "card": child, "reason": "required acceptance"}])
++
++
++def test_legacy_renderer_metadata_never_becomes_authority(conn, configured):
++    parent, child, run, metadata = _renderer(conn, declaration=False)
++    _complete(conn, parent, run, metadata)
++    result = _admit(conn, child)
++    assert not result["applied"] and "typed completion attestation missing" in result["rejected"][0]["why"]
++    assert lanes.admitted_today(conn, "hermes") == 0
++
++
++@pytest.mark.parametrize("mutation,why", [
++    ("digest", "exact parent body digest"), ("criterion", "literal source criterion"),
++    ("unrelated", "created dependency"), ("no_run_owner", "current owned genuinely claimed run"),
++])
++def test_completion_declaration_refuses_forgery_atomically(conn, configured, mutation, why):
++    parent, child, run, metadata = _renderer(conn)
++    if mutation == "digest":
++        metadata["acceptance_continuations"]["source_body_sha256"] = "0" * 64
++    elif mutation == "criterion":
++        metadata["acceptance_continuations"]["items"][0]["criterion"] = "Unrelated optional improvement"
++    elif mutation == "unrelated":
++        other = kb.create_task(conn, title="unrelated", assignee="default", parents=[parent])
++        metadata["acceptance_continuations"]["items"][0]["card"] = other
++    else:
++        run = None
++    with pytest.raises(ValueError, match=why):
++        kb.complete_task(conn, parent, summary="done", metadata=metadata, expected_run_id=run)
++    assert kb.get_task(conn, parent).status == "running"
++    assert kb.get_task(conn, child).status == "triage"
++    assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='completed'", (parent,)).fetchone()
++
++
++@pytest.mark.parametrize("field,value,why", [
++    ("body", "Unsolicited improvement", "child scope changed"),
++    ("title", "Now do unrelated work", "child scope changed"),
++    ("assignee", "other", "child scope changed"),
++    ("human_request", '{"interaction":"physical"}', "human/physical ask"),
++    ("block_kind", "needs_input", "not held solely"),
++])
++def test_changed_scope_and_independent_holds_not_cleared(conn, configured, field, value, why):
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    conn.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (value, child))
++    conn.commit()
++    result = _admit(conn, child)
++    assert not result["applied"] and why in result["rejected"][0]["why"]
++    assert kb.get_task(conn, child).status == "triage"
++    assert lanes.admitted_today(conn, "hermes") == 0
++
++
++def test_budget_exhaustion_defers_without_consuming_extra_admission(conn, configured):
++    for _ in range(2):
++        p, c, r, m = _renderer(conn)
++        _complete(conn, p, r, m)
++        assert _admit(conn, c)["applied"]
++    p, child, r, m = _renderer(conn)
++    _complete(conn, p, r, m)
++    result = _admit(conn, child)
++    assert not result["applied"] and "budget spent (2/2" in result["rejected"][0]["why"]
++    assert kb.get_task(conn, child).status == "triage"
++    assert lanes.admitted_today(conn, "hermes") == 2
++
++
++def test_unsatisfied_parent_rechecked_after_completion(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    assert "parent not genuinely complete" in _admit(conn, child)["rejected"][0]["why"]
++    _complete(conn, parent, run, metadata)
++    other = kb.create_task(conn, title="separate prerequisite", assignee="default")
++    kb.link_tasks(conn, other, child)
++    assert "unsatisfied" in _admit(conn, child)["rejected"][0]["why"]
++    assert kb.complete_task(conn, other, summary="prerequisite complete")
++    assert _admit(conn, child)["applied"]
++
++
++def test_unlinked_child_and_parent_scope_edit_invalidate_proof(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    kb.unlink_tasks(conn, parent, child)
++    assert "creator dependency missing" in _admit(conn, child)["rejected"][0]["why"]
++    kb.link_tasks(conn, parent, child)
++    kb.edit_task(conn, parent, body="Scope changed after completion")
++    assert "parent acceptance changed" in _admit(conn, child)["rejected"][0]["why"]
++
++
++def test_restart_idempotence_preserves_exact_request_and_admission_history(conn, configured):
++    from hermes_cli.kanban_db_connect import connect
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    before = [tuple(r) for r in conn.execute("SELECT id,kind,payload FROM task_events WHERE task_id=? ORDER BY id", (child,))]
++    assert _admit(conn, child)["applied"]
++    with connect() as reopened:
++        assert not _admit(reopened, child)["applied"]
++        assert lanes.admitted_today(reopened, "hermes") == 1
++        after = [tuple(r) for r in reopened.execute("SELECT id,kind,payload FROM task_events WHERE task_id=? ORDER BY id", (child,))]
++        assert after[:len(before)] == before
++        assert sum(kind == lanes.ADMITTED for _, kind, _ in after) == 1
++
++
++def test_parent_cannot_add_a_new_goal_before_attesting(conn, configured):
++    parent, _child, run, metadata = _renderer(conn)
++    body = kb.get_task(conn, parent).body + "\nOptional new improvement acceptance."
++    kb.edit_task(conn, parent, body=body)
++    metadata["acceptance_continuations"]["source_body_sha256"] = hashlib.sha256(body.encode()).hexdigest()
++    with pytest.raises(ValueError, match="original creation scope"):
++        _complete(conn, parent, run, metadata)
++
++
++def test_metadata_edit_cannot_rewrite_or_create_attestation(conn, configured):
++    from hermes_cli.kanban_completion_receipt import keep_admitted_receipt
++    parent, _child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    assert keep_admitted_receipt(conn, run, {})["acceptance_continuations"] == metadata["acceptance_continuations"]
++    changed = json.loads(json.dumps(metadata))
++    changed["acceptance_continuations"]["items"][0]["card"] = parent
++    with pytest.raises(ValueError, match="only kanban complete"):
++        keep_admitted_receipt(conn, run, changed)
++    with pytest.raises(ValueError, match="only kanban complete"):
++        keep_admitted_receipt(conn, None, metadata)
++
++
++@pytest.mark.parametrize("cause", ["safety_refusal", "scope_stopped", "budget"])
++def test_native_independent_decision_evidence_is_never_released(conn, configured, cause):
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    with kb.write_txn(conn):
++        kb._append_event(conn, child, "spend_budget_triaged", {"cause": cause, "reason": "fixture restriction"})
++    before = [tuple(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (child,))]
++    result = _admit(conn, child)
++    assert not result["applied"] and "scope/safety/spend restriction" in result["rejected"][0]["why"]
++    assert [tuple(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=? ORDER BY id", (child,))] == before
++
++
++def test_native_containment_marker_preserved(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    conn.execute("UPDATE tasks SET containment_episode='unobserved-stop' WHERE id=?", (child,))
++    conn.commit()
++    result = _admit(conn, child)
++    assert not result["applied"] and "existing protection" in result["rejected"][0]["why"]
++    assert conn.execute("SELECT containment_episode FROM tasks WHERE id=?", (child,)).fetchone()[0] == "unobserved-stop"
++
++
++def test_unsolicited_sibling_does_not_inherit_attestation(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    sibling = kb.create_task(conn, title="Optional refactoring improvement", assignee="default", created_by="default",
++                             creator_task_id=parent, parents=[parent], workspace_path="/src/hermes-agent")
++    bootstrap(conn)
++    _complete(conn, parent, run, metadata)
++    assert "required acceptance evidence missing" in _admit(conn, sibling)["rejected"][0]["why"]
++    assert _admit(conn, child)["applied"]
++
++
++def test_paused_lane_and_never_admit_policy_preserved(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    mapping = json.loads(json.dumps(base.LANES))
++    mapping["hermes"]["paused"] = True
++    configured(mapping)
++    assert "lane paused" in _admit(conn, child)["rejected"][0]["why"]
++    mapping["hermes"]["paused"] = False
++    mapping["hermes"]["never_admit"] = ["Verify painted"]
++    configured(mapping)
++    assert "never auto-admits" in _admit(conn, child)["rejected"][0]["why"]
++
++
++def test_synced_execution_is_not_confused_with_creation_namespace(conn, configured):
++    parent, child, run, metadata = _renderer(conn)
++    # Actual synced pool execution preserves creation namespace rather than moving ownership.
++    conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++    conn.execute("UPDATE tasks SET created_on='origin-gateway' WHERE id IN (?,?)", (parent, child))
++    conn.commit()
++    _complete(conn, parent, run, metadata)
++    assert _admit(conn, child)["applied"]
++
++
++@pytest.mark.parametrize("payload", ["null", "[]", '{"acceptance_continuations":{"version":1,"items":[null]}}'])
++def test_malformed_completion_history_is_a_per_card_deferral(conn, configured, payload):
++    from hermes_cli.kanban_acceptance_continuations import candidates
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='completed'", (payload, parent))
++    conn.commit()
++    result = next(c for c in candidates(conn) if c["card"] == child)
++    assert not result["eligible"]
++    assert "attestation missing" in result["reason"]
++
++
++def test_budget_is_reloaded_under_admission_lock_not_stale_plan_state(conn, configured):
++    from hermes_cli.kanban_acceptance_continuations import admit
++    for _ in range(2):
++        p, c, r, m = _renderer(conn)
++        _complete(conn, p, r, m)
++        assert _admit(conn, c)["applied"]
++    p, child, r, m = _renderer(conn)
++    _complete(conn, p, r, m)
++    stale = {"now": kb.time.time(), "actor": plan.ACTOR, "used": {"hermes": 0}}
++    why = admit(conn, lanes.policy(), {"reason": "required acceptance"}, plan._card(conn, child), stale)
++    assert why and "budget spent (2/2" in why
++
++
++def test_malformed_creator_reference_defers_only_that_card(conn, configured):
++    from hermes_cli.kanban_acceptance_continuations import candidates
++    parent, child, run, metadata = _renderer(conn)
++    _complete(conn, parent, run, metadata)
++    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='created'",
++                 ('{"creator_task_id":{}}', child))
++    conn.commit()
++    result = next(c for c in candidates(conn) if c["card"] == child)
++    assert not result["eligible"] and "creator dependency missing" in result["reason"]
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 76125a1a62e7770a510c8b7d59eef0c34a8f2279..17a189314e7e166b4ecefed74f9796aafcd6aa2d 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -223,6 +223,23 @@
+                 "workers alongside ``summary``."
+         )), "properties": {
+             "completion_receipt": _completion_receipt_schema(),
++            "acceptance_continuations": {
++                "type": "object", "additionalProperties": False,
++                "description": "Optional explicit attestation: these never-run created children are REQUIRED to finish "
++                               "this card's original acceptance, not improvements. Copy source_body_sha256 from this "
++                               "card's immutable created event; body must be unchanged. Only owned claimed-run completion "
++                               "admits it. Planner rechecks unchanged scope, dependencies, holds and existing lane budgets.",
++                "required": ["version", "source_body_sha256", "items"],
++                "properties": {
++                    "version": {"type": "integer", "enum": [1]},
++                    "source_body_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
++                    "items": {"type": "array", "minItems": 1, "maxItems": 16, "items": {
++                        "type": "object", "additionalProperties": False, "required": ["card", "criterion"],
++                        "properties": {"card": {"type": "string"}, "criterion": {
++                            "type": "string", "minLength": 16, "maxLength": 2000,
++                            "description": "Verbatim original acceptance criterion. This is executor attestation, not inferred authority."}}}},
++                },
++            },
+             "containment_retained": {"description": "Retained episode uids; explain why in summary."},
+             # Advertise canonical values without narrowing formerly free-form metadata.
+             # Existing readers and ship gates, not deferred transport, own validation.
+-- 
+2.43.0
+

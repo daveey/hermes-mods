@@ -1,0 +1,351 @@
+From dd65c1dfb38b69afa236a844a02b9b03103b8e1f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 21:00:57 +0000
+Subject: [PATCH 6880] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit dd65c1dfb38b69afa236a844a02b9b03103b8e1f.
+
+---
+diff --git a/docs/kanban-replay-recovery-audit.md b/docs/kanban-replay-recovery-audit.md
+index 3a099d70db7d866970d8fb32bb83883c2e0ddfb9..8fc2ccaa947aeeb2a03db32d48f47099aa2fb51b 100644
+--- a/docs/kanban-replay-recovery-audit.md
++++ b/docs/kanban-replay-recovery-audit.md
+@@ -94,25 +94,46 @@
+ business-row refill and parent ambiguity controls. Tests run through
+ `scripts/run_tests.sh`, with file retries disabled.
+ 
+-## Boundaries requiring disposition before activation
+-
+-- A lost INTEGER-PK singleton cannot be reconstructed by the present refill
+-  algorithm. Index-derived loss counts alone cannot prove its survival. A
+-  surviving sync journal anchor plus lost sender state causes `missing journal
+-  state`; this is a fault, not a recoverable allocator inferred from a backup.
+-- Loss/recreation of the **sync anchor** is different: public push selects strict
+-  transport from `sync_state.journal_id`. This audit does not establish a safe
+-  legacy fallback after that anchor is lost or recreated. The supported attach /
+-  recovery / admission chain must be disposed before activation; do not infer it
+-  from nofill coverage or passing integrity checks.
+-- `_build` does not invoke `mark_restore_required`; the helper's existence is not
+-  evidence of a wired restore lifecycle. Normal strict push does inspect/reconcile
+-  the serving slot before issue, but that does not prove the lost-anchor case.
+-- Missing deferred, command, omission or lineage custody needs authoritative
+-  reconciliation. This change prevents stale refill; it does not promise complete
+-  recovery or turn missing metadata into known history.
+-- Ordinary sync status counts are not an allocator/restore/deferred-custody
+-  readiness proof. No live status or no-pending acceptance is claimed here.
+-
+-These boundaries are recorded for the managing owner's post-B disposition. They
+-are not permission to begin C, certify original captures, merge, deploy or replay.
++## Lost-anchor admission (B5)
++
++`_build` now writes `kanban_replay_recovery_loss1` in the same transaction as
++salvage, before the rebuilt image can be installed. This independent singleton
++records recovery and the protocol loss report even if the sync anchor or sender
++singleton was unreadable. It is also written for a not-yet-synced database, so
++later sync installation cannot turn recovered unknown history into a clean legacy
++image. It has no independent index/refill route and is not a per-operation ledger.
++Readable prior rebuild reports are retained; unreadable prior history stays loss.
++
++Public sender admission checks the marker, the restore flag and any existing
++journal binding **before** selecting legacy or performing sender network I/O.
++Missing/recreated anchors with surviving journal custody become durably
++restore-required. Every rebuilt database is held, even if no protocol loss was
++index-countable or the anchor survived intact. Clearing the ordinary flag alone
++cannot clear the independent rebuild hold. `RestoreRequired` is isolated as a
++per-board round error, so an affected board does not crash sync for other boards.
++The gate installs no journal, certifies no original capture and enables no mode.
++
++`test_kanban_replay_admission_loss.py` exercises actual table and singleton page
++damage through `_build` and reopen, NULL/recreated anchors, all eleven indexed
++custody-loss classes, later sync installation and the real sync-round boundary.
++Lost command/deferred/omission/lineage rows remain explicitly reported LOSS, not
++absent work that can be silently retired or reconstructed. Never-bound,
++unrecovered legacy databases retain their existing transport.
++
++## Remaining recovery and rollout boundaries
++
++- Authoritative reconciliation tooling for incomplete/lost journals is not
++  implemented here. The independent rebuild hold has no automatic clear path;
++  replay's existing intact-image reconciliation helper is not sufficient to
++  certify completeness of a rebuilt image.
++- Complete loss of all local evidence cannot be diagnosed from surviving local
++  metadata. Recovery of that case remains outside this bounded sender change.
++- These checks fence the commissioned sender and its normal sync round. They do
++  not certify the excluded direct non-outbox protect commands/scan or promise
++  that all unrelated read-only reconciliation interfaces are disabled.
++- Ordinary sync status counts are not allocator/restore/deferred readiness or
++  live no-pending proof. Old-writer drain/minimum-writer admission stays dormant
++  and must be proved separately before final independent review and landing.
++- No activation, receiver migration, integration, deployment or live proof is
++  established by B4/B5. No runtime write hook, SQLite authorizer or reentrancy is
++  introduced.
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index dcf58d6cd7883ad838b37828cca8da97dbb679ee..545b6dd7c7767160251e4b0688f6eb674506e2a4 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -481,6 +481,11 @@
+             floors = {name: max((rid for _cols, entries in (listed_by_table.get(name) or {}).values()
+                                  for rid in entries), default=0) for name, _sql in tables}
+             _rebuild_sequence(src, dst, tables, fill, floors)
++        from hermes_cli.kanban_replay_admission import mark_rebuilt
++        mark_rebuilt(dst, {name: asdict(loss) for name, loss in result.tables.items()
++                           if name.startswith(('kanban_replay_', 'kanban_sync_', 'kanban_failure_',
++                                               'kanban_actionability_')) and
++                           (loss.unreadable_paths or loss.known_lost or loss.possibly_lost)})
+         dst.execute("COMMIT")
+         for sql in later:
+             with contextlib.suppress(sqlite3.Error):  # an index the data now violates is reported by the check below
+diff --git a/hermes_cli/kanban_replay_admission.py b/hermes_cli/kanban_replay_admission.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e712b417aa7a3589746a3557e6c6b6e79bbaf921
+--- /dev/null
++++ b/hermes_cli/kanban_replay_admission.py
+@@ -0,0 +1,47 @@
++"""Fail-closed sender admission for damaged or unbound local replay custody."""
++import json
++
++from hermes_cli.kanban_db_connect import write_txn
++
++_RECOVERY = 'kanban_replay_recovery_loss1'
++_SCHEMA = f'CREATE TABLE IF NOT EXISTS {_RECOVERY} (singleton INTEGER PRIMARY KEY CHECK(singleton=1), loss TEXT NOT NULL)'
++
++
++class RestoreRequired(ValueError):
++    """Local custody is incomplete; network retry cannot repair this board."""
++
++
++def mark_rebuilt(conn, losses):
++    """Persist recovery independently of a potentially lost sync-state row.
++
++    This marker is custody LOSS, not a reconstructed receipt or reconciliation.
++    Reconciliation of an incomplete database is deliberately not provided here.
++    """
++    conn.execute(_SCHEMA)
++    old = conn.execute(f'SELECT loss FROM {_RECOVERY} WHERE singleton=1').fetchone()
++    history = json.loads(old[0]) if old else []
++    history.append(dict(reason='rebuilt database; custody completeness unknown', tables=losses))
++    conn.execute(f'INSERT OR REPLACE INTO {_RECOVERY} VALUES (1,?)', (json.dumps(history),))
++    columns = {row[1] for row in conn.execute('PRAGMA table_info(kanban_sync_state)')}
++    if 'replay_restore_required' in columns:
++        conn.execute('UPDATE kanban_sync_state SET replay_restore_required=1')
++
++
++def guard(conn):
++    """Never use NULL anchor as evidence that previously bound custody was absent."""
++    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    recovered = _RECOVERY in tables
++    state = conn.execute('SELECT journal_id,replay_restore_required FROM kanban_sync_state LIMIT 1').fetchone()
++    held = recovered or (state is not None and state[1] != 0)
++    if 'kanban_replay_sender1' in tables:
++        from hermes_cli import kanban_replay_journal as journal
++        try:
++            journal.snapshot(conn)
++        except ValueError:
++            held = True
++    elif state is not None and state[0] is not None:
++        held = True
++    if held:
++        with write_txn(conn):
++            conn.execute('UPDATE kanban_sync_state SET replay_restore_required=1')
++        raise RestoreRequired('journal restore reconciliation required; custody LOSS or invalid anchor')
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 270a521c815b5a080ed64d9c2047a02c2649cbeb..61427a8f5aab9e61af7211bb1fabd0f3cf9343e4 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -43,6 +43,8 @@
+     """Select only the journal-bound transport; never auto-enroll or fall back."""
+     from hermes_cli import kanban_sync_client as client
+     client.refuse_if_schema_ahead(conn)
++    from hermes_cli.kanban_replay_admission import guard
++    guard(conn)
+     if (sync.sync_state(conn) or {}).get('journal_id') is not None:
+         from hermes_cli import kanban_replay_existence as existence
+         existence.guard(conn)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 4814b93ab99cea6d0408113d1fac4a49ee2afd4f..39c3ebbf46ba66e9e75b7af15a6eeb56d4acf747 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1116,6 +1116,7 @@
+                   boards: Optional[list[tuple[str, Path]]] = None) -> list[RoundResult]:
+     from hermes_cli.kanban_sync_guard import SyncRoundBusy
+     from hermes_cli import kanban_containment_functions as udf_errors
++    from hermes_cli.kanban_replay_admission import RestoreRequired
+ 
+     ident = load_identity() if hub is None else hub.ident
+     hub = hub or Hub(ident)
+@@ -1145,7 +1146,7 @@
+             # (no WARNING, the board is not marked failed, the outbox-age alarm keeps its last verdict).
+             _log.debug("kanban sync: round for %s skipped (%s)", slug, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"SyncRoundBusy: {exc}", skipped=True))
+-        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable) as exc:
++        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, RestoreRequired) as exc:
+             _log.warning("kanban sync: round for %s failed (%s: %s)%s", slug, type(exc).__name__, exc,
+                          udf_errors.error_suffix(exc))
+             from hermes_cli.kanban_sync_host_outage import classify  # one host card, not one per board [daveey]
+diff --git a/tests/hermes_cli/test_kanban_replay_admission_loss.py b/tests/hermes_cli/test_kanban_replay_admission_loss.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..777bfb380bf526ef0c5ed953e112e42d90f2dc0e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_admission_loss.py
+@@ -0,0 +1,158 @@
++"""Lost local anchors and rebuilt images must not downgrade to legacy transport."""
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_recover as recovery
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as sender
++from tests.hermes_cli import test_kanban_db_recover as damage
++from tests.hermes_cli import test_kanban_recovery_protocol as protocol
++from hermes_cli import kanban_db_sync as sync
++
++live = sender.live
++
++
++def assert_held(conn):
++    peer = sender.Receiver()
++    with pytest.raises(ValueError, match='restore reconciliation required'):
++        client.push(conn, peer, 'default', 'macbook', primary=False, max_batches=1)
++    assert peer.calls == [] and peer.sent == []
++    assert conn.execute('SELECT replay_restore_required FROM kanban_sync_state').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('anchor', [None, 'recreated-journal'])
++def test_missing_or_recreated_anchor_is_durably_held_before_transport(live, anchor):
++    kb.create_task(live, title='custody stays', assignee='worker')
++    before = [tuple(row) for row in live.execute('SELECT * FROM kanban_sync_outbox')]
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_state SET journal_id=?', (anchor,))
++    assert_held(live)
++    assert [tuple(row) for row in live.execute('SELECT * FROM kanban_sync_outbox')] == before
++    assert_held(live)
++
++
++def test_damaged_database_build_reopen_sets_hold_even_with_intact_anchor(live, tmp_path):
++    path = tmp_path / 'damaged.db'
++    target = sqlite3.connect(path)
++    live.backup(target)
++    target.close()
++    damage._make_board(path)
++    lost = damage._damage_table(path, 'task_events')
++    assert lost
++    rebuilt = tmp_path / 'rebuilt.db'
++    report = recovery.RecoveryResult(status='building', db_path=str(path))
++    recovery._build(path, rebuilt, None, report)
++    assert report.tables['task_events'].known_lost == len(lost)
++    conn = kbc.connect(rebuilt)
++    try:
++        assert conn.execute('SELECT replay_restore_required FROM kanban_sync_state').fetchone()[0] == 1
++        assert_held(conn)
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('table,mutable', protocol.CASES)
++def test_built_custody_loss_is_reported_not_absence(tmp_path, table, mutable):
++    path, rebuilt = tmp_path / 'current.db', tmp_path / 'rebuilt.db'
++    with sqlite3.connect(path) as conn:
++        protocol.install(conn)
++        for name, column, sql in sync._SYNC_COLUMN_DDL:
++            if name == 'kanban_sync_state':
++                conn.execute(f'ALTER TABLE {name} ADD COLUMN {sql}')
++        conn.execute("INSERT INTO kanban_sync_state(board_id,gateway_id,hlc_last,mode) "
++                     "VALUES ('default','macbook','','shadow')")
++        columns = list(conn.execute(f'PRAGMA table_info({table})'))
++        for i in range(100):
++            values = [i if 'INT' in col[2].upper() else f'{col[1]}-{i:03}-' + 'x' * 80 for col in columns]
++            conn.execute(f"INSERT INTO {table} VALUES ({','.join('?' for _ in values)})", values)
++    lost = damage._damage_table(path, table)
++    report = recovery.RecoveryResult(status='building', db_path=str(path))
++    recovery._build(path, rebuilt, path, report)
++    conn = kbc.connect(rebuilt)
++    try:
++        losses = json.loads(conn.execute('SELECT loss FROM kanban_replay_recovery_loss1').fetchone()[0])
++        assert table in losses[-1]['tables'], 'lost custody treated as absent'
++        assert losses[-1]['tables'][table]['known_lost'] == len(lost)
++        assert losses[-1]['tables'][table]['filled_from_backup'] == 0
++        assert_held(conn)
++    finally:
++        conn.close()
++
++
++def test_no_sync_state_at_rebuild_does_not_erase_loss_on_later_install(tmp_path):
++    path, rebuilt = tmp_path / 'plain.db', tmp_path / 'rebuilt.db'
++    conn = kbc.connect(path)
++    conn.close()
++    report = recovery.RecoveryResult(status='building', db_path=str(path))
++    recovery._build(path, rebuilt, None, report)
++    with sqlite3.connect(rebuilt) as conn:
++        conn.executescript(sync.SYNC_SCHEMA_SQL)
++        for table, column, sql in sync._SYNC_COLUMN_DDL:
++            if table == 'kanban_sync_state':
++                conn.execute(f'ALTER TABLE {table} ADD COLUMN {sql}')
++        conn.execute("INSERT INTO kanban_sync_state(board_id,gateway_id,hlc_last,mode) "
++                     "VALUES ('default','macbook','','shadow')")
++        conn.commit()
++        assert_held(conn)
++
++
++def test_restore_hold_isolated_to_its_board_in_real_sync_round(live, monkeypatch):
++    from pathlib import Path
++    path = live.execute('PRAGMA database_list').fetchone()[2]
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++    peer = sender.Receiver()
++    peer.ident = SimpleNamespace(gateway='macbook')
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    from hermes_cli import kanban_source_clones
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    original = client.sync_board
++    visited = []
++
++    def board_round(slug, db, hub, gateway):
++        visited.append(slug)
++        if slug == 'healthy':
++            return client.RoundResult(board=slug, mode='shadow')
++        return original(slug, db, hub, gateway)
++
++    monkeypatch.setattr(client, 'sync_board', board_round)
++    results = client.sync_all_once(peer, boards=[('default', Path(path)), ('healthy', Path(path))])
++    assert visited == ['default', 'healthy']
++    assert 'RestoreRequired' in results[0].error
++    assert results[1].error is None
++    assert peer.calls == []
++
++
++@pytest.mark.parametrize('table', ['kanban_sync_state', 'kanban_replay_sender1'])
++def test_damaged_singleton_loss_remains_held_after_reopen(live, tmp_path, table):
++    path, rebuilt = tmp_path / 'singleton.db', tmp_path / 'rebuilt.db'
++    target = sqlite3.connect(path)
++    live.backup(target)
++    target.close()
++    with sqlite3.connect(path) as conn:
++        root = conn.execute('SELECT rootpage FROM sqlite_master WHERE name=?', (table,)).fetchone()[0]
++        page_size = conn.execute('PRAGMA page_size').fetchone()[0]
++    with path.open('r+b') as stream:
++        stream.seek((root - 1) * page_size)
++        stream.write(b'\xff' * page_size)
++    report = recovery.RecoveryResult(status='building', db_path=str(path))
++    recovery._build(path, rebuilt, None, report)
++    assert report.tables[table].unreadable_paths > 0
++    conn = kbc.connect(rebuilt)
++    try:
++        # A missing sync row may be recreated by ordinary schema installation;
++        # the independent rebuild marker must survive that new NULL anchor.
++        if conn.execute('SELECT 1 FROM kanban_sync_state').fetchone() is None:
++            with kbc.write_txn(conn):
++                conn.execute("INSERT INTO kanban_sync_state(board_id,gateway_id,hlc_last,mode) "
++                             "VALUES ('default','macbook','','shadow')")
++        assert_held(conn)
++        with kbc.write_txn(conn):
++            conn.execute('UPDATE kanban_sync_state SET replay_restore_required=0')
++        assert_held(conn)
++    finally:
++        conn.close()
+-- 
+2.43.0
+

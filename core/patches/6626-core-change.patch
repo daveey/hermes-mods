@@ -1,0 +1,188 @@
+From d6b33d4cc0d009236681f258270e7071ba09950e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 17:54:35 +0000
+Subject: [PATCH 6626] Annotation holder counts custody and read sharing
+
+Public mirror of source commit d6b33d4cc0d009236681f258270e7071ba09950e.
+
+---
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 8c0b54ae43ae5d4c1eb406924ab279fa45045f27..7ec1d8264327977bf63b8ab77e2622346f5d9a0c 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -728,45 +728,42 @@
+                 # A deadline dropped here may have come due unseen: the part keys vouch for nothing after it.
+                 _parts.failed(scope)
+                 return None
++            from hermes_cli import kanban_annotation_counts as counts
++
+             if not _ksa._annotate_refresh_lock.acquire(blocking=False):
+                 return _scope_retry(scope)
+-            # Native scheduling uses part keys, never the legacy narrow-key gate. Do not build its expensive
+-            # inventory in prepare or claim its extended display lifetime: publish the ordinary exact copy.
+-            # Inner caches can return without emitting their clock boundaries.
+-            # Preserve those until consumed; replacing the list needs per-cache
+-            # deadline ownership, not just a successful outer projection.
+-            confirmations = _settle_deadlines.get(scope, ())
+-            started = time.time()
+-            pending = [t for t in _clock_deadlines.get(scope, ()) if t not in confirmations]
+-            _holder_ctx.deadlines = [t for t in pending if t > started]
+-            # [daveey] Force only the parts whose own inputs moved (kanban_annotation_parts). A provider deadline
+-            # that came due is a wall-time transition no key sees: it forces them all. A settle confirmation is
+-            # not one: it re-takes the keys, which is what shows a commit the first read was too early for. The
+-            # counts are also read once their last read is ``STRICT_REFRESH_AGE_S`` old, so the published
+-            # ``read_at`` is renewed before exact adopters drop the copy at ``_COUNTS_MAX_AGE_S``.
+-            # The age is this scope's own: the active count slot belongs to whichever scope was read last.
+-            from hermes_cli import kanban_annotation_counts as counts
+-            read_at = counts.read_at(scope)
+-            if read_at is None:
+-                with _ksa._cache_lock:
+-                    read_at = _ksa._count_scopes.read_at_locked(scope)
+-            if lost:
+-                _parts.failed(scope)
+-            clock = len(_holder_ctx.deadlines) != len(pending)
+-            renew = read_at is None or time.monotonic() - read_at >= STRICT_REFRESH_AGE_S
+-            forced, part_keys = _parts.plan(scope, clock=clock, renew=renew)
+-            _ksa._revalidate.force_read.scope = scope
+-            _ksa._revalidate.force_read.parts = forced
+-            _ksa._revalidate.force_read.content_only_boards = not (lost or clock or renew)
+             try:
+-                try:
+-                    # No part needs a read: avoid prepare/freeze/publication and ordinary inner TTLs.
+-                    # Keep the deadline/settle path below: this hint can precede COMMIT visibility.
+-                    if forced:
+-                        _ksa._refresh_annotation_locked(scope)
+-                except BaseException:
++                # Native scheduling uses part keys, never the legacy narrow-key gate. Do not build its expensive
++                # inventory in prepare or claim its extended display lifetime: publish the ordinary exact copy.
++                # Inner caches can return without emitting their clock boundaries.
++                # Preserve those until consumed; replacing the list needs per-cache
++                # deadline ownership, not just a successful outer projection.
++                confirmations = _settle_deadlines.get(scope, ())
++                started = time.time()
++                pending = [t for t in _clock_deadlines.get(scope, ()) if t not in confirmations]
++                _holder_ctx.deadlines = [t for t in pending if t > started]
++                # [daveey] Force only the parts whose own inputs moved (kanban_annotation_parts). A provider deadline
++                # that came due is a wall-time transition no key sees: it forces them all. A settle confirmation is
++                # not one: it re-takes the keys, which is what shows a commit the first read was too early for. The
++                # counts are also read once their last read is ``STRICT_REFRESH_AGE_S`` old, so the published
++                # ``read_at`` is renewed before exact adopters drop the copy at ``_COUNTS_MAX_AGE_S``.
++                # The age is this scope's own: the active count slot belongs to whichever scope was read last.
++                read_at = counts.read_at(scope)
++                if read_at is None:
++                    with _ksa._cache_lock:
++                        read_at = _ksa._count_scopes.read_at_locked(scope)
++                if lost:
+                     _parts.failed(scope)
+-                    raise
++                clock = len(_holder_ctx.deadlines) != len(pending)
++                renew = read_at is None or time.monotonic() - read_at >= STRICT_REFRESH_AGE_S
++                forced, part_keys = _parts.plan(scope, clock=clock, renew=renew)
++                _ksa._revalidate.force_read.scope = scope
++                _ksa._revalidate.force_read.parts = forced
++                _ksa._revalidate.force_read.content_only_boards = not (lost or clock or renew)
++                # No part needs a read: avoid prepare/freeze/publication and ordinary inner TTLs.
++                # Keep the deadline/settle path below: this hint can precede COMMIT visibility.
++                if forced:
++                    _ksa._refresh_annotation_locked(scope)
+                 _parts.done(scope, part_keys)
+                 _, due = waiting_events(time.time())
+                 note_deadline(due)
+@@ -781,6 +778,9 @@
+                 _clock_deadlines[scope] = sorted({*_holder_ctx.deadlines, *confirmations})
+                 _event_ready.add(scope)
+                 return min(_clock_deadlines[scope], default=None)
++            except BaseException:
++                _parts.failed(scope)
++                raise
+             finally:
+                 counts.clear_use()
+                 _holder_ctx.deadlines = None
+diff --git a/tests/hermes_cli/test_review_mutation_plan_recovery.py b/tests/hermes_cli/test_review_mutation_plan_recovery.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..37b4b8fb52bf4481001b5f18b33113ed7664d550
+--- /dev/null
++++ b/tests/hermes_cli/test_review_mutation_plan_recovery.py
+@@ -0,0 +1,79 @@
++"""An unreadable mutation cue must not leak global holder custody. [daveey]"""
++import contextvars
++
++import pytest
++
++from hermes_cli import kanban_annotation_counts as counts
++from hermes_cli import kanban_annotation_host as host
++from hermes_cli import kanban_annotation_parts as parts
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_annotation_parts as holders
++
++world = holders.world
++
++
++def _assert_released():
++    available = ksa._annotate_refresh_lock.acquire(blocking=False)
++    # This synchronous fixture owns any leaked lock; release even on RED.
++    ksa._annotate_refresh_lock.release()
++    assert available, 'failed planning leaked the process-wide annotation refresh lock'
++
++
++def _assert_cleared(scope):
++    assert scope not in parts._seen
++    assert counts.read_at(scope) is None
++    assert counts._use.scope is None
++    assert counts._use.keys is None
++    assert counts._use.source is None
++    assert host._holder_ctx.deadlines is None
++    assert getattr(ksa._revalidate.force_read, 'scope', None) is None
++    assert getattr(ksa._revalidate.force_read, 'parts', None) is None
++    assert not getattr(ksa._revalidate.force_read, 'content_only_boards', False)
++
++
++def test_corrupt_cue_does_not_permanently_lock_annotation(world):
++    holders._refresh()
++    cue = host._disk._path(holders.SCOPE).with_suffix('.mutation.json')
++    cue.write_text('{broken-json')
++    holders._refresh()
++    _assert_released()
++    _assert_cleared(holders.SCOPE)
++    cue.unlink()
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    holders._refresh()
++    assert holders._published()[0] == {}
++
++
++@pytest.mark.parametrize('failed_read', [1, 2], ids=['begin', 'needs_read'])
++@pytest.mark.parametrize('error', [OSError, ValueError])
++def test_failed_plan_clears_custody_and_healthy_scope_progresses(world, monkeypatch, failed_read, error):
++    scope_var = contextvars.ContextVar('review_scope', default=holders.SCOPE)
++    monkeypatch.setattr(ksa, '_origin_scope', scope_var.get)
++    holders._refresh()
++    other = ('annotation-review-healthy', 'default')
++    other_context = contextvars.copy_context()
++    other_context.run(scope_var.set, other)
++    host._known[other] = other_context
++    host._disk.touch_demand(other)
++    original = host._mutation.current
++    calls = 0
++
++    def read(scope):
++        nonlocal calls
++        if scope == holders.SCOPE:
++            calls += 1
++            if calls == failed_read:
++                raise error('fixture cue unavailable')
++        return original(scope)
++
++    monkeypatch.setattr(host._mutation, 'current', read)
++    holders._refresh()
++    _assert_released()
++    _assert_cleared(holders.SCOPE)
++    assert other in host._event_ready, 'one failed scope starved its healthy peer'
++    assert ksa._last_annotation[other][0] == {'s1': 1}
++    monkeypatch.setattr(host._mutation, 'current', original)
++    world.conn.execute("UPDATE tasks SET status='done' WHERE id='t1'")
++    holders._refresh()
++    assert ksa._last_annotation[holders.SCOPE][0] == {}
++    assert ksa._last_annotation[other][0] == {}
+-- 
+2.43.0
+

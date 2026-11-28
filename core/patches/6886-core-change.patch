@@ -1,0 +1,369 @@
+From e1169f288657623104561f05a142df10a7a33e00 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:44:39 +0000
+Subject: [PATCH 6886] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit e1169f288657623104561f05a142df10a7a33e00.
+
+---
+diff --git a/docs/kanban-replay-final-audit.md b/docs/kanban-replay-final-audit.md
+index d0d0e0655e940e07690e3adda1854d77fe35b35e..b245d48026141050c459472664bc9055f089679a 100644
+--- a/docs/kanban-replay-final-audit.md
++++ b/docs/kanban-replay-final-audit.md
+@@ -35,14 +35,28 @@
+ 
+ ## Unresolved sender requirements: D stays open
+ 
+-1. **Normal ACK carrier / throughput.** Design section 2 (lines 251–258 of the
+-   pinned spec) requires successor-piggyback ACK and standalone ACK for idle or
+-   rotation/cancellation. `_push_strict` currently sends ops, performs separate
+-   inspect, then standalone ACK before selecting another operation. The allocator
+-   can freeze predecessor ACK, but this public steady-state path does not yet
+-   establish the specified one-round-trip behavior. Implement and prove the
+-   specified path before throughput benchmarking; do not call the present
+-   three-request-per-operation loop compliant or infer a waiver from an old test.
++1. **Normal ACK carrier / throughput (partial progress).** The public sender now
++   leaves the predecessor ACK for the successor's frozen envelope rather than
++   sending an intermediate standalone control. Exact newly consuming ops replies
++   (explicit protocol, consumed=true, sequence, H, ID and digest) can settle without
++   a redundant inspect; all incomplete/nonconsuming/unknown/duplicate reply shapes
++   still require authoritative inspection. Idle/end-of-turn and recovery ACKs stay.
++   ACK readback requires identical slot fields and JSON-equivalent final verdicts,
++   allowing only representation differences (Board JSON.stringify versus Python),
++   never different verdict content. Nineteen new fixture cases include40 successive
++   settlements, uncertain successor/reopen, bad consuming metadata, compact JSON,
++   changed verdict refusal and exclusion of current-row reply enrichment.
++
++   This is **not yet production HTTP one-round-trip or throughput acceptance**:
++   `kanban_sync_exposure.send` still performs a pinned credential capability probe
++   for each mutation. Preserve that exposure/authentication boundary while designing
++   session-scoped reuse; never simply omit the probe. The real receiver's reply
++   shape was read from `settleReplay` at hub main f4ca27cfe489b413c1bc576684b9655ed2a1cac1,
++   not invented from client expectations. Its current ingress reads top-level
++   `op.ack`, whereas the frozen sender stores `op.replay.ack`; this interoperability
++   mismatch remains explicitly receiver/integration-owned and unproven. Do not
++   unilaterally change frozen wire identity. Fixture request counts are not real
++   Board/latency/backlog/lease throughput evidence.
+ 2. **General bounded transport recovery.** Spec lines 384–393 bound automatic
+    timeout/gap/ACK-required recovery to eight attempts or five reachable minutes,
+    preserve custody offline, stop with one actionable recovery fault and require
+diff --git a/hermes_cli/kanban_replay_reply.py b/hermes_cli/kanban_replay_reply.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..01b87d3428a7ed7bf9c182c654e6ea70bfff2150
+--- /dev/null
++++ b/hermes_cli/kanban_replay_reply.py
+@@ -0,0 +1,66 @@
++"""Authenticated consuming replies avoid a redundant inspect on new sends.
++
++The caller already owns the serialized sender session. This adapter is only for
++an exact newly consumed H+1 reply, not historical coverage, duplicates, recovery,
++or current-row evidence. Every other shape requires authoritative inspection.
++"""
++import json
++
++from hermes_cli.kanban_replay_reconcile import reconcile
++
++
++_TRANSPORT = frozenset({'consumed', 'sequence', 'payload_sha256', 'h', 'dup',
++                        'row', 'source_predecessor'})
++
++
++def consumed_slot(reply, wire, previous, local):
++    """Return a validated final snapshot, or require inspect without settlement.
++
++    Board settleReplay returns its slim retained verdict plus consumption fields.
++    A successful HTTP status alone, empty results or an unbound final-looking
++    status never authorize source pruning. Readback is still required for CAS,
++    uncertain replies and standalone ACK controls.
++    """
++    if (not isinstance(reply, dict) or reply.get('protocol') != 'processed_prefix1'
++            or not isinstance(reply.get('results'), list) or len(reply['results']) != 1):
++        return None
++    result = reply['results'][0]
++    replay = wire['replay']
++    if (not isinstance(result, dict) or result.get('consumed') is not True
++            or result.get('outcome_unknown') or result.get('dup')
++            or result.get('client_op_id') != wire['client_op_id']
++            or result.get('sequence') != replay['sequence'] or result.get('h') != replay['sequence']
++            or result.get('payload_sha256') != replay['payload_sha256']
++            or int(replay['sequence']) != int(previous['h']) + 1):
++        return None
++    verdict = {key: value for key, value in result.items() if key not in _TRANSPORT}
++    try:
++        candidate = dict(previous, a=previous['h'], h=replay['sequence'],
++                         last_op_id=wire['client_op_id'], last_payload_sha256=replay['payload_sha256'],
++                         last_verdict=json.dumps(verdict, ensure_ascii=False, allow_nan=False))
++        if reconcile(local, candidate)['action'] != 'record':
++            return None
++    except (ValueError, TypeError, RecursionError):
++        return None
++    return candidate
++
++
++def same_slot(left, right):
++    """Compare exact counters/bindings and JSON-equivalent retained verdicts.
++
++    An ops reply carries the verdict object, not the Board's JSON.stringify bytes.
++    Only this representation difference is allowed in standalone ACK readback;
++    canonical JSON keeps booleans distinct from numbers and rejects nonfinite data.
++    """
++    import rfc8785
++    if not isinstance(right, dict) or left.keys() != right.keys():
++        return False
++    if {k: v for k, v in left.items() if k != 'last_verdict'} != {
++            k: v for k, v in right.items() if k != 'last_verdict'}:
++        return False
++    if left['last_verdict'] == right['last_verdict']:
++        return True
++    try:
++        return rfc8785.dumps(json.loads(left['last_verdict'])) == rfc8785.dumps(json.loads(right['last_verdict']))
++    except (ValueError, TypeError, RecursionError):
++        return False
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index dfa04fdca0a868dc8e39580e4786cc1f5ac0b105..396205ddb92ba8b57443df535402361e58c6826f 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -384,20 +384,21 @@
+         wire['replay']['session'] = remote['session']
+         if isinstance(hub, client._HTTP_HUB):
+             from hermes_cli.kanban_sync_exposure import send
+-            send(hub, conn, board, [wire], replay=identity)
++            reply = send(hub, conn, board, [wire], replay=identity)
+         else:
+-            hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
++            reply = hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
+         out.sent += 1
+-        remote = hub._call('GET', root + 'inspect')['slot']
++        from hermes_cli.kanban_replay_reply import consumed_slot
++        remote = (consumed_slot(reply, wire, remote, journal.snapshot(conn)) or
++                  hub._call('GET', root + 'inspect')['slot'])
+         membership = refresh_capacity()
+         current_row = refresh_current_row()
+         with settlement():
+             decision = journal.recover(conn, remote, record)
+         if decision['action'] != 'record':
+             break
+-        # W=1: locally settling a verdict is not enough to open the next slot.
+-        # Publish its ACK before selecting/issuing another intent in this push.
+-        remote = _ack_settled(conn, hub, root, identity, remote)
++        # The next issued envelope freezes the durable predecessor ACK. Keep
++        # standalone ACK for idle/end-of-turn and recovery, not between sends.
+     settled = journal.snapshot(conn)
+     remote = _ack_settled(conn, hub, root, identity, remote)
+     from hermes_cli.kanban_replay_observation import after_push
+@@ -412,7 +413,8 @@
+         remote = hub._call('POST', root + 'ack', dict(identity, session=remote['session'],
+             generation=settled['generation'], ack=dict(sequence=settled['settled'],
+                 op_id=settled['last_op_id'], payload_sha256=settled['last_payload_sha256'])))['slot']
+-        if remote != expected:
++        from hermes_cli.kanban_replay_reply import same_slot
++        if not same_slot(expected, remote):
+             raise ValueError('ack readback mismatch')
+         reconcile(settled, remote)
+     return remote
+diff --git a/tests/hermes_cli/test_kanban_replay_ack_carrier.py b/tests/hermes_cli/test_kanban_replay_ack_carrier.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91ed2c089d4af1bcc09d1d844c0f09fd6a3d69ee
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_ack_carrier.py
+@@ -0,0 +1,182 @@
++"""Normal successor ACK carrier; fixture Board, not deployed receiver proof."""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as sender
++
++live = sender.live
++
++
++class AckReceiver(sender.Receiver):
++    def __init__(self):
++        super().__init__()
++        self.predecessors = []
++
++    def _call(self, method, path, body=None):
++        if path.endswith('/ops'):
++            op, = body['ops']
++            predecessor = op['replay'].get('ack')
++            if self.slot['h'] != '0':
++                assert predecessor == dict(sequence=self.slot['h'], op_id=self.slot['last_op_id'],
++                                           payload_sha256=self.slot['last_payload_sha256'])
++                self.slot['a'] = self.slot['h']
++            else:
++                assert predecessor is None
++            self.predecessors.append(predecessor)
++        reply = super()._call(method, path, body)
++        if path.endswith('/ops'):
++            # Serving Board settleReplay at f4ca27cf: slim verdict plus explicit
++            # consumption/sequence/digest/prefix, never an implied HTTP-200 ACK.
++            verdict = json.loads(self.slot['last_verdict'])
++            # Board JSON.stringify uses compact JSON; the local adapter must not
++            # assume Python's verdict string formatting is the serving slot's.
++            self.slot['last_verdict'] = json.dumps(verdict, separators=(',', ':'))
++            verdict.update(consumed=True, sequence=self.slot['h'], h=self.slot['h'],
++                           payload_sha256=self.slot['last_payload_sha256'])
++            return dict(protocol='processed_prefix1', results=[verdict])
++        return reply
++
++
++def test_successor_carries_ack_without_intermediate_standalone_control(live):
++    kb.create_task(live, title='first', assignee='worker')
++    kb.create_task(live, title='second', assignee='worker')
++    receiver = AckReceiver()
++    result = client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=2)
++    assert result.applied == 2
++    assert len(receiver.sent) == 2
++    assert receiver.calls == ['capability', 'inspect', 'session', 'ops', 'ops', 'ack']
++    assert receiver.predecessors[0] is None
++    first = receiver.sent[0]
++    assert receiver.predecessors[1] == dict(sequence='1', op_id=first['client_op_id'],
++                                          payload_sha256=first['replay']['payload_sha256'])
++    assert journal.snapshot(live)['settled'] == receiver.slot['a'] == '2'
++    assert journal.pending_wire(live) is None
++
++
++def test_idle_stream_still_acknowledges_last_durable_verdict(live):
++    kb.create_task(live, title='idle', assignee='worker')
++    receiver = AckReceiver()
++    client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert receiver.calls[-1] == 'ack'
++    assert receiver.slot['a'] == journal.snapshot(live)['settled'] == '1'
++    verdict = json.loads(receiver.slot['last_verdict'])
++    assert verdict['client_op_id'] == receiver.sent[0]['client_op_id']
++
++
++@pytest.mark.parametrize('field,value', [
++    ('consumed', False), ('consumed', 1), ('consumed', None),
++    ('sequence', '2'), ('sequence', 1), ('h', '2'),
++    ('payload_sha256', 'f' * 64), ('client_op_id', 'foreign-operation'),
++    ('status', 'already_processed'), ('outcome_unknown', True), ('dup', True),
++])
++def test_unbound_or_nonconsuming_reply_requires_inspect_before_prune(live, field, value):
++    tid = kb.create_task(live, title='untrusted final-looking reply', assignee='worker')
++
++    class DamagedReply(AckReceiver):
++        def _call(self, method, path, body=None):
++            if path.endswith('/inspect') and self.sent:
++                raise OSError('independent inspection unavailable')
++            reply = super()._call(method, path, body)
++            if path.endswith('/ops'):
++                reply['results'][0][field] = value
++            return reply
++
++    receiver = DamagedReply()
++    with pytest.raises(OSError, match='independent inspection unavailable'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    assert journal.snapshot(live)['settled'] == '0'
++    assert journal.pending_wire(live) is not None
++    assert live.execute('SELECT sync_version FROM tasks WHERE id=?', (tid,)).fetchone()[0] is None
++    assert receiver.slot['a'] == '0' and 'ack' not in receiver.calls
++
++
++def test_successor_disconnect_restart_keeps_frozen_predecessor_and_exact_intent(live):
++    from hermes_cli import kanban_db_connect as kbc
++    kb.create_task(live, title='settled predecessor', assignee='worker')
++    kb.create_task(live, title='uncertain successor', assignee='worker')
++
++    class Disconnect(AckReceiver):
++        fail = True
++
++        def _call(self, method, path, body=None):
++            if path.endswith('/ops') and len(self.sent) == 1 and self.fail:
++                raise OSError('successor disconnected before commit')
++            return super()._call(method, path, body)
++
++    receiver = Disconnect()
++    with pytest.raises(OSError, match='successor disconnected'):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=2)
++    assert receiver.slot['h'] == '1' and receiver.slot['a'] == '0'
++    saved = journal.pending_wire(live)
++    assert saved is not None
++    assert json.loads(saved)['replay']['ack']['op_id'] == receiver.sent[0]['client_op_id']
++    state = journal.snapshot(live)
++    assert state['settled'] == '1' and state['pending']['sequence'] == '2'
++    path = live.execute('PRAGMA database_list').fetchone()[2]
++    live.close()
++    receiver.fail = False
++    conn = kbc.connect(Path(path))
++    try:
++        assert journal.pending_wire(conn) == saved
++        result = client.push(conn, receiver, 'default', 'macbook', primary=False, max_batches=1)
++        assert result.applied == 1
++        actual = dict(receiver.sent[-1])
++        actual['replay'] = dict(actual['replay'])
++        actual['replay'].pop('session')
++        assert actual == json.loads(saved)
++        assert journal.snapshot(conn)['settled'] == receiver.slot['a'] == '2'
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('changed', [dict(status='merged'), dict(version=True), dict(version=8)])
++def test_ack_readback_never_accepts_changed_verdict_content(live, changed):
++    kb.create_task(live, title='ACK verdict content', assignee='worker')
++
++    class ChangedAck(AckReceiver):
++        def _call(self, method, path, body=None):
++            reply = super()._call(method, path, body)
++            if path.endswith('/ack'):
++                verdict = json.loads(reply['slot']['last_verdict'])
++                verdict.update(changed)
++                reply['slot']['last_verdict'] = json.dumps(verdict)
++            return reply
++
++    with pytest.raises(ValueError, match='^ack readback mismatch$'):
++        client.push(live, ChangedAck(), 'default', 'macbook', primary=False, max_batches=1)
++    assert journal.snapshot(live)['settled'] == '1'
++    assert journal.pending_wire(live) is None
++
++
++def test_current_row_reply_enrichment_is_not_retained_history(live):
++    kb.create_task(live, title='not the reply row', assignee='worker')
++
++    class Enriched(AckReceiver):
++        def _call(self, method, path, body=None):
++            reply = super()._call(method, path, body)
++            if path.endswith('/ops'):
++                reply['results'][0].update(row=dict(title='untrusted current image'),
++                                           source_predecessor=dict(title='not historical'))
++            return reply
++
++    receiver = Enriched()
++    assert client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1).applied == 1
++    verdict = json.loads(journal.snapshot(live)['last_verdict'])
++    assert 'row' not in verdict and 'source_predecessor' not in verdict
++
++
++def test_forty_settlements_use_one_ops_roundtrip_each_after_session(live):
++    for n in range(40):
++        kb.create_task(live, title=f'backlog {n}', assignee='worker')
++    receiver = AckReceiver()
++    result = client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=40)
++    assert result.applied == result.sent == 40
++    assert receiver.calls == ['capability', 'inspect', 'session'] + ['ops'] * 40 + ['ack']
++    assert receiver.slot['h'] == receiver.slot['a'] == journal.snapshot(live)['settled'] == '40'
++    assert journal.pending_wire(live) is None
++    assert [op['replay']['sequence'] for op in receiver.sent] == [str(n) for n in range(1, 41)]
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index c69da77bf806b2629d1c3b67d0b76dfc13c63664..d92923920d0dd96e530df19a1105b075e961e38f 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -44,6 +44,10 @@
+         assert body['journal_id'] == self.slot['journal_id']
+         op, = body['ops']
+         assert op['replay']['session'] == self.slot['session']
++        if int(op['replay']['sequence']) > int(self.slot['h']) and self.slot['a'] != self.slot['h']:
++            assert op['replay'].get('ack') == dict(sequence=self.slot['h'], op_id=self.slot['last_op_id'],
++                                                  payload_sha256=self.slot['last_payload_sha256'])
++            self.slot['a'] = self.slot['h']
+         self.sent.append(op)
+         self.slot.update(h=op['replay']['sequence'], last_op_id=op['client_op_id'],
+                          last_payload_sha256=op['replay']['payload_sha256'],
+-- 
+2.43.0
+

@@ -1,0 +1,407 @@
+From dbd3ac34e82bcfd2545c4dafc75c85c43a00ec28 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 13:06:32 +0000
+Subject: [PATCH 6818] Policy-config interning: exact-byte storage and opt-in rollout
+
+Public mirror of source commit dbd3ac34e82bcfd2545c4dafc75c85c43a00ec28.
+
+---
+diff --git a/hermes_state_local.py b/hermes_state_local.py
+index 3276fe59ff9b785f05c8373601669b5e59497fb5..348d8c0b975662c25b79dc3a7b096c22629d2b31 100644
+--- a/hermes_state_local.py
++++ b/hermes_state_local.py
+@@ -390,17 +390,9 @@
+ 
+ 
+ def local_receipt(db, session_id):
++    from hermes_state_policy_config import load_receipt
+     with db._read_ctx() as conn:
+-        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
+-    if row is None:
+-        raise RuntimeStoreError('storage_unavailable')
+-    try:
+-        value = json.loads(row[0])
+-        if not isinstance(value, dict):
+-            raise ValueError('invalid receipt')
+-        return value
+-    except (TypeError, ValueError) as exc:
+-        raise RuntimeStoreError('storage_unavailable') from exc
++        return load_receipt(conn, session_id)
+ 
+ 
+ def end_idle_local_session(db, *, epoch, session_id, target_id, reason):
+diff --git a/hermes_state_policy_config.py b/hermes_state_policy_config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..062dbdc04ad713492f50e6b15566fa21bad3b745
+--- /dev/null
++++ b/hermes_state_policy_config.py
+@@ -0,0 +1,158 @@
++"""Transaction-owned, exact-byte frozen-policy config interning.
++
++Legacy inline receipts remain the default. Callers must explicitly opt in only
++AFTER every reader is upgraded; this module installs no schema or activation.
++Blob/reference keys live in state_meta so ordinary recovery copies their custody.
++The request and all other receipt fields stay inline and byte-identical as values.
++"""
++import hashlib
++import json
++import re
++
++from hermes_state_runtime import RuntimeStoreError, _json
++
++POLICY_PREFIX = 'gateway.local_policy.v1:'
++BLOB_PREFIX = 'gateway.policy_config.blob.v1:'
++REF_PREFIX = 'gateway.policy_config.ref.v1:'
++_DIGEST = re.compile(r'[0-9a-f]{64}\Z')
++
++
++def _digest(text):
++    return hashlib.sha256(text.encode('utf-8')).hexdigest()
++
++
++def _reference(receipt):
++    policy = receipt.get('policy')
++    if not isinstance(policy, dict):
++        return None
++    digest = policy.get('config_ref_v1')
++    if digest is not None and (not isinstance(digest, str) or not _DIGEST.fullmatch(digest)
++                               or 'config_json' in policy):
++        raise RuntimeStoreError('storage_unavailable')
++    return digest
++
++
++def _decode(raw, lookup):
++    """Decode with blob lookup bound to the receipt's SQLite snapshot."""
++    try:
++        receipt = json.loads(raw)
++        if not isinstance(receipt, dict):
++            raise ValueError('invalid receipt')
++        digest = _reference(receipt)
++        if digest is not None:
++            text = lookup(digest)
++            if not isinstance(text, str) or _digest(text) != digest:
++                raise ValueError('invalid config blob')
++            receipt['policy'].pop('config_ref_v1')
++            receipt['policy']['config_json'] = text
++        return receipt
++    except (ValueError, TypeError, UnicodeError) as exc:
++        raise RuntimeStoreError('storage_unavailable') from exc
++
++
++def decode_receipt(conn, raw):
++    """Hydrate raw bytes already read inside the caller's owner transaction.
++
++    An autocommit connection cannot promise that its earlier raw SELECT and this
++    blob SELECT share a snapshot; use load_receipt for standalone reads instead.
++    """
++    if not conn.in_transaction:
++        raise RuntimeStoreError('runtime_coordination_required')
++    def lookup(digest):
++        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (BLOB_PREFIX + digest,)).fetchone()
++        return row[0] if row is not None else None
++    return _decode(raw, lookup)
++
++
++def load_receipt(conn, session_id):
++    # One statement is one snapshot even on pooled autocommit readers. Merely
++    # borrowing the same connection for two SELECTs does NOT provide that fence.
++    row = conn.execute(
++        "SELECT m.value,b.value FROM state_meta m LEFT JOIN state_meta b "
++        "ON b.key=? || CASE WHEN json_valid(m.value) THEN json_extract(m.value,'$.policy.config_ref_v1') END "
++        "WHERE m.key=?", (BLOB_PREFIX, POLICY_PREFIX + session_id)).fetchone()
++    if row is None:
++        raise RuntimeStoreError('storage_unavailable')
++    return _decode(row[0], lambda digest: row[1])
++
++
++def _stored_reference(conn, session_id):
++    row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
++    if row is None:
++        return None
++    try:
++        return _reference(json.loads(row[0]))
++    except (ValueError, TypeError, AttributeError) as exc:
++        raise RuntimeStoreError('storage_unavailable') from exc
++
++
++def _retire_reference(conn, session_id, digest):
++    if digest is None:
++        return
++    conn.execute('DELETE FROM state_meta WHERE key=?', (REF_PREFIX + digest + ':' + session_id,))
++    # GLOB's fixed hash prefix uses state_meta's key index; never scan policy
++    # payloads (hundreds of MB) or maintain a refcount that can drift on retries.
++    if conn.execute('SELECT 1 FROM state_meta WHERE key GLOB ? LIMIT 1',
++                    (REF_PREFIX + digest + ':*',)).fetchone() is None:
++        conn.execute('DELETE FROM state_meta WHERE key=?', (BLOB_PREFIX + digest,))
++
++
++def store_receipt(conn, session_id, receipt, *, intern=False):
++    """Store with its exact-byte blob/ref in the existing owner transaction.
++
++    Does not commit, open connections or change activation. Inline is also the
++    rollback representation: callers first hydrate, then store with intern=False.
++    A local savepoint makes a caught statement failure leave no partial inventory.
++    """
++    # Validate/serialize before any write and copy so caller snapshots stay intact.
++    saved = json.loads(_json(receipt))
++    if _reference(saved) is not None:
++        raise RuntimeStoreError('storage_unavailable')
++    digest, text = None, None
++    if intern:
++        text = saved['policy'].get('config_json')
++        if not isinstance(text, str):
++            raise RuntimeStoreError('storage_unavailable')
++        digest = _digest(text)
++        saved['policy'].pop('config_json')
++        saved['policy']['config_ref_v1'] = digest
++    old = _stored_reference(conn, session_id)
++    # Do not use an outermost savepoint: its RELEASE would commit on an
++    # autocommit caller and make rollback of a larger owner operation impossible.
++    if not conn.in_transaction:
++        raise RuntimeStoreError('runtime_coordination_required')
++    conn.execute('SAVEPOINT policy_config_store')
++    try:
++        if digest is not None:
++            key = BLOB_PREFIX + digest
++            existing = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
++            if existing is not None and existing[0] != text:
++                raise RuntimeStoreError('storage_unavailable')
++            conn.execute('INSERT OR IGNORE INTO state_meta(key,value) VALUES(?,?)', (key, text))
++            conn.execute('INSERT OR IGNORE INTO state_meta(key,value) VALUES(?,?)',
++                         (REF_PREFIX + digest + ':' + session_id, digest))
++        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
++                     (POLICY_PREFIX + session_id, _json(saved)))
++        if old != digest:
++            _retire_reference(conn, session_id, old)
++        conn.execute('RELEASE policy_config_store')
++    except BaseException:
++        conn.execute('ROLLBACK TO policy_config_store')
++        conn.execute('RELEASE policy_config_store')
++        raise
++
++
++def delete_receipt(conn, session_id):
++    """Delete a receipt and its last reference on its owner's delete transaction."""
++    digest = _stored_reference(conn, session_id)
++    if not conn.in_transaction:
++        raise RuntimeStoreError('runtime_coordination_required')
++    conn.execute('SAVEPOINT policy_config_delete')
++    try:
++        conn.execute('DELETE FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,))
++        _retire_reference(conn, session_id, digest)
++        conn.execute('RELEASE policy_config_delete')
++    except BaseException:
++        conn.execute('ROLLBACK TO policy_config_delete')
++        conn.execute('RELEASE policy_config_delete')
++        raise
+diff --git a/tests/hermes_state/test_policy_config_storage.py b/tests/hermes_state/test_policy_config_storage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..56e30e09246ffd63f606fd3b75f524d302af4791
+--- /dev/null
++++ b/tests/hermes_state/test_policy_config_storage.py
+@@ -0,0 +1,202 @@
++"""Exact-byte frozen configuration storage; no production activation in this test."""
++import json
++import sqlite3
++from contextlib import closing
++
++import pytest
++
++from hermes_state_policy_config import (
++    BLOB_PREFIX, REF_PREFIX, delete_receipt, load_receipt, store_receipt,
++)
++from hermes_state_runtime import RuntimeStoreError
++
++
++@pytest.fixture
++def conn():
++    with closing(sqlite3.connect(':memory:')) as value:
++        value.execute('CREATE TABLE state_meta(key TEXT PRIMARY KEY, value TEXT)')
++        value.execute('BEGIN')
++        yield value
++
++
++def receipt(config=' {"unicode": "雪", "a": 1} \n'):
++    return {'session_id': 'one', 'policy': {'config_json': config, 'request_json': '{ "raw": true }'}}
++
++
++def inventory(conn, prefix):
++    return conn.execute('SELECT key,value FROM state_meta WHERE key GLOB ?', (prefix + '*',)).fetchall()
++
++
++def test_default_is_legacy_inline_without_auxiliary_writes(conn):
++    expected = receipt()
++    store_receipt(conn, 'one', expected)
++    raw = conn.execute('SELECT value FROM state_meta').fetchone()[0]
++    assert json.loads(raw) == expected
++    assert inventory(conn, BLOB_PREFIX) == inventory(conn, REF_PREFIX) == []
++
++
++def test_exact_bytes_shared_and_last_reference_retirement(conn):
++    expected = receipt()
++    original = json.loads(json.dumps(expected))
++    store_receipt(conn, 'one', expected, intern=True)
++    store_receipt(conn, 'two', expected, intern=True)
++    assert expected == original
++    assert len(inventory(conn, BLOB_PREFIX)) == 1
++    assert len(inventory(conn, REF_PREFIX)) == 2
++    assert load_receipt(conn, 'one') == load_receipt(conn, 'two') == expected
++    raw = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', ('gateway.local_policy.v1:one',)).fetchone()[0])
++    assert 'config_json' not in raw['policy']
++    assert raw['policy']['request_json'] == expected['policy']['request_json']
++    delete_receipt(conn, 'one')
++    assert load_receipt(conn, 'two') == expected
++    assert len(inventory(conn, BLOB_PREFIX)) == 1
++    delete_receipt(conn, 'two')
++    assert inventory(conn, BLOB_PREFIX) == inventory(conn, REF_PREFIX) == []
++
++
++def test_byte_distinct_json_not_normalized(conn):
++    for sid, text in [('a', '{"a":1}'), ('b', '{ "a": 1 }')]:
++        store_receipt(conn, sid, receipt(text), intern=True)
++        assert load_receipt(conn, sid)['policy']['config_json'] == text
++    assert len(inventory(conn, BLOB_PREFIX)) == 2
++
++
++def test_replacement_and_inline_rollback_drop_only_unreferenced_blob(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    store_receipt(conn, 'two', receipt(), intern=True)
++    store_receipt(conn, 'one', receipt('new'), intern=True)
++    assert len(inventory(conn, BLOB_PREFIX)) == 2
++    store_receipt(conn, 'two', load_receipt(conn, 'two'))
++    assert len(inventory(conn, BLOB_PREFIX)) == 1
++    assert load_receipt(conn, 'one')['policy']['config_json'] == 'new'
++    store_receipt(conn, 'one', load_receipt(conn, 'one'))
++    assert inventory(conn, BLOB_PREFIX) == inventory(conn, REF_PREFIX) == []
++
++
++@pytest.mark.parametrize('corrupt', [None, 'wrong bytes'])
++def test_missing_or_corrupt_blob_fails_closed_without_changes(conn, corrupt):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    key = inventory(conn, BLOB_PREFIX)[0][0]
++    if corrupt is None:
++        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
++    else:
++        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (corrupt, key))
++    before = conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall()
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        load_receipt(conn, 'one')
++    assert conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall() == before
++
++
++def test_blob_and_reference_rollback_with_receipt_transaction(conn):
++    conn.commit()
++    with pytest.raises(RuntimeError, match='injected'):
++        with conn:
++            conn.execute('BEGIN')
++            store_receipt(conn, 'one', receipt(), intern=True)
++            raise RuntimeError('injected')
++    assert conn.execute('SELECT * FROM state_meta').fetchall() == []
++
++
++def test_legacy_decoder_boundary_is_explicit(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    raw = conn.execute('SELECT value FROM state_meta WHERE key=?', ('gateway.local_policy.v1:one',)).fetchone()[0]
++    with pytest.raises(KeyError, match='config_json'):
++        json.loads(raw)['policy']['config_json']
++    assert load_receipt(conn, 'one') == receipt()
++
++
++def test_failed_receipt_write_rolls_back_blob_and_reference_only(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    before = conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall()
++    conn.execute("CREATE TRIGGER fail_receipt BEFORE UPDATE ON state_meta "
++                 "WHEN NEW.key='gateway.local_policy.v1:one' "
++                 "BEGIN SELECT RAISE(ABORT, 'injected'); END")
++    with pytest.raises(sqlite3.IntegrityError, match='injected'):
++        store_receipt(conn, 'one', receipt('replacement'), intern=True)
++    assert conn.in_transaction
++    assert conn.execute('SELECT * FROM state_meta ORDER BY key').fetchall() == before
++    assert load_receipt(conn, 'one') == receipt()
++
++
++def test_no_owner_transaction_refuses_writes(conn):
++    conn.commit()
++    for operation in (lambda: store_receipt(conn, 'one', receipt(), intern=True),
++                      lambda: delete_receipt(conn, 'one')):
++        with pytest.raises(RuntimeStoreError, match='runtime_coordination_required'):
++            operation()
++        assert not conn.in_transaction
++        assert conn.execute('SELECT * FROM state_meta').fetchall() == []
++
++
++@pytest.mark.parametrize('digest', ['bad', 'A' * 64, {}, 1])
++def test_invalid_reference_refused(conn, digest):
++    from hermes_state_policy_config import decode_receipt
++    raw = json.dumps({'policy': {'config_ref_v1': digest}})
++    with pytest.raises(RuntimeStoreError, match='storage_unavailable'):
++        decode_receipt(conn, raw)
++
++
++def test_legacy_invalid_policy_stays_at_existing_validation_boundary(conn):
++    from hermes_state_policy_config import decode_receipt
++    for value in ({}, {'policy': None}, {'policy': {}}, {'policy': []}):
++        assert decode_receipt(conn, json.dumps(value)) == value
++
++
++def test_dbstat_pages_reclaimed_logically_without_vacuum(conn, record_property):
++    text = ' {"frozen": "' + 'x' * 65536 + '"} '
++    for number in range(40):
++        store_receipt(conn, str(number), receipt(text))
++    before = conn.execute("SELECT sum(pgsize) FROM dbstat WHERE name='state_meta'").fetchone()[0]
++    for number in range(40):
++        store_receipt(conn, str(number), load_receipt(conn, str(number)), intern=True)
++    after = conn.execute("SELECT sum(pgsize) FROM dbstat WHERE name='state_meta'").fetchone()[0]
++    record_property('state_meta_dbstat_before_bytes', before)
++    record_property('state_meta_dbstat_after_bytes', after)
++    assert after < before // 10
++    assert len(inventory(conn, BLOB_PREFIX)) == 1
++    assert len(inventory(conn, REF_PREFIX)) == 40
++    assert load_receipt(conn, '39')['policy']['config_json'] == text
++
++
++def test_autocommit_read_hydrates_one_snapshot_during_lastref_retirement(tmp_path):
++    path = tmp_path / 'config.db'
++    with closing(sqlite3.connect(path, isolation_level=None)) as writer, closing(
++            sqlite3.connect(path, isolation_level=None)) as reader:
++        writer.execute('PRAGMA journal_mode=WAL')
++        writer.execute('CREATE TABLE state_meta(key TEXT PRIMARY KEY, value TEXT)')
++        writer.execute('BEGIN IMMEDIATE')
++        store_receipt(writer, 'one', receipt(), intern=True)
++        writer.commit()
++
++        class ReadThenReplace:
++            def execute(self, sql, parameters):
++                cursor = reader.execute(sql, parameters)
++                class Cursor:
++                    def fetchone(self):
++                        row = cursor.fetchone()
++                        cursor.close()
++                        writer.execute('BEGIN IMMEDIATE')
++                        store_receipt(writer, 'one', receipt('new'))
++                        writer.commit()
++                        return row
++                return Cursor()
++
++        assert load_receipt(ReadThenReplace(), 'one') == receipt()
++        assert load_receipt(reader, 'one') == receipt('new')
++        assert not reader.in_transaction
++        assert inventory(writer, BLOB_PREFIX) == []
++
++
++def test_real_sessiondb_local_receipt_hydrates(tmp_path):
++    from hermes_state import SessionDB
++    from hermes_state_local import local_receipt
++    with closing(SessionDB(db_path=tmp_path / 'state.db')) as db:
++        db._execute_write(lambda conn: store_receipt(conn, 'one', receipt(), intern=True))
++        assert local_receipt(db, 'one') == receipt()
++
++
++def test_reference_lookup_uses_key_index(conn):
++    store_receipt(conn, 'one', receipt(), intern=True)
++    plan = conn.execute('EXPLAIN QUERY PLAN SELECT 1 FROM state_meta WHERE key GLOB ? LIMIT 1',
++                        (REF_PREFIX + 'a' * 64 + ':*',)).fetchall()
++    assert any('SEARCH' in row[3] and 'INDEX' in row[3] for row in plan)
+-- 
+2.43.0
+

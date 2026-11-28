@@ -1,0 +1,526 @@
+From 9c7fc06ed40d4499b3c2a28689494e922b340ad8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:57:32 +0000
+Subject: [PATCH 6875] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 9c7fc06ed40d4499b3c2a28689494e922b340ad8.
+
+---
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index acc7f33580ad17020501bc30e496fcc78fb45fbf..84d2abf27e840d9dcdc6503bde338904c0d6d28b 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -642,7 +642,11 @@
+         )
+     else:
+         fields = "json_object(" + ", ".join(f"'{_wire_name(table, c)}', json({_wire_value(table, c, 'NEW')})" for c in columns) + ")"
+-        body = _outbox_insert(table, "upsert", _row_uid_sql(table, "NEW"), fields)
++        if table == 'tasks':
++            from hermes_cli.kanban_sync_exposure import task_insert
++            body = task_insert(_row_uid_sql(table, 'NEW'), fields, _UUID7_SQL, _NOW_MS_SQL)
++        else:
++            body = _outbox_insert(table, "upsert", _row_uid_sql(table, "NEW"), fields)
+         if table == "task_links":  # add-wins: re-linking clears an earlier removal
+             body = (f"DELETE FROM kanban_sync_tombstones WHERE table_name = 'task_links' "
+                     f"AND row_uid = {_row_uid_sql(table, 'NEW')}; " + body)
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index c2e740a1efb2331bbc5f3a2370b05a547aae6a95..270a521c815b5a080ed64d9c2047a02c2649cbeb 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -358,7 +358,11 @@
+             if not allowed:
+                 break
+         wire['replay']['session'] = remote['session']
+-        hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
++        if isinstance(hub, client._HTTP_HUB):
++            from hermes_cli.kanban_sync_exposure import send
++            send(hub, conn, board, [wire], replay=identity)
++        else:
++            hub._call('POST', root + 'ops', dict(identity, ops=[wire]))
+         out.sent += 1
+         remote = hub._call('GET', root + 'inspect')['slot']
+         membership = refresh_capacity()
+diff --git a/hermes_cli/kanban_sync_capture_sites.py b/hermes_cli/kanban_sync_capture_sites.py
+index 443465aa064df8f7b42d4485f83fe45aca985d76..7b4af37aae6000d62924c9aaa7b5b842eaf0972c 100644
+--- a/hermes_cli/kanban_sync_capture_sites.py
++++ b/hermes_cli/kanban_sync_capture_sites.py
+@@ -30,6 +30,9 @@
+ SITES: dict[tuple[str, str, str, str], str] = {
+     ("kanban_db_sync.py", "_outbox_insert", "INSERT", _O): ORIGINAL_CANDIDATE,
+     ("kanban_db_sync.py", "_insert_trigger", "INSERT", _O): ORIGINAL_CANDIDATE,
++    ("kanban_sync_exposure.py", "task_insert", "INSERT", _O): ORIGINAL_CANDIDATE,
++    ("kanban_sync_exposure.py", "_observe", "UPDATE", _O): STATE_ONLY,
++    ("kanban_sync_exposure.py", "_observe", "UPDATE", _P): STATE_ONLY,
+     ("kanban_retain_transport.py", "reserve", "INSERT", _O): ORIGINAL_CANDIDATE,
+     ("kanban_actionability_transport.py", "reserve", "INSERT", _O): ORIGINAL_CANDIDATE,
+     ("kanban_failure_release.py", "queue", "INSERT", _O): ORIGINAL_CANDIDATE,
+diff --git a/hermes_cli/kanban_sync_capture_storage.py b/hermes_cli/kanban_sync_capture_storage.py
+index a9c67a5d109edc39d7f82e5be41b4d5e7e0d3a7f..0382aab1db567b124dea91b743bad973068783dd 100644
+--- a/hermes_cli/kanban_sync_capture_storage.py
++++ b/hermes_cli/kanban_sync_capture_storage.py
+@@ -28,6 +28,7 @@
+     UNKNOWN, and no certification may start before the writer-version gate.
+     """
+     for table in ("kanban_sync_outbox", "kanban_sync_parent_envelopes"):
++        add_column_if_missing(conn, table, 'exposure_history', 'exposure_history TEXT')
+         for name, kind in _COLUMNS:
+             add_column_if_missing(conn, table, name, f"{name} {kind}")
+         unchanged = " AND ".join(f"NEW.{name} IS OLD.{name}" for name, _ in _COLUMNS[:3])
+@@ -36,6 +37,16 @@
+             WHEN NOT ({unchanged}) OR
+                 NOT (NEW.identity_state IS OLD.identity_state OR NEW.identity_state IS 'ambiguous')
+             BEGIN SELECT RAISE(ABORT, 'capture provenance is immutable'); END""")
++        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS replay_exposure1_{table}_append
++            BEFORE UPDATE OF exposure_history ON {table}
++            WHEN OLD.exposure_history IS NOT NULL AND (
++                NEW.exposure_history IS NULL OR
++                json_extract(NEW.exposure_history,'$.protocol') IS NOT json_extract(OLD.exposure_history,'$.protocol') OR
++                json_extract(NEW.exposure_history,'$.coverage') IS NOT json_extract(OLD.exposure_history,'$.coverage') OR
++                json_extract(NEW.exposure_history,'$.certified') IS NOT json_extract(OLD.exposure_history,'$.certified') OR
++                EXISTS (SELECT 1 FROM json_each(OLD.exposure_history,'$.exposures') AS old
++                    WHERE old.value IS NOT json_extract(NEW.exposure_history,'$.exposures[' || old.key || ']')))
++            BEGIN SELECT RAISE(ABORT, 'exposure history is append-only'); END""")
+     # Frozen wire is a conservative exposure indicator, NOT a certified attempt
+     # journal. A pre-I/O freeze followed by edits may over-taint, never certify.
+     changed = " OR ".join(f"NEW.{name} IS NOT OLD.{name}" for name in (
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index fc53cec4cd8ca769b6a18e7d8afe9e2be6fe529d..4814b93ab99cea6d0408113d1fac4a49ee2afd4f 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -418,7 +418,10 @@
+                 raise
+         raise AssertionError("unreachable")  # pragma: no cover
+ 
+-    def ops(self, board: str, ops: list[dict]) -> dict:
++    def ops(self, board: str, ops: list[dict], *, custody=None) -> dict:
++        if custody is not None:
++            from hermes_cli.kanban_sync_exposure import send
++            return send(self, custody, board, ops)
+         return self._call("POST", f"/v2/boards/{board}/ops", {"ops": ops})
+ 
+     def changes(self, board: str, since: int, limit: int = FEED_PAGE) -> dict:
+@@ -468,7 +471,7 @@
+         return _bounded_call(self.ident, "POST", "/v2/machines/me/metrics", metrics, CPU_REPORT_BUDGET_S)
+ 
+ 
+-# --- boards ---------------------------------------------------------------------------------------
++_HTTP_HUB = Hub  # Concrete transport identity survives a caller replacing the factory.
+ 
+ def board_paths() -> list[tuple[str, Path]]:
+     """``(slug, kanban.db)`` for every board on this host that ``kanban.sync.boards`` selects."""
+@@ -673,7 +676,7 @@
+             parents = [(envelopes.parent(conn, tid, lambda op=op: op, supported=bool(origin_cap)), tid) for op, tid in parents]
+             wire = [op for op, _tid in parents] + wire
+         try:
+-            resp = hub.ops(board, wire)
++            resp = hub.ops(board, wire, custody=conn) if isinstance(hub, _HTTP_HUB) else hub.ops(board, wire)
+         except (HubError, OSError) as exc:
+             with write_txn(conn):
+                 conn.executemany("UPDATE kanban_sync_outbox SET attempts = attempts + 1, last_error = ? WHERE op_id = ?",
+diff --git a/hermes_cli/kanban_sync_exposure.py b/hermes_cli/kanban_sync_exposure.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e7efba62c9cbbcaa11cdfcdff9122ff298de918
+--- /dev/null
++++ b/hermes_cli/kanban_sync_exposure.py
+@@ -0,0 +1,91 @@
++"""Dormant pending-custody capture and authenticated HTTP exposure observations.
++
++Candidate coverage is NOT certified completeness: old-writer drain, the minimum
++writer gate and the rest of the insertion/recovery audit remain prerequisites.
++Historical missing history stays unknown even after a new observed transmission.
++No permanent per-operation ledger or credential material is stored.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from urllib.parse import quote
++
++from hermes_cli.kanban_db_connect import write_txn
++
++
++def task_insert(uid: str, fields: str, uuid: str, clock: str) -> str:
++    """New task INSERT only; unresolved predecessors cannot acquire candidates.
++
++    A materialized expression samples identity/time once. This is part of the
++    original capture INSERT, not a retrofit inferred later from row appearance.
++    C has not enabled certification: identity_state deliberately remains NULL.
++    """
++    eligible = (f"NOT EXISTS (SELECT 1 FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid={uid}) "
++                f"AND NOT EXISTS (SELECT 1 FROM kanban_sync_tombstones WHERE table_name='tasks' AND row_uid={uid}) "
++                f"AND NOT EXISTS (SELECT 1 FROM kanban_sync_parent_envelopes WHERE task_id={uid})")
++    return ("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,base_version,hlc,created_at,"
++            "capture_protocol,original_op_id,original_created_at,exposure_history) "
++            f"WITH capture AS MATERIALIZED (SELECT {uuid} AS id,{clock} AS ms,({eligible}) AS eligible) "
++            f"SELECT id,'tasks',{uid},'upsert',{fields},NULL,'',ms,"
++            "CASE WHEN eligible THEN 'capture_candidate1' END,CASE WHEN eligible THEN id END,"
++            "CASE WHEN eligible THEN ms END,CASE WHEN eligible THEN "
++            "'{\"protocol\":\"exposure1\",\"coverage\":\"candidate\",\"certified\":false,\"exposures\":[]}' END FROM capture;")
++
++
++def _observe(conn, ops, board, endpoint, ident, capability):
++    """Append under the writer reservation; COMMIT is a prerequisite to sending."""
++    principal = capability.get('gateway_principal')
++    incarnation = capability.get('board_incarnation')
++    authenticated = all(isinstance(value, str) and value for value in (principal, incarnation))
++    with write_txn(conn):
++        for op in ops:
++            op_id = op.get('client_op_id')
++            row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++            table = 'kanban_sync_outbox'
++            if row is None:
++                table = 'kanban_sync_parent_envelopes'
++                row = conn.execute('SELECT rowid,exposure_history FROM kanban_sync_parent_envelopes '
++                                   "WHERE json_extract(wire,'$.client_op_id')=?", (op_id,)).fetchone()
++            if row is None:
++                raise ValueError('exposure source custody missing')
++            history = json.loads(row[1]) if row[1] is not None else dict(
++                protocol='exposure1', coverage='unknown', certified=False, exposures=[])
++            if (history.get('protocol') != 'exposure1' or history.get('certified') is not False or
++                    history.get('coverage') not in ('unknown', 'candidate') or not isinstance(history.get('exposures'), list)):
++                raise ValueError('unsupported exposure history; preserve custody')
++            exposure = dict(board=board, endpoint=endpoint, url=ident.url,
++                            credential_epoch=hashlib.sha256(ident.key.encode()).hexdigest(),
++                            gateway_principal=principal if authenticated else None,
++                            board_incarnation=incarnation if authenticated else None, wire=op)
++            if exposure not in history['exposures']:
++                history['exposures'].append(exposure)
++            conn.execute(f'UPDATE {table} SET exposure_history=? WHERE rowid=?',
++                         (json.dumps(history, sort_keys=True, separators=(',', ':'), allow_nan=False), row[0]))
++
++
++def send(hub, conn, board, ops, *, replay=None):
++    """Pin the credentials for capability AND mutation, including header creation.
++
++    A fresh transport prevents a caller replacing hub.ident during the probe from
++    substituting credentials after the observation. Unsupported legacy capability
++    yields an explicitly unidentified observation, never a complete principal set.
++    """
++    from hermes_cli.kanban_sync_client import Hub, HubError
++    if conn.in_transaction:
++        raise ValueError('exposure requires a standalone durable commit before I/O')
++    root = f'/v2/boards/{quote(board, safe="")}/'
++    endpoint = root + ('replay/ops' if replay is not None else 'ops')
++    transport = Hub(hub.ident, timeout=hub.timeout, deadline=hub.deadline)
++    try:
++        try:
++            capability = transport._call('GET', root + 'replay/capability')
++        except HubError as exc:
++            if exc.status not in (404, 405, 501, 503):
++                raise
++            capability = {}
++        _observe(conn, ops, board, endpoint, transport.ident, capability)
++        body = dict(replay, ops=ops) if replay is not None else dict(ops=ops)
++        return transport._call('POST', endpoint, body)
++    finally:
++        transport.close()
+diff --git a/tests/hermes_cli/test_kanban_replay_exposure.py b/tests/hermes_cli/test_kanban_replay_exposure.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ddccaf649211be54d829743077859f79159cdeb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_exposure.py
+@@ -0,0 +1,218 @@
++"""Pending exposure observations use actual HTTP credentials, never a display gateway."""
++import hashlib
++import json
++import sqlite3
++import threading
++from contextlib import contextmanager
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    client.ensure_identity(conn, 'default', 'display-only')
++    yield conn
++    conn.close()
++
++
++def history(conn, op_id):
++    columns = {r[1] for r in conn.execute('PRAGMA table_info(kanban_sync_outbox)')}
++    if 'exposure_history' not in columns:
++        return None
++    row = conn.execute('SELECT exposure_history FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++    return json.loads(row[0]) if row is not None and row[0] is not None else None
++
++
++@contextmanager
++def serving(conn):
++    path = conn.execute('PRAGMA database_list').fetchone()[2]
++    observations = []
++    principals = {'epoch-one': 'principal-one', 'epoch-two': 'principal-two', 'epoch-three': 'principal-one'}
++
++    class Handler(BaseHTTPRequestHandler):
++        protocol_version = 'HTTP/1.1'
++
++        def do_GET(self):
++            key = self.headers.get('Authorization', '').removeprefix('Bearer ')
++            if self.path.endswith('/replay/capability'):
++                self.answer(dict(board_incarnation='incarnation-one', gateway_principal=principals[key]))
++            else:
++                self.answer({})  # optional status-origin capability is absent
++
++        def do_POST(self):
++            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
++            with sqlite3.connect('file:' + path + '?mode=ro', uri=True) as observed:
++                observed.row_factory = sqlite3.Row
++                rows = {op['client_op_id']: history(observed, op['client_op_id']) for op in body['ops']}
++            observations.append((self.headers.get('Authorization'), body['ops'], rows))
++            # The controlled peer consumed the full body; the reply is lost.
++            self.close_connection = True
++
++        def answer(self, body):
++            data = json.dumps(body).encode()
++            self.send_response(200)
++            self.send_header('Content-Length', str(len(data)))
++            self.end_headers()
++            self.wfile.write(data)
++
++        def log_message(self, *_args):
++            pass
++
++    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f'http://127.0.0.1:{server.server_port}', observations
++    finally:
++        server.shutdown()
++        thread.join(5)
++        server.server_close()
++
++
++def send_lost(conn, url, key):
++    hub = client.Hub(client.Identity(url, key, 'not-the-authenticated-principal'))
++    try:
++        with pytest.raises(OSError):
++            client.push(conn, hub, 'default', 'display-only', primary=False, max_batches=1)
++    finally:
++        hub.close()
++
++
++def test_new_task_capture_is_immutable_and_exposure_is_durable_before_http(board):
++    tid = kb.create_task(board, title='authorized fresh intent', assignee='worker')
++    row = dict(board.execute('SELECT * FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone())
++    assert (row['capture_protocol'], row['original_op_id'], row['original_created_at']) == (
++        'capture_candidate1', row['op_id'], row['created_at']), 'fresh capture tuple missing'
++    assert row['identity_state'] is None, 'C has not authorized original certification'
++    with serving(board) as (url, observations):
++        send_lost(board, url, 'epoch-one')
++        auth, ops, histories = observations[0]
++        op = next(op for op in ops if op['client_op_id'] == row['op_id'])
++        saved = histories[row['op_id']]
++        assert saved is not None, 'exposure must commit before the first mutation HTTP body'
++        assert saved['coverage'] == 'candidate' and saved['certified'] is False
++        entry, = saved['exposures']
++        assert entry['gateway_principal'] == 'principal-one'
++        assert entry['board_incarnation'] == 'incarnation-one' and entry['board'] == 'default'
++        assert entry['credential_epoch'] == hashlib.sha256(b'epoch-one').hexdigest()
++        assert entry['wire'] == op and entry['endpoint'] == '/v2/boards/default/ops'
++        assert auth == 'Bearer epoch-one' and 'epoch-one' not in json.dumps(saved)
++        assert history(board, row['op_id']) == saved
++        with pytest.raises(sqlite3.IntegrityError, match='capture provenance is immutable'):
++            board.execute('UPDATE kanban_sync_outbox SET original_op_id=? WHERE op_id=?', ('other', row['op_id']))
++
++
++def test_reopen_and_authenticated_reenrollment_keep_all_exposure_epochs(board):
++    tid = kb.create_task(board, title='multiple enrollments', assignee='worker')
++    op_id = board.execute('SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone()[0]
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    with serving(board) as (url, observations):
++        send_lost(board, url, 'epoch-one')
++        first = history(board, op_id)
++        reopened = kbc.connect(Path(path))
++        try:
++            assert history(reopened, op_id) == first
++            client.ensure_identity(reopened, 'default', 'reenrolled-display')
++            for key in ('epoch-two', 'epoch-three'):
++                send_lost(reopened, url, key)
++            saved = history(reopened, op_id)
++            assert saved['coverage'] == 'candidate' and saved['certified'] is False
++            assert saved['exposures'][:len(first['exposures'])] == first['exposures']
++            assert [e['gateway_principal'] for e in saved['exposures']] == [
++                'principal-one', 'principal-two', 'principal-one']
++            assert [e['credential_epoch'] for e in saved['exposures']] == [
++                hashlib.sha256(k.encode()).hexdigest() for k in ('epoch-one', 'epoch-two', 'epoch-three')]
++            for index, (_auth, _ops, histories) in enumerate(observations):
++                assert len(histories[op_id]['exposures']) == index + 1, 'every epoch durable before its HTTP body'
++            row = reopened.execute('SELECT original_op_id,identity_state FROM kanban_sync_outbox WHERE op_id=?', (op_id,)).fetchone()
++            assert tuple(row) == (op_id, None)
++        finally:
++            reopened.close()
++
++
++def test_missing_history_is_not_reconstructed_from_a_new_authenticated_send(board):
++    with kbc.write_txn(board):
++        board.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                      "VALUES ('historical','tasks','t_historical','upsert','{}','',123)")
++    with serving(board) as (url, observations):
++        send_lost(board, url, 'epoch-one')
++        saved = history(board, 'historical')
++        assert saved is not None and saved['coverage'] == 'unknown' and saved['certified'] is False
++        assert observations[0][2]['historical'] == saved
++        assert len(saved['exposures']) == 1
++        assert tuple(board.execute('SELECT capture_protocol,original_op_id,original_created_at,identity_state '
++                                   "FROM kanban_sync_outbox WHERE op_id='historical'").fetchone()) == (None,) * 4
++
++
++def test_http_first_io_reads_already_committed_exposure(board):
++    tid = kb.create_task(board, title='first I/O boundary', assignee='worker')
++    op_id = board.execute('SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone()[0]
++    with serving(board) as (url, observations):
++        send_lost(board, url, 'epoch-one')
++        assert observations[0][2][op_id] is not None, 'the HTTP peer saw no durable exposure'
++        assert len(observations[0][2][op_id]['exposures']) == 1, 'exposure was written after HTTP I/O'
++
++
++def test_exposure_commit_failure_forbids_http_mutation(board):
++    tid = kb.create_task(board, title='retain on journal write failure', assignee='worker')
++    op_id = board.execute('SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone()[0]
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    before = history(board, op_id)
++    with serving(board) as (url, observations):
++        with sqlite3.connect('file:' + path + '?mode=ro', uri=True) as readonly:
++            readonly.row_factory = sqlite3.Row
++            hub = client.Hub(client.Identity(url, 'epoch-one', 'display'))
++            try:
++                with pytest.raises(sqlite3.OperationalError, match='readonly'):
++                    hub.ops('default', [dict(client_op_id=op_id)], custody=readonly)
++            finally:
++                hub.close()
++        assert observations == []
++        assert history(board, op_id) == before
++
++
++def test_probe_and_http_headers_pin_the_same_credential_snapshot(board, monkeypatch):
++    tid = kb.create_task(board, title='credential transition during probe', assignee='worker')
++    op_id = board.execute('SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone()[0]
++    with serving(board) as (url, observations):
++        outer = client.Hub(client.Identity(url, 'epoch-one', 'same-display'))
++        original = client.Hub._headers
++
++        def change_enrollment(transport):
++            headers = original(transport)
++            outer.ident = client.Identity(url, 'epoch-two', 'same-display')
++            return headers
++
++        monkeypatch.setattr(client.Hub, '_headers', change_enrollment)
++        try:
++            with pytest.raises(OSError):
++                outer.ops('default', [dict(client_op_id=op_id)], custody=board)
++        finally:
++            outer.close()
++        assert observations[0][0] == 'Bearer epoch-one'
++        entry, = history(board, op_id)['exposures']
++        assert entry['gateway_principal'] == 'principal-one'
++        assert entry['credential_epoch'] == hashlib.sha256(b'epoch-one').hexdigest()
++
++
++@pytest.mark.parametrize('replacement', [None, '{}'])
++def test_recorded_exposure_cannot_be_erased_or_relabelled(board, replacement):
++    tid = kb.create_task(board, title='sticky history', assignee='worker')
++    op_id = board.execute('SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?', (tid,)).fetchone()[0]
++    with serving(board) as (url, _observations):
++        send_lost(board, url, 'epoch-one')
++    saved = history(board, op_id)
++    assert saved is not None
++    with pytest.raises(sqlite3.IntegrityError, match='exposure history is append-only'):
++        with kbc.write_txn(board):
++            board.execute('UPDATE kanban_sync_outbox SET exposure_history=? WHERE op_id=?', (replacement, op_id))
++    assert history(board, op_id) == saved
+diff --git a/tests/hermes_cli/test_kanban_replay_sender.py b/tests/hermes_cli/test_kanban_replay_sender.py
+index dca8019a93a210be6c504f85eb69f1759125d5b0..3fa2c3727b3c5b7f2fe0d828fd00dbde4b54b3ed 100644
+--- a/tests/hermes_cli/test_kanban_replay_sender.py
++++ b/tests/hermes_cli/test_kanban_replay_sender.py
+@@ -144,7 +144,9 @@
+         kb.create_task(live, title='HTTP tracer', assignee='worker')
+         result = client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1)
+         assert result.applied == 1 and receiver.slot['a'] == '1'
+-        assert len(authorizations) == 6 and set(authorizations) == {'Bearer fixture-key'}
++        # A second authenticated capability probe pins exposure to the mutation's
++        # own immutable credential snapshot, after issuance and before HTTP I/O.
++        assert len(authorizations) == 7 and set(authorizations) == {'Bearer fixture-key'}
+     finally:
+         server.shutdown()
+         server.server_close()
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_sites.py b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+index 9437f5509f16a43e31761cae9660c0cd7178937b..a3cbdf36113f853d897de28369d772f067ac5754 100644
+--- a/tests/hermes_cli/test_kanban_sync_capture_sites.py
++++ b/tests/hermes_cli/test_kanban_sync_capture_sites.py
+@@ -17,6 +17,9 @@
+ EXPECTED_SITES = """
+ hermes_cli.kanban_db_sync._outbox_insert|INSERT|kanban_sync_outbox|original_candidate
+ hermes_cli.kanban_db_sync._insert_trigger|INSERT|kanban_sync_outbox|original_candidate
++hermes_cli.kanban_sync_exposure.task_insert|INSERT|kanban_sync_outbox|original_candidate
++hermes_cli.kanban_sync_exposure._observe|UPDATE|kanban_sync_outbox|state_only
++hermes_cli.kanban_sync_exposure._observe|UPDATE|kanban_sync_parent_envelopes|state_only
+ hermes_cli.kanban_retain_transport.reserve|INSERT|kanban_sync_outbox|original_candidate
+ hermes_cli.kanban_actionability_transport.reserve|INSERT|kanban_sync_outbox|original_candidate
+ hermes_cli.kanban_failure_release.queue|INSERT|kanban_sync_outbox|original_candidate
+diff --git a/tests/hermes_cli/test_kanban_sync_capture_storage.py b/tests/hermes_cli/test_kanban_sync_capture_storage.py
+index 55c420c4b2a2dcf97bee801013f6fe3068b4aa4b..a1e351d2a1c7ac3e7304dd1c706be6858cfb4059 100644
+--- a/tests/hermes_cli/test_kanban_sync_capture_storage.py
++++ b/tests/hermes_cli/test_kanban_sync_capture_storage.py
+@@ -49,8 +49,8 @@
+ 
+ def test_arbitrary_and_trigger_inserts_are_unknown_not_retroactively_certified(board):
+     tid = kb.create_task(board, title="not yet certified", assignee="worker")
+-    row = board.execute("SELECT op_id FROM kanban_sync_outbox WHERE row_uid=?", (tid,)).fetchone()
+-    assert metadata(board, "kanban_sync_outbox", "op_id", row[0]) == (None, None, None, None)
++    row = board.execute("SELECT op_id,created_at FROM kanban_sync_outbox WHERE row_uid=?", (tid,)).fetchone()
++    assert metadata(board, "kanban_sync_outbox", "op_id", row[0]) == ('capture_candidate1', row[0], row[1], None)
+     board.execute("INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES (?,?)", (tid, '{}'))
+     assert metadata(board, "kanban_sync_parent_envelopes", "task_id", tid) == (None, None, None, None)
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_detach_race.py b/tests/hermes_cli/test_kanban_sync_detach_race.py
+index b6825797b7c149edba05518a476491bc6fbb958d..67d74689c511bb37d25524fd4eb9f09dce9db4c2 100644
+--- a/tests/hermes_cli/test_kanban_sync_detach_race.py
++++ b/tests/hermes_cli/test_kanban_sync_detach_race.py
+@@ -29,12 +29,12 @@
+         real_txn = kbc.write_txn
+ 
+         @contextmanager
+-        def detach_before_writer(target):
++        def detach_before_writer(target, *, allow_nested=False):
+             # Real second connection commits detach in the old check/lock gap.
+             with monkeypatch.context() as m:
+                 m.setattr(kbc, "write_txn", real_txn)
+                 sync.set_mode(detacher, "off")
+-            with real_txn(target):
++            with real_txn(target, allow_nested=allow_nested):
+                 yield
+ 
+         monkeypatch.setattr(kbc, "write_txn", detach_before_writer)
+diff --git a/tests/hermes_cli/test_kanban_sync_writer_gate.py b/tests/hermes_cli/test_kanban_sync_writer_gate.py
+index 9e04983b0c88c18690a4cbc20f7e5c35062fd15c..8880ad88fa71554a48f6004b34cff99cb6d26933 100644
+--- a/tests/hermes_cli/test_kanban_sync_writer_gate.py
++++ b/tests/hermes_cli/test_kanban_sync_writer_gate.py
+@@ -82,13 +82,13 @@
+     try:
+         old.execute("INSERT INTO tasks(id,title,status,created_at) VALUES ('t_old','old','todo',1)")
+         row = conn.execute("SELECT capture_protocol,identity_state FROM kanban_sync_outbox").fetchone()
+-        assert tuple(row) == (None, None)
++        assert tuple(row) == ('capture_candidate1', None)
+     finally:
+         old.close()
+ 
+ 
+ @pytest.mark.parametrize("sql", [
+-    "INSERT INTO kanban_sync_parent_envelopes VALUES ('t_parent','{}',NULL,NULL,NULL,NULL)",
++    "INSERT INTO kanban_sync_parent_envelopes(task_id,wire) VALUES ('t_parent','{}')",
+     "UPDATE kanban_sync_outbox SET op_id='replaced'",
+     "DELETE FROM kanban_sync_outbox",
+     "UPDATE kanban_sync_state SET applying=1",
+-- 
+2.43.0
+

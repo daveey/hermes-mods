@@ -1,0 +1,848 @@
+From 136bc5e101789b75b7c06d68ab22596773a6ba63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:15:13 +0000
+Subject: [PATCH 7015] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit 136bc5e101789b75b7c06d68ab22596773a6ba63.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 3067d2be8489ddb81f7b8d2ac4f6c123fb0acd19..05db48ddde280c58407876ca03a40c6d12b43cfd 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -812,6 +812,7 @@
+     WAL setup can take an exclusive lock while SQLite creates sidecars for a
+     fresh DB, and concurrent gateway startup threads must not race before
+     ``_INITIALIZED_PATHS`` is populated. Closed if anything raises."""
++    from hermes_cli import kanban_sync_cpu as _sync_cpu
+     conn = _sqlite_connect(path, check_same_thread=check_same_thread)
+     try:
+         conn.row_factory = sqlite3.Row
+@@ -820,23 +821,13 @@
+             # WAL doesn't work on network filesystems; the helper falls back to
+             # DELETE with one ERROR log (see hermes_state_wal._WAL_INCOMPAT_MARKERS).
+             from hermes_state_wal import apply_wal_with_fallback
+-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
++            _sync_cpu.mark("acq.wal", apply_wal_with_fallback, conn, db_label=f"kanban.db ({path.name})")
+             # A fresh board only becomes WAL here: (re)apply the OFD lock guard now, so a stray
+             # in-process close can't strand this handle on a deleted generation. [daveey]
+-            _kanban_lockguard.guard(conn)
++            _sync_cpu.mark("acq.guard2", _kanban_lockguard.guard, conn)
+             # FULL (not NORMAL): fsync before each checkpoint to narrow the
+             # crash window that can leave a b-tree page header torn.
+-            conn.execute("PRAGMA synchronous=FULL")
+-            conn.execute("PRAGMA wal_autocheckpoint=100")
+-            # Bound the WAL file: the periodic explicit checkpoint is PASSIVE
+-            # (never truncates), so SQLite trims -wal to this limit on the
+-            # writer's natural post-checkpoint reset.
+-            conn.execute("PRAGMA journal_size_limit=8388608")
+-            conn.execute("PRAGMA foreign_keys=ON")
+-            # Zero freed pages so a later torn write can't expose stale cells.
+-            conn.execute("PRAGMA secure_delete=ON")
+-            # Surface corrupt cells as read errors instead of silent wrong data.
+-            conn.execute("PRAGMA cell_size_check=ON")
++            _sync_cpu.mark("acq.pragmas", _configure_pragmas, conn)
+             out = under_lock(conn)
+     except Exception:
+         conn.close()
+@@ -844,6 +835,20 @@
+     return conn, out
+ 
+ 
++def _configure_pragmas(conn):
++    conn.execute("PRAGMA synchronous=FULL")
++    conn.execute("PRAGMA wal_autocheckpoint=100")
++    # Bound the WAL file: the periodic explicit checkpoint is PASSIVE
++    # (never truncates), so SQLite trims -wal to this limit on the
++    # writer's natural post-checkpoint reset.
++    conn.execute("PRAGMA journal_size_limit=8388608")
++    conn.execute("PRAGMA foreign_keys=ON")
++    # Zero freed pages so a later torn write can't expose stale cells.
++    conn.execute("PRAGMA secure_delete=ON")
++    # Surface corrupt cells as read errors instead of silent wrong data.
++    conn.execute("PRAGMA cell_size_check=ON")
++
++
+ def _refuse_dead_board_resurrection(path: Path, board: Optional[str]) -> None:
+     """Refuse to create a fresh DB for a board that is not live.
+ 
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index 7b635d607f01cafdc243338eb78ea16d02ac5da2..d713b55debc4ae87ed0feaf44a983f63dc5f6f07 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -19,6 +19,7 @@
+     from hermes_cli.kanban_db_connect import _dispatch_tick_lock
+     from hermes_cli.kanban_generation import lifecycle_access, prepare_connection, recover, retry_open
+     from hermes_cli.sqlite_safe_read import connect_tracked, _tracking_factory
++    from hermes_cli import kanban_sync_cpu as _sync_cpu
+ 
+     canonical = Path(path).resolve()
+     # Keep guard release outside the tracking close lock, as in the previous
+@@ -30,18 +31,19 @@
+ 
+     def open_once(remaining):
+         key = canonical.with_name(canonical.name + '.generation') if generation_only else canonical
+-        with lifecycle_access(canonical, remaining) as lock, _dispatch_tick_lock(
+-                key, create_parent=not generation_only) as held:
++        with _sync_cpu.marked_cm(lifecycle_access(canonical, remaining), "acq.lifecycle") as lock, \
++                _sync_cpu.marked_cm(_dispatch_tick_lock(key, create_parent=not generation_only),
++                                    "acq.lifecycle") as held:
+             if generation_only and not held:
+                 raise sqlite3.OperationalError('database is locked: board generation busy')
+-            recover(str(canonical))
++            _sync_cpu.mark("acq.recover", recover, str(canonical))
+             # Observer opens must never resurrect an archived/deleted board.
+             database = canonical.as_uri() + '?mode=rw' if existing_only else str(canonical)
+             options = {**kwargs, 'uri': True} if existing_only else kwargs
+-            conn = connect_tracked(database, wait_for_tracking=False, **options)
++            conn = _sync_cpu.mark("acq.connect_tracked", connect_tracked, database, wait_for_tracking=False, **options)
+             conn._hermes_lifecycle_lock = lock
+             try:
+-                prepare_connection(conn, timeout)
++                _sync_cpu.mark("acq.prepare", prepare_connection, conn, timeout)
+                 stat = canonical.stat() if held else None
+                 conn._dispatch_identity = (stat.st_dev, stat.st_ino) if stat else None
+                 conn._dispatch_open_contended = not held
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index 052694c3ada8ea49011c6921eeb96669414929f0..f21ab8aaef2c9ac706ced0b1d7d219568b4f1dbf 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -245,10 +245,11 @@
+     lets existing readers close without waiting for a native writer's budget.
+     """
+     from hermes_cli.kanban_lockguard import guard
++    from hermes_cli import kanban_sync_cpu as sync_cpu
+ 
+     conn.execute("PRAGMA busy_timeout=0")
+-    guard(conn, strict=True)
+-    remember(conn, strict=True)
++    sync_cpu.mark("prepare.guard", guard, conn, strict=True)
++    sync_cpu.mark("prepare.remember", remember, conn, strict=True)
+     conn.execute(f"PRAGMA busy_timeout={max(0, int(float(timeout) * 1000))}")
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+index 62a73cf4f81f941052a72e8edbc5be0c67bc117b..58255c1c2022f034d8c2383badfc01ff20e73444 100644
+--- a/hermes_cli/kanban_sync_board_watch.py
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -41,8 +41,11 @@
+     then the rows statement makes SQLite parse it again. Kept as rows and compared with ``==``:
+     hashing them cost four times the read (0.63 ms against 0.16 ms for the hub board's 239
+     rows during an observation)."""
+-    return (conn.execute("PRAGMA schema_version").fetchall()
+-            + conn.execute("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY rowid").fetchall())
++    cookie = _sync_cpu.mark("schema.cookie", lambda: conn.execute("PRAGMA schema_version").fetchall())
++    rows = _sync_cpu.mark(
++        "schema.rows",
++        lambda: conn.execute("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY rowid").fetchall())
++    return cookie + rows
+ 
+ 
+ def parsed_from(conn: sqlite3.Connection, real: str) -> Optional[list]:
+@@ -55,7 +58,7 @@
+     live board the main file's copy never changes after that. Read with a lock-safe ``pread``."""
+     if not hasattr(os, "pread"):  # no lock-safe header evidence on this platform: never keep
+         return None
+-    header = pread_lock_safe(real, 44, 4)
++    header = _sync_cpu.mark("schema.header", pread_lock_safe, real, 44, 4)
+     return None if header is None else [header] + schema_rows(conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+index 20b8639e3b031746bf5e9e3f2bf5bb276ca37305..e3376708dd9a087a05987a486b0ceaf939810a90 100644
+--- a/hermes_cli/kanban_sync_cpu.py
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -12,6 +12,7 @@
+ from contextlib import ExitStack, contextmanager
+ from functools import wraps
+ import os
++import sys
+ import threading
+ import time
+ 
+@@ -19,6 +20,16 @@
+ 
+ _local = threading.local()
+ 
++# Fixed, bounded vocabulary of nested diagnostic parts (see ``mark``). No paths, SQL or values.
++MARK_PARTS = frozenset((
++    "schema.header", "schema.cookie", "schema.rows",
++    "full.acquire", "full.query", "full.close",
++    "acq.lifecycle", "acq.recover", "acq.connect_tracked", "acq.prepare",
++    "prepare.guard", "prepare.remember",
++    "acq.wal", "acq.guard2", "acq.pragmas",
++    "stamp.shape", "stamp.tables", "stamp.triggers", "stamp.invariant", "stamp.row",
++))
++
+ 
+ def step(fn, *args, **kwargs):
+     """Name a completed loop step; nested scopes book only their residual CPU."""
+@@ -29,7 +40,10 @@
+             return fn(*args, **kwargs)
+         return loop_accounting.scoped_call("sync.step", fn)(*args, **kwargs)
+     finally:
+-        _local.step = outer
++        try:
++            flush_marks()
++        finally:
++            _local.step = outer
+ 
+ 
+ def note_reader_open(cpu, reason):
+@@ -40,6 +54,7 @@
+     why (``first``: no reader yet; ``replaced``: another file; ``changed``: the same file moved
+     with no checkpoint proof). ``WaitSplit`` subtracts the running total from its outbox probe."""
+     _local.opened = getattr(_local, "opened", 0.0) + cpu
++    flush_marks()
+     where = getattr(_local, "step", None) or ("board" if getattr(_local, "frames", ()) else "other")
+     loop_accounting.record(f"sync.reader_open.step/{where}", cpu_s=cpu, outer=False)
+     loop_accounting.record(f"sync.reader_open.reason/{reason}", cpu_s=cpu, outer=False)
+@@ -49,6 +64,7 @@
+     """A reader kept across a proven checkpoint (the CPU is the proof's own cost)."""
+     loop_accounting.record("sync.reader_keep/checkpoint", cpu_s=cpu, outer=False)
+     loop_accounting.record(f"sync.reader_keep.step/{_step_name()}", cpu_s=cpu, outer=False)
++    flush_marks()
+ 
+ 
+ def _step_name():
+@@ -68,8 +84,67 @@
+     try:
+         return fn(*args)
+     finally:
+-        loop_accounting.record(f"sync.detail/{where}.{part}",
+-                               cpu_s=time.thread_time() - began, outer=False)
++        try:
++            loop_accounting.record(f"sync.detail/{where}.{part}",
++                                   cpu_s=time.thread_time() - began, outer=False)
++        finally:
++            flush_marks()
++
++
++def mark(part, fn, *args, **kwargs):
++    """Run ``fn`` and, inside a sync step on this thread, add its thread CPU to ``part``.
++
++    A nested, inclusive diagnostic finer than ``detail``: it only accumulates into a thread-local
++    ``(step, part) -> [calls, cpu]`` table (step captured here, at call time) and takes no lock, so
++    it is safe inside the connection-open critical sections. ``flush_marks`` publishes the table at
++    lock-free points. Outside a sync step (``_local.step`` unset) it is a plain call. The part must
++    be one of ``MARK_PARTS``. Never sum these with steps."""
++    where = getattr(_local, "step", None)
++    if where is None:
++        return fn(*args, **kwargs)
++    if part not in MARK_PARTS:
++        raise ValueError(f"unknown sync mark part: {part!r}")
++    began = time.thread_time()
++    try:
++        return fn(*args, **kwargs)
++    finally:
++        cpu = time.thread_time() - began
++        pending = getattr(_local, "pending", None)
++        if pending is None:
++            pending = _local.pending = {}
++        entry = pending.setdefault((where, part), [0, 0.0])
++        entry[0] += 1
++        entry[1] += cpu
++
++
++def flush_marks():
++    """Publish and clear this thread's pending marks as ``sync.detail/<step>.<part>``.
++
++    ``rows`` is the exact number of marks, ``cpu_s`` their exact sum, ``outer=False`` (never part
++    of ``sync.cpu.total/loop``). ``runs`` counts flushes."""
++    pending = getattr(_local, "pending", None)
++    if not pending:
++        return
++    _local.pending = {}
++    for (where, part), (count, cpu) in pending.items():
++        loop_accounting.record(f"sync.detail/{where}.{part}", cpu_s=cpu, rows=count, outer=False)
++
++
++@contextmanager
++def marked_cm(cm, enter_part, exit_part=None):
++    """Enter an existing context manager, timing its entry (and, if given, its exit) as marks."""
++    value = mark(enter_part, cm.__enter__)
++    try:
++        yield value
++    except BaseException:
++        exit_ = cm.__exit__(*sys.exc_info()) if exit_part is None else mark(exit_part, cm.__exit__, *sys.exc_info())
++        if not exit_:
++            raise
++    else:
++        if exit_part is None:
++            cm.__exit__(None, None, None)
++        else:
++            mark(exit_part, cm.__exit__, None, None, None)
+ 
+ 
+ WAIT_PARTS = ("event_wait", "outbox_probe", "reader_open")  # sync.wait/boundary: TimingDiag.wait
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index c2615818e60550587b13839accb5c673fcd3ca78..6f94631e7ac93bd07e33522a488161a572fb58b8 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -97,17 +97,22 @@
+     """Original clock, backlog and sendability read for one board that is not structurally empty."""
+     from hermes_cli import kanban_db_connect as kbc
+     from hermes_cli import kanban_sync_backlog as backlog
+-    with kbc.connect_closing(path) as conn:
+-        conn.row_factory = sqlite3.Row
+-        rows = [dict(r) for r in conn.execute(
+-            "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' "
+-            "AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at, rowid",
+-            (int(time.time()),))]
+-        if backlog.behind(path):
+-            rows, _ = backlog.sendable_before_head(
+-                conn, _NoBoardReads(), "", rows, backlog.evidence(path))
+-        row = next((r for r in rows if r["retry_after"] is None), None)
+-        return (row["op_id"], _since(row["created_at"])) if row else None
++    from hermes_cli import kanban_sync_cpu as sync_cpu
++    with sync_cpu.marked_cm(kbc.connect_closing(path), "full.acquire", "full.close") as conn:
++        return sync_cpu.mark("full.query", _full_query, conn, path, backlog)
++
++
++def _full_query(conn, path, backlog):
++    conn.row_factory = sqlite3.Row
++    rows = [dict(r) for r in conn.execute(
++        "SELECT * FROM kanban_sync_outbox WHERE state = 'pending' "
++        "AND (retry_after IS NULL OR retry_after <= ?) ORDER BY created_at, rowid",
++        (int(time.time()),))]
++    if backlog.behind(path):
++        rows, _ = backlog.sendable_before_head(
++            conn, _NoBoardReads(), "", rows, backlog.evidence(path))
++    row = next((r for r in rows if r["retry_after"] is None), None)
++    return (row["op_id"], _since(row["created_at"])) if row else None
+ 
+ 
+ def _sample(path: Path) -> Optional[tuple[str, float]]:
+diff --git a/hermes_cli/session_throughput_revision.py b/hermes_cli/session_throughput_revision.py
+index 185fe34ce6ff3de27f21fb3c63c7decafd1fd74c..29b4209be998ee32b9881c2caff3ebad30cfea96 100644
+--- a/hermes_cli/session_throughput_revision.py
++++ b/hermes_cli/session_throughput_revision.py
+@@ -18,6 +18,8 @@
+ import sqlite3
+ from typing import Optional
+ 
++from hermes_cli import kanban_sync_cpu as _sync_cpu
++
+ logger = logging.getLogger(__name__)
+ 
+ SCHEMA_VERSION = 1
+@@ -357,13 +359,14 @@
+ def read_stamp(conn: sqlite3.Connection) -> Optional[tuple]:
+     """(schema_version, epoch, rev, nonce, floor) when tracking is fully valid, else None."""
+     try:
+-        if not _supported_shape(conn) or _tables_exact(conn) is not True or not _triggers_exact(conn):
++        if (not _sync_cpu.mark("stamp.shape", _supported_shape, conn)
++                or _sync_cpu.mark("stamp.tables", _tables_exact, conn) is not True
++                or not _sync_cpu.mark("stamp.triggers", _triggers_exact, conn)):
+             return None
+-        if not _invariant_ok(conn):
++        if not _sync_cpu.mark("stamp.invariant", _invariant_ok, conn):
+             return None
+-        row = conn.execute(
+-            "SELECT version, epoch, rev, nonce, floor FROM throughput_revision WHERE id = 1").fetchone()
+-        if row is None or not anchor_matches(conn, row[2], row[3]):
++        row = _sync_cpu.mark("stamp.row", _stamp_row, conn)
++        if row is None:
+             return None
+         schema = conn.execute("PRAGMA schema_version").fetchone()[0]
+         return (schema, *tuple(row)[1:])
+@@ -371,6 +374,15 @@
+         return None
+ 
+ 
++def _stamp_row(conn: sqlite3.Connection):
++    """The stamp row when its ring anchor matches, else None."""
++    row = conn.execute(
++        "SELECT version, epoch, rev, nonce, floor FROM throughput_revision WHERE id = 1").fetchone()
++    if row is None or not anchor_matches(conn, row[2], row[3]):
++        return None
++    return row
++
++
+ def anchor_matches(conn: sqlite3.Connection, rev: int, nonce: bytes) -> bool:
+     try:
+         row = conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_sync_marks.py b/tests/hermes_cli/test_kanban_sync_marks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4fa2893de3470fe6a5513850d5e06cc64c74e62
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_marks.py
+@@ -0,0 +1,459 @@
++"""Nested ``sync.detail/<step>.<part>`` marks (diagnostic only, ``outer=False``). [daveey]
++
++``kanban_sync_cpu.mark`` accumulates thread CPU per (step, part) in a thread-local table with no lock and
++``flush_marks`` publishes it at lock-free points. These tests pin identity (same results, exceptions and
++SQL), exact aggregation, publication points, per-statement attribution and lock order at the real sites.
++"""
++import re
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_board_watch as watch
++from hermes_cli import kanban_sync_cpu as cpu
++from hermes_cli import kanban_sync_outbox_age as age
++from hermes_cli import loop_accounting
++from hermes_cli import session_throughput_revision as rev
++
++
++@pytest.fixture
++def measured(monkeypatch):
++    clock = [0.0]
++    records = []
++    monkeypatch.setattr(cpu.time, "thread_time", lambda: clock[0])
++    monkeypatch.setattr(cpu.loop_accounting, "record", lambda name, **kw: records.append((name, kw)))
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    monkeypatch.setattr(cpu.loop_accounting, "scopes_enabled", lambda: False)
++    return clock, records
++
++
++def marks(records):
++    return {name: kw for name, kw in records if name.startswith("sync.detail/")}
++
++
++def test_outside_a_step_mark_is_a_plain_call(measured):
++    _clock, records = measured
++    assert cpu.mark("full.query", lambda a, b=2: (a, b), 1, b=3) == (1, 3)
++    assert not getattr(cpu._local, "pending", None)
++    cpu.flush_marks()
++    assert records == []
++
++
++def test_other_thread_is_not_attributed(measured):
++    _clock, records = measured
++
++    def body():
++        out = []
++        t = threading.Thread(target=lambda: out.append(cpu.mark("full.query", lambda: 7)))
++        t.start()
++        t.join(5)
++        assert out == [7]
++        assert not hasattr(cpu._local, "pending")
++
++    def after_round():
++        body()
++    cpu.step(after_round)
++    assert marks(records) == {}
++
++
++def test_unknown_part_is_refused_inside_a_step(measured):
++    def body():
++        with pytest.raises(ValueError):
++            cpu.mark("not.a.part", lambda: None)
++
++    def named():
++        body()
++    cpu.step(named)
++
++
++def test_exact_count_and_sum_published_once_at_step_exit(measured):
++    clock, records = measured
++
++    def after_round():
++        for cost in (1.0, 2.0, 4.0):
++            cpu.mark("full.query", lambda c=cost: clock.__setitem__(0, clock[0] + c))
++        assert marks(records) == {}  # nothing published inside the step body
++    cpu.step(after_round)
++    got = marks(records)
++    assert set(got) == {"sync.detail/after_round.full.query"}
++    kw = got["sync.detail/after_round.full.query"]
++    assert kw["rows"] == 3 and kw["cpu_s"] == 7.0 and kw["outer"] is False
++    assert not cpu._local.pending
++
++
++def test_identity_value_exception_and_flush_on_exception(measured):
++    clock, records = measured
++    boom = ValueError("x", 1)
++
++    def raising():
++        raise boom
++
++    def select():
++        cpu.mark("full.query", lambda: clock.__setitem__(0, clock[0] + 3))
++        return cpu.mark("full.query", raising)
++
++    with pytest.raises(ValueError) as caught:
++        cpu.step(select)
++    assert caught.value is boom and caught.value.args == ("x", 1)
++    kw = marks(records)["sync.detail/select.full.query"]
++    assert kw["rows"] == 2 and kw["cpu_s"] == 3.0  # raising call booked too
++
++
++def test_exception_in_detail_flushes_marks_and_propagates_the_original(measured):
++    clock, records = measured
++    boom = KeyError("k")
++
++    def body():
++        cpu.mark("stamp.row", lambda: clock.__setitem__(0, clock[0] + 2))
++        raise boom
++
++    def report():
++        try:
++            return cpu.detail("collect", body)
++        finally:
++            # the failing detail already published its marks, before the step ends
++            assert "sync.detail/report.stamp.row" in marks(records)
++    with pytest.raises(KeyError) as caught:
++        cpu.step(report)
++    assert caught.value is boom
++    got = marks(records)
++    assert got["sync.detail/report.stamp.row"]["rows"] == 1
++    assert "sync.detail/report.collect" in got
++    names = [n for n, _ in records if n.startswith("sync.detail/")]
++    assert names.index("sync.detail/report.collect") < names.index("sync.detail/report.stamp.row")
++
++
++def test_detail_flush_runs_after_its_own_record_and_with_exact_rows(measured):
++    clock, records = measured
++
++    def step_fn():
++        cpu.detail("census", lambda: [cpu.mark("schema.rows", lambda: clock.__setitem__(0, clock[0] + 5))
++                                      for _ in range(2)])
++        # Published by the detail's own exit, not held for the step's end.
++        assert [n for n, _ in records] == ["sync.detail/step_fn.census", "sync.detail/step_fn.schema.rows"]
++        assert not cpu._local.pending
++    cpu.step(step_fn)
++    names = [n for n, _ in records]
++    assert names == ["sync.detail/step_fn.census", "sync.detail/step_fn.schema.rows"]
++    assert records[1][1]["rows"] == 2 and records[1][1]["cpu_s"] == 10.0
++
++
++def test_bare_step_publishes_without_any_detail(measured):
++    _clock, records = measured
++
++    def acquire():
++        cpu.mark("acq.recover", lambda: None)
++    cpu.step(acquire)
++    assert marks(records)["sync.detail/acquire.acq.recover"]["rows"] == 1
++
++
++def test_nested_step_keys_by_the_step_active_at_mark_time(measured):
++    _clock, records = measured
++
++    def inner():
++        cpu.mark("full.close", lambda: None)
++
++    def outer():
++        cpu.mark("full.acquire", lambda: None)
++        cpu.step(inner)
++        assert "sync.detail/inner.full.close" in marks(records)  # the inner step published at its exit
++        cpu.mark("full.query", lambda: None)
++    cpu.step(outer)
++    assert set(marks(records)) == {
++        "sync.detail/outer.full.acquire", "sync.detail/outer.full.query", "sync.detail/inner.full.close"}
++
++
++def test_parent_covers_nested_children(measured):
++    clock, records = measured
++
++    def advance(c):
++        clock[0] += c
++
++    def full_query():
++        advance(1)
++        cpu.mark("stamp.row", advance, 2)
++        advance(4)
++
++    def sample():
++        cpu.detail("sample_full", lambda: cpu.mark("full.query", full_query))
++    cpu.step(sample)
++    got = marks(records)
++    assert got["sync.detail/sample.full.query"]["cpu_s"] == 7.0
++    assert got["sync.detail/sample.stamp.row"]["cpu_s"] == 2.0
++    assert got["sync.detail/sample.sample_full"]["cpu_s"] >= got["sync.detail/sample.full.query"]["cpu_s"]
++    assert got["sync.detail/sample.full.query"]["cpu_s"] >= got["sync.detail/sample.stamp.row"]["cpu_s"]
++
++
++def test_reader_open_and_keep_flush(measured):
++    _clock, records = measured
++    cpu._local.step = "wait"
++    cpu.mark("schema.cookie", lambda: None)
++    cpu.note_reader_open(0.5, "changed")
++    assert "sync.detail/wait.schema.cookie" in marks(records)
++    cpu.mark("schema.rows", lambda: None)
++    cpu.note_reader_keep(0.25)
++    assert "sync.detail/wait.schema.rows" in marks(records)
++    assert not cpu._local.pending
++
++
++def test_marked_cm_times_both_halves_and_keeps_exception_semantics(measured):
++    clock, records = measured
++    seen = []
++
++    class CM:
++        def __enter__(self):
++            clock[0] += 2
++            seen.append("in")
++            return "conn"
++
++        def __exit__(self, *exc):
++            clock[0] += 3
++            seen.append(("out", exc[0]))
++            return False
++
++    def step_fn():
++        with cpu.marked_cm(CM(), "full.acquire", "full.close") as conn:
++            assert conn == "conn"
++        with pytest.raises(RuntimeError):
++            with cpu.marked_cm(CM(), "full.acquire", "full.close"):
++                raise RuntimeError("body")
++    cpu.step(step_fn)
++    assert seen == ["in", ("out", None), "in", ("out", RuntimeError)]
++    got = marks(records)
++    assert got["sync.detail/step_fn.full.acquire"]["cpu_s"] == 4.0
++    assert got["sync.detail/step_fn.full.close"]["cpu_s"] == 6.0
++
++
++def test_marked_cm_honours_a_suppressing_exit_and_a_failed_enter(measured):
++    class Quiet:
++        def __enter__(self):
++            return 1
++
++        def __exit__(self, *exc):
++            return True
++
++    with cpu.marked_cm(Quiet(), "full.acquire", "full.close"):
++        raise RuntimeError("swallowed")
++
++    class Bad:
++        exited = False
++
++        def __enter__(self):
++            raise OSError("no")
++
++        def __exit__(self, *exc):
++            Bad.exited = True
++
++    with pytest.raises(OSError):
++        with cpu.marked_cm(Bad(), "full.acquire", "full.close"):
++            pass
++    assert Bad.exited is False
++
++
++# ---------------------------------------------------------------- real sites
++
++class Proxy:
++    """A connection whose statements cost a distinct fake CPU each."""
++
++    def __init__(self, clock, costs, results):
++        self.clock, self.costs, self.results = clock, costs, results
++
++    def execute(self, sql, *args):
++        for needle, cost in self.costs.items():
++            if needle in sql:
++                self.clock[0] += cost
++        got = self.results[next(k for k in self.results if k in sql)]
++        return type("Cur", (), {"fetchall": lambda s: got, "fetchone": lambda s: got[0]})()
++
++
++def test_census_parts_are_attributed_per_statement(measured, monkeypatch):
++    clock, records = measured
++    monkeypatch.setattr(watch.os, "pread", lambda *a: b"", raising=False)
++
++    def header(real, off, n):
++        clock[0] += 1
++        return b"\x00\x00\x00\x04"
++    monkeypatch.setattr(watch, "pread_lock_safe", header)
++    conn = Proxy(clock, {"schema_version": 10, "sqlite_schema": 100}, {"schema_version": [(5,)], "sqlite_schema": [("t",)]})
++
++    def census():
++        return watch.parsed_from(conn, "/x")
++    out = cpu.step(census)
++    assert out == [b"\x00\x00\x00\x04", (5,), ("t",)]
++    got = marks(records)
++    assert got["sync.detail/census.schema.header"]["cpu_s"] == 1
++    assert got["sync.detail/census.schema.cookie"]["cpu_s"] == 10
++    assert got["sync.detail/census.schema.rows"]["cpu_s"] == 100
++
++
++def test_census_equals_the_original_pair_on_a_real_connection():
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE a (x)")
++    expected = (conn.execute("PRAGMA schema_version").fetchall()
++                + conn.execute("SELECT type, name, tbl_name, rootpage, sql FROM sqlite_schema ORDER BY rowid").fetchall())
++    assert watch.schema_rows(conn) == expected
++
++
++def _outbox_conn():
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE kanban_sync_outbox (op_id, state, retry_after, created_at)")
++    conn.execute("INSERT INTO kanban_sync_outbox VALUES ('op', 'pending', NULL, 1000)")
++    return conn
++
++
++def test_sample_full_parts_close_on_normal_and_failure_exits(measured, monkeypatch):
++    clock, records = measured
++    import contextlib
++    opened = []
++
++    @contextlib.contextmanager
++    def connect_closing(path, **kw):
++        clock[0] += 2
++        conn = _outbox_conn()
++        opened.append(conn)
++        try:
++            yield conn
++        finally:
++            clock[0] += 3
++            conn.close()
++    monkeypatch.setattr(kbc, "connect_closing", connect_closing)
++    from hermes_cli import kanban_sync_backlog as backlog
++    monkeypatch.setattr(backlog, "behind", lambda p: clock.__setitem__(0, clock[0] + 5) or False)
++    monkeypatch.setattr(age, "_since", lambda created: float(created))
++
++    assert cpu.step(lambda: age._sample_full("p")) == ("op", 1000.0)
++    got = marks(records)
++    assert got["sync.detail/<lambda>.full.acquire"]["cpu_s"] == 2
++    assert got["sync.detail/<lambda>.full.query"]["cpu_s"] == 5
++    assert got["sync.detail/<lambda>.full.close"]["cpu_s"] == 3
++    with pytest.raises(sqlite3.Error):
++        opened[0].execute("SELECT 1")  # closed after the normal exit
++
++    monkeypatch.setattr(backlog, "behind", lambda p: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
++    with pytest.raises(sqlite3.OperationalError, match="locked"):
++        cpu.step(lambda: age._sample_full("p"))
++    with pytest.raises(sqlite3.Error):
++        opened[1].execute("SELECT 1")  # closed after the failing exit too
++
++
++def test_read_stamp_parts_and_original_decisions(measured, monkeypatch):
++    clock, records = measured
++
++    def stub(name, cost, value):
++        def fn(conn):
++            clock[0] += cost
++            return value
++        monkeypatch.setattr(rev, name, fn)
++    stub("_supported_shape", 1, True)
++    stub("_tables_exact", 10, True)
++    stub("_triggers_exact", 100, True)
++    stub("_invariant_ok", 1000, True)
++    monkeypatch.setattr(rev, "anchor_matches", lambda conn, r, n: clock.__setitem__(0, clock[0] + 10000) or True)
++
++    class Conn:
++        def execute(self, sql):
++            clock[0] += 100000 if "throughput_revision" in sql else 0
++            row = (1, 2, 3, b"n", 5)
++            return type("C", (), {"fetchone": lambda s: row if "throughput_revision" in sql else (9,)})()
++    out = cpu.step(lambda: rev.read_stamp(Conn()))
++    assert out == (9, 2, 3, b"n", 5)
++    got = {k.split(">.", 1)[1]: v["cpu_s"] for k, v in marks(records).items()}
++    assert got == {"stamp.shape": 1, "stamp.tables": 10, "stamp.triggers": 100,
++                   "stamp.invariant": 1000, "stamp.row": 110000}
++
++
++def test_read_stamp_short_circuits_like_the_original(measured, monkeypatch):
++    _clock, records = measured
++    called = []
++    monkeypatch.setattr(rev, "_supported_shape", lambda c: called.append("shape") or False)
++    monkeypatch.setattr(rev, "_tables_exact", lambda c: called.append("tables"))
++    assert cpu.step(lambda: rev.read_stamp(object())) is None
++    assert called == ["shape"]
++    assert set(marks(records)) == {"sync.detail/<lambda>.stamp.shape"}
++
++
++def test_real_stamp_chain_of_13_databases_loses_no_mark(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    from hermes_cli import machine_throughput_metrics as mt
++    paths = [tmp_path / "state.db"] + [tmp_path / "profiles" / f"p{i}" / "state.db" for i in range(12)]
++    for path in paths:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        SessionDB(db_path=path).close()
++    mt.reset_cache()
++    loop_accounting.reset()
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: False)
++    stamps = []
++    real = rev.read_stamp
++    monkeypatch.setattr(rev, "read_stamp", lambda conn: stamps.append(1) or real(conn))
++    try:
++        def machine_report():
++            return mt.counters(tmp_path)
++        assert cpu.step(machine_report)
++        assert cpu.step(machine_report)  # warm: every database stamps again
++        snap = loop_accounting.snapshot()["loops"]
++    finally:
++        mt.reset_cache()
++    shape = snap["sync.detail/machine_report.stamp.shape"]
++    assert len(stamps) >= 13 and shape["rows"] == len(stamps)
++    for part in ("tables", "triggers", "invariant", "row"):
++        assert snap[f"sync.detail/machine_report.stamp.{part}"]["rows"] == len(stamps)
++    assert not getattr(cpu._local, "pending", None)
++
++
++def test_open_chain_publishes_each_part_and_never_records_under_a_lock(tmp_path, monkeypatch):
++    from hermes_cli import kanban_generation as gen
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: False)
++    loop_accounting.reset()
++    real = loop_accounting.record
++    held = []
++
++    def record(name, **kw):
++        if name.startswith("sync.detail/"):
++            got = kbc._INIT_LOCK._is_owned()
++            held.append((name, got, gen_lock_owned(gen)))
++        return real(name, **kw)
++
++    def gen_lock_owned(module):
++        lock = getattr(module, "_lock", None)
++        return bool(lock is not None and getattr(lock, "_is_owned", lambda: False)())
++    monkeypatch.setattr(loop_accounting, "record", record)
++
++    def acquire():
++        conn = kbc.connect(home / "kanban.db")
++        conn.close()
++    cpu.step(acquire)
++    names = {n for n, *_ in held}
++    for part in ("acq.wal", "acq.guard2", "acq.pragmas"):
++        assert f"sync.detail/acquire.{part}" in names
++    assert not [h for h in held if h[1] or h[2]]
++    for name in names:
++        assert re.fullmatch(r"sync\.detail/[a-z_]+\.[a-z0-9_.]+", name), name
++
++
++def test_dispatch_owner_open_marks_lifecycle_recover_connect_prepare(tmp_path, monkeypatch):
++    from hermes_cli import kanban_dispatch_owner as owner
++    from tests.hermes_cli import kanban_sync_support as support
++    home = support.kanban_home(tmp_path, monkeypatch)
++    kbc.connect(home / "kanban.db").close()
++    monkeypatch.setattr(cpu, "_local", threading.local())
++    monkeypatch.setattr(loop_accounting, "scopes_enabled", lambda: False)
++    loop_accounting.reset()
++
++    def acquire():
++        conn = owner.connect_with_identity(home / "kanban.db")
++        try:
++            return conn.execute("SELECT 1").fetchone()[0]
++        finally:
++            conn.close()
++    assert cpu.step(acquire) == 1
++    snap = loop_accounting.snapshot()["loops"]
++    for part in ("acq.lifecycle", "acq.recover", "acq.connect_tracked", "acq.prepare",
++                 "prepare.guard", "prepare.remember"):
++        assert snap[f"sync.detail/acquire.{part}"]["rows"] >= 1, part
++    assert snap["sync.detail/acquire.acq.lifecycle"]["rows"] == 2  # lifecycle access + tick lock
+diff --git a/tests/hermes_cli/test_kanban_sync_outbox_deferred.py b/tests/hermes_cli/test_kanban_sync_outbox_deferred.py
+index 2ec6e77766c36748b199ab7ead82a607f2cd9d21..9e36f3fb6b6c5d66f9fd333fcd9de50e487177e7 100644
+--- a/tests/hermes_cli/test_kanban_sync_outbox_deferred.py
++++ b/tests/hermes_cli/test_kanban_sync_outbox_deferred.py
+@@ -231,6 +231,11 @@
+         assert sync_cpu.step(age.after_round, [result], [("default", path)], awake_fn=lambda: True) == []
+         # Inclusive parts of the step: published with outer=False, so they add nothing to the thread's
+         # accounted CPU, the step or sync.cpu.total/loop (the collector's total-minus-board value).
++        # Nested ``mark`` parts (kanban_sync_cpu.MARK_PARTS) publish alongside, also outer=False; they are
++        # asserted separately so this list still pins the original detail sequence.
++        part_marks = [d for d in details if d[0].split("after_round.", 1)[1] in sync_cpu.MARK_PARTS]
++        assert all(outer is False for _, outer in part_marks)
++        details = [d for d in details if d not in part_marks]
+         assert details == [
+             ("sync.detail/after_round.awake", False),
+             ("sync.detail/after_round.query_rebaseline", False),
+-- 
+2.43.0
+

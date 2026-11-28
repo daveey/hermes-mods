@@ -1,0 +1,131 @@
+From d2332ae22ff20104d88606866d8909e53004d585 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:01:16 +0000
+Subject: [PATCH 6744] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit d2332ae22ff20104d88606866d8909e53004d585.
+
+---
+diff --git a/hermes_cli/fd_headroom_transport.py b/hermes_cli/fd_headroom_transport.py
+index cb4eed73c3ae85d948a9985338519d549dad705d..c07616a429092473168efb3c42e61a63c4957a86 100644
+--- a/hermes_cli/fd_headroom_transport.py
++++ b/hermes_cli/fd_headroom_transport.py
+@@ -1,12 +1,28 @@
+ """Bounded in-process Kanban client for FD alerts; no subprocess or local board lock."""
+ from __future__ import annotations
+ 
++import hashlib
++import re
+ import time
+ from urllib.parse import quote, urlencode
+ 
+ from hermes_cli import kanban_sync_client as sync
+ 
+ 
++def _wire_envelope(envelope):
++    """Retain valid old request IDs; map unrepresentable incident IDs deterministically.
++
++    Courier IDs allow 8..128 ASCII alphanumerics or ._:-, unlike Kanban's
++    idempotency key (which includes an ISO timestamp with a '+' timezone).
++    Do not mutate the frozen intent or its card idempotency key on retries.
++    """
++    ident = envelope['id']
++    if re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', ident):
++        return envelope
++    prefix = 'fd-headroom-probe:' if ident.startswith('fd-headroom-probe:') else 'fd-headroom:'
++    return {**envelope, 'id': prefix + hashlib.sha256(ident.encode()).hexdigest()}
++
++
+ class Client:
+     """One total 20s budget across request readback/delivery, privately owned connections.
+ 
+@@ -44,8 +60,10 @@
+         return {'state': 'live', 'row': row}
+ 
+     def create(self, envelope):
++        envelope = _wire_envelope(envelope)
+         try:
+-            response = self._call('GET', '/v2/sync/requests/' + quote(envelope['id'], safe=''))
++            # The deployed route matches raw ._:- characters, not %-encoded IDs.
++            response = self._call('GET', '/v2/sync/requests/' + envelope['id'])
+         except sync.HubError as exc:
+             # Only the service's typed missing answer permits resending the frozen request.
+             import json
+@@ -66,4 +84,4 @@
+         return None
+ 
+     def comment(self, envelope):
+-        self._call('POST', '/v2/sync/requests', envelope)
++        self._call('POST', '/v2/sync/requests', _wire_envelope(envelope))
+diff --git a/tests/hermes_cli/test_fd_headroom_wire_ids.py b/tests/hermes_cli/test_fd_headroom_wire_ids.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ddfdb3fc13816ae7ecd3f72600e67f6be62d44e9
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_wire_ids.py
+@@ -0,0 +1,63 @@
++"""Courier's deployed route/body grammar, exercised with real incident envelopes."""
++import re
++
++import pytest
++
++from hermes_cli import fd_headroom_incident as incident
++from hermes_cli import kanban_sync_client as sync
++from hermes_cli.fd_headroom_transport import Client
++
++
++@pytest.mark.parametrize('host', ['hermes-hub', 'worker-' + 'a' * 180])
++def test_incident_create_and_comment_use_replayable_wire_ids(monkeypatch, host):
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
++    requests = {}
++    paths = []
++    # index.ts's GET route and hub.ts's OPID_RE do not URL-decode IDs.
++    route = re.compile(r'/v2/sync/requests/([A-Za-z0-9._:-]{1,128})\Z')
++    opid = re.compile(r'[A-Za-z0-9._:-]{8,128}\Z')
++    def request(ident, method, path, body, budget_s):
++        paths.append(path)
++        if method == 'GET':
++            match = route.fullmatch(path)
++            assert match, f'GET does not match deployed request route: {path}'
++            if match[1] not in requests:
++                raise sync.HubError(404, '{"error":"no such request"}')
++            return {'request': requests[match[1]]}
++        assert opid.fullmatch(body['id']), f'POST ID rejected by deployed OPID_RE: {body["id"]}'
++        existing = requests.get(body['id'])
++        if existing:
++            assert existing['envelope'] == body
++        requests[body['id']] = {'state': 'done', 'result': {'task_id': 't_0123456789abcdef'}, 'envelope': body}
++        return {}
++    monkeypatch.setattr(sync, '_bounded_call', request)
++    state = {}
++    sample = dict(host=host, profile='default', role='backend', count=100, soft=128,
++                  census={'classes': {'other': 100}}, triggered=True)
++    incident._new_envelope(sample, state, 1700000017.972333, True, 'fd-headroom-proof')
++    envelope = state['envelope']
++    original_id = envelope['id']
++    original_key = envelope['args']['idempotency_key']
++    assert '+00:00' in original_id
++    assert Client().create(envelope) is None
++    assert Client().create(envelope) == 't_0123456789abcdef'
++    assert len(requests) == 1
++    assert envelope['id'] == original_id
++    assert next(iter(requests.values()))['envelope']['args']['idempotency_key'] == original_key
++    comment = dict(id=original_id + ':comment:1700000100', to_gw='hub', coll='tasks',
++                   key='default/fd-headroom-proof/t_0123456789abcdef', action='comment', args={'text': 'headroom'})
++    Client().comment(comment)
++    Client().comment(comment)
++    assert len(requests) == 2
++    assert all('%' not in path for path in paths)
++
++
++def test_valid_existing_request_identity_is_not_rekeyed(monkeypatch):
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
++    paths = []
++    def request(ident, method, path, body, budget_s):
++        paths.append(path)
++        return {'request': {'state': 'done', 'result': {'task_id': 't_0123456789abcdef'}}}
++    monkeypatch.setattr(sync, '_bounded_call', request)
++    assert Client().create({'id': 'fd-headroom:legacy-valid'}) == 't_0123456789abcdef'
++    assert paths == ['/v2/sync/requests/fd-headroom:legacy-valid']
+-- 
+2.43.0
+

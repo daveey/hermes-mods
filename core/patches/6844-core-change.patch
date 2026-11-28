@@ -1,0 +1,377 @@
+From 89eed80ded2761d0f021782e6277d4e6ba16626a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:38:58 +0000
+Subject: [PATCH 6844] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 89eed80ded2761d0f021782e6277d4e6ba16626a.
+
+---
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 8b712407fd4c0b076a1176c6c69c4434008f9173..c07443ae9306e1daee2f68b1a808cd0b99daffb9 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -285,6 +285,9 @@
+     ("kanban_sync_state", "mirror_pulled_at", "mirror_pulled_at REAL"),
+     # Local-only round-robin position; refused revisions must not monopolize bounded batches.
+     ("kanban_sync_state", "worker_reserve_cursor", "worker_reserve_cursor TEXT"),
++    # NULL is never-enrolled/unknown, not permission to replace a lost replay journal.
++    ("kanban_sync_state", "journal_id", "journal_id TEXT"),
++    ("kanban_sync_state", "replay_restore_required", "replay_restore_required INTEGER NOT NULL DEFAULT 0"),
+ )
+ 
+ # Resolved db paths whose triggers this process installed. Empty = no synced
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+index 4b02360f8c6c99095593c111938e82ebdc88a27b..1dfeaa792decc864228ca40437723cc45f6fa331 100644
+--- a/hermes_cli/kanban_replay_journal.py
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -17,7 +17,7 @@
+ 
+ _SCHEMA = """CREATE TABLE IF NOT EXISTS kanban_replay_sender1 (
+     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+-    state TEXT NOT NULL, wire BLOB
++    board_id TEXT NOT NULL, state TEXT NOT NULL, wire BLOB
+ )"""
+ 
+ 
+@@ -71,19 +71,41 @@
+         raise ValueError('missing journal state')
+     state = json.loads(row[0])
+     _validate(state)
++    anchor = conn.execute('SELECT s.journal_id FROM kanban_sync_state s '
++                          'JOIN kanban_replay_sender1 j ON s.board_id=j.board_id '
++                          'WHERE j.singleton=1').fetchone()
++    if anchor is None or anchor[0] != state['journal_id']:
++        raise ValueError('sync journal binding mismatch')
+     _check_wire(state, row[1])
+     return state, row[1]
+ 
+ 
+-def initialize(conn: sqlite3.Connection, binding: dict) -> None:
+-    """Install an explicitly bound empty journal, without taking remote authority."""
++def initialize(conn: sqlite3.Connection, binding: dict, *, board_id: str) -> None:
++    """Bind a first journal atomically; never reset one after loss.
++
++    The caller must obtain the serving Board's authenticated enrollment first.
++    This local binding is not remote enrollment or migration readiness.
++    """
+     _transaction(conn)
+     _validate(binding)
+     if binding['settled'] != '0' or binding['pending'] is not None:
+         raise ValueError('initial journal must be empty')
+-    conn.execute(_SCHEMA)
+-    conn.execute('INSERT INTO kanban_replay_sender1(singleton,state) VALUES (1,?)',
+-                 (json.dumps(binding),))
++    conn.execute('SAVEPOINT replay_initialize1')
++    try:
++        updated = conn.execute('UPDATE kanban_sync_state SET journal_id=? '
++                               'WHERE board_id=? AND journal_id IS NULL',
++                               (binding['journal_id'], board_id))
++        if updated.rowcount != 1:
++            raise ValueError('journal already bound; recovery required')
++        conn.execute(_SCHEMA)
++        conn.execute('INSERT INTO kanban_replay_sender1(singleton,board_id,state) VALUES (1,?,?)',
++                     (board_id, json.dumps(binding)))
++        conn.execute('RELEASE replay_initialize1')
++    except BaseException:
++        if conn.in_transaction:
++            conn.execute('ROLLBACK TO replay_initialize1')
++            conn.execute('RELEASE replay_initialize1')
++        raise
+ 
+ 
+ def snapshot(conn: sqlite3.Connection) -> dict:
+@@ -100,6 +122,10 @@
+     """Freeze only the dependency-ordered head selected by the serialized sender."""
+     _reserve(conn)
+     state = snapshot(conn)
++    restore = conn.execute('SELECT replay_restore_required FROM kanban_sync_state '
++                           'WHERE board_id=(SELECT board_id FROM kanban_replay_sender1 WHERE singleton=1)').fetchone()
++    if restore[0] != 0:
++        raise ValueError('journal restore reconciliation required')
+     if state['pending'] is not None:
+         raise ValueError('outstanding issued envelope')
+     if 'replay' in intent:
+@@ -150,3 +176,23 @@
+                 conn.execute('RELEASE replay_record1')
+             raise
+     return decision
++
++
++def mark_restore_required(conn: sqlite3.Connection) -> None:
++    """Recovery tooling marks a copied database before any sender may allocate."""
++    _reserve(conn)
++    snapshot(conn)
++    conn.execute('UPDATE kanban_sync_state SET replay_restore_required=1 '
++                 'WHERE board_id=(SELECT board_id FROM kanban_replay_sender1 WHERE singleton=1)')
++
++
++def reconcile_restore(conn: sqlite3.Connection, remote: dict, record: Callable[[dict], None]) -> dict:
++    """Clear the restore hold only after exact byte/verdict reconciliation.
++
++    Caller authenticates the serving Board and current session, and owns COMMIT.
++    An incompatible copy remains held; this does not rotate a lost journal.
++    """
++    decision = recover(conn, remote, record)
++    conn.execute('UPDATE kanban_sync_state SET replay_restore_required=0 '
++                 'WHERE board_id=(SELECT board_id FROM kanban_replay_sender1 WHERE singleton=1)')
++    return decision
+diff --git a/tests/hermes_cli/test_kanban_replay_binding.py b/tests/hermes_cli/test_kanban_replay_binding.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..134d281189bbdcdbc29467ba0687b63152e99058
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_binding.py
+@@ -0,0 +1,156 @@
++"""Journal loss cannot masquerade as first enrollment on a real sync database."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_journal as journal
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_replay_journal import binding
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    conn = kbc.connect(home / 'kanban.db')
++    yield conn
++    conn.close()
++
++
++def test_initialize_wrong_board_never_claims_another_sync_row(board):
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError, match='journal already bound; recovery required'):
++            journal.initialize(board, binding(), board_id='not-the-board')
++    assert board.execute('SELECT journal_id FROM kanban_sync_state').fetchone()[0] is None
++
++
++@pytest.mark.parametrize('field', ['settled', 'pending'])
++def test_nonempty_initial_journal_is_refused_before_anchor_write(board, field):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    state = binding()
++    if field == 'settled':
++        state.update(settled='1', last_op_id='operation-0001', last_payload_sha256='0' * 64)
++    else:
++        state['pending'] = dict(sequence='1', op_id='operation-0001', payload_sha256='0' * 64)
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError, match='initial journal must be empty'):
++            journal.initialize(board, state, board_id=board_id)
++    assert board.execute('SELECT journal_id FROM kanban_sync_state').fetchone()[0] is None
++
++
++def test_first_binding_persists_beside_outbox_and_survives_schema_reinstall(board):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++    assert board.execute('SELECT journal_id FROM kanban_sync_state').fetchone()[0] == binding()['journal_id']
++    sync.apply_sync_schema_steps(board)
++    assert journal.snapshot(board)['journal_id'] == binding()['journal_id']
++    assert board.execute('SELECT board_id FROM kanban_replay_sender1').fetchone()[0] == board_id
++
++
++def test_deleted_allocator_cannot_reset_retained_journal_identity(board):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++        journal.issue(board, {'client_op_id': 'operation-0001'})
++    with kbc.write_txn(board):
++        board.execute('DELETE FROM kanban_replay_sender1')
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError, match='journal already bound; recovery required'):
++            journal.initialize(board, binding(), board_id=board_id)
++    assert board.execute('SELECT COUNT(*) FROM kanban_replay_sender1').fetchone()[0] == 0
++    assert board.execute('SELECT journal_id FROM kanban_sync_state').fetchone()[0] == binding()['journal_id']
++
++
++@pytest.mark.parametrize('defect', ['missing', 'different', 'null'])
++@pytest.mark.parametrize('action', ['snapshot', 'pending_wire', 'issue', 'recover'])
++def test_divergent_sync_anchor_refuses_every_journal_entrypoint(board, defect, action):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++    with kbc.write_txn(board):
++        if defect == 'missing':
++            board.execute('DELETE FROM kanban_sync_state')
++        else:
++            board.execute('UPDATE kanban_sync_state SET journal_id=?',
++                          (None if defect == 'null' else 'different-journal',))
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError, match='sync journal binding mismatch'):
++            if action == 'issue':
++                journal.issue(board, {'client_op_id': 'operation-0001'})
++            elif action == 'recover':
++                remote = dict(binding(), mode='STRICT', session='1', h='0', a='0', last_verdict=None)
++                journal.recover(board, remote, lambda verdict: pytest.fail('recorded corrupt journal'))
++            else:
++                getattr(journal, action)(board)
++    assert board.execute('SELECT wire FROM kanban_replay_sender1').fetchone()[0] is None
++
++
++def test_restore_marker_persists_until_matching_remote_reconciliation(board):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++        journal.mark_restore_required(board)
++    sync.apply_sync_schema_steps(board)
++    assert board.execute('SELECT replay_restore_required FROM kanban_sync_state').fetchone()[0] == 1
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError, match='journal restore reconciliation required'):
++            journal.issue(board, {'client_op_id': 'operation-0001'})
++    remote = dict(binding(), mode='STRICT', session='1', h='0', a='0', last_verdict=None)
++    with kbc.write_txn(board):
++        journal.reconcile_restore(board, remote, lambda verdict: pytest.fail('unexpected verdict'))
++    with kbc.write_txn(board):
++        assert journal.issue(board, {'client_op_id': 'operation-0001'})
++
++
++def test_initialize_failure_caught_inside_transaction_does_not_publish_anchor(board):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++    with kbc.write_txn(board):
++        board.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++    with kbc.write_txn(board):
++        with pytest.raises(sqlite3.IntegrityError):
++            journal.initialize(board, dict(binding(), journal_id='replacement-journal'), board_id=board_id)
++    assert board.execute('SELECT journal_id FROM kanban_sync_state').fetchone()[0] is None
++    assert json.loads(board.execute('SELECT state FROM kanban_replay_sender1').fetchone()[0]) == binding()
++
++
++@pytest.mark.parametrize('defect', ['identity', 'cursor', 'wire'])
++def test_restore_fault_retains_hold_and_exact_pending_custody(board, defect):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++        wire = journal.issue(board, {'client_op_id': 'operation-0001'})
++        journal.mark_restore_required(board)
++    remote = dict(binding(), mode='STRICT', session='1', h='0', a='0', last_verdict=None)
++    with kbc.write_txn(board):
++        if defect == 'identity':
++            remote['journal_id'] = 'different-journal'
++        elif defect == 'cursor':
++            remote['h'] = remote['a'] = '2'
++        else:
++            board.execute('UPDATE kanban_replay_sender1 SET wire=?', (b'{}',))
++    before = board.execute('SELECT wire FROM kanban_replay_sender1').fetchone()[0]
++    with kbc.write_txn(board):
++        with pytest.raises(ValueError):
++            journal.reconcile_restore(board, remote, lambda verdict: pytest.fail('unexpected verdict'))
++    assert board.execute('SELECT replay_restore_required FROM kanban_sync_state').fetchone()[0] == 1
++    assert board.execute('SELECT wire FROM kanban_replay_sender1').fetchone()[0] == before
++    assert before == (b'{}' if defect == 'wire' else wire)
++
++
++def test_successful_restore_reconciliation_rollback_keeps_hold(board):
++    board_id = board.execute('SELECT board_id FROM kanban_sync_state').fetchone()[0]
++    with kbc.write_txn(board):
++        journal.initialize(board, binding(), board_id=board_id)
++        journal.mark_restore_required(board)
++    remote = dict(binding(), mode='STRICT', session='1', h='0', a='0', last_verdict=None)
++    with pytest.raises(RuntimeError, match='rollback'):
++        with kbc.write_txn(board):
++            journal.reconcile_restore(board, remote, lambda verdict: pytest.fail('unexpected verdict'))
++            raise RuntimeError('rollback')
++    assert board.execute('SELECT replay_restore_required FROM kanban_sync_state').fetchone()[0] == 1
+diff --git a/tests/hermes_cli/test_kanban_replay_journal.py b/tests/hermes_cli/test_kanban_replay_journal.py
+index fdc3175fb009b9be9008e222dcef1c36ffe1d058..1286d25a99db737fd9819b000c8fa9fa436c5cc5 100644
+--- a/tests/hermes_cli/test_kanban_replay_journal.py
++++ b/tests/hermes_cli/test_kanban_replay_journal.py
+@@ -11,6 +11,14 @@
+                 last_op_id=None, last_payload_sha256=None, pending=None)
+ 
+ 
++def initialize(conn, journal):
++    # Minimal storage fixture; real schema/adoption is covered by test_kanban_replay_binding.
++    conn.execute('CREATE TABLE IF NOT EXISTS kanban_sync_state('
++                 'board_id TEXT PRIMARY KEY, journal_id TEXT, replay_restore_required INTEGER NOT NULL DEFAULT 0)')
++    conn.execute("INSERT OR IGNORE INTO kanban_sync_state(board_id) VALUES ('fixture-board')")
++    journal.initialize(conn, binding(), board_id='fixture-board')
++
++
+ def test_allocate_rollback_and_restart_keep_one_exact_successor(tmp_path):
+     from hermes_cli import kanban_replay_journal as journal
+ 
+@@ -18,7 +26,7 @@
+     conn = sqlite3.connect(path)
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+     conn.execute('BEGIN IMMEDIATE')
+     first = journal.issue(conn, {'client_op_id': 'operation-0001', 'fields': {'n': 1.0}})
+     assert json.loads(first)['replay']['sequence'] == '1'
+@@ -46,10 +54,10 @@
+     conn = sqlite3.connect(':memory:')
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+     with pytest.raises(ValueError, match='caller transaction required'):
+         if action == 'initialize':
+-            journal.initialize(conn, binding())
++            journal.initialize(conn, binding(), board_id='fixture-board')
+         elif action == 'issue':
+             journal.issue(conn, {'client_op_id': 'operation-0001'})
+         else:
+@@ -67,7 +75,7 @@
+     conn = sqlite3.connect(':memory:')
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+         encoded = journal.issue(conn, {'client_op_id': 'operation-0001'})
+     wire = json.loads(encoded)
+     state = journal.snapshot(conn)
+@@ -107,7 +115,7 @@
+     conn = sqlite3.connect(':memory:')
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+     with pytest.raises(ValueError, match=expected):
+         with conn:
+             conn.execute('BEGIN IMMEDIATE')
+@@ -124,7 +132,7 @@
+     first, second = sqlite3.connect(path), sqlite3.connect(path, timeout=0)
+     with first:
+         first.execute('BEGIN IMMEDIATE')
+-        journal.initialize(first, binding())
++        initialize(first, journal)
+     first.execute('BEGIN IMMEDIATE')
+     issued = journal.issue(first, {'client_op_id': 'operation-0001'})
+     second.execute('BEGIN')
+@@ -151,7 +159,7 @@
+     conn = sqlite3.connect(':memory:')
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+         state = dict(binding(), settled=settled, last_op_id='operation-0001', last_payload_sha256='0' * 64)
+         conn.execute('UPDATE kanban_replay_sender1 SET state=?', (json.dumps(state),))
+     with pytest.raises(ValueError, match=expected):
+@@ -168,7 +176,7 @@
+     conn = sqlite3.connect(':memory:')
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+         conn.execute('CREATE TABLE outcomes(verdict TEXT)')
+         wire = json.loads(journal.issue(conn, {'client_op_id': 'operation-0001'}))
+     remote = dict(binding(), mode='STRICT', session='1', h='1', a='0', last_op_id='operation-0001',
+@@ -196,7 +204,7 @@
+     conn = sqlite3.connect(tmp_path / 'board.db')
+     with conn:
+         conn.execute('BEGIN IMMEDIATE')
+-        journal.initialize(conn, binding())
++        initialize(conn, journal)
+         conn.execute('CREATE TABLE outcomes (verdict TEXT)')
+         wire = json.loads(journal.issue(conn, {'client_op_id': 'operation-0001'}))
+     remote = dict(binding(), mode='STRICT', session='1', h='1', a='0',
+-- 
+2.43.0
+

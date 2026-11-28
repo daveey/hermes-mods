@@ -1,0 +1,289 @@
+From fe2182c9a9ee9eb5264b339060bfdfc81b93fecb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:23:02 +0000
+Subject: [PATCH 6794] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit fe2182c9a9ee9eb5264b339060bfdfc81b93fecb.
+
+---
+diff --git a/hermes_cli/fd_headroom_transport.py b/hermes_cli/fd_headroom_transport.py
+index c07616a429092473168efb3c42e61a63c4957a86..43b629ab02a7a8762dcbad814cabb65898ce6a6e 100644
+--- a/hermes_cli/fd_headroom_transport.py
++++ b/hermes_cli/fd_headroom_transport.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import re
+ import time
+ from urllib.parse import quote, urlencode
+@@ -66,8 +67,11 @@
+             response = self._call('GET', '/v2/sync/requests/' + envelope['id'])
+         except sync.HubError as exc:
+             # Only the service's typed missing answer permits resending the frozen request.
+-            import json
+-            if exc.status != 404 or json.loads(exc.detail).get('error') != 'no such request':
++            try:
++                missing = json.loads(exc.detail) == {'error': 'no such request'}
++            except (ValueError, TypeError):
++                missing = False
++            if exc.status != 404 or not missing:
+                 raise
+         else:
+             request = response.get('request')
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index 126db8dd781a3cd375a84cbd90b78e72faa77f90..39630cfb1928eaf77780261034fec503138abd15 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -177,6 +177,7 @@
+ 
+ _fd_thread: threading.Thread | None = None
+ _fd_request_lock = threading.Lock()
++_fd_role: tuple[int, str] | None = None
+ 
+ 
+ def apply_server_nofile_policy(*, role: str) -> None:
+@@ -198,9 +199,14 @@
+ 
+ def request_fd_headroom(*, role: str) -> None:
+     """Nonblocking service tick: retain one worker, count overlap instead of queueing work."""
+-    global _fd_thread
++    global _fd_thread, _fd_role
+     try:
+         with _fd_request_lock:
++            # The launcher's first tick owns the process. An embedded dashboard or
++            # on-demand gateway must not alternate identities for the same FDs.
++            if _fd_role is None or _fd_role[0] != os.getpid():
++                _fd_role = (os.getpid(), role)
++            role = _fd_role[1]
+             if _fd_thread is not None and _fd_thread.is_alive():
+                 _fd_status['skipped'] = _fd_status.get('skipped', 0) + 1
+                 if role == 'gateway':
+@@ -330,7 +336,10 @@
+     elapsed = now - _fd_samples[0][0]
+     slope = ((count - _fd_samples[0][1]) * 60 / elapsed
+              if len(_fd_samples) >= 4 and elapsed >= 1200 else 0.0)
+-    predicted = slope > 0 and (soft - count) / slope <= settings['horizon_hours'] * 60
++    # Startup ramps are not sustained leaks. Keep their slope as diagnostics, but
++    # never predict pressure below half the current soft limit.
++    predicted = (count >= soft * .5 and slope > 0
++                 and (soft - count) / slope <= settings['horizon_hours'] * 60)
+     warn = count >= soft * settings['warn_ratio'] or predicted
+     sample = dict(host=socket.gethostname(), pid=os.getpid(), role=role, count=count,
+                   soft=soft, hard=hard, census=census, slope=slope, core=_fd_core_head(), raised='',
+diff --git a/tests/hermes_cli/test_fd_headroom_amended.py b/tests/hermes_cli/test_fd_headroom_amended.py
+index 547249de743f00d73e066ba0e81dc4df07cc98d6..9a7db1369f11aa4ba69d66f56daa5caa40433738 100644
+--- a/tests/hermes_cli/test_fd_headroom_amended.py
++++ b/tests/hermes_cli/test_fd_headroom_amended.py
+@@ -30,12 +30,12 @@
+ 
+ def test_slope_requires_four_samples_twenty_minutes(guard):
+     _, snapshot, notify = guard
+-    for now, count in [(0, 100), (300, 120), (600, 140), (900, 160)]:
++    for now, count in [(0, 420), (300, 440), (600, 460), (900, 480)]:
+         snapshot.return_value = (count, {})
+-        check(now)
++        check(now, settings={'warn_ratio': .7})
+     notify.assert_not_called()
+-    snapshot.return_value = (180, {})
+-    sample = check(1200)
++    snapshot.return_value = (500, {})
++    sample = check(1200, settings={'warn_ratio': .7})
+     assert sample['slope'] == 4  # fd/min, endpoint estimator
+     assert notify.call_count == 1
+ 
+@@ -122,9 +122,9 @@
+ 
+ def test_interval_590_retains_four_sample_trend_and_591_falls_back(guard):
+     _, snapshot, notify = guard
+-    for now, count in [(0, 100), (591, 140), (1182, 180), (1773, 220)]:
++    for now, count in [(0, 400), (591, 440), (1182, 480), (1773, 520)]:
+         snapshot.return_value = (count, {})
+-        sample = check(now, settings={'interval_seconds': 590})
++        sample = check(now, settings={'interval_seconds': 590, 'warn_ratio': .7})
+     assert sample is not None and sample['slope'] == pytest.approx(120 * 60 / 1773)
+     assert notify.call_count == 1
+     check(2400, settings={'interval_seconds': 591})
+diff --git a/tests/hermes_cli/test_fd_headroom_callers.py b/tests/hermes_cli/test_fd_headroom_callers.py
+index b18cdb86553f16932e28f8463d11b7a2188d9066..9c6a69332fda24df986092c713b65b3926b8c766 100644
+--- a/tests/hermes_cli/test_fd_headroom_callers.py
++++ b/tests/hermes_cli/test_fd_headroom_callers.py
+@@ -7,6 +7,11 @@
+ from hermes_cli import resource_limits as limits
+ 
+ 
++@pytest.fixture(autouse=True)
++def fresh_launch_role(monkeypatch):
++    monkeypatch.setattr(limits, '_fd_role', None)
++
++
+ def test_requested_tick_one_worker_and_overlap_skip(monkeypatch):
+     entered, release = threading.Event(), threading.Event()
+     calls = []
+diff --git a/tests/hermes_cli/test_fd_headroom_review.py b/tests/hermes_cli/test_fd_headroom_review.py
+index a83c067a6076434a4a89cb1dc6538b6046b0e039..cb10528b2a766659bf979bd17e515e1f5bbf06bd 100644
+--- a/tests/hermes_cli/test_fd_headroom_review.py
++++ b/tests/hermes_cli/test_fd_headroom_review.py
+@@ -76,9 +76,9 @@
+     _, snapshot = guard
+     maximum = max(i for i in range(30, 602) if not validated(
+         {'runtime': {'fd_headroom': {'interval_seconds': i}}})[1])
+-    settings = {'runtime': {'fd_headroom': {'interval_seconds': maximum}}}
++    settings = {'runtime': {'fd_headroom': {'interval_seconds': maximum, 'warn_ratio': .7}}}
+     for tick in range(8):
+-        snapshot.return_value = (100 + tick * 400, {})
++        snapshot.return_value = (3800 + tick * 400, {})
+         sample = limits.check_fd_headroom(settings, now=tick * (maximum + 1), wall_now=tick * 600)
+         assert sample is not None
+         if tick >= 3:
+diff --git a/tests/hermes_cli/test_fd_headroom_routes.py b/tests/hermes_cli/test_fd_headroom_routes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8aff65eec18ec6bd20d3579f6070a0c407fdbeee
+--- /dev/null
++++ b/tests/hermes_cli/test_fd_headroom_routes.py
+@@ -0,0 +1,128 @@
++"""Board route/ID regressions from read-only deployed-service observations."""
++import re
++
++import pytest
++from hermes_cli import kanban_sync_client as sync
++from hermes_cli import resource_limits as limits
++from tests.hermes_cli.test_fd_headroom import guard as guard  # noqa: PLC0414 -- pytest fixture reexport
++
++
++@pytest.mark.parametrize('rid', ['fd-headroom:incident',
++    'fd-headroom:worker:default:gateway:2099-01-01T00:00:00.460000+00:00',
++    'fd-headroom:' + 'x' * 150], ids=['colon', 'legacy-iso', 'long'])
++def test_real_route_missing_then_same_envelope_reconciles(monkeypatch, rid):
++    from hermes_cli.fd_headroom_transport import Client
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
++    held, posts, paths = {}, [], []
++    def call(ident, method, path, body, budget):
++        if method == 'GET':
++            paths.append(path)
++            match = re.fullmatch(r'/v2/sync/requests/([A-Za-z0-9._:-]{1,128})', path)
++            if not match:
++                raise sync.HubError(404, '{"error":"not found"}')
++            if match[1] not in held:
++                raise sync.HubError(404, '{"error":"no such request"}')
++            return {'request': held[match[1]]}
++        assert re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', body['id'])
++        posts.append(body)
++        held[body['id']] = {'state': 'queued', 'result': None}
++        return {}
++    monkeypatch.setattr(sync, '_bounded_call', call)
++    envelope = {'id': rid, 'args': {'idempotency_key': rid}, 'action': 'create'}
++    original = dict(envelope)
++    assert Client().create(envelope) is None
++    assert Client().create(envelope) is None
++    assert len(posts) == 1 and paths[0] == paths[1]
++    assert posts[0]['args'] == envelope['args'] and envelope == original
++    held[posts[0]['id']] = {'state': 'done', 'result': {'task_id': 't_0123456789abcdef'}}
++    assert Client().create(envelope) == 't_0123456789abcdef'
++    assert len(posts) == 1
++
++
++@pytest.mark.parametrize(('status', 'detail'), [(404, '{"error":"not found"}'),
++    (404, 'bad JSON'), (403, '{"error":"no such request"}'), (503, 'unavailable')])
++def test_only_typed_missing_allows_post(monkeypatch, status, detail):
++    from hermes_cli.fd_headroom_transport import Client
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
++    calls = []
++    def fail(ident, method, *args):
++        calls.append(method)
++        raise sync.HubError(status, detail)
++    monkeypatch.setattr(sync, '_bounded_call', fail)
++    with pytest.raises(sync.HubError):
++        Client().create({'id': 'fd-headroom:incident'})
++    assert calls == ['GET']
++
++
++def test_legacy_comment_id_is_accepted_by_board(monkeypatch):
++    from hermes_cli.fd_headroom_transport import Client
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
++    calls = []
++    monkeypatch.setattr(sync, '_bounded_call', lambda *args: calls.append(args))
++    envelope = {'id': 'fd-headroom:legacy+00:00:comment:12345', 'args': {'text': 'sample'}}
++    Client().comment(envelope)
++    assert re.fullmatch(r'[A-Za-z0-9._:-]{8,128}', calls[0][3]['id'])
++    assert calls[0][3]['args'] == envelope['args']
++
++
++@pytest.mark.parametrize('state', ['queued', 'claimed', 'waiting', 'rejected', 'failed', 'expired'])
++def test_held_request_never_resends(monkeypatch, state):
++    from hermes_cli.fd_headroom_transport import Client
++    monkeypatch.setattr(sync, 'load_identity', lambda: sync.Identity('http://example.invalid', 'unused', 'worker'))
++    calls = []
++    def held(ident, method, *args):
++        calls.append(method)
++        return {'request': {'state': state, 'result': None}}
++    monkeypatch.setattr(sync, '_bounded_call', held)
++    if state in {'rejected', 'failed', 'expired'}:
++        with pytest.raises(RuntimeError):
++            Client().create({'id': 'fd-headroom:incident'})
++    else:
++        assert Client().create({'id': 'fd-headroom:incident'}) is None
++    assert calls == ['GET']
++
++
++@pytest.mark.parametrize('final_count', [367, 2047, 2048])
++def test_startup_slope_requires_half_soft_before_warning(guard, final_count, caplog):
++    resource, snapshot, notify = guard
++    resource.getrlimit.return_value = (4096, 10000)
++    for now, count in [(0, 15), (300, 100), (600, 200), (900, 300), (1200, final_count)]:
++        snapshot.return_value = (count, {})
++        sample = limits.check_fd_headroom({}, now=now)
++    assert sample['slope'] > 0
++    assert sample['triggered'] == (final_count >= 2048)
++    assert notify.call_count == int(final_count >= 2048)
++    if final_count < 2048:
++        assert 'fd-headroom:' not in caplog.text
++
++
++def test_prediction_still_warns_before_configured_high_ratio(guard):
++    _, snapshot, notify = guard
++    for now, count in [(0, 100), (400, 200), (800, 400), (1200, 500)]:
++        snapshot.return_value = (count, {})
++        sample = limits.check_fd_headroom({'runtime': {'fd_headroom': {'warn_ratio': .7}}}, now=now)
++    assert sample['triggered'] and notify.call_count == 1
++
++
++@pytest.mark.parametrize('first', ['gateway', 'backend'])
++def test_one_launch_role_for_embedded_service_ticks(monkeypatch, first):
++    monkeypatch.setattr(limits, '_fd_role', None, raising=False)
++    monkeypatch.setattr(limits, '_fd_thread', None)
++    calls = []
++    monkeypatch.setattr(limits, 'gateway_fd_headroom_tick', lambda: calls.append('gateway'))
++    monkeypatch.setattr(limits, 'check_fd_headroom', lambda **kw: calls.append(kw['role']))
++    class InlineThread:
++        def __init__(self, target, args, **kwargs):
++            self.target, self.args = target, args
++        def start(self):
++            self.target(*self.args)
++        def is_alive(self):
++            return False
++    monkeypatch.setattr(limits.threading, 'Thread', InlineThread)
++    limits.request_fd_headroom(role=first)
++    limits.request_fd_headroom(role='backend' if first == 'gateway' else 'gateway')
++    assert calls == [first, first]
++    # Forked children may launch a different service; do not inherit the parent's role.
++    monkeypatch.setattr(limits.os, 'getpid', lambda: 987654321)
++    limits.request_fd_headroom(role='backend')
++    assert calls[-1] == 'backend'
+diff --git a/tests/hermes_cli/test_fd_headroom_transport.py b/tests/hermes_cli/test_fd_headroom_transport.py
+index 0947bdd45dc87ef1b1e8d55b6abd017b5a7c1230..6eb4e0bb8b0a6264644c2ec03a57bed52612a876 100644
+--- a/tests/hermes_cli/test_fd_headroom_transport.py
++++ b/tests/hermes_cli/test_fd_headroom_transport.py
+@@ -10,6 +10,8 @@
+     def request(ident, method, path, body, budget_s):
+         calls.append((method, path, body, budget_s))
+         if method == 'GET' and '/requests/' in path:
++            if '%' in path or '+' in path:
++                raise sync.HubError(404, '{"error":"not found"}')
+             raise sync.HubError(404, '{"error":"no such request"}')
+         return {}
+     monkeypatch.setattr(sync, '_bounded_call', request)
+-- 
+2.43.0
+

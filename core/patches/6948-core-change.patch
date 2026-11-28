@@ -1,0 +1,1098 @@
+From 3d878fb931e5162b39fa89735e4bdde9ebb067a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 17:21:18 +0000
+Subject: [PATCH 6948] Sessions capture standby child and exit-signal dispatch
+
+Public mirror of source commit 3d878fb931e5162b39fa89735e4bdde9ebb067a7.
+
+---
+diff --git a/hermes_cli/runtime_state.py b/hermes_cli/runtime_state.py
+index 7eba6e79f6cb31504552f921c24942d0db92f9df..ac380d78e5f45bb5aad3240a75d4afe9ec3f7380 100644
+--- a/hermes_cli/runtime_state.py
++++ b/hermes_cli/runtime_state.py
+@@ -169,16 +169,32 @@
+ 
+     def release() -> None:
+         atexit.unregister(release)
++        with suppress(ValueError):
++            _process_leases.remove(release)
+         os.close(fd)
+         # Best effort: the collector ignores unlocked lease files, but one per
+         # invocation would otherwise accumulate for the life of the generation.
+         with suppress(OSError):
+             lease.unlink()
+ 
++    _process_leases.append(release)
+     atexit.register(release)
+     return release
+ 
+ 
++# Leases this process still holds, for a caller that ends the process without running atexit.
++_process_leases: list[Callable[[], None]] = []
++
++
++def release_process_leases() -> int:
++    """Release every lease this process still holds, exactly as its atexit hooks would; returns how many."""
++    released = 0
++    while _process_leases:
++        _process_leases[-1]()  # removes itself
++        released += 1
++    return released
++
++
+ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> list[Path]:
+     """Remove unselected lease-managed generations after their readers exit."""
+     from pm.environments import selected_venv
+diff --git a/hermes_cli/sessions_capture_process.py b/hermes_cli/sessions_capture_process.py
+index e3eb9e2e0f1d1ad0b046905e127ebe8ad195a8ce..40e7e10b09f7dd7309d2ef65d7a90fa7d9dcf503 100644
+--- a/hermes_cli/sessions_capture_process.py
++++ b/hermes_cli/sessions_capture_process.py
+@@ -15,11 +15,14 @@
+ from hermes_cli._launchers import runtime_command
+ from hermes_cli._startup_fast import project_root_str
+ from hermes_cli._subprocess_compat import kill_process_tree
++from hermes_cli.git_fingerprint import read_git_revision_fingerprint
+ from hermes_cli.process_identity import spawn_owned, stop_owned_group_survivors
+ from tools.environments.local import build_subprocess_env
+ 
+ MAX_REQUEST = 16 * 1024
+ MAX_RESPONSE = 4 * 1024 * 1024
++# A standby older than this is not used: it imported its code, and leased its dependencies, that long ago.
++STANDBY_MAX_AGE_S = 30
+ 
+ 
+ class CaptureUnavailable(RuntimeError):
+@@ -49,15 +52,74 @@
+     return bytes(data)
+ 
+ 
++def _generation():
++    """Checkout identity, as the code-skew watchdog reads it (``.git`` HEAD/ref files, no git spawn)."""
++    return read_git_revision_fingerprint(Path(project_root_str()))
++
++
++class _Standby:
++    __slots__ = ('child', 'cpu_s', 'generation', 'recorded', 'spawned')
++
++    def __init__(self, child, spawned):
++        self.child, self.spawned, self.generation = child, spawned, _generation()
++        self.cpu_s, self.recorded = None, False
++
++
+ class CaptureProcess:
+-    """One child at a time; close cancels it, and a later capture gets a fresh child."""
++    """One active child at a time; close cancels it, and a later capture gets a fresh child.
++
++    ``prepare`` may spawn one standby ahead of the first capture; it serves at most one request.
++    """
+     def __init__(self, *, seconds=5, max_bytes=MAX_RESPONSE, command=None):
+         self.seconds, self.max_bytes = seconds, min(max_bytes, MAX_RESPONSE)
+         self.command = command
+         self._lock = threading.Lock()
+         self._child = None
++        self._standby = None
+         self._closed = False
+ 
++    def _spawn(self):
++        # Resolve installation-bound Python/dependencies, not ambient python/PYTHONPATH.
++        command = self.command or runtime_command(Path(project_root_str()),
++                                                   module='hermes_cli.sessions_capture_worker')
++        return spawn_owned(command, purpose='sessions-canonical-capture',
++                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
++                           env=build_subprocess_env())
++
++    def prepare(self):
++        """Spawn the standby the next capture will use (it imports while it waits for the request).
++        No-op when closed, busy or already prepared; a failed spawn leaves captures spawning fresh."""
++        with self._lock:
++            if self._closed or self._standby is not None or self._child is not None:
++                return
++            spawned = time.monotonic()
++            try:
++                child = self._spawn()
++            except OSError:
++                return
++            try:
++                self._standby = _Standby(child, spawned)
++            except BaseException:
++                _la.record('sessions.capture.child', cpu_s=_child_cpu(child.pid) or 0.0,
++                           wall_s=time.monotonic() - spawned, skipped=True, outer=False)
++                _stop(child)
++                raise
++
++    def _discard_standby(self):
++        """Retire the unused standby (caller holds the lock): one ``skipped`` record, then the same
++        custody as any child. A group that does not stop keeps the standby owned for the next try."""
++        standby = self._standby
++        if standby is None:
++            return
++        if not standby.recorded:
++            # A standby poll() already reaped lost its counters: use the sample taken before that.
++            cpu_s = _child_cpu(standby.child.pid) if standby.child.returncode is None else standby.cpu_s
++            standby.recorded = True
++            _la.record('sessions.capture.child', cpu_s=cpu_s or 0.0, wall_s=time.monotonic() - standby.spawned,
++                       skipped=True, fallback=cpu_s is None, outer=False)
++        _stop(standby.child)
++        self._standby = None
++
+     def __call__(self, name, selector):
+         return self._request({'name': name, 'selector': selector})
+ 
+@@ -89,20 +151,24 @@
+         request = json.dumps(value, allow_nan=False).encode('utf-8')
+         if len(request) > MAX_REQUEST:
+             raise CaptureUnavailable('request_bytes')
+-        # Resolve installation-bound Python/dependencies, not ambient python/PYTHONPATH.
+-        command = self.command or runtime_command(Path(project_root_str()),
+-                                                   module='hermes_cli.sessions_capture_worker')
+         with self._lock:
+             if self._closed:
+                 raise CaptureUnavailable('closed')
+             if self._child is not None:
+                 raise CaptureUnavailable('busy')
+-            try:
+-                child = spawn_owned(command, purpose='sessions-canonical-capture',
+-                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+-                                    env=build_subprocess_env())
+-            except OSError as exc:
+-                raise CaptureUnavailable('spawn') from exc
++            child, standby = None, self._standby
++            if standby is not None:
++                standby.cpu_s = _child_cpu(standby.child.pid)  # before poll() can reap a dead one
++                if (standby.child.poll() is None and time.monotonic() - standby.spawned <= STANDBY_MAX_AGE_S
++                        and standby.generation == _generation()):
++                    child, self._standby = standby.child, None
++                else:
++                    self._discard_standby()
++            if child is None:
++                try:
++                    child = self._spawn()
++                except OSError as exc:
++                    raise CaptureUnavailable('spawn') from exc
+             self._child = child
+         cpu_s, completed = None, False
+         try:
+@@ -137,17 +203,11 @@
+             if cpu_s is None:
+                 cpu_s = _child_cpu(child.pid)  # a failed or cancelled child spent CPU too
+             # The child's CPU is outside this process: no thread here may claim it (outer=False).
++            # Lifetime CPU, so a used standby's imports count; wall is this request's (the batch charge).
+             _la.record('sessions.capture.child', cpu_s=cpu_s or 0.0, wall_s=time.monotonic() - started,
+                        fallback=cpu_s is None, error=not completed,
+                        error_kind=None if completed else 'CaptureUnavailable', outer=False)
+-            if child.poll() is None:
+-                kill_process_tree(child)
+-            child.wait(timeout=1)
+-            child.stdout.close()
+-            if not child.stdin.closed:
+-                child.stdin.close()
+-            if not stop_owned_group_survivors(child.pid, proc=child, grace=0):
+-                raise TimeoutError('sessions child group did not stop; custody retained')
++            _stop(child)
+             with self._lock:
+                 self._child = None
+ 
+@@ -155,15 +215,30 @@
+         with self._lock:
+             self._closed = True
+             child = self._child
+-        if child is not None:
+-            if child.poll() is None:
+-                kill_process_tree(child)
+-            child.wait(timeout=1)
+-            if not stop_owned_group_survivors(child.pid, proc=child, grace=0):
+-                raise TimeoutError('sessions child group did not stop; custody retained')
+-            with self._lock:
+-                if self._child is child:
+-                    self._child = None
++        try:
++            if child is not None:  # its own request accounts it
++                if child.poll() is None:
++                    kill_process_tree(child)
++                child.wait(timeout=1)
++                if not stop_owned_group_survivors(child.pid, proc=child, grace=0):
++                    raise TimeoutError('sessions child group did not stop; custody retained')
++                with self._lock:
++                    if self._child is child:
++                        self._child = None
++        finally:
++            with self._lock:  # attempted even when the active child's custody is retained
++                self._discard_standby()
++
++
++def _stop(child):
++    if child.poll() is None:
++        kill_process_tree(child)
++    child.wait(timeout=1)
++    child.stdout.close()
++    if not child.stdin.closed:
++        child.stdin.close()
++    if not stop_owned_group_survivors(child.pid, proc=child, grace=0):
++        raise TimeoutError('sessions child group did not stop; custody retained')
+ 
+ 
+ def _read_trailer(child, deadline):
+diff --git a/hermes_cli/sessions_capture_worker.py b/hermes_cli/sessions_capture_worker.py
+index e66aca5a0a2d5d13cb5c70deecdb6cf179165a73..e0c7526a48b93ca3823eded79d463ee9a74058f3 100644
+--- a/hermes_cli/sessions_capture_worker.py
++++ b/hermes_cli/sessions_capture_worker.py
+@@ -1,11 +1,21 @@
+ """Private one-request worker; stdout contains only one bounded binary frame."""
+ from contextlib import redirect_stdout
+ import json
++import os
+ import struct
+ import sys
++import threading
+ 
+ MAX_REQUEST = 16 * 1024
+ MAX_RESPONSE = 4 * 1024 * 1024
++REFRESH_JOIN_S = .2
++
++
++def preimport():
++    """Reader imports, before the request: a standby child does them while it waits for stdin."""
++    import hermes_cli.web_routers.profiles
++    import hermes_cli.web_json_response
++    import hermes_cli.kanban_session_activity
+ 
+ 
+ def capture(name, selector):
+@@ -28,6 +38,10 @@
+ 
+ def main():
+     incoming, outgoing = sys.stdin.buffer, sys.stdout.buffer
++    baseline = _open_fds()
++    # Libraries/plugins may print, at import too. Never permit such output to enter IPC framing.
++    with redirect_stdout(sys.stderr):
++        preimport()
+     header = incoming.read(4)
+     if len(header) != 4:
+         return 2
+@@ -38,7 +52,6 @@
+     if len(request) != size or incoming.read(1):
+         return 2
+     value = json.loads(request)
+-    # Libraries/plugins may print. Never permit such output to enter IPC framing.
+     with redirect_stdout(sys.stderr):
+         if isinstance(value, dict) and set(value) == {'views'}:
+             body = capture_many(value['views'])
+@@ -52,6 +65,10 @@
+     outgoing.write(struct.pack('!I', len(body)))
+     outgoing.write(body)
+     outgoing.flush()
++    # Rollback: HERMES_SESSIONS_CAPTURE_FAST_EXIT=0 keeps the ordinary interpreter exit.
++    # health: allow HX002 -- creator-defined rollback switch, never a credential
++    if os.environ.get('HERMES_SESSIONS_CAPTURE_FAST_EXIT', '1').strip() != '0' and released(baseline):
++        os._exit(0)  # the parent's budget also covers this exit; interpreter teardown was ~0.4 s of it
+     return 0
+ 
+ 
+@@ -75,5 +92,119 @@
+     return json.dumps({'results': results}, separators=(',', ':'), allow_nan=False).encode()
+ 
+ 
++def _open_fds():
++    """Open descriptors of this process, or None when procfs cannot say (then nothing is verified)."""
++    try:
++        listed = [int(name) for name in os.listdir('/proc/self/fd')]
++    except (OSError, ValueError):
++        return None
++    found = set()
++    for fd in listed:
++        try:
++            os.fstat(fd)  # drops the listing's own, already closed, descriptor
++        except OSError:
++            continue
++        found.add(fd)
++    return found
++
++
++def released(baseline):
++    """Do, and verify, what interpreter exit would do for this worker; True only when all of it held.
++
++    The frame is already flushed, so a False here costs only the ordinary (slower) exit.
++    """
++    try:
++        return (baseline is not None and threading.current_thread() is threading.main_thread()
++                and _cleaned() and _quiescent(baseline))
++    except Exception:  # health: allow BLE001 -- any doubt keeps the ordinary exit; the frame is already out
++        return False
++
++
++def _cleaned():
++    """Release what this worker holds, each step checked. In order:
++
++    - join the daemon ``kanban-annotation-refresh`` thread (bounded): it borrows the readers closed
++      below and would otherwise be cut off mid-read; still running means no early exit.
++    - close the two ``ProfileSessionScanCache`` observers of ``web_routers.profiles`` under their
++      own locks: read-only, autocommit connections that never hold a transaction.
++    - close the retained kanban readers (``kanban_waiting_reader`` and ``kanban_reader_retention``,
++      i.e. ``cached_ro``) with the very functions their atexit hooks run; one that stays borrowed
++      stays in its cache, which is checked empty.
++    - run ``hermes_profile_resources``'s own exit hook (releases drained diagnostic owners).
++    - stop and join the code-attestation settler when one runs (its atexit hook, same function).
++    - release the dependency-generation lease ``hermes_bootstrap`` took (its atexit hook), so no
++      unlocked lease file is left for the next pruner.
++    - ``logging.shutdown()`` and flush stdout/stderr, as exit would.
++    """
++    for thread in threading.enumerate():
++        if thread.name == 'kanban-annotation-refresh':
++            thread.join(REFRESH_JOIN_S)
++            if thread.is_alive():
++                return False
++    loaded = sys.modules.get
++    profiles = loaded('hermes_cli.web_routers.profiles')
++    for lock, cache in () if profiles is None else (
++            (profiles._PROFILE_SESSION_SCAN_LOCK, profiles._PROFILE_SESSION_SCAN_CACHE),
++            (profiles._PROJECT_TREE_SCAN_LOCK, profiles._PROJECT_TREE_SCAN_CACHE)):
++        if not lock.acquire(blocking=False):
++            return False
++        try:
++            cache.clear()
++        finally:
++            lock.release()
++        if cache._profiles:
++            return False
++    waiting, activity = loaded('hermes_cli.kanban_waiting_reader'), loaded('hermes_cli.kanban_session_activity')
++    if waiting is not None:
++        waiting.close_all()
++    if activity is not None:
++        from hermes_cli import kanban_reader_retention
++        kanban_reader_retention.close_all()
++    if getattr(waiting, '_cache', None) or getattr(activity, '_RO_CACHE', None):
++        return False
++    resources = loaded('hermes_profile_resources')
++    if resources is not None:
++        resources._cleanup_drained_at_exit()
++    attestation = getattr(loaded('hermes_cli.code_attestation'), '_installed', None)
++    if attestation is not None and attestation._settler is not None:
++        attestation._stop_settling()
++        if attestation._settler is not None and attestation._settler.is_alive():
++            return False
++    state = loaded('hermes_cli.runtime_state')
++    if state is not None:
++        state.release_process_leases()
++        if state._process_leases:
++            return False
++    import logging
++    logging.shutdown()
++    sys.stdout.flush()
++    sys.stderr.flush()
++    return True
++
++
++def _quiescent(baseline):
++    """Nothing else may be pending: no live non-daemon thread but this one, no exit-time
++    ``weakref.finalize``, and no descriptor opened since ``baseline`` other than the raw read-only
++    probe descriptors ``sqlite_safe_read``/``hermes_state_dbfile`` never close by design (they hold
++    no SQLite state; closing one would drop SQLite's POSIX locks). A SQLite connection that
++    ``_cleaned`` does not know about fails this descriptor check."""
++    import weakref
++    if any(thread is not threading.current_thread() and not thread.daemon and thread.is_alive()
++           for thread in threading.enumerate()):
++        return False
++    if any(info.atexit for info in list(vars(weakref.finalize)['_registry'].values())):
++        return False
++    probes = set()
++    safe, dbfile = sys.modules.get('hermes_cli.sqlite_safe_read'), sys.modules.get('hermes_state_dbfile')
++    if safe is not None:
++        probes.update(entry[0] for entry in safe._PREAD_FDS.values())
++        probes.update(safe._RETIRED_PREAD_FDS)
++    if dbfile is not None:
++        probes.update(entry[0] for entry in dbfile._HEADER_PROBE_FDS.values())
++        probes.update(dbfile._RETIRED_HEADER_PROBE_FDS)
++    after = _open_fds()
++    return after is not None and after <= baseline | probes
++
++
+ if __name__ == '__main__':
+     raise SystemExit(main())
+diff --git a/hermes_cli/sessions_early_boot.py b/hermes_cli/sessions_early_boot.py
+index 584e74f7ec92bf190fd618091043fd388eb30a65..0c7367eb3cf4b09655d86d36a185b079dd25eaab 100644
+--- a/hermes_cli/sessions_early_boot.py
++++ b/hermes_cli/sessions_early_boot.py
+@@ -48,17 +48,21 @@
+     assert_backend_home(isolated=isolated)
+     restore_user_proxy_env()
+     record_launch_scope(isolated=isolated, desktop_owned=is_desktop_owned_backend())
+-    from hermes_cli.sessions_native_startup import SessionsRuntime
+-    from hermes_cli.web_routers import profiles
+-
+-    owner = EarlySessions(SessionsRuntime(profiles, profiles._profile_targets('sessions facts startup')))
++    # The capture child is spawned HERE, before the imports below, so its own imports run beside
++    # them. From this line one try/finally owns it: the reader until the runtime owns the reader.
++    from hermes_cli.sessions_capture_process import CaptureProcess
++    reader = CaptureProcess()
++    owner = None
+     previous = {}
+ 
++    def close():
++        (reader if owner is None else owner).close()
++
+     def stop(signum, frame):
+         handler = previous[signum]
+         if handler == signal.SIG_IGN:
+             return
+-        owner.close()
++        close()
+         if callable(handler):
+             handler(signum, frame)
+         elif handler != signal.SIG_IGN:
+@@ -74,11 +78,17 @@
+                     previous[signum] = signal.signal(signum, stop)
+                 except (ValueError, OSError, RuntimeError):
+                     previous.pop(signum, None)
++        reader.prepare()
++        from hermes_cli.sessions_native_startup import SessionsRuntime
++        from hermes_cli.web_routers import profiles
++
++        owner = EarlySessions(SessionsRuntime(profiles, profiles._profile_targets('sessions facts startup'),
++                                              capture_reader=reader))
+         owner.runtime.start_background()
+         yield owner
+     finally:
+         try:
+-            owner.close()
++            close()
+         finally:
+             if previous and threading.current_thread() is threading.main_thread():
+                 for signum, handler in previous.items():
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+index b7f251fb362cc7a121b7c3987c8e94005f141b7e..0afa1cb2e545a176dc4b40ce83656c1802dfbe41 100644
+--- a/hermes_cli/sessions_native_source.py
++++ b/hermes_cli/sessions_native_source.py
+@@ -164,7 +164,9 @@
+         facts = tuple(self._fact(key, body, started, budget) for key, body in zip(keys, bodies))
+         timing = None
+         with self._lock:
+-            # <=50% duty charges the WHOLE batch, including spawn and serialization.
++            # <=50% duty charges the WHOLE batch, including spawn and serialization. One exception:
++            # the boot standby child was spawned before its batch began, so that one-time wall is
++            # not charged here; its CPU still is recorded (sessions.capture.child), used or not.
+             ended = time.monotonic()
+             self._next_capture = ended + max(.2, ended - started)
+             due = self._deadline()
+diff --git a/tests/hermes_cli/test_sessions_capture_standby.py b/tests/hermes_cli/test_sessions_capture_standby.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b525712387a203da2ffffc126b7c6962c04ca81
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_capture_standby.py
+@@ -0,0 +1,284 @@
++"""Standby capture child: prepared once, used once, retired with custody, always accounted."""
++import json
++import struct
++import subprocess
++import threading
++import time
++
++import pytest
++
++from hermes_cli import loop_accounting
++from hermes_cli import sessions_capture_process as module
++from hermes_cli.sessions_capture_process import CaptureProcess, CaptureUnavailable
++from tests.hermes_cli.test_sessions_capture_process import _burn, command, frame
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms('linux')
++
++# A frame naming the child that wrote it.
++PID_FRAME = ('import json, os, struct, sys\nsys.stdin.buffer.read()\n'
++             'body = json.dumps({"pid": os.getpid()}).encode()\n'
++             'sys.stdout.buffer.write(struct.pack("!I", len(body)) + body)\nsys.stdout.buffer.flush()\n')
++# Burns CPU before it blocks on stdin, so an unused standby has CPU to account.
++BUSY_STANDBY = ('import time\nend = time.process_time() + .2\n'
++                'while time.process_time() < end:\n    pass\n' + PID_FRAME)
++
++
++def stat():
++    return dict(loop_accounting.counters().get('sessions.capture.child', {}))
++
++
++def delta(before, key):
++    return stat().get(key, 0) - before.get(key, 0)
++
++
++def served_by(capture):
++    return json.loads(capture('sessions', {}))['pid']
++
++
++@pytest.fixture(autouse=True)
++def generation(monkeypatch):
++    # The real identity reads the checkout's .git, which a worktree keeps under the real Hermes home.
++    monkeypatch.setattr(module, '_generation', lambda: 'boot', raising=False)
++
++
++@pytest.fixture
++def spawns(monkeypatch):
++    """Every child spawned, and every pid whose group was stopped; no child outlives the test."""
++    children, stopped = [], []
++    spawn, stop = module.spawn_owned, module.stop_owned_group_survivors
++
++    def spawned(*args, **kwargs):
++        children.append(spawn(*args, **kwargs))
++        return children[-1]
++
++    def stopping(pid, **kwargs):
++        stopped.append(pid)
++        return stop(pid, **kwargs)
++    monkeypatch.setattr(module, 'spawn_owned', spawned)
++    monkeypatch.setattr(module, 'stop_owned_group_survivors', stopping)
++    yield children, stopped
++    for child in children:
++        if child.poll() is None:
++            child.kill()
++        child.wait(5)
++        stop(child.pid, proc=child, grace=0)
++
++
++def test_prepared_child_serves_the_next_capture_only(spawns):
++    children, _ = spawns
++    capture = CaptureProcess(command=command(PID_FRAME))
++    capture.prepare()
++    standby = capture._standby.child
++    assert standby.poll() is None and capture._child is None
++    assert served_by(capture) == standby.pid
++    assert capture._standby is None and len(children) == 1
++    assert served_by(capture) == children[1].pid != standby.pid
++    assert len(children) == 2
++    capture.close()
++
++
++def test_prepare_is_idempotent_and_refused_when_closed_or_busy(spawns):
++    children, _ = spawns
++    capture = CaptureProcess(command=command(PID_FRAME))
++    capture.prepare()
++    capture.prepare()
++    assert len(children) == 1
++    capture.close()
++    capture.prepare()
++    assert len(children) == 1 and capture._standby is None
++
++    busy = CaptureProcess(seconds=30, command=command('import time; time.sleep(30)'))
++    thread = threading.Thread(target=lambda: pytest.raises(CaptureUnavailable, busy, 'sessions', {}))
++    thread.start()
++    wait_until(lambda: busy._child is not None, what='active capture child')
++    busy.prepare()
++    assert len(children) == 2 and busy._standby is None
++    busy.close()
++    thread.join(5)
++    assert not thread.is_alive()
++
++
++@pytest.mark.parametrize('stale', ['age', 'generation'])
++def test_stale_standby_is_retired_accounted_and_replaced(spawns, monkeypatch, stale):
++    children, stopped = spawns
++    generations = iter(['boot', 'boot' if stale == 'age' else 'updated'])
++    monkeypatch.setattr(module, '_generation', lambda: next(generations))
++    capture = CaptureProcess(command=command(BUSY_STANDBY))
++    capture.prepare()
++    standby = capture._standby.child
++    wait_until(lambda: (module._child_cpu(standby.pid) or 0) >= .15, what='standby CPU')
++    if stale == 'age':
++        monkeypatch.setattr(module, 'STANDBY_MAX_AGE_S', -1)
++    before = stat()
++    capture.command = command(PID_FRAME)
++    assert served_by(capture) == children[1].pid != standby.pid
++    assert standby.poll() is not None and standby.pid in stopped
++    assert delta(before, 'runs') == 2 and delta(before, 'skips') == 1 and delta(before, 'errors') == 0
++    assert delta(before, 'cpu_s') >= .15
++    capture.close()
++    assert delta(before, 'runs') == 2  # nothing left to account
++
++
++def test_fresh_standby_of_the_same_generation_is_used(spawns, monkeypatch):
++    children, _ = spawns
++    monkeypatch.setattr(module, '_generation', lambda: 'boot', raising=False)
++    capture = CaptureProcess(command=command(PID_FRAME))
++    capture.prepare()
++    before = stat()
++    assert served_by(capture) == children[0].pid
++    assert delta(before, 'runs') == 1 and delta(before, 'skips') == 0
++    capture.close()
++
++
++def test_generation_is_the_checkout_fingerprint(monkeypatch):
++    from pathlib import Path
++    from hermes_cli._startup_fast import project_root_str
++    monkeypatch.undo()
++    monkeypatch.setattr(module, 'read_git_revision_fingerprint', lambda root: ('git', root))
++    assert module._generation() == ('git', Path(project_root_str()))
++
++
++def _zombie(pid):
++    with open(f'/proc/{pid}/stat', encoding='ascii', errors='replace') as stat_file:
++        return stat_file.read().rpartition(')')[2].split()[0] == 'Z'
++
++
++def test_dead_standby_is_replaced_and_its_cpu_accounted(spawns):
++    children, stopped = spawns
++    capture = CaptureProcess(command=command(_burn(.2, '').replace('sys.stdin.buffer.read()\n', '')))
++    capture.prepare()
++    standby = capture._standby.child
++    wait_until(lambda: _zombie(standby.pid), what='standby exit')
++    before = stat()
++    capture.command = command(PID_FRAME)
++    assert served_by(capture) == children[1].pid
++    assert standby.pid in stopped
++    assert delta(before, 'runs') == 2 and delta(before, 'skips') == 1
++    assert delta(before, 'fallbacks') == 0  # sampled before the poll that reaped it
++    assert delta(before, 'cpu_s') >= .15
++    capture.close()
++
++
++def test_close_retires_and_accounts_a_live_standby(spawns):
++    _, stopped = spawns
++    capture = CaptureProcess(command=command(PID_FRAME))
++    capture.prepare()
++    standby = capture._standby.child
++    before = stat()
++    capture.close()
++    assert standby.poll() is not None and standby.pid in stopped and capture._standby is None
++    assert delta(before, 'runs') == 1 and delta(before, 'skips') == 1 and delta(before, 'errors') == 0
++    capture.close()
++    assert delta(before, 'runs') == 1
++    with pytest.raises(CaptureUnavailable, match='closed'):
++        capture('sessions', {})
++
++
++def test_close_attempts_the_standby_when_the_active_child_keeps_custody(spawns, monkeypatch):
++    # White box: the public flow never holds both, so close() is given both to prove it tries each.
++    children, stopped = spawns
++    capture = CaptureProcess(seconds=30, command=command('import time; time.sleep(30)'))
++    errors = []
++
++    def run():
++        try:
++            capture('sessions', {})
++        except (CaptureUnavailable, TimeoutError) as error:
++            errors.append(error)
++    thread = threading.Thread(target=run)
++    thread.start()
++    wait_until(lambda: capture._child is not None, what='active capture child')
++    active = capture._child
++    capture._standby = module._Standby(capture._spawn(), time.monotonic())
++    standby = capture._standby.child
++    tracked = module.stop_owned_group_survivors
++    monkeypatch.setattr(module, 'stop_owned_group_survivors',
++                        lambda pid, **kwargs: pid != active.pid and tracked(pid, **kwargs))
++    before = stat()
++    with pytest.raises(TimeoutError, match='custody retained'):
++        capture.close()
++    thread.join(5)
++    assert not thread.is_alive() and errors
++    assert standby.poll() is not None and standby.pid in stopped and capture._standby is None
++    assert capture._child is active  # custody of the unstopped group is kept
++    assert delta(before, 'skips') == 1 and delta(before, 'runs') == 2
++    assert len(children) == 2
++
++
++def test_standby_whose_group_does_not_stop_stays_owned_and_is_accounted_once(spawns, monkeypatch):
++    children, _ = spawns
++    capture = CaptureProcess(command=command(PID_FRAME))
++    capture.prepare()
++    standby = capture._standby
++    monkeypatch.setattr(module, 'STANDBY_MAX_AGE_S', -1)
++    tracked = module.stop_owned_group_survivors
++    monkeypatch.setattr(module, 'stop_owned_group_survivors', lambda pid, **kwargs: False)
++    before = stat()
++    with pytest.raises(TimeoutError, match='custody retained'):
++        capture('sessions', {})
++    assert capture._standby is standby and capture._child is None and len(children) == 1
++    monkeypatch.setattr(module, 'stop_owned_group_survivors', tracked)
++    assert served_by(capture) == children[1].pid
++    assert capture._standby is None
++    assert delta(before, 'runs') == 2 and delta(before, 'skips') == 1
++    capture.close()
++
++
++def test_prepare_spawn_failure_leaves_the_reader_usable(spawns):
++    children, _ = spawns
++    capture = CaptureProcess(command=['/nonexistent/capture-worker'])
++    before = stat()
++    capture.prepare()
++    assert capture._standby is None and not children and delta(before, 'runs') == 0
++    capture.command = command(PID_FRAME)
++    assert served_by(capture) == children[0].pid
++    capture.close()
++
++
++def test_partially_prepared_child_is_rolled_back(spawns, monkeypatch):
++    children, stopped = spawns
++
++    def broken():
++        raise RuntimeError('no identity')
++    monkeypatch.setattr(module, '_generation', broken)
++    capture = CaptureProcess(command=command(PID_FRAME))
++    before = stat()
++    with pytest.raises(RuntimeError, match='no identity'):
++        capture.prepare()
++    assert capture._standby is None and len(children) == 1
++    assert children[0].poll() is not None and children[0].pid in stopped
++    assert delta(before, 'runs') == 1 and delta(before, 'skips') == 1
++    capture.close()
++
++
++def test_every_spawned_child_is_accounted_exactly_once(spawns, monkeypatch):
++    children, _ = spawns
++    before = stat()
++    capture = CaptureProcess(seconds=5, command=command(PID_FRAME))
++    served_by(capture)                                  # fresh, success
++    capture.prepare()
++    served_by(capture)                                  # standby, success
++    capture.command = command('import sys, os; sys.stdin.buffer.read(); os._exit(7)')
++    with pytest.raises(CaptureUnavailable):
++        capture('sessions', {})                         # fresh, failure
++    capture.prepare()
++    with pytest.raises(CaptureUnavailable):
++        capture('sessions', {})                         # standby, failure
++    capture.command = command(PID_FRAME)
++    capture.prepare()
++    monkeypatch.setattr(module, 'STANDBY_MAX_AGE_S', -1)
++    served_by(capture)                                  # standby discarded by age + fresh, success
++    monkeypatch.setattr(module, 'STANDBY_MAX_AGE_S', 30)
++    capture.prepare()
++    capture.close()                                     # standby discarded by close
++    assert len(children) == 7
++    assert delta(before, 'runs') == 7
++    assert delta(before, 'skips') == 2 and delta(before, 'errors') == 2
++    assert all(child.poll() is not None for child in children)
++
++
++def test_fake_frame_helper_matches_the_wire():
++    # Guard for the fixtures above: the shared frame helper still yields one valid frame.
++    out = subprocess.run(command(frame()), input=b'', capture_output=True, check=True).stdout
++    assert struct.unpack('!I', out[:4])[0] == len(out) - 4
+diff --git a/tests/hermes_cli/test_sessions_capture_worker_exit.py b/tests/hermes_cli/test_sessions_capture_worker_exit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ae09c41508ca6026af53c600c441db35e7d11ce
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_capture_worker_exit.py
+@@ -0,0 +1,168 @@
++"""Real worker processes: imports ahead of the request, and the verified early exit."""
++import json
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli._launchers import runtime_command
++from hermes_cli._startup_fast import project_root_str
++from hermes_cli.sessions_capture_process import CaptureProcess, CaptureUnavailable
++from tests.waiting import wait_until
++
++pytestmark = pytest.mark.platforms('linux')
++ROOT = project_root_str()
++
++
++def wire(value):
++    request = json.dumps(value).encode()
++    return struct.pack('!I', len(request)) + request
++
++
++def one_frame(stdout):
++    size = struct.unpack('!I', stdout[:4])[0]
++    assert len(stdout) == 4 + size, stdout[:200]
++    return json.loads(stdout[4:])
++
++
++# A stand-in reader module that prints while it is imported, then records that it was.
++NOISY_READERS = '''
++import importlib.abc, importlib.util, sys
++class Readers(importlib.abc.MetaPathFinder, importlib.abc.Loader):
++    def find_spec(self, name, path=None, target=None):
++        if name == 'hermes_cli.web_routers.profiles':
++            return importlib.util.spec_from_loader(name, self)
++    def exec_module(self, module):
++        print('import-time noise')
++        def sidebar(**selector): return {}
++        sidebar.__wrapped__ = sidebar
++        module.get_profiles_sessions = lambda **selector: {'sessions': [{'id': 'stub-row'}]}
++        module.get_profiles_sessions_sidebar = module.get_profiles_session_stamps = sidebar
++        open(sys.argv[1], 'w').close()
++sys.meta_path.insert(0, Readers())
++from hermes_cli import sessions_capture_worker
++raise SystemExit(sessions_capture_worker.main())
++'''
++
++
++def test_reader_imports_precede_the_request_and_cannot_print_into_the_frame(tmp_path):
++    imported = tmp_path / 'imported'
++    child = subprocess.Popen([sys.executable, '-c', NOISY_READERS, str(imported)], cwd=ROOT,
++                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    try:
++        # No request byte has been written: only a pre-request import can create the marker.
++        wait_until(lambda: imported.exists() or child.poll() is not None, timeout=60, what='reader imports')
++        assert imported.exists() and child.poll() is None
++        stdout, stderr = child.communicate(wire({'name': 'sessions', 'selector': {}}), timeout=60)
++    finally:
++        child.kill()
++        child.wait(5)
++    assert one_frame(stdout) == {'sessions': [{'id': 'stub-row'}]}
++    assert b'import-time noise' in stderr and child.returncode == 0
++
++
++@pytest.mark.parametrize('request_bytes', [wire({'nope': 1}), wire({'name': 'bogus', 'selector': {}}),
++                                           b'\x00\x00', struct.pack('!I', 17 * 1024)])
++def test_invalid_request_still_exits_two_without_a_frame(request_bytes):
++    done = subprocess.run([sys.executable, '-m', 'hermes_cli.sessions_capture_worker'], cwd=ROOT,
++                          input=request_bytes, capture_output=True, timeout=120, check=False)
++    assert done.returncode == 2 and done.stdout == b''
++
++
++IMPORT_ONLY = '''
++import json, sys
++seen = []
++def audit(event, args):
++    if event == 'sqlite3.connect' or (event == 'open' and str(args[0]).endswith(('config.yaml', '.db'))):
++        seen.append([event, str(args[0])])
++sys.addaudithook(audit)
++from hermes_cli import sessions_capture_worker
++sessions_capture_worker.preimport()
++found, seen = list(seen), []
++import os, sqlite3
++open(os.path.join(os.environ['HERMES_HOME'], 'config.yaml')).close()
++sqlite3.connect(':memory:').close()
++print(json.dumps({'seen': found, 'readers': 'hermes_cli.web_routers.profiles' in sys.modules,
++                  'control': [event for event, _ in seen]}))
++'''
++
++
++def test_reader_imports_open_no_database_and_read_no_config(tmp_path):
++    # A standby imports before any request authorises a read: the imports alone must touch no data.
++    home = tmp_path / 'home'
++    home.mkdir()
++    (home / 'config.yaml').write_text('{}\n', encoding='utf-8')
++    env = dict(os.environ, HERMES_HOME=str(home), HOME=str(tmp_path))
++    done = subprocess.run([sys.executable, '-c', IMPORT_ONLY], cwd=ROOT, env=env, capture_output=True,
++                          text=True, timeout=120, check=False)
++    assert done.returncode == 0, done.stderr[-2000:]
++    assert json.loads(done.stdout.splitlines()[-1]) == {
++        'seen': [], 'readers': True, 'control': ['open', 'sqlite3.connect']}  # the control proves the audit sees both
++    # Importing scaffolds the home's directories (as every Hermes process does) but creates no store.
++    assert not [path.name for path in home.rglob('*') if path.name.endswith(('.db', '.db-wal', '.db-shm'))]
++    assert (home / 'config.yaml').read_text(encoding='utf-8') == '{}\n'
++
++
++# The canonical worker with an exit hook only the ordinary interpreter exit runs, plus one fault.
++EXIT_PROBE = '''
++import atexit, os, runpy, sys, threading
++atexit.register(lambda: open({marker!r}, 'w').close())
++fault = {fault!r}
++if fault == 'switch':
++    os.environ['HERMES_SESSIONS_CAPTURE_FAST_EXIT'] = '0'
++elif fault == 'step':
++    from hermes_cli import runtime_state
++    def refuse():
++        raise OSError('lease')
++    runtime_state.release_process_leases = refuse
++elif fault == 'descriptor':
++    import logging
++    logging.shutdown = lambda: os.open(os.devnull, os.O_RDONLY)
++elif fault == 'thread':
++    # Lives until the main thread is finishing, as a real worker thread with work left would.
++    threading.Thread(target=threading.main_thread().join).start()
++runpy.run_module('hermes_cli.sessions_capture_worker', run_name='__main__', alter_sys=True)
++'''
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    home = tmp_path / 'home'
++    home.mkdir()
++    monkeypatch.setenv('HERMES_HOME', str(home))
++    monkeypatch.setenv('HOME', str(home))
++    db = SessionDB(db_path=home / 'state.db')
++    db.create_session('canonical-row', source='cli', model='test')
++    db.close()
++    return tmp_path
++
++
++@pytest.mark.parametrize('fault', [None, 'switch', 'step', 'descriptor', 'thread'])
++def test_worker_exits_early_only_when_its_cleanup_is_verified(store, monkeypatch, fault):
++    from hermes_cli import sessions_capture_process as module
++    from tests.hermes_cli.test_sessions_native_startup import selected
++    marker, diagnostics = store / 'ordinary-exit', store / 'child-stderr'
++    original = module.spawn_owned
++
++    def diagnostic_spawn(*args, **kwargs):
++        with diagnostics.open('wb') as output:
++            kwargs['stderr'] = output
++            return original(*args, **kwargs)
++    monkeypatch.setattr(module, 'spawn_owned', diagnostic_spawn)
++    capture = CaptureProcess(seconds=30, command=runtime_command(
++        Path(ROOT), code=EXIT_PROBE.format(marker=str(marker), fault=fault)))
++    try:
++        # One frame, EOF and exit code 0 are what the parent requires of either exit path.
++        try:
++            bodies = capture.capture_many([('sessions', selected(limit=20)), ('sessions_sidebar', {})])
++        except CaptureUnavailable as error:
++            pytest.fail(f'{error.reason}: {diagnostics.read_text()[-3000:]}')
++    finally:
++        capture.close()
++    assert any(row['id'] == 'canonical-row' for row in json.loads(bodies[0])['sessions'])
++    assert isinstance(bodies[1], bytes)
++    assert marker.exists() == (fault is not None), diagnostics.read_text()[-3000:]
+diff --git a/tests/hermes_cli/test_sessions_early_boot.py b/tests/hermes_cli/test_sessions_early_boot.py
+index ddfd4c080387bd78669b57fc6f5a3c8fe8861975..4cddd7ddbfc212f39536eb1f5fa85601326010a8 100644
+--- a/tests/hermes_cli/test_sessions_early_boot.py
++++ b/tests/hermes_cli/test_sessions_early_boot.py
+@@ -1,6 +1,7 @@
+ """Early capture keeps one owner through import failures and app adoption."""
+-from types import SimpleNamespace
++from types import ModuleType, SimpleNamespace
+ import signal
++import sys
+ import threading
+ 
+ from fastapi import FastAPI
+@@ -12,9 +13,20 @@
+ 
+ @pytest.fixture
+ def boot(monkeypatch):
+-    from hermes_cli import isolated_scope, process_identity, proof_home, update_proxy_env
++    from hermes_cli import isolated_scope, process_identity, proof_home, sessions_capture_process, update_proxy_env
+     from hermes_cli.web_routers import profiles
+     calls = []
++
++    class Reader:
++        def __init__(self):
++            calls.append('reader')
++
++        def prepare(self):
++            calls.append('prepare')
++
++        def close(self):
++            calls.append('reader-close')
++    monkeypatch.setattr(sessions_capture_process, 'CaptureProcess', Reader)
+     runtime = SimpleNamespace(start_background=lambda: calls.append('start'),
+                               close=lambda: calls.append('close'))
+     monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
+@@ -24,7 +36,7 @@
+     monkeypatch.setattr(process_identity, 'is_desktop_owned_backend', lambda: False)
+     monkeypatch.setattr(isolated_scope, 'record_launch_scope', lambda **kw: calls.append(('scope', kw)))
+     monkeypatch.setattr(profiles, '_profile_targets', lambda reason: calls.append('targets') or [('default', '/unused')])
+-    monkeypatch.setattr(native, 'SessionsRuntime', lambda *a: runtime)
++    monkeypatch.setattr(native, 'SessionsRuntime', lambda *a, capture_reader: runtime)
+     return calls, runtime
+ 
+ 
+@@ -34,7 +46,8 @@
+     with pytest.raises(error):
+         with early.early_sessions(headless=True, isolated=True):
+             raise error()
+-    assert calls == ['preflight', 'proxy', ('scope', {'isolated': True, 'desktop_owned': False}), 'targets', 'start', 'close']
++    assert calls == ['preflight', 'proxy', ('scope', {'isolated': True, 'desktop_owned': False}),
++                     'reader', 'prepare', 'targets', 'start', 'close']
+ 
+ 
+ @pytest.mark.asyncio
+@@ -135,3 +148,74 @@
+     assert owner.closed
+     with pytest.raises(RuntimeError):
+         owner.adopt()
++
++
++class _Startup(ModuleType):
++    """Stands in for sessions_native_startup: the from-import of SessionsRuntime is its import point."""
++    def __init__(self, calls, factory):
++        super().__init__('hermes_cli.sessions_native_startup')
++        self.__dict__['_calls'], self.__dict__['_factory'] = calls, factory
++
++    def __getattr__(self, name):
++        if name != 'SessionsRuntime':
++            raise AttributeError(name)
++        self._calls.append('startup-import')
++        return self._factory()
++
++
++def test_standby_is_prepared_before_startup_imports_and_handed_to_the_runtime(boot, monkeypatch):
++    calls, runtime = boot
++    readers = []
++
++    def construct(profiles, targets, *, capture_reader):
++        calls.append('runtime')
++        readers.append(capture_reader)
++        return runtime
++    monkeypatch.setitem(sys.modules, 'hermes_cli.sessions_native_startup', _Startup(calls, lambda: construct))
++    with early.early_sessions(headless=True, isolated=False) as owner:
++        assert owner.runtime is runtime
++    assert calls[3:] == ['reader', 'prepare', 'startup-import', 'targets', 'runtime', 'start', 'close']
++    assert type(readers[0]).__name__ == 'Reader'
++    assert 'reader-close' not in calls  # the runtime owns the reader once it exists
++
++
++@pytest.mark.parametrize('stage', ['import', 'construct'])
++def test_failure_before_the_owner_exists_closes_the_reader(boot, monkeypatch, stage):
++    calls, _ = boot
++
++    def failed_import():
++        raise ImportError('startup')
++
++    def failed_construct(*args, **kwargs):
++        raise RuntimeError('targets')
++    factory = failed_import if stage == 'import' else lambda: failed_construct
++    monkeypatch.setitem(sys.modules, 'hermes_cli.sessions_native_startup', _Startup(calls, factory))
++    with pytest.raises(ImportError if stage == 'import' else RuntimeError):
++        with early.early_sessions(headless=True, isolated=False):
++            pytest.fail('must not yield')
++    assert calls.index('prepare') < calls.index('startup-import')
++    assert calls[-1] == 'reader-close' and 'start' not in calls and 'close' not in calls
++
++
++@pytest.mark.parametrize('signum', [signal.SIGTERM, signal.SIGINT])
++def test_signal_before_the_owner_exists_closes_the_reader(boot, monkeypatch, signum):
++    calls, _ = boot
++    from hermes_cli.web_routers import profiles
++    original = signal.getsignal(signum)
++
++    def previous(sig, frame):
++        calls.append('previous')
++        raise SystemExit(123)
++
++    def targets(reason):
++        signal.getsignal(signum)(signum, None)  # delivered between prepare and the runtime
++    monkeypatch.setattr(profiles, '_profile_targets', targets)
++    signal.signal(signum, previous)
++    try:
++        with pytest.raises(SystemExit, match='123'):
++            with early.early_sessions(headless=True, isolated=False):
++                pytest.fail('must not yield')
++        assert calls[3:] == ['reader', 'prepare', 'reader-close', 'previous', 'reader-close']
++        assert signal.getsignal(signum) is previous
++    finally:
++        signal.signal(signum, original)
+diff --git a/tests/pm/test_runtime_lease_cleanup.py b/tests/pm/test_runtime_lease_cleanup.py
+index 5976b41defe7579196b58aa7ea2d8d33914c90de..77a09202c2140a7a62fe31e4c0b1fec5e96f7e03 100644
+--- a/tests/pm/test_runtime_lease_cleanup.py
++++ b/tests/pm/test_runtime_lease_cleanup.py
+@@ -39,6 +39,22 @@
+     assert locked_at_delete == [True]
+ 
+ 
++@pytest.mark.platforms("any")
++def test_process_leases_release_early_exactly_as_at_exit(tmp_path, monkeypatch):
++    # A process that ends without atexit (the sessions capture worker) releases what it holds.
++    monkeypatch.setattr(runtime_state, "_process_leases", [])
++    first, second = _generation(tmp_path / "one"), _generation(tmp_path / "two")
++    early = runtime_state.lease_directory(first)
++    runtime_state.lease_directory(first)
++    runtime_state.lease_directory(second)
++    early()  # an early release (lease reselection) is no longer held, and is not released twice
++    assert runtime_state.leases_held(first) and runtime_state.leases_held(second)
++    assert runtime_state.release_process_leases() == 2
++    assert not runtime_state.leases_held(first) and not runtime_state.leases_held(second)
++    assert list((first / ".leases").iterdir()) == [] == list((second / ".leases").iterdir())
++    assert runtime_state.release_process_leases() == 0
++
++
+ @pytest.mark.platforms("windows")
+ def test_pruner_keeps_a_windows_creator_before_its_first_lock(tmp_path, monkeypatch):
+     generation = _generation(tmp_path / "generation")
+-- 
+2.43.0
+

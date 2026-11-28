@@ -1,0 +1,1063 @@
+From 76774ef7e9c0dbf10a3b8b56ac7c38b964e163c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:41:36 +0000
+Subject: [PATCH 6736] Lanes flow wait kinds, park semantics, triage attention and lane samples
+
+Public mirror of source commit 76774ef7e9c0dbf10a3b8b56ac7c38b964e163c0.
+
+---
+diff --git a/apps/desktop/src/app/chat/session-status-dot.test.tsx b/apps/desktop/src/app/chat/session-status-dot.test.tsx
+index b708aa9cbc776dac726dcdcd1748ec8cb35044f5..ea1cbb1c08b7619b74d72b7a088a2ac74a7864e8 100644
+--- a/apps/desktop/src/app/chat/session-status-dot.test.tsx
++++ b/apps/desktop/src/app/chat/session-status-dot.test.tsx
+@@ -21,6 +21,14 @@
+ )
+ 
+ describe('SessionStatusDot published status', () => {
++  it('red overdue triage is agent attention, not a human decision', () => {
++    const outcome = canonicalOutcome('stuck', { kind: 'waiting', presentation: { stripe: 'stuck', reason_codes: ['triage_overdue'] } })
++    const { container } = mount(outcome)
++    const dot = container.querySelector('[data-session-status-dot]')!
++    expect(dot.getAttribute('data-session-status-dot')).toBe('stuck')
++    expect(dot.getAttribute('aria-label')).toBe("Overdue triage · waiting on this chat's agent")
++    expect(dot.className).toContain('--color-red-500')
++  })
+   it.each(['done', 'waiting', 'attention', 'blocked', 'stuck', 'none'] as const)(
+     'paints %s independently of local activity, unread and card counts', stripe => {
+       const { container } = mount(canonicalOutcome(stripe, {}, { kind: 'done' }))
+@@ -60,6 +68,7 @@
+       reason: 'empty',
+       presentation: { stripe: 'none', reason_codes: ['never_started'] }
+     }
++
+     const { container } = mount({ kind: 'unresolved', status })
+     const dot = container.querySelector('[data-session-status-dot]')!
+ 
+diff --git a/apps/desktop/src/app/chat/session-status-dot.tsx b/apps/desktop/src/app/chat/session-status-dot.tsx
+index 47c72eb9136a8fbf556bbb857de9636afff8039f..59763a15c2f83e85735c58096bf9620a1d073be2 100644
+--- a/apps/desktop/src/app/chat/session-status-dot.tsx
++++ b/apps/desktop/src/app/chat/session-status-dot.tsx
+@@ -106,7 +106,7 @@
+       : stripe === 'done'
+         ? r.outcomeDone
+         : stripe === 'stuck'
+-          ? r.outcomeDecision
++          ? outcome?.status?.presentation?.reason_codes?.includes('triage_overdue') ? r.outcomeTriageOverdue : r.outcomeDecision
+           : stripe === 'blocked'
+             ? r.outcomeMuted
+             : stripe === 'attention'
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-card-squares.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row-card-squares.test.tsx
+index 7ee294a5dcdb07954357ed8438661b0eda4b2c6c..9033ea3ab64ac8792f95d6ad0baff956f237e533 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-card-squares.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-card-squares.test.tsx
+@@ -84,6 +84,28 @@
+ })
+ 
+ describe('sessionCardColours', () => {
++  it('counts backend overdue triage once on ordinary and Background rows, without needs_you', () => {
++    const fields = { kanban_active: 1, kanban_parked: 1, kanban_stalled: 1, needs_you: [],
++      kanban_observed_at: Date.now() / 1000,
++      kanban_triage_attention: { count: 1, refs: ['owner/default/work/t_card'], parked: 1, held: 0, stalled: 1 } }
++
++    expect(sessionCardColours(session(fields), 0)).toEqual([{ colour: 'red', count: 1 }])
++    expect(aggregateCardColours([session(fields)])).toEqual([{ colour: 'red', count: 1 }])
++    const { container } = draw(fields)
++    expect(container.querySelector('[data-card-colour="red"]')).not.toBeNull()
++    expect(container.querySelector('[role="img"]')?.getAttribute('aria-label')).toBe('Needs attention 1')
++    const mounted = render(<BackgroundCardSquares sessions={[session(fields)]} />)
++    expect(mounted.container.querySelector('[data-card-colour="red"]')?.textContent).toBe('1')
++  })
++  it.each(['expired', 'unstamped', 'future'] as const)('overdue attention needs a fresh observation: %s', stamp => {
++    const now = Date.now() / 1000
++
++    const value = session({ kanban_active: 1, kanban_parked: 1,
++      kanban_observed_at: stamp === 'unstamped' ? undefined : now + (stamp === 'expired' ? -181 : 3600),
++      needs_you: [], kanban_triage_attention: { count: 1, refs: ['owner/default/work/t_card'], parked: 1, held: 0, stalled: 0 } })
++
++    expect(aggregateCardColours([value])).toEqual([{ colour: 'unknown', count: 1 }])
++  })
+   it('red uses needs_you when present, including an empty array, otherwise blocked', () => {
+     expect(sessionCardColours(session({ kanban_blocked: 2 }), 0)).toEqual([{ colour: 'red', count: 2 }])
+     expect(
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-card-squares.tsx b/apps/desktop/src/app/chat/sidebar/session-row-card-squares.tsx
+index 714bacba8107b3e5a2f79ecfe8f7f7da11cf62ea..95eba457387f32fefdf16416492de4bf9e38edad 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-card-squares.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-card-squares.tsx
+@@ -36,16 +36,21 @@
+   session: SessionInfo,
+   executionUnknown: number
+ ): { colour: CardColour; count: number }[] {
+-  const parked = session.kanban_parked ?? 0
+-  const stalled = session.kanban_stalled ?? 0
+-  const live = Math.max(0, (session.kanban_active ?? 0) - parked - (session.kanban_held ?? 0))
++  const attention = hasFreshKanbanObservation(session) ? session.kanban_triage_attention : undefined
++  const aged = attention?.count ?? 0
++  const agedParked = attention?.parked ?? 0
++  const agedHeld = attention?.held ?? 0
++  const parked = Math.max(0, (session.kanban_parked ?? 0) - agedParked)
++  const held = Math.max(0, (session.kanban_held ?? 0) - agedHeld)
++  const stalled = Math.max(0, (session.kanban_stalled ?? 0) - (attention?.stalled ?? 0))
++  const live = Math.max(0, (session.kanban_active ?? 0) - parked - held - aged)
+   const work = sidebarCardWork(session)
+   const queued = Math.min(live, work.queued)
+   const quiet = Math.min(Math.max(0, live - queued), work.quiet)
+ 
+   const counts: Record<CardColour, number> = {
+-    red: session.needs_you?.length ?? session.kanban_blocked ?? 0,
+-    pink: session.kanban_held ?? 0,
++    red: (session.needs_you?.length ?? session.kanban_blocked ?? 0) + aged,
++    pink: held,
+     orange: stalled + quiet,
+     green: queued,
+     amber: session.kanban_attention ?? 0,
+@@ -103,7 +108,7 @@
+   // eslint-disable-next-line react-hooks/exhaustive-deps
+   const colours = useMemo(() => aggregateCardColours(sessions), [sessions, tick])
+ 
+-  return <CardSquares colours={colours} counts />
++  return <CardSquares attention={sessions.some(s => hasFreshKanbanObservation(s) && Boolean(s.kanban_triage_attention?.count))} colours={colours} counts />
+ }
+ 
+ const trailingColours = (session: SessionInfo, executionUnknown: number) =>
+@@ -119,15 +124,17 @@
+   const counts = useContext(CardCountsContext)
+   const colours = counts ? backgroundCardColours(session) : trailingColours(session, executionUnknown)
+ 
+-  return counts ? <BackgroundCardSquares sessions={[session]} /> : <CardSquares colours={colours} />
++  return counts ? <BackgroundCardSquares sessions={[session]} /> : <CardSquares attention={hasFreshKanbanObservation(session) && Boolean(session.kanban_triage_attention?.count)} colours={colours} />
+ }
+ 
+ export function CardSquares({
+   colours,
+-  counts = false
++  counts = false,
++  attention = false
+ }: {
+   colours: ReturnType<typeof sessionCardColours>
+   counts?: boolean
++  attention?: boolean
+ }) {
+   const { t } = useI18n()
+ 
+@@ -138,7 +145,7 @@
+   const label = colours
+     .map(
+       ({ colour, count }) =>
+-        `${colour === 'unknown' ? t.messaging.unknown : t.sidebar.row.cardColours[colour]} ${count}`
++        `${colour === 'unknown' ? t.messaging.unknown : t.sidebar.row.cardColours[colour === 'red' && attention ? 'amber' : colour]} ${count}`
+     )
+     .join(' · ')
+ 
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+index dddd811e2d2867f14a31e4a6dfc575601be25d7f..7deb200d134d3764dcdf6587d32a53426226430e 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.test.tsx
+@@ -17,6 +17,21 @@
+ const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
+   ({ id, message_count: 4, source: 'desktop', started_at: 0, title: id, ...extra }) as SessionInfo
+ 
++it('operational overdue triage paints red without asking for a decision', () => {
++  const outcome = canonicalOutcome('stuck', { kind: 'waiting',
++    presentation: { stripe: 'stuck', reason_codes: ['open_work', 'triage_overdue'] } },
++    { kind: 'waiting', on: [{ kind: 'card', id: 't_owned', state: 'triage_overdue' }] })
++
++  const session = row('triage-chat', { outcome, kanban_active: 1, needs_you: [] })
++  setSessions([session])
++  const { result } = renderHook(() => useSessionRowStripe(session, 'background', true))
++  const { container } = render(<SessionRowStatusStripe outcomePainted={result.current.outcomePainted} session={session} statusStripe={result.current.statusStripe} />)
++  expect(stripe(container)?.getAttribute('data-status-stripe')).toBe('stuck')
++  expect(stripe(container)?.className).toContain('--color-red-500')
++  expect(stripe(container)?.getAttribute('aria-label')).toContain("overdue triage · waiting on this chat's agent")
++  expect(stripe(container)?.getAttribute('aria-label')).not.toContain('your decision')
++})
++
+ it.each(['ci', 'deploy'])('a replica %s park paints the canonical light-blue hollow cloud', () => {
+   const session = row('replica-wait', {
+     kanban_active: 1, kanban_parked: 1, kanban_external: 1, kanban_external_unknown: 1,
+diff --git a/apps/desktop/src/i18n/en_session_row_status.ts b/apps/desktop/src/i18n/en_session_row_status.ts
+index a3e48b2e7663c6f77924a92fc641bc47ac6517ce..2dcc79c79ab7227aed46b8edcb05b84f7b3a559f 100644
+--- a/apps/desktop/src/i18n/en_session_row_status.ts
++++ b/apps/desktop/src/i18n/en_session_row_status.ts
+@@ -63,6 +63,7 @@
+   outcomeCrons: names => `Keeps running: ${names.join(', ')}`,
+   outcomeWatches: cards => `Still watching: ${cards.map(watchLabel).join(', ')}`,
+   outcomeDecision: 'Waiting on your decision',
++  outcomeTriageOverdue: "Overdue triage · waiting on this chat's agent",
+   outcomeMuted: 'Muted',
+   outcomeRunning: 'Running',
+   outcomeWaiting: 'Waiting',
+diff --git a/apps/desktop/src/i18n/types_session_row_status.ts b/apps/desktop/src/i18n/types_session_row_status.ts
+index 827b86cd794659af62f719b72644ec45f857470d..89aa5ad603c8aed2ef364066a9e13310e2feced1 100644
+--- a/apps/desktop/src/i18n/types_session_row_status.ts
++++ b/apps/desktop/src/i18n/types_session_row_status.ts
+@@ -20,6 +20,7 @@
+   /** [daveey] Cards a done chat still watches; `label` = card title, `eta` = wake time in epoch seconds, when known. */
+   outcomeWatches: (cards: { id: string; label?: string; eta?: number }[]) => string
+   outcomeDecision: string
++  outcomeTriageOverdue: string
+   outcomeMuted: string
+   outcomeRunning: string
+   outcomeWaiting: string
+diff --git a/apps/desktop/src/lib/session-outcome.ts b/apps/desktop/src/lib/session-outcome.ts
+index fa06f13ad8ca0712aa226cfd73af570b058cea6f..cb174580e7817495ce7a9149697c95c4da385d4a 100644
+--- a/apps/desktop/src/lib/session-outcome.ts
++++ b/apps/desktop/src/lib/session-outcome.ts
+@@ -141,6 +141,10 @@
+ 
+ /** One `on[]` entry in words: a card reads `t_… scheduled · 14:00`, anything else `capacity: hub slot`. */
+ export const outcomeWaitingLine = (item: SessionOutcomeWaitingOn): string => {
++  if (item.kind === 'card' && item.state === 'triage_overdue') {
++    return `${item.id} · overdue triage · waiting on this chat's agent`
++  }
++
+   const head = item.kind === 'card' ? item.id : `${item.kind}: ${item.label || item.id}`
+   const state = item.state ? ` ${item.state}` : ''
+   const eta = typeof item.eta === 'number' && Number.isFinite(item.eta) ? ` · ${outcomeEtaLabel(item.eta)}` : ''
+diff --git a/apps/desktop/src/types/hermes-session-activity.ts b/apps/desktop/src/types/hermes-session-activity.ts
+index 8b78fe2015e70f51ea01c5e92f4da3d132156066..53a864f3c66ed8784d790264ab513f3537463a5b 100644
+--- a/apps/desktop/src/types/hermes-session-activity.ts
++++ b/apps/desktop/src/types/hermes-session-activity.ts
+@@ -61,6 +61,8 @@
+   /** [daveey] How many of `kanban_active` are queued behind a card blocked on a human ask (painted red). Absent
+    *  when zero. */
+   kanban_held?: number
++  /** Backend-authored overdue triage attention; never a human request. */
++  kanban_triage_attention?: { count: number; refs: string[]; parked: number; held: number; stalled: number }
+   /** [daveey] How many of `kanban_parked` wait on something only an agent can end (transient/capability block,
+    *  triage, continuation exhausted, a park with no named producer) and have waited over 2 h. Painted amber
+    *  "stalled", distinct from grey waiting and red needs-you. Absent when zero. */
+diff --git a/hermes_cli/fact_annotation_kanban.py b/hermes_cli/fact_annotation_kanban.py
+index ab9dccd1d5fedf05747ef13172a062d2a17a8eec..b2511d6cd9c297b457f09e7bcce988da686fd22d 100644
+--- a/hermes_cli/fact_annotation_kanban.py
++++ b/hermes_cli/fact_annotation_kanban.py
+@@ -34,6 +34,8 @@
+             keys.setdefault(sid, set()).update(activity._external_activity.replica_markers(card))
+         keys.setdefault(sid, set()).add((str(card.get('key')), str(bucket), is_parked))
+         keys[sid].update(activity._identity.timers.marker(card))
++        from hermes_cli.kanban_triage_attention import marker
++        keys[sid].update(marker(card))
+         activity._replica_exec.collect(card, execution)
+         if card.get('status') not in activity.PENDING_RELEASE_STATUSES and (
+                 activity._remote_wait(card) or {}).get('wait_state') == 'stalled':
+@@ -125,6 +127,8 @@
+     parts = (*maps[:4], waiting, parked, held, stalled, activity._identity.merge_keys(remote_keys, local_keys),
+              activity._extra_waiting(), _attention(paths, now, due), execution)
+     _, provider_due = activity._host_copy.waiting_events(now)
++    from hermes_cli.kanban_triage_attention import deadlines
++    due.extend(deadlines({m for values in parts[8].values() for m in values}, now=now))
+     if provider_due is not None:
+         due.append(provider_due)
+     value = freeze({'parts': parts, 'observed_at': now, 'external': external})
+diff --git a/hermes_cli/kanban_activity_identity.py b/hermes_cli/kanban_activity_identity.py
+index 8aac75533d2c54259e36a66da011e89fbce56d4d..659ec22eba120af151accf559cc645ace9969fd0 100644
+--- a/hermes_cli/kanban_activity_identity.py
++++ b/hermes_cli/kanban_activity_identity.py
+@@ -20,6 +20,8 @@
+         card = reads.get('timers', {}).get(tid)
+         if card:
+             out.setdefault(sid, set()).update(timers.marker({**card, 'key': f'{label}/{tid}'}))
++            from hermes_cli.kanban_triage_attention import marker
++            out[sid].update(marker({**card, 'key': f'{label}/{tid}'}))
+     return out
+ 
+ 
+@@ -104,7 +106,7 @@
+     """Drop the counts and stamp ``kanban_unknown`` (a failed read is unknown, never \"no work\")."""
+     for row in rows:
+         for key in ("kanban_active", "kanban_blocked", "kanban_unseen", "kanban_attention", "kanban_remote_stale",
+-                    "kanban_parked", "kanban_held", "kanban_stalled"):
++                    "kanban_parked", "kanban_held", "kanban_stalled", "kanban_triage_attention"):
+             row.pop(key, None)
+         row.pop("kanban_observed_at", None)
+         row.pop("kanban_waiting_on", None)
+diff --git a/hermes_cli/kanban_activity_projection.py b/hermes_cli/kanban_activity_projection.py
+index 6d3e1a312e5d73a7599b0640a5b6b77c47faf4ed..ce650d27695f31c1796eed6a96e246a29853f65a 100644
+--- a/hermes_cli/kanban_activity_projection.py
++++ b/hermes_cli/kanban_activity_projection.py
+@@ -36,6 +36,8 @@
+         row.pop("kanban_unknown", None)
+         ids = list(identity.row_ids(row))
+         identity.timers.stamp(row, {key for sid in ids for key in remote_keys.get(sid, ())})
++        from hermes_cli.kanban_triage_attention import project
++        project(row, {key for sid in ids for key in remote_keys.get(sid, ())}, now=now)
+         dup = identity.lineage_duplicates(remote_keys, ids)
+         identity.stamp_blocked_owners(row, remote_keys, ids, WAITING_ON_CAP)
+         for key, counts in (("kanban_active", active), ("kanban_blocked", blocked), ("kanban_unseen", unseen),
+diff --git a/hermes_cli/kanban_annotation_facts.py b/hermes_cli/kanban_annotation_facts.py
+index 49923736f27089885324b100d115a6dc038ad074..56f19538fee3249d3e73ccbf3655d4f091232e21 100644
+--- a/hermes_cli/kanban_annotation_facts.py
++++ b/hermes_cli/kanban_annotation_facts.py
+@@ -20,7 +20,7 @@
+ FIELDS = {
+     'kanban': frozenset(('kanban_active', 'kanban_blocked', 'kanban_unseen',
+         'kanban_attention', 'kanban_remote_stale', 'kanban_parked', 'kanban_held',
+-        'kanban_stalled', 'kanban_observed_at', 'kanban_unknown', 'kanban_waiting_on',
++        'kanban_stalled', 'kanban_observed_at', 'kanban_unknown', 'kanban_waiting_on', 'kanban_triage_attention',
+         'kanban_blocked_on', 'needs_you', 'kanban_external', 'kanban_external_unknown',
+         'kanban_external_down', 'kanban_external_cards', 'kanban_timed_cards', 'kanban_timed_more')),
+     'goal': frozenset(('goal_active',)),
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 8b2481c07751399a731da38d52301cce0bfe87b5..efb0c6e00a236376a58d0ad32008304b4dba2d9d 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -720,6 +720,8 @@
+         "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
+         "AND (t.id IS NULL OR (t.created_on IS NOT NULL AND t.created_on != ?))",
+         (gateway, profile, gateway)).fetchall()]
++    from hermes_cli.kanban_triage_attention import annotate
++    annotate(conn, rows)
+     return enrich(conn, rows)
+ 
+ 
+@@ -1052,6 +1054,7 @@
+                 "source": "replica",
+             }
+             out[pair].update(upstream_fields(r))
++            out[pair]['triage_entered_at'] = r.get('triage_entered_at')
+             out[pair].update({k: v for k, v in r.items() if k.startswith('timer_')})
+             out[pair].update(_ledger_wait(index, owner, owner_profile, board, tid, status,
+                                           named=named and not unknown))
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index e96ea409ef7d7748d0c06ab3b5d1f3ff376ef952..05635da61ebb417cfaae3394137609cf94219e2a 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -294,6 +294,11 @@
+             payload.update(published_park(conn, task['id']))
+     # No per-task timestamp: an unchanged task must publish an identical record, or every sync republishes
+     # every task. Owner liveness is the collector's per-scope heartbeat (``task_scopes[].observed_at``).
++    if row[0] == 'triage':
++        from hermes_cli.kanban_triage_attention import annotate
++        annotate(conn, [payload])
++    else:
++        payload.pop('triage_entered_at', None)
+     observation = {
+         'schema': 1,
+         'task_hash': hashlib.sha256(_json(payload).encode()).hexdigest(),
+@@ -735,7 +740,7 @@
+                 result.append({
+                     **diagnostic_fields(task, owner, current=current and not final, now=now),
+                     **remote_fields(task, **owner),
+-                    **{k: task.get(k) for k in ('title', 'assignee', 'block_kind', 'created_at', 'started_at', 'priority')},
++                    **{k: task.get(k) for k in ('title', 'assignee', 'block_kind', 'created_at', 'started_at', 'priority', 'triage_entered_at')},
+                     **owner, 'id': owner['task_id'],
+                     'key': '/'.join(owner[k] for k in ('gateway', 'profile', 'board', 'task_id')),
+                     'session': resolved, 'origin_session': origin['session'],
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index 689f123e27560c72b511a95658c20bc4cdc2dd12..a04de8940dbd87166c3f58846996e74c6dea9996 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -39,7 +39,7 @@
+ # ``_fold_legacy_aliases`` (status, sessions, created_at, created_by), and the record's own identity. Release
+ # evidence (``record_attests_terminal``) is computed in ``_stage`` from the whole record before it is slimmed.
+ SLIM_FIELDS = ('id', 'status', 'profile', 'board', 'gateway', 'created_at', 'created_by', 'sessions')
+-_REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority")
++_REMOTE_FIELDS = ("title", "status", "block_kind", "human_request", "assignee", "created_at", "started_at", "priority", "triage_entered_at")
+ 
+ 
+ def linked_sessions(task: dict[str, Any], me: str, origin_profile: str) -> tuple[str, ...]:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 4a3b26d9af2491949b8e2319455a0d83b175351e..8d597b451b572125aad6765dc4ebda58255616d1 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1313,6 +1313,8 @@
+             remote_keys.setdefault(sid, set()).update(_external_activity.replica_markers(card))
+         remote_keys.setdefault(sid, set()).add((str(card.get("key")), str(bucket), is_parked))
+         remote_keys[sid].update(_identity.timers.marker(card))
++        from hermes_cli.kanban_triage_attention import marker
++        remote_keys[sid].update(marker(card))
+         _replica_exec.collect(card, execution)
+         # Same status test as parked/blocked above: a legacy row whose live status is unknown (reported_status is
+         # only its last report) is never counted stalled, so stalled can't exceed what the row shows parked.
+diff --git a/hermes_cli/kanban_session_activity_timers.py b/hermes_cli/kanban_session_activity_timers.py
+index 867a5b19aec18eefa598fa80c749fdd28bc2a5c1..6fd4be7ff3736759b0e798e7873c44f74dc012c5 100644
+--- a/hermes_cli/kanban_session_activity_timers.py
++++ b/hermes_cli/kanban_session_activity_timers.py
+@@ -77,6 +77,8 @@
+             (json.dumps(ids),))}
+         from hermes_cli.kanban_producer_wait import stamp
+         stamp(conn, list(found.values()))
++        from hermes_cli.kanban_triage_attention import annotate
++        annotate(conn, found.values())
+         return found
+     except (sqlite3.Error, TypeError, ValueError):
+         return {}
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index 324facdea8be8bd3d57e55869cf6af61139f7d56..1966e101b40c3d2e39dd811ba10e708de64e32ad 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -79,6 +79,8 @@
+     except sqlite3.Error:  # board predates notify subscriptions
+         if strict and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'").fetchone():
+             raise
++    from hermes_cli.kanban_triage_attention import annotate
++    annotate(conn, found.values())
+     return found, pairs
+ 
+ 
+diff --git a/hermes_cli/kanban_triage_attention.py b/hermes_cli/kanban_triage_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..82fd200a36de8b3b276d7dcb110080048aca7d5d
+--- /dev/null
++++ b/hermes_cli/kanban_triage_attention.py
+@@ -0,0 +1,133 @@
++"""Current lifecycle episode and overdue attention; never an ask or permission.
++
++Detached timestamps can travel through replicas and annotation snapshots. Only
++source acquisition reads events; clock transitions reuse that captured evidence.
++"""
++import json
++import math
++
++TRIAGE_AFTER_S = 600
++_FIXED = {
++    'spend_budget_triaged': 'triage', 'spend_budget_held': 'triage', 'decision_retained': 'triage',
++    'contained': 'triage', 'gave_up': 'triage', 'supervisor_escalated': 'triage',
++    'decision_protected_stopped': 'triage', 'block_loop_detected': 'triage', 'agent_block_escalated': 'triage',
++    'claimed': 'running', 'spawned': 'running', 'unblocked': 'ready', 'triage_swept': 'ready',
++    'scheduled': 'scheduled', 'continued': 'scheduled', 'blocked': 'blocked',
++    'completed': 'done', 'archived': 'archived', 'review_requested': 'review',
++    'specified': 'todo', 'decomposed': 'todo',
++}
++_PAYLOAD = {'created', 'status', 'reopened', 'no_progress_escalated'}
++_PROMOTED = {'promoted', 'promoted_manual', 'unblocked'}
++LIFECYCLE_KINDS = tuple(sorted(set(_FIXED) | _PAYLOAD | _PROMOTED))
++
++
++def _epoch(value):
++    return value if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
++
++
++def _obj(value):
++    if isinstance(value, str):
++        try:
++            value = json.loads(value)
++        except ValueError:
++            return {}
++    return value if isinstance(value, dict) else {}
++
++
++def current_entry(row):
++    """First event in the current consecutive triage episode, else unknown.
++
++    No creation/update/heartbeat fallback. Repeated holds retain even an unknown
++    first timestamp; a later valid hold cannot fabricate the missing entry.
++    """
++    if row.get('status') != 'triage' or row.get('stale') or row.get('partial_source_unknown'):
++        return None
++    if 'triage_entered_at' in row:
++        return _epoch(row['triage_entered_at'])
++    phase, entered = None, None
++    for event in row.get('events') or ():
++        if not isinstance(event, dict):
++            continue
++        kind, payload = event.get('kind'), _obj(event.get('payload'))
++        landing = (payload.get('status', 'ready') if kind in _PROMOTED else
++                   payload.get('status') if kind in _PAYLOAD else _FIXED.get(kind or ''))
++        if landing is None:
++            continue
++        if landing == 'triage' and phase != 'triage':
++            entered = _epoch(event.get('created_at'))
++        elif landing != 'triage':
++            entered = None
++        phase = landing
++    return entered if phase == 'triage' else None
++
++
++def overdue(row, *, now):
++    entered = current_entry(row)
++    return entered is not None and entered <= now and now - entered > TRIAGE_AFTER_S
++
++
++def next_transition(row, *, now):
++    entered = current_entry(row)
++    if entered is None or entered > now or overdue(row, now=now):
++        return None
++    return math.nextafter(entered + TRIAGE_AFTER_S, math.inf)
++
++
++def annotate(conn, rows):
++    """Batch capture lifecycle evidence inside the caller's source transaction.
++
++    Only triage cards need histories. Callers retain this detached result under
++    their existing source revision memo; elapsed clock passes never call here.
++    """
++    from hermes_cli.kanban_table_columns import table_columns
++    rows = list(rows)
++    targets = {str(row['id']) for row in rows if row.get('status') == 'triage'}
++    columns = table_columns(conn, 'task_events')
++    events = {tid: [] for tid in targets}
++    if targets and {'task_id', 'id', 'kind', 'created_at', 'payload'} <= columns:
++        for item in conn.execute(
++                'SELECT task_id, kind, created_at, payload FROM task_events '
++                'WHERE task_id IN (SELECT value FROM json_each(?)) '
++                'AND kind IN (SELECT value FROM json_each(?)) ORDER BY id',
++                (json.dumps(sorted(targets)), json.dumps(LIFECYCLE_KINDS))):
++            tid, kind, at, payload = item
++            events[str(tid)].append({'kind': kind, 'created_at': at, 'payload': payload})
++    for row in rows:
++        row['triage_entered_at'] = current_entry({'status': row.get('status'), 'events': events.get(str(row['id']), ())})
++    return rows
++
++
++def marker(card):
++    entered = current_entry(card)
++    if entered is None:
++        return set()
++    key = str(card.get('key') or card['id'])
++    return {(key, 'triage:' + json.dumps({'entered_at': entered}, sort_keys=True), False)}
++
++
++def entries(markers):
++    """Owner-qualified, lineage-deduplicated detached clocks."""
++    return {key: json.loads(bucket[len('triage:'):]) for key, bucket, _ in markers if bucket.startswith('triage:')}
++
++
++def project(row, markers, *, now):
++    """Operational red counts, kept separate from human-only needs_you."""
++    clocks = entries(markers)
++    aged = {key for key, value in clocks.items()
++            if overdue({'status': 'triage', 'triage_entered_at': value['entered_at']}, now=now)}
++    # Human asks are already red. Count each card exactly once, including lineage aliases.
++    aged -= {key for key, bucket, _ in markers if bucket == 'blocked'}
++    if aged:
++        row['kanban_triage_attention'] = {
++            'count': len(aged), 'refs': sorted(aged),
++            'parked': len(aged & {key for key, _, parked in markers if parked}),
++            'held': len(aged & {key for key, bucket, _ in markers if bucket == 'held'}),
++            'stalled': len(aged & {key for key, bucket, _ in markers if bucket == 'stalled'}),
++        }
++    else:
++        row.pop('kanban_triage_attention', None)
++
++
++def deadlines(markers, *, now):
++    return [at for value in entries(markers).values()
++            if (at := next_transition({'status': 'triage', 'triage_entered_at': value['entered_at']}, now=now)) is not None]
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 6a1106e695dfba7c03a52d09d30b5debcd195c92..280a308065c43fbfb41609914dfe891f4a6204af 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -394,6 +394,9 @@
+         # Only a fresh owner watch reporting a running job can make this claim.
+         external = wait.get("external") if isinstance(wait.get("external"), dict) else {}
+         display_state = status
++        from hermes_cli.kanban_triage_attention import overdue
++        if overdue(card, now=time.time()):
++            display_state = 'triage_overdue'
+         if (status == "scheduled" and wait_kind != "clock"
+                 and wait.get("wait_state") == "external_running" and external.get("job") == "running"):
+             display_state = "external_running"
+diff --git a/hermes_state_session_status.py b/hermes_state_session_status.py
+index 4b193c71fb17a8f9ba863a1c2a005f588ba58830..8a33f2477354d164e2f635ecb3cb9b68b13da16b 100644
+--- a/hermes_state_session_status.py
++++ b/hermes_state_session_status.py
+@@ -15,7 +15,7 @@
+ _SUCCESS = frozenset({"succeeded", "done", "completed"})
+ _TURN_REASONS = frozenset({"notice_tail", "turn_unsettled", "subagent_killed"})
+ _OPEN = frozenset({"ready", "todo", "running", "waiting", "blocked", "scheduled", "review", "triage",
+-                   "external_running", "external_unknown", "source_unknown", "pending", "queued", "producer_wait"})
++                   "external_running", "external_unknown", "source_unknown", "pending", "queued", "producer_wait", "triage_overdue"})
+ 
+ 
+ def _identity(value: Any) -> dict[str, str]:
+@@ -79,6 +79,7 @@
+     turn = snapshot.get("turn") or {}
+     own_turn = turn.get("generation") == generation
+     asks = snapshot.get("asks") or []
++
+     if snapshot.get("muted"):
+         return {"kind": "muted", "presentation": {"stripe": "blocked", "reason_codes": ["muted"]}}
+     if asks:
+@@ -144,6 +145,12 @@
+     value = {"status_version": STATUS_VERSION, "identity": identity, "generation": generation,
+              "source_revisions": revisions, "coverage": coverage, "failures": failures,
+              **_verdict(snapshot, coverage, generation, failures)}
++    overdue = [item for item in snapshot.get('work') or ()
++               if item.get('kind') == 'card' and item.get('state') == 'triage_overdue']
++    if overdue and not snapshot.get('asks'):
++        value['presentation'] = {'stripe': 'stuck', 'reason_codes': list(dict.fromkeys([
++            *value['presentation']['reason_codes'], 'triage_overdue']))}
++        value.setdefault('on', deepcopy(overdue))
+     old = {key: prior.get(key) for key in value}
+     # An owner change is itself evidence even if the presentation is unchanged.
+     revision = int(prior.get("revision", 0))
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 1179176dd0fa7c39cfb4e4d305ee3a28ee252bc6..4ef11a7d3e282e6d7e31a48fbc34fe6bfc6b60e5 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -4991,6 +4991,7 @@
+     "sidebar.row.outcomeDone",
+     "sidebar.row.outcomeMuted",
+     "sidebar.row.outcomeRunning",
++    "sidebar.row.outcomeTriageOverdue",
+     "sidebar.row.outcomeUnresolved",
+     "sidebar.row.outcomeWaiting",
+     "sidebar.row.outcomeWatches",
+diff --git a/tests/hermes_cli/test_kanban_origin_ledger.py b/tests/hermes_cli/test_kanban_origin_ledger.py
+index bf23e87ba48b3c163e9c5339f139e60d3b80e3a2..e0df635cbdd4f6000ed0ccd4ef46114320cb5275 100644
+--- a/tests/hermes_cli/test_kanban_origin_ledger.py
++++ b/tests/hermes_cli/test_kanban_origin_ledger.py
+@@ -200,6 +200,21 @@
+         conn.rollback()
+ 
+ 
++def test_owner_publication_detaches_current_triage_episode_and_clears_on_exit(owner_board):
++    kb, conn = owner_board
++    tid = kb.create_task(conn, title='owned triage fixture', assignee='default')
++    conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++    conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'contained',1000,'{}')", (tid,))
++    conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',1600,'{}')", (tid,))
++    conn.commit()
++    record = _observe(conn, tid)
++    assert record['triage_entered_at'] == 1000
++    assert ledger._owner_evidence(record)
++    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    conn.commit()
++    assert 'triage_entered_at' not in _observe(conn, tid)
++
++
+ def _parks(kb, conn):
+     owner = kb.create_task(conn, title="builds the image", assignee="default")
+     tids = {k: kb.create_task(conn, title=k, assignee="default") for k in ("card", "ci", "probe", "clock")}
+diff --git a/tests/hermes_cli/test_kanban_triage_attention.py b/tests/hermes_cli/test_kanban_triage_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..051a0602f78e40eb690c30e1938923dc537b9721
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_triage_attention.py
+@@ -0,0 +1,86 @@
++"""Triage age is attention, never human authority or execution permission."""
++import math
++
++import pytest
++
++from hermes_cli import kanban_triage_attention as attention
++
++NOW = 1_800_000_000
++
++
++def event(kind, at, **payload):
++    return {'kind': kind, 'created_at': at, 'payload': payload}
++
++
++@pytest.mark.parametrize('age,overdue', [(599, False), (600, False), (601, True), (6 * 86400, True)])
++def test_strict_boundary_and_six_days(age, overdue):
++    row = {'status': 'triage', 'created_at': 1, 'events': [event('decision_retained', NOW - age)]}
++    assert attention.current_entry(row) == NOW - age
++    assert attention.overdue(row, now=NOW) is overdue
++    assert 'human_request' not in row
++
++
++def test_current_episode_survives_repeated_holds_and_clears_on_exit():
++    events = [event('created', 1, status='ready'), event('contained', NOW - 1000),
++              event('decision_retained', NOW - 10), event('heartbeat', NOW - 1)]
++    row = {'status': 'triage', 'events': events}
++    assert attention.current_entry(row) == NOW - 1000
++    events.append(event('unblocked', NOW - 5))
++    row['status'] = 'ready'
++    assert attention.current_entry(row) is None
++    events.append(event('decision_retained', NOW - 2))
++    row['status'] = 'triage'
++    assert attention.current_entry(row) == NOW - 2
++    assert not attention.overdue(row, now=NOW)
++
++
++@pytest.mark.parametrize('value', [None, True, '100', 0, -1, math.nan, math.inf, NOW + 1])
++def test_invalid_or_future_time_is_unknown(value):
++    row = {'status': 'triage', 'created_at': 1, 'events': [event('contained', value)]}
++    assert not attention.overdue(row, now=NOW)
++    assert attention.next_transition(row, now=NOW) is None
++
++
++def test_creation_only_counts_if_it_entered_triage():
++    assert attention.current_entry({'status': 'triage', 'created_at': 1}) is None
++    assert attention.current_entry({'status': 'triage', 'events': [event('created', 1, status='ready')]}) is None
++    assert attention.current_entry({'status': 'triage', 'events': [event('created', 1, status='triage')]}) == 1
++
++
++def test_unchanged_input_crossing_and_recovery():
++    row = {'status': 'triage', 'events': [event('contained', NOW)]}
++    assert attention.next_transition(row, now=NOW + 599) > NOW + 600
++    assert not attention.overdue(row, now=NOW + 600)
++    assert attention.overdue(row, now=NOW + 601)
++    row['status'] = 'done'
++    assert not attention.overdue(row, now=NOW + 601)
++
++
++@pytest.mark.parametrize('flag', ['stale', 'partial_source_unknown'])
++def test_unreadable_rows_cannot_assert_attention(flag):
++    row = {'status': 'triage', flag: True, 'events': [event('contained', 1)]}
++    assert not attention.overdue(row, now=NOW)
++
++
++@pytest.mark.parametrize('cause', [kind for kind, state in attention._FIXED.items() if state == 'triage'])
++def test_every_triage_cause_gets_the_same_visual_policy(cause):
++    assert attention.overdue({'status': 'triage', 'events': [event(cause, NOW - 601)]}, now=NOW)
++
++
++@pytest.mark.parametrize('exit_kind', ['specified', 'decomposed', 'scheduled', 'review_requested'])
++def test_administrative_exit_resets_episode(exit_kind):
++    row = {'status': 'triage', 'events': [event('contained', NOW - 1000), event(exit_kind, NOW - 5), event('decision_retained', NOW - 1)]}
++    assert attention.current_entry(row) == NOW - 1
++    assert not attention.overdue(row, now=NOW)
++
++
++def test_detached_markers_dedupe_aliases_and_do_not_double_count_human_asks():
++    key = 'owner/profile/board/t_same'
++    marker = attention.marker({'id': 't_same', 'key': key, 'status': 'triage', 'triage_entered_at': NOW - 601})
++    row = {'needs_you': []}
++    markers = marker | {(key, 'active', True), (key, 'stalled', False)}
++    attention.project(row, markers | marker, now=NOW)
++    assert row['kanban_triage_attention'] == {'count': 1, 'refs': [key], 'parked': 1, 'held': 0, 'stalled': 1}
++    attention.project(row, markers | {(key, 'blocked', False)}, now=NOW)
++    assert 'kanban_triage_attention' not in row
++    assert row['needs_you'] == []
+diff --git a/tests/tui_gateway/test_triage_attention.py b/tests/tui_gateway/test_triage_attention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91f460c2c941ee6a069c5c1b958edad281d0c6e8
+--- /dev/null
++++ b/tests/tui_gateway/test_triage_attention.py
+@@ -0,0 +1,111 @@
++"""Exercise current-episode clocks through real board readers and canonical publication."""
++import contextlib
++import json
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_triage_attention as attention
++from tui_gateway import notice_fanout as fanout
++from tui_gateway import notice_triage_clock as clocks
++from tests.tui_gateway import test_session_outcome_notices as helpers
++
++db = helpers.db
++
++
++def hold(tid, entered):
++    with contextlib.closing(kbc.connect()) as conn:
++        conn.execute("UPDATE tasks SET status='triage',block_kind='decision_pending' WHERE id=?", (tid,))
++        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',?,'{}')", (tid, entered))
++        conn.commit()
++    activity._reset_cache_for_tests()
++
++
++@pytest.mark.parametrize('age,red', [(599, False), (600, False), (601, True), (6 * 86400, True)])
++def test_board_to_canonical_status_and_detached_count(db, monkeypatch, age, red):
++    now = 1_800_000_000
++    tid = helpers._card(done=False)
++    hold(tid, now - age)
++    monkeypatch.setattr(fanout.time, 'time', lambda: now)
++    from hermes_state_outcome import refresh_outcome
++    outcome = refresh_outcome(helpers.CHAT, 'card_change', db=db)
++    assert (outcome['status']['presentation']['stripe'] == 'stuck') is red
++    assert outcome['kind'] != 'decision'
++    selected = activity.session_tasks([helpers.CHAT])
++    card = next(c for c in selected if c['id'] == tid)
++    assert card['triage_entered_at'] == now - age
++    markers = attention.marker(card) | {(card['key'], 'active', True)}
++    row = {}
++    attention.project(row, markers, now=now)
++    assert ('kanban_triage_attention' in row) is red
++    assert 'needs_you' not in row
++
++
++def test_natural_threshold_refreshes_existing_canonical_without_card_mutation(db, monkeypatch):
++    now = [1_800_000_000.]
++    monkeypatch.setattr(fanout.time, 'time', lambda: now[0])
++    tid = helpers._card(done=False)
++    hold(tid, now[0] - 599)
++    opener = helpers._opener(db)
++    helpers.so.refresh_outcome(helpers.CHAT, 'card_change', db=db)
++    first = fanout.card_change_pass(session_db=opener)
++    assert first.clock_deadline is not None
++    with contextlib.closing(kbc.connect()) as conn:
++        top = conn.execute('SELECT MAX(id) FROM task_events').fetchone()[0]
++    boundary = helpers.so.get_outcome(helpers.CHAT, db=db)
++    assert boundary['status']['presentation']['stripe'] != 'stuck'
++    now[0] += 1
++    assert not fanout.card_change_pass(session_db=opener)
++    # A clock pass must not reacquire task history.
++    now[0] += 1
++    from hermes_cli.kanban_reader_retention import reader
++    with monkeypatch.context() as patch:
++        patch.setattr(attention, 'annotate', lambda *a, **k: pytest.fail('unexpected history reread'))
++        with reader(kb.kanban_db_path()) as conn:
++            aged, due = clocks.local(conn, str(kb.kanban_db_path().resolve()), top, now=now[0])
++    assert aged == {tid} and due is None
++    second = fanout.card_change_pass(session_db=opener)
++    assert [r['task_id'] for r in second] == [tid]
++    result = helpers.so.get_outcome(helpers.CHAT, db=db)
++    assert result['status']['presentation']['stripe'] == 'stuck'
++    assert result['status']['kind'] != 'decision'
++    assert result['status']['revision'] > boundary['status']['revision']
++    with contextlib.closing(kbc.connect()) as conn:
++        assert conn.execute('SELECT MAX(id) FROM task_events').fetchone()[0] == top
++    assert not fanout.card_change_pass(session_db=opener)
++
++
++def test_remote_projection_changes_with_clock_and_clears_after_exit():
++    from types import SimpleNamespace
++    card = {'id': 't_same', 'key': 'remote/default/work/t_same', 'status': 'triage',
++            'session': 'chat', 'triage_entered_at': 1000}
++    source = SimpleNamespace(LISTED_STATUSES=('triage', 'ready'), _remote_cards=lambda *a, **k: [card])
++    from unittest.mock import patch
++    with patch.object(fanout.time, 'time', return_value=1600):
++        old, _ = fanout._remote_projection(source)
++        assert clocks.remote_due() > 1600
++    with patch.object(fanout.time, 'time', return_value=1601):
++        aged, _ = fanout._remote_projection(source)
++    assert old['chat'] == frozenset({(card['key'], 'triage')})
++    assert aged['chat'] == frozenset({(card['key'], 'triage_overdue')})
++    card['status'] = 'ready'
++    with patch.object(fanout.time, 'time', return_value=1602):
++        cleared, _ = fanout._remote_projection(source)
++    assert cleared['chat'] == frozenset({(card['key'], 'ready')})
++
++
++def test_same_status_reentry_is_semantic_in_both_remote_memo_paths(db):
++    tid = helpers._card(done=False)
++    hold(tid, 1000)
++    with contextlib.closing(kbc.connect()) as conn:
++        first = fanout._task_prints(conn, [tid])
++        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'unblocked',1600,'{}')", (tid,))
++        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES (?,'decision_retained',1601,'{}')", (tid,))
++        conn.commit()
++        second = fanout._task_prints(conn, [tid])
++        assert first != second
++        assert second[tid][0][-1] == 1601
++    row = {'key': 'owner/default/board/' + tid, 'status': 'triage', 'triage_entered_at': 1000}
++    before = fanout._ledger_content_key([row])
++    row['triage_entered_at'] = 1601
++    assert fanout._ledger_content_key([row]) != before
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index ea8a0af454df96df0c7426c14c6a0d66600f7bfc..61f359303a110916d6ed4d256247d403d6321f89 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -673,6 +673,8 @@
+             if getattr(result, 'next_deadline', None) is not None:
+                 source = getattr(result, 'retry_origin', None)
+                 due_report(report, result.next_deadline, *(source[1:] if source is not None else (kind, 'unknown')), cause='retry')
++            if getattr(result, 'clock_deadline', None) is not None:
++                due_report(report, result.clock_deadline, kind)
+             return result
+         inputs = probe(kind, every_store=every_store, live=live) if every_store else Inputs()
+         if report is not None:
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 27f802bb372344d7683a2e1e0637098eb321b282..0122ea24a067838bd9d6071fd1aa27cfe293bed2 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -66,6 +66,8 @@
+     _remote_pending.clear()
+     from tui_gateway import notice_fanout_state
+     notice_fanout_state.reset_for_tests()
++    from tui_gateway import notice_triage_clock
++    notice_triage_clock.reset()
+ 
+ 
+ def chat_skip_reason(db: Any, chat_id: str) -> Optional[str]:
+@@ -194,7 +196,7 @@
+     return list(dict.fromkeys(str(r[0]) for r in rows)), boundary
+ 
+ 
+-def _board_idle(ident: str) -> bool:
++def _board_idle(ident: str, report=None) -> bool:
+     """True when the board's newest ``task_events`` id equals the durable cursor: nothing happened since the last
+     pass, so the per-pass board connect (schema prepare, 121 of the pass's 647 profile samples) and the fan-out are
+     skipped. Read through the shared retained reader. The cursor IS the effective key (a changed board, or any
+@@ -207,6 +209,12 @@
+             return False
+         with reader(Path(ident)) as ro:
+             top = int(ro.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
++            from tui_gateway import notice_triage_clock
++            aged, due = notice_triage_clock.local(ro, ident, top, now=time.time())
++            if report is not None:
++                report.clock(due)
++            if aged:
++                return False
+             if top == since:
+                 return True
+             if top < since:
+@@ -308,7 +316,7 @@
+ # The ledger-card fields ``kanban_chat_links.replica_cards`` reads (owner labels, profile-board cards, cold-start
+ # fallback) and the pass keeps (key, status, chat, origin chat, unfinished).
+ _LEDGER_KEY_FIELDS = ("key", "board", "id", "gateway", "profile", "session", "origin_session", "origin_gateway",
+-                      "origin_profile", "status", "unfinished", "released", "ownership_state")
++                      "origin_profile", "status", "unfinished", "released", "ownership_state", "triage_entered_at")
+ 
+ 
+ def _ledger_content_key(cards: list[dict]) -> str:
+@@ -359,6 +367,10 @@
+         marks = ",".join("?" * len(chunk))
+         for tid, status, owner in conn.execute(f"SELECT id, status, created_on FROM tasks WHERE id IN ({marks})", chunk):
+             out[tid] = [(status, owner), []]
++        from hermes_cli.kanban_triage_attention import annotate
++        triage = [{'id': tid, 'status': 'triage'} for tid in chunk if tid in out and out[tid][0][0] == 'triage']
++        for card in annotate(conn, triage):
++            out[card['id']][0] += (card['triage_entered_at'],)
+         for row in conn.execute(f"SELECT task_id, chat_gateway, chat_profile, chat_session, kind, released "
+                                 f"FROM task_chat_links WHERE task_id IN ({marks})", chunk):
+             if row[0] in out:
+@@ -450,7 +462,11 @@
+             remote_retry(out, 'initial_poll_failed')
+             inputs = None
+     memo = _remote_memo
+-    if not diagnostic.test('health_pending', health_generation is not None) and not absent_due and not _remote_pending and inputs is not None \
++    from tui_gateway import notice_triage_clock
++    due = notice_triage_clock.remote_due()
++    out.clock(due)
++    clock_due = due is not None and time.time() >= due
++    if not clock_due and not diagnostic.test('health_pending', health_generation is not None) and not absent_due and not _remote_pending and inputs is not None \
+             and not diagnostic.test('no_memo', memo is None) \
+             and not diagnostic.test('inputs_changed', memo[0] != inputs[0]) \
+             and not diagnostic.check('ledger_changed', lambda: memo[1] != _ledger_content_key(inputs[1])) \
+@@ -461,13 +477,15 @@
+     _remote_memo = None
+     from tui_gateway import notice_fanout_state as state
+     snapshot, known = _remote_projection(activity)
++    out.clock_deadline = None
++    out.clock(notice_triage_clock.remote_due())
+     previous = state.load_remote(strict=True)
+     if previous is None:
+         if not state.seed_remote(snapshot):
+             remote_retry(out, 'seed_failed')
+             diagnostic.call = 'seed_failed'
+             return out
+-        if health_generation is None:
++        if health_generation is None and not any(s == 'triage_overdue' for values in snapshot.values() for _, s in values):
+             diagnostic.call = 'seed_only'
+             return out
+         previous = {}  # first source publication must also repair retained unknown outcomes
+@@ -518,11 +536,16 @@
+     from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+     current: dict[str, set[tuple[str, str]]] = {}
+     known: dict[str, set[str]] = {}
+-    for card in activity._remote_cards(None, activity.LISTED_STATUSES, stale_ok=False):
++    from tui_gateway import notice_triage_clock
++    from hermes_cli.kanban_triage_attention import overdue
++    now = time.time()
++    for card in notice_triage_clock.remote_cards(activity._remote_cards(None, activity.LISTED_STATUSES, stale_ok=False), now=now):
+         known.setdefault(str(card.get("board")), set()).add(str(card.get("id")))
+         status = card.get("status")
+         if status not in activity.LISTED_STATUSES and not (status in PENDING_RELEASE_STATUSES and card.get("unfinished")):
+             continue
++        if overdue(card, now=now):
++            status = 'triage_overdue'
+         for chat in {card.get("session"), card.get("origin_session")} - {None, ""}:
+             current.setdefault(chat, set()).add((card["key"], status))
+     return {chat: frozenset(cards) for chat, cards in current.items()}, known
+@@ -643,14 +666,21 @@
+     for slug in boards:
+         try:
+             ident = str(_kb.kanban_db_path(slug).resolve())
+-            if _board_idle(ident):
++            if _board_idle(ident, done):
+                 continue
+             with contextlib.closing(_kbc.connect(board=slug)) as conn:
+                 from tui_gateway import notice_fanout_state as state
+                 tids, cursor = _changed_tasks(conn, ident)
++                from tui_gateway import notice_triage_clock
++                top = int(conn.execute('SELECT COALESCE(MAX(id), 0) FROM task_events').fetchone()[0])
++                aged, due = notice_triage_clock.local(conn, ident, top, now=time.time())
++                done.clock(due)
++                tids = list(dict.fromkeys([*tids, *sorted(aged)]))
+                 done += _fan_out_changes(conn, _kb, session_db, slug, tids, hosted)
+                 if not state.set_cursor(ident, cursor):
+                     local_retry(done, 'set_cursor_failed')
++                else:
++                    notice_triage_clock.ack(ident, aged)
+                 top = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
+                 if top > cursor:
+                     local_retry(done, 'top_gt_cursor', 0.0)
+diff --git a/tui_gateway/notice_fanout_result.py b/tui_gateway/notice_fanout_result.py
+index 05f76e774ba1fc7ef07d6a3d53417e9837a8eaff..8f452d3b68178bc008cee0dbf75e11310181068a 100644
+--- a/tui_gateway/notice_fanout_result.py
++++ b/tui_gateway/notice_fanout_result.py
+@@ -17,6 +17,7 @@
+         super().__init__()
+         self.incomplete = False
+         self.next_deadline: float | None = None
++        self.clock_deadline: float | None = None
+         self.retry_origin = None
+         self.subpass = origin(subpass)[0]
+ 
+@@ -33,6 +34,9 @@
+ 
+     def absorb(self, other: FanoutResult) -> None:
+         self.extend(other)
++        if other.clock_deadline is not None:
++            self.clock_deadline = (other.clock_deadline if self.clock_deadline is None
++                                   else min(self.clock_deadline, other.clock_deadline))
+         if other.incomplete:
+             self.incomplete = True
+             if other.next_deadline is not None:
+@@ -41,3 +45,9 @@
+             source = getattr(other, 'retry_origin', None)
+             if source is not None:
+                 self.retry_origin = earliest(self.retry_origin, *source)
++
++    def clock(self, wall_due):
++        """A successful pass can owe a future semantic transition, not a retry."""
++        if wall_due is not None:
++            due = time.monotonic() + max(0., wall_due - time.time())
++            self.clock_deadline = due if self.clock_deadline is None else min(self.clock_deadline, due)
+diff --git a/tui_gateway/notice_triage_clock.py b/tui_gateway/notice_triage_clock.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7b2f06425ae6214a96e4c4c7eac169d10e086a9
+--- /dev/null
++++ b/tui_gateway/notice_triage_clock.py
+@@ -0,0 +1,53 @@
++"""Detached triage clocks for canonical outcome fanout; no lifecycle writes."""
++from pathlib import Path
++
++from hermes_cli import kanban_triage_attention as attention
++
++_cache = {}
++_remote_due = None
++
++
++def reset():
++    global _remote_due
++    _cache.clear()
++    _remote_due = None
++
++
++def local(conn, ident, top, *, now):
++    stat = Path(ident).stat()
++    identity = (stat.st_dev, stat.st_ino)
++    hit = _cache.get(ident)
++    changed = hit is None or hit[0] != identity or top < hit[1]
++    if not changed and top != hit[1]:
++        changed = conn.execute(
++            'SELECT 1 FROM task_events WHERE id > ? AND kind IN (SELECT value FROM json_each(?)) LIMIT 1',
++            (hit[1], __import__('json').dumps(attention.LIFECYCLE_KINDS))).fetchone() is not None
++    if changed:
++        cards = [dict(id=tid, status='triage') for tid, in conn.execute("SELECT id FROM tasks WHERE status='triage'")]
++        attention.annotate(conn, cards)
++        acked = set() if hit is None or hit[0] != identity else hit[3]
++    else:
++        cards, acked = hit[2], hit[3]
++    episodes = {(c['id'], c.get('triage_entered_at')) for c in cards}
++    acked &= episodes
++    _cache[ident] = (identity, top, cards, acked)
++    ready = {c['id'] for c in cards if attention.overdue(c, now=now) and (c['id'], c.get('triage_entered_at')) not in acked}
++    due = min((at for c in cards if (at := attention.next_transition(c, now=now)) is not None), default=None)
++    return ready, due
++
++
++def ack(ident, tids):
++    hit = _cache.get(ident)
++    if hit:
++        hit[3].update((c['id'], c.get('triage_entered_at')) for c in hit[2] if c['id'] in tids)
++
++
++def remote_cards(cards, *, now):
++    global _remote_due
++    cards = list(cards)
++    _remote_due = min((at for c in cards if (at := attention.next_transition(c, now=now)) is not None), default=None)
++    return cards
++
++
++def remote_due():
++    return _remote_due
+-- 
+2.43.0
+

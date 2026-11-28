@@ -1,0 +1,103 @@
+From 6602dba7d3e51a50ad1480740dc11f141583a624 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:40:42 +0000
+Subject: [PATCH 6718] Producer chat-link reconciliation without display feedback
+
+Public mirror of source commit 6602dba7d3e51a50ad1480740dc11f141583a624.
+
+---
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index f3807c77d0db4d53f88aa443a004cc7b6afd99b1..8b2481c07751399a731da38d52301cce0bfe87b5 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -484,10 +484,16 @@
+         stale = _stale_uids(board, gateway, cards)
+         profile_board = la.timed("sync.links.profile_board", _profile_board_ids, board, gateway, cards)
+         want.update(la.timed("sync.links.ledger", _ledger_links, board, gateway, cards, profile_board))
+-    want.update(la.timed("sync.links.owner_releases", _owner_written_releases, board, gateway, want))
+     with la.pass_("sync.links.existing"):
+         rows = conn.execute("SELECT uid, released, chat_session, kind, task_id, chat_profile FROM task_chat_links "
+                             "WHERE chat_gateway = ?", (gateway,)).fetchall()
++    existing = {r[0] for r in rows}
++    # Finished origins authorize closure of an existing link, not a backfill of
++    # historical links this gateway never held. Owner-written receipts below
++    # retain their separate release protocol.
++    want = {uid: link for uid, link in want.items()
++            if not (link["kind"] == "created" and link["released"] and uid not in existing)}
++    want.update(la.timed("sync.links.owner_releases", _owner_written_releases, board, gateway, want))
+     return want, rows, profile_board, stale
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 7adaab0f93400d367156834ef08386cd160f0b37..276fccbe529a70a71e7cae6a5b56167971b528b7 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1335,8 +1335,11 @@
+                 cards = kanban_chat_links.reconciliation_cards()
+                 ledger = la.timed("sync.links.ledger_slices", ledger_slices, cards, gateway)
+             local = {slug for slug, _path in boards}
+-            if not skip_unchanged or set(ledger) - local:
+-                created = la.timed("sync.links.ensure_boards", ensure_link_boards, set(ledger), gateway)
++            # Keep closed rows in ledger signatures for existing-board invalidation,
++            # but history alone cannot discover a new link-only board.
++            active = {slug for slug, rows in ledger.items() if any(not row[-1] for row in rows)}
++            if not skip_unchanged or active - local:
++                created = la.timed("sync.links.ensure_boards", ensure_link_boards, active, gateway)
+                 if created:
+                     _log.info("kanban sync: link-only boards %s", created)
+                     boards = board_paths()
+diff --git a/tests/hermes_cli/test_kanban_chat_links_oscillation.py b/tests/hermes_cli/test_kanban_chat_links_oscillation.py
+index f4ad273fe32a1e6c50a007b48f83c647d82bc2bc..7686ebf20028ecfe3e59335d540bc3078d8c02a9 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_oscillation.py
++++ b/tests/hermes_cli/test_kanban_chat_links_oscillation.py
+@@ -54,6 +54,47 @@
+         assert live.execute('SELECT released FROM task_chat_links WHERE uid=?', (uid,)).fetchone()[0] == state
+ 
+ 
++def test_finished_origin_does_not_backfill_missing_link(live, monkeypatch):
++    task = kb.create_task(live, title='finished between passes', assignee='worker', session_id='placement')
++    uid = links.link_uid(task, ME, 'default', 'human', 'created')
++    origin = dict(id=task, board='default', origin_gateway=ME, origin_profile='default',
++                  session='human', via='origin', status='done', unfinished=False, stale=False)
++    monkeypatch.setattr(activity, 'remote_links_and_origin_rows', lambda: ([], [origin]))
++    # Settle unrelated local links before measuring historical-origin effects.
++    links.reconcile(live, 'default', ME, ledger=False)
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_sync_outbox')
++    for _ in range(4):
++        assert not any(links.reconcile(live, 'default', ME).values())
++        assert not live.execute('SELECT 1 FROM task_chat_links WHERE uid=?', (uid,)).fetchone()
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE table_name='task_chat_links'").fetchone()
++    # This is not a blanket ban on new origin links: a genuine reopen creates once.
++    origin.update(unfinished=True, status='ready')
++    assert links.reconcile(live, 'default', ME)['added'] == 1
++    assert live.execute('SELECT released FROM task_chat_links WHERE uid=?', (uid,)).fetchone()[0] == 0
++    for _ in range(3):
++        assert not any(links.reconcile(live, 'default', ME).values())
++
++
++@pytest.mark.parametrize('skip_unchanged', [False, True])
++def test_finished_history_does_not_create_link_only_board(live, kanban_home, monkeypatch, skip_unchanged):
++    from hermes_cli import kanban_sync_client as client
++    closed = dict(id='t_finished', board='history-only', origin_gateway=ME, origin_profile='default',
++                  session='human', via='origin', status='done', unfinished=False, stale=False)
++    monkeypatch.setattr(activity, 'remote_links_and_origin_rows', lambda: ([], [closed]))
++    for _ in range(3):
++        client.reconcile_links([], ME, skip_unchanged=skip_unchanged)
++        assert not (kanban_home / 'kanban' / client.sync.LINKS_DIR / 'history-only.db').exists()
++    # Closed rows remain signature inputs on an existing board: closure must wake it.
++    cards = links.reconciliation_cards()
++    assert client.ledger_slices(cards, ME)['history-only']
++    assert all(row[-1] for row in client.ledger_slices(cards, ME)['history-only'])
++    # Exercise actual discovery/board creation when the producer really reopens.
++    closed.update(unfinished=True, status='ready')
++    client.reconcile_links([], ME, skip_unchanged=skip_unchanged)
++    assert (kanban_home / 'kanban' / client.sync.LINKS_DIR / 'history-only.db').exists()
++
++
+ @pytest.mark.parametrize('profile', [None, 'default'])
+ def test_contained_shepherd_reconcile_does_not_fight_pull(live, monkeypatch, profile):
+     task = kb.create_task(live, title='held', assignee='worker', session_id='placement')
+-- 
+2.43.0
+

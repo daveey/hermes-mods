@@ -1,0 +1,140 @@
+From dfbe4672e4148e9c0159f152d037ec27a2461e3b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:36:41 +0000
+Subject: [PATCH 6947] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit dfbe4672e4148e9c0159f152d037ec27a2461e3b.
+
+---
+diff --git a/hermes_cli/kanban_replica_transport.py b/hermes_cli/kanban_replica_transport.py
+index cf0b9de24b8c3a81a1434ee4b74da0ebd9fde544..7f3bdc5564da49c75ca21349fb8e59826b6ed9c7 100644
+--- a/hermes_cli/kanban_replica_transport.py
++++ b/hermes_cli/kanban_replica_transport.py
+@@ -6,7 +6,9 @@
+ import re
+ import sqlite3
+ 
+-_TOKENS = re.compile(r'\\.|\\$|["\[\]{}]', re.DOTALL)
++_TOKENS = re.compile(r'["\[\]{}]')
++# Possessive runs skip serialized task strings in C without dispatching each escape.
++_STRING = re.compile(r'(?:[^"\\]++|\\.)*+', re.DOTALL)
+ _CHUNK = 16 << 10
+ 
+ 
+@@ -24,23 +26,30 @@
+         for offset in range(0, len(packed), _CHUNK):
+             chunk = decoder.decode(packed[offset:offset + _CHUNK], final=offset + _CHUNK >= len(packed))
+             start = 0 if depth >= 2 else None
+-            scan_start = 0
++            pos = 0
+             if escaped and chunk:
+-                scan_start, escaped = 1, False
+-            for match in _TOKENS.finditer(chunk, scan_start):
+-                token = match.group()
+-                pos = match.start()
++                pos, escaped = 1, False
++            while pos < len(chunk):
+                 if quoted:
+-                    if token == '"':
+-                        quoted = False
+-                    elif token == '\\':
++                    pos = _STRING.match(chunk, pos).end()
++                    if pos == len(chunk):
++                        break
++                    if chunk[pos] == '\\':  # an escape split across decoded chunks
+                         escaped = True
++                        break
++                    quoted = False  # the first unescaped quote closes the string
++                    pos += 1
+                     continue
++                match = _TOKENS.search(chunk, pos)
++                if match is None:
++                    break
++                token = match.group()
++                pos = match.end()
+                 if token == '"':
+                     quoted = True
+                 elif token in ('[', '{'):
+                     if depth == 1:
+-                        start = pos
++                        start = match.start()
+                     depth += 1
+                 elif token in (']', '}'):
+                     depth -= 1
+diff --git a/tests/hermes_cli/test_kanban_replica_transport_strings.py b/tests/hermes_cli/test_kanban_replica_transport_strings.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd330977cdb6216a17af8d26d9f4c10741c9902f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_transport_strings.py
+@@ -0,0 +1,68 @@
++"""String-heavy replica pages keep Python work structural, not per escape. [daveey]"""
++import json
++
++import pytest
++
++from hermes_cli import kanban_replica_transport as transport
++
++
++def test_escaped_payload_does_not_dispatch_each_escape_to_python(monkeypatch):
++    tokens = transport._TOKENS
++    visits = []
++
++    class CountTokens:
++        def finditer(self, *args):
++            for match in tokens.finditer(*args):
++                visits.append(1)
++                yield match
++
++        def search(self, *args):
++            match = tokens.search(*args)
++            if match is not None:
++                visits.append(1)
++            return match
++
++    monkeypatch.setattr(transport, '_TOKENS', CountTokens())
++    row = ['owner', 'p/b/t_one', '\\"[]{}\n' * 20000, 1000, 1, 1, 140000]
++    packed = json.dumps([row], ensure_ascii=False).encode()
++    assert list(transport.iter_page(packed)) == [tuple(row)]
++    # Chunk count can grow with payload size; escaped punctuation must not cause
++    # one Python token dispatch per byte of a serialized task/history string.
++    assert len(visits) < 100, len(visits)
++
++
++@pytest.mark.parametrize('encoding', ['utf-8', 'utf-16le', 'utf-16be'])
++@pytest.mark.parametrize('chunk', [1, 2, 3, 7, 31, 16384])
++def test_chunk_boundaries_preserve_nested_strings_and_typed_cells(monkeypatch, encoding, chunk):
++    monkeypatch.setattr(transport, '_CHUNK', chunk)
++    strings = ['', '"', '\\', '\\"', '\\\\"', '[]{}', '\n\t\r\b\f', '😀é中',
++               json.dumps({'body': '"\\[]{}😀\n' * 20}), '\\' * 33]
++    rows = [['gw', 'p/b/t', text, None, -1, 1.25, {'nested': [text, True, False]}] for text in strings]
++    packed = json.dumps(rows, ensure_ascii=False).encode(encoding)
++    assert list(transport.iter_page(packed, encoding)) == [tuple(row) for row in rows]
++    assert list(transport.iter_page('[]'.encode(encoding), encoding)) == []
++
++
++@pytest.mark.parametrize('packed', [b'[["open', b'[["escape\\', b'[[1,2', b'[[{"k":'])
++def test_truncated_page_still_refuses(packed):
++    with pytest.raises(ValueError):
++        list(transport.iter_page(packed))
++
++
++def test_seeded_string_rows_match_full_decode(monkeypatch):
++    import random
++
++    rng = random.Random(435)
++    alphabet = 'abc"\\[]{}\n\t😀é中'
++    rows = [[i, ''.join(rng.choices(alphabet, k=rng.randrange(1500))), None, True] for i in range(120)]
++    packed = json.dumps(rows, ensure_ascii=False).encode()
++    for chunk in (1, 19, 16384):
++        monkeypatch.setattr(transport, '_CHUNK', chunk)
++        assert list(transport.iter_page(packed)) == [tuple(row) for row in rows]
++
++
++def test_invalid_utf8_retains_sqlite_error():
++    import sqlite3
++
++    with pytest.raises(sqlite3.OperationalError, match='Could not decode replica page as text'):
++        list(transport.iter_page(b'[["\xff"]]'))
+-- 
+2.43.0
+

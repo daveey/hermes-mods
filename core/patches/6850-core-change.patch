@@ -1,0 +1,195 @@
+From 7a70c513e7fe7a7495a9ddb95aeabafdf0a2ab90 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:24:19 +0000
+Subject: [PATCH 6850] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 7a70c513e7fe7a7495a9ddb95aeabafdf0a2ab90.
+
+---
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+index 1dfeaa792decc864228ca40437723cc45f6fa331..bfcbfcba94629fce12f028773ecc51b3de795423 100644
+--- a/hermes_cli/kanban_replay_journal.py
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -8,7 +8,7 @@
+ 
+ import json
+ import sqlite3
+-from collections.abc import Callable
++from collections.abc import Callable, Mapping
+ 
+ import rfc8785
+ 
+@@ -113,6 +113,24 @@
+     return _read(conn)[0]
+ 
+ 
++def guard_import(conn: sqlite3.Connection, tables: tuple[str, ...], only: Mapping[str, set[str]] | None) -> bool:
++    """Fence import scopes under the writer reservation; imports are not replay repair."""
++    _transaction(conn)
++    anchor = conn.execute('SELECT journal_id FROM kanban_sync_state').fetchone()
++    if anchor is None or anchor[0] is None:
++        return False
++    _reserve(conn)
++    _state, encoded = _read(conn)
++    held = list(conn.execute("SELECT table_name,row_uid FROM kanban_sync_outbox WHERE state='rejected'"))
++    if encoded is not None:
++        wire = json.loads(encoded)
++        held.append((wire['table'], wire['uid']))
++    for table, uid in held:
++        if table in tables and (only is None or uid in only.get(table, set())):
++            raise ValueError('import overlaps replay custody; explicit reconciliation required')
++    return True
++
++
+ def pending_wire(conn: sqlite3.Connection) -> bytes | None:
+     """Return exact canonical bytes after validating identity, digest and ack custody."""
+     return _read(conn)[1]
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 4e93e6c0d91bd3fff2ddd1c91f8036672b9628dd..bd2a077a5b3c8de14c12a7549019d791642425f8 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1630,8 +1630,11 @@
+     counts: dict[str, int] = {}
+     now = time.time_ns() // 1_000_000
+     with write_txn(conn):
+-        # Rows the service refused before the import (edits of cards it had not seen) are superseded by the full rows.
+-        counts["cleared_rejected"] = (0 if only is not None else
++        from hermes_cli.kanban_replay_journal import guard_import
++        tables = tuple(tables)
++        bound = guard_import(conn, tables, only)
++        # Bound rejections retain semantic custody; a bulk import is not authorized repair.
++        counts["cleared_rejected"] = (0 if bound or only is not None else
+                                       conn.execute("DELETE FROM kanban_sync_outbox WHERE state = 'rejected'").rowcount)
+         for table in tables:
+             wanted = None if only is None else only.get(table, set())
+diff --git a/tests/hermes_cli/test_kanban_replay_import.py b/tests/hermes_cli/test_kanban_replay_import.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..295216d5b79b2ecbdaf5b827c9f9c55bc21202a4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_import.py
+@@ -0,0 +1,122 @@
++"""Import is not permission to replace an issued or rejected replay identity."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++
++def frozen_import_state(conn):
++    return (list(map(tuple, conn.execute('SELECT * FROM kanban_sync_outbox ORDER BY op_id'))),
++            list(map(tuple, conn.execute('SELECT * FROM kanban_replay_sender1'))))
++
++
++@pytest.mark.parametrize('scoped', [False, True])
++@pytest.mark.parametrize('status', ['pending', 'rejected'])
++def test_import_cannot_replace_replay_custody(live, scoped, status):
++    tid = kb.create_task(live, title='custody', assignee='worker')
++    receiver = helpers.Receiver()
++    if status == 'pending':
++        receiver.lose_reply = True
++        with pytest.raises(OSError, match='reply lost'):
++            client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    else:
++        receiver.status = status
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    before = frozen_import_state(live)
++    with pytest.raises(ValueError, match='import overlaps replay custody'):
++        client.import_board(live, tables=['tasks'], only={'tasks': {tid}} if scoped else None)
++    assert frozen_import_state(live) == before
++
++
++@pytest.mark.parametrize('status', ['pending', 'rejected'])
++def test_unrelated_scoped_import_preserves_custody(live, status):
++    tid = kb.create_task(live, title='custody', assignee='worker')
++    receiver = helpers.Receiver()
++    receiver.status = status if status == 'rejected' else 'applied'
++    receiver.lose_reply = status == 'pending'
++    if receiver.lose_reply:
++        with pytest.raises(OSError):
++            client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    else:
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    other = kb.create_task(live, title='unrelated', assignee='worker')
++    before = frozen_import_state(live)
++    counts = client.import_board(live, tables=iter(['tasks']), only={'tasks': {other}})
++    after = frozen_import_state(live)
++    assert counts == {'cleared_rejected': 0, 'tasks': 1}
++    assert after[1] == before[1]
++    assert [r for r in after[0] if r[2] == tid] == [r for r in before[0] if r[2] == tid]
++    assert len(after[0]) == len(before[0]) + 1
++
++
++def test_bound_import_does_not_clear_unrelated_rejections(live):
++    kb.create_task(live, title='rejected', assignee='worker')
++    receiver = helpers.Receiver()
++    receiver.status = 'rejected'
++    client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    before = frozen_import_state(live)
++    assert client.import_board(live, tables=['task_links']) == {'cleared_rejected': 0, 'task_links': 0}
++    assert frozen_import_state(live) == before
++
++
++def test_bound_import_validates_journal_anchor(live):
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_state SET journal_id=?', ('different',))
++    before = frozen_import_state(live)
++    with pytest.raises(ValueError, match='binding mismatch'):
++        client.import_board(live, tables=['tasks'])
++    assert frozen_import_state(live) == before
++
++
++def test_empty_import_scope_keeps_pending_custody(live):
++    kb.create_task(live, title='issued', assignee='worker')
++    receiver = helpers.Receiver()
++    receiver.lose_reply = True
++    with pytest.raises(OSError):
++        client.push(live, receiver, 'default', 'macbook', primary=False, max_batches=1)
++    before = frozen_import_state(live)
++    assert client.import_board(live, tables=['tasks'], only={'tasks': set()}) == {
++        'cleared_rejected': 0, 'tasks': 0}
++    assert frozen_import_state(live) == before
++
++
++@pytest.mark.parametrize('scoped', [False, True])
++def test_import_guard_uses_frozen_wire_even_without_materialized_source(live, scoped):
++    # Synthetic or historically missing sources must still fence their logical import scope.
++    tid = kb.create_task(live, title='would import first', assignee='worker')
++    with kbc.write_txn(live):
++        journal.issue(live, dict(client_op_id=client.sync.uuid7(), table='task_links',
++                                uid=f'{tid}>missing', op='upsert', fields={}))
++    before = frozen_import_state(live)
++    with pytest.raises(ValueError, match='import overlaps replay custody'):
++        client.import_board(live, tables=['tasks', 'task_links'],
++                            only={'tasks': {tid}, 'task_links': {f'{tid}>missing'}} if scoped else None)
++    assert frozen_import_state(live) == before
++
++
++def test_corrupt_pending_wire_refuses_unrelated_import(live):
++    with kbc.write_txn(live):
++        journal.issue(live, dict(client_op_id=client.sync.uuid7(), table='tasks',
++                                uid='missing', op='upsert', fields={}))
++        live.execute('UPDATE kanban_replay_sender1 SET wire=?', (b'{}',))
++    before = frozen_import_state(live)
++    with pytest.raises(ValueError, match='invalid pending wire'):
++        client.import_board(live, tables=['task_links'])
++    assert frozen_import_state(live) == before
++
++
++def test_unbound_import_keeps_legacy_clear_behavior(live):
++    # Remove only the dormant test enrollment to exercise the unchanged legacy branch.
++    with kbc.write_txn(live):
++        live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++        live.execute('DROP TABLE kanban_replay_sender1')
++    kb.create_task(live, title='legacy', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_outbox SET state='rejected'")
++    counts = client.import_board(live, tables=['tasks'])
++    assert counts['cleared_rejected'] > 0 and counts['tasks'] == 1
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox WHERE state='rejected'").fetchone()
+-- 
+2.43.0
+

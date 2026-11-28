@@ -1,0 +1,166 @@
+From 840ad6350662b102c6c0f094726a1b1ba2260ffb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:21:58 +0000
+Subject: [PATCH 6977] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 840ad6350662b102c6c0f094726a1b1ba2260ffb.
+
+---
+diff --git a/tests/tools/test_kanban_home_explicit_origin.py b/tests/tools/test_kanban_home_explicit_origin.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..362bd0440f81ea68f2d811207e76f1fdfa7fc4a3
+--- /dev/null
++++ b/tests/tools/test_kanban_home_explicit_origin.py
+@@ -0,0 +1,96 @@
++"""Explicit chat custody must not bypass canonical pool-worker creation."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_origin as origin
++from hermes_cli import kanban_placement as placement
++from tools import kanban_tools as tools
++from tests.tools import test_kanban_worker_canonical_home as home
++
++svc = home.svc
++gws = home.gws
++pool_labels = home.pool_labels
++
++
++@pytest.mark.parametrize('ambient', [False, True])
++@pytest.mark.parametrize('options,labels', [
++    ({'runs_on': ['pool:worker']}, ['pool:worker']),
++    ({'runs_on': []}, []),
++    ({'skills': ['session-status-panel', 'inspecting-hermes-desktop-dom']},
++     ['pool:worker', 'capability:tailnet-exec']),
++    ({'placement': 'local'}, ['machine:worker-1']),
++])
++def test_explicit_origin_forwards_worker_home(gws, monkeypatch, ambient, options, labels):
++    _, worker = gws
++    worker.enter()
++    ref = origin.Origin('hub', 'default', 'canonical-home-owner')
++    # Origin resolution/authentication has its own real-courier suites; here retain
++    # the resolved identity through the actual tool's placement branch.
++    monkeypatch.setattr(origin, 'resolve', lambda value: ref)
++    monkeypatch.setattr(placement.reg, 'self_gateway', lambda: home.nodes.WORKER)
++    monkeypatch.setattr(placement, 'config', lambda: {'worker_queue': {'hub': 'pool:worker'}})
++    monkeypatch.setattr(placement, '_machine_picks_up', lambda _: True)
++    # Model the pre-existing admitted creator evidence only; receiving origin
++    # authorization is deliberately not replaced by this sender-branch test.
++    monkeypatch.setattr(tools, '_forwarding_fields', lambda *a: {
++        'origin_gateway': ref.gateway, 'creator': {'task_id': 'admitted-creator'}, 'run_uid': 'admitted-run'})
++    captured = []
++
++    def courier(view, **context):
++        captured.append((view, context))
++        return {'ok': True, 'request_id': 'explicit-origin-home', 'queued_only': True}
++
++    monkeypatch.setattr(placement, 'create_remote', courier)
++    before = worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    args = {'title': 'Origin-bound portable review', 'body': 'Inspect the Desktop DOM',
++            'assignee': 'default', 'requires': [], **options}
++    if ambient:
++        monkeypatch.setenv(origin.ENV, ref.ref)
++    else:
++        args['origin_session'] = ref.ref
++    out = json.loads(tools._handle_create(args))
++    assert len(captured) == 1, out
++    view, context = captured[0]
++    assert context['target'] == 'hub'
++    assert context['origin_session'] == ref.session
++    assert context['origin_profile'] == ref.profile
++    assert context['origin_gateway'] == ref.gateway
++    assert context['canonical_home'] is True
++    assert view['runs_on'] == labels
++    assert worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
++
++
++@pytest.mark.parametrize('failure', ['missing_creator', 'receiver_refusal', 'planner_exception'])
++def test_explicit_origin_never_falls_back_to_worker(gws, monkeypatch, failure):
++    _, worker = gws
++    worker.enter()
++    monkeypatch.setattr(origin, 'resolve', lambda value: origin.Origin('hub', 'default', 'canonical-home-owner'))
++    monkeypatch.setattr(placement.reg, 'self_gateway', lambda: home.nodes.WORKER)
++    monkeypatch.setattr(placement, 'config', lambda: {'worker_queue': {'hub': 'pool:worker'}})
++    if failure == 'receiver_refusal':
++        monkeypatch.setattr(tools, '_forwarding_fields', lambda *a: {'origin_gateway': 'hub'})
++        monkeypatch.setattr(placement, 'create_remote', lambda *a, **kw: {'ok': False, 'error': 'origin denied'})
++    elif failure == 'planner_exception':
++        from hermes_cli import kanban_creation_home
++
++        def unavailable(*a, **kw):
++            raise RuntimeError('registry unavailable')
++
++        monkeypatch.setattr(kanban_creation_home, 'plan', unavailable)
++    before = worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0]
++    out = json.loads(tools._handle_create({'title': 'Origin refusal', 'requires': [], 'runs_on': ['pool:worker']}))
++    assert not out.get('task_id'), out
++    assert out.get('error'), out
++    assert worker.conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == before
++
++
++def test_explicit_origin_nonpool_keeps_existing_storage(gws, monkeypatch):
++    _, worker = gws
++    worker.enter()
++    monkeypatch.setattr(origin, 'resolve', lambda value: origin.Origin('hub', 'default', 'canonical-home-owner'))
++    monkeypatch.setattr(placement, 'config', dict)
++    monkeypatch.setattr(placement, 'create_remote', lambda *a, **kw: pytest.fail('nonpool forwarded'))
++    out = json.loads(tools._handle_create({'title': 'Nonpool origin card', 'requires': []}))
++    assert out.get('task_id'), out
++    assert out['placement']['where'] == 'local'
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 23f68c21862a62dd387beefe12ae41fd3b367300..0b570e9228febc23843529e4d7045a0255e48ff6 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -29,7 +29,7 @@
+                                           _create_session_id, _placement_origin, _placement_refused, _runs_where,
+                                           _effective_board_args, _origin_enrollment, _landing_placement, _pinned_note,
+                                           _admission_refused, _effective_requires, _with_admission, _forwarding_fields,
+-                                          _placed_rejection, _standing_owner_refusal)
++                                          _placed_rejection, _standing_owner_refusal, _canonical_origin_home, _origin_route)
+ # SSRF-checked capped download lives in a sibling; tests monkeypatch it on this module.
+ from tools.kanban_tools_attach_url import _download_url_with_cap, _store_attachment
+ from tools.kanban_tools_db_hint import generic_tool_error
+@@ -1624,11 +1624,11 @@
+                                                      title=str(title).strip(), session_id=session_id, self_tid=self_tid, parents=parents)
+         if refused:
+             return refused
+-        if courier_intent is None and origin is None:
++        if courier_intent is None and _canonical_origin_home(args, origin):
+             check_tool_create(args.get("requires"), workspace_kind=workspace_kind, project_id=project_id,
+                               skills=skills, assignee=str(assignee))  # before placement routes it away [daveey]
+             # Default placement: no local-only need -> the card runs on the routed gateway. [daveey]
+-            place_origin = _placement_origin(conn, self_tid, session_id)  # a worker's: its creator's chat
++            place_origin = _origin_route(conn, self_tid, session_id, origin)
+             remote, marker_placement = _place_remote(
+                 args, assignee=str(assignee), skills=skills, parents=parents, project_id=project_id, conn=conn,
+                 creator_task_id=self_tid, note_local_pin=pinned_machine is None, **place_origin)
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 34e29bfca14813d462e175796b185fa9393b5863..a729a3ea090c8690daa669f5f672e769856d8e12 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -22,6 +22,21 @@
+     return courier_plan(conn, {**args, **effective}, runs_on, request_id=origin_intent.get("request_id")) or marker
+ 
+ 
++def _canonical_origin_home(args, origin):
++    """Pool custody overrides legacy origin-local storage, not origin authority."""
++    if origin is None:
++        return True
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli.kanban_creation_home import plan
++    return plan(args, cfg=kp.config(), gateway=kp.reg.self_gateway(), machine_ok=None) is not None
++
++
++def _origin_route(conn, creator_task_id, session_id, origin):
++    if origin is None:
++        return _placement_origin(conn, creator_task_id, session_id)
++    return {"session_id": origin.session, "origin_profile": origin.profile, "origin_gateway": origin.gateway}
++
++
+ def _origin_enrollment(args, origin, marker, **effective):
+     """Chat ownership pins storage, not execution; never forward an origin-bound card."""
+     if origin is None:
+-- 
+2.43.0
+

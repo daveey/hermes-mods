@@ -1,0 +1,230 @@
+From 8e308e81da5039c862db20b391fb13c944b59e2b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:00:52 +0000
+Subject: [PATCH 6618] Startup import ordering, deferred plugin API sweep and update bytecode warmup
+
+Public mirror of source commit 8e308e81da5039c862db20b391fb13c944b59e2b.
+
+---
+diff --git a/hermes_cli/update_bytecode.py b/hermes_cli/update_bytecode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfe98008acd7fa560ef977958f6069e4ae62a5e9
+--- /dev/null
++++ b/hermes_cli/update_bytecode.py
+@@ -0,0 +1,43 @@
++"""Best-effort update-time warming of source bytecode, never application imports."""
++from __future__ import annotations
++
++import logging
++from pathlib import Path
++import subprocess
++import sys
++
++from hermes_cli._subprocess_compat import windows_hide_flags
++
++logger = logging.getLogger(__name__)
++_IMPORT_ROOTS = ("hermes_cli", "agent", "tools", "tui_gateway", "gateway", "cron", "pm", "plugins", "acp_adapter")
++
++
++def precompile_checkout(root: Path) -> None:
++    """Warm the prepared interpreter's cache before restarting services.
++
++    Only update completion calls this: launch-time warming would add to startup
++    latency. A 30-second cap may leave partial caches; imports still fall back to
++    source. Older updater/interpreter paths may create a different cache tag;
++    that cache is harmless but will not accelerate the later interpreter.
++    Isolated mode ignores ambient PYTHONPYCACHEPREFIX/PYTHONDONTWRITEBYTECODE;
++    the completion parent's temporary -X pycache_prefix is not inherited.
++    Single-worker compileall has no pool descendants to orphan on timeout.
++    """
++    try:
++        root = root.resolve()
++        targets = [root / name for name in _IMPORT_ROOTS]
++        targets.extend(sorted(root.glob("*.py")))
++        targets = [path for path in targets if not path.is_symlink() and path.exists()]
++        if not targets:
++            return
++        result = subprocess.run(
++            [sys.executable, "-I", "-S", "-m", "compileall", "-q", "-j", "1",
++             "-e", str(root), *map(str, targets)],
++            cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL, timeout=30, check=False,
++            creationflags=windows_hide_flags(),
++        )
++        if result.returncode:
++            logger.debug("Update bytecode warming incomplete (exit %s)", result.returncode)
++    except (OSError, subprocess.SubprocessError) as exc:
++        logger.debug("Update bytecode warming skipped: %s", exc)
+diff --git a/hermes_cli/update_cmd_maint.py b/hermes_cli/update_cmd_maint.py
+index fe94d33635a25486c7aa57576160f57cb894445f..2e18f78134ae0c1560bb3e5864c61fb4e219b22d 100644
+--- a/hermes_cli/update_cmd_maint.py
++++ b/hermes_cli/update_cmd_maint.py
+@@ -819,6 +819,13 @@
+         _m()._record_bytecode_fingerprint()
+     except Exception as exc:  # health: allow BLE001 -- owed to the next launch's fingerprint sweep
+         record_followup("bytecode_sweep", str(exc) or type(exc).__name__)
++    else:
++        # Warming is optional, distinct from successful stale-bytecode invalidation.
++        try:
++            from hermes_cli.update_bytecode import precompile_checkout
++            precompile_checkout(root)
++        except Exception as exc:  # health: allow BLE001 -- optional optimization must never fail a committed update
++            print(f"  ⚠ Bytecode warming skipped: {type(exc).__name__}")
+     try:
+         _m()._refresh_bootstrap_cache_scripts(branch)
+     except Exception as exc:  # health: allow BLE001 -- refreshed again by the next update
+diff --git a/hermes_cli/worker_drain_spawn_inventory.json b/hermes_cli/worker_drain_spawn_inventory.json
+index 0da06a4974b5b775967dbcc8f362213e22f36e4c..9de4192c8eeae4f82e2ad7699db03a4375ea247f 100644
+--- a/hermes_cli/worker_drain_spawn_inventory.json
++++ b/hermes_cli/worker_drain_spawn_inventory.json
+@@ -920,6 +920,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "hermes_cli/update_bytecode.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
+   "hermes_cli/update_cmd_maint.py": {
+    "direct": 1,
+    "routed": 0,
+diff --git a/tests/hermes_cli/test_update_bytecode_precompile.py b/tests/hermes_cli/test_update_bytecode_precompile.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..935436cfaee3c9762f50f420d6b9776355845208
+--- /dev/null
++++ b/tests/hermes_cli/test_update_bytecode_precompile.py
+@@ -0,0 +1,130 @@
++"""Update warming must not execute sources, escape the checkout, or fail updates."""
++import importlib.util
++from pathlib import Path
++import subprocess
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import update_bytecode
++
++
++def test_real_compile_isolated_and_bounded_to_checkout(tmp_path, monkeypatch):
++    root = tmp_path / "repo"
++    root.mkdir()
++    package = root / "hermes_cli"
++    package.mkdir()
++    source = package / "sample.py"
++    source.write_text("raise RuntimeError('must never execute')\n")
++    top = root / "entry.py"
++    top.write_text("answer = 42\n")
++    tests = root / "tests"
++    tests.mkdir()
++    (tests / "ignored.py").write_text("pass\n")
++    outside = tmp_path / "outside"
++    outside.mkdir()
++    external = outside / "foreign.py"
++    external.write_text("pass\n")
++    try:
++        (root / "agent").symlink_to(outside, target_is_directory=True)
++        (root / "foreign.py").symlink_to(external)
++        (package / "foreign.py").symlink_to(external)
++        (package / "nested").symlink_to(outside, target_is_directory=True)
++    except OSError:
++        pytest.skip("symlinks unavailable")
++    prefix = tmp_path / "not-the-checkout"
++    monkeypatch.setenv("PYTHONPYCACHEPREFIX", str(prefix))
++    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
++    update_bytecode.precompile_checkout(root)
++    assert Path(importlib.util.cache_from_source(str(source))).is_file()
++    assert Path(importlib.util.cache_from_source(str(top))).is_file()
++    assert not (tests / "__pycache__").exists()
++    assert not (outside / "__pycache__").exists()
++    assert not prefix.exists()
++
++
++@pytest.mark.parametrize("failure", [OSError("unavailable"), subprocess.TimeoutExpired("compile", 30),
++                                     subprocess.SubprocessError("failed"), None])
++def test_compile_failures_are_best_effort(tmp_path, monkeypatch, failure):
++    (tmp_path / "entry.py").write_text("pass\n")
++    calls = []
++
++    def run(argv, **kwargs):
++        calls.append((argv, kwargs))
++        if failure:
++            raise failure
++        return SimpleNamespace(returncode=1)
++
++    monkeypatch.setattr(update_bytecode.subprocess, "run", run)
++    update_bytecode.precompile_checkout(tmp_path)
++    argv, options = calls[0]
++    assert argv[:9] == [sys.executable, "-I", "-S", "-m", "compileall", "-q", "-j", "1", "-e"]
++    assert options["timeout"] == 30
++    assert options["stdin"] == subprocess.DEVNULL
++    assert options["stdout"] == subprocess.DEVNULL
++    assert options["stderr"] == subprocess.DEVNULL
++
++
++def test_empty_tree_does_not_spawn(tmp_path, monkeypatch):
++    monkeypatch.setattr(update_bytecode.subprocess, "run", lambda *a, **kw: pytest.fail("unneeded spawn"))
++    update_bytecode.precompile_checkout(tmp_path)
++
++
++@pytest.mark.parametrize("sweep_fails,compile_fails", [(False, False), (True, False), (False, True)])
++def test_update_warms_after_successful_stamp_only(tmp_path, monkeypatch, sweep_fails, compile_fails):
++    from hermes_cli import update_cmd_maint as maintenance
++    from hermes_cli import main_web_build, update_receipt
++    events = []
++
++    def clear(root):
++        events.append("clear")
++        if sweep_fails:
++            raise OSError("cannot clear")
++        return 0
++
++    facade = SimpleNamespace(PROJECT_ROOT=tmp_path, _clear_bytecode_cache=clear,
++                             _record_bytecode_fingerprint=lambda: events.append("stamp"),
++                             _refresh_bootstrap_cache_scripts=lambda branch: events.append("refresh"))
++    monkeypatch.setattr(maintenance, "_m", lambda: facade, raising=False)
++    from hermes_cli import update_cmd
++    monkeypatch.setattr(update_cmd, "_m", lambda: facade)
++    monkeypatch.setattr(main_web_build, "_recorded_bytecode_fingerprint", lambda root: None)
++    monkeypatch.setattr(main_web_build, "_prune_dropped_directories", lambda *args: 0)
++    monkeypatch.setattr(update_receipt, "record_followup", lambda *args, **kw: events.append(args[0]))
++    def compile_checkout(root):
++        events.append("compile")
++        if compile_fails:
++            raise RuntimeError("unexpected helper failure")
++
++    monkeypatch.setattr(update_bytecode, "precompile_checkout", compile_checkout)
++    maintenance._sweep_bytecode_after_update("main")
++    assert events == (["clear", "bytecode_sweep", "refresh"] if sweep_fails else
++                      ["clear", "stamp", "compile", "refresh"])
++
++
++def test_update_sweep_replaces_stale_cache_with_usable_bytecode(tmp_path, monkeypatch):
++    from hermes_cli import main, main_web_build, update_cmd, update_cmd_maint
++    source = tmp_path / "entry.py"
++    source.write_text("value = 'new'\n")
++    cache = Path(importlib.util.cache_from_source(str(source)))
++    cache.parent.mkdir()
++    cache.write_bytes(b"stale")
++    facade = SimpleNamespace(PROJECT_ROOT=tmp_path, _clear_bytecode_cache=main._clear_bytecode_cache,
++                             _record_bytecode_fingerprint=lambda: None,
++                             _refresh_bootstrap_cache_scripts=lambda branch: None)
++    monkeypatch.setattr(update_cmd, "_m", lambda: facade)
++    monkeypatch.setattr(main_web_build, "_recorded_bytecode_fingerprint", lambda root: None)
++    monkeypatch.setattr(main_web_build, "_prune_dropped_directories", lambda *a: 0)
++    update_cmd_maint._sweep_bytecode_after_update("main")
++    assert cache.read_bytes().startswith(importlib.util.MAGIC_NUMBER)
++
++
++def test_matching_launch_fingerprint_does_not_compile(tmp_path, monkeypatch):
++    from hermes_cli import main, main_web_build
++    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
++    monkeypatch.setattr(main, "_read_git_revision_fingerprint", lambda root: "same")
++    monkeypatch.setattr(main_web_build, "_recorded_bytecode_fingerprint", lambda root: "same")
++    monkeypatch.setattr(main, "_clear_bytecode_cache", lambda root: pytest.fail("unneeded sweep"))
++    monkeypatch.setattr(update_bytecode, "precompile_checkout", lambda root: pytest.fail("launch warming"))
++    main_web_build._sweep_stale_bytecode_if_checkout_changed()
+-- 
+2.43.0
+

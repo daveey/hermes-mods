@@ -1,0 +1,440 @@
+From baf8db4f84d9840b27003932f38ca5ffa8e6785f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 13:56:34 +0000
+Subject: [PATCH 6901] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit baf8db4f84d9840b27003932f38ca5ffa8e6785f.
+
+---
+diff --git a/hermes_cli/kanban_awaited_card_wake.py b/hermes_cli/kanban_awaited_card_wake.py
+index 2842bea7bbd8c3e2c13827806e7ea00b349e89e3..e1c02e0cf45f9fa975b9bc69abeaf3776edbcf6e 100644
+--- a/hermes_cli/kanban_awaited_card_wake.py
++++ b/hermes_cli/kanban_awaited_card_wake.py
+@@ -252,12 +252,15 @@
+ def changes_page(hub: Any, board: str, cursor: int, applied: Mapping[str, str]) -> dict:
+     """``hub.changes(board, cursor)``; a Resync it raises carries ``status_changed``, the status changes the pull
+     already applied from earlier pages (the rebuild's pre-read sees them as the old state, so its diff would not)."""
+-    from hermes_cli.kanban_sync_client import Resync
++    from hermes_cli.kanban_sync_client import HubError, Resync
+     try:
+-        return hub.changes(board, cursor)
++        page = hub.changes(board, cursor)
+     except Resync as exc:
+         exc.status_changed = dict(applied)  # type: ignore[attr-defined]
+         raise
++    if not isinstance(page, dict):
++        raise HubError(200, 'changes envelope malformed')
++    return page
+ 
+ 
+ def _statuses(conn: sqlite3.Connection) -> Optional[dict[str, str]]:
+diff --git a/hermes_cli/kanban_protect_transport.py b/hermes_cli/kanban_protect_transport.py
+index 1ba3f064b39f297b837fcd1b67ad1275b2f2b406..70b8da750f4d8969532d730d30647d4859fdbcd5 100644
+--- a/hermes_cli/kanban_protect_transport.py
++++ b/hermes_cli/kanban_protect_transport.py
+@@ -107,7 +107,9 @@
+     proof.frozen(old, wire, board)
+     capability(hub,board)  # Old serving DO/unsupported route cannot consume this identity.
+     actor_gateway = proof.request(hub, board, old, wire)
+-    reply=hub.ops(board,[wire])
++    from hermes_cli.kanban_replay_controls import confirmed_transport
++    strict = confirmed_transport(conn, old)
++    reply=None if strict else hub.ops(board,[wire])
+     results=reply.get('results',[]) if isinstance(reply,dict) else []
+     if (isinstance(results,list) and len(results)==1 and isinstance(results[0],dict)
+             and results[0].get('client_op_id')==wire['client_op_id'] and results[0].get('status')=='rejected'
+@@ -119,7 +121,7 @@
+                          "WHERE request_uid=? AND request_sha256=? AND delivery_state!='confirmed'",
+                          (wireutil.canonical(rejection),request_uid,old['request_sha256']))
+         raise Rejected(results[0])
+-    if (not isinstance(results,list) or len(results)!=1 or not isinstance(results[0],dict)
++    if not strict and (not isinstance(results,list) or len(results)!=1 or not isinstance(results[0],dict)
+             or results[0].get('client_op_id')!=wire['client_op_id'] or results[0].get('status')!='applied'):
+         raise ValueError('protect delivery unknown; preserve exact request')
+     gateway=old['home']
+diff --git a/hermes_cli/kanban_replay_controls.py b/hermes_cli/kanban_replay_controls.py
+index c2b753a77183dfa82d3f14ad36c9890842d8ed33..59b6408b13e7a2550fa774d6cb5228c69d66143f 100644
+--- a/hermes_cli/kanban_replay_controls.py
++++ b/hermes_cli/kanban_replay_controls.py
+@@ -28,8 +28,8 @@
+ 
+ def confirmed_transport(conn, owned):
+     """Strict confirmations inspect receipts; never replay through fenced legacy ops."""
+-    from hermes_cli import kanban_db_sync as sync
+-    if (sync.sync_state(conn) or {}).get('journal_id') is None:
++    from hermes_cli import kanban_replay_journal as journal
++    if not journal.bound_custody(conn):
+         return False
+     if owned.get('delivery_state') not in ('acknowledged', 'confirmed'):
+         raise ValueError('command still in replay custody; recover exact transport before confirmation')
+diff --git a/hermes_cli/kanban_replay_journal.py b/hermes_cli/kanban_replay_journal.py
+index 83f5869183c6fc1277e1f0206cfbbcc336610829..d91455f248727ab642f5f366cf6b4339dc5b98be 100644
+--- a/hermes_cli/kanban_replay_journal.py
++++ b/hermes_cli/kanban_replay_journal.py
+@@ -125,6 +125,15 @@
+     return False
+ 
+ 
++def bound_custody(conn: sqlite3.Connection) -> bool:
++    """True only for a live bound journal.
++
++    Missing, NULL or recreated anchors with surviving journal, wire or loss
++    evidence raise instead of looking never-enrolled.
++    """
++    return _bound_custody(conn)
++
++
+ def guard_import(conn: sqlite3.Connection, tables: tuple[str, ...], only: Mapping[str, set[str]] | None) -> bool:
+     """Fence import scopes under the writer reservation; imports are not replay repair."""
+     _transaction(conn)
+diff --git a/hermes_cli/kanban_replay_primary.py b/hermes_cli/kanban_replay_primary.py
+index 2c5186d8fab344d6bf41fa8aeee6f08fb6c5f96d..45d494e9b85396c781066ec0db9b79252990bfdc 100644
+--- a/hermes_cli/kanban_replay_primary.py
++++ b/hermes_cli/kanban_replay_primary.py
+@@ -26,8 +26,9 @@
+         from hermes_cli.kanban_replay_existence import CurrentRowHold
+         from hermes_cli.kanban_sync_client import HubError, Resync
+         try:
+-            evidence = self.hub.row_evidence(self.board, row['table_name'], row['row_uid'])
+-        except (OSError, HubError, Resync) as exc:
++            from hermes_cli.kanban_replay_reply import row_evidence_envelope
++            evidence = row_evidence_envelope(self.hub.row_evidence(self.board, row['table_name'], row['row_uid']))
++        except (OSError, HubError, Resync, ValueError) as exc:
+             raise CurrentRowHold(f'primary replay live current row unavailable: {exc}', transient=True) from exc
+         image = evidence.get('row')
+         if (evidence.get('board') != self.board or evidence.get('table') != row['table_name'] or
+diff --git a/hermes_cli/kanban_replay_reply.py b/hermes_cli/kanban_replay_reply.py
+index 4b708296459a6f955177f617c2a8245e1e563d7c..29e7883622ccfc51692ac61657826c5922279613 100644
+--- a/hermes_cli/kanban_replay_reply.py
++++ b/hermes_cli/kanban_replay_reply.py
+@@ -13,6 +13,13 @@
+                         'row', 'source_predecessor'})
+ 
+ 
++def mapping_envelope(payload, label):
++    """Refuse a non-object Board payload as a typed board-local fault."""
++    if not isinstance(payload, dict):
++        raise ValueError(f'replay {label} envelope malformed')
++    return payload
++
++
+ def capability_envelope(payload):
+     """Refuse a non-object capability as a board-local stream fault."""
+     if not isinstance(payload, dict):
+@@ -22,14 +29,18 @@
+ 
+ def slot_envelope(payload):
+     """Refuse a missing or non-object serving slot as a board-local stream fault."""
+-    if not isinstance(payload, dict):
+-        raise ValueError('replay serving envelope malformed')
++    mapping_envelope(payload, 'serving')
+     slot = payload.get('slot')
+     if not isinstance(slot, dict):
+         raise ValueError('replay serving envelope malformed')
+     return slot
+ 
+ 
++def row_evidence_envelope(payload):
++    """Refuse a non-object current-row evidence payload before dereference."""
++    return mapping_envelope(payload, 'current-row')
++
++
+ def consumed_slot(reply, wire, previous, local):
+     """Return a validated final snapshot, or require inspect without settlement.
+ 
+diff --git a/hermes_cli/kanban_replay_sender.py b/hermes_cli/kanban_replay_sender.py
+index 091314dc2128f122a97a290b3a7ac3d60ed4fb72..f6c63817a7720320690a738e32a9bdac0ceed843 100644
+--- a/hermes_cli/kanban_replay_sender.py
++++ b/hermes_cli/kanban_replay_sender.py
+@@ -64,7 +64,7 @@
+     guard(conn)
+     if (sync.sync_state(conn) or {}).get('mode') == 'off':
+         raise ValueError('sync is detached; sender disabled')
+-    if (sync.sync_state(conn) or {}).get('journal_id') is not None:
++    if journal.bound_custody(conn):
+         from hermes_cli import kanban_replay_existence as existence
+         existence.guard(conn)
+         try:
+@@ -221,8 +221,9 @@
+             return None
+         from hermes_cli.kanban_replay_existence import CurrentRowHold
+         try:
+-            evidence = hub.row_evidence(board, 'tasks', row['row_uid'])
+-        except (OSError, client.HubError, client.Resync) as exc:
++            from hermes_cli.kanban_replay_reply import row_evidence_envelope
++            evidence = row_evidence_envelope(hub.row_evidence(board, 'tasks', row['row_uid']))
++        except (OSError, client.HubError, client.Resync, ValueError) as exc:
+             raise CurrentRowHold(f'synthetic parent current row unavailable: {exc}', transient=True) from exc
+         state = evidence.get('row')
+         if (evidence.get('board') != board or evidence.get('table') != 'tasks' or
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 9e8f5dbd7be3616e93bdc4fd389cd3b86a3f5b8d..c455f4ab15ed94117f4cf8444499194b23ca3bca 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -438,8 +438,9 @@
+     def row_evidence(self, board: str, table: str, uid: str, *, max_response_bytes: Optional[int] = None) -> dict:
+         """Exact authoritative evidence; optional wire/decoded cap is enforced before JSON parsing."""
+         from urllib.parse import urlencode
++        from hermes_cli.kanban_replay_reply import row_evidence_envelope
+         bounded: dict[str, Any] = {} if max_response_bytes is None else {"max_response_bytes": max_response_bytes}
+-        return self._call("GET", f"/v2/boards/{board}/evidence?" + urlencode({"table": table, "uid": uid}), **bounded)
++        return row_evidence_envelope(self._call("GET", f"/v2/boards/{board}/evidence?" + urlencode({"table": table, "uid": uid}), **bounded))
+ 
+     def sessions(self, board: str, body: dict) -> dict:
+         """Session owners (session handover, :mod:`hermes_cli.session_owner`): ``get`` / ``move``. A 409 refusal
+@@ -1146,7 +1147,7 @@
+             # (no WARNING, the board is not marked failed, the outbox-age alarm keeps its last verdict).
+             _log.debug("kanban sync: round for %s skipped (%s)", slug, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"SyncRoundBusy: {exc}", skipped=True))
+-        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, RestoreRequired, ReplayFault) as exc:
++        except (HubError, OSError, Resync, sqlite3.Error, SyncUnavailable, RestoreRequired, ReplayFault, ValueError) as exc:
+             _log.warning("kanban sync: round for %s failed (%s: %s)%s", slug, type(exc).__name__, exc,
+                          udf_errors.error_suffix(exc))
+             from hermes_cli.kanban_sync_host_outage import classify  # one host card, not one per board [daveey]
+diff --git a/tests/hermes_cli/test_kanban_replay_board_isolation.py b/tests/hermes_cli/test_kanban_replay_board_isolation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..37acc1aadc3c03e84e070e262d6760756818acc8
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_board_isolation.py
+@@ -0,0 +1,135 @@
++"""Malformed Board payloads stay on one board in sync_all_once."""
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_replay_existence as existence
++from hermes_cli import kanban_replay_journal as journal
++from hermes_cli import kanban_source_clones
++from hermes_cli import kanban_sync_client as client
++from hermes_cli.kanban_replay_reply import mapping_envelope, row_evidence_envelope
++from tests.hermes_cli.test_kanban_replay_http_session import serving, AckReceiver
++from tests.hermes_cli import test_kanban_replay_sender as helpers
++
++live = helpers.live
++
++# Inventory of Board parses in the multi-board loop: capability/inspect/session
++# envelopes, ACK, current-row evidence, feed changes, and error bodies.
++SHAPES = (
++    ('capability', []),
++    ('inspect', {}),
++    ('inspect', {'slot': []}),
++    ('session', {}),
++    ('session', {'slot': []}),
++    ('ack', {}),
++    ('evidence', []),
++    ('evidence', None),
++    ('evidence', 'x'),
++    ('changes', []),
++    ('changes', None),
++)
++
++
++def test_mapping_helpers_refuse_non_objects():
++    with pytest.raises(ValueError, match='envelope malformed'):
++        mapping_envelope([], 'current-row')
++    with pytest.raises(ValueError, match='envelope malformed'):
++        row_evidence_envelope(None)
++    assert row_evidence_envelope({'state': 'live'})['state'] == 'live'
++
++
++@pytest.mark.parametrize('endpoint,body', SHAPES)
++def test_malformed_board_payload_does_not_abort_later_board(live, tmp_path, monkeypatch, endpoint, body):
++    kb.create_task(live, title='broken first board', assignee='worker')
++    if endpoint == 'evidence':
++        sync.set_mode(live, 'primary')
++    broken_path = Path(live.execute('PRAGMA database_list').fetchone()[2])
++    healthy_path = tmp_path / 'healthy.db'
++    with kbc.connect(healthy_path) as healthy:
++        client.ensure_identity(healthy, 'healthy', 'macbook')
++        sync.set_mode(healthy, 'shadow')
++    peer = AckReceiver()
++    original = peer._call
++    frozen = journal.snapshot(live)
++
++    def route(method, path, body_arg=None):
++        if endpoint == 'changes' and '/default/' in path and '/changes' in path:
++            return body
++        if endpoint == 'evidence' and '/default/' in path and '/evidence' in path:
++            return body
++        if endpoint not in ('changes', 'evidence') and f'/default/replay/{endpoint}' in path:
++            return body
++        if '/changes' in path:
++            return dict(changes=[], next=0, head=0, more=False)
++        return original(method, path, body_arg)
++
++    peer._call = route
++    monkeypatch.setattr(client, 'publish_pickup_if_changed', lambda hub: None)
++    monkeypatch.setattr(kanban_source_clones, 'attest_if_due', lambda hub: None)
++    with serving(live, peer) as (url, requests, _):
++        hub = client.Hub(client.Identity(url, 'fixture-key', 'display'))
++        try:
++            results = client.sync_all_once(hub, boards=[('default', broken_path), ('healthy', healthy_path)])
++            assert [r.board for r in results] == ['default', 'healthy']
++            assert results[0].error
++            assert results[1].error is None
++            if endpoint == 'changes':
++                assert 'HubError' in results[0].error and 'envelope malformed' in results[0].error
++            if endpoint == 'evidence':
++                assert 'CurrentRowHold' in results[0].error or 'ValueError' in results[0].error
++            assert any('/healthy/' in p for _, p, _, _ in requests)
++            if endpoint == 'evidence':
++                assert journal.snapshot(live)['pending'] is not None
++            else:
++                assert journal.snapshot(live)['pending'] == frozen['pending']
++        finally:
++            hub.close()
++
++
++def test_malformed_evidence_same_pending_repairs_after_resume(live):
++    from tests.hermes_cli.test_kanban_replay_primary import Primary
++    tid = kb.create_task(live, title='repair after malformed evidence', assignee='worker')
++    receiver = Primary(live)
++    receiver.evidence = []
++    with pytest.raises((client.ReplayFault, client.HubError, client.SyncUnavailable, OSError, ValueError)):
++        client.push(live, receiver, 'default', 'macbook', primary=True, max_batches=1)
++    frozen = journal.pending_wire(live)
++    assert frozen
++    fault = existence.fault(live)
++    assert fault is not None
++    existence.resume(live, fault['op_id'], 'owner checked serving Board current-row envelope')
++    receiver.evidence = dict(board='default', table='tasks', uid=tid, state='live', head=4,
++                             row=dict(uid=tid, title='restored', status='todo', version=4))
++    result = client.push(live, receiver, 'default', 'macbook', primary=True, max_batches=1)
++    assert result.merged == 1
++    assert journal.pending_wire(live) is None
++    assert existence.fault(live) is None
++    assert len(receiver.sent) == 1
++
++
++def test_synthetic_parent_non_object_evidence_is_current_row_hold(live):
++    import json
++    tid = kb.create_task(live, title='parent version unavailable', assignee='worker')
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_sync_outbox WHERE 1=1')
++    kb.add_comment(live, tid, 'author', 'child')
++
++    class MissingVersion(helpers.Receiver):
++        def _call(self, method, path, body=None):
++            result = super()._call(method, path, body)
++            if path.endswith('/ops'):
++                encoded = self.slot['last_verdict']
++                assert isinstance(encoded, str)
++                verdict = json.loads(encoded)
++                verdict.pop('version')
++                self.slot['last_verdict'] = json.dumps(verdict)
++            return result
++
++        def row_evidence(self, board, table, uid):
++            return []
++
++    with pytest.raises((client.ReplayFault, client.HubError, client.SyncUnavailable, ValueError)):
++        client.push(live, MissingVersion(), 'default', 'macbook', primary=False, max_batches=1)
+diff --git a/tests/hermes_cli/test_kanban_replay_lost_anchor_class.py b/tests/hermes_cli/test_kanban_replay_lost_anchor_class.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec53ca082341764473a963a4938e49f64b9be3e5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_lost_anchor_class.py
+@@ -0,0 +1,97 @@
++"""Lost/NULL/missing replay anchors fail closed at every journal consumer."""
++import pytest
++
++from hermes_cli import kanban_actionability_transport as act
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_replay_admission as admission
++from hermes_cli import kanban_retain_transport as retain
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_replay_controls as controls
++from tests.hermes_cli.test_kanban_replay_lost_anchor_cleanup import consume, custody
++from tests.hermes_cli.test_kanban_replay_parent_custody import issued_parent
++from tests.hermes_cli import test_kanban_replay_sender as sender
++
++live = sender.live
++
++# Inventory: send, import, strip, prune, retire, echo, retain confirm, actionability confirm.
++PLACES = (
++    'send', 'import', 'strip', 'prune', 'retire', 'echo',
++    'confirm_retain', 'confirm_actionability',
++)
++
++
++def damage_anchor(conn, damage):
++    with kbc.write_txn(conn):
++        if damage == 'null':
++            conn.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++        else:
++            conn.execute('DELETE FROM kanban_sync_state')
++
++
++def invoke(conn, place, tid, op_id, owned, peer):
++    if place == 'send':
++        client.push(conn, peer, 'default', 'macbook', primary=True, max_batches=1)
++    elif place == 'confirm_retain':
++        retain.confirm(conn, peer, 'default', owned['run_uid'])
++    elif place == 'confirm_actionability':
++        act.confirm(conn, peer, 'default', owned['op_id'])
++    else:
++        consume(conn, tid, op_id, place)
++
++
++@pytest.mark.parametrize('damage', ['null', 'missing'])
++@pytest.mark.parametrize('place', PLACES)
++def test_lost_anchor_fails_closed_at_every_consumer(live, damage, place):
++    peer = controls.Controls()
++    peer.lose_reply = True
++    if place.startswith('confirm_'):
++        kind = 'retain' if place == 'confirm_retain' else act.KIND
++        tid, owned, _ = controls.reserve(live, kind)
++        with pytest.raises(OSError):
++            client.push(live, peer, 'default', 'macbook', primary=True, max_batches=1)
++        op_id = owned['op_id']
++    else:
++        tid, peer, _ = issued_parent(live)
++        owned = None
++        op_id = live.execute('SELECT op_id FROM kanban_sync_outbox LIMIT 1').fetchone()[0]
++    before = custody(live)
++    damage_anchor(live, damage)
++    calls = []
++    original = peer.ops
++
++    def ops(board, wires):
++        calls.extend(wires)
++        return original(board, wires)
++
++    peer.ops = ops
++    refusal = (ValueError, RuntimeError, client.SyncUnavailable, admission.RestoreRequired)
++    with pytest.raises(refusal):
++        invoke(live, place, tid, op_id, owned, peer)
++    assert calls == []
++    after = custody(live)
++    assert after['kanban_replay_sender1'] == before['kanban_replay_sender1']
++    assert after['kanban_sync_outbox'] == before['kanban_sync_outbox']
++
++
++@pytest.mark.parametrize('kind', ['retain', act.KIND])
++def test_never_enrolled_confirmation_may_use_legacy(live, kind):
++    _, owned, _ = controls.reserve(live, kind)
++    peer = controls.Controls()
++    with kbc.write_txn(live):
++        live.execute('DROP TABLE kanban_replay_sender1')
++        live.execute('UPDATE kanban_sync_state SET journal_id=NULL')
++    calls = []
++
++    def ops(board, wires):
++        calls.extend(wires)
++        return {'results': [{'client_op_id': wires[0]['client_op_id'], 'status': 'applied'}]}
++
++    peer.ops = ops
++    try:
++        if kind == 'retain':
++            retain.confirm(live, peer, 'default', owned['run_uid'])
++        else:
++            act.confirm(live, peer, 'default', owned['op_id'])
++    except (ValueError, AttributeError, IndexError, KeyError):
++        pass
++    assert calls, 'genuinely never-enrolled boards may still take legacy transport'
+-- 
+2.43.0
+

@@ -1,0 +1,469 @@
+From 3a2b559493072cacc8e4d14ef1cb458f93525d7a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:58:00 +0000
+Subject: [PATCH 6999] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit 3a2b559493072cacc8e4d14ef1cb458f93525d7a.
+
+---
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index dde4986832144dc8fb627550ee179af3471b8c28..3067d2be8489ddb81f7b8d2ac4f6c123fb0acd19 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1911,11 +1911,12 @@
+     boundary.execute("BEGIN IMMEDIATE")
+     opt_in = bool(boundary.no_retry or boundary.done is not None)
+     try:
+-        home_schema_before = home_schema.begin(conn)
+-        annotation_scope = annotation_mutation.arm(conn)
+-        _local_status_wake.arm(conn)  # [daveey] record this txn's status changes for the awaited-card wake
+-        origin_armed = status_origin.arm(conn)
+-        yield conn
++        with home_schema.first_install_scope(conn) as home_schema_first:
++            home_schema_before = home_schema.begin(conn)
++            annotation_scope = annotation_mutation.arm(conn)
++            _local_status_wake.arm(conn)  # [daveey] record this txn's status changes for the awaited-card wake
++            origin_armed = status_origin.arm(conn)
++            yield conn
+     except Exception:
+         # SQLite may already have auto-rolled-back (EIO, contention, corruption);
+         # don't let this secondary failure shadow the real one.
+@@ -1930,7 +1931,7 @@
+     else:
+         try:
+             status_origin.bind(conn, origin_armed)
+-            home_schema_after = home_schema.finish(conn, home_schema_before)
++            home_schema_after = home_schema.finish(conn, home_schema_before, home_schema_first)
+             boundary.execute("COMMIT")
+         except (Exception, _DispatchWriteContended):
+             # COMMIT exhausted retries with the txn still open; roll back so the
+diff --git a/hermes_cli/kanban_home_schema.py b/hermes_cli/kanban_home_schema.py
+index 337e6028c252297231491237c7a11bbab7c3e3ea..b98513eb61c8e5bbda9b27b77a46c6a88c78d5d0 100644
+--- a/hermes_cli/kanban_home_schema.py
++++ b/hermes_cli/kanban_home_schema.py
+@@ -13,6 +13,8 @@
+ from __future__ import annotations
+ 
+ import sqlite3
++from contextlib import contextmanager
++from contextvars import ContextVar
+ 
+ from hermes_cli import kanban_home_abort as abort
+ from hermes_cli import kanban_home_finalized as finalized
+@@ -21,6 +23,32 @@
+ _EXEMPT = {_TABLE, 'kanban_home_finalized1', 'kanban_home_aborted1',
+            'containment_canonical_receipts'}
+ _RESTRICTIVE = {'containment_sync_quarantine', 'containment_sync_quarantine_tasks'}
++_FIRST_INSTALL: ContextVar[tuple[sqlite3.Connection, list[tuple | None]] | None] = ContextVar(
++    'home_schema_first_install', default=None)
++
++
++@contextmanager
++def first_install_scope(conn):
++    """Keep speculative installation evidence only for this outer writer.
++
++    A nested savepoint can roll back the first install. A later fresh install
++    replaces that snapshot; ordinary repeated prepare calls cannot rebaseline
++    already installed guards after intervening DDL.
++    """
++    snapshot: list[tuple | None] = [None]
++    token = _FIRST_INSTALL.set((conn, snapshot))
++    try:
++        yield snapshot
++    finally:
++        _FIRST_INSTALL.reset(token)
++
++
++def installed_first(conn, first):
++    """Called immediately after the first guard installation, before user DDL."""
++    scope = _FIRST_INSTALL.get()
++    if first and scope is not None and scope[0] is conn:
++        scope[1][0] = (conn.execute('PRAGMA schema_version').fetchone()[0],
++                       _identities(conn, _tables(conn)))
+ 
+ 
+ def _quote(name):
+@@ -95,12 +123,14 @@
+     return conn.execute('PRAGMA schema_version').fetchone()[0], _identities(conn, tables)
+ 
+ 
+-def finish(conn, before):
++def finish(conn, before, first_install=None):
+     """Fail closed before COMMIT; all failures use write_txn's ordinary rollback."""
+     if not _installed(conn):
+         if before is not None:
+             raise sqlite3.IntegrityError('home transfer prepared: preparation schema removed')
+         return
++    if before is None and first_install is not None:
++        before = first_install[0]
+     version = conn.execute('PRAGMA schema_version').fetchone()[0]
+     if before is not None and before[0] == version:
+         return before
+diff --git a/hermes_cli/kanban_home_transfer.py b/hermes_cli/kanban_home_transfer.py
+index f0da0e1028cdc797d2f17adb2d681225e1f99bc4..a80a248035154119104e23d19c1d913a05d4d2fd 100644
+--- a/hermes_cli/kanban_home_transfer.py
++++ b/hermes_cli/kanban_home_transfer.py
+@@ -36,6 +36,7 @@
+ 
+ 
+ def _install(conn: sqlite3.Connection) -> None:
++    first = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone()
+     conn.execute(f"""CREATE TABLE IF NOT EXISTS {_TABLE} (
+         task_id TEXT PRIMARY KEY, source TEXT NOT NULL, destination TEXT NOT NULL,
+         nonce TEXT NOT NULL, expected_version INTEGER NOT NULL)""")
+@@ -151,6 +152,8 @@
+     conn.execute(f"""CREATE TRIGGER IF NOT EXISTS home_prepared1_marker_insert
+         BEFORE INSERT ON {_TABLE} WHEN EXISTS(SELECT 1 FROM {_TABLE} WHERE task_id=NEW.task_id)
+         BEGIN SELECT RAISE(ABORT, 'home transfer preparation immutable'); END""")
++    from hermes_cli.kanban_home_schema import installed_first
++    installed_first(conn, first)
+ 
+ 
+ def prepare(conn: sqlite3.Connection, task_id: str, *, source: str, destination: str,
+diff --git a/hermes_cli/kanban_shared_blocker_checks.py b/hermes_cli/kanban_shared_blocker_checks.py
+index a071abbc90cd167d27e4ca66de64280fb41ec522..4ddb9ce6d1b8cfcdbce3ff4a0264dcd460f4ec9c 100644
+--- a/hermes_cli/kanban_shared_blocker_checks.py
++++ b/hermes_cli/kanban_shared_blocker_checks.py
+@@ -216,6 +216,16 @@
+         return "timeout", output[-OUTPUT_TAIL_CHARS:].strip()
+ 
+ 
++def _carriers(conn, task_ids):
++    """Evidence carriers must still be locally writable, not merely home-owned."""
++    from hermes_cli import kanban_blocker_rows as rows
++    from hermes_cli.kanban_home_transfer import frozen
++
++    tasks = set(task_ids)
++    foreign = rows.foreign_among(conn, tasks)
++    return sorted(t for t in tasks - foreign if not frozen(conn, t))
++
++
+ @input_pass
+ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+     """Check each open registered wall on its home, even with a worker probe in flight.
+@@ -241,7 +251,7 @@
+     for bid, st in states.items():
+         command = commands.get(bid)
+         # Events need a real card FK; a home-owned card carries evidence only.
+-        homes = sorted(set(st.behind) - foreign)
++        homes = _carriers(conn, set(st.behind) - foreign)
+         if not st.is_open or not command or not homes:
+             continue
+         token = tokens.get(bid)
+@@ -276,7 +286,8 @@
+                    "started_at": ts, "checked_at": checked_at, "assertion_id": token, "fails": fails}
+         with kb.write_txn(conn):
+             # A shell check can overlap a new assertion or a home ownership change.
+-            if blocker_rows.foreign_among(conn, (homes[0],)):
++            homes = _carriers(conn, homes)
++            if not homes:
+                 continue
+             if _assertion_tokens(conn, ts).get(bid) != token:
+                 kb._append_event(conn, homes[0], ATTEMPT_EVENT, {
+diff --git a/tests/hermes_cli/test_home_first_schema_identity.py b/tests/hermes_cli/test_home_first_schema_identity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc7997fb5d7e65205195c18c675c6f40805de115
+--- /dev/null
++++ b/tests/hermes_cli/test_home_first_schema_identity.py
+@@ -0,0 +1,142 @@
++"""First native preparation must retain its installed identity baseline. [daveey]"""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as dbc, kanban_home_schema as schema
++from hermes_cli import kanban_home_transfer as transfer
++from tests.hermes_cli import test_home_lazy_schema_custody as lazy
++from tests.hermes_cli import test_kanban_home_transfer_fence as support
++
++board = support.board
++
++
++def custody(conn, task):
++    with dbc.write_txn(conn):
++        lazy.late(conn)
++        conn.execute("INSERT INTO late_custody VALUES ('protected',?,'shared')", (task,))
++
++
++def rows(conn):
++    return [tuple(r) for r in conn.execute('SELECT * FROM late_custody')]
++
++
++def replace(conn):
++    conn.execute("INSERT OR REPLACE INTO late_custody VALUES ('healthy','other-task','shared')")
++
++
++def test_authentic_first_prepare_identity_change_cannot_erase_custody(board):
++    task = support.seed(board)
++    custody(board, task)
++    before = rows(board)
++    # Keep the reviewer's expected-invariant oracle: either atomic refusal or
++    # correct replacement coverage must preserve the protected original row.
++    try:
++        with dbc.write_txn(board):
++            support.prepare(board, task)
++            board.execute('CREATE UNIQUE INDEX late_value ON late_custody(value)')
++    except sqlite3.IntegrityError:
++        assert rows(board) == before
++        return
++    try:
++        with dbc.write_txn(board):
++            replace(board)
++    except sqlite3.IntegrityError:
++        pass
++    assert rows(board) == before
++
++
++@pytest.mark.parametrize(('change', 'repeat'), [
++    ('index', False), ('index', True), ('drop', False), ('drop', True),
++    ('alter', False), ('alter', True), ('trigger', False),
++])
++def test_first_prepare_rejects_changed_guarded_schema(board, change, repeat):
++    task = support.seed(board)
++    custody(board, task)
++    before = rows(board)
++    sql = {
++        'index': 'CREATE UNIQUE INDEX late_value ON late_custody(value)',
++        'drop': 'DROP TABLE late_custody',
++        'alter': 'ALTER TABLE late_custody ADD COLUMN extra TEXT',
++        'trigger': 'DROP TRIGGER home_prepared1_late_custody_delete',
++    }[change]
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared: guarded'):
++        with dbc.write_txn(board):
++            support.prepare(board, task)
++            board.execute(sql)
++            if repeat:
++                # A second prepare must not rebaseline already installed guards.
++                support.prepare(board, task)
++    assert rows(board) == before
++    assert not transfer.frozen(board, task)
++    assert schema._FIRST_INSTALL.get() is None
++
++
++def test_first_prepare_then_index_and_replace_in_same_writer_rolls_back(board):
++    task = support.seed(board)
++    custody(board, task)
++    before = rows(board)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        with dbc.write_txn(board):
++            support.prepare(board, task)
++            board.execute('CREATE UNIQUE INDEX late_value ON late_custody(value)')
++            replace(board)
++    assert rows(board) == before
++    assert not transfer.frozen(board, task)
++
++
++@pytest.mark.parametrize('installed', [False, True])
++def test_index_before_prepare_gets_durable_replace_coverage(board, installed):
++    task = support.seed(board)
++    custody(board, task)
++    if installed:
++        other = support.seed(board)
++        with dbc.write_txn(board):
++            support.prepare(board, other, nonce='transfer-other-0001')
++        with pytest.raises(sqlite3.IntegrityError, match='guarded identity changed'):
++            with dbc.write_txn(board):
++                support.prepare(board, task)
++                board.execute('CREATE UNIQUE INDEX late_value ON late_custody(value)')
++        assert not transfer.frozen(board, task)
++        return
++    with dbc.write_txn(board):
++        board.execute('CREATE UNIQUE INDEX late_value ON late_custody(value)')
++        support.prepare(board, task)
++    before = rows(board)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        replace(board)  # Durable raw-SQL guard, no native wrapper needed.
++    assert rows(board) == before
++
++
++def test_savepoint_rollback_then_fresh_install_replaces_speculative_snapshot(board):
++    task = support.seed(board)
++    custody(board, task)
++    with dbc.write_txn(board):
++        with pytest.raises(ValueError, match='rollback'):
++            with dbc.write_txn(board, allow_nested=True):
++                support.prepare(board, task)
++                raise ValueError('rollback')
++        board.execute('CREATE UNIQUE INDEX late_value ON late_custody(value)')
++        support.prepare(board, task)
++    before = rows(board)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        replace(board)
++    assert rows(board) == before
++    assert schema._FIRST_INSTALL.get() is None
++
++
++def test_rolled_back_only_install_leaves_no_context_or_committed_cache(board):
++    task = support.seed(board)
++    with dbc.write_txn(board):
++        with pytest.raises(ValueError, match='rollback'):
++            with dbc.write_txn(board, allow_nested=True):
++                support.prepare(board, task)
++                raise ValueError('rollback')
++    assert not transfer.frozen(board, task)
++    assert board._home_schema_committed is None
++    assert schema._FIRST_INSTALL.get() is None
++    with dbc.write_txn(board):
++        support.prepare(board, task)
++        lazy.late(board)
++    with pytest.raises(sqlite3.IntegrityError, match='home transfer prepared'):
++        board.execute('INSERT INTO late_custody VALUES (?,?,?)', ('protected', task, 'late'))
+diff --git a/tests/hermes_cli/test_home_registered_checks.py b/tests/hermes_cli/test_home_registered_checks.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1cd268ad1caccb0c2c80bd928e4d8422dadc29e
+--- /dev/null
++++ b/tests/hermes_cli/test_home_registered_checks.py
+@@ -0,0 +1,109 @@
++"""Registered-check carrier selection and writer custody races. [daveey]"""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_idle_candidates as idle
++from hermes_cli import kanban_sweep_gate as gate
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_home_shared_consumer_custody as support
++
++consumer_board = support.consumer_board
++
++
++def evidence(c):
++    return [r[0] for r in c.execute('SELECT task_id FROM task_events WHERE kind=?', (checks.CHECK_EVENT,))]
++
++
++def events(c, tid):
++    return [tuple(r) for r in c.execute('SELECT * FROM task_events WHERE task_id=? ORDER BY id', (tid,))]
++
++
++@pytest.mark.parametrize('phase', ['pending', 'prepared', 'ordinary'])
++@pytest.mark.parametrize('race', [False, True])
++def test_checks_frozen_carrier_does_not_starve_peer(consumer_board, monkeypatch, race, phase):
++    c = consumer_board
++    for tid in ('t_A', 't_B'):
++        support.card(c, tid)
++        support.wall(c, tid, 'wall-' + tid.lower())
++    calls, frozen_events = [], []
++
++    def run(command):
++        calls.append(command)
++        if race and command == 'check-a':
++            support.freeze(c, 't_A', phase)
++            frozen_events[:] = events(c, 't_A')
++        return 0, 'ok'
++
++    monkeypatch.setattr(checks, '_run_check', run)
++    monkeypatch.setattr(checks, 'registered_checks', lambda cfg=None: {'wall-t_a': 'check-a', 'wall-t_b': 'check-b'})
++    if not race:
++        support.freeze(c, 't_A', phase)
++        frozen_events[:] = events(c, 't_A')
++    result = SimpleNamespace()
++    gate.reset()
++    idle.sweep_shared_blockers(c, result)
++    assert 't_B' in evidence(c), (calls, evidence(c), vars(result))
++    assert ('t_A' in evidence(c)) == (phase == 'ordinary')
++    if phase != 'ordinary':
++        assert events(c, 't_A') == frozen_events
++        assert kb.get_task(c, 't_A').status == 'blocked'
++        assert ('check-a' in calls) == race  # preselection exclusions perform no I/O
++
++
++@pytest.mark.parametrize('phase', ['pending', 'prepared'])
++@pytest.mark.parametrize('race', [False, True])
++@pytest.mark.parametrize('rc', [0, 1, 'error'])
++def test_same_wall_reselects_healthy_carrier(consumer_board, monkeypatch, phase, race, rc):
++    c = consumer_board
++    for tid in ('t_A', 't_B'):
++        support.card(c, tid)
++        support.wall(c, tid, 'wall-a')
++    before = []
++    if not race:
++        support.freeze(c, 't_A', phase)
++        before[:] = events(c, 't_A')
++    calls = []
++
++    def run(command):
++        calls.append(command)
++        if race:
++            support.freeze(c, 't_A', phase)
++            before[:] = events(c, 't_A')
++        return rc, 'result'
++
++    monkeypatch.setattr(checks, '_run_check', run)
++    monkeypatch.setattr(checks, 'registered_checks', lambda cfg=None: {'wall-a': 'check-a'})
++    due = []
++    assert checks.run_due_checks(c, due_out=due) == (['wall-a'] if rc == 0 else [])
++    assert calls == ['check-a']
++    assert evidence(c) == ['t_B']
++    assert events(c, 't_A') == before
++    payload = kb._json_dict(c.execute('SELECT payload FROM task_events WHERE kind=?', (checks.CHECK_EVENT,)).fetchone()[0])
++    assert payload['rc'] == rc
++    assert payload['fails'] == (1 if rc == 'error' else 0)
++    assert bool(due) == (rc != 0)
++
++
++@pytest.mark.parametrize('phase', ['pending', 'prepared'])
++def test_raced_frozen_carrier_discards_changed_assertion_without_starving_next_wall(consumer_board, monkeypatch, phase):
++    c = consumer_board
++    for tid, bid in [('t_A', 'wall-a'), ('t_B', 'wall-a'), ('t_C', 'wall-c')]:
++        support.card(c, tid)
++        support.wall(c, tid, bid)
++    before = []
++    def run(command):
++        if command == 'check-a':
++            # New assertion changes the cohort while the check is out of lock.
++            support.card(c, 't_new')
++            support.wall(c, 't_new', 'wall-a')
++            support.freeze(c, 't_A', phase)
++            before[:] = events(c, 't_A')
++        return 0, 'ok'
++    monkeypatch.setattr(checks, '_run_check', run)
++    monkeypatch.setattr(checks, 'registered_checks', lambda cfg=None: {'wall-a': 'check-a', 'wall-c': 'check-c'})
++    checks.run_due_checks(c)
++    assert evidence(c) == ['t_C']
++    assert events(c, 't_A') == before
++    assert c.execute('SELECT task_id FROM task_events WHERE kind=?', (checks.ATTEMPT_EVENT,)).fetchone()[0] == 't_B'
+diff --git a/tests/hermes_cli/test_home_shared_invariant_consumers.py b/tests/hermes_cli/test_home_shared_invariant_consumers.py
+index a25e6a7ddb759af7d88b9309d8df49ac0d0209a9..06e081c047ab6db8242dc48c1ea86c97dc98179c 100644
+--- a/tests/hermes_cli/test_home_shared_invariant_consumers.py
++++ b/tests/hermes_cli/test_home_shared_invariant_consumers.py
+@@ -5,6 +5,7 @@
+ from tests.hermes_cli import test_review_daily_transfer as daily
+ from tests.hermes_cli import test_home_release_landing_race as release_landing
+ from tests.hermes_cli import test_kanban_home_source_stop as support
++from tests.hermes_cli import test_home_registered_checks as checks
+ 
+ release_board = release_landing.release_board
+ consumer_board = consumer_cases.consumer_board
+@@ -26,3 +27,6 @@
+ test_publication_holds_real_writer_reservation = consumer_io.test_publication_holds_real_writer_reservation
+ test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay = consumer_io.test_epoch_envelope_keeps_semantic_receipt_digest_and_exact_replay
+ test_review_target_is_captured_not_just_source = consumer_io.test_review_target_is_captured_not_just_source
++test_checks_frozen_carrier_does_not_starve_peer = checks.test_checks_frozen_carrier_does_not_starve_peer
++test_same_wall_reselects_healthy_carrier = checks.test_same_wall_reselects_healthy_carrier
++test_raced_frozen_carrier_discards_changed_assertion_without_starving_next_wall = checks.test_raced_frozen_carrier_discards_changed_assertion_without_starving_next_wall
+diff --git a/tests/hermes_cli/test_home_shared_invariant_schema.py b/tests/hermes_cli/test_home_shared_invariant_schema.py
+index 28baab88fe8d4a5057c1d543b630fb931d1643e9..52d8e625179031d4d7859cfb07bde4f6174066f8 100644
+--- a/tests/hermes_cli/test_home_shared_invariant_schema.py
++++ b/tests/hermes_cli/test_home_shared_invariant_schema.py
+@@ -1,6 +1,7 @@
+ """Shared home invariant: native late-schema boundary; run every partition."""
+ from tests.hermes_cli import test_home_lazy_schema_custody as custody
+ from tests.hermes_cli import test_home_lazy_schema_boundary as boundary
++from tests.hermes_cli import test_home_first_schema_identity as first
+ 
+ board = custody.board
+ 
+@@ -17,3 +18,9 @@
+ test_healthy_new_table_has_replace_and_update_sql_guards = boundary.test_healthy_new_table_has_replace_and_update_sql_guards
+ test_noop_writer_does_not_reinstall_schema_or_scan_custody = boundary.test_noop_writer_does_not_reinstall_schema_or_scan_custody
+ test_removed_existing_custody_trigger_is_not_silently_adopted = boundary.test_removed_existing_custody_trigger_is_not_silently_adopted
++test_first_prepare_identity_change_cannot_erase_custody = first.test_authentic_first_prepare_identity_change_cannot_erase_custody
++test_first_prepare_rejects_changed_guarded_schema = first.test_first_prepare_rejects_changed_guarded_schema
++test_first_prepare_then_index_and_replace_in_same_writer_rolls_back = first.test_first_prepare_then_index_and_replace_in_same_writer_rolls_back
++test_index_before_prepare_gets_durable_replace_coverage = first.test_index_before_prepare_gets_durable_replace_coverage
++test_savepoint_rollback_then_fresh_install_replaces_speculative_snapshot = first.test_savepoint_rollback_then_fresh_install_replaces_speculative_snapshot
++test_rolled_back_only_install_leaves_no_context_or_committed_cache = first.test_rolled_back_only_install_leaves_no_context_or_committed_cache
+-- 
+2.43.0
+

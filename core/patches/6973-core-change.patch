@@ -1,0 +1,398 @@
+From bb31660095f6fe7917b96d5c73d6ab17b7d5190d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:47:40 +0000
+Subject: [PATCH 6973] Cooperative home custody: dormant live-home transfer substrate
+
+Public mirror of source commit bb31660095f6fe7917b96d5c73d6ab17b7d5190d.
+
+---
+diff --git a/hermes_cli/kanban_actionability_transport.py b/hermes_cli/kanban_actionability_transport.py
+index 3e0e402eb206a23854bea02acd8c48b34450a942..44b143d5343df4908f29c6d9bf2081f97e55822a 100644
+--- a/hermes_cli/kanban_actionability_transport.py
++++ b/hermes_cli/kanban_actionability_transport.py
+@@ -12,6 +12,7 @@
+ 
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_retain_transport as retain
++from hermes_cli import kanban_home_command as home
+ 
+ KIND = 'actionability_record'
+ 
+@@ -33,6 +34,7 @@
+     columns = {r[1] for r in conn.execute('PRAGMA table_info(kanban_actionability_commands)')}
+     if 'eligibility_checked_at' not in columns:
+         conn.execute('ALTER TABLE kanban_actionability_commands ADD COLUMN eligibility_checked_at INTEGER')
++    home.install(conn, 'kanban_actionability_commands')
+ 
+ 
+ def envelope(task_id: str, payload: dict, phase: str = 'contract') -> dict:
+@@ -74,12 +76,13 @@
+         if old['request_json'] != frozen:
+             raise ValueError('actionability request changed after first committed bytes')
+         return old
++    epoch = home.capture(conn, wire)
+     conn.execute('INSERT INTO kanban_actionability_commands '
+-                 '(op_id,task_id,contract_key,phase,request_json,request_sha256,delivery_state) '
+-                 "VALUES (?,?,?,?,?,?,'pending')", (wire['client_op_id'], task_id, wire['payload']['contract_key'],
+-                                                     phase, frozen, digest(frozen)))
+-    conn.execute('INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) '
+-                 f"VALUES (?,'tasks',?,?,?,'',{sync._NOW_MS_SQL})", (wire['client_op_id'], task_id, KIND, frozen))
++                 '(op_id,task_id,contract_key,phase,request_json,request_sha256,delivery_state,home_generations) '
++                 "VALUES (?,?,?,?,?,?,'pending',?)", (wire['client_op_id'], task_id, wire['payload']['contract_key'],
++                                                     phase, frozen, digest(frozen), epoch))
++    conn.execute('INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,home_generations) '
++                 f"VALUES (?,'tasks',?,?,?,'',{sync._NOW_MS_SQL},?)", (wire['client_op_id'], task_id, KIND, frozen, epoch))
+     return command(conn, wire['client_op_id'])
+ 
+ 
+@@ -100,7 +103,7 @@
+             or owned['request_sha256'] != digest(owned['request_json'])
+             or owned['task_id'] != wire['task'] or envelope(wire['task'], wire['payload'], wire['phase']) != wire):
+         raise ValueError('actionability outbox lost immutable custody')
+-    return wire
++    return home.outbound(owned, wire)
+ 
+ 
+ def capability(hub, board: str) -> dict:
+diff --git a/hermes_cli/kanban_failure_release.py b/hermes_cli/kanban_failure_release.py
+index 70de204a35d8778e56ecbf16c3c40ddcf1146021..da53775f08eecc97967f08f8cc2060891cae3785 100644
+--- a/hermes_cli/kanban_failure_release.py
++++ b/hermes_cli/kanban_failure_release.py
+@@ -100,6 +100,8 @@
+                  "delivery_state", "canonical_receipt_json", "rejected_release_op_id"):
+         if name not in existing:
+             conn.execute(f"ALTER TABLE kanban_failure_commands ADD COLUMN {name} TEXT")
++    from hermes_cli.kanban_home_command import install
++    install(conn, 'kanban_failure_commands')
+ 
+ 
+ def mark_sent(conn: sqlite3.Connection, run_uid: str, task_id: str) -> None:
+@@ -127,6 +129,10 @@
+     if not conn.in_transaction:
+         raise ValueError("failure release requires a write transaction")
+     _ensure_commands(conn)
++    if observer_held(conn, run_id):
++        return True  # Existing custody is replay, not a new current-epoch intent.
++    from hermes_cli.kanban_home_command import capture
++    epoch = capture(conn, {'op': 'release', 'task': task_id})
+     op_id = sync.uuid7()
+     inserted = conn.execute("INSERT OR IGNORE INTO kanban_failure_commands (run_uid,task_id,op_id,operation_kind) "
+                             "VALUES (?, ?, ?, 'release')",
+@@ -143,7 +149,7 @@
+         # Same millisecond clock as captured rows: a release may reference a
+         # systemic fix card created earlier in this transaction.
+         conn.execute("INSERT INTO kanban_sync_outbox "
+-                     "(op_id,table_name,row_uid,op,fields,hlc,created_at) "
+-                     f"VALUES (?, 'tasks', ?, 'release', ?, '', {sync._NOW_MS_SQL})",
+-                     (op_id, task_id, json.dumps(fields)))
++                     "(op_id,table_name,row_uid,op,fields,hlc,created_at,home_generations) "
++                     f"VALUES (?, 'tasks', ?, 'release', ?, '', {sync._NOW_MS_SQL},?)",
++                     (op_id, task_id, json.dumps(fields), epoch))
+     return True
+diff --git a/hermes_cli/kanban_home_command.py b/hermes_cli/kanban_home_command.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d5c8aca727a56d53b0cae7acdd04f65bc2e4446
+--- /dev/null
++++ b/hermes_cli/kanban_home_command.py
+@@ -0,0 +1,60 @@
++"""Capture-time sidecars for immutable typed intent; never enrich during send. [daveey]
++
++Semantic request JSON and its attested hash stay unchanged. The separate replay
++fence is captured once in the same writer transaction, and NULL legacy custody
++stays unknown forever. Board ingress fences the full wire before semantic work.
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_home_generation as epochs
++from hermes_cli.sqlite_util import add_column_if_missing
++
++_TABLES = frozenset({'kanban_failure_commands', 'kanban_actionability_commands',
++                    'kanban_protect_commands', 'containment_delivery'})
++
++
++def install(conn, table: str) -> None:
++    if table not in _TABLES:
++        raise ValueError('unsupported home command custody')
++    add_column_if_missing(conn, table, 'home_generations', 'home_generations TEXT')
++    conn.execute(f'CREATE TRIGGER IF NOT EXISTS home_epoch1_{table} '
++                 f'BEFORE UPDATE OF home_generations ON {table} '
++                 'WHEN NEW.home_generations IS NOT OLD.home_generations '
++                 "BEGIN SELECT RAISE(ABORT,'captured command home generation is immutable'); END")
++
++
++def touched(wire: dict) -> set[str]:
++    ids = {wire.get(k) for k in ('task', 'parent', 'child', 'actor_task')}
++    payload = wire.get('payload')
++    if isinstance(payload, dict):
++        if wire.get('op') == 'actionability_record' and wire.get('phase') == 'escalation':
++            owner = payload.get('owner', {})
++            if owner.get('kind') == 'task':
++                ids.update(owner.get('refs', []))
++        if wire.get('op') == 'renew_scope' and payload.get('authority_kind') == 'creator_task':
++            ids.add(payload.get('authority_ref'))
++    return {v for v in ids if isinstance(v, str) and v}
++
++
++def capture(conn, wire: dict) -> str | None:
++    if not conn.in_transaction:
++        raise ValueError('home command capture requires writer transaction')
++    from hermes_cli.kanban_home_transfer import frozen
++    tasks = touched(wire)
++    if any(frozen(conn, task) for task in tasks):
++        raise ValueError('home transfer pending')
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_home_generations1'").fetchone():
++        return None
++    values = {}
++    for task in sorted(tasks):
++        row = conn.execute('SELECT nonce FROM kanban_home_generations1 WHERE task_id=?', (task,)).fetchone()
++        if row:
++            values[task] = row[0]
++    return json.dumps(values, sort_keys=True, separators=(',', ':')) if values else None
++
++
++def outbound(owned: dict, semantic: dict) -> dict:
++    """Read only the durable sidecar; no lookup of today's task/epoch is allowed."""
++    return epochs.add_captured(owned, semantic)
+diff --git a/hermes_cli/kanban_protect_transport.py b/hermes_cli/kanban_protect_transport.py
+index 0174d2481e44170b3d3a731bceb172a4b16ebbf0..e1a2ea2211ff6d14c13bad44a9e1505335084a17 100644
+--- a/hermes_cli/kanban_protect_transport.py
++++ b/hermes_cli/kanban_protect_transport.py
+@@ -12,6 +12,7 @@
+ from hermes_cli import kanban_actionability_transport as wireutil
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_protect_stopped as kernel
++from hermes_cli import kanban_home_command as home_intent
+ 
+ KIND = 'protect_stopped'
+ 
+@@ -36,6 +37,7 @@
+                  'delivery_state TEXT NOT NULL,canonical_receipt_json TEXT)')
+     conn.execute('CREATE TABLE IF NOT EXISTS kanban_protect_scan (board TEXT PRIMARY KEY,last_id INTEGER NOT NULL)')
+     conn.execute('CREATE INDEX IF NOT EXISTS idx_protect_pending ON kanban_protect_commands(board,request_uid)')
++    home_intent.install(conn, 'kanban_protect_commands')
+ 
+ 
+ def command(conn, request_uid):
+@@ -77,10 +79,11 @@
+         if old['request_json']!=frozen or old['board']!=board or old['home']!=home:
+             raise ValueError('protect frozen command conflict; recover original custody')
+         return old
++    epoch = home_intent.capture(conn, wire)
+     conn.execute('INSERT INTO kanban_protect_commands '
+-                 '(request_uid,board,task_id,home,request_event_uid,request_json,request_sha256,delivery_state) '
+-                 "VALUES (?,?,?,?,?,?,?,'pending')",(payload['request_uid'],board,wire['task'],home,
+-                  request_event_uid,frozen,wireutil.digest(frozen)))
++                 '(request_uid,board,task_id,home,request_event_uid,request_json,request_sha256,delivery_state,home_generations) '
++                 "VALUES (?,?,?,?,?,?,?,'pending',?)",(payload['request_uid'],board,wire['task'],home,
++                  request_event_uid,frozen,wireutil.digest(frozen),epoch))
+     return command(conn,payload['request_uid'])
+ 
+ 
+@@ -111,7 +114,7 @@
+     # Protect has its own frozen transport, not the replay sender's ACK state.
+     # Still refuse enrollment loss before this independent command can leave.
+     journal.bound_custody(conn)
+-    reply=hub.ops(board,[wire])
++    reply=hub.ops(board,[home_intent.outbound(old,wire)])
+     results=reply.get('results',[]) if isinstance(reply,dict) else []
+     if (isinstance(results,list) and len(results)==1 and isinstance(results[0],dict)
+             and results[0].get('client_op_id')==wire['client_op_id'] and results[0].get('status')=='rejected'
+diff --git a/hermes_cli/kanban_retain_transport.py b/hermes_cli/kanban_retain_transport.py
+index 6291544f3aac11ca43cf2670ef15d1d2533e4e66..ff02d3e916a8fe48f625386abdda35689e84cae8 100644
+--- a/hermes_cli/kanban_retain_transport.py
++++ b/hermes_cli/kanban_retain_transport.py
+@@ -13,6 +13,7 @@
+ 
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_failure_release as release
++from hermes_cli import kanban_home_command as home
+ 
+ 
+ def canonical(value: dict) -> str:
+@@ -57,7 +58,7 @@
+             or owned["task_id"] != row["row_uid"] or owned["request_json"] != canonical(wire)
+             or owned["request_sha256"] != hashlib.sha256(owned["request_json"].encode("utf-8")).hexdigest()):
+         raise ValueError("retain outbox lost its exact immutable command custody")
+-    return wire
++    return home.outbound(owned, wire)
+ 
+ 
+ def _replayable(owned: dict) -> None:
+@@ -135,7 +136,7 @@
+     capability(hub, board)
+     from hermes_cli.kanban_replay_controls import confirmed_transport
+     strict = confirmed_transport(conn, owned)
+-    results = [] if strict else hub.ops(board, [wire]).get("results", [])
++    results = [] if strict else hub.ops(board, [home.outbound(owned, wire)]).get("results", [])
+     if (len(results) == 1 and results[0].get("client_op_id") == owned["request_uid"]
+             and results[0].get("status") == "rejected"):
+         from hermes_cli import kanban_db as kb
+@@ -239,11 +240,12 @@
+         return old
+     request_uid, event_uid = sync.uuid7(), sync.uuid7()
+     wire = canonical(_envelope(task_id, run_uid, payload, expected_episode, request_uid, event_uid))
++    epoch = home.capture(conn, json.loads(wire))
+     digest = hashlib.sha256(wire.encode("utf-8")).hexdigest()
+     conn.execute("INSERT INTO kanban_failure_commands "
+-                 "(run_uid,task_id,op_id,operation_kind,request_uid,event_uid,request_json,request_sha256,delivery_state) "
+-                 "VALUES (?,?,?,'retain',?,?,?,?,'pending')",
+-                 (run_uid, task_id, request_uid, request_uid, event_uid, wire, digest))
+-    conn.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at) "
+-                 f"VALUES (?,'tasks',?,'retain',?,'',{sync._NOW_MS_SQL})", (request_uid, task_id, wire))
++                 "(run_uid,task_id,op_id,operation_kind,request_uid,event_uid,request_json,request_sha256,delivery_state,home_generations) "
++                 "VALUES (?,?,?,'retain',?,?,?,?,'pending',?)",
++                 (run_uid, task_id, request_uid, request_uid, event_uid, wire, digest, epoch))
++    conn.execute("INSERT INTO kanban_sync_outbox (op_id,table_name,row_uid,op,fields,hlc,created_at,home_generations) "
++                 f"VALUES (?,'tasks',?,'retain',?,'',{sync._NOW_MS_SQL},?)", (request_uid, task_id, wire, epoch))
+     return command(conn, run_uid)
+diff --git a/tests/hermes_cli/test_home_typed_capture.py b/tests/hermes_cli/test_home_typed_capture.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..455dcdf161404bf45ceb779908e88d83f0307570
+--- /dev/null
++++ b/tests/hermes_cli/test_home_typed_capture.py
+@@ -0,0 +1,140 @@
++"""Typed intent binds its home epoch at reservation, never at replay. [daveey]"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_actionability_transport as act
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_failure_release as release
++from hermes_cli import kanban_retain_transport as retain
++from tests.hermes_cli import test_kanban_actionability_transport as action_fixture
++from tests.hermes_cli import test_kanban_failure_transport as failure_fixture
++from tests.hermes_cli import test_kanban_retain_transport as retain_fixture
++
++live = failure_fixture.live
++
++
++def mirror(conn, task, nonce, pending=0):
++    with kbc.write_txn(conn):
++        conn.execute('INSERT INTO kanban_home_generations1(task_id,nonce,pending) VALUES (?,?,?) '
++                     'ON CONFLICT(task_id) DO UPDATE SET nonce=excluded.nonce,pending=excluded.pending',
++                     (task, nonce, pending))
++
++
++def fixture(conn, kind):
++    if kind == 'actionability':
++        task, payload = action_fixture.contract(conn)
++        return task, lambda: act.reserve(conn, task, payload)
++    task, rid = failure_fixture._running(conn)
++    if kind == 'retain':
++        run = sync.run_uid(conn, rid)
++        assert run is not None
++        return task, lambda: retain.reserve(conn, task, run, retain_fixture.PAYLOAD, None)
++    return task, lambda: release.queue(conn, task, rid, outcome='crashed', error='fixture')
++
++
++def outbound(conn, kind):
++    row = sync.outbox(conn)[0]
++    if kind == 'actionability':
++        return act.outbound(conn, row)
++    if kind == 'retain':
++        return retain.outbound(conn, row)
++    from hermes_cli import kanban_sync_envelope as envelopes
++    from hermes_cli import kanban_sync_wire as wire
++    with kbc.write_txn(conn):
++        return envelopes.outbound(conn, row, lambda: wire.translate(row, '100-0-fixture'))
++
++
++@pytest.mark.parametrize('kind', ['retain', 'actionability', 'release'])
++@pytest.mark.parametrize('captured', [False, True])
++def test_reservation_epoch_survives_new_mirror_and_actual_outbound(live, kind, captured):
++    task, reserve = fixture(live, kind)
++    if captured:
++        mirror(live, task, 'committed-nonce-0001')
++    with kbc.write_txn(live):
++        owned = reserve()
++    first = outbound(live, kind)
++    expected = {task: 'committed-nonce-0001'} if captured else None
++    assert first.get('home_generations') == expected
++    if kind != 'release':
++        assert isinstance(owned, dict)
++        assert owned['request_sha256'] == hashlib.sha256(owned['request_json'].encode()).hexdigest()
++        assert 'home_generations' not in json.loads(owned['request_json'])
++    mirror(live, task, 'committed-nonce-0002')
++    with kbc.write_txn(live):
++        assert reserve() == owned
++    assert outbound(live, kind) == first
++    mirror(live, task, 'committed-nonce-0002', pending=1)
++    with kbc.write_txn(live):
++        assert reserve() == owned  # An existing command is not fresh pending intent.
++    if kind != 'release':
++        with kbc.write_txn(live):
++            live.execute('DELETE FROM kanban_sync_outbox')
++        with kbc.write_txn(live):
++            assert reserve() == owned  # ACK never discards the captured epoch.
++
++
++@pytest.mark.parametrize('kind', ['retain', 'actionability', 'release'])
++def test_pending_transfer_refuses_new_command_without_custody_effects(live, kind):
++    task, reserve = fixture(live, kind)
++    mirror(live, task, 'committed-nonce-0001', pending=1)
++    with pytest.raises(ValueError, match='home transfer pending'):
++        with kbc.write_txn(live):
++            reserve()
++    assert not sync.outbox(live)
++
++
++@pytest.mark.parametrize('kind', ['retain', 'actionability'])
++def test_command_sidecar_is_immutable_and_survives_transport_removal(live, kind):
++    task, reserve = fixture(live, kind)
++    mirror(live, task, 'committed-nonce-0001')
++    with kbc.write_txn(live):
++        owned = reserve()
++    assert isinstance(owned, dict)
++    table = 'kanban_failure_commands' if kind == 'retain' else 'kanban_actionability_commands'
++    with pytest.raises(sqlite3.IntegrityError, match='captured command home generation is immutable'):
++        with kbc.write_txn(live):
++            live.execute(f'UPDATE {table} SET home_generations=NULL')
++    with kbc.write_txn(live):
++        live.execute('DELETE FROM kanban_sync_outbox')
++    mirror(live, task, 'committed-nonce-0002')
++    with kbc.write_txn(live):
++        assert reserve() == owned
++
++
++def test_protect_captures_separate_target_epoch_without_changing_semantic_bytes(live):
++    from hermes_cli import kanban_protect_transport as protect
++    task, _ = action_fixture.contract(live)
++    args = {'source_event_uid': 'source-event', 'source_run_uid': 'source-run', 'expected_status': 'ready',
++            'expected_current_run_uid': None, 'expected_updated_at': 1, 'expected_episode': None,
++            'requested_owner': 'actor-fixture', 'next_step': 'Resolve scope', 'recovery_trigger': 'Scoped decision',
++            'escalate_at': 1000, 'evidence': ['isolated capture fixture']}
++    payload = {'action': 'protect_stopped', 'board': 'default', 'home': 'fixture', 'request_uid': 'typed-protect-request',
++               'target_task_id': task, 'caller': {'task_id': 'actor-fixture', 'run_uid': 'actor-run'}, 'args': args}
++    mirror(live, task, 'committed-nonce-0001')
++    with kbc.write_txn(live):
++        owned = protect.reserve(live, 'default', payload, 'request-event')
++    assert json.loads(owned['home_generations']) == {task: 'committed-nonce-0001'}
++    assert json.loads(owned['request_json']) == protect.envelope(payload, 'request-event')
++    mirror(live, task, 'committed-nonce-0002', pending=1)
++    with kbc.write_txn(live):
++        assert protect.reserve(live, 'default', payload, 'request-event') == owned
++
++
++@pytest.mark.parametrize('kind', ['retain', 'actionability', 'release'])
++def test_source_marker_alone_blocks_new_typed_capture_before_any_epoch_mirror(live, kind):
++    from hermes_cli import kanban_home_transfer as source
++    task, reserve = fixture(live, kind)
++    with kbc.write_txn(live):
++        source._install(live)
++        live.execute('INSERT INTO kanban_home_prepared1 VALUES (?,?,?,?,?)',
++                     (task, 'fixture', 'hub', 'malformed', 1))
++    assert source.frozen(live, task)
++    with pytest.raises(ValueError, match='home transfer pending'):
++        with kbc.write_txn(live):
++            reserve()
+-- 
+2.43.0
+

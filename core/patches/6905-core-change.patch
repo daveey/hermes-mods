@@ -1,0 +1,132 @@
+From 9bd86a4f595e63ec71a22cf37225a6273442d63a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:42:28 +0000
+Subject: [PATCH 6905] Replay sender: durable single-slot journal, deferred observation and bounded recovery (dormant)
+
+Public mirror of source commit 9bd86a4f595e63ec71a22cf37225a6273442d63a.
+
+---
+diff --git a/docs/kanban-replay-recovery-audit.md b/docs/kanban-replay-recovery-audit.md
+index bdaedefac107f1ff23323dd50c715cd9e1d386e8..ac7e401e5cd749695caf4669a81ae8bd4ffc5283 100644
+--- a/docs/kanban-replay-recovery-audit.md
++++ b/docs/kanban-replay-recovery-audit.md
+@@ -99,16 +99,17 @@
+ `_build` now writes `kanban_replay_recovery_loss1` in the same transaction as
+ salvage, before the rebuilt image can be installed. This independent singleton
+ records recovery and the protocol loss report even if the sync anchor or sender
+-singleton was unreadable. It is also written for a not-yet-synced database, so
+-later sync installation cannot turn recovered unknown history into a clean legacy
+-image. It has no independent index/refill route and is not a per-operation ledger.
++singleton was unreadable. For a never-enrolled database (no sender table, no journal
++anchor) it is written only when a replay table reported loss; legacy sync-table
++damage is healed by legacy resync and does not hold the board. It has no independent index/refill route and is not a per-operation ledger.
+ Readable prior rebuild reports are retained; unreadable prior history stays loss.
+ 
+ Public sender admission checks the marker, the restore flag and any existing
+ journal binding **before** selecting legacy or performing sender network I/O.
+ Missing/recreated anchors with surviving journal custody become durably
+-restore-required. Every rebuilt database is held, even if no protocol loss was
+-index-countable or the anchor survived intact. Clearing the ordinary flag alone
++restore-required. Every rebuilt database that was enrolled (sender table or journal
++anchor present) is held, even if no protocol loss was index-countable or the anchor
++survived intact. Clearing the ordinary flag alone
+ cannot clear the independent rebuild hold. `RestoreRequired` is isolated as a
+ per-board round error, so an affected board does not crash sync for other boards.
+ The gate installs no journal, certifies no original capture and enables no mode.
+diff --git a/hermes_cli/kanban_db_recover.py b/hermes_cli/kanban_db_recover.py
+index 2e8f12922345752650219fe305f30dc99c249dd4..1409894c9b4afe29df82fc6882393800ce70235f 100644
+--- a/hermes_cli/kanban_db_recover.py
++++ b/hermes_cli/kanban_db_recover.py
+@@ -491,9 +491,12 @@
+             except sqlite3.DatabaseError:
+                 row = None
+             enrolled = row is not None and row[0] is not None
++        # A never-enrolled board has no replay custody to lose: damage to its legacy sync tables is
++        # healed by the ordinary legacy resync, so only replay tables can hold it.
++        prefixes = (('kanban_replay_', 'kanban_sync_', 'kanban_failure_', 'kanban_actionability_')
++                    if enrolled else ('kanban_replay_',))
+         mark_rebuilt(dst, {name: asdict(loss) for name, loss in result.tables.items()
+-                           if name.startswith(('kanban_replay_', 'kanban_sync_', 'kanban_failure_',
+-                                               'kanban_actionability_')) and
++                           if name.startswith(prefixes) and
+                            (loss.unreadable_paths or loss.known_lost or loss.possibly_lost)},
+                      enrolled=enrolled)
+         dst.execute("COMMIT")
+diff --git a/tests/hermes_cli/test_kanban_replay_rebuild_enrollment.py b/tests/hermes_cli/test_kanban_replay_rebuild_enrollment.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b64c8c5c515dd1c64067edab15f3c86fe4eebce3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replay_rebuild_enrollment.py
+@@ -0,0 +1,69 @@
++"""Rebuild hold depends on enrollment: legacy-table damage never holds a never-enrolled board.
++
++Regression for review 6043365687 on the replay sender PR.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import kanban_db_recover as recovery
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_db_recover as damage
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++MARKER = 'kanban_replay_recovery_loss1'
++
++
++def _has_marker(path):
++    conn = kbc.connect(path)
++    try:
++        return conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (MARKER,)).fetchone() is not None
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('table', ['kanban_sync_outbox', 'task_events'])
++def test_never_enrolled_legacy_table_damage_keeps_legacy_push(tmp_path, monkeypatch, table):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    path = home / 'kanban.db'
++    conn = kbc.connect(path)
++    client.ensure_identity(conn, 'default', 'macbook')
++    assert conn.execute('SELECT journal_id FROM kanban_sync_state').fetchone()[0] is None
++    for i in range(120):
++        kb.create_task(conn, title=f'card {i} ' + 'x' * 300, assignee='worker')
++    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
++    conn.close()
++    damage._forget(path)
++    assert damage._damage_table(path, table)
++    rebuilt = tmp_path / 'rebuilt.db'
++    report = recovery.RecoveryResult(status='building', db_path=str(path))
++    recovery._build(path, rebuilt, None, report)
++    recovery._install(rebuilt, path)
++    damage._forget(path)
++    assert not _has_marker(path)
++    hub = FakeService().hub('macbook')
++    live = kbc.connect(path)
++    try:
++        assert client.push(live, hub, 'default', 'macbook', primary=False, max_batches=1).applied >= 1
++    finally:
++        live.close()
++
++
++def test_anchor_without_sender_table_still_counts_as_enrolled(tmp_path, monkeypatch):
++    """The journal_id fallback: sender table gone, anchor survives -> rebuilt board is held."""
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    path = home / 'kanban.db'
++    conn = kbc.connect(path)
++    client.ensure_identity(conn, 'default', 'macbook')
++    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++    assert 'kanban_replay_sender1' not in names
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET journal_id='surviving-anchor'")
++    conn.close()
++    damage._forget(path)
++    rebuilt = tmp_path / 'rebuilt.db'
++    report = recovery.RecoveryResult(status='building', db_path=str(path))
++    recovery._build(path, rebuilt, None, report)
++    assert _has_marker(rebuilt)
+-- 
+2.43.0
+

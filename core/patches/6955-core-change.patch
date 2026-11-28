@@ -1,0 +1,305 @@
+From cd0b6191b19842d19671823219b66b6582db1313 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:01:15 +0000
+Subject: [PATCH 6955] Hot-path read-cost reductions (SQLite hand-offs, request coalescing, memoization)
+
+Public mirror of source commit cd0b6191b19842d19671823219b66b6582db1313.
+
+---
+diff --git a/hermes_cli/kanban_completion_refs.py b/hermes_cli/kanban_completion_refs.py
+index d8929d71924beda9bdf1415b6ff6a87dd5e28c42..477e300bd0517f46c3740cf731bac22e0d3804c2 100644
+--- a/hermes_cli/kanban_completion_refs.py
++++ b/hermes_cli/kanban_completion_refs.py
+@@ -29,6 +29,8 @@
+ import sqlite3
+ from typing import Any, Iterable
+ 
++from hermes_cli.kanban_table_columns import table_columns
++
+ RECEIPT_KINDS = ("pr_acceptance", "goal_verified")
+ UID_KEYS = {"pr_acceptance": "pr_acceptance_event_uid", "goal_verified": "goal_verified_event_uid"}
+ ID_KEYS = {"pr_acceptance": "pr_acceptance_event_id", "goal_verified": "goal_verified_event_id"}
+@@ -49,8 +51,10 @@
+             payload[UID_KEYS[kind]] = row[0]
+ 
+ 
+-def _columns(conn: sqlite3.Connection) -> set[str]:
+-    return {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++def _columns(conn: sqlite3.Connection) -> frozenset[str]:
++    # One result row, not one per column: each stepped row is a GIL handoff in the serve. The links projection
++    # asks this once per owner card, and profiling put a large share of its samples here (t_d0c5000000000005).
++    return table_columns(conn, "task_events")
+ 
+ 
+ def read_candidates(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+@@ -80,7 +84,7 @@
+     """``{task_id: holder}`` for each ``{task_id: run_id}`` whose run the Board leased to exactly one gateway
+     other than this board's own (``claimed`` with ``holder`` and that run's ``run_uid``). One SELECT."""
+     runs = {t: r for t, r in runs.items() if type(r) is int}
+-    if not runs or "uid" not in {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}:
++    if not runs or "uid" not in table_columns(conn, "task_runs"):
+         return {}
+     try:
+         own = conn.execute("SELECT gateway_id FROM kanban_sync_state LIMIT 1").fetchone()
+diff --git a/tests/hermes_cli/test_kanban_completion_refs_columns.py b/tests/hermes_cli/test_kanban_completion_refs_columns.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f681ce0650b5740984df35d08ee579f5c59fa3e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_completion_refs_columns.py
+@@ -0,0 +1,49 @@
++"""Completion-receipt readers probe board columns in one handed-out row. [daveey]
++
++``read_candidates``/``origin_of`` run once per owner card in the remote-links projection
++(``observe_owner_task`` -> ``completion_verdict``), and ``PRAGMA table_info(task_events)`` handed one
++row per column to Python: each a GIL handoff under the serve's convoy. Profiling a busy serve put
++a large share of links-projection samples on that probe (t_d0c5000000000005).
++"""
++import sqlite3
++
++from hermes_cli import kanban_completion_refs as refs
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++def _counting(conn):
++    handed = {"rows": 0}
++    inner = conn.row_factory
++
++    def factory(cursor, row):
++        handed["rows"] += 1
++        return inner(cursor, row) if inner is not None else row
++
++    conn.row_factory = factory
++    return handed
++
++
++def test_column_probes_hand_out_one_row(tmp_path):
++    with kbc.connect(tmp_path / "kanban.db") as conn:
++        tid = kb.create_task(conn, title="card", assignee="dev")
++        expected = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++        handed = _counting(conn)
++        assert refs._columns(conn) == expected
++        assert handed["rows"] == 1
++        handed["rows"] = 0
++        assert refs.read_candidates(conn, [tid]) == {tid: []}
++        assert handed["rows"] == 1  # the column probe; no receipt rows
++        assert refs.leased_elsewhere(conn, {tid: 1}) == {}
++
++
++def test_missing_columns_still_read_as_null(tmp_path):
++    conn = sqlite3.connect(tmp_path / "bare.db")
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT)")
++    conn.execute("INSERT INTO task_events (task_id, kind, payload) VALUES ('t1', 'pr_acceptance', '{}')")
++    rows = refs.read_candidates(conn, ["t1"])["t1"]
++    assert rows == [{"id": 1, "uid": None, "task_id": "t1", "kind": "pr_acceptance", "run_id": None,
++                     "origin_gateway": None, "payload": "{}"}]
++    assert refs.origin_of(conn, 1) is None
++    assert refs.leased_elsewhere(conn, {"t1": 1}) == {}  # no uid column on task_runs
+diff --git a/tests/tui_gateway/test_notify_private_chat.py b/tests/tui_gateway/test_notify_private_chat.py
+index d32fc367d1a2bfb2d133c5c9d3b97c3b4a68d43f..23e73bbb8c8ba10949ca8da37f2121c027353e49 100644
+--- a/tests/tui_gateway/test_notify_private_chat.py
++++ b/tests/tui_gateway/test_notify_private_chat.py
+@@ -72,7 +72,7 @@
+         private = {chat: idle.board_signature(path, chat) for chat in (CHAT, OTHER, "absent-chat")}
+     assert private == shared  # byte-identical signatures, including the empty slice
+     assert idle._SIGS[str(path)] is held  # still never published
+-    assert not any(s.startswith(idle._SUBS_SQL) for s in statements), statements
++    assert not any(idle._SUBS_SQL in s for s in statements), statements
+     chat_reads = [s for s in statements if "FROM kanban_notify_subs" in s and "chat_id = " in s]
+     assert len(chat_reads) == 3, statements
+ 
+diff --git a/tests/tui_gateway/test_notify_reader.py b/tests/tui_gateway/test_notify_reader.py
+index 29eb957c3caff69a545672faf4dcc7811fb3c5ca..d7051553a75f69b0d8541d20ad417befdde44cb7 100644
+--- a/tests/tui_gateway/test_notify_reader.py
++++ b/tests/tui_gateway/test_notify_reader.py
+@@ -43,7 +43,7 @@
+         release.set()
+         thread.join(5)
+     assert not thread.is_alive()
+-    scans = [s for s in statements if s.startswith(idle._SUBS_SQL)]
++    scans = [s for s in statements if idle._SUBS_SQL in s]
+     zero = [s for s in statements if 'FROM task_events WHERE id > 0 ' in s]
+     assert (len(scans), len(zero)) == (0, 0), statements
+ 
+@@ -76,7 +76,7 @@
+         assert after[2][0][4] == 96
+         for _ in range(3):
+             assert idle.board_signature(path, helpers.CHAT) == after
+-        assert sum(s.startswith(idle._SUBS_SQL) for s in statements) == 1
++        assert sum(idle._SUBS_SQL in s for s in statements) == 1
+         assert not any('FROM task_events WHERE id > 0 ' in s for s in statements)
+     finally:
+         release.set()
+diff --git a/tests/tui_gateway/test_notify_subs_packed.py b/tests/tui_gateway/test_notify_subs_packed.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..97fbaa86d1570a22445e2e873e5f65c504a613c9
+--- /dev/null
++++ b/tests/tui_gateway/test_notify_subs_packed.py
+@@ -0,0 +1,114 @@
++"""Subscription reads behind ``board_signature`` hand their rows over in one packed row.
++
++CPython's sqlite3 releases the GIL on every stepped row. A changed subscription revision makes the
++retained observer re-read every tui subscription row on the board (~4k on the hub), and under the
++serve's convoy each of those handoffs waited for the GIL: after the private-read cut, profiling
++still put most active ``_notify_content`` samples on that fetch (t_d0c5000000000005).
++"""
++import contextlib
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from hermes_cli import kanban_generation as generation
++from tests.tui_gateway import test_notify_private_chat as private
++from tests.tui_gateway import test_notify_subs_gate as helpers
++from tui_gateway import notification_idle as idle
++
++board = helpers.board
++CHAT, OTHER = helpers.CHAT, helpers.OTHER
++N_CHATS = 40
++
++
++def _counted_rows(monkeypatch):
++    """Count every row sqlite3 hands to Python on connections the notification readers open."""
++    original = generation.open_ro
++    handed = {"rows": 0}
++
++    def counted(*args, **kwargs):
++        conn = original(*args, **kwargs)
++        inner = conn.row_factory
++
++        def factory(cursor, row):
++            handed["rows"] += 1
++            return inner(cursor, row) if inner is not None else row
++
++        conn.row_factory = factory
++        return conn
++
++    monkeypatch.setattr(generation, "open_ro", counted)
++    return handed
++
++
++def _bulk(tasks):
++    with contextlib.closing(kbc.connect()) as conn:
++        for i in range(N_CHATS):
++            kbn.add_notify_sub(conn, task_id=tasks[i % len(tasks)], platform="tui",
++                               chat_id=f"20261127_2200{i:02d}_bulk{i:02d}")
++
++
++def _fresh_reader():
++    idle.reset_board_signatures()
++
++
++def test_retained_full_subscription_read_is_one_handed_row(board, monkeypatch):
++    path, tasks = board
++    _bulk(tasks)
++    _fresh_reader()
++    expected = idle.board_signature(path)  # unpatched: the reference answer
++    _fresh_reader()
++    handed = _counted_rows(monkeypatch)
++    got = idle.board_signature(path)
++    assert got == expected
++    assert len(got[2]) == N_CHATS + 2
++    # sqlite_master (2), data_version, the revision probes and MAX(id)s: a handful, never one per row
++    assert handed["rows"] < N_CHATS, handed
++
++
++def test_private_chat_read_is_one_handed_row(board, monkeypatch):
++    path, _tasks = board
++    with contextlib.closing(kbc.connect()) as conn:
++        for i in range(N_CHATS):
++            kbn.add_notify_sub(conn, task_id=f"t_bulk{i:03d}", platform="tui", chat_id=CHAT)
++    shared = idle.board_signature(path, CHAT)
++    assert len(shared[2]) == N_CHATS + 3
++    handed = _counted_rows(monkeypatch)
++    with private._shared_observer_busy(path):
++        got = idle.board_signature(path, CHAT)
++    assert got == shared
++    assert handed["rows"] < N_CHATS, handed
++
++
++def test_packed_rows_keep_types_nulls_and_order(board):
++    from tests.tui_gateway.test_notify_revision import writer
++    path, _tasks = board
++    with writer(path) as conn:
++        conn.execute("UPDATE kanban_notify_subs SET last_event_id = 9007199254740993, inflight_from = NULL, "
++                     "thread_id = '' WHERE chat_id = ?", (OTHER,))
++    sig = idle.board_signature(path)
++    rows = sig[2][OTHER]
++    assert [r[4] for r in rows] == [9007199254740993] and rows[0][5] is None
++    assert type(rows[0][4]) is int
++    for chat, subs in sig[2].items():
++        assert list(subs) == sorted(subs, key=lambda r: (r[1], r[2], r[3]))
++    assert list(sig[2]) == sorted(sig[2])
++
++
++def test_a_value_json_cannot_carry_reads_plainly(board):
++    from tests.tui_gateway.test_notify_revision import writer
++    path, _tasks = board
++    with writer(path) as conn:
++        conn.execute("UPDATE kanban_notify_subs SET thread_id = X'00ff' WHERE chat_id = ?", (OTHER,))
++    rows = idle.board_signature(path)[2][OTHER]
++    assert rows[0][3] == b"\x00\xff"
++    with idle_conn(path) as conn:
++        assert idle._subs_rows(conn, idle._SUBS_SQL) == [tuple(r) for r in conn.execute(idle._SUBS_SQL)]
++
++
++@contextlib.contextmanager
++def idle_conn(path):
++    import sqlite3
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
++    try:
++        yield conn
++    finally:
++        conn.close()
+diff --git a/tui_gateway/notification_idle.py b/tui_gateway/notification_idle.py
+index edefe3dd9c044e71c406591f3de5ef241a2db1e7..3ba0965a1e0bce3fa94e8ee295c62fa2026717ed 100644
+--- a/tui_gateway/notification_idle.py
++++ b/tui_gateway/notification_idle.py
+@@ -6,7 +6,9 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import json
+ import logging
++import sqlite3
+ import threading
+ from pathlib import Path
+ 
+@@ -91,6 +93,22 @@
+ _CHAT_SUBS_SQL = ("SELECT chat_id, task_id, platform, thread_id, last_event_id, inflight_from "
+                   "FROM kanban_notify_subs WHERE chat_id = ? AND LOWER(platform) = 'tui' "
+                   "ORDER BY task_id, platform, thread_id")
++# Both subscription reads hand their rows to Python in ONE result row, as a JSON array built inside SQLite. A
++# changed subscription revision re-reads all of the tui rows, and each stepped row was a GIL handoff that
++# waited out the serve's convoy: profiling put most tui-notif-poller ``_notify_content`` samples on that
++# fetch after the private-read cut (t_d0c5000000000005). The columns are TEXT/INTEGER/NULL, which JSON carries
++# exactly, so this skips ``hermes_state_page_pack``'s per-cell type tags (5x the CPU of a plain fetch for these
++# rows; this costs about 1.2x). A value JSON cannot carry (a BLOB) reads plainly instead.
++_SUBS_PACK = ("WITH _subs(a, b, c, d, e, f) AS MATERIALIZED ({}) "
++              "SELECT json_group_array(json_array(a, b, c, d, e, f)) FROM _subs")
++
++
++def _subs_rows(conn, sql, params=()):
++    try:
++        packed = conn.execute(_SUBS_PACK.format(sql), params).fetchone()[0]
++    except sqlite3.OperationalError:
++        return [tuple(r) for r in conn.execute(sql, params).fetchall()]
++    return [tuple(r) for r in json.loads(packed)]
+ 
+ 
+ def _notify_content(conn, version, held, path=None, only_chat=None):
+@@ -119,9 +137,9 @@
+         if by_chat is not None:
+             rows = ()
+         elif only_chat is not None:
+-            rows = conn.execute(_CHAT_SUBS_SQL, (only_chat,)).fetchall()
++            rows = _subs_rows(conn, _CHAT_SUBS_SQL, (only_chat,))
+         else:
+-            rows = conn.execute(_SUBS_SQL).fetchall()
++            rows = _subs_rows(conn, _SUBS_SQL)
+     finally:
+         conn.execute("COMMIT")
+     if by_chat is None:
+-- 
+2.43.0
+

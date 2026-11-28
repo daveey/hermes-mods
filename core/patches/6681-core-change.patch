@@ -1,0 +1,335 @@
+From 4438f58e6f42d75ffc05abe86dfa97b03303611a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 02:57:46 +0000
+Subject: [PATCH 6681] File-descriptor headroom guard and incident reporting
+
+Public mirror of source commit 4438f58e6f42d75ffc05abe86dfa97b03303611a.
+
+---
+diff --git a/gateway/run.py b/gateway/run.py
+index 0680d879a819ecf658cb474d847c988bcd91b582..4f203bf58ce2733980ea773f7c65d6e5d9f3d979 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4297,12 +4297,13 @@
+     Cadences are ticks of ``interval``; inner gates own the real cadence."""
+     from gateway.run_runtime_heartbeat import runtime_heartbeat
+     from gateway.run_checkpoint_prune import CHORE_LABEL as PRUNE_LABEL, CheckpointPruneWorker
+-    from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
++    from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch
+     from gateway.runtime_ownership import process_ownership
+     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+     from gateway.run_housekeeping_disk import housekeeping_gone_board_handles, housekeeping_media_caches, maybe_post_auto_prune_prompt
+     from hermes_cli.plugins_idle_tasks import IdleTaskFence
+     from hermes_cli.resource_limits import request_fd_headroom
++    from gateway.run_housekeeping_resources import run_due_chores, wait_for_resource_tick
+     request_fd_headroom(role='gateway')  # Before potentially slow housekeeping chores.
+     prune_worker = CheckpointPruneWorker(logger, start=process_ownership.start_writer)
+     chores: list[tuple[int, str, Any]] = [
+@@ -4337,7 +4338,6 @@
+         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
+         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
+         (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
+-        (1, "FD headroom", lambda: request_fd_headroom(role='gateway')),
+         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
+         (1, "FTS backfill tick", _housekeeping_fts_backfill),
+         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
+@@ -4358,13 +4358,13 @@
+ 
+     logger.info("Gateway housekeeping started (interval=%ds)", interval)
+     tick_count, idle_fence = 0, IdleTaskFence(stop_event)
++    next_chores = time.monotonic()
+     try:
+         while not stop_event.is_set():
+-            tick_count += 1
+-            for every, label, fn in chores:
+-                if tick_count % every == 0:
+-                    _housekeeping_chore(label, fn)
+-            wait_for_next_tick(stop_event, interval, queue_watch, _housekeeping_chore)
++            request_fd_headroom(role='gateway')
++            tick_count, next_chores = run_due_chores(
++                tick_count, next_chores, chores, interval, _housekeeping_chore)
++            wait_for_resource_tick(stop_event, next_chores, queue_watch, _housekeeping_chore)
+     finally:
+         prune_worker.close()
+     logger.info("Gateway housekeeping stopped (idle-task runs settled: %s)", idle_fence.close())
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index 72ff22fbe82f0916217c4a860d55042eff93baec..e162507591b5a790bab0376f05f5b7b14f069d4c 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -912,6 +912,8 @@
+     from gateway.code_skew import install_boot_pinned_imports, record_boot_fingerprint
+     record_boot_fingerprint()
+     install_boot_pinned_imports()
++    from hermes_cli.resource_limits import request_fd_headroom
++    request_fd_headroom(role='gateway')  # Do not wait for platform connects/housekeeping startup.
+ 
+     # Config verdicts come before the duplicate-instance guard: `--replace` must not stop a healthy
+     # gateway for a launch that cannot start.
+diff --git a/gateway/run_housekeeping_resources.py b/gateway/run_housekeeping_resources.py
+index a696d99a5d3e9b05da644712509001aedd7a9442..829242243c4fd0209a8d4cd423510bb83ced13cd 100644
+--- a/gateway/run_housekeeping_resources.py
++++ b/gateway/run_housekeeping_resources.py
+@@ -1,5 +1,25 @@
+ """Allocator housekeeping shared by the gateway's periodic resource chores."""
+ 
++import time
++
++
++def wait_for_resource_tick(stop_event, next_chores, queue_watch, chore):
++    from hermes_cli.resource_limits import fd_headroom_delay
++    from gateway.run_delivery_queue_watch import wait_for_next_tick
++    delay = fd_headroom_delay(max(0.0, next_chores - time.monotonic()))
++    wait_for_next_tick(stop_event, delay, queue_watch, chore)
++
++
++def run_due_chores(tick_count, next_chores, chores, interval, chore):
++    """A shorter FD timer must not accelerate the existing housekeeping cadences."""
++    if time.monotonic() >= next_chores:
++        tick_count += 1
++        for every, label, fn in chores:
++            if tick_count % every == 0:
++                chore(label, fn)
++        next_chores = time.monotonic() + interval
++    return tick_count, next_chores
++
+ 
+ def housekeeping_memory_trim() -> None:
+     """Messaging-gateway timer lane: full GC only once idle (#139763)."""
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index fda37ac0efd025bd2baab5624fc98dbea0f648f5..a7922e774e9f84ecb4d8518adac86d947c2137af 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -2477,9 +2477,9 @@
+     # Apply final nofile policy after routing/re-exec, before web imports/state;
+     # this includes isolated Desktop SSH serves. A higher named-profile limit
+     # must not leak into the default dashboard, whose lower limit cannot undo it.
+-    from hermes_cli.resource_limits import apply_nofile_soft_limit
++    from hermes_cli.resource_limits import apply_server_nofile_policy
+ 
+-    apply_nofile_soft_limit()
++    apply_server_nofile_policy(role='backend')
+ 
+     if _headless_backend:
+         # [daveey] Never boot a backend on a tree a core update is about to swap: wait out a live
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index 69a72f101d3719e128d44c34d9fcda62f219cabc..c236cff6a78140c081b1dc5bd6202099c4554c65 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -97,6 +97,7 @@
+ 
+ _fd_samples: deque[tuple[float, int]] = deque(maxlen=1801)
+ _fd_last_check: float | None = None
++_fd_interval = 300.0
+ _fd_pid = os.getpid()
+ _fd_lock = threading.Lock()
+ 
+@@ -177,6 +178,23 @@
+ _fd_request_lock = threading.Lock()
+ 
+ 
++def apply_server_nofile_policy(*, role: str) -> None:
++    """Startup floor plus an immediate off-loop sample, before slow service initialization."""
++    apply_nofile_soft_limit()
++    request_fd_headroom(role=role)
++
++
++def fd_headroom_delay(maximum: float) -> float:
++    """Reuse the service timer without running its unrelated chores more frequently.
++
++    Only the worker reads config; the loop reads this bounded, cached deadline.
++    A slow in-flight check is revisited after 1s, never busy-looped or queued.
++    """
++    remaining = (_fd_last_check + _fd_interval - time.monotonic()
++                 if _fd_last_check is not None else 1.0)
++    return min(maximum, max(1.0, remaining))
++
++
+ def request_fd_headroom(*, role: str) -> None:
+     """Nonblocking service tick: retain one worker, count overlap instead of queueing work."""
+     global _fd_thread
+@@ -184,6 +202,9 @@
+         with _fd_request_lock:
+             if _fd_thread is not None and _fd_thread.is_alive():
+                 _fd_status['skipped'] = _fd_status.get('skipped', 0) + 1
++                if role == 'gateway':
++                    from gateway.status import publish_runtime_status
++                    publish_runtime_status(fd_headroom=fd_headroom_status())
+                 return
+             import contextvars
+             scope = contextvars.copy_context()
+@@ -254,7 +275,7 @@
+ 
+ 
+ def _check_fd_headroom(config, role, now, wall, probe, probe_board):
+-    global _fd_last_check, _fd_pid, _fd_config_warning, _fd_incident
++    global _fd_last_check, _fd_pid, _fd_config_warning, _fd_incident, _fd_interval
+     from hermes_cli.fd_headroom_config import validated
+     if _resource is None:
+         return None
+@@ -262,7 +283,9 @@
+         from hermes_cli.config import load_config_readonly
+         config = load_config_readonly()
+     settings, errors = validated(config)
++    _fd_interval = settings['interval_seconds']
+     if not settings['enabled']:
++        _fd_last_check = now
+         return None
+     if _fd_pid != os.getpid():
+         _fd_pid, _fd_last_check = os.getpid(), None
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 335b05ab717d004e43e64d100be3b36587fed3e5..1a5a028a10afc3778f45171a485a77baf3812a89 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -828,11 +828,15 @@
+ 
+ async def _dashboard_selftest_loop() -> None:
+     """Periodic self-test driver started from the lifespan."""
+-    from hermes_cli.resource_limits import request_fd_headroom
++    from hermes_cli.resource_limits import fd_headroom_delay, request_fd_headroom
++    next_selftest = time.monotonic() + _DASHBOARD_SELFTEST_INTERVAL_SECONDS
+     while True:
+         # Same lifespan for both launch paths; an in-flight check never delays the next tick.
+         request_fd_headroom(role='backend')
+-        await asyncio.sleep(_DASHBOARD_SELFTEST_INTERVAL_SECONDS)
++        await asyncio.sleep(fd_headroom_delay(max(0.0, next_selftest - time.monotonic())))
++        if time.monotonic() < next_selftest:
++            continue
++        next_selftest = time.monotonic() + _DASHBOARD_SELFTEST_INTERVAL_SECONDS
+         # OAuth-gated binds don't honour the session token; the probe would false-alarm 401.
+         if getattr(app.state, "auth_required", False):
+             continue
+@@ -1749,9 +1753,9 @@
+ 
+     # Dashboard-mode starts don't route through main.py's `serve` path, which
+     # applies the same RLIMIT_NOFILE floor (policy in resource_limits, #81547).
+-    from hermes_cli.resource_limits import apply_nofile_soft_limit
++    from hermes_cli.resource_limits import apply_server_nofile_policy
+ 
+-    apply_nofile_soft_limit()
++    apply_server_nofile_policy(role='backend')
+ 
+     import uvicorn
+ 
+diff --git a/tests/gateway/test_plugin_check_housekeeping.py b/tests/gateway/test_plugin_check_housekeeping.py
+index c7c6fb6aed898c87eaa00c977cd8ca7392186217..befc3ccebe6c2851af34a95245b877401c3f01bb 100644
+--- a/tests/gateway/test_plugin_check_housekeeping.py
++++ b/tests/gateway/test_plugin_check_housekeeping.py
+@@ -17,9 +17,15 @@
+ 
+     # Stop an unfixed loop after its second sleep, without waiting for tick 60.
+     sleeps = []
++    clock = [0.0]
++    monkeypatch.setattr(run.time, 'monotonic', lambda: clock[0])
++    from hermes_cli import resource_limits
++    monkeypatch.setattr(resource_limits, 'request_fd_headroom', lambda **kw: None)
++    monkeypatch.setattr(resource_limits, 'fd_headroom_delay', lambda maximum: maximum)
+ 
+     def wait(timeout=None):
+         sleeps.append(timeout)
++        clock[0] += timeout
+         if len(sleeps) == 2:
+             stop.set()
+         return stop.is_set()
+diff --git a/tests/hermes_cli/test_fd_headroom_callers.py b/tests/hermes_cli/test_fd_headroom_callers.py
+index 35b55b1cfc3eeb70dc78cd046ec8575e522ab53b..93b5a13d5b0160b21ff085475edd45943c399d35 100644
+--- a/tests/hermes_cli/test_fd_headroom_callers.py
++++ b/tests/hermes_cli/test_fd_headroom_callers.py
+@@ -57,6 +57,95 @@
+     assert calls == [{'role': 'backend'}]
+ 
+ 
++def test_backend_short_interval_preserves_selftest_cadence(monkeypatch):
++    from hermes_cli import web_server as backend
++    clock, samples, selftests = [0.0], [], []
++    monkeypatch.setattr(backend.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(limits, 'fd_headroom_delay', lambda maximum: min(30, maximum), raising=False)
++    monkeypatch.setattr(limits, 'request_fd_headroom', lambda **kw: samples.append(clock[0]))
++    async def sleep(seconds):
++        clock[0] += seconds
++        if clock[0] > 90:
++            raise asyncio.CancelledError
++    async def selftest():
++        selftests.append(clock[0])
++    monkeypatch.setattr(backend.asyncio, 'sleep', sleep)
++    monkeypatch.setattr(backend, '_dashboard_selftest_once', selftest)
++    monkeypatch.setattr(backend.app.state, 'auth_required', False, raising=False)
++    async def exercise():
++        with pytest.raises(asyncio.CancelledError):
++            await backend._dashboard_selftest_loop()
++    asyncio.run(exercise())
++    assert samples == [0, 30, 60, 90]
++    assert selftests == [60]
++
++
++def test_gateway_short_interval_does_not_accelerate_chores(monkeypatch):
++    import gateway.run as gateway
++    import gateway.run_delivery_queue_watch as watch
++    clock, samples, chores = [0.0], [], []
++    stop = threading.Event()
++    monkeypatch.setattr(gateway.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(limits, 'fd_headroom_delay', lambda maximum: min(30, maximum), raising=False)
++    monkeypatch.setattr(limits, 'request_fd_headroom', lambda **kw: samples.append(clock[0]))
++    monkeypatch.setattr(gateway, '_housekeeping_chore', lambda *a: chores.append(clock[0]))
++    def wait(*args):
++        clock[0] += args[1]
++        if clock[0] >= 90:
++            stop.set()
++    monkeypatch.setattr(watch, 'wait_for_next_tick', wait)
++    gateway._start_gateway_housekeeping(stop, interval=60)
++    assert sorted(set(samples)) == [0, 30, 60]
++    assert sorted(set(chores)) == [0, 60]
++
++
++def test_gateway_boot_dispatches_before_platform_initialization(monkeypatch):
++    import gateway.code_skew as skew
++    import gateway.run as gateway
++    calls = []
++    class StopStartup(Exception):
++        pass
++    monkeypatch.setattr(limits, 'apply_nofile_soft_limit', lambda: calls.append('floor'))
++    monkeypatch.setattr(skew, 'record_boot_fingerprint', lambda: None)
++    monkeypatch.setattr(skew, 'install_boot_pinned_imports', lambda: None)
++    def request(**kw):
++        calls.append(kw)
++        raise StopStartup
++    monkeypatch.setattr(limits, 'request_fd_headroom', request)
++    async def exercise():
++        with pytest.raises(StopStartup):
++            await gateway.start_gateway()
++    asyncio.run(exercise())
++    assert calls == ['floor', {'role': 'gateway'}]
++
++
++def test_serve_boot_dispatches_before_server(monkeypatch):
++    from tests.hermes_cli import test_resource_limits as regression
++    calls = []
++    monkeypatch.setattr(limits, 'request_fd_headroom', lambda **kw: calls.append(kw))
++    regression.test_serve_startup_applies_limit_before_web_server(monkeypatch)
++    assert calls == [{'role': 'backend'}]
++
++
++def test_dashboard_health_snapshot_excludes_private_fields(monkeypatch):
++    from hermes_cli.web_server import DashboardHealth
++    monkeypatch.setattr(limits, '_fd_status', {'state': 'warn', 'count': 50,
++                        'error_class': 'TimeoutError', 'error': '/private/token',
++                        'envelope': {'body': 'private card text'}})
++    public = DashboardHealth().snapshot()['fd_headroom']
++    assert public == {'state': 'warn', 'count': 50, 'error_class': 'TimeoutError'}
++
++
++def test_delay_uses_cached_worker_deadline(monkeypatch):
++    monkeypatch.setattr(limits, '_fd_interval', 30)
++    monkeypatch.setattr(limits, '_fd_last_check', 100)
++    monkeypatch.setattr(limits.time, 'monotonic', lambda: 110)
++    assert limits.fd_headroom_delay(60) == 20
++    assert limits.fd_headroom_delay(5) == 5
++    monkeypatch.setattr(limits.time, 'monotonic', lambda: 131)
++    assert limits.fd_headroom_delay(60) == 1
++
++
+ def test_gateway_thread_publishes_public_status(monkeypatch, tmp_path):
+     from gateway import status
+     monkeypatch.setattr(limits, 'check_fd_headroom', lambda **kw: {'count': 50})
+-- 
+2.43.0
+
