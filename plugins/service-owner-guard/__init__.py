@@ -1517,6 +1517,7 @@ def _ownership_table(table: dict, pids: list) -> dict:
         return table
     collect = libs()[0]
     boundaries, manager_candidates = set(), set()
+    non_managers = {}
     ancestors = {q for p in pids for q in collect.chain(table, p)} - set(pids)
     for pid in ancestors:
         if table[pid]["ppid"] != 1:
@@ -1531,6 +1532,7 @@ def _ownership_table(table: dict, pids: list) -> dict:
             unit = f"user@{uid}.service"
             group = f"/user.slice/user-{uid}.slice/{unit}"
             if ppid != 1 or cgroup != f"0::{group}/init.scope":
+                non_managers[pid] = before
                 manager_candidates.discard(pid)
                 continue
             res = subprocess.run(
@@ -1571,6 +1573,9 @@ def _ownership_table(table: dict, pids: list) -> dict:
         try:
             before = _uid_identity(pid)
             birth, ppid, ruid, euid, suid, fsuid = before
+            negative = non_managers.get(pid)
+            if negative is not None and before != (negative[0], negative[1], *([negative[2]] * 4)):
+                continue
             if ppid != table[pid]["ppid"]:
                 continue
             foreign_uid = ruid != os.getuid() or euid != os.getuid()
@@ -1596,8 +1601,11 @@ def _ownership_table(table: dict, pids: list) -> dict:
                         continue
                 except OSError:
                     unreadable = True
+            # Negative manager evidence and UID eligibility must describe the
+            # same incarnation throughout observation, not two stable epochs.
             if (unreadable and _uid_identity(pid) == before and
-                    (parent is None or _uid_identity(ppid) == parent)):
+                    (parent is None or _uid_identity(ppid) == parent) and
+                    (negative is None or _manager_identity(pid) == negative)):
                 boundaries.add(pid)
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             continue

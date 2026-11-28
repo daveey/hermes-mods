@@ -119,6 +119,44 @@ class LinuxBoundary(Base):
         with mock.patch.object(Path, 'read_text', read_text):
             self.assertIsNone(self.fixture())
 
+    def test_negative_manager_identity_must_match_uid_fallback_incarnation(self):
+        real_read = Path.read_text
+        for schedule in (('12345', '12346', '12346', '12346'),
+                         ('12345', '12346', '12346', '12345')):
+            with self.subTest(schedule=schedule):
+                stat_reads = []
+                def read_text(path, *args, **kwargs):
+                    if path == self.home / 'proc/4200/cgroup':
+                        return '0::/ordinary-session\n'
+                    text = real_read(path, *args, **kwargs)
+                    if path == self.home / 'proc/4200/stat':
+                        stat_reads.append(text)
+                        return text.replace('12345', schedule[min(len(stat_reads) - 1, 3)])
+                    return text
+                with mock.patch.object(Path, 'read_text', read_text):
+                    result = self.fixture()
+                self.assertGreaterEqual(len(stat_reads), 2)
+                self.assertIsNotNone(result, 'negative manager evidence belongs to another incarnation')
+                self.assertIn('incomplete owner observation', result)
+
+    def test_negative_manager_evidence_is_revalidated_before_exclusion(self):
+        real_read = Path.read_text
+        for late in ('manager', 'unreadable'):
+            with self.subTest(late=late):
+                group_reads = []
+                def read_text(path, *args, **kwargs):
+                    if path == self.home / 'proc/4200/cgroup':
+                        group_reads.append(path)
+                        if len(group_reads) == 1:
+                            return '0::/ordinary-session\n'
+                        if late == 'unreadable':
+                            raise PermissionError('late cgroup unavailable')
+                    return real_read(path, *args, **kwargs)
+                with mock.patch.object(Path, 'read_text', read_text):
+                    result = self.fixture()
+                self.assertIsNotNone(result, 'negative evidence must still hold at exclusion')
+                self.assertIn('incomplete owner observation', result)
+
     def test_unreadable_manager_cgroup_retains_strict_observation(self):
         real_read = Path.read_text
         def read_text(path, *args, **kwargs):
