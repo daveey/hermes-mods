@@ -10,6 +10,7 @@ this plugin adds presentation projections, not scheduling behaviour.
 | `GET /api/plugins/lanes/v1/lanes/flow?window=1h\|6h\|24h\|7d` | Same view model, expanded. Also preserves top-level `cards`, `window` and per-lane limits/usage for older Desktop renderers |
 | `WS /api/plugins/lanes/v1/lanes/stream?hours=6&window=6h&expanded=false` | Initial `{version, view, params}`, then changed views only. Client may send `{hours, window, expanded}` (any subset) without reconnecting |
 | `PUT /api/plugins/lanes/v1/lanes/<lane>` | `{share, paused, admit_per_day, max_workers, cards_per_day, usd_per_day}`, any subset; last three accept null to clear on supporting core |
+| `GET /api/plugins/lanes/v1/lanes/steering` | Cheap policy-only `{configured, steering}`; true when a local lane is gated. No board/replica/projection reads; usable while full views warm. Older backends fall back to full-view discovery. |
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 

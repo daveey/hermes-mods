@@ -622,6 +622,20 @@ def start_legacy():
                               lambda: _delivery_view(6., '6h', False), interval=REST_REFRESH_S)
 
 
+@router.get('/v1/lanes/steering')
+async def get_steering() -> Dict[str, Any]:
+    """Policy-only discovery: no board, replica, projector or threadpool wait."""
+    mods = core()
+    if mods is None:
+        return {'configured': False, 'steering': False}
+    try:
+        policy = mods[1].policy()
+        return {'configured': policy is not None,
+                'steering': bool(policy and any(lane.gated for lane in policy.lanes.values()))}
+    except Exception as exc:
+        return {'configured': False, 'steering': False, 'reason': str(exc)}
+
+
 @router.get("/v1/lanes")
 async def get_lanes(hours: float = Query(6.0), window: str = Query("6h"), expanded: bool = Query(False)) -> Dict[str, Any]:
     _validate_view(hours, window, expanded)

@@ -91,7 +91,21 @@ an isolated HERMES_HOME. Bootstrapping production `runtime_command` against a fr
 print "preparing dependencies" and miss the five-second ready bound; fix fixture setup, never skip
 the tests or raise that timeout. The production runtime launcher remains unchanged.
 
-## 3. Do not just raise the client timeout
+## 3. Steering discovery is separate from projection freshness
+
+Probe `GET /api/plugins/lanes/v1/lanes/steering` through the same authenticated
+Desktop connection. Its `{configured, steering}` answer reads only local lane
+policy (gated flags), without board/replica/projector work. A warming projection
+must not revoke this separately observed authority. Older backends can still be
+identified by a real full view with gated lanes or planner notes.
+
+When a display-source stream advances during an in-flight discovery, rearm the
+next discovery retry independently of the stale-frame rendering check. Otherwise
+one fresh local frame consumes the retry, its live stream disables fallback
+polling, and the panel can stay local after the hub becomes ready. Exercise this
+interleaving through real `createSource`, not only sequential `read()` calls.
+
+## 4. Do not just raise the client timeout
 
 A longer timeout hides the latency. The fix belongs on the hub request path: serve the last view
 while a recompute runs, or cut the cold cost.

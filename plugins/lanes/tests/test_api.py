@@ -74,6 +74,26 @@ def core(api, monkeypatch):
     return fake
 
 
+def test_steering_probe_avoids_projection_and_board(api, monkeypatch):
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    def forbidden(*args, **kwargs):
+        raise AssertionError('steering discovery must not project or open a board')
+    fake = SimpleNamespace(policy=lambda: SimpleNamespace(lanes={'project': SimpleNamespace(gated=True)}))
+    monkeypatch.setattr(api, 'core', lambda: (SimpleNamespace(connect_closing=forbidden), fake, None))
+    monkeypatch.setattr(api, 'rest_view', forbidden)
+    app = fastapi.FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client:
+        assert client.get('/v1/lanes/steering').json() == {'configured': True, 'steering': True}
+        fake.policy = lambda: SimpleNamespace(lanes={'project': SimpleNamespace(gated=False)})
+        assert client.get('/v1/lanes/steering').json() == {'configured': True, 'steering': False}
+        fake.policy = lambda: None
+        assert client.get('/v1/lanes/steering').json() == {'configured': False, 'steering': False}
+        monkeypatch.setattr(api, 'core', lambda: None)
+        assert client.get('/v1/lanes/steering').json() == {'configured': False, 'steering': False}
+
+
 def test_worker_limit_and_null_clear_supported(api, core):
     core.UNSET = object()
     api.change("product", {"max_workers": 2, "cards_per_day": None, "usd_per_day": None})

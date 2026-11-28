@@ -16,7 +16,7 @@ test('warming GET retries soon and stops its retry on teardown', async () => {
   const deadlines = new Map(); let next = 0, calls = 0
   const timers = {setTimeout(fn, ms) {const id = ++next; deadlines.set(id, {fn, ms}); return id},
     clearTimeout(id) {deadlines.delete(id)}, setInterval() {return 1}, clearInterval() {}}
-  const source = P.createSource({rest: async () => {calls++; return {configured: true, warming: true}}}, host)
+  const source = P.createSource({rest: async (path) => {if (path === '/v1/lanes/steering') throw Error('old server'); calls++; return {configured: true, warming: true}}}, host)
   const stop = source.subscribe({hours: 6, window: '6h', expanded: false}, () => {}, () => {}, timers)
   const flush = () => new Promise(r => setTimeout(r, 10))
   try {

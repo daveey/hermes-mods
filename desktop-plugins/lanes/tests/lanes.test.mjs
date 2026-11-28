@@ -203,6 +203,7 @@ const MAC_WORK = { connectionId: 'this-mac', mode: 'local', primary: true, profi
 test('the panel reads and writes, by id, on the gateway that has lanes', async () => {
   const calls = []
   const ctx = { rest: async (path, opts = {}) => {
+    if (path === '/v1/lanes/steering') throw Error('old server has no authority probe')
     calls.push([where(opts), opts.method || 'GET', path])
     if (where(opts) === 'this-mac') return { configured: false, reason: 'no lanes are configured (kanban.admission.lanes)' }
     if (where(opts) === 'mini') throw Error('unreachable')
@@ -222,6 +223,7 @@ test('with lanes nowhere it shows the reason, names unreachable gateways, does n
   let now = 0
   const calls = []
   const ctx = { rest: async (path, opts = {}) => {
+    if (path === '/v1/lanes/steering') throw Error('old server has no authority probe')
     calls.push(where(opts))
     if (where(opts) === 'mini') throw Error('plugin not installed')
     return { configured: false, reason: 'no lanes here' }
@@ -243,6 +245,7 @@ test('a failed read keeps the chosen gateway and is an error, not "no lanes"', a
   const calls = []
   let hubUp = true
   const ctx = { rest: async (path, opts = {}) => {
+    if (path === '/v1/lanes/steering') throw Error('old server has no authority probe')
     calls.push(where(opts))
     if (where(opts) === 'hub') { if (!hubUp) throw Error('hub restarting'); return snap() }
     return { configured: false, reason: 'no lanes here' }
@@ -292,6 +295,7 @@ test('the gateway with lanes is found whichever gateway is in front, and a missi
   // Lanes live on this Mac's own connection; the window has another gateway in front, so an untagged request
   // would land on the hub and miss them.
   const ctx = { rest: async (path, opts = {}) => {
+    if (path === '/v1/lanes/steering') throw Error('old server has no authority probe')
     calls.push(where(opts))
     return where(opts) === 'this-mac' ? snap() : { configured: false, reason: 'no lanes here' }
   } }
@@ -307,7 +311,7 @@ test('the gateway with lanes is found whichever gateway is in front, and a missi
 test('a search in which nothing answers throws, and the next read searches again', async () => {
   let up = true
   const calls = []
-  const ctx = { rest: async (path, opts = {}) => { calls.push(where(opts)); if (!up) throw Error('offline'); return { configured: false, reason: 'no lanes here' } } }
+  const ctx = { rest: async (path, opts = {}) => { if (path === '/v1/lanes/steering') throw Error('old server has no authority probe'); calls.push(where(opts)); if (!up) throw Error('offline'); return { configured: false, reason: 'no lanes here' } } }
   let now = 0
   const source = P.createSource(ctx, { profileRoutes: async () => [HUB] }, () => now)
   await source.read(6)
@@ -334,6 +338,7 @@ test('mounted: the task pill follows a remote gateway that has lanes', async () 
   host.routes = [MAC, HUB]
   const calls = []
   const ctx = { rest: async (path, opts = {}) => {
+    if (path === '/v1/lanes/steering') throw Error('old server has no authority probe')
     calls.push([where(opts), opts.method || 'GET', path])
     return where(opts) === 'hub' ? snap() : { configured: false, reason: 'no lanes here' }
   } }

@@ -101,16 +101,29 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     let fallback // display only: definitions alone never authorize a write
     let warming
     const pending = []
+    const cheapAuthority = async (target) => {
+      try {
+        const authority = await ctx.rest('/v1/lanes/steering', opts(target))
+        if (authority?.configured === true && authority?.steering === true) {
+          steering.set(target.connectionId, true)
+          chosen = target; unconfigured = undefined
+          return true
+        }
+      } catch { /* Older backends retain full-view discovery. */ }
+      return false
+    }
     const probe = async (target, retry = false) => {
       try {
         const body = await ctx.rest(path, opts(target))
         steering.set(target.connectionId, body?.configured === true && !body?.warming && steers(body))
         if (steering.get(target.connectionId)) { chosen = target; unconfigured = undefined; return body }
+        if (body?.warming && await cheapAuthority(target)) return body
         if (body?.warming) { warming ??= { target, body }; if (!retry) pending.push(target) }
         else if (body?.configured === true) fallback ??= { target, body }
         else first ??= body
       } catch (e) {
         steering.set(target.connectionId, false)
+        if (await cheapAuthority(target)) return { configured: true, warming: true }
         unreachable.push(String(e?.message || e).slice(0, 80))
         if (!retry) pending.push(target)
       }
@@ -147,7 +160,9 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       return discover(path)
     }
     failures = 0
-    steering.set(chosen.connectionId, body?.configured === true && !body?.warming && steers(body))
+    // A warming projection contains no policy evidence; it cannot revoke the
+    // separately observed authority. A real non-steering view still can.
+    if (!body?.warming) steering.set(chosen.connectionId, body?.configured === true && steers(body))
     return body?.configured === true ? body : discover(path)
   }
   // `target` is the gateway chosen when Apply was pressed: every lane of that Apply goes there even if a poll
@@ -181,10 +196,14 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       const at = epoch, before = frames, previousTarget = chosen?.connectionId
       try {
         const view = await read(params.hours, params.window, params.expanded)
-        if (!disposed && at === epoch && (before === frames || previousTarget !== chosen?.connectionId)) {
-          onView(view)
+        if (!disposed && at === epoch) {
+          // A display stream may advance frames while discovery is in flight.
+          // Suppress stale rendering, never the next authority-discovery retry.
           timers.clearTimeout(warmingPoll)
           if (view?.warming || !steering.get(chosen?.connectionId)) warmingPoll = timers.setTimeout(() => { if (!disposed) void fetch() }, 1000)
+        }
+        if (!disposed && at === epoch && (before === frames || previousTarget !== chosen?.connectionId)) {
+          onView(view)
           if (redial && started && previousTarget !== chosen?.connectionId) {
             epoch += 1; off?.(); off = undefined; socket?.close(); socket = undefined
             timers.clearTimeout(watchdog); timers.clearTimeout(retry)

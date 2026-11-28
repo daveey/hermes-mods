@@ -4,6 +4,65 @@ import { loadPlugin } from './sdk-mock.mjs'
 const P = await loadPlugin()
 const plain = { configured: true, lanes: { project: { share: 20, gated: false } } }
 const steering = { configured: true, lanes: { project: { share: 40, gated: true } } }
+
+test('cheap authority selects the hub even when its full projection only warms', async () => {
+  const calls = []
+  let ready = false
+  const source = P.createSource({ rest: async (path, opts) => {
+    calls.push([opts.connectionId, path, opts.method || 'GET'])
+    if (opts.connectionId === 'mac') return plain
+    if (path === '/v1/lanes/steering') return { configured: true, steering: true }
+    return ready ? steering : { configured: true, warming: true }
+  } }, { profileRoutes: async () => ['mac', 'hub'].map(connectionId => ({ connectionId, targetProfile: 'default' })) })
+  assert.equal((await source.read(6)).warming, true)
+  assert.equal(source.target().connectionId, 'hub')
+  await source.read(6)
+  await source.write('project', { share: 40 })
+  assert.equal(calls.at(-1)[0], 'hub')
+  assert.equal(calls.at(-1)[2], 'PUT')
+  ready = true
+  assert.deepEqual(await source.read(6), steering)
+})
+
+test('only the cheap hub probe responds: it still owns writes', async () => {
+  const calls = []
+  const source = P.createSource({ rest: async (path, opts) => {
+    if (opts.method === 'PUT') { calls.push(opts.connectionId); return {} }
+    if (opts.connectionId === 'mac') return plain
+    if (path === '/v1/lanes/steering') return { configured: true, steering: true }
+    throw Error('full projection unavailable')
+  } }, { profileRoutes: async () => ['mac', 'hub'].map(connectionId => ({ connectionId, targetProfile: 'default' })) })
+  assert.equal((await source.read(6)).warming, true)
+  assert.equal(source.target().connectionId, 'hub')
+  await source.write('project', { share: 40 })
+  assert.deepEqual(calls, ['hub'])
+})
+
+test('a display frame during a still-warming discovery cannot consume its next retry', async () => {
+  const oldBridge = window.hermesDesktop, oldWS = globalThis.WebSocket
+  const deadlines = new Map(), sockets = []; let serial = 0, hold = false, release
+  const timers = { setTimeout(fn, ms) { const id = ++serial; deadlines.set(id, { fn, ms }); return id },
+    clearTimeout(id) { deadlines.delete(id) }, setInterval() { return 1 }, clearInterval() {} }
+  window.hermesDesktop = { getConnectionFor: async () => ({ authMode: 'native' }), getPluginWsUrl: async () => 'ws://example.com/ticket' }
+  globalThis.WebSocket = class { constructor() { this.readyState = 1; sockets.push(this) } send() {} close() { this.readyState = 3 } }
+  const source = P.createSource({ rest: async (path, opts) => {
+    if (path === '/v1/lanes/steering') throw Error('old server')
+    if (opts.connectionId === 'mac') return plain
+    if (hold) { hold = false; await new Promise(resolve => { release = resolve }) }
+    return { configured: true, warming: true }
+  } }, { profileRoutes: async () => ['mac', 'hub'].map(connectionId => ({ connectionId, targetProfile: 'default' })) })
+  const flush = () => new Promise(resolve => setTimeout(resolve, 10))
+  const stop = source.subscribe({ hours: 6, window: '6h', expanded: false }, () => {}, () => {}, timers)
+  try {
+    await flush()
+    const retry = [...deadlines.entries()].find(([, t]) => t.ms === 1000)
+    assert.ok(retry)
+    hold = true; deadlines.delete(retry[0]); retry[1].fn(); await flush()
+    sockets[0].onmessage({ data: JSON.stringify({ version: 1, view: plain }) })
+    release(); await flush()
+    assert.ok([...deadlines.values()].some(t => t.ms === 1000), 'discovery must rearm independently of display frame freshness')
+  } finally { stop(); window.hermesDesktop = oldBridge; globalThis.WebSocket = oldWS }
+})
 for (const ids of [['hub', 'mac'], ['mac', 'hub']]) {
   const routes = { profileRoutes: async () => ids.map(connectionId => ({ connectionId, targetProfile: 'default' })) }
   for (const initial of ['warming', 'timeout']) test(`${ids}: ${initial} hub is re-probed before fallback`, async () => {
