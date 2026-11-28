@@ -201,12 +201,31 @@ class LedgerReworkTests(unittest.TestCase):
         with mock.patch('chrome_agent_process.fingerprint', return_value='process-generation'):
             grant = self.ledger.acquire(['/profiles/example', 'worker', 'default'], 100, worker_pid=123)
         self.ledger.bind(grant['capability'], 'worker-page')
-        with mock.patch('chrome_agent_process.fingerprint', return_value=None):
+        # None alone is UNKNOWN. This control explicitly observes ESRCH and
+        # must not depend on whether the CI runner happens to own PID123.
+        with mock.patch('chrome_agent_process.fingerprint', return_value=None), \
+             mock.patch('chrome_agent_process.is_zombie', return_value=False), \
+             mock.patch('chrome_agent_process.os.kill', side_effect=ProcessLookupError):
             self.ledger.reap_workers()
         self.now += 2
         self.assertEqual(self.ledger.reap(['page', 'worker-page'], lambda _: True), [])
         self.now += 130
         self.assertEqual(self.ledger.reap(['page', 'worker-page'], lambda _: True), ['worker-page'])
+
+    def test_unknown_worker_retains_custody_after_orphan_grace(self):
+        with mock.patch('chrome_agent_process.fingerprint', return_value='process-generation'):
+            grant = self.ledger.acquire(['/profiles/example', 'worker', 'default'], 100, worker_pid=123)
+        self.ledger.bind(grant['capability'], 'worker-page')
+        with mock.patch('chrome_agent_process.fingerprint', return_value=None), \
+             mock.patch('chrome_agent_process.is_zombie', return_value=False), \
+             mock.patch('chrome_agent_process.os.kill', side_effect=PermissionError):
+            self.ledger.reap_workers()
+        self.now += 132
+        self.assertEqual(self.ledger.reap(['page', 'worker-page'], lambda _: True), [])
+        with self.ledger.transaction(readonly=True) as data:
+            lease = data['leases'][grant['capability']]
+            self.assertEqual(lease['workers'], {'123': 'process-generation'})
+            self.assertNotIn('restart_until', lease)
 
     def test_orphan_daemon_cleanup_waits_for_request_and_handoff(self):
         with self.ledger.transaction() as data:
