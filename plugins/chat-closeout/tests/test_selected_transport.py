@@ -74,12 +74,13 @@ def test_increment_and_rebuild_match_after_arrival_and_delete():
         conn.close()
 
 
-def test_transport_absent_empty_and_legacy_sql():
+@pytest.mark.parametrize('error', ['near "MATERIALIZED": syntax error', 'no such function: json_array'])
+def test_transport_absent_empty_and_legacy_sql(error):
     conn, watch = world(3)
     class Legacy:
         def execute(self, sql, *args):
             if 'MATERIALIZED' in sql:
-                raise sqlite3.OperationalError('near MATERIALIZED')
+                raise sqlite3.OperationalError(error)
             return conn.execute(sql, *args)
     try:
         keys = list(watch.rows) + [('g', 'absent')]
@@ -89,6 +90,20 @@ def test_transport_absent_empty_and_legacy_sql():
         before = conn.calls
         assert list(watch._selected_rows(conn, [])) == []
         assert conn.calls == before
+    finally:
+        conn.close()
+
+
+def test_transport_noncompatibility_error_is_not_retried():
+    conn, watch = world(3)
+    class Broken:
+        def execute(self, sql, *args):
+            if 'MATERIALIZED' in sql:
+                raise sqlite3.OperationalError('disk I/O error')
+            return conn.execute(sql, *args)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match='disk I/O error'):
+            dict(watch._selected_rows(Broken(), list(watch.rows)))
     finally:
         conn.close()
 

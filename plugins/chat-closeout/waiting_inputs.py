@@ -295,8 +295,12 @@ class ReplicaWatch:
                    'THEN (SELECT json_group_array(json_array(gw,key,data)) FROM selected) END FROM selected')
             try:
                 packed = conn.execute(sql, [v for key in page for v in key]).fetchone()[0]
-            except sqlite3.Error:
-                packed = None  # e.g. a legacy SQLite without MATERIALIZED / JSON1
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if not (message.startswith('no such function: json_')
+                        or message == 'near "materialized": syntax error'):
+                    raise  # real reader failures must reach refresh's fail-fresh path
+                packed = None
             if packed is not None:
                 for gw, key, raw in json.loads(packed):
                     out[(gw, key)] = raw
