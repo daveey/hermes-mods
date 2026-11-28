@@ -84,6 +84,40 @@ def test_a_negated_payment_mention_does_not_exempt_the_billing_ask():
     assert ac.acceptance_met(BILLING["human_request"], BILLING["body"]) is not None
 
 
+@pytest.mark.parametrize("why_human, action", [
+    ("Only you can authorize this action", "No permission change is needed, but approve a one-time $50 payment"),
+    ("I am not authorized to pay $50 without your approval", "Approve it in the GitHub billing page"),
+])
+def test_negation_removal_keeps_an_affirmative_payment(why_human, action):
+    """Review 6094667454 P2: negation removal swallowed a later affirmative $50 approval and a human-only payment."""
+    hr = dict(BILLING["human_request"], why_human=why_human, scope="Only this operation",
+              action=action + ". Unblock = do it; archive = drop it.")
+    assert ac.acceptance_met(hr, BILLING["body"]) is None
+    assert ac.hit(hr, BILLING["body"]) is None or ac.hit(hr, BILLING["body"])["rule"] != "acceptance_met"
+
+
+@pytest.mark.parametrize("why_human, action", [
+    ("Only you can read the invoice status through your signed-in browser",
+     "Open the billing support ticket and supply its latest status"),
+    ("Only you can see the subscription status page", "Read the subscription status and paste it here"),
+    ("Only you can open the budget report", "Send me this month's budget report"),
+])
+def test_read_only_financial_context_does_not_exempt_the_ask(why_human, action):
+    """Review 6094667454 P2: invoice/subscription/budget as subject matter is not a money change."""
+    hr = dict(BILLING["human_request"], why_human=why_human, scope="Only this operation",
+              action=action + ". Unblock = do it; archive = drop it.")
+    hit = ac.hit(hr, BILLING["body"])
+    assert hit and hit["rule"] == "acceptance_met"
+
+
+@pytest.mark.parametrize("text", [
+    "Pay the March invoice", "Raise the monthly budget to cover the overage", "Cancel the Superhuman subscription",
+])
+def test_a_financial_change_is_still_exempt(text):
+    hr = dict(BILLING["human_request"], action=text + ". Unblock = do it; archive = drop it.")
+    assert ac.acceptance_met(hr, BILLING["body"]) is None
+
+
 @pytest.mark.parametrize("body", [
     "Acceptance:\n- the installed build runs on the iPhone (physical check)\n- verify the logs or document the gap with "
     "evidence",
