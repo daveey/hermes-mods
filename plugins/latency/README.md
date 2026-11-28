@@ -98,6 +98,15 @@ are transcript/tool, board and ship proxies, not endpoint request times.
   discards older affected aggregates whose raw contributions were not retained;
   corrected observations then accumulate up to the normal 90-day retention.
   All collection, including manual cycles, must hold `collector.lock`.
+  Reconciliation verifies the complete per-metric histogram against retained
+  contributions and repairs mismatches transactionally, including old-only
+  hours and unchanged replay. This is linear in retained contributions and only
+  rewrites histogram rows on a mismatch. A pre-migration process can temporarily
+  append stale values after winning the lock; the next corrected source cycle
+  removes them, even when the legacy attempt has no corrected counterpart.
+  Reload all collector processes normally before reporting rollout complete.
+  Recent events on cards created 30–90 days ago can revise their retained
+  last-completed duration; a mere archive/comment does not remove the sample.
 * Optional request-stage joins keep at most 10,000 recent request IDs for one
   hour; excess in-flight requests can be lost. Retired definition cursors remain
   in this small local metadata table. Neither limit changes the shipped 17 rows,

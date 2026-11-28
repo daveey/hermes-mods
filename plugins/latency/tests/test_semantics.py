@@ -133,6 +133,12 @@ class Semantics(unittest.TestCase):
             collectors.collect_board(path,store,defs,5*day,35*day+1)
             self.assertEqual(store.view('done',0,40*day)['n'],1)
             self.assertEqual(store.view('done',0,40*day)['slowest'][0]['dur_ms'],3600000)
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("INSERT INTO task_events VALUES (4,'t','completed',?)",(36*day,))
+            collectors.collect_board(path,store,defs,6*day,36*day+1)
+            view = store.view('done',0,40*day)
+            self.assertEqual(view['n'],1)
+            self.assertEqual(view['slowest'][0]['dur_ms'],(36*day-100)*1000)
 
     def test_reconcile_fences_legacy_ingest_and_prunes_contributions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,6 +153,22 @@ class Semantics(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM contributions').fetchone()[0],0)
                 self.assertEqual(db.execute('SELECT COUNT(*) FROM identities').fetchone()[0],0)
             self.assertEqual(store.view('ci',0,1000)['n'],0)
+
+    def test_legacy_new_ids_and_old_only_hours_are_repaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp)/'series.sqlite')
+            def row(key,start,dur=1):
+                return dict(id=key,metric='ci',start=start,dur_ms=dur,host='h',gateway='g')
+            a,b,legacy = row('a',100),row('b',100,2),row('legacy-attempt',4000,3)
+            store.reconcile([a],['ci'],'v2',{},[])
+            store.ingest([b,legacy])  # actual byte-identical legacy ingest path
+            self.assertEqual(store.view('ci',0,5000)['n'],3)
+            store.reconcile([a,b],['ci'],'v2',{},[])
+            self.assertEqual(store.view('ci',0,5000)['n'],2)
+            self.assertEqual({r['id'] for r in store.view('ci',0,5000)['slowest']},{'a','b'})
+            store.ingest([row('another-old-attempt',8000)])
+            store.reconcile([a,b],['ci'],'v2',{},[])  # unchanged incoming still heals
+            self.assertEqual(store.view('ci',0,10000)['n'],2)
 
     def test_sweep_advances_across_successful_cycles(self):
         from unittest.mock import patch

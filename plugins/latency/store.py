@@ -195,7 +195,8 @@ class Store:
                     # Fence pre-migration append-only collectors as well: the
                     # singleton lock serializes generations, but an old module
                     # can acquire it later and must not count these IDs again.
-                    db.execute('INSERT OR IGNORE INTO identities VALUES (?,?)',
+                    db.execute('''INSERT INTO identities VALUES (?,?)
+                        ON CONFLICT(id) DO UPDATE SET start=excluded.start''',
                                (identity,new['start']))
                 if old == new:
                     continue
@@ -207,6 +208,25 @@ class Store:
                     adjust(new, 1)
                     db.execute('INSERT INTO contributions VALUES (?,?,?,?,?,?)',
                                (identity,new['metric'],new['host'],new['start'],new['dur_ms'],json.dumps(new,allow_nan=False)))
+            # contributions are authoritative after migration. A stale module
+            # can later win the process-shared lock and append new/attempt IDs
+            # via legacy ingest. Heal ALL hours, including legacy-only hours and
+            # unchanged replays, rather than leaving silent 90-day double counts.
+            for metric in metrics:
+                expected = defaultdict(int)
+                days = set()
+                for host, start, dur in db.execute(
+                        'SELECT host,start,dur FROM contributions WHERE metric=?', (metric,)):
+                    expected[(host,math.floor(start/3600)*3600,_bucket(dur))] += 1
+                    days.add(math.floor(start/86400)*86400)
+                actual = {(host,hour,bucket):n for host,hour,bucket,n in db.execute(
+                    'SELECT host,hour,bucket,n FROM hist WHERE metric=?', (metric,))}
+                if actual != expected:
+                    days.update(row[0] for row in db.execute('SELECT DISTINCT day FROM slow WHERE metric=?', (metric,)))
+                    db.execute('DELETE FROM hist WHERE metric=?', (metric,))
+                    db.executemany('INSERT INTO hist VALUES (?,?,?,?,?)',
+                                   [(metric,host,hour,bucket,n) for (host,hour,bucket),n in expected.items()])
+                    groups.update((metric,day) for day in days)
             for metric, day in groups:
                 db.execute('DELETE FROM slow WHERE metric=? AND day=?', (metric,day))
                 db.execute('''INSERT INTO slow SELECT id,metric,?,start,dur,sample FROM contributions
