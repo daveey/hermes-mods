@@ -273,7 +273,15 @@ Allowed read-only flags, verified against `hermes update --help`: `-h`, `--help`
 `--check`, `--plan`, `--list-venv-holders`, `--install-id`. Neither `--yes` nor
 `--no-gateway-restart` is read-only. Grep patterns, SQLite LIKE strings, echo text
 and heredocs written as data do not trigger the update rule; heredocs/herestrings
-fed to a shell or SSH are checked as executable input.
+fed to a shell or SSH are checked as executable input. This includes a data reader
+piped into a shell (`cat <<'EOF' | bash`), not just a shell owning the heredoc.
+Literal `echo` and `printf` (`%s`, `%%`, fixed newline/tab/return/backslash escapes)
+output piped through zero or more plain `cat` stages into a stdin shell is checked
+too. Printer operands are concatenated before analysis, so an updater mentioned
+inside an echoed command stays data. Shell script-file operands, syntax-check mode,
+and redirected pipeline input/output do not establish that literal stdin path.
+Unsupported formatting, computed producers, aliases/functions and arbitrary script
+execution remain outside this bounded lexical rule; this is not a shell sandbox.
 
 `HERMES_UPDATE_OK=1` in agent-submitted text is not authenticated approval. It cannot
 exempt an updater, SSH command, shell wrapper, heredoc or herestring. A user-approved
@@ -281,8 +289,26 @@ manual update must use an authenticated operator terminal outside this agent too
 
 Tests: `tests_update.py` exercises terminal and execute_code for blocked and
 allowed forms, including both incident SSH spellings, every read-only flag,
-text-only mentions, shell input, and rejection of inline approval flags. Run
+text-only mentions, shell input, and rejection of inline approval flags.
+`tests_update_pipeline.py` registers the real adapter and compares its verdict with
+harmless Bash/fake-updater oracles, including inert pipeline controls; it also
+checks literal printer output against Bash. `tests_update_floor.py` replays the
+committed wave corpus against the frozen main refusal floor and asserts parity
+with the real `kanban-worker-nice` prefix generator. Run
 `scripts/test-all -k live-checkout-guard`.
+
+### External executable custody
+
+Overlap reads select `PR_OVERLAP_GH` or PATH `gh` in `pr_overlap.py`; publication CI
+and Git's credential helper separately select PATH `gh` (`gh run list` and
+`gh auth git-credential`). The overlap override does not bind the publisher.
+A custom metered wrapper, broker, quota helper or its configured Python/import
+path is custom deciding code, not a managed binary merely because it is named
+`gh`. Source audits must supply its selection/config, exact path, source revision,
+Git blob and byte hash, including transitive helpers. Missing effective-process
+or installed-byte evidence remains **UNVERIFIED**. Likewise the lexical
+`hermes-sync` basename exception does not authenticate that executable's source.
+Plugin source approval alone certifies none of those deployment selections.
 
 ## Archive-verified stash retirement
 
