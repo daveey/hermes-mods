@@ -12,8 +12,10 @@ Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, co
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
 const atom = value => ({ value, get() { return this.value } })
 const host = { state: { focusedStoredSessionId: atom('S1'), connectionId: atom('C1'), profile: atom('default'), focusedSessionOwner: atom({ connectionId: 'C1', profile: 'default' }) }, composer: { submit() { assert.fail('no composer submission') }, focus() {} } }
-globalThis.queueHarness = { React, J, host }
-register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.queueHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.queueHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.queueHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get(),MessageTextContent=({text})=>text'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
+const timings = []
+const timing = { start: (...args) => { const token = Symbol(); timings.push(['start', ...args, token]); return token }, complete: (...args) => timings.push(['complete', ...args]), cancel: (...args) => timings.push(['cancel', ...args]) }
+globalThis.queueHarness = { React, J, host, timing }
+register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.queueHarness.React;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.queueHarness.J;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':'export const host=globalThis.queueHarness.host,COMPOSER_AREAS={top:"composer.top"},TRANSCRIPT_DIRECTIVE_AREA="transcript.directives",useValue=a=>a?.get(),MessageTextContent=({text})=>text;export const startUiLatency=(...a)=>globalThis.queueHarness.timing.start(...a),completeUiLatency=(...a)=>globalThis.queueHarness.timing.complete(...a),cancelUiLatency=(...a)=>globalThis.queueHarness.timing.cancel(...a)'};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const m = await import('../plugin.js')
 const { createRoot } = require('react-dom/client')
 const root = createRoot(document.getElementById('root'))
@@ -51,6 +53,10 @@ test('card-question asks draw no card UI here; the choice posts the unchanged pa
  const { idempotencyKey, ...payload } = post[1].body
  assert.ok(idempotencyKey)
  assert.deepEqual(payload, { session: 'S1', expectedRevision: 1, choiceId: 'answer-text', revisionText: 'Green' })
+ const start = timings.find(e => e[0] === 'start')
+ assert.deepEqual(start.slice(0, 3), ['start', 'ui.decision_submit', { gateway: 'G1', profile: 'default', session_id: 'S1' }])
+ assert.equal(timings.find(e => e[0] === 'complete')[3], start[3], 'exact attempt completed')
+ assert.ok(!JSON.stringify(timings).includes('Green'), 'no answer text in timing')
 })
 
 test('dismissRequest still hides one request locally and updates the queue count without a write', async () => {
@@ -101,6 +107,7 @@ test('a recorded decision forces blocked-panel\'s refresh even when the delivery
 
 test('a decision whose POST fails does not force a refresh (nothing changed)', async () => {
  const r = request(), forced = []
+ const before = timings.length
  window.__blockedPanel = { refresh: force => { forced.push(force) } }
  try {
   const call = async () => { throw new Error('offline') }
@@ -108,5 +115,25 @@ test('a decision whose POST fails does not force a refresh (nothing changed)', a
   await answerOther()
   await React.act(async () => { await flush(); await flush() })
   assert.deepEqual(forced, [])
+  assert.deepEqual(timings.slice(before).map(e => e[0]), ['start', 'cancel'], 'unknown outcome emits no success sample')
  } finally { delete window.__blockedPanel }
+})
+
+test('an answered POST without a recording receipt is not a successful timing sample', async () => {
+ const r = request(), before = timings.length
+ const call = async () => ({ request: r })
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
+ await answerOther()
+ assert.deepEqual(timings.slice(before).map(e => e[0]), ['start', 'cancel'])
+})
+
+test('broken telemetry never prevents recording a decision', async () => {
+ const saved = timing.start, r = request(), posts = []
+ timing.start = () => { throw Error('telemetry unavailable') }
+ try {
+  const call = async (path, opts = {}) => { if (opts.method === 'POST') posts.push(opts.body); return { request: r, operation: { operationId: 'op-safe', dispatchState: 'pending' } } }
+  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
+  await answerOther()
+  assert.equal(posts.length, 1)
+ } finally { timing.start = saved }
 })
