@@ -42,7 +42,10 @@ def version() -> Dict[str, Any]:
 
 @router.post("/update")
 def update() -> Dict[str, Any]:
-    return _version().update_now()
+    try:
+        return _version().update_now()
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "reason": str(exc)}
 
 
 @router.get("/ping")

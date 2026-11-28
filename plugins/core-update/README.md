@@ -5,7 +5,7 @@ There is no footer update chip or version pill.
 
 The Hub shows an up-arrow for a ready/building update with pending commits. Its
 **Hermes version** section shows the running backend revision, installed Desktop
-build, target and newest-first `running..target` commit subjects/times (collapsed
+build, applied checkout, target and newest-first `running..target` commit subjects/times (collapsed
 after 15). Version reads never fetch or edit Git.
 
 **Update now** works even without a pending prebuild. It writes the standard
@@ -22,6 +22,11 @@ update never quits Desktop. Only a ready, restart-capable bundle serving latest
 `origin/main` whose build inputs differ from the installed bundle triggers the
 existing apply-on-quit waiter and quit/reopen flow. Unknown bundle identity does
 not authorize a quit. Concurrent windows share one installation-level monitor lock.
+After reopening, the view reconciles the monitor's swap receipt against checkout
+and installed bundle identity. A dead monitor without a completed swap reports
+a retryable deferral, not endless Updating. The running backend keeps its boot
+SHA until its own process restarts; Applied checkout names the installed source.
+Completed/error receipts expire, so historical results do not mask current status.
 
 ## API
 

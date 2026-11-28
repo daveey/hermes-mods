@@ -5,8 +5,10 @@ updater, not a command or path supplied by the browser or state files.
 """
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import os
+import time
 from pathlib import Path
 import subprocess
 import sys
@@ -23,11 +25,45 @@ def installation_root(home):
     return home.parent.parent if home.parent.name == "profiles" else home
 
 
+def monitor_alive(directory):
+    # Read-only lock probe: PID reuse must never keep a dead operation active.
+    try:
+        with (directory / "hub-update.lock").open("r") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def reconcile_operation(core, operation, result, directory):
+    if operation.get("expires_at") and operation["expires_at"] <= time.time():
+        return {}
+    if operation.get("phase") in ("updating", "restarting"):
+        target = operation.get("target")
+        applied = result.get("applied")
+        if target and applied == target and result.get("desktop_swap_pending") is False and not result.get("force_request") and not result.get("progress"):
+            return {**operation, "phase": "updated", "sha": applied}
+        if not monitor_alive(directory):
+            # The swap waiter outlives the monitor and has its own live receipt.
+            waiter = core._read_json(directory / "waiter.json")
+            if waiter.get("state") not in (None, "done", "exited") and core._pid_alive(waiter.get("pid")):
+                return operation
+            return {**operation, "phase": "deferred", "reason": "Update monitor stopped; check the installed revision or retry Update now"}
+    # Terminal results are a short-lived receipt, not a permanent status banner.
+    if operation.get("finished_at") and time.time() - operation["finished_at"] > 300:
+        return {}
+    return operation
+
+
 def view(home=None, checkout=None):
     core = _core()
     home = home or core.hermes_home()
     root = checkout or core.running_checkout()
-    result = core.status(home, root)
+    result = core.status(installation_root(home), root)
+    result["applied"] = core._git(root, "rev-parse", "HEAD")
     running = result.get("running")
     from hermes_cli.git_fingerprint import process_boot_fingerprint
     boot = (process_boot_fingerprint(root) or "").rsplit(":", 1)[-1]
@@ -52,16 +88,18 @@ def view(home=None, checkout=None):
             sha, subject, at = line.split("\0", 2)
             changes.append({"sha": sha, "subject": subject, "at": at})
     result["changes"] = changes
+    result["commits"] = len(changes)
     from hermes_cli.core_update_force import read_force_request, running_turn_count
     from hermes_cli.core_update_progress import read_progress
     result["running_turns"] = running_turn_count(installation_root(home))
     result["force_request"] = read_force_request(installation_root(home))
     result["progress"] = read_progress()
-    result["operation"] = core._read_json(core.state_dir(installation_root(home)) / "hub-update.json")
+    directory = core.state_dir(installation_root(home))
+    result["operation"] = reconcile_operation(core, core._read_json(directory / "hub-update.json"), result, directory)
     reasons = (result["progress"] or {}).get("waiting_on") or []
     if reasons:
         result["deferral_reason"] = "; ".join(reasons)
-    waiter = core._read_json(core.state_dir(home) / "waiter.json")
+    waiter = core._read_json(directory / "waiter.json")
     if not result["progress"] and waiter.get("state") == "deferred" and core._pid_alive(waiter.get("pid")):
         result["deferral_reason"] = waiter.get("reason")
     return result

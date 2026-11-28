@@ -141,6 +141,14 @@ def test_concurrent_core_load_publishes_once(api, monkeypatch, tmp_path):
         sys.modules.pop(key, None)
 
 
+@pytest.mark.parametrize("error", [OSError("updater unavailable"), ValueError("unsafe updater")])
+def test_update_failure_is_structured(api, monkeypatch, error):
+    def fail():
+        raise error
+    monkeypatch.setattr(api, "_version", lambda: SimpleNamespace(update_now=fail))
+    assert api.update() == {"ok": False, "reason": str(error)}
+
+
 @pytest.mark.parametrize("path", ["/status", "/restart"])
 def test_error_contract(api, monkeypatch, path):
     def fail():

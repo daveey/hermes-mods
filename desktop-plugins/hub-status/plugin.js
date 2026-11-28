@@ -362,9 +362,10 @@ export function createVersionStore(api = options => window.hermesDesktop.api(opt
       } else if (v.deferral_reason) $message.set(v.deferral_reason)
       else if (v.progress) $message.set(v.progress.state === 'applying' ? 'Updating' : 'Waiting for turns')
       else if (v.force_request) $message.set('Waiting for turns')
-      else if (operation?.phase === 'updated' && operation.sha) {
-        $message.set(`Updated to ${operation.sha.slice(0, 10)}`); busy = false
+      else if (operation?.phase === 'updated') {
+        $message.set(operation.sha ? `Updated to ${operation.sha.slice(0, 10)}` : 'Update completed; revision unavailable'); busy = false
       } else if (['updating', 'restarting'].includes(operation?.phase)) $message.set('Updating')
+      else { $message.set(''); busy = false }
       return v
     } catch (e) { $message.set(String(e?.message || e)); return null }
   }
@@ -403,6 +404,7 @@ export function VersionSection({ store }) {
     jsx('b', { children: 'Hermes version' }),
     jsxs('dl', { children: [
       jsx('dt', { children: 'Running backend' }), jsx('dd', { children: v?.running?.slice(0, 10) || 'Unavailable' }),
+      jsx('dt', { children: 'Applied checkout' }), jsx('dd', { children: v?.applied?.slice(0, 10) || 'Unavailable' }),
       jsx('dt', { children: 'Installed Desktop' }), jsx('dd', { children: v?.desktop_build?.map(s => s?.slice(0, 10)).join(', ') || 'Unavailable' }),
       jsx('dt', { children: 'Target' }), jsx('dd', { children: v?.target?.slice(0, 10) || 'Unavailable' })
     ] }),
@@ -562,7 +564,7 @@ function Chip({ store, placement = 'titlebar' }) {
           'data-slot': 'hub-status-chip',
           'data-state': m.cur.state,
           'aria-label': m.label,
-          title: updateTooltip(version) || m.title,
+          title: [updateTooltip(version), m.title].filter(Boolean).join('\n'),
           children: [
             jsx(Strip, { slots: m.slots }),
             jsx('span', { children: 'Hub' }),
